@@ -33,10 +33,18 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+    tl = None
 
-from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
+try:
+    from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
+except ImportError:
+    can_use_store_cache = None
+    store_cache = None
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -61,6 +69,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_tpu,
     next_power_of_2,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -75,6 +84,7 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 _is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
@@ -2046,37 +2056,39 @@ def move_kv_cache_native(
         v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
 
 
-@triton.jit
-def copy_all_layer_kv_cache_tiled(
-    data_ptrs,
-    strides,
-    tgt_loc_ptr,
-    src_loc_ptr,
-    num_locs,
-    num_locs_upper: tl.constexpr,
-    BYTES_PER_TILE: tl.constexpr,
-):
-    """2D tiled kernel. Safe for in-place copy."""
-    bid = tl.program_id(0)
-    tid = tl.program_id(1)
+if triton is not None:
 
-    stride = tl.load(strides + bid)
-    base_ptr = tl.load(data_ptrs + bid)
-    base_ptr = tl.cast(base_ptr, tl.pointer_type(tl.uint8))
+    @triton.jit
+    def copy_all_layer_kv_cache_tiled(
+        data_ptrs,
+        strides,
+        tgt_loc_ptr,
+        src_loc_ptr,
+        num_locs,
+        num_locs_upper: tl.constexpr,
+        BYTES_PER_TILE: tl.constexpr,
+    ):
+        """2D tiled kernel. Safe for in-place copy."""
+        bid = tl.program_id(0)
+        tid = tl.program_id(1)
 
-    byte_off = tid * BYTES_PER_TILE + tl.arange(0, BYTES_PER_TILE)
-    mask_byte = byte_off < stride
-    tl.multiple_of(byte_off, 16)
+        stride = tl.load(strides + bid)
+        base_ptr = tl.load(data_ptrs + bid)
+        base_ptr = tl.cast(base_ptr, tl.pointer_type(tl.uint8))
 
-    loc_idx = tl.arange(0, num_locs_upper)
-    mask_loc = loc_idx < num_locs
+        byte_off = tid * BYTES_PER_TILE + tl.arange(0, BYTES_PER_TILE)
+        mask_byte = byte_off < stride
+        tl.multiple_of(byte_off, 16)
 
-    src = tl.load(src_loc_ptr + loc_idx, mask=mask_loc, other=0)
-    tgt = tl.load(tgt_loc_ptr + loc_idx, mask=mask_loc, other=0)
+        loc_idx = tl.arange(0, num_locs_upper)
+        mask_loc = loc_idx < num_locs
 
-    src_ptr = base_ptr + src[:, None] * stride + byte_off[None, :]
-    tgt_ptr = base_ptr + tgt[:, None] * stride + byte_off[None, :]
+        src = tl.load(src_loc_ptr + loc_idx, mask=mask_loc, other=0)
+        tgt = tl.load(tgt_loc_ptr + loc_idx, mask=mask_loc, other=0)
 
-    mask = mask_loc[:, None] & mask_byte[None, :]
-    vals = tl.load(src_ptr, mask=mask)
-    tl.store(tgt_ptr, vals, mask=mask)
+        src_ptr = base_ptr + src[:, None] * stride + byte_off[None, :]
+        tgt_ptr = base_ptr + tgt[:, None] * stride + byte_off[None, :]
+
+        mask = mask_loc[:, None] & mask_byte[None, :]
+        vals = tl.load(src_ptr, mask=mask)
+        tl.store(tgt_ptr, vals, mask=mask)

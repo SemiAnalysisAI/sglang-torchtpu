@@ -582,6 +582,19 @@ class ModelRunnerKVCacheMixin:
                     kvcache=self.token_to_kv_pool,
                     need_sort=need_sort,
                 )
+            elif current_platform.is_tpu():
+                from sglang.srt.hardware_backend.tpu.allocator_tpu import (
+                    TpuPagedTokenToKVPoolAllocator,
+                )
+
+                self.token_to_kv_pool_allocator = TpuPagedTokenToKVPoolAllocator(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                    kvcache=self.token_to_kv_pool,
+                    need_sort=need_sort,
+                )
             elif _is_npu and (
                 self.server_args.attention_backend == "ascend"
                 or self.hybrid_gdn_config is not None
