@@ -11,14 +11,20 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, is_tpu
 from sglang.srt.utils.common import get_num_new_pages
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.allocator_npu import (
         NPUPagedTokenToKVPoolAllocator,
+    )
+
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.allocator_tpu import (
+        TpuPagedTokenToKVPoolAllocator,
     )
 
 logger = logging.getLogger(__name__)
@@ -266,6 +272,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             if _is_npu:
                 PagedTokenToKVPoolAllocatorClass = NPUPagedTokenToKVPoolAllocator
+            elif _is_tpu:
+                PagedTokenToKVPoolAllocatorClass = TpuPagedTokenToKVPoolAllocator
             else:
                 PagedTokenToKVPoolAllocatorClass = PagedTokenToKVPoolAllocator
             self.full_attn_allocator = PagedTokenToKVPoolAllocatorClass(
