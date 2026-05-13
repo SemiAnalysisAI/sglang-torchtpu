@@ -37,11 +37,12 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_tpu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
 if _is_cuda or _is_hip:

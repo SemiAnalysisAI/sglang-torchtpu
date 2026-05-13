@@ -224,6 +224,7 @@ from sglang.srt.weight_sync.tensor_bucket import (
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_tpu = current_platform.is_tpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -232,6 +233,8 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
     init_npu_backend()
+elif _is_tpu:
+    current_platform.init_backend()
 elif current_platform.is_out_of_tree():
     current_platform.init_backend()
 
@@ -781,7 +784,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_device_graphs()
-        elif self.device == "cpu":
+        elif self.device in ["cpu", "tpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
         elif self.device == "npu":
@@ -2757,12 +2760,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "musa": "cuda graph",
                 "cpu": "cpu graph",
                 "npu": "npu graph",
+                "tpu": "tpu graph",
             },
         )
         logger.info(
             f"Capture {graph_backend[self.device]} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        if current_platform.is_out_of_tree():
+        if current_platform.is_out_of_tree() or _is_tpu:
             GraphRunnerCls = current_platform.get_graph_runner_cls()
             self.graph_runner = GraphRunnerCls(self)
         else:

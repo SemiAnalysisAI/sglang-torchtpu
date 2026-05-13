@@ -1,7 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import List, NamedTuple, Union
+from typing import Any, List, NamedTuple, Union
 
 import torch
 
@@ -15,7 +15,15 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
 from sglang.srt.utils import get_device_module
 
-device_module = get_device_module()
+device_module = None
+
+
+def _get_device_module():
+    global device_module
+    if device_module is None:
+        device_module = get_device_module()
+    return device_module
+
 
 from sglang.jit_kernel.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
@@ -27,8 +35,8 @@ logger = logging.getLogger(__name__)
 
 
 class HiSparseAct(NamedTuple):
-    start_event: device_module.Event
-    finish_event: device_module.Event
+    start_event: Any
+    finish_event: Any
     req: Req
 
 
@@ -122,11 +130,11 @@ class HiSparseCoordinator:
             max_num_req_slots, dtype=torch.int64, device="cpu"
         )
 
-        self.write_staging_stream = device_module.Stream()
-        self.decode_backup_stream = device_module.Stream()
+        self.write_staging_stream = _get_device_module().Stream()
+        self.decode_backup_stream = _get_device_module().Stream()
         self.ack_staging_queue: List[HiSparseAct] = []
         self.decode_producer_stream = None
-        self._backup_done_event = device_module.Event()
+        self._backup_done_event = _get_device_module().Event()
         self._has_pending_backup = False
 
         self.tp_group = tp_group
@@ -214,10 +222,10 @@ class HiSparseCoordinator:
             prefill_len,
         )
 
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        start_event = _get_device_module().Event()
+        finish_event = _get_device_module().Event()
         start_event.record()
-        with device_module.stream(self.write_staging_stream):
+        with _get_device_module().stream(self.write_staging_stream):
             start_event.wait(self.write_staging_stream)
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device,
@@ -565,8 +573,8 @@ class HiSparseCoordinator:
         host_locs = torch.cat(host_locs_list)
 
         self.wait_for_pending_backup()
-        schedule_stream = device_module.current_stream()
-        with device_module.stream(self.decode_backup_stream):
+        schedule_stream = _get_device_module().current_stream()
+        with _get_device_module().stream(self.decode_backup_stream):
             self.decode_backup_stream.wait_stream(schedule_stream)
             if self.decode_producer_stream is not None:
                 self.decode_backup_stream.wait_stream(self.decode_producer_stream)
@@ -590,7 +598,7 @@ class HiSparseCoordinator:
     def wait_for_pending_backup(self) -> None:
         if not self._has_pending_backup:
             return
-        self._backup_done_event.wait(device_module.current_stream())
+        self._backup_done_event.wait(_get_device_module().current_stream())
         self._has_pending_backup = False
 
     def naive_load_topk(
@@ -726,7 +734,7 @@ class HiSparseCoordinator:
     def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
-            device_module.current_stream().wait_stream(self.decode_producer_stream)
+            _get_device_module().current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the

@@ -45,21 +45,28 @@ from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
 
-device_module = get_device_module()
+device_module = None
+
+
+def _get_device_module():
+    global device_module
+    if device_module is None:
+        device_module = get_device_module()
+    return device_module
 
 
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
-        self.load_events = [device_module.Event() for _ in range(num_layers)]
-        self.start_event = device_module.Event()  # start event on controller stream
+        self.load_events = [_get_device_module().Event() for _ in range(num_layers)]
+        self.start_event = _get_device_module().Event()  # start event on controller stream
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
         self.load_events[layer_index].record()
 
     def wait(self, layer_index: int):
-        device_module.current_stream().wait_event(self.load_events[layer_index])
+        _get_device_module().current_stream().wait_event(self.load_events[layer_index])
 
     @property
     def finish_event(self):
@@ -320,8 +327,8 @@ class HiCacheController:
         self.write_buffer = TransferBuffer(self.stop_event)
         self.load_buffer = TransferBuffer(self.stop_event, buffer_count=10)
 
-        self.write_stream = device_module.Stream()
-        self.load_stream = device_module.Stream()
+        self.write_stream = _get_device_module().Stream()
+        self.load_stream = _get_device_module().Stream()
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -708,11 +715,11 @@ class HiCacheController:
         )
         self.write_queue.clear()
 
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        start_event = _get_device_module().Event()
+        finish_event = _get_device_module().Event()
 
         start_event.record()
-        with device_module.stream(self.write_stream):
+        with _get_device_module().stream(self.write_stream):
             start_event.wait(self.write_stream)
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
@@ -787,7 +794,7 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
-        with device_module.stream(self.load_stream):
+        with _get_device_module().stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(

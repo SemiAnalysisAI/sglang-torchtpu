@@ -80,7 +80,10 @@ import pybase64
 import requests
 import torch
 import torch.distributed as dist
-import triton
+try:
+    import triton
+except ImportError:
+    triton = None
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
@@ -190,6 +193,13 @@ def is_musa() -> bool:
     except ImportError:
         return False
     return hasattr(torch.version, "musa") and torch.version.musa is not None
+
+
+@lru_cache(maxsize=1)
+def is_tpu() -> bool:
+    from sglang.srt.platforms import current_platform
+
+    return current_platform.is_tpu()
 
 
 @lru_cache(maxsize=1)
@@ -633,7 +643,7 @@ def get_available_gpu_memory(
     else:
         from sglang.srt.platforms import current_platform
 
-        if not current_platform.is_out_of_tree():
+        if not (current_platform.is_out_of_tree() or current_platform.is_tpu()):
             raise ValueError(
                 f"Unsupported device type: {device!r}. "
                 "If this is an OOT platform, ensure it is properly registered "
@@ -1971,6 +1981,11 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "npu"
         return "npu:{}".format(device_id)
 
+    if is_tpu():
+        if device_id is None:
+            return "tpu"
+        return "tpu:{}".format(device_id)
+
     if is_habana_available():
         try:
             import habana_frameworks.torch.hpu  # noqa: F401
@@ -1994,7 +2009,9 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "mps"
         return "mps:{}".format(device_id)
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) is available.")
+    raise RuntimeError(
+        "No accelerator (CUDA, XPU, HPU, NPU, TPU, MUSA, MPS) is available."
+    )
 
 
 @lru_cache(maxsize=1)
@@ -2661,7 +2678,8 @@ def round_up(x: int, y: int) -> int:
     return ((x - 1) // y + 1) * y
 
 
-setattr(triton, "next_power_of_2", next_power_of_2)
+if triton is not None:
+    setattr(triton, "next_power_of_2", next_power_of_2)
 
 
 class EmptyContextManager:

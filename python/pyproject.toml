@@ -169,6 +169,9 @@ vsa = ["torch", "setuptools"]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
+[project.entry-points."sglang.srt.platforms"]
+tpu = "sglang.srt.hardware_backend.tpu:activate"
+
 [project.scripts]
 sglang = "sglang.cli.main:main"
 killall_sglang = "sglang.cli.killall:main"
