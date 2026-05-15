@@ -60,14 +60,21 @@ def _prepare_tpu_env(world_size: int = 1) -> None:
     if "TORCH_TPU_SLICEBUILDER_ADDRESSES" in os.environ:
         return
 
-    import socket
+    try:
+        import portpicker
 
-    def _pick_free_port() -> int:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        sb_ports = [portpicker.pick_unused_port() for _ in range(world_size)]
+    except ImportError:
+        import socket
+
+        # Hold sockets open until env var is written so OS doesn't reassign.
+        _held = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(world_size)]
+        for s in _held:
             s.bind(("", 0))
-            return s.getsockname()[1]
+        sb_ports = [s.getsockname()[1] for s in _held]
+        for s in _held:
+            s.close()
 
-    sb_ports = [_pick_free_port() for _ in range(world_size)]
     os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
         f"localhost:{p}" for p in sb_ports
     )
@@ -91,8 +98,53 @@ def _prepare_tpu_env(world_size: int = 1) -> None:
     )
 
 
+_set_device_patched = False
+
+
+def _patch_set_device_tolerate_mismatch() -> None:
+    """Make torch.tpu.set_device tolerant of sglang/torch_tpu chiplet-index
+    disagreements.
+
+    sglang's ModelRunner.init_torch_distributed calls set_device(self.gpu_id).
+    torch_tpu auto-binds each process to a chiplet at first PJRT init based
+    on env vars set by run_scheduler_process; if the auto-bound chiplet
+    index doesn't match sglang's gpu_id (e.g. on v7 where PJRT may assign
+    chiplet 5 to local_rank=3 depending on slicebuilder coordination),
+    torch_tpu raises "Cannot set TPU device to index X, current process is
+    bound to device index Y". Accept the existing binding — chiplet
+    assignment is owned by torch_tpu/PJRT, sglang's gpu_id is just a label.
+    """
+    global _set_device_patched
+    if _set_device_patched:
+        return
+    _set_device_patched = True
+
+    from torch_tpu._internal.device import _device_module
+
+    orig_set_device = _device_module._DeviceModule.set_device
+
+    def wrapped(cls, device):
+        try:
+            return orig_set_device(device)
+        except ValueError as e:
+            if "Cannot set TPU device" in str(e):
+                idx = (
+                    device.index
+                    if hasattr(device, "index") and device.index is not None
+                    else int(device)
+                )
+                logger.warning(
+                    "TPU set_device(idx=%s) skipped: %s", idx, e,
+                )
+                return
+            raise
+
+    _device_module._DeviceModule.set_device = classmethod(wrapped)
+
+
 def apply_tpu_patches(world_size: int = 1) -> None:
     _prepare_tpu_env(world_size)
     _configure_eager_mode()
     _unwrap_dynamic_compile_fns()
+    _patch_set_device_tolerate_mismatch()
     logger.info("TPU patches applied.")
