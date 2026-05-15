@@ -12,7 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, is_tpu
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.srt.utils.profile_utils import ProfileManager
 
@@ -30,6 +30,47 @@ if _is_npu:
         ["profiler.ProfilerActivity.CPU", torch_npu.profiler.ProfilerActivity.CPU],
     ]
     torch_npu._apply_patches(patches)
+
+
+class _TpuProfilerAdapter:
+    """Adapter that wraps ``torch_tpu._internal.profiler.start_trace`` /
+    ``stop_trace`` into the same ``.start()`` / ``.stop()`` shape as
+    ``torch.profiler.profile``, so SGLang's scheduler can use the TPU
+    profiler through the existing /start_profile and /stop_profile flow.
+
+    torch_tpu's public ``profiler.profile`` is context-manager-only, so we
+    drive the underlying ``start_trace`` + ``_push_enable_profiler`` calls
+    directly here.
+    """
+
+    def __init__(self, log_dir: str):
+        from torch_tpu._internal.profiler import (  # noqa: F401
+            ProfilerActivity,
+            profiler_api,
+        )
+        from torch_tpu._internal.profiler import _impl  # type: ignore
+        from torch_tpu._internal.profiler import _profiler_backend  # type: ignore
+
+        self._log_dir = log_dir
+        self._impl = _impl
+        self._profiler_backend = _profiler_backend
+        # Build the same options ``profiler.profile`` uses (CPU + TPU).
+        self._options = profiler_api._get_profile_options(
+            [ProfilerActivity.CPU, ProfilerActivity.TPU]
+        )
+
+    def start(self) -> None:
+        os.makedirs(self._log_dir, exist_ok=True)
+        # ``_impl.start_trace`` is what ``profiler.profile.__enter__`` calls.
+        self._impl.start_trace(self._log_dir, profiler_options=self._options)
+        # pylint: disable-next=protected-access
+        self._profiler_backend._push_enable_profiler()
+
+    def stop(self) -> None:
+        # pylint: disable-next=protected-access
+        self._profiler_backend._pop_enable_profiler()
+        self._impl.stop_trace()
+
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +201,15 @@ class SchedulerProfilerMixin:
             activity_map[a] for a in activities if a in activity_map
         ]
 
+        # On TPU the torch.profiler Kineto backend doesn't speak the TPU's
+        # protobuf trace format, so we use torch_tpu's native profiler API
+        # (which writes xprof-compatible traces). Activate it whenever the
+        # caller asks for "TPU" activity or when the platform is TPU and
+        # no GPU/XPU activity is requested.
+        use_tpu_profiler = "TPU" in activities or (
+            is_tpu() and not torchprof_activities
+        )
+
         if "RPD" in activities:  # for ROCM
             from rpdTracerControl import rpdTracerControl
 
@@ -188,6 +238,14 @@ class SchedulerProfilerMixin:
             self.rpd_profiler.setPythonTrace(True)
             self.rpd_profiler.start()
             self.rpd_profiler.rangePush("", "rpd profile range", "")
+            self.profile_in_progress = True
+        elif use_tpu_profiler:
+            # Native torch_tpu profiler writes xprof-format traces directly
+            # into the output directory; no on_trace_ready callback needed.
+            self.torch_profiler = _TpuProfilerAdapter(
+                str(self.torch_profiler_output_dir)
+            )
+            self.torch_profiler.start()
             self.profile_in_progress = True
         elif torchprof_activities:
             self.torch_profiler = torch.profiler.profile(
@@ -271,7 +329,13 @@ class SchedulerProfilerMixin:
         logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
-            if not _is_npu:
+            if isinstance(self.torch_profiler, _TpuProfilerAdapter):
+                # torch_tpu writes xprof-compatible traces directly to the
+                # output directory; nothing else to export.
+                logger.info(
+                    "TPU trace written to %s", self.torch_profiler_output_dir
+                )
+            elif not _is_npu:
                 # Build filename with only non-zero ranks to maintain backward compatibility
                 filename_parts = [self.profile_id, f"TP-{self.tp_rank}"]
 
@@ -293,7 +357,8 @@ class SchedulerProfilerMixin:
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, filename)
                 )
-            torch.distributed.barrier(self.dp_tp_cpu_group)
+            if not isinstance(self.torch_profiler, _TpuProfilerAdapter):
+                torch.distributed.barrier(self.dp_tp_cpu_group)
 
         if self.rpd_profiler is not None:
             self.rpd_profiler.rangePop()

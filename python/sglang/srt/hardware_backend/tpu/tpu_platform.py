@@ -97,6 +97,22 @@ class TpuSRTPlatform(SRTPlatform):
         # process / before patches run in some test paths, so be defensive.
         _register_tpu_compile_backend()
 
+        # SGLang's batch shape varies per request (decode-1, prefill-N for
+        # several Ns, mixed). With ``dynamic=False`` each distinct shape is
+        # a fresh dynamo specialisation, which quickly blows past the
+        # default ``cache_size_limit=8``. Bump it to something generous
+        # enough to cover the common bucket counts so the scheduler does
+        # not crash with FailOnRecompileLimitHit during steady-state
+        # serving. A future change should switch the model wrap to
+        # ``dynamic=True`` and rely on symbolic-shape specialisation
+        # instead, but until that's plumbed through (see Pallas kernel
+        # block-size selection) raising the limit is the safest knob.
+        import torch._dynamo
+
+        torch._dynamo.config.cache_size_limit = max(
+            torch._dynamo.config.cache_size_limit, 256
+        )
+
         wrapped = []
         for method_name in ("forward", "forward_split_prefill"):
             fn = getattr(model, method_name, None)
@@ -105,14 +121,30 @@ class TpuSRTPlatform(SRTPlatform):
             compiled = torch.compile(
                 fn, backend="tpu", fullgraph=True, dynamic=False,
             )
-            setattr(model, method_name, compiled)
+            # Pad the token-axis of (input_ids, positions) to a small set of
+            # static buckets *outside* the compiled region. dynamo only ever
+            # sees those bucket sizes, so the number of recompiles is bounded
+            # by ``len(TOKEN_BUCKETS) * |forward_modes|`` instead of growing
+            # with every distinct request length. Outputs are sliced back to
+            # the real token count for forward modes whose output is
+            # per-token (decode); per-sequence outputs (extend) need no
+            # slicing because the LogitsProcessor selects last-token indices
+            # via ``extend_seq_lens.cumsum()`` which is unaffected by the
+            # padded tail.
+            from sglang.srt.hardware_backend.tpu.compile_shape_buckets import (
+                make_token_bucketed_forward,
+            )
+
+            setattr(model, method_name, make_token_bucketed_forward(compiled))
             wrapped.append(method_name)
 
         logger.info(
             "Wrapped %s.{%s} with torch.compile(backend='tpu', "
-            "fullgraph=True, dynamic=False).",
+            "fullgraph=True, dynamic=False, cache_size_limit=%d) "
+            "+ token-bucket padding.",
             type(model).__name__,
             ", ".join(wrapped),
+            torch._dynamo.config.cache_size_limit,
         )
 
     # ------------------------------------------------------------------
@@ -120,7 +152,11 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     def get_default_attention_backend(self) -> str:
-        return "torch_native"
+        # The "pallas" backend wraps the Pallas v3 ragged-paged-attention
+        # kernel (see sglang.srt.layers.attention.pallas_backend). Falling
+        # back to "torch_native" is still possible via --attention-backend
+        # for debugging.
+        return "pallas"
 
     def get_graph_runner_cls(self) -> type:
         from sglang.srt.hardware_backend.tpu.graph_runner.tpu_graph_runner import (
@@ -130,6 +166,21 @@ class TpuSRTPlatform(SRTPlatform):
         return TpuGraphRunner
 
     def get_mha_kv_pool_cls(self) -> type:
+        # The Pallas backend requires a fused 5D KV cache layout that the
+        # ragged-paged-attention kernel writes into directly. When the user
+        # opts out of the Pallas backend (e.g. for debugging via
+        # ``--attention-backend torch_native``) fall back to the standard
+        # MHA pool, whose separate K / V buffers are what the torch-native
+        # backend expects.
+        from sglang.srt.server_args import get_global_server_args
+
+        if get_global_server_args().attention_backend == "pallas":
+            from sglang.srt.hardware_backend.tpu.kv_pool import (
+                TpuFusedMHATokenToKVPool,
+            )
+
+            return TpuFusedMHATokenToKVPool
+
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
         return MHATokenToKVPool

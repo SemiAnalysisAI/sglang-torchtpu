@@ -283,10 +283,15 @@ class ModelRunnerKVCacheMixin:
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
 
-        # Check out-of-tree platform (plugin system) first
+        # Check out-of-tree platform (plugin system) first. TPU is in-tree
+        # but its Pallas attention backend needs a fused 5D KV layout that
+        # only ``TpuFusedMHATokenToKVPool`` provides — route TPU through the
+        # same platform-factory path so the right pool gets picked up.
         from sglang.srt.platforms import current_platform
 
-        if current_platform.is_out_of_tree() and not self.mambaish_config:
+        if (
+            current_platform.is_out_of_tree() or current_platform.is_tpu()
+        ) and not self.mambaish_config:
             if self.use_mla_backend and is_nsa_model:
                 PoolCls = current_platform.get_nsa_kv_pool_cls()
                 self.token_to_kv_pool = PoolCls(

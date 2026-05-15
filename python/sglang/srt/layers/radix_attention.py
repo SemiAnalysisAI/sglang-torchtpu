@@ -120,7 +120,17 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+        # NB: keep the ``get_forward_context()`` check on the left of the
+        # ``and``. On TPU (and any platform without piecewise-CUDA-graph /
+        # breakable-CUDA-graph runners), ``get_forward_context()`` is always
+        # ``None``, so the right-hand side is dead code. If we let dynamo
+        # evaluate ``forward_batch.forward_mode.is_extend()`` first, it
+        # installs an ``___check_obj_id(args[2].forward_mode, ...)`` guard
+        # that fails whenever the mode flips between EXTEND and DECODE —
+        # doubling the compile count for *every* input-shape specialisation.
+        # Putting the always-None check first lets dynamo constant-fold the
+        # ``and`` to False without ever looking at ``forward_mode``.
+        if get_forward_context() is not None and forward_batch.forward_mode.is_extend():
             if self.qk_head_dim != self.v_head_dim:
                 output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
             else:

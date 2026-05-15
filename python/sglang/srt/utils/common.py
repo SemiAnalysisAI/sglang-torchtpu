@@ -375,7 +375,9 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    # ``pallas`` is the TPU torch_tpu backend; Triton is not available on TPU
+    # so we must fall back to the torch-loop path for req_to_token writes.
+    return backend not in ["torch_native", "intel_amx", "pallas"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(

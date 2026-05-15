@@ -273,3 +273,11 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("pallas")
+def create_pallas_backend(runner):
+    """Pallas ragged-paged-attention backend for the TPU torch_tpu platform."""
+    from sglang.srt.layers.attention.pallas_backend import PallasAttnBackend
+
+    return PallasAttnBackend(runner)
