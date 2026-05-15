@@ -28,6 +28,13 @@ def _configure_eager_mode() -> None:
     logger.info("TorchTPU eager mode set to DEFER_AND_FUSE.")
 
 
+def _register_tpu_compile_backend() -> None:
+    # Importing `torch_tpu._internal.compile` registers the "tpu" backend with
+    # torch._dynamo so that `torch.compile(backend="tpu", ...)` works. Must run
+    # before any code applies that decorator (e.g. on imports of layers/models).
+    import torch_tpu._internal.compile  # noqa: F401
+
+
 def _unwrap_dynamic_compile_fns() -> None:
     global _dynamic_compile_unwrapped
     if _dynamic_compile_unwrapped:
@@ -192,6 +199,7 @@ def _patch_compute_position_torch() -> None:
 def apply_tpu_patches(world_size: int = 1) -> None:
     _prepare_tpu_env(world_size)
     _configure_eager_mode()
+    _register_tpu_compile_backend()
     _unwrap_dynamic_compile_fns()
     _patch_set_device_tolerate_mismatch()
     _patch_compute_position_torch()

@@ -1552,6 +1552,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger,
         )
 
+        # Platform-specific torch.compile install for backends that have no
+        # graph runner (e.g. TPU). No-op for CUDA / NPU — they wrap via
+        # CudaGraphRunner / NpuGraphRunner.
+        current_platform.maybe_install_torch_compile_on_model(
+            self.model, self.server_args
+        )
+
         if self.server_args.elastic_ep_backend == "mooncake":
             # Mooncake does not support `monitored_barrier`
             dist.barrier(group=get_tp_group().cpu_group)

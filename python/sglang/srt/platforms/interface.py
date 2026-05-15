@@ -46,6 +46,20 @@ class SRTPlatform(DeviceMixin):
         """
         pass
 
+    def maybe_install_torch_compile_on_model(self, model, server_args) -> None:
+        """Optionally install a platform-specific torch.compile wrapper on the
+        model's forward.
+
+        Default is a no-op: most platforms apply torch.compile via the graph
+        runner (e.g. CudaGraphRunner). Platforms that do not have a graph
+        runner — and want torch.compile on the backbone — can override this
+        and rewrite ``model.forward`` in place.
+
+        Called from ``ModelRunner.load_model`` after the model is fully loaded
+        and only when ``server_args.enable_torch_compile`` is True.
+        """
+        return
+
     # ------------------------------------------------------------------
     # Subsystem factory methods
     # ------------------------------------------------------------------
