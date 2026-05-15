@@ -582,6 +582,14 @@ class GroupCoordinator:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
 
+        if input_.device.type == "tpu":
+            # sglang's registered custom op (inplace_all_reduce) is CUDA-only.
+            # Route to _all_reduce_in_place which falls through to
+            # torch.distributed.all_reduce with the tpu_dist backend (native
+            # StableHLO all-reduce via ProcessGroupTpu).
+            self._all_reduce_in_place(input_)
+            return input_
+
         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
             return self.hpu_communicator.all_reduce(input_)
 
@@ -753,7 +761,7 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu:
+        if _is_npu or input.device.type == "tpu":
             self._reduce_scatter_tensor(output, input)
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
@@ -816,7 +824,7 @@ class GroupCoordinator:
             )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_xpu:
+        if _is_npu or _is_xpu or input.device.type == "tpu":
             self._all_gather_into_tensor(output, input)
         else:
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
@@ -1439,12 +1447,19 @@ def init_model_parallel_group(
         use_mscclpp_allreduce = _ENABLE_MSCCLPP_ALL_REDUCE
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
+    # All three of these communicators are CUDA-only (PyNcclCommunicator,
+    # CustomAllReduce, MscclppCommunicator, TorchSymmMemCommunicator all
+    # call torch.cuda.device(...) which raises on TPU). Disable for tpu_dist.
+    if backend == "tpu_dist":
+        use_custom_allreduce = False
+        use_mscclpp_allreduce = False
+        use_torch_symm_mem_allreduce = False
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
         use_pynccl=(
-            not (_is_npu or _is_xpu or backend == "mooncake")
+            not (_is_npu or _is_xpu or backend in ("mooncake", "tpu_dist"))
             if use_pynccl is None
             else use_pynccl
         ),
@@ -1603,6 +1618,7 @@ _DEVICE_TO_DISTRIBUTED_BACKEND = {
     "cpu": "gloo",
     "npu": "hccl" if not envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 else "zbal",
     "musa": "mccl",
+    "tpu": "tpu_dist",
 }
 
 

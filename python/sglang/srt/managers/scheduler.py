@@ -3742,6 +3742,21 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+
+    # torch_tpu's PJRT slicebuilder reads torchrun-style env vars
+    # (RANK/LOCAL_RANK/WORLD_SIZE/MASTER_ADDR/MASTER_PORT) to coordinate
+    # multi-process init. sglang's mp.Process spawn path doesn't otherwise
+    # set them. Set here before any model/distributed code imports torch_tpu
+    # so PJRT lazy-init in each worker sees the correct rank info.
+    if server_args.device == "tpu":
+        world_size = server_args.tp_size * server_args.nnodes
+        os.environ["RANK"] = str(tp_rank + server_args.node_rank * server_args.tp_size)
+        os.environ["LOCAL_RANK"] = str(tp_rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["LOCAL_WORLD_SIZE"] = str(server_args.tp_size)
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29500")
+
     dp_rank = configure_scheduler_process(
         server_args,
         gpu_id,
