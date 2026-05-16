@@ -80,6 +80,99 @@ def _next_bucket(n: int, buckets: tuple[int, ...]) -> int:
 _PALLAS_RPA_OP = None
 
 
+# --------------------------------------------------------------------------- #
+# Compiled metadata builders.
+#
+# Building the per-forward attention metadata (kv_lens / cu_q_lens / cu_kv_lens
+# / page_indices / distribution) currently fires ~15 separate eager tensor ops
+# per call. Each one becomes its own XLA dispatch on TPU, adding ~50–100µs of
+# host overhead per dispatch — i.e. ~1 ms wasted per decode step. Wrapping the
+# tensor-only inner computation in ``torch.compile`` collapses all of those
+# into a single XLA program with a single dispatch, mirroring the way
+# torchtpu-vllm wraps its post-forward steps and sglang-jax keeps the analog
+# under jax.jit. We pick separate functions for decode vs extend so neither
+# graph carries a Python branch on ``forward_mode``.
+# --------------------------------------------------------------------------- #
+
+
+def _build_decode_metadata_kernel(
+    seq_lens_padded: torch.Tensor,       # [padded_bs] int32  (0 in padded slots)
+    extend_seq_lens_padded: torch.Tensor, # [padded_bs] int32 (1 in real slots, 0 in padded)
+    req_pool_indices_padded: torch.Tensor, # [padded_bs] int64
+    req_to_token: torch.Tensor,          # [max_reqs+1, max_ctx] int32
+    pages_per_seq: int,
+    page_size: int,
+):
+    padded_bs = seq_lens_padded.shape[0]
+    cu_q_lens = torch.zeros(padded_bs + 1, dtype=torch.int32, device=seq_lens_padded.device)
+    cu_q_lens[1:] = torch.cumsum(extend_seq_lens_padded, dim=0, dtype=torch.int32)
+    cu_kv_lens = torch.arange(
+        padded_bs + 1, dtype=torch.int32, device=seq_lens_padded.device
+    ) * (pages_per_seq * page_size)
+    per_seq = req_to_token[req_pool_indices_padded]
+    page_indices = (
+        per_seq[:, : pages_per_seq * page_size : page_size] // page_size
+    ).to(torch.int32)
+    page_indices = page_indices.reshape(padded_bs * pages_per_seq).contiguous()
+    num_active = (seq_lens_padded > 0).sum().to(torch.int32)
+    distribution = num_active.repeat(3).to(torch.int32)  # decode: [N, N, N]
+    return seq_lens_padded, cu_q_lens, cu_kv_lens, page_indices, distribution
+
+
+def _build_extend_metadata_kernel(
+    seq_lens_padded: torch.Tensor,
+    extend_seq_lens_padded: torch.Tensor,
+    req_pool_indices_padded: torch.Tensor,
+    req_to_token: torch.Tensor,
+    pages_per_seq: int,
+    page_size: int,
+):
+    padded_bs = seq_lens_padded.shape[0]
+    cu_q_lens = torch.zeros(padded_bs + 1, dtype=torch.int32, device=seq_lens_padded.device)
+    cu_q_lens[1:] = torch.cumsum(extend_seq_lens_padded, dim=0, dtype=torch.int32)
+    cu_kv_lens = torch.arange(
+        padded_bs + 1, dtype=torch.int32, device=seq_lens_padded.device
+    ) * (pages_per_seq * page_size)
+    per_seq = req_to_token[req_pool_indices_padded]
+    page_indices = (
+        per_seq[:, : pages_per_seq * page_size : page_size] // page_size
+    ).to(torch.int32)
+    page_indices = page_indices.reshape(padded_bs * pages_per_seq).contiguous()
+    num_active = (seq_lens_padded > 0).sum().to(torch.int32)
+    zero = torch.zeros((), dtype=torch.int32, device=seq_lens_padded.device)
+    distribution = torch.stack([zero, num_active, num_active]).to(torch.int32)  # [0, N, N]
+    return seq_lens_padded, cu_q_lens, cu_kv_lens, page_indices, distribution
+
+
+# Lazily-compiled wrappers: built on first use so unit tests that don't have
+# torch_tpu installed can still import this module on CPU. The compiled
+# variants are only attached when the runtime device is "tpu".
+_compiled_decode_metadata = None
+_compiled_extend_metadata = None
+
+
+def _get_compiled_metadata_kernels(device: torch.device):
+    """Return ``(decode_fn, extend_fn)`` compiled with the ``"tpu"`` backend,
+    or the eager Python originals on non-TPU devices."""
+    global _compiled_decode_metadata, _compiled_extend_metadata
+    if device.type != "tpu":
+        return _build_decode_metadata_kernel, _build_extend_metadata_kernel
+    if _compiled_decode_metadata is None:
+        _compiled_decode_metadata = torch.compile(
+            _build_decode_metadata_kernel,
+            backend="tpu",
+            fullgraph=True,
+            dynamic=False,
+        )
+        _compiled_extend_metadata = torch.compile(
+            _build_extend_metadata_kernel,
+            backend="tpu",
+            fullgraph=True,
+            dynamic=False,
+        )
+    return _compiled_decode_metadata, _compiled_extend_metadata
+
+
 def _build_pallas_kernel_op():
     """Lazily register the ragged_paged_attention kernel as a torch custom op.
 
@@ -223,61 +316,52 @@ class PallasAttnBackend(AttentionBackend):
         max_context_len = req_to_token.shape[1]
         pages_per_seq = max_context_len // page_size
 
-        # Pad seq_lens and (when applicable) extend_seq_lens to ``padded_bs``
-        # with zeros. ``seq_lens=0`` is the "no-op" sequence the kernel
-        # short-circuits via ``distribution``.
-        seq_lens = self._pad_to(forward_batch.seq_lens, padded_bs)
+        # Pad the per-sequence input tensors here (cheap, only 3 ops).
+        seq_lens_padded = self._pad_to(forward_batch.seq_lens, padded_bs)
 
-        if forward_batch.forward_mode.is_extend():
+        is_extend = forward_batch.forward_mode.is_extend()
+        if is_extend:
             assert forward_batch.extend_seq_lens is not None, (
                 "extend_seq_lens is required for the Pallas attention backend in "
                 "extend mode."
             )
-            extend_seq_lens = self._pad_to(forward_batch.extend_seq_lens, padded_bs)
+            extend_seq_lens_padded = self._pad_to(
+                forward_batch.extend_seq_lens, padded_bs
+            )
         else:
-            # Decode: q_len == 1 per *real* sequence, 0 for padded slots so
-            # ``cu_q_lens`` stays consistent with the real input layout
-            # (which the platform wrapper also pads — see tpu_platform.py).
-            extend_seq_lens = torch.zeros(padded_bs, dtype=torch.int32, device=device)
-            extend_seq_lens[:real_bs] = 1
+            # Decode: q_len == 1 per *real* sequence, 0 for padded slots.
+            extend_seq_lens_padded = torch.zeros(
+                padded_bs, dtype=torch.int32, device=device
+            )
+            extend_seq_lens_padded[:real_bs] = 1
 
-        # req_pool_indices padded to ``padded_bs`` with 0. req_to_token[0] is
-        # an all-zero row so padded sequences' page indices land in block 0
-        # (the dummy padding block).
         req_pool_indices_padded = self._pad_to(
             forward_batch.req_pool_indices.to(torch.int64), padded_bs
         )
 
-        cu_q_lens = torch.zeros(padded_bs + 1, dtype=torch.int32, device=device)
-        cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
-
-        # cu_kv_lens[i] = i * pages_per_seq * page_size so the kernel addresses
-        # ``page_indices[i * pages_per_seq + j]`` for token j of seq i.
-        cu_kv_lens = torch.arange(
-            padded_bs + 1, dtype=torch.int32, device=device
-        ) * (pages_per_seq * page_size)
-
-        per_seq = req_to_token[req_pool_indices_padded]  # [padded_bs, max_ctx]
-        # ``req_to_token.shape[1]`` may not be an exact multiple of
-        # ``page_size`` (SGLang adds extra slack tokens), in which case
-        # ``per_seq[:, ::page_size]`` would emit one extra trailing column.
-        # Trim to exactly ``pages_per_seq`` entries per row so the flat
-        # ``page_indices`` shape matches the rectangular layout the kernel
-        # expects.
-        page_indices = (
-            per_seq[:, : pages_per_seq * page_size : page_size] // page_size
-        ).to(torch.int32)
-        page_indices = page_indices.reshape(padded_bs * pages_per_seq).contiguous()
-
-        num_active = (seq_lens > 0).sum().to(torch.int32)
-        if forward_batch.forward_mode.is_decode():
-            distribution = num_active.repeat(3).to(torch.int32)
-        else:
-            zero = torch.zeros((), dtype=torch.int32, device=device)
-            distribution = torch.stack([zero, num_active, num_active]).to(torch.int32)
+        # Dispatch the rest (cumsum, arange, gather, reshape, distribution
+        # build) as a single compiled XLA program. On TPU this collapses ~12
+        # individual eager-mode dispatches into one, which is what removes
+        # the per-step host overhead we saw in xprof.
+        decode_fn, extend_fn = _get_compiled_metadata_kernels(device)
+        fn = extend_fn if is_extend else decode_fn
+        (
+            kv_lens_out,
+            cu_q_lens,
+            cu_kv_lens,
+            page_indices,
+            distribution,
+        ) = fn(
+            seq_lens_padded,
+            extend_seq_lens_padded,
+            req_pool_indices_padded,
+            req_to_token,
+            pages_per_seq,
+            page_size,
+        )
 
         return PallasForwardMetadata(
-            kv_lens=seq_lens,
+            kv_lens=kv_lens_out,
             cu_q_lens=cu_q_lens,
             cu_kv_lens=cu_kv_lens,
             page_indices=page_indices,

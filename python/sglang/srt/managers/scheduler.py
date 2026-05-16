@@ -248,6 +248,12 @@ else:
         pass
 
 
+from sglang.srt.hardware_backend.tpu.scheduler_overlap_mixin import (
+    SchedulerTpuOverlapMixin,
+)
+from sglang.srt.platforms import current_platform
+
+
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
@@ -333,6 +339,7 @@ class Scheduler(
     SchedulerDPAttnMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
+    SchedulerTpuOverlapMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -380,8 +387,18 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
-        self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
-        self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
+        _is_tpu = current_platform.is_tpu()
+        self.enable_overlap_tpu = (
+            not server_args.disable_overlap_schedule and _is_tpu
+        )
+        self.enable_overlap_mlx = (
+            not server_args.disable_overlap_schedule and use_mlx()
+        )
+        self.enable_overlap = (
+            not server_args.disable_overlap_schedule
+            and not use_mlx()
+            and not _is_tpu
+        )
         self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
@@ -653,6 +670,12 @@ class Scheduler(
             from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
 
             self.tp_worker = MlxTpModelWorker(**worker_kwargs)
+        elif self.enable_overlap_tpu:
+            from sglang.srt.hardware_backend.tpu.tp_worker_overlap_thread import (
+                TpuTpModelWorkerClient,
+            )
+
+            self.tp_worker = TpuTpModelWorkerClient(**worker_kwargs)
         else:
             from sglang.srt.managers.tp_worker import TpModelWorker
 
@@ -1315,6 +1338,29 @@ class Scheduler(
             self.result_queue: Deque = deque()
             return
 
+        if self.enable_overlap_tpu:
+            # TPU overlap is thread-based — no CUDA-style streams. We
+            # still want a FutureMap so consecutive steps can chain
+            # without a host round-trip (placeholders rewritten on
+            # device by the worker thread's resolve_future).
+            self.future_map = FutureMap(
+                self.max_running_requests,
+                self.chunked_prefill_size,
+                self.model_config.context_len,
+                self.device,
+                self.spec_algorithm,
+            )
+            self.tp_worker.set_future_map(self.future_map)
+            self.result_queue = deque()
+            # Used by ``record_batch_in_overlap`` to anchor a couple of
+            # recent ``ModelWorkerBatch`` objects against torch GC. Not
+            # strictly required when the worker thread already keeps a
+            # reference, but matches the contract of the shared
+            # ``record_batch_in_overlap`` helper.
+            self.batch_record_buf = [None] * 2
+            self.batch_record_ct = 0
+            return
+
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
@@ -1508,6 +1554,15 @@ class Scheduler(
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
             # not PyTorch MPS streams.
+            dispatch_event_loop(self)
+            return
+
+        if self.enable_overlap_tpu:
+            # torch_tpu's Stream is a stub; running everything under a
+            # non-default schedule_stream confuses the C++ runtime and
+            # serialises work on a single PJRT queue anyway. Skip the
+            # wrapper and rely on PJRT's intrinsic async dispatch plus
+            # our worker thread for overlap.
             dispatch_event_loop(self)
             return
 
@@ -2407,7 +2462,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             model_config=self.model_config,
-            enable_overlap=self.enable_overlap,
+            enable_overlap=self.enable_overlap or self.enable_overlap_tpu,
             spec_algorithm=self.spec_algorithm,
         )
 
@@ -2767,7 +2822,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             self.tree_cache,
             self.model_config,
-            self.enable_overlap,
+            self.enable_overlap or self.enable_overlap_tpu,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
         )
@@ -3250,7 +3305,10 @@ class Scheduler(
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (self.cur_batch is None or self.cur_batch.is_empty())
-            and (not self.enable_overlap or len(self.result_queue) == 0)
+            and (
+                not (self.enable_overlap or self.enable_overlap_tpu)
+                or len(self.result_queue) == 0
+            )
             and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
         )
 
@@ -3844,6 +3902,8 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_pp()
         elif scheduler.enable_overlap_mlx:
             scheduler.event_loop_overlap_mlx()
+        elif scheduler.enable_overlap_tpu:
+            scheduler.event_loop_overlap_tpu()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap()
         else:

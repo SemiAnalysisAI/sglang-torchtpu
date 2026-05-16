@@ -46,7 +46,12 @@ class TpuSRTPlatform(SRTPlatform):
 
         server_args.disable_cuda_graph = True
         server_args.disable_piecewise_cuda_graph = True
-        server_args.disable_overlap_schedule = True
+        # Overlap scheduling on TPU uses the thread-based path in
+        # ``hardware_backend.tpu.scheduler_overlap_mixin`` /
+        # ``tp_worker_overlap_thread`` — NOT SGLang's CUDA-stream overlap,
+        # which hangs because ``torch.tpu.Stream`` is a stub. Leave it
+        # enabled by default; users can still opt out via
+        # ``--disable-overlap-schedule``.
         # `enable_torch_compile` is honored on TPU and wired up by
         # `maybe_install_torch_compile_on_model` below. Off by default
         # (the SGLang-wide default); opt in with `--enable-torch-compile`.

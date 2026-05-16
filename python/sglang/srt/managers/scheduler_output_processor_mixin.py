@@ -477,9 +477,11 @@ class SchedulerOutputProcessorMixin:
         for i, req in enumerate(batch.reqs):
             req: Req
 
-            if (self.enable_overlap or self.enable_overlap_mlx) and (
-                req.finished() or req.is_retracted
-            ):
+            if (
+                self.enable_overlap
+                or self.enable_overlap_mlx
+                or self.enable_overlap_tpu
+            ) and (req.finished() or req.is_retracted):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
