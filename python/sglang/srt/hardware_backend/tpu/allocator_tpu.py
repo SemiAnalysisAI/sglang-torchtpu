@@ -43,11 +43,17 @@ if TYPE_CHECKING:
 
 
 def _np_to_device(arr: np.ndarray, device) -> torch.Tensor:
-    """Synchronous H2D copy. We deliberately avoid ``non_blocking=True``
-    on torch_tpu — it has subtle interactions with PJRT's queue and is
-    not actually faster for the tiny (bs,)-shaped tensors we move here.
+    """Synchronous H2D copy. ``arr.copy()`` so the source numpy buffer
+    is owned by the resulting torch CPU tensor's storage (and stays
+    alive across the H2D), and ``.to(device)`` without
+    ``non_blocking=True`` because torch_tpu's PJRT path mishandles
+    fire-and-forget transfers from temporary CPU memory.
     """
     return torch.from_numpy(arr.copy()).to(device)
+
+
+# Alias so the rare prefill-time call site reads clearly.
+_np_to_device_oneshot = _np_to_device
 
 
 class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
@@ -111,7 +117,7 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             out_pages_np[:, None] * self.page_size
             + np.arange(self.page_size, dtype=np.int64)
         ).reshape(-1)
-        return _np_to_device(out_indices_np, self.device)
+        return _np_to_device_oneshot(out_indices_np, self.device)
 
     def alloc_extend(
         self,
@@ -151,7 +157,7 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         # anyway, so the per-call recompile is unavoidable and
         # orthogonal to the decode-path fix.
         if num_new_pages_item > 0:
-            free_pages_view = _np_to_device(
+            free_pages_view = _np_to_device_oneshot(
                 self.free_pages[:num_new_pages_item], self.device
             )
         else:

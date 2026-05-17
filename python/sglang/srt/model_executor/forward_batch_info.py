@@ -560,12 +560,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)
+            # NOTE: on torch_tpu, ``non_blocking=True`` here would leave
+            # the CPU source tensor (a Python-list temporary) eligible
+            # for GC before the PJRT H2D completes, which causes the
+            # worker thread's ``compute_position_torch`` zip-iter to
+            # block forever on ``.item()`` of the corrupted tensor. The
+            # H2D is two ints; ``non_blocking=False`` cost is negligible.
+            _h2d_nb = str(device) != "tpu" and getattr(
+                device, "type", None) != "tpu"
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
+            ).to(device, non_blocking=_h2d_nb)
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
+            ).to(device, non_blocking=_h2d_nb)
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
                 model_runner.server_args.attention_backend,
