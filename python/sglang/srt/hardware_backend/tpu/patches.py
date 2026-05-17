@@ -142,9 +142,57 @@ def _patch_set_device_tolerate_mismatch() -> None:
     _device_module._DeviceModule.set_device = classmethod(wrapped)
 
 
+_compute_position_torch_patched = False
+
+
+def _patch_compute_position_torch() -> None:
+    """Replace forward_batch_info.compute_position_torch with a CPU-staged
+    variant that doesn't deadlock the torch_tpu device queue.
+
+    Upstream iterates `for p, s in zip(extend_prefix_lens, extend_seq_lens)`
+    and calls `torch.arange(p, p+s, device=tpu)` per element. Each iter mixes
+    an implicit scalar materialization of the 0-dim TPU tensor with a
+    device-side arange — interleaved sync-and-launch ops wedge the torch_tpu
+    device queue after the first batch leaves pending work. Symptom: TP=8
+    warmup completes, then all schedulers hang at this line on the next
+    request.
+
+    Fix: `.tolist()` both length tensors once (single explicit sync), build
+    positions on CPU, transfer to device once. Behavior identical on CUDA/CPU
+    (which doesn't use this path anyway — CUDA goes through the triton
+    variant).
+    """
+    global _compute_position_torch_patched
+    if _compute_position_torch_patched:
+        return
+    _compute_position_torch_patched = True
+
+    import torch
+
+    from sglang.srt.model_executor import forward_batch_info
+
+    def compute_position_torch_cpu_staged(
+        extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
+    ):
+        device = extend_prefix_lens.device
+        prefix_lens = extend_prefix_lens.tolist()
+        seq_lens = extend_seq_lens.tolist()
+        positions_cpu = torch.cat(
+            [torch.arange(p, p + s) for p, s in zip(prefix_lens, seq_lens)],
+            axis=0,
+        ).to(torch.int64)
+        extend_start_loc = torch.zeros_like(extend_seq_lens)
+        if extend_seq_lens.numel() > 1:
+            extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+        return positions_cpu.to(device), extend_start_loc
+
+    forward_batch_info.compute_position_torch = compute_position_torch_cpu_staged
+
+
 def apply_tpu_patches(world_size: int = 1) -> None:
     _prepare_tpu_env(world_size)
     _configure_eager_mode()
     _unwrap_dynamic_compile_fns()
     _patch_set_device_tolerate_mismatch()
+    _patch_compute_position_torch()
     logger.info("TPU patches applied.")
