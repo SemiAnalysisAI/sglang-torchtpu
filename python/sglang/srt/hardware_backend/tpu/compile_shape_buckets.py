@@ -55,6 +55,43 @@ def _pad_token_axis(t: torch.Tensor, length: int) -> torch.Tensor:
     return out
 
 
+def _maybe_to_list(x):
+    """tensor → Python list; pass through Python lists / None."""
+    if isinstance(x, torch.Tensor):
+        return x.tolist()
+    return x
+
+
+def _tensors_to_lists_nested(seq_lists):
+    """Walk a list-shaped prefill-logprob field and .tolist() any tensors.
+
+    The shape produced by LogitsProcessor.process_input_logprobs in PREFILL is
+    ``List[<per-seq>]`` where each per-seq entry is either ``[]`` or a
+    ``List[Tensor]`` (top-k path) / a single 2D ``Tensor`` (token-ids path).
+    When the LogitsProcessor runs inside ``torch.compile`` on TPU, the inner
+    ``.tolist()`` is deferred (see logprob.py); this finishes it after the
+    compile boundary so downstream consumers see the same Python-list shape
+    they get from the eager (GPU) path.
+    """
+    if seq_lists is None:
+        return None
+    out = []
+    for entry in seq_lists:
+        if isinstance(entry, list):
+            out.append([_maybe_to_list(x) for x in entry])
+        else:
+            out.append(_maybe_to_list(entry))
+    return out
+
+
+_PREFILL_LOGPROB_FIELDS = (
+    "input_top_logprobs_val",
+    "input_top_logprobs_idx",
+    "input_token_ids_logprobs_val",
+    "input_token_ids_logprobs_idx",
+)
+
+
 def make_token_bucketed_forward(compiled_fn: Callable) -> Callable:
     """Wrap a compiled model.forward with token-axis bucket padding.
 
@@ -87,6 +124,13 @@ def make_token_bucketed_forward(compiled_fn: Callable) -> Callable:
                 out.next_token_logits = out.next_token_logits[:real_n]
             if getattr(out, "hidden_states", None) is not None:
                 out.hidden_states = out.hidden_states[:real_n]
+
+        # Finish the deferred .tolist() for prefill input-logprob fields.
+        for field in _PREFILL_LOGPROB_FIELDS:
+            val = getattr(out, field, None)
+            if val is not None:
+                setattr(out, field, _tensors_to_lists_nested(val))
+
         return out
 
     return _forward

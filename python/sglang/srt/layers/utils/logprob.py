@@ -72,7 +72,10 @@ def get_top_logprobs_raw(
 ):
     max_k = max(top_logprobs_nums)
     values, indices = logprobs.topk(max_k, dim=-1)
-    if not no_copy_to_cpu:
+    # Defer the device→CPU sync when running inside torch.compile (TPU fullgraph
+    # mode): Tensor.tolist() on a float tensor is unsupported by dynamo. The
+    # compile boundary wrapper finishes the conversion after the graph returns.
+    if not no_copy_to_cpu and not torch.compiler.is_compiling():
         values = values.tolist()
         indices = indices.tolist()
 
@@ -129,6 +132,8 @@ def get_token_ids_logprobs_raw(
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None,
     no_copy_to_cpu: bool = False,
 ):
+    # See note in get_top_logprobs_raw: keep tensors when inside torch.compile.
+    keep_tensors = no_copy_to_cpu or torch.compiler.is_compiling()
     vals, idxs = [], []
     if stage == LogprobStage.DECODE:
         for i, token_ids in enumerate(token_ids_logprobs_list):
@@ -140,7 +145,7 @@ def get_token_ids_logprobs_raw(
                     logprobs.device, non_blocking=True
                 )
                 row = logprobs[i, token_ids_tensor]
-                vals.append(row if no_copy_to_cpu else row.tolist())
+                vals.append(row if keep_tensors else row.tolist())
                 idxs.append(token_ids)
     else:  # prefill
         pt = 0
@@ -155,7 +160,7 @@ def get_token_ids_logprobs_raw(
                 logprobs.device, non_blocking=True
             )
             pos_logprobs = logprobs[pt : pt + pruned_len, token_ids_tensor]
-            vals.append(pos_logprobs if no_copy_to_cpu else pos_logprobs.tolist())
+            vals.append(pos_logprobs if keep_tensors else pos_logprobs.tolist())
             idxs.append([token_ids for _ in range(pruned_len)])
             pt += pruned_len
     return vals, idxs
@@ -211,8 +216,13 @@ def get_top_logprobs_chunk(
 
     max_k = max(logits_metadata.top_logprobs_nums)
     ret = logprobs.topk(max_k, dim=1)
-    values = ret.values.tolist()
-    indices = ret.indices.tolist()
+    # See note in get_top_logprobs_raw: keep tensors when inside torch.compile.
+    if torch.compiler.is_compiling():
+        values = ret.values
+        indices = ret.indices
+    else:
+        values = ret.values.tolist()
+        indices = ret.indices.tolist()
 
     pt = 0
     next_split_pruned_len = 0
@@ -307,13 +317,15 @@ def get_token_ids_logprobs_chunk(
         # Get the token ids logprobs
         val = []
         idx = []
+        keep_tensors = torch.compiler.is_compiling()
         for j in range(pruned_len):
             # Handle remaining tokens in next chunk if any
             if pt + j >= logprobs.shape[0]:
                 next_split_pruned_len = split_pruned_len + j
                 break
             if token_ids is not None:
-                val.append(logprobs[pt + j, token_ids].tolist())
+                row = logprobs[pt + j, token_ids]
+                val.append(row if keep_tensors else row.tolist())
                 idx.append(token_ids)
 
         # Append or extend based on whether the sequence was split across chunks
