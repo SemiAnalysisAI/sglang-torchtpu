@@ -189,10 +189,179 @@ def _patch_compute_position_torch() -> None:
     forward_batch_info.compute_position_torch = compute_position_torch_cpu_staged
 
 
+_torch_native_attn_backend_patched = False
+
+
+def _patch_torch_native_attn_backend() -> None:
+    """Replace TorchNativeAttnBackend._run_sdpa_forward_{extend,decode} with
+    CPU-staged variants that don't crash the torch_tpu device queue under
+    TP>1.
+
+    Upstream loops over per-request control values pulled straight off device
+    tensors — `extend_seq_lens[i]`, `extend_prefix_lens[i]`, `seq_lens[i]`,
+    `req_pool_indices[i]` — and feeds them into Python slices/indexes
+    (`query[:, start_q:end_q, :]`, `req_to_token[req_pool_idx, :seq_len_kv]`).
+    Each use forces an implicit mid-graph 0-dim device->host materialization.
+
+    On TP=1 that implicit sync succeeds. Under TP>1 the workers run in
+    torch_tpu SPMD mode, and the implicit DtoH of a derived scalar fails:
+      "Attempted to execute with 1 argument lists when local device count
+       is 0 (total replica count: 1, partition count: 2) - TpuMemcpyDtoHDirect:
+       DeviceBufferRef has nonzero size, but does not have a PjRtBuffer"
+    Symptom: TP=8 server starts, first /v1/chat/completions crashes all
+    schedulers at torch_native_backend.py:80 `query[:, start_q:end_q, :]`.
+
+    Fix: `.tolist()` the control tensors once per call (single explicit
+    sync), drive the loop with Python ints. Same approach as
+    _patch_compute_position_torch. Behavior is identical on CUDA/CPU, which
+    don't take this backend (they use FlashInfer/FlashAttention/triton).
+    """
+    global _torch_native_attn_backend_patched
+    if _torch_native_attn_backend_patched:
+        return
+    _torch_native_attn_backend_patched = True
+
+    import torch
+    from torch.nn.functional import scaled_dot_product_attention
+
+    from sglang.srt.layers.attention.torch_native_backend import (
+        TorchNativeAttnBackend,
+    )
+
+    def _run_sdpa_forward_extend(
+        self,
+        query,
+        output,
+        k_cache,
+        v_cache,
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        extend_prefix_lens,
+        extend_seq_lens,
+        scaling=None,
+        enable_gqa=False,
+        causal=False,
+    ):
+        assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
+        assert seq_lens.shape[0] == extend_seq_lens.shape[0]
+
+        # Single explicit host sync of all loop-control tensors. Avoids the
+        # per-iteration implicit 0-dim DtoH that wedges torch_tpu SPMD.
+        seq_lens_l = seq_lens.tolist()
+        extend_prefix_lens_l = extend_prefix_lens.tolist()
+        extend_seq_lens_l = extend_seq_lens.tolist()
+        req_pool_indices_l = req_pool_indices.tolist()
+
+        query = query.movedim(0, query.dim() - 2)
+
+        start_q, start_kv = 0, 0
+        for seq_idx in range(len(seq_lens_l)):
+            extend_seq_len_q = extend_seq_lens_l[seq_idx]
+            prefill_seq_len_q = extend_prefix_lens_l[seq_idx]
+
+            seq_len_kv = seq_lens_l[seq_idx]
+            end_q = start_q + extend_seq_len_q
+            end_kv = start_kv + seq_len_kv
+
+            per_req_query = query[:, start_q:end_q, :]
+            per_req_query_redudant = torch.empty(
+                (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
+                dtype=per_req_query.dtype,
+                device=per_req_query.device,
+            )
+
+            per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
+
+            req_pool_idx = req_pool_indices_l[seq_idx]
+            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+
+            if not (per_req_query.dtype == per_req_key.dtype == per_req_value.dtype):
+                per_req_key = per_req_key.to(per_req_query.dtype)
+                per_req_value = per_req_value.to(per_req_query.dtype)
+
+            per_req_out_redudant = (
+                scaled_dot_product_attention(
+                    per_req_query_redudant.unsqueeze(0),
+                    per_req_key.unsqueeze(0),
+                    per_req_value.unsqueeze(0),
+                    enable_gqa=enable_gqa,
+                    scale=scaling,
+                    is_causal=causal,
+                )
+                .squeeze(0)
+                .movedim(query.dim() - 2, 0)
+            )
+            output[start_q:end_q, :, :] = per_req_out_redudant[
+                prefill_seq_len_q:, :, :
+            ]
+            start_q, start_kv = end_q, end_kv
+        return output
+
+    def _run_sdpa_forward_decode(
+        self,
+        query,
+        output,
+        k_cache,
+        v_cache,
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        scaling=None,
+        enable_gqa=False,
+        causal=False,
+    ):
+        seq_lens_l = seq_lens.tolist()
+        req_pool_indices_l = req_pool_indices.tolist()
+
+        query = query.movedim(0, query.dim() - 2)
+
+        start_q, start_kv = 0, 0
+        for seq_idx in range(len(seq_lens_l)):
+            seq_len_q = 1
+            seq_len_kv = seq_lens_l[seq_idx]
+            end_q = start_q + seq_len_q
+            end_kv = start_kv + seq_len_kv
+
+            per_req_query = query[:, start_q:end_q, :]
+
+            req_pool_idx = req_pool_indices_l[seq_idx]
+            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+
+            if not (per_req_query.dtype == per_req_key.dtype == per_req_value.dtype):
+                per_req_key = per_req_key.to(per_req_query.dtype)
+                per_req_value = per_req_value.to(per_req_query.dtype)
+
+            per_req_out = (
+                scaled_dot_product_attention(
+                    per_req_query.unsqueeze(0),
+                    per_req_key.unsqueeze(0),
+                    per_req_value.unsqueeze(0),
+                    enable_gqa=enable_gqa,
+                    scale=scaling,
+                    is_causal=causal,
+                )
+                .squeeze(0)
+                .movedim(query.dim() - 2, 0)
+            )
+            output[start_q:end_q, :, :] = per_req_out
+            start_q, start_kv = end_q, end_kv
+
+        return output
+
+    TorchNativeAttnBackend._run_sdpa_forward_extend = _run_sdpa_forward_extend
+    TorchNativeAttnBackend._run_sdpa_forward_decode = _run_sdpa_forward_decode
+
+
 def apply_tpu_patches(world_size: int = 1) -> None:
     _prepare_tpu_env(world_size)
     _configure_eager_mode()
     _unwrap_dynamic_compile_fns()
     _patch_set_device_tolerate_mismatch()
     _patch_compute_position_torch()
+    _patch_torch_native_attn_backend()
     logger.info("TPU patches applied.")
