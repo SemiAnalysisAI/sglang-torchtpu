@@ -251,12 +251,20 @@ class TpuSRTPlatform(SRTPlatform):
     # Device identity & operations (DeviceMixin)
     # ------------------------------------------------------------------
 
+    # HBM sizes are per PJRT-addressable device (chiplet), not per package.
+    # On v7 each chip has 2 cores and PJRT exposes each core as its own
+    # device, so the per-rank usable HBM is half the package spec (192 GB
+    # → 96 GB; libtpu reserves ~1.25 GB so XLA's effective budget is
+    # 94.75 GB — round down to 95 to mirror the v5p entry's margin).
+    # Using the 192 GB per-package number caused mem_fraction_static to
+    # be applied to 2× the real budget, producing static KV-cache slabs
+    # that exceeded HBM at compile time for any mf > ~0.4 with tp=8.
     _TPU_HBM_BYTES = {
         "TPU v4": 32 * (1 << 30),
         "TPU v5p": 95 * (1 << 30),
         "TPU v5e": 16 * (1 << 30),
         "TPU v6e": 32 * (1 << 30),
-        "TPU v7": 192 * (1 << 30),
+        "TPU v7": 95 * (1 << 30),
     }
 
     def get_device_total_memory(self, device_id: int = 0) -> int:
