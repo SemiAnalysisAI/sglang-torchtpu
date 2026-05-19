@@ -357,6 +357,94 @@ def _patch_torch_native_attn_backend() -> None:
     TorchNativeAttnBackend._run_sdpa_forward_decode = _run_sdpa_forward_decode
 
 
+_support_triton_patched = False
+
+
+def _patch_support_triton_for_tpu() -> None:
+    """Make `support_triton("pallas_tpu")` return False.
+
+    SGLang gates Triton kernels behind `support_triton(attn_backend)`, which
+    is a hardcoded name allowlist: `backend not in ["torch_native",
+    "intel_amx"]`. The `torch_native` backend therefore dodges Triton (no
+    Triton driver exists for TPU), but the new "pallas_tpu" name is not in the
+    list, so `mem_cache/common.py:write_cache_indices` and
+    `forward_batch_info.py` take the Triton path and crash with
+    `RuntimeError: 0 active drivers` on TPU.
+
+    Fix: treat "pallas_tpu" exactly like "torch_native" w.r.t. Triton
+    availability (correct — TPU has no Triton driver regardless of attention
+    backend). Other backends are unaffected. `support_triton` is imported
+    by value in two modules, so rebind it there too. Keeps upstream untouched.
+    """
+    global _support_triton_patched
+    if _support_triton_patched:
+        return
+    _support_triton_patched = True
+
+    import sglang.srt.utils.common as _utils_common
+
+    orig = _utils_common.support_triton
+
+    def support_triton(backend: str) -> bool:
+        if backend == "pallas_tpu":
+            return False
+        return orig(backend)
+
+    _utils_common.support_triton = support_triton
+
+    # Rebind the by-value imports (and the package re-export).
+    for modname in (
+        "sglang.srt.utils",
+        "sglang.srt.mem_cache.common",
+        "sglang.srt.model_executor.forward_batch_info",
+    ):
+        try:
+            mod = importlib.import_module(modname)
+        except (ImportError, ModuleNotFoundError):
+            continue
+        if getattr(mod, "support_triton", None) is orig:
+            mod.support_triton = support_triton
+
+
+_pallas_attention_registered = False
+
+
+def _register_pallas_attention_backend() -> None:
+    """Register the TPU Pallas attention backend ("pallas_tpu") in SGLang's
+    attention registry at runtime, without editing upstream
+    attention_registry.py.
+
+    `register_attention_backend(name)` is a plain function returning a
+    decorator that mutates the module-global ATTENTION_BACKENDS dict, so
+    calling it programmatically is equivalent to the upstream
+    @register_attention_backend decorator — keeps upstream untouched.
+
+    Ordering: this runs from apply_tpu_patches() via init_backend(), which
+    executes at `model_runner` module import (model_runner.py:236-238),
+    strictly before ModelRunner.init_attention_backend() (model_runner.py:776)
+    looks the name up. The backend module itself is imported lazily inside the
+    factory so importing patches does not pull in jax/torch_tpu early.
+    """
+    global _pallas_attention_registered
+    if _pallas_attention_registered:
+        return
+    _pallas_attention_registered = True
+
+    from sglang.srt.layers.attention.attention_registry import (
+        register_attention_backend,
+    )
+
+    def create_pallas_tpu_backend(runner):
+        from sglang.srt.hardware_backend.tpu.attention_pallas import (
+            TpuPallasAttnBackend,
+        )
+
+        return TpuPallasAttnBackend(runner)
+
+    register_attention_backend("pallas_tpu")(create_pallas_tpu_backend)
+    logger.info("Registered 'pallas_tpu' attention backend.")
+
+
 def apply_tpu_patches(world_size: int = 1) -> None:
     _prepare_tpu_env(world_size)
     _configure_eager_mode()
@@ -364,4 +452,6 @@ def apply_tpu_patches(world_size: int = 1) -> None:
     _patch_set_device_tolerate_mismatch()
     _patch_compute_position_torch()
     _patch_torch_native_attn_backend()
+    _patch_support_triton_for_tpu()
+    _register_pallas_attention_backend()
     logger.info("TPU patches applied.")

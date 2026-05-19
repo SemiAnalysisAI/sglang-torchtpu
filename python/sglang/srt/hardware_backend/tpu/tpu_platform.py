@@ -57,7 +57,15 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     def get_default_attention_backend(self) -> str:
-        return "torch_native"
+        # Pallas backend: flash_attention for prefill/extend, jax pallas
+        # paged_attention for decode (decode-native: no q>=128 padding, batched
+        # single call, native GQA). Registered in
+        # server_args.py:ATTENTION_BACKEND_CHOICES alongside other hardware-
+        # specific backends (intel_amx, ascend, intel_xpu), so it is also
+        # accepted via --attention-backend / --prefill-attention-backend /
+        # --decode-attention-backend. Override to the reference path with
+        # `--attention-backend torch_native`.
+        return "pallas_tpu"
 
     def get_graph_runner_cls(self) -> type:
         from sglang.srt.hardware_backend.tpu.graph_runner.tpu_graph_runner import (
