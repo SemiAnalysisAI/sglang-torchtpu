@@ -5,7 +5,7 @@ These tests mock torch_tpu so they can run on any machine without TPU hardware.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 from sglang.srt.platforms.device_mixin import PlatformEnum
@@ -114,7 +114,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             attention_backend=None,
             disable_cuda_graph=False,
             disable_piecewise_cuda_graph=False,
-            enable_torch_compile=True,
+            enable_torch_compile=False,
             disable_overlap_schedule=False,
             mem_fraction_static=None,
             tp_size=1,
@@ -129,9 +129,29 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         self.assertEqual(args.attention_backend, "pallas_tpu_rpa_v3")
         self.assertTrue(args.disable_cuda_graph)
         self.assertTrue(args.disable_piecewise_cuda_graph)
+        # enable_torch_compile is opt-in on TPU and must not be forced off.
         self.assertFalse(args.enable_torch_compile)
         self.assertTrue(args.disable_overlap_schedule)
         self.assertEqual(args.mem_fraction_static, 0.40)
+
+    def test_enable_torch_compile_preserved_when_opted_in(self):
+        args = SimpleNamespace(
+            dtype=None,
+            attention_backend=None,
+            disable_cuda_graph=False,
+            disable_piecewise_cuda_graph=False,
+            enable_torch_compile=True,
+            disable_overlap_schedule=False,
+            mem_fraction_static=None,
+            tp_size=1,
+        )
+        platform = TpuSRTPlatform()
+        with patch(
+            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
+        ):
+            platform.apply_server_args_defaults(args)
+
+        self.assertTrue(args.enable_torch_compile)
 
     def test_explicit_dtype_not_overridden(self):
         args = SimpleNamespace(

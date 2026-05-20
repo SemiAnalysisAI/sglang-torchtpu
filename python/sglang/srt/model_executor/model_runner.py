@@ -2758,11 +2758,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
             return
 
-        if self.device != "cpu" and self.server_args.disable_cuda_graph:
-            return
+        # TPU uses this hook only to install torch.compile via
+        # TpuGraphRunner (PJRT handles compilation caching, so there is
+        # no CUDA-style capture/replay). The two legacy gates below
+        # would always return early on TPU because disable_cuda_graph
+        # is True by default, so handle TPU in a dedicated branch and
+        # leave the original gates untouched for the other devices.
+        if self.device == "tpu":
+            if not self.server_args.enable_torch_compile:
+                return
+        else:
+            if self.device != "cpu" and self.server_args.disable_cuda_graph:
+                return
 
-        if self.device == "cpu" and not self.server_args.enable_torch_compile:
-            return
+            if self.device == "cpu" and not self.server_args.enable_torch_compile:
+                return
 
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
