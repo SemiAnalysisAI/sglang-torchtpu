@@ -196,6 +196,160 @@ def _patch_compute_position_torch() -> None:
     forward_batch_info.compute_position_torch = compute_position_torch_cpu_staged
 
 
+_alloc_extend_naive_patched = False
+
+
+def _patch_alloc_extend_naive() -> None:
+    """Replace mem_cache.allocator.alloc_extend_naive with a CPU-staged variant
+    that doesn't crash the torch_tpu device queue under TP>1.
+
+    # (qinghan) todo: examine carefully
+
+    Upstream loops over per-request control values pulled straight off device
+    tensors — ``seq_lens[i]``, ``prefix_lens[i]``, ``last_loc[i]``,
+    ``end_new_pages[i]``, ``start_new_pages[i]``, ``need_page[i]`` — and feeds
+    them into Python ``if`` checks, slice bounds (``out_indices[start_pos[i] :
+    start_pos[i] + num1]``), and most importantly fancy indexing
+    (``free_pages[end_new_pages[i] - 1]``). Each use forces an implicit
+    mid-graph 0-dim device->host materialization.
+
+    On TP=1 that implicit sync succeeds. Under TP>1 (replica_count=1,
+    partition_count=2 on v7x because each chip exposes 2 cores) the workers
+    run in torch_tpu SPMD mode, and the implicit DtoH of a derived scalar
+    fails:
+      "Attempted to execute with 1 argument lists when local device count
+       is 0 (total replica count: 1, partition count: 2) - TpuMemcpyDtoHDirect:
+       DeviceBufferRef has nonzero size, but does not have a PjRtBuffer"
+    Symptom: TP>=2 server starts and finishes init, then the first
+    /v1/chat/completions (or warmup prefill) crashes all schedulers at
+    allocator.py:236 ``free_pages[end_new_pages[i] - 1] * page_size +
+    pos_in_page[:num3]``.
+
+    Fix: ``.tolist()`` the control tensors once per call (single explicit
+    sync), drive the loop with Python ints, keep ``free_pages`` and
+    ``out_indices`` on device. Same approach as
+    :func:`_patch_compute_position_torch` and
+    :func:`_patch_torch_native_attn_backend`. Behavior is identical on
+    CUDA/CPU, which don't take this path on TPU (they have a triton
+    variant — see ``support_triton``).
+    """
+    global _alloc_extend_naive_patched
+    if _alloc_extend_naive_patched:
+        return
+    _alloc_extend_naive_patched = True
+
+    import torch
+
+    from sglang.srt.mem_cache import allocator as _allocator
+
+    def alloc_extend_naive_cpu_staged(
+        prefix_lens,
+        seq_lens,
+        last_loc,
+        free_pages,
+        out_indices,
+        page_size,
+        device,
+    ):
+        # Single explicit host sync of all loop-control tensors. Avoids the
+        # per-iteration implicit 0-dim DtoH that wedges torch_tpu SPMD.
+        prefix_lens_l = prefix_lens.tolist()
+        seq_lens_l = seq_lens.tolist()
+        last_loc_l = last_loc.tolist()
+
+        bs = len(prefix_lens_l)
+        extend_lens_l = [seq_lens_l[i] - prefix_lens_l[i] for i in range(bs)]
+        end_pos_l: list[int] = []
+        _acc = 0
+        for v in extend_lens_l:
+            _acc += v
+            end_pos_l.append(_acc)
+        start_pos_l = [end_pos_l[i] - extend_lens_l[i] for i in range(bs)]
+        num_new_pages_l = [
+            (seq_lens_l[i] + page_size - 1) // page_size
+            - (prefix_lens_l[i] + page_size - 1) // page_size
+            for i in range(bs)
+        ]
+        num_full_new_pages_l = [
+            seq_lens_l[i] // page_size
+            - (prefix_lens_l[i] + page_size - 1) // page_size
+            for i in range(bs)
+        ]
+        need_page_l = [
+            num_new_pages_l[i] - num_full_new_pages_l[i] for i in range(bs)
+        ]
+        end_new_pages_l: list[int] = []
+        _acc = 0
+        for v in num_new_pages_l:
+            _acc += v
+            end_new_pages_l.append(_acc)
+        start_new_pages_l = [
+            end_new_pages_l[i] - num_new_pages_l[i] for i in range(bs)
+        ]
+
+        pos_in_page = torch.arange(page_size, device=device, dtype=torch.int32)
+
+        for i in range(bs):
+            prefix_i = prefix_lens_l[i]
+            seq_i = seq_lens_l[i]
+            last_loc_i = last_loc_l[i]
+            start_pos_i = start_pos_l[i]
+            end_pos_i = end_pos_l[i]
+            start_new_pages_i = start_new_pages_l[i]
+            end_new_pages_i = end_new_pages_l[i]
+            need_page_i = need_page_l[i]
+
+            num1 = (
+                min(seq_i, (prefix_i + page_size - 1) // page_size * page_size)
+                - prefix_i
+            )
+            if num1:
+                out_indices[start_pos_i : start_pos_i + num1] = (
+                    last_loc_i + 1 + pos_in_page[:num1].view(-1)
+                )
+
+            if prefix_i + num1 == seq_i:
+                continue
+
+            num2 = (
+                seq_i // page_size - (prefix_i + page_size - 1) // page_size
+            ) * page_size
+            if num2:
+                pages = (
+                    free_pages[start_new_pages_i : end_new_pages_i - need_page_i]
+                    * page_size
+                )
+                out_indices[start_pos_i + num1 : start_pos_i + num1 + num2] = (
+                    pages.view(-1, 1) + pos_in_page.view(1, -1)
+                ).view(-1)
+
+            if prefix_i + num1 + num2 == seq_i:
+                continue
+
+            num3 = seq_i - seq_i // page_size * page_size
+            if num3:
+                out_indices[end_pos_i - num3 : end_pos_i] = (
+                    free_pages[end_new_pages_i - 1] * page_size
+                    + pos_in_page[:num3]
+                ).view(-1)
+
+    _allocator.alloc_extend_naive = alloc_extend_naive_cpu_staged
+
+    # ``allocator_tpu`` does ``from sglang.srt.mem_cache.allocator import
+    # alloc_extend_naive`` at module-load time — that binding captures the
+    # function value, not a module attribute, so we also have to rebind it
+    # there (or in any other module that imported the original by name).
+    try:
+        from sglang.srt.hardware_backend.tpu import allocator_tpu as _allocator_tpu
+
+        _allocator_tpu.alloc_extend_naive = alloc_extend_naive_cpu_staged
+    except ImportError:
+        # allocator_tpu hasn't been imported yet; its ``from ... import
+        # alloc_extend_naive`` will pick up the patched module attribute
+        # we just set above. Nothing more to do.
+        pass
+
+
 def apply_tpu_patches(world_size: int = 1) -> None:
     _prepare_tpu_env(world_size)
     _configure_eager_mode()
@@ -203,4 +357,5 @@ def apply_tpu_patches(world_size: int = 1) -> None:
     _unwrap_dynamic_compile_fns()
     _patch_set_device_tolerate_mismatch()
     _patch_compute_position_torch()
+    _patch_alloc_extend_naive()
     logger.info("TPU patches applied.")

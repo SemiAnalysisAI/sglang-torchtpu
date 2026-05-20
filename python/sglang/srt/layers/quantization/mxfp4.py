@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_tpu,
     is_triton_kernels_available,
     mxfp_supported,
     next_power_of_2,
@@ -438,6 +439,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        if is_tpu():
+            self._process_weights_tpu(layer)
+            return
         if self.use_flashinfer:
             # TODO: these values are hardcoded for now, we need to get them from the model
             layer.gemm1_alpha = Parameter(
@@ -736,6 +740,79 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
 
+    def _apply_tpu(self, layer, dispatch_output):
+        """TPU MoE forward — shares the Pallas fused-MoE op with the unquant path.
+
+        Weights arrive in the load-time-processed packed layout (see
+        :func:`_process_weights_tpu`): ``uint8`` MXFP4-packed ``w*``,
+        ``fp32 (g, num_blocks, 1, n)`` scales, ``bf16 (g, 1, n)`` biases.
+        ``fused_moe_func`` dispatches on ``dtype`` at JAX trace time, so the
+        Qwen3 (BF16) trace and the GPT-OSS (uint8) trace are independent
+        jaxprs.
+        """
+        from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        moe_runner_config = self.moe_runner_config
+        if moe_runner_config.apply_router_weight_on_input:
+            raise NotImplementedError(
+                "apply_router_weight_on_input is not supported on TPU yet."
+            )
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+
+        output = fused_moe_call(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w1_bias=layer.w13_weight_bias,
+            w2_bias=layer.w2_weight_bias,
+            topk_weights=topk_weights.to(x.dtype),
+            topk_ids=topk_ids.to(torch.int32),
+            topk=int(topk_ids.shape[-1]),
+            activation=moe_runner_config.activation,
+        )
+        return StandardCombineInput(hidden_states=output)
+
+    def _process_weights_tpu(self, layer):
+        """One-time GPT-OSS MoE weight rewrite on the TPU device.
+
+        Currently uses the **BF16 triage path** (mirrors torchtpu-vllm's
+        fallback): dequant MXFP4 → BF16, deinterleave w13, pad N, transpose
+        to gmm_v2's ``(g, k, n)`` layout. Lets us validate sinks/SWA/
+        swigluoai end-to-end on a known-correct numerical path before
+        re-enabling the packed-FP4 fast path.
+
+        TODO: switch back to ``process_gpt_oss_mxfp4_weights`` once BF16 is
+        confirmed working.
+        """
+        from sglang.srt.layers.quantization.mxfp4_tpu import (
+            process_gpt_oss_mxfp4_weights_bf16,
+        )
+
+        w13, w13_scale, w13_bias, w2, w2_scale, w2_bias = (
+            process_gpt_oss_mxfp4_weights_bf16(
+                layer.w13_weight.data,
+                layer.w13_weight_scale.data,
+                layer.w13_weight_bias.data,
+                layer.w2_weight.data,
+                layer.w2_weight_scale.data,
+                layer.w2_weight_bias.data,
+            )
+        )
+        layer.w13_weight = Parameter(w13, requires_grad=False)
+        layer.w13_weight_bias = Parameter(w13_bias, requires_grad=False)
+        layer.w2_weight = Parameter(w2, requires_grad=False)
+        layer.w2_weight_bias = Parameter(w2_bias, requires_grad=False)
+        # Use ``register_parameter(..., None)`` so the attribute is still
+        # accessible but flagged as no-scale to the JAX kernel.
+        layer.register_parameter("w13_weight_scale", None)
+        layer.register_parameter("w2_weight_scale", None)
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -769,6 +846,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        # TODO(qinghan): once the packed-FP4 fast path lands, gate this on a
+        # config flag instead of unconditionally taking the BF16 triage path.
+        if is_tpu():
+            return self._apply_tpu(layer, dispatch_output)
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
