@@ -152,33 +152,38 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if num_new_pages_item > len(self.free_pages):
             return None
 
-        # Ship exactly the pages this extend will consume to the device
-        # once. Prefill batches have variable shapes by prompt length
-        # anyway, so the per-call recompile is unavoidable and
-        # orthogonal to the decode-path fix.
+        # Compute the per-token page indices entirely on host, then do a
+        # single H2D copy. The shared ``alloc_extend_naive`` iterates over
+        # ``range(len(prefix_lens))`` and reads scalar elements off its
+        # tensor inputs each iteration — if those tensors are on TPU, the
+        # XLA backend lowers each ``//`` to a one-element
+        # ``tt_jit_floor_divide_div`` HLO module per call, which is both
+        # slow (~64 tiny compiles per extend) and has been observed to
+        # halt the SparseCore with a UserFatal on Qwen3-32B at TP=8,
+        # concurrency=64. ``prefix_lens_cpu`` / ``seq_lens_cpu`` are
+        # already mirrors of the device tensors so the only extra D2H is
+        # the tiny ``last_loc`` vector (one int32 per sequence).
         if num_new_pages_item > 0:
-            free_pages_view = _np_to_device_oneshot(
-                self.free_pages[:num_new_pages_item], self.device
+            free_pages_cpu = torch.from_numpy(
+                self.free_pages[:num_new_pages_item].copy()
             )
         else:
-            free_pages_view = torch.empty(
-                (0,), dtype=torch.int64, device=self.device
-            )
+            free_pages_cpu = torch.empty((0,), dtype=torch.int64)
 
-        out_indices = torch.empty(
+        out_indices_cpu = torch.empty(
             (extend_num_tokens,),
             dtype=torch.int32,
-            device=self.device,
         )
         alloc_extend_naive(
-            prefix_lens,
-            seq_lens,
-            last_loc,
-            free_pages_view,
-            out_indices,
+            prefix_lens_cpu,
+            seq_lens_cpu,
+            last_loc.cpu(),
+            free_pages_cpu,
+            out_indices_cpu,
             self.page_size,
-            self.device,
+            "cpu",
         )
+        out_indices = out_indices_cpu.to(self.device)
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
