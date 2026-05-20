@@ -780,6 +780,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         elif self.device in ["npu", "cpu", "tpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
+            # Pre-compile the model.forward bucket grid (TPU only). Mirrors
+            # torchtpu-vllm's ``_precompile_backbone``; see kernel_warmup.
+            self.kernel_warmup()
         elif current_platform.is_out_of_tree():
             self.init_attention_backend()
             if current_platform.support_cuda_graph():
@@ -2406,11 +2409,68 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Warmup and tune kernels before cuda graph capture.
         Currently only doing FlashInfer autotune.
         """
+        if self.device == "tpu":
+            self._tpu_precompile_decode_buckets()
+            return
+
         if self.device != "cuda":
             return
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
+
+    def _tpu_precompile_decode_buckets(self):
+        """Pre-compile the model.forward in decode mode for every token
+        bucket >= 1 and <= MAX_RUNNING_REQUESTS.
+
+        Mirrors torchtpu-vllm's ``_precompile_backbone``. Without this,
+        the dynamo cache only warms for whichever bucket the first few
+        live requests happen to hit; every later request with a new
+        running-req count pays a ~1-5 s recompile mid-bench. SEQ_BUCKETS
+        is now a single value (see pallas_backend.py) so the model body's
+        compile key is effectively (input_ids_bucket × forward_mode) —
+        small enough to enumerate explicitly.
+        """
+        if not getattr(self.server_args, "enable_torch_compile", False):
+            return
+
+        try:
+            from sglang.srt.hardware_backend.tpu.compile_shape_buckets import (
+                TOKEN_BUCKETS,
+            )
+        except Exception as exc:
+            logger.warning(
+                "TPU precompile: could not import TOKEN_BUCKETS (%s); "
+                "skipping pre-warmup.", exc,
+            )
+            return
+
+        max_decode_bs = min(
+            self.server_args.max_running_requests or 64,
+            self.req_to_token_pool.size,
+        )
+        buckets = [b for b in TOKEN_BUCKETS if b <= max_decode_bs]
+        if not buckets:
+            return
+
+        logger.info(
+            "TPU precompile: warming decode-mode model.forward for "
+            "%d token buckets %s", len(buckets), buckets,
+        )
+        import time
+        t0 = time.perf_counter()
+        for bucket in buckets:
+            try:
+                self._dummy_run(batch_size=bucket)
+            except Exception as exc:
+                logger.warning(
+                    "TPU precompile: bucket=%d _dummy_run failed (%s); "
+                    "continuing.", bucket, exc,
+                )
+        logger.info(
+            "TPU precompile: decode-mode warmup done in %.1f s",
+            time.perf_counter() - t0,
+        )
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.
