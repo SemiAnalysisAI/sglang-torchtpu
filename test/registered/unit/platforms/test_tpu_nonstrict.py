@@ -37,6 +37,15 @@ class TestTpuNonstrict(unittest.TestCase):
         self.assertTrue(hasattr(gm, "_nonstrict_jit_out_spec"))
         torch.testing.assert_close(gm(torch.ones(2))[0], torch.tensor([2.0, 2.0]))
 
+    def test_traceable_collective_remap_context(self):
+        def fn(x):
+            return x + 1
+
+        with nonstrict.traceable_collective_remap():
+            gm = nonstrict.make_fx(fn)(torch.ones(2))
+
+        torch.testing.assert_close(gm(torch.ones(2))[0], torch.tensor([2.0, 2.0]))
+
     def test_jit_static_argnames_pytree_io_and_cache(self):
         traces = 0
 

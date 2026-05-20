@@ -135,17 +135,19 @@ class TpuGraphRunner:
 
         with torch.no_grad():
             # First call traces and compiles the bs-specific executable through
-            # nonstrict.jit/backend="tpu".
-            self.decode(
-                bs,
-                input_ids,
-                positions,
-                req_pool_indices,
-                seq_lens,
-                out_cache_loc,
-                self.model_runner.req_to_token_pool.req_to_token,
-                *self._kv_buffers(),
-            )
+            # nonstrict.jit/backend="tpu". The collective remap is only needed
+            # while make_fx is tracing tensor-parallel collectives.
+            with nonstrict.traceable_collective_remap():
+                self.decode(
+                    bs,
+                    input_ids,
+                    positions,
+                    req_pool_indices,
+                    seq_lens,
+                    out_cache_loc,
+                    self.model_runner.req_to_token_pool.req_to_token,
+                    *self._kv_buffers(),
+                )
 
     def _kv_buffers(self) -> tuple[torch.Tensor, ...]:
         token_to_kv_pool = self.model_runner.token_to_kv_pool

@@ -19,6 +19,7 @@ the original Python function.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+import contextlib
 import dataclasses
 import functools
 import inspect
@@ -125,6 +126,57 @@ def _flat_outputs(out: Any) -> tuple[tuple[Any, ...], pytree.TreeSpec]:
     flat_out, out_spec = pytree.tree_flatten(out)
     _check_tensor_leaves(flat_out, "outputs")
     return tuple(flat_out), out_spec
+
+
+class _TraceableCollectiveRemap(torch.overrides.TorchFunctionMode):
+    """Apply PyTorch's traceable collective remaps during make_fx tracing."""
+
+    def __torch_function__(
+        self,
+        func: Callable[..., Any],
+        types: tuple[type, ...],
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        kwargs = kwargs or {}
+        if torch.compiler.is_dynamo_compiling():
+            return func(*args, **kwargs)
+
+        if torch.distributed.is_available():
+            from torch.distributed._functional_collectives import (
+                REDUCE_OP_TO_STR,
+                traceable_collective_remaps,
+            )
+
+            if func in traceable_collective_remaps:
+                mapped_func = traceable_collective_remaps[func]
+                signature = inspect.signature(func)
+                kwargs = dict(signature.bind(*args, **kwargs).arguments)
+                args = ()
+
+                reduce_collectives = (
+                    torch.distributed.all_reduce,
+                    torch.distributed.reduce_scatter_tensor,
+                    torch.distributed._reduce_scatter_base,
+                )
+                if func in reduce_collectives and "op" in kwargs:
+                    kwargs["op"] = REDUCE_OP_TO_STR[kwargs["op"]]
+                return mapped_func(*args, **kwargs)
+
+        return func(*args, **kwargs)
+
+
+@contextlib.contextmanager
+def traceable_collective_remap():
+    """Remap c10d collectives to traceable functional collectives.
+
+    This is useful for callers that trace functions containing tensor-parallel
+    collectives with ``make_fx`` directly. It is deliberately opt-in so
+    ``jit`` and ``make_fx`` do not rewrite collective calls for users that do
+    not need TPU TP graph capture.
+    """
+    with _TraceableCollectiveRemap():
+        yield
 
 
 def _bind_dynamic(
@@ -316,4 +368,4 @@ def jit(
     return wrapped
 
 
-__all__ = ["jit", "make_fx"]
+__all__ = ["jit", "make_fx", "traceable_collective_remap"]
