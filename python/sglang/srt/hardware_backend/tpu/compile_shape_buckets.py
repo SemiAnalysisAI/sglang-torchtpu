@@ -110,6 +110,124 @@ _PREFILL_LOGPROB_FIELDS = (
 )
 
 
+# Bucket set for the *sequence-count* axis in the LogitsProcessor compiled
+# region (``extend_seq_lens.shape[0]``, a.k.a. K — the number of sequences
+# whose last-token logits get computed). Without bucketing, dynamo
+# specialises ``LogitsProcessor.forward`` per distinct K value (1, 2, 3,
+# 5, 6, 27, 32, ...), producing 10+ recompiles in a single c=64 bench.
+# torchtpu-vllm avoids the same trap with ``_get_req_paddings`` rooted at
+# ``MIN_NUM_SEQS = 8`` doubling to ``max_num_reqs``; mirror that here.
+K_BUCKETS: tuple[int, ...] = (8, 16, 32, 64, 128, 256, 512)
+
+
+def _next_k_bucket(k: int) -> int:
+    for b in K_BUCKETS:
+        if k <= b:
+            return b
+    return K_BUCKETS[-1]
+
+
+def make_k_bucketed_lp_forward(compiled_fn: Callable) -> Callable:
+    """Wrap a compiled ``LogitsProcessor.forward`` with K-axis bucket padding.
+
+    The compiled function is dispatched as
+    ``compiled_fn(input_ids, hidden_states, lm_head, logits_metadata, ...)``.
+    Pads ``logits_metadata.extend_seq_lens`` (and reuses the existing
+    in-LP ``last_index`` padding) to the next entry in ``K_BUCKETS``, then
+    slices ``next_token_logits`` back to the real K on the way out.
+
+    Why padding with zeros works: when ``extend_seq_lens`` is right-padded
+    with zeros, ``cumsum(extend_seq_lens) - 1`` produces duplicate indices
+    for every padded slot (each padded slot's cumulative count equals the
+    last real slot's). ``hidden_states[last_index]`` therefore replicates
+    the final real row into the padded slots — pure redundant compute
+    that gets sliced away after the compile boundary. The matmul + TP
+    all-gather inside the compiled region see only bucket-aligned shapes.
+    """
+    import dataclasses
+
+    # Defer imports of sglang internals to first call so a bad import in a
+    # helper module doesn't poison module load order during platform init.
+    _IMPORTED = {"LogitsMetadata": None, "ForwardBatch": None}
+
+    def _import_once():
+        if _IMPORTED["LogitsMetadata"] is None:
+            from sglang.srt.layers.logits_processor import LogitsMetadata
+            from sglang.srt.model_executor.forward_batch_info import (
+                ForwardBatch,
+            )
+
+            _IMPORTED["LogitsMetadata"] = LogitsMetadata
+            _IMPORTED["ForwardBatch"] = ForwardBatch
+        return _IMPORTED["LogitsMetadata"], _IMPORTED["ForwardBatch"]
+
+    def _forward(
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        lm_head,
+        logits_metadata,
+        *args,
+        **kwargs,
+    ):
+        LogitsMetadata, ForwardBatch = _import_once()
+
+        # Normalize to LogitsMetadata so ``dataclasses.replace`` works.
+        # For the rare multi-item-scoring path we fall back to passing the
+        # original ForwardBatch through unchanged — Qwen3-32B does not use
+        # it, and the path has its own scheduler-side shape handling.
+        if isinstance(logits_metadata, ForwardBatch):
+            if logits_metadata.multi_item_delimiter_indices is not None:
+                return compiled_fn(
+                    input_ids, hidden_states, lm_head, logits_metadata,
+                    *args, **kwargs,
+                )
+            lm = LogitsMetadata.from_forward_batch(logits_metadata)
+        else:
+            lm = logits_metadata
+
+        # Only bucket on the extend path. Decode shape is already bounded
+        # by ``TOKEN_BUCKETS`` (decode batch == token count).
+        if not lm.forward_mode.is_extend():
+            return compiled_fn(input_ids, hidden_states, lm_head, lm,
+                               *args, **kwargs)
+
+        # The padded_static_len branch in _get_pruned_states computes
+        # ``idx * padded_static_len + extend_seq_lens - 1`` and would
+        # produce out-of-bounds indices for zero-padded positions. Sglang
+        # chunked prefill leaves padded_static_len == -1 so this is rare,
+        # but skip bucketing for safety when it's set.
+        if getattr(lm, "padded_static_len", -1) > 0:
+            return compiled_fn(input_ids, hidden_states, lm_head, lm,
+                               *args, **kwargs)
+
+        esl = lm.extend_seq_lens
+        real_k = esl.shape[0]
+        padded_k = _next_k_bucket(real_k)
+        if padded_k <= real_k:
+            return compiled_fn(input_ids, hidden_states, lm_head, lm,
+                               *args, **kwargs)
+
+        pad = padded_k - real_k
+        zero_pad = torch.zeros(pad, dtype=esl.dtype, device=esl.device)
+        padded_esl = torch.cat([esl, zero_pad])
+        padded_lm = dataclasses.replace(lm, extend_seq_lens=padded_esl)
+
+        out = compiled_fn(input_ids, hidden_states, lm_head, padded_lm,
+                          *args, **kwargs)
+
+        # Slice ``next_token_logits`` back to real K. Other LogitsProcessor
+        # output fields are either per-token-bucket (sliced upstream by
+        # ``make_token_bucketed_forward``) or not K-shaped, so leave them.
+        if (
+            out.next_token_logits is not None
+            and out.next_token_logits.shape[0] == padded_k
+        ):
+            out.next_token_logits = out.next_token_logits[:real_k]
+        return out
+
+    return _forward
+
+
 def make_token_bucketed_forward(compiled_fn: Callable) -> Callable:
     """Wrap a compiled model.forward with token-axis bucket padding.
 

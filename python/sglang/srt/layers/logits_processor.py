@@ -56,11 +56,26 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import is_npu, use_intel_amx_backend
+from sglang.srt.utils.common import is_npu, is_tpu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
+
+# When the LogitsProcessor selects `last_index = cumsum(extend_seq_lens) - 1`
+# during an extend (prefill) step, the number of selected rows equals the
+# number of sequences in the batch (K). Single-sequence prefills produce
+# K=1, which causes XLA to squeeze the batch dim of the lm_head matmul; the
+# subsequent TP all-gather then lowers to a 1-D pad-then-all-reduce on a
+# `bf16[vocab]` vector. The SparseCore-offload pass for that collective
+# trips `Core index should be smaller than the number of logical devices
+# per chip` (offload_collective_factory.cc:724) on TP=8 / v7x-8.
+#
+# torchtpu-vllm avoids the same failure via `MIN_NUM_SEQS = 8` in
+# tpu_inference/runner/tpu_runner.py — every `indices_do_sample` is padded
+# to at least 8 before `compute_selected_logits` runs. Mirror that here.
+_TPU_LM_HEAD_MIN_K = 8
 
 
 @dataclasses.dataclass
@@ -345,6 +360,14 @@ class LogitsProcessor(nn.Module):
                 logits[sample_indices] if sample_indices is not None else logits
             )
 
+            # Undo the TPU K-padding applied in _get_pruned_states for
+            # single-sequence prefill. Slice is a no-op when real K >=
+            # _TPU_LM_HEAD_MIN_K, so it's safe to apply unconditionally on
+            # the extend-no-return_logprob path.
+            if _is_tpu and logits_metadata.forward_mode.is_extend():
+                real_k = logits_metadata.extend_seq_lens.shape[0]
+                sampled_logits = sampled_logits[:real_k]
+
             # Decode mode or extend mode without return_logprob.
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
@@ -443,6 +466,18 @@ class LogitsProcessor(nn.Module):
                     idx * logits_metadata.padded_static_len
                     + logits_metadata.extend_seq_lens
                     - 1
+                )
+            # On TPU, pad ``last_index`` to at least ``_TPU_LM_HEAD_MIN_K``
+            # by replicating the final index. The padded rows of the
+            # downstream lm_head matmul carry duplicate computation that
+            # is sliced off in ``forward`` (after the LP epilogue). This
+            # keeps the matmul batch dim >= 8, which prevents XLA from
+            # squeezing it and rewriting the TP all-gather as a 1-D
+            # padded all-reduce — see ``_TPU_LM_HEAD_MIN_K`` block above.
+            if _is_tpu and 0 < last_index.shape[0] < _TPU_LM_HEAD_MIN_K:
+                pad = _TPU_LM_HEAD_MIN_K - last_index.shape[0]
+                last_index = torch.cat(
+                    [last_index, last_index[-1:].expand(pad)]
                 )
             pruned_states = hidden_states[last_index]
             if hidden_states_before_norm is not None:

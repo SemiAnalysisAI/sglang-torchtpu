@@ -68,14 +68,26 @@ class TpuSRTPlatform(SRTPlatform):
         TPU (its torch.compile wiring lives in CudaGraphRunner, which is
         disabled here), so we install the wrapper directly on the model.
 
-        Reassigning the attribute on the instance shadows the class method
-        for that instance only — every existing call site in ModelRunner
-        (`self.model.<name>(...)`) picks up the compiled version
-        automatically. Two entry points are wrapped:
+        When the model exposes the standard SGLang split of a transformer
+        backbone (``model.model``) and a logits processor
+        (``model.logits_processor``), we compile each as a **separate**
+        ``torch.compile`` region and leave the outer ``ForCausalLM.forward``
+        as an uncompiled orchestrator. This mirrors torchtpu-vllm's pattern
+        where ``compute_selected_logits`` is its own
+        ``@torch.compile(backend="tpu", fullgraph=True)`` region distinct
+        from the model backbone (see
+        ``torchtpu-vllm/tpu_inference/runner/tpu_runner.py``). Fusing both
+        into a single compiled graph triggers a SparseCore halt
+        (``tt_jit_logits_processor`` UserFatal) on Qwen3-32B at TP=8 with
+        concurrency=64 because an ``aten.to`` near the final RMSNorm +
+        LM-head matmul is offloaded to SparseCore.
 
-        * ``forward`` — used by forward_decode / forward_extend / forward_idle.
-        * ``forward_split_prefill`` — used by forward_split_prefill, when
-          the model exposes it (e.g. qwen2, qwen3_moe, glm4, gemma).
+        Falling back to the legacy single-graph compile happens for models
+        that don't expose the ``(model, logits_processor)`` pair (e.g.
+        pure-embedding models). ``forward_split_prefill`` is left
+        uncompiled in the split path — its layer-by-layer Python loop
+        already breaks the graph anyway, and standard prefill flows
+        (chunked_prefill_size ≥ chunk size) don't take that path.
         """
         from sglang.srt.hardware_backend.tpu.patches import (
             _register_tpu_compile_backend,
@@ -118,30 +130,68 @@ class TpuSRTPlatform(SRTPlatform):
             torch._dynamo.config.cache_size_limit, 256
         )
 
+        from sglang.srt.hardware_backend.tpu.compile_shape_buckets import (
+            make_token_bucketed_forward,
+        )
+
+        backbone = getattr(model, "model", None)
+        lp = getattr(model, "logits_processor", None)
+        can_split = (
+            isinstance(backbone, torch.nn.Module)
+            and isinstance(lp, torch.nn.Module)
+            and hasattr(model, "forward")
+        )
+
         wrapped = []
-        for method_name in ("forward", "forward_split_prefill"):
-            fn = getattr(model, method_name, None)
-            if fn is None:
-                continue
-            compiled = torch.compile(
-                fn, backend="tpu", fullgraph=True, dynamic=False,
+        if can_split:
+            # Compile the transformer backbone and the LogitsProcessor as
+            # two independent torch.compile regions (separate HLO graphs).
+            setattr(
+                backbone,
+                "forward",
+                torch.compile(
+                    backbone.forward,
+                    backend="tpu",
+                    fullgraph=True,
+                    dynamic=False,
+                ),
             )
-            # Pad the token-axis of (input_ids, positions) to a small set of
-            # static buckets *outside* the compiled region. dynamo only ever
-            # sees those bucket sizes, so the number of recompiles is bounded
-            # by ``len(TOKEN_BUCKETS) * |forward_modes|`` instead of growing
-            # with every distinct request length. Outputs are sliced back to
-            # the real token count for forward modes whose output is
-            # per-token (decode); per-sequence outputs (extend) need no
-            # slicing because the LogitsProcessor selects last-token indices
-            # via ``extend_seq_lens.cumsum()`` which is unaffected by the
-            # padded tail.
+            # Compile LP, then wrap with K-axis bucket padding so dynamo
+            # specialises per ``K_BUCKETS`` (8, 16, 32, 64, ...) instead
+            # of per distinct ``extend_seq_lens.shape[0]`` value. Mirrors
+            # torchtpu-vllm's ``_get_req_paddings`` rooted at MIN_NUM_SEQS=8.
             from sglang.srt.hardware_backend.tpu.compile_shape_buckets import (
-                make_token_bucketed_forward,
+                make_k_bucketed_lp_forward,
             )
 
-            setattr(model, method_name, make_token_bucketed_forward(compiled))
-            wrapped.append(method_name)
+            compiled_lp = torch.compile(
+                lp.forward,
+                backend="tpu",
+                fullgraph=True,
+                dynamic=False,
+            )
+            setattr(lp, "forward", make_k_bucketed_lp_forward(compiled_lp))
+            # The outer ForCausalLM.forward is *not* compiled; it just
+            # orchestrates the two compiled regions and runs token-axis
+            # bucket padding around them. The inner regions see padded
+            # shapes; the bucket wrapper slices the LogitsProcessorOutput
+            # back to the real token count for decode mode.
+            outer = getattr(model, "forward")
+            setattr(model, "forward", make_token_bucketed_forward(outer))
+            wrapped.append("forward(split: model + logits_processor)")
+        else:
+            # Legacy single-graph path: compile the full forward(s) as one
+            # graph. Used when a model doesn't expose the standard
+            # (model, logits_processor) pair.
+            for method_name in ("forward", "forward_split_prefill"):
+                fn = getattr(model, method_name, None)
+                if fn is None:
+                    continue
+                compiled = torch.compile(
+                    fn, backend="tpu", fullgraph=True, dynamic=False,
+                )
+                setattr(model, method_name, make_token_bucketed_forward(compiled))
+                wrapped.append(method_name)
 
         logger.info(
             "Wrapped %s.{%s} with torch.compile(backend='tpu', "
