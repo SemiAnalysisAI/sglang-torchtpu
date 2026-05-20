@@ -1,21 +1,237 @@
-"""No-op TPU graph runner stub for Phase 1 (eager mode only).
-
-Phase 1 disables graph capture via support_cuda_graph() -> False,
-so this class is never instantiated. It exists to satisfy the
-factory method contract in TpuSRTPlatform.
-"""
+"""TPU graph runner using the nonstrict JIT helper."""
 
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
+
+import torch
+
+from sglang.srt.hardware_backend.tpu import nonstrict
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import (
+    log_info_on_rank0,
+    require_gathered_buffer,
+    require_mlp_sync,
+    require_mlp_tp_gather,
+)
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
 
-class TpuGraphRunner:
+def get_batch_sizes_to_capture(model_runner: ModelRunner) -> list[int]:
+    server_args = model_runner.server_args
+    max_bs = min(server_args.torch_compile_max_bs, model_runner.req_to_token_pool.size)
+    # Decode schedules exactly one token per request, so the static compile
+    # shape is the request batch size.
+    capture_bs = [
+        bs
+        for bs in (server_args.cuda_graph_bs or [])
+        if bs > 0 and bs <= max_bs
+    ]
+    if max_bs > 0 and max_bs not in capture_bs:
+        capture_bs.append(max_bs)
+    capture_bs = list(sorted(set(capture_bs)))
+    assert capture_bs, f"{capture_bs=}, {max_bs=}"
+    return capture_bs
 
-    def __init__(self, model_runner):
-        raise NotImplementedError(
-            "TPU graph runner not yet implemented. "
-            "Ensure --disable-cuda-graph is set."
+
+class TpuGraphRunner:
+    """Runs eligible SGLang batches through nonstrict.jit(..., backend="tpu")."""
+
+    def __init__(self, model_runner: ModelRunner):
+        self.model_runner = model_runner
+        self.device = model_runner.device
+        self.decode = nonstrict.jit(
+            self._run_decode,
+            static_argnames=("bs",),
+            backend="tpu",
+            tracing_mode="real",
+        )
+        self._logged_replay = False
+
+        self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
+        self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
+        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
+        self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
+        self.enable_two_batch_overlap = (
+            model_runner.server_args.enable_two_batch_overlap
+        )
+        self.dp_size = model_runner.server_args.dp_size
+        self.pp_size = model_runner.server_args.pp_size
+
+        assert (
+            not self.model_runner.server_args.enable_lora
+        ), "TpuGraphRunner does not support LoRA yet."
+        assert (
+            not self.enable_two_batch_overlap
+        ), "TpuGraphRunner does not support two batch overlap yet."
+        assert (
+            not self.require_mlp_tp_gather
+        ), "TpuGraphRunner does not support MLP TP gather yet."
+        assert (
+            not self.require_mlp_sync
+        ), "TpuGraphRunner does not support MLP sync yet."
+        assert (
+            not self.require_gathered_buffer
+        ), "TpuGraphRunner does not support gathered buffer yet."
+        assert (
+            model_runner.spec_algorithm == SpeculativeAlgorithm.NONE
+        ), "TpuGraphRunner does not support speculative inference yet."
+        assert (
+            not self.is_encoder_decoder
+        ), "TpuGraphRunner does not support encoder-decoder models yet."
+        assert self.dp_size == 1, "TpuGraphRunner does not support DP yet."
+        assert self.pp_size == 1, "TpuGraphRunner does not support PP yet."
+
+        self.capture_bs = get_batch_sizes_to_capture(model_runner)
+        log_info_on_rank0(logger, f"Capture TPU nonstrict graph bs {self.capture_bs}")
+
+        self.capture_forward_mode = ForwardMode.DECODE
+        self.capture_hidden_mode = CaptureHiddenMode.NULL
+
+        self.capture()
+
+    def can_run(self, forward_batch: ForwardBatch) -> bool:
+        capture_hidden_mode = forward_batch.capture_hidden_mode
+        if capture_hidden_mode is None:
+            capture_hidden_mode = CaptureHiddenMode.NULL
+        return (
+            # Normal decode enters through ModelRunner.forward_decode.
+            forward_batch.forward_mode.is_decode()
+            and forward_batch.batch_size in self.capture_bs
+            and capture_hidden_mode == self.capture_hidden_mode
+        )
+
+    def capture(self) -> None:
+        for bs in self.capture_bs:
+            self.warmup_decode_batch_size(bs)
+
+    def warmup_decode_batch_size(self, bs: int) -> None:
+        """Compile one fixed-shape decode batch.
+
+        Unlike CUDA graph replay, TorchTPU compiled functions do not require
+        stable input tensor addresses. The dummy tensors below are only used to
+        produce the first trace for this static shape. Real decode steps pass
+        their live scheduler tensors directly to the shared compiled callable.
+        """
+        with torch.device(self.device):
+            # Decode has one input token per request, so each dummy tensor has
+            # shape `(bs,)`. Prefill/extend would need token-count buckets.
+            input_ids = torch.zeros((bs,), dtype=torch.int64)
+            req_pool_indices = torch.arange(bs, dtype=torch.int64)
+            seq_lens = torch.ones((bs,), dtype=torch.int64)
+            out_cache_loc = torch.arange(bs, dtype=torch.int64)
+            positions = torch.zeros((bs,), dtype=torch.int64)
+
+        with torch.no_grad():
+            # First call traces and compiles the bs-specific executable through
+            # nonstrict.jit/backend="tpu".
+            self.decode(
+                bs,
+                input_ids,
+                positions,
+                req_pool_indices,
+                seq_lens,
+                out_cache_loc,
+                self.model_runner.req_to_token_pool.req_to_token,
+                *self._kv_buffers(),
+            )
+
+    def _kv_buffers(self) -> tuple[torch.Tensor, ...]:
+        token_to_kv_pool = self.model_runner.token_to_kv_pool
+        # KV cache tensors are dynamic graph inputs. Passing them explicitly
+        # prevents the compiled function from closing over stale buffer objects.
+        return tuple(token_to_kv_pool.k_buffer) + tuple(token_to_kv_pool.v_buffer)
+
+    def _run_decode(
+        self,
+        bs: int,
+        input_ids,
+        positions,
+        req_pool_indices,
+        seq_lens,
+        out_cache_loc,
+        req_to_token,
+        *kv_buffers,
+    ) -> torch.Tensor:
+        model = self.model_runner.model
+        req_to_token_pool = self.model_runner.req_to_token_pool
+        token_to_kv_pool = self.model_runner.token_to_kv_pool
+        num_k_buffers = len(token_to_kv_pool.k_buffer)
+        old_req_to_token = req_to_token_pool.req_to_token
+        old_k_buffers = token_to_kv_pool.k_buffer
+        old_v_buffers = token_to_kv_pool.v_buffer
+        try:
+            # SGLang stores these tensors behind pool objects that model
+            # layers read from forward_batch. Temporarily point the pools at
+            # the dynamic tensor inputs so the tracer sees them as graph
+            # arguments instead of Python-closed globals.
+            req_to_token_pool.req_to_token = req_to_token
+            token_to_kv_pool.k_buffer = list(kv_buffers[:num_k_buffers])
+            token_to_kv_pool.v_buffer = list(kv_buffers[num_k_buffers:])
+            forward_batch = ForwardBatch(
+                forward_mode=self.capture_forward_mode,
+                batch_size=bs,
+                input_ids=input_ids,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool=token_to_kv_pool,
+                attn_backend=self.model_runner.attn_backend,
+                out_cache_loc=out_cache_loc,
+                seq_lens_sum=bs,
+                return_logprob=False,
+                positions=positions,
+                spec_algorithm=self.model_runner.spec_algorithm,
+                spec_info=None,
+                capture_hidden_mode=self.capture_hidden_mode,
+                num_token_non_padded=input_ids.new_full((1,), bs),
+                global_forward_mode=self.capture_forward_mode,
+            )
+            output = model.forward(input_ids, positions, forward_batch)
+            # Return only logits so replay matches SGLang's decode contract.
+            return output.next_token_logits
+        finally:
+            req_to_token_pool.req_to_token = old_req_to_token
+            token_to_kv_pool.k_buffer = old_k_buffers
+            token_to_kv_pool.v_buffer = old_v_buffers
+
+    def replay(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool,
+        pp_proxy_tensors=None,
+    ) -> LogitsProcessorOutput:
+        del skip_attn_backend_init, pp_proxy_tensors
+        if not self._logged_replay:
+            log_info_on_rank0(
+                logger,
+                f"Replay TPU nonstrict graph bs={forward_batch.batch_size}",
+            )
+            self._logged_replay = True
+        # TorchTPU compile is shape-specialized, not address-specialized like
+        # CUDA graphs. Pass the live SGLang tensors directly.
+        logits = self.decode(
+            forward_batch.batch_size,
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.out_cache_loc,
+            self.model_runner.req_to_token_pool.req_to_token,
+            *self._kv_buffers(),
+        )
+        return LogitsProcessorOutput(
+            next_token_logits=logits[: forward_batch.batch_size],
+            hidden_states=None,
         )

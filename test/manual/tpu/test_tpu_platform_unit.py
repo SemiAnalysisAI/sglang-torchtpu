@@ -5,10 +5,12 @@ These tests mock torch_tpu so they can run on any machine without TPU hardware.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
+from sglang.srt.hardware_backend.tpu import patches as tpu_patches
 from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 from sglang.srt.platforms.device_mixin import PlatformEnum
+from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -106,6 +108,16 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             tp_size=1,
         )
 
+    def _apply_defaults(self, args):
+        platform = TpuSRTPlatform()
+        with patch(
+            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.patches.patch_tpu_server_args"
+        ) as mock_patch_server_args:
+            platform.apply_server_args_defaults(args)
+        return mock_patch_server_args
+
     def test_defaults_applied(self):
         args = SimpleNamespace(
             dtype=None,
@@ -117,19 +129,31 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             mem_fraction_static=None,
             tp_size=1,
         )
-        platform = TpuSRTPlatform()
-        with patch(
-            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
-        ):
-            platform.apply_server_args_defaults(args)
+        mock_patch_server_args = self._apply_defaults(args)
 
         self.assertEqual(args.dtype, "bfloat16")
         self.assertEqual(args.attention_backend, "pallas_tpu")
-        self.assertTrue(args.disable_cuda_graph)
+        self.assertFalse(args.disable_cuda_graph)
         self.assertTrue(args.disable_piecewise_cuda_graph)
-        self.assertFalse(args.enable_torch_compile)
+        self.assertTrue(args.enable_torch_compile)
         self.assertTrue(args.disable_overlap_schedule)
         self.assertEqual(args.mem_fraction_static, 0.40)
+        mock_patch_server_args.assert_called_once()
+
+    def test_cuda_graph_disabled_without_torch_compile(self):
+        args = SimpleNamespace(
+            dtype=None,
+            attention_backend=None,
+            disable_cuda_graph=False,
+            disable_piecewise_cuda_graph=False,
+            enable_torch_compile=False,
+            disable_overlap_schedule=False,
+            mem_fraction_static=None,
+            tp_size=1,
+        )
+        self._apply_defaults(args)
+
+        self.assertTrue(args.disable_cuda_graph)
 
     def test_explicit_dtype_not_overridden(self):
         args = SimpleNamespace(
@@ -142,11 +166,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             mem_fraction_static=None,
             tp_size=1,
         )
-        platform = TpuSRTPlatform()
-        with patch(
-            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
-        ):
-            platform.apply_server_args_defaults(args)
+        self._apply_defaults(args)
 
         self.assertEqual(args.dtype, "float32")
 
@@ -161,13 +181,66 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             mem_fraction_static=0.60,
             tp_size=1,
         )
-        platform = TpuSRTPlatform()
-        with patch(
-            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
-        ):
-            platform.apply_server_args_defaults(args)
+        self._apply_defaults(args)
 
         self.assertEqual(args.mem_fraction_static, 0.60)
+
+
+class TestTpuServerArgsPatch(CustomTestCase):
+    """TPU plugin patch for ServerArgs graph policy."""
+
+    def setUp(self):
+        self.original_handler = ServerArgs._handle_attention_backend_compatibility
+        self.original_patched_flag = tpu_patches._server_args_tpu_compile_patched
+        tpu_patches._server_args_tpu_compile_patched = False
+
+    def tearDown(self):
+        ServerArgs._handle_attention_backend_compatibility = self.original_handler
+        tpu_patches._server_args_tpu_compile_patched = self.original_patched_flag
+
+    def test_tpu_compile_reenables_graph_after_torch_native_rule(self):
+        def generic_torch_native_rule(args):
+            args.disable_cuda_graph = True
+
+        ServerArgs._handle_attention_backend_compatibility = generic_torch_native_rule
+
+        tpu_patches.patch_tpu_server_args()
+
+        args = SimpleNamespace(
+            device="tpu",
+            enable_torch_compile=True,
+            attention_backend="torch_native",
+            disable_cuda_graph=True,
+        )
+        ServerArgs._handle_attention_backend_compatibility(args)
+
+        self.assertFalse(args.disable_cuda_graph)
+
+    def test_tpu_patch_does_not_affect_non_compile_or_non_tpu(self):
+        def generic_torch_native_rule(args):
+            args.disable_cuda_graph = True
+
+        ServerArgs._handle_attention_backend_compatibility = generic_torch_native_rule
+
+        tpu_patches.patch_tpu_server_args()
+
+        for args in [
+            SimpleNamespace(
+                device="tpu",
+                enable_torch_compile=False,
+                attention_backend="torch_native",
+                disable_cuda_graph=True,
+            ),
+            SimpleNamespace(
+                device="cuda",
+                enable_torch_compile=True,
+                attention_backend="torch_native",
+                disable_cuda_graph=True,
+            ),
+        ]:
+            with self.subTest(device=args.device, compile=args.enable_torch_compile):
+                ServerArgs._handle_attention_backend_compatibility(args)
+                self.assertTrue(args.disable_cuda_graph)
 
 
 class TestTpuPlatformFactoryMethods(CustomTestCase):

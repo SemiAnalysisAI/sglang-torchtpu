@@ -9,6 +9,7 @@ All patches are idempotent.
 from __future__ import annotations
 
 import importlib
+import functools
 import logging
 import os
 
@@ -19,6 +20,47 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 ]
 
 _dynamic_compile_unwrapped = False
+_server_args_tpu_compile_patched = False
+
+
+def patch_tpu_server_args() -> None:
+    """Keep TPU torch.compile policy in the TPU backend.
+
+    SGLang's generic ServerArgs validation disables graph capture for
+    torch_native attention. TPU uses torch_native attention, but its graph
+    runner is not a CUDA graph; it is the nonstrict TorchTPU compile path.
+    Install this during TpuSRTPlatform.apply_server_args_defaults(), before
+    ServerArgs runs the generic attention compatibility pass.
+    """
+    global _server_args_tpu_compile_patched
+    if _server_args_tpu_compile_patched:
+        return
+
+    from sglang.srt.server_args import ServerArgs
+
+    original = ServerArgs._handle_attention_backend_compatibility
+    if getattr(original, "_sglang_tpu_compile_patch", False):
+        _server_args_tpu_compile_patched = True
+        return
+
+    @functools.wraps(original)
+    def _handle_attention_backend_compatibility_with_tpu_compile(self, *args, **kwargs):
+        ret = original(self, *args, **kwargs)
+        if (
+            getattr(self, "device", None) == "tpu"
+            and getattr(self, "enable_torch_compile", False)
+            and getattr(self, "attention_backend", None) == "torch_native"
+        ):
+            self.disable_cuda_graph = False
+        return ret
+
+    _handle_attention_backend_compatibility_with_tpu_compile._sglang_tpu_compile_patch = (
+        True
+    )
+    ServerArgs._handle_attention_backend_compatibility = (
+        _handle_attention_backend_compatibility_with_tpu_compile
+    )
+    _server_args_tpu_compile_patched = True
 
 
 def _configure_eager_mode() -> None:
@@ -193,9 +235,7 @@ _torch_native_attn_backend_patched = False
 
 
 def _patch_torch_native_attn_backend() -> None:
-    """Replace TorchNativeAttnBackend._run_sdpa_forward_{extend,decode} with
-    CPU-staged variants that don't crash the torch_tpu device queue under
-    TP>1.
+    """Patch TorchNativeAttnBackend for TorchTPU eager and compile paths.
 
     Upstream loops over per-request control values pulled straight off device
     tensors — `extend_seq_lens[i]`, `extend_prefix_lens[i]`, `seq_lens[i]`,
@@ -215,18 +255,57 @@ def _patch_torch_native_attn_backend() -> None:
     sync), drive the loop with Python ints. Same approach as
     _patch_compute_position_torch. Behavior is identical on CUDA/CPU, which
     don't take this backend (they use FlashInfer/FlashAttention/triton).
+
+    The nonstrict compile path has two extra TPU constraints:
+    - Avoid SDPA here. During bringup, TorchTPU/XLA hit an unaligned-DUS fusion
+      failure in the SDPA/output-write path.
+    - Keep decode as tensor control flow. `nonstrict.jit` can trace tensor
+      gathers and masks, but not `.tolist()`-driven Python decode loops.
     """
     global _torch_native_attn_backend_patched
     if _torch_native_attn_backend_patched:
         return
     _torch_native_attn_backend_patched = True
 
+    import math
+
     import torch
-    from torch.nn.functional import scaled_dot_product_attention
 
     from sglang.srt.layers.attention.torch_native_backend import (
         TorchNativeAttnBackend,
     )
+    from sglang.srt.layers.radix_attention import AttentionType
+
+    def _repeat_kv_for_gqa(query, key, value, enable_gqa):
+        # Qwen uses grouped-query attention: KV has fewer heads than Q.
+        # Match PyTorch SDPA's enable_gqa behavior before explicit matmul.
+        head_dim = 1 if query.dim() == 4 else 0
+        if not enable_gqa or key.shape[head_dim] == query.shape[head_dim]:
+            return key, value
+        repeat = query.shape[head_dim] // key.shape[head_dim]
+        return (
+            key.repeat_interleave(repeat, dim=head_dim),
+            value.repeat_interleave(repeat, dim=head_dim),
+        )
+
+    def _matmul_attention(query, key, value, scaling=None, causal_mask=None):
+        # Use primitive ops instead of SDPA so TorchTPU can run and trace this
+        # path without hitting the SDPA/DUS lowering issue seen in bringup.
+        if query.dtype != key.dtype:
+            key = key.to(query.dtype)
+        if query.dtype != value.dtype:
+            value = value.to(query.dtype)
+
+        scale = scaling if scaling is not None else 1.0 / math.sqrt(query.shape[-1])
+        scores = torch.matmul(
+            query.to(torch.float32),
+            key.to(torch.float32).transpose(-2, -1),
+        )
+        scores = scores * scale
+        if causal_mask is not None:
+            scores = scores.masked_fill(~causal_mask, torch.finfo(scores.dtype).min)
+        probs = torch.softmax(scores, dim=-1).to(value.dtype)
+        return torch.matmul(probs, value).to(query.dtype)
 
     def _run_sdpa_forward_extend(
         self,
@@ -254,51 +333,48 @@ def _patch_torch_native_attn_backend() -> None:
         req_pool_indices_l = req_pool_indices.tolist()
 
         query = query.movedim(0, query.dim() - 2)
+        # Build outputs and concatenate rather than writing into `output[...]`.
+        # Slice writes lower to DUS-style updates, which were unstable on TPU.
+        outputs = []
 
-        start_q, start_kv = 0, 0
+        start_q = 0
         for seq_idx in range(len(seq_lens_l)):
             extend_seq_len_q = extend_seq_lens_l[seq_idx]
             prefill_seq_len_q = extend_prefix_lens_l[seq_idx]
 
             seq_len_kv = seq_lens_l[seq_idx]
             end_q = start_q + extend_seq_len_q
-            end_kv = start_kv + seq_len_kv
 
             per_req_query = query[:, start_q:end_q, :]
-            per_req_query_redudant = torch.empty(
-                (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
-                dtype=per_req_query.dtype,
-                device=per_req_query.device,
-            )
-
-            per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
 
             req_pool_idx = req_pool_indices_l[seq_idx]
             per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
-
-            if not (per_req_query.dtype == per_req_key.dtype == per_req_value.dtype):
-                per_req_key = per_req_key.to(per_req_query.dtype)
-                per_req_value = per_req_value.to(per_req_query.dtype)
-
-            per_req_out_redudant = (
-                scaled_dot_product_attention(
-                    per_req_query_redudant.unsqueeze(0),
-                    per_req_key.unsqueeze(0),
-                    per_req_value.unsqueeze(0),
-                    enable_gqa=enable_gqa,
-                    scale=scaling,
-                    is_causal=causal,
-                )
-                .squeeze(0)
-                .movedim(query.dim() - 2, 0)
+            per_req_key, per_req_value = _repeat_kv_for_gqa(
+                per_req_query, per_req_key, per_req_value, enable_gqa
             )
-            output[start_q:end_q, :, :] = per_req_out_redudant[
-                prefill_seq_len_q:, :, :
-            ]
-            start_q, start_kv = end_q, end_kv
-        return output
+
+            causal_mask = None
+            if causal:
+                q_pos = torch.arange(
+                    prefill_seq_len_q,
+                    prefill_seq_len_q + extend_seq_len_q,
+                    device=per_req_query.device,
+                )
+                kv_pos = torch.arange(seq_len_kv, device=per_req_query.device)
+                causal_mask = kv_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
+
+            per_req_out = _matmul_attention(
+                per_req_query,
+                per_req_key,
+                per_req_value,
+                scaling=scaling,
+                causal_mask=causal_mask,
+            ).movedim(query.dim() - 2, 0)
+            outputs.append(per_req_out)
+            start_q = end_q
+        return torch.cat(outputs, dim=0)
 
     def _run_sdpa_forward_decode(
         self,
@@ -313,48 +389,109 @@ def _patch_torch_native_attn_backend() -> None:
         enable_gqa=False,
         causal=False,
     ):
-        seq_lens_l = seq_lens.tolist()
-        req_pool_indices_l = req_pool_indices.tolist()
+        # Decode is captured by TpuGraphRunner. Keep it fully tensor based:
+        # no `.tolist()` and no request-by-request Python loop.
+        del output, causal
+        max_seq_len = req_to_token.shape[1]
+        # Gather a fixed-width KV window. Invalid tail positions are masked out
+        # with `seq_lens`, which keeps the captured graph shape stable.
+        token_ids = req_to_token[req_pool_indices, :max_seq_len]
 
-        query = query.movedim(0, query.dim() - 2)
+        query = query.unsqueeze(2)
+        key = k_cache[token_ids].permute(0, 2, 1, 3)
+        value = v_cache[token_ids].permute(0, 2, 1, 3)
+        key, value = _repeat_kv_for_gqa(query, key, value, enable_gqa)
 
-        start_q, start_kv = 0, 0
-        for seq_idx in range(len(seq_lens_l)):
-            seq_len_q = 1
-            seq_len_kv = seq_lens_l[seq_idx]
-            end_q = start_q + seq_len_q
-            end_kv = start_kv + seq_len_kv
+        kv_pos = torch.arange(max_seq_len, device=query.device)
+        causal_mask = kv_pos.unsqueeze(0) < seq_lens.unsqueeze(1)
+        out = _matmul_attention(
+            query,
+            key,
+            value,
+            scaling=scaling,
+            causal_mask=causal_mask[:, None, None, :],
+        )
+        return out.squeeze(2)
 
-            per_req_query = query[:, start_q:end_q, :]
+    def forward_extend(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        save_kv_cache=True,
+    ):
+        cache_loc = (
+            forward_batch.encoder_out_cache_loc
+            if layer.is_cross_attention
+            else forward_batch.out_cache_loc
+        )
+        if save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
-            req_pool_idx = req_pool_indices_l[seq_idx]
-            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
-            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
-            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+        # Route through the TPU-safe implementation above instead of the
+        # upstream method that calls SDPA and writes into an output buffer.
+        q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        causal = not (
+            layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY
+        )
+        out = _run_sdpa_forward_extend(
+            self,
+            q_,
+            None,
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            forward_batch.req_to_token_pool.req_to_token,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.extend_prefix_lens,
+            forward_batch.extend_seq_lens,
+            scaling=layer.scaling,
+            enable_gqa=layer.tp_q_head_num != layer.tp_k_head_num,
+            causal=causal,
+        )
+        return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-            if not (per_req_query.dtype == per_req_key.dtype == per_req_value.dtype):
-                per_req_key = per_req_key.to(per_req_query.dtype)
-                per_req_value = per_req_value.to(per_req_query.dtype)
+    def forward_decode(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        save_kv_cache=True,
+    ):
+        q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+        cache_loc = (
+            forward_batch.encoder_out_cache_loc
+            if layer.is_cross_attention
+            else forward_batch.out_cache_loc
+        )
+        if save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
-            per_req_out = (
-                scaled_dot_product_attention(
-                    per_req_query.unsqueeze(0),
-                    per_req_key.unsqueeze(0),
-                    per_req_value.unsqueeze(0),
-                    enable_gqa=enable_gqa,
-                    scale=scaling,
-                    is_causal=causal,
-                )
-                .squeeze(0)
-                .movedim(query.dim() - 2, 0)
-            )
-            output[start_q:end_q, :, :] = per_req_out
-            start_q, start_kv = end_q, end_kv
-
-        return output
+        # Decode must stay traceable for nonstrict JIT graph capture.
+        q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        out = _run_sdpa_forward_decode(
+            self,
+            q_,
+            None,
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            forward_batch.req_to_token_pool.req_to_token,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            scaling=layer.scaling,
+            enable_gqa=layer.tp_q_head_num != layer.tp_k_head_num,
+            causal=False,
+        )
+        return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     TorchNativeAttnBackend._run_sdpa_forward_extend = _run_sdpa_forward_extend
     TorchNativeAttnBackend._run_sdpa_forward_decode = _run_sdpa_forward_decode
+    TorchNativeAttnBackend.forward_extend = forward_extend
+    TorchNativeAttnBackend.forward_decode = forward_decode
 
 
 _support_triton_patched = False
@@ -443,6 +580,15 @@ def _patch_req_to_token_pool_max_context_len() -> None:
     orig_init = ReqToTokenPool.__init__
 
     def wrapped_init(self, *args, **kwargs):
+        from sglang.srt.server_args import get_global_server_args
+
+        try:
+            server_args = get_global_server_args()
+        except Exception:
+            server_args = None
+        if getattr(server_args, "attention_backend", None) != "pallas_tpu":
+            return orig_init(self, *args, **kwargs)
+
         # All known call sites (model_runner_kv_cache_mixin,
         # HybridReqToTokenPool.super().__init__) pass max_context_len as a
         # keyword, so only handle that form.

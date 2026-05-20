@@ -34,8 +34,12 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     def apply_server_args_defaults(self, server_args) -> None:
-        from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
+        from sglang.srt.hardware_backend.tpu.patches import (
+            _prepare_tpu_env,
+            patch_tpu_server_args,
+        )
 
+        patch_tpu_server_args()
         _prepare_tpu_env(server_args.tp_size)
 
         if server_args.dtype is None or server_args.dtype == "auto":
@@ -44,9 +48,13 @@ class TpuSRTPlatform(SRTPlatform):
         if server_args.attention_backend is None:
             server_args.attention_backend = self.get_default_attention_backend()
 
-        server_args.disable_cuda_graph = True
+        # SGLang uses the "cuda graph" flag as the generic non-CPU graph-runner
+        # gate. If it is true, ModelRunner.init_device_graphs returns before
+        # creating current_platform.get_graph_runner_cls(), and decode cannot
+        # reach graph_runner.replay. See model_executor/model_runner.py:
+        # init_device_graphs and forward_decode.
+        server_args.disable_cuda_graph = not server_args.enable_torch_compile
         server_args.disable_piecewise_cuda_graph = True
-        server_args.enable_torch_compile = False
         server_args.disable_overlap_schedule = True
 
         if server_args.mem_fraction_static is None:
