@@ -61,11 +61,20 @@ class PallasForwardMetadata:
     distribution: torch.Tensor
 
 
-# Pad the *batch* axis of the per-sequence metadata up to one of these
-# bucket sizes so torch.compile only ever sees a handful of distinct shapes.
-# The kernel ignores entries beyond ``distribution[2] = num_active``, so the
-# trailing padded slots cost nothing.
-SEQ_BUCKETS: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64)
+# Pad the *batch* axis of the per-sequence metadata up to a single fixed
+# size so torch.compile sees exactly one ``kv_lens.shape[0]`` value, never
+# multiple. Mirrors torchtpu-vllm's
+#   ``seq_lens = self.seq_lens_cpu[:self.num_reqs_max_model_len]``
+# pattern (see tpu_runner.py:1374/1386). With multiple SEQ_BUCKETS the
+# model body's compile key becomes ``(input_ids_bucket × kv_lens_bucket ×
+# forward_mode)`` — a 9 × 7 × 2 = 126-cell grid — and only the small
+# subset the workload happens to hit at runtime gets compiled, leaving
+# stalls every time the scheduler produces a new (token, seq) tuple.
+# Collapsing to one bucket makes it 9 × 1 × 2 = 18, all of which we can
+# enumerate at startup. The Pallas RPA kernel already ignores entries
+# beyond ``distribution[2] = num_active``, so padded slots cost nothing
+# at runtime.
+SEQ_BUCKETS: tuple[int, ...] = (64,)
 
 
 def _next_bucket(n: int, buckets: tuple[int, ...]) -> int:
