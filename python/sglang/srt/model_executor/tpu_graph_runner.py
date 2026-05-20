@@ -32,7 +32,11 @@ from sglang.srt.hardware_backend.tpu._logging import get_logger
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-logger = get_logger(__name__)
+# This module lives outside the tpu/ tree, so __name__ does not start with
+# the TPU logger root. Pass a short suffix so the logger lands cleanly under
+# that root (one setLevel covers the whole backend) instead of producing a
+# doubled "...tpu.sglang.srt.model_executor.tpu_graph_runner" name.
+logger = get_logger("tpu_graph_runner")
 
 
 def _wrap_with_tpu_compile(model, attr_name: str) -> bool:
@@ -114,7 +118,7 @@ class TpuGraphRunner:
             ", ".join(wrapped),
         )
 
-    def can_run(self, forward_batch) -> bool:
+    def can_run(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.
 
         PJRT/libtpu caches HLO compilations internally and dispatches
