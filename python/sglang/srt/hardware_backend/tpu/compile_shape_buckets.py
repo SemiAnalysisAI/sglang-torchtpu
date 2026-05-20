@@ -30,11 +30,29 @@ import torch
 
 
 # Bucket set covering the typical SGLang chunked-prefill window
-# (``--chunked-prefill-size`` defaults to 4096 on TPU). Powers of two from
-# 1 to 4096. Exceed the largest bucket → a one-off recompile, but the
-# scheduler is configured to cap chunks at 4096 tokens.
+# (``--chunked-prefill-size`` defaults to 4096 on TPU). Exceed the largest
+# bucket → a one-off recompile, but the scheduler is configured to cap
+# chunks at 4096 tokens.
+#
+# Bucket 4 is retained as the smallest bucket so single-stream / small-
+# concurrency (c<=4) workloads still get a near-tight specialisation
+# rather than padding all the way to 16 (4x extra matmul work on each
+# decode step). Buckets 1, 2, 8 are dropped: each ratio jump (4→16→32→...)
+# wastes at most a factor of ~4 in matmul work for in-between batch
+# sizes, which is acceptable, and we save the dynamo specialisations.
+#
+# We do not include sub-4 buckets and we keep ``>=16`` as the dense set
+# above 4 to mirror torchtpu-vllm's ``min_token_size=16`` in
+# ``_get_token_paddings`` (see
+# ``torchtpu-vllm/tpu_inference/platforms/tpu_platform.py``).
+# torchtpu-vllm's reasoning: shapes ``bf16[<8, 5120]`` can trip XLA's
+# SparseCore-collective-offload pass on TP=8 / v7x-8
+# (``Core index should be smaller than the number of logical devices per
+# chip``, offload_collective_factory.cc:724). We have not reproduced
+# that trap in our c=64 bench, but matching their bucket pattern avoids
+# walking onto it as concurrency scales down.
 TOKEN_BUCKETS: tuple[int, ...] = (
-    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
+    4, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
 )
 
 
