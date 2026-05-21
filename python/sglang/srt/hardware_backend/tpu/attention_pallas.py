@@ -371,11 +371,11 @@ class TpuPallasAttnBackend(AttentionBackend):
     ):
         # The Pallas flash kernel (kernels/flash_attention.py:120) raises
         # NotImplementedError if qk_head_dim != v_head_dim. Fail loudly here
-        # rather than crashing deep inside the kernel — pallas_tpu is the
-        # TPU default, so silent fallthrough would surprise users of MLA-
-        # style models. Use `--attention-backend torch_native` for those.
+        # rather than crashing deep inside the kernel — fail-fast surfaces the
+        # incompatibility instead of surprising users of MLA-style models.
+        # Use `--attention-backend torch_native` for those.
         assert layer.qk_head_dim == layer.v_head_dim, (
-            f"pallas_tpu attention backend requires qk_head_dim == "
+            f"pallas_tpu_flash attention backend requires qk_head_dim == "
             f"v_head_dim, got qk={layer.qk_head_dim}, v={layer.v_head_dim}. "
             f"Re-run with --attention-backend torch_native."
         )
@@ -427,7 +427,7 @@ class TpuPallasAttnBackend(AttentionBackend):
         # Symmetric with forward_extend: forbid qk != v upfront so the
         # whole-request path (prefill + decode) gives a consistent error.
         assert layer.qk_head_dim == layer.v_head_dim, (
-            f"pallas_tpu attention backend requires qk_head_dim == "
+            f"pallas_tpu_flash attention backend requires qk_head_dim == "
             f"v_head_dim, got qk={layer.qk_head_dim}, v={layer.v_head_dim}. "
             f"Re-run with --attention-backend torch_native."
         )

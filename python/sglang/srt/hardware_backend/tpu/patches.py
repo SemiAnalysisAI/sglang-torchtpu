@@ -360,21 +360,25 @@ def _patch_torch_native_attn_backend() -> None:
 _support_triton_patched = False
 
 
+_PALLAS_TPU_BACKENDS = ("pallas_tpu_flash", "pallas_tpu_rpa_v3")
+
+
 def _patch_support_triton_for_tpu() -> None:
-    """Make `support_triton("pallas_tpu")` return False.
+    """Make `support_triton("pallas_tpu_flash" | "pallas_tpu_rpa_v3")` return False.
 
     SGLang gates Triton kernels behind `support_triton(attn_backend)`, which
     is a hardcoded name allowlist: `backend not in ["torch_native",
     "intel_amx"]`. The `torch_native` backend therefore dodges Triton (no
-    Triton driver exists for TPU), but the new "pallas_tpu" name is not in the
-    list, so `mem_cache/common.py:write_cache_indices` and
+    Triton driver exists for TPU), but the new Pallas backend names are not in
+    the list, so `mem_cache/common.py:write_cache_indices` and
     `forward_batch_info.py` take the Triton path and crash with
     `RuntimeError: 0 active drivers` on TPU.
 
-    Fix: treat "pallas_tpu" exactly like "torch_native" w.r.t. Triton
-    availability (correct — TPU has no Triton driver regardless of attention
-    backend). Other backends are unaffected. `support_triton` is imported
-    by value in two modules, so rebind it there too. Keeps upstream untouched.
+    Fix: treat the Pallas backend names exactly like "torch_native" w.r.t.
+    Triton availability (correct — TPU has no Triton driver regardless of
+    attention backend). Other backends are unaffected. `support_triton` is
+    imported by value in two modules, so rebind it there too. Keeps upstream
+    untouched.
     """
     global _support_triton_patched
     if _support_triton_patched:
@@ -386,7 +390,7 @@ def _patch_support_triton_for_tpu() -> None:
     orig = _utils_common.support_triton
 
     def support_triton(backend: str) -> bool:
-        if backend == "pallas_tpu":
+        if backend in _PALLAS_TPU_BACKENDS:
             return False
         return orig(backend)
 
@@ -464,43 +468,76 @@ def _patch_req_to_token_pool_max_context_len() -> None:
     ReqToTokenPool.__init__ = wrapped_init
 
 
-_pallas_attention_registered = False
+# Active attention backend name, populated by
+# ``TpuSRTPlatform.apply_server_args_defaults`` so that the KV-pool swap
+# below can see which backend the server resolved to. ``apply_tpu_patches``
+# runs at model_runner module import time — long after ``ServerArgs`` has
+# been finalised — so this is set well before the pool patch reads it.
+_active_attention_backend: str | None = None
 
 
-def _register_pallas_attention_backend() -> None:
-    """Register the TPU Pallas attention backend ("pallas_tpu") in SGLang's
-    attention registry at runtime, without editing upstream
-    attention_registry.py.
+def set_active_attention_backend(name: str | None) -> None:
+    """Record the resolved attention backend so later patches can branch on it.
 
-    `register_attention_backend(name)` is a plain function returning a
-    decorator that mutates the module-global ATTENTION_BACKENDS dict, so
-    calling it programmatically is equivalent to the upstream
-    @register_attention_backend decorator — keeps upstream untouched.
-
-    Ordering: this runs from apply_tpu_patches() via init_backend(), which
-    executes at `model_runner` module import (model_runner.py:236-238),
-    strictly before ModelRunner.init_attention_backend() (model_runner.py:776)
-    looks the name up. The backend module itself is imported lazily inside the
-    factory so importing patches does not pull in jax/torch_tpu early.
+    Called from :meth:`TpuSRTPlatform.apply_server_args_defaults` once the
+    backend has been resolved (either from ``--attention-backend`` or the
+    platform default). Idempotent; last write wins.
     """
-    global _pallas_attention_registered
-    if _pallas_attention_registered:
+    global _active_attention_backend
+    _active_attention_backend = name
+
+
+_mha_kv_pool_patched = False
+
+
+def _patch_mha_kv_pool_for_rpa_v3() -> None:
+    """Swap ``MHATokenToKVPool`` for the fused TPU pool when the active
+    attention backend is ``pallas_tpu_rpa_v3``.
+
+    The RPA v3 kernel reads/writes a single fused 5D KV buffer
+    (``[blocks, page_size, num_kv_heads*2 // packing, packing, head_dim]``)
+    that the stock :class:`MHATokenToKVPool` does not produce. Rather than
+    edit ``model_runner_kv_cache_mixin._init_pools`` (upstream code), we
+    rebind the ``MHATokenToKVPool`` symbol *in that module's namespace* to
+    :class:`TpuFusedMHATokenToKVPool` — the existing ``pool_cls = ...
+    MHATokenToKVPool`` lookup will resolve to the fused variant. This
+    matches the rest of this file's "patch around upstream" convention.
+
+    When the active backend is the flash variant (``pallas_tpu_flash``,
+    PR #5's design), the upstream pool is the correct one and no swap is
+    performed. The flash backend reads K and V via the standard
+    ``get_key_buffer`` / ``get_value_buffer`` accessors against that layout
+    and would silently mis-read the fused buffer if we swapped it in.
+
+    Ordering: depends on ``set_active_attention_backend`` having been
+    called first. ``apply_tpu_patches`` is invoked from
+    ``TpuSRTPlatform.init_backend`` (model_runner.py:237, module-import
+    time), which runs *after* ``apply_server_args_defaults`` has resolved
+    the backend name, so the flag is reliably populated by then.
+    """
+    global _mha_kv_pool_patched
+    if _mha_kv_pool_patched:
         return
-    _pallas_attention_registered = True
 
-    from sglang.srt.layers.attention.attention_registry import (
-        register_attention_backend,
+    if _active_attention_backend != "pallas_tpu_rpa_v3":
+        # No swap needed for flash or torch_native. Leave the patched flag
+        # false so a later re-run (e.g. spawned worker that resolves a
+        # different backend) can still apply the swap if it lands on RPA v3.
+        return
+
+    _mha_kv_pool_patched = True
+
+    import sglang.srt.model_executor.model_runner_kv_cache_mixin as mix
+    from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+    if mix.MHATokenToKVPool is TpuFusedMHATokenToKVPool:
+        return
+
+    mix.MHATokenToKVPool = TpuFusedMHATokenToKVPool
+    logger.info(
+        "TPU: swapped MHATokenToKVPool -> TpuFusedMHATokenToKVPool for the "
+        "pallas_tpu_rpa_v3 attention backend (fused 5D KV layout)."
     )
-
-    def create_pallas_tpu_backend(runner):
-        from sglang.srt.hardware_backend.tpu.attention_pallas import (
-            TpuPallasAttnBackend,
-        )
-
-        return TpuPallasAttnBackend(runner)
-
-    register_attention_backend("pallas_tpu")(create_pallas_tpu_backend)
-    logger.info("Registered 'pallas_tpu' attention backend.")
 
 
 def apply_tpu_patches(world_size: int = 1) -> None:
@@ -512,5 +549,5 @@ def apply_tpu_patches(world_size: int = 1) -> None:
     _patch_torch_native_attn_backend()
     _patch_support_triton_for_tpu()
     _patch_req_to_token_pool_max_context_len()
-    _register_pallas_attention_backend()
+    _patch_mha_kv_pool_for_rpa_v3()
     logger.info("TPU patches applied.")
