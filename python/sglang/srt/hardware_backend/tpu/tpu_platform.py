@@ -34,7 +34,10 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     def apply_server_args_defaults(self, server_args) -> None:
-        from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
+        from sglang.srt.hardware_backend.tpu.patches import (
+            _prepare_tpu_env,
+            set_active_attention_backend,
+        )
 
         _prepare_tpu_env(server_args.tp_size)
 
@@ -43,6 +46,11 @@ class TpuSRTPlatform(SRTPlatform):
 
         if server_args.attention_backend is None:
             server_args.attention_backend = self.get_default_attention_backend()
+
+        # Record for ``_patch_mha_kv_pool_for_rpa_v3``: the pool swap runs at
+        # model_runner module import (well after this point) and needs to
+        # know which TPU Pallas variant the server resolved to.
+        set_active_attention_backend(server_args.attention_backend)
 
         server_args.disable_cuda_graph = True
         server_args.disable_piecewise_cuda_graph = True
@@ -57,15 +65,19 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     def get_default_attention_backend(self) -> str:
-        # Pallas backend: flash_attention for prefill/extend, jax pallas
-        # paged_attention for decode (decode-native: no q>=128 padding, batched
-        # single call, native GQA). Registered in
-        # server_args.py:ATTENTION_BACKEND_CHOICES alongside other hardware-
-        # specific backends (intel_amx, ascend, intel_xpu), so it is also
-        # accepted via --attention-backend / --prefill-attention-backend /
-        # --decode-attention-backend. Override to the reference path with
-        # `--attention-backend torch_native`.
-        return "pallas_tpu"
+        # Two Pallas backends are registered for TPU:
+        #   - "pallas_tpu_rpa_v3" (default): ragged_paged_attention v3 kernel
+        #     in `pallas/ragged_paged_attention_v3.py`. Single unified kernel
+        #     for prefill + decode, fused KV cache (interleaved K/V, packed),
+        #     decode-native batched call.
+        #   - "pallas_tpu_flash": flash_attention for prefill/extend +
+        #     `jax.experimental.pallas.ops.tpu.paged_attention` for decode.
+        #     Original implementation from PR #5; works against the flat
+        #     `MHATokenToKVPool` layout (no fused-pool swap required).
+        # Both are listed in `server_args.ATTENTION_BACKEND_CHOICES` and
+        # registered in `patches._register_pallas_attention_backends()`.
+        # Override to the reference path with `--attention-backend torch_native`.
+        return "pallas_tpu_rpa_v3"
 
     def get_graph_runner_cls(self) -> type:
         from sglang.srt.hardware_backend.tpu.graph_runner.tpu_graph_runner import (
