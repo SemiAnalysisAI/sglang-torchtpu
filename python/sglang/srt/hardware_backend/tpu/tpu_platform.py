@@ -54,10 +54,14 @@ class TpuSRTPlatform(SRTPlatform):
 
         server_args.disable_cuda_graph = True
         server_args.disable_piecewise_cuda_graph = True
-        server_args.disable_overlap_schedule = True
-        # `enable_torch_compile` is honored on TPU and wired up by
-        # TpuGraphRunner (see init_device_graphs). Off by default (the
-        # SGLang-wide default); opt in with `--enable-torch-compile`.
+        server_args.enable_torch_compile = False
+        # TPU runs SGLang's regular event-based overlap scheduling, minus the
+        # CUDA-style forward/copy/schedule streams: torch_tpu serialises on a
+        # single PJRT queue so cross-stream ordering is a no-op (see
+        # ``Scheduler.init_overlap``'s ``use_overlap_streams``). Overlap comes
+        # from PJRT's async dispatch and a scoped ``torch.tpu.Event`` D2H fence.
+        # Leave it enabled by default; users can opt out via
+        # ``--disable-overlap-schedule``.
 
         if server_args.mem_fraction_static is None:
             server_args.mem_fraction_static = 0.40
@@ -128,6 +132,14 @@ class TpuSRTPlatform(SRTPlatform):
         return False
 
     def support_piecewise_cuda_graph(self) -> bool:
+        return False
+
+    def supports_overlap_streams(self) -> bool:
+        # torch_tpu serialises all device work on a single implicit PJRT queue:
+        # cross-stream ordering (wait_stream / wait_event) is a no-op and a
+        # non-default stream only relabels async-copy fences. Overlap comes from
+        # async PJRT dispatch + a scoped torch.tpu.Event D2H fence instead. Flip
+        # to True once torch_tpu exposes real multi-stream execution.
         return False
 
     # ------------------------------------------------------------------

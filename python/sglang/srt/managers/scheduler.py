@@ -327,8 +327,12 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
-        self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
-        self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
+        self.enable_overlap_mlx = (
+            not server_args.disable_overlap_schedule and use_mlx()
+        )
+        self.enable_overlap = (
+            not server_args.disable_overlap_schedule and not use_mlx()
+        )
         self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
@@ -1257,6 +1261,19 @@ class Scheduler(
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
 
+        # CUDA-style forward/copy/schedule streams only buy overlap on backends
+        # with real multi-stream execution. Single-queue backends (see
+        # Platform.supports_overlap_streams) get no benefit and risk fragility
+        # from a non-default stream: cross-stream ordering is a no-op there,
+        # entering a non-default stream only relabels async-copy fences, and
+        # batch-to-batch ordering (store_to_map(N) -> resolve_future(N+1)) is
+        # already guaranteed by issue order on the one queue. Their overlap
+        # comes from async dispatch plus the scoped ``device_module.Event()``
+        # D2H fence recorded in ``copy_to_cpu``.
+        self.use_overlap_streams = (
+            not use_mlx() and current_platform.supports_overlap_streams()
+        )
+
         if use_mlx():
             # MLX overlap scheduling uses mx.async_eval / mx.eval for
             # synchronisation so no CUDA/MPS streams or FutureMap needed.
@@ -1266,13 +1283,18 @@ class Scheduler(
             self.result_queue: Deque = deque()
             return
 
-        self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
-            self.forward_stream
-        )
-        self.copy_stream: CudaStream = self.device_module.Stream()
-        self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
-            self.copy_stream
-        )
+        if self.use_overlap_streams:
+            self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
+                self.forward_stream
+            )
+            self.copy_stream: CudaStream = self.device_module.Stream()
+            self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
+                self.copy_stream
+            )
+        else:
+            # Single-queue backend (torch_tpu): stay on the default stream.
+            self.forward_stream_ctx = nullcontext()
+            self.copy_stream_ctx = nullcontext()
 
         if not self.enable_overlap:
             self.future_map = None
@@ -1491,6 +1513,13 @@ class Scheduler(
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
             # not PyTorch MPS streams.
+            dispatch_event_loop(self)
+            return
+
+        if not self.use_overlap_streams:
+            # Single-queue backend (torch_tpu): don't wrap the loop in a
+            # non-default schedule_stream — it adds nothing and the C++ runtime
+            # prefers the default stream. See init_overlap.
             dispatch_event_loop(self)
             return
 
@@ -2841,7 +2870,8 @@ class Scheduler(
                     future_indices = self.future_map.alloc_future_indices(bs)
 
                     with self.forward_stream_ctx:
-                        self.forward_stream.wait_stream(self.schedule_stream)
+                        if self.use_overlap_streams:
+                            self.forward_stream.wait_stream(self.schedule_stream)
                         self.future_map.resolve_future(batch)
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(batch)
@@ -2915,7 +2945,8 @@ class Scheduler(
             if self.enable_overlap:
                 self.record_batch_in_overlap(batch)
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
+                    if self.use_overlap_streams:
+                        self.forward_stream.wait_stream(self.schedule_stream)
                     pooler_output = self.tp_worker.forward_batch_embedding(batch)
                     ret = EmbeddingBatchResult(
                         embeddings=pooler_output.embeddings,
