@@ -222,17 +222,19 @@ class TpuPallasAttnBackend(AttentionBackend):
 
         op = _get_flash_op(bool(causal), float(scaling))
 
-        start_q, start_kv = 0, 0
+        start_q = 0
         for seq_idx in range(len(seq_lens_l)):
             extend_seq_len_q = extend_seq_lens_l[seq_idx]
             prefill_seq_len_q = extend_prefix_lens_l[seq_idx]
 
             seq_len_kv = seq_lens_l[seq_idx]
             end_q = start_q + extend_seq_len_q
-            end_kv = start_kv + seq_len_kv
 
             per_req_query = query[:, start_q:end_q, :]
-            per_req_query_redudant = torch.empty(
+            # Zero (not empty): the prefix rows (0..prefill_seq_len_q) get
+            # masked off the final output, but uninitialized values can carry
+            # NaN/Inf into the flash kernel's softmax intermediates.
+            per_req_query_redudant = torch.zeros(
                 (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
                 dtype=per_req_query.dtype,
                 device=per_req_query.device,
@@ -270,7 +272,7 @@ class TpuPallasAttnBackend(AttentionBackend):
             output[start_q:end_q, :, :] = per_req_out_redudant[
                 prefill_seq_len_q:, :, :
             ]
-            start_q, start_kv = end_q, end_kv
+            start_q = end_q
         return output
 
     def _run_paged_forward_decode(
@@ -308,24 +310,21 @@ class TpuPallasAttnBackend(AttentionBackend):
         ppb = min(8, pps)
 
         # Vectorized gather of per-request token slots from the flat pool.
-        # Slots past the real length are stale but masked by `lengths`. If the
-        # bucket Lb exceeds req_to_token.shape[1] (e.g. max_context_len is not
-        # a multiple of _PAGE_SIZE), the trailing positions are padded with
-        # slot 0 — also masked away by `lengths` since lengths <= max_len <=
-        # req_to_token.shape[1] < Lb.
-        tok = req_to_token[req_pool_indices.long()][:, :Lb]  # [batch, Lb']
-        if tok.shape[1] < Lb:
-            tok = torch.cat(
-                [
-                    tok,
-                    torch.zeros(
-                        (batch, Lb - tok.shape[1]),
-                        dtype=tok.dtype,
-                        device=tok.device,
-                    ),
-                ],
-                dim=1,
-            )
+        # Slots past the real length are stale but masked by `lengths`.
+        #
+        # Invariant: req_to_token.shape[1] >= Lb. `_bucket_kv_len` is monotone
+        # and maps any input to a power-of-two multiple of `_PAGE_SIZE`, so
+        # this holds whenever `req_to_token.shape[1]` is itself such a value.
+        # `_patch_req_to_token_pool_max_context_len` enforces that at pool
+        # allocation. Asserting here means any future regression surfaces
+        # loudly instead of right-padding with slot 0 — a live KV slot owned
+        # by another request, whose data would leak into attention if length
+        # masking ever drifted.
+        assert req_to_token.shape[1] >= Lb, (
+            f"req_to_token.shape[1] ({req_to_token.shape[1]}) must be >= Lb "
+            f"({Lb}); is _patch_req_to_token_pool_max_context_len applied?"
+        )
+        tok = req_to_token[req_pool_indices.long()][:, :Lb]  # [batch, Lb]
 
         k_g = k_cache[tok.long()]  # [batch, Lb, Hkv, D]
         v_g = v_cache[tok.long()]  # [batch, Lb, Hkv, Dv]

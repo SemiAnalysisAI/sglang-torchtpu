@@ -10,6 +10,8 @@ silently regress:
   * _maybe_expand_kv_heads GQA expansion;
   * _patch_support_triton_for_tpu (else the Triton path crashes on TPU
     with "0 active drivers");
+  * _patch_req_to_token_pool_max_context_len (else paged decode gather
+    would right-pad with slot 0 — a live slot owned by another request);
   * _register_pallas_attention_backend (else "pallas_tpu" is unknown).
 
 The numeric tests need TPU + torch_tpu and are skipped otherwise. The
@@ -98,6 +100,58 @@ class TestSupportTritonPatch(CustomTestCase):
         # Idempotent.
         _patch_support_triton_for_tpu()
         self.assertFalse(uc.support_triton("pallas_tpu"))
+
+
+class TestReqToTokenPoolRoundingPatch(CustomTestCase):
+    """_patch_req_to_token_pool_max_context_len must round max_context_len
+    up to a power-of-two multiple of _PAGE_SIZE so the paged decode gather
+    is always within the per-request slot row (no fall-through to slot 0)."""
+
+    def test_rounding(self):
+        from sglang.srt.hardware_backend.tpu.attention_pallas import (
+            _PAGE_SIZE,
+            _bucket_kv_len,
+        )
+        from sglang.srt.hardware_backend.tpu.patches import (
+            _patch_req_to_token_pool_max_context_len,
+        )
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+
+        _patch_req_to_token_pool_max_context_len()
+
+        # Non-aligned width rounds up; aligned width is unchanged.
+        for raw, expected in (
+            (1, 64),
+            (_PAGE_SIZE, _PAGE_SIZE),
+            (_PAGE_SIZE + 1, _PAGE_SIZE * 2),
+            (200, 256),
+            (4096, 4096),
+            (8193, 16384),
+        ):
+            pool = ReqToTokenPool(
+                size=2,
+                max_context_len=raw,
+                device="cpu",
+                enable_memory_saver=False,
+            )
+            self.assertEqual(pool.req_to_token.shape[1], expected)
+            self.assertEqual(pool.max_context_len, expected)
+
+        # Decode gather invariant: for any max_len <= pool width, the
+        # bucketed Lb fits inside the per-request slot row.
+        pool = ReqToTokenPool(
+            size=2, max_context_len=8193, device="cpu", enable_memory_saver=False,
+        )
+        width = pool.req_to_token.shape[1]
+        for max_len in (1, 64, 65, 4096, 8000, width):
+            self.assertLessEqual(_bucket_kv_len(max_len), width)
+
+        # Idempotent.
+        _patch_req_to_token_pool_max_context_len()
+        pool = ReqToTokenPool(
+            size=2, max_context_len=200, device="cpu", enable_memory_saver=False,
+        )
+        self.assertEqual(pool.req_to_token.shape[1], 256)
 
 
 class TestPallasRegistration(CustomTestCase):
