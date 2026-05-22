@@ -116,10 +116,23 @@ def _build_fused_moe_op():
         )
         return TileSizes(tile_m=tm, tile_k=tk, tile_n=tn)
 
+    # GPT-OSS swiglu-oai constants (see ``sglang/srt/models/gpt_oss.py``:
+    # alpha=1.702, limit=7.0 are the published values from the OpenAI
+    # GPT-OSS release).  Hardcoded here because the existing call sites
+    # in ``unquant.py`` / ``mxfp4.py`` do not yet thread these through
+    # the ``fused_moe_call`` boundary; lift them into kwargs if a
+    # future model uses different values.
+    _SWIGLU_OAI_ALPHA = 1.702
+    _SWIGLU_OAI_LIMIT = 7.0
+
     def _activation(gmm1_out, activation_name):
         """Apply the gated activation to a ``[m*topk, 2*n]`` GMM1 output.
 
         Returns the ``[m*topk, n]`` post-activation tensor consumed by GMM2.
+        The split convention is ``acc[:, :n]`` = gate, ``acc[:, n:]`` = up —
+        the GPT-OSS BF16 path must pre-deinterleave w13 so that this
+        midpoint split lines up with the canonical SwiGLU-OAI math
+        (see ``layers/quantization/mxfp4_tpu.py``).
         """
         n = gmm1_out.shape[-1] // 2
         gate, up = gmm1_out[:, :n], gmm1_out[:, n:]
@@ -127,15 +140,21 @@ def _build_fused_moe_op():
             return jax.nn.silu(gate) * up
         if activation_name == "gelu":
             return jax.nn.gelu(gate) * up
-        if activation_name == "swiglu_oai":
-            raise NotImplementedError(
-                "swiglu_oai gating in the Pallas fused-MoE op is not wired "
-                "up yet; the GPT-OSS path still goes through the mxfp4 "
-                "specialised forward."
-            )
+        if activation_name in ("swigluoai", "swiglu_oai"):
+            # OpenAI GPT-OSS SwiGLU variant:
+            #   gate = clip(gate, max=limit)
+            #   up   = clip(up,   min=-limit, max=limit)
+            #   glu  = gate * sigmoid(alpha * gate)
+            #   out  = (up + 1.0) * glu
+            limit = _SWIGLU_OAI_LIMIT
+            alpha = _SWIGLU_OAI_ALPHA
+            gate_c = jnp.minimum(gate, limit)
+            up_c = jnp.clip(up, -limit, limit)
+            glu = gate_c * jax.nn.sigmoid(alpha * gate_c)
+            return (up_c + 1.0) * glu
         raise NotImplementedError(
             f"Unsupported activation '{activation_name}' for the Pallas "
-            "fused-MoE op. Supported: silu, gelu."
+            "fused-MoE op. Supported: silu, gelu, swigluoai."
         )
 
     def _fused_moe_jax(
@@ -172,6 +191,27 @@ def _build_fused_moe_op():
 
         # GMM1: gather rows then expert-batched matmul.
         x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
+
+        # gmm_v2 requires the LHS row dim to be a multiple of the sublane
+        # tiling (16 for bf16 on TPU v7) — concretely it does
+        # ``zero_ref.reshape(-1, size_lhs_sublane, num_lanes)`` in its
+        # zero-init path, which dies on m=24-style warmup shapes. The
+        # sglang-jax wrapper at ``megablox_gmm_backend.gmm`` solves this
+        # by padding lhs rows to 32; we do the same here (and at the end
+        # slice the padded rows back off before un-permuting).
+        # ``M_total`` is static at JAX trace time, so the branch below
+        # collapses to a constant at trace time and produces no extra
+        # ops when the inputs are already aligned.
+        M_total = x_sorted.shape[0]
+        M_ALIGN = 32
+        pad_m = (-M_total) % M_ALIGN
+        if pad_m > 0:
+            x_sorted = jnp.pad(x_sorted, ((0, pad_m), (0, 0)))
+            # The padded rows are zero. Route them to the last expert so
+            # the kernel processes them (producing zero output rows we
+            # discard below); group_sizes shape stays [num_experts].
+            group_sizes = group_sizes.at[num_experts - 1].add(pad_m)
+
         gmm1_out = gmm_v2(
             lhs=x_sorted,
             rhs=w1,
@@ -180,7 +220,7 @@ def _build_fused_moe_op():
             rhs_bias=w1_bias,
             preferred_element_type=out_dtype,
             tile_info=_lookup_tile_info(x_sorted, w1, num_experts),
-        )  # [m*topk, 2 * n_intermediate]
+        )  # [M_total+pad_m, 2 * n_intermediate]
 
         # Gated activation.
         act_out = _activation(gmm1_out, activation_name)
@@ -194,7 +234,11 @@ def _build_fused_moe_op():
             rhs_bias=w2_bias,
             preferred_element_type=out_dtype,
             tile_info=_lookup_tile_info(act_out, w2, num_experts),
-        )  # [m*topk, k]
+        )  # [M_total+pad_m, k]
+
+        # Drop the padded rows before un-permuting.
+        if pad_m > 0:
+            gmm2_out = gmm2_out[:M_total]
 
         # Un-permute back to token-major order and reduce across the top-k
         # experts with the routing weights.
