@@ -4,7 +4,7 @@ Requires TPU hardware and torch_tpu. Launches a server with Qwen3-0.6B
 on a single TPU chip and verifies basic inference works.
 
 Usage:
-    SGLANG_PLATFORM=tpu python test/manual/tpu/test_tpu_basic_inference.py
+    SGLANG_PLATFORM=tpu python test/registered/tpu/basic_function/test_tpu_basic_inference.py
 """
 
 import os
@@ -13,11 +13,18 @@ import unittest
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+)
+
+register_tpu_ci(
+    est_time=300,
+    suite="stage-a-test-tpu-unit",
+    nightly=False,
 )
 
 MODEL = "Qwen/Qwen3-0.6B"

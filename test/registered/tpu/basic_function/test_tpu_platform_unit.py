@@ -9,7 +9,14 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 from sglang.srt.platforms.device_mixin import PlatformEnum
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_tpu_ci(
+    est_time=30,
+    suite="stage-a-test-tpu-unit",
+    nightly=False,
+)
 
 
 class TestTpuPlatformIdentity(CustomTestCase):

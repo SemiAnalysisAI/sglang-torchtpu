@@ -18,14 +18,21 @@ The numeric tests need TPU + torch_tpu and are skipped otherwise. The
 helper / patch tests run anywhere.
 
 Usage:
-    SGLANG_PLATFORM=tpu python test/manual/tpu/test_pallas_attention.py
+    SGLANG_PLATFORM=tpu python test/registered/tpu/basic_function/test_pallas_attention.py
 """
 
 import importlib.util
 import math
 import unittest
 
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_tpu_ci(
+    est_time=180,
+    suite="stage-a-test-tpu-unit",
+    nightly=False,
+)
 
 
 def _skip_if_no_tpu() -> bool:
