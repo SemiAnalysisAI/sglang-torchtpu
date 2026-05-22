@@ -1,0 +1,218 @@
+name: PR Test (TPU)
+
+# Pipeline: pr-gate -> check-changes -> [stage-a-test-tpu-unit,
+#                                        stage-b-test-tpu-4-v7,
+#                                        stage-cuda-guard]
+#                  -> pr-test-tpu-finish
+#
+# stage-cuda-guard is *mandatory* from day 1: TPU work edits shared files
+# (parallel_state.py, scheduler.py, attention_registry.py, utils/common.py)
+# and letting CUDA regressions land in this fork would create painful debt
+# at upstream-merge time. We don't reproduce the full B200/H200 matrix —
+# we only prove the smallest CUDA path still parses and runs.
+#
+# Container image: the workflow pulls a pre-built image from private GAR
+# (built/refreshed by release-docker-tpu.yml). The GKE runner pods are
+# bound to a GCP SA with roles/artifactregistry.reader so the kubelet
+# pulls without explicit `credentials:` in the container directive.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      run_all_tests:
+        description: 'Run all tests (for releasing or testing purpose)'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: pr-test-tpu-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+env:
+  # TODO(infra): replace once the GAR repo exists. The workflow expects
+  # release-docker-tpu.yml to publish :nightly and :<sha> tags here.
+  TPU_CI_IMAGE: 'us-docker.pkg.dev/REPLACE_ME/sglang-tpu/sglang-tpu:nightly'
+
+jobs:
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+            echo "run_all_tests=true" >> $GITHUB_OUTPUT
+            echo "Run mode: ALL TESTS"
+          else
+            echo "run_all_tests=false" >> $GITHUB_OUTPUT
+            echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
+          fi
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        if: steps.run-mode.outputs.run_all_tests != 'true'
+        with:
+          filters: |
+            main_package:
+              - "python/sglang/srt/hardware_backend/tpu/**"
+              - "python/sglang/srt/layers/attention/pallas*"
+              - "python/sglang/srt/distributed/parallel_state.py"
+              - "python/sglang/srt/managers/scheduler.py"
+              - "python/sglang/srt/layers/attention/attention_registry.py"
+              - "python/sglang/srt/utils/common.py"
+              - "python/pyproject_tpu.toml"
+              - "test/registered/tpu/**"
+              - "scripts/ci/tpu/**"
+              - "docker/tpu.Dockerfile"
+              - ".github/workflows/pr-test-tpu.yml"
+
+  pr-gate:
+    needs: check-changes
+    if: needs.check-changes.outputs.main_package == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
+
+  stage-a-test-tpu-unit:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.main_package == 'true'
+    runs-on: tpu-v7-1
+    timeout-minutes: 20
+    container:
+      image: us-docker.pkg.dev/REPLACE_ME/sglang-tpu/sglang-tpu:nightly
+      volumes:
+        - /cache/hf:/cache/hf
+    env:
+      SGLANG_PLATFORM: tpu
+      SGLANG_IS_IN_CI: 'true'
+      HF_HOME: /cache/hf
+      XLA_PYTHON_CLIENT_PREALLOCATE: 'false'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Mark repository safe
+        run: git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
+      - name: Reinstall sglang from PR source
+        run: |
+          rm -f python/pyproject.toml
+          cp python/pyproject_tpu.toml python/pyproject.toml
+          python3 -m pip install --no-deps -e python
+
+      - name: Run TPU stage-a unit suite
+        run: |
+          cd test
+          python3 run_suite.py --hw tpu --suite stage-a-test-tpu-unit
+
+  stage-b-test-tpu-4-v7:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.main_package == 'true'
+    runs-on: tpu-v7-4
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [ 0, 1 ]
+    container:
+      image: us-docker.pkg.dev/REPLACE_ME/sglang-tpu/sglang-tpu:nightly
+      volumes:
+        - /cache/hf:/cache/hf
+    env:
+      SGLANG_PLATFORM: tpu
+      SGLANG_IS_IN_CI: 'true'
+      HF_HOME: /cache/hf
+      XLA_PYTHON_CLIENT_PREALLOCATE: 'false'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Mark repository safe
+        run: git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
+      - name: Reinstall sglang from PR source
+        run: |
+          rm -f python/pyproject.toml
+          cp python/pyproject_tpu.toml python/pyproject.toml
+          python3 -m pip install --no-deps -e python
+
+      - name: Run TPU stage-b 4-chip suite
+        run: |
+          cd test
+          python3 run_suite.py --hw tpu --suite stage-b-test-tpu-4-v7 \
+            --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+
+  # Mandatory PR-blocking smoke on the cheapest CUDA runner. Runs in
+  # parallel with the TPU jobs (no `needs:` chain) so it does not lengthen
+  # the critical path. Uses the existing CUDA install pipeline + the
+  # smallest existing suite.
+  stage-cuda-guard:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.main_package == 'true'
+    # Resolved label per scripts/ci/runner_configs.yml `1-gpu-small.runs_on`.
+    runs-on: 1-gpu-5090
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install CUDA dependencies (default sgl-kernel wheel from index)
+        run: bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Run base-a-test-1-gpu-small (smoke)
+        timeout-minutes: 45
+        env:
+          SGLANG_IS_IN_CI: 'true'
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite base-a-test-1-gpu-small
+
+  pr-test-tpu-finish:
+    needs:
+      [
+        check-changes,
+        stage-a-test-tpu-unit,
+        stage-b-test-tpu-4-v7,
+        stage-cuda-guard,
+      ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          json_needs='${{ toJson(needs) }}'
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+          for job in $job_names; do
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+            echo "$job: $result"
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "The above jobs failed."
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0
