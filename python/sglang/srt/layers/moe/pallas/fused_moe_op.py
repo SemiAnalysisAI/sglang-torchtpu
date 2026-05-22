@@ -121,6 +121,7 @@ def _build_fused_moe_op():
 
         Returns the ``[m*topk, n]`` post-activation tensor consumed by GMM2.
         """
+        # TODO(Qinghan): case/switch
         n = gmm1_out.shape[-1] // 2
         gate, up = gmm1_out[:, :n], gmm1_out[:, n:]
         if activation_name == "silu":
