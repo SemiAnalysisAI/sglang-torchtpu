@@ -68,7 +68,9 @@ def _prepare_tpu_env(world_size: int = 1) -> None:
         import socket
 
         # Hold sockets open until env var is written so OS doesn't reassign.
-        _held = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(world_size)]
+        _held = [
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(world_size)
+        ]
         for s in _held:
             s.bind(("", 0))
         sb_ports = [s.getsockname()[1] for s in _held]
@@ -134,7 +136,9 @@ def _patch_set_device_tolerate_mismatch() -> None:
                     else int(device)
                 )
                 logger.warning(
-                    "TPU set_device(idx=%s) skipped: %s", idx, e,
+                    "TPU set_device(idx=%s) skipped: %s",
+                    idx,
+                    e,
                 )
                 return
             raise
@@ -294,9 +298,7 @@ def _patch_torch_native_attn_backend() -> None:
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_q:end_q, :, :] = per_req_out_redudant[
-                prefill_seq_len_q:, :, :
-            ]
+            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
             start_q, start_kv = end_q, end_kv
         return output
 
