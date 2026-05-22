@@ -1,0 +1,112 @@
+name: Release Docker (TPU)
+
+# Builds and publishes docker/tpu.Dockerfile to private Google Artifact
+# Registry. Tags published: :<short-sha>, :nightly, and (only when on
+# main) :latest. The torch_tpu wheel pulls from a private wheel server
+# whose access token is fetched at build time via workload-identity
+# federation (no long-lived password in repo secrets).
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'docker/tpu.Dockerfile'
+      - 'python/pyproject_tpu.toml'
+      - 'scripts/ci/tpu/**'
+      - '.github/workflows/release-docker-tpu.yml'
+  schedule:
+    # 04:00 UTC daily ≈ 21:00 PT previous day. Off-peak window for GAR
+    # writes and TPU pool — and ahead of the 10:00 UTC nightly-test-tpu
+    # so :nightly is fresh by the time tests run.
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      push_latest:
+        description: 'Also push :latest tag (default true on main)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  # Required by google-github-actions/auth for OIDC token exchange.
+  id-token: write
+
+env:
+  # TODO(infra): replace with the real private GAR repo path once
+  # provisioned. Same value as TPU_CI_IMAGE in pr-test-tpu.yml.
+  GAR_IMAGE: 'us-docker.pkg.dev/REPLACE_ME/sglang-tpu/sglang-tpu'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          docker-images: false
+
+      - name: Authenticate to Google Cloud
+        id: gcp-auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GAR_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GAR_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for GAR
+        run: |
+          GAR_HOST="${GAR_IMAGE%%/*}"
+          gcloud auth configure-docker "${GAR_HOST}" --quiet
+
+      - name: Mint short-lived torch_tpu wheel token
+        id: wheel-token
+        run: |
+          # Use the same access token; gcloud's print-access-token
+          # returns the SA's OAuth bearer (workload-identity-minted).
+          # Buildx exposes it via --secret so it never enters a layer.
+          echo "::add-mask::${{ steps.gcp-auth.outputs.access_token }}"
+          printf '%s' "${{ steps.gcp-auth.outputs.access_token }}" > /tmp/torch_tpu_token
+          echo "token_file=/tmp/torch_tpu_token" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute tags
+        id: tags
+        run: |
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          {
+            echo "tag_sha=${GAR_IMAGE}:${SHORT_SHA}"
+            echo "tag_nightly=${GAR_IMAGE}:nightly"
+            echo "tag_latest=${GAR_IMAGE}:latest"
+            echo "push_latest=${{ github.ref == 'refs/heads/main' || inputs.push_latest == true }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/tpu.Dockerfile
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.tags.outputs.tag_sha }}
+            ${{ steps.tags.outputs.tag_nightly }}
+            ${{ steps.tags.outputs.push_latest == 'true' && steps.tags.outputs.tag_latest || '' }}
+          build-args: |
+            TORCH_TPU_INDEX_URL=${{ secrets.TORCH_TPU_INDEX_URL }}
+          secret-files: |
+            torch_tpu_token=${{ steps.wheel-token.outputs.token_file }}
+
+      - name: Cleanup token file
+        if: always()
+        run: rm -f /tmp/torch_tpu_token
