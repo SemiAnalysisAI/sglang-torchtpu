@@ -1,0 +1,121 @@
+name: Nightly Test (TPU)
+
+# Runs the TPU nightly suite + a bench_serving perf trend. Slack-notifies
+# on failure. Cron: 10:00 UTC = 02:00 PT — avoids the upstream NPU
+# 18:00 UTC nightly slot, and lands a few hours after
+# release-docker-tpu's 04:00 UTC nightly image push so :nightly is fresh.
+
+on:
+  schedule:
+    - cron: '0 10 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to test (default: main)'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: nightly-test-tpu-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TPU_CI_IMAGE: 'us-docker.pkg.dev/REPLACE_ME/sglang-tpu/sglang-tpu:nightly'
+
+jobs:
+  nightly-tpu-4-v7:
+    runs-on: tpu-v7-4
+    timeout-minutes: 180
+    container:
+      image: us-docker.pkg.dev/REPLACE_ME/sglang-tpu/sglang-tpu:nightly
+      volumes:
+        - /cache/hf:/cache/hf
+    env:
+      SGLANG_PLATFORM: tpu
+      SGLANG_IS_IN_CI: 'true'
+      HF_HOME: /cache/hf
+      XLA_PYTHON_CLIENT_PREALLOCATE: 'false'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Mark repository safe
+        run: git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
+      - name: Reinstall sglang from source
+        run: |
+          rm -f python/pyproject.toml
+          cp python/pyproject_tpu.toml python/pyproject.toml
+          python3 -m pip install --no-deps -e python
+
+      - name: Run nightly-tpu-4-v7 suite
+        run: |
+          cd test
+          python3 run_suite.py --hw tpu --suite nightly-tpu-4-v7 --nightly \
+            --timeout-per-file 3600 --continue-on-error
+
+  nightly-perf-tpu:
+    runs-on: tpu-v7-4
+    timeout-minutes: 180
+    container:
+      image: us-docker.pkg.dev/REPLACE_ME/sglang-tpu/sglang-tpu:nightly
+      volumes:
+        - /cache/hf:/cache/hf
+    env:
+      SGLANG_PLATFORM: tpu
+      SGLANG_IS_IN_CI: 'true'
+      HF_HOME: /cache/hf
+      XLA_PYTHON_CLIENT_PREALLOCATE: 'false'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Mark repository safe
+        run: git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
+      - name: Reinstall sglang from source
+        run: |
+          rm -f python/pyproject.toml
+          cp python/pyproject_tpu.toml python/pyproject.toml
+          python3 -m pip install --no-deps -e python
+
+      - name: Run nightly-perf-tpu suite (bench_serving trend on Qwen3-32B)
+        # Suite body should invoke bench_serving with isl/osl = 1024/1024
+        # against Qwen3-32B and persist RESULTS.md / perf JSON to
+        # ${{ github.workspace }}/perf-out/ for trend upload below.
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/perf-out"
+          cd test
+          PERF_OUT_DIR="${GITHUB_WORKSPACE}/perf-out" \
+            python3 run_suite.py --hw tpu --suite nightly-perf-tpu --nightly \
+            --timeout-per-file 7200 --continue-on-error
+
+      - name: Upload perf trend artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tpu-nightly-perf-${{ github.run_id }}
+          path: perf-out/
+          if-no-files-found: warn
+          retention-days: 30
+
+  notify-failure:
+    needs: [nightly-tpu-4-v7, nightly-perf-tpu]
+    if: always() && (failure() || cancelled())
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post Slack notification
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": ":x: TPU nightly failed on ${{ github.ref_name }} (run #${{ github.run_number }}): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
