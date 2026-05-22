@@ -225,8 +225,8 @@ class ExpertLocationMetadata:
             value=-1,
         )
 
-        logical_to_all_physical_map_num_valid = torch.count_nonzero(
-            logical_to_all_physical_map != -1, dim=-1
+        logical_to_all_physical_map_num_valid = (logical_to_all_physical_map != -1).sum(
+            dim=-1
         )
 
         return ExpertLocationMetadata(

@@ -107,8 +107,11 @@ class MultiPlatformOp(nn.Module):
         return self.forward_native(*args, **kwargs)
 
     def dispatch_forward(self):
-        # OOT platform dispatch: check registry then method lookup
-        if current_platform.is_out_of_tree():
+        # OOT platform dispatch: check registry then method lookup.
+        # TPU is in-tree (``PlatformEnum.TPU``) but its forwards are
+        # method-dispatched the same way OOT plugins are, so route it
+        # through this branch as well.
+        if current_platform.is_out_of_tree() or current_platform.is_tpu():
             key = current_platform.get_dispatch_key_name()
             oot = self._oot_forward_registry.get(key, {})
             if type(self) in oot:

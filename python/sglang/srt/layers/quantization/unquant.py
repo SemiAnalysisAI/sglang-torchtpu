@@ -684,8 +684,41 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         return StandardCombineInput(hidden_states=final_hidden_states)
 
-    def forward_tpu(self, *args, **kwargs) -> CombineInput:
-        raise NotImplementedError("The TPU backend currently does not support MoE.")
+    def forward_tpu(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        moe_runner_config = self.moe_runner_config
+        if moe_runner_config.apply_router_weight_on_input:
+            raise NotImplementedError(
+                "apply_router_weight_on_input is not supported on TPU yet."
+            )
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+
+        # SGLang's MoE weights are stored as (num_experts, n, k) but the
+        # Pallas gmm_v2 kernel expects (num_experts, k, n). Transpose at the
+        # call site for now — once stable, move this to
+        # ``process_weights_after_loading`` so the swap happens once.
+        w13 = layer.w13_weight.transpose(1, 2).contiguous()
+        w2 = layer.w2_weight.transpose(1, 2).contiguous()
+
+        output = fused_moe_call(
+            hidden_states=x,
+            w1=w13,
+            w2=w2,
+            topk_weights=topk_weights.to(x.dtype),
+            topk_ids=topk_ids.to(torch.int32),
+            topk=int(topk_ids.shape[-1]),
+            activation=moe_runner_config.activation,
+        )
+        return StandardCombineInput(hidden_states=output)
 
     def forward_musa(self, *args, **kwargs) -> CombineInput:
         return self.forward_cuda(*args, **kwargs)
