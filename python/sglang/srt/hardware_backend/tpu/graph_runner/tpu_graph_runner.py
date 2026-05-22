@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import logging
 from typing import TYPE_CHECKING
 
@@ -30,7 +31,10 @@ logger = logging.getLogger(__name__)
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner) -> list[int]:
     server_args = model_runner.server_args
-    max_bs = min(server_args.torch_compile_max_bs, model_runner.req_to_token_pool.size)
+    max_bs = min(
+        server_args.cuda_graph_max_bs or server_args.torch_compile_max_bs,
+        model_runner.req_to_token_pool.size,
+    )
     # Decode schedules exactly one token per request, so the static compile
     # shape is the request batch size.
     capture_bs = [
@@ -57,7 +61,8 @@ class TpuGraphRunner:
             backend="tpu",
             tracing_mode="real",
         )
-        self._logged_replay = False
+        self.decode_buffers: dict[str, torch.Tensor] = {}
+        self._logged_decode_replay_buckets: set[tuple[int, int]] = set()
 
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
@@ -68,6 +73,7 @@ class TpuGraphRunner:
         )
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
+        self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
 
         assert (
             not self.model_runner.server_args.enable_lora
@@ -94,6 +100,8 @@ class TpuGraphRunner:
         assert self.pp_size == 1, "TpuGraphRunner does not support PP yet."
 
         self.capture_bs = get_batch_sizes_to_capture(model_runner)
+        self.max_bs = max(self.capture_bs)
+        self.decode_buffers = self._create_decode_buffers(self.max_bs)
         log_info_on_rank0(logger, f"Capture TPU nonstrict graph bs {self.capture_bs}")
 
         self.capture_forward_mode = ForwardMode.DECODE
@@ -108,13 +116,66 @@ class TpuGraphRunner:
         return (
             # Normal decode enters through ModelRunner.forward_decode.
             forward_batch.forward_mode.is_decode()
-            and forward_batch.batch_size in self.capture_bs
+            and self._select_decode_batch_size(forward_batch.batch_size) is not None
             and capture_hidden_mode == self.capture_hidden_mode
         )
 
     def capture(self) -> None:
         for bs in self.capture_bs:
             self.warmup_decode_batch_size(bs)
+
+    def _select_decode_batch_size(self, raw_bs: int) -> int | None:
+        if self.disable_padding:
+            return raw_bs if raw_bs in self.capture_bs else None
+        index = bisect.bisect_left(self.capture_bs, raw_bs)
+        if index == len(self.capture_bs):
+            return None
+        return self.capture_bs[index]
+
+    def _create_decode_buffers(self, max_bs: int) -> dict[str, torch.Tensor]:
+        with torch.device(self.device):
+            return {
+                "input_ids": torch.zeros((max_bs,), dtype=torch.int64),
+                "positions": torch.zeros((max_bs,), dtype=torch.int64),
+                "req_pool_indices": torch.zeros((max_bs,), dtype=torch.int64),
+                "seq_lens": torch.ones((max_bs,), dtype=torch.int64),
+                "out_cache_loc": torch.zeros((max_bs,), dtype=torch.int64),
+            }
+
+    def _prepare_decode_inputs(
+        self, forward_batch: ForwardBatch, bs: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        raw_bs = forward_batch.batch_size
+        if raw_bs == bs:
+            return (
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.out_cache_loc,
+            )
+
+        buffers = self.decode_buffers
+        input_ids = buffers["input_ids"][:bs]
+        positions = buffers["positions"][:bs]
+        req_pool_indices = buffers["req_pool_indices"][:bs]
+        seq_lens = buffers["seq_lens"][:bs]
+        out_cache_loc = buffers["out_cache_loc"][:bs]
+
+        input_ids[:raw_bs].copy_(forward_batch.input_ids)
+        positions[:raw_bs].copy_(forward_batch.positions)
+        req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+        seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        out_cache_loc[:raw_bs].copy_(forward_batch.out_cache_loc)
+
+        # Match SGLang CUDA graph replay: padded requests use reserved request
+        # and KV slot 0, so their dummy work does not mutate real request state.
+        input_ids[raw_bs:bs].zero_()
+        positions[raw_bs:bs].zero_()
+        req_pool_indices[raw_bs:bs].zero_()
+        seq_lens[raw_bs:bs].fill_(1)
+        out_cache_loc[raw_bs:bs].zero_()
+        return input_ids, positions, req_pool_indices, seq_lens, out_cache_loc
 
     def warmup_decode_batch_size(self, bs: int) -> None:
         """Compile one fixed-shape decode batch.
@@ -215,25 +276,37 @@ class TpuGraphRunner:
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
         del skip_attn_backend_init, pp_proxy_tensors
-        if not self._logged_replay:
+        raw_bs = forward_batch.batch_size
+        bs = self._select_decode_batch_size(raw_bs)
+        assert bs is not None
+        replay_bucket = (raw_bs, bs)
+        if replay_bucket not in self._logged_decode_replay_buckets:
             log_info_on_rank0(
                 logger,
-                f"Replay TPU nonstrict graph bs={forward_batch.batch_size}",
+                f"Replay TPU nonstrict graph bs={raw_bs} bucket_bs={bs}",
             )
-            self._logged_replay = True
+            self._logged_decode_replay_buckets.add(replay_bucket)
+        (
+            input_ids,
+            positions,
+            req_pool_indices,
+            seq_lens,
+            out_cache_loc,
+        ) = self._prepare_decode_inputs(forward_batch, bs)
         # TorchTPU compile is shape-specialized, not address-specialized like
-        # CUDA graphs. Pass the live SGLang tensors directly.
+        # CUDA graphs. Exact bucket hits pass live SGLang tensors; padded
+        # bucket hits pass reusable static buffers.
         logits = self.decode(
-            forward_batch.batch_size,
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            forward_batch.out_cache_loc,
+            bs,
+            input_ids,
+            positions,
+            req_pool_indices,
+            seq_lens,
+            out_cache_loc,
             self.model_runner.req_to_token_pool.req_to_token,
             *self._kv_buffers(),
         )
         return LogitsProcessorOutput(
-            next_token_logits=logits[: forward_batch.batch_size],
+            next_token_logits=logits[:raw_bs],
             hidden_states=None,
         )
