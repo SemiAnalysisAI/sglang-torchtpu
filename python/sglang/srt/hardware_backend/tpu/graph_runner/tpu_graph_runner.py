@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import bisect
+import contextlib
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
 from sglang.srt.hardware_backend.tpu import nonstrict
+from sglang.srt.hardware_backend.tpu.attention_pallas import (
+    _PAGE_SIZE,
+    _bucket_kv_len,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -27,6 +32,19 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+class DecodeKey(NamedTuple):
+    batch_size: int
+    kv_len_bucket: int
+
+
+def _tuple_from_cpu_values(values) -> tuple[int, ...] | None:
+    if values is None:
+        return None
+    if isinstance(values, torch.Tensor):
+        values = values.tolist()
+    return tuple(int(v) for v in values)
 
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner) -> list[int]:
@@ -57,12 +75,13 @@ class TpuGraphRunner:
         self.device = model_runner.device
         self.decode = nonstrict.jit(
             self._run_decode,
-            static_argnames=("bs",),
+            static_argnames=("decode_key",),
             backend="tpu",
             tracing_mode="real",
         )
         self.decode_buffers: dict[str, torch.Tensor] = {}
-        self._logged_decode_replay_buckets: set[tuple[int, int]] = set()
+        self._compiled_decode_keys: set[DecodeKey] = set()
+        self._logged_decode_replay_buckets: set[tuple[int, int, int]] = set()
 
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
@@ -117,6 +136,7 @@ class TpuGraphRunner:
             # Normal decode enters through ModelRunner.forward_decode.
             forward_batch.forward_mode.is_decode()
             and self._select_decode_batch_size(forward_batch.batch_size) is not None
+            and self._decode_key(forward_batch) is not None
             and capture_hidden_mode == self.capture_hidden_mode
         )
 
@@ -198,9 +218,10 @@ class TpuGraphRunner:
             # First call traces and compiles the bs-specific executable through
             # nonstrict.jit/backend="tpu". The collective remap is only needed
             # while make_fx is tracing tensor-parallel collectives.
+            decode_key = DecodeKey(batch_size=bs, kv_len_bucket=_PAGE_SIZE)
             with nonstrict.traceable_collective_remap():
                 self.decode(
-                    bs,
+                    decode_key,
                     input_ids,
                     positions,
                     req_pool_indices,
@@ -209,6 +230,18 @@ class TpuGraphRunner:
                     self.model_runner.req_to_token_pool.req_to_token,
                     *self._kv_buffers(),
                 )
+            self._compiled_decode_keys.add(decode_key)
+
+    def _decode_key(self, forward_batch: ForwardBatch) -> DecodeKey | None:
+        bs = self._select_decode_batch_size(forward_batch.batch_size)
+        seq_lens = _tuple_from_cpu_values(forward_batch.seq_lens_cpu)
+        if bs is None or seq_lens is None:
+            return None
+        max_len = max(seq_lens) if seq_lens else _PAGE_SIZE
+        kv_len_bucket = max(_PAGE_SIZE, _bucket_kv_len(max_len))
+        if kv_len_bucket > self.model_runner.req_to_token_pool.req_to_token.shape[1]:
+            return None
+        return DecodeKey(batch_size=bs, kv_len_bucket=kv_len_bucket)
 
     def _kv_buffers(self) -> tuple[torch.Tensor, ...]:
         token_to_kv_pool = self.model_runner.token_to_kv_pool
@@ -218,7 +251,7 @@ class TpuGraphRunner:
 
     def _run_decode(
         self,
-        bs: int,
+        decode_key: DecodeKey,
         input_ids,
         positions,
         req_pool_indices,
@@ -227,13 +260,18 @@ class TpuGraphRunner:
         req_to_token,
         *kv_buffers,
     ) -> torch.Tensor:
+        bs = decode_key.batch_size
         model = self.model_runner.model
+        attn_backend = self.model_runner.attn_backend
         req_to_token_pool = self.model_runner.req_to_token_pool
         token_to_kv_pool = self.model_runner.token_to_kv_pool
         num_k_buffers = len(token_to_kv_pool.k_buffer)
         old_req_to_token = req_to_token_pool.req_to_token
         old_k_buffers = token_to_kv_pool.k_buffer
         old_v_buffers = token_to_kv_pool.v_buffer
+        old_decode_kv_len_bucket = getattr(
+            attn_backend, "decode_kv_len_bucket", None
+        )
         try:
             # SGLang stores these tensors behind pool objects that model
             # layers read from forward_batch. Temporarily point the pools at
@@ -242,6 +280,8 @@ class TpuGraphRunner:
             req_to_token_pool.req_to_token = req_to_token
             token_to_kv_pool.k_buffer = list(kv_buffers[:num_k_buffers])
             token_to_kv_pool.v_buffer = list(kv_buffers[num_k_buffers:])
+            if hasattr(attn_backend, "decode_kv_len_bucket"):
+                attn_backend.decode_kv_len_bucket = decode_key.kv_len_bucket
             forward_batch = ForwardBatch(
                 forward_mode=self.capture_forward_mode,
                 batch_size=bs,
@@ -268,6 +308,8 @@ class TpuGraphRunner:
             req_to_token_pool.req_to_token = old_req_to_token
             token_to_kv_pool.k_buffer = old_k_buffers
             token_to_kv_pool.v_buffer = old_v_buffers
+            if hasattr(attn_backend, "decode_kv_len_bucket"):
+                attn_backend.decode_kv_len_bucket = old_decode_kv_len_bucket
 
     def replay(
         self,
@@ -277,13 +319,15 @@ class TpuGraphRunner:
     ) -> LogitsProcessorOutput:
         del skip_attn_backend_init, pp_proxy_tensors
         raw_bs = forward_batch.batch_size
-        bs = self._select_decode_batch_size(raw_bs)
-        assert bs is not None
-        replay_bucket = (raw_bs, bs)
+        decode_key = self._decode_key(forward_batch)
+        assert decode_key is not None
+        bs = decode_key.batch_size
+        replay_bucket = (raw_bs, bs, decode_key.kv_len_bucket)
         if replay_bucket not in self._logged_decode_replay_buckets:
             log_info_on_rank0(
                 logger,
-                f"Replay TPU nonstrict graph bs={raw_bs} bucket_bs={bs}",
+                "Replay TPU nonstrict graph "
+                f"bs={raw_bs} bucket_bs={bs} kv_bucket={decode_key.kv_len_bucket}",
             )
             self._logged_decode_replay_buckets.add(replay_bucket)
         (
@@ -296,16 +340,22 @@ class TpuGraphRunner:
         # TorchTPU compile is shape-specialized, not address-specialized like
         # CUDA graphs. Exact bucket hits pass live SGLang tensors; padded
         # bucket hits pass reusable static buffers.
-        logits = self.decode(
-            bs,
-            input_ids,
-            positions,
-            req_pool_indices,
-            seq_lens,
-            out_cache_loc,
-            self.model_runner.req_to_token_pool.req_to_token,
-            *self._kv_buffers(),
-        )
+        if decode_key in self._compiled_decode_keys:
+            trace_context = contextlib.nullcontext()
+        else:
+            trace_context = nonstrict.traceable_collective_remap()
+        with trace_context:
+            logits = self.decode(
+                decode_key,
+                input_ids,
+                positions,
+                req_pool_indices,
+                seq_lens,
+                out_cache_loc,
+                self.model_runner.req_to_token_pool.req_to_token,
+                *self._kv_buffers(),
+            )
+        self._compiled_decode_keys.add(decode_key)
         return LogitsProcessorOutput(
             next_token_logits=logits[:raw_bs],
             hidden_states=None,

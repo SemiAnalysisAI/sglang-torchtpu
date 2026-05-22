@@ -188,6 +188,7 @@ class TpuPallasAttnBackend(AttentionBackend):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
+        self.decode_kv_len_bucket = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         pass
@@ -293,19 +294,24 @@ class TpuPallasAttnBackend(AttentionBackend):
         """
         batch = query.shape[0]
 
-        # One explicit host sync (TP-safe, same reason as the other tpu
-        # patches): the kv-length bucket must be a Python int.
-        seq_lens_l = seq_lens.tolist()
-        max_len = max(seq_lens_l) if seq_lens_l else _PAGE_SIZE
+        if self.decode_kv_len_bucket is None:
+            # Eager fallback: compute the static page count from a host copy.
+            # TpuGraphRunner sets this field from ForwardBatch.seq_lens_cpu
+            # before tracing so graph capture does not read a TPU tensor.
+            seq_lens_l = seq_lens.tolist()
+            max_len = max(seq_lens_l) if seq_lens_l else _PAGE_SIZE
+            Lb = max(_PAGE_SIZE, _bucket_kv_len(max_len))
+        else:
+            Lb = int(self.decode_kv_len_bucket)
+
         # The real per-request seq length must fit in the allocated per-req
         # slot row; the scheduler/allocator guarantees this by construction.
         # We assert so any future regression surfaces here, not as silent
         # KV truncation passed to the kernel.
-        assert max_len <= req_to_token.shape[1], (
-            f"seq_len {max_len} exceeds req_to_token capacity "
+        assert Lb <= req_to_token.shape[1], (
+            f"decode kv bucket {Lb} exceeds req_to_token capacity "
             f"{req_to_token.shape[1]}"
         )
-        Lb = max(_PAGE_SIZE, _bucket_kv_len(max_len))
         pps = Lb // _PAGE_SIZE
         ppb = min(8, pps)
 
