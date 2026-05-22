@@ -130,6 +130,42 @@ class TpuSRTPlatform(SRTPlatform):
             torch._dynamo.config.cache_size_limit, 256
         )
 
+        # Pre-warm the Pallas fused-MoE op cache for every distinct
+        # ``(topk, activation)`` combo this model uses. ``jax_op`` does
+        # Python-introspection-heavy work (``inspect.signature``) at
+        # registration time that dynamo cannot trace; mirrors the eager
+        # RPA v3 registration in ``PallasAttnBackend.__init__``. Once the
+        # cache is warm, the in-graph call is a cheap dict lookup followed
+        # by a torch.library op invocation, both of which dynamo handles.
+        try:
+            from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+            from sglang.srt.layers.moe.pallas.fused_moe_op import (
+                prewarm_fused_moe_op,
+            )
+
+            seen: set[tuple[int, str]] = set()
+            for module in model.modules():
+                if not isinstance(module, FusedMoE):
+                    continue
+                topk = int(getattr(module, "top_k", 0))
+                activation = str(
+                    getattr(module.moe_runner_config, "activation", "silu")
+                )
+                key = (topk, activation)
+                if key in seen or topk <= 0:
+                    continue
+                seen.add(key)
+                prewarm_fused_moe_op(topk=topk, activation=activation)
+            if seen:
+                logger.info(
+                    "Pre-warmed fused-MoE op cache for %s.",
+                    sorted(seen),
+                )
+        except ImportError:
+            # FusedMoE or pallas MoE op not importable on this build —
+            # dense-only model, nothing to pre-warm.
+            pass
+
         from sglang.srt.hardware_backend.tpu.compile_shape_buckets import (
             make_token_bucketed_forward,
         )
@@ -188,7 +224,10 @@ class TpuSRTPlatform(SRTPlatform):
                 if fn is None:
                     continue
                 compiled = torch.compile(
-                    fn, backend="tpu", fullgraph=True, dynamic=False,
+                    fn,
+                    backend="tpu",
+                    fullgraph=True,
+                    dynamic=False,
                 )
                 setattr(model, method_name, make_token_bucketed_forward(compiled))
                 wrapped.append(method_name)
@@ -259,9 +298,7 @@ class TpuSRTPlatform(SRTPlatform):
         return "tpu"
 
     def get_piecewise_backend_cls(self) -> type:
-        raise NotImplementedError(
-            "TPU piecewise backend not yet implemented."
-        )
+        raise NotImplementedError("TPU piecewise backend not yet implemented.")
 
     # ------------------------------------------------------------------
     # Capability flags
@@ -324,9 +361,7 @@ class TpuSRTPlatform(SRTPlatform):
             return hbm
         return 32 * (1 << 30)
 
-    def get_current_memory_usage(
-        self, device: Optional[torch.device] = None
-    ) -> float:
+    def get_current_memory_usage(self, device: Optional[torch.device] = None) -> float:
         return 0.0
 
     def get_device(self, local_rank: int) -> torch.device:

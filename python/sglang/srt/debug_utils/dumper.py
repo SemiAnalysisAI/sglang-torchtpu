@@ -747,6 +747,7 @@ def _register_forward_hook_or_replace_fn(
 
 def _torch_save(value, path: str):
     value = _clone_if_view(value)
+    value = _to_cpu(value)
     try:
         try:
             return torch.save(value, path)
@@ -773,6 +774,15 @@ def _clone_if_view(value):
     def _fn(t: torch.Tensor) -> torch.Tensor:
         if t.untyped_storage().nbytes() > t.nelement() * t.element_size():
             return t.clone()
+        return t
+
+    return _map_tensor(value, _fn)
+
+
+def _to_cpu(value):
+    def _fn(t: torch.Tensor) -> torch.Tensor:
+        if t.device.type != "cpu":
+            return t.detach().to("cpu")
         return t
 
     return _map_tensor(value, _fn)
