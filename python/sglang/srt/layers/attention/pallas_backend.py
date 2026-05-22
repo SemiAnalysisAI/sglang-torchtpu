@@ -59,6 +59,9 @@ class PallasForwardMetadata:
     page_indices: torch.Tensor
     # i32[3]  (decode_end, prefill_end, mixed_end) sequence-index ranges
     distribution: torch.Tensor
+    # i32[max_num_seqs * pages_per_seq]  page indices into the *SWA* sub-pool
+    # for hybrid-SWA models. ``None`` for non-SWA setups.
+    swa_page_indices: Optional[torch.Tensor] = None
 
 
 # Pad the *batch* axis of the per-sequence metadata up to a single fixed
@@ -105,15 +108,17 @@ _PALLAS_RPA_OP = None
 
 
 def _build_decode_metadata_kernel(
-    seq_lens_padded: torch.Tensor,       # [padded_bs] int32  (0 in padded slots)
-    extend_seq_lens_padded: torch.Tensor, # [padded_bs] int32 (1 in real slots, 0 in padded)
-    req_pool_indices_padded: torch.Tensor, # [padded_bs] int64
-    req_to_token: torch.Tensor,          # [max_reqs+1, max_ctx] int32
+    seq_lens_padded: torch.Tensor,  # [padded_bs] int32  (0 in padded slots)
+    extend_seq_lens_padded: torch.Tensor,  # [padded_bs] int32 (1 in real slots, 0 in padded)
+    req_pool_indices_padded: torch.Tensor,  # [padded_bs] int64
+    req_to_token: torch.Tensor,  # [max_reqs+1, max_ctx] int32
     pages_per_seq: int,
     page_size: int,
 ):
     padded_bs = seq_lens_padded.shape[0]
-    cu_q_lens = torch.zeros(padded_bs + 1, dtype=torch.int32, device=seq_lens_padded.device)
+    cu_q_lens = torch.zeros(
+        padded_bs + 1, dtype=torch.int32, device=seq_lens_padded.device
+    )
     cu_q_lens[1:] = torch.cumsum(extend_seq_lens_padded, dim=0, dtype=torch.int32)
     cu_kv_lens = torch.arange(
         padded_bs + 1, dtype=torch.int32, device=seq_lens_padded.device
@@ -137,7 +142,9 @@ def _build_extend_metadata_kernel(
     page_size: int,
 ):
     padded_bs = seq_lens_padded.shape[0]
-    cu_q_lens = torch.zeros(padded_bs + 1, dtype=torch.int32, device=seq_lens_padded.device)
+    cu_q_lens = torch.zeros(
+        padded_bs + 1, dtype=torch.int32, device=seq_lens_padded.device
+    )
     cu_q_lens[1:] = torch.cumsum(extend_seq_lens_padded, dim=0, dtype=torch.int32)
     cu_kv_lens = torch.arange(
         padded_bs + 1, dtype=torch.int32, device=seq_lens_padded.device
@@ -149,7 +156,9 @@ def _build_extend_metadata_kernel(
     page_indices = page_indices.reshape(padded_bs * pages_per_seq).contiguous()
     num_active = (seq_lens_padded > 0).sum().to(torch.int32)
     zero = torch.zeros((), dtype=torch.int32, device=seq_lens_padded.device)
-    distribution = torch.stack([zero, num_active, num_active]).to(torch.int32)  # [0, N, N]
+    distribution = torch.stack([zero, num_active, num_active]).to(
+        torch.int32
+    )  # [0, N, N]
     return seq_lens_padded, cu_q_lens, cu_kv_lens, page_indices, distribution
 
 
@@ -215,6 +224,7 @@ def _build_pallas_kernel_op():
         cu_q_lens: jax.Array,
         cu_kv_lens: jax.Array,
         distribution: jax.Array,
+        attention_sink: Optional[jax.Array] = None,
         sm_scale: float = 1.0,
         sliding_window: Optional[int] = None,
         soft_cap: Optional[float] = None,
@@ -230,7 +240,7 @@ def _build_pallas_kernel_op():
             cu_kv_lens,
             distribution,
             None,  # custom_mask
-            None,  # attention_sink
+            attention_sink,
             causal=1,
             sm_scale=sm_scale,
             sliding_window=sliding_window,
@@ -272,6 +282,11 @@ class PallasAttnBackend(AttentionBackend):
         self.device = model_runner.device
         self.page_size = model_runner.page_size
         self.req_to_token_pool = model_runner.req_to_token_pool
+        # Hybrid-SWA models (e.g. GPT-OSS) keep two KV sub-pools and need a
+        # second page_indices tensor with indices translated into the SWA
+        # sub-pool. ``token_to_kv_pool`` carries the full→swa index mapping.
+        self._is_hybrid_swa = bool(getattr(model_runner, "is_hybrid_swa", False))
+        self._token_to_kv_pool = model_runner.token_to_kv_pool
 
         self.forward_metadata: Optional[PallasForwardMetadata] = None
         # Register the custom op eagerly so the (Python-introspection-heavy)
@@ -369,12 +384,29 @@ class PallasAttnBackend(AttentionBackend):
             page_size,
         )
 
+        swa_page_indices: Optional[torch.Tensor] = None
+        if self._is_hybrid_swa:
+            # ``page_indices`` are *page*-level indices into the full pool. To
+            # get the SWA-pool variant we look up the corresponding full→swa
+            # token mapping at the first token of each page and divide by
+            # ``page_size`` again. ``full_to_swa_index_mapping`` is registered
+            # by ``SWATokenToKVPoolAllocator`` at init time.
+            full_to_swa = self._token_to_kv_pool.full_to_swa_index_mapping
+            assert full_to_swa is not None, (
+                "Hybrid-SWA model is configured but full_to_swa_index_mapping "
+                "has not been registered yet — did the allocator finish init?"
+            )
+            full_tokens = page_indices.to(torch.int64) * page_size
+            swa_tokens = full_to_swa[full_tokens]
+            swa_page_indices = (swa_tokens // page_size).to(torch.int32)
+
         return PallasForwardMetadata(
             kv_lens=kv_lens_out,
             cu_q_lens=cu_q_lens,
             cu_kv_lens=cu_kv_lens,
             page_indices=page_indices,
             distribution=distribution,
+            swa_page_indices=swa_page_indices,
         )
 
     @staticmethod
@@ -406,7 +438,7 @@ class PallasAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        return self._forward(q, k, v, layer, forward_batch)
+        return self._forward(q, k, v, layer, forward_batch, sinks=kwargs.get("sinks"))
 
     def forward_decode(
         self,
@@ -422,7 +454,7 @@ class PallasAttnBackend(AttentionBackend):
         # the view below matches the kernel's expected layout. This mirrors
         # TorchNativeAttnBackend.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
-        return self._forward(q, k, v, layer, forward_batch)
+        return self._forward(q, k, v, layer, forward_batch, sinks=kwargs.get("sinks"))
 
     def _forward(
         self,
@@ -431,6 +463,7 @@ class PallasAttnBackend(AttentionBackend):
         v: torch.Tensor,
         layer: "RadixAttention",
         forward_batch: ForwardBatch,
+        sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert self.forward_metadata is not None, (
             "Pallas attention backend was not initialised for this forward pass; "
@@ -450,6 +483,16 @@ class PallasAttnBackend(AttentionBackend):
         if sliding_window is not None and sliding_window <= 0:
             sliding_window = None
 
+        # For hybrid-SWA models, SWA layers index into the SWA sub-pool, so
+        # use the translated page_indices built in ``_build_metadata``. Pure
+        # full-attention layers (or non-hybrid models) keep the full-pool
+        # page_indices.
+        is_swa_layer = sliding_window is not None
+        if is_swa_layer and self.forward_metadata.swa_page_indices is not None:
+            page_indices = self.forward_metadata.swa_page_indices
+        else:
+            page_indices = self.forward_metadata.page_indices
+
         soft_cap = layer.logit_cap if getattr(layer, "logit_cap", 0) else None
 
         out, updated_kv = op(
@@ -458,10 +501,11 @@ class PallasAttnBackend(AttentionBackend):
             v,
             kv_cache,
             self.forward_metadata.kv_lens,
-            self.forward_metadata.page_indices,
+            page_indices,
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
+            sinks,
             float(layer.scaling),
             sliding_window,
             soft_cap,

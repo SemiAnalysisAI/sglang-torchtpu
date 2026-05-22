@@ -149,6 +149,21 @@ class SWAKVPool(KVCache):
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
+    def get_fused_kv_buffer(self, layer_id: int):
+        """TPU-only proxy: route to the sub-pool's fused 5D buffer.
+
+        ``TpuFusedMHATokenToKVPool`` exposes the Pallas-kernel-shaped
+        ``[num_blocks, page_size, num_kv_heads_x2, kv_packing, head_dim]``
+        buffer via this method; SWA layers need to read from ``swa_kv_pool``
+        and full layers from ``full_kv_pool``. The layer-id remap is the
+        same one ``get_kv_buffer`` uses.
+        """
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        if is_swa_layer:
+            return self.swa_kv_pool.get_fused_kv_buffer(layer_id_pool)
+        else:
+            return self.full_kv_pool.get_fused_kv_buffer(layer_id_pool)
+
     def set_swa_loc(self, loc: torch.Tensor):
         self.swa_loc = loc
 
@@ -367,7 +382,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
-        if _is_npu:
+        if _is_npu or _is_tpu:
+            # TODO (Qinghan): int64 is not native on TPU; further optimization needed
             self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
                 alloc_swa_indices.to(torch.int64)
             )
@@ -417,7 +433,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
-        if _is_npu:
+        if _is_npu or _is_tpu:
             self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
                 alloc_swa_indices.to(torch.int64)
             )
@@ -445,7 +461,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if alloc_full_indices is None or alloc_swa_indices is None:
             return None
 
-        if _is_npu:
+        if _is_npu or _is_tpu:
             self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
                 alloc_swa_indices.to(torch.int64)
             )

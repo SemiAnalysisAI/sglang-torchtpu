@@ -116,10 +116,23 @@ def _build_fused_moe_op():
         )
         return TileSizes(tile_m=tm, tile_k=tk, tile_n=tn)
 
+    # GPT-OSS swiglu-oai constants (see ``sglang/srt/models/gpt_oss.py``:
+    # alpha=1.702, limit=7.0 are the published values from the OpenAI
+    # GPT-OSS release).  Hardcoded here because the existing call sites
+    # in ``unquant.py`` / ``mxfp4.py`` do not yet thread these through
+    # the ``fused_moe_call`` boundary; lift them into kwargs if a
+    # future model uses different values.
+    _SWIGLU_OAI_ALPHA = 1.702
+    _SWIGLU_OAI_LIMIT = 7.0
+
     def _activation(gmm1_out, activation_name):
         """Apply the gated activation to a ``[m*topk, 2*n]`` GMM1 output.
 
         Returns the ``[m*topk, n]`` post-activation tensor consumed by GMM2.
+        The split convention is ``acc[:, :n]`` = gate, ``acc[:, n:]`` = up —
+        the GPT-OSS BF16 path must pre-deinterleave w13 so that this
+        midpoint split lines up with the canonical SwiGLU-OAI math
+        (see ``layers/quantization/mxfp4_tpu.py``).
         """
         n = gmm1_out.shape[-1] // 2
         gate, up = gmm1_out[:, :n], gmm1_out[:, n:]
@@ -127,15 +140,21 @@ def _build_fused_moe_op():
             return jax.nn.silu(gate) * up
         if activation_name == "gelu":
             return jax.nn.gelu(gate) * up
-        if activation_name == "swiglu_oai":
-            raise NotImplementedError(
-                "swiglu_oai gating in the Pallas fused-MoE op is not wired "
-                "up yet; the GPT-OSS path still goes through the mxfp4 "
-                "specialised forward."
-            )
+        if activation_name in ("swigluoai", "swiglu_oai"):
+            # OpenAI GPT-OSS SwiGLU variant:
+            #   gate = clip(gate, max=limit)
+            #   up   = clip(up,   min=-limit, max=limit)
+            #   glu  = gate * sigmoid(alpha * gate)
+            #   out  = (up + 1.0) * glu
+            limit = _SWIGLU_OAI_LIMIT
+            alpha = _SWIGLU_OAI_ALPHA
+            gate_c = jnp.minimum(gate, limit)
+            up_c = jnp.clip(up, -limit, limit)
+            glu = gate_c * jax.nn.sigmoid(alpha * gate_c)
+            return (up_c + 1.0) * glu
         raise NotImplementedError(
             f"Unsupported activation '{activation_name}' for the Pallas "
-            "fused-MoE op. Supported: silu, gelu."
+            "fused-MoE op. Supported: silu, gelu, swigluoai."
         )
 
     def _fused_moe_jax(
