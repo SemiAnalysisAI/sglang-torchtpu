@@ -103,6 +103,29 @@ def _modify_tuple(t, index: int, modifier: Callable):
     return *t[:index], modifier(t[index]), *t[index + 1 :]
 
 
+def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
+    """Set torchrun-style env vars for torch_tpu's PJRT slicebuilder.
+
+    torch_tpu's PJRT slicebuilder reads RANK/LOCAL_RANK/WORLD_SIZE/MASTER_ADDR/
+    MASTER_PORT to coordinate multi-process init. sglang's mp.Process spawn path
+    doesn't otherwise set them. Must run before any model/distributed code
+    imports torch_tpu so PJRT lazy-init in each worker sees the correct rank
+    info. No-op for non-TPU runs.
+    """
+    if server_args.device != "tpu":
+        return
+
+    import os
+
+    world_size = server_args.tp_size * server_args.nnodes
+    os.environ["RANK"] = str(tp_rank + server_args.node_rank * server_args.tp_size)
+    os.environ["LOCAL_RANK"] = str(tp_rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_WORLD_SIZE"] = str(server_args.tp_size)
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+
+
 def monkey_patch_torch_compile():
     if torch_release < (2, 8):
         # These things are cacheable by torch.compile. torch.compile just doesn't know it.
