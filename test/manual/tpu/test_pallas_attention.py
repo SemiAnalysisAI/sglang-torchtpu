@@ -12,7 +12,8 @@ silently regress:
     with "0 active drivers");
   * _patch_req_to_token_pool_max_context_len (else paged decode gather
     would right-pad with slot 0 — a live slot owned by another request);
-  * _register_pallas_attention_backend (else "pallas_tpu" is unknown).
+  * Both Pallas backend names appear in the attention registry (else
+    "pallas_tpu_flash" / "pallas_tpu_rpa_v3" are unknown).
 
 The numeric tests need TPU + torch_tpu and are skipped otherwise. The
 helper / patch tests run anywhere.
@@ -78,8 +79,8 @@ class TestPallasHelpers(CustomTestCase):
 
 
 class TestSupportTritonPatch(CustomTestCase):
-    """_patch_support_triton_for_tpu must treat pallas_tpu like a
-    non-Triton backend (no Triton driver exists on TPU)."""
+    """_patch_support_triton_for_tpu must treat both Pallas TPU backend names
+    like non-Triton backends (no Triton driver exists on TPU)."""
 
     def test_pallas_tpu_is_non_triton_after_patch(self):
         import sglang.srt.utils.common as uc
@@ -88,18 +89,21 @@ class TestSupportTritonPatch(CustomTestCase):
         )
 
         # Before: stock allowlist treats an unknown name as Triton-capable.
-        self.assertTrue(uc.support_triton("pallas_tpu"))
+        self.assertTrue(uc.support_triton("pallas_tpu_flash"))
+        self.assertTrue(uc.support_triton("pallas_tpu_rpa_v3"))
 
         _patch_support_triton_for_tpu()
 
-        # After: pallas_tpu is non-Triton; other backends unchanged.
-        self.assertFalse(uc.support_triton("pallas_tpu"))
+        # After: both Pallas backend names are non-Triton; others unchanged.
+        self.assertFalse(uc.support_triton("pallas_tpu_flash"))
+        self.assertFalse(uc.support_triton("pallas_tpu_rpa_v3"))
         self.assertFalse(uc.support_triton("torch_native"))
         self.assertTrue(uc.support_triton("flashinfer"))
 
         # Idempotent.
         _patch_support_triton_for_tpu()
-        self.assertFalse(uc.support_triton("pallas_tpu"))
+        self.assertFalse(uc.support_triton("pallas_tpu_flash"))
+        self.assertFalse(uc.support_triton("pallas_tpu_rpa_v3"))
 
 
 class TestReqToTokenPoolRoundingPatch(CustomTestCase):
@@ -155,23 +159,17 @@ class TestReqToTokenPoolRoundingPatch(CustomTestCase):
 
 
 class TestPallasRegistration(CustomTestCase):
-    """_register_pallas_attention_backend must put 'pallas_tpu' in the
-    attention registry without editing upstream attention_registry.py."""
+    """Both Pallas backend names must be registered in the attention
+    registry at module import time (same convention as ascend / intel_xpu)."""
 
     def test_registered(self):
-        from sglang.srt.hardware_backend.tpu.patches import (
-            _register_pallas_attention_backend,
-        )
         from sglang.srt.layers.attention.attention_registry import (
             ATTENTION_BACKENDS,
         )
 
-        _register_pallas_attention_backend()
-        self.assertIn("pallas_tpu", ATTENTION_BACKENDS)
-        self.assertTrue(callable(ATTENTION_BACKENDS["pallas_tpu"]))
-        # Idempotent.
-        _register_pallas_attention_backend()
-        self.assertIn("pallas_tpu", ATTENTION_BACKENDS)
+        for name in ("pallas_tpu_flash", "pallas_tpu_rpa_v3"):
+            self.assertIn(name, ATTENTION_BACKENDS)
+            self.assertTrue(callable(ATTENTION_BACKENDS[name]))
 
 
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
