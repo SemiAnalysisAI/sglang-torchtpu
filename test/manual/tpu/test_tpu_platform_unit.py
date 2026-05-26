@@ -50,7 +50,9 @@ class TestTpuPlatformIdentity(CustomTestCase):
         self.assertEqual(self.platform.get_torch_distributed_backend_str(), "tpu_dist")
 
     def test_default_attention_backend(self):
-        self.assertEqual(self.platform.get_default_attention_backend(), "pallas_tpu")
+        self.assertEqual(
+            self.platform.get_default_attention_backend(), "pallas_tpu_rpa_v3"
+        )
 
 
 class TestTpuPlatformMemory(CustomTestCase):
@@ -124,7 +126,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             platform.apply_server_args_defaults(args)
 
         self.assertEqual(args.dtype, "bfloat16")
-        self.assertEqual(args.attention_backend, "pallas_tpu")
+        self.assertEqual(args.attention_backend, "pallas_tpu_rpa_v3")
         self.assertTrue(args.disable_cuda_graph)
         self.assertTrue(args.disable_piecewise_cuda_graph)
         self.assertFalse(args.enable_torch_compile)

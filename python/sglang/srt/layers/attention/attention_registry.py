@@ -306,3 +306,19 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("pallas_tpu_flash")
+def create_pallas_tpu_flash_backend(runner):
+    from sglang.srt.hardware_backend.tpu.attention_pallas import TpuPallasAttnBackend
+
+    return TpuPallasAttnBackend(runner)
+
+
+@register_attention_backend("pallas_tpu_rpa_v3")
+def create_pallas_tpu_rpa_v3_backend(runner):
+    from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
+        TpuPallasRpaV3AttnBackend,
+    )
+
+    return TpuPallasRpaV3AttnBackend(runner)
