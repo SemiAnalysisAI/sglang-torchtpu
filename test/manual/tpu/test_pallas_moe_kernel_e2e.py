@@ -234,6 +234,105 @@ class TestPallasFusedMoEEager(unittest.TestCase):
         max_diff = (out - ref).abs().max().item()
         self.assertLess(max_diff, 5e-2, f"gelu vs reference max diff = {max_diff}")
 
+    def test_silu_through_process_weights_after_loading(self):
+        """Pin the full ``process_weights_after_loading`` -> ``fused_moe_call`` contract.
+
+        The other tests in this file hand kernel-layout ``(g, k, n)``
+        weights straight to ``fused_moe_call`` and so bypass the
+        ``UnquantizedFusedMoEMethod.process_weights_after_loading`` TPU
+        branch entirely. That leaves two silent regression classes
+        uncovered:
+
+          * A broken transpose in ``process_weights_after_loading``
+            (wrong axes, missing ``.contiguous()``, accidentally a no-op).
+            Nothing downstream asserts the kernel-expected layout, so a
+            wrong swap just produces garbage.
+          * A drift between the layout ``process_weights_after_loading``
+            emits and the layout ``gmm_v2`` actually consumes -- i.e. the
+            integration contract between the loader hook and the kernel.
+
+        Build w1/w2 in SGLang's storage layout (the transpose of gmm_v2's
+        form -- what the model weight loader produces), run them through
+        ``process_weights_after_loading``, then through ``fused_moe_call``,
+        and compare to the same CPU reference the other tests use. A single
+        numeric mismatch catches either drift.
+        """
+        from sglang.srt.layers.quantization import unquant
+        from sglang.srt.layers.quantization.unquant import (
+            UnquantizedFusedMoEMethod,
+        )
+
+        m, k, n, g, topk = 32, 64, 64, 4, 2
+
+        torch.manual_seed(7)
+        hidden = (torch.randn(m, k, dtype=self.dtype) * 0.5).to(self.device)
+        # Ground-truth weights in gmm_v2 (g, k, n) layout.
+        w1_gmm = torch.randn(g, k, 2 * n, dtype=self.dtype) * 0.05
+        w2_gmm = torch.randn(g, n, k, dtype=self.dtype) * 0.05
+        # SGLang storage layout = gmm_v2 layout transposed on (1, 2).
+        # This is what the weight loader hands to the MoE method.
+        w13_sglang = w1_gmm.transpose(1, 2).contiguous()  # (g, 2n, k)
+        w2_sglang = w2_gmm.transpose(1, 2).contiguous()  # (g, k, n)
+        topk_ids = torch.randint(0, g, (m, topk), dtype=torch.int32, device=self.device)
+        topk_weights = torch.softmax(
+            torch.randn(m, topk, device=self.device).float(), dim=-1
+        ).to(self.dtype)
+
+        # _is_tpu is True under the TPU runtime that gates this whole
+        # class. Assert the precondition so a host where it drifts to
+        # False fails loudly instead of silently exercising a non-TPU
+        # branch.
+        self.assertTrue(
+            unquant._is_tpu,
+            "unquant._is_tpu must be True under the TPU runtime",
+        )
+
+        layer = torch.nn.Module()
+        layer.w13_weight = torch.nn.Parameter(w13_sglang, requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(w2_sglang, requires_grad=False)
+        UnquantizedFusedMoEMethod().process_weights_after_loading(layer)
+
+        # Cheap CPU pin: the hook must recover gmm_v2 layout exactly.
+        torch.testing.assert_close(layer.w13_weight.data, w1_gmm)
+        torch.testing.assert_close(layer.w2_weight.data, w2_gmm)
+        self.assertFalse(layer.w13_weight.requires_grad)
+        self.assertFalse(layer.w2_weight.requires_grad)
+
+        # Integration pin: post-process weights through the kernel must
+        # match the CPU reference within bf16 matmul tolerance.
+        out = (
+            self._run(
+                hidden,
+                layer.w13_weight.data.to(self.device),
+                layer.w2_weight.data.to(self.device),
+                topk_weights,
+                topk_ids,
+                "silu",
+            )
+            .cpu()
+            .float()
+        )
+        torch.tpu.synchronize()
+
+        ref = _ref_moe_torch(
+            hidden.cpu(),
+            w1_gmm,
+            w2_gmm,
+            topk_weights.cpu(),
+            topk_ids.cpu(),
+            "silu",
+        ).float()
+
+        self.assertEqual(out.shape, ref.shape)
+        self.assertTrue(torch.isfinite(out).all().item())
+        max_diff = (out - ref).abs().max().item()
+        self.assertLess(
+            max_diff,
+            5e-2,
+            "process_weights_after_loading -> fused_moe_call vs reference "
+            f"max diff = {max_diff}",
+        )
+
 
 @unittest.skipUnless(_has_tpu_device(), _SKIP_REASON)
 class TestPallasFusedMoETorchCompile(unittest.TestCase):
