@@ -17,6 +17,7 @@
 
 import logging
 import math
+import os as _os
 import re
 from collections.abc import Iterable
 from functools import partial
@@ -25,6 +26,39 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+
+# Env-gated logits dump for apple-to-apple comparison against the CPU
+# mxfp4-native reference (``.runs/gpt-oss-ref-driver-mxfp4.py``). When
+# ``SGLANG_TPU_LOGITS_DUMP_DIR`` is set, the last-token logits of each
+# /generate forward are saved as ``tpu_step_{N:02d}.pt`` in that
+# directory. Off (no overhead) when the env var is not set.
+_LOGITS_DUMP_DIR = _os.environ.get("SGLANG_TPU_LOGITS_DUMP_DIR")
+_LOGITS_DUMP_STEP = [0]
+
+
+def _maybe_dump_step_logits(logits_output, forward_batch) -> None:
+    if _LOGITS_DUMP_DIR is None or logits_output is None:
+        return
+    nxt = getattr(logits_output, "next_token_logits", None)
+    if nxt is None:
+        return
+    try:
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+    except Exception:
+        pass
+    # next_token_logits is [num_real_or_padded_seqs, vocab]. The first
+    # row corresponds to the first real sequence (bucket-padding appends
+    # at the end). Dump the full tensor (capped at the first 4 rows so
+    # we never write hundreds of MB for large batches) so the offline
+    # diff can pick whichever row is non-NaN and matches the expected
+    # argmax.
+    rows = nxt[: min(nxt.shape[0], 4)].detach().to("cpu").float()
+    _os.makedirs(_LOGITS_DUMP_DIR, exist_ok=True)
+    path = f"{_LOGITS_DUMP_DIR}/tpu_step_{_LOGITS_DUMP_STEP[0]:02d}.pt"
+    torch.save(rows, path)
+    _LOGITS_DUMP_STEP[0] += 1
+
 
 from sglang.srt.compilation.piecewise_context_manager import (
     get_forward_context,
@@ -230,14 +264,8 @@ class GptOssSparseMoeBlock(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
-        print(
-            f"[gpt_oss] layer {self.layer_id} moe.forward enter shape={tuple(hidden_states.shape)}",
-            flush=True,
-        )
         if not get_moe_a2a_backend().is_deepep():
-            out = self.forward_normal(hidden_states, should_allreduce_fusion)
-            print(f"[gpt_oss] layer {self.layer_id} moe.forward done", flush=True)
-            return out
+            return self.forward_normal(hidden_states, should_allreduce_fusion)
         else:
             raise Exception("forward_deepep branch not implemented yet")
 
@@ -258,30 +286,14 @@ class GptOssSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         if is_in_piecewise_cuda_graph():
-            print(
-                f"[gpt_oss] layer {self.layer_id} moe piecewise moe_impl call",
-                flush=True,
-            )
             final_hidden_states = moe_impl(self.layer_id, hidden_states)
         else:
-            print(f"[gpt_oss] layer {self.layer_id} moe router enter", flush=True)
             router_logits, _ = self.router(hidden_states)
-            print(
-                f"[gpt_oss] layer {self.layer_id} moe router done; topk enter",
-                flush=True,
-            )
             topk_output = self.topk(hidden_states, router_logits)
-            print(
-                f"[gpt_oss] layer {self.layer_id} moe topk done; experts enter",
-                flush=True,
-            )
             final_hidden_states = self.experts(hidden_states, topk_output)
-            print(f"[gpt_oss] layer {self.layer_id} moe experts done", flush=True)
 
         if self.tp_size > 1 and not should_allreduce_fusion:
-            print(f"[gpt_oss] layer {self.layer_id} moe allreduce enter", flush=True)
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-            print(f"[gpt_oss] layer {self.layer_id} moe allreduce done", flush=True)
 
         ans = final_hidden_states.view(num_tokens, hidden_dim)
         return ans
@@ -444,16 +456,12 @@ class GptOssAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        print(f"[gpt_oss] layer {self.layer_id} attn.forward enter", flush=True)
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        print(f"[gpt_oss] layer {self.layer_id} attn.forward_prepare done", flush=True)
-        out = self.forward_core(s)
-        print(f"[gpt_oss] layer {self.layer_id} attn.forward_core done", flush=True)
-        return out
+        return self.forward_core(s)
 
 
 class GptOssDecoderLayer(nn.Module):
@@ -551,11 +559,9 @@ class GptOssDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        print(f"[gpt_oss] layer {self.layer_id} decoder.forward enter", flush=True)
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
-        print(f"[gpt_oss] layer {self.layer_id} prepare_attn done", flush=True)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -563,12 +569,10 @@ class GptOssDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        print(f"[gpt_oss] layer {self.layer_id} self_attn done", flush=True)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        print(f"[gpt_oss] layer {self.layer_id} prepare_mlp done", flush=True)
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -577,7 +581,6 @@ class GptOssDecoderLayer(nn.Module):
         )
 
         hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
-        print(f"[gpt_oss] layer {self.layer_id} mlp done", flush=True)
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -586,7 +589,6 @@ class GptOssDecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
-        print(f"[gpt_oss] layer {self.layer_id} decoder.forward exit", flush=True)
 
         return hidden_states, residual
 
@@ -648,20 +650,12 @@ class GptOssModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        print(
-            f"[gpt_oss] GptOssModel.forward enter; start_layer={self.start_layer} end_layer={self.end_layer}",
-            flush=True,
-        )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
             residual = None
-            print(
-                f"[gpt_oss] embed_tokens done; hidden={tuple(hidden_states.shape)}",
-                flush=True,
-            )
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
@@ -669,7 +663,6 @@ class GptOssModel(nn.Module):
 
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
-            print(f"[gpt_oss] GptOssModel loop iter={i}", flush=True)
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(hidden_states + residual)
@@ -677,7 +670,6 @@ class GptOssModel(nn.Module):
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual
                 )
-        print(f"[gpt_oss] GptOssModel loop finished", flush=True)
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -751,10 +743,6 @@ class GptOssForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        print(
-            f"[gpt_oss] GptOssForCausalLM.forward enter; input_ids={tuple(input_ids.shape)}",
-            flush=True,
-        )
         hidden_states = self.model(
             input_ids,
             positions,
@@ -762,14 +750,12 @@ class GptOssForCausalLM(nn.Module):
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        print(f"[gpt_oss] GptOssForCausalLM model done", flush=True)
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
-            print(f"[gpt_oss] GptOssForCausalLM logits_processor enter", flush=True)
             out = self.logits_processor(
                 input_ids,
                 hidden_states,
@@ -777,7 +763,7 @@ class GptOssForCausalLM(nn.Module):
                 forward_batch,
                 aux_hidden_states,
             )
-            print(f"[gpt_oss] GptOssForCausalLM logits_processor done", flush=True)
+            _maybe_dump_step_logits(out, forward_batch)
             return out
         else:
             return hidden_states
@@ -934,9 +920,7 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
         moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
-        # Avoid hard-coding CUDA: torch_tpu's privateuse1 device is "tpu";
-        # for CPU/CUDA dev we still want the GPU. Fall back to the model's
-        # first parameter device, which is always the right backend.
+        # Use the model's existing parameter device (handles TPU as well as CUDA).
         target_device = next(self.parameters()).device
 
         for name, weight in weights:
@@ -1312,8 +1296,12 @@ def _dequant_mlp_weight(debug_name, w_blocks, w_scales):
 
     original_device = w_blocks.device
 
-    w_blocks = w_blocks.cuda()
-    w_scales = w_scales.cuda()
+    # Stage on the device that's actually available (handles TPU + CPU paths;
+    # ``dequant_mxfp4`` is hardware-agnostic but the original upstream version
+    # assumed CUDA. Keep CUDA when present, fall through otherwise.)
+    if torch.cuda.is_available():
+        w_blocks = w_blocks.cuda()
+        w_scales = w_scales.cuda()
 
     w_bf16 = dequant_mxfp4(w_block=w_blocks, w_scale=w_scales, out_dtype=torch.bfloat16)
     w_bf16 = w_bf16.transpose(-2, -1).contiguous()

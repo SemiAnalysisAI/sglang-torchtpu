@@ -779,23 +779,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         return StandardCombineInput(hidden_states=output)
 
     def _process_weights_tpu(self, layer):
-        """One-time GPT-OSS MoE weight rewrite on the TPU device.
+        """One-time GPT-OSS MoE weight rewrite on the TPU device — native MXFP4 path.
 
-        Currently uses the **BF16 triage path** (mirrors torchtpu-vllm's
-        fallback): dequant MXFP4 → BF16, deinterleave w13, pad N, transpose
-        to gmm_v2's ``(g, k, n)`` layout. Lets us validate sinks/SWA/
-        swigluoai end-to-end on a known-correct numerical path before
-        re-enabling the packed-FP4 fast path.
+        Keeps the HF block-wise representation (packed FP4 codes +
+        per-32-element e8m0 scales → fp32) intact through to the Pallas
+        ``gmm_v2`` kernel, which dequantizes inside VMEM right before the
+        MXU. **Lossless** vs the bf16-dequant alternative — same numerics
+        with ~4× lower HBM footprint for MoE weights.
 
-        TODO: switch back to ``process_gpt_oss_mxfp4_weights`` once BF16 is
-        confirmed working.
+        Output layout (see ``mxfp4_tpu.process_gpt_oss_mxfp4_weights_native``):
+        * ``w13_weight``        : ``(E, hidden/2, 2*N_int_padded)`` uint8
+        * ``w13_weight_scale``  : ``(E, num_blocks_K, 1, 2*N_int_padded)`` fp32
+        * ``w13_weight_bias``   : ``(E, 1, 2*N_int_padded)`` fp32
+        * ``w2_weight``         : ``(E, N_int_padded/2, hidden)`` uint8
+        * ``w2_weight_scale``   : ``(E, num_blocks_K_padded, 1, hidden)`` fp32
+        * ``w2_weight_bias``    : ``(E, 1, hidden)`` fp32
         """
         from sglang.srt.layers.quantization.mxfp4_tpu import (
-            process_gpt_oss_mxfp4_weights_bf16,
+            process_gpt_oss_mxfp4_weights_native,
         )
 
         w13, w13_scale, w13_bias, w2, w2_scale, w2_bias = (
-            process_gpt_oss_mxfp4_weights_bf16(
+            process_gpt_oss_mxfp4_weights_native(
                 layer.w13_weight.data,
                 layer.w13_weight_scale.data,
                 layer.w13_weight_bias.data,
@@ -805,13 +810,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
         )
         layer.w13_weight = Parameter(w13, requires_grad=False)
+        layer.w13_weight_scale = Parameter(w13_scale, requires_grad=False)
         layer.w13_weight_bias = Parameter(w13_bias, requires_grad=False)
         layer.w2_weight = Parameter(w2, requires_grad=False)
+        layer.w2_weight_scale = Parameter(w2_scale, requires_grad=False)
         layer.w2_weight_bias = Parameter(w2_bias, requires_grad=False)
-        # Use ``register_parameter(..., None)`` so the attribute is still
-        # accessible but flagged as no-scale to the JAX kernel.
-        layer.register_parameter("w13_weight_scale", None)
-        layer.register_parameter("w2_weight_scale", None)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

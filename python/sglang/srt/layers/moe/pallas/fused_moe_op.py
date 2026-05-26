@@ -157,14 +157,38 @@ def _build_fused_moe_op():
             "fused-MoE op. Supported: silu, gelu, swigluoai."
         )
 
+    def _maybe_unpack_fp4(rhs):
+        """If ``rhs`` is packed MXFP4 (``uint8``) shaped ``(E, K/2, N)``,
+        bitcast to ``float4_e2m1fn`` and reshape to ``(E, K, N)``.
+
+        HF stores ``byte_low`` at even K index and ``byte_high`` at odd
+        K index; JAX's ``bitcast_convert_type(uint8 → float4_e2m1fn)``
+        emits the same low-then-high ordering as a new trailing dim of
+        size 2. We swap that with the N dim and then reshape to merge
+        ``(K_packed, 2)`` → ``K``, which preserves HF's element order.
+
+        For unquantized inputs (bf16/etc.) the function returns ``rhs``
+        unchanged. The branch is decided at JAX trace time on a static
+        dtype so it does not produce runtime ops.
+        """
+        if rhs.dtype != jnp.uint8:
+            return rhs
+        fp4 = jax.lax.bitcast_convert_type(
+            rhs, jnp.float4_e2m1fn
+        )  # (E, K_packed, N, 2)
+        fp4 = fp4.swapaxes(-1, -2)  # (E, K_packed, 2, N)
+        E_, K_p, two, N_ = fp4.shape
+        assert two == 2, f"unexpected fp4 unpack shape {fp4.shape}"
+        return fp4.reshape(E_, K_p * 2, N_)  # (E, K, N) fp4_e2m1fn
+
     def _fused_moe_jax(
         hidden_states,  # [m, k]
-        w1,  # [g, k, 2 * n_intermediate]
-        w2,  # [g, n_intermediate, k]
+        w1,  # [g, k, 2 * n_intermediate]  bf16, OR [g, k/2, 2*n] uint8 (packed FP4)
+        w2,  # [g, n_intermediate, k]      bf16, OR [g, n/2, k]    uint8 (packed FP4)
         topk_weights,  # [m, topk]
         topk_ids,  # i32[m, topk]
-        w1_scale,  # Optional[g, 1, 1, 2 * n_intermediate] f32
-        w2_scale,  # Optional[g, 1, 1, k] f32
+        w1_scale,  # Optional[g, num_blocks, 1, 2 * n_intermediate] f32
+        w2_scale,  # Optional[g, num_blocks, 1, k] f32
         w1_bias,  # Optional[g, 1, 2 * n_intermediate] f32
         w2_bias,  # Optional[g, 1, k] f32
         topk,
@@ -173,6 +197,10 @@ def _build_fused_moe_op():
         m, hidden_size = hidden_states.shape
         num_experts = w1.shape[0]
         out_dtype = hidden_states.dtype
+
+        # Unpack packed-FP4 weights if needed. No-op for bf16 weights.
+        w1 = _maybe_unpack_fp4(w1)
+        w2 = _maybe_unpack_fp4(w2)
 
         # Routing: build a permutation that puts rows of hidden_states in
         # expert-major order so a single grouped-matmul covers GMM1 / GMM2.
@@ -212,6 +240,17 @@ def _build_fused_moe_op():
             # discard below); group_sizes shape stays [num_experts].
             group_sizes = group_sizes.at[num_experts - 1].add(pad_m)
 
+        # For the quantized (block-wise mxfp4) path, defer to gmm_v2's
+        # built-in ``calculate_tiling`` — the tuned table is keyed on
+        # per-channel (block_size == K) quant configs and doesn't have
+        # entries for block-wise FP4. ``calculate_tiling`` is MXU-geometry
+        # aware and picks a sane tile triple in that regime.
+        gmm1_tile = (
+            None
+            if w1_scale is not None
+            else _lookup_tile_info(x_sorted, w1, num_experts)
+        )
+        gmm1_kwargs = {} if gmm1_tile is None else {"tile_info": gmm1_tile}
         gmm1_out = gmm_v2(
             lhs=x_sorted,
             rhs=w1,
@@ -219,13 +258,19 @@ def _build_fused_moe_op():
             rhs_scale=w1_scale,
             rhs_bias=w1_bias,
             preferred_element_type=out_dtype,
-            tile_info=_lookup_tile_info(x_sorted, w1, num_experts),
+            **gmm1_kwargs,
         )  # [M_total+pad_m, 2 * n_intermediate]
 
         # Gated activation.
         act_out = _activation(gmm1_out, activation_name)
 
         # GMM2: project back to hidden size.
+        gmm2_tile = (
+            None
+            if w2_scale is not None
+            else _lookup_tile_info(act_out, w2, num_experts)
+        )
+        gmm2_kwargs = {} if gmm2_tile is None else {"tile_info": gmm2_tile}
         gmm2_out = gmm_v2(
             lhs=act_out,
             rhs=w2,
@@ -233,7 +278,7 @@ def _build_fused_moe_op():
             rhs_scale=w2_scale,
             rhs_bias=w2_bias,
             preferred_element_type=out_dtype,
-            tile_info=_lookup_tile_info(act_out, w2, num_experts),
+            **gmm2_kwargs,
         )  # [M_total+pad_m, k]
 
         # Drop the padded rows before un-permuting.
