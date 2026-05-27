@@ -6,6 +6,7 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -34,10 +35,24 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     def apply_server_args_defaults(self, server_args) -> None:
+        from sglang.srt.hardware_backend.tpu import envs
         from sglang.srt.hardware_backend.tpu.patches import (
             _prepare_tpu_env,
             set_active_attention_backend,
         )
+
+        # When compilation mode is enabled, importing the warmup module
+        # fires its `@warmup("tpu_compilation_warmup")` decorator, which
+        # registers it in sglang's `_warmup_registry`. Done here because
+        # this method runs in the parent HTTP/TokenizerManager process —
+        # the same process that later calls `execute_warmups`.
+        # TODO(wyzhang): when sglang adds a public
+        # `register_warmup(name, fn)` API, replace this side-effect
+        # import with an explicit call.
+        if envs.TPU_COMPILATION_MODE:
+            from sglang.srt.hardware_backend.tpu.compilation import (  # noqa: F401
+                warmup as _tpu_warmup,
+            )
 
         _prepare_tpu_env(server_args.tp_size)
 
@@ -51,6 +66,9 @@ class TpuSRTPlatform(SRTPlatform):
         # model_runner module import (well after this point) and needs to
         # know which TPU Pallas variant the server resolved to.
         set_active_attention_backend(server_args.attention_backend)
+        # Spawned TP workers do not inherit module-level state from the parent,
+        # so we also publish this to the environment for them to fall back on.
+        os.environ["TPU_ACTIVE_ATTENTION_BACKEND"] = server_args.attention_backend
 
         server_args.disable_cuda_graph = True
         server_args.disable_piecewise_cuda_graph = True

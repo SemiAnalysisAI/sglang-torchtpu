@@ -11,7 +11,9 @@ from __future__ import annotations
 import importlib
 import os
 
+from sglang.srt.hardware_backend.tpu import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang.srt.hardware_backend.tpu.compilation import manager as compilation_manager
 
 logger = get_logger(__name__)
 
@@ -25,8 +27,11 @@ _dynamic_compile_unwrapped = False
 def _configure_eager_mode() -> None:
     from torch_tpu._internal import execution_mode
 
-    execution_mode.set_eager_mode(execution_mode.EagerMode.DEFER_AND_FUSE)
-    logger.info("TorchTPU eager mode set to DEFER_AND_FUSE.")
+    mode = execution_mode.EagerMode.DEFER_AND_FUSE
+    if envs.TPU_COMPILATION_MODE:
+        mode = execution_mode.EagerMode.INTERNAL_DEFER_ALL
+    execution_mode.eager_mode = mode
+    logger.info("TorchTPU eager mode set to %s.", mode.name)
 
 
 def _unwrap_dynamic_compile_fns() -> None:
@@ -520,7 +525,11 @@ def _patch_mha_kv_pool_for_rpa_v3() -> None:
     if _mha_kv_pool_patched:
         return
 
-    if _active_attention_backend != "pallas_tpu_rpa_v3":
+    # The parent process sets ``_active_attention_backend`` directly.
+    # Spawned workers don't inherit module-level state, so they fall back
+    # to reading ``envs.TPU_ACTIVE_ATTENTION_BACKEND`` that sets by parent.
+    active = _active_attention_backend or envs.TPU_ACTIVE_ATTENTION_BACKEND
+    if active != "pallas_tpu_rpa_v3":
         # No swap needed for flash or torch_native. Leave the patched flag
         # false so a later re-run (e.g. spawned worker that resolves a
         # different backend) can still apply the swap if it lands on RPA v3.
@@ -551,4 +560,5 @@ def apply_tpu_patches(world_size: int = 1) -> None:
     _patch_support_triton_for_tpu()
     _patch_req_to_token_pool_max_context_len()
     _patch_mha_kv_pool_for_rpa_v3()
+    compilation_manager.maybe_apply_compilation_patches()
     logger.info("TPU patches applied.")
