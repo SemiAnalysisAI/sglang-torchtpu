@@ -61,6 +61,196 @@ logger = logging.getLogger(__name__)
 _PALLAS_MOE_OP = None
 
 
+# ---- JAX kernel body -------------------------------------------------------
+#
+# ``_fused_moe_jax`` (with ``_activation`` and ``_lookup_tile_info``) is the
+# function that ``torch_tpu._internal.pallas.jax_op`` exports and that all the
+# per-shape JAX traces specialise. It lives at module scope (not in the
+# ``_build_fused_moe_op`` closure) so unit tests can import and call it
+# directly with JAX inputs — exercising the exact production execution path
+# without going through the torch custom-op shuttle.
+#
+# JAX is imported inside each function body, not at module scope, so importing
+# ``fused_moe_op`` on a non-TPU host stays cheap (the only inbound paths to
+# this module are TPU-only: ``UnquantizedFusedMoEMethod.forward_tpu`` and the
+# TPU pre-warm hook).
+
+
+def _lookup_tile_info(lhs, rhs, num_total_groups):
+    """Pick a ``TileSizes`` for this gmm_v2 call.
+
+    ``get_tuned_block_sizes`` is a pure-Python lookup keyed on static
+    shapes / dtypes, so it runs at JAX trace time (not at device exec
+    time). On a hit we pin the kernel's tile sizes to the tuned
+    triple; on a miss we hand ``None`` back to gmm_v2, which falls
+    through to its built-in ``calculate_tiling`` heuristic.
+
+    ``num_current_groups`` is set equal to ``num_total_groups``
+    because this bridge is single-host (no expert parallelism); when
+    EP is added the caller will need to pass the local group count
+    through.
+    """
+    import jax.numpy as jnp
+
+    from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes
+    from sglang.srt.layers.moe.pallas.tuned_block_sizes import (
+        get_tuned_block_sizes,
+    )
+
+    m, k = lhs.shape
+    _g, _k, n = rhs.shape
+    assert _k == k, f"gmm_v2 lhs/rhs k mismatch: {k=} vs {_k=}"
+    # Quantization is per-channel (kernel asserts rhs_scale.shape[1] == 1),
+    # so quant_block_size == k whenever scales are provided.
+    quant_block_size = k
+    tm, tk, tn = get_tuned_block_sizes(
+        m=int(m),
+        k=int(k),
+        n=int(n),
+        num_total_groups=int(num_total_groups),
+        num_current_groups=int(num_total_groups),
+        lhs_dtype=str(jnp.dtype(lhs.dtype).name),
+        rhs_dtype=str(jnp.dtype(rhs.dtype).name),
+        quant_block_size=quant_block_size,
+    )
+    return TileSizes(tile_m=tm, tile_k=tk, tile_n=tn)
+
+
+def _activation(gmm1_out, activation_name):
+    """Apply the gated activation to a ``[m*topk, 2*n]`` GMM1 output.
+
+    Returns the ``[m*topk, n]`` post-activation tensor consumed by GMM2.
+    """
+    import jax
+
+    # TODO(Qinghan): case/switch
+    n = gmm1_out.shape[-1] // 2
+    gate, up = gmm1_out[:, :n], gmm1_out[:, n:]
+    if activation_name == "silu":
+        return jax.nn.silu(gate) * up
+    if activation_name == "gelu":
+        return jax.nn.gelu(gate) * up
+    if activation_name == "swiglu_oai":
+        raise NotImplementedError(
+            "swiglu_oai gating in the Pallas fused-MoE op is not wired "
+            "up yet; the GPT-OSS path still goes through the mxfp4 "
+            "specialised forward."
+        )
+    raise NotImplementedError(
+        f"Unsupported activation '{activation_name}' for the Pallas "
+        "fused-MoE op. Supported: silu, gelu."
+    )
+
+
+def _fused_moe_jax(
+    hidden_states,  # [m, k]
+    w1,  # [g, k, 2 * n_intermediate]
+    w2,  # [g, n_intermediate, k]
+    topk_weights,  # [m, topk]
+    topk_ids,  # i32[m, topk]
+    w1_scale,  # Optional[g, 1, 1, 2 * n_intermediate] f32
+    w2_scale,  # Optional[g, 1, 1, k] f32
+    w1_bias,  # Optional[g, 1, 2 * n_intermediate] f32
+    w2_bias,  # Optional[g, 1, k] f32
+    topk,
+    activation_name,
+):
+    """Production fused-MoE kernel body. Exported by ``_build_fused_moe_op``.
+
+    Module-scoped (rather than nested in ``_build_fused_moe_op``) so unit
+    tests can call it directly with JAX inputs and exercise the exact
+    permute / GMM1 / activation / GMM2 / un-permute path that production
+    uses.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from sglang.srt.layers.moe.pallas.gmm_v2 import gmm_v2
+
+    m, hidden_size = hidden_states.shape
+    num_experts = w1.shape[0]
+    out_dtype = hidden_states.dtype
+
+    # Routing: build a permutation that puts rows of hidden_states in
+    # expert-major order so a single grouped-matmul covers GMM1 / GMM2.
+    topk_ids_flat = topk_ids.reshape(-1).astype(jnp.int32)  # [m*topk]
+    # argsort is stable enough on TPU for our usage; the gmm kernel
+    # only cares about contiguous expert runs.
+    argsort_idx = jnp.argsort(topk_ids_flat)
+    # Row-of-original-token for each sorted slot.
+    token_indices = jnp.repeat(jnp.arange(m, dtype=jnp.int32), topk)
+    sorted_token_ids = token_indices[argsort_idx]
+
+    # one_hot+sum is cheaper on TPU than bincount.
+    group_sizes = jax.nn.one_hot(topk_ids_flat, num_experts, dtype=jnp.int32).sum(
+        axis=0
+    )
+
+    # GMM1: gather rows then expert-batched matmul.
+    x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
+
+    # TODO: (Qinghan) check the performance
+    # gmm_v2 requires the LHS row dim to be a multiple of the sublane
+    # tiling. The hard bound is ``size_m % size_lhs_sublane == 0`` (16
+    # for bf16 on TPU v7); the reshape that enforces it lives at
+    # ``gmm_v2.py:624-625`` (steady-state) and ``zero_out_start``. Without
+    # the pad, ``m*topk=24``-style warmup shapes raise a Pallas
+    # ``ValueError`` at JAX trace time. We pad to 32 (a multiple of 16
+    # that's also a multiple of 8, the f32/i32 sublane) following the
+    # sglang-jax wrapper at ``megablox_gmm_backend.gmm:66-73``; this
+    # over-pads by up to 16 rows in the rare misaligned-batch case but
+    # gives us dtype-agnostic safety. tpu-inference takes the opposite
+    # tack: it asserts ``% 16`` at the MoE entry and pushes alignment
+    # onto the runner-level token bucketing.
+    # ``M_total`` is static at JAX trace time, so the branch below
+    # collapses to a constant at trace time and produces no extra
+    # ops when the inputs are already aligned.
+    M_total = x_sorted.shape[0]
+    M_ALIGN = 32
+    pad_m = (-M_total) % M_ALIGN
+    if pad_m > 0:
+        x_sorted = jnp.pad(x_sorted, ((0, pad_m), (0, 0)))
+        # The padded rows are zero. Route them to the last expert so
+        # the kernel processes them (producing zero output rows we
+        # discard below); group_sizes shape stays [num_experts].
+        group_sizes = group_sizes.at[num_experts - 1].add(pad_m)
+
+    gmm1_out = gmm_v2(
+        lhs=x_sorted,
+        rhs=w1,
+        group_sizes=group_sizes,
+        rhs_scale=w1_scale,
+        rhs_bias=w1_bias,
+        preferred_element_type=out_dtype,
+        tile_info=_lookup_tile_info(x_sorted, w1, num_experts),
+    )  # [M_total+pad_m, 2 * n_intermediate]
+
+    # Gated activation.
+    act_out = _activation(gmm1_out, activation_name)
+
+    # GMM2: project back to hidden size.
+    gmm2_out = gmm_v2(
+        lhs=act_out,
+        rhs=w2,
+        group_sizes=group_sizes,
+        rhs_scale=w2_scale,
+        rhs_bias=w2_bias,
+        preferred_element_type=out_dtype,
+        tile_info=_lookup_tile_info(act_out, w2, num_experts),
+    )  # [M_total+pad_m, k]
+
+    # Drop the padded rows before un-permuting.
+    if pad_m > 0:
+        gmm2_out = gmm2_out[:M_total]
+
+    # Un-permute back to token-major order and reduce across the top-k
+    # experts with the routing weights.
+    unsort_idx = jnp.argsort(argsort_idx)
+    unsorted = gmm2_out[unsort_idx].reshape(m, topk, hidden_size)
+    weights = topk_weights.reshape(m, topk, 1).astype(unsorted.dtype)
+    return (unsorted * weights).sum(axis=1).astype(out_dtype)
+
+
 def _build_fused_moe_op():
     """Lazily register the fused-MoE kernel as a torch custom op.
 
@@ -74,160 +264,9 @@ def _build_fused_moe_op():
         return _PALLAS_MOE_OP
 
     import jax  # noqa: F401  (force loud failure if JAX is missing)
-    import jax.numpy as jnp
     from torch_tpu._internal import pallas as _torch_pallas
 
-    from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes, gmm_v2
-    from sglang.srt.layers.moe.pallas.tuned_block_sizes import (
-        get_tuned_block_sizes,
-    )
-
     op_name = "sglang_tpu_pallas::fused_moe"
-
-    def _lookup_tile_info(lhs, rhs, num_total_groups):
-        """Pick a ``TileSizes`` for this gmm_v2 call.
-
-        ``get_tuned_block_sizes`` is a pure-Python lookup keyed on static
-        shapes / dtypes, so it runs at JAX trace time (not at device exec
-        time). On a hit we pin the kernel's tile sizes to the tuned
-        triple; on a miss we hand ``None`` back to gmm_v2, which falls
-        through to its built-in ``calculate_tiling`` heuristic.
-
-        ``num_current_groups`` is set equal to ``num_total_groups``
-        because this bridge is single-host (no expert parallelism); when
-        EP is added the caller will need to pass the local group count
-        through.
-        """
-        m, k = lhs.shape
-        _g, _k, n = rhs.shape
-        assert _k == k, f"gmm_v2 lhs/rhs k mismatch: {k=} vs {_k=}"
-        # Quantization is per-channel (kernel asserts rhs_scale.shape[1] == 1),
-        # so quant_block_size == k whenever scales are provided.
-        quant_block_size = k
-        tm, tk, tn = get_tuned_block_sizes(
-            m=int(m),
-            k=int(k),
-            n=int(n),
-            num_total_groups=int(num_total_groups),
-            num_current_groups=int(num_total_groups),
-            lhs_dtype=str(jnp.dtype(lhs.dtype).name),
-            rhs_dtype=str(jnp.dtype(rhs.dtype).name),
-            quant_block_size=quant_block_size,
-        )
-        return TileSizes(tile_m=tm, tile_k=tk, tile_n=tn)
-
-    def _activation(gmm1_out, activation_name):
-        """Apply the gated activation to a ``[m*topk, 2*n]`` GMM1 output.
-
-        Returns the ``[m*topk, n]`` post-activation tensor consumed by GMM2.
-        """
-        # TODO(Qinghan): case/switch
-        n = gmm1_out.shape[-1] // 2
-        gate, up = gmm1_out[:, :n], gmm1_out[:, n:]
-        if activation_name == "silu":
-            return jax.nn.silu(gate) * up
-        if activation_name == "gelu":
-            return jax.nn.gelu(gate) * up
-        if activation_name == "swiglu_oai":
-            raise NotImplementedError(
-                "swiglu_oai gating in the Pallas fused-MoE op is not wired "
-                "up yet; the GPT-OSS path still goes through the mxfp4 "
-                "specialised forward."
-            )
-        raise NotImplementedError(
-            f"Unsupported activation '{activation_name}' for the Pallas "
-            "fused-MoE op. Supported: silu, gelu."
-        )
-
-    def _fused_moe_jax(
-        hidden_states,  # [m, k]
-        w1,  # [g, k, 2 * n_intermediate]
-        w2,  # [g, n_intermediate, k]
-        topk_weights,  # [m, topk]
-        topk_ids,  # i32[m, topk]
-        w1_scale,  # Optional[g, 1, 1, 2 * n_intermediate] f32
-        w2_scale,  # Optional[g, 1, 1, k] f32
-        w1_bias,  # Optional[g, 1, 2 * n_intermediate] f32
-        w2_bias,  # Optional[g, 1, k] f32
-        topk,
-        activation_name,
-    ):
-        m, hidden_size = hidden_states.shape
-        num_experts = w1.shape[0]
-        out_dtype = hidden_states.dtype
-
-        # Routing: build a permutation that puts rows of hidden_states in
-        # expert-major order so a single grouped-matmul covers GMM1 / GMM2.
-        topk_ids_flat = topk_ids.reshape(-1).astype(jnp.int32)  # [m*topk]
-        # argsort is stable enough on TPU for our usage; the gmm kernel
-        # only cares about contiguous expert runs.
-        argsort_idx = jnp.argsort(topk_ids_flat)
-        # Row-of-original-token for each sorted slot.
-        token_indices = jnp.repeat(jnp.arange(m, dtype=jnp.int32), topk)
-        sorted_token_ids = token_indices[argsort_idx]
-
-        # one_hot+sum is cheaper on TPU than bincount.
-        group_sizes = jax.nn.one_hot(topk_ids_flat, num_experts, dtype=jnp.int32).sum(
-            axis=0
-        )
-
-        # GMM1: gather rows then expert-batched matmul.
-        x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
-
-        # gmm_v2 requires the LHS row dim to be a multiple of the sublane
-        # tiling (16 for bf16 on TPU v7) — concretely it does
-        # ``zero_ref.reshape(-1, size_lhs_sublane, num_lanes)`` in its
-        # zero-init path, which dies on m=24-style warmup shapes. The
-        # sglang-jax wrapper at ``megablox_gmm_backend.gmm`` solves this
-        # by padding lhs rows to 32; we do the same here (and at the end
-        # slice the padded rows back off before un-permuting).
-        # ``M_total`` is static at JAX trace time, so the branch below
-        # collapses to a constant at trace time and produces no extra
-        # ops when the inputs are already aligned.
-        M_total = x_sorted.shape[0]
-        M_ALIGN = 32
-        pad_m = (-M_total) % M_ALIGN
-        if pad_m > 0:
-            x_sorted = jnp.pad(x_sorted, ((0, pad_m), (0, 0)))
-            # The padded rows are zero. Route them to the last expert so
-            # the kernel processes them (producing zero output rows we
-            # discard below); group_sizes shape stays [num_experts].
-            group_sizes = group_sizes.at[num_experts - 1].add(pad_m)
-
-        gmm1_out = gmm_v2(
-            lhs=x_sorted,
-            rhs=w1,
-            group_sizes=group_sizes,
-            rhs_scale=w1_scale,
-            rhs_bias=w1_bias,
-            preferred_element_type=out_dtype,
-            tile_info=_lookup_tile_info(x_sorted, w1, num_experts),
-        )  # [M_total+pad_m, 2 * n_intermediate]
-
-        # Gated activation.
-        act_out = _activation(gmm1_out, activation_name)
-
-        # GMM2: project back to hidden size.
-        gmm2_out = gmm_v2(
-            lhs=act_out,
-            rhs=w2,
-            group_sizes=group_sizes,
-            rhs_scale=w2_scale,
-            rhs_bias=w2_bias,
-            preferred_element_type=out_dtype,
-            tile_info=_lookup_tile_info(act_out, w2, num_experts),
-        )  # [M_total+pad_m, k]
-
-        # Drop the padded rows before un-permuting.
-        if pad_m > 0:
-            gmm2_out = gmm2_out[:M_total]
-
-        # Un-permute back to token-major order and reduce across the top-k
-        # experts with the routing weights.
-        unsort_idx = jnp.argsort(argsort_idx)
-        unsorted = gmm2_out[unsort_idx].reshape(m, topk, hidden_size)
-        weights = topk_weights.reshape(m, topk, 1).astype(unsorted.dtype)
-        return (unsorted * weights).sum(axis=1).astype(out_dtype)
 
     # ``jax_op`` inspects annotations to decide which positional params
     # are tensors (jax.Array) vs. compile-time constants (int/str/...).
