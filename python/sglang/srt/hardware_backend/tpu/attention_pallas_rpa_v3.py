@@ -97,9 +97,11 @@ def _build_pallas_kernel_op():
         cu_q_lens: jax.Array,
         cu_kv_lens: jax.Array,
         distribution: jax.Array,
+        custom_mask: Optional[jax.Array] = None,
         sm_scale: float = 1.0,
         sliding_window: Optional[int] = None,
         soft_cap: Optional[float] = None,
+        causal: int = 1,
     ) -> tuple[jax.Array, jax.Array]:
         return _jax_rpa(
             queries,
@@ -111,9 +113,9 @@ def _build_pallas_kernel_op():
             cu_q_lens,
             cu_kv_lens,
             distribution,
-            None,  # custom_mask
+            custom_mask,
             None,  # attention_sink
-            causal=1,
+            causal=causal,
             sm_scale=sm_scale,
             sliding_window=sliding_window,
             soft_cap=soft_cap,
@@ -221,9 +223,9 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
 
         # cu_kv_lens[i] = i * pages_per_seq * page_size so the kernel addresses
         # ``page_indices[i * pages_per_seq + j]`` for token j of seq i.
-        cu_kv_lens = torch.arange(
-            bs + 1, dtype=torch.int32, device=device
-        ) * (pages_per_seq * page_size)
+        cu_kv_lens = torch.arange(bs + 1, dtype=torch.int32, device=device) * (
+            pages_per_seq * page_size
+        )
 
         per_seq = req_to_token[req_pool_indices]  # [bs, max_ctx]
         # ``req_to_token.shape[1]`` may not be an exact multiple of
@@ -312,6 +314,19 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
 
         soft_cap = layer.logit_cap if getattr(layer, "logit_cap", 0) else None
 
+        # Spec-decoding verify step: forward_batch.spec_info.custom_mask carries
+        # the tree mask in the [pattern_total_kv_len] layout the kernel expects
+        # (per-sequence q_len*kv_len row-major, matching the FULL_MASK output
+        # of build_tree_kernel_efficient). Cast bool -> int32 so the kernel's
+        # `< 1` test reads 1=keep / 0=mask.
+        custom_mask = None
+        causal = 1
+        spec_info = getattr(forward_batch, "spec_info", None)
+        cm = getattr(spec_info, "custom_mask", None) if spec_info is not None else None
+        if cm is not None and cm.numel() > 0:
+            custom_mask = cm.to(torch.int32) if cm.dtype == torch.bool else cm
+            causal = 0
+
         out, updated_kv = op(
             q,
             k,
@@ -322,9 +337,11 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
+            custom_mask,
             float(layer.scaling),
             sliding_window,
             soft_cap,
+            causal,
         )
         # ``donate_argnums=(3,)`` lets XLA alias the input KV cache with the
         # output; in that common path the explicit ``copy_`` below is a

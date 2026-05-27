@@ -20,12 +20,13 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_tpu, next_power_of_2
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_tpu = is_tpu()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -181,6 +182,16 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
+    if _is_tpu:
+        _assign_req_to_token_pool_torch(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            batch_size,
+        )
+        return
     assign_req_to_token_pool[(batch_size,)](
         req_pool_indices,
         req_to_token,
@@ -190,6 +201,39 @@ def assign_req_to_token_pool_func(
         req_to_token.shape[1],
         next_power_of_2(batch_size),
     )
+
+
+def _assign_req_to_token_pool_torch(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    batch_size: int,
+):
+    """Pure-torch fallback for ``assign_req_to_token_pool`` on TPU.
+
+    Mirrors the Triton kernel: per batch, copy
+    ``out_cache_loc[cum:cum+(end-start)]`` into
+    ``req_to_token[req_pool_indices[bid]][start:end]``, where ``cum`` is the
+    running prefix sum of ``end - start`` over prior batches.
+    """
+    if batch_size == 0:
+        return
+    rp = req_pool_indices[:batch_size].to(torch.int64)
+    so = start_offset[:batch_size].to(torch.int64).tolist()
+    eo = end_offset[:batch_size].to(torch.int64).tolist()
+    out_offset = 0
+    for bid in range(batch_size):
+        kv_start = int(so[bid])
+        kv_end = int(eo[bid])
+        length = kv_end - kv_start
+        if length <= 0:
+            continue
+        req_to_token[int(rp[bid].item()), kv_start:kv_end] = out_cache_loc[
+            out_offset : out_offset + length
+        ]
+        out_offset += length
 
 
 @triton.jit
