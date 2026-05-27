@@ -104,13 +104,24 @@ def _modify_tuple(t, index: int, modifier: Callable):
 
 
 def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
-    """Set torchrun-style env vars for torch_tpu's PJRT slicebuilder.
+    """TPU-only per-child-process startup work, called from
+    ``run_scheduler_process`` before ``Scheduler`` is constructed.
 
-    torch_tpu's PJRT slicebuilder reads RANK/LOCAL_RANK/WORLD_SIZE/MASTER_ADDR/
-    MASTER_PORT to coordinate multi-process init. sglang's mp.Process spawn path
-    doesn't otherwise set them. Must run before any model/distributed code
-    imports torch_tpu so PJRT lazy-init in each worker sees the correct rank
-    info. No-op for non-TPU runs.
+    Two responsibilities:
+
+    1. Set torchrun-style env vars for torch_tpu's PJRT slicebuilder
+       (RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT). PJRT
+       lazy-init in each worker reads these to coordinate; sglang's
+       mp.Process spawn path doesn't otherwise set them.
+
+    2. Re-arm the TPU pool swap in the child. ``apply_tpu_patches`` runs at
+       model_runner module-import time — before the child has any view of
+       ``server_args`` — so the swap of ``MHATokenToKVPool`` →
+       ``TpuFusedMHATokenToKVPool`` is silently skipped on the child side.
+       Replaying it here (before ``ModelRunner._init_pools`` runs) puts
+       the fused pool in place for the ``pallas_tpu_rpa_v3`` backend.
+
+    No-op for non-TPU runs.
     """
     if server_args.device != "tpu":
         return
@@ -124,6 +135,14 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
     os.environ["LOCAL_WORLD_SIZE"] = str(server_args.tp_size)
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29500")
+
+    from sglang.srt.hardware_backend.tpu.patches import (
+        _patch_mha_kv_pool_for_rpa_v3,
+        set_active_attention_backend,
+    )
+
+    set_active_attention_backend(server_args.attention_backend)
+    _patch_mha_kv_pool_for_rpa_v3()
 
 
 def monkey_patch_torch_compile():

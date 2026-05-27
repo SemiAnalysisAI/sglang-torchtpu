@@ -471,11 +471,15 @@ def _patch_req_to_token_pool_max_context_len() -> None:
     ReqToTokenPool.__init__ = wrapped_init
 
 
-# Active attention backend name, populated by
-# ``TpuSRTPlatform.apply_server_args_defaults`` so that the KV-pool swap
-# below can see which backend the server resolved to. ``apply_tpu_patches``
-# runs at model_runner module import time — long after ``ServerArgs`` has
-# been finalised — so this is set well before the pool patch reads it.
+# Active attention backend name. Set from two places:
+#   1. ``TpuSRTPlatform.apply_server_args_defaults`` — covers the parent
+#      process (tokenizer manager / engine) that finalises ``ServerArgs``.
+#   2. ``monkey_patch_torch_tpu_env`` in ``utils/patch_torch.py`` — covers
+#      each spawned scheduler child. ``apply_tpu_patches`` runs at
+#      model_runner module import time (long before the child reaches
+#      ``run_scheduler_process``), and ``mp.Process`` does not propagate
+#      module-level globals to children, so the child has to repopulate
+#      this and re-trigger the swap before ``ModelRunner._init_pools``.
 _active_attention_backend: str | None = None
 
 
