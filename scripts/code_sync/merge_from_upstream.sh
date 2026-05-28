@@ -41,8 +41,8 @@ fi
 
 UP_SHA=$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")
 DATE=$(date +%Y%m%d)
-# Include time so every run gets a fresh, unique branch (no force-push needed).
-BRANCH="bot/sync-from-upstream-$(date +%Y%m%d-%H%M%S)-${UP_SHA}"
+# Use a deterministic branch name per upstream commit to prevent duplicate PRs.
+BRANCH="bot/sync-from-upstream-${UP_SHA}"
 
 echo "${AHEAD} new upstream commit(s); upstream/${UPSTREAM_BRANCH} is at ${UP_SHA}."
 
