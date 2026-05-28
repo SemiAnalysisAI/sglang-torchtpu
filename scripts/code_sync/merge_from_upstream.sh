@@ -67,7 +67,7 @@ else
   git commit --no-edit
 fi
 
-git push origin "$BRANCH"
+git push origin "$BRANCH" --force
 
 # Build the PR body.
 COMMIT_RANGE_URL="https://github.com/sgl-project/sglang/commits/${UPSTREAM_BRANCH}"
