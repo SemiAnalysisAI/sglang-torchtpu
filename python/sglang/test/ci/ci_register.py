@@ -13,7 +13,11 @@ __all__ = [
     "register_cuda_ci",
     "register_amd_ci",
     "register_npu_ci",
+<<<<<<< HEAD
     "register_tpu_ci",
+=======
+    "register_xpu_ci",
+>>>>>>> upstream/main
     "ut_parse_one_file",
 ]
 
@@ -109,9 +113,12 @@ def register_npu_ci(
 
 def register_xpu_ci(
     est_time: float,
-    suite: str,
+    suite: Optional[str] = None,
     nightly: bool = False,
     disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
 ):
     """Marker for XPU CI registration (parsed via AST; runtime no-op)."""
     return None
