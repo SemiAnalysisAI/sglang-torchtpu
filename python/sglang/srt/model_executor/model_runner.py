@@ -610,12 +610,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.remote_instance_init_transfer_engine()
 
         if not self.is_draft_worker:
+            # Skip expert-location metadata when nothing consumes it. On TPU,
+            # _compute_logical_to_all_physical_map issues many D2H copies and costs
+            # ~22s at startup; for configs without EP dispatch / EPLB / distribution
+            # recording, the metadata is never read (see expert_location_dispatch.py
+            # and fused_moe_triton/layer.py which handle None).
+            needs_expert_location_metadata = (
+                server_args.enable_eplb
+                or server_args.ep_dispatch_algorithm is not None
+                or server_args.expert_distribution_recorder_mode is not None
+                or server_args.init_expert_location != "trivial"
+            )
             set_global_expert_location_metadata(
                 compute_initial_expert_location_metadata(
                     server_args=server_args,
                     model_config=self.model_config,
                     moe_ep_rank=self.moe_ep_rank,
                 )
+                if needs_expert_location_metadata
+                else None
             )
             if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
                 logger.info(

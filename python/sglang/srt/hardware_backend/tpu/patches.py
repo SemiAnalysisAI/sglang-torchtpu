@@ -69,7 +69,9 @@ def _prepare_tpu_env(world_size: int = 1) -> None:
         import socket
 
         # Hold sockets open until env var is written so OS doesn't reassign.
-        _held = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(world_size)]
+        _held = [
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(world_size)
+        ]
         for s in _held:
             s.bind(("", 0))
         sb_ports = [s.getsockname()[1] for s in _held]
@@ -135,7 +137,9 @@ def _patch_set_device_tolerate_mismatch() -> None:
                     else int(device)
                 )
                 logger.warning(
-                    "TPU set_device(idx=%s) skipped: %s", idx, e,
+                    "TPU set_device(idx=%s) skipped: %s",
+                    idx,
+                    e,
                 )
                 return
             raise
@@ -295,9 +299,7 @@ def _patch_torch_native_attn_backend() -> None:
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_q:end_q, :, :] = per_req_out_redudant[
-                prefill_seq_len_q:, :, :
-            ]
+            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
             start_q, start_kv = end_q, end_kv
         return output
 
@@ -469,11 +471,15 @@ def _patch_req_to_token_pool_max_context_len() -> None:
     ReqToTokenPool.__init__ = wrapped_init
 
 
-# Active attention backend name, populated by
-# ``TpuSRTPlatform.apply_server_args_defaults`` so that the KV-pool swap
-# below can see which backend the server resolved to. ``apply_tpu_patches``
-# runs at model_runner module import time — long after ``ServerArgs`` has
-# been finalised — so this is set well before the pool patch reads it.
+# Active attention backend name. Set from two places:
+#   1. ``TpuSRTPlatform.apply_server_args_defaults`` — covers the parent
+#      process (tokenizer manager / engine) that finalises ``ServerArgs``.
+#   2. ``monkey_patch_torch_tpu_env`` in ``utils/patch_torch.py`` — covers
+#      each spawned scheduler child. ``apply_tpu_patches`` runs at
+#      model_runner module import time (long before the child reaches
+#      ``run_scheduler_process``), and ``mp.Process`` does not propagate
+#      module-level globals to children, so the child has to repopulate
+#      this and re-trigger the swap before ``ModelRunner._init_pools``.
 _active_attention_backend: str | None = None
 
 

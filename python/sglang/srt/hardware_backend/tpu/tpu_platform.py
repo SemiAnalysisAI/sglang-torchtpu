@@ -112,9 +112,7 @@ class TpuSRTPlatform(SRTPlatform):
         return "tpu"
 
     def get_piecewise_backend_cls(self) -> type:
-        raise NotImplementedError(
-            "TPU piecewise backend not yet implemented."
-        )
+        raise NotImplementedError("TPU piecewise backend not yet implemented.")
 
     # ------------------------------------------------------------------
     # Capability flags
@@ -169,9 +167,7 @@ class TpuSRTPlatform(SRTPlatform):
             return hbm
         return 32 * (1 << 30)
 
-    def get_current_memory_usage(
-        self, device: Optional[torch.device] = None
-    ) -> float:
+    def get_current_memory_usage(self, device: Optional[torch.device] = None) -> float:
         return 0.0
 
     def get_device(self, local_rank: int) -> torch.device:
