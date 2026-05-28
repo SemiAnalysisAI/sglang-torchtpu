@@ -244,14 +244,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # call site can hand layer.w13_weight / layer.w2_weight straight
         # to fused_moe_call with no per-step transpose.
         if _is_tpu:
-            layer.w13_weight = Parameter(
-                layer.w13_weight.data.transpose(1, 2).contiguous(),
-                requires_grad=False,
-            )
-            layer.w2_weight = Parameter(
-                layer.w2_weight.data.transpose(1, 2).contiguous(),
-                requires_grad=False,
-            )
+            for name in ("w13_weight", "w2_weight"):
+                old = getattr(layer, name).data
+                new = old.transpose(1, 2).contiguous()
+                copy_or_rebind_param(layer, name, new)
+                old.untyped_storage().resize_(0)
             return
 
         _should_use_aiter_moe = _use_aiter and (

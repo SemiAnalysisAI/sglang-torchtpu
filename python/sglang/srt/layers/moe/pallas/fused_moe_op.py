@@ -245,6 +245,7 @@ def _fused_moe_jax(
 
     # Un-permute back to token-major order and reduce across the top-k
     # experts with the routing weights.
+    # TODO (Qinghan): check performance against scatter
     unsort_idx = jnp.argsort(argsort_idx)
     unsorted = gmm2_out[unsort_idx].reshape(m, topk, hidden_size)
     weights = topk_weights.reshape(m, topk, 1).astype(unsorted.dtype)
