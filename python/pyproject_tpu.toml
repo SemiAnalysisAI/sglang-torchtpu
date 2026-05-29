@@ -104,6 +104,9 @@ dev_tpu = ["sglang[all_tpu]", "sglang[test]"]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
+[project.entry-points."sglang.srt.platforms"]
+tpu = "sglang.srt.hardware_backend.tpu:activate"
+
 [project.scripts]
 sglang = "sglang.cli.main:main"
 
