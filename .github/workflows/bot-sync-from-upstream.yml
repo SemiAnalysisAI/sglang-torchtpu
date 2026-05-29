@@ -1,0 +1,39 @@
+name: Bot Sync From Upstream sglang
+
+# Periodically merges sgl-project/sglang `main` into this fork and opens a PR.
+# Preserves upstream git history (real `git merge`), unlike the rsync-based
+# "Open A PR to Copy Code From OSS" workflow.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every 2 days at 10:00 UTC.
+    - cron: '0 10 */2 * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Don't let two sync runs race on the same branches.
+concurrency:
+  group: bot-sync-from-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+
+      - name: Install GitHub CLI (if not present)
+        run: bash scripts/code_sync/install_github_cli.sh
+
+      - name: Merge upstream and open PR
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+        run: bash scripts/code_sync/merge_from_upstream.sh

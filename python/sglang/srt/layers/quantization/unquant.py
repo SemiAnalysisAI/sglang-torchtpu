@@ -35,6 +35,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_hip,
     is_npu,
+    is_tpu,
     next_power_of_2,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -52,6 +53,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
@@ -237,6 +239,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # TPU: gmm_v2 expects (num_experts, k, n) but SGLang stores
+        # (num_experts, n, k). Swap once at load time so the forward_tpu
+        # call site can hand layer.w13_weight / layer.w2_weight straight
+        # to fused_moe_call with no per-step transpose.
+        if _is_tpu:
+            for name in ("w13_weight", "w2_weight"):
+                old = getattr(layer, name).data
+                new = old.transpose(1, 2).contiguous()
+                copy_or_rebind_param(layer, name, new)
+                old.untyped_storage().resize_(0)
+            return
+
         _should_use_aiter_moe = _use_aiter and (
             get_moe_runner_backend().is_auto() or get_moe_runner_backend().is_aiter()
         )
@@ -719,8 +733,37 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         return StandardCombineInput(hidden_states=final_hidden_states)
 
-    def forward_tpu(self, *args, **kwargs) -> CombineInput:
-        raise NotImplementedError("The TPU backend currently does not support MoE.")
+    def forward_tpu(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        moe_runner_config = self.moe_runner_config
+        if moe_runner_config.apply_router_weight_on_input:
+            raise NotImplementedError(
+                "apply_router_weight_on_input is not supported on TPU yet."
+            )
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+
+        # Weights are already in gmm_v2's (num_experts, k, n) layout —
+        # the swap from SGLang's (num_experts, n, k) happens once in
+        # process_weights_after_loading above.
+        output = fused_moe_call(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights.to(x.dtype),
+            topk_ids=topk_ids.to(torch.int32),
+            topk=int(topk_ids.shape[-1]),
+            activation=moe_runner_config.activation,
+        )
+        return StandardCombineInput(hidden_states=output)
 
     def forward_musa(self, *args, **kwargs) -> CombineInput:
         return self.forward_cuda(*args, **kwargs)
