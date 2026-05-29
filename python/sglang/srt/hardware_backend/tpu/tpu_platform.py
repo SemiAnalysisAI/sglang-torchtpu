@@ -54,8 +54,10 @@ class TpuSRTPlatform(SRTPlatform):
 
         server_args.disable_cuda_graph = True
         server_args.disable_piecewise_cuda_graph = True
-        server_args.enable_torch_compile = False
         server_args.disable_overlap_schedule = True
+        # `enable_torch_compile` is honored on TPU and wired up by
+        # TpuGraphRunner (see init_device_graphs). Off by default (the
+        # SGLang-wide default); opt in with `--enable-torch-compile`.
 
         if server_args.mem_fraction_static is None:
             server_args.mem_fraction_static = 0.40
@@ -82,9 +84,7 @@ class TpuSRTPlatform(SRTPlatform):
         return "pallas_tpu_rpa_v3"
 
     def get_graph_runner_cls(self) -> type:
-        from sglang.srt.hardware_backend.tpu.graph_runner.tpu_graph_runner import (
-            TpuGraphRunner,
-        )
+        from sglang.srt.model_executor.tpu_graph_runner import TpuGraphRunner
 
         return TpuGraphRunner
 
