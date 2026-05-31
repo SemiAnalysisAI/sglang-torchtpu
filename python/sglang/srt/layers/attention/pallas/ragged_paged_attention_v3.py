@@ -1130,8 +1130,9 @@ def _ragged_paged_attention_kernel_loop(
     @pl.when(seq_idx == start_seq_idx)
     def prologue():
         start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
-        # Initialize bkv_x2_ref to zeros to avoid NaN issues.
-        # Use bitcast to int32 and preserve actual shape (which may include bank conflict padding)
+        # Zero both bkv buffers (bitcast to int32 to handle bank-conflict padding).
+        # JAX 0.10 Pallas refs require `ref.at[i][...] = explicit_zeros`
+        # rather than the older `ref[i][...] = 0` form.
         bkv_x2_int32_ref = bkv_x2_ref.bitcast(jnp.int32)
         zeros = jnp.zeros(bkv_x2_int32_ref.shape[1:], jnp.int32)
         bkv_x2_int32_ref[0] = zeros

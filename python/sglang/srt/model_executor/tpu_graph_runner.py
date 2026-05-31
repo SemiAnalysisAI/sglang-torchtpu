@@ -69,6 +69,10 @@ class TpuGraphRunner:
     _COMPILE_TARGETS: tuple[str, ...] = ("forward", "forward_split_prefill")
 
     def __init__(self, model_runner: ModelRunner):
+        assert model_runner.server_args.enable_torch_compile, (
+            "TpuGraphRunner should only be initialized when enable_torch_compile=True."
+        )
+
         # Side-effectful import: registers the "tpu" dynamo backend so that
         # torch.compile(backend="tpu", ...) resolves. apply_tpu_patches does
         # this in init_backend; redo it defensively in case the runner is
@@ -117,6 +121,15 @@ class TpuGraphRunner:
             type(self.model).__name__,
             ", ".join(wrapped),
         )
+
+        from sglang.srt.hardware_backend.tpu import envs
+
+        if envs.TPU_INPUT_PADDING_ENABLED:
+            from sglang.srt.hardware_backend.tpu.compilation.static_shape_shim import (
+                StaticShapeShim,
+            )
+
+            model_runner.static_shape_shim = StaticShapeShim(model_runner).install()
 
     def can_run(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.

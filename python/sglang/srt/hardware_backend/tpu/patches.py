@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib
 import os
 
+from sglang.srt.hardware_backend.tpu import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 
 logger = get_logger(__name__)
@@ -533,7 +534,11 @@ def _patch_mha_kv_pool_for_rpa_v3() -> None:
     if _mha_kv_pool_patched:
         return
 
-    if _active_attention_backend != "pallas_tpu_rpa_v3":
+    # The parent process sets ``_active_attention_backend`` directly.
+    # Spawned workers don't inherit module-level state, so they fall back
+    # to reading ``envs.TPU_ATTN_BACKEND`` that sets by parent.
+    active = _active_attention_backend or envs.TPU_ATTN_BACKEND
+    if active != "pallas_tpu_rpa_v3":
         # No swap needed for flash or torch_native. Leave the patched flag
         # false so a later re-run (e.g. spawned worker that resolves a
         # different backend) can still apply the swap if it lands on RPA v3.

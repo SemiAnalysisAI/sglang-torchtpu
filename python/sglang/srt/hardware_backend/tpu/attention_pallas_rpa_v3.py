@@ -211,8 +211,43 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             )
             extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
         else:
-            # Decode: q_len == 1 per sequence.
-            extend_seq_lens = torch.ones(bs, dtype=torch.int32, device=device)
+            # Decode is *mostly* "q_len == 1 per sequence", but sglang's
+            # mixed-prefill / running-merge can produce a decode forward
+            # where ``input_ids`` has more tokens than seqs (e.g. the
+            # running seq carries a previously-sampled-but-not-yet-cached
+            # token plus its decode query → T == B + 1; multi-step
+            # accumulation → T == k * B). ``forward_batch.extend_seq_lens``
+            # is nulled by ``init_new`` in decode mode so we can't read
+            # the true per-seq q-count from the standard field. Recover
+            # it heuristically from the (T, B) shape relationship.
+            T_actual = (
+                int(forward_batch.input_ids.shape[0])
+                if forward_batch.input_ids is not None
+                else bs
+            )
+            if T_actual == bs:
+                extend_seq_lens = torch.ones(bs, dtype=torch.int32, device=device)
+            elif T_actual > bs and (T_actual % bs) == 0:
+                # Stacked / multi-step case: every seq has the same number
+                # of q tokens.
+                q_per_seq = T_actual // bs
+                extend_seq_lens = torch.full(
+                    (bs,), q_per_seq, dtype=torch.int32, device=device
+                )
+            elif T_actual > bs:
+                # Non-uniform case (T=B+1 running-merge, or larger
+                # asymmetric distributions). Empirically the extra tokens
+                # are appended at the end of input_ids, so attribute them
+                # all to the last seq. May produce incorrect KV state in
+                # exotic cases but unblocks the common ones we've
+                # measured (T=B+1, T=B+k with running-merge).
+                extend_seq_lens = torch.ones(bs, dtype=torch.int32, device=device)
+                extend_seq_lens[-1] = T_actual - bs + 1
+            else:
+                raise RuntimeError(
+                    "[pallas RPA v3] decode forward with T=%d B=%d (T < B). "
+                    "No way to recover per-seq q-counts." % (T_actual, bs)
+                )
 
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
 
