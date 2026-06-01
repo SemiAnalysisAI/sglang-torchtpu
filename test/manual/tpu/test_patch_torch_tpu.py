@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from sglang.srt.utils.patch_torch import monkey_patch_torch_tpu_env
 from sglang.test.test_utils import CustomTestCase
 
-
 _TORCHRUN_ENV_VARS = (
     "RANK",
     "LOCAL_RANK",

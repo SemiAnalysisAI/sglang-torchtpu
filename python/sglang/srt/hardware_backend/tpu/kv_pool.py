@@ -81,7 +81,9 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         # its ``_create_buffers`` allocates the legacy two-buffer (K / V) layout
         # which is incompatible with the Pallas kernel. Instead we initialize
         # the ``KVCache`` base directly, then build the fused buffers ourselves.
-        from sglang.srt.mem_cache.memory_pool import KVCache  # local import to avoid cycles
+        from sglang.srt.mem_cache.memory_pool import (
+            KVCache,  # local import to avoid cycles
+        )
 
         KVCache.__init__(
             self,
@@ -108,10 +110,14 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
                 "head dims are not supported by the Pallas kernel."
             )
 
-        self.padded_head_dim = _cdiv(self.head_dim, self.HEAD_DIM_ALIGNMENT) * self.HEAD_DIM_ALIGNMENT
+        self.padded_head_dim = (
+            _cdiv(self.head_dim, self.HEAD_DIM_ALIGNMENT) * self.HEAD_DIM_ALIGNMENT
+        )
         self.kv_packing = _torch_dtype_packing(self.store_dtype)
         # K and V are interleaved along the kv-heads axis, then packed in 32-bit lanes.
-        self.num_kv_heads_x2 = _cdiv(self.head_num * 2, self.kv_packing) * self.kv_packing
+        self.num_kv_heads_x2 = (
+            _cdiv(self.head_num * 2, self.kv_packing) * self.kv_packing
+        )
 
         if self.size % self.page_size != 0:
             raise ValueError(
