@@ -249,6 +249,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 new = old.transpose(1, 2).contiguous()
                 copy_or_rebind_param(layer, name, new)
                 old.untyped_storage().resize_(0)
+            # Build the Pallas fused-MoE custom op NOW (eager, post weight-load)
+            # instead of lazily inside forward_tpu. Registration runs
+            # inspect.signature + JAX export, which dynamo cannot trace — if the
+            # op is first built inside the compiled forward it crashes (gb0088).
+            # The op is a cached singleton, so this makes the trace-time
+            # fused_moe_call() a plain lookup.
+            from sglang.srt.layers.moe.pallas.fused_moe_op import (
+                prewarm_fused_moe_op,
+            )
+
+            prewarm_fused_moe_op(topk=getattr(layer, "top_k", 1), activation="silu")
             return
 
         _should_use_aiter_moe = _use_aiter and (
