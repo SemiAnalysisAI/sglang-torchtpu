@@ -78,9 +78,7 @@ class TestTpuPlatformMemory(CustomTestCase):
 
     def test_hbm_lookup_unknown_device_defaults(self):
         with patch.object(self.platform, "get_device_name", return_value="TPU v99"):
-            self.assertEqual(
-                self.platform.get_device_total_memory(), 32 * (1 << 30)
-            )
+            self.assertEqual(self.platform.get_device_total_memory(), 32 * (1 << 30))
 
     def test_current_memory_usage_returns_zero(self):
         self.assertEqual(self.platform.get_current_memory_usage(), 0.0)
@@ -95,7 +93,9 @@ class TestTpuPlatformMemory(CustomTestCase):
 class TestTpuPlatformServerDefaults(CustomTestCase):
     """apply_server_args_defaults sets correct values."""
 
-    @patch("sglang.srt.hardware_backend.tpu.tpu_platform.TpuSRTPlatform.apply_server_args_defaults")
+    @patch(
+        "sglang.srt.hardware_backend.tpu.tpu_platform.TpuSRTPlatform.apply_server_args_defaults"
+    )
     def _make_args(self, mock_apply):
         return SimpleNamespace(
             dtype=None,
@@ -120,9 +120,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             tp_size=1,
         )
         platform = TpuSRTPlatform()
-        with patch(
-            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
-        ):
+        with patch("sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"):
             platform.apply_server_args_defaults(args)
 
         self.assertEqual(args.dtype, "bfloat16")
@@ -148,9 +146,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             tp_size=1,
         )
         platform = TpuSRTPlatform()
-        with patch(
-            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
-        ):
+        with patch("sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"):
             platform.apply_server_args_defaults(args)
 
         self.assertTrue(args.enable_torch_compile)
@@ -167,9 +163,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             tp_size=1,
         )
         platform = TpuSRTPlatform()
-        with patch(
-            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
-        ):
+        with patch("sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"):
             platform.apply_server_args_defaults(args)
 
         self.assertEqual(args.dtype, "float32")
@@ -186,9 +180,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             tp_size=1,
         )
         platform = TpuSRTPlatform()
-        with patch(
-            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
-        ):
+        with patch("sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"):
             platform.apply_server_args_defaults(args)
 
         self.assertEqual(args.mem_fraction_static, 0.60)

@@ -75,9 +75,7 @@ class TestInitOverlapStreamGating(CustomTestCase):
         dm.Stream.assert_not_called()
         # Overlap bookkeeping is shared with the GPU path.
         self.assertIs(s.future_map, s.spec_algorithm.create_future_map.return_value)
-        s.spec_algorithm.create_future_map.assert_called_once_with(
-            8, 2048, 4096, "cpu"
-        )
+        s.spec_algorithm.create_future_map.assert_called_once_with(8, 2048, 4096, "cpu")
         self.assertEqual(s.batch_record_buf, [None, None])
         self.assertEqual(s.batch_record_ct, 0)
 
