@@ -144,7 +144,10 @@ class TestReqToTokenPoolRoundingPatch(CustomTestCase):
         # Decode gather invariant: for any max_len <= pool width, the
         # bucketed Lb fits inside the per-request slot row.
         pool = ReqToTokenPool(
-            size=2, max_context_len=8193, device="cpu", enable_memory_saver=False,
+            size=2,
+            max_context_len=8193,
+            device="cpu",
+            enable_memory_saver=False,
         )
         width = pool.req_to_token.shape[1]
         for max_len in (1, 64, 65, 4096, 8000, width):
@@ -153,7 +156,10 @@ class TestReqToTokenPoolRoundingPatch(CustomTestCase):
         # Idempotent.
         _patch_req_to_token_pool_max_context_len()
         pool = ReqToTokenPool(
-            size=2, max_context_len=200, device="cpu", enable_memory_saver=False,
+            size=2,
+            max_context_len=200,
+            device="cpu",
+            enable_memory_saver=False,
         )
         self.assertEqual(pool.req_to_token.shape[1], 256)
 
@@ -227,12 +233,9 @@ class TestPagedKernelNumerics(CustomTestCase):
         total_pages = batch * pps
         rng = np.random.default_rng(0)
         q = rng.standard_normal((batch, Hq, D)).astype(np.float32)
-        kp = rng.standard_normal(
-            (Hkv, total_pages, page_size, D)).astype(np.float32)
-        vp = rng.standard_normal(
-            (Hkv, total_pages, page_size, D)).astype(np.float32)
-        page_indices = np.arange(
-            total_pages, dtype=np.int32).reshape(batch, pps)
+        kp = rng.standard_normal((Hkv, total_pages, page_size, D)).astype(np.float32)
+        vp = rng.standard_normal((Hkv, total_pages, page_size, D)).astype(np.float32)
+        page_indices = np.arange(total_pages, dtype=np.int32).reshape(batch, pps)
         scale = 1.0 / math.sqrt(D)
 
         ppb = max(1, min(8, pps))

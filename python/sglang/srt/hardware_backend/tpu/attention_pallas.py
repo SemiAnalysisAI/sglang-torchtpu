@@ -21,16 +21,15 @@ from typing import TYPE_CHECKING
 
 import jax
 import torch
-
 from jax.experimental.pallas.ops.tpu.paged_attention.paged_attention_kernel import (
     paged_attention,
 )
 
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.hardware_backend.tpu.kernels.flash_attention import (
     flash_attention,
 )
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.radix_attention import AttentionType
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -246,9 +245,7 @@ class TpuPallasAttnBackend(AttentionBackend):
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
-            if not (
-                per_req_query.dtype == per_req_key.dtype == per_req_value.dtype
-            ):
+            if not (per_req_query.dtype == per_req_key.dtype == per_req_value.dtype):
                 per_req_key = per_req_key.to(per_req_query.dtype)
                 per_req_value = per_req_value.to(per_req_query.dtype)
 
@@ -269,9 +266,7 @@ class TpuPallasAttnBackend(AttentionBackend):
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_q:end_q, :, :] = per_req_out_redudant[
-                prefill_seq_len_q:, :, :
-            ]
+            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
             start_q = end_q
         return output
 

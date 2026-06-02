@@ -59,7 +59,9 @@ class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
         self.load_events = [_get_device_module().Event() for _ in range(num_layers)]
-        self.start_event = _get_device_module().Event()  # start event on controller stream
+        self.start_event = (
+            _get_device_module().Event()
+        )  # start event on controller stream
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers

@@ -20,6 +20,7 @@ def _model_with(**attrs):
     None) returns a Mock instead of None, and we can't distinguish
     "method present" from "method absent."
     """
+
     class _M:
         pass
 

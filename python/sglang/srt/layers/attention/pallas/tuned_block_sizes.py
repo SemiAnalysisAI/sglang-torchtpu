@@ -31,6 +31,7 @@ def get_device_name(num_devices: int | None = None) -> str:
         kind += f"-{num_devices}"
     return kind
 
+
 logger = logging.getLogger(__name__)
 # key
 #   - device_name
@@ -1487,7 +1488,10 @@ def get_tuned_block_sizes(
         # TPUv4 has much smaller VMEM size so we pick fixed block sizes.
         bkv_p, bq = (512 // page_size, 32)
     else:
-        if device_name in TUNED_BLOCK_SIZES and keys[1:] in TUNED_BLOCK_SIZES[device_name]:
+        if (
+            device_name in TUNED_BLOCK_SIZES
+            and keys[1:] in TUNED_BLOCK_SIZES[device_name]
+        ):
             bkv_p, bq = TUNED_BLOCK_SIZES[device_name][keys[1:]]
         else:
             logger.info(

@@ -251,13 +251,13 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.srt.utils.common import is_npu
-from sglang.srt.utils.patch_torch import monkey_patch_torch_tpu_env
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
+from sglang.srt.utils.patch_torch import monkey_patch_torch_tpu_env
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback

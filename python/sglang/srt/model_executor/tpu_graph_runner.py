@@ -99,7 +99,8 @@ class TpuGraphRunner:
         _register_tpu_compile_backend()
 
         wrapped = [
-            name for name in self._COMPILE_TARGETS
+            name
+            for name in self._COMPILE_TARGETS
             if _wrap_with_tpu_compile(self.model, name)
         ]
         if not wrapped:
@@ -118,7 +119,7 @@ class TpuGraphRunner:
             ", ".join(wrapped),
         )
 
-    def can_run(self, forward_batch: ForwardBatch) -> bool:
+    def can_run(self, forward_batch) -> bool:
         """Always False — no captured graph to replay.
 
         PJRT/libtpu caches HLO compilations internally and dispatches
