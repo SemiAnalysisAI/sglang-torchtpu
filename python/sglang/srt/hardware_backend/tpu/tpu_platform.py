@@ -54,7 +54,9 @@ class TpuSRTPlatform(SRTPlatform):
 
         server_args.disable_cuda_graph = True
         server_args.disable_piecewise_cuda_graph = True
-        server_args.enable_torch_compile = False
+        # ``enable_torch_compile`` is honored on TPU and wired up by
+        # ``TpuGraphRunner`` (see ``ModelRunner.init_device_graphs``). Off by
+        # default (the SGLang-wide default); opt in with ``--enable-torch-compile``.
         # TPU runs SGLang's regular event-based overlap scheduling, minus the
         # CUDA-style forward/copy/schedule streams: torch_tpu serialises on a
         # single PJRT queue so cross-stream ordering is a no-op (see
