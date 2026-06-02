@@ -1506,16 +1506,11 @@ class Scheduler(
         Sets up the schedule stream and dispatches to the appropriate event loop.
         The event loop blocks until shutdown.
         """
-        if use_mlx():
+        if use_mlx() or not self.use_overlap_streams:
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
             # not PyTorch MPS streams.
-            dispatch_event_loop(self)
-            return
-
-        if not self.use_overlap_streams:
-            # Single-queue backend (torch_tpu): don't wrap the loop in a
-            # non-default schedule_stream — it adds nothing and the C++ runtime
-            # prefers the default stream. See init_overlap.
+            # Also, this avoids having another stream for
+            # single-stream backends(TPU)
             dispatch_event_loop(self)
             return
 
