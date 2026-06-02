@@ -119,5 +119,68 @@ class TestInitOverlapStreamGating(CustomTestCase):
         dm.Stream.assert_not_called()
 
 
+class TestLaunchBatchSampleStreamGating(CustomTestCase):
+    """``launch_batch_sample_if_needed`` runs inside ``forward_stream_ctx`` and
+    cross-waits the schedule stream — but that wait is only valid when
+    ``use_overlap_streams`` is set. On a single-queue backend ``schedule_stream``
+    is never created (see ``test_single_queue_skips_streams``), so an unguarded
+    ``wait_stream`` raises AttributeError on the delayed-sample (spec-V2) path.
+    Basic inference returns early (``delay_sample_func is None``) and never hits
+    it, so this path needs its own coverage."""
+
+    @staticmethod
+    def _make_batch_result():
+        br = SimpleNamespace()
+        br.future_indices = object()
+        br.logits_output = None
+        br.copy_to_cpu = MagicMock()
+        br.delay_sample_func = lambda: br  # must return the same result
+        return br
+
+    @staticmethod
+    def _make_self(*, use_overlap_streams: bool) -> Scheduler:
+        s = Scheduler.__new__(Scheduler)
+        s.use_overlap_streams = use_overlap_streams
+        s.forward_stream_ctx = nullcontext()
+        s.future_map = MagicMock()
+        s.cur_batch = SimpleNamespace(
+            return_logprob=False, return_hidden_states=False
+        )
+        return s
+
+    def test_single_queue_skips_wait_stream(self):
+        # Regression: with overlap streams off, schedule_stream is never created,
+        # so the method must not touch it. Both stream attrs are left unset — an
+        # unguarded wait_stream would AttributeError here.
+        s = self._make_self(use_overlap_streams=False)
+        br = self._make_batch_result()
+
+        Scheduler.launch_batch_sample_if_needed(s, br)  # must not raise
+
+        br.copy_to_cpu.assert_called_once()
+        s.future_map.store_to_map.assert_called_once_with(br.future_indices, br)
+        self.assertIsNone(br.delay_sample_func)  # closure released
+
+    def test_multi_stream_waits_on_schedule_stream(self):
+        # The multi-stream (GPU) path still cross-waits the schedule stream.
+        s = self._make_self(use_overlap_streams=True)
+        s.forward_stream = MagicMock()
+        s.schedule_stream = MagicMock()
+        br = self._make_batch_result()
+
+        Scheduler.launch_batch_sample_if_needed(s, br)
+
+        s.forward_stream.wait_stream.assert_called_once_with(s.schedule_stream)
+        br.copy_to_cpu.assert_called_once()
+
+    def test_no_delay_sample_func_is_noop(self):
+        s = self._make_self(use_overlap_streams=False)
+        out = Scheduler.launch_batch_sample_if_needed(
+            s, SimpleNamespace(delay_sample_func=None)
+        )
+        self.assertIsNone(out)
+        s.future_map.store_to_map.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
