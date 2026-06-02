@@ -36,7 +36,6 @@ def _bool(name: str, default: bool = True) -> bool:
 #   - "torch_native" (fallback native PyTorch attention)
 TPU_ATTN_BACKEND: str | None = _str("TPU_ATTN_BACKEND", default="pallas_tpu_rpa_v3")
 
-# Controls whether the dynamic shape input padding shimming system is enabled.
-# If True (default), inputs are padded to compile-time bucket sizes to minimize
-# compilation stalls. If False, shimming is completely disabled.
-TPU_INPUT_PADDING_ENABLED: bool = _bool("TPU_INPUT_PADDING_ENABLED", default=True)
+# Enable static shape precompilation padding to minimize dynamic compiles.
+TPU_PRECOMPILATION_ENABLED: bool = _bool("TPU_PRECOMPILATION_ENABLED", default=True)
+

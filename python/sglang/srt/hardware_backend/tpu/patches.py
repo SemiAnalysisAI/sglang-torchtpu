@@ -26,8 +26,9 @@ _dynamic_compile_unwrapped = False
 def _configure_eager_mode() -> None:
     from torch_tpu._internal import execution_mode
 
-    execution_mode.set_eager_mode(execution_mode.EagerMode.DEFER_AND_FUSE)
-    logger.info("TorchTPU eager mode set to DEFER_AND_FUSE.")
+    # Set eager_mode to INTERNAL_DEFER_ALL for whole-model graph capture.
+    execution_mode.eager_mode = execution_mode.EagerMode.INTERNAL_DEFER_ALL
+    logger.info("TorchTPU eager mode set to %s.", execution_mode.eager_mode.name)
 
 
 def _register_tpu_compile_backend() -> None:
@@ -35,6 +36,13 @@ def _register_tpu_compile_backend() -> None:
     # torch._dynamo so that `torch.compile(backend="tpu", ...)` works. Must run
     # before any code applies that decorator (e.g. on imports of layers/models).
     import torch_tpu._internal.compile  # noqa: F401
+
+    import torch._dynamo
+    # Might need to be increased further with more shape buckets and dynamic
+    # dimensions.
+    torch._dynamo.config.cache_size_limit = 128
+    torch._dynamo.config.accumulated_cache_size_limit = 1024
+    torch._dynamo.config.raise_on_ctx_limit_exceeded = True
 
 
 def _unwrap_dynamic_compile_fns() -> None:

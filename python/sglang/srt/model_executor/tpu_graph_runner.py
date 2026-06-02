@@ -124,7 +124,7 @@ class TpuGraphRunner:
 
         from sglang.srt.hardware_backend.tpu import envs
 
-        if envs.TPU_INPUT_PADDING_ENABLED:
+        if envs.TPU_PRECOMPILATION_ENABLED:
             from sglang.srt.hardware_backend.tpu.compilation.static_shape_shim import (
                 StaticShapeShim,
             )
