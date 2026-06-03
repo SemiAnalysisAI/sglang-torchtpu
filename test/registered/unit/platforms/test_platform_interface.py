@@ -232,6 +232,40 @@ class TestSRTPlatform(CustomTestCase):
         self.assertFalse(base.is_cuda_alike())
 
 
+class TestOverlapStreamCapability(CustomTestCase):
+    """supports_overlap_streams is the seam Scheduler.init_overlap uses to pick
+    between CUDA-style overlap streams and a single-queue (e.g. TPU) event-only
+    overlap path."""
+
+    def test_default_is_true(self):
+        """Backends with real multi-stream execution keep streams by default."""
+        mixin = _make_device_mixin(PlatformEnum.CUDA, "cuda", "cuda")
+        self.assertTrue(mixin.supports_overlap_streams())
+
+    def test_cuda_platform_inherits_true(self):
+        self.assertTrue(CudaSRTPlatform().supports_overlap_streams())
+
+    def test_subclass_can_opt_out(self):
+        """Single-queue backends (torch_tpu) override to False so the scheduler
+        skips the forward/copy/schedule streams."""
+
+        class _SingleQueue(DeviceMixin):
+            _enum = PlatformEnum.TPU
+            device_name = "tpu"
+            device_type = "tpu"
+
+            def get_device_total_memory(self, device_id=0):
+                return 10**9
+
+            def get_current_memory_usage(self, device=None):
+                return 0.0
+
+            def supports_overlap_streams(self):
+                return False
+
+        self.assertFalse(_SingleQueue().supports_overlap_streams())
+
+
 class TestCudaDeviceMixin(CustomTestCase):
     """Tests for CUDA device operation defaults."""
 

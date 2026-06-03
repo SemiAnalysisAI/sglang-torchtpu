@@ -129,7 +129,9 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         self.assertTrue(args.disable_piecewise_cuda_graph)
         # enable_torch_compile is opt-in on TPU and must not be forced off.
         self.assertFalse(args.enable_torch_compile)
-        self.assertTrue(args.disable_overlap_schedule)
+        # Overlap is enabled on TPU via the thread-based path in
+        # scheduler_overlap_mixin; the platform must NOT force-disable it.
+        self.assertFalse(args.disable_overlap_schedule)
         self.assertEqual(args.mem_fraction_static, 0.40)
 
     def test_enable_torch_compile_preserved_when_opted_in(self):
