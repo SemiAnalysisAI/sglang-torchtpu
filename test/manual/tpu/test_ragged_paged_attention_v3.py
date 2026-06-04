@@ -88,12 +88,10 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         from sglang.srt.layers.attention.pallas.util import get_dtype_packing
 
         num_q_heads = num_q_heads if num_q_heads is not None else self.NUM_Q_HEADS
-        num_kv_heads = (
-            num_kv_heads if num_kv_heads is not None else self.NUM_KV_HEADS
-        )
-        assert num_q_heads % num_kv_heads == 0, (
-            "num_q_heads must be a multiple of num_kv_heads for GQA tests"
-        )
+        num_kv_heads = num_kv_heads if num_kv_heads is not None else self.NUM_KV_HEADS
+        assert (
+            num_q_heads % num_kv_heads == 0
+        ), "num_q_heads must be a multiple of num_kv_heads for GQA tests"
 
         for kv_len, q_len in seqs:
             assert kv_len >= q_len, "kv_len must include the new q_len tokens"
@@ -102,9 +100,9 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
                 f"({self.PAGES_PER_SEQ * self.PAGE_SIZE})"
             )
         num_seqs = len(seqs)
-        assert num_seqs * self.PAGES_PER_SEQ <= self.TOTAL_NUM_PAGES, (
-            "too many sequences for the configured page table"
-        )
+        assert (
+            num_seqs * self.PAGES_PER_SEQ <= self.TOTAL_NUM_PAGES
+        ), "too many sequences for the configured page table"
 
         dtype = jnp.bfloat16
         total_q_tokens = sum(q for _, q in seqs)
@@ -155,12 +153,8 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
                 rel_page = abs_pos // self.PAGE_SIZE
                 slot = abs_pos % self.PAGE_SIZE
                 abs_page = int(page_indices_2d[seq_idx, rel_page])
-                ref_kpages = ref_kpages.at[abs_page, slot].set(
-                    new_k[q_offset + tok]
-                )
-                ref_vpages = ref_vpages.at[abs_page, slot].set(
-                    new_v[q_offset + tok]
-                )
+                ref_kpages = ref_kpages.at[abs_page, slot].set(new_k[q_offset + tok])
+                ref_vpages = ref_vpages.at[abs_page, slot].set(new_v[q_offset + tok])
             q_offset += q_len
 
         # Fused/packed KV cache for the kernel, built from the *pre-write*
@@ -197,9 +191,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             [i * self.PAGES_PER_SEQ * self.PAGE_SIZE for i in range(num_seqs + 1)],
             dtype=jnp.int32,
         )
-        page_indices_flat = jnp.asarray(
-            page_indices_2d.reshape(-1), dtype=jnp.int32
-        )
+        page_indices_flat = jnp.asarray(page_indices_2d.reshape(-1), dtype=jnp.int32)
         ref_page_indices = jnp.asarray(page_indices_2d, dtype=jnp.int32)
 
         return {
@@ -306,9 +298,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         """GQA: num_q_heads=8, num_kv_heads=2 (group=4). Verifies the
         kernel's Q-heads-per-KV-head replication matches the reference's
         ``jnp.repeat(..., num_query_per_kv, axis=1)`` path."""
-        inputs = self._build_inputs(
-            [(33, 8)], num_q_heads=8, num_kv_heads=2
-        )
+        inputs = self._build_inputs([(33, 8)], num_q_heads=8, num_kv_heads=2)
         self._run_and_compare(inputs, distribution=(0, 0, 1))
 
     def test_decode_sliding_window(self):
@@ -316,18 +306,14 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         prefix tokens (plus the new decode token) are attended to.
         Hits the sliding-window precise-skipping path in the kernel."""
         inputs = self._build_inputs([(33, 1)])
-        self._run_and_compare(
-            inputs, distribution=(1, 1, 1), sliding_window=8
-        )
+        self._run_and_compare(inputs, distribution=(1, 1, 1), sliding_window=8)
 
     def test_decode_soft_cap(self):
         """soft_cap rescales logits with tanh before softmax. Verifies the
         kernel's logit-cap path matches the reference's
         ``soft_cap * jnp.tanh(attn / soft_cap)``."""
         inputs = self._build_inputs([(33, 1)])
-        self._run_and_compare(
-            inputs, distribution=(1, 1, 1), soft_cap=30.0
-        )
+        self._run_and_compare(inputs, distribution=(1, 1, 1), soft_cap=30.0)
 
     def test_mixed_decode_and_extend(self):
         """One decode seq (q=1) + one extend seq (q=8) in the same batch.

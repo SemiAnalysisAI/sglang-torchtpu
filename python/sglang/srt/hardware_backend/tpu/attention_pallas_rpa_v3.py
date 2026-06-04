@@ -221,9 +221,9 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
 
         # cu_kv_lens[i] = i * pages_per_seq * page_size so the kernel addresses
         # ``page_indices[i * pages_per_seq + j]`` for token j of seq i.
-        cu_kv_lens = torch.arange(
-            bs + 1, dtype=torch.int32, device=device
-        ) * (pages_per_seq * page_size)
+        cu_kv_lens = torch.arange(bs + 1, dtype=torch.int32, device=device) * (
+            pages_per_seq * page_size
+        )
 
         per_seq = req_to_token[req_pool_indices]  # [bs, max_ctx]
         # ``req_to_token.shape[1]`` may not be an exact multiple of

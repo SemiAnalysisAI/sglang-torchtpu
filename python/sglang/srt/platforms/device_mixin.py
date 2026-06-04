@@ -133,6 +133,23 @@ class DeviceMixin:
         return self._enum == PlatformEnum.OOT
 
     # ------------------------------------------------------------------
+    # Capability queries
+    # ------------------------------------------------------------------
+
+    def supports_overlap_streams(self) -> bool:
+        """Whether overlap scheduling should use CUDA-style forward/copy/schedule
+        streams.
+
+        True for backends with real multi-stream execution (CUDA/ROCm/...).
+        A platform whose runtime serialises all device work on a single queue
+        (so cross-stream ordering is a no-op and a non-default stream only
+        relabels async-copy fences) should return False: overlap there comes
+        from async dispatch plus a scoped completion event, not streams. See
+        ``Scheduler.init_overlap``.
+        """
+        return True
+
+    # ------------------------------------------------------------------
     # Active methods — core calls these through current_platform.
     # OOT implementations take effect immediately.
     # ------------------------------------------------------------------

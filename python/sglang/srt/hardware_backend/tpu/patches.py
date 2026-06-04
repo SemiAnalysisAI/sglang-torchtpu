@@ -108,6 +108,32 @@ def _prepare_tpu_env(world_size: int = 1) -> None:
     )
 
 
+_aten_fallbacks_registered = False
+
+
+def _register_aten_fallbacks() -> None:
+    """Register Python fallbacks for ATen ops not yet implemented in torch_tpu.
+
+    These should eventually move into torch_tpu's C++ kernel set (see
+    torch_tpu/ops/* for the registration pattern). Kept here as a stopgap
+    until those land — each fallback is a pure-torch equivalent of the
+    missing op.
+    """
+    global _aten_fallbacks_registered
+    if _aten_fallbacks_registered:
+        return
+    _aten_fallbacks_registered = True
+
+    import torch
+
+    # aten::count_nonzero.dim_IntList — equivalent to (x != 0).sum over dims.
+    @torch.library.register_kernel("aten::count_nonzero.dim_IntList", "PrivateUse1")
+    def _count_nonzero_dim_intlist(self, dim):
+        return (self != 0).to(torch.int64).sum(dim=dim)
+
+    logger.info("Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList")
+
+
 _set_device_patched = False
 
 
@@ -589,4 +615,5 @@ def apply_tpu_patches(world_size: int = 1) -> None:
     _patch_req_to_token_pool_max_context_len()
     _patch_mha_kv_pool_for_rpa_v3()
     _prewarm_fused_moe()  # TODO(Qinghan): this will just be temporary
+    _register_aten_fallbacks()
     logger.info("TPU patches applied.")

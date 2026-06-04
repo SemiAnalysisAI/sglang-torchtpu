@@ -26,7 +26,7 @@ skips that step; the methods under test never touch ``self._op``.
 
 import types
 import unittest
-from typing import List, Optional
+from typing import Optional
 
 import torch
 
@@ -253,14 +253,13 @@ class TestPallasRpaV3MetadataLayoutCorners(CustomTestCase):
         meta = backend._build_metadata(fb)
 
         expected_pages_per_seq = max_ctx_raw // page_size  # 4
-        self.assertEqual(
-            tuple(meta.page_indices.shape), (bs * expected_pages_per_seq,)
-        )
+        self.assertEqual(tuple(meta.page_indices.shape), (bs * expected_pages_per_seq,))
         # cu_kv_lens stride must match the trimmed pages_per_seq, not the raw
         # max_ctx — otherwise the kernel's page-index addressing skews.
         stride = expected_pages_per_seq * page_size
         expected_cu_kv = (torch.arange(bs + 1) * stride).to(torch.int32)
         self.assertTrue(torch.equal(meta.cu_kv_lens, expected_cu_kv))
+
 
 if __name__ == "__main__":
     unittest.main()

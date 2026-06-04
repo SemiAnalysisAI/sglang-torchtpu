@@ -734,7 +734,9 @@ class HiSparseCoordinator:
     def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
-            _get_device_module().current_stream().wait_stream(self.decode_producer_stream)
+            _get_device_module().current_stream().wait_stream(
+                self.decode_producer_stream
+            )
         self.wait_for_pending_backup()
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
