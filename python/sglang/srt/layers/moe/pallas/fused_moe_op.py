@@ -171,8 +171,7 @@ def _fused_moe_jax(
     num_experts = w1.shape[0]
     out_dtype = hidden_states.dtype
 
-    # Pad the TOKEN dimension up-front instead of padding the gathered LHS
-    # after the permute. gmm_v2 needs the routed-row count ``m*topk`` to be a
+    # gmm_v2 needs the routed-row count ``m*topk`` to be a
     # multiple of the bf16 sublane (16). Padding the *input* tokens here keeps
     # the permute/gather operating on an already-aligned, fixed-bucket shape
     # and removes the post-gather ``jnp.pad`` + ``group_sizes`` scatter that
