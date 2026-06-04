@@ -171,6 +171,26 @@ def _fused_moe_jax(
     num_experts = w1.shape[0]
     out_dtype = hidden_states.dtype
 
+    # gmm_v2 needs the routed-row count ``m*topk`` to be a
+    # multiple of the bf16 sublane (16). Padding the *input* tokens here keeps
+    # the permute/gather operating on an already-aligned, fixed-bucket shape
+    # and removes the post-gather ``jnp.pad`` + ``group_sizes`` scatter that
+    # XLA was offloading to the SparseCore (and crashing on). Pad tokens route
+    # to expert 0 with zero weight, so they contribute nothing to any real
+    # token and are sliced off at the very end.
+    m_orig = m
+    TOKEN_ALIGN = (
+        16  # token bucket; m_pad % 16 == 0 => (m_pad*topk) % 16 == 0 for any topk
+    )
+    m_pad = ((m + TOKEN_ALIGN - 1) // TOKEN_ALIGN) * TOKEN_ALIGN
+    if m_pad != m:
+        hidden_states = jnp.pad(hidden_states, ((0, m_pad - m), (0, 0)))
+        topk_ids = jnp.pad(topk_ids, ((0, m_pad - m), (0, 0)))  # pad -> expert 0
+        topk_weights = jnp.pad(
+            topk_weights, ((0, m_pad - m), (0, 0))
+        )  # pad -> weight 0
+        m = m_pad
+
     # Routing: build a permutation that puts rows of hidden_states in
     # expert-major order so a single grouped-matmul covers GMM1 / GMM2.
     topk_ids_flat = topk_ids.reshape(-1).astype(jnp.int32)  # [m*topk]
@@ -186,34 +206,7 @@ def _fused_moe_jax(
         axis=0
     )
 
-    # GMM1: gather rows then expert-batched matmul.
     x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
-
-    # TODO: (Qinghan) check the performance
-    # gmm_v2 requires the LHS row dim to be a multiple of the sublane
-    # tiling. The hard bound is ``size_m % size_lhs_sublane == 0`` (16
-    # for bf16 on TPU v7); the reshape that enforces it lives at
-    # ``gmm_v2.py:624-625`` (steady-state) and ``zero_out_start``. Without
-    # the pad, ``m*topk=24``-style warmup shapes raise a Pallas
-    # ``ValueError`` at JAX trace time. We pad to 32 (a multiple of 16
-    # that's also a multiple of 8, the f32/i32 sublane) following the
-    # sglang-jax wrapper at ``megablox_gmm_backend.gmm:66-73``; this
-    # over-pads by up to 16 rows in the rare misaligned-batch case but
-    # gives us dtype-agnostic safety. tpu-inference takes the opposite
-    # tack: it asserts ``% 16`` at the MoE entry and pushes alignment
-    # onto the runner-level token bucketing.
-    # ``M_total`` is static at JAX trace time, so the branch below
-    # collapses to a constant at trace time and produces no extra
-    # ops when the inputs are already aligned.
-    M_total = x_sorted.shape[0]
-    M_ALIGN = 32
-    pad_m = (-M_total) % M_ALIGN
-    if pad_m > 0:
-        x_sorted = jnp.pad(x_sorted, ((0, pad_m), (0, 0)))
-        # The padded rows are zero. Route them to the last expert so
-        # the kernel processes them (producing zero output rows we
-        # discard below); group_sizes shape stays [num_experts].
-        group_sizes = group_sizes.at[num_experts - 1].add(pad_m)
 
     gmm1_out = gmm_v2(
         lhs=x_sorted,
@@ -223,7 +216,7 @@ def _fused_moe_jax(
         rhs_bias=w1_bias,
         preferred_element_type=out_dtype,
         tile_info=_lookup_tile_info(x_sorted, w1, num_experts),
-    )  # [M_total+pad_m, 2 * n_intermediate]
+    )  # [m*topk, 2 * n_intermediate]
 
     # Gated activation.
     act_out = _activation(gmm1_out, activation_name)
@@ -237,11 +230,7 @@ def _fused_moe_jax(
         rhs_bias=w2_bias,
         preferred_element_type=out_dtype,
         tile_info=_lookup_tile_info(act_out, w2, num_experts),
-    )  # [M_total+pad_m, k]
-
-    # Drop the padded rows before un-permuting.
-    if pad_m > 0:
-        gmm2_out = gmm2_out[:M_total]
+    )  # [m*topk, k]
 
     # Un-permute back to token-major order and reduce across the top-k
     # experts with the routing weights.
@@ -249,7 +238,9 @@ def _fused_moe_jax(
     unsort_idx = jnp.argsort(argsort_idx)
     unsorted = gmm2_out[unsort_idx].reshape(m, topk, hidden_size)
     weights = topk_weights.reshape(m, topk, 1).astype(unsorted.dtype)
-    return (unsorted * weights).sum(axis=1).astype(out_dtype)
+    out = (unsorted * weights).sum(axis=1).astype(out_dtype)
+    # Slice off the padded tokens added at entry.
+    return out[:m_orig]
 
 
 def _build_fused_moe_op():
@@ -324,19 +315,6 @@ def _build_fused_moe_op():
 
     _PALLAS_MOE_OP = custom_op
     return custom_op
-
-
-def prewarm_fused_moe_op(*, topk: int, activation: str) -> None:
-    """Ensure the fused-MoE custom op is registered before dynamo traces it.
-
-    ``topk`` and ``activation`` are accepted for parity with the call site
-    (``tpu_platform.py``'s pre-warm loop iterates over distinct combos),
-    but the op itself is a singleton — the JAX trace cache inside
-    ``JaxCallable`` handles per-(topk, activation, shape, dtype)
-    specialisation on first invocation.
-    """
-    del topk, activation  # used purely to scope the loop in the caller
-    _build_fused_moe_op()
 
 
 def fused_moe_call(
