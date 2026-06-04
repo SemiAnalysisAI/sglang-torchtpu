@@ -588,5 +588,5 @@ def apply_tpu_patches(world_size: int = 1) -> None:
     _patch_support_triton_for_tpu()
     _patch_req_to_token_pool_max_context_len()
     _patch_mha_kv_pool_for_rpa_v3()
-    _prewarm_fused_moe()
+    _prewarm_fused_moe()  # TODO(Qinghan): this will just be temporary
     logger.info("TPU patches applied.")
