@@ -206,8 +206,6 @@ def _fused_moe_jax(
         axis=0
     )
 
-    # GMM1: gather rows then expert-batched matmul. ``m`` was padded so that
-    # ``m*topk`` is sublane-aligned, so x_sorted needs no further padding.
     x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
 
     gmm1_out = gmm_v2(
