@@ -7,12 +7,8 @@ The ``gmm_v2`` kernel is vendored from sglang-jax (which adapts the upstream
 load the rest of SGLang.
 """
 
-from sglang.srt.layers.moe.pallas.fused_moe_op import (
-    fused_moe_call,
-    prewarm_fused_moe_op,
-)
+from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 
 __all__ = [
     "fused_moe_call",
-    "prewarm_fused_moe_op",
 ]

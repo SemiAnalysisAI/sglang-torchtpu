@@ -13,11 +13,10 @@ The behaviour being guarded here:
     double-registration of the same op with a confusing error, so the
     module-level ``_PALLAS_MOE_OP`` singleton must short-circuit on
     subsequent calls.
-  * ``prewarm_fused_moe_op`` invokes the builder. The TPU platform
-    startup hook calls prewarm so the heavyweight JAX export happens
-    before dynamo tracing; if prewarm becomes a no-op, the first
-    ``forward_tpu`` call pays the full registration cost (and may
-    graph-break inside dynamo).
+  * ``apply_tpu_patches`` (TPU backend init) invokes the builder via
+    ``_prewarm_fused_moe`` so the heavyweight JAX export happens before
+    dynamo tracing; if that hook becomes a no-op, the first ``forward_tpu``
+    call pays the full registration cost (and may graph-break inside dynamo).
 
 These tests require torch_tpu + JAX with a TPU backend visible to
 ``jax.devices()`` because ``_build_fused_moe_op`` does JAX export at
@@ -90,18 +89,20 @@ class TestPallasMoeOpIdempotency(CustomTestCase):
 
 @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
 class TestPallasMoePrewarmHook(CustomTestCase):
-    """``prewarm_fused_moe_op`` is called from the TPU platform startup
-    hook so the JAX export (~hundreds of ms) happens before the first
-    forward. The hook must actually invoke ``_build_fused_moe_op`` --
-    a silent no-op would defer registration to first inference and may
-    cause a dynamo graph break."""
+    """``apply_tpu_patches`` (TPU backend init) calls ``_prewarm_fused_moe``
+    so the JAX export (~hundreds of ms) happens before the first forward.
+    The hook must actually invoke ``_build_fused_moe_op`` -- a silent no-op
+    would defer registration to first inference and may cause a dynamo
+    graph break."""
 
     def test_prewarm_invokes_builder(self):
         import sglang.srt.layers.moe.pallas.fused_moe_op as fmop
+        from sglang.srt.hardware_backend.tpu import patches
 
         # Spy on ``_build_fused_moe_op`` without re-registering (which
         # would fail because torch.library has already accepted the op
-        # from prior test runs in this process).
+        # from prior test runs in this process). ``_prewarm_fused_moe``
+        # imports the builder lazily, so it picks up the patched attribute.
         original = fmop._build_fused_moe_op
         called = []
 
@@ -111,10 +112,10 @@ class TestPallasMoePrewarmHook(CustomTestCase):
 
         fmop._build_fused_moe_op = spy
         try:
-            fmop.prewarm_fused_moe_op(topk=8, activation="silu")
+            patches._prewarm_fused_moe()
             self.assertTrue(
                 called,
-                "prewarm_fused_moe_op did not invoke _build_fused_moe_op",
+                "_prewarm_fused_moe did not invoke _build_fused_moe_op",
             )
         finally:
             fmop._build_fused_moe_op = original

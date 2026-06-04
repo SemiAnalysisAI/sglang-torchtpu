@@ -319,19 +319,6 @@ def _build_fused_moe_op():
     return custom_op
 
 
-def prewarm_fused_moe_op(*, topk: int, activation: str) -> None:
-    """Ensure the fused-MoE custom op is registered before dynamo traces it.
-
-    ``topk`` and ``activation`` are accepted for parity with the call site
-    (``tpu_platform.py``'s pre-warm loop iterates over distinct combos),
-    but the op itself is a singleton — the JAX trace cache inside
-    ``JaxCallable`` handles per-(topk, activation, shape, dtype)
-    specialisation on first invocation.
-    """
-    del topk, activation  # used purely to scope the loop in the caller
-    _build_fused_moe_op()
-
-
 def fused_moe_call(
     *,
     hidden_states: torch.Tensor,
