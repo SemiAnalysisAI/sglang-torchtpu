@@ -4,14 +4,17 @@ import numpy as np
 import torch
 
 from sglang.srt.mem_cache.memory_pool import copy_all_layer_kv_cache_tiled
-from sglang.srt.speculative.spec_utils import assign_draft_cache_locs
+from sglang.srt.speculative.spec_utils import (
+    _assign_draft_cache_locs_torch,
+    _assign_req_to_token_pool_torch,
+    assign_draft_cache_locs,
+)
 from sglang.srt.utils import next_power_of_2
 
 BYTES_PER_TILE = 128
 
 
 class TestSpecUtils(unittest.TestCase):
-
     def setUp(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.data_ptrs = torch.zeros(2, 1, dtype=torch.uint64, device=self.device)
@@ -342,6 +345,183 @@ class TestSpecUtils(unittest.TestCase):
             )
         expected_out_cache_loc = torch.cat(expected)
         assert torch.allclose(trimmed, expected_out_cache_loc)
+
+
+class TestAssignDraftCacheLocs(unittest.TestCase):
+    """Verify _assign_draft_cache_locs_torch against a naive reference."""
+
+    @staticmethod
+    def _ref(
+        req_pool_indices,
+        req_to_token,
+        seq_lens,
+        out_cache_loc,
+        topk,
+        speculative_num_steps,
+        batch_size,
+    ):
+        """Naive per-request loop for page_size=1 or topk=1."""
+        copy_len = topk * speculative_num_steps
+        for pid in range(batch_size):
+            out_start = pid * copy_len
+            kv_start = int(seq_lens[pid].item())
+            row = int(req_pool_indices[pid].item())
+            for i in range(copy_len):
+                req_to_token[row, kv_start + i] = out_cache_loc[out_start + i]
+
+    def test_page_size_1_single(self):
+        """page_size=1, topk=1: simplest path."""
+        device = "cpu"
+        bs, pool_len, topk, steps = 1, 100, 1, 5
+        req_pool_indices = torch.tensor([0], dtype=torch.int32, device=device)
+        req_to_token = torch.zeros((bs, pool_len), dtype=torch.int32, device=device)
+        req_to_token[0, :7] = torch.tensor([4, 5, 6, 7, 8, 9, 10], device=device)
+        seq_lens = torch.tensor([7], dtype=torch.int32, device=device)
+        out_cache_loc = torch.arange(11, 11 + steps, device=device)
+
+        ref_table = req_to_token.clone()
+        ref_out = out_cache_loc.clone()
+        self._ref(req_pool_indices, ref_table, seq_lens, ref_out, topk, steps, bs)
+
+        got_table = req_to_token.clone()
+        got_out = out_cache_loc.clone()
+        _assign_draft_cache_locs_torch(
+            req_pool_indices,
+            got_table,
+            seq_lens,
+            None,
+            None,
+            got_out,
+            None,
+            None,
+            None,
+            0,
+            pool_len,
+            topk,
+            steps,
+            1,
+            bs,
+        )
+
+        torch.testing.assert_close(got_table, ref_table)
+        torch.testing.assert_close(got_out, ref_out)
+
+    def test_page_size_1_batch(self):
+        """page_size=1, topk=8, batch of 3."""
+        device = "cpu"
+        bs, pool_len, topk, steps = 3, 100, 8, 5
+        req_pool_indices = torch.arange(bs, dtype=torch.int32, device=device)
+        req_to_token = torch.zeros((bs, pool_len), dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([8, 7, 5], dtype=torch.int32, device=device)
+        total = bs * topk * steps
+        out_cache_loc = torch.arange(100, 100 + total, device=device)
+
+        ref_table = req_to_token.clone()
+        ref_out = out_cache_loc.clone()
+        self._ref(req_pool_indices, ref_table, seq_lens, ref_out, topk, steps, bs)
+
+        got_table = req_to_token.clone()
+        got_out = out_cache_loc.clone()
+        _assign_draft_cache_locs_torch(
+            req_pool_indices,
+            got_table,
+            seq_lens,
+            None,
+            None,
+            got_out,
+            None,
+            None,
+            None,
+            0,
+            pool_len,
+            topk,
+            steps,
+            1,
+            bs,
+        )
+
+        torch.testing.assert_close(got_table, ref_table)
+        torch.testing.assert_close(got_out, ref_out)
+
+    def test_empty_batch(self):
+        device = "cpu"
+        table = torch.full((4, 32), -1, dtype=torch.int32, device=device)
+        expected = table.clone()
+        out = torch.zeros(0, dtype=torch.int32, device=device)
+        _assign_draft_cache_locs_torch(
+            torch.zeros(0, dtype=torch.int32, device=device),
+            table,
+            torch.zeros(0, dtype=torch.int32, device=device),
+            None,
+            None,
+            out,
+            None,
+            None,
+            None,
+            0,
+            32,
+            1,
+            5,
+            1,
+            0,
+        )
+        torch.testing.assert_close(table, expected)
+
+
+class TestAssignReqToTokenPool(unittest.TestCase):
+    """Verify _assign_req_to_token_pool_torch against a naive reference loop."""
+
+    @staticmethod
+    def _ref(req_pool_indices, req_to_token, start_offset, end_offset, out_cache_loc):
+        pos = 0
+        for i in range(len(req_pool_indices)):
+            row = int(req_pool_indices[i])
+            for j in range(int(start_offset[i]), int(end_offset[i])):
+                req_to_token[row, j] = out_cache_loc[pos]
+                pos += 1
+
+    def _run_case(self, batch_size, pool_len, max_tokens, seed=0):
+        torch.manual_seed(seed)
+        num_rows = batch_size + 10
+        req_pool_indices = torch.randperm(num_rows)[:batch_size]
+        start_offset = torch.randint(0, pool_len - max_tokens, (batch_size,))
+        lengths = torch.randint(1, max_tokens + 1, (batch_size,))
+        end_offset = start_offset + lengths
+        out_cache_loc = torch.randint(
+            0, 10000, (int(lengths.sum()),), dtype=torch.int64
+        )
+
+        ref = torch.full((num_rows, pool_len), -1, dtype=torch.int64)
+        self._ref(req_pool_indices, ref, start_offset, end_offset, out_cache_loc)
+
+        got = torch.full((num_rows, pool_len), -1, dtype=torch.int64)
+        _assign_req_to_token_pool_torch(
+            req_pool_indices, got, start_offset, end_offset, out_cache_loc, batch_size
+        )
+        torch.testing.assert_close(got, ref)
+
+    def test_single_request(self):
+        self._run_case(batch_size=1, pool_len=128, max_tokens=10)
+
+    def test_batch(self):
+        self._run_case(batch_size=16, pool_len=256, max_tokens=31)
+
+    def test_large_start_offset(self):
+        """Regression: dst_index must be clamped to avoid OOB."""
+        self._run_case(batch_size=8, pool_len=64, max_tokens=15, seed=42)
+
+    def test_empty_batch(self):
+        table = torch.full((4, 32), -1, dtype=torch.int64)
+        expected = table.clone()
+        _assign_req_to_token_pool_torch(
+            torch.zeros(0, dtype=torch.long),
+            table,
+            torch.zeros(0, dtype=torch.long),
+            torch.zeros(0, dtype=torch.long),
+            torch.zeros(0, dtype=torch.int64),
+            0,
+        )
+        torch.testing.assert_close(table, expected)
 
 
 if __name__ == "__main__":

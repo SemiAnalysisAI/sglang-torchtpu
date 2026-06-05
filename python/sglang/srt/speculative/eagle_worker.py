@@ -56,7 +56,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
-    assign_draft_cache_locs,
+    assign_draft_cache_locs_func,
     draft_tp_context,
     fast_topk,
     generate_token_bitmask,
@@ -75,7 +75,6 @@ from sglang.srt.utils import (
     is_npu,
     is_tpu,
     log_info_on_rank0,
-    next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
@@ -690,42 +689,23 @@ class EAGLEWorker(TpModelWorker):
             duplicate_cache_len = 0
             source_cache_loc, target_cache_loc, last_page_lens_cumsum = None, None, None
 
-        if _is_tpu:
-            if self.page_size != 1 or self.topk != 1:
-                raise NotImplementedError(
-                    "TPU EAGLE draft cache assignment currently supports only "
-                    f"page_size=1 and topk=1, got {self.page_size=} {self.topk=}."
-                )
-            offsets = torch.arange(
-                self.speculative_num_steps,
-                dtype=batch.seq_lens.dtype,
-                device=self.device,
-            )
-            batch.req_to_token_pool.req_to_token[
-                batch.req_pool_indices[:, None],
-                batch.seq_lens[:, None] + offsets[None, :],
-            ] = out_cache_loc.view(num_seqs, self.speculative_num_steps).to(
-                batch.req_to_token_pool.req_to_token.dtype
-            )
-        else:
-            assign_draft_cache_locs[(num_seqs,)](
-                batch.req_pool_indices,
-                batch.req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                self.extend_lens,
-                self.num_new_pages_per_topk,
-                out_cache_loc,
-                source_cache_loc,
-                target_cache_loc,
-                last_page_lens_cumsum,
-                duplicate_cache_len,
-                batch.req_to_token_pool.req_to_token.shape[1],
-                self.topk,
-                self.speculative_num_steps,
-                self.page_size,
-                next_power_of_2(num_seqs),
-                next_power_of_2(self.speculative_num_steps + self.page_size),
-            )
+        assign_draft_cache_locs_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            self.extend_lens,
+            self.num_new_pages_per_topk,
+            out_cache_loc,
+            source_cache_loc,
+            target_cache_loc,
+            last_page_lens_cumsum,
+            duplicate_cache_len,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            self.topk,
+            self.speculative_num_steps,
+            self.page_size,
+            num_seqs,
+        )
 
         if self.page_size > 1 and self.topk > 1:
             if duplicate_cache_len > 0:

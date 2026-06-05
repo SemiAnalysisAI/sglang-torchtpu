@@ -182,11 +182,7 @@ def _assign_req_to_token_pool_torch(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
-    """Pure-PyTorch implementation of assign_req_to_token_pool for TPU/XLA.
-
-    Avoids host-device syncs (no .item()) and data-dependent shapes
-    (no boolean indexing) that are incompatible with XLA.
-    """
+    """Pure-PyTorch implementation of assign_req_to_token_pool for TPU/XLA."""
     if batch_size == 0:
         return
     lengths = end_offset - start_offset
@@ -206,7 +202,9 @@ def _assign_req_to_token_pool_torch(
     src_index = (src_starts[:, None] + offsets[None, :]).clamp(
         max=out_cache_loc.numel() - 1
     )
-    dst_index = start_offset[:, None] + offsets[None, :]
+    dst_index = (start_offset[:, None] + offsets[None, :]).clamp(
+        max=req_to_token.shape[1] - 1
+    )
     row_index = req_pool_indices[:, None].expand(batch_size, max_len)
     # Use torch.where with scatter instead of boolean indexing to avoid
     # data-dependent shapes that force host-device sync on XLA.
@@ -356,6 +354,103 @@ def assign_draft_cache_locs(
                 indices,
                 mask=combined_mask,
             )
+
+
+def _assign_draft_cache_locs_torch(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_lens: torch.Tensor,
+    num_new_pages_per_topk: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    source_cache_loc: torch.Tensor,
+    target_cache_loc: torch.Tensor,
+    last_page_lens_cumsum: torch.Tensor,
+    duplicate_cache_len: int,
+    pool_len: int,
+    topk: int,
+    speculative_num_steps: int,
+    page_size: int,
+    batch_size: int,
+):
+    """Pure-PyTorch implementation of assign_draft_cache_locs for TPU/XLA.
+
+    Currently supports only page_size=1 or topk=1.
+    """
+    if batch_size == 0:
+        return
+
+    if page_size != 1 and topk != 1:
+        raise NotImplementedError(
+            "TPU assign_draft_cache_locs currently supports only "
+            f"page_size=1 or topk=1, got {page_size=} {topk=}."
+        )
+
+    device = req_to_token.device
+    copy_len = topk * speculative_num_steps
+    # out_cache_loc is laid out as (batch_size, copy_len)
+    offsets = torch.arange(copy_len, device=device, dtype=seq_lens.dtype)
+    rows = req_pool_indices[:, None]  # (bs, 1)
+    cols = seq_lens[:, None] + offsets[None, :]  # (bs, copy_len)
+    src = out_cache_loc.view(batch_size, copy_len).to(req_to_token.dtype)
+    req_to_token[rows, cols] = src
+
+
+def assign_draft_cache_locs_func(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_lens: torch.Tensor,
+    num_new_pages_per_topk: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    source_cache_loc: torch.Tensor,
+    target_cache_loc: torch.Tensor,
+    last_page_lens_cumsum: torch.Tensor,
+    duplicate_cache_len: int,
+    pool_len: int,
+    topk: int,
+    speculative_num_steps: int,
+    page_size: int,
+    batch_size: int,
+):
+    if _is_tpu:
+        _assign_draft_cache_locs_torch(
+            req_pool_indices,
+            req_to_token,
+            seq_lens,
+            extend_lens,
+            num_new_pages_per_topk,
+            out_cache_loc,
+            source_cache_loc,
+            target_cache_loc,
+            last_page_lens_cumsum,
+            duplicate_cache_len,
+            pool_len,
+            topk,
+            speculative_num_steps,
+            page_size,
+            batch_size,
+        )
+        return
+
+    assign_draft_cache_locs[(batch_size,)](
+        req_pool_indices,
+        req_to_token,
+        seq_lens,
+        extend_lens,
+        num_new_pages_per_topk,
+        out_cache_loc,
+        source_cache_loc,
+        target_cache_loc,
+        last_page_lens_cumsum,
+        duplicate_cache_len,
+        pool_len,
+        topk,
+        speculative_num_steps,
+        page_size,
+        next_power_of_2(batch_size),
+        next_power_of_2(speculative_num_steps + page_size),
+    )
 
 
 @triton.jit

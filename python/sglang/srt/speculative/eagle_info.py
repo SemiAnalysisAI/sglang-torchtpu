@@ -468,10 +468,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 else:
                     unfinished_accept_index.append(accept_index[i])
             req.spec_verify_ct += 1
-            num_correct_drafts_this_req = num_accept_tokens - 1
-            num_correct_drafts_list.append(num_correct_drafts_this_req)
-            req.spec_num_correct_drafts += num_correct_drafts_this_req
-            req.update_spec_correct_drafts_histogram(num_correct_drafts_this_req)
+            num_accepted_drafts = num_accept_tokens - 1
+            num_correct_drafts_list.append(num_accepted_drafts)
+            req.spec_num_correct_drafts += num_accepted_drafts
+            req.update_spec_correct_drafts_histogram(num_accepted_drafts)
 
         if has_finished:
             num_correct_drafts = (accept_index != -1).sum(dim=1) - 1
