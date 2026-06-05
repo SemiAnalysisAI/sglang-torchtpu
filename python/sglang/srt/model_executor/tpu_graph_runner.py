@@ -96,6 +96,18 @@ class TpuGraphRunner:
             model_runner.server_args.enable_torch_compile = False
             return
 
+        # Raise dynamo's recompile ceiling. torch.compile builds a fresh graph
+        # per distinct input shape, and the TPU backbone is hit with many: one
+        # per prefill token bucket ({16..4096}) plus the decode batch-size
+        # buckets. dynamo's default cache_size_limit=8 is far too low — under
+        # fullgraph=True it trips FailOnRecompileLimitHit (killing the
+        # scheduler) as soon as warmup or a multi-shape benchmark walks past
+        # ~8 shapes. Match the CUDA / CPU / piecewise graph runners, which all
+        # set 1024 (see cuda_graph_runner.set_torch_compile_config).
+        torch._dynamo.config.accumulated_cache_size_limit = 1024
+        if hasattr(torch._dynamo.config, "cache_size_limit"):
+            torch._dynamo.config.cache_size_limit = 1024
+
         _register_tpu_compile_backend()
 
         wrapped = [
