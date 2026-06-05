@@ -22,7 +22,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-
 # Token buckets used by hardware_backend/tpu/compilation compile-shape buckets.
 # kernel_warmup covers 16/32/64 in DECODE mode only — and those entries have a
 # different dispatch key set (no AutogradPrivateUse1) so they don't satisfy the
@@ -52,6 +51,7 @@ def _unique_input_ids(n: int) -> list:
     input_ids.shape[0]=4096 is never compiled, defeating the warmup.
     """
     import random
+
     global _CALL_COUNTER
     with _COUNTER_LOCK:
         _CALL_COUNTER += 1
