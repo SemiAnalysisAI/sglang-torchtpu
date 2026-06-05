@@ -63,12 +63,6 @@ class PallasForwardMetadata:
 
 _PALLAS_RPA_OP = None
 
-# fp8 KV cache storage dtypes supported by the Pallas kernel. e4m3 is the
-# default/tested path (TPU's natural fp8 storage format); e5m2 is accepted for
-# parity. See the format trade-off: with per-tensor scaling, e4m3's extra
-# mantissa bit gives better accuracy for a KV cache.
-_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
-
 
 def _quantize_kv_to_fp8(
     t: torch.Tensor, scale: float, fp8_dtype: torch.dtype
@@ -198,9 +192,13 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # fp8 KV cache: when the resolved cache dtype is fp8, K/V are quantized
         # before the kernel call and the kernel dequantizes on read via
         # ``k_scale``/``v_scale``. ``None`` for bf16 caches (the default path).
+        # e4m3 is the default/tested fp8 storage format (TPU's natural one);
+        # e5m2 is accepted for parity. With per-tensor scaling, e4m3's extra
+        # mantissa bit gives better KV-cache accuracy.
         kv_cache_dtype = getattr(model_runner, "kv_cache_dtype", None)
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
         self.kv_cache_quant_dtype: Optional[torch.dtype] = (
-            kv_cache_dtype if kv_cache_dtype in _FP8_DTYPES else None
+            kv_cache_dtype if kv_cache_dtype in fp8_dtypes else None
         )
 
         self.forward_metadata: Optional[PallasForwardMetadata] = None
