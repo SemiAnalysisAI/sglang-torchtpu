@@ -174,6 +174,50 @@ def assign_req_to_token_pool(
         load_offset += BLOCK_SIZE
 
 
+def _assign_req_to_token_pool_torch(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    batch_size: int,
+):
+    """Pure-PyTorch implementation of assign_req_to_token_pool for TPU/XLA.
+
+    Avoids host-device syncs (no .item()) and data-dependent shapes
+    (no boolean indexing) that are incompatible with XLA.
+    """
+    if batch_size == 0:
+        return
+    lengths = end_offset - start_offset
+    # Use the KV pool width as a safe upper bound for max_len to avoid
+    # a host-device sync from torch.max().item().
+    max_len = min(
+        int(req_to_token.shape[1]),
+        int(out_cache_loc.numel()) if out_cache_loc.numel() > 0 else 0,
+    )
+    if max_len == 0:
+        return
+    offsets = torch.arange(
+        max_len, device=req_to_token.device, dtype=start_offset.dtype
+    )
+    mask = offsets[None, :] < lengths[:, None]  # (batch_size, max_len)
+    src_starts = torch.cumsum(lengths, dim=0) - lengths
+    src_index = (src_starts[:, None] + offsets[None, :]).clamp(
+        max=out_cache_loc.numel() - 1
+    )
+    dst_index = start_offset[:, None] + offsets[None, :]
+    row_index = req_pool_indices[:, None].expand(batch_size, max_len)
+    # Use torch.where with scatter instead of boolean indexing to avoid
+    # data-dependent shapes that force host-device sync on XLA.
+    vals = torch.where(
+        mask,
+        out_cache_loc[src_index].to(req_to_token.dtype),
+        req_to_token[row_index, dst_index],
+    )
+    req_to_token[row_index, dst_index] = vals
+
+
 def assign_req_to_token_pool_func(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -183,35 +227,14 @@ def assign_req_to_token_pool_func(
     batch_size: int,
 ):
     if _is_tpu:
-        if batch_size == 0:
-            return
-        lengths = end_offset - start_offset
-        # Use the KV pool width as a safe upper bound for max_len to avoid
-        # a host-device sync from torch.max().item().
-        max_len = min(
-            int(req_to_token.shape[1]),
-            int(out_cache_loc.numel()) if out_cache_loc.numel() > 0 else 0,
+        _assign_req_to_token_pool_torch(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            batch_size,
         )
-        if max_len == 0:
-            return
-        offsets = torch.arange(
-            max_len, device=req_to_token.device, dtype=start_offset.dtype
-        )
-        mask = offsets[None, :] < lengths[:, None]  # (batch_size, max_len)
-        src_starts = torch.cumsum(lengths, dim=0) - lengths
-        src_index = (src_starts[:, None] + offsets[None, :]).clamp(
-            max=out_cache_loc.numel() - 1
-        )
-        dst_index = start_offset[:, None] + offsets[None, :]
-        row_index = req_pool_indices[:, None].expand(batch_size, max_len)
-        # Use torch.where with scatter instead of boolean indexing to avoid
-        # data-dependent shapes that force host-device sync on XLA.
-        vals = torch.where(
-            mask,
-            out_cache_loc[src_index].to(req_to_token.dtype),
-            req_to_token[row_index, dst_index],
-        )
-        req_to_token[row_index, dst_index] = vals
         return
 
     assign_req_to_token_pool[(batch_size,)](

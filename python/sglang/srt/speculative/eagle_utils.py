@@ -46,6 +46,35 @@ class TreeMaskMode(IntEnum):
     QLEN_ONLY_BITPACKING = 2
 
 
+def _build_tree_kernel_efficient_torch(
+    topk: int,
+    tree_mask_mode: TreeMaskMode,
+    num_verify_tokens: int,
+    bs: int,
+    device: torch.device,
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+):
+    """TPU-specific tree construction for EAGLE (topk=1 only)."""
+    assert (
+        topk == 1
+    ), f"TPU EAGLE tree construction currently supports topk=1, got {topk=}."
+    assert tree_mask_mode == TreeMaskMode.FULL_MASK
+    token_offsets = torch.arange(num_verify_tokens, device=device, dtype=torch.long)
+    positions.copy_((seq_lens[:, None] + token_offsets[None, :]).flatten())
+    retrieve_index.copy_(
+        torch.arange(bs * num_verify_tokens, device=device, dtype=torch.long).view(
+            bs, num_verify_tokens
+        )
+    )
+    if num_verify_tokens > 1:
+        retrieve_next_token[:, :-1] = torch.arange(
+            1, num_verify_tokens, device=device, dtype=torch.long
+        )
+
+
 def build_tree_kernel_efficient(
     bonus_tokens: torch.Tensor,
     parent_list: List[torch.Tensor],
@@ -121,21 +150,17 @@ def build_tree_kernel_efficient(
         )
 
     if _is_tpu:
-        assert (
-            topk == 1
-        ), f"TPU EAGLE tree construction currently supports topk=1, got {topk=}."
-        assert tree_mask_mode == TreeMaskMode.FULL_MASK
-        token_offsets = torch.arange(num_verify_tokens, device=device, dtype=torch.long)
-        positions.copy_((seq_lens[:, None] + token_offsets[None, :]).flatten())
-        retrieve_index.copy_(
-            torch.arange(bs * num_verify_tokens, device=device, dtype=torch.long).view(
-                bs, num_verify_tokens
-            )
+        _build_tree_kernel_efficient_torch(
+            topk,
+            tree_mask_mode,
+            num_verify_tokens,
+            bs,
+            device,
+            seq_lens,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
         )
-        if num_verify_tokens > 1:
-            retrieve_next_token[:, :-1] = torch.arange(
-                1, num_verify_tokens, device=device, dtype=torch.long
-            )
     elif _is_npu:
         torch.ops.npu.build_tree_kernel_efficient(
             parent_list.to(dtype=torch.int64),
@@ -174,6 +199,64 @@ def build_tree_kernel_efficient(
         retrieve_next_sibling,
         draft_tokens,
     )
+
+
+def _verify_tree_greedy_torch(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    target_predict: torch.Tensor,
+    topk: int,
+):
+    """TPU-specific greedy tree verification for EAGLE (topk=1 only)."""
+    assert (
+        topk == 1
+    ), f"TPU EAGLE greedy verification currently supports topk=1, got {topk=}."
+
+    bs, num_verify_tokens = candidates.shape
+    predicts[: bs * num_verify_tokens] = target_predict.flatten().to(predicts.dtype)
+    accept_index.fill_(-1)
+
+    if num_verify_tokens > 1:
+        matches = target_predict[:, :-1] == candidates[:, 1:]
+    else:
+        matches = torch.empty((bs, 0), dtype=torch.bool, device=candidates.device)
+
+    # Vectorized accept-length computation (no Python loop, no .item()).
+    # Step 1: find first mismatch per row.
+    all_match = matches.all(dim=1)  # (bs,)
+    # argmax on int32 of ~matches finds the first True (= first mismatch).
+    # If all match, argmax returns 0 but all_match guards that case.
+    first_mismatch = (~matches).to(torch.int32).argmax(dim=1)  # (bs,)
+    num_correct = torch.where(all_match, num_verify_tokens - 1, first_mismatch)  # (bs,)
+    accept_len = num_correct + 1  # (bs,)
+
+    # Step 2: clamp at first invalid (-1) retrieve_index entry.
+    # retrieve_index: (bs, num_verify_tokens).  Build a mask of valid
+    # positions (not -1) and find the first invalid one per row.
+    ri_valid = retrieve_index != -1  # (bs, num_verify_tokens)
+    # For each row, check if any position up to accept_len is invalid.
+    col_idx = torch.arange(
+        num_verify_tokens, device=candidates.device, dtype=torch.long
+    )  # (num_verify_tokens,)
+    within_accept = col_idx.unsqueeze(0) < accept_len.unsqueeze(1)  # (bs, N)
+    invalid_within = within_accept & ~ri_valid  # (bs, N)
+    has_invalid = invalid_within.any(dim=1)  # (bs,)
+    first_invalid = invalid_within.to(torch.int32).argmax(dim=1)  # (bs,)
+    accept_len = torch.where(has_invalid, first_invalid, accept_len)  # (bs,)
+    num_correct = accept_len - 1  # (bs,)
+
+    # Step 3: build accept_index and accept_token_num.
+    # Copy retrieve_index values where col < accept_len.
+    copy_mask = col_idx.unsqueeze(0) < accept_len.unsqueeze(1)  # (bs, N)
+    accept_index[:bs] = torch.where(
+        copy_mask,
+        retrieve_index.to(accept_index.dtype),
+        torch.tensor(-1, dtype=accept_index.dtype, device=candidates.device),
+    )
+    accept_token_num[:bs] = num_correct.to(accept_token_num.dtype)
 
 
 def verify_tree_greedy_func(
@@ -217,52 +300,13 @@ def verify_tree_greedy_func(
             target_predict=target_predict,
         )
     elif _is_tpu:
-        assert (
-            topk == 1
-        ), f"TPU EAGLE greedy verification currently supports topk=1, got {topk=}."
-
-        bs, num_verify_tokens = candidates.shape
-        predicts[: bs * num_verify_tokens] = target_predict.flatten().to(predicts.dtype)
-        accept_index.fill_(-1)
-
-        if num_verify_tokens > 1:
-            matches = target_predict[:, :-1] == candidates[:, 1:]
-        else:
-            matches = torch.empty((bs, 0), dtype=torch.bool, device=candidates.device)
-
-        # Vectorized accept-length computation (no Python loop, no .item()).
-        # Step 1: find first mismatch per row.
-        all_match = matches.all(dim=1)  # (bs,)
-        # argmax on int32 of ~matches finds the first True (= first mismatch).
-        # If all match, argmax returns 0 but all_match guards that case.
-        first_mismatch = (~matches).to(torch.int32).argmax(dim=1)  # (bs,)
-        num_correct = torch.where(
-            all_match, num_verify_tokens - 1, first_mismatch
-        )  # (bs,)
-        accept_len = num_correct + 1  # (bs,)
-
-        # Step 2: clamp at first invalid (-1) retrieve_index entry.
-        # retrieve_index: (bs, num_verify_tokens).  Build a mask of valid
-        # positions (not -1) and find the first invalid one per row.
-        ri_valid = retrieve_index != -1  # (bs, num_verify_tokens)
-        # For each row, check if any position up to accept_len is invalid.
-        col_idx = torch.arange(
-            num_verify_tokens, device=candidates.device, dtype=torch.long
-        )  # (num_verify_tokens,)
-        within_accept = col_idx.unsqueeze(0) < accept_len.unsqueeze(1)  # (bs, N)
-        invalid_within = within_accept & ~ri_valid  # (bs, N)
-        has_invalid = invalid_within.any(dim=1)  # (bs,)
-        first_invalid = invalid_within.to(torch.int32).argmax(dim=1)  # (bs,)
-        accept_len = torch.where(has_invalid, first_invalid, accept_len)  # (bs,)
-        num_correct = accept_len - 1  # (bs,)
-
-        # Step 3: build accept_index and accept_token_num.
-        # Copy retrieve_index values where col < accept_len.
-        copy_mask = col_idx.unsqueeze(0) < accept_len.unsqueeze(1)  # (bs, N)
-        accept_index[:bs] = torch.where(
-            copy_mask,
-            retrieve_index.to(accept_index.dtype),
-            torch.tensor(-1, dtype=accept_index.dtype, device=candidates.device),
+        _verify_tree_greedy_torch(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrieve_index,
+            target_predict,
+            topk,
         )
-        accept_token_num[:bs] = num_correct.to(accept_token_num.dtype)
     return predicts, accept_index, accept_token_num
