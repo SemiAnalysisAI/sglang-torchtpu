@@ -20,12 +20,13 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_tpu, next_power_of_2
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_tpu = is_tpu()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -181,6 +182,38 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
+    if _is_tpu:
+        if batch_size == 0:
+            return
+        lengths = end_offset - start_offset
+        # Use the KV pool width as a safe upper bound for max_len to avoid
+        # a host-device sync from torch.max().item().
+        max_len = min(
+            int(req_to_token.shape[1]),
+            int(out_cache_loc.numel()) if out_cache_loc.numel() > 0 else 0,
+        )
+        if max_len == 0:
+            return
+        offsets = torch.arange(
+            max_len, device=req_to_token.device, dtype=start_offset.dtype
+        )
+        mask = offsets[None, :] < lengths[:, None]  # (batch_size, max_len)
+        src_starts = torch.cumsum(lengths, dim=0) - lengths
+        src_index = (src_starts[:, None] + offsets[None, :]).clamp(
+            max=out_cache_loc.numel() - 1
+        )
+        dst_index = start_offset[:, None] + offsets[None, :]
+        row_index = req_pool_indices[:, None].expand(batch_size, max_len)
+        # Use torch.where with scatter instead of boolean indexing to avoid
+        # data-dependent shapes that force host-device sync on XLA.
+        vals = torch.where(
+            mask,
+            out_cache_loc[src_index].to(req_to_token.dtype),
+            req_to_token[row_index, dst_index],
+        )
+        req_to_token[row_index, dst_index] = vals
+        return
+
     assign_req_to_token_pool[(batch_size,)](
         req_pool_indices,
         req_to_token,
@@ -454,7 +487,7 @@ def get_target_cache_loc(
     )
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=(_is_npu or _is_tpu))
 def get_src_tgt_cache_loc(
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,
@@ -506,7 +539,7 @@ def filter_finished_cache_loc_kernel(
     )
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=(_is_npu or _is_tpu))
 def create_num_accept_tokens_filter(
     num_correct_drafts: torch.Tensor,
     unfinished_index_device: torch.Tensor,
@@ -540,7 +573,7 @@ def _select_top_k_tokens_first(
     return input_ids, hidden_states, topk_p, tree_info
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=(_is_npu or _is_tpu))
 def _select_top_k_tokens_later(
     i: int,
     topk_p: torch.Tensor,

@@ -73,6 +73,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_musa,
     is_npu,
+    is_tpu,
     log_info_on_rank0,
     next_power_of_2,
 )
@@ -80,6 +81,7 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_tpu = is_tpu()
 
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
@@ -88,7 +90,6 @@ logger = logging.getLogger(__name__)
 
 
 class EAGLEWorker(TpModelWorker):
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -155,8 +156,10 @@ class EAGLEWorker(TpModelWorker):
         else:
             ctx = empty_context()
         with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            ctx,
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -687,24 +690,42 @@ class EAGLEWorker(TpModelWorker):
             duplicate_cache_len = 0
             source_cache_loc, target_cache_loc, last_page_lens_cumsum = None, None, None
 
-        assign_draft_cache_locs[(num_seqs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            self.extend_lens,
-            self.num_new_pages_per_topk,
-            out_cache_loc,
-            source_cache_loc,
-            target_cache_loc,
-            last_page_lens_cumsum,
-            duplicate_cache_len,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            self.topk,
-            self.speculative_num_steps,
-            self.page_size,
-            next_power_of_2(num_seqs),
-            next_power_of_2(self.speculative_num_steps + self.page_size),
-        )
+        if _is_tpu:
+            if self.page_size != 1 or self.topk != 1:
+                raise NotImplementedError(
+                    "TPU EAGLE draft cache assignment currently supports only "
+                    f"page_size=1 and topk=1, got {self.page_size=} {self.topk=}."
+                )
+            offsets = torch.arange(
+                self.speculative_num_steps,
+                dtype=batch.seq_lens.dtype,
+                device=self.device,
+            )
+            batch.req_to_token_pool.req_to_token[
+                batch.req_pool_indices[:, None],
+                batch.seq_lens[:, None] + offsets[None, :],
+            ] = out_cache_loc.view(num_seqs, self.speculative_num_steps).to(
+                batch.req_to_token_pool.req_to_token.dtype
+            )
+        else:
+            assign_draft_cache_locs[(num_seqs,)](
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                self.extend_lens,
+                self.num_new_pages_per_topk,
+                out_cache_loc,
+                source_cache_loc,
+                target_cache_loc,
+                last_page_lens_cumsum,
+                duplicate_cache_len,
+                batch.req_to_token_pool.req_to_token.shape[1],
+                self.topk,
+                self.speculative_num_steps,
+                self.page_size,
+                next_power_of_2(num_seqs),
+                next_power_of_2(self.speculative_num_steps + self.page_size),
+            )
 
         if self.page_size > 1 and self.topk > 1:
             if duplicate_cache_len > 0:
@@ -718,7 +739,7 @@ class EAGLEWorker(TpModelWorker):
             ]
 
         batch.out_cache_loc = out_cache_loc
-        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
         batch.return_hidden_states = False
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
@@ -785,6 +806,7 @@ class EAGLEWorker(TpModelWorker):
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
+                device=self.device,
             )
 
         (
@@ -1268,7 +1290,7 @@ class EAGLEWorker(TpModelWorker):
         return success, message
 
 
-@torch.compile(dynamic=True, disable=(_is_npu or _is_musa))
+@torch.compile(dynamic=True, disable=(_is_npu or _is_musa or _is_tpu))
 def get_last_loc_large_page_size_top_k_1(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,

@@ -44,7 +44,9 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
+from sglang.srt.utils import is_cuda, is_musa, is_tpu, next_power_of_2
+
+_is_tpu = is_tpu()
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -97,19 +99,21 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         return self.draft_token_num, self.draft_token_num
 
     @classmethod
-    def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
+    def create_idle_input(
+        cls, topk: int, spec_steps: int, num_verify_tokens: int, device="cuda"
+    ):
         return cls(
-            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
-            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
-            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
+            draft_token=torch.empty((0,), dtype=torch.long, device=device),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
+            positions=torch.empty((0,), dtype=torch.int64, device=device),
             retrieve_index=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_next_token=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_next_sibling=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_cum_len=None,
             topk=topk,
@@ -425,6 +429,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         predict_cpu = predict.tolist()
         has_finished = False
         think_end_id = batch.model_config.think_end_id
+        # Track per-request correct drafts from the CPU loop to avoid a
+        # separate num_correct_drafts.cpu() device sync later.
+        num_correct_drafts_list: List[int] = []
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
@@ -443,9 +450,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     try:
                         req.grammar.accept_token(id)
                     except ValueError as e:
-                        logger.info(
-                            f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                        )
+                        logger.info(f"{i=}, {req=}\n{accept_index=}\n{predict=}\n")
                         raise e
                     req.update_finish_state()
                 if req.finished():
@@ -463,9 +468,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 else:
                     unfinished_accept_index.append(accept_index[i])
             req.spec_verify_ct += 1
-            num_correct_drafts_this_req = (
-                sum(1 for idx in accept_index_row if idx != -1) - 1
-            )
+            num_correct_drafts_this_req = num_accept_tokens - 1
+            num_correct_drafts_list.append(num_correct_drafts_this_req)
             req.spec_num_correct_drafts += num_correct_drafts_this_req
             req.update_spec_correct_drafts_histogram(num_correct_drafts_this_req)
 
@@ -478,12 +482,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accept_tokens = predict[accept_index]
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
-        num_correct_drafts_cpu = num_correct_drafts.cpu()
-        num_accept_tokens_cpu = num_correct_drafts_cpu + 1
-        # FIXME: this `tolist()` fixes the numerical calculation consistency
-        # try to unify the tensor representation and list representation
-        num_correct_drafts_list = num_correct_drafts_cpu.tolist()
-        num_accept_tokens_list = num_accept_tokens_cpu.tolist()
+        # Derive CPU values from the loop above instead of device transfer.
+        num_accept_tokens_list = [n + 1 for n in num_correct_drafts_list]
+        num_accept_tokens_cpu = torch.tensor(
+            num_accept_tokens_list, dtype=batch.seq_lens_cpu.dtype
+        )
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
@@ -873,6 +876,42 @@ class EagleDraftExtendInput(SpecInput):
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
+    @staticmethod
+    def build_extend_after_decode_tpu_tensors(
+        input_ids: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_accept_tokens: torch.Tensor,
+        num_accept_tokens_cpu: List[int],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
+        if num_accept_tokens.numel() == 0:
+            return (
+                torch.empty_like(input_ids, dtype=torch.long),
+                torch.empty_like(num_accept_tokens, dtype=torch.int32),
+                num_accept_tokens,
+                num_accept_tokens_cpu,
+            )
+
+        # Build req_indices and local_offsets from CPU counts to avoid
+        # torch.repeat_interleave with device-tensor counts (forces XLA sync).
+        total_tokens = sum(num_accept_tokens_cpu)
+        req_indices_cpu = []
+        local_offsets_cpu = []
+        for i, n in enumerate(num_accept_tokens_cpu):
+            req_indices_cpu.extend([i] * n)
+            local_offsets_cpu.extend(range(n))
+        req_indices = torch.tensor(req_indices_cpu, device=device, dtype=torch.long)
+        local_offsets = torch.tensor(
+            local_offsets_cpu, device=device, dtype=seq_lens.dtype
+        )
+
+        positions = (
+            seq_lens[req_indices] - num_accept_tokens[req_indices] + local_offsets
+        ).to(torch.long)
+        cumsum = torch.cumsum(num_accept_tokens, dim=0)
+        bonus_tokens = input_ids[cumsum - 1].to(torch.int32)
+        return positions, bonus_tokens, num_accept_tokens, num_accept_tokens_cpu
+
     @classmethod
     def hidden_size_for(cls, worker) -> Optional[int]:
         """Extend-phase `hidden_states` width: target's `spec_hidden_size`,
@@ -940,11 +979,69 @@ class EagleDraftExtendInput(SpecInput):
         if batch.forward_mode.is_idle():
             return
 
+        if _is_tpu:
+            if len(self.seq_lens) == 0:
+                return
+            (
+                positions,
+                bonus_tokens,
+                num_accept_tokens,
+                num_accept_tokens_cpu,
+            ) = self.build_extend_after_decode_tpu_tensors(
+                self.input_ids,
+                self.seq_lens,
+                self.num_accept_tokens,
+                self.num_accept_tokens_cpu,
+                batch.device,
+            )
+            self.num_accept_tokens = num_accept_tokens
+            self.num_accept_tokens_cpu = num_accept_tokens_cpu
+        else:
+            num_accept_tokens = self.num_accept_tokens
+            num_accept_tokens_cpu = self.num_accept_tokens_cpu
+
+        if _is_tpu:
+            # Pad input_ids, positions, out_cache_loc, and hidden_states to
+            # a fixed size so XLA sees one compiled graph regardless of
+            # accept count.  The attention backend uses extend_seq_lens per
+            # request, and the logits processor picks the last real token
+            # per request via cumsum(extend_seq_lens), so padding tokens
+            # are processed but their outputs are ignored.
+            # Padding KV writes target slot 0 (the reserved padding row).
+            bs = len(self.seq_lens)
+            padded_len = (speculative_num_steps + 1) * bs
+            actual_len = self.input_ids.numel()
+            pad_size = max(padded_len - actual_len, 0)
+            if pad_size > 0:
+                self.input_ids = torch.nn.functional.pad(
+                    self.input_ids, (0, pad_size), value=0
+                )
+                positions = torch.nn.functional.pad(positions, (0, pad_size), value=0)
+                if batch.out_cache_loc is not None:
+                    batch.out_cache_loc = torch.nn.functional.pad(
+                        batch.out_cache_loc, (0, pad_size), value=0
+                    )
+                if self.hidden_states is not None:
+                    self.hidden_states = torch.nn.functional.pad(
+                        self.hidden_states,
+                        (0, 0, 0, pad_size),  # pad first dim only
+                        value=0,
+                    )
+            elif batch.out_cache_loc is not None:
+                oc_len = batch.out_cache_loc.numel()
+                target_len = self.input_ids.numel()
+                if oc_len > target_len:
+                    batch.out_cache_loc = batch.out_cache_loc[:target_len]
+                elif oc_len < target_len:
+                    batch.out_cache_loc = torch.nn.functional.pad(
+                        batch.out_cache_loc, (0, target_len - oc_len), value=0
+                    )
+
         # The kernel below populates `self.positions` and `self.bonus_tokens`;
         # the worker reads `self.bonus_tokens` to construct next iter's
         # `EagleDraftInput`.
         batch.input_ids = self.input_ids
-        batch.extend_lens = self.num_accept_tokens_cpu
+        batch.extend_lens = num_accept_tokens_cpu
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = self.seq_lens
         batch.seq_lens_cpu = self.seq_lens_cpu
@@ -954,16 +1051,22 @@ class EagleDraftExtendInput(SpecInput):
 
         self.capture_hidden_mode = CaptureHiddenMode.LAST
         self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
-        self.bonus_tokens = torch.empty_like(self.num_accept_tokens, dtype=torch.int32)
+        self.bonus_tokens = torch.empty_like(num_accept_tokens, dtype=torch.int32)
 
-        create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
-            batch.input_ids,
-            batch.seq_lens,
-            self.num_accept_tokens,
-            self.positions,
-            self.bonus_tokens,
-            next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
-        )
+        if _is_tpu:
+            self.positions[:actual_len] = positions[:actual_len].to(
+                self.positions.dtype
+            )
+            self.bonus_tokens.copy_(bonus_tokens.to(self.bonus_tokens.dtype))
+        else:
+            create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
+                batch.input_ids,
+                batch.seq_lens,
+                num_accept_tokens,
+                self.positions,
+                self.bonus_tokens,
+                next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
+            )
 
     def generate_attn_arg_prefill(
         self,
