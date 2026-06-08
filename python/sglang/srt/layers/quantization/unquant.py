@@ -61,6 +61,9 @@ if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.tuned_gemm import tgemm
 
+if _is_tpu:
+    from sglang.srt.layers.moe.pallas.fused_moe_op import _build_fused_moe_op
+
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
@@ -250,6 +253,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 new = old.transpose(1, 2).contiguous()
                 copy_or_rebind_param(layer, name, new)
                 old.untyped_storage().resize_(0)
+            # Register the Pallas fused-MoE custom op eagerly so the
+            # inspect.signature call inside jax_op() does not run during
+            # a torch.compile dynamo trace (dynamo cannot handle it).
+            # Mirrors the pattern used by the attention backend in
+            # attention_pallas_rpa_v3.py:__init__.
+            _build_fused_moe_op()
             return
 
         _should_use_aiter_moe = _use_aiter and (

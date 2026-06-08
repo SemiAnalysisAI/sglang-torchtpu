@@ -7,10 +7,11 @@ from typing import Tuple
 
 import torch
 
-from sglang.srt.utils import cpu_has_amx_support, get_compiler_backend, is_cpu, is_npu
+from sglang.srt.utils import cpu_has_amx_support, get_compiler_backend, is_cpu, is_npu, is_tpu
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_tpu = is_tpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_npu:
@@ -94,6 +95,8 @@ def apply_rotary_pos_emb_native(
     return q_embed, k_embed
 
 
+
+
 def apply_rotary_pos_emb_npu(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -130,6 +133,11 @@ def apply_rotary_pos_emb_npu(
 
 if _is_npu:
     apply_rotary_pos_emb = apply_rotary_pos_emb_npu
+elif _is_tpu:
+    # TorchTPU does not support dynamic compile yet; unwrap at load time
+    # so cross-module importers (e.g. vision.py) get the undecorated version.
+    apply_rotary_pos_emb_native = apply_rotary_pos_emb_native.__wrapped__
+    apply_rotary_pos_emb = apply_rotary_pos_emb_native
 elif _is_cpu and _is_cpu_amx_available:
     apply_rotary_pos_emb = torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu
 else:
