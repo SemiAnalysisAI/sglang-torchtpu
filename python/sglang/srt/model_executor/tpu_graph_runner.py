@@ -98,26 +98,61 @@ class TpuGraphRunner:
 
         _register_tpu_compile_backend()
 
-        wrapped = [
-            name
-            for name in self._COMPILE_TARGETS
-            if _wrap_with_tpu_compile(self.model, name)
-        ]
-        if not wrapped:
-            logger.warning(
-                "enable_torch_compile=True but %s exposes none of %s; "
-                "nothing compiled.",
-                type(self.model).__name__,
-                self._COMPILE_TARGETS,
-            )
-            return
+        # VL models set _compile_model_attrs to list the sub-modules
+        # whose forward should be compiled (e.g. the inner LLM decoder).
+        # The outer VL forward has data-dependent MM embedding code that
+        # is incompatible with fullgraph=True.
+        compile_attrs = getattr(self.model, "_compile_model_attrs", None)
 
-        logger.info(
-            "Wrapped %s.{%s} with torch.compile(backend='tpu', "
-            "fullgraph=True, dynamic=False) inside torch.no_grad.",
-            type(self.model).__name__,
-            ", ".join(wrapped),
-        )
+        if compile_attrs is not None:
+            wrapped = []
+            for attr in compile_attrs:
+                target = getattr(self.model, attr, None)
+                if target is None:
+                    logger.warning(
+                        "_compile_model_attrs lists %r but %s has no such "
+                        "attribute; skipping.",
+                        attr,
+                        type(self.model).__name__,
+                    )
+                    continue
+                for name in self._COMPILE_TARGETS:
+                    if _wrap_with_tpu_compile(target, name):
+                        wrapped.append(f"{attr}.{name}")
+            if not wrapped:
+                logger.warning(
+                    "enable_torch_compile=True but none of %s on %s "
+                    "could be compiled.",
+                    compile_attrs,
+                    type(self.model).__name__,
+                )
+                return
+            logger.info(
+                "Compiled %s.{%s} with torch.compile(backend='tpu', "
+                "fullgraph=True, dynamic=False).",
+                type(self.model).__name__,
+                ", ".join(wrapped),
+            )
+        else:
+            wrapped = [
+                name
+                for name in self._COMPILE_TARGETS
+                if _wrap_with_tpu_compile(self.model, name)
+            ]
+            if not wrapped:
+                logger.warning(
+                    "enable_torch_compile=True but %s exposes none of %s; "
+                    "nothing compiled.",
+                    type(self.model).__name__,
+                    self._COMPILE_TARGETS,
+                )
+                return
+            logger.info(
+                "Wrapped %s.{%s} with torch.compile(backend='tpu', "
+                "fullgraph=True, dynamic=False) inside torch.no_grad.",
+                type(self.model).__name__,
+                ", ".join(wrapped),
+            )
 
     def can_run(self, forward_batch) -> bool:
         """Always False — no captured graph to replay.
