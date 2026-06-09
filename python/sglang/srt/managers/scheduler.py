@@ -2901,7 +2901,9 @@ class Scheduler(
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
-                    batch.input_ids = batch_result.next_token_ids.to(torch.int64)
+                    batch.input_ids = batch_result.next_token_ids.to(
+                        device=batch.seq_lens.device, dtype=torch.int64
+                    )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
@@ -2914,7 +2916,9 @@ class Scheduler(
                 # PP intermediate ranks return None; DLLM returns a per-req list.
                 # Only the tensor case maps onto batch.input_ids as next-iter input.
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
-                    batch.input_ids = batch_result.next_token_ids.to(torch.int64)
+                    batch.input_ids = batch_result.next_token_ids.to(
+                        device=batch.seq_lens.device, dtype=torch.int64
+                    )
                 self.update_cache_from_scheduler(batch, batch_result)
 
             # These 2 values are needed for processing the output, but the values can be

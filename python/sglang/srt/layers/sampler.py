@@ -22,6 +22,7 @@ from sglang.srt.utils.common import (
     is_cuda,
     is_musa,
     is_npu,
+    is_tpu,
 )
 
 if is_cuda():
@@ -120,7 +121,14 @@ class Sampler(nn.Module):
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
-            batch_next_token_ids = torch.argmax(logits, -1)
+            if is_tpu() and not return_logprob:
+                # torch_tpu lowers argmax to a SparseCore program that can halt
+                # under high-concurrency serving. Keep greedy sampling on CPU
+                # for now; the scheduler moves the token ids back to TPU for
+                # the next decode step.
+                batch_next_token_ids = torch.argmax(logits.cpu(), -1)
+            else:
+                batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 original_logprobs = logprobs = torch.nn.functional.log_softmax(
                     logits, dim=-1

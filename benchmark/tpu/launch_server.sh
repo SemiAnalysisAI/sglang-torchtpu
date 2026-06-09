@@ -45,8 +45,15 @@
 #   DISABLE_OVERLAP_SCHEDULE=1
 #   TPU_COMPILE_TOKENS=            # optional token bucket override
 #   TPU_COMPILE_BS=                # optional bs bucket override
-#   TPU_COMPILE_GRANULARITY=model  # model | layer; layer is useful for
-#                                  # memory-tight very large models.
+#   TPU_COMPILE_GRANULARITY=model  # model | backbone | decode |
+#                                  # backbone_decode | layer | layer_decode |
+#                                  # mlp_decode | attn_decode | attn_mlp_decode.
+#                                  # Backbone modes leave lm_head/logits out
+#                                  # of the compiled graph, which is useful
+#                                  # for memory-tight very large models.
+#   SGLANG_TPU_COMPILE_LAYER_LIMIT=
+#                                  # optional debug cap for layer/submodule
+#                                  # compile modes.
 #   TORCH_COMPILE_MAX_BS=$MAX_RUNNING
 #   SGLANG_TPU_DECODE_PROCESS_INTERVAL=
 #                                  # passed as env when set.
@@ -136,6 +143,9 @@ if [[ -n "${SGLANG_TPU_DECODE_PROCESS_INTERVAL:-}" ]]; then
 fi
 if [[ -n "${TPU_COMPILE_GRANULARITY:-}" ]]; then
     export SGLANG_TPU_COMPILE_GRANULARITY="$TPU_COMPILE_GRANULARITY"
+fi
+if [[ -n "${SGLANG_TPU_COMPILE_LAYER_LIMIT:-}" ]]; then
+    export SGLANG_TPU_COMPILE_LAYER_LIMIT
 fi
 # Per-phase scheduler/worker timing dumps every ~5 s (cheap).
 export SGLANG_TPU_OVERLAP_PROFILE=${SGLANG_TPU_OVERLAP_PROFILE:-1}
@@ -255,6 +265,7 @@ echo "  max_total_tokens   = ${MAX_TOTAL_TOKENS:-<unset>}"
 echo "  tpu_compile_tokens = ${TPU_COMPILE_TOKENS:-<derived>}"
 echo "  tpu_compile_bs     = ${TPU_COMPILE_BS:-<derived>}"
 echo "  tpu_compile_granularity = $TPU_COMPILE_GRANULARITY"
+echo "  tpu_compile_layer_limit = ${SGLANG_TPU_COMPILE_LAYER_LIMIT:-<unset>}"
 echo "  mem_fraction_static= ${MEM_FRACTION_STATIC:-<sglang default>}"
 echo "  kv_cache_dtype     = ${KV_CACHE_DTYPE:-<sglang default (auto)>}"
 echo "  enable_torch_compile = $ENABLE_TORCH_COMPILE"

@@ -42,6 +42,16 @@ if TYPE_CHECKING:
 logger = get_logger("tpu_graph_runner")
 
 
+def _tpu_compile_layer_limit() -> int | None:
+    value = os.environ.get("SGLANG_TPU_COMPILE_LAYER_LIMIT")
+    if not value:
+        return None
+    limit = int(value)
+    if limit <= 0:
+        return None
+    return limit
+
+
 def _wrap_with_tpu_compile(model, attr_name: str) -> bool:
     """Replace ``model.<attr_name>`` with a torch.compile + no_grad wrapper.
 
@@ -89,6 +99,37 @@ def _wrap_forward_decode_with_tpu_compile(model) -> bool:
     return True
 
 
+def _wrap_backbone_with_tpu_compile(model, *, decode_only: bool = False) -> bool:
+    """Compile the inner language-model backbone, leaving logits eager."""
+    inner_model = getattr(model, "model", None)
+    fn = getattr(inner_model, "forward", None)
+    if fn is None:
+        return False
+    signature = inspect.signature(fn)
+    compiled = torch.compile(
+        torch.no_grad()(fn),
+        backend="tpu",
+        fullgraph=True,
+        dynamic=False,
+    )
+    compiled.__signature__ = signature
+    if decode_only:
+
+        @torch.no_grad()
+        def decode_only_backbone_forward(
+            input_ids, positions, forward_batch, *args, **kwargs
+        ):
+            if forward_batch.forward_mode.is_decode():
+                return compiled(input_ids, positions, forward_batch, *args, **kwargs)
+            return fn(input_ids, positions, forward_batch, *args, **kwargs)
+
+        decode_only_backbone_forward.__signature__ = signature
+        inner_model.forward = decode_only_backbone_forward
+    else:
+        inner_model.forward = compiled
+    return True
+
+
 def _wrap_decoder_layers_with_tpu_compile(
     model, *, decode_only: bool = False
 ) -> list[str]:
@@ -98,8 +139,11 @@ def _wrap_decoder_layers_with_tpu_compile(
     if layers is None:
         return []
 
+    layer_limit = _tpu_compile_layer_limit()
     wrapped: list[str] = []
     for idx, layer in enumerate(layers):
+        if layer_limit is not None and idx >= layer_limit:
+            break
         fn = getattr(layer, "forward", None)
         if fn is None:
             continue
@@ -129,6 +173,65 @@ def _wrap_decoder_layers_with_tpu_compile(
         else:
             layer.forward = compiled
         wrapped.append(f"model.layers.{idx}.forward")
+    return wrapped
+
+
+def _extract_forward_batch(args, kwargs):
+    forward_batch = kwargs.get("forward_batch")
+    if forward_batch is not None:
+        return forward_batch
+    for arg in args:
+        if hasattr(arg, "forward_mode"):
+            return arg
+    return None
+
+
+def _wrap_decoder_submodules_with_tpu_compile(
+    model, submodule_names: tuple[str, ...], *, decode_only: bool = False
+) -> list[str]:
+    """Compile selected decoder-layer submodule forwards in place."""
+    inner_model = getattr(model, "model", None)
+    layers = getattr(inner_model, "layers", None)
+    if layers is None:
+        return []
+
+    layer_limit = _tpu_compile_layer_limit()
+    wrapped: list[str] = []
+    for idx, layer in enumerate(layers):
+        if layer_limit is not None and idx >= layer_limit:
+            break
+        for submodule_name in submodule_names:
+            submodule = getattr(layer, submodule_name, None)
+            fn = getattr(submodule, "forward", None)
+            if fn is None:
+                continue
+            signature = inspect.signature(fn)
+            compiled = torch.compile(
+                torch.no_grad()(fn),
+                backend="tpu",
+                fullgraph=True,
+                dynamic=False,
+            )
+            compiled.__signature__ = signature
+            if decode_only:
+
+                @torch.no_grad()
+                def decode_only_submodule_forward(
+                    *args, __fn=fn, __compiled=compiled, **kwargs
+                ):
+                    forward_batch = _extract_forward_batch(args, kwargs)
+                    if (
+                        forward_batch is not None
+                        and forward_batch.forward_mode.is_decode()
+                    ):
+                        return __compiled(*args, **kwargs)
+                    return __fn(*args, **kwargs)
+
+                decode_only_submodule_forward.__signature__ = signature
+                submodule.forward = decode_only_submodule_forward
+            else:
+                submodule.forward = compiled
+            wrapped.append(f"model.layers.{idx}.{submodule_name}.forward")
     return wrapped
 
 
@@ -187,6 +290,8 @@ class TpuGraphRunner:
         torch._dynamo.config.accumulated_cache_size_limit = 1024
         if hasattr(torch._dynamo.config, "cache_size_limit"):
             torch._dynamo.config.cache_size_limit = 1024
+        if hasattr(torch._dynamo.config, "allow_unspec_int_on_nn_module"):
+            torch._dynamo.config.allow_unspec_int_on_nn_module = True
         # Fail loudly on compile-limit hits to expose latency cliffs early.
         if hasattr(torch._dynamo.config, "fail_on_recompile_limit_hit"):
             torch._dynamo.config.fail_on_recompile_limit_hit = True
@@ -200,6 +305,20 @@ class TpuGraphRunner:
             )
             compiled_fns = {"forward": getattr(self.model, "forward")}
             log_target = f"{type(self.model).__name__} decode"
+        elif compile_granularity == "backbone":
+            wrapped = (
+                ["model.forward"] if _wrap_backbone_with_tpu_compile(self.model) else []
+            )
+            compiled_fns = {"forward": getattr(self.model, "forward")}
+            log_target = f"{type(self.model).__name__} backbone"
+        elif compile_granularity == "backbone_decode":
+            wrapped = (
+                ["model.forward"]
+                if _wrap_backbone_with_tpu_compile(self.model, decode_only=True)
+                else []
+            )
+            compiled_fns = {"forward": getattr(self.model, "forward")}
+            log_target = f"{type(self.model).__name__} backbone decode"
         elif compile_granularity == "layer_decode":
             wrapped = _wrap_decoder_layers_with_tpu_compile(
                 self.model, decode_only=True
@@ -210,6 +329,24 @@ class TpuGraphRunner:
             wrapped = _wrap_decoder_layers_with_tpu_compile(self.model)
             compiled_fns = {"forward": getattr(self.model, "forward")}
             log_target = "decoder layers"
+        elif compile_granularity == "mlp_decode":
+            wrapped = _wrap_decoder_submodules_with_tpu_compile(
+                self.model, ("mlp",), decode_only=True
+            )
+            compiled_fns = {"forward": getattr(self.model, "forward")}
+            log_target = "decoder MLPs decode"
+        elif compile_granularity == "attn_decode":
+            wrapped = _wrap_decoder_submodules_with_tpu_compile(
+                self.model, ("self_attn",), decode_only=True
+            )
+            compiled_fns = {"forward": getattr(self.model, "forward")}
+            log_target = "decoder attention decode"
+        elif compile_granularity == "attn_mlp_decode":
+            wrapped = _wrap_decoder_submodules_with_tpu_compile(
+                self.model, ("self_attn", "mlp"), decode_only=True
+            )
+            compiled_fns = {"forward": getattr(self.model, "forward")}
+            log_target = "decoder attention+MLP decode"
         elif compile_granularity == "model":
             wrapped = [
                 name
@@ -225,7 +362,8 @@ class TpuGraphRunner:
         else:
             raise ValueError(
                 "SGLANG_TPU_COMPILE_GRANULARITY must be 'model', 'layer', "
-                "'decode', or 'layer_decode', "
+                "'decode', 'backbone', 'backbone_decode', 'layer_decode', "
+                "'mlp_decode', 'attn_decode', or 'attn_mlp_decode', "
                 f"got {compile_granularity!r}."
             )
 

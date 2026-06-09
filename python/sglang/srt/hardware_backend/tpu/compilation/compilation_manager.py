@@ -60,7 +60,14 @@ class CompilationManager:
         """Run precompilation for all valid extend and decode bucket shapes."""
         overall = time.perf_counter()
         compile_granularity = os.environ.get("SGLANG_TPU_COMPILE_GRANULARITY")
-        if compile_granularity in {"decode", "layer_decode"}:
+        if compile_granularity in {
+            "decode",
+            "backbone_decode",
+            "layer_decode",
+            "mlp_decode",
+            "attn_decode",
+            "attn_mlp_decode",
+        }:
             logger.info(
                 "[compilation manager] EXTEND skipped "
                 "(SGLANG_TPU_COMPILE_GRANULARITY=%s).",

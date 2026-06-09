@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import ceil_align, is_pin_memory_available, is_tpu
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -2410,7 +2410,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_allocated_len += 1
 
         # Update seq_lens after allocation
-        if self.enable_overlap:
+        if is_tpu() and self.seq_lens_cpu is not None:
+            # Keep the decode length increment off TPU. On torch_tpu, this small
+            # integer add can lower as a separate tt_jit_add SparseCore program
+            # and fail asynchronously at the next host sync.
+            self.seq_lens_cpu.add_(1)
+            self.seq_lens = self.seq_lens_cpu.to(self.device)
+            self.orig_seq_lens = self.seq_lens
+        elif self.enable_overlap:
             # Do not use in-place operations in the overlap mode
             self.seq_lens = self.seq_lens + 1
             self.seq_lens_cpu = self.seq_lens_cpu + 1

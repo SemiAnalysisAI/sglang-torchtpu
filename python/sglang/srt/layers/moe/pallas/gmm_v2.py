@@ -187,6 +187,31 @@ def _largest_aligned_divisor_at_most(size: int, limit: int, alignment: int) -> i
     return size
 
 
+def _largest_compact_scale_tile_n_at_most(
+    size_n: int,
+    limit: int,
+    scale_block_n: int,
+    alignment: int,
+) -> int:
+    """Return a legal N tile for compact block scales.
+
+    The compact scale layout stores the scale blocks for each 512 output-column
+    tile in a 128-slot record. A single RHS scale BlockSpec load can therefore
+    cover at most one 512-column output tile.
+    """
+
+    compact_output_tile_n = 4 * scale_block_n
+    limit = min(limit, compact_output_tile_n)
+    limit = min(size_n, limit)
+    for candidate in range(limit - (limit % alignment), 0, -alignment):
+        if size_n % candidate != 0:
+            continue
+        scale_tile_n = pl.cdiv(candidate, scale_block_n)
+        if alignment % scale_tile_n == 0:
+            return candidate
+    return scale_block_n
+
+
 @dataclasses.dataclass(frozen=True)
 class Dimensions:
     size_m: int
@@ -206,6 +231,7 @@ class InputConfigs:
     has_scale: bool = False
     packing: int = 1
     num_quant_blocks: int = 1
+    scale_size_n: int = 0
     scale_block_n: int = 1
 
 
@@ -318,12 +344,16 @@ def create_rhs_spec(index_map: IndexMaps, cfgs: GmmConfigs) -> RhsRef:
             index_map.rhs_bias_index_map,
         )
     if cfgs.rhs_cfgs.has_scale:
+        if cfgs.rhs_cfgs.scale_block_n != 1 and cfgs.rhs_cfgs.scale_size_n >= 128:
+            scale_tile_n = 128
+        else:
+            scale_tile_n = pl.cdiv(cfgs.tiles.tile_n, cfgs.rhs_cfgs.scale_block_n)
         rhs_scale_spec = pl.BlockSpec(
             (
                 None,
                 cfgs.num_quant_blocks_per_tile_k,
                 1,
-                pl.cdiv(cfgs.tiles.tile_n, cfgs.rhs_cfgs.scale_block_n),
+                scale_tile_n,
             ),
             index_map.rhs_scale_index_map,
         )
@@ -1121,8 +1151,12 @@ def make_gmm_configs(
         has_scale = True
         rhs_quant_dtype = rhs.dtype
         num_blocks = rhs_scale.shape[1]
+        scale_size_n = rhs_scale.shape[3]
         block_size = dims.size_k // num_blocks
-        scale_block_n = rhs.shape[2] // rhs_scale.shape[3]
+        if rhs_scale.shape[3] != rhs.shape[2] and rhs_scale.shape[3] % 128 == 0:
+            scale_block_n = 128
+        else:
+            scale_block_n = rhs.shape[2] // rhs_scale.shape[3]
         # When rhs is quantized, pack elements into uint32 along the K axis.
         # In kernel_main we bitcast [G, K, N] -> [G, K//packing, N] uint32,
         # and in inner_kernel we unpack back to the original dtype via
@@ -1132,6 +1166,7 @@ def make_gmm_configs(
         has_scale = False
         rhs_quant_dtype = None
         num_blocks = 1
+        scale_size_n = 0
         block_size = dims.size_k
         scale_block_n = 1
         rhs_packing = 1
@@ -1144,6 +1179,7 @@ def make_gmm_configs(
         has_scale=has_scale,
         packing=rhs_packing,
         num_quant_blocks=num_blocks,
+        scale_size_n=scale_size_n,
         scale_block_n=scale_block_n,
     )
 
@@ -1211,6 +1247,15 @@ def make_gmm_configs(
                 dims.size_n, tiles.tile_n, pltpu.get_tpu_info().num_lanes
             ),
         )
+    if rhs_cfgs.has_scale and rhs_cfgs.scale_block_n != 1:
+        compact_tile_n = _largest_compact_scale_tile_n_at_most(
+            dims.size_n,
+            tiles.tile_n,
+            rhs_cfgs.scale_block_n,
+            pltpu.get_tpu_info().num_lanes,
+        )
+        if compact_tile_n != tiles.tile_n:
+            tiles = dataclasses.replace(tiles, tile_n=compact_tile_n)
 
     return GmmConfigs(
         dims=dims,

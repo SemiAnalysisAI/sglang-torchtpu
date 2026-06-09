@@ -155,6 +155,9 @@ def _to_tpu_fp8_moe_block_scale_layout(
     out_size: int,
 ) -> torch.Tensor:
     """Convert block FP8 MoE scales to gmm_v2's RHS scale layout."""
+    scale_tile_n = 512
+    scale_block_n = 128
+    scale_tile_stride = 128
     scale = scale.to(torch.bfloat16)
     if scale.dim() == 4:
         if scale.shape[2] != 1:
@@ -177,21 +180,57 @@ def _to_tpu_fp8_moe_block_scale_layout(
             "TPU FP8 MoE block scale output blocks do not cover output channels: "
             f"{tuple(scale.shape)} for {out_size=}"
         )
-    return scale[:, :, None, :].contiguous()
-
-
-def _expand_tpu_fp8_moe_block_scale_for_pallas(
-    scale: torch.Tensor,
-    out_size: int,
-) -> torch.Tensor:
-    if scale.shape[-1] == out_size:
-        return scale
-    if out_size % scale.shape[-1] != 0:
-        raise ValueError(
-            "TPU FP8 MoE block scale output blocks do not cover output channels: "
-            f"{tuple(scale.shape)} for {out_size=}"
+    block_n = out_size // scale.shape[2]
+    use_compact_scales = (
+        get_bool_env_var("SGLANG_TPU_FP8_MOE_COMPACT_SCALES")
+        or (
+            get_bool_env_var("SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES")
+            and out_size == 5120
         )
-    return scale.repeat_interleave(out_size // scale.shape[-1], dim=-1)
+        or (
+            get_bool_env_var("SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES")
+            and out_size == 6144
+        )
+    )
+    if not use_compact_scales:
+        return scale.repeat_interleave(block_n, dim=2)[:, :, None, :].contiguous()
+    if block_n > scale_block_n:
+        if block_n % scale_block_n != 0:
+            raise ValueError(
+                "Unsupported TPU FP8 MoE block scale output block size: "
+                f"{block_n=} for {out_size=} and scale shape {tuple(scale.shape)}"
+            )
+        scale = scale.repeat_interleave(block_n // scale_block_n, dim=2)
+        block_n = scale_block_n
+    if block_n == scale_block_n and out_size > scale_tile_n:
+        if out_size % scale_tile_n != 0:
+            raise ValueError(
+                "TPU FP8 MoE compact scale layout requires output size divisible by "
+                f"{scale_tile_n}, got {out_size=}"
+            )
+        scale_blocks_per_tile = scale_tile_n // scale_block_n
+        num_tiles = out_size // scale_tile_n
+        expected_blocks = num_tiles * scale_blocks_per_tile
+        if scale.shape[2] != expected_blocks:
+            raise ValueError(
+                "TPU FP8 MoE compact scale block count mismatch: "
+                f"{tuple(scale.shape)} for {out_size=}, expected {expected_blocks}"
+            )
+        tiled_scale = torch.zeros(
+            scale.shape[0],
+            scale.shape[1],
+            num_tiles * scale_tile_stride,
+            dtype=scale.dtype,
+            device=scale.device,
+        )
+        for tile_id in range(num_tiles):
+            src_start = tile_id * scale_blocks_per_tile
+            dst_start = tile_id * scale_tile_stride
+            tiled_scale[:, :, dst_start : dst_start + scale_blocks_per_tile].copy_(
+                scale[:, :, src_start : src_start + scale_blocks_per_tile]
+            )
+        scale = tiled_scale
+    return scale[:, :, None, :].contiguous()
 
 
 def _scaled_fp8_quant_tpu_weight(
@@ -2061,14 +2100,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w2_scale = (
                 layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
             )
-            if self.block_quant:
-                w1_scale = _expand_tpu_fp8_moe_block_scale_for_pallas(
-                    w1_scale, layer.w13_weight.shape[-1]
-                )
-                w2_scale = _expand_tpu_fp8_moe_block_scale_for_pallas(
-                    w2_scale, layer.w2_weight.shape[-1]
-                )
-
             output = fused_moe_call(
                 hidden_states=x,
                 w1=layer.w13_weight,
