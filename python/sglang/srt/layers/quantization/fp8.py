@@ -150,17 +150,83 @@ def _to_tpu_fp8_moe_scale_layout(
     return scale[:, None, None, :].contiguous()
 
 
+def _to_tpu_fp8_moe_block_scale_layout(
+    scale: torch.Tensor,
+    out_size: int,
+) -> torch.Tensor:
+    """Convert block FP8 MoE scales to gmm_v2's RHS scale layout."""
+    scale = scale.to(torch.float32)
+    if scale.dim() == 4:
+        if scale.shape[2] != 1:
+            raise ValueError(
+                "Unsupported TPU FP8 MoE block scale shape: "
+                f"{tuple(scale.shape)} for {out_size=}"
+            )
+        return scale.contiguous()
+    if scale.dim() != 3:
+        raise ValueError(
+            "Unsupported TPU FP8 MoE block scale rank: "
+            f"{scale.dim()} for shape {tuple(scale.shape)}"
+        )
+
+    scale = scale.transpose(1, 2).contiguous()
+    if out_size % scale.shape[2] != 0:
+        raise ValueError(
+            "TPU FP8 MoE block scale output blocks do not cover output channels: "
+            f"{tuple(scale.shape)} for {out_size=}"
+        )
+    return scale[:, :, None, :].contiguous()
+
+
 def _scaled_fp8_quant_tpu_weight(
     weight: torch.Tensor, scale: Optional[torch.Tensor] = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-tensor FP8 quantization fallback for TPU weight post-processing."""
     fp8_max = torch.finfo(fp8_dtype).max
+    device = weight.device
+    weight = weight.detach().cpu()
     if scale is None:
         scale = weight.abs().max().to(torch.float32).clamp(min=1e-12) / fp8_max
     else:
-        scale = scale.to(torch.float32)
+        scale = scale.detach().cpu().to(torch.float32)
     qweight = (weight / scale).clamp(min=-fp8_max, max=fp8_max).to(fp8_dtype)
-    return qweight, scale
+    return qweight.to(device), scale.to(device)
+
+
+def _requantize_tpu_fp8_block_linear_weight(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    weight_block_size: List[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert checkpoint block-FP8 dense weights to TPU per-channel layout."""
+    block_n, block_k = weight_block_size
+    out_size, in_size = weight.shape
+    if out_size % block_n != 0 or in_size % block_k != 0:
+        raise ValueError(
+            "TPU FP8 block linear weights must be divisible by the checkpoint "
+            f"block size, got {tuple(weight.shape)=} and {weight_block_size=}."
+        )
+
+    fp8_max = torch.finfo(fp8_dtype).max
+    device = weight.device
+    weight = weight.detach().cpu()
+    weight_scale_inv = weight_scale_inv.detach().cpu().to(torch.float32)
+    weight = weight.to(torch.float32).reshape(
+        out_size // block_n, block_n, in_size // block_k, block_k
+    )
+    weight = weight * weight_scale_inv[:, None, :, None]
+    weight = weight.reshape(out_size, in_size)
+
+    weight_scale = weight.abs().amax(dim=1).clamp(min=1e-12) / fp8_max
+    qweight = (
+        (weight / weight_scale[:, None]).clamp(min=-fp8_max, max=fp8_max).to(fp8_dtype)
+    )
+    return qweight.t().contiguous().to(device), weight_scale.to(device)
+
+
+def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:
+    if old.untyped_storage().data_ptr() != new.untyped_storage().data_ptr():
+        old.untyped_storage().resize_(0)
 
 
 def _require_fp4_dtype():
@@ -401,7 +467,7 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
-        if _is_tpu and not self.block_quant and not self.use_mxfp8:
+        if _is_tpu and not self.use_mxfp8:
             from sglang.srt.hardware_backend.tpu.fp8_linear import (
                 prebuild_tpu_fp8_linear_op,
             )
@@ -548,6 +614,22 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if _is_tpu and not self.use_mxfp8:
+            old_weight = layer.weight.data
+            old_weight_scale_inv = layer.weight_scale_inv.data
+            weight, weight_scale = _requantize_tpu_fp8_block_linear_weight(
+                old_weight,
+                old_weight_scale_inv,
+                self.quant_config.weight_block_size,
+            )
+            copy_or_rebind_param(layer, "weight", weight)
+            copy_or_rebind_param(layer, "weight_scale", weight_scale)
+            del layer._parameters["weight_scale_inv"]
+            _free_replaced_storage(old_weight, layer.weight.data)
+            _free_replaced_storage(old_weight_scale_inv, layer.weight_scale.data)
+            layer.input_scale = None
+            return
+
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
@@ -830,6 +912,18 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight=layer.weight,
                 weight_scale=weight_scale,
                 input_scale=None,
+                bias=bias,
+            )
+
+        if _is_tpu and self.block_quant and not self.use_mxfp8:
+            from sglang.srt.hardware_backend.tpu.fp8_linear import (
+                apply_tpu_fp8_linear,
+            )
+
+            return apply_tpu_fp8_linear(
+                x=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
                 bias=bias,
             )
 
@@ -1749,24 +1843,44 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
         if _is_tpu:
-            if self.block_quant or self.use_mxfp8 or self.is_fp4_expert:
+            if self.use_mxfp8 or self.is_fp4_expert:
                 raise NotImplementedError(
-                    "TPU FP8 MoE currently supports non-block FP8 experts only."
+                    "TPU FP8 MoE currently supports FP8 and block-FP8 experts only."
                 )
             for name in ("w13_weight", "w2_weight"):
                 old = getattr(layer, name).data
                 new = old.transpose(1, 2).contiguous()
                 copy_or_rebind_param(layer, name, new)
-                old.untyped_storage().resize_(0)
+                _free_replaced_storage(old, getattr(layer, name).data)
 
-            w13_scale = _to_tpu_fp8_moe_scale_layout(
-                layer.w13_weight_scale.data, layer.w13_weight.shape[-1]
-            )
-            w2_scale = _to_tpu_fp8_moe_scale_layout(
-                layer.w2_weight_scale.data, layer.w2_weight.shape[-1]
-            )
-            copy_or_rebind_param(layer, "w13_weight_scale", w13_scale)
-            copy_or_rebind_param(layer, "w2_weight_scale", w2_scale)
+            if self.block_quant:
+                old_w13_scale = layer.w13_weight_scale_inv.data
+                old_w2_scale = layer.w2_weight_scale_inv.data
+                w13_scale = _to_tpu_fp8_moe_block_scale_layout(
+                    old_w13_scale,
+                    layer.w13_weight.shape[-1],
+                )
+                w2_scale = _to_tpu_fp8_moe_block_scale_layout(
+                    old_w2_scale,
+                    layer.w2_weight.shape[-1],
+                )
+                copy_or_rebind_param(layer, "w13_weight_scale_inv", w13_scale)
+                copy_or_rebind_param(layer, "w2_weight_scale_inv", w2_scale)
+                _free_replaced_storage(old_w13_scale, layer.w13_weight_scale_inv.data)
+                _free_replaced_storage(old_w2_scale, layer.w2_weight_scale_inv.data)
+            else:
+                old_w13_scale = layer.w13_weight_scale.data
+                old_w2_scale = layer.w2_weight_scale.data
+                w13_scale = _to_tpu_fp8_moe_scale_layout(
+                    old_w13_scale, layer.w13_weight.shape[-1]
+                )
+                w2_scale = _to_tpu_fp8_moe_scale_layout(
+                    old_w2_scale, layer.w2_weight.shape[-1]
+                )
+                copy_or_rebind_param(layer, "w13_weight_scale", w13_scale)
+                copy_or_rebind_param(layer, "w2_weight_scale", w2_scale)
+                _free_replaced_storage(old_w13_scale, layer.w13_weight_scale.data)
+                _free_replaced_storage(old_w2_scale, layer.w2_weight_scale.data)
 
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
@@ -1932,8 +2046,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 topk_ids=topk_ids,
                 topk=int(topk_ids.shape[-1]),
                 activation=moe_runner_config.activation,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
+                w1_scale=(
+                    layer.w13_weight_scale_inv
+                    if self.block_quant
+                    else layer.w13_weight_scale
+                ),
+                w2_scale=(
+                    layer.w2_weight_scale_inv
+                    if self.block_quant
+                    else layer.w2_weight_scale
+                ),
             )
             return StandardCombineInput(hidden_states=output)
 

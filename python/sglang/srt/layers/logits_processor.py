@@ -56,11 +56,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import is_npu, use_intel_amx_backend
+from sglang.srt.utils.common import is_npu, is_tpu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 
 @dataclasses.dataclass
@@ -987,7 +988,9 @@ class LogitsProcessor(nn.Module):
     def _copy_logits_to_buffer(
         self, logits: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> torch.Tensor:
-        if logits_metadata.next_token_logits_buffer is not None:
+        if _is_tpu:
+            logits = logits[:, : self.vocab_size]
+        elif logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer
             assert logits_buffer.dtype == torch.float
             logits_buffer.copy_(logits[:, : self.vocab_size])

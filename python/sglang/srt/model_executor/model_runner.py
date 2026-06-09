@@ -1232,6 +1232,52 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
             )
 
+    def _log_tpu_param_memory(self):
+        by_dtype = defaultdict(int)
+        by_top = defaultdict(int)
+        by_name = []
+        total = 0
+
+        for name, param in self.model.named_parameters():
+            size = param.numel() * param.element_size()
+            total += size
+            by_dtype[str(param.dtype)] += size
+            if name.startswith(("model.embed_tokens.", "lm_head.")):
+                top_name = ".".join(name.split(".")[:2])
+            elif name.startswith("model.layers."):
+                parts = name.split(".")
+                top_name = ".".join(parts[:4]) if len(parts) >= 4 else name
+            else:
+                top_name = name.split(".", 1)[0]
+            by_top[top_name] += size
+            by_name.append((size, name, tuple(param.shape), str(param.dtype)))
+
+        def fmt(num_bytes: int) -> str:
+            return f"{num_bytes / 1024**3:.3f} GiB"
+
+        logger.info("[TPU_PARAM_MEMORY] total=%s", fmt(total))
+        logger.info(
+            "[TPU_PARAM_MEMORY] by_dtype=%s",
+            ", ".join(
+                f"{dtype}:{fmt(size)}"
+                for dtype, size in sorted(by_dtype.items(), key=lambda x: -x[1])
+            ),
+        )
+        logger.info(
+            "[TPU_PARAM_MEMORY] top_modules=%s",
+            ", ".join(
+                f"{name}:{fmt(size)}"
+                for name, size in sorted(by_top.items(), key=lambda x: -x[1])[:40]
+            ),
+        )
+        logger.info(
+            "[TPU_PARAM_MEMORY] top_params=%s",
+            ", ".join(
+                f"{name}:{fmt(size)}:{shape}:{dtype}"
+                for size, name, shape, dtype in sorted(by_name, reverse=True)[:40]
+            ),
+        )
+
     def load_model(self):
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1397,6 +1443,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
+        if _is_tpu and os.getenv("SGLANG_TPU_DEBUG_PARAM_MEMORY") == "1":
+            self._log_tpu_param_memory()
         if self.server_args.debug_tensor_dump_output_folder is not None:
             dump_folder = self.server_args.debug_tensor_dump_output_folder
             if self.spec_algorithm.is_eagle():
@@ -2501,6 +2549,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
+            allocate_next_token_logits_buffer=not _is_tpu,
         )
         buffers.num_token_non_padded[...] = num_tokens
 

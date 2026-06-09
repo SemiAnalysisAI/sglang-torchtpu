@@ -140,7 +140,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     mrope_positions: torch.Tensor
     num_token_non_padded: torch.Tensor
     custom_mask: torch.Tensor
-    next_token_logits_buffer: torch.Tensor
+    next_token_logits_buffer: Optional[torch.Tensor]
     mamba_track_indices: Optional[torch.Tensor]
     mamba_track_mask: Optional[torch.Tensor]
     global_num_tokens_gpu: torch.Tensor
@@ -171,6 +171,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         ne_token_table: Optional[torch.Tensor] = None,
         is_hybrid_swa: bool = False,
         hc_hidden_size: Optional[int] = None,
+        allocate_next_token_logits_buffer: bool = True,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -190,9 +191,13 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
                 dtype=torch.bool,
             )
-            next_token_logits_buffer = torch.zeros(
-                (max_num_token, vocab_size),
-                dtype=torch.float,
+            next_token_logits_buffer = (
+                torch.zeros(
+                    (max_num_token, vocab_size),
+                    dtype=torch.float,
+                )
+                if allocate_next_token_logits_buffer
+                else None
             )
             mamba_track_indices = (
                 torch.zeros((max_bs,), dtype=torch.int64)
