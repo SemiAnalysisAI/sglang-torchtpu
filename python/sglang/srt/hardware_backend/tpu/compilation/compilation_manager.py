@@ -7,6 +7,7 @@ Iterates over shape buckets to compile:
 
 from __future__ import annotations
 
+import os
 import time
 from typing import TYPE_CHECKING, Callable
 
@@ -58,7 +59,15 @@ class CompilationManager:
     def precompile_all(self) -> None:
         """Run precompilation for all valid extend and decode bucket shapes."""
         overall = time.perf_counter()
-        self._precompile_extend()
+        compile_granularity = os.environ.get("SGLANG_TPU_COMPILE_GRANULARITY")
+        if compile_granularity in {"decode", "layer_decode"}:
+            logger.info(
+                "[compilation manager] EXTEND skipped "
+                "(SGLANG_TPU_COMPILE_GRANULARITY=%s).",
+                compile_granularity,
+            )
+        else:
+            self._precompile_extend()
         self._precompile_decode()
         logger.info(
             "[compilation manager] precompile_all done in %.1fs.",
@@ -210,7 +219,11 @@ def _materialize_out(out, forward_batch) -> None:
     if getattr(forward_batch.attn_backend, "requires_kv_sync_after_compile", False):
         pool = forward_batch.token_to_kv_pool
         for layer_id in range(pool.start_layer, pool.start_layer + pool.layer_num):
-            tensors.append(pool.get_fused_kv_buffer(layer_id))
+            # RPA-v3 updates the long-lived KV cache as a side effect. A tiny
+            # view is enough to fence that side effect for compilation warmup;
+            # syncing the full cache can require a large temporary buffer on
+            # memory-tight FP8 480B runs.
+            tensors.append(pool.get_fused_kv_buffer(layer_id).reshape(-1)[:1].clone())
 
     if not tensors:
         return

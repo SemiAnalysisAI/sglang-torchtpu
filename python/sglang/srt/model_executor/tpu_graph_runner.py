@@ -24,7 +24,8 @@ for that instance only — every existing call site in ``ModelRunner``
 from __future__ import annotations
 
 import inspect
-from typing import TYPE_CHECKING, Callable
+import os
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -61,6 +62,74 @@ def _wrap_with_tpu_compile(model, attr_name: str) -> bool:
     compiled.__signature__ = signature
     setattr(model, attr_name, compiled)
     return True
+
+
+def _wrap_forward_decode_with_tpu_compile(model) -> bool:
+    """Compile ``forward`` only for decode; run other modes eagerly."""
+    fn = getattr(model, "forward", None)
+    if fn is None:
+        return False
+    signature = inspect.signature(fn)
+    compiled = torch.compile(
+        torch.no_grad()(fn),
+        backend="tpu",
+        fullgraph=True,
+        dynamic=False,
+    )
+    compiled.__signature__ = signature
+
+    @torch.no_grad()
+    def decode_only_forward(input_ids, positions, forward_batch, *args, **kwargs):
+        if forward_batch.forward_mode.is_decode():
+            return compiled(input_ids, positions, forward_batch, *args, **kwargs)
+        return fn(input_ids, positions, forward_batch, *args, **kwargs)
+
+    decode_only_forward.__signature__ = signature
+    setattr(model, "forward", decode_only_forward)
+    return True
+
+
+def _wrap_decoder_layers_with_tpu_compile(
+    model, *, decode_only: bool = False
+) -> list[str]:
+    """Compile decoder-layer forwards in place and return wrapped names."""
+    inner_model = getattr(model, "model", None)
+    layers = getattr(inner_model, "layers", None)
+    if layers is None:
+        return []
+
+    wrapped: list[str] = []
+    for idx, layer in enumerate(layers):
+        fn = getattr(layer, "forward", None)
+        if fn is None:
+            continue
+        signature = inspect.signature(fn)
+        compiled = torch.compile(
+            torch.no_grad()(fn),
+            backend="tpu",
+            fullgraph=True,
+            dynamic=False,
+        )
+        compiled.__signature__ = signature
+        if decode_only:
+
+            @torch.no_grad()
+            def decode_only_layer_forward(
+                *args, __fn=fn, __compiled=compiled, **kwargs
+            ):
+                forward_batch = kwargs.get("forward_batch")
+                if forward_batch is None and len(args) >= 3:
+                    forward_batch = args[2]
+                if forward_batch is not None and forward_batch.forward_mode.is_decode():
+                    return __compiled(*args, **kwargs)
+                return __fn(*args, **kwargs)
+
+            decode_only_layer_forward.__signature__ = signature
+            layer.forward = decode_only_layer_forward
+        else:
+            layer.forward = compiled
+        wrapped.append(f"model.layers.{idx}.forward")
+    return wrapped
 
 
 class TpuGraphRunner:
@@ -124,11 +193,42 @@ class TpuGraphRunner:
 
         _register_tpu_compile_backend()
 
-        wrapped = [
-            name
-            for name in self._COMPILE_TARGETS
-            if _wrap_with_tpu_compile(self.model, name)
-        ]
+        compile_granularity = os.environ.get("SGLANG_TPU_COMPILE_GRANULARITY", "model")
+        if compile_granularity == "decode":
+            wrapped = (
+                ["forward"] if _wrap_forward_decode_with_tpu_compile(self.model) else []
+            )
+            compiled_fns = {"forward": getattr(self.model, "forward")}
+            log_target = f"{type(self.model).__name__} decode"
+        elif compile_granularity == "layer_decode":
+            wrapped = _wrap_decoder_layers_with_tpu_compile(
+                self.model, decode_only=True
+            )
+            compiled_fns = {"forward": getattr(self.model, "forward")}
+            log_target = "decoder layers decode"
+        elif compile_granularity == "layer":
+            wrapped = _wrap_decoder_layers_with_tpu_compile(self.model)
+            compiled_fns = {"forward": getattr(self.model, "forward")}
+            log_target = "decoder layers"
+        elif compile_granularity == "model":
+            wrapped = [
+                name
+                for name in self._COMPILE_TARGETS
+                if _wrap_with_tpu_compile(self.model, name)
+            ]
+            compiled_fns = {
+                name: getattr(self.model, name)
+                for name in wrapped
+                if name in self._COMPILE_TARGETS
+            }
+            log_target = type(self.model).__name__
+        else:
+            raise ValueError(
+                "SGLANG_TPU_COMPILE_GRANULARITY must be 'model', 'layer', "
+                "'decode', or 'layer_decode', "
+                f"got {compile_granularity!r}."
+            )
+
         if not wrapped:
             logger.warning(
                 "enable_torch_compile=True but %s exposes none of %s; "
@@ -139,19 +239,18 @@ class TpuGraphRunner:
             return
 
         logger.info(
-            "Wrapped %s.{%s} with torch.compile(backend='tpu', "
-            "fullgraph=True, dynamic=False) inside torch.no_grad.",
-            type(self.model).__name__,
+            "Wrapped %s {%s} with torch.compile(backend='tpu', "
+            "fullgraph=True, dynamic=False) inside torch.no_grad "
+            "(granularity=%s).",
+            log_target,
             ", ".join(wrapped),
+            compile_granularity,
         )
 
         from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
             TpuCompiledForwardShim,
         )
 
-        compiled_fns: dict[str, Callable] = {
-            name: getattr(self.model, name) for name in wrapped
-        }
         compiled_forward_shim = TpuCompiledForwardShim(
             model_runner, compiled_fns=compiled_fns
         ).install()

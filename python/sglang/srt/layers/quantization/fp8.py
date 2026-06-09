@@ -122,7 +122,7 @@ def _to_tpu_fp8_moe_scale_layout(
     out_size: int,
 ) -> torch.Tensor:
     """Convert per-expert FP8 MoE scales to gmm_v2's RHS scale layout."""
-    scale = scale.to(torch.float32)
+    scale = scale.to(torch.bfloat16)
     if scale.dim() == 1:
         scale = scale[:, None].expand(-1, out_size)
     elif scale.dim() == 2:
@@ -155,7 +155,7 @@ def _to_tpu_fp8_moe_block_scale_layout(
     out_size: int,
 ) -> torch.Tensor:
     """Convert block FP8 MoE scales to gmm_v2's RHS scale layout."""
-    scale = scale.to(torch.float32)
+    scale = scale.to(torch.bfloat16)
     if scale.dim() == 4:
         if scale.shape[2] != 1:
             raise ValueError(
@@ -177,9 +177,21 @@ def _to_tpu_fp8_moe_block_scale_layout(
             "TPU FP8 MoE block scale output blocks do not cover output channels: "
             f"{tuple(scale.shape)} for {out_size=}"
         )
-    scale_block_n = out_size // scale.shape[2]
-    scale = scale.repeat_interleave(scale_block_n, dim=2)
     return scale[:, :, None, :].contiguous()
+
+
+def _expand_tpu_fp8_moe_block_scale_for_pallas(
+    scale: torch.Tensor,
+    out_size: int,
+) -> torch.Tensor:
+    if scale.shape[-1] == out_size:
+        return scale
+    if out_size % scale.shape[-1] != 0:
+        raise ValueError(
+            "TPU FP8 MoE block scale output blocks do not cover output channels: "
+            f"{tuple(scale.shape)} for {out_size=}"
+        )
+    return scale.repeat_interleave(out_size // scale.shape[-1], dim=-1)
 
 
 def _scaled_fp8_quant_tpu_weight(
@@ -2041,6 +2053,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             topk_weights, topk_ids = mask_tpu_moe_non_local_experts(
                 topk_weights, topk_ids
             )
+            w1_scale = (
+                layer.w13_weight_scale_inv
+                if self.block_quant
+                else layer.w13_weight_scale
+            )
+            w2_scale = (
+                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
+            )
+            if self.block_quant:
+                w1_scale = _expand_tpu_fp8_moe_block_scale_for_pallas(
+                    w1_scale, layer.w13_weight.shape[-1]
+                )
+                w2_scale = _expand_tpu_fp8_moe_block_scale_for_pallas(
+                    w2_scale, layer.w2_weight.shape[-1]
+                )
 
             output = fused_moe_call(
                 hidden_states=x,
@@ -2050,16 +2077,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 topk_ids=topk_ids,
                 topk=int(topk_ids.shape[-1]),
                 activation=moe_runner_config.activation,
-                w1_scale=(
-                    layer.w13_weight_scale_inv
-                    if self.block_quant
-                    else layer.w13_weight_scale
-                ),
-                w2_scale=(
-                    layer.w2_weight_scale_inv
-                    if self.block_quant
-                    else layer.w2_weight_scale
-                ),
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
             )
             return StandardCombineInput(hidden_states=output)
 

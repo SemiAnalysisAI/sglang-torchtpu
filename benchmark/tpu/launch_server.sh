@@ -45,6 +45,8 @@
 #   DISABLE_OVERLAP_SCHEDULE=1
 #   TPU_COMPILE_TOKENS=            # optional token bucket override
 #   TPU_COMPILE_BS=                # optional bs bucket override
+#   TPU_COMPILE_GRANULARITY=model  # model | layer; layer is useful for
+#                                  # memory-tight very large models.
 #   TORCH_COMPILE_MAX_BS=$MAX_RUNNING
 #   SGLANG_TPU_DECODE_PROCESS_INTERVAL=
 #                                  # passed as env when set.
@@ -131,6 +133,9 @@ fi
 export SGLANG_PLATFORM=tpu
 if [[ -n "${SGLANG_TPU_DECODE_PROCESS_INTERVAL:-}" ]]; then
     export SGLANG_TPU_DECODE_PROCESS_INTERVAL
+fi
+if [[ -n "${TPU_COMPILE_GRANULARITY:-}" ]]; then
+    export SGLANG_TPU_COMPILE_GRANULARITY="$TPU_COMPILE_GRANULARITY"
 fi
 # Per-phase scheduler/worker timing dumps every ~5 s (cheap).
 export SGLANG_TPU_OVERLAP_PROFILE=${SGLANG_TPU_OVERLAP_PROFILE:-1}
@@ -225,6 +230,7 @@ ENABLE_TORCH_COMPILE=${ENABLE_TORCH_COMPILE:-1}
 # unset to use the backend's derived powers-of-two buckets.
 TPU_COMPILE_TOKENS=${TPU_COMPILE_TOKENS:-}
 TPU_COMPILE_BS=${TPU_COMPILE_BS:-}
+TPU_COMPILE_GRANULARITY=${TPU_COMPILE_GRANULARITY:-model}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-}
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-}
 DISABLE_OVERLAP_SCHEDULE=${DISABLE_OVERLAP_SCHEDULE:-1}
@@ -248,6 +254,7 @@ echo "  max_prefill_tokens = ${MAX_PREFILL_TOKENS:-<unset>}"
 echo "  max_total_tokens   = ${MAX_TOTAL_TOKENS:-<unset>}"
 echo "  tpu_compile_tokens = ${TPU_COMPILE_TOKENS:-<derived>}"
 echo "  tpu_compile_bs     = ${TPU_COMPILE_BS:-<derived>}"
+echo "  tpu_compile_granularity = $TPU_COMPILE_GRANULARITY"
 echo "  mem_fraction_static= ${MEM_FRACTION_STATIC:-<sglang default>}"
 echo "  kv_cache_dtype     = ${KV_CACHE_DTYPE:-<sglang default (auto)>}"
 echo "  enable_torch_compile = $ENABLE_TORCH_COMPILE"
