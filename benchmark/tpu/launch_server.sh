@@ -162,11 +162,14 @@ export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
 export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}
 
 # ===== torch.compile debug =====
-# +recompiles surfaces recompilation churn cheaply. Avoid +dynamo /
-# +output_code / +guards here — those stream per-bytecode tracing logs
-# synchronously and turn a ~minute compile into 10+ minutes plus a
-# multi-GB log file.
-export TORCH_LOGS=${TORCH_LOGS:-+recompiles}
+# Set TORCH_LOGS=+recompiles when debugging Dynamo cache misses. Keep it off by
+# default for large-model benchmarks; 480B precompile emits enough guard output
+# to dominate startup and produce multi-GB logs.
+if [[ -n "${TORCH_LOGS:-}" ]]; then
+    export TORCH_LOGS
+else
+    unset TORCH_LOGS 2>/dev/null || true
+fi
 if [[ "$ENABLE_TORCH_COMPILE_DEBUG" == "1" ]]; then
     # FX + lowered graphs per compile (~100s of MB at 32B/tp=8).
     export TORCH_COMPILE_DEBUG=1
@@ -279,7 +282,7 @@ echo "  libtpu_init_args     = $LIBTPU_INIT_ARGS"
 echo "  ENABLE_HLO_DUMP        = $ENABLE_HLO_DUMP  ($HLO_DUMP_DIR)"
 echo "  ENABLE_TORCH_COMPILE_DEBUG = $ENABLE_TORCH_COMPILE_DEBUG  ($TORCH_COMPILE_DEBUG_DIR)"
 echo "  ENABLE_PROFILER_ENDPOINT   = $ENABLE_PROFILER_ENDPOINT  ($PROFILER_DIR)"
-echo "  TORCH_LOGS         = $TORCH_LOGS"
+echo "  TORCH_LOGS         = ${TORCH_LOGS:-<unset>}"
 echo "======================="
 
 # Build the launch_server arg list, only adding optional flags when set.
