@@ -134,6 +134,10 @@ if [[ -n "${SGLANG_TPU_DECODE_PROCESS_INTERVAL:-}" ]]; then
 fi
 # Per-phase scheduler/worker timing dumps every ~5 s (cheap).
 export SGLANG_TPU_OVERLAP_PROFILE=${SGLANG_TPU_OVERLAP_PROFILE:-1}
+# Keep TP collectives inside the compiled graph on torch_tpu. Without this,
+# Dynamo sees the c10d functional all_reduce path and graph-breaks during
+# startup precompile for TP/EP models.
+export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=${TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS:-false}
 
 # HF cache. Defaults here are generic (standard HF cache, online download).
 # The team's TPU hosts keep weights on a GCS-FUSE mount and run fully offline;
@@ -172,14 +176,21 @@ if [[ "$ENABLE_COMPILE_CACHE" == "1" ]]; then
 fi
 
 # ===== XLA / libtpu init =====
-# XLA/libtpu tuning flags (latency-hiding scheduler + async collective fusion
-# keep collectives from serializing behind matmuls on TPU v7). Override the
-# whole string to retune. Changing it invalidates the compile cache (see above).
-export LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"--xla_tpu_scoped_vmem_limit_kib=32768 \
+# XLA/libtpu tuning flags for TPU serving benchmarks. These keep collectives
+# from serializing behind matmuls on TPU v7, use the conservative collective
+# matmul lowering we have validated for TP/EP, and keep ordinary TP collectives
+# off SparseCore. Override the whole string to retune. Changing it invalidates
+# the compile cache (see above).
+export LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"--xla_tpu_scoped_vmem_limit_kib=65536 \
 --xla_tpu_enable_async_collective_fusion=true \
 --xla_tpu_overlap_compute_collective_tc=true \
 --xla_tpu_enable_async_collective_fusion_multiple_steps=true \
---xla_tpu_enable_latency_hiding_scheduler=true"}
+--xla_tpu_enable_latency_hiding_scheduler=true \
+--xla_latency_hiding_scheduler_rerun=10 \
+--xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative \
+--xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative \
+--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false \
+--xla_tpu_enable_sparse_core_collective_offload_all_gather=false"}
 
 # ===== XLA HLO dump (opt-in) =====
 # Match on `tt_jit.*` — torch_tpu compiles are named `tt_jit_<op>`; a
@@ -242,7 +253,9 @@ echo "  torch_compile_max_bs = $TORCH_COMPILE_MAX_BS"
 echo "  disable_radix_cache  = $DISABLE_RADIX_CACHE"
 echo "  disable_overlap_schedule = $DISABLE_OVERLAP_SCHEDULE"
 echo "  tpu_decode_process_interval = ${SGLANG_TPU_DECODE_PROCESS_INTERVAL:-<unset>}"
+echo "  materialize_collectives = $TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"
 echo "  compile_cache        = $ENABLE_COMPILE_CACHE  (tier2=${TORCH_TPU_TIER2_NAME}, tier3=${TORCH_TPU_TIER3_ROOT})"
+echo "  libtpu_init_args     = $LIBTPU_INIT_ARGS"
 echo "  ENABLE_HLO_DUMP        = $ENABLE_HLO_DUMP  ($HLO_DUMP_DIR)"
 echo "  ENABLE_TORCH_COMPILE_DEBUG = $ENABLE_TORCH_COMPILE_DEBUG  ($TORCH_COMPILE_DEBUG_DIR)"
 echo "  ENABLE_PROFILER_ENDPOINT   = $ENABLE_PROFILER_ENDPOINT  ($PROFILER_DIR)"

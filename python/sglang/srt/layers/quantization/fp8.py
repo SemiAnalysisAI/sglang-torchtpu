@@ -91,6 +91,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_tpu,
     log_info_on_rank0,
     print_warning_once,
     set_weight_attrs,
@@ -109,10 +110,57 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_tpu = is_tpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+
+
+def _to_tpu_fp8_moe_scale_layout(
+    scale: torch.Tensor,
+    out_size: int,
+) -> torch.Tensor:
+    """Convert per-expert FP8 MoE scales to gmm_v2's RHS scale layout."""
+    scale = scale.to(torch.float32)
+    if scale.dim() == 1:
+        scale = scale[:, None].expand(-1, out_size)
+    elif scale.dim() == 2:
+        if scale.shape[1] == 1:
+            scale = scale.expand(-1, out_size)
+        elif scale.shape[1] == 2 and out_size % 2 == 0:
+            scale = scale.repeat_interleave(out_size // 2, dim=1)
+        elif scale.shape[1] != out_size:
+            raise ValueError(
+                "Unsupported TPU FP8 MoE scale shape: "
+                f"{tuple(scale.shape)} for {out_size=}"
+            )
+    elif scale.dim() == 4:
+        if scale.shape[1:] != (1, 1, out_size):
+            raise ValueError(
+                "Unsupported TPU FP8 MoE scale shape: "
+                f"{tuple(scale.shape)} for {out_size=}"
+            )
+        return scale.contiguous()
+    else:
+        raise ValueError(
+            "Unsupported TPU FP8 MoE scale rank: "
+            f"{scale.dim()} for shape {tuple(scale.shape)}"
+        )
+    return scale[:, None, None, :].contiguous()
+
+
+def _scaled_fp8_quant_tpu_weight(
+    weight: torch.Tensor, scale: Optional[torch.Tensor] = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-tensor FP8 quantization fallback for TPU weight post-processing."""
+    fp8_max = torch.finfo(fp8_dtype).max
+    if scale is None:
+        scale = weight.abs().max().to(torch.float32).clamp(min=1e-12) / fp8_max
+    else:
+        scale = scale.to(torch.float32)
+    qweight = (weight / scale).clamp(min=-fp8_max, max=fp8_max).to(fp8_dtype)
+    return qweight, scale
 
 
 def _require_fp4_dtype():
@@ -353,6 +401,12 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
+        if _is_tpu and not self.block_quant and not self.use_mxfp8:
+            from sglang.srt.hardware_backend.tpu.fp8_linear import (
+                prebuild_tpu_fp8_linear_op,
+            )
+
+            prebuild_tpu_fp8_linear_op()
 
     def validate_block_quant_shapes(
         self,
@@ -807,6 +861,18 @@ class Fp8LinearMethod(LinearMethodBase):
                 block_size=self.quant_config.weight_block_size,
                 weight_scale=layer.weight_scale_inv,
                 input_scale=None,
+                bias=bias,
+            )
+
+        if _is_tpu and not self.block_quant and not self.use_mxfp8:
+            from sglang.srt.hardware_backend.tpu.fp8_linear import (
+                apply_tpu_fp8_linear,
+            )
+
+            return apply_tpu_fp8_linear(
+                x=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
                 bias=bias,
             )
 
@@ -1559,12 +1625,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             for expert in range(layer.num_local_experts):
-                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                )
-                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                )
+                if _is_tpu:
+                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+                        _scaled_fp8_quant_tpu_weight(
+                            layer.w13_weight.data[expert, :, :]
+                        )
+                    )
+                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                        _scaled_fp8_quant_tpu_weight(layer.w2_weight.data[expert, :, :])
+                    )
+                else:
+                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+                        scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                    )
+                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                        scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                    )
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
@@ -1640,10 +1716,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         layer.w13_weight[expert_id][start : start + shard_size, :],
                         layer.w13_weight_scale[expert_id][shard_id],
                     )
-                    (
-                        layer.w13_weight[expert_id][start : start + shard_size, :],
-                        _,
-                    ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
+                    if _is_tpu:
+                        (
+                            layer.w13_weight[expert_id][start : start + shard_size, :],
+                            _,
+                        ) = _scaled_fp8_quant_tpu_weight(
+                            dq_weight, max_w13_scales[expert_id]
+                        )
+                    else:
+                        (
+                            layer.w13_weight[expert_id][start : start + shard_size, :],
+                            _,
+                        ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
                     start += shard_size
 
             layer.w13_weight_scale = torch.nn.Parameter(
@@ -1663,6 +1747,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
+
+        if _is_tpu:
+            if self.block_quant or self.use_mxfp8 or self.is_fp4_expert:
+                raise NotImplementedError(
+                    "TPU FP8 MoE currently supports non-block FP8 experts only."
+                )
+            for name in ("w13_weight", "w2_weight"):
+                old = getattr(layer, name).data
+                new = old.transpose(1, 2).contiguous()
+                copy_or_rebind_param(layer, name, new)
+                old.untyped_storage().resize_(0)
+
+            w13_scale = _to_tpu_fp8_moe_scale_layout(
+                layer.w13_weight_scale.data, layer.w13_weight.shape[-1]
+            )
+            w2_scale = _to_tpu_fp8_moe_scale_layout(
+                layer.w2_weight_scale.data, layer.w2_weight.shape[-1]
+            )
+            copy_or_rebind_param(layer, "w13_weight_scale", w13_scale)
+            copy_or_rebind_param(layer, "w2_weight_scale", w2_scale)
 
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
@@ -1800,6 +1904,38 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
+
+        if _is_tpu:
+            from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+            from sglang.srt.layers.moe.tpu_moe_utils import (
+                mask_tpu_moe_non_local_experts,
+            )
+
+            if moe_runner_config.apply_router_weight_on_input:
+                raise NotImplementedError(
+                    "apply_router_weight_on_input is not supported on TPU yet."
+                )
+
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            topk_weights = topk_weights.to(x.dtype)
+            topk_ids = topk_ids.to(torch.int32)
+            topk_weights, topk_ids = mask_tpu_moe_non_local_experts(
+                topk_weights, topk_ids
+            )
+
+            output = fused_moe_call(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                topk=int(topk_ids.shape[-1]),
+                activation=moe_runner_config.activation,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+            )
+            return StandardCombineInput(hidden_states=output)
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
