@@ -41,6 +41,18 @@ class CompilationManager:
         self.compiled_fns = compiled_fns
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
+        self.compile_granularity = os.environ.get("SGLANG_TPU_COMPILE_GRANULARITY")
+        self.sync_kv_side_effects = self.compile_granularity in {
+            None,
+            "model",
+            "decode",
+            "backbone",
+            "backbone_decode",
+            "layer",
+            "layer_decode",
+            "attn_decode",
+            "attn_mlp_decode",
+        }
 
         # TODO(wyzhang): support ``forward_split_prefill`` on TPU. Its
         # signature includes a ``(split_index, next_split_index)`` tuple
@@ -59,7 +71,7 @@ class CompilationManager:
     def precompile_all(self) -> None:
         """Run precompilation for all valid extend and decode bucket shapes."""
         overall = time.perf_counter()
-        compile_granularity = os.environ.get("SGLANG_TPU_COMPILE_GRANULARITY")
+        compile_granularity = self.compile_granularity
         if compile_granularity in {
             "decode",
             "backbone_decode",
@@ -152,7 +164,11 @@ class CompilationManager:
                 forward_batch,
             )
             # Materialize lazy outputs and backend-marked side effects.
-            _materialize_out(out, forward_batch)
+            _materialize_out(
+                out,
+                forward_batch,
+                sync_kv_side_effects=self.sync_kv_side_effects,
+            )
 
     def _make_dummy_forward_batch(
         self, num_tokens: int, bs: int, mode: ForwardMode
@@ -215,7 +231,7 @@ class CompilationManager:
         )
 
 
-def _materialize_out(out, forward_batch) -> None:
+def _materialize_out(out, forward_batch, *, sync_kv_side_effects: bool) -> None:
     """Sync returned tensors and backend-marked KV side effects."""
     tensors: list[torch.Tensor] = []
 
@@ -223,7 +239,9 @@ def _materialize_out(out, forward_batch) -> None:
     if isinstance(next_token_logits, torch.Tensor):
         tensors.append(next_token_logits)
 
-    if getattr(forward_batch.attn_backend, "requires_kv_sync_after_compile", False):
+    if sync_kv_side_effects and getattr(
+        forward_batch.attn_backend, "requires_kv_sync_after_compile", False
+    ):
         pool = forward_batch.token_to_kv_pool
         for layer_id in range(pool.start_layer, pool.start_layer + pool.layer_num):
             # RPA-v3 updates the long-lived KV cache as a side effect. A tiny
