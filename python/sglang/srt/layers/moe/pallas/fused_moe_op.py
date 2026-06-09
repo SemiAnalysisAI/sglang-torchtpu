@@ -161,6 +161,7 @@ def _fused_moe_jax(
 
     from sglang.srt.layers.moe.pallas.gmm_v2 import (
         TileSizes,
+        apply_act_fn,
         calculate_tiling,
         gmm_v2,
     )
@@ -206,18 +207,18 @@ def _fused_moe_jax(
 
     x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
 
-    # GMM1: gate/up projection with the gated activation fused in-kernel.
-    # ``fuse_act`` makes gmm_v2 split the [.., 2*n] accumulator and write only
-    # [.., n] = act(gate) * up, avoiding a full materialize of the 2*n tensor
-    # to HBM plus a separate activation pass. The fused path uses gmm_v2's own
-    # fuse_act-aware tiling (``tile_n`` is per-projection when fused), so we do
-    # *not* pass the non-fused tuned tile_info here.
+    # GMM1: gate/up projection. For per-column/per-tensor scales, the gated
+    # activation can be fused in-kernel. Compact block-FP8 scales need different
+    # scale offsets for the gate and up halves, so run an unfused GMM1 and apply
+    # the activation in JAX for correctness.
+    compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
+    gmm1_fuse_act = None if compact_block_scales else _fuse_act_name(activation_name)
     gmm1_tile_info = None
-    if w1_scale is not None and w1_scale.shape[1] > 1:
+    if compact_block_scales:
         gmm1_tile_info = TileSizes(
             tile_m=min(128, int(x_sorted.shape[0])),
             tile_k=int(w1.shape[1]),
-            tile_n=min(896, int(w1.shape[2] // 2)),
+            tile_n=min(896, int(w1.shape[2])),
         )
 
     gmm1_out = gmm_v2(
@@ -228,8 +229,13 @@ def _fused_moe_jax(
         rhs_bias=w1_bias,
         preferred_element_type=out_dtype,
         tile_info=gmm1_tile_info or calculate_tiling,
-        fuse_act=_fuse_act_name(activation_name),
-    )  # [m*topk, n_intermediate]
+        fuse_act=gmm1_fuse_act,
+    )
+    if compact_block_scales:
+        gmm1_out = apply_act_fn(
+            gmm1_out, int(gmm1_out.shape[-1] // 2), _fuse_act_name(activation_name)
+        )
+    # gmm1_out: [m*topk, n_intermediate]
 
     # GMM2: project back to hidden size.
     gmm2_out = gmm_v2(

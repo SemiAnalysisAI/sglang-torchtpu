@@ -177,6 +177,16 @@ class TileSizes:
     tile_n: int
 
 
+def _largest_aligned_divisor_at_most(size: int, limit: int, alignment: int) -> int:
+    """Return the largest aligned divisor of ``size`` that is <= ``limit``."""
+
+    limit = min(size, limit)
+    for candidate in range(limit - (limit % alignment), 0, -alignment):
+        if size % candidate == 0:
+            return candidate
+    return size
+
+
 @dataclasses.dataclass(frozen=True)
 class Dimensions:
     size_m: int
@@ -309,7 +319,12 @@ def create_rhs_spec(index_map: IndexMaps, cfgs: GmmConfigs) -> RhsRef:
         )
     if cfgs.rhs_cfgs.has_scale:
         rhs_scale_spec = pl.BlockSpec(
-            (None, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n),
+            (
+                None,
+                cfgs.num_quant_blocks_per_tile_k,
+                1,
+                pl.cdiv(cfgs.tiles.tile_n, cfgs.rhs_cfgs.scale_block_n),
+            ),
             index_map.rhs_scale_index_map,
         )
 
@@ -1186,6 +1201,16 @@ def make_gmm_configs(
         tiles = tile_info
     else:
         tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+    if dims.size_n % tiles.tile_n != 0:
+        # The kernel uses fixed-size BlockSpecs and disables bounds checks. A
+        # partial final N tile would read/write past the RHS/output buffers, so
+        # constrain N tiling to cleanly divide the logical output width.
+        tiles = dataclasses.replace(
+            tiles,
+            tile_n=_largest_aligned_divisor_at_most(
+                dims.size_n, tiles.tile_n, pltpu.get_tpu_info().num_lanes
+            ),
+        )
 
     return GmmConfigs(
         dims=dims,

@@ -162,7 +162,9 @@ def _to_tpu_fp8_moe_block_scale_layout(
                 "Unsupported TPU FP8 MoE block scale shape: "
                 f"{tuple(scale.shape)} for {out_size=}"
             )
-        return scale.contiguous()
+        if scale.shape[-1] == out_size:
+            return scale.contiguous()
+        scale = scale.squeeze(2)
     if scale.dim() != 3:
         raise ValueError(
             "Unsupported TPU FP8 MoE block scale rank: "
@@ -175,6 +177,8 @@ def _to_tpu_fp8_moe_block_scale_layout(
             "TPU FP8 MoE block scale output blocks do not cover output channels: "
             f"{tuple(scale.shape)} for {out_size=}"
         )
+    scale_block_n = out_size // scale.shape[2]
+    scale = scale.repeat_interleave(scale_block_n, dim=2)
     return scale[:, :, None, :].contiguous()
 
 

@@ -220,6 +220,7 @@ MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-}
 MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-}
 # Maximum batch size cap for torch.compile and bucketing grids.
 TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$MAX_RUNNING}
+ENABLE_TORCH_COMPILE=${ENABLE_TORCH_COMPILE:-1}
 # Optional shape bucket overrides for the TPU precompile + pad shim. Leave
 # unset to use the backend's derived powers-of-two buckets.
 TPU_COMPILE_TOKENS=${TPU_COMPILE_TOKENS:-}
@@ -249,6 +250,7 @@ echo "  tpu_compile_tokens = ${TPU_COMPILE_TOKENS:-<derived>}"
 echo "  tpu_compile_bs     = ${TPU_COMPILE_BS:-<derived>}"
 echo "  mem_fraction_static= ${MEM_FRACTION_STATIC:-<sglang default>}"
 echo "  kv_cache_dtype     = ${KV_CACHE_DTYPE:-<sglang default (auto)>}"
+echo "  enable_torch_compile = $ENABLE_TORCH_COMPILE"
 echo "  torch_compile_max_bs = $TORCH_COMPILE_MAX_BS"
 echo "  disable_radix_cache  = $DISABLE_RADIX_CACHE"
 echo "  disable_overlap_schedule = $DISABLE_OVERLAP_SCHEDULE"
@@ -271,13 +273,13 @@ args=(
     --attention-backend "$ATTENTION_BACKEND"
     --tp-size "$TP_SIZE"
     --grammar-backend none
-    --enable-torch-compile
     --host "$HOST"
     --port "$PORT"
     --max-running-requests "$MAX_RUNNING"
     --page-size "$PAGE_SIZE"
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
 )
+[[ "$ENABLE_TORCH_COMPILE" == "1" ]] && args+=(--enable-torch-compile)
 [[ -n "$TPU_COMPILE_TOKENS" ]] && args+=(--tpu-compile-tokens $TPU_COMPILE_TOKENS)
 [[ -n "$TPU_COMPILE_BS" ]] && args+=(--tpu-compile-bs $TPU_COMPILE_BS)
 [[ -n "$EP_SIZE" ]] && args+=(--ep-size "$EP_SIZE")
