@@ -184,9 +184,12 @@ class TpuGraphRunner:
             TpuCompiledForwardShim,
         )
 
-        compiled_fns: dict[str, Callable] = {
-            name: getattr(self.model, name) for name in wrapped
-        }
+        compiled_fns: dict[str, Callable] = {}
+        for name in wrapped:
+            obj = self.model
+            for part in name.split("."):
+                obj = getattr(obj, part)
+            compiled_fns[name] = obj
         compiled_forward_shim = TpuCompiledForwardShim(
             model_runner, compiled_fns=compiled_fns
         ).install()
