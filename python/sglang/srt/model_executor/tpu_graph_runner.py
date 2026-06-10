@@ -29,6 +29,9 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+    ViTTpuCompileRunner,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -198,6 +201,14 @@ class TpuGraphRunner:
         from sglang.srt.hardware_backend.tpu.compilation.compilation_manager import (
             CompilationManager,
         )
+
+        # Precompile ViT graph runners before LLM warmup so the global
+        # state (default_dtype, grad_mode, torch_function_mode_stack)
+        # matches what the LLM warmup and inference will use.
+        for module in self.model.modules():
+            runner = getattr(module, "graph_runners", None)
+            if isinstance(runner, ViTTpuCompileRunner):
+                runner.precompile()
 
         CompilationManager(
             model_runner=model_runner,

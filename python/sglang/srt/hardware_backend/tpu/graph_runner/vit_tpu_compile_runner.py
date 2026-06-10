@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
 import os
 
 import torch
+import torch._dynamo
 from torch_tpu._internal.sync.sync import synchronize as tpu_sync
 
 from sglang.srt.hardware_backend.tpu.patches import _register_tpu_compile_backend
@@ -14,15 +16,17 @@ from sglang.srt.hardware_backend.tpu.patches import _register_tpu_compile_backen
 logger = logging.getLogger(__name__)
 
 
-def _compute_patch_counts(patch_size, merge_size, max_patches=1600):
+def _compute_patch_counts(merge_size, min_patches=196, max_patches=1600):
     """Compute valid square-image patch counts from model config.
 
     Image dims are snapped to multiples of (patch_size * merge_size) by the
     preprocessor, so grid dims are always multiples of merge_size.  This
-    enumerates the resulting square patch counts up to max_patches.
+    enumerates the resulting square patch counts from min_patches to
+    max_patches.
     """
     counts = []
-    grid_dim = merge_size
+    min_grid = max(merge_size, math.ceil(math.sqrt(min_patches) / merge_size) * merge_size)
+    grid_dim = min_grid
     while True:
         pc = grid_dim * grid_dim
         if pc > max_patches:
@@ -133,6 +137,15 @@ class ViTTpuCompileRunner:
         """Lazily create the compiled function if it does not exist yet."""
         if self._compiled_fn is not None:
             return
+
+        # Match the cache limit used by tpu_graph_runner / cuda_graph_runner
+        # so the ViT's many per-patch-count variants don't trip
+        # FailOnRecompileLimitHit before the LLM runner gets a chance to
+        # raise the limit itself.
+        torch._dynamo.config.accumulated_cache_size_limit = 1024
+        if hasattr(torch._dynamo.config, "cache_size_limit"):
+            torch._dynamo.config.cache_size_limit = 1024
+
         _register_tpu_compile_backend()
         self._compiled_fn = torch.compile(
             torch.no_grad()(self._blocks_and_merger),
@@ -155,10 +168,10 @@ class ViTTpuCompileRunner:
         Args:
             patch_counts: list of int patch counts to precompile for.
                 Defaults to patch counts computed from the model config
-                (square images up to SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES
-                patches, default 1600).  Set the env var
-                SGLANG_TPU_VIT_PRECOMPILE_PATCHES to a comma-separated
-                list to override, or to an empty string to disable.
+                (square images from min_patches to max_patches).  Set the
+                env var SGLANG_TPU_VIT_PRECOMPILE_PATCHES to a
+                comma-separated list to override, or to an empty string
+                to disable.
         """
         if not self._supports_segment_ids:
             logger.info(
@@ -180,13 +193,15 @@ class ViTTpuCompileRunner:
                 return
             patch_counts = [int(x.strip()) for x in env_val.split(",") if x.strip()]
         elif patch_counts is None:
-            patch_size = getattr(vit, "patch_size", 16)
             merge_size = getattr(vit, "spatial_merge_size", 2)
+            min_patches = int(os.environ.get(
+                "SGLANG_TPU_VIT_MIN_PRECOMPILE_PATCHES", 196
+            ))
             max_patches = int(os.environ.get(
                 "SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES", 1600
             ))
             patch_counts = _compute_patch_counts(
-                patch_size, merge_size, max_patches
+                merge_size, min_patches, max_patches
             )
 
         if not patch_counts:
@@ -212,22 +227,32 @@ class ViTTpuCompileRunner:
             rotary_dim,
         )
 
-        for i, pc in enumerate(patch_counts):
-            logger.info(
-                "ViTTpuCompileRunner.precompile: [%d/%d] patch_count=%d ...",
-                i + 1,
-                len(patch_counts),
-                pc,
-            )
-            x = torch.zeros(pc, 1, embed_dim, device=device, dtype=dtype)
-            cu_seqlens = torch.tensor([0, pc], device=device, dtype=torch.int32)
-            cos = torch.zeros(pc, rotary_dim, device=device, dtype=dtype)
-            sin = torch.zeros(pc, rotary_dim, device=device, dtype=dtype)
-            segment_ids = torch.zeros(1, pc, device=device, dtype=torch.int32)
+        # Match the runtime global state so dynamo GLOBAL_STATE guard
+        # does not invalidate every precompiled graph.  Ensure
+        # default_dtype=float32 and no_grad to match inference.
+        init_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float32)
+        try:
+            with torch.no_grad():
+                for i, pc in enumerate(patch_counts):
+                    logger.info(
+                        "ViTTpuCompileRunner.precompile: [%d/%d] patch_count=%d ...",
+                        i + 1,
+                        len(patch_counts),
+                        pc,
+                    )
+                    x = torch.zeros(pc, 1, embed_dim, device=device, dtype=dtype)
+                    cu_seqlens = torch.tensor([0, pc], device=device, dtype=torch.int32)
+                    cos = torch.zeros(pc, rotary_dim, device=device, dtype=dtype)
+                    sin = torch.zeros(pc, rotary_dim, device=device, dtype=dtype)
+                    segment_ids = torch.zeros(1, pc, device=device, dtype=torch.int32)
 
-            result = self._compiled_fn(x, cu_seqlens, cos, sin, segment_ids)
-            # Force compilation to finish by synchronizing.
-            tpu_sync([result], wait=True)
+                    result = self._compiled_fn(x, cu_seqlens, cos, sin, segment_ids)
+                    # Force compilation to finish by synchronizing.
+                    tpu_sync([result], wait=True)
+
+        finally:
+            torch.set_default_dtype(init_dtype)
 
         logger.info("ViTTpuCompileRunner.precompile: done.")
 

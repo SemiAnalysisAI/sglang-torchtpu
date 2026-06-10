@@ -436,9 +436,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         )
         self.graph_runners = graph_runners_dict[self.device.type](self)
 
-        if _is_tpu and hasattr(self.graph_runners, "precompile"):
-            self.graph_runners.precompile()
-
     @property
     def dtype(self) -> torch.dtype:
         return self.patch_embed.proj.weight.dtype
