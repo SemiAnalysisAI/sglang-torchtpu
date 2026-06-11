@@ -225,6 +225,8 @@ class Qwen3_VisionBlock(nn.Module):
         output_ws: Optional[torch.Tensor] = None,
         max_seqlen: Optional[torch.Tensor] = None,
         sequence_lengths: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        segment_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -236,6 +238,8 @@ class Qwen3_VisionBlock(nn.Module):
             output_ws=output_ws,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x += attn
