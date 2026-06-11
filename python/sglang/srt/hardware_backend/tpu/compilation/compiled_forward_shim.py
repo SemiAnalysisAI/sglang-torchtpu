@@ -113,6 +113,16 @@ def _pad_forward_batch_inputs(
         if isinstance(val, list) and len(val) < pad_b:
             setattr(forward_batch, field, val + [0] * (pad_b - len(val)))
 
+    # mm_inputs is a per-sequence list (one entry per req, None for text-only).
+    # general_mm_embed_routine runs in the eager outer VL forward — before the
+    # compiled inner LM — and indexes mm_inputs by batch position alongside the
+    # padded extend_*_cpu lists. It must grow to pad_b too, otherwise a batch
+    # whose real size isn't already a bs bucket (e.g. 3 reqs -> pad_b 4) raises
+    # IndexError. Ghost padding slots carry no multimodal input (None).
+    mm_inputs = getattr(forward_batch, "mm_inputs", None)
+    if isinstance(mm_inputs, list) and len(mm_inputs) < pad_b:
+        forward_batch.mm_inputs = mm_inputs + [None] * (pad_b - len(mm_inputs))
+
     forward_batch.batch_size = pad_b
 
     return real_q, real_b
@@ -170,6 +180,7 @@ def resolve_compile_caps(
     context_len: int | None,
     torch_compile_max_bs: int | None,
     max_running_requests: int | None,
+    tpu_compile_bs: list[int] | None = None,
 ) -> tuple[int, int]:
     """Resolve (max_t, max_b) limits for compilation bucketing."""
     candidates = [
@@ -182,21 +193,22 @@ def resolve_compile_caps(
             "Cannot determine max_t for TPU compile bucketing: "
             "chunked_prefill_size, max_prefill_tokens, and context_len are all unset."
         )
-    # Use the compile knob for the batch grid; max_running_requests is a
-    # scheduler capacity and can be much larger than useful compile shapes.
-    max_b = torch_compile_max_bs or max_running_requests or 1
-    if (
-        torch_compile_max_bs
-        and max_running_requests
-        and torch_compile_max_bs < max_running_requests
-    ):
+    # Use the explicit TPU compile grid first; otherwise use the compile knob
+    # for the batch grid. max_running_requests is a scheduler capacity and can
+    # be much larger than useful compile shapes.
+    max_b = (
+        max(tpu_compile_bs)
+        if tpu_compile_bs
+        else torch_compile_max_bs or max_running_requests or 1
+    )
+    if max_running_requests and max_b < max_running_requests:
         logger.warning(
-            "[compiled forward shim] torch_compile_max_bs=%d < max_running_requests=%d; "
+            "[compiled forward shim] TPU compile max_bs=%d < max_running_requests=%d; "
             "batches above %d are outside the TPU compile grid. Raise "
             "--torch-compile-max-bs or pin --tpu-compile-bs to cover them.",
-            torch_compile_max_bs,
+            max_b,
             max_running_requests,
-            torch_compile_max_bs,
+            max_b,
         )
     return min(candidates), max_b
 
@@ -216,6 +228,7 @@ class TpuCompiledForwardShim:
             context_len=model_runner.model_config.context_len,
             torch_compile_max_bs=getattr(server_args, "torch_compile_max_bs", None),
             max_running_requests=model_runner.max_running_requests,
+            tpu_compile_bs=server_args.tpu_compile_bs,
         )
 
         self.t_bucketer, self.b_bucketer = build_bucketers(
