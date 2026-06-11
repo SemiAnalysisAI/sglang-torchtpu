@@ -1680,9 +1680,21 @@ class RowParallelLinear(LinearBase):
 
         # Matrix multiply.
         assert self.quant_method is not None
-        # Only fuse bias add into GEMM for rank 0 (this ensures that
-        # bias will not get added more than once in TP>1 case)
-        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        # On TPU, defer the bias only when this call performs the TP all-reduce;
+        # that keeps all ranks' compiled graphs structurally identical without
+        # changing the rank-0-only bias semantics of unreduced paths.
+        defer_tpu_bias = (
+            _is_tpu
+            and self.reduce_results
+            and self.tp_size > 1
+            and not skip_all_reduce
+            and not self.skip_bias_add
+            and self.bias is not None
+        )
+        if defer_tpu_bias:
+            bias_ = None
+        else:
+            bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         if self.use_dp_attention_reduce:
             symm_ctx = use_symmetric_memory(get_attention_tp_group())
         else:
@@ -1710,6 +1722,9 @@ class RowParallelLinear(LinearBase):
                     output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
+
+        if defer_tpu_bias:
+            output = output + self.bias
 
         output_bias = self.bias if self.skip_bias_add else None
 
