@@ -104,6 +104,13 @@ def _pad_forward_batch_inputs(
         if isinstance(val, torch.Tensor) and val.shape[0] < pad_t:
             setattr(forward_batch, field, _zero_pad_1d(val, pad_t))
 
+    # MROPE positions are (3, num_tokens) — pad along the token dim.
+    mrope_pos = getattr(forward_batch, "mrope_positions", None)
+    if isinstance(mrope_pos, torch.Tensor) and mrope_pos.shape[-1] < pad_t:
+        forward_batch.mrope_positions = F.pad(
+            mrope_pos, (0, pad_t - mrope_pos.shape[-1])
+        )
+
     for field in _BS_FIELDS:
         val = getattr(forward_batch, field, None)
         if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
@@ -247,7 +254,15 @@ class TpuCompiledForwardShim:
         self.model.prepare_forward_batch = _prepare
 
         for attr, compiled_fn in self._compiled_fns.items():
-            setattr(self.model, attr, CompiledForwardShim(compiled_fn))
+            parts = attr.rsplit(".", 1)
+            shim = CompiledForwardShim(compiled_fn)
+            if len(parts) == 2:
+                parent = self.model
+                for p in parts[0].split("."):
+                    parent = getattr(parent, p)
+                setattr(parent, parts[1], shim)
+            else:
+                setattr(self.model, attr, shim)
 
         logger.info(
             "[compiled forward shim] Installed compiled-forward adaptation on %s.{%s} "

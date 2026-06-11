@@ -153,11 +153,30 @@ class CompilationManager:
         model = self.model_runner.model
         model.prepare_forward_batch(forward_batch)
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+
+        # VL models compile an inner sub-module (e.g. model.model) rather
+        # than the outer forward which contains MM embedding code that
+        # dynamo cannot trace.  Resolve the compile target here.
+        compile_attrs = getattr(model, "_compile_model_attrs", None)
+        if compile_attrs:
+            target = model
+            for part in compile_attrs[0].split("."):
+                target = getattr(target, part)
+        else:
+            target = model
+
+        # The outer VL forward overrides positions with mrope_positions
+        # (shape [3, num_tokens]).  When calling the inner model directly,
+        # replicate that override so MROPE sees the right shape.
+        positions = forward_batch.positions
+        if compile_attrs and self.model_runner.model_is_mrope:
+            positions = forward_batch.mrope_positions
+
         # Match TpuGraphRunner's no_grad wrapper for Dynamo cache reuse.
         with torch.no_grad():
-            out = model.forward(
+            out = target.forward(
                 forward_batch.input_ids,
-                forward_batch.positions,
+                positions,
                 forward_batch,
             )
             # Materialize lazy outputs and backend-marked side effects.
@@ -175,6 +194,11 @@ class CompilationManager:
         input_ids[:bs] = 1
         positions = torch.zeros(num_tokens, dtype=torch.int64, device=device)
         out_cache_loc = torch.zeros(num_tokens, dtype=torch.int64, device=device)
+
+        # MROPE models need (3, num_tokens) positions to match runtime guards.
+        mrope_positions = None
+        if self.model_runner.model_is_mrope:
+            mrope_positions = positions.unsqueeze(0).expand(3, -1)
 
         # Batch-level inputs
         seq_lens = torch.ones(bs, dtype=torch.int64, device=device)
@@ -217,6 +241,7 @@ class CompilationManager:
             extend_logprob_start_lens_cpu=extend_logprob_start_lens_cpu,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            mrope_positions=mrope_positions,
             attn_backend=self.model_runner.attn_backend,
             # Model accesses ``capture_hidden_mode.need_capture()``; default
             # of None would raise AttributeError inside the compiled region.
