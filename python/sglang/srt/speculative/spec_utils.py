@@ -139,6 +139,71 @@ def create_extend_after_decode_spec_info(
     tl.store(bonus_tokens_ptr + pid, bonus_token)
 
 
+def _create_extend_after_decode_spec_info_torch(
+    accept_tokens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    positions: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+):
+    """Pure-PyTorch implementation of create_extend_after_decode_spec_info.
+
+    For each request *pid*, compute:
+      - positions[start:start+accept_len] = seq_len - accept_len .. seq_len - 1
+      - bonus_tokens[pid] = accept_tokens[start + accept_len - 1]
+    where start = sum(accept_lens[:pid]).
+    """
+    batch_size = seq_lens.numel()
+    if batch_size == 0:
+        return
+
+    cumsum = torch.cumsum(accept_lens, dim=0)
+
+    # bonus_tokens: last accepted token per request (vectorised, no collisions)
+    bonus_idx = (cumsum - 1).clamp(min=0)
+    bonus_tokens.copy_(accept_tokens[bonus_idx].to(bonus_tokens.dtype))
+
+    # positions: per-request loop because requests write non-overlapping
+    # variable-length slices into the flat positions array. A batched
+    # scatter with clamp would cause index collisions across requests.
+    offset = 0
+    for pid in range(batch_size):
+        al = int(accept_lens[pid].item())
+        sl = int(seq_lens[pid].item())
+        positions[offset : offset + al] = torch.arange(
+            sl - al, sl, device=positions.device, dtype=positions.dtype
+        )
+        offset += al
+
+
+def create_extend_after_decode_spec_info_func(
+    accept_tokens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    positions: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+    speculative_num_steps: int,
+):
+    if _is_tpu:
+        _create_extend_after_decode_spec_info_torch(
+            accept_tokens,
+            seq_lens,
+            accept_lens,
+            positions,
+            bonus_tokens,
+        )
+        return
+
+    create_extend_after_decode_spec_info[(len(seq_lens),)](
+        accept_tokens,
+        seq_lens,
+        accept_lens,
+        positions,
+        bonus_tokens,
+        next_power_of_2(max(speculative_num_steps + 1, len(seq_lens))),
+    )
+
+
 @triton.jit
 def assign_req_to_token_pool(
     req_pool_indices,

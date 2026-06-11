@@ -7,6 +7,7 @@ from sglang.srt.mem_cache.memory_pool import copy_all_layer_kv_cache_tiled
 from sglang.srt.speculative.spec_utils import (
     _assign_draft_cache_locs_torch,
     _assign_req_to_token_pool_torch,
+    _create_extend_after_decode_spec_info_torch,
     assign_draft_cache_locs,
 )
 from sglang.srt.utils import next_power_of_2
@@ -522,6 +523,79 @@ class TestAssignReqToTokenPool(unittest.TestCase):
             0,
         )
         torch.testing.assert_close(table, expected)
+
+
+class TestCreateExtendAfterDecodeSpecInfo(unittest.TestCase):
+    """Verify _create_extend_after_decode_spec_info_torch against a naive reference."""
+
+    @staticmethod
+    def _ref(accept_tokens, seq_lens, accept_lens, positions, bonus_tokens):
+        """Naive per-request loop matching the Triton kernel."""
+        offset = 0
+        for pid in range(len(seq_lens)):
+            seq_length = int(seq_lens[pid].item())
+            accept_len = int(accept_lens[pid].item())
+            for j in range(accept_len):
+                positions[offset + j] = seq_length - accept_len + j
+            bonus_tokens[pid] = accept_tokens[offset + accept_len - 1]
+            offset += accept_len
+
+    def _run_case(self, seq_vals, accept_vals):
+        device = "cpu"
+        bs = len(seq_vals)
+        seq_lens = torch.tensor(seq_vals, dtype=torch.int32, device=device)
+        accept_lens = torch.tensor(accept_vals, dtype=torch.int32, device=device)
+        total_tokens = sum(accept_vals)
+        accept_tokens = torch.arange(
+            100, 100 + total_tokens, dtype=torch.int32, device=device
+        )
+
+        ref_pos = torch.zeros(total_tokens, dtype=torch.long, device=device)
+        ref_bonus = torch.zeros(bs, dtype=torch.int32, device=device)
+        self._ref(accept_tokens, seq_lens, accept_lens, ref_pos, ref_bonus)
+
+        got_pos = torch.zeros(total_tokens, dtype=torch.long, device=device)
+        got_bonus = torch.zeros(bs, dtype=torch.int32, device=device)
+        _create_extend_after_decode_spec_info_torch(
+            accept_tokens,
+            seq_lens,
+            accept_lens,
+            got_pos,
+            got_bonus,
+        )
+
+        torch.testing.assert_close(got_pos, ref_pos)
+        torch.testing.assert_close(got_bonus, ref_bonus)
+
+    def test_single_request_all_accepted(self):
+        """1 request, accepted 6 tokens (5 drafts + 1 bonus)."""
+        self._run_case(seq_vals=[106], accept_vals=[6])
+
+    def test_single_request_one_accepted(self):
+        """1 request, only bonus token accepted."""
+        self._run_case(seq_vals=[50], accept_vals=[1])
+
+    def test_batch_uniform(self):
+        """3 requests, all accepted same number."""
+        self._run_case(seq_vals=[20, 30, 40], accept_vals=[3, 3, 3])
+
+    def test_batch_varying(self):
+        """3 requests with different accept counts."""
+        self._run_case(seq_vals=[10, 20, 30], accept_vals=[1, 4, 2])
+
+    def test_empty_batch(self):
+        device = "cpu"
+        positions = torch.zeros(0, dtype=torch.long, device=device)
+        bonus = torch.zeros(0, dtype=torch.int32, device=device)
+        _create_extend_after_decode_spec_info_torch(
+            torch.zeros(0, dtype=torch.int32, device=device),
+            torch.zeros(0, dtype=torch.int32, device=device),
+            torch.zeros(0, dtype=torch.int32, device=device),
+            positions,
+            bonus,
+        )
+        assert positions.numel() == 0
+        assert bonus.numel() == 0
 
 
 if __name__ == "__main__":

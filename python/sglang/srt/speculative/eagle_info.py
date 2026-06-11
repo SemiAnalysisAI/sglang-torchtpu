@@ -37,7 +37,7 @@ from sglang.srt.speculative.spec_utils import (
     TREE_SPEC_KERNEL_AVAILABLE,
     align_evict_mask_to_page_size,
     assign_req_to_token_pool_func,
-    create_extend_after_decode_spec_info,
+    create_extend_after_decode_spec_info_func,
     create_num_accept_tokens_filter,
     filter_finished_cache_loc_kernel,
     generate_simulated_accept_index,
@@ -876,42 +876,6 @@ class EagleDraftExtendInput(SpecInput):
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
-    @staticmethod
-    def build_extend_after_decode_tpu_tensors(
-        input_ids: torch.Tensor,
-        seq_lens: torch.Tensor,
-        num_accept_tokens: torch.Tensor,
-        num_accept_tokens_cpu: List[int],
-        device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
-        if num_accept_tokens.numel() == 0:
-            return (
-                torch.empty_like(input_ids, dtype=torch.long),
-                torch.empty_like(num_accept_tokens, dtype=torch.int32),
-                num_accept_tokens,
-                num_accept_tokens_cpu,
-            )
-
-        # Build req_indices and local_offsets from CPU counts to avoid
-        # torch.repeat_interleave with device-tensor counts (forces XLA sync).
-        total_tokens = sum(num_accept_tokens_cpu)
-        req_indices_cpu = []
-        local_offsets_cpu = []
-        for i, n in enumerate(num_accept_tokens_cpu):
-            req_indices_cpu.extend([i] * n)
-            local_offsets_cpu.extend(range(n))
-        req_indices = torch.tensor(req_indices_cpu, device=device, dtype=torch.long)
-        local_offsets = torch.tensor(
-            local_offsets_cpu, device=device, dtype=seq_lens.dtype
-        )
-
-        positions = (
-            seq_lens[req_indices] - num_accept_tokens[req_indices] + local_offsets
-        ).to(torch.long)
-        cumsum = torch.cumsum(num_accept_tokens, dim=0)
-        bonus_tokens = input_ids[cumsum - 1].to(torch.int32)
-        return positions, bonus_tokens, num_accept_tokens, num_accept_tokens_cpu
-
     @classmethod
     def hidden_size_for(cls, worker) -> Optional[int]:
         """Extend-phase `hidden_states` width: target's `spec_hidden_size`,
@@ -979,26 +943,8 @@ class EagleDraftExtendInput(SpecInput):
         if batch.forward_mode.is_idle():
             return
 
-        if _is_tpu:
-            if len(self.seq_lens) == 0:
-                return
-            (
-                positions,
-                bonus_tokens,
-                num_accept_tokens,
-                num_accept_tokens_cpu,
-            ) = self.build_extend_after_decode_tpu_tensors(
-                self.input_ids,
-                self.seq_lens,
-                self.num_accept_tokens,
-                self.num_accept_tokens_cpu,
-                batch.device,
-            )
-            self.num_accept_tokens = num_accept_tokens
-            self.num_accept_tokens_cpu = num_accept_tokens_cpu
-        else:
-            num_accept_tokens = self.num_accept_tokens
-            num_accept_tokens_cpu = self.num_accept_tokens_cpu
+        num_accept_tokens = self.num_accept_tokens
+        num_accept_tokens_cpu = self.num_accept_tokens_cpu
 
         if _is_tpu:
             # Pad input_ids, positions, out_cache_loc, and hidden_states to
@@ -1016,7 +962,6 @@ class EagleDraftExtendInput(SpecInput):
                 self.input_ids = torch.nn.functional.pad(
                     self.input_ids, (0, pad_size), value=0
                 )
-                positions = torch.nn.functional.pad(positions, (0, pad_size), value=0)
                 if batch.out_cache_loc is not None:
                     batch.out_cache_loc = torch.nn.functional.pad(
                         batch.out_cache_loc, (0, pad_size), value=0
@@ -1037,7 +982,7 @@ class EagleDraftExtendInput(SpecInput):
                         batch.out_cache_loc, (0, target_len - oc_len), value=0
                     )
 
-        # The kernel below populates `self.positions` and `self.bonus_tokens`;
+        # The function below populates `self.positions` and `self.bonus_tokens`;
         # the worker reads `self.bonus_tokens` to construct next iter's
         # `EagleDraftInput`.
         batch.input_ids = self.input_ids
@@ -1053,20 +998,14 @@ class EagleDraftExtendInput(SpecInput):
         self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
         self.bonus_tokens = torch.empty_like(num_accept_tokens, dtype=torch.int32)
 
-        if _is_tpu:
-            self.positions[:actual_len] = positions[:actual_len].to(
-                self.positions.dtype
-            )
-            self.bonus_tokens.copy_(bonus_tokens.to(self.bonus_tokens.dtype))
-        else:
-            create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
-                batch.input_ids,
-                batch.seq_lens,
-                num_accept_tokens,
-                self.positions,
-                self.bonus_tokens,
-                next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
-            )
+        create_extend_after_decode_spec_info_func(
+            batch.input_ids,
+            batch.seq_lens,
+            num_accept_tokens,
+            self.positions,
+            self.bonus_tokens,
+            speculative_num_steps,
+        )
 
     def generate_attn_arg_prefill(
         self,

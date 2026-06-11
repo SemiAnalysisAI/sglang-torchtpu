@@ -57,6 +57,7 @@ class DraftBackendFactory:
             "nsa": self._create_nsa_decode_backend,
             "ascend": self._create_ascend_decode_backend,
             "pallas_tpu_flash": self._create_tpu_pallas_decode_backend,
+            "pallas_tpu_rpa_v3": self._create_tpu_pallas_rpa_v3_decode_backend,
             "fa4": self._create_fa4_decode_backend,
             "dsv4": self._create_dsv4_decode_backend,
         }
@@ -85,6 +86,7 @@ class DraftBackendFactory:
             "nsa": self._create_nsa_prefill_backend,
             "ascend": self._create_ascend_prefill_backend,
             "pallas_tpu_flash": self._create_tpu_pallas_prefill_backend,
+            "pallas_tpu_rpa_v3": self._create_tpu_pallas_rpa_v3_prefill_backend,
             "fa4": self._create_fa4_prefill_backend,
             "dsv4": self._create_dsv4_prefill_backend,
         }
@@ -326,6 +328,22 @@ class DraftBackendFactory:
         )
 
         return TpuPallasAttnBackend(self.draft_model_runner)
+
+    def _create_tpu_pallas_rpa_v3_decode_backend(self):
+        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
+            TpuPallasRpaV3MultiStepDraftBackend,
+        )
+
+        return TpuPallasRpaV3MultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_tpu_pallas_rpa_v3_prefill_backend(self):
+        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
+            TpuPallasRpaV3AttnBackend,
+        )
+
+        return TpuPallasRpaV3AttnBackend(self.draft_model_runner)
 
     def _create_flashmla_prefill_backend(self):
         logger.warning(
