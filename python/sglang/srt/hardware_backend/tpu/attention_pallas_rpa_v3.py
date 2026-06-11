@@ -1,4 +1,4 @@
-"""Pallas ragged-paged-attention backend for the TPU torch_tpu platform.
+    """Pallas ragged-paged-attention backend for the TPU torch_tpu platform.
 
 This backend wraps the JAX/Pallas v3 ragged_paged_attention kernel
 (``sglang.srt.layers.attention.pallas.ragged_paged_attention_v3``) and
@@ -34,6 +34,9 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+    resolve_compile_caps,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -229,6 +232,36 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.req_to_token_pool = model_runner.req_to_token_pool
 
+        # Fixed padded batch size for the attention metadata tensors.
+        #
+        # The compiled-forward shim (``compiled_forward_shim.py``) pads the
+        # ForwardBatch per-request fields up to ``b_bucketer.next_bucket(real_b)``
+        # before ``init_forward_metadata`` runs, but it does NOT touch the
+        # metadata this backend builds. If we sized the metadata at the (bucketed
+        # but still batch-dependent) real batch size, every distinct bs bucket
+        # (1/2/4/8, ...) would produce a differently-shaped ``kv_lens`` /
+        # ``cu_q_lens`` / ``page_indices``, and the compiled LLM forward would
+        # guard on those shapes and recompile once per bucket.
+        #
+        # The kernel only ever reads rows ``[0, distribution[-1])`` (it loops
+        # ``for i in range(num_seqs[0])`` bounded by ``distribution``), so the
+        # padded rows beyond the real batch are inert. We therefore pad all
+        # per-request metadata to a single FIXED size = ``max_num_reqs``, making
+        # the attention graph batch-size invariant (one shape -> one graph). We
+        # reuse the shim's own ``resolve_compile_caps`` so ``max_num_reqs``
+        # matches the largest bs bucket the shim ever pads to (its ``max_b``);
+        # the kernel's SMEM is already sized for this same ``max_num_seqs`` via
+        # the largest compiled bucket, so padding here does not grow SMEM.
+        server_args = model_runner.server_args
+        _, max_b = resolve_compile_caps(
+            chunked_prefill_size=server_args.chunked_prefill_size,
+            max_prefill_tokens=server_args.max_prefill_tokens,
+            context_len=model_runner.model_config.context_len,
+            torch_compile_max_bs=getattr(server_args, "torch_compile_max_bs", None),
+            max_running_requests=model_runner.max_running_requests,
+        )
+        self.max_num_reqs = int(max_b)
+
         # fp8 KV cache: when the resolved cache dtype is fp8, K/V are quantized
         # before the kernel call and the kernel dequantizes on read via
         # ``k_scale``/``v_scale``. ``None`` for bf16 caches (the default path).
@@ -274,12 +307,27 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         """
         page_size = self.page_size
         device = forward_batch.seq_lens.device
+        # ``bs`` is the size of the (already shim-padded) per-request fields.
         bs = int(forward_batch.seq_lens.shape[0])
+        # ``pad_b`` is the FIXED padded batch size we build every metadata tensor
+        # at, so the attention graph has a single batch-size-invariant shape and
+        # the compiled LLM forward stops recompiling once per bs bucket. The
+        # shim only ever pads the ForwardBatch up to its largest bs bucket
+        # (== ``self.max_num_reqs``), so this must always be >= bs.
+        pad_b = self.max_num_reqs
+        assert bs <= pad_b, (
+            f"RPA v3 metadata padding target max_num_reqs={pad_b} is smaller than "
+            f"the incoming batch size {bs}; the compile bs grid does not cover this "
+            "batch. Raise --torch-compile-max-bs / --tpu-compile-bs."
+        )
         req_to_token = self.req_to_token_pool.req_to_token
         max_context_len = req_to_token.shape[1]
         pages_per_seq = max_context_len // page_size
 
+        # kv_lens: pad seq_lens with 0 to length pad_b (ghost rows -> kv_len 0).
         seq_lens = forward_batch.seq_lens.to(torch.int32)
+        kv_lens = torch.zeros(pad_b, dtype=torch.int32, device=device)
+        kv_lens[:bs] = seq_lens
 
         if forward_batch.forward_mode.is_extend():
             assert forward_batch.extend_seq_lens is not None, (
@@ -293,12 +341,19 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
 
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
 
-        cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32, device=device)
-        cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
+        # cu_q_lens: length pad_b + 1, monotonic. Real rows carry the cumulative
+        # query lengths; the tail repeats the last cumsum value so every padded
+        # row has q_len 0 (cu_q_lens[i+1] - cu_q_lens[i] == 0).
+        cu_q_lens = torch.zeros(pad_b + 1, dtype=torch.int32, device=device)
+        cu_real = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
+        cu_q_lens[1 : bs + 1] = cu_real
+        if bs < pad_b:
+            cu_q_lens[bs + 1 :] = cu_real[-1] if bs > 0 else 0
 
         # cu_kv_lens[i] = i * pages_per_seq * page_size so the kernel addresses
-        # ``page_indices[i * pages_per_seq + j]`` for token j of seq i.
-        cu_kv_lens = torch.arange(bs + 1, dtype=torch.int32, device=device) * (
+        # ``page_indices[i * pages_per_seq + j]`` for token j of seq i. Built for
+        # pad_b + 1 directly (the padded tail rows are never read by the kernel).
+        cu_kv_lens = torch.arange(pad_b + 1, dtype=torch.int32, device=device) * (
             pages_per_seq * page_size
         )
 
@@ -309,10 +364,16 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # Trim to exactly ``pages_per_seq`` entries per row so the flat
         # ``page_indices`` shape matches the rectangular layout the kernel
         # expects.
-        page_indices = (
+        page_indices_real = (
             per_seq[:, : pages_per_seq * page_size : page_size] // page_size
         ).to(torch.int32)
-        page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
+        page_indices_real = page_indices_real.reshape(bs * pages_per_seq).contiguous()
+        # page_indices: pad with 0 to pad_b * pages_per_seq (ghost rows point at
+        # page 0; never read because the kernel loop is bounded by distribution).
+        page_indices = torch.zeros(
+            pad_b * pages_per_seq, dtype=torch.int32, device=device
+        )
+        page_indices[: bs * pages_per_seq] = page_indices_real
 
         # The TPU compile shim pads batch-shaped metadata up to the selected
         # compile bucket. Keep the padded tensor shapes, but only mark the real
@@ -326,7 +387,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             distribution = torch.stack([zero, num_active, num_active]).to(torch.int32)
 
         return PallasForwardMetadata(
-            kv_lens=seq_lens,
+            kv_lens=kv_lens,
             cu_q_lens=cu_q_lens,
             cu_kv_lens=cu_kv_lens,
             page_indices=page_indices,

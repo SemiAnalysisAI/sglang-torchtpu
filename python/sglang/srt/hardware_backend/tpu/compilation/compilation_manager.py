@@ -49,6 +49,7 @@ class CompilationManager:
         self.compiled_fns = compiled_fns
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
+        self._logged_vl_warmup = False
 
         # TODO(wyzhang): support ``forward_split_prefill`` on TPU. Its
         # signature includes a ``(split_index, next_split_index)`` tuple
@@ -174,13 +175,68 @@ class CompilationManager:
 
         # Match TpuGraphRunner's no_grad wrapper for Dynamo cache reuse.
         with torch.no_grad():
-            out = target.forward(
-                forward_batch.input_ids,
-                positions,
-                forward_batch,
-            )
+            if compile_attrs:
+                # VL inference NEVER calls the inner LM with input_ids: the
+                # outer (eager) forward embeds the tokens (and scatters image
+                # features) and calls the compiled LM with input_ids=None and
+                # input_embeds (see mm_utils.general_mm_embed_routine). Warming
+                # the input_ids path here would compile graphs that no real
+                # request ever hits, so every request would recompile per
+                # token bucket on first use. Drive the input_embeds path
+                # instead so the warmed graphs actually match runtime.
+                out = self._run_one_vl(target, model, forward_batch, positions, mode)
+            else:
+                out = target.forward(
+                    forward_batch.input_ids,
+                    positions,
+                    forward_batch,
+                )
             # Materialize lazy outputs and backend-marked side effects.
             _materialize_out(out, forward_batch)
+
+    def _run_one_vl(self, target, model, forward_batch, positions, mode):
+        """Warm a VL inner-LM forward via the runtime input_embeds path.
+
+        Mirrors ``general_mm_embed_routine``'s call:
+            language_model(input_ids=None, forward_batch, input_embeds=<T,H>,
+                           positions=..., input_deepstack_embeds=<T, H*K>?)
+        ``input_deepstack_embeds`` is only present on image-bearing EXTEND
+        batches of deepstack models (K = num_deepstack_embeddings); DECODE and
+        text-only batches never carry it. We warm the deepstack EXTEND variant
+        because that is what image serving (the reason VL is compiled) hits;
+        a text-only EXTEND on a VL model still cold-compiles once.
+        """
+        embed_tokens = target.get_input_embeddings()
+        input_embeds = embed_tokens(forward_batch.input_ids)
+
+        call_kwargs = {}
+        num_deepstack = int(getattr(model, "num_deepstack_embeddings", 0) or 0)
+        if mode == ForwardMode.EXTEND and num_deepstack > 0:
+            call_kwargs["input_deepstack_embeds"] = torch.zeros(
+                input_embeds.shape[0],
+                input_embeds.shape[1] * num_deepstack,
+                dtype=input_embeds.dtype,
+                device=input_embeds.device,
+            )
+
+        if not self._logged_vl_warmup:
+            self._logged_vl_warmup = True
+            logger.info(
+                "[compilation manager] VL warmup uses input_embeds path: "
+                "input_ids=None, input_embeds=%s, input_deepstack_embeds=%s",
+                tuple(input_embeds.shape),
+                tuple(call_kwargs["input_deepstack_embeds"].shape)
+                if "input_deepstack_embeds" in call_kwargs
+                else None,
+            )
+
+        return target.forward(
+            input_ids=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+            **call_kwargs,
+        )
 
     def _make_dummy_forward_batch(
         self, num_tokens: int, bs: int, mode: ForwardMode
@@ -196,9 +252,14 @@ class CompilationManager:
         out_cache_loc = torch.zeros(num_tokens, dtype=torch.int64, device=device)
 
         # MROPE models need (3, num_tokens) positions to match runtime guards.
+        # Materialize with .contiguous(): runtime mrope_positions is a real
+        # [3, num_tokens] tensor (stride [num_tokens, 1]), but a bare
+        # .expand(3, -1) is a broadcast view with stride 0 on dim 0. Dynamo
+        # guards on strides, so the expand view would force a per-token-bucket
+        # recompile on the first real request despite matching shapes.
         mrope_positions = None
         if self.model_runner.model_is_mrope:
-            mrope_positions = positions.unsqueeze(0).expand(3, -1)
+            mrope_positions = positions.unsqueeze(0).expand(3, -1).contiguous()
 
         # Batch-level inputs
         seq_lens = torch.ones(bs, dtype=torch.int64, device=device)

@@ -121,6 +121,16 @@ def _pad_forward_batch_inputs(
         if isinstance(val, list) and len(val) < pad_b:
             setattr(forward_batch, field, val + [0] * (pad_b - len(val)))
 
+    # mm_inputs is a per-sequence list (one entry per req, None for text-only).
+    # general_mm_embed_routine runs in the eager outer VL forward — before the
+    # compiled inner LM — and indexes mm_inputs by batch position alongside the
+    # padded extend_*_cpu lists. It must grow to pad_b too, otherwise a batch
+    # whose real size isn't already a bs bucket (e.g. 3 reqs -> pad_b 4) raises
+    # IndexError. Ghost padding slots carry no multimodal input (None).
+    mm_inputs = getattr(forward_batch, "mm_inputs", None)
+    if isinstance(mm_inputs, list) and len(mm_inputs) < pad_b:
+        forward_batch.mm_inputs = mm_inputs + [None] * (pad_b - len(mm_inputs))
+
     forward_batch.batch_size = pad_b
 
     return real_q, real_b
