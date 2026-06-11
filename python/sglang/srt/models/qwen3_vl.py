@@ -77,11 +77,13 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_npu,
+    is_tpu,
     round_up,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
 if _is_npu:
     from sglang.srt.hardware_backend.npu.graph_runner.vit_npu_graph_runner import (
@@ -89,6 +91,13 @@ if _is_npu:
     )
 
     graph_runners_dict["npu"] = ViTNpuGraphRunner
+
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+        ViTTpuCompileRunner,
+    )
+
+    graph_runners_dict["tpu"] = ViTTpuCompileRunner
 
 
 logger = logging.getLogger(__name__)
@@ -205,6 +214,7 @@ class Qwen3_VisionBlock(nn.Module):
             use_data_parallel=use_data_parallel,
             use_dp_attention_reduce=is_dp_attention_enabled(),
             workspace_buffer=workspace_buffer,
+            qkv_backend="tpu" if _is_tpu else None,
         )
         self.mlp = Qwen3_VisionMLP(
             dim,
@@ -758,6 +768,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if _is_npu:
                 return self.forward_with_npu_graph(x, grid_thw)
+            return self.forward_with_cuda_graph(x, grid_thw)
+        if _is_tpu:
             return self.forward_with_cuda_graph(x, grid_thw)
 
         x = x.to(device=self.device, dtype=self.dtype)
