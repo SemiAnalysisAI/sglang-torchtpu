@@ -943,9 +943,6 @@ class EagleDraftExtendInput(SpecInput):
         if batch.forward_mode.is_idle():
             return
 
-        num_accept_tokens = self.num_accept_tokens
-        num_accept_tokens_cpu = self.num_accept_tokens_cpu
-
         if _is_tpu:
             # Pad input_ids, positions, out_cache_loc, and hidden_states to
             # a fixed size so XLA sees one compiled graph regardless of
@@ -986,7 +983,7 @@ class EagleDraftExtendInput(SpecInput):
         # the worker reads `self.bonus_tokens` to construct next iter's
         # `EagleDraftInput`.
         batch.input_ids = self.input_ids
-        batch.extend_lens = num_accept_tokens_cpu
+        batch.extend_lens = self.num_accept_tokens_cpu
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = self.seq_lens
         batch.seq_lens_cpu = self.seq_lens_cpu
@@ -996,12 +993,12 @@ class EagleDraftExtendInput(SpecInput):
 
         self.capture_hidden_mode = CaptureHiddenMode.LAST
         self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
-        self.bonus_tokens = torch.empty_like(num_accept_tokens, dtype=torch.int32)
+        self.bonus_tokens = torch.empty_like(self.num_accept_tokens, dtype=torch.int32)
 
         create_extend_after_decode_spec_info_func(
             batch.input_ids,
             batch.seq_lens,
-            num_accept_tokens,
+            self.num_accept_tokens,
             self.positions,
             self.bonus_tokens,
             speculative_num_steps,
