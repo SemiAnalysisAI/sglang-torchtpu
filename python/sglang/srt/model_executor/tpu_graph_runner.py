@@ -124,23 +124,43 @@ class TpuGraphRunner:
 
         _register_tpu_compile_backend()
 
-        wrapped = [
-            name
-            for name in self._COMPILE_TARGETS
-            if _wrap_with_tpu_compile(self.model, name)
-        ]
+        # VL models set _compile_model_attrs to list the sub-modules
+        # whose forward should be compiled (e.g. the inner LLM decoder).
+        # The outer VL forward has data-dependent MM embedding code that
+        # is incompatible with fullgraph=True.
+        compile_attrs = getattr(self.model, "_compile_model_attrs", None)
+
+        # Normalize to a list of attrs to compile; a None entry means the
+        # model's own forward (the non-VL default).
+        wrapped = []
+        for attr in compile_attrs or [None]:
+            target = self.model if attr is None else getattr(self.model, attr, None)
+            if target is None:
+                logger.warning(
+                    "_compile_model_attrs lists %r but %s has no such "
+                    "attribute; skipping.",
+                    attr,
+                    type(self.model).__name__,
+                )
+                continue
+            prefix = "" if attr is None else f"{attr}."
+            for name in self._COMPILE_TARGETS:
+                if _wrap_with_tpu_compile(target, name):
+                    wrapped.append(f"{prefix}{name}")
+
         if not wrapped:
             logger.warning(
-                "enable_torch_compile=True but %s exposes none of %s; "
-                "nothing compiled.",
+                "enable_torch_compile=True but nothing on %s could be "
+                "compiled (attrs=%s, targets=%s).",
                 type(self.model).__name__,
+                compile_attrs,
                 self._COMPILE_TARGETS,
             )
             return
 
         logger.info(
-            "Wrapped %s.{%s} with torch.compile(backend='tpu', "
-            "fullgraph=True, dynamic=False) inside torch.no_grad.",
+            "Compiled %s.{%s} with torch.compile(backend='tpu', "
+            "fullgraph=True, dynamic=False).",
             type(self.model).__name__,
             ", ".join(wrapped),
         )
@@ -149,9 +169,12 @@ class TpuGraphRunner:
             TpuCompiledForwardShim,
         )
 
-        compiled_fns: dict[str, Callable] = {
-            name: getattr(self.model, name) for name in wrapped
-        }
+        compiled_fns: dict[str, Callable] = {}
+        for name in wrapped:
+            obj = self.model
+            for part in name.split("."):
+                obj = getattr(obj, part)
+            compiled_fns[name] = obj
         compiled_forward_shim = TpuCompiledForwardShim(
             model_runner, compiled_fns=compiled_fns
         ).install()
