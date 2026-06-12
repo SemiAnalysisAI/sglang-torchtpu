@@ -183,11 +183,10 @@ def _maybe_expand_kv_heads(
 
 
 class TpuPallasAttnBackend(AttentionBackend):
-    def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
+    def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
-        self.speculative_step_id = speculative_step_id
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         pass
@@ -267,9 +266,7 @@ class TpuPallasAttnBackend(AttentionBackend):
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_q:end_q, :, :] = per_req_out_redudant[
-                prefill_seq_len_q : prefill_seq_len_q + extend_seq_len_q, :, :
-            ]
+            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
             start_q = end_q
         return output
 
@@ -396,27 +393,6 @@ class TpuPallasAttnBackend(AttentionBackend):
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
 
-        if forward_batch.forward_mode.is_target_verify():
-            assert forward_batch.spec_info is not None
-            device = forward_batch.seq_lens.device
-            bs = int(forward_batch.seq_lens.shape[0])
-            draft_token_num = forward_batch.spec_info.draft_token_num
-            seq_lens = forward_batch.seq_lens + draft_token_num
-            extend_prefix_lens = forward_batch.seq_lens.to(torch.int32)
-            extend_seq_lens = torch.full(
-                (bs,), draft_token_num, dtype=torch.int32, device=device
-            )
-        elif forward_batch.forward_mode.is_draft_extend():
-            # DRAFT_EXTEND: batch.prefix_lens is stale from the initial
-            # prefill; recompute from current seq_lens and extend_seq_lens.
-            seq_lens = forward_batch.seq_lens
-            extend_seq_lens = forward_batch.extend_seq_lens
-            extend_prefix_lens = (seq_lens - extend_seq_lens).to(torch.int32)
-        else:
-            seq_lens = forward_batch.seq_lens
-            extend_prefix_lens = forward_batch.extend_prefix_lens
-            extend_seq_lens = forward_batch.extend_seq_lens
-
         self._run_flash_forward_extend(
             q_,
             o_,
@@ -424,9 +400,9 @@ class TpuPallasAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
-            seq_lens,
-            extend_prefix_lens,
-            extend_seq_lens,
+            forward_batch.seq_lens,
+            forward_batch.extend_prefix_lens,
+            forward_batch.extend_seq_lens,
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=causal,
@@ -465,13 +441,6 @@ class TpuPallasAttnBackend(AttentionBackend):
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        seq_lens = forward_batch.seq_lens
-        if (
-            forward_batch.forward_mode.is_decode_or_idle()
-            and forward_batch.spec_info is not None
-        ):
-            seq_lens = seq_lens + self.speculative_step_id + 1
-
         self._run_paged_forward_decode(
             q_,
             o_,
@@ -479,7 +448,7 @@ class TpuPallasAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
-            seq_lens,
+            forward_batch.seq_lens,
             scaling=layer.scaling,
         )
 
@@ -487,34 +456,3 @@ class TpuPallasAttnBackend(AttentionBackend):
 
     def support_triton(self):
         return False
-
-
-class TpuPallasMultiStepDraftBackend:
-    """Wrap one TPU Pallas flash/paged backend per EAGLE draft decode step."""
-
-    def __init__(
-        self,
-        model_runner: ModelRunner,
-        topk: int,
-        speculative_num_steps: int,
-    ):
-        self.topk = topk
-        self.speculative_num_steps = speculative_num_steps
-        self.attn_backends = [
-            TpuPallasAttnBackend(model_runner, speculative_step_id=i)
-            for i in range(self.speculative_num_steps - 1)
-        ]
-
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        assert forward_batch.spec_info is not None
-        for attn_backend in self.attn_backends:
-            attn_backend.init_forward_metadata(forward_batch)
-
-    def init_cuda_graph_state(self, max_bs, max_num_tokens):
-        pass
-
-    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_metadata_replay_cuda_graph(self, forward_batch: ForwardBatch, bs):
-        self.init_forward_metadata(forward_batch)

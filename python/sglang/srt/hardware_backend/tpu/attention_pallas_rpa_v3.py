@@ -276,7 +276,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             # Decode (including draft decode).
             seq_lens = forward_batch.seq_lens.to(torch.int32)
             if (
-                forward_batch.forward_mode.is_decode_or_idle()
+                forward_batch.forward_mode.is_decode()
                 and forward_batch.spec_info is not None
             ):
                 # Multi-step draft decode: each step's backend has a
