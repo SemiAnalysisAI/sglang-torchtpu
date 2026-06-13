@@ -10,7 +10,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
-_is_tpu = is_tpu()
+_use_torch_native = is_tpu()
 
 if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
@@ -149,7 +149,7 @@ def build_tree_kernel_efficient(
             (bs * num_verify_tokens,), device=device, dtype=torch.long
         )
 
-    if _is_tpu:
+    if _use_torch_native:
         _build_tree_kernel_efficient_torch(
             topk,
             tree_mask_mode,
@@ -217,7 +217,6 @@ def _verify_tree_greedy_torch(
 
     bs, num_verify_tokens = candidates.shape
     predicts[: bs * num_verify_tokens] = target_predict.flatten().to(predicts.dtype)
-    accept_index.fill_(-1)
 
     if num_verify_tokens > 1:
         matches = target_predict[:, :-1] == candidates[:, 1:]
@@ -299,7 +298,7 @@ def verify_tree_greedy_func(
             retrive_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
         )
-    elif _is_tpu:
+    elif _use_torch_native:
         _verify_tree_greedy_torch(
             predicts,
             accept_index,

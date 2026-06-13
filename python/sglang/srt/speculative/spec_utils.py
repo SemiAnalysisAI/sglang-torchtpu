@@ -27,6 +27,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_tpu = is_tpu()
+_use_torch_native = _is_tpu
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -166,6 +167,8 @@ def _create_extend_after_decode_spec_info_torch(
     # positions: per-request loop because requests write non-overlapping
     # variable-length slices into the flat positions array. A batched
     # scatter with clamp would cause index collisions across requests.
+    # TODO(pyc96): vectorize with a padded 2D scatter or torch_xla fori_loop
+    # to avoid per-request .item() host-device syncs on XLA.
     offset = 0
     for pid in range(batch_size):
         al = int(accept_lens[pid].item())
@@ -184,7 +187,7 @@ def create_extend_after_decode_spec_info_func(
     bonus_tokens: torch.Tensor,
     speculative_num_steps: int,
 ):
-    if _is_tpu:
+    if _use_torch_native:
         _create_extend_after_decode_spec_info_torch(
             accept_tokens,
             seq_lens,
@@ -267,12 +270,11 @@ def _assign_req_to_token_pool_torch(
     src_index = (src_starts[:, None] + offsets[None, :]).clamp(
         max=out_cache_loc.numel() - 1
     )
-    dst_index = (start_offset[:, None] + offsets[None, :]).clamp(
-        max=req_to_token.shape[1] - 1
-    )
+    dst_index = start_offset[:, None] + offsets[None, :]
     row_index = req_pool_indices[:, None].expand(batch_size, max_len)
-    # Use torch.where with scatter instead of boolean indexing to avoid
-    # data-dependent shapes that force host-device sync on XLA.
+    # Redirect masked-out positions to the padding row (row 0, col 0).
+    dst_index = torch.where(mask, dst_index, torch.zeros_like(dst_index))
+    row_index = torch.where(mask, row_index, torch.zeros_like(row_index))
     vals = torch.where(
         mask,
         out_cache_loc[src_index].to(req_to_token.dtype),
@@ -289,7 +291,7 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
-    if _is_tpu:
+    if _use_torch_native:
         _assign_req_to_token_pool_torch(
             req_pool_indices,
             req_to_token,
@@ -453,7 +455,9 @@ def _assign_draft_cache_locs_torch(
 
     device = req_to_token.device
     copy_len = topk * speculative_num_steps
-    # out_cache_loc is laid out as (batch_size, copy_len)
+    # out_cache_loc is laid out as (batch_size, copy_len).
+    # Out-of-bounds safety: cols stay within req_to_token.shape[1] because
+    # the KV pool allocator guarantees seq_lens + copy_len <= pool width.
     offsets = torch.arange(copy_len, device=device, dtype=seq_lens.dtype)
     rows = req_pool_indices[:, None]  # (bs, 1)
     cols = seq_lens[:, None] + offsets[None, :]  # (bs, copy_len)
@@ -478,7 +482,7 @@ def assign_draft_cache_locs_func(
     page_size: int,
     batch_size: int,
 ):
-    if _is_tpu:
+    if _use_torch_native:
         _assign_draft_cache_locs_torch(
             req_pool_indices,
             req_to_token,
