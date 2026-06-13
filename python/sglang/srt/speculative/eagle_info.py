@@ -450,7 +450,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     try:
                         req.grammar.accept_token(id)
                     except ValueError as e:
-                        logger.info(f"{i=}, {req=}\n{accept_index=}\n{predict=}\n")
+                        logger.info(
+                            f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
+                        )
                         raise e
                     req.update_finish_state()
                 if req.finished():

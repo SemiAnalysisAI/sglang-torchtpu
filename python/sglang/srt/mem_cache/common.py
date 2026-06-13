@@ -159,7 +159,6 @@ def get_last_loc(
     uses_triton_dispatch = attn_backend not in (
         "ascend",
         "torch_native",
-        "pallas_tpu_flash",
         "pallas_tpu_rpa_v3",
     )
 

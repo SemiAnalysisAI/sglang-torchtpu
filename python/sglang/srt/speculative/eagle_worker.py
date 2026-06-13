@@ -155,10 +155,8 @@ class EAGLEWorker(TpModelWorker):
         else:
             ctx = empty_context()
         with (
-            ctx,
-            speculative_moe_backend_context(),
-            speculative_moe_a2a_backend_context(),
-        ):
+            ctx
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,
