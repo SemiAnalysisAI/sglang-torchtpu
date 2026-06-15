@@ -202,7 +202,28 @@ class SchedulerBatchResultProcessor:
             )
 
             # Move next_token_ids and logprobs to cpu
-            next_token_ids = next_token_ids.tolist()
+            try:
+                next_token_ids = next_token_ids.tolist()
+            except RuntimeError as e:
+                import logging
+
+                # Use repr() in a nested try to avoid cascading device
+                # errors when accessing .shape on crashed TPU tensors.
+                try:
+                    diag = (
+                        f"forward_mode={getattr(batch, 'forward_mode', '?')} "
+                        f"batch_size={getattr(batch, 'batch_size', '?')}"
+                    )
+                except Exception:
+                    diag = "(diagnostic unavailable)"
+                logging.getLogger(__name__).error(
+                    "Failed to move next_token_ids to CPU (%s). "
+                    "This often indicates that the XLA program that "
+                    "produced these tensors crashed on the TPU device. %s",
+                    e,
+                    diag,
+                )
+                raise
             self._move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
 
             hidden_state_offset = 0
@@ -669,7 +690,24 @@ class SchedulerBatchResultProcessor:
             elif isinstance(next_token_ids, list):
                 pass  # MLX path: already a list[int], skip torch round-trip
             else:
-                next_token_ids = next_token_ids.tolist()
+                try:
+                    next_token_ids = next_token_ids.tolist()
+                except RuntimeError as e:
+                    import logging
+
+                    try:
+                        diag = (
+                            f"forward_mode={getattr(batch, 'forward_mode', '?')} "
+                            f"batch_size={getattr(batch, 'batch_size', '?')}"
+                        )
+                    except Exception:
+                        diag = "(diagnostic unavailable)"
+                    logging.getLogger(__name__).error(
+                        "Failed to move decode next_token_ids to CPU (%s). %s",
+                        e,
+                        diag,
+                    )
+                    raise
 
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()

@@ -77,12 +77,16 @@ class TestTpuGraphRunner(CustomTestCase):
             model=model,
             model_config=SimpleNamespace(context_len=2048),
             max_running_requests=1,
+            is_draft_worker=False,
             server_args=SimpleNamespace(
                 enable_torch_compile=enable_torch_compile,
                 tpu_compile_tokens=None,
                 tpu_compile_bs=None,
                 chunked_prefill_size=None,
                 max_prefill_tokens=2048,
+                speculative_num_steps=None,
+                speculative_algorithm=None,
+                speculative_eagle_topk=None,
             ),
         )
 
@@ -153,6 +157,65 @@ class TestTpuGraphRunner(CustomTestCase):
         self.mock_compile.assert_not_called()
         # Backend registration still happens — the gate is _can_torch_compile.
         self.mock_register.assert_called_once()
+
+    def test_draft_worker_compiles_and_precompiles(self):
+        original = MagicMock()
+        model = _model_with(forward=original)
+        runner = self._runner_for(model)
+        runner.is_draft_worker = True
+        runner.server_args.speculative_num_steps = 3
+        TpuGraphRunner(runner)
+        # Draft model IS compiled via torch.compile with precompilation.
+        self.mock_compile.assert_called_once()
+        self.assertIsNot(model.forward, original)
+
+    def test_unwraps_no_grad_decorator_for_dynamo_isolation(self):
+        """torch.compile receives the unwrapped forward, not the
+        @torch.no_grad() decorator wrapper, so that models with
+        inherited forward() get distinct Dynamo graph caches."""
+        import torch
+
+        # Simulate @torch.no_grad() decorated parent forward.
+        @torch.no_grad()
+        def parent_forward(self, input_ids, positions, forward_batch):
+            pass
+
+        # Child overrides with super() delegation — distinct __code__.
+        @torch.no_grad()
+        def child_forward(self, input_ids, positions, forward_batch):
+            return parent_forward(self, input_ids, positions, forward_batch)
+
+        # Both share the same decorator __code__.
+        self.assertIs(
+            parent_forward.__code__,
+            child_forward.__code__,
+        )
+        # But __wrapped__ has distinct __code__.
+        self.assertIsNot(
+            parent_forward.__wrapped__.__code__,
+            child_forward.__wrapped__.__code__,
+        )
+
+        # _wrap_with_tpu_compile should pass the unwrapped fn to
+        # torch.compile so Dynamo sees distinct code objects.
+        target_model = _model_with(forward=parent_forward)
+        draft_model = _model_with(forward=child_forward)
+
+        from sglang.srt.model_executor.tpu_graph_runner import (
+            _wrap_with_tpu_compile,
+        )
+
+        _wrap_with_tpu_compile(target_model, "forward")
+        _wrap_with_tpu_compile(draft_model, "forward")
+
+        # torch.compile was called twice (once per model).
+        self.assertEqual(self.mock_compile.call_count, 2)
+
+        # The raw functions passed to torch.compile should have
+        # different __code__ (the actual forward, not the decorator).
+        target_compiled_fn = self.mock_compile.call_args_list[0][0][0]
+        draft_compiled_fn = self.mock_compile.call_args_list[1][0][0]
+        self.assertIsNot(target_compiled_fn.__code__, draft_compiled_fn.__code__)
 
     def test_can_run_is_always_false(self):
         # ModelRunner.forward branches on `graph_runner.can_run(...)`

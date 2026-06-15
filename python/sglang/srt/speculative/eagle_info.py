@@ -425,8 +425,19 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         unfinished_index = []
         unfinished_accept_index = []
-        accept_index_cpu = accept_index.tolist()
-        predict_cpu = predict.tolist()
+        # Coalesce two device->host syncs (accept_index + predict) into one.
+        # Pre-gather, on device, the accepted token id at every (req, slot) using
+        # -1 as the rejected/end sentinel: `predict` holds vocab ids >= 0, so -1 is
+        # unambiguous and matches exactly where accept_index == -1. The host loop
+        # then reads token ids directly from a single `.tolist()`, removing the
+        # separate `predict.tolist()` stall. The device `accept_index` tensor is
+        # left untouched here so the downstream gathers/eviction are unchanged.
+        accept_token_per_slot = torch.where(
+            accept_index >= 0,
+            predict[accept_index.clamp(min=0)],
+            accept_index.new_full((), -1),
+        )
+        accept_token_per_slot_cpu = accept_token_per_slot.tolist()
         has_finished = False
         think_end_id = batch.model_config.think_end_id
         # Track per-request correct drafts from the CPU loop to avoid a
@@ -435,13 +446,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
-        for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
+        for i, (req, accept_token_row) in enumerate(
+            zip(batch.reqs, accept_token_per_slot_cpu)
+        ):
             num_accept_tokens = 0
-            for j, idx in enumerate(accept_index_row):
-                if idx == -1:
+            id = -1
+            for j, id in enumerate(accept_token_row):
+                if id == -1:
                     break
                 num_accept_tokens += 1
-                id = predict_cpu[idx]
                 req.output_ids.append(id)
                 if req.require_reasoning and think_end_id is not None:
                     req.update_reasoning_tokens(id, think_end_id)
@@ -465,7 +478,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             req.kv_allocated_len = req.kv_committed_len
             if not req.finished():
                 unfinished_index.append(i)
-                if idx == -1:
+                # `id == -1` (the per-slot accepted token sentinel) is equivalent
+                # to the old `idx == -1` test: a trailing rejected slot.
+                if id == -1:
                     unfinished_accept_index.append(accept_index[i, :j])
                 else:
                     unfinished_accept_index.append(accept_index[i])
@@ -478,17 +493,36 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if has_finished:
             num_correct_drafts = (accept_index != -1).sum(dim=1) - 1
 
-        # Free the KV cache for unaccepted tokens
-        # TODO: fuse them
-        accept_index = accept_index[accept_index != -1]
-        accept_tokens = predict[accept_index]
-        evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
-        evict_mask[accept_index] = False
         # Derive CPU values from the loop above instead of device transfer.
         num_accept_tokens_list = [n + 1 for n in num_correct_drafts_list]
         num_accept_tokens_cpu = torch.tensor(
             num_accept_tokens_list, dtype=batch.seq_lens_cpu.dtype
         )
+
+        # Flatten the accepted indices WITHOUT a boolean-mask shape sync.
+        # `accept_index` is rectangular [bs, spec_steps+1] with each row's valid
+        # entries front-packed: verify writes a valid prefix then -1 padding, and
+        # the host loop above sets a finished request's trailing slots to -1. So the
+        # non-(-1) entries of row i are exactly its first `num_accept_tokens_list[i]`
+        # entries, and that per-request count is already known on host (no extra
+        # sync). The total length is therefore host-known, so we copy each valid
+        # prefix into a statically-shaped flat tensor instead of
+        # `accept_index[accept_index != -1]`, which would device->host sync to
+        # materialize the dynamic output shape on TPU.
+        total_accept = sum(num_accept_tokens_list)
+        accept_index_flat = accept_index.new_empty((total_accept,))
+        _off = 0
+        for _i, _c in enumerate(num_accept_tokens_list):
+            if _c:
+                accept_index_flat[_off : _off + _c] = accept_index[_i, :_c]
+            _off += _c
+        accept_index = accept_index_flat
+
+        # Free the KV cache for unaccepted tokens
+        # TODO: fuse them
+        accept_tokens = predict[accept_index]
+        evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
+        evict_mask[accept_index] = False
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.

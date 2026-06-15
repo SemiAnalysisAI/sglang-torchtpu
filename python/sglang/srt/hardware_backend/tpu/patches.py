@@ -84,6 +84,12 @@ def _prepare_tpu_env(world_size: int = 1) -> None:
     # torch implementation instead.
     os.environ.setdefault("SGLANG_NATIVE_MOVE_KV_CACHE", "1")
 
+    # Keep TP collectives compiled in-graph (no graph break) for
+    # fullgraph=True torch.compile on TPU.  Without this, functional
+    # collectives may be materialized early, breaking the compiled graph.
+    # (Ported from torchtpu-vllm env_override.py.)
+    os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
+
     if "TORCH_TPU_SLICEBUILDER_ADDRESSES" in os.environ:
         return
 
@@ -622,6 +628,58 @@ def _prewarm_fused_moe() -> None:
         logger.warning("TPU: fused-MoE op prewarm skipped (%s)", e)
 
 
+_row_parallel_bias_patched = False
+
+
+def _patch_row_parallel_linear_bias_for_tp_determinism() -> None:
+    """Make RowParallelLinear produce identical FX graphs on all TP ranks.
+
+    The upstream ``tp_rank > 0`` bias branch creates rank-dependent graphs.
+    Fix: defer bias add after all_reduce using a rank-independent scale
+    buffer (_tpu_bias_scale: 1.0 on rank 0, 0.0 on others).
+    """
+    global _row_parallel_bias_patched
+    if _row_parallel_bias_patched:
+        return
+    _row_parallel_bias_patched = True
+
+    from sglang.srt.layers.linear import RowParallelLinear
+
+    orig_forward = RowParallelLinear.forward
+
+    def patched_forward(self, input_, forward_batch=None, skip_all_reduce=False):
+        orig_skip = self.skip_bias_add
+        self.skip_bias_add = True
+        output, output_bias = orig_forward(
+            self, input_, forward_batch=forward_batch, skip_all_reduce=skip_all_reduce
+        )
+        self.skip_bias_add = orig_skip
+        if not orig_skip and self.bias is not None:
+            output = output + self.bias * self._tpu_bias_scale
+            output_bias = None
+        return output, output_bias
+
+    orig_init = RowParallelLinear.__init__
+
+    def patched_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        import torch
+
+        scale_val = 1.0 if self.tp_rank == 0 else 0.0
+        self.register_buffer(
+            "_tpu_bias_scale",
+            torch.tensor(scale_val, dtype=torch.float32),
+            persistent=False,
+        )
+
+    RowParallelLinear.forward = patched_forward
+    RowParallelLinear.__init__ = patched_init
+    logger.info(
+        "TPU: patched RowParallelLinear.forward to defer bias add "
+        "after all_reduce (TP-deterministic graph structure)."
+    )
+
+
 def apply_tpu_patches(world_size: int = 1) -> None:
     _prepare_tpu_env(world_size)
     _configure_eager_mode()
@@ -635,4 +693,5 @@ def apply_tpu_patches(world_size: int = 1) -> None:
     _patch_mha_kv_pool_for_rpa_v3()
     _prewarm_fused_moe()  # TODO(Qinghan): this will just be temporary
     _register_aten_fallbacks()
+    _patch_row_parallel_linear_bias_for_tp_determinism()
     logger.info("TPU patches applied.")

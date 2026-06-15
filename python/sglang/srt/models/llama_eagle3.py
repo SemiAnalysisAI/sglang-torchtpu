@@ -35,7 +35,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
 from sglang.srt.server_args import get_global_server_args
@@ -270,8 +273,21 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 layer.self_attn.attn.sliding_window_size = self._draft_window_size
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
+        #
+        # A reduced-vocab EAGLE3 draft (draft_vocab_size < target vocab_size, paired
+        # with a d2t draft->target map) ships its OWN trained lm_head over the draft
+        # vocab. Such a checkpoint must NOT tie lm_head to embed_tokens even when its
+        # config inherits tie_word_embeddings=True from the base model: embed_tokens
+        # is later overwritten with the target's full-vocab embedding via set_embed(),
+        # which would discard the draft head and project through the wrong matrix
+        # (garbage draft logits -> 0% acceptance). E.g. AngelSlim/Qwen3-1.7B_eagle3
+        # has tie_word_embeddings=True, draft_vocab_size=32000, vocab_size=151936.
+        has_reduced_draft_vocab = (
+            config.draft_vocab_size is not None
+            and config.draft_vocab_size != config.vocab_size
+        )
         self.load_lm_head_from_target = False
-        if self.config.tie_word_embeddings:
+        if self.config.tie_word_embeddings and not has_reduced_draft_vocab:
             self.lm_head = self.model.embed_tokens
         else:
             if config.draft_vocab_size is None:

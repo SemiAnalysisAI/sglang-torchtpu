@@ -250,13 +250,9 @@ def _assign_req_to_token_pool_torch(
     """Pure-PyTorch implementation of assign_req_to_token_pool for TPU/XLA."""
     if batch_size == 0:
         return
-    # Process exactly `batch_size` entries, matching the Triton kernel (which
-    # launches `batch_size` programs). Slice every batch-indexed input up front
-    # so trailing entries beyond `batch_size` never affect shapes or writes.
     req_pool_indices = req_pool_indices[:batch_size]
     start_offset = start_offset[:batch_size]
     end_offset = end_offset[:batch_size]
-    # Opt-in async OOB check (no host sync unless SGLANG_SPEC_OOB_DETECTION is on).
     lengths = end_offset - start_offset
     # Use the KV pool width as a safe upper bound for max_len to avoid
     # a host-device sync from torch.max().item().

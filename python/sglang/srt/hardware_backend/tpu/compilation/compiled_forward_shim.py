@@ -114,23 +114,61 @@ def _pad_forward_batch_inputs(
         if isinstance(val, list) and len(val) < pad_b:
             setattr(forward_batch, field, val + [0] * (pad_b - len(val)))
 
+    # Pad spec_info tensors whose token dim must match input_ids after padding.
+    # EAGLE3 draft models concatenate spec_info.hidden_states with the padded
+    # embedding output along the feature dimension — both must have the same
+    # number of rows (token dim).
+    spec_info = getattr(forward_batch, "spec_info", None)
+    if spec_info is not None:
+        hs = getattr(spec_info, "hidden_states", None)
+        if isinstance(hs, torch.Tensor) and hs.ndim >= 1 and hs.shape[0] < pad_t:
+            pad_rows = pad_t - hs.shape[0]
+            spec_info.hidden_states = F.pad(hs, (0,) * (2 * (hs.ndim - 1)) + (0, pad_rows))
+
     forward_batch.batch_size = pad_b
 
     return real_q, real_b
 
 
+# Opt-in env switch for per-forward shape/mode tracing. Off by default so the
+# hot serving path pays nothing. When truthy, each compiled forward call logs
+# the first occurrence of every distinct (mode, capture, shape, dtype, backend)
+# signature it sees, so a serving log can be grepped to learn exactly which
+# graphs appear after the server becomes ready (the ones that cold-compile show
+# up after the precompile phase).
+
+
 class CompiledForwardShim:
     """Adapt compiled forward calls and outputs for padded execution."""
 
-    def __init__(self, compiled_fn):
+    def __init__(self, compiled_fn, *, model_runner=None):
         self.fn = compiled_fn
+        # Kept only so compile tracing can resolve the model role and the
+        # per-step / draft-extend attention backend identity at call time.
+        self.model_runner = model_runner
         signature = getattr(compiled_fn, "__signature__", None)
         if signature is not None:
             self.__signature__ = signature
         self._default_kwargs = _static_default_kwargs(compiled_fn)
+        # Distinct forward signatures already traced by this shim. Only used
+        # when compile tracing is enabled; logs each signature at most once.
         functools.update_wrapper(self, compiled_fn)
 
     def __call__(self, input_ids, positions, forward_batch, *args, **kwargs):
+        # Normalize input_ids dtype to int64 so the compiled model is not
+        # recompiled when callers alternate int32/int64 inputs (Dynamo guard
+        # failure "expected Long, actual Int"). Normal decode already casts
+        # next_token_ids -> int64 (scheduler.py), but the speculative path bypasses
+        # prepare_forward_batch and sets batch.input_ids = draft_token without that
+        # cast, so its int32 draft/verify tokens otherwise force a recompile of the
+        # target and draft forwards on every shape they hit. Embedding lookup is
+        # dtype-agnostic, so this is bit-exact.
+        if isinstance(input_ids, torch.Tensor) and input_ids.dtype != torch.int64:
+            input_ids = input_ids.to(torch.int64)
+            fb_ids = getattr(forward_batch, "input_ids", None)
+            if isinstance(fb_ids, torch.Tensor) and fb_ids.dtype != torch.int64:
+                forward_batch.input_ids = fb_ids.to(torch.int64)
+
         if self._default_kwargs and kwargs:
             # Dynamo treats omitted kwargs and explicit defaults as
             # different call shapes; drop explicit default values.
@@ -142,6 +180,7 @@ class CompiledForwardShim:
                     and _matches_default(v, self._default_kwargs[k])
                 )
             }
+
         out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
 
         real_q = getattr(forward_batch, _REAL_Q_KEY, None)
@@ -150,8 +189,16 @@ class CompiledForwardShim:
             return out
 
         next_token_logits = getattr(out, "next_token_logits", None)
-        if next_token_logits is not None and real_b < next_token_logits.shape[0]:
-            out.next_token_logits = next_token_logits[:real_b]
+        if next_token_logits is not None and next_token_logits.shape[0] > real_b:
+            # TARGET_VERIFY outputs bs * draft_token_num logits (one per
+            # draft token across all requests).  Slicing to real_b would
+            # drop the verify tokens.  Use real_q instead.
+            fm = getattr(forward_batch, "forward_mode", None)
+            logit_rows = (
+                real_q if (fm is not None and fm.is_target_verify()) else real_b
+            )
+            if logit_rows < next_token_logits.shape[0]:
+                out.next_token_logits = next_token_logits[:logit_rows]
 
         hidden_states = getattr(out, "hidden_states", None)
         if hidden_states is not None and real_q < hidden_states.shape[0]:
@@ -183,25 +230,21 @@ def resolve_compile_caps(
             "Cannot determine max_t for TPU compile bucketing: "
             "chunked_prefill_size, max_prefill_tokens, and context_len are all unset."
         )
-    # TPU serving should compile the requested scheduler capacity by default for
-    # practical benchmark sizes (for example max_running_requests=64). Avoid
-    # blindly expanding to very large upstream defaults unless the user raises
-    # torch_compile_max_bs or pins --tpu-compile-bs.
-    max_running_compile_bs = (
-        min(max_running_requests, DEFAULT_TPU_COMPILE_MAX_BS)
-        if max_running_requests
-        else 1
+    # The TPU compile grid must cover the scheduler's serving capacity. The
+    # scheduler runs in a separate process and can form batches up to
+    # ``max_running_requests``; ``_pad_forward_batch_inputs`` calls
+    # ``b_bucketer.next_bucket(real_b)``, which raises ValueError if a real
+    # batch exceeds the largest bucket. So the largest batch bucket is the
+    # configured serving capacity (falling back to ``DEFAULT_TPU_COMPILE_MAX_BS``
+    # when unset). Users can still raise it via ``--torch-compile-max-bs`` or
+    # shape the grid explicitly via ``--tpu-compile-bs``. For the common case
+    # (``max_running_requests <= 64``) this matches the previous default cap;
+    # it only differs for >64, where the old ``min(.., 64)`` cap made valid
+    # serving batches crash instead of compiling.
+    max_b = max(
+        torch_compile_max_bs or 1,
+        max_running_requests or DEFAULT_TPU_COMPILE_MAX_BS,
     )
-    max_b = max(torch_compile_max_bs or 1, max_running_compile_bs)
-    if max_running_requests and max_b < max_running_requests:
-        logger.warning(
-            "[compiled forward shim] TPU compile bs cap=%d < max_running_requests=%d; "
-            "batches above %d are outside the TPU compile grid. Raise "
-            "--torch-compile-max-bs or pin --tpu-compile-bs to cover them.",
-            max_b,
-            max_running_requests,
-            max_b,
-        )
     return min(candidates), max_b
 
 
@@ -247,7 +290,11 @@ class TpuCompiledForwardShim:
         self.model.prepare_forward_batch = _prepare
 
         for attr, compiled_fn in self._compiled_fns.items():
-            setattr(self.model, attr, CompiledForwardShim(compiled_fn))
+            setattr(
+                self.model,
+                attr,
+                CompiledForwardShim(compiled_fn, model_runner=self.model_runner),
+            )
 
         logger.info(
             "[compiled forward shim] Installed compiled-forward adaptation on %s.{%s} "
