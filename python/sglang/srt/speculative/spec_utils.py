@@ -164,19 +164,16 @@ def _create_extend_after_decode_spec_info_torch(
     bonus_idx = (cumsum - 1).clamp(min=0)
     bonus_tokens.copy_(accept_tokens[bonus_idx].to(bonus_tokens.dtype))
 
-    # positions: per-request loop because requests write non-overlapping
-    # variable-length slices into the flat positions array. A batched
-    # scatter with clamp would cause index collisions across requests.
-    # TODO(pyc96): vectorize with a padded 2D scatter or torch_xla fori_loop
-    # to avoid per-request .item() host-device syncs on XLA.
-    offset = 0
-    for pid in range(batch_size):
-        al = int(accept_lens[pid].item())
-        sl = int(seq_lens[pid].item())
-        positions[offset : offset + al] = torch.arange(
-            sl - al, sl, device=positions.device, dtype=positions.dtype
-        )
-        offset += al
+    total = positions.numel()
+    if total == 0:
+        return
+    flat = torch.arange(total, device=positions.device, dtype=accept_lens.dtype)
+    req_id = (flat[:, None] >= cumsum[None, :]).sum(dim=1).clamp_(max=batch_size - 1)
+    start_excl = cumsum - accept_lens  # exclusive prefix offset per request
+    within = flat - start_excl[req_id]
+    positions.copy_(
+        (seq_lens[req_id] - accept_lens[req_id] + within).to(positions.dtype)
+    )
 
 
 def create_extend_after_decode_spec_info_func(
@@ -253,6 +250,13 @@ def _assign_req_to_token_pool_torch(
     """Pure-PyTorch implementation of assign_req_to_token_pool for TPU/XLA."""
     if batch_size == 0:
         return
+    # Process exactly `batch_size` entries, matching the Triton kernel (which
+    # launches `batch_size` programs). Slice every batch-indexed input up front
+    # so trailing entries beyond `batch_size` never affect shapes or writes.
+    req_pool_indices = req_pool_indices[:batch_size]
+    start_offset = start_offset[:batch_size]
+    end_offset = end_offset[:batch_size]
+    # Opt-in async OOB check (no host sync unless SGLANG_SPEC_OOB_DETECTION is on).
     lengths = end_offset - start_offset
     # Use the KV pool width as a safe upper bound for max_len to avoid
     # a host-device sync from torch.max().item().
@@ -267,20 +271,20 @@ def _assign_req_to_token_pool_torch(
     )
     mask = offsets[None, :] < lengths[:, None]  # (batch_size, max_len)
     src_starts = torch.cumsum(lengths, dim=0) - lengths
-    src_index = (src_starts[:, None] + offsets[None, :]).clamp(
-        max=out_cache_loc.numel() - 1
-    )
-    dst_index = start_offset[:, None] + offsets[None, :]
+    # Static-shape masked scatter (dynamic boolean indexing is unsupported on
+    # TPU/XLA). Masked-out (padding) columns fall back to each request's OWN
+    # first valid column (offset 0) and its first source value, keeping the row
+    # unchanged. Requests occupy distinct KV-pool rows, so the only duplicate
+    # scatter indices occur WITHIN a request and write identical values
+    # (idempotent, collision-free). This avoids the previous (row 0, col 0)
+    # global redirect, whose "preserve old value" writes could clobber a real
+    # mapping at slot (0, 0). Requires length >= 1 per request, which all
+    # callers guarantee (draft_token_num / num_correct_drafts+1 / decode window).
+    col_offsets = offsets[None, :] * mask  # valid -> j ; masked -> 0
+    src_index = (src_starts[:, None] + col_offsets).clamp(max=out_cache_loc.numel() - 1)
+    dst_index = start_offset[:, None] + col_offsets
     row_index = req_pool_indices[:, None].expand(batch_size, max_len)
-    # Redirect masked-out positions to the padding row (row 0, col 0).
-    dst_index = torch.where(mask, dst_index, torch.zeros_like(dst_index))
-    row_index = torch.where(mask, row_index, torch.zeros_like(row_index))
-    vals = torch.where(
-        mask,
-        out_cache_loc[src_index].to(req_to_token.dtype),
-        req_to_token[row_index, dst_index],
-    )
-    req_to_token[row_index, dst_index] = vals
+    req_to_token[row_index, dst_index] = out_cache_loc[src_index].to(req_to_token.dtype)
 
 
 def assign_req_to_token_pool_func(
@@ -455,7 +459,13 @@ def _assign_draft_cache_locs_torch(
 
     device = req_to_token.device
     copy_len = topk * speculative_num_steps
-    # out_cache_loc is laid out as (batch_size, copy_len).
+    # Process exactly `batch_size` entries, matching the Triton kernel. Slice
+    # every batch-indexed input up front so trailing entries beyond `batch_size`
+    # never affect shapes or writes. out_cache_loc is laid out as
+    # (batch_size, copy_len); take only the active prefix.
+    req_pool_indices = req_pool_indices[:batch_size]
+    seq_lens = seq_lens[:batch_size]
+    out_cache_loc = out_cache_loc[: batch_size * copy_len]
     # Out-of-bounds safety: cols stay within req_to_token.shape[1] because
     # the KV pool allocator guarantees seq_lens + copy_len <= pool width.
     offsets = torch.arange(copy_len, device=device, dtype=seq_lens.dtype)
