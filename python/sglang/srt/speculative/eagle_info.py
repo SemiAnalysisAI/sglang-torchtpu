@@ -70,6 +70,36 @@ def _draft_runner_of(worker):
     )
 
 
+def _flatten_accept_index(accept_index, num_accept_tokens_list, topk):
+    """Flatten the rectangular ``[bs, spec_steps+1]`` ``accept_index`` to the 1-D list of
+    accepted cache locations, returning ``(accept_index_flat, total_accept)``.
+
+    At ``topk == 1`` the verify accept rows are front-packed (a linear chain: a valid
+    prefix then ``-1`` padding; the verify host loop also breaks at the first ``-1`` and
+    finished rows are truncated to ``-1``). So the non-(-1) entries of row ``i`` are exactly
+    its first ``num_accept_tokens_list[i]`` entries — a host-known count — and we copy each
+    static prefix into a statically-shaped buffer instead of ``accept_index[accept_index
+    != -1]`` (a boolean-mask gather whose output length is a runtime value, forcing a
+    device->host sync on TPU).
+
+    For ``topk > 1`` (tree paths) a row can have holes (e.g. ``[0, -1, 2]``) where valid
+    entries are NOT a contiguous prefix; the prefix copy would drop the post-hole accepted
+    slots. Fall back to the exact mask gather there so EVERY accepted cache location is
+    kept (this off-fast-path case accepts the dynamic-shape sync).
+    """
+    if topk == 1:
+        total_accept = sum(num_accept_tokens_list)
+        accept_index_flat = accept_index.new_empty((total_accept,))
+        _off = 0
+        for _i, _c in enumerate(num_accept_tokens_list):
+            if _c:
+                accept_index_flat[_off : _off + _c] = accept_index[_i, :_c]
+            _off += _c
+        return accept_index_flat, total_accept
+    accept_index_flat = accept_index[accept_index != -1]
+    return accept_index_flat, int(accept_index_flat.shape[0])
+
+
 @dataclass
 class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     draft_token: torch.Tensor
@@ -278,7 +308,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
-        predict = torch.empty(predict_shape, dtype=torch.int32, device=batch.device)
+        # int64 to match ScheduleBatch.input_ids (always int64, see schedule_batch.py).
+        # The spec path feeds predict[...] as input_ids into the compiled forward;
+        # int32 here would cause Dynamo guard failures on TPU and trigger serving-time
+        # recompiles on every verify step.
+        predict = torch.empty(predict_shape, dtype=torch.int64, device=batch.device)
         accept_index = torch.full(
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=batch.device
         )
@@ -425,8 +459,19 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         unfinished_index = []
         unfinished_accept_index = []
-        accept_index_cpu = accept_index.tolist()
-        predict_cpu = predict.tolist()
+        # Coalesce two device->host syncs (accept_index + predict) into one.
+        # Pre-gather, on device, the accepted token id at every (req, slot) using
+        # -1 as the rejected/end sentinel: `predict` holds vocab ids >= 0, so -1 is
+        # unambiguous and matches exactly where accept_index == -1. The host loop
+        # then reads token ids directly from a single `.tolist()`, removing the
+        # separate `predict.tolist()` stall. The device `accept_index` tensor is
+        # left untouched here so the downstream gathers/eviction are unchanged.
+        accept_token_per_slot = torch.where(
+            accept_index >= 0,
+            predict[accept_index.clamp(min=0)],
+            accept_index.new_full((), -1),
+        )
+        accept_token_per_slot_cpu = accept_token_per_slot.tolist()
         has_finished = False
         think_end_id = batch.model_config.think_end_id
         # Track per-request correct drafts from the CPU loop to avoid a
@@ -435,13 +480,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
-        for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
+        for i, (req, accept_token_row) in enumerate(
+            zip(batch.reqs, accept_token_per_slot_cpu)
+        ):
             num_accept_tokens = 0
-            for j, idx in enumerate(accept_index_row):
-                if idx == -1:
+            id = -1
+            for j, id in enumerate(accept_token_row):
+                if id == -1:
                     break
                 num_accept_tokens += 1
-                id = predict_cpu[idx]
                 req.output_ids.append(id)
                 if req.require_reasoning and think_end_id is not None:
                     req.update_reasoning_tokens(id, think_end_id)
@@ -465,7 +512,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             req.kv_allocated_len = req.kv_committed_len
             if not req.finished():
                 unfinished_index.append(i)
-                if idx == -1:
+                # `id == -1` (the per-slot accepted token sentinel) is equivalent
+                # to the old `idx == -1` test: a trailing rejected slot.
+                if id == -1:
                     unfinished_accept_index.append(accept_index[i, :j])
                 else:
                     unfinished_accept_index.append(accept_index[i])
@@ -478,21 +527,46 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if has_finished:
             num_correct_drafts = (accept_index != -1).sum(dim=1) - 1
 
-        # Free the KV cache for unaccepted tokens
-        # TODO: fuse them
-        accept_index = accept_index[accept_index != -1]
-        accept_tokens = predict[accept_index]
-        evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
-        evict_mask[accept_index] = False
         # Derive CPU values from the loop above instead of device transfer.
         num_accept_tokens_list = [n + 1 for n in num_correct_drafts_list]
         num_accept_tokens_cpu = torch.tensor(
             num_accept_tokens_list, dtype=batch.seq_lens_cpu.dtype
         )
 
+        # Flatten the accepted indices. At topk==1 (front-packed rows) this avoids a
+        # boolean-mask dynamic-shape device->host sync by copying each row's host-known
+        # valid prefix; at topk>1 (tree rows with holes) it falls back to the exact mask
+        # gather so no non-prefix accepted cache location is dropped. See
+        # `_flatten_accept_index`.
+        accept_index, total_accept = _flatten_accept_index(
+            accept_index, num_accept_tokens_list, self.topk
+        )
+
+        # Free the KV cache for unaccepted tokens
+        # TODO: fuse them
+        accept_tokens = predict[accept_index]
+        evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
+        evict_mask[accept_index] = False
+
         if page_size == 1:
-            # TODO: boolean array index leads to a device sync. Remove it.
-            token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+            # `out_cache_loc[evict_mask]` is a boolean-mask gather whose output length
+            # is a runtime value, so on TPU it forces a device->host sync to materialize
+            # the dynamic shape (this was the dominant measured verify-accept host cost).
+            # The freed count is host-known here (n_slots - total_accept), so compact the
+            # rejected cache locations into a statically-shaped buffer on device — a
+            # cumsum assigns each rejected slot a dense front position [0, free_count),
+            # accepted slots scatter to a dump index that is then sliced off — and free a
+            # static slice. Same freed SET as the boolean mask (free() is order-agnostic),
+            # with no dynamic-shape sync.
+            n_slots = evict_mask.shape[0]
+            free_count = n_slots - total_accept
+            dense_pos = torch.cumsum(evict_mask.to(torch.int32), dim=0) - 1
+            scatter_pos = torch.where(
+                evict_mask, dense_pos, dense_pos.new_full((), n_slots)
+            ).to(torch.int64)
+            packed = batch.out_cache_loc.new_empty((n_slots + 1,))
+            packed.scatter_(0, scatter_pos, batch.out_cache_loc)
+            token_to_kv_pool_allocator.free(packed[:free_count])
         else:
             if self.topk == 1:
                 # Only evict full empty page. Do not evict partial empty page

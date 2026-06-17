@@ -23,6 +23,7 @@ for that instance only — every existing call site in ``ModelRunner``
 
 from __future__ import annotations
 
+import functools
 import inspect
 from typing import TYPE_CHECKING, Callable
 
@@ -52,14 +53,28 @@ def _wrap_with_tpu_compile(model, attr_name: str) -> bool:
     if fn is None:
         return False
     signature = inspect.signature(fn)
+
+    # Unwrap @torch.no_grad() so torch.compile traces the raw forward,
+    # not the contextlib wrapper (which Dynamo cannot trace under
+    # fullgraph=True). Re-apply torch.no_grad() outside the compiled
+    # region below.
+    raw_fn = getattr(fn, "__wrapped__", fn)
+    if hasattr(fn, "__self__") and not hasattr(raw_fn, "__self__"):
+        raw_fn = raw_fn.__get__(fn.__self__, type(fn.__self__))
     compiled = torch.compile(
-        torch.no_grad()(fn),
+        raw_fn,
         backend="tpu",
         fullgraph=True,
         dynamic=False,
     )
-    compiled.__signature__ = signature
-    setattr(model, attr_name, compiled)
+
+    @functools.wraps(raw_fn)
+    def _no_grad_compiled(*args, **kwargs):
+        with torch.no_grad():
+            return compiled(*args, **kwargs)
+
+    _no_grad_compiled.__signature__ = signature
+    setattr(model, attr_name, _no_grad_compiled)
     return True
 
 
@@ -118,6 +133,11 @@ class TpuGraphRunner:
         torch._dynamo.config.accumulated_cache_size_limit = 1024
         if hasattr(torch._dynamo.config, "cache_size_limit"):
             torch._dynamo.config.cache_size_limit = 1024
+        # flashinfer_backend.py sets suppress_errors=True at module level
+        # when SGLANG_ENABLE_TORCH_COMPILE is active, but on TPU we need
+        # compilation failures to be loud.  Clear it before enabling
+        # fail_on_recompile_limit_hit (the two flags conflict in Dynamo).
+        torch._dynamo.config.suppress_errors = False
         # Fail loudly on compile-limit hits to expose latency cliffs early.
         if hasattr(torch._dynamo.config, "fail_on_recompile_limit_hit"):
             torch._dynamo.config.fail_on_recompile_limit_hit = True
@@ -161,12 +181,20 @@ class TpuGraphRunner:
             CompilationManager,
         )
 
-        CompilationManager(
+        sa = model_runner.server_args
+
+        manager = CompilationManager(
             model_runner=model_runner,
             compiled_fns=compiled_fns,
             t_bucketer=compiled_forward_shim.t_bucketer,
             b_bucketer=compiled_forward_shim.b_bucketer,
-        ).precompile_all()
+            speculative_num_steps=sa.speculative_num_steps or 0,
+            speculative_algorithm=sa.speculative_algorithm,
+            is_draft_worker=model_runner.is_draft_worker,
+            topk=sa.speculative_eagle_topk or 1,
+        )
+        if not model_runner.is_draft_worker:
+            manager.precompile_all()
 
     def can_run(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.

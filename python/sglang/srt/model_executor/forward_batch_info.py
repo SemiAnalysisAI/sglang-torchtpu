@@ -408,6 +408,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     mm_input_embeds: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = None
+    # Per-step kv_lens override for fused multi-step draft (TPU RPA-v3). Set by
+    # the eagle_worker before each draft step so the attention backend uses the
+    # step's lengths without re-initializing metadata. None on the normal path.
+    rpa_draft_kv_lens: Optional[torch.Tensor] = None
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded

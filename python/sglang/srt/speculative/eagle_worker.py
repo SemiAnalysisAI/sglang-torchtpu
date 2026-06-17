@@ -774,10 +774,15 @@ class EAGLEWorker(TpModelWorker):
             ):
                 # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
-            # Run forward steps
-            parent_list, top_scores_index, draft_tokens = self.draft_forward(
-                forward_batch
-            )
+            # Run forward steps. Use the fused region when eligible.
+            if self._fused_draft_eligible(batch, forward_batch):
+                parent_list, top_scores_index, draft_tokens = self._fused_draft_forward(
+                    forward_batch
+                )
+            else:
+                parent_list, top_scores_index, draft_tokens = self.draft_forward(
+                    forward_batch
+                )
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -826,6 +831,110 @@ class EAGLEWorker(TpModelWorker):
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
+
+    def _fused_draft_eligible(
+        self, batch: ScheduleBatch, forward_batch: ForwardBatch
+    ) -> bool:
+        """Whether the fused multi-step draft region may run for this step.
+
+        Requires: TPU, topk=1 (linear chain speculation), page_size=1,
+        no grammar/logprob, and not idle.
+        """
+        return (
+            _is_tpu
+            and not forward_batch.forward_mode.is_idle()
+            and self.topk == 1
+            and self.page_size == 1
+            and not getattr(batch, "has_grammar", False)
+            and not getattr(batch, "return_logprob", False)
+        )
+
+    def _fused_draft_forward(self, forward_batch: ForwardBatch):
+        """Fused multi-step draft path (TPU, topk=1).
+
+        Binds ONE stable draft backend (no per-step object swap) and stacks the
+        per-step kv_lens. The compiled inner body _fused_draft_steps runs the
+        unrolled per-step forwards as ONE graph.
+        """
+        spec_info = forward_batch.spec_info
+        assert isinstance(spec_info, EagleDraftInput)
+        topk_p, topk_index, hidden_states = (
+            spec_info.topk_p,
+            spec_info.topk_index,
+            spec_info.hidden_states,
+        )
+        maybe_detect_nan(topk_p, "fused_draft: NaN in initial topk_p from spec_info")
+        if self.hot_token_id is not None:
+            topk_index = self.hot_token_id[topk_index]
+
+        attn_backends = self.draft_attn_backend.attn_backends
+        forward_batch.attn_backend = attn_backends[0]
+        kv_lens_stack = torch.stack([b.forward_metadata.kv_lens for b in attn_backends])
+
+        steps_fn = getattr(self, "_compiled_fused_steps", None)
+        if steps_fn is None:
+            steps_fn = torch.compile(
+                self._fused_draft_steps,
+                backend="tpu",
+                fullgraph=True,
+                dynamic=False,
+            )
+            self._compiled_fused_steps = steps_fn
+
+        score_list, token_list, parents_list = steps_fn(
+            forward_batch, topk_p, topk_index, hidden_states, kv_lens_stack
+        )
+        return organize_draft_results(
+            list(score_list),
+            list(token_list),
+            list(parents_list),
+            self.speculative_num_draft_tokens,
+        )
+
+    def _fused_draft_steps(
+        self,
+        forward_batch: ForwardBatch,
+        topk_p: torch.Tensor,
+        topk_index: torch.Tensor,
+        hidden_states: torch.Tensor,
+        kv_lens_stack: torch.Tensor,
+    ):
+        """Unrolled draft forwards compiled as ONE graph.
+
+        No forward_batch attribute writes, no .item()/.cpu()/.tolist().
+        Per-step kv_lens and spec_hidden_states are threaded as tensor args.
+        """
+        num_steps = self.speculative_num_steps
+        model = self.draft_model_runner.model
+        base_positions = forward_batch.positions
+        score_acc: Tuple[torch.Tensor, ...] = ()
+        token_acc: Tuple[torch.Tensor, ...] = ()
+        parents_acc: Tuple[torch.Tensor, ...] = ()
+        scores = None
+        for i in range(num_steps):
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, topk_p, topk_index, hidden_states, scores, self.topk
+            )
+            score_acc = score_acc + (tree_info[0],)
+            token_acc = token_acc + (tree_info[1],)
+            parents_acc = parents_acc + (tree_info[2],)
+            if i == num_steps - 1:
+                break
+
+            forward_batch.rpa_draft_kv_lens = kv_lens_stack[i]
+            logits_output = model.forward(
+                input_ids,
+                base_positions + i,
+                forward_batch,
+                spec_hidden_states=hidden_states,
+            )
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.hot_token_id is not None:
+                topk_index = self.hot_token_id[topk_index]
+            hidden_states = logits_output.hidden_states
+
+        return score_acc, token_acc, parents_acc
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -1156,6 +1265,8 @@ class EAGLEWorker(TpModelWorker):
             )
             batch.spec_info = draft_extend_input
 
+        real_bs = len(draft_extend_input.num_accept_tokens_cpu)
+
         # Phase 1: prepare extend (kernel writes draft_extend_input.{positions, bonus_tokens})
         draft_extend_input.num_tokens_per_req = self.speculative_num_steps + 1
         draft_extend_input.num_tokens_for_logprob_per_req = 1
@@ -1215,6 +1326,18 @@ class EAGLEWorker(TpModelWorker):
             logits_output.next_token_logits,
             f"draft_extend_after_decode (cuda_graph={can_cuda_graph})",
         )
+
+        # Slice the draft-extend outputs back to the real request count before storing them
+        # for the next iteration. `_pad_draft_extend_for_tpu` pads input_ids/out_cache_loc/
+        # hidden_states to the worst-case (num_steps+1)*bs tokens for XLA shape stability, so
+        # any path that returns per-padded-row outputs would otherwise leak ghost rows (or a
+        # padded token-0 draft) into the next EagleDraftInput while positions/cache locs are
+        # sized for the real batch. `real_bs` comes from the un-padded num_accept_tokens_cpu;
+        # with LAST capture the rows are already `bs`, so this is a no-op on the normal path.
+        topk_p = topk_p[:real_bs]
+        topk_index = topk_index[:real_bs]
+        if hidden_states is not None:
+            hidden_states = hidden_states[:real_bs]
 
         # Phase 3: assemble next-iter EagleDraftInput from extend output
         next_decode_capture_mode = (

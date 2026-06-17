@@ -29,13 +29,17 @@ from transformers import LlamaConfig
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
 from sglang.srt.server_args import get_global_server_args
@@ -96,7 +100,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             # Fuse the previous layer's MLP residual add into hidden_norm.
             hidden_states, residual = self.hidden_norm(hidden_states, residual)
 
-        # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -189,6 +192,7 @@ class LlamaModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        spec_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if input_embeds is None:
             embeds = forward_batch.mm_input_embeds
@@ -209,7 +213,13 @@ class LlamaModel(nn.Module):
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
-        hidden_states = forward_batch.spec_info.hidden_states
+        # The fused multi-step draft path passes the step's target hidden as a tensor
+        # arg (spec_hidden_states) instead of mutating forward_batch.spec_info per step.
+        hidden_states = (
+            spec_hidden_states
+            if spec_hidden_states is not None
+            else forward_batch.spec_info.hidden_states
+        )
         if hidden_states.shape[-1] != embeds.shape[-1]:
             if self.fc_norm is not None:
                 chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
@@ -270,8 +280,21 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 layer.self_attn.attn.sliding_window_size = self._draft_window_size
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
+        #
+        # A reduced-vocab EAGLE3 draft (draft_vocab_size < target vocab_size, paired
+        # with a d2t draft->target map) ships its OWN trained lm_head over the draft
+        # vocab. Such a checkpoint must NOT tie lm_head to embed_tokens even when its
+        # config inherits tie_word_embeddings=True from the base model: embed_tokens
+        # is later overwritten with the target's full-vocab embedding via set_embed(),
+        # which would discard the draft head and project through the wrong matrix
+        # (garbage draft logits -> 0% acceptance). E.g. AngelSlim/Qwen3-1.7B_eagle3
+        # has tie_word_embeddings=True, draft_vocab_size=32000, vocab_size=151936.
+        has_reduced_draft_vocab = (
+            config.draft_vocab_size is not None
+            and config.draft_vocab_size != config.vocab_size
+        )
         self.load_lm_head_from_target = False
-        if self.config.tie_word_embeddings:
+        if self.config.tie_word_embeddings and not has_reduced_draft_vocab:
             self.lm_head = self.model.embed_tokens
         else:
             if config.draft_vocab_size is None:
@@ -289,9 +312,54 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             config_.draft_vocab_size
         )  # draft logits processor has it's own vocab size
         self.logits_processor = LogitsProcessor(config_)
+        # Mirror LlamaForCausalLM: __init__ here calls nn.Module.__init__ (not super), so
+        # the parent's pooler is not set. Add it so the get_embedding forward branch works.
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        spec_hidden_states: Optional[torch.Tensor] = None,
+    ) -> LogitsProcessorOutput:
+        # Mirrors LlamaForCausalLM.forward, but threads the fused multi-step draft path's
+        # per-step target hidden (spec_hidden_states) as a tensor arg instead of
+        # reading/mutating object state. None on the normal draft path.
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+            spec_hidden_states=spec_hidden_states,
+        )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+        # Preserve the parent LlamaForCausalLM.forward branches: only the last PP rank
+        # produces logits/embeddings; earlier ranks pass raw hidden states down the
+        # pipeline. get_embedding requests return pooled embeddings, not draft logits.
+        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                    aux_hidden_states,
+                )
+            else:
+                return self.pooler(hidden_states, forward_batch)
+        else:
+            return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
