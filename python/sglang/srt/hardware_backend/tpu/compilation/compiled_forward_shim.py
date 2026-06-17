@@ -25,6 +25,13 @@ logger = get_logger(__name__)
 
 DEFAULT_TPU_COMPILE_MAX_BS = 64
 
+# Attention backends that save K/V via set_kv_buffer(layer, out_cache_loc, k, v). The
+# compiled-forward shim pads input_ids/positions to the token bucket but cannot safely sync
+# out_cache_loc for these (padding it would write the padded forward's ghost K/V over a real
+# slot, e.g. slot 0), so they are incompatible with the shim. The default
+# ``pallas_tpu_rpa_v3`` writes K/V inside the kernel and ignores out_cache_loc, so it is fine.
+_SHIM_INCOMPATIBLE_ATTENTION_BACKENDS = ("torch_native", "pallas_tpu_flash")
+
 # Fields whose token dim gets padded to the token bucket.
 _TOKEN_FIELDS = ("input_ids", "positions")
 
@@ -75,6 +82,15 @@ def _zero_pad_1d(t: torch.Tensor, target_size: int) -> torch.Tensor:
     return F.pad(t, (0, target_size - t.shape[0]))
 
 
+def _zero_pad_dim0(t: torch.Tensor, target_size: int) -> torch.Tensor:
+    """Zero-pad an N-D tensor along dim 0 to target_size (other dims unchanged)."""
+    if t.shape[0] >= target_size:
+        return t
+    # F.pad's pad spec runs last-dim-first; pad only dim 0 (the trailing pair).
+    pad = (0, 0) * (t.ndim - 1) + (0, target_size - t.shape[0])
+    return F.pad(t, pad)
+
+
 def _pad_forward_batch_inputs(
     forward_batch,
     t_bucketer: Bucketer,
@@ -95,7 +111,16 @@ def _pad_forward_batch_inputs(
         pad_b = b_bucketer.next_bucket(real_b)
     else:
         # Prefill/extend is precompiled at a fixed batch cap to avoid compiling
-        # the full token_bucket x batch_bucket cross product.
+        # the full token_bucket x batch_bucket cross product. A real batch larger than
+        # the cap cannot be padded DOWN (the bs-field padding below only grows tensors),
+        # so batch_size would silently disagree with the seq_lens/req_pool_indices rows.
+        # Fail fast and require a larger batch grid instead of mis-shaping the batch.
+        if real_b > b_bucketer.max_val:
+            raise ValueError(
+                f"EXTEND/prefill batch size {real_b} exceeds the TPU compile batch cap "
+                f"{b_bucketer.max_val}. Raise it via --torch-compile-max-bs or shape the "
+                f"grid explicitly with --tpu-compile-bs."
+            )
         pad_b = b_bucketer.max_val
         pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
 
@@ -142,6 +167,23 @@ class CompiledForwardShim:
                     and _matches_default(v, self._default_kwargs[k])
                 )
             }
+
+        # input_embeds (multimodal / embedding-input requests) is built by
+        # model_runner.forward_extend from the pre-pad tokens, but input_ids / positions /
+        # attn metadata were padded to the compiled token bucket by prepare_forward_batch.
+        # Pad input_embeds along the token dim to the same bucket (input_ids.shape[0] == pad_t)
+        # so the compiled model sees consistent shapes; otherwise rotary/attention shape
+        # checks fail at length real_q vs pad_t. Only when bucket padding is active.
+        if getattr(forward_batch, _REAL_Q_KEY, None) is not None:
+            input_embeds = kwargs.get("input_embeds")
+            if (
+                isinstance(input_embeds, torch.Tensor)
+                and input_embeds.shape[0] < input_ids.shape[0]
+            ):
+                kwargs["input_embeds"] = _zero_pad_dim0(
+                    input_embeds, input_ids.shape[0]
+                )
+
         out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
 
         real_q = getattr(forward_batch, _REAL_Q_KEY, None)
@@ -160,6 +202,26 @@ class CompiledForwardShim:
         # Restore real batch_size so downstream consumers (sampler,
         # logprob, scheduler hooks) don't iterate over ghost slots.
         forward_batch.batch_size = real_b
+
+        # Restore real per-request / per-token tensor SHAPES on the (in-place padded)
+        # ForwardBatch — not just batch_size. _pad_forward_batch_inputs appended ghost rows
+        # at the END, so a prefix slice recovers the originals. Without this, post-forward
+        # consumers see padded shapes: e.g. ModelRunner.sample() builds positions =
+        # seq_lens - 1 for non-decode, and deterministic-sampling murmur_hash32 asserts the
+        # seed and positions share shape, so a single real request padded to the batch
+        # bucket would crash despite the logits being sliced back.
+        for field in _BS_FIELDS:
+            val = getattr(forward_batch, field, None)
+            if isinstance(val, torch.Tensor) and val.shape[0] > real_b:
+                setattr(forward_batch, field, val[:real_b])
+        for field in _BS_CPU_LIST_FIELDS:
+            val = getattr(forward_batch, field, None)
+            if isinstance(val, list) and len(val) > real_b:
+                setattr(forward_batch, field, val[:real_b])
+        for field in _TOKEN_FIELDS:
+            val = getattr(forward_batch, field, None)
+            if isinstance(val, torch.Tensor) and val.shape[0] > real_q:
+                setattr(forward_batch, field, val[:real_q])
 
         return out
 
@@ -183,24 +245,21 @@ def resolve_compile_caps(
             "Cannot determine max_t for TPU compile bucketing: "
             "chunked_prefill_size, max_prefill_tokens, and context_len are all unset."
         )
-    # TPU serving should compile the requested scheduler capacity by default for
-    # practical benchmark sizes (for example max_running_requests=64). Avoid
-    # blindly expanding to very large upstream defaults unless the user raises
-    # torch_compile_max_bs or pins --tpu-compile-bs.
-    max_running_compile_bs = (
-        min(max_running_requests, DEFAULT_TPU_COMPILE_MAX_BS)
-        if max_running_requests
-        else 1
-    )
-    max_b = max(torch_compile_max_bs or 1, max_running_compile_bs)
-    if max_running_requests and max_b < max_running_requests:
-        logger.warning(
-            "[compiled forward shim] TPU compile bs cap=%d < max_running_requests=%d; "
-            "batches above %d are outside the TPU compile grid. Raise "
-            "--torch-compile-max-bs or pin --tpu-compile-bs to cover them.",
-            max_b,
-            max_running_requests,
-            max_b,
+    # Largest batch bucket (used only when ``--tpu-compile-bs`` is unset).
+    # ``_pad_forward_batch_inputs`` pads every prefill/extend to ``pad_b = max_val`` (and
+    # ``pad_t >= pad_b``), so ``max_b`` must NOT be forced up to the full scheduler capacity:
+    # ``max_running_requests`` defaults to thousands, which would make even a single-request
+    # prefill/warmup compile and allocate ~2048-row/token shapes (extremely slow startup /
+    # OOM). Default to ``DEFAULT_TPU_COMPILE_MAX_BS`` and never exceed it unless the user
+    # explicitly opts in via ``--torch-compile-max-bs`` (or shapes the grid with
+    # ``--tpu-compile-bs``). A real batch larger than the cap (without those flags) raises in
+    # ``next_bucket`` rather than silently OOM-ing at startup — the user then opts in.
+    if torch_compile_max_bs:
+        max_b = torch_compile_max_bs
+    else:
+        max_b = min(
+            max_running_requests or DEFAULT_TPU_COMPILE_MAX_BS,
+            DEFAULT_TPU_COMPILE_MAX_BS,
         )
     return min(candidates), max_b
 
@@ -227,6 +286,20 @@ class TpuCompiledForwardShim:
         )
 
     def install(self) -> TpuCompiledForwardShim:
+        # The shim pads input_ids/positions to the compiled token bucket but does not (and
+        # cannot safely) sync out_cache_loc, so set_kv_buffer-based attention backends would
+        # save the padded forward's K/V at mismatched/real slots. Reject them here; the
+        # default pallas_tpu_rpa_v3 writes K/V inside the kernel and is unaffected.
+        backend = getattr(self.model_runner.server_args, "attention_backend", None)
+        if backend in _SHIM_INCOMPATIBLE_ATTENTION_BACKENDS:
+            raise ValueError(
+                f"The TPU compiled-forward shim does not support attention backend "
+                f"'{backend}': it pads input_ids/positions to the compiled token bucket but "
+                f"cannot sync out_cache_loc for set_kv_buffer backends without corrupting KV. "
+                f"Use --attention-backend pallas_tpu_rpa_v3 (writes K/V inside the kernel) "
+                f"with --enable-torch-compile."
+            )
+
         # TODO(wyzhang): Speculative decoding bypasses prepare_forward_batch via
         # skip_attn_backend_init=True. Speculative decoding is not yet supported
         # on TPU; when added, either integrate padding into the batch builder
