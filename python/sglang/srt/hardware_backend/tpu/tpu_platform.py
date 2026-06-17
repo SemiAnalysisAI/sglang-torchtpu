@@ -90,6 +90,17 @@ class TpuSRTPlatform(SRTPlatform):
         elif server_args.page_size is None:
             server_args.page_size = 64
 
+        # Opt-in persistent compile-cache reuse (default OFF). Done here — after the
+        # effective defaults above (dtype, attention backend, page_size) but before
+        # the TPU runtime initializes its Tier-2/Tier-3 caches — so the version-keyed
+        # manifest records the full effective compile identity and the inductor +
+        # torch_tpu cache env vars are set early enough for libtpu to read them.
+        from sglang.srt.hardware_backend.tpu.persistent_compile_cache import (
+            setup_persistent_compile_cache,
+        )
+
+        setup_persistent_compile_cache(server_args, server_args.tp_size)
+
     # ------------------------------------------------------------------
     # Subsystem factory methods
     # ------------------------------------------------------------------
