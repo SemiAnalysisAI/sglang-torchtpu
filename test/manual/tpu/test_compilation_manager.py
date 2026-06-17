@@ -11,8 +11,30 @@ from sglang.srt.hardware_backend.tpu.compilation.compilation_manager import (
     CompilationManager,
     _materialize_out,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+)
 from sglang.test.test_utils import CustomTestCase
+
+# Mock get_tensor_model_parallel_rank for all tests in this module
+# (TP group is not initialized in unit tests).
+_tp_rank_patcher = None
+
+
+def setUpModule():
+    global _tp_rank_patcher
+    _tp_rank_patcher = patch(
+        "sglang.srt.hardware_backend.tpu.compilation.compilation_manager"
+        ".get_tensor_model_parallel_rank",
+        return_value=0,
+    )
+    _tp_rank_patcher.start()
+
+
+def tearDownModule():
+    if _tp_rank_patcher is not None:
+        _tp_rank_patcher.stop()
 
 
 class _FakeAttnBackend:
@@ -27,32 +49,55 @@ class _FakeAttnBackend:
         )
 
 
-def _model_runner(device="cpu"):
+def _model_runner(device="cpu", eagle_hidden_size=0):
     """Minimal ModelRunner stand-in for unit tests.
 
     ``prepare_forward_batch`` is included because ``_run_one`` calls it
     before ``init_forward_metadata`` (mirrors the runtime chain installed
     by ``TpuCompiledForwardShim.install()``)."""
+    inner_model = SimpleNamespace()
+    if eagle_hidden_size:
+        # EAGLE3 draft models have a ``model.fc`` with ``in_features``.
+        inner_model.fc = SimpleNamespace(in_features=eagle_hidden_size)
     return SimpleNamespace(
         device=device,
         model=SimpleNamespace(
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
+            model=inner_model,
         ),
+        model_config=SimpleNamespace(hidden_size=4096),
         attn_backend=_FakeAttnBackend(),
-        req_to_token_pool=SimpleNamespace(),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.zeros(4, 64, dtype=torch.int64),
+        ),
         token_to_kv_pool=SimpleNamespace(),
     )
 
 
-def _make_manager(model_runner=None, token_buckets=(64, 256), bs_buckets=(1, 4)):
+def _make_manager(
+    model_runner=None,
+    token_buckets=(64, 256),
+    bs_buckets=(1, 4),
+    speculative_num_steps=0,
+    speculative_algorithm=None,
+    is_draft_worker=False,
+    speculative_eagle_topk=1,
+    eagle_hidden_size=0,
+):
     if model_runner is None:
-        model_runner = _model_runner()
+        model_runner = _model_runner(
+            eagle_hidden_size=eagle_hidden_size if is_draft_worker else 0,
+        )
     return CompilationManager(
         model_runner=model_runner,
         compiled_fns={"forward": model_runner.model.forward},
         t_bucketer=Bucketer(name="Token", buckets=list(token_buckets)),
         b_bucketer=Bucketer(name="Bs", buckets=list(bs_buckets)),
+        speculative_num_steps=speculative_num_steps,
+        speculative_algorithm=speculative_algorithm,
+        is_draft_worker=is_draft_worker,
+        speculative_eagle_topk=speculative_eagle_topk,
     )
 
 
@@ -77,8 +122,10 @@ class TestMakeDummyForwardBatch(CustomTestCase):
         self.assertEqual(fb.extend_seq_lens.shape[0], 4)
         self.assertEqual(fb.extend_seq_lens.tolist(), [1, 1, 1, 1])
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0, 0, 0, 0])
-        # KV writes go to dummy slot 0 across the whole token range.
-        self.assertEqual(fb.out_cache_loc.sum().item(), 0)
+        # KV writes go to slot 1 (not 0) to avoid stale page-index
+        # conflicts on the shared req_to_token_pool.
+        self.assertTrue((fb.out_cache_loc == 1).all())
+        self.assertTrue((fb.req_pool_indices == 1).all())
 
     def test_decode_has_no_extend_fields(self):
         mr = _model_runner()
@@ -99,25 +146,27 @@ class TestPrecompileLoops(CustomTestCase):
     EXTEND covers token buckets at the fixed batch cap, and DECODE varies bs
     (tokens == bs)."""
 
-    def test_extend_iterates_token_buckets_at_fixed_batch_cap(self):
+    def test_extend_iterates_bs_x_token_cross_product(self):
         mr = _model_runner()
         mgr = _make_manager(mr, token_buckets=(8, 64, 256), bs_buckets=(1, 4))
         mgr._precompile_extend()
-        self.assertEqual(mr.model.forward.call_count, 3)
+        # Cross product where t >= b: (8,1), (64,1), (256,1), (8,4), (64,4), (256,4)
+        self.assertEqual(mr.model.forward.call_count, 6)
         self.assertEqual(
             mr.attn_backend.calls,
-            [(8, 4), (64, 4), (256, 4)],
+            [(8, 1), (64, 1), (256, 1), (8, 4), (64, 4), (256, 4)],
         )
 
     def test_extend_skips_token_bucket_below_bs(self):
-        # A 4-token bucket can't hold the fixed 8-req extend cap.
+        # A 4-token bucket can't hold bs=8.
         mr = _model_runner()
         mgr = _make_manager(mr, token_buckets=(4, 64), bs_buckets=(1, 8))
         mgr._precompile_extend()
-        self.assertEqual(mr.model.forward.call_count, 1)
-        self.assertEqual(mr.attn_backend.calls, [(64, 8)])
+        # (4,1), (64,1), (64,8) — (4,8) skipped since 4 < 8
+        self.assertEqual(mr.model.forward.call_count, 3)
+        self.assertEqual(mr.attn_backend.calls, [(4, 1), (64, 1), (64, 8)])
 
-    def test_extend_raises_when_no_token_bucket_can_hold_bs_cap(self):
+    def test_extend_raises_when_no_valid_shapes(self):
         mr = _model_runner()
         mgr = _make_manager(mr, token_buckets=(4,), bs_buckets=(8,))
         with self.assertRaisesRegex(ValueError, "No TPU extend compile shapes"):
@@ -135,8 +184,8 @@ class TestPrecompileLoops(CustomTestCase):
         mr = _model_runner()
         mgr = _make_manager(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
         mgr.precompile_all()
-        # EXTEND: (8,4), (64,4) = 2. DECODE: (1,1), (4,4) = 2.
-        self.assertEqual(mr.model.forward.call_count, 4)
+        # EXTEND: (8,1),(64,1),(8,4),(64,4) = 4. DECODE: (1,1),(4,4) = 2. Total = 6.
+        self.assertEqual(mr.model.forward.call_count, 6)
 
 
 class TestRunOneCallsCompiledForward(CustomTestCase):
@@ -163,12 +212,15 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
         mr = _model_runner()
         mgr = _make_manager(mr)
         cm = MagicMock()
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.compilation_manager.torch.no_grad",
-            return_value=cm,
-        ) as no_grad, patch(
-            "sglang.srt.hardware_backend.tpu.compilation.compilation_manager.torch.inference_mode",
-            side_effect=AssertionError("inference_mode should not be used"),
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.compilation_manager.torch.no_grad",
+                return_value=cm,
+            ) as no_grad,
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.compilation_manager.torch.inference_mode",
+                side_effect=AssertionError("inference_mode should not be used"),
+            ),
         ):
             mgr._run_one(num_tokens=64, bs=4, mode=ForwardMode.EXTEND)
         no_grad.assert_called_once_with()
@@ -193,8 +245,209 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
         tensors, kwargs = sync.call_args
         self.assertEqual(tensors[0], [logits, kv0, kv1])
         self.assertEqual(kwargs, {"wait": True})
-        self.assertEqual(pool.get_fused_kv_buffer.call_args_list[0].args, (2,))
-        self.assertEqual(pool.get_fused_kv_buffer.call_args_list[1].args, (3,))
+
+
+class TestMakeDummyForwardBatchSpeculative(CustomTestCase):
+    """Dummy batch construction for speculative decoding modes."""
+
+    def test_target_verify_has_extend_fields_with_draft_token_num(self):
+        mr = _model_runner()
+        mgr = _make_manager(mr, speculative_num_steps=5)
+        spec_info = SimpleNamespace(draft_token_num=6)
+        fb = mgr._make_dummy_forward_batch(
+            num_tokens=24,
+            bs=4,
+            mode=ForwardMode.TARGET_VERIFY,
+            spec_info=spec_info,
+        )
+        # TARGET_VERIFY is extend-like, so extend fields must be present.
+        self.assertIsNotNone(fb.extend_seq_lens)
+        # Each request contributes draft_token_num tokens.
+        self.assertEqual(fb.extend_seq_lens.tolist(), [6, 6, 6, 6])
+        self.assertEqual(fb.extend_prefix_lens.tolist(), [0, 0, 0, 0])
+        self.assertEqual(fb.extend_start_loc.tolist(), [0, 6, 12, 18])
+        self.assertEqual(fb.extend_num_tokens, 24)
+        self.assertEqual(fb.extend_seq_lens_cpu, [6, 6, 6, 6])
+        self.assertEqual(fb.extend_prefix_lens_cpu, [0, 0, 0, 0])
+        # Token-level tensors at num_tokens.
+        self.assertEqual(fb.input_ids.shape[0], 24)
+        self.assertEqual(fb.positions.shape[0], 24)
+        # spec_info is passed through.
+        self.assertIs(fb.spec_info, spec_info)
+        self.assertEqual(fb.forward_mode, ForwardMode.TARGET_VERIFY)
+
+    def test_extend_full_capture_hidden_mode(self):
+        mr = _model_runner()
+        mgr = _make_manager(mr, speculative_num_steps=5)
+        fb = mgr._make_dummy_forward_batch(
+            num_tokens=64,
+            bs=4,
+            mode=ForwardMode.EXTEND,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+        self.assertEqual(fb.capture_hidden_mode, CaptureHiddenMode.FULL)
+        # Normal EXTEND fields: 1 token per request.
+        self.assertEqual(fb.extend_seq_lens.tolist(), [1, 1, 1, 1])
+        self.assertIsNone(fb.spec_info)
+
+    def test_default_capture_hidden_mode_is_null(self):
+        mr = _model_runner()
+        mgr = _make_manager(mr)
+        fb = mgr._make_dummy_forward_batch(
+            num_tokens=64,
+            bs=4,
+            mode=ForwardMode.EXTEND,
+        )
+        self.assertEqual(fb.capture_hidden_mode, CaptureHiddenMode.NULL)
+
+
+class TestPrecompileTargetVerify(CustomTestCase):
+    """``_precompile_target_verify`` iterates bs buckets with
+    ``num_tokens = bs * draft_token_num``."""
+
+    def test_iterates_bs_buckets_with_draft_token_num(self):
+        mr = _model_runner()
+        mgr = _make_manager(
+            mr,
+            token_buckets=(64,),
+            bs_buckets=(1, 4, 8),
+            speculative_num_steps=5,
+        )
+        mgr._precompile_target_verify()
+        # draft_token_num = 5 + 1 = 6.
+        # Shapes: bs=1 -> tokens=6, bs=4 -> tokens=24, bs=8 -> tokens=48.
+        self.assertEqual(mr.model.forward.call_count, 3)
+        self.assertEqual(
+            mr.attn_backend.calls,
+            [(6, 1), (24, 4), (48, 8)],
+        )
+
+    def test_forward_batch_has_spec_info_and_full_capture(self):
+        mr = _model_runner()
+        mgr = _make_manager(
+            mr,
+            token_buckets=(64,),
+            bs_buckets=(1,),
+            speculative_num_steps=3,
+        )
+        mgr._precompile_target_verify()
+        # Verify that the forward was called with a batch carrying spec_info
+        # and CaptureHiddenMode.FULL (the EAGLE worker sets FULL during verify
+        # so the target model captures hidden states for the draft model).
+        args, _ = mr.model.forward.call_args
+        fb = args[2]
+        self.assertEqual(fb.forward_mode, ForwardMode.TARGET_VERIFY)
+        self.assertIsNotNone(fb.spec_info)
+        self.assertEqual(fb.spec_info.draft_token_num, 4)
+        self.assertEqual(fb.capture_hidden_mode, CaptureHiddenMode.FULL)
+
+    def test_extend_fields_populated_for_verify(self):
+        mr = _model_runner()
+        mgr = _make_manager(
+            mr,
+            token_buckets=(64,),
+            bs_buckets=(2,),
+            speculative_num_steps=3,
+        )
+        mgr._precompile_target_verify()
+        args, _ = mr.model.forward.call_args
+        fb = args[2]
+        # draft_token_num=4, bs=2, so extend_seq_lens=[4, 4].
+        self.assertEqual(fb.extend_seq_lens.tolist(), [4, 4])
+        self.assertEqual(fb.extend_start_loc.tolist(), [0, 4])
+        self.assertEqual(fb.extend_num_tokens, 8)
+
+
+class TestPrecompileExtendCaptureHidden(CustomTestCase):
+    """``_precompile_extend_full`` mirrors EXTEND but with
+    ``CaptureHiddenMode.FULL``."""
+
+    def test_iterates_same_grid_as_extend(self):
+        mr = _model_runner()
+        mgr = _make_manager(
+            mr,
+            token_buckets=(8, 64),
+            bs_buckets=(1, 4),
+            speculative_num_steps=3,
+        )
+        mgr._precompile_extend_full()
+        # Same grid as EXTEND: (8,1), (64,1), (8,4), (64,4).
+        self.assertEqual(mr.model.forward.call_count, 4)
+        self.assertEqual(
+            mr.attn_backend.calls,
+            [(8, 1), (64, 1), (8, 4), (64, 4)],
+        )
+
+    def test_capture_hidden_mode_is_full(self):
+        mr = _model_runner()
+        mgr = _make_manager(
+            mr,
+            token_buckets=(64,),
+            bs_buckets=(1,),
+            speculative_num_steps=3,
+        )
+        mgr._precompile_extend_full()
+        args, _ = mr.model.forward.call_args
+        fb = args[2]
+        self.assertEqual(fb.capture_hidden_mode, CaptureHiddenMode.FULL)
+        self.assertEqual(fb.forward_mode, ForwardMode.EXTEND)
+
+    def test_skips_token_bucket_below_bs(self):
+        mr = _model_runner()
+        mgr = _make_manager(
+            mr,
+            token_buckets=(4, 64),
+            bs_buckets=(1, 8),
+            speculative_num_steps=3,
+        )
+        mgr._precompile_extend_full()
+        # Same skip rule as EXTEND: (4,1), (64,1), (64,8).
+        self.assertEqual(mr.model.forward.call_count, 3)
+        self.assertEqual(mr.attn_backend.calls, [(4, 1), (64, 1), (64, 8)])
+
+
+class TestPrecompileAllWithSpeculative(CustomTestCase):
+    """``precompile_all`` includes speculative paths when configured."""
+
+    def test_includes_spec_paths_when_speculative(self):
+        mr = _model_runner()
+        mgr = _make_manager(
+            mr,
+            token_buckets=(8,),
+            bs_buckets=(1, 4),
+            speculative_num_steps=3,
+        )
+        mgr.precompile_all()
+        # EXTEND: (8,1), (8,4) = 2.
+        # DECODE: (1,1), (4,4) = 2.
+        # TARGET_VERIFY: bs=1 -> tokens=4, bs=4 -> tokens=16 = 2.
+        # EXTEND(FULL): (8,1), (8,4) = 2.
+        # Total = 8.
+        self.assertEqual(mr.model.forward.call_count, 8)
+
+    def test_skips_spec_paths_when_no_speculative(self):
+        mr = _model_runner()
+        mgr = _make_manager(
+            mr,
+            token_buckets=(8,),
+            bs_buckets=(1, 4),
+            speculative_num_steps=0,
+        )
+        mgr.precompile_all()
+        # EXTEND: (8,1), (8,4) = 2. DECODE: (1,1), (4,4) = 2. Total = 4.
+        self.assertEqual(mr.model.forward.call_count, 4)
+
+    def test_enable_spec_decoding_property(self):
+        mgr_spec = _make_manager(speculative_num_steps=3)
+        mgr_none = _make_manager(speculative_num_steps=0)
+        self.assertTrue(mgr_spec.enable_spec_decoding)
+        self.assertFalse(mgr_none.enable_spec_decoding)
+
+    def test_draft_token_num_computed_correctly(self):
+        mgr = _make_manager(speculative_num_steps=5)
+        self.assertEqual(mgr.draft_token_num, 6)  # 5 + 1
+        mgr0 = _make_manager(speculative_num_steps=0)
+        self.assertEqual(mgr0.draft_token_num, 0)
 
 
 if __name__ == "__main__":

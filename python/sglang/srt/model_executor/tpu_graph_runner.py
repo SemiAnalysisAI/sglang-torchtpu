@@ -162,11 +162,16 @@ class TpuGraphRunner:
             CompilationManager,
         )
 
+        sa = model_runner.server_args
         CompilationManager(
             model_runner=model_runner,
             compiled_fns=compiled_fns,
             t_bucketer=compiled_forward_shim.t_bucketer,
             b_bucketer=compiled_forward_shim.b_bucketer,
+            speculative_num_steps=sa.speculative_num_steps or 0,
+            speculative_algorithm=sa.speculative_algorithm,
+            is_draft_worker=getattr(model_runner, "is_draft_worker", False),
+            speculative_eagle_topk=sa.speculative_eagle_topk or 1,
         ).precompile_all()
 
         # Wire serving-time recompilation detection into the compiled

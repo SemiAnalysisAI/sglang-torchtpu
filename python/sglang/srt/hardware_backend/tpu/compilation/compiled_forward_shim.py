@@ -114,6 +114,16 @@ def _pad_forward_batch_inputs(
         if isinstance(val, list) and len(val) < pad_b:
             setattr(forward_batch, field, val + [0] * (pad_b - len(val)))
 
+    # Pad spec_info tensors whose token dim must match input_ids after padding.
+    spec_info = getattr(forward_batch, "spec_info", None)
+    if spec_info is not None:
+        hs = getattr(spec_info, "hidden_states", None)
+        if isinstance(hs, torch.Tensor) and hs.ndim >= 1 and hs.shape[0] < pad_t:
+            pad_rows = pad_t - hs.shape[0]
+            spec_info.hidden_states = F.pad(
+                hs, (0,) * (2 * (hs.ndim - 1)) + (0, pad_rows)
+            )
+
     forward_batch.batch_size = pad_b
 
     return real_q, real_b
@@ -122,9 +132,10 @@ def _pad_forward_batch_inputs(
 class CompiledForwardShim:
     """Adapt compiled forward calls and outputs for padded execution."""
 
-    def __init__(self, compiled_fn):
+    def __init__(self, compiled_fn, model_runner=None):
         self.fn = compiled_fn
         self._recompilation_checker = None
+        self.model_runner = model_runner
         signature = getattr(compiled_fn, "__signature__", None)
         if signature is not None:
             self.__signature__ = signature
@@ -163,7 +174,15 @@ class CompiledForwardShim:
 
         next_token_logits = getattr(out, "next_token_logits", None)
         if next_token_logits is not None and real_b < next_token_logits.shape[0]:
-            out.next_token_logits = next_token_logits[:real_b]
+            # TARGET_VERIFY outputs bs * draft_token_num logits (one per
+            # draft token across all requests).  Slicing to real_b would
+            # drop the verify tokens.  Use real_q instead.
+            fm = getattr(forward_batch, "forward_mode", None)
+            logit_rows = (
+                real_q if (fm is not None and fm.is_target_verify()) else real_b
+            )
+            if logit_rows < next_token_logits.shape[0]:
+                out.next_token_logits = next_token_logits[:logit_rows]
 
         hidden_states = getattr(out, "hidden_states", None)
         if hidden_states is not None and real_q < hidden_states.shape[0]:
@@ -267,7 +286,11 @@ class TpuCompiledForwardShim:
         self.model.prepare_forward_batch = _prepare
 
         for attr, compiled_fn in self._compiled_fns.items():
-            setattr(self.model, attr, CompiledForwardShim(compiled_fn))
+            setattr(
+                self.model,
+                attr,
+                CompiledForwardShim(compiled_fn, model_runner=self.model_runner),
+            )
 
         logger.info(
             "[compiled forward shim] Installed compiled-forward adaptation on %s.{%s} "

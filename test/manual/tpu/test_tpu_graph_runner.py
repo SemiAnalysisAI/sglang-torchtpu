@@ -77,12 +77,16 @@ class TestTpuGraphRunner(CustomTestCase):
             model=model,
             model_config=SimpleNamespace(context_len=2048),
             max_running_requests=1,
+            is_draft_worker=False,
             server_args=SimpleNamespace(
                 enable_torch_compile=enable_torch_compile,
                 tpu_compile_tokens=None,
                 tpu_compile_bs=None,
                 chunked_prefill_size=None,
                 max_prefill_tokens=2048,
+                speculative_num_steps=None,
+                speculative_algorithm=None,
+                speculative_eagle_topk=None,
             ),
         )
 
@@ -153,6 +157,17 @@ class TestTpuGraphRunner(CustomTestCase):
         self.mock_compile.assert_not_called()
         # Backend registration still happens — the gate is _can_torch_compile.
         self.mock_register.assert_called_once()
+
+    def test_draft_worker_compiles_and_precompiles(self):
+        original = MagicMock()
+        model = _model_with(forward=original)
+        runner = self._runner_for(model)
+        runner.is_draft_worker = True
+        runner.server_args.speculative_num_steps = 3
+        TpuGraphRunner(runner)
+        # Draft model IS compiled via torch.compile with precompilation.
+        self.mock_compile.assert_called_once()
+        self.assertIsNot(model.forward, original)
 
     def test_can_run_is_always_false(self):
         # ModelRunner.forward branches on `graph_runner.can_run(...)`
