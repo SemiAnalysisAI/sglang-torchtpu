@@ -126,11 +126,22 @@ class CompilationManager:
     def precompile_all(self) -> None:
         """Run precompilation for all valid extend and decode bucket shapes.
 
-        Only precompiles the **target** model. Draft-model shapes are compiled
-        during the startup server warmup (``skip_server_warmup=False``, the
-        default), which drives the full speculative loop before readiness.
-        Measured: 0 post-ready recompiles on Qwen3-1.7B and Llama-3.1-8B.
+        Target model: always precompiled (EXTEND, DECODE, and when speculative:
+        TARGET_VERIFY, EXTEND_FULL).
+
+        Draft model: skipped. Draft shapes are compiled during the startup
+        server warmup (``skip_server_warmup=False``, the default), which drives
+        the full speculative loop before readiness. Measured: 0 post-ready
+        recompiles on Qwen3-1.7B and Llama-3.1-8B.
+        TODO: enable draft precompilation once the TP collective desync on
+        shared target/draft model families (Llama-3.1-8B error_0200) is resolved.
         """
+        if self.is_draft_worker:
+            logger.info(
+                "[compilation manager] DRAFT: skipping precompilation "
+                "(startup server warmup compiles draft shapes before readiness)."
+            )
+            return
         overall = time.perf_counter()
         self._precompile_extend()
         self._precompile_decode()
@@ -351,6 +362,67 @@ class CompilationManager:
             device=self.model_runner.device,
         )
 
+    # ------------------------------------------------------------------
+    # Draft precompile helpers (dormant — see precompile_all docstring)
+    # ------------------------------------------------------------------
+
+    def _make_draft_spec_info(self, num_tokens: int):
+        """Build an ``EagleDraftInput`` for draft-model precompilation."""
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        device = self.model_runner.device
+        return EagleDraftInput(
+            hidden_states=torch.zeros(
+                num_tokens,
+                self.eagle_hidden_size,
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+            bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
+            topk_p=torch.empty(
+                (num_tokens, self.speculative_eagle_topk),
+                device=device,
+                dtype=torch.float32,
+            ),
+            topk_index=torch.empty(
+                (num_tokens, self.speculative_eagle_topk),
+                device=device,
+                dtype=torch.int64,
+            ),
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
+        )
+
+    def _make_draft_extend_input(self, num_tokens: int, bs: int):
+        """Build an ``EagleDraftExtendInput`` for DRAFT_EXTEND precompilation."""
+        from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+        device = self.model_runner.device
+        draft_token_num = self.draft_token_num or 1
+        return EagleDraftExtendInput(
+            hidden_states=torch.zeros(
+                num_tokens,
+                self.eagle_hidden_size,
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+            num_correct_drafts=torch.zeros(bs, dtype=torch.int32, device=device),
+            num_accept_tokens=torch.ones(bs, dtype=torch.int32, device=device),
+            num_accept_tokens_cpu=[1] * bs,
+            input_ids=torch.zeros(num_tokens, dtype=torch.long, device=device),
+            seq_lens=torch.ones(bs, dtype=torch.int32, device=device),
+            seq_lens_cpu=torch.ones(bs, dtype=torch.int32),
+            req_pool_indices=torch.ones(bs, dtype=torch.int64, device=device),
+            positions=torch.zeros(num_tokens, dtype=torch.int64, device=device),
+            bonus_tokens=torch.zeros(bs, dtype=torch.int32, device=device),
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+            num_tokens_per_req=draft_token_num,
+        )
+
+    # ------------------------------------------------------------------
+    # Core execution
+    # ------------------------------------------------------------------
+
     def _run_one(
         self,
         num_tokens: int,
@@ -359,9 +431,13 @@ class CompilationManager:
         *,
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
         spec_info: Optional[object] = None,
+        skip_prepare: bool = False,
+        attn_backend: Optional[object] = None,
     ) -> None:
         """Build and execute one dummy forward pass for compilation."""
-        backend = self.model_runner.attn_backend
+        backend = (
+            attn_backend if attn_backend is not None else self.model_runner.attn_backend
+        )
         forward_batch = self._make_dummy_forward_batch(
             num_tokens=num_tokens,
             bs=bs,
@@ -380,7 +456,7 @@ class CompilationManager:
         req_to_token[1, :num_tokens] = 1  # all positions map to KV slot 1
 
         model = self.model_runner.model
-        if hasattr(model, "prepare_forward_batch"):
+        if not skip_prepare and hasattr(model, "prepare_forward_batch"):
             model.prepare_forward_batch(forward_batch)
         backend.init_forward_metadata(forward_batch)
 
