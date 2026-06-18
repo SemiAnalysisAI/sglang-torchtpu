@@ -223,6 +223,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
+        # Whether NGram-on-TPU greedy-only admission applies (device + algo are
+        # fixed at startup, so resolve the static part once instead of per request).
+        self._tpu_ngram_greedy_only = (
+            server_args.device == "tpu"
+            and server_args.speculative_algorithm is not None
+            and SpeculativeAlgorithm.from_string(
+                server_args.speculative_algorithm
+            ).is_ngram()
+        )
         self.enable_metrics = server_args.enable_metrics
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
@@ -972,6 +981,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
                 )
 
+    def _reject_unsupported_tpu_ngram_sampling(self, sampling_params) -> None:
+        """Reject non-greedy requests under NGram-on-TPU, per request at admission.
+
+        NGram on the TPU backend supports greedy verification only. Rejecting here
+        (after normalize/verify) keeps the rejection request-scoped: the server
+        stays up and greedy requests in flight are unaffected. A defensive
+        backstop also lives in NgramVerifyInput.verify(). Greediness mirrors the
+        batch-level definition (``top_k <= 1`` post-normalize).
+        """
+        if not self._tpu_ngram_greedy_only:
+            return
+        if envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get():
+            return
+        if sampling_params.top_k > 1:
+            raise ValueError(
+                "NGram speculative decoding on the TPU backend supports greedy "
+                "decoding only, but this request uses non-greedy sampling "
+                "(temperature/top-p/top-k). Use greedy sampling, or set "
+                "SGLANG_NGRAM_FORCE_GREEDY_VERIFY=1 to force greedy verification "
+                "for all requests."
+            )
+
     def _create_tokenized_object(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -992,6 +1023,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
+        self._reject_unsupported_tpu_ngram_sampling(sampling_params)
 
         # Build return object
         if isinstance(obj, GenerateReqInput):

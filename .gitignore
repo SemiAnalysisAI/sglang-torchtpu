@@ -282,3 +282,6 @@ sgl-kernel/csrc/**/*_musa/
 *.npz
 artifacts/
 .claude/scheduled_tasks.lock
+
+# Humanize loop state (RLCR trackers, round summaries, contracts, skill cache)
+.humanize/

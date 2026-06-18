@@ -368,9 +368,76 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
         )
 
 
+def _validate_ngram_device_capability(server_args: "ServerArgs") -> None:
+    """Gate ngram speculative decoding to supported device envelopes.
+
+    CUDA keeps full support. TPU is admitted only for the linear-greedy configuration:
+    breadth=1 (linear draft chain), greedy verification, the pallas_tpu_rpa_v3
+    attention backend, page_size=1, and eager execution (no torch.compile).
+    Anything outside that envelope fails fast rather than being silently
+    downgraded. Greediness is a request-level property, not a server arg, so
+    non-greedy requests are rejected per request at admission
+    (TokenizerManager._reject_unsupported_tpu_ngram_sampling), with a defensive
+    backstop in NgramVerifyInput.verify().
+    """
+    device = server_args.device
+    if device.startswith("cuda"):
+        return
+    if device != "tpu":
+        raise ValueError(
+            "Ngram speculative decoding only supports CUDA and TPU devices, "
+            f"got device={device!r}."
+        )
+
+    from sglang.srt.server_args import ServerArgs
+
+    if server_args.enable_torch_compile:
+        raise ValueError(
+            "Ngram speculative decoding on TPU is supported in eager mode only; "
+            "remove --enable-torch-compile (torch.compile with ngram verify on "
+            "TPU is not yet supported)."
+        )
+
+    if (
+        server_args.attention_backend is not None
+        and server_args.attention_backend != "pallas_tpu_rpa_v3"
+    ):
+        raise ValueError(
+            "Ngram speculative decoding on TPU requires the 'pallas_tpu_rpa_v3' "
+            f"attention backend, got {server_args.attention_backend!r}."
+        )
+
+    if server_args.page_size is not None and server_args.page_size != 1:
+        raise ValueError(
+            "Ngram speculative decoding on TPU requires page_size=1, got "
+            f"page_size={server_args.page_size}."
+        )
+
+    default_breadth = ServerArgs.speculative_ngram_max_bfs_breadth
+    breadth = server_args.speculative_ngram_max_bfs_breadth
+    if breadth == default_breadth and breadth != 1:
+        # Unset / default breadth: coerce to the linear chain the TPU path serves.
+        logger.warning(
+            "Coercing speculative_ngram_max_bfs_breadth from the default %d to 1 "
+            "for the TPU linear-greedy ngram path. Pass "
+            "--speculative-ngram-max-bfs-breadth 1 to silence this warning.",
+            default_breadth,
+        )
+        server_args.speculative_ngram_max_bfs_breadth = 1
+    elif breadth != 1:
+        raise ValueError(
+            "Ngram speculative decoding on TPU supports only "
+            "speculative_ngram_max_bfs_breadth=1 (a linear draft chain), got "
+            f"{breadth}. Tree drafting (breadth>1) on TPU is not yet supported."
+        )
+
+    # A linear chain also requires the minimum breadth to collapse to 1.
+    if server_args.speculative_ngram_min_bfs_breadth != 1:
+        server_args.speculative_ngram_min_bfs_breadth = 1
+
+
 def _handle_ngram(server_args: "ServerArgs") -> None:
-    if not server_args.device.startswith("cuda"):
-        raise ValueError("Ngram speculative decoding only supports CUDA device.")
+    _validate_ngram_device_capability(server_args)
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48

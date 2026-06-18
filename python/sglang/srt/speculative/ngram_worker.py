@@ -3,7 +3,6 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -17,8 +16,19 @@ from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import generate_token_bitmask
+from sglang.srt.utils import is_tpu
 
 logger = logging.getLogger(__name__)
+
+_is_tpu = is_tpu()
+
+# `reconstruct_indices_from_tree_mask` is a CUDA-only sgl_kernel op with no TPU
+# build. On TPU the ngram path runs a linear (breadth=1) draft chain whose index
+# layout is reconstructed by a torch-native helper instead (see
+# `NGRAMWorker._reconstruct_indices_linear_torch`). Import the kernel lazily so
+# importing this module never requires sgl_kernel on TPU.
+if not _is_tpu:
+    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 
 USE_FULL_MASK = True
@@ -45,7 +55,7 @@ class NGRAMWorker:
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
 
         self.max_batch_size = target_worker.max_running_requests
-        self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
+        self.device = server_args.device
 
         self._init_preallocated_tensors()
 
@@ -189,6 +199,49 @@ class NGRAMWorker:
         ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
         return req_drafts, mask
 
+    def _reconstruct_indices_linear_torch(
+        self,
+        batch: ScheduleBatch,
+        bs: int,
+        positions: torch.Tensor,
+        retrieve_index: torch.Tensor,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+    ):
+        """Torch-native replacement for the CUDA ``reconstruct_indices_from_tree_mask``,
+        valid for a linear (breadth=1) draft chain.
+
+        For request row ``i`` and chain node ``j`` (``n = draft_token_num``):
+
+            retrieve_index[i, j]        = i * n + j   (global flattened index)
+            retrieve_next_token[i, j]   = j + 1 if j + 1 < n else -1   (local)
+            retrieve_next_sibling[i, j] = -1
+            positions[i * n + j]        = seq_lens[i] + j   (absolute)
+
+        Every sentinel is written explicitly because the destination tensors are
+        preallocated with ``torch.empty`` (no implicit -1 fill). This matches the
+        layout the CUDA kernel emits for breadth=1, which the torch-native
+        ``verify_tree_greedy_func`` consumes.
+        """
+        n = self.draft_token_num
+        device = self.device
+
+        flat = torch.arange(bs * n, device=device, dtype=retrieve_index.dtype)
+        retrieve_index.copy_(flat.view(bs, n))
+
+        # Per-row chain [1, 2, ..., n-1, -1]; copy_ broadcasts [1, n] -> [bs, n].
+        next_token = torch.arange(
+            1, n + 1, device=device, dtype=retrieve_next_token.dtype
+        )
+        next_token[n - 1] = -1
+        retrieve_next_token.copy_(next_token.view(1, n))
+
+        retrieve_next_sibling.fill_(-1)
+
+        col = torch.arange(n, device=device, dtype=positions.dtype).view(1, n)
+        seq_lens = batch.seq_lens.to(device=device, dtype=positions.dtype).view(bs, 1)
+        positions.copy_((seq_lens + col).reshape(bs * n))
+
     def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
         if batch.forward_mode.is_extend():
             return
@@ -206,16 +259,27 @@ class NGRAMWorker:
         tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
         draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
 
-        reconstruct_indices_from_tree_mask(
-            tree_mask,
-            batch.seq_lens,
-            positions,  # mutable
-            retrieve_index,  # mutable
-            retrieve_next_token,  # mutable
-            retrieve_next_sibling,  # mutable
-            bs,
-            self.draft_token_num,
-        )
+        if _is_tpu:
+            # TPU has no sgl_kernel reconstruct; the TPU path runs a linear chain.
+            self._reconstruct_indices_linear_torch(
+                batch,
+                bs,
+                positions,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+            )
+        else:
+            reconstruct_indices_from_tree_mask(
+                tree_mask,
+                batch.seq_lens,
+                positions,  # mutable
+                retrieve_index,  # mutable
+                retrieve_next_token,  # mutable
+                retrieve_next_sibling,  # mutable
+                bs,
+                self.draft_token_num,
+            )
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
@@ -226,9 +290,11 @@ class NGRAMWorker:
             )
             for i, req in enumerate(batch.reqs):
                 seq_len = len(req.origin_input_ids) + len(req.output_ids)
-                req_mask = torch.ones((self.draft_token_num, seq_len - 1)).cuda()
+                req_mask = torch.ones(
+                    (self.draft_token_num, seq_len - 1), device=self.device
+                )
                 req_mask = torch.cat(
-                    (req_mask, torch.from_numpy(mask[i]).cuda()), dim=1
+                    (req_mask, torch.from_numpy(mask[i]).to(self.device)), dim=1
                 ).to(torch.bool)
                 tree_mask.append(req_mask.flatten())
             tree_mask = torch.cat(tree_mask, dim=0)

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 from typing import Optional, Tuple
 
 import torch
-import triton
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.server_args import get_global_server_args
@@ -30,11 +30,11 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     TREE_SPEC_KERNEL_AVAILABLE,
-    assign_req_to_token_pool,
+    assign_req_to_token_pool_func,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_musa, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_tpu, next_power_of_2
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -45,6 +45,115 @@ if is_cuda() or is_musa():
     )
 elif is_hip():
     from sgl_kernel import verify_tree_greedy
+
+_is_tpu = is_tpu()
+
+# Test-only, env-gated NGram verify state recorder. Off (no-op) unless
+# SGLANG_NGRAM_TPU_STATE_GUARD=1, so it has zero production impact by default.
+# When enabled it asserts cache/bookkeeping invariants in-process after
+# verify/free-cache and appends a per-verify event record (batch membership,
+# accept counts, finished flags, freed-slot counts) to SGLANG_NGRAM_TPU_STATE_FILE
+# for the TPU NGram integration tests.
+_NGRAM_TPU_STATE_GUARD = os.environ.get("SGLANG_NGRAM_TPU_STATE_GUARD") == "1"
+
+
+def _capture_ngram_verify_pre_state(batch: ScheduleBatch) -> dict:
+    # available_size() here is measured after prepare_for_verify() has already
+    # allocated the bs * draft_token_num draft slots, so the post-verify delta
+    # equals the number of unaccepted draft slots that free-cache returned.
+    return {
+        "seq_lens_before": batch.seq_lens.clone(),
+        "seq_lens_cpu_before": batch.seq_lens_cpu.clone(),
+        "req_pool_indices": batch.req_pool_indices.clone(),
+        "rids": [r.rid for r in batch.reqs],
+        "kv_committed_before": [
+            int(getattr(r, "kv_committed_len", 0)) for r in batch.reqs
+        ],
+        "available_before": int(batch.token_to_kv_pool_allocator.available_size()),
+    }
+
+
+def _record_and_assert_ngram_verify_state(
+    batch: ScheduleBatch,
+    verify_input: "NgramVerifyInput",
+    pre: dict,
+    num_accept_tokens_cpu: torch.Tensor,
+    num_correct_drafts_cpu: torch.Tensor,
+) -> None:
+    """Assert NGram verify cache/bookkeeping invariants and record the event."""
+    import json
+
+    bs = len(pre["rids"])
+    nat_cpu = num_accept_tokens_cpu
+
+    # seq_lens / seq_lens_cpu advance by num_accept_tokens.
+    seq_delta = (batch.seq_lens - pre["seq_lens_before"]).cpu()
+    assert torch.equal(seq_delta, nat_cpu.to(seq_delta.dtype)), (
+        f"[ngram-tpu-state] seq_lens delta {seq_delta.tolist()} != "
+        f"num_accept_tokens {nat_cpu.tolist()}"
+    )
+    seq_cpu_delta = batch.seq_lens_cpu - pre["seq_lens_cpu_before"]
+    assert torch.equal(
+        seq_cpu_delta, nat_cpu.to(seq_cpu_delta.dtype)
+    ), "[ngram-tpu-state] seq_lens_cpu delta != num_accept_tokens"
+
+    # Bonus-token invariant.
+    assert torch.equal(
+        nat_cpu, num_correct_drafts_cpu + 1
+    ), "[ngram-tpu-state] num_accept_tokens != num_correct_drafts + 1"
+
+    # Per-request: accepted out_cache_loc wired into req_to_token, and KV
+    # bookkeeping advanced by the accepted length.
+    req_to_token = batch.req_to_token_pool.req_to_token
+    out_cache_loc = batch.out_cache_loc
+    nat_list = nat_cpu.tolist()
+    rp = pre["req_pool_indices"].tolist()
+    sb = pre["seq_lens_before"].tolist()
+    start = 0
+    for i in range(bs):
+        n = nat_list[i]
+        seg = out_cache_loc[start : start + n]
+        row = req_to_token[rp[i], sb[i] : sb[i] + n]
+        assert torch.equal(
+            row.cpu(), seg.cpu()
+        ), f"[ngram-tpu-state] req_to_token wiring mismatch for req index {i}"
+        start += n
+        req = batch.reqs[i]
+        expected = pre["kv_committed_before"][i] + n
+        assert (
+            int(req.kv_committed_len) == expected
+        ), f"[ngram-tpu-state] kv_committed_len {req.kv_committed_len} != {expected}"
+        assert int(req.kv_allocated_len) == int(
+            req.kv_committed_len
+        ), "[ngram-tpu-state] kv_allocated_len != kv_committed_len"
+
+    # Unaccepted draft KV slots must be freed: for page_size=1 the allocator's
+    # available size grows by (total draft slots - accepted slots).
+    total_draft_slots = bs * verify_input.draft_token_num
+    accepted_slots = int(nat_cpu.sum().item())
+    expected_freed = total_draft_slots - accepted_slots
+    available_after = int(batch.token_to_kv_pool_allocator.available_size())
+    freed = available_after - pre["available_before"]
+    assert freed == expected_freed, (
+        f"[ngram-tpu-state] freed draft slots {freed} != expected "
+        f"{expected_freed} (total={total_draft_slots}, accepted={accepted_slots})"
+    )
+
+    path = os.environ.get("SGLANG_NGRAM_TPU_STATE_FILE")
+    if path:
+        record = {
+            "batch_size": bs,
+            "rids": pre["rids"],
+            "num_correct_drafts": num_correct_drafts_cpu.tolist(),
+            "num_accept_tokens": nat_list,
+            "finished": [bool(r.finished()) for r in batch.reqs],
+            "draft_token_num": verify_input.draft_token_num,
+            "available_before": pre["available_before"],
+            "available_after": available_after,
+            "freed": freed,
+        }
+        with open(path, "a") as fh:
+            fh.write(json.dumps(record) + "\n")
 
 
 @dataclass
@@ -108,14 +217,15 @@ class NgramVerifyInput(SpecInput):
             )
 
         bs = batch.batch_size()
-        assign_req_to_token_pool[(bs,)](
+        # Routed through the dispatch wrapper so TPU uses the torch-native
+        # implementation; raw Triton launch only happens on CUDA/HIP.
+        assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
             batch.seq_lens,
             end_offset,
             batch.out_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            triton.next_power_of_2(bs),
+            bs,
         )
 
     def generate_attn_arg_prefill(
@@ -274,14 +384,13 @@ class NgramVerifyInput(SpecInput):
             req.kv_committed_len += num_correct_drafts_list[i] + 1
             req.kv_allocated_len = req.kv_committed_len
 
-        assign_req_to_token_pool[(bs,)](
+        assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
             batch.seq_lens,
             batch.seq_lens + self.num_accept_tokens,
             batch.out_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            triton.next_power_of_2(bs),
+            bs,
         )
 
     def _greedy_verify(
@@ -304,16 +413,22 @@ class NgramVerifyInput(SpecInput):
             (bs,), dtype=torch.int32, device=self.device
         )
 
-        verify_tree_greedy(
+        from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
+
+        # verify_tree_greedy_func dispatches to the CUDA/HIP/MUSA sgl_kernel where
+        # available and to a torch-native linear-chain verifier on TPU. topk is the
+        # n-gram BFS breadth (1 for the TPU linear-greedy path); the torch path
+        # asserts topk == 1 and ignores the (trivial) sibling links.
+        verify_tree_greedy_func(
             predicts=self.predict,  # mutable
             accept_index=self.accept_indices,  # mutable
             accept_token_num=self.num_correct_drafts,  # mutable
             candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=self.retrieve_index,
-            retrive_next_token=self.retrieve_next_token,
-            retrive_next_sibling=self.retrieve_next_sibling,
+            retrieve_index=self.retrieve_index,
+            retrieve_next_token=self.retrieve_next_token,
+            retrieve_next_sibling=self.retrieve_next_sibling,
             target_predict=target_predict,
+            topk=get_global_server_args().speculative_eagle_topk,
         )
 
     def _sampling_verify(
@@ -397,6 +512,10 @@ class NgramVerifyInput(SpecInput):
         bs = self.retrieve_index.shape[0]
         sampling_info = batch.sampling_info
 
+        pre_state = (
+            _capture_ngram_verify_pre_state(batch) if _NGRAM_TPU_STATE_GUARD else None
+        )
+
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
             # NOTE: retrieve_index are the indices of the requests that are kept.
@@ -439,6 +558,19 @@ class NgramVerifyInput(SpecInput):
         is_all_greedy = (
             sampling_info.is_all_greedy or envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get()
         )
+        # Defensive backstop for the TPU path (primary per-request rejection
+        # happens at admission in TokenizerManager). The TPU path supports greedy
+        # verification only; fail loudly rather than reaching the CUDA-only
+        # _sampling_verify path. SGLANG_NGRAM_FORCE_GREEDY_VERIFY (folded into
+        # is_all_greedy) is the explicit opt-in to greedy-verify everything.
+        if _is_tpu and not is_all_greedy:
+            raise ValueError(
+                "Ngram speculative decoding on the TPU backend supports greedy "
+                "decoding only, but a request with non-greedy sampling parameters "
+                "(temperature/top-p/top-k) was received. Use greedy sampling, or "
+                "set SGLANG_NGRAM_FORCE_GREEDY_VERIFY=1 to force greedy "
+                "verification for all requests."
+            )
         if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
             logger.warning(
                 "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
@@ -465,6 +597,11 @@ class NgramVerifyInput(SpecInput):
 
         batch.seq_lens.add_(self.num_accept_tokens)
         batch.seq_lens_cpu.add_(num_accept_tokens_cpu)
+
+        if _NGRAM_TPU_STATE_GUARD:
+            _record_and_assert_ngram_verify_state(
+                batch, self, pre_state, num_accept_tokens_cpu, num_correct_drafts_cpu
+            )
 
         return logits_output, self.accept_tokens, num_correct_drafts
 

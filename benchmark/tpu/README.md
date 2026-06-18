@@ -130,6 +130,35 @@ torch.compile warmup doesn't yet cover all compile-shape buckets:
 MODEL=Qwen/Qwen3-32B ./warmup.sh
 ```
 
+## Speculative decoding (`spec/`)
+
+End-to-end spec-decode benchmarks live in `spec/`. Each launches a baseline
+(no spec) server and a spec server, benchmarks both with MT-Bench (greedy,
+`temperature=0`), and prints throughput + accept length. Every knob is an env
+var — see each script header.
+
+```bash
+# EAGLE3 (needs a draft model; defaults to Llama-3.1-8B TP4):
+./spec/bench_eagle_e2e.sh
+
+# NGram (no draft model; linear-greedy MVP on TPU):
+./spec/bench_ngram_e2e.sh                      # defaults: Qwen3-0.6B, TP=1
+MODEL=meta-llama/Llama-3.1-8B-Instruct TP_SIZE=4 ./spec/bench_ngram_e2e.sh
+SKIP_BASELINE=1 ./spec/bench_ngram_e2e.sh      # spec run only
+```
+
+NGram on TorchTPU runs in a single fixed mode: linear draft chain
+(`--speculative-ngram-max-bfs-breadth 1`), **greedy only** (a non-greedy request
+is rejected with HTTP 400), `pallas_tpu_rpa_v3`, `page_size=1`, eager (no
+`--enable-torch-compile`). The proposer runs on host CPU; only the target verify
+forward runs on TPU. Unsupported configs (breadth>1, non-rpa_v3 backend,
+`--enable-torch-compile`) fail fast at startup.
+
+For a fast functional check without the full MT-Bench run, the manual TPU tests
+under `test/manual/tpu/` (`test_ngram_tpu_e2e.py`, `test_ngram_tpu_state.py`,
+`test_ngram_tpu_startup.py`, `test_ngram_tpu_kernel_guard.py`) launch a TPU NGram
+server and assert correctness, spec activity, cache state, and the capability gate.
+
 ## Notes
 
 - Needs `torch_tpu` + `sglang` importable by `PYTHON` (default `python3`). For a
