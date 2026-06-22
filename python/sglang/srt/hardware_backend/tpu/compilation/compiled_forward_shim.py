@@ -138,20 +138,7 @@ def _pad_forward_batch_inputs(
 
 
 def pad_draft_decode_inputs(forward_batch, b_bucketer: Bucketer) -> int | None:
-    """Pad an EAGLE draft-decode ForwardBatch to a torch.compile batch bucket.
-
-    The draft decode runs with ``skip_attn_backend_init=True`` and so bypasses
-    the shim's ``prepare_forward_batch`` / ``_pad_forward_batch_inputs`` padding.
-    This is the equivalent padding for that path: it pads the batch-dim fields,
-    the ``(bs * topk)``-shaped token-dim fields (scaled by the per-seq token
-    count), and the ``EagleDraftInput`` seeds consumed by ``select_top_k_tokens``,
-    then marks the real row count via ``_tpu_real_b`` (the RPA-v3 backend zeroes
-    ghost rows and only processes ``num_active=real_bs``).
-
-    ``spec_info`` fields are reached via ``getattr`` to avoid an EAGLE type
-    dependency here. Returns ``real_bs`` when padding was applied (so the caller
-    can slice the draft outputs back), else ``None`` (already at a bucket).
-    """
+    """Pad an EAGLE draft-decode ForwardBatch to a torch.compile batch bucket."""
     real_bs = int(forward_batch.seq_lens.shape[0])
     pad_b = b_bucketer.next_bucket(real_bs)
     if pad_b == real_bs:
@@ -326,10 +313,17 @@ class TpuCompiledForwardShim:
         )
 
     def install(self) -> TpuCompiledForwardShim:
-        # TODO(wyzhang): Speculative decoding bypasses prepare_forward_batch via
-        # skip_attn_backend_init=True. Speculative decoding is not yet supported
-        # on TPU; when added, either integrate padding into the batch builder
-        # or ensure speculative runners invoke prepare_forward_batch.
+        # Speculative decoding bypasses this prepare_forward_batch padding: the
+        # draft runner calls forward(..., skip_attn_backend_init=True). The two
+        # bypass sites are handled separately:
+        #   * Draft decode: padded explicitly by pad_draft_decode_inputs() (this
+        #     module), called before the draft attn metadata is built.
+        #   * Draft extend (forward_draft_extend_after_decode): runs unpadded --
+        #     its query total = sum of per-seq accept lengths varies every step,
+        #     so uniform bucket padding can't pin a static shape. It recompiles
+        #     per accept-total (a bounded set, served from the persistent compile
+        #     cache after warmup).
+        # TODO(pyc): pad draft extend to a fixed token bucket.
         existing_prep = getattr(self.model, "prepare_forward_batch", None)
         t_bucketer = self.t_bucketer
         b_bucketer = self.b_bucketer

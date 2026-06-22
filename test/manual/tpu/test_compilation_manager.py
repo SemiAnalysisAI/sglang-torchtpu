@@ -146,15 +146,15 @@ class TestPrecompileLoops(CustomTestCase):
     EXTEND covers token buckets at the fixed batch cap, and DECODE varies bs
     (tokens == bs)."""
 
-    def test_extend_iterates_bs_x_token_cross_product(self):
+    def test_extend_compiles_token_buckets_at_batch_cap(self):
         mr = _model_runner()
         mgr = _make_manager(mr, token_buckets=(8, 64, 256), bs_buckets=(1, 4))
         mgr._precompile_extend()
-        # Cross product where t >= b: (8,1), (64,1), (256,1), (8,4), (64,4), (256,4)
-        self.assertEqual(mr.model.forward.call_count, 6)
+        # Only the fixed batch cap (max_val=4); every token bucket >= 4.
+        self.assertEqual(mr.model.forward.call_count, 3)
         self.assertEqual(
             mr.attn_backend.calls,
-            [(8, 1), (64, 1), (256, 1), (8, 4), (64, 4), (256, 4)],
+            [(8, 4), (64, 4), (256, 4)],
         )
 
     def test_extend_skips_token_bucket_below_bs(self):
@@ -162,9 +162,9 @@ class TestPrecompileLoops(CustomTestCase):
         mr = _model_runner()
         mgr = _make_manager(mr, token_buckets=(4, 64), bs_buckets=(1, 8))
         mgr._precompile_extend()
-        # (4,1), (64,1), (64,8) — (4,8) skipped since 4 < 8
-        self.assertEqual(mr.model.forward.call_count, 3)
-        self.assertEqual(mr.attn_backend.calls, [(4, 1), (64, 1), (64, 8)])
+        # Only the batch cap (max_val=8): (64,8); 4 < 8 skipped.
+        self.assertEqual(mr.model.forward.call_count, 1)
+        self.assertEqual(mr.attn_backend.calls, [(64, 8)])
 
     def test_extend_raises_when_no_valid_shapes(self):
         mr = _model_runner()
@@ -184,8 +184,8 @@ class TestPrecompileLoops(CustomTestCase):
         mr = _model_runner()
         mgr = _make_manager(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
         mgr.precompile_all()
-        # EXTEND: (8,1),(64,1),(8,4),(64,4) = 4. DECODE: (1,1),(4,4) = 2. Total = 6.
-        self.assertEqual(mr.model.forward.call_count, 6)
+        # EXTEND (batch cap 4): (8,4),(64,4) = 2. DECODE: (1,1),(4,4) = 2. Total = 4.
+        self.assertEqual(mr.model.forward.call_count, 4)
 
 
 class TestRunOneCallsCompiledForward(CustomTestCase):
@@ -302,10 +302,10 @@ class TestMakeDummyForwardBatchSpeculative(CustomTestCase):
 
 
 class TestPrecompileTargetVerify(CustomTestCase):
-    """``_precompile_target_verify`` iterates bs buckets with
-    ``num_tokens = bs * draft_token_num``."""
+    """``_precompile_target_verify`` compiles the fixed batch cap with
+    ``num_tokens = max_val * draft_token_num``."""
 
-    def test_iterates_bs_buckets_with_draft_token_num(self):
+    def test_compiles_batch_cap_with_draft_token_num(self):
         mr = _model_runner()
         mgr = _make_manager(
             mr,
@@ -314,12 +314,11 @@ class TestPrecompileTargetVerify(CustomTestCase):
             speculative_num_steps=5,
         )
         mgr._precompile_target_verify()
-        # draft_token_num = 5 + 1 = 6.
-        # Shapes: bs=1 -> tokens=6, bs=4 -> tokens=24, bs=8 -> tokens=48.
-        self.assertEqual(mr.model.forward.call_count, 3)
+        # draft_token_num = 5 + 1 = 6; only the batch cap (max_val=8): tokens=48.
+        self.assertEqual(mr.model.forward.call_count, 1)
         self.assertEqual(
             mr.attn_backend.calls,
-            [(6, 1), (24, 4), (48, 8)],
+            [(48, 8)],
         )
 
     def test_forward_batch_has_spec_info_and_full_capture(self):
@@ -371,11 +370,11 @@ class TestPrecompileExtendCaptureHidden(CustomTestCase):
             speculative_num_steps=3,
         )
         mgr._precompile_extend_full()
-        # Same grid as EXTEND: (8,1), (64,1), (8,4), (64,4).
-        self.assertEqual(mr.model.forward.call_count, 4)
+        # Same batch-cap policy as EXTEND (max_val=4): (8,4), (64,4).
+        self.assertEqual(mr.model.forward.call_count, 2)
         self.assertEqual(
             mr.attn_backend.calls,
-            [(8, 1), (64, 1), (8, 4), (64, 4)],
+            [(8, 4), (64, 4)],
         )
 
     def test_capture_hidden_mode_is_full(self):
@@ -401,9 +400,9 @@ class TestPrecompileExtendCaptureHidden(CustomTestCase):
             speculative_num_steps=3,
         )
         mgr._precompile_extend_full()
-        # Same skip rule as EXTEND: (4,1), (64,1), (64,8).
-        self.assertEqual(mr.model.forward.call_count, 3)
-        self.assertEqual(mr.attn_backend.calls, [(4, 1), (64, 1), (64, 8)])
+        # Same skip rule as EXTEND, batch cap max_val=8: (64,8); 4 < 8 skipped.
+        self.assertEqual(mr.model.forward.call_count, 1)
+        self.assertEqual(mr.attn_backend.calls, [(64, 8)])
 
 
 class TestPrecompileAllWithSpeculative(CustomTestCase):
@@ -418,12 +417,12 @@ class TestPrecompileAllWithSpeculative(CustomTestCase):
             speculative_num_steps=3,
         )
         mgr.precompile_all()
-        # EXTEND: (8,1), (8,4) = 2.
+        # EXTEND (batch cap 4): (8,4) = 1.
         # DECODE: (1,1), (4,4) = 2.
-        # TARGET_VERIFY: bs=1 -> tokens=4, bs=4 -> tokens=16 = 2.
-        # EXTEND(FULL): (8,1), (8,4) = 2.
-        # Total = 8.
-        self.assertEqual(mr.model.forward.call_count, 8)
+        # TARGET_VERIFY (batch cap 4): tokens=16 = 1.
+        # EXTEND(FULL) (batch cap 4): (8,4) = 1.
+        # Total = 5.
+        self.assertEqual(mr.model.forward.call_count, 5)
 
     def test_skips_spec_paths_when_no_speculative(self):
         mr = _model_runner()
@@ -434,8 +433,8 @@ class TestPrecompileAllWithSpeculative(CustomTestCase):
             speculative_num_steps=0,
         )
         mgr.precompile_all()
-        # EXTEND: (8,1), (8,4) = 2. DECODE: (1,1), (4,4) = 2. Total = 4.
-        self.assertEqual(mr.model.forward.call_count, 4)
+        # EXTEND (batch cap 4): (8,4) = 1. DECODE: (1,1), (4,4) = 2. Total = 3.
+        self.assertEqual(mr.model.forward.call_count, 3)
 
     def test_enable_spec_decoding_property(self):
         mgr_spec = _make_manager(speculative_num_steps=3)
