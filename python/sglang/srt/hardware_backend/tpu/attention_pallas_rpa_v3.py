@@ -332,13 +332,6 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
                 # kernel sees KV entries from prior draft steps.
                 seq_lens = seq_lens + self.speculative_step_id + 1
             extend_seq_lens = torch.ones(bs, dtype=torch.int32, device=device)
-            # Mirror of the TARGET_VERIFY handling. No-op when unpadded.
-            real_b = getattr(forward_batch, "_tpu_real_b", None)
-            if real_b is not None and real_b < bs:
-                # Clone to avoid mutating forward_batch.seq_lens in place.
-                seq_lens = seq_lens.clone()
-                seq_lens[real_b:] = 0
-                extend_seq_lens[real_b:] = 0
 
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
 

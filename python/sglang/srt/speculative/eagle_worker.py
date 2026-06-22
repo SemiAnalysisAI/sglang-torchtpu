@@ -1240,14 +1240,6 @@ class EAGLEWorker(TpModelWorker):
             f"draft_extend_after_decode (cuda_graph={can_cuda_graph})",
         )
 
-        # Slice the draft-extend outputs back to the real request count before storing them
-        # for the next iteration.
-        real_bs = len(draft_extend_input.num_accept_tokens_cpu)
-        topk_p = topk_p[:real_bs]
-        topk_index = topk_index[:real_bs]
-        if hidden_states is not None:
-            hidden_states = hidden_states[:real_bs]
-
         # Phase 3: assemble next-iter EagleDraftInput from extend output
         next_decode_capture_mode = (
             CaptureHiddenMode.NULL

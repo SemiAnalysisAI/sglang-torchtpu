@@ -140,12 +140,9 @@ class CompilationManager:
         """Compile extend at each token bucket and the fixed batch cap.
 
         The runtime pad shim pads extend batch metadata to
-        ``b_bucketer.max_val`` (the non-decode branch of
-        ``_pad_forward_batch_inputs``). Keeping precompile on the same policy
-        avoids the full token_bucket x batch_bucket grid: every extend batch is
-        padded to ``max_val`` at runtime, so the smaller bs buckets would just
-        re-pad to ``(token_bucket, max_val)`` and cache-hit -- one shape per
-        token bucket covers all runtime extend shapes.
+        ``b_bucketer.max_val``. Keeping precompile on the same policy avoids
+        the full token_bucket x batch_bucket compile grid while still covering
+        the runtime extend shapes.
         """
         bs = self.b_bucketer.max_val
         valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
