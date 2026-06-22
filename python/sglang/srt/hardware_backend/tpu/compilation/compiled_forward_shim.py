@@ -75,6 +75,14 @@ def _zero_pad_1d(t: torch.Tensor, target_size: int) -> torch.Tensor:
     return F.pad(t, (0, target_size - t.shape[0]))
 
 
+def _pad_first_dim(t: torch.Tensor, target_rows: int) -> torch.Tensor:
+    """Zero-pad a tensor's first (row) dim to target_rows. Works for any ndim."""
+    if t.shape[0] >= target_rows:
+        return t
+    pad = t.new_zeros((target_rows - t.shape[0], *t.shape[1:]))
+    return torch.cat([t, pad], dim=0)
+
+
 def _pad_forward_batch_inputs(
     forward_batch,
     t_bucketer: Bucketer,
@@ -127,6 +135,52 @@ def _pad_forward_batch_inputs(
     forward_batch.batch_size = pad_b
 
     return real_q, real_b
+
+
+def pad_draft_decode_inputs(forward_batch, b_bucketer: Bucketer) -> int | None:
+    """Pad an EAGLE draft-decode ForwardBatch to a torch.compile batch bucket.
+
+    The draft decode runs with ``skip_attn_backend_init=True`` and so bypasses
+    the shim's ``prepare_forward_batch`` / ``_pad_forward_batch_inputs`` padding.
+    This is the equivalent padding for that path: it pads the batch-dim fields,
+    the ``(bs * topk)``-shaped token-dim fields (scaled by the per-seq token
+    count), and the ``EagleDraftInput`` seeds consumed by ``select_top_k_tokens``,
+    then marks the real row count via ``_tpu_real_b`` (the RPA-v3 backend zeroes
+    ghost rows and only processes ``num_active=real_bs``).
+
+    ``spec_info`` fields are reached via ``getattr`` to avoid an EAGLE type
+    dependency here. Returns ``real_bs`` when padding was applied (so the caller
+    can slice the draft outputs back), else ``None`` (already at a bucket).
+    """
+    real_bs = int(forward_batch.seq_lens.shape[0])
+    pad_b = b_bucketer.next_bucket(real_bs)
+    if pad_b == real_bs:
+        return None
+
+    forward_batch.seq_lens = _pad_first_dim(forward_batch.seq_lens, pad_b)
+    forward_batch.req_pool_indices = _pad_first_dim(
+        forward_batch.req_pool_indices, pad_b
+    )
+    # Token-dim fields are (real_bs * tokens_per_seq) long; scale to pad_b.
+    for field in ("positions", "out_cache_loc"):
+        val = getattr(forward_batch, field, None)
+        if val is not None:
+            setattr(
+                forward_batch,
+                field,
+                _pad_first_dim(val, val.shape[0] // real_bs * pad_b),
+            )
+
+    spec_info = getattr(forward_batch, "spec_info", None)
+    if spec_info is not None:
+        for field in ("topk_p", "topk_index", "hidden_states"):
+            val = getattr(spec_info, field, None)
+            if val is not None:
+                setattr(spec_info, field, _pad_first_dim(val, pad_b))
+
+    forward_batch.batch_size = pad_b
+    forward_batch._tpu_real_b = real_bs
+    return real_bs
 
 
 class CompiledForwardShim:
