@@ -2,22 +2,11 @@
 
 Iterates over shape buckets to compile:
 
-Target model (``is_draft_worker=False``):
 * EXTEND: configured token-count and batch-size bucket combinations.
 * DECODE: configured batch-size buckets (tokens == batch_size).
 * TARGET_VERIFY: batch-size buckets × draft_token_num (speculative decoding).
 * EXTEND(FULL): same grid as EXTEND but with CaptureHiddenMode.FULL so the
   Dynamo graph that captures all hidden states is pre-compiled.
-
-Draft model (``is_draft_worker=True``):
-* EXTEND(LAST): same grid as EXTEND but with CaptureHiddenMode.LAST.
-* DECODE(draft): batch-size buckets with tokens = bs × speculative_eagle_topk, spec_info
-  stub attached so Dynamo sees the draft-decode guard.  Runs without
-  ``prepare_forward_batch`` to match the runtime path that uses
-  ``skip_attn_backend_init=True``.
-* DRAFT_EXTEND: batch-size buckets with tokens =
-  (speculative_num_steps + 1) × bs.  Also runs without
-  ``prepare_forward_batch``.
 """
 
 from __future__ import annotations
@@ -148,24 +137,29 @@ class CompilationManager:
         )
 
     def _precompile_extend(self) -> None:
-        """Compile every (token_bucket, bs_bucket) combination."""
-        valid_shapes = [
-            (t, b)
-            for b in self.b_bucketer.buckets
-            for t in self.t_bucketer.buckets
-            if t >= b
-        ]
+        """Compile extend at each token bucket and the fixed batch cap.
+
+        The runtime pad shim pads extend batch metadata to
+        ``b_bucketer.max_val`` (the non-decode branch of
+        ``_pad_forward_batch_inputs``). Keeping precompile on the same policy
+        avoids the full token_bucket x batch_bucket grid: every extend batch is
+        padded to ``max_val`` at runtime, so the smaller bs buckets would just
+        re-pad to ``(token_bucket, max_val)`` and cache-hit -- one shape per
+        token bucket covers all runtime extend shapes.
+        """
+        bs = self.b_bucketer.max_val
+        valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
         if not valid_shapes:
             raise ValueError(
-                "No TPU extend compile shapes are valid: every token bucket "
-                f"{list(self.t_bucketer.buckets)} is smaller than every bs bucket "
-                f"{list(self.b_bucketer.buckets)}."
+                "No TPU extend compile shapes are valid: token buckets "
+                f"{list(self.t_bucketer.buckets)} are all smaller than the "
+                f"extend batch cap {bs}."
             )
         n = len(valid_shapes)
         logger.info(
-            "[compilation manager] EXTEND: %d shapes (bs_buckets=%s, token_buckets=%s)",
+            "[compilation manager] EXTEND: %d shapes (bs=%d, token_buckets=%s)",
             n,
-            list(self.b_bucketer.buckets),
+            bs,
             list(self.t_bucketer.buckets),
         )
         compile_range = (
@@ -217,9 +211,14 @@ class CompilationManager:
                 )
 
     def _precompile_target_verify(self) -> None:
-        """Compile TARGET_VERIFY mode for each batch-size bucket."""
+        """Compile TARGET_VERIFY at the fixed batch cap.
+
+        Like extend, verify is padded to ``b_bucketer.max_val`` at runtime
+        (non-decode branch of the pad shim), so only that one batch size needs
+        precompiling -- smaller buckets re-pad to it and cache-hit.
+        """
         draft_token_num = self.draft_token_num
-        bs_buckets = list(self.b_bucketer.buckets)
+        bs_buckets = [self.b_bucketer.max_val]
         n = len(bs_buckets)
         logger.info(
             "[compilation manager] TARGET_VERIFY: %d shapes "
@@ -262,19 +261,15 @@ class CompilationManager:
                 )
 
     def _precompile_extend_full(self) -> None:
-        """Compile EXTEND with CaptureHiddenMode.FULL."""
-        valid_shapes = [
-            (t, b)
-            for b in self.b_bucketer.buckets
-            for t in self.t_bucketer.buckets
-            if t >= b
-        ]
+        """Compile EXTEND with CaptureHiddenMode.FULL at the fixed batch cap."""
+        bs = self.b_bucketer.max_val
+        valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
         n = len(valid_shapes)
         logger.info(
             "[compilation manager] EXTEND(FULL): %d shapes "
-            "(bs_buckets=%s, token_buckets=%s)",
+            "(bs=%d, token_buckets=%s)",
             n,
-            list(self.b_bucketer.buckets),
+            bs,
             list(self.t_bucketer.buckets),
         )
         compile_range = (
