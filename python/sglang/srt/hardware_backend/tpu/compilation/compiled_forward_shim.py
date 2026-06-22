@@ -132,10 +132,9 @@ def _pad_forward_batch_inputs(
 class CompiledForwardShim:
     """Adapt compiled forward calls and outputs for padded execution."""
 
-    def __init__(self, compiled_fn, model_runner=None):
+    def __init__(self, compiled_fn):
         self.fn = compiled_fn
         self._recompilation_checker = None
-        self.model_runner = model_runner
         signature = getattr(compiled_fn, "__signature__", None)
         if signature is not None:
             self.__signature__ = signature
@@ -296,7 +295,7 @@ class TpuCompiledForwardShim:
             setattr(
                 self.model,
                 attr,
-                CompiledForwardShim(compiled_fn, model_runner=self.model_runner),
+                CompiledForwardShim(compiled_fn),
             )
 
         logger.info(

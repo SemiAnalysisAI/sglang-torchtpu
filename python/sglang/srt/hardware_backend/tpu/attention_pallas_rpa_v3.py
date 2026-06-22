@@ -233,18 +233,11 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.req_to_token_pool = model_runner.req_to_token_pool
 
-        try:
-            ctx_len = int(model_runner.model_config.context_len)
-            extra = 4
-            eff_draft = (
-                model_runner.server_args.effective_max_speculative_num_draft_tokens()
-            )
-            if eff_draft is not None:
-                extra += int(eff_draft)
-            self._max_kv_len = ctx_len + extra
-        except Exception:
-            # Fall back to the full pool width if anything is unavailable.
-            self._max_kv_len = None
+        ctx_len = int(model_runner.model_config.context_len)
+        eff_draft = (
+            model_runner.server_args.effective_max_speculative_num_draft_tokens()
+        )
+        self._max_kv_len = ctx_len + int(eff_draft) if eff_draft is not None else None
 
         # fp8 KV cache: when the resolved cache dtype is fp8, K/V are quantized
         # before the kernel call and the kernel dequantizes on read via
