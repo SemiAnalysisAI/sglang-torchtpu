@@ -122,6 +122,14 @@ class TpuGraphRunner:
         # Fail loudly on compile-limit hits to expose latency cliffs early.
         if hasattr(torch._dynamo.config, "fail_on_recompile_limit_hit"):
             torch._dynamo.config.fail_on_recompile_limit_hit = True
+            # dynamo forbids fail_on_recompile_limit_hit and suppress_errors
+            # being active together (check_for_incompatible_configs). Some
+            # CUDA-oriented backends (e.g. flashinfer_backend) flip
+            # suppress_errors=True at import time when SGLANG_ENABLE_TORCH_COMPILE
+            # is set, which would trip that assertion the next time torch.compile
+            # runs (notably the EAGLE draft worker, compiled after the target).
+            # The TPU path wants the fail-loud behavior, so force suppress off.
+            torch._dynamo.config.suppress_errors = False
 
         _register_tpu_compile_backend()
 

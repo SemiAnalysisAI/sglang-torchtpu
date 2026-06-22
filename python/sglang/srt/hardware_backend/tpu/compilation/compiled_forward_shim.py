@@ -185,8 +185,15 @@ class CompiledForwardShim:
                 out.next_token_logits = next_token_logits[:logit_rows]
 
         hidden_states = getattr(out, "hidden_states", None)
-        if hidden_states is not None and real_q < hidden_states.shape[0]:
-            out.hidden_states = hidden_states[:real_q]
+        if hidden_states is not None:
+            # Capture-LAST (EAGLE draft extend) emits one hidden row per
+            # sequence, i.e. a batch-dim tensor padded to the compile bucket, so
+            # it must be sliced back to the real batch size. Every other capture
+            # mode emits one row per token (real_q).
+            cap = getattr(forward_batch, "capture_hidden_mode", None)
+            n_real = real_b if (cap is not None and cap.is_last()) else real_q
+            if n_real < hidden_states.shape[0]:
+                out.hidden_states = hidden_states[:n_real]
 
         # Restore real batch_size so downstream consumers (sampler,
         # logprob, scheduler hooks) don't iterate over ghost slots.

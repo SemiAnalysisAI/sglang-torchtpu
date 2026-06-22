@@ -768,16 +768,25 @@ class EAGLEWorker(TpModelWorker):
             )
         else:
             forward_batch.can_run_dp_cuda_graph = False
+            tpu_real_bs = None
             if (
                 not forward_batch.forward_mode.is_idle()
                 and self.speculative_num_steps > 1
             ):
+                # On the TPU torch.compile path, pad the draft-decode batch to a
+                # static bs bucket before building attention metadata, so the
+                # compiled draft forward sees consistent (padded) shapes.
+                tpu_real_bs = self._maybe_pad_draft_decode_for_tpu(forward_batch)
                 # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             # Run forward steps
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
+            if tpu_real_bs is not None:
+                parent_list = parent_list[:tpu_real_bs]
+                top_scores_index = top_scores_index[:tpu_real_bs]
+                draft_tokens = draft_tokens[:tpu_real_bs]
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -826,6 +835,48 @@ class EAGLEWorker(TpModelWorker):
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
+
+    def _maybe_pad_draft_decode_for_tpu(self, forward_batch: ForwardBatch):
+        """Pad the draft-decode batch to a TPU torch.compile batch bucket."""
+        shim = getattr(self.draft_model_runner, "compiled_forward_shim", None)
+        if shim is None or forward_batch.forward_mode.is_idle():
+            return None
+        real_bs = int(forward_batch.seq_lens.shape[0])
+        pad_b = shim.b_bucketer.next_bucket(real_bs)
+        if pad_b == real_bs:
+            return None
+
+        def _pad_rows(t: Optional[torch.Tensor], target_rows: int):
+            if t is None or t.shape[0] >= target_rows:
+                return t
+            pad = t.new_zeros((target_rows - t.shape[0], *t.shape[1:]))
+            return torch.cat([t, pad], dim=0)
+
+        spec_info = forward_batch.spec_info
+
+        forward_batch.seq_lens = _pad_rows(forward_batch.seq_lens, pad_b)
+        forward_batch.req_pool_indices = _pad_rows(
+            forward_batch.req_pool_indices, pad_b
+        )
+        # Token-dim tensors: length is (real_bs * tokens_per_seq); scale to pad_b.
+        if forward_batch.positions is not None:
+            forward_batch.positions = _pad_rows(
+                forward_batch.positions,
+                forward_batch.positions.shape[0] // real_bs * pad_b,
+            )
+        if forward_batch.out_cache_loc is not None:
+            forward_batch.out_cache_loc = _pad_rows(
+                forward_batch.out_cache_loc,
+                forward_batch.out_cache_loc.shape[0] // real_bs * pad_b,
+            )
+        # EagleDraftInput seeds consumed by select_top_k_tokens.
+        spec_info.topk_p = _pad_rows(spec_info.topk_p, pad_b)
+        spec_info.topk_index = _pad_rows(spec_info.topk_index, pad_b)
+        spec_info.hidden_states = _pad_rows(spec_info.hidden_states, pad_b)
+
+        forward_batch.batch_size = pad_b
+        forward_batch._tpu_real_b = real_bs
+        return real_bs
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args

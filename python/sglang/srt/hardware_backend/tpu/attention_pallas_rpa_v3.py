@@ -233,6 +233,19 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.req_to_token_pool = model_runner.req_to_token_pool
 
+        try:
+            ctx_len = int(model_runner.model_config.context_len)
+            extra = 4
+            eff_draft = (
+                model_runner.server_args.effective_max_speculative_num_draft_tokens()
+            )
+            if eff_draft is not None:
+                extra += int(eff_draft)
+            self._max_kv_len = ctx_len + extra
+        except Exception:
+            # Fall back to the full pool width if anything is unavailable.
+            self._max_kv_len = None
+
         # fp8 KV cache: when the resolved cache dtype is fp8, K/V are quantized
         # before the kernel call and the kernel dequantizes on read via
         # ``k_scale``/``v_scale``. ``None`` for bf16 caches (the default path).
@@ -290,6 +303,11 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         req_to_token = self.req_to_token_pool.req_to_token
         max_context_len = req_to_token.shape[1]
         pages_per_seq = max_context_len // page_size
+        # Cap to the tight per-sequence KV budget to avoid prefetching the
+        # pow2-rounded pool slack into SMEM.
+        if self._max_kv_len is not None:
+            tight_pages = (self._max_kv_len + page_size - 1) // page_size
+            pages_per_seq = min(pages_per_seq, tight_pages)
 
         # Host-resident fast path: when req_to_token is on CPU, build the
         # metadata on host (one H2D) instead of the on-device gather/reshape
