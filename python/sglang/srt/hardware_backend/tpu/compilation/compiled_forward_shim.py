@@ -151,10 +151,13 @@ def pad_draft_decode_inputs(forward_batch, b_bucketer: Bucketer) -> int | None:
     forward_batch.req_pool_indices = _pad_first_dim(
         forward_batch.req_pool_indices, pad_b
     )
-    # Token-dim fields are (real_bs * tokens_per_seq) long; scale to pad_b.
-    pad_t = forward_batch.positions.shape[0] // real_bs * pad_b
-    forward_batch.positions = _pad_first_dim(forward_batch.positions, pad_t)
-    forward_batch.out_cache_loc = _pad_first_dim(forward_batch.out_cache_loc, pad_t)
+    forward_batch.positions = _pad_first_dim(
+        forward_batch.positions, forward_batch.positions.shape[0] // real_bs * pad_b
+    )
+    forward_batch.out_cache_loc = _pad_first_dim(
+        forward_batch.out_cache_loc,
+        forward_batch.out_cache_loc.shape[0] // real_bs * pad_b,
+    )
 
     # EagleDraftInput seeds consumed by select_top_k_tokens.
     spec_info = forward_batch.spec_info
