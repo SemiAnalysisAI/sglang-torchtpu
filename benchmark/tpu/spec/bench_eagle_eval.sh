@@ -78,6 +78,18 @@ export SGLANG_PLATFORM=tpu
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 unset TPU_VISIBLE_CHIPS TPU_CHIPS_PER_HOST_BOUNDS TPU_HOST_BOUNDS 2>/dev/null || true
 
+# torch.compile / inductor caches can reach tens of GB (page_size=1 spec
+# especially), and default to /tmp -- often a small root fs that then fills and
+# breaks the run. Pin them to a roomy dir (default: repo-local). Doubles as a
+# persistent cache across runs. Override COMPILE_CACHE_DIR to relocate.
+if [ "$COMPILE" = "1" ]; then
+    COMPILE_CACHE_DIR="${COMPILE_CACHE_DIR:-$REPO_ROOT/.torch_tpu_cache}"
+    mkdir -p "$COMPILE_CACHE_DIR/inductor" "$COMPILE_CACHE_DIR/tier3"
+    export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$COMPILE_CACHE_DIR/inductor}"
+    export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT="${TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT:-$COMPILE_CACHE_DIR/tier3}"
+    echo "Compile cache: $COMPILE_CACHE_DIR"
+fi
+
 export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:---xla_tpu_scoped_vmem_limit_kib=32768 \
   --xla_tpu_enable_async_collective_fusion=true \
   --xla_tpu_overlap_compute_collective_tc=true \
@@ -167,8 +179,6 @@ if [ "$COMPILE" = "1" ]; then
         --tpu-compile-tokens $COMPILE_TOKENS
         --chunked-prefill-size "$CHUNKED_PREFILL"
     )
-else
-    BASE_ARGS+=(--skip-server-warmup)
 fi
 
 if [ "$BENCHMARK" = "gsm8k" ]; then
