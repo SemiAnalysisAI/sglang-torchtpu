@@ -314,13 +314,6 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             extend_seq_lens = torch.full(
                 (bs,), draft_token_num, dtype=torch.int32, device=device
             )
-            # Under torch.compile bs-padding, `bs` is the compile batch cap and
-            # rows >= the real batch size are ghost rows with no real queries or
-            # KV.
-            real_b = getattr(forward_batch, "_tpu_real_b", None)
-            if real_b is not None and real_b < bs:
-                extend_seq_lens[real_b:] = 0
-                seq_lens[real_b:] = 0
         elif forward_batch.forward_mode.is_draft_extend():
             # DRAFT_EXTEND: batch.prefix_lens may be stale from the
             # initial prefill; seq_lens and extend_seq_lens are current.
