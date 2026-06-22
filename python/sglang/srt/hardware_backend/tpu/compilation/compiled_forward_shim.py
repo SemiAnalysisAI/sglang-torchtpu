@@ -75,9 +75,12 @@ def _zero_pad_1d(t: torch.Tensor, target_size: int) -> torch.Tensor:
     return F.pad(t, (0, target_size - t.shape[0]))
 
 
-def _pad_first_dim(t: torch.Tensor, target_rows: int) -> torch.Tensor:
-    """Zero-pad a tensor's first (row) dim to target_rows. Works for any ndim."""
-    if t.shape[0] >= target_rows:
+def _pad_first_dim(t: torch.Tensor | None, target_rows: int) -> torch.Tensor | None:
+    """Zero-pad a tensor's first (row) dim to target_rows (any ndim).
+
+    None (an unset field) passes through unchanged.
+    """
+    if t is None or t.shape[0] >= target_rows:
         return t
     pad = t.new_zeros((target_rows - t.shape[0], *t.shape[1:]))
     return torch.cat([t, pad], dim=0)
@@ -149,21 +152,16 @@ def pad_draft_decode_inputs(forward_batch, b_bucketer: Bucketer) -> int | None:
         forward_batch.req_pool_indices, pad_b
     )
     # Token-dim fields are (real_bs * tokens_per_seq) long; scale to pad_b.
-    for field in ("positions", "out_cache_loc"):
-        val = getattr(forward_batch, field, None)
-        if val is not None:
-            setattr(
-                forward_batch,
-                field,
-                _pad_first_dim(val, val.shape[0] // real_bs * pad_b),
-            )
+    pad_t = forward_batch.positions.shape[0] // real_bs * pad_b
+    forward_batch.positions = _pad_first_dim(forward_batch.positions, pad_t)
+    forward_batch.out_cache_loc = _pad_first_dim(forward_batch.out_cache_loc, pad_t)
 
-    spec_info = getattr(forward_batch, "spec_info", None)
+    # EagleDraftInput seeds consumed by select_top_k_tokens.
+    spec_info = forward_batch.spec_info
     if spec_info is not None:
-        for field in ("topk_p", "topk_index", "hidden_states"):
-            val = getattr(spec_info, field, None)
-            if val is not None:
-                setattr(spec_info, field, _pad_first_dim(val, pad_b))
+        spec_info.topk_p = _pad_first_dim(spec_info.topk_p, pad_b)
+        spec_info.topk_index = _pad_first_dim(spec_info.topk_index, pad_b)
+        spec_info.hidden_states = _pad_first_dim(spec_info.hidden_states, pad_b)
 
     forward_batch.batch_size = pad_b
     forward_batch._tpu_real_b = real_bs
