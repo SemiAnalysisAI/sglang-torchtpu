@@ -151,7 +151,30 @@ def set_seed(seed_value):
     torch.backends.cudnn.benchmark = False
 
 
-def prepare_samples(eval_args: EvalArgs):
+_IMAGE_PLACEHOLDER = re.compile(r"<image(?:\s+(\d+))?>", flags=re.IGNORECASE)
+
+
+def _referenced_image_indices(prompt: str, image_count: int) -> list[int]:
+    matches = list(_IMAGE_PLACEHOLDER.finditer(prompt))
+    if not matches:
+        return [0] if image_count else []
+
+    indices = []
+    for placeholder_index, match in enumerate(matches):
+        image_index = (
+            int(match.group(1)) - 1 if match.group(1) is not None else placeholder_index
+        )
+        if image_index < 0 or image_index >= image_count:
+            raise ValueError(
+                f"Prompt references image {image_index + 1}, but only "
+                f"{image_count} image slot(s) are available"
+            )
+        if image_index not in indices:
+            indices.append(image_index)
+    return indices
+
+
+def prepare_samples(eval_args: EvalArgs, max_samples: Optional[int] = None):
     print("Preparing samples...")
     # Build prompts
     set_seed(eval_args.seed)
@@ -168,21 +191,16 @@ def prepare_samples(eval_args: EvalArgs):
             assert len(value) == 1, "key {} has more than one value".format(key)
             eval_args.config[key] = value[0]
 
-    # run for each subject in parallel
-    sub_dataset_list = []
     subjects = list(CAT_SHORT2LONG.values())  # Get a fixed list of subjects
-
+    sub_dataset_list = []
     print(f"Loading datasets for {len(subjects)} subjects...")
     with ThreadPoolExecutor() as executor:
-        # Submit all load_dataset tasks
         future_to_subject = {
             executor.submit(
                 load_dataset, eval_args.dataset_path, subject, split=eval_args.split
             ): subject
             for subject in subjects
         }
-
-        # Collect results as they complete
         results = {}
         for future in tqdm(
             as_completed(future_to_subject),
@@ -195,16 +213,24 @@ def prepare_samples(eval_args: EvalArgs):
             except Exception as exc:
                 print(f"{subject} generated an exception: {exc}")
 
-    # Ensure datasets are added in the original order for consistency
     for subject in subjects:
         if subject in results:
             sub_dataset_list.append(results[subject])
         else:
-            # Handle cases where a dataset failed to load (optional, depends on desired behavior)
             print(f"Warning: Dataset for subject '{subject}' could not be loaded.")
-
-    # merge all dataset
     dataset = concatenate_datasets(sub_dataset_list)
+
+    prompt_samples = [
+        construct_prompt(process_single_sample(sample), eval_args.config)
+        for sample in dataset
+    ]
+    prompt_samples.sort(key=lambda sample: sample["final_input_prompt"])
+    if (
+        max_samples is not None
+        and max_samples > 0
+        and eval_args.image_pixels_limit <= 0
+    ):
+        prompt_samples = prompt_samples[:max_samples]
 
     # Prepare images in parallel
     images_path = os.path.expanduser("~/.cache/mmmu/images")
@@ -214,31 +240,47 @@ def prepare_samples(eval_args: EvalArgs):
     samples = []
     skip_count = 0
 
-    def process_sample(i, sample):
-        sample = process_single_sample(sample)
-        sample = construct_prompt(sample, eval_args.config)
-        image = sample["image"]
-        width, height = image.size
-        if 0 < eval_args.image_pixels_limit <= width * height:
+    def process_sample(sample):
+        images = sample.get("images", [])
+        referenced_indices = _referenced_image_indices(
+            sample["final_input_prompt"], len(images)
+        )
+        referenced_images = []
+        for image_index in referenced_indices:
+            image = images[image_index]
+            if image is None:
+                raise ValueError(
+                    f"MMMU sample {sample['id']} references missing image "
+                    f"{image_index + 1}"
+                )
+            referenced_images.append((image_index, image))
+        if not referenced_images:
+            raise ValueError(f"MMMU sample {sample['id']} has no usable images")
+        if 0 < eval_args.image_pixels_limit and any(
+            image.width * image.height >= eval_args.image_pixels_limit
+            for _, image in referenced_images
+        ):
             return None, True
-        # Use a unique identifier for the image path to avoid potential collisions if indices reset
-        image_path = f"{images_path}/image_{sample['id']}.png"
-        if not os.path.exists(image_path):
-            image.save(image_path)
-        sample["image_path"] = image_path
+        image_paths = [None] * len(images)
+        for image_index, image in referenced_images:
+            suffix = "" if len(referenced_images) == 1 else f"_{image_index + 1}"
+            image_path = f"{images_path}/image_{sample['id']}{suffix}.png"
+            if not os.path.exists(image_path):
+                image.save(image_path)
+            image_paths[image_index] = image_path
+        first_index, first_image = referenced_images[0]
+        sample["image"] = first_image
+        sample["image_path"] = image_paths[first_index]
+        sample["image_paths"] = image_paths
         return sample, False
 
     print("Processing samples...")
     with ThreadPoolExecutor() as executor:
-        # Pass the sample itself to process_sample, index is less reliable now
-        futures = [
-            executor.submit(
-                process_sample, i, sample
-            )  # Keep index i for tqdm maybe? Or remove it. Let's keep it for now.
-            for i, sample in enumerate(dataset)
-        ]
+        futures = [executor.submit(process_sample, sample) for sample in prompt_samples]
         for future in tqdm(
-            as_completed(futures), total=len(dataset), desc="Processing samples"
+            as_completed(futures),
+            total=len(prompt_samples),
+            desc="Processing samples",
         ):
             sample, skipped = future.result()
             if skipped:
@@ -247,6 +289,8 @@ def prepare_samples(eval_args: EvalArgs):
                 samples.append(sample)
 
     samples.sort(key=lambda x: x["final_input_prompt"])
+    if max_samples is not None and max_samples > 0:
+        samples = samples[:max_samples]
 
     print(
         f"Skipping {skip_count} samples with large images, {round((float(skip_count) / len(dataset)) * 100, 2)}% of dataset"
@@ -300,7 +344,9 @@ def _parse_explicit_multi_choice_answer(response, all_choices):
     return max(matches)[1] if matches else None
 
 
-def parse_multi_choice_response(response, all_choices, index2ans):
+def parse_multi_choice_response(
+    response, all_choices, index2ans, *, random_fallback=True
+):
     """
     Parse the prediction from the generated response.
     Return the predicted index e.g., A, B, C, D.
@@ -333,8 +379,8 @@ def parse_multi_choice_response(response, all_choices, index2ans):
                 candidates.append(index)
                 index_ans = False  # it's content ans.
 
-    if len(candidates) == 0:  # still not get answer, randomly choose one.
-        pred_index = random.choice(all_choices)
+    if len(candidates) == 0:
+        pred_index = random.choice(all_choices) if random_fallback else None
     elif len(candidates) > 1:
         start_indexes = []
         if index_ans:

@@ -204,6 +204,28 @@ class TestMMMUEvalUtils(CustomTestCase):
 
         self.assertEqual(pred_ans, "B")
 
+    def test_parse_multi_choice_can_disable_random_fallback(self):
+        pred_ans = self.eval_utils.parse_multi_choice_response(
+            "I cannot determine this.",
+            ["A", "B", "C", "D"],
+            self._index_to_answer(),
+            random_fallback=False,
+        )
+
+        self.assertIsNone(pred_ans)
+
+    def test_referenced_image_indices_follow_prompt_placeholders(self):
+        self.assertEqual(
+            self.eval_utils._referenced_image_indices(
+                "Compare <image 1> with <image 3> and <image 1>.", 3
+            ),
+            [0, 2],
+        )
+        self.assertEqual(
+            self.eval_utils._referenced_image_indices("Inspect <image 1>.", 2),
+            [0],
+        )
+
     def test_parse_multi_choice_ignores_parenthetical_option_mentions(self):
         # Thinking-style outputs discuss/reject several options inside
         # ``<think>...</think>`` using parenthetical mentions like ``(A)``,

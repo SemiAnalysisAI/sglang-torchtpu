@@ -108,6 +108,13 @@ def parse_img_path(text):
 
 def process_single_sample(data):
     question = data["question"]
+    image_indices = [
+        int(key.rsplit("_", 1)[1]) for key in data if re.fullmatch(r"image_\d+", key)
+    ]
+    images = [
+        data.get(f"image_{index}")
+        for index in range(1, max(image_indices, default=0) + 1)
+    ]
     o_imgs_paths = []
     for option in data["options"]:
         current_o_imgs_paths = parse_img_path(option)
@@ -121,6 +128,7 @@ def process_single_sample(data):
             "options": data["options"],
             "answer": data["answer"],
             "image": None,
+            "images": images,
             "question_type": data["question_type"],
         }
     else:
@@ -129,7 +137,8 @@ def process_single_sample(data):
             "question": question,
             "options": data["options"],
             "answer": data["answer"],
-            "image": data["image_1"],
+            "image": images[0] if images else None,
+            "images": images,
             "question_type": data["question_type"],
         }
 
