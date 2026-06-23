@@ -6,8 +6,9 @@ PyTorch/Python and need no JAX / torch_tpu / TPU device:
 * :meth:`TpuPallasRpaV3AttnBackend._build_metadata` — the
   ``PallasForwardMetadata`` produced for decode vs extend matches the kernel's
   rectangular-page layout (cu_q_lens from extend_seq_lens, cu_kv_lens =
-  i * pages_per_seq * page_size, page_indices gathered + page-divided from
-  req_to_token, distribution = [bs,bs,bs] decode / [0,bs,bs] extend).
+        i * pages_per_seq * page_size, page_indices gathered + page-divided from
+        req_to_token, metadata padded to max_num_reqs with inactive ghost rows,
+        distribution = [bs,bs,bs] decode / [0,bs,bs] extend).
 * :meth:`TpuPallasRpaV3AttnBackend.init_forward_metadata` populates
   ``self.forward_metadata``.
 * :meth:`TpuPallasRpaV3AttnBackend.forward_decode` flattens a 3D ``q`` to 2D
@@ -48,10 +49,16 @@ class _BackendUnderTest(TpuPallasRpaV3AttnBackend):
     reshape) never touch ``self._op``, so leaving it as ``None`` is safe.
     """
 
-    def __init__(self, page_size: int, req_to_token: torch.Tensor) -> None:
+    def __init__(
+        self,
+        page_size: int,
+        req_to_token: torch.Tensor,
+        max_num_reqs: int | None = None,
+    ) -> None:
         AttentionBackend.__init__(self)
         self.device = req_to_token.device
         self.page_size = page_size
+        self.max_num_reqs = max_num_reqs or req_to_token.shape[0]
         # _build_metadata reads req_to_token_pool.req_to_token only.
         self.req_to_token_pool = types.SimpleNamespace(req_to_token=req_to_token)
         self.forward_metadata = None
@@ -102,10 +109,13 @@ class TestPallasRpaV3MetadataDecode(CustomTestCase):
 
     def setUp(self):
         self.bs = 3
+        self.max_num_reqs = 8
         self.req_to_token = _build_req_to_token(
-            num_reqs=8, max_context_len=self.MAX_CONTEXT_LEN
+            num_reqs=self.max_num_reqs, max_context_len=self.MAX_CONTEXT_LEN
         )
-        self.backend = _BackendUnderTest(self.PAGE_SIZE, self.req_to_token)
+        self.backend = _BackendUnderTest(
+            self.PAGE_SIZE, self.req_to_token, self.max_num_reqs
+        )
         self.req_pool_indices = torch.tensor([5, 2, 7], dtype=torch.int64)
         self.seq_lens = torch.tensor([10, 24, 33], dtype=torch.int32)
         self.fb = _make_forward_batch(
@@ -123,13 +133,16 @@ class TestPallasRpaV3MetadataDecode(CustomTestCase):
 
     def test_kv_lens_matches_seq_lens(self):
         meta = self._build()
-        self.assertTrue(torch.equal(meta.kv_lens, self.seq_lens.to(torch.int32)))
+        expected = torch.zeros(self.max_num_reqs, dtype=torch.int32)
+        expected[: self.bs] = self.seq_lens.to(torch.int32)
+        self.assertTrue(torch.equal(meta.kv_lens, expected))
         self.assertEqual(meta.kv_lens.dtype, torch.int32)
 
     def test_cu_q_lens_decode_is_arange(self):
         # Each sequence contributes one query token, so cu_q_lens = [0,1,2,...,bs].
         meta = self._build()
-        expected = torch.arange(self.bs + 1, dtype=torch.int32)
+        expected = torch.full((self.max_num_reqs + 1,), self.bs, dtype=torch.int32)
+        expected[: self.bs + 1] = torch.arange(self.bs + 1, dtype=torch.int32)
         self.assertTrue(torch.equal(meta.cu_q_lens, expected))
         self.assertEqual(meta.cu_q_lens.dtype, torch.int32)
 
@@ -137,16 +150,17 @@ class TestPallasRpaV3MetadataDecode(CustomTestCase):
         # cu_kv_lens[i] = i * pages_per_seq * page_size.
         meta = self._build()
         stride = self.PAGES_PER_SEQ * self.PAGE_SIZE
-        expected = (torch.arange(self.bs + 1) * stride).to(torch.int32)
+        expected = (torch.arange(self.max_num_reqs + 1) * stride).to(torch.int32)
         self.assertTrue(torch.equal(meta.cu_kv_lens, expected))
         self.assertEqual(meta.cu_kv_lens.dtype, torch.int32)
 
     def test_page_indices_layout(self):
         meta = self._build()
-        # Shape is flat [bs * pages_per_seq] — the kernel reads
+        # Shape is flat [max_num_reqs * pages_per_seq] — the kernel reads
         # page_indices[i * pages_per_seq + j].
         self.assertEqual(
-            tuple(meta.page_indices.shape), (self.bs * self.PAGES_PER_SEQ,)
+            tuple(meta.page_indices.shape),
+            (self.max_num_reqs * self.PAGES_PER_SEQ,),
         )
         self.assertEqual(meta.page_indices.dtype, torch.int32)
 
@@ -163,6 +177,8 @@ class TestPallasRpaV3MetadataDecode(CustomTestCase):
                     expected,
                     f"seq {i} page {j}: page_indices mismatch",
                 )
+        tail = meta.page_indices[self.bs * self.PAGES_PER_SEQ :]
+        self.assertTrue(torch.equal(tail, torch.zeros_like(tail)))
 
     def test_distribution_decode_all_active(self):
         # Decode: every sequence is in the [0,bs) decode range.
@@ -188,10 +204,13 @@ class TestPallasRpaV3MetadataExtend(CustomTestCase):
 
     def setUp(self):
         self.bs = 4
+        self.max_num_reqs = 8
         self.req_to_token = _build_req_to_token(
-            num_reqs=8, max_context_len=self.MAX_CONTEXT_LEN
+            num_reqs=self.max_num_reqs, max_context_len=self.MAX_CONTEXT_LEN
         )
-        self.backend = _BackendUnderTest(self.PAGE_SIZE, self.req_to_token)
+        self.backend = _BackendUnderTest(
+            self.PAGE_SIZE, self.req_to_token, self.max_num_reqs
+        )
         self.req_pool_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
         # Mixed q-lengths to make sure the cumsum is computed properly.
         self.extend_seq_lens = torch.tensor([3, 5, 2, 1], dtype=torch.int32)
@@ -209,7 +228,8 @@ class TestPallasRpaV3MetadataExtend(CustomTestCase):
     def test_cu_q_lens_is_cumsum_of_extend_seq_lens(self):
         meta = self._build()
         # cumsum prepended with 0.
-        expected = torch.tensor([0, 3, 8, 10, 11], dtype=torch.int32)
+        expected = torch.full((self.max_num_reqs + 1,), 11, dtype=torch.int32)
+        expected[: self.bs + 1] = torch.tensor([0, 3, 8, 10, 11], dtype=torch.int32)
         self.assertTrue(torch.equal(meta.cu_q_lens, expected))
 
     def test_distribution_extend(self):

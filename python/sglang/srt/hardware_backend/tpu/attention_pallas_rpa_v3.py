@@ -34,6 +34,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+    build_bucketers,
+    resolve_compile_caps,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -229,6 +233,17 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.req_to_token_pool = model_runner.req_to_token_pool
 
+        server_args = model_runner.server_args
+        max_t, max_b = resolve_compile_caps(
+            chunked_prefill_size=server_args.chunked_prefill_size,
+            max_prefill_tokens=server_args.max_prefill_tokens,
+            context_len=model_runner.model_config.context_len,
+            torch_compile_max_bs=getattr(server_args, "torch_compile_max_bs", None),
+            max_running_requests=model_runner.max_running_requests,
+        )
+        _, b_bucketer = build_bucketers(server_args, max_t=max_t, max_b=max_b)
+        self.max_num_reqs = int(b_bucketer.max_val)
+
         # fp8 KV cache: when the resolved cache dtype is fp8, K/V are quantized
         # before the kernel call and the kernel dequantizes on read via
         # ``k_scale``/``v_scale``. ``None`` for bf16 caches (the default path).
@@ -275,11 +290,19 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         page_size = self.page_size
         device = forward_batch.seq_lens.device
         bs = int(forward_batch.seq_lens.shape[0])
+        pad_b = self.max_num_reqs
+        assert bs <= pad_b, (
+            f"RPA v3 metadata padding target max_num_reqs={pad_b} is smaller than "
+            f"the incoming batch size {bs}; raise --torch-compile-max-bs or "
+            "--tpu-compile-bs."
+        )
         req_to_token = self.req_to_token_pool.req_to_token
         max_context_len = req_to_token.shape[1]
         pages_per_seq = max_context_len // page_size
 
         seq_lens = forward_batch.seq_lens.to(torch.int32)
+        kv_lens = torch.zeros(pad_b, dtype=torch.int32, device=device)
+        kv_lens[:bs] = seq_lens
 
         if forward_batch.forward_mode.is_extend():
             assert forward_batch.extend_seq_lens is not None, (
@@ -293,12 +316,15 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
 
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
 
-        cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32, device=device)
-        cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
+        cu_q_lens = torch.zeros(pad_b + 1, dtype=torch.int32, device=device)
+        cu_real = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
+        cu_q_lens[1 : bs + 1] = cu_real
+        if bs < pad_b:
+            cu_q_lens[bs + 1 :] = cu_real[-1] if bs > 0 else 0
 
         # cu_kv_lens[i] = i * pages_per_seq * page_size so the kernel addresses
         # ``page_indices[i * pages_per_seq + j]`` for token j of seq i.
-        cu_kv_lens = torch.arange(bs + 1, dtype=torch.int32, device=device) * (
+        cu_kv_lens = torch.arange(pad_b + 1, dtype=torch.int32, device=device) * (
             pages_per_seq * page_size
         )
 
@@ -309,10 +335,14 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # Trim to exactly ``pages_per_seq`` entries per row so the flat
         # ``page_indices`` shape matches the rectangular layout the kernel
         # expects.
-        page_indices = (
+        page_indices_real = (
             per_seq[:, : pages_per_seq * page_size : page_size] // page_size
         ).to(torch.int32)
-        page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
+        page_indices_real = page_indices_real.reshape(bs * pages_per_seq).contiguous()
+        page_indices = torch.zeros(
+            pad_b * pages_per_seq, dtype=torch.int32, device=device
+        )
+        page_indices[: bs * pages_per_seq] = page_indices_real
 
         # The TPU compile shim pads batch-shaped metadata up to the selected
         # compile bucket. Keep the padded tensor shapes, but only mark the real
@@ -326,7 +356,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             distribution = torch.stack([zero, num_active, num_active]).to(torch.int32)
 
         return PallasForwardMetadata(
-            kv_lens=seq_lens,
+            kv_lens=kv_lens,
             cu_q_lens=cu_q_lens,
             cu_kv_lens=cu_kv_lens,
             page_indices=page_indices,
