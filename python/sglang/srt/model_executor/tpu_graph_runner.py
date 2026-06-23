@@ -43,6 +43,27 @@ if TYPE_CHECKING:
 logger = get_logger("tpu_graph_runner")
 
 
+def _prebuild_tpu_fp8_dense_linear_op(model: Any) -> None:
+    """Register TPU FP8 dense custom ops before Dynamo traces them."""
+    modules = model.modules() if callable(getattr(model, "modules", None)) else (model,)
+    for module in modules:
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is None:
+            continue
+        if quant_method.__class__.__name__ != "Fp8LinearMethod":
+            continue
+
+        from sglang.srt.hardware_backend.tpu.fp8_linear import (
+            prebuild_tpu_fp8_linear_op,
+        )
+
+        prebuild_tpu_fp8_linear_op()
+        logger.info(
+            "Pre-registered TPU FP8 dense linear custom op before torch.compile."
+        )
+        return
+
+
 class TpuGraphRunner:
     """Orchestrate ``torch.compile(backend='tpu')`` annotation policies."""
 
@@ -94,6 +115,7 @@ class TpuGraphRunner:
             torch._dynamo.config.fail_on_recompile_limit_hit = True
 
         _register_tpu_compile_backend()
+        _prebuild_tpu_fp8_dense_linear_op(self.model)
 
         modules = (
             self.model.modules()

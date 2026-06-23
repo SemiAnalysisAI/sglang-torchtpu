@@ -64,12 +64,12 @@ class TestTpuFp8Linear(CustomTestCase):
         torch.testing.assert_close(eager_out.cpu(), ref.cpu(), rtol=0.25, atol=0.25)
         torch.testing.assert_close(compiled_out.cpu(), eager_out.cpu())
 
-    def test_fp8_linear_rejects_unaligned_weight(self):
+    def test_fp8_linear_rejects_mismatched_hidden_dim(self):
         x = torch.randn(1, 15, dtype=torch.bfloat16)
-        weight = torch.empty(15, 16, dtype=torch.float8_e4m3fn)
+        weight = torch.empty(16, 16, dtype=torch.float8_e4m3fn)
         weight_scale = torch.ones(16, dtype=torch.float32)
 
-        with self.assertRaisesRegex(ValueError, "multiples of 16"):
+        with self.assertRaisesRegex(ValueError, "Input hidden dim"):
             apply_tpu_fp8_linear(x, weight, weight_scale)
 
     def test_block_fp8_linear_requantizes_and_runs(self):
