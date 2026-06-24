@@ -329,26 +329,23 @@ def _tensor_summary(t, max_show: int = 8) -> str:
         return f"shape={tuple(t.shape)} dtype={t.dtype} <readback-failed: {exc}>"
 
 
-def dump_draft_extend_inputs(forward_batch, tag: str = "draft_extend") -> None:
-    """Log a compact snapshot of every tensor that feeds the draft forward.
+def _dump_forward_batch_snapshot(forward_batch, tag: str) -> None:
+    """Log a compact snapshot of every tensor on a ForwardBatch.
 
-    Gated by ``SGLANG_TPU_DUMP_DRAFT_INPUTS=1``. Intended for diffing
-    consecutive calls to find what is changing between forward invocations
-    when a recompile is observed. Logs at WARNING level so it shows up
-    even with default log_level=info, and prefixes each line with the
-    rank/mode tag for easy grep.
+    Intended for diffing precompile-dummy vs runtime data to find what
+    value/shape differences trigger libtpu cold-compile on a forward whose
+    Dynamo-level shape signature should already cache-hit. Logs at WARNING
+    level so it shows up under default log_level=info.
     """
-    import os
-
-    if os.environ.get("SGLANG_TPU_DUMP_DRAFT_INPUTS") != "1":
-        return
     fb = forward_batch
     mode = getattr(getattr(fb, "forward_mode", None), "name", "?")
     real_q = getattr(fb, _REAL_Q_KEY, None)
     real_b = getattr(fb, _REAL_B_KEY, None)
     bs = getattr(fb, "batch_size", None)
+    capture = getattr(fb, "capture_hidden_mode", None)
+    cap_name = getattr(capture, "name", str(capture))
     lines = [
-        f"[{tag} {mode}] bs={bs} real_q={real_q} real_b={real_b}",
+        f"[{tag} {mode}] bs={bs} real_q={real_q} real_b={real_b} capture={cap_name}",
         f"  input_ids        = {_tensor_summary(fb.input_ids)}",
         f"  positions        = {_tensor_summary(fb.positions)}",
         f"  seq_lens         = {_tensor_summary(fb.seq_lens)}",
@@ -359,14 +356,21 @@ def dump_draft_extend_inputs(forward_batch, tag: str = "draft_extend") -> None:
         f"  req_pool_indices = {_tensor_summary(fb.req_pool_indices)}",
         f"  out_cache_loc    = {_tensor_summary(getattr(fb, 'out_cache_loc', None))}",
     ]
-    # spec_info.hidden_states is the per-token target hidden feed (EAGLE3).
+    # spec_info: dump every tensor attribute so we can diff verify vs draft
+    # vs decode spec_info dummies against runtime.
     spec_info = getattr(fb, "spec_info", None)
     if spec_info is not None:
-        for attr in ("hidden_states", "topk_p", "topk_index", "bonus_tokens"):
-            val = getattr(spec_info, attr, None)
-            if val is not None:
-                lines.append(f"  spec_info.{attr:14s} = {_tensor_summary(val)}")
-    # Attention backend's per-call kernel inputs (what Pallas actually sees).
+        lines.append(f"  spec_info type     = {type(spec_info).__name__}")
+        for attr in dir(spec_info):
+            if attr.startswith("_"):
+                continue
+            try:
+                val = getattr(spec_info, attr, None)
+            except Exception:
+                continue
+            if isinstance(val, torch.Tensor):
+                lines.append(f"  spec_info.{attr:18s} = {_tensor_summary(val)}")
+    # Attention backend's per-call kernel inputs.
     attn = getattr(fb, "attn_backend", None)
     fmd = getattr(attn, "forward_metadata", None)
     if fmd is not None:
@@ -379,8 +383,30 @@ def dump_draft_extend_inputs(forward_batch, tag: str = "draft_extend") -> None:
         ):
             val = getattr(fmd, attr, None)
             if val is not None:
-                lines.append(f"  attn.{attr:14s}       = {_tensor_summary(val)}")
+                lines.append(f"  attn.{attr:18s}   = {_tensor_summary(val)}")
     logger.warning("\n".join(lines))
+
+
+def dump_draft_extend_inputs(forward_batch, tag: str = "draft_extend") -> None:
+    """Compatibility wrapper for callers that only want draft-extend dumps."""
+    import os
+
+    if os.environ.get("SGLANG_TPU_DUMP_DRAFT_INPUTS") != "1":
+        return
+    _dump_forward_batch_snapshot(forward_batch, tag)
+
+
+def dump_forward_batch(forward_batch, tag: str) -> None:
+    """General forward-batch dump.
+
+    Gated by ``SGLANG_TPU_DUMP_FORWARD=1`` so it can be enabled
+    independently of the draft-extend-specific dump above.
+    """
+    import os
+
+    if os.environ.get("SGLANG_TPU_DUMP_FORWARD") != "1":
+        return
+    _dump_forward_batch_snapshot(forward_batch, tag)
 
 
 class CompiledForwardShim:
@@ -419,6 +445,10 @@ class CompiledForwardShim:
                     and _matches_default(v, self._default_kwargs[k])
                 )
             }
+        # Optional: snapshot the runtime ForwardBatch entering the compiled
+        # forward, paired with the precompile-time snapshot in
+        # CompilationManager._run_one. Gated by SGLANG_TPU_DUMP_FORWARD=1.
+        dump_forward_batch(forward_batch, tag=f"runtime {self._model_label}")
         out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
 
         real_q = getattr(forward_batch, _REAL_Q_KEY, None)

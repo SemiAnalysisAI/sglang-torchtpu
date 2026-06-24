@@ -639,6 +639,20 @@ class CompilationManager:
             model.prepare_forward_batch(forward_batch)
         backend.init_forward_metadata(forward_batch)
 
+        # Optional: snapshot the dummy ForwardBatch just before it crosses
+        # into the compiled forward, so it can be diffed against the
+        # runtime snapshot (taken in CompiledForwardShim.__call__) to find
+        # value/shape differences that trigger cold libtpu recompiles.
+        # Gated by SGLANG_TPU_DUMP_FORWARD=1.
+        from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+            dump_forward_batch,
+        )
+
+        is_draft = getattr(self.model_runner, "is_draft_worker", False)
+        model_name = type(model).__name__
+        tag = f"precompile {'draft ' if is_draft else ''}{model_name}"
+        dump_forward_batch(forward_batch, tag=tag)
+
         # Match TpuGraphRunner's no_grad wrapper for Dynamo cache reuse.
         with torch.no_grad():
             out = model.forward(
@@ -698,10 +712,14 @@ class CompilationManager:
         # req_pool_indices: start at 1 (slot 0 reserved for padding).
         req_pool_indices = torch.arange(1, bs + 1, dtype=torch.int64, device=device)
 
-        if is_extend:
-            if mode.is_target_verify() and spec_info is not None:
-                tokens_per_req = spec_info.draft_token_num
-            elif mode.is_draft_extend() and self.draft_token_num:
+        # TARGET_VERIFY is technically extend-like (``is_extend()`` returns
+        # True) but ``ForwardBatch.init_new`` takes the decode-or-verify
+        # branch and leaves ``extend_*`` as None. The attention backend
+        # reconstructs them on the fly from ``spec_info.draft_token_num``.
+        # Mirror that here so the compiled forward sees the same tensor-vs-
+        # None pattern at precompile and at runtime.
+        if is_extend and not mode.is_target_verify():
+            if mode.is_draft_extend() and self.draft_token_num:
                 tokens_per_req = self.draft_token_num
             else:
                 tokens_per_req = 1
@@ -736,7 +754,10 @@ class CompilationManager:
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             seq_lens_sum=bs,
-            orig_seq_lens=seq_lens,
+            # ``orig_seq_lens`` is ``int32`` at runtime (see
+            # ScheduleBatch.orig_seq_lens). Match it so Dynamo guards on
+            # dtype don't fire between precompile and runtime.
+            orig_seq_lens=seq_lens.to(torch.int32),
             out_cache_loc=out_cache_loc,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,

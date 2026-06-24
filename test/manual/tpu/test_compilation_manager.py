@@ -252,7 +252,12 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
 class TestMakeDummyForwardBatchSpeculative(CustomTestCase):
     """Dummy batch construction for speculative decoding modes."""
 
-    def test_target_verify_has_extend_fields_with_draft_token_num(self):
+    def test_target_verify_does_not_set_extend_fields(self):
+        # ``ForwardBatch.init_new`` takes the decode-or-verify branch for
+        # TARGET_VERIFY and leaves ``extend_*`` as None (attention metadata
+        # is rebuilt on the fly from ``spec_info.draft_token_num``). The
+        # precompile dummy must match that to avoid Dynamo guard mismatches
+        # between precompile (tensor) and runtime (None).
         mr = _model_runner()
         mgr = _make_manager(mr, speculative_num_steps=5)
         spec_info = SimpleNamespace(draft_token_num=6)
@@ -262,15 +267,13 @@ class TestMakeDummyForwardBatchSpeculative(CustomTestCase):
             mode=ForwardMode.TARGET_VERIFY,
             spec_info=spec_info,
         )
-        # TARGET_VERIFY is extend-like, so extend fields must be present.
-        self.assertIsNotNone(fb.extend_seq_lens)
-        # Each request contributes draft_token_num tokens.
-        self.assertEqual(fb.extend_seq_lens.tolist(), [6, 6, 6, 6])
-        self.assertEqual(fb.extend_prefix_lens.tolist(), [0, 0, 0, 0])
-        self.assertEqual(fb.extend_start_loc.tolist(), [0, 6, 12, 18])
-        self.assertEqual(fb.extend_num_tokens, 24)
-        self.assertEqual(fb.extend_seq_lens_cpu, [6, 6, 6, 6])
-        self.assertEqual(fb.extend_prefix_lens_cpu, [0, 0, 0, 0])
+        # extend_* fields are None to mirror runtime.
+        self.assertIsNone(fb.extend_seq_lens)
+        self.assertIsNone(fb.extend_prefix_lens)
+        self.assertIsNone(fb.extend_start_loc)
+        self.assertIsNone(fb.extend_num_tokens)
+        self.assertIsNone(fb.extend_seq_lens_cpu)
+        self.assertIsNone(fb.extend_prefix_lens_cpu)
         # Token-level tensors at num_tokens.
         self.assertEqual(fb.input_ids.shape[0], 24)
         self.assertEqual(fb.positions.shape[0], 24)
@@ -342,7 +345,10 @@ class TestPrecompileTargetVerify(CustomTestCase):
         self.assertEqual(fb.spec_info.draft_token_num, 4)
         self.assertEqual(fb.capture_hidden_mode, CaptureHiddenMode.FULL)
 
-    def test_extend_fields_populated_for_verify(self):
+    def test_extend_fields_are_none_for_verify(self):
+        # TARGET_VERIFY runtime takes the decode-or-verify branch in
+        # ForwardBatch.init_new and leaves extend_* as None. Precompile
+        # must mirror that to keep Dynamo guards aligned.
         mr = _model_runner()
         mgr = _make_manager(
             mr,
@@ -353,10 +359,9 @@ class TestPrecompileTargetVerify(CustomTestCase):
         mgr._precompile_target_verify()
         args, _ = mr.model.forward.call_args
         fb = args[2]
-        # draft_token_num=4, bs=2, so extend_seq_lens=[4, 4].
-        self.assertEqual(fb.extend_seq_lens.tolist(), [4, 4])
-        self.assertEqual(fb.extend_start_loc.tolist(), [0, 4])
-        self.assertEqual(fb.extend_num_tokens, 8)
+        self.assertIsNone(fb.extend_seq_lens)
+        self.assertIsNone(fb.extend_start_loc)
+        self.assertIsNone(fb.extend_num_tokens)
 
 
 class TestPrecompileExtendCaptureHidden(CustomTestCase):
