@@ -66,7 +66,7 @@ def _model_runner(device="cpu", eagle_hidden_size=0):
             prepare_forward_batch=MagicMock(),
             model=inner_model,
         ),
-        model_config=SimpleNamespace(hidden_size=4096),
+        model_config=SimpleNamespace(hidden_size=4096, dtype=torch.bfloat16),
         attn_backend=_FakeAttnBackend(),
         req_to_token_pool=SimpleNamespace(
             req_to_token=torch.zeros(4, 64, dtype=torch.int64),
@@ -108,24 +108,26 @@ class TestMakeDummyForwardBatch(CustomTestCase):
         mr = _model_runner()
         mgr = _make_manager(mr)
         fb = mgr._make_dummy_forward_batch(num_tokens=64, bs=4, mode=ForwardMode.EXTEND)
-        # Token-axis tensors padded to num_tokens; bs=4 valid + 60 ghost.
+        # Token-axis tensors padded to num_tokens; arange-based content so
+        # libtpu's sub-graph cache keys see runtime-like value patterns.
         self.assertEqual(fb.input_ids.shape[0], 64)
         self.assertEqual(fb.positions.shape[0], 64)
         self.assertEqual(fb.out_cache_loc.shape[0], 64)
-        self.assertEqual(fb.input_ids[:4].tolist(), [1, 1, 1, 1])
-        self.assertEqual(fb.input_ids[4:].sum().item(), 0)
+        self.assertEqual(fb.input_ids[:4].tolist(), [1, 2, 3, 4])
+        self.assertEqual(fb.positions[:4].tolist(), [0, 1, 2, 3])
         self.assertEqual(fb.input_ids.dtype, torch.int64)
         self.assertEqual(fb.positions.dtype, torch.int64)
         # Per-request tensors at bs.
         self.assertEqual(fb.seq_lens.shape[0], 4)
         self.assertEqual(fb.seq_lens.dtype, torch.int64)
+        self.assertEqual(fb.seq_lens.tolist(), [2, 3, 4, 5])
         self.assertEqual(fb.extend_seq_lens.shape[0], 4)
         self.assertEqual(fb.extend_seq_lens.tolist(), [1, 1, 1, 1])
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0, 0, 0, 0])
-        # KV writes go to slot 1 (not 0) to avoid stale page-index
-        # conflicts on the shared req_to_token_pool.
-        self.assertTrue((fb.out_cache_loc == 1).all())
-        self.assertTrue((fb.req_pool_indices == 1).all())
+        # KV writes start at slot 1 (not 0) and use distinct slot indices
+        # matching real allocator output (arange-based).
+        self.assertEqual(fb.out_cache_loc[:4].tolist(), [1, 2, 3, 4])
+        self.assertEqual(fb.req_pool_indices.tolist(), [1, 2, 3, 4])
 
     def test_decode_has_no_extend_fields(self):
         mr = _model_runner()
@@ -447,6 +449,132 @@ class TestPrecompileAllWithSpeculative(CustomTestCase):
         self.assertEqual(mgr.draft_token_num, 6)  # 5 + 1
         mgr0 = _make_manager(speculative_num_steps=0)
         self.assertEqual(mgr0.draft_token_num, 0)
+
+
+class TestPrecompileDraftExtend(CustomTestCase):
+    """``_precompile_draft_extend`` compiles one shape per bs bucket: the
+    worst-case ``(bs * draft_token_num, bs)``."""
+
+    def test_compiles_one_shape_per_bs_bucket(self):
+        mr = _model_runner(eagle_hidden_size=256)
+        mgr = _make_manager(
+            mr,
+            token_buckets=(8, 16, 64),
+            bs_buckets=(1, 4),
+            speculative_num_steps=3,
+            speculative_algorithm="EAGLE3",
+            is_draft_worker=True,
+            eagle_hidden_size=256,
+        )
+        mgr._precompile_draft_extend()
+        # draft_token_num = num_steps + 1 = 4.
+        # bs=1 -> worst-case q = max(1*4, 1) = 4 -> smallest token bucket >= 4 is 8.
+        # bs=4 -> worst-case q = max(4*4, 4) = 16 -> smallest token bucket >= 16 is 16.
+        self.assertEqual(mr.model.forward.call_count, 2)
+        self.assertEqual(mr.attn_backend.calls, [(8, 1), (16, 4)])
+
+    def test_falls_back_to_max_bucket_when_no_bucket_fits(self):
+        # bs=4, draft_token_num=4 -> worst-case q = 16, but largest
+        # token bucket is 8. Falls back to max bucket (8); runtime pad
+        # also clamps via next_bucket(... ) so shapes still align.
+        mr = _model_runner(eagle_hidden_size=128)
+        mgr = _make_manager(
+            mr,
+            token_buckets=(4, 8),
+            bs_buckets=(1, 4),
+            speculative_num_steps=3,
+            speculative_algorithm="EAGLE3",
+            is_draft_worker=True,
+            eagle_hidden_size=128,
+        )
+        mgr._precompile_draft_extend()
+        # bs=1 -> worst-case q = 4 -> bucket 4.
+        # bs=4 -> worst-case q = 16 -> no bucket fits -> fall back to max=8.
+        self.assertEqual(mr.model.forward.call_count, 2)
+        self.assertEqual(mr.attn_backend.calls, [(4, 1), (8, 4)])
+
+    def test_skips_single_bucket_when_single_bs(self):
+        # b_buckets=(4,) -> exactly one DRAFT_EXTEND compile.
+        mr = _model_runner(eagle_hidden_size=128)
+        mgr = _make_manager(
+            mr,
+            token_buckets=(8, 16, 64),
+            bs_buckets=(4,),
+            speculative_num_steps=3,
+            speculative_algorithm="EAGLE3",
+            is_draft_worker=True,
+            eagle_hidden_size=128,
+        )
+        mgr._precompile_draft_extend()
+        self.assertEqual(mr.model.forward.call_count, 1)
+        self.assertEqual(mr.attn_backend.calls, [(16, 4)])
+
+
+class TestMakeDraftExtendSpecInfo(CustomTestCase):
+    """``_make_draft_extend_spec_info`` builds a stub ``EagleDraftExtendInput``
+    with shapes the EAGLE3 draft model's forward expects."""
+
+    def test_hidden_states_shape_matches_eagle_fc_in_features(self):
+        mr = _model_runner(eagle_hidden_size=384)
+        mgr = _make_manager(
+            mr,
+            speculative_num_steps=3,
+            speculative_algorithm="EAGLE3",
+            is_draft_worker=True,
+            eagle_hidden_size=384,
+        )
+        spec_info = mgr._make_draft_extend_spec_info(num_tokens=32, bs=8)
+        # spec_info.hidden_states drives the draft model's fc projection;
+        # token dim = num_tokens, feature dim = eagle_hidden_size.
+        self.assertEqual(spec_info.hidden_states.shape, (32, 384))
+        self.assertEqual(spec_info.hidden_states.dtype, torch.bfloat16)
+        # Batch-shaped book-keeping tensors are bs-shaped.
+        self.assertEqual(spec_info.num_correct_drafts.shape, (8,))
+        self.assertEqual(spec_info.num_accept_tokens.shape, (8,))
+        # num_accept_tokens carries the worst-case accept count so the
+        # downstream extend kernel exercises the full draft_token_num path.
+        self.assertEqual(spec_info.num_accept_tokens.tolist(), [4] * 8)
+        self.assertEqual(spec_info.num_accept_tokens_cpu, [4] * 8)
+        # Per-request tensors at bs.
+        self.assertEqual(spec_info.seq_lens.shape, (8,))
+        self.assertEqual(spec_info.req_pool_indices.shape, (8,))
+        # input_ids matches the token dim.
+        self.assertEqual(spec_info.input_ids.shape, (32,))
+
+
+class TestDraftWorkerPrecompileAll(CustomTestCase):
+    """``precompile_all`` on the draft worker compiles only DRAFT_EXTEND."""
+
+    def test_draft_worker_with_spec_compiles_all_draft_modes(self):
+        mr = _model_runner(eagle_hidden_size=256)
+        mgr = _make_manager(
+            mr,
+            token_buckets=(8, 16, 64),
+            bs_buckets=(1, 4),
+            speculative_num_steps=3,
+            speculative_algorithm="EAGLE3",
+            is_draft_worker=True,
+            eagle_hidden_size=256,
+        )
+        mgr.precompile_all()
+        # Draft worker compiles three modes:
+        # * EXTEND   (initial forward_draft_extend, bs=cap=4, tokens in {8,16,64}) = 3
+        # * DECODE   (unrolled spec loop, one per bs bucket {1,4})                = 2
+        # * DRAFT_EXTEND (one per bs bucket {1,4})                                = 2
+        # TARGET_VERIFY and EXTEND(FULL) are target-only.
+        self.assertEqual(mr.model.forward.call_count, 7)
+
+    def test_draft_worker_without_spec_compiles_nothing(self):
+        mr = _model_runner()
+        mgr = _make_manager(
+            mr,
+            token_buckets=(8,),
+            bs_buckets=(1, 4),
+            speculative_num_steps=0,
+            is_draft_worker=True,
+        )
+        mgr.precompile_all()
+        self.assertEqual(mr.model.forward.call_count, 0)
 
 
 if __name__ == "__main__":

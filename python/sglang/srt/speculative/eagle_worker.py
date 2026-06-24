@@ -86,13 +86,17 @@ if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
 
 if _is_tpu:
-    # Draft-decode padding for the TPU torch.compile path. Guarded so the TPU
-    # package isn't imported on other platforms.
+    # Draft-decode / draft-extend padding for the TPU torch.compile path.
+    # Guarded so the TPU package isn't imported on other platforms.
     from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+        dump_draft_extend_inputs,
         pad_draft_decode_inputs,
+        pad_draft_extend_inputs,
     )
 else:
+    dump_draft_extend_inputs = None
     pad_draft_decode_inputs = None
+    pad_draft_extend_inputs = None
 
 logger = logging.getLogger(__name__)
 
@@ -164,8 +168,10 @@ class EAGLEWorker(TpModelWorker):
         else:
             ctx = empty_context()
         with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            ctx,
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -1221,12 +1227,32 @@ class EAGLEWorker(TpModelWorker):
         else:
             forward_batch.can_run_dp_cuda_graph = False
             if not forward_batch.forward_mode.is_idle():
+                # On the TPU torch.compile path, pad the draft-extend batch to
+                # static (token, bs) buckets before attention metadata is
+                # built, so the compiled draft forward sees one fixed shape
+                # across verify steps. The draft forward is invoked with
+                # skip_attn_backend_init=True, which bypasses the model-level
+                # prepare_forward_batch hook, so the bucketed pad must be
+                # applied explicitly here.
+                shim = getattr(self.draft_model_runner, "compiled_forward_shim", None)
+                if shim is not None and pad_draft_extend_inputs is not None:
+                    pad_draft_extend_inputs(
+                        forward_batch,
+                        shim.t_bucketer,
+                        shim.b_bucketer,
+                        draft_token_num=self.speculative_num_steps + 1,
+                    )
                 attn_backend = (
                     self.draft_extend_attn_backend
                     or self.draft_model_runner.attn_backend
                 )
                 attn_backend.init_forward_metadata(forward_batch)
                 forward_batch.attn_backend = attn_backend
+                # Optional diagnostic: dump a structural+value snapshot of
+                # every input that crosses into the compiled draft forward.
+                # Enabled by SGLANG_TPU_DUMP_DRAFT_INPUTS=1.
+                if dump_draft_extend_inputs is not None:
+                    dump_draft_extend_inputs(forward_batch, tag="draft_extend")
             logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output

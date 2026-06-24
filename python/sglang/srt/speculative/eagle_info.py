@@ -450,9 +450,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     try:
                         req.grammar.accept_token(id)
                     except ValueError as e:
-                        logger.info(
-                            f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                        )
+                        logger.info(f"{i=}, {req=}\n{accept_index=}\n{predict=}\n")
                         raise e
                     req.update_finish_state()
                 if req.finished():
@@ -720,13 +718,37 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         # Prefill only generate 1 token.
         assert len(self.bonus_tokens) == len(batch.seq_lens)
 
-        pt = 0
-        for i, extend_len in enumerate(batch.extend_lens):
-            input_ids = batch.input_ids[pt : pt + extend_len]
-            batch.input_ids[pt : pt + extend_len] = torch.cat(
-                (input_ids[1:], self.bonus_tokens[i].reshape(1))
-            )
-            pt += extend_len
+        # Shift each request's per-request slice in ``batch.input_ids`` left
+        # by 1 and write the target's bonus token into the now-vacant last
+        # slot. The per-request loop equivalent is::
+        #
+        #     pt = 0
+        #     for i, extend_len in enumerate(batch.extend_lens):
+        #         seg = batch.input_ids[pt : pt + extend_len]
+        #         batch.input_ids[pt : pt + extend_len] = torch.cat(
+        #             (seg[1:], self.bonus_tokens[i].reshape(1))
+        #         )
+        #         pt += extend_len
+        #
+        # We replace it with two batch-wide ops so the libtpu / XLA cache
+        # only sees a small number of shape signatures across requests
+        # (shape depends on total token count, not on per-request lengths).
+        # The cross-request boundaries are corrected by writing the
+        # per-request "last slot" via index_copy_ at the end.
+        device = batch.input_ids.device
+        # cumsum(extend_lens) - 1 = position of the last input slot per request.
+        extend_lens_t = torch.tensor(
+            batch.extend_lens, dtype=torch.int64, device=device
+        )
+        last_positions = torch.cumsum(extend_lens_t, dim=0) - 1
+        # Shift left by 1. Clone the source to avoid aliasing with the
+        # destination during the in-place copy.
+        if batch.input_ids.shape[0] > 1:
+            batch.input_ids[:-1] = batch.input_ids[1:].clone()
+        # Overwrite each request's last slot with its bonus token.
+        batch.input_ids.index_copy_(
+            0, last_positions, self.bonus_tokens.to(batch.input_ids.dtype)
+        )
 
     @classmethod
     def hidden_size_for(cls, worker) -> Optional[int]:

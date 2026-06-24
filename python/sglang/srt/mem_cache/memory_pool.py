@@ -136,6 +136,35 @@ def _set_kv_buffer_impl(
         v_cache[indices] = v
 
 
+def _tpu_flat_indices_for_int_slice(indices, max_context_len: int, device):
+    """Return a 1-D int64 flat-index tensor for ``req_to_token[(int, slice)]``
+    indexing on TPU, or ``None`` if the indices don't match that pattern.
+
+    The returned indices put the per-call ``req_pool_idx`` and ``start`` values
+    into a 0-d device tensor so they cross into HLO as DATA, leaving the
+    compiled graph dependent only on the bucketed ``length = stop - start``.
+    """
+    if not (isinstance(indices, tuple) and len(indices) == 2):
+        return None
+    req_pool_idx, sl = indices
+    if not (isinstance(req_pool_idx, int) and isinstance(sl, slice)):
+        return None
+    start = sl.start if sl.start is not None else 0
+    stop = sl.stop if sl.stop is not None else max_context_len
+    step = sl.step if sl.step is not None else 1
+    if step != 1:
+        return None
+    length = stop - start
+    if length <= 0:
+        return None
+    base = torch.tensor(
+        req_pool_idx * max_context_len + start,
+        device=device,
+        dtype=torch.int64,
+    )
+    return torch.arange(length, device=device, dtype=torch.int64) + base
+
+
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
@@ -163,7 +192,50 @@ class ReqToTokenPool:
         self.free_slots = list(range(1, self._alloc_size))
 
     def write(self, indices, values):
+        # Detect the per-request `(int, slice(int, int))` indexing pattern. On
+        # TPU, that lowers to a `dynamic_update_slice` whose row/col offsets
+        # are baked into the HLO as compile-time constants, so every distinct
+        # `(req_pool_idx, start, stop)` triple compiles a fresh program and
+        # explodes the libtpu cache (`tt_jit_copy__copy_from_as_strided_inverse`
+        # in HLO dumps). Rewrite it as a flat `index_put_` with runtime-tensor
+        # indices so the HLO depends only on the bucketed `len(values)`.
+        if self.req_to_token.device.type == "tpu":
+            flat = _tpu_flat_indices_for_int_slice(
+                indices, self.max_context_len, self.device
+            )
+            if flat is not None:
+                self.req_to_token.view(-1).index_put_(
+                    (flat,), values.to(self.req_to_token.dtype)
+                )
+                return
         self.req_to_token[indices] = values
+
+    def read_int_slice(self, req_pool_idx: int, start: int, stop: int) -> torch.Tensor:
+        """Read ``req_to_token[req_pool_idx, start:stop]`` without baking the
+        per-call ``(req_pool_idx, start, stop)`` integers into HLO.
+
+        Direct `self.req_to_token[int, int:int]` lowers to a static slice on
+        TPU whose offsets compile-bake -- every distinct triple is a fresh HLO
+        (``tt_jit_to_copy_copy__copy_from`` in dumps). This helper routes the
+        same read through a runtime-tensor gather so the HLO depends only on
+        the bucketed ``length = stop - start``.
+
+        On non-TPU devices, falls back to the natural 2D slice.
+        """
+        if self.req_to_token.device.type != "tpu":
+            return self.req_to_token[req_pool_idx, start:stop]
+        length = stop - start
+        if length <= 0:
+            return self.req_to_token.new_zeros((0,))
+        base = torch.tensor(
+            req_pool_idx * self.max_context_len + start,
+            device=self.device,
+            dtype=torch.int64,
+        )
+        flat_indices = (
+            torch.arange(length, device=self.device, dtype=torch.int64) + base
+        )
+        return self.req_to_token.view(-1)[flat_indices]
 
     def available_size(self):
         return len(self.free_slots)
@@ -585,9 +657,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 pass
             else:
                 mid = self.mamba_pool.alloc(1)
-                assert (
-                    mid is not None
-                ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_pool.available_size()=}, {len(reqs)=}"
+                assert mid is not None, (
+                    f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_pool.available_size()=}, {len(reqs)=}"
+                )
                 req.mamba_pool_idx = mid[0]
                 req.mamba_needs_clear = True
             mamba_indices.append(req.mamba_pool_idx)
@@ -596,18 +668,18 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     req.mamba_ping_pong_track_buffer = self.mamba_pool.alloc(
                         self.mamba_ping_pong_track_buffer_size
                     )
-                    assert (
-                        req.mamba_ping_pong_track_buffer is not None
-                    ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+                    assert req.mamba_ping_pong_track_buffer is not None, (
+                        "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+                    )
                     req.mamba_next_track_idx = 0
                 mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
-        assert len(select_index) == len(
-            mamba_indices
-        ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        assert len(select_index) == len(mamba_indices), (
+            f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        )
         if self.enable_mamba_extra_buffer:
-            assert len(select_index) == len(
-                mamba_ping_pong_track_buffers
-            ), f"Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+            assert len(select_index) == len(mamba_ping_pong_track_buffers), (
+                f"Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+            )
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
@@ -657,7 +729,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 assert mamba_ping_pong_track_buffer_to_keep in [
                     0,
                     1,
-                ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                ], (
+                    f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                )
                 # Avoid Python-list advanced indexing on a device tensor.
                 # The ping-pong buffer size is either 2 (normal) or 1 (spec decode).
                 if self.mamba_ping_pong_track_buffer_size == 2:
@@ -788,7 +862,6 @@ class KVCache(abc.ABC):
 
 
 class MHATokenToKVPool(KVCache):
-
     def __init__(
         self,
         size: int,
@@ -823,7 +896,9 @@ class MHATokenToKVPool(KVCache):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim if v_head_dim is not None else head_dim
+            else v_head_dim
+            if v_head_dim is not None
+            else head_dim
         )
 
         self._create_buffers()
@@ -1093,9 +1168,9 @@ class MHATokenToKVPool(KVCache):
         if N == 0:
             return
 
-        assert (
-            self._kv_copy_config is not None
-        ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+        assert self._kv_copy_config is not None, (
+            "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+        )
 
         cfg = self._kv_copy_config
         cap = int(cfg.get("num_locs_upper", 256))
@@ -1245,7 +1320,6 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
-
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -1422,7 +1496,6 @@ class HybridLinearKVPool(KVCache):
         assert not enable_kvcache_transpose
         self.use_mla = use_mla
         if not use_mla:
-
             TokenToKVPoolClass = MHATokenToKVPool
 
             if current_platform.is_out_of_tree():
@@ -1445,7 +1518,6 @@ class HybridLinearKVPool(KVCache):
                 enable_memory_saver=enable_memory_saver,
             )
         else:
-
             TokenToKVPoolClass = MLATokenToKVPool
 
             if current_platform.is_out_of_tree():
@@ -1851,7 +1923,6 @@ class MLATokenToKVPool(KVCache):
 
 
 class MLATokenToKVPoolFP4(MLATokenToKVPool):
-
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -2029,13 +2100,13 @@ class NSATokenToKVPool(MLATokenToKVPool):
 
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
-                assert (
-                    self.page_size % 16 == 0
-                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+                assert self.page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+                )
             else:
-                assert (
-                    self.page_size == 1
-                ), f"HIP legacy NSA path requires page_size == 1, got {self.page_size}"
+                assert self.page_size == 1, (
+                    f"HIP legacy NSA path requires page_size == 1, got {self.page_size}"
+                )
         else:
             assert self.page_size == 64
         with (

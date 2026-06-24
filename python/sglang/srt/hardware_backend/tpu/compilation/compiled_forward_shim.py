@@ -171,12 +171,225 @@ def pad_draft_decode_inputs(forward_batch, b_bucketer: Bucketer) -> int | None:
     return real_bs
 
 
+def _pad_first_dim_with_value(
+    t: torch.Tensor | None, target_rows: int, fill_value: int
+) -> torch.Tensor | None:
+    """Pad a tensor's first dim to target_rows, filling new rows with fill_value.
+
+    Used for ghost rows of bookkeeping tensors (e.g. req_pool_indices) where a
+    plain zero-pad would point ghost reqs at the permanent padding slot. We
+    instead reuse the last real value so the attention metadata for ghost
+    rows is built from a valid req_to_token row.
+    """
+    if t is None or t.shape[0] >= target_rows:
+        return t
+    pad_shape = (target_rows - t.shape[0], *t.shape[1:])
+    pad = t.new_full(pad_shape, fill_value)
+    return torch.cat([t, pad], dim=0)
+
+
+def pad_draft_extend_inputs(
+    forward_batch,
+    t_bucketer: Bucketer,
+    b_bucketer: Bucketer,
+    *,
+    draft_token_num: int | None = None,
+) -> tuple[int, int] | None:
+    """Pad an EAGLE draft-extend ForwardBatch to fixed (tokens, bs) buckets.
+
+    The draft-extend forward (``forward_draft_extend_after_decode``) runs once
+    per verify step on the draft model with a query total equal to the sum of
+    per-seq accept lengths -- a value that varies every step. Without padding,
+    every distinct (bs, sum_accept) pair compiles a fresh HLO graph.
+
+    Per-bs bucketing (matching ``CompilationManager._precompile_draft_extend``):
+
+    * ``pad_b = b_bucketer.next_bucket(real_b)`` -- the smallest bs bucket
+      that fits the real batch.
+    * ``pad_t = t_bucketer.next_bucket(max(real_q, pad_b, pad_b * draft_token_num))``
+      when ``draft_token_num`` is provided -- pads to the per-bs worst case so
+      the runtime shape always matches one of the precompiled (bs, t) pairs.
+      When ``draft_token_num`` is ``None``, falls back to
+      ``max(real_q, pad_b)`` (single-shape policy).
+
+    Must be called *after* ``ForwardBatch.init_new`` has materialized
+    ``extend_seq_lens`` / ``extend_prefix_lens`` / ``positions`` / etc. as
+    tensors, and *before* ``attn_backend.init_forward_metadata`` consumes
+    them. The caller (eagle_worker) bypasses the model-level
+    ``prepare_forward_batch`` hook by passing ``skip_attn_backend_init=True``
+    to ``forward``, so this function is the only padding site.
+
+    Returns ``(real_q, real_b)`` so the caller can record them on the batch
+    for output slicing in ``CompiledForwardShim.__call__``, or ``None`` if
+    no padding was needed.
+    """
+    real_q = int(forward_batch.input_ids.shape[0])
+    real_b = int(forward_batch.seq_lens.shape[0])
+
+    # Per-bs bucketing: pad batch to the smallest bs bucket that fits real_b,
+    # then choose the token bucket holding the per-bs worst-case q total.
+    pad_b = b_bucketer.next_bucket(real_b)
+    worst_q_for_pad_b = (
+        pad_b * draft_token_num if draft_token_num is not None else pad_b
+    )
+    pad_t = t_bucketer.next_bucket(max(real_q, pad_b, worst_q_for_pad_b))
+    if pad_t == real_q and pad_b == real_b:
+        return None
+
+    # Pick a ghost-slot req_pool_index that already has valid req_to_token
+    # entries: reuse the last real index. (Zero would point at the permanent
+    # padding slot and may not have its page indices populated for this
+    # request's KV pool.) Fall back to 0 only when the batch is empty.
+    ghost_pool_idx = int(forward_batch.req_pool_indices[-1].item()) if real_b > 0 else 0
+
+    # Token-dim fields (one entry per query token).
+    forward_batch.input_ids = _pad_first_dim(forward_batch.input_ids, pad_t)
+    forward_batch.positions = _pad_first_dim(forward_batch.positions, pad_t)
+    if forward_batch.out_cache_loc is not None:
+        forward_batch.out_cache_loc = _pad_first_dim(forward_batch.out_cache_loc, pad_t)
+
+    # Batch-dim fields (one entry per request). extend_seq_lens ghosts must be
+    # zero so cu_q_lens stays monotone and the kernel sees no extra work for
+    # ghost reqs. seq_lens / extend_prefix_lens are also zero-padded (the RPA
+    # backend reads seq_lens but relies on the active-row `distribution` cap
+    # to ignore ghost rows). req_pool_indices ghosts use a valid index so the
+    # block-table gather stays in-bounds.
+    forward_batch.seq_lens = _pad_first_dim(forward_batch.seq_lens, pad_b)
+    if getattr(forward_batch, "orig_seq_lens", None) is not None:
+        forward_batch.orig_seq_lens = _pad_first_dim(forward_batch.orig_seq_lens, pad_b)
+    forward_batch.req_pool_indices = _pad_first_dim_with_value(
+        forward_batch.req_pool_indices, pad_b, ghost_pool_idx
+    )
+    if forward_batch.extend_seq_lens is not None:
+        forward_batch.extend_seq_lens = _pad_first_dim(
+            forward_batch.extend_seq_lens, pad_b
+        )
+    if forward_batch.extend_prefix_lens is not None:
+        forward_batch.extend_prefix_lens = _pad_first_dim(
+            forward_batch.extend_prefix_lens, pad_b
+        )
+    if forward_batch.extend_start_loc is not None:
+        # Ghost reqs contribute zero tokens, so they all start at real_q.
+        forward_batch.extend_start_loc = _pad_first_dim_with_value(
+            forward_batch.extend_start_loc, pad_b, real_q
+        )
+
+    # Python-list batch metadata can become Dynamo guards; mirror _BS_CPU_LIST_FIELDS.
+    for field in _BS_CPU_LIST_FIELDS:
+        val = getattr(forward_batch, field, None)
+        if isinstance(val, list) and len(val) < pad_b:
+            setattr(forward_batch, field, val + [0] * (pad_b - len(val)))
+
+    # spec_info.hidden_states is the per-token target hidden feed. Pad its
+    # token dim to match input_ids.
+    spec_info = getattr(forward_batch, "spec_info", None)
+    if spec_info is not None:
+        hs = getattr(spec_info, "hidden_states", None)
+        if isinstance(hs, torch.Tensor) and hs.ndim >= 1 and hs.shape[0] < pad_t:
+            spec_info.hidden_states = _pad_first_dim(hs, pad_t)
+
+    forward_batch.batch_size = pad_b
+    setattr(forward_batch, _REAL_Q_KEY, real_q)
+    setattr(forward_batch, _REAL_B_KEY, real_b)
+    return real_q, real_b
+
+
+def _tensor_summary(t, max_show: int = 8) -> str:
+    """Compact one-line summary of a tensor: shape, dtype, head/tail values, sum.
+
+    Designed for diff-friendly logging: two calls with identical structure
+    produce identical strings; any drift in shape/dtype/values shows up
+    immediately when the lines are compared.
+    """
+    if t is None:
+        return "None"
+    if not isinstance(t, torch.Tensor):
+        return f"<{type(t).__name__}>"
+    n = int(t.numel())
+    if n == 0:
+        return f"shape={tuple(t.shape)} dtype={t.dtype} empty"
+    try:
+        # 1-D tensor: dump head and tail. ND: dump shape + dtype + sum.
+        flat = t.detach().reshape(-1)
+        if n <= max_show:
+            vals = flat.tolist()
+            vstr = f"vals={vals}"
+        else:
+            head = flat[:max_show].tolist()
+            tail = flat[-min(4, n - max_show) :].tolist()
+            vstr = f"head={head} tail={tail}"
+        # Try to print a checksum for content fingerprinting (skip on bf16
+        # to keep the sum deterministic across runs at the same call).
+        if t.dtype.is_floating_point:
+            chk = f"sum={float(flat.float().sum().item()):.4g}"
+        else:
+            chk = f"sum={int(flat.long().sum().item())}"
+        return f"shape={tuple(t.shape)} dtype={t.dtype} {vstr} {chk}"
+    except Exception as exc:  # noqa: BLE001
+        return f"shape={tuple(t.shape)} dtype={t.dtype} <readback-failed: {exc}>"
+
+
+def dump_draft_extend_inputs(forward_batch, tag: str = "draft_extend") -> None:
+    """Log a compact snapshot of every tensor that feeds the draft forward.
+
+    Gated by ``SGLANG_TPU_DUMP_DRAFT_INPUTS=1``. Intended for diffing
+    consecutive calls to find what is changing between forward invocations
+    when a recompile is observed. Logs at WARNING level so it shows up
+    even with default log_level=info, and prefixes each line with the
+    rank/mode tag for easy grep.
+    """
+    import os
+
+    if os.environ.get("SGLANG_TPU_DUMP_DRAFT_INPUTS") != "1":
+        return
+    fb = forward_batch
+    mode = getattr(getattr(fb, "forward_mode", None), "name", "?")
+    real_q = getattr(fb, _REAL_Q_KEY, None)
+    real_b = getattr(fb, _REAL_B_KEY, None)
+    bs = getattr(fb, "batch_size", None)
+    lines = [
+        f"[{tag} {mode}] bs={bs} real_q={real_q} real_b={real_b}",
+        f"  input_ids        = {_tensor_summary(fb.input_ids)}",
+        f"  positions        = {_tensor_summary(fb.positions)}",
+        f"  seq_lens         = {_tensor_summary(fb.seq_lens)}",
+        f"  orig_seq_lens    = {_tensor_summary(getattr(fb, 'orig_seq_lens', None))}",
+        f"  extend_seq_lens  = {_tensor_summary(getattr(fb, 'extend_seq_lens', None))}",
+        f"  extend_prefix_lens = {_tensor_summary(getattr(fb, 'extend_prefix_lens', None))}",
+        f"  extend_start_loc = {_tensor_summary(getattr(fb, 'extend_start_loc', None))}",
+        f"  req_pool_indices = {_tensor_summary(fb.req_pool_indices)}",
+        f"  out_cache_loc    = {_tensor_summary(getattr(fb, 'out_cache_loc', None))}",
+    ]
+    # spec_info.hidden_states is the per-token target hidden feed (EAGLE3).
+    spec_info = getattr(fb, "spec_info", None)
+    if spec_info is not None:
+        for attr in ("hidden_states", "topk_p", "topk_index", "bonus_tokens"):
+            val = getattr(spec_info, attr, None)
+            if val is not None:
+                lines.append(f"  spec_info.{attr:14s} = {_tensor_summary(val)}")
+    # Attention backend's per-call kernel inputs (what Pallas actually sees).
+    attn = getattr(fb, "attn_backend", None)
+    fmd = getattr(attn, "forward_metadata", None)
+    if fmd is not None:
+        for attr in (
+            "kv_lens",
+            "cu_q_lens",
+            "cu_kv_lens",
+            "page_indices",
+            "distribution",
+        ):
+            val = getattr(fmd, attr, None)
+            if val is not None:
+                lines.append(f"  attn.{attr:14s}       = {_tensor_summary(val)}")
+    logger.warning("\n".join(lines))
+
+
 class CompiledForwardShim:
     """Adapt compiled forward calls and outputs for padded execution."""
 
     def __init__(self, compiled_fn):
         self.fn = compiled_fn
         self._compilation_manager = None
+        self._model_label = ""
         signature = getattr(compiled_fn, "__signature__", None)
         if signature is not None:
             self.__signature__ = signature

@@ -183,9 +183,8 @@ class TpuGraphRunner:
         )
         manager.precompile_all()
 
-        # Wire the manager into the compiled forward shim for
-        # serving-time recompilation detection (opt-in via
-        # SGLANG_TPU_CHECK_RECOMPILATION=1).
+        # Wire the manager into the compiled forward shim for serving-time
+        # recompilation detection (opt-in via SGLANG_TPU_CHECK_RECOMPILATION=1).
         if not envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
             return
         model_name = type(model_runner.model).__name__

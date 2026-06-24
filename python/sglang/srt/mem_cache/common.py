@@ -697,9 +697,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         start_p = ceil_align(start_p, page_size)
 
     if start_p < end_p:
-        indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
-            start_p:end_p
-        ]
+        indices_to_free = tree_cache.req_to_token_pool.read_int_slice(
+            req.req_pool_idx, start_p, end_p
+        )
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (

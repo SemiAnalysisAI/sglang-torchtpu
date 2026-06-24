@@ -204,7 +204,6 @@ class RadixKey:
 
 
 class TreeNode:
-
     counter = 0
 
     def __init__(self, id: Optional[int] = None, priority: int = 0):
@@ -445,16 +444,16 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
-            ]
+            kv_indices = self.req_to_token_pool.read_int_slice(
+                req.req_pool_idx, 0, kv_committed_len
+            )
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
-        ]
+        kv_indices = self.req_to_token_pool.read_int_slice(
+            req.req_pool_idx, 0, len(token_ids)
+        )
 
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
@@ -490,9 +489,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         token_ids = req.fill_ids
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
-        ]
+        kv_indices = self.req_to_token_pool.read_int_slice(
+            req.req_pool_idx, 0, len(token_ids)
+        )
 
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
@@ -520,9 +519,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             match_result.device_indices,
             match_result.last_device_node,
         )
-        assert len(new_indices) == len(
-            radix_key
-        ), f"{len(new_indices)=}, {len(radix_key)=}"
+        assert len(new_indices) == len(radix_key), (
+            f"{len(new_indices)=}, {len(radix_key)=}"
+        )
 
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
@@ -616,9 +615,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             node.lock_ref -= 1
             self._update_leaf_status(node)
             if node.parent is None:
-                assert (
-                    node is self.root_node
-                ), f"This request holds the node from another tree"
+                assert node is self.root_node, (
+                    f"This request holds the node from another tree"
+                )
             node = node.parent
         return DecLockRefResult(delta=delta)
 
@@ -766,9 +765,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             for key, child in current_node.children.items():
                 stack.append((child, current_indent + 2))
 
-                assert key == child.key.child_key(
-                    self.page_size
-                ), f"{key=}, {child.key.child_key(self.page_size)=}"
+                assert key == child.key.child_key(self.page_size), (
+                    f"{key=}, {child.key.child_key(self.page_size)=}"
+                )
 
     def _delete_leaf(self, node):
         key = node.key.child_key(self.page_size)

@@ -19,6 +19,7 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _static_default_kwargs,
     _zero_pad_1d,
     build_bucketers,
+    pad_draft_extend_inputs,
     resolve_compile_caps,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -162,6 +163,150 @@ class TestPadForwardBatchInputs(CustomTestCase):
                 t_bucketer=_bucketer("Token", [64]),
                 b_bucketer=_bucketer("Bs", [1]),
             )
+
+
+def _draft_extend_forward_batch(real_q, real_b, accept_lens, hidden_size=None):
+    """Synthetic draft-extend ForwardBatch as `pad_draft_extend_inputs` expects.
+
+    Models the post-``ForwardBatch.init_new`` state: token-dim tensors are
+    sized to ``real_q`` (= sum of accept_lens), and batch-dim tensors to
+    ``real_b``. ``extend_seq_lens`` holds the per-req accept lengths.
+    """
+    assert sum(accept_lens) == real_q
+    assert len(accept_lens) == real_b
+    spec_info = SimpleNamespace()
+    if hidden_size is not None:
+        spec_info.hidden_states = torch.zeros(real_q, hidden_size, dtype=torch.float32)
+    return SimpleNamespace(
+        input_ids=torch.arange(1, real_q + 1, dtype=torch.int64),
+        positions=torch.arange(real_q, dtype=torch.int64),
+        out_cache_loc=torch.arange(100, 100 + real_q, dtype=torch.int64),
+        seq_lens=torch.full((real_b,), 50, dtype=torch.int32),
+        orig_seq_lens=torch.full((real_b,), 50, dtype=torch.int32),
+        req_pool_indices=torch.arange(real_b, dtype=torch.int64) + 5,
+        extend_seq_lens=torch.tensor(accept_lens, dtype=torch.int32),
+        extend_prefix_lens=torch.zeros(real_b, dtype=torch.int32),
+        extend_start_loc=torch.tensor(
+            [0, *list(__import__("itertools").accumulate(accept_lens[:-1]))],
+            dtype=torch.int32,
+        ),
+        extend_seq_lens_cpu=list(accept_lens),
+        extend_prefix_lens_cpu=[0] * real_b,
+        extend_logprob_start_lens_cpu=[0] * real_b,
+        spec_info=spec_info,
+        batch_size=real_b,
+    )
+
+
+class TestPadDraftExtendInputs(CustomTestCase):
+    """Bucketed pad for the EAGLE draft-extend forward on TPU."""
+
+    def test_pads_token_and_batch_to_bucket(self):
+        # bs=2, accept_lens=[3, 2] -> real_q=5, real_b=2, draft_token_num=4.
+        # pad_b = next_bucket(2) = 2 ; pad_t = next_bucket(max(5, 2, 2*4=8)) = 8
+        fb = _draft_extend_forward_batch(real_q=5, real_b=2, accept_lens=[3, 2])
+        out = pad_draft_extend_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [4, 8, 16]),
+            b_bucketer=_bucketer("Bs", [1, 2, 4]),
+            draft_token_num=4,
+        )
+        self.assertEqual(out, (5, 2))
+        # Token-dim padded to pad_t = 8.
+        self.assertEqual(fb.input_ids.shape[0], 8)
+        self.assertEqual(fb.positions.shape[0], 8)
+        self.assertEqual(fb.out_cache_loc.shape[0], 8)
+        # Batch-dim padded to pad_b = 2 (real_b already at bucket -> no pad).
+        self.assertEqual(fb.seq_lens.shape[0], 2)
+        self.assertEqual(fb.req_pool_indices.shape[0], 2)
+        self.assertEqual(fb.extend_seq_lens.shape[0], 2)
+        # Real values preserved on token dim.
+        self.assertEqual(fb.input_ids[:5].tolist(), [1, 2, 3, 4, 5])
+        self.assertEqual(fb.seq_lens.tolist(), [50, 50])
+        self.assertEqual(fb.extend_seq_lens.tolist(), [3, 2])
+        # _tpu_real_q / _tpu_real_b set for output slicing.
+        self.assertEqual(fb._tpu_real_q, 5)
+        self.assertEqual(fb._tpu_real_b, 2)
+        # batch_size reflects the padded size.
+        self.assertEqual(fb.batch_size, 2)
+
+    def test_pads_batch_to_next_bs_bucket(self):
+        # bs=3, draft_token_num=4 -> pad_b = next_bucket(3) = 4, not max=8.
+        # pad_t = next_bucket(max(real_q=3, pad_b=4, 4*4=16)) = 16.
+        fb = _draft_extend_forward_batch(real_q=3, real_b=3, accept_lens=[1, 1, 1])
+        out = pad_draft_extend_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [16, 32]),
+            b_bucketer=_bucketer("Bs", [1, 2, 4, 8]),
+            draft_token_num=4,
+        )
+        self.assertEqual(out, (3, 3))
+        self.assertEqual(fb.input_ids.shape[0], 16)
+        self.assertEqual(fb.seq_lens.shape[0], 4)
+        self.assertEqual(fb.req_pool_indices.shape[0], 4)
+        # Ghost reqs: extend_seq_lens zero so cu_q_lens stays monotone.
+        self.assertEqual(fb.extend_seq_lens.tolist(), [1, 1, 1, 0])
+        # extend_start_loc ghost -> real_q so kernel sees no extra work.
+        self.assertEqual(fb.extend_start_loc.tolist(), [0, 1, 2, 3])
+        # req_pool_indices ghost -> last real (here 7) for valid gather.
+        self.assertEqual(fb.req_pool_indices.tolist(), [5, 6, 7, 7])
+        self.assertEqual(fb.extend_seq_lens_cpu, [1, 1, 1, 0])
+        self.assertEqual(fb.batch_size, 4)
+
+    def test_pads_spec_info_hidden_states(self):
+        # EAGLE3 draft consumes spec_info.hidden_states (one row per draft input
+        # token). Padder must grow its token dim to match input_ids.
+        fb = _draft_extend_forward_batch(
+            real_q=3, real_b=2, accept_lens=[2, 1], hidden_size=16
+        )
+        pad_draft_extend_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [8]),
+            b_bucketer=_bucketer("Bs", [4]),
+        )
+        self.assertEqual(fb.spec_info.hidden_states.shape, (8, 16))
+        # Real rows preserved (all zeros, since the fixture is zero-init).
+        self.assertTrue(torch.equal(fb.spec_info.hidden_states[:3], torch.zeros(3, 16)))
+
+    def test_noop_when_already_at_bucket(self):
+        # real_q == pad_t and real_b == pad_b: no change, return None.
+        fb = _draft_extend_forward_batch(real_q=4, real_b=4, accept_lens=[1, 1, 1, 1])
+        orig_input_ids = fb.input_ids
+        out = pad_draft_extend_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [4]),
+            b_bucketer=_bucketer("Bs", [4]),
+        )
+        self.assertIsNone(out)
+        self.assertIs(fb.input_ids, orig_input_ids)
+
+    def test_token_bucket_grows_to_cover_pad_b(self):
+        # real_q=2 < pad_b=4 -> pad_t = next_bucket(max(2, 4)) = 4 (not 2).
+        # This matches the EXTEND policy: the compiled forward expects at
+        # least pad_b tokens (e.g. one per request).
+        fb = _draft_extend_forward_batch(real_q=2, real_b=2, accept_lens=[1, 1])
+        out = pad_draft_extend_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [4, 8]),
+            b_bucketer=_bucketer("Bs", [4]),
+        )
+        self.assertEqual(out, (2, 2))
+        self.assertEqual(fb.input_ids.shape[0], 4)
+        self.assertEqual(fb.seq_lens.shape[0], 4)
+
+    def test_no_spec_info_hidden_states(self):
+        # STANDALONE spec algorithm: spec_info has no hidden_states attr.
+        # Must not crash.
+        fb = _draft_extend_forward_batch(real_q=3, real_b=2, accept_lens=[2, 1])
+        delattr(fb.spec_info, "hidden_states") if hasattr(
+            fb.spec_info, "hidden_states"
+        ) else None
+        pad_draft_extend_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [8]),
+            b_bucketer=_bucketer("Bs", [4]),
+        )
+        self.assertEqual(fb.input_ids.shape[0], 8)
 
 
 class TestDefaultKwargHelpers(CustomTestCase):
