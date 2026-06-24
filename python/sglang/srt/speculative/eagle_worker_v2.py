@@ -33,6 +33,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -47,11 +48,6 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.eagle_info_v2 import (
-    assign_extend_cache_locs,
-    fill_accepted_out_cache_loc,
-    fill_bonus_tokens,
-)
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -64,6 +60,11 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_for_v2_verify,
     select_top_k_tokens,
 )
+from sglang.srt.speculative.spec_v2_tpu_kernels import (
+    assign_extend_cache_locs_kernel_func,
+    fill_accepted_out_cache_loc_func,
+    fill_bonus_tokens_func,
+)
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,
     empty_context,
@@ -73,8 +74,8 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_tpu,
     log_info_on_rank0,
-    next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
@@ -82,6 +83,16 @@ _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
+_is_tpu = is_tpu()
+
+if _is_tpu:
+    # Draft-decode bucket padding for the TPU torch.compile path. Guarded so the
+    # TPU package isn't imported on other platforms (mirrors eagle_worker.py V1).
+    from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+        pad_draft_decode_inputs,
+    )
+else:
+    pad_draft_decode_inputs = None
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +100,17 @@ logger = logging.getLogger(__name__)
 def _get_plan_stream(
     device: str,
 ) -> Tuple[any, contextlib.AbstractContextManager]:
+    # The plan stream is a GPU multi-stream optimization: it fences the draft
+    # CUDA-graph kernels before the target verify plan via a real stream +
+    # `_draft_done_event`. On single-PJRT-queue backends (TPU) there is no real
+    # multi-stream execution -- a non-default "stream" only relabels async-copy
+    # fences and `wait_event` is a no-op -- so the draft->verify hand-off is held
+    # instead by PJRT issue order on the one queue plus the scheduler's
+    # `copy_done` D2H event (the same primitive the non-spec overlap path uses).
+    # Force the plan stream OFF there so correctness provably never depends on a
+    # no-op fence, regardless of SGLANG_ENABLE_OVERLAP_PLAN_STREAM.
+    if not current_platform.supports_overlap_streams():
+        return None, contextlib.nullcontext()
     if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
         plan_stream = torch.get_device_module(device).Stream()
         plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
@@ -356,16 +378,33 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch,
             )
         else:
+            tpu_real_bs = None
             if (
                 not forward_batch.forward_mode.is_idle()
                 and self.speculative_num_steps > 1
             ):
+                if _is_tpu:
+                    # The draft decode bypasses prepare_forward_batch, so the TPU
+                    # compile shim's bucket padding is not applied automatically.
+                    # Pad to a static bs bucket before building attention
+                    # metadata so the compiled draft forward sees consistent
+                    # (padded) shapes, then slice the outputs back to real_bs
+                    # (mirrors the V1 path in eagle_worker.py).
+                    shim = getattr(self.draft_runner, "compiled_forward_shim", None)
+                    if shim is not None:
+                        tpu_real_bs = pad_draft_decode_inputs(
+                            forward_batch, shim.b_bucketer
+                        )
                 # Skip attention backend init for 1-step draft,
                 # `draft_forward` only does sample in this case.
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
+            if tpu_real_bs is not None:
+                parent_list = parent_list[:tpu_real_bs]
+                top_scores_index = top_scores_index[:tpu_real_bs]
+                draft_tokens = draft_tokens[:tpu_real_bs]
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -1083,7 +1122,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
-            fill_bonus_tokens[(bs,)](
+            fill_bonus_tokens_func(
                 accept_tokens,
                 accept_lens,
                 bonus_tokens,
@@ -1208,20 +1247,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
         accepted_out_cache_loc = torch.zeros(
             size, dtype=torch.int64, device=self.device
         )
-        assign_extend_cache_locs[(bs,)](
+        assign_extend_cache_locs_kernel_func(
             batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,
             batch.seq_lens,
             batch.seq_lens + num_correct_drafts + 1,
             tgt_cache_loc,
-            self.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
         )
-        fill_accepted_out_cache_loc[(size,)](
+        fill_accepted_out_cache_loc_func(
             accept_index,
             batch.out_cache_loc,
             accepted_out_cache_loc,
-            next_power_of_2(size),
         )
         self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
             tgt_cache_loc, accepted_out_cache_loc

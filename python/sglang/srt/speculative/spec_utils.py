@@ -272,6 +272,13 @@ def _assign_req_to_token_pool_torch(
     )
     dst_index = start_offset[:, None] + offsets[None, :]
     row_index = req_pool_indices[:, None].expand(batch_size, max_len)
+    # torch_tpu lowers a two-tensor advanced index (req_to_token[row, col]) to a
+    # stablehlo.concatenate of the coordinate tensors, which requires both to
+    # share an integer dtype (CUDA silently promotes mixed i32/i64). row_index
+    # (req_pool_indices) and dst_index (start_offset + offsets) can disagree, so
+    # pin both to int64 before indexing.
+    row_index = row_index.to(torch.int64)
+    dst_index = dst_index.to(torch.int64)
     # Redirect masked-out positions to the padding row (row 0, col 0).
     dst_index = torch.where(mask, dst_index, torch.zeros_like(dst_index))
     row_index = torch.where(mask, row_index, torch.zeros_like(row_index))
@@ -458,9 +465,12 @@ def _assign_draft_cache_locs_torch(
     # out_cache_loc is laid out as (batch_size, copy_len).
     # Out-of-bounds safety: cols stay within req_to_token.shape[1] because
     # the KV pool allocator guarantees seq_lens + copy_len <= pool width.
-    offsets = torch.arange(copy_len, device=device, dtype=seq_lens.dtype)
-    rows = req_pool_indices[:, None]  # (bs, 1)
-    cols = seq_lens[:, None] + offsets[None, :]  # (bs, copy_len)
+    # Both coordinate tensors must share an integer dtype: torch_tpu lowers the
+    # two-tensor advanced index to a stablehlo.concatenate that rejects mixed
+    # i32/i64 (CUDA promotes). Pin both to int64.
+    offsets = torch.arange(copy_len, device=device, dtype=torch.int64)
+    rows = req_pool_indices.to(torch.int64)[:, None]  # (bs, 1)
+    cols = seq_lens.to(torch.int64)[:, None] + offsets[None, :]  # (bs, copy_len)
     src = out_cache_loc.view(batch_size, copy_len).to(req_to_token.dtype)
     req_to_token[rows, cols] = src
 

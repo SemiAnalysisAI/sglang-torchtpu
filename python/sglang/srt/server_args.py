@@ -567,6 +567,11 @@ class ServerArgs:
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
+    # Opt-in enabler for the SpecV2 overlap scheduler with EAGLE/EAGLE3 on TPU.
+    # Off by default; it is the SOLE enabler on TPU and overrides the global
+    # SGLANG_ENABLE_SPEC_V2 env in both directions (the env alone never turns
+    # TPU SpecV2 on). No effect on non-TPU devices.
+    enable_spec_v2_tpu: bool = False
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -5455,6 +5460,14 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--enable-spec-v2-tpu",
+            action="store_true",
+            help="Enable the SpecV2 overlap scheduler for EAGLE/EAGLE3 on TPU "
+            "(default: disabled). On TPU this flag is the sole enabler of SpecV2 "
+            "and overrides the global SGLANG_ENABLE_SPEC_V2 env; it has no effect "
+            "on non-TPU devices.",
         )
         parser.add_argument(
             "--speculative-dflash-block-size",

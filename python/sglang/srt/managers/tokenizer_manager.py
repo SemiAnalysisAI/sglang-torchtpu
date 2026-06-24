@@ -833,6 +833,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
+        # Reject request-time features TPU SpecV2 EAGLE3 does not support yet
+        # (structured-output/grammar, per-request logprob) so they fail clearly
+        # rather than silently running an unvalidated path.
+        from sglang.srt.arg_groups.speculative_hook import (
+            reject_request_for_tpu_spec_v2,
+        )
+
+        reject_request_for_tpu_spec_v2(
+            self.server_args,
+            getattr(obj, "sampling_params", None) or {},
+            bool(getattr(obj, "return_logprob", False)),
+        )
+
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0

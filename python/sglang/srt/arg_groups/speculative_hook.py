@@ -250,6 +250,61 @@ def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:
         )
 
 
+def _apply_eagle_overlap_gate(server_args: "ServerArgs") -> Optional[str]:
+    """Decide V1 vs V2 (overlap) for the EAGLE family and mutate server_args.
+
+    Sets ``server_args.disable_overlap_schedule`` (True => V1 worker, False =>
+    V2 worker) and returns a human-readable reason when V1 was forced, else
+    ``None``. Kept as a standalone, side-effect-contained helper so the routing
+    decision can be unit-tested (flag x env x device x topk) without a model
+    config or a TPU server.
+
+    TPU precedence: ``--enable-spec-v2-tpu`` is the SOLE enabler
+    of SpecV2 on TPU and overrides the global ``SGLANG_ENABLE_SPEC_V2`` env in
+    both directions -- the env alone never enables TPU SpecV2, and the flag
+    enables it regardless of the env. We only ever force V1 here (never force
+    V2), so an explicit ``--disable-overlap-schedule`` still wins.
+    """
+    is_tpu = server_args.device == "tpu"
+    if server_args.enable_spec_v2_tpu and not is_tpu:
+        logger.warning(
+            "--enable-spec-v2-tpu has no effect on device=%s; it only enables "
+            "the SpecV2 overlap scheduler for EAGLE/EAGLE3 on TPU.",
+            server_args.device,
+        )
+
+    spec_v1_reason = None
+    if (
+        server_args.speculative_eagle_topk is not None
+        and server_args.speculative_eagle_topk > 1
+        and not server_args.disable_overlap_schedule
+    ):
+        server_args.disable_overlap_schedule = True
+        spec_v1_reason = "spec v2 currently only supports topk = 1"
+    elif is_tpu:
+        if (
+            not server_args.enable_spec_v2_tpu
+            and not server_args.disable_overlap_schedule
+        ):
+            server_args.disable_overlap_schedule = True
+            spec_v1_reason = (
+                "TPU SpecV2 is opt-in; pass --enable-spec-v2-tpu to enable it"
+            )
+    elif (
+        not envs.SGLANG_ENABLE_SPEC_V2.get()
+        and not server_args.disable_overlap_schedule
+    ):
+        server_args.disable_overlap_schedule = True
+        spec_v1_reason = "SGLANG_ENABLE_SPEC_V2=False"
+
+    # When TPU SpecV2 is actually active, reject the configurations this first
+    # pass does not support rather than silently running an untested path.
+    if is_tpu and not server_args.disable_overlap_schedule:
+        _reject_unsupported_tpu_spec_v2(server_args)
+
+    return spec_v1_reason
+
+
 def _handle_eagle_family(server_args: "ServerArgs") -> None:
     if (
         server_args.speculative_algorithm == "STANDALONE"
@@ -266,25 +321,17 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    spec_v1_reason = None
-    if (
-        server_args.speculative_eagle_topk is not None
-        and server_args.speculative_eagle_topk > 1
-        and not server_args.disable_overlap_schedule
-    ):
-        server_args.disable_overlap_schedule = True
-        spec_v1_reason = "spec v2 currently only supports topk = 1"
-    elif (
-        not envs.SGLANG_ENABLE_SPEC_V2.get()
-        and not server_args.disable_overlap_schedule
-    ):
-        server_args.disable_overlap_schedule = True
-        spec_v1_reason = "SGLANG_ENABLE_SPEC_V2=False"
+    spec_v1_reason = _apply_eagle_overlap_gate(server_args)
 
     if server_args.disable_overlap_schedule:
         logger.warning(
             "Spec v1 is used for eagle/eagle3/standalone speculative decoding because %s.",
             spec_v1_reason or "overlap schedule is disabled",
+        )
+    elif server_args.device == "tpu":
+        logger.warning(
+            "Spec v2 is enabled for eagle/eagle3 speculative decoding on TPU "
+            "via --enable-spec-v2-tpu."
         )
     else:
         logger.warning(
@@ -365,6 +412,94 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
     ):
         raise ValueError(
             "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+        )
+
+
+def is_tpu_spec_v2_active(server_args: "ServerArgs") -> bool:
+    """True when the SpecV2 overlap scheduler is actually running EAGLE3 on TPU."""
+    return (
+        getattr(server_args, "device", None) == "tpu"
+        and getattr(server_args, "enable_spec_v2_tpu", False)
+        and not getattr(server_args, "disable_overlap_schedule", True)
+        and getattr(server_args, "speculative_algorithm", None) == "EAGLE3"
+    )
+
+
+# Structured-output / grammar sampling-param keys excluded on the TPU SpecV2 path.
+_TPU_SPEC_V2_GRAMMAR_KEYS = ("json_schema", "regex", "ebnf", "structural_tag")
+
+
+def reject_request_for_tpu_spec_v2(
+    server_args: "ServerArgs",
+    sampling_params,
+    return_logprob: bool,
+) -> None:
+    """Reject request-time features the TPU SpecV2 path does not support yet.
+
+    Grammar/structured-output and per-request logprob returns are out of scope and
+    the server cannot see them at startup, so guard them per request when TPU
+    SpecV2 is active. ``sampling_params`` may be a dict or a SamplingParams object.
+    """
+    if not is_tpu_spec_v2_active(server_args):
+        return
+
+    if return_logprob:
+        raise ValueError(
+            "return_logprob is not supported with --enable-spec-v2-tpu (TPU "
+            "SpecV2 EAGLE3)."
+        )
+
+    def _get(key):
+        if isinstance(sampling_params, dict):
+            return sampling_params.get(key)
+        return getattr(sampling_params, key, None)
+
+    active = [k for k in _TPU_SPEC_V2_GRAMMAR_KEYS if _get(k)]
+    if active:
+        raise ValueError(
+            "Structured-output/grammar sampling params "
+            f"{active} are not supported with --enable-spec-v2-tpu (TPU SpecV2 "
+            "EAGLE3)."
+        )
+
+
+def _reject_unsupported_tpu_spec_v2(server_args: "ServerArgs") -> None:
+    """Fail fast on configurations the TPU SpecV2 path does not support.
+
+    Called only when SpecV2 is actually active on TPU (device == "tpu",
+    --enable-spec-v2-tpu set, overlap not otherwise disabled). This path is
+    validated only for EAGLE3 with topk == 1; the scoped-out features below are
+    explicitly excluded, so we raise here rather than silently run an untested
+    path. Request-time-only features (structured-output/grammar requests, per-
+    request logprob returns) are rejected per request by
+    reject_request_for_tpu_spec_v2() when this gate is active.
+    """
+    unsupported = []
+    if server_args.speculative_algorithm != "EAGLE3":
+        unsupported.append(
+            f"speculative_algorithm={server_args.speculative_algorithm} "
+            "(only EAGLE3 is supported)"
+        )
+    if (
+        server_args.speculative_eagle_topk is not None
+        and server_args.speculative_eagle_topk > 1
+    ):
+        unsupported.append(
+            f"speculative_eagle_topk={server_args.speculative_eagle_topk} (only topk == 1)"
+        )
+    if server_args.speculative_adaptive:
+        unsupported.append("speculative_adaptive=True (adaptive spec)")
+    if server_args.enable_dp_attention:
+        unsupported.append("enable_dp_attention=True (DP attention)")
+    if server_args.enable_return_hidden_states:
+        unsupported.append("enable_return_hidden_states=True (hidden-state return)")
+
+    if unsupported:
+        raise ValueError(
+            "--enable-spec-v2-tpu does not support the following "
+            "" + "; ".join(unsupported) + ". Remove --enable-spec-v2-tpu "
+            "to run EAGLE/EAGLE3 with the V1 worker, or drop the unsupported "
+            "option(s)."
         )
 
 

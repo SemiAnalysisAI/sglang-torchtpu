@@ -262,6 +262,20 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
     # Metadata
     # ------------------------------------------------------------------ #
 
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info, cuda_graph_bs: Optional[int] = None
+    ):
+        # No-op on TPU (SpecV2 verify hand-off). On GPU this refreshes the
+        # CUDA-graph capture buffers whose tree-mask/position values the plan
+        # step pre-filled before the draft outputs were known. TPU has no such
+        # capture buffers: get_verify_buffers_to_fill_after_draft returns no
+        # pre-filled buffers, so EAGLEWorkerV2 builds fresh tree_mask/position
+        # buffers with the correct post-draft values, and this backend rebuilds
+        # its attention metadata from scratch each verify forward. Nothing to
+        # redo here (matches the Triton backend's no-op); defined so the base
+        # NotImplementedError is not hit.
+        pass
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self._build_metadata(forward_batch)
 
