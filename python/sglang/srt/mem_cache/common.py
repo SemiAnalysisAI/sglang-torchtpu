@@ -101,6 +101,67 @@ def write_req_to_token_pool_triton(
         )
 
 
+def _write_req_to_token_vectorized(
+    req_to_token: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    extend_lens: torch.Tensor,
+    prefix_tensors: list[torch.Tensor],
+) -> None:
+    """Vectorized, device-resident ``req_to_token`` write — the tensor-indexed
+    equivalent of the per-request Python-int loop in ``write_cache_indices``.
+
+    For each request ``i`` at row ``req_pool_indices[i]`` it writes:
+      * ``out_cache_loc`` (concatenated over requests) into the extend columns
+        ``[prefix_lens[i], prefix_lens[i] + extend_lens[i])``, and
+      * ``prefix_tensors[i]`` into the prefix columns ``[0, prefix_lens[i])``.
+
+    Each part is a single ``index_put_`` so the destination offsets stay DATA (a
+    dynamic scatter); on TPU this avoids torch_tpu baking per-request offsets as
+    HLO constants. Device-agnostic — also correct on CPU (relied on by the test).
+    """
+    index_dtype = torch.int64
+    max_context_len = req_to_token.shape[1]  # row stride of the flattened table
+    flat_table = req_to_token.view(-1)
+    device = req_to_token.device
+
+    def _scatter_segments(values, seg_rows, seg_lens, seg_col_starts):
+        """Write ``values`` into ``req_to_token`` one contiguous segment per
+        request: segment ``i`` goes to row ``seg_rows[i]``, columns
+        ``[seg_col_starts[i], seg_col_starts[i] + seg_lens[i])`` (column 0 when
+        ``seg_col_starts`` is None)."""
+        num_tokens = values.shape[0]
+        if num_tokens == 0:
+            return
+        # ``torch.repeat_interleave`` is not implemented on torch_tpu, so we
+        # build the per-token -> per-segment map with bucketize:
+        # ``src_seg[k]`` is the index ``i`` such that
+        # ``cumsum_starts[i] <= k < cumsum_starts[i+1]``.
+        seg_token_starts = torch.cumsum(seg_lens, 0) - seg_lens
+        all_tokens = torch.arange(num_tokens, device=device)
+        # bucketize(x, boundaries, right=True) returns the count of boundary
+        # entries <= x; subtract 1 to get the segment index.
+        src_seg = torch.bucketize(all_tokens, seg_token_starts, right=True) - 1
+        row_per_token = seg_rows[src_seg]
+        col_within_seg = all_tokens - seg_token_starts[src_seg]
+        if seg_col_starts is not None:
+            col_per_token = seg_col_starts[src_seg] + col_within_seg
+        else:
+            col_per_token = col_within_seg
+        flat_indices = row_per_token.to(
+            index_dtype
+        ) * max_context_len + col_per_token.to(index_dtype)
+        flat_table.index_put_((flat_indices,), values.to(flat_table.dtype))
+
+    # extend: out_cache_loc -> req_to_token[req_idx, prefix_len:seq_len]
+    _scatter_segments(out_cache_loc, req_pool_indices, extend_lens, prefix_lens)
+    # prefix: prefix_tensors[i] -> req_to_token[req_idx, 0:prefix_len] (often empty)
+    if prefix_tensors and any(p.numel() for p in prefix_tensors):
+        prefix_vals = torch.cat([p.reshape(-1) for p in prefix_tensors])
+        _scatter_segments(prefix_vals, req_pool_indices, prefix_lens, None)
+
+
 def write_cache_indices(
     out_cache_loc: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
@@ -130,6 +191,34 @@ def write_cache_indices(
             extend_lens_tensor,
             out_cache_loc,
             req_to_token_pool.req_to_token.shape[1],
+        )
+    elif req_to_token_pool.req_to_token.device.type == "tpu":
+        # TEMPORARY TPU FIX. TPU has no Triton driver, so the per-request Python-int
+        # loop below would run — but `req_to_token[req_idx, prefix_len:seq_len] = ...`
+        # with Python-int bounds makes torch_tpu bake the (slot, prefix_len, seq_len)
+        # offsets as COMPILE-TIME CONSTANTS, so every distinct (slot, len) is a new
+        # graph with a new compilation-cache key -> constant recompilation
+        # (tt_jit_to_copy_.._as_strided), inflating TTFT.
+        # `_write_req_to_token_vectorized` does one tensor-indexed `index_put_`
+        # instead: the destination offsets stay DATA, so the graph depends only on
+        # the (bucketed) token count, not the index values, and compiles once.
+        # Mirrors the Triton kernel / vLLM's `.at[idx].set`.
+        #
+        # TODO(perf): this keeps `req_to_token` device-resident and writes it with an
+        # on-device scatter. The alternative is to make `req_to_token_pool`
+        # host-resident — the write becomes a trivial CPU scatter with no recompile,
+        # at the cost of a per-forward `page_indices` H2D copy in the attention
+        # backend. Static analysis predicts host-resident is a regression (the slot
+        # indices are device-produced and device-consumed; see
+        # docs/tpu-prs/PR_BODY-write-cache-vectorize.md), but the two approaches
+        # should be measured (TTFT / throughput) to confirm.
+        _write_req_to_token_vectorized(
+            req_to_token_pool.req_to_token,
+            out_cache_loc,
+            req_pool_indices_tensor,
+            prefix_lens_tensor,
+            extend_lens_tensor,
+            prefix_tensors,
         )
     else:
         pt = 0
@@ -570,9 +659,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
-        assert (
-            tree_cache.supports_mamba()
-        ), "Only MambaRadixCache allow freeing before alloc"
+        assert tree_cache.supports_mamba(), (
+            "Only MambaRadixCache allow freeing before alloc"
+        )
         # TODO (csy, hanming): clean up this early allocation logic
         if req.mamba_pool_idx is not None:
             tree_cache.req_to_token_pool.mamba_pool.free(
@@ -600,9 +689,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not global_server_args.strip_thinking_cache:
-        assert (
-            start_p == end_p
-        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
+        assert start_p == end_p, (
+            f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
+        )
 
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
@@ -616,9 +705,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()
     ):
-        assert (
-            req.mamba_pool_idx is not None
-        ), "mamba state is freed while the tree cache does not manage mamba states"
+        assert req.mamba_pool_idx is not None, (
+            "mamba state is freed while the tree cache does not manage mamba states"
+        )
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     tree_cache.req_to_token_pool.free(req)
 

@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 
 if TYPE_CHECKING:
@@ -76,9 +77,9 @@ class TpuGraphRunner:
     _COMPILE_TARGETS: tuple[str, ...] = ("forward", "forward_split_prefill")
 
     def __init__(self, model_runner: ModelRunner):
-        assert (
-            model_runner.server_args.enable_torch_compile
-        ), "TpuGraphRunner should only be initialized when enable_torch_compile=True."
+        assert model_runner.server_args.enable_torch_compile, (
+            "TpuGraphRunner should only be initialized when enable_torch_compile=True."
+        )
 
         # Side-effectful import: registers the "tpu" dynamo backend so that
         # torch.compile(backend="tpu", ...) resolves. apply_tpu_patches does
@@ -170,7 +171,7 @@ class TpuGraphRunner:
         )
 
         sa = model_runner.server_args
-        CompilationManager(
+        manager = CompilationManager(
             model_runner=model_runner,
             compiled_fns=compiled_fns,
             t_bucketer=compiled_forward_shim.t_bucketer,
@@ -179,7 +180,18 @@ class TpuGraphRunner:
             speculative_algorithm=sa.speculative_algorithm,
             is_draft_worker=getattr(model_runner, "is_draft_worker", False),
             speculative_eagle_topk=sa.speculative_eagle_topk or 1,
-        ).precompile_all()
+        )
+        manager.precompile_all()
+
+        # Wire the manager into the compiled forward shim for
+        # serving-time recompilation detection (opt-in via
+        # SGLANG_TPU_CHECK_RECOMPILATION=1).
+        if not envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
+            return
+        model_name = type(model_runner.model).__name__
+        is_draft = getattr(model_runner, "is_draft_worker", False)
+        label = f"{'draft ' if is_draft else ''}{model_name}"
+        compiled_forward_shim.set_compilation_manager(manager, model_label=label)
 
     def can_run(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.
