@@ -36,12 +36,6 @@ def _register_tpu_compile_backend() -> None:
     # before any code applies that decorator (e.g. on imports of layers/models).
     import torch_tpu._internal.compile  # noqa: F401
 
-    # Upgrade the just-registered TPU Dynamo backend to a serializable backend
-    # so PyTorch's bundled AOTAutogradCache can persist compile artifacts.
-    from sglang.srt.hardware_backend.tpu.compilation import aot_autograd_cache
-
-    aot_autograd_cache.install()
-
 
 def _unwrap_dynamic_compile_fns() -> None:
     global _dynamic_compile_unwrapped
@@ -76,9 +70,7 @@ def _set_torch_tpu_topology_env_multihost(
     ``TPU_TOPOLOGY`` chip grid with an extra dim appended on v7x (>1 core/chip).
     """
     os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
-        f"{host}:{base_port + i}"
-        for host in hosts
-        for i in range(devices_per_host)
+        f"{host}:{base_port + i}" for host in hosts for i in range(devices_per_host)
     )
 
     if not tpu_topology:
@@ -118,8 +110,7 @@ def _set_torch_tpu_topology_env_single(world_size: int) -> None:
 
         # Hold sockets open until env var is written so OS doesn't reassign.
         _held = [
-            socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            for _ in range(world_size)
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(world_size)
         ]
         for s in _held:
             s.bind(("", 0))
