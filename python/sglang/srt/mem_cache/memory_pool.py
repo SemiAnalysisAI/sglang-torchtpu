@@ -199,6 +199,14 @@ class ReqToTokenPool:
         # explodes the libtpu cache (`tt_jit_copy__copy_from_as_strided_inverse`
         # in HLO dumps). Rewrite it as a flat `index_put_` with runtime-tensor
         # indices so the HLO depends only on the bucketed `len(values)`.
+        #
+        # NOTE: I tried pow2-padding ``flat`` and ``values`` here to bucket
+        # the index_put_ HLO. On TPU, plain on-device ``cat`` doesn't help
+        # because torch_tpu fuses the cat back into the index_put_ trace,
+        # leaving the entry signature at the un-padded length. The only
+        # working bucket-pad is a CPU round-trip, which is too expensive
+        # per call. Leaving this unbucketed; the cost is ~30ms per unique
+        # length and amortizes after a few requests of each length cluster.
         if self.req_to_token.device.type == "tpu":
             flat = _tpu_flat_indices_for_int_slice(
                 indices, self.max_context_len, self.device

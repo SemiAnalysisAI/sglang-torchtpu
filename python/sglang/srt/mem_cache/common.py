@@ -120,6 +120,17 @@ def _write_req_to_token_vectorized(
     Each part is a single ``index_put_`` so the destination offsets stay DATA (a
     dynamic scatter); on TPU this avoids torch_tpu baking per-request offsets as
     HLO constants. Device-agnostic — also correct on CPU (relied on by the test).
+
+    The HLO is shape-keyed on ``out_cache_loc.shape[0]`` (the total token
+    count). On TPU that means a fresh compile per unique runtime length.
+    Past attempts to pow2-bucket this shape -- either by padding the input
+    here or by lifting the pad to the caller -- did not cluster the cache
+    keys because torch_tpu fuses the ``cat`` back into the index_put_ HLO
+    so the traced entry signature is the un-padded length. The only thing
+    that actually breaks the fusion is a CPU round-trip, which is too
+    expensive per call. This function only runs during target prefill
+    (forward_mode EXTEND), so the cost is at most once per request and
+    once per unique prompt-length cluster; we accept this and don't pad.
     """
     index_dtype = torch.int64
     max_context_len = req_to_token.shape[1]  # row stride of the flattened table
@@ -130,7 +141,8 @@ def _write_req_to_token_vectorized(
         """Write ``values`` into ``req_to_token`` one contiguous segment per
         request: segment ``i`` goes to row ``seg_rows[i]``, columns
         ``[seg_col_starts[i], seg_col_starts[i] + seg_lens[i])`` (column 0 when
-        ``seg_col_starts`` is None)."""
+        ``seg_col_starts`` is None).
+        """
         num_tokens = values.shape[0]
         if num_tokens == 0:
             return
@@ -204,14 +216,15 @@ def write_cache_indices(
         # the (bucketed) token count, not the index values, and compiles once.
         # Mirrors the Triton kernel / vLLM's `.at[idx].set`.
         #
-        # TODO(perf): this keeps `req_to_token` device-resident and writes it with an
-        # on-device scatter. The alternative is to make `req_to_token_pool`
-        # host-resident — the write becomes a trivial CPU scatter with no recompile,
-        # at the cost of a per-forward `page_indices` H2D copy in the attention
-        # backend. Static analysis predicts host-resident is a regression (the slot
-        # indices are device-produced and device-consumed; see
-        # docs/tpu-prs/PR_BODY-write-cache-vectorize.md), but the two approaches
-        # should be measured (TTFT / throughput) to confirm.
+        # NOTE on pow2 bucketing: attempts to lift the pad here (above the
+        # _write_req_to_token_vectorized call) did NOT cluster the HLO
+        # because torch_tpu fused the lifted ``cat`` back into the inner
+        # function's HLO -- the traced ``arg0`` was still the un-padded
+        # shape. Only a CPU round-trip (``cat.cpu().to(device)``) broke
+        # the fusion, and that's too expensive to do per call. Leaving
+        # the inner pad-via-ghost-segment in ``_write_req_to_token_vectorized``
+        # for now; the cost is ~30ms per unique total-token count, which
+        # amortizes after a few requests of each length cluster.
         _write_req_to_token_vectorized(
             req_to_token_pool.req_to_token,
             out_cache_loc,

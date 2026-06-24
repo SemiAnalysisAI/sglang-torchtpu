@@ -66,6 +66,10 @@ class CompilationManager:
     #     per-compile durations of the new entries.
     _shared_baseline_misses: int = -1
     _shared_baseline_graph_count: int = -1
+    # Set to True once dump-on-miss has been activated on this process.
+    # Both managers (target + draft) share the same libtpu cache so it only
+    # needs to be enabled once.
+    _dump_on_miss_enabled: bool = False
 
     def __init__(
         self,
@@ -155,6 +159,31 @@ class CompilationManager:
           accepted prefix after each verify; query total is the per-bs
           worst case ``bs * draft_token_num``.
         """
+        # Optional: enable libtpu's "dump StableHLO on cache miss" for the
+        # ENTIRE process lifetime (precompile + warmup + serving). Enabled by
+        # SGLANG_TPU_DUMP_HLO_ON_MISS=1; off by default because the dump
+        # volume is large. Enabled at the start of precompile_all rather than
+        # after, so dumps from precompile dummy forwards are also captured.
+        import os
+
+        if (
+            os.environ.get("SGLANG_TPU_DUMP_HLO_ON_MISS") == "1"
+            and not CompilationManager._dump_on_miss_enabled
+        ):
+            try:
+                torch.tpu._set_dump_on_cache_miss(True)
+                CompilationManager._dump_on_miss_enabled = True
+                logger.warning(
+                    "[compilation manager] enabled libtpu StableHLO dump-on-"
+                    "cache-miss. Each compile will print its HLO module + loc."
+                )
+            except (AttributeError, RuntimeError) as exc:
+                logger.warning(
+                    "[compilation manager] could not enable dump-on-cache-miss"
+                    " (this torch_tpu build may not support it): %s",
+                    exc,
+                )
+
         overall = time.perf_counter()
         if self.is_draft_worker:
             if self.enable_spec_decoding:
@@ -172,6 +201,14 @@ class CompilationManager:
             if self.enable_spec_decoding:
                 self._precompile_target_verify()
                 self._precompile_extend_full()
+            # NOTE: scheduler-side ops (write_cache_indices, ReqToTokenPool.write)
+            # are not pre-compiled here. Attempts to pre-compile them with pow2
+            # bucket shapes didn't cluster the runtime HLOs because torch_tpu
+            # fuses the pad ``cat`` back into the inner function's HLO -- the
+            # traced entry signature is the un-padded shape, so the precompile
+            # bucket and runtime bucket never share a cache entry. Runtime
+            # compiles them on the first request that hits each shape; the cost
+            # is ~30ms per unique shape and amortizes quickly.
         logger.info(
             "[compilation manager] precompile_all done in %.1fs.",
             time.perf_counter() - overall,
@@ -191,27 +228,6 @@ class CompilationManager:
             CompilationManager._shared_baseline_graph_count,
             CompilationManager._shared_baseline_misses,
         )
-
-        # Optional: enable libtpu's "dump StableHLO on cache miss" so each
-        # post-readiness compile prints its module name, op signature, and
-        # source location. Enabled by SGLANG_TPU_DUMP_HLO_ON_MISS=1; off by
-        # default because the dump volume is large.
-        import os
-
-        if os.environ.get("SGLANG_TPU_DUMP_HLO_ON_MISS") == "1":
-            try:
-                torch.tpu._set_dump_on_cache_miss(True)
-                logger.warning(
-                    "[compilation manager] enabled libtpu StableHLO dump-on-"
-                    "cache-miss. Each post-readiness recompile will print "
-                    "its HLO module and source location."
-                )
-            except (AttributeError, RuntimeError) as exc:
-                logger.warning(
-                    "[compilation manager] could not enable dump-on-cache-miss"
-                    " (this torch_tpu build may not support it): %s",
-                    exc,
-                )
 
     @staticmethod
     def _get_xla_graph_count() -> int:
@@ -539,6 +555,7 @@ class CompilationManager:
                     f"Compiled DRAFT_EXTEND (tokens={num_tokens}, bs={bs})"
                     f" in {elapsed:.1f}s{hbm_str}"
                 )
+
 
     def _make_draft_extend_spec_info(self, num_tokens: int, bs: int):
         """Build an ``EagleDraftExtendInput`` stub for DRAFT_EXTEND precompile.

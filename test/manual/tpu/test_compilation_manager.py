@@ -49,6 +49,25 @@ class _FakeAttnBackend:
         )
 
 
+class _FakeReqToTokenPool:
+    """Minimal stand-in for ReqToTokenPool with a ``write`` mock.
+
+    Some precompile methods exercise ``ReqToTokenPool.write`` directly; the
+    real class isn't constructible without a TPU device, so this mock just
+    records the call without performing any backing-tensor side effect.
+    """
+
+    def __init__(self, req_to_token):
+        self.req_to_token = req_to_token
+        self.max_context_len = req_to_token.shape[1]
+        self.device = req_to_token.device
+        self.write_calls: list = []
+
+    def write(self, indices, values):
+        # Test only cares that this doesn't crash and is callable.
+        self.write_calls.append((indices, getattr(values, "shape", None)))
+
+
 def _model_runner(device="cpu", eagle_hidden_size=0):
     """Minimal ModelRunner stand-in for unit tests.
 
@@ -68,9 +87,7 @@ def _model_runner(device="cpu", eagle_hidden_size=0):
         ),
         model_config=SimpleNamespace(hidden_size=4096, dtype=torch.bfloat16),
         attn_backend=_FakeAttnBackend(),
-        req_to_token_pool=SimpleNamespace(
-            req_to_token=torch.zeros(4, 64, dtype=torch.int64),
-        ),
+        req_to_token_pool=_FakeReqToTokenPool(torch.zeros(4, 64, dtype=torch.int64)),
         token_to_kv_pool=SimpleNamespace(),
     )
 
