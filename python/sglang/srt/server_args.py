@@ -978,6 +978,13 @@ class ServerArgs:
         # Handle any other necessary validations.
         self._handle_other_validations()
 
+        # EXPERIMENT(overlap-validation): force overlap scheduling on regardless
+        # of upstream gating, to validate poll-vs-deferral with a healthy
+        # DEFER_AND_FUSE overlap path. Gate: FORCE_OVERLAP=1.
+        import os as _os
+        if _os.environ.get("FORCE_OVERLAP") == "1":
+            self.disable_overlap_schedule = False
+
     def _maybe_download_model_for_runai(self):
         if is_runai_obj_uri(self.model_path):
             ObjectStorageModel.download_and_get_path(self.model_path)
