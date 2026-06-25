@@ -73,7 +73,22 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
-        if isinstance(self.kv_cache, MHATokenToKVPool):
+        from sglang.srt.platforms import current_platform
+
+        platform_host_pool_cls = current_platform.get_hicache_host_pool_cls()
+
+        if platform_host_pool_cls is not None:
+            # Platform-specific host pool (e.g. raiden-backed on TPU). Takes the
+            # same constructor signature as MHATokenToKVPoolHost.
+            self.token_to_kv_pool_host = platform_host_pool_cls(
+                self.kv_cache,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            )
+        elif isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
@@ -135,7 +150,10 @@ class HiRadixCache(RadixCache):
                 attn_tp_group=self.attn_tp_group,
             )
         else:
-            self.cache_controller = HiCacheController(
+            controller_cls = (
+                current_platform.get_hicache_controller_cls() or HiCacheController
+            )
+            self.cache_controller = controller_cls(
                 params.token_to_kv_pool_allocator,
                 self.token_to_kv_pool_host,
                 self.page_size,

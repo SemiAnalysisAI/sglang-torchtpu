@@ -3479,6 +3479,10 @@ class ServerArgs:
             self._resolve_layout_io_compatibility()
 
     def _resolve_layout_io_compatibility(self):
+        if self.hicache_io_backend == "raiden":
+            # raiden manages its own DMA-pinned host pool with a fused page
+            # layout; the kernel/direct layout coercions below don't apply.
+            return
         if (
             self.hicache_mem_layout == "page_first_direct"
             and self.hicache_io_backend == "kernel"
@@ -5895,9 +5899,10 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-io-backend",
             type=str,
-            choices=["direct", "kernel", "kernel_ascend"],
+            choices=["direct", "kernel", "kernel_ascend", "raiden"],
             default=ServerArgs.hicache_io_backend,
-            help="The IO backend for KV cache transfer between CPU and GPU",
+            help="The IO backend for KV cache transfer between CPU and GPU "
+            "('raiden' offloads TPU<->host via the raiden DMA engine)",
         )
         parser.add_argument(
             "--hicache-mem-layout",
