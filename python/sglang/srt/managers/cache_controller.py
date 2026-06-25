@@ -329,8 +329,18 @@ class HiCacheController:
         self.write_buffer = TransferBuffer(self.stop_event)
         self.load_buffer = TransferBuffer(self.stop_event, buffer_count=10)
 
-        self.write_stream = _get_device_module().Stream()
-        self.load_stream = _get_device_module().Stream()
+        # Real device streams only exist where the platform supports stream
+        # overlap. On torch_tpu (single PJRT queue, wait_event is a no-op)
+        # there are none; subclasses that override start_writing/start_loading
+        # drive transfers without a stream context.
+        from sglang.srt.platforms import current_platform
+
+        if current_platform.supports_overlap_streams():
+            self.write_stream = _get_device_module().Stream()
+            self.load_stream = _get_device_module().Stream()
+        else:
+            self.write_stream = None
+            self.load_stream = None
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.

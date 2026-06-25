@@ -69,6 +69,25 @@ class SRTPlatform(DeviceMixin):
         """Return the paged allocator class for this platform."""
         raise NotImplementedError
 
+    def get_hicache_host_pool_cls(self) -> type | None:
+        """Return a platform-specific HiCache host KV pool class, or None.
+
+        ``None`` (the default) means the platform uses the stock CUDA host
+        pools (``MHATokenToKVPoolHost`` etc.). TPU returns a raiden-backed
+        pool because the CUDA transfer kernels and pinned host memory are
+        unavailable there.
+        """
+        return None
+
+    def get_hicache_controller_cls(self) -> type | None:
+        """Return a platform-specific HiCache controller class, or None.
+
+        ``None`` (the default) means the platform uses the stock
+        ``HiCacheController``. TPU returns a raiden controller that replaces
+        the CUDA stream/event transfer path with raiden DMA.
+        """
+        return None
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the compilation backend identifier.
 
