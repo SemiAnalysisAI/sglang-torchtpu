@@ -90,6 +90,21 @@ class TpuSRTPlatform(SRTPlatform):
         elif server_args.page_size is None:
             server_args.page_size = 64
 
+        # HiCache on TPU can only transfer through raiden: the CUDA kernel /
+        # direct IO backends and pinned host memory are unavailable. Coerce the
+        # default (or any CUDA-only choice) to raiden so the user doesn't have
+        # to pass --hicache-io-backend raiden explicitly.
+        if (
+            server_args.enable_hierarchical_cache
+            and server_args.hicache_io_backend != "raiden"
+        ):
+            logger.warning(
+                "TPU HiCache requires the 'raiden' io backend; overriding "
+                "--hicache-io-backend %s -> raiden.",
+                server_args.hicache_io_backend,
+            )
+            server_args.hicache_io_backend = "raiden"
+
     # ------------------------------------------------------------------
     # Subsystem factory methods
     # ------------------------------------------------------------------
@@ -135,6 +150,37 @@ class TpuSRTPlatform(SRTPlatform):
         )
 
         return TpuPagedTokenToKVPoolAllocator
+
+    def get_hicache_host_pool_cls(self) -> type | None:
+        # TPU_HICACHE_BACKEND selects the host pool: "native" (torch pinned-host
+        # buffers, in-place D2H/H2D) or "raiden" (default; raiden's DMA-pinned
+        # pool, since torch_tpu has no pinned host memory).
+        if os.environ.get("TPU_HICACHE_BACKEND", "raiden") == "native":
+            from sglang.srt.hardware_backend.tpu.kv_pool_host_native import (
+                TpuNativeHostKVCache,
+            )
+
+            return TpuNativeHostKVCache
+
+        from sglang.srt.hardware_backend.tpu.raiden_transfer import raiden_available
+
+        if not raiden_available():
+            raise RuntimeError(
+                "Hierarchical cache on TPU needs the 'tpu_raiden' package "
+                "(or set TPU_HICACHE_BACKEND=native); it is not importable."
+            )
+        from sglang.srt.hardware_backend.tpu.kv_pool_host import (
+            TpuRaidenHostKVCache,
+        )
+
+        return TpuRaidenHostKVCache
+
+    def get_hicache_controller_cls(self) -> type | None:
+        from sglang.srt.hardware_backend.tpu.raiden_cache_controller import (
+            TpuRaidenHiCacheController,
+        )
+
+        return TpuRaidenHiCacheController
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
