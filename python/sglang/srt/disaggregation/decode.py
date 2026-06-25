@@ -424,6 +424,10 @@ class DecodePreallocQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        # TPU backend scatters received KV pages into its own pool tensors
+        # (H2D); hand it the pool so it can index_copy_ into the buffers.
+        if hasattr(kv_manager, "attach_kv_pool"):
+            kv_manager.attach_kv_pool(self.token_to_kv_pool)
         # Staging buffer setup (only when heterogeneous TP staging is enabled)
         if self.enable_staging and not self.is_mla_backend:
             kv_pool_for_heads = self.token_to_kv_pool
