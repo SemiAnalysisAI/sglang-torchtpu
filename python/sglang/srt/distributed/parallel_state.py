@@ -585,11 +585,12 @@ class GroupCoordinator:
             return input_
 
         if _is_tpu:
-            # sglang's registered custom op (inplace_all_reduce) is CUDA-only.
-            # Route to _all_reduce_in_place which falls through to
-            # torch.distributed.all_reduce with the tpu_dist backend (native
-            # StableHLO all-reduce via ProcessGroupTpu).
-            self._all_reduce_in_place(input_)
+            # Route through the registered custom op so torch.compile sees a
+            # single traceable collective node (its body runs the StableHLO
+            # all-reduce via ProcessGroupTpu); calling _all_reduce_in_place
+            # directly emits torch.distributed.all_reduce, which Dynamo cannot
+            # trace and which is fatal under fullgraph at tp>1.
+            inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
@@ -763,7 +764,10 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_tpu:
+        # TPU uses the registered custom op (its body falls through to the
+        # StableHLO reduce-scatter) so torch.compile sees one traceable node
+        # instead of the raw torch.distributed call Dynamo cannot trace at tp>1.
+        if _is_npu:
             self._reduce_scatter_tensor(output, input)
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
@@ -826,7 +830,10 @@ class GroupCoordinator:
             )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_xpu or _is_tpu:
+        # TPU uses the registered custom op (its body falls through to the
+        # StableHLO all-gather) so torch.compile sees one traceable node instead
+        # of the raw torch.distributed call Dynamo cannot trace at tp>1.
+        if _is_npu or _is_xpu:
             self._all_gather_into_tensor(output, input)
         else:
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)

@@ -2167,7 +2167,8 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        if is_npu():
+        if is_npu() or is_tpu():
+            # NPU and torch_tpu both dispatch on the PrivateUse1 backend key.
             # https://github.com/sgl-project/sglang/pull/12287/files#r2499583982
             my_lib.impl(op_name, op_func, "PrivateUse1")
         elif is_xpu():
