@@ -2550,6 +2550,15 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            if (
+                self.enable_hierarchical_cache
+                and getattr(self.tree_cache, "async_load_back", False)
+                and not self.tree_cache.async_load_back_ready(req)
+            ):
+                # Host->device load-back is in flight (TPU raiden async loads):
+                # defer this request so other already-resident requests run and
+                # overlap their compute with the DMA. Admitted once it lands.
+                continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

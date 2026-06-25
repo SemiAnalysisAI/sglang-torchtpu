@@ -5,12 +5,17 @@ neither of which exist on torch_tpu. This subclass overrides only the
 transfer-issuing methods (``start_writing`` / ``start_loading`` /
 ``move_indices``) to route through raiden's DMA; queues, ack draining, and write
 policy are inherited. D2H write-back is async (polled by
-``HiRadixCache.writing_check``); H2D load-back is poll-to-complete --
-``start_loading`` blocks on the future before the consuming forward reads KV,
-since raiden's H2D bypasses XLA dependency tracking.
+``HiRadixCache.writing_check``). H2D load-back needs a gate because raiden's H2D
+bypasses XLA dependency tracking; ``TPU_HICACHE_LOAD_MODE`` selects it:
+``"poll"`` (default) blocks on the future in ``start_loading``; ``"deferral"``
+issues the H2D async and holds the consuming request out of the running batch
+(``HiRadixCache.async_load_back_ready``) until the future is ready, overlapping
+the DMA with other requests.
 """
 
 from __future__ import annotations
+
+import os
 
 from sglang.srt.hardware_backend.tpu.raiden_transfer import NOOP_EVENT
 from sglang.srt.managers.cache_controller import (
@@ -19,9 +24,15 @@ from sglang.srt.managers.cache_controller import (
     HiCacheController,
 )
 
+_LOAD_MODE = os.environ.get("TPU_HICACHE_LOAD_MODE", "poll")
+
 
 class TpuRaidenHiCacheController(HiCacheController):
     """HiCache controller whose transfers go through raiden DMA."""
+
+    # "deferral" defers the request at the scheduler; "poll" blocks in
+    # start_loading. Both gate the H2D, which is untracked by XLA.
+    async_load_back = _LOAD_MODE == "deferral"
 
     def move_indices(self, host_indices, device_indices):
         # raiden addresses whole pages; the token->page conversion happens in
@@ -78,10 +89,10 @@ class TpuRaidenHiCacheController(HiCacheController):
         finish_event = self.mem_pool_host.load_all_layer(
             self.mem_pool_device, host_indices, device_indices
         )
-        # Block until the DMA has landed (poll-only; never Await). TPU's
-        # wait_event is a no-op and the consuming forward runs this same step,
-        # so we cannot defer this without a request-level gate.
-        finish_event.synchronize()
+        if not self.async_load_back:
+            # poll mode: the consuming forward runs this same step, so block on
+            # the DMA before it reads KV (poll-only; never Await).
+            finish_event.synchronize()
 
         # Mark every layer complete so the LayerDoneCounter contract (which
         # asserts the prior producer's finish_event is ready before reuse)

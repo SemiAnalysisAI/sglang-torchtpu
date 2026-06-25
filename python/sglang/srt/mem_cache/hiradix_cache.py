@@ -185,6 +185,13 @@ class HiRadixCache(RadixCache):
         self.ongoing_write_through = {}
         # record the node segments with ongoing load back
         self.ongoing_load_back = {}
+        # Async load-back (TPU raiden): nodes whose host->device DMA is still in
+        # flight. Requests matching them are deferred by the scheduler until the
+        # DMA lands. ``_load_chains`` maps the tracked last-hit node id to every
+        # node id in its loaded chain (for cleanup in loading_check).
+        self.async_load_back = getattr(self.cache_controller, "async_load_back", False)
+        self.loading_node_ids: set = set()
+        self._load_chains: dict = {}
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
@@ -817,9 +824,35 @@ class HiRadixCache(RadixCache):
             for ack_id in ack_list:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
+                if self.async_load_back:
+                    # DMA landed: clear this chain so deferred requests admit.
+                    for nid in self._load_chains.pop(ack_id, ()):
+                        self.loading_node_ids.discard(nid)
 
         # ACK until all events are processed
         del self.cache_controller.ack_load_queue[:finish_count]
+
+    def async_load_back_ready(self, req) -> bool:
+        """Async L2 load-back gate (TPU raiden). Returns False to DEFER the
+        request — its host->device DMA is in flight — and True to admit it
+        (loaded, or nothing to load). Mirrors the L3 prefetch deferral so other
+        already-resident requests run while this one's KV streams in.
+
+        Must be called after ``init_next_round_input`` (which re-matches the
+        prefix). On the first call for a host hit it issues the async load and
+        defers; subsequent calls defer until ``loading_check`` clears the chain.
+        """
+        node = req.last_node
+        if node is not None and node.id in self.loading_node_ids:
+            return False
+        if req.host_hit_length > 0 and req.best_match_node.evicted:
+            loading_values = self.load_back(req.best_match_node)
+            if loading_values is not None:
+                # Drains the load_queue load_back just enqueued and issues the
+                # H2D asynchronously (the raiden controller does not block).
+                self.cache_controller.start_loading()
+                return False
+        return True
 
     def evictable_size(self):
         return self.evictable_size_
@@ -1043,6 +1076,14 @@ class HiRadixCache(RadixCache):
             return None
 
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
+        if self.async_load_back:
+            # Mark the whole loaded chain as in-flight so the scheduler defers
+            # any request matching it until the DMA lands (cleared in
+            # loading_check). Eviction is leaf-first, so a request touching the
+            # loading region always ends on a node in this chain.
+            chain_ids = [n.id for n in nodes_to_load]
+            self._load_chains[last_hit_node.id] = chain_ids
+            self.loading_node_ids.update(chain_ids)
         offset = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)].clone()
