@@ -1,10 +1,10 @@
-"""TPU "graph runner": installs torch.compile on the model.
+"""TPU "graph runner": orchestrates annotated torch.compile boundaries.
 
 Unlike CudaGraphRunner / NPUGraphRunner there is no graph capture or
 replay here — PJRT (libtpu) caches HLO compilations internally, keyed
 by tensor shape, so we get "compile once, dispatch by shape" behavior
 without an explicit capture step. This class exists so the
-torch.compile install hangs off the same factory hook
+torch.compile orchestration hangs off the same factory hook
 (``current_platform.get_graph_runner_cls()``) as the in-tree runners,
 matching the pattern used by ``CPUGraphRunner`` which is also just a
 torch.compile wrapper.
@@ -16,18 +16,20 @@ Wired up by ``ModelRunner.init_device_graphs`` when both:
 * the model does not set ``_can_torch_compile = False`` (the same
   per-model opt-out the CUDA path honors in ``kernel_warmup``).
 
-Reassigning attributes on the model instance shadows the class methods
-for that instance only — every existing call site in ``ModelRunner``
-(``self.model.<name>(...)``) picks up the compiled version automatically.
+The runner discovers ``@support_torch_compile`` metadata and delegates the
+boundary-specific install / warmup work to the annotated object's compile
+policy or driver. It should not know decoder- or ViT-specific padding rules.
 """
 
 from __future__ import annotations
 
-import inspect
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.compilation.support_torch_compile import (
+    get_torch_compile_policy,
+)
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 
 if TYPE_CHECKING:
@@ -41,41 +43,10 @@ if TYPE_CHECKING:
 logger = get_logger("tpu_graph_runner")
 
 
-def _wrap_with_tpu_compile(model, attr_name: str) -> bool:
-    """Replace ``model.<attr_name>`` with a torch.compile + no_grad wrapper.
-
-    Returns True if the attribute existed and was wrapped, False if the
-    model does not expose it (which is the common case for the optional
-    ``forward_split_prefill`` entry point).
-    """
-    fn = getattr(model, attr_name, None)
-    if fn is None:
-        return False
-    signature = inspect.signature(fn)
-    compiled = torch.compile(
-        torch.no_grad()(fn),
-        backend="tpu",
-        fullgraph=True,
-        dynamic=False,
-    )
-    compiled.__signature__ = signature
-    setattr(model, attr_name, compiled)
-    return True
-
-
 class TpuGraphRunner:
-    """Install ``torch.compile(backend='tpu')`` on the model backbone."""
+    """Orchestrate ``torch.compile(backend='tpu')`` annotation policies."""
 
-    # Entry points wrapped with torch.compile. ``forward`` is hit by
-    # forward_decode / forward_extend / forward_idle.
-    # ``forward_split_prefill`` is hit by the split-prefill path on
-    # models that expose it (qwen2/qwen3 family, glm4, gemma); it is
-    # wrapped so first invocation populates the HLO cache, but
-    # ``CompilationManager`` only precompiles ``forward`` today — see
-    # the warning in ``CompilationManager.__init__``.
-    _COMPILE_TARGETS: tuple[str, ...] = ("forward", "forward_split_prefill")
-
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(self, model_runner: ModelRunner) -> None:
         assert (
             model_runner.server_args.enable_torch_compile
         ), "TpuGraphRunner should only be initialized when enable_torch_compile=True."
@@ -124,49 +95,47 @@ class TpuGraphRunner:
 
         _register_tpu_compile_backend()
 
-        wrapped = [
-            name
-            for name in self._COMPILE_TARGETS
-            if _wrap_with_tpu_compile(self.model, name)
-        ]
-        if not wrapped:
-            logger.warning(
-                "enable_torch_compile=True but %s exposes none of %s; "
-                "nothing compiled.",
-                type(self.model).__name__,
-                self._COMPILE_TARGETS,
+        modules = (
+            self.model.modules()
+            if callable(getattr(self.model, "modules", None))
+            else (self.model,)
+        )
+        installed_any = False
+        for module in modules:
+            policy_cls = get_torch_compile_policy(module)
+            if policy_cls is None:
+                continue
+            if policy_cls.backend not in (None, "tpu"):
+                continue
+
+            method_name = "forward"
+            method = getattr(module, method_name, None)
+            if method is None:
+                logger.warning(
+                    "TPU compile annotation %s.%s has no such method; skipping.",
+                    type(module).__name__,
+                    method_name,
+                )
+                continue
+
+            policy = policy_cls(
+                model_runner=model_runner,
+                owner=module,
+                method_name=method_name,
+                method=method,
+                label=type(module).__name__,
             )
-            return
+            installed = policy.install()
+            if installed:
+                installed_any = True
+                policy.precompile()
 
-        logger.info(
-            "Wrapped %s.{%s} with torch.compile(backend='tpu', "
-            "fullgraph=True, dynamic=False) inside torch.no_grad.",
-            type(self.model).__name__,
-            ", ".join(wrapped),
-        )
-
-        from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
-            TpuCompiledForwardShim,
-        )
-
-        compiled_fns: dict[str, Callable] = {
-            name: getattr(self.model, name) for name in wrapped
-        }
-        compiled_forward_shim = TpuCompiledForwardShim(
-            model_runner, compiled_fns=compiled_fns
-        ).install()
-        model_runner.compiled_forward_shim = compiled_forward_shim
-
-        from sglang.srt.hardware_backend.tpu.compilation.compilation_manager import (
-            CompilationManager,
-        )
-
-        CompilationManager(
-            model_runner=model_runner,
-            compiled_fns=compiled_fns,
-            t_bucketer=compiled_forward_shim.t_bucketer,
-            b_bucketer=compiled_forward_shim.b_bucketer,
-        ).precompile_all()
+        if not installed_any:
+            logger.warning(
+                "enable_torch_compile=True but %s declares no TPU compile "
+                "policies; nothing compiled.",
+                type(self.model).__name__,
+            )
 
     def can_run(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.
