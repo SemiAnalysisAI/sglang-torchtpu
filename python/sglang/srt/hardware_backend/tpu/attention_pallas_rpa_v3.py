@@ -369,7 +369,10 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             pages_per_seq * page_size
         )
 
-        per_seq = req_to_token[req_pool_indices]  # [bs, max_ctx]
+        if req_to_token.device.type == "cpu":
+            per_seq = req_to_token[req_pool_indices.cpu()].to(device)  # [bs, max_ctx]
+        else:
+            per_seq = req_to_token[req_pool_indices]  # [bs, max_ctx]
         # ``req_to_token.shape[1]`` may not be an exact multiple of
         # ``page_size`` (SGLang adds extra slack tokens), in which case
         # ``per_seq[:, ::page_size]`` would emit one extra trailing column.
