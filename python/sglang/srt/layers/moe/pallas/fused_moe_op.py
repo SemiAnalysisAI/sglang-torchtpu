@@ -151,6 +151,7 @@ def _fused_moe_jax(
     w2_bias,  # Optional[g, 1, k] f32
     topk,
     activation_name,
+    no_combine,
 ):
     """Production fused-MoE kernel body. Exported by ``_build_fused_moe_op``.
 
@@ -264,6 +265,15 @@ def _fused_moe_jax(
     # TODO (Qinghan): check performance against scatter
     unsort_idx = jnp.argsort(argsort_idx)
     unsorted = gmm2_out[unsort_idx].reshape(m, topk, hidden_size)
+    if no_combine:
+        # Return per-expert outputs [m, topk, hidden] without the weighted
+        # reduce. Models that do their own post-expert-norm + combine
+        # (e.g. llama4x) need the un-combined tensor. Slice off pad tokens.
+        # Note: the per-expert output is returned at out_dtype precision; the
+        # caller performs the weighted reduce in out_dtype, whereas the
+        # combined branch below reduces in unsorted.dtype before the final
+        # cast. The caller should upcast first if it needs bit-parity.
+        return unsorted[:m_orig].astype(out_dtype)
     weights = topk_weights.reshape(m, topk, 1).astype(unsorted.dtype)
     out = (unsorted * weights).sum(axis=1).astype(out_dtype)
     # Slice off the padded tokens added at entry.
@@ -303,6 +313,7 @@ def _build_fused_moe_op():
         w2_bias: Optional[jax.Array] = None,
         topk: int = 1,
         activation: str = "silu",
+        no_combine: bool = False,
     ) -> jax.Array:
         return _fused_moe_jax(
             hidden_states,
@@ -316,6 +327,7 @@ def _build_fused_moe_op():
             w2_bias,
             topk,
             activation,
+            no_combine,
         )
 
     custom_op = _torch_pallas.jax_op(op_name, _wrapped)
@@ -332,10 +344,15 @@ def _build_fused_moe_op():
         w2_bias: Optional[torch.Tensor] = None,
         topk: int = 1,
         activation: str = "silu",
+        no_combine: bool = False,
     ):
-        # Output is [m, hidden] in the dtype of hidden_states. Using
-        # ``empty_like`` on a slice lets ``torch.compile`` thread the
+        # Output is [m, hidden] in the dtype of hidden_states, or the
+        # un-combined per-expert [m, topk, hidden] when no_combine is set.
+        # Using ``empty``/``empty_like`` lets ``torch.compile`` thread the
         # dynamic token dimension without invoking the JAX tracer.
+        if no_combine:
+            m, hidden = hidden_states.shape
+            return hidden_states.new_empty((m, topk, hidden))
         return torch.empty_like(hidden_states)
 
     custom_op.register_fake(_fake_impl)
@@ -357,6 +374,7 @@ def fused_moe_call(
     w2_scale: Optional[torch.Tensor] = None,
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
+    no_combine: bool = False,
 ) -> torch.Tensor:
     """Invoke the Pallas fused-MoE op.
 
@@ -367,7 +385,9 @@ def fused_moe_call(
       * ``topk_weights``: ``[num_tokens, topk]``  (routing scores, dtype of x)
       * ``topk_ids``: ``[num_tokens, topk]``  (int32 expert ids)
 
-    Returns ``[num_tokens, hidden_size]`` in ``hidden_states.dtype``.
+    Returns ``[num_tokens, hidden_size]`` in ``hidden_states.dtype``,
+    or the un-combined per-expert ``[num_tokens, topk, hidden_size]``
+    when ``no_combine`` is True.
     """
     op = _build_fused_moe_op()
     return op(
@@ -382,4 +402,5 @@ def fused_moe_call(
         w2_bias,
         topk,
         activation,
+        no_combine,
     )

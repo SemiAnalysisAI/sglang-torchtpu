@@ -776,6 +776,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             topk_ids=topk_ids,
             topk=int(topk_ids.shape[-1]),
             activation=moe_runner_config.activation,
+            no_combine=moe_runner_config.no_combine,
         )
         return StandardCombineInput(hidden_states=output)
 
