@@ -74,6 +74,22 @@ class TpuSRTPlatform(SRTPlatform):
     def apply_server_args_defaults(self, server_args) -> None:
         from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
 
+        # apply_tpu_patches() runs _prepare_tpu_env(world_size=1) at model_runner
+        # import time, pinning TORCH_TPU_SLICEBUILDER_ADDRESSES to a single
+        # address; _prepare_tpu_env early-returns when that is set. For tp>1 on a
+        # single host, clear the stale single-address env here (the authoritative
+        # tp_size) so _prepare_tpu_env re-sizes the per-rank slicebuilder list.
+        # A genuine multi-host deployment provides these externally (>1 host), so
+        # leave them untouched in that case.
+        import os
+
+        _hosts = [
+            h for h in os.environ.get("TPU_WORKER_HOSTNAMES", "").split(",") if h
+        ]
+        if server_args.tp_size > 1 and len(_hosts) <= 1:
+            os.environ.pop("TORCH_TPU_SLICEBUILDER_ADDRESSES", None)
+            os.environ.pop("TORCH_TPU_TOPOLOGY", None)
+
         _prepare_tpu_env(server_args.tp_size)
 
         if server_args.dtype is None or server_args.dtype == "auto":
