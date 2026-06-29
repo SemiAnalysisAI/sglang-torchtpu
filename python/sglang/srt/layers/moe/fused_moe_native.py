@@ -18,6 +18,12 @@ from sglang.srt.layers.moe.token_dispatcher import (
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 
+def _linear_maybe_transposed_weight(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if weight.dim() == 2 and weight.shape[0] == x.shape[-1]:
+        return x @ weight
+    return F.linear(x, weight)
+
+
 def fused_moe_forward_native(
     layer: torch.nn.Module,
     dispatch_output: StandardDispatchOutput,
@@ -100,8 +106,11 @@ def moe_forward_native(
         layer_w13_bias = w13_bias[i] if w13_bias is not None else None
         layer_w2_bias = w2_bias[i] if w2_bias is not None else None
 
-        # Apply w13 linear
-        gate_up = F.linear(tokens_for_this_expert, layer_w13_weight)
+        # Apply w13 linear. TPU Pallas weight prep stores MoE weights as
+        # (in, out), while the default native path expects (out, in).
+        gate_up = _linear_maybe_transposed_weight(
+            tokens_for_this_expert, layer_w13_weight
+        )
 
         # Add bias if present (for models like GPT-OSS)
         if layer_w13_bias is not None:
@@ -122,8 +131,8 @@ def moe_forward_native(
         else:
             gate_up = act(gate_up)
 
-        # Apply w2 linear
-        expert_out = F.linear(gate_up, layer_w2_weight)
+        # Apply w2 linear.
+        expert_out = _linear_maybe_transposed_weight(gate_up, layer_w2_weight)
 
         # Add bias if present (for models like GPT-OSS)
         if layer_w2_bias is not None:
@@ -137,9 +146,12 @@ def moe_forward_native(
     new_x = torch.empty_like(outs)
 
     new_x[idxs] = outs
+    per_expert_out = new_x.view(*topk_ids.shape, -1)
+    if moe_runner_config.no_combine:
+        return per_expert_out
+
     final_out = (
-        new_x.view(*topk_ids.shape, -1)
-        .type(topk_weights.dtype)
+        per_expert_out.type(topk_weights.dtype)
         .mul_(topk_weights.unsqueeze(dim=-1))
         .sum(dim=1)
         .type(new_x.dtype)
