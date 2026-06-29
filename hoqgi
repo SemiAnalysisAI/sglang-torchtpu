@@ -1,0 +1,200 @@
+[33mcommit eb070080c19f5f12dd5139ac11a489a8c32b7ca9[m
+Author: angelayi <angelayi@meta.com>
+Date:   Mon Jun 29 18:43:59 2026 +0000
+
+    [tpu] SWA KV pool: device/dtype-safe index mapping + fused KV buffer
+    
+    Make the sliding-window-attention KV pool work on TPU:
+    
+    - translate_loc_from_full_to_swa: move the CPU index tensor onto the
+      mapping's device before indexing. On TPU kv_indices can arrive on CPU
+      while full_to_swa_index_mapping lives on the TPU device, which
+      otherwise raises a device-mismatch error.
+    - SWA index-mapping assignments: cast indices to int64 and cast the
+      assigned values to the mapping dtype unconditionally (previously only
+      the NPU branch cast). TPU requires matching dtype/int64 index on the
+      scatter assignment; the plain CUDA path relied on implicit casting.
+    - Add get_fused_kv_buffer, delegating to the per-pool fused buffer.
+      The TPU pallas RPA v3 backend reads K/V from a single fused buffer,
+      so the SWA wrapper must expose it alongside get_kv_buffer.
+
+[1mdiff --git a/python/sglang/srt/mem_cache/swa_memory_pool.py b/python/sglang/srt/mem_cache/swa_memory_pool.py[m
+[1mindex e616c97c3..23c6c6aec 100644[m
+[1m--- a/python/sglang/srt/mem_cache/swa_memory_pool.py[m
+[1m+++ b/python/sglang/srt/mem_cache/swa_memory_pool.py[m
+[36m@@ -165,6 +165,13 @@[m [mclass SWAKVPool(BaseSWAKVPool):[m
+         else:[m
+             return self.full_kv_pool.get_kv_buffer(layer_id_pool)[m
+ [m
+[32m+[m[32m    def get_fused_kv_buffer(self, layer_id: int):[m
+[32m+[m[32m        self._wait_for_layer(layer_id)[m
+[32m+[m[32m        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id][m
+[32m+[m[32m        if is_swa_layer:[m
+[32m+[m[32m            return self.swa_kv_pool.get_fused_kv_buffer(layer_id_pool)[m
+[32m+[m[32m        return self.full_kv_pool.get_fused_kv_buffer(layer_id_pool)[m
+[32m+[m
+     def set_swa_loc(self, loc: torch.Tensor):[m
+         self.swa_loc = loc[m
+ [m
+[36m@@ -173,7 +180,9 @@[m [mclass SWAKVPool(BaseSWAKVPool):[m
+ [m
+         # Note: kv_indices could have -1 values (from alloc_extend), which will be mapped to -1[m
+         # since the last item of full_to_swa_index_mapping is -1.[m
+[31m-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)[m
+[32m+[m[32m        return self.full_to_swa_index_mapping[[m
+[32m+[m[32m            kv_indices.to(self.full_to_swa_index_mapping.device)[m
+[32m+[m[32m        ].to(torch.int32)[m
+ [m
+     def set_kv_buffer([m
+         self,[m
+[36m@@ -435,12 +444,9 @@[m [mclass SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):[m
+         assert alloc_full_indices is not None[m
+         assert alloc_swa_indices is not None[m
+ [m
+[31m-        if _is_npu:[m
+[31m-            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = ([m
+[31m-                alloc_swa_indices.to(torch.int64)[m
+[31m-            )[m
+[31m-        else:[m
+[31m-            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices[m
+[32m+[m[32m        self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = ([m
+[32m+[m[32m            alloc_swa_indices.to(self.full_to_swa_index_mapping.dtype)[m
+[32m+[m[32m        )[m
+         return alloc_full_indices[m
+ [m
+     def alloc_extend([m
+[36m@@ -485,12 +491,9 @@[m [mclass SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):[m
+         assert alloc_full_indices is not None[m
+         assert alloc_swa_indices is not None[m
+ [m
+[31m-        if _is_npu:[m
+[31m-            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = ([m
+[31m-                alloc_swa_indices.to(torch.int64)[m
+[31m-            )[m
+[31m-        else:[m
+[31m-            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices[m
+[32m+[m[32m        self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = ([m
+[32m+[m[32m            alloc_swa_indices.to(self.full_to_swa_index_mapping.dtype)[m
+[32m+[m[32m        )[m
+ [m
+         return alloc_full_indices[m
+ [m
+[36m@@ -554,9 +557,9 @@[m [mclass SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):[m
+         )[m
+         assert alloc_swa_indices is not None[m
+ [m
+[31m-        self.full_to_swa_index_mapping[alloc_full_indices[-swa_tail_len:]] = ([m
+[31m-            alloc_swa_indices[m
+[31m-        )[m
+[32m+[m[32m        self.full_to_swa_index_mapping[[m
+[32m+[m[32m            alloc_full_indices[-swa_tail_len:].to(torch.int64)[m
+[32m+[m[32m        ] = alloc_swa_indices.to(self.full_to_swa_index_mapping.dtype)[m
+         return alloc_full_indices[m
+ [m
+     def alloc_decode([m
+[36m@@ -578,12 +581,9 @@[m [mclass SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):[m
+         if alloc_full_indices is None or alloc_swa_indices is None:[m
+             return None[m
+ [m
+[31m-        if _is_npu:[m
+[31m-            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = ([m
+[31m-                alloc_swa_indices.to(torch.int64)[m
+[31m-            )[m
+[31m-        else:[m
+[31m-            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices[m
+[32m+[m[32m        self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = ([m
+[32m+[m[32m            alloc_swa_indices.to(self.full_to_swa_index_mapping.dtype)[m
+[32m+[m[32m        )[m
+ [m
+         return alloc_full_indices[m
+ [m
+[36m@@ -612,12 +612,9 @@[m [mclass SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):[m
+         if full_indices.numel() == 0:[m
+             return[m
+         assert full_indices.numel() == swa_indices.numel()[m
+[31m-        if _is_npu:[m
+[31m-            self.full_to_swa_index_mapping[full_indices.to(torch.int64)] = ([m
+[31m-                swa_indices.to(torch.int64)[m
+[31m-            )[m
+[31m-        else:[m
+[31m-            self.full_to_swa_index_mapping[full_indices] = swa_indices[m
+[32m+[m[32m        self.full_to_swa_index_mapping[full_indices.to(torch.int64)] = ([m
+[32m+[m[32m            swa_indices.to(self.full_to_swa_index_mapping.dtype)[m
+[32m+[m[32m        )[m
+ [m
+     def free_swa(self, free_index: torch.Tensor):[m
+         swa_indices = self.full_to_swa_index_mapping[free_index][m
+[1mdiff --git a/test/registered/unit/mem_cache/test_swa_tpu_kv_pool.py b/test/registered/unit/mem_cache/test_swa_tpu_kv_pool.py[m
+[1mnew file mode 100644[m
+[1mindex 000000000..6b9bed5a1[m
+[1m--- /dev/null[m
+[1m+++ b/test/registered/unit/mem_cache/test_swa_tpu_kv_pool.py[m
+[36m@@ -0,0 +1,68 @@[m
+[32m+[m[32m"""Unit tests for the TPU SWA KV-pool additions (CPU-runnable).[m
+[32m+[m
+[32m+[m[32mExercises the device-/dtype-safe behaviors added to ``SWAKVPool`` for TPU[m
+[32m+[m[32mwithout standing up a real KV cache: instances are built with ``__new__``[m
+[32m+[m[32mand only the attributes the methods touch are populated.[m
+[32m+[m[32m"""[m
+[32m+[m
+[32m+[m[32mimport unittest[m
+[32m+[m
+[32m+[m[32mimport torch[m
+[32m+[m
+[32m+[m[32mfrom sglang.srt.mem_cache.swa_memory_pool import SWAKVPool[m
+[32m+[m[32mfrom sglang.test.ci.ci_register import register_cpu_ci[m
+[32m+[m[32mfrom sglang.test.test_utils import CustomTestCase[m
+[32m+[m
+[32m+[m[32mregister_cpu_ci(est_time=5, suite="base-a-test-cpu")[m
+[32m+[m
+[32m+[m
+[32m+[m[32mclass _FakePool:[m
+[32m+[m[32m    def __init__(self, tag):[m
+[32m+[m[32m        self.tag = tag[m
+[32m+[m
+[32m+[m[32m    def get_kv_buffer(self, layer_id_pool):[m
+[32m+[m[32m        return ("kv", self.tag, layer_id_pool)[m
+[32m+[m
+[32m+[m[32m    def get_fused_kv_buffer(self, layer_id_pool):[m
+[32m+[m[32m        return ("fused", self.tag, layer_id_pool)[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _make_pool():[m
+[32m+[m[32m    pool = SWAKVPool.__new__(SWAKVPool)[m
+[32m+[m[32m    pool.full_kv_pool = _FakePool("full")[m
+[32m+[m[32m    pool.swa_kv_pool = _FakePool("swa")[m
+[32m+[m[32m    # layer 0 -> full (pool idx 0), layer 1 -> swa (pool idx 0)[m
+[32m+[m[32m    pool.layers_mapping = {0: (0, False), 1: (0, True)}[m
+[32m+[m[32m    pool.layer_transfer_counter = None  # _wait_for_layer no-ops when None[m
+[32m+[m[32m    return pool[m
+[32m+[m
+[32m+[m
+[32m+[m[32mclass TestSwaTranslateDevice(CustomTestCase):[m
+[32m+[m[32m    def test_translate_moves_index_to_mapping_device(self):[m
+[32m+[m[32m        pool = SWAKVPool.__new__(SWAKVPool)[m
+[32m+[m[32m        # mapping with a trailing -1 sentinel; int32 dtype like production.[m
+[32m+[m[32m        pool.full_to_swa_index_mapping = torch.tensor([m
+[32m+[m[32m            [10, 11, 12, 13, -1], dtype=torch.int32[m
+[32m+[m[32m        )[m
+[32m+[m[32m        # index tensor explicitly on CPU; method must .to(mapping.device).[m
+[32m+[m[32m        kv_indices = torch.tensor([0, 2, 4, -1], dtype=torch.int64, device="cpu")[m
+[32m+[m[32m        out = pool.translate_loc_from_full_to_swa(kv_indices)[m
+[32m+[m[32m        self.assertEqual(out.dtype, torch.int32)[m
+[32m+[m[32m        # index 4 and -1 both hit the -1 sentinel (last element).[m
+[32m+[m[32m        torch.testing.assert_close([m
+[32m+[m[32m            out, torch.tensor([10, 12, -1, -1], dtype=torch.int32)[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m
+[32m+[m[32mclass TestSwaGetFusedKvBuffer(CustomTestCase):[m
+[32m+[m[32m    def test_full_layer_routes_to_full_pool(self):[m
+[32m+[m[32m        pool = _make_pool()[m
+[32m+[m[32m        self.assertEqual(pool.get_fused_kv_buffer(0), ("fused", "full", 0))[m
+[32m+[m
+[32m+[m[32m    def test_swa_layer_routes_to_swa_pool(self):[m
+[32m+[m[32m        pool = _make_pool()[m
+[32m+[m[32m        self.assertEqual(pool.get_fused_kv_buffer(1), ("fused", "swa", 0))[m
+[32m+[m
+[32m+[m
+[32m+[m[32mif __name__ == "__main__":[m
+[32m+[m[32m    unittest.main()[m

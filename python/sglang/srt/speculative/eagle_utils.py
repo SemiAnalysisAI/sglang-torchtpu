@@ -309,3 +309,14 @@ def verify_tree_greedy_func(
             topk,
         )
     return predicts, accept_index, accept_token_num
+
+
+# prod_inference sglang_meta compat: present in newer upstream sglang.
+def get_draft_recurrent_hidden_state_spec(model_runner):
+    """Return hidden_states width/dtype carried between draft decode steps."""
+    if model_runner.spec_algorithm.is_standalone():
+        return None, None
+    return (
+        model_runner.model_config.spec_hidden_size,
+        model_runner.model_config.dtype,
+    )

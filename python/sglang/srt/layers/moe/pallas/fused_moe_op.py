@@ -330,7 +330,7 @@ def _build_fused_moe_op():
             no_combine,
         )
 
-    custom_op = _torch_pallas.jax_op(op_name, _wrapped)
+    custom_op = _torch_pallas.jax_op(op_name, _wrapped, keep_unused=True)
 
     def _fake_impl(
         hidden_states: torch.Tensor,

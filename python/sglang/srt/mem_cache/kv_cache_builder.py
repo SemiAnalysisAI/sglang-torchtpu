@@ -49,7 +49,7 @@ def get_draft_kv_pool(
     draft_worker: "BaseTpWorker",
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
-    enable_overlap: bool,
+    enable_overlap: bool = False,
 ):
     """Return (draft_token_to_kv_pool, draft_model_config) for the current
     draft worker, or (None, None) when no draft KV pool is available."""

@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -61,6 +62,23 @@ from sglang.srt.utils.common import is_npu, is_tpu, use_intel_amx_backend
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+# Compatibility for prod_inference Llama4x imports.
+_in_autotune_dummy_run = False
+
+
+def get_in_autotune_dummy_run() -> bool:
+    return _in_autotune_dummy_run
+
+
+@contextmanager
+def autotune_dummy_run_mode():
+    global _in_autotune_dummy_run
+    _in_autotune_dummy_run = True
+    try:
+        yield
+    finally:
+        _in_autotune_dummy_run = False
 _is_tpu = is_tpu()
 
 

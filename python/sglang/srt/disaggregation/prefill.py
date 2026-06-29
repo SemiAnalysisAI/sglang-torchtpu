@@ -88,6 +88,10 @@ def release_req_to_metadata_buffer(
         req.metadata_buffer_index = -1
 
 
+# prod_inference's sglang_meta still imports the older helper name.
+maybe_release_metadata_buffer = release_req_to_metadata_buffer
+
+
 class PrefillBootstrapQueue:
     """
     Store the requests in bootstrapping

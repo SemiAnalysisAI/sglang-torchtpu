@@ -2224,6 +2224,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
         return kv_size_bytes
 
 
+# prod_inference's sglang_meta still imports the older DSA class name.
+DSATokenToKVPool = NSATokenToKVPool
+
+
 def move_kv_cache_native(
     k_buffer: List[torch.Tensor],
     v_buffer: List[torch.Tensor],

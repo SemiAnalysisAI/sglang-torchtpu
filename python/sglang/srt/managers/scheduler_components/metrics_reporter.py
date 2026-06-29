@@ -1002,3 +1002,11 @@ class SchedulerMetricsReporter:
                 self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
             )
         self.metrics_collector.log_stats(self.stats)
+
+
+# prod_inference sglang_meta compat: present in newer upstream sglang.
+def _decode_total_seq_lens(batch):
+    """Sync-free sum of seq_lens for decode metrics."""
+    if batch.seq_lens_cpu is not None:
+        return int(batch.seq_lens_cpu.sum().item())
+    return sum(req.seqlen for req in batch.reqs)
