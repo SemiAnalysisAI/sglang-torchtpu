@@ -249,7 +249,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 old = getattr(layer, name).data
                 new = old.transpose(1, 2).contiguous()
                 copy_or_rebind_param(layer, name, new)
-                old.untyped_storage().resize_(0)
             return
 
         _should_use_aiter_moe = _use_aiter and (
@@ -739,6 +738,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        if get_bool_env_var("SGLANG_TPU_MOE_NATIVE", "false"):
+            return self.forward_cpu(layer, dispatch_output)
+
         from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.tpu_moe_utils import (
