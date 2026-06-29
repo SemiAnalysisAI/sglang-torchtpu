@@ -16,6 +16,9 @@ class DeviceTimer:
 
     @contextmanager
     def wrap(self, metadata: Dict):
+        if not torch.cuda.is_available():
+            yield
+            return
         self._intervals.append(_TimingInterval.create())
         try:
             yield
@@ -49,6 +52,9 @@ class GapTimer(DeviceTimer):
 
     @contextmanager
     def wrap(self, metadata: Dict):
+        if not torch.cuda.is_available():
+            yield
+            return
         if self._pending is not None:
             self._pending.end(metadata=metadata)
             self._intervals.append(self._pending)
