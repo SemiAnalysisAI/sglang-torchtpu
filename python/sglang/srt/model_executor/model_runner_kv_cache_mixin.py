@@ -609,6 +609,16 @@ class ModelRunnerKVCacheMixin:
                         "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.hf_text_config.v_head_dim,
                     }
+                if (
+                    current_platform.is_tpu()
+                    and self.server_args.attention_backend == "pallas_tpu_rpa_v3"
+                ):
+                    from sglang.srt.hardware_backend.tpu.kv_pool import (
+                        TpuFusedMHATokenToKVPool,
+                    )
+
+                    kwargs["token_to_kv_pool_class"] = TpuFusedMHATokenToKVPool
+
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
