@@ -106,6 +106,15 @@ class TpuSRTPlatform(SRTPlatform):
         if server_args.mem_fraction_static is None:
             server_args.mem_fraction_static = 0.40
 
+        # KV offload indexes the device KV buffers with the scheduler's block
+        # indices (backup_gather's D2H, the loaded-back prefixes' device slots).
+        # The host-resident req_to_token path (SGLANG_TPU_HOST_R2T) leaves those
+        # indices on CPU, which mixes devices in backup_gather and in the
+        # match_prefix / alloc_for_extend torch.cat. Pin req_to_token to device
+        # whenever offload is on.
+        if server_args.enable_hierarchical_cache:
+            os.environ["SGLANG_TPU_HOST_R2T"] = "0"
+
         # The default TPU backend (Pallas RPA v3) expects a paged KV cache where
         # page_size is the HBM<->VMEM DMA chunk and the fused KV buffer's page
         # axis. SGLang's global page_size=1 default is valid for token-granular
@@ -164,6 +173,16 @@ class TpuSRTPlatform(SRTPlatform):
             MHATokenToKVPoolHost,
             TpuFusedMHATokenToKVPoolHost,
         )
+        from sglang.srt.server_args import get_global_server_args
+
+        # raiden offloads through tpu-raiden's DMA-pinned host pool instead of the
+        # torch-copy fused host pool; native (torch_tpu) keeps the fused pool.
+        if get_global_server_args().hicache_io_backend == "raiden":
+            from sglang.srt.hardware_backend.tpu.kv_pool_host import (
+                TpuRaidenHostKVCache,
+            )
+
+            return TpuRaidenHostKVCache
 
         if isinstance(device_pool, TpuFusedMHATokenToKVPool):
             return TpuFusedMHATokenToKVPoolHost
