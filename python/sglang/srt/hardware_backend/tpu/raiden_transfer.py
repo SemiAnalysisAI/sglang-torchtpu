@@ -15,6 +15,8 @@ import logging
 import time
 from typing import TYPE_CHECKING, List
 
+from sglang.srt.hardware_backend.tpu import offload_trace as _ot
+
 if TYPE_CHECKING:
     from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
 
@@ -134,7 +136,8 @@ class RaidenKVTransfer:
         """
         n = len(device_page_ids)
         assert n == len(host_page_ids)
-        fut = self._mgr.D2h(device_page_ids, host_page_ids, [1] * n)
+        with _ot.trace("offload", "d2h_issue"):
+            fut = self._mgr.D2h(device_page_ids, host_page_ids, [1] * n)
         return RaidenFutureEvent(fut)
 
     def load(
@@ -143,5 +146,6 @@ class RaidenKVTransfer:
         """Host->device (H2D): load host pages back into the fused KV buffer."""
         n = len(host_page_ids)
         assert n == len(device_page_ids)
-        fut = self._mgr.H2d(host_page_ids, device_page_ids, [1] * n)
+        with _ot.trace("offload", "h2d_issue"):
+            fut = self._mgr.H2d(host_page_ids, device_page_ids, [1] * n)
         return RaidenFutureEvent(fut)

@@ -1523,6 +1523,8 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        from sglang.srt.hardware_backend.tpu import offload_trace as _ot
+
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1531,13 +1533,16 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
-            batch = self.get_next_batch_to_run()
+            with _ot.trace("sched", "get_next_batch"):
+                batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
             # Launch the current batch
             if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                with _ot.trace("sched", "run_batch"):
+                    result = self.run_batch(batch)
+                with _ot.trace("sched", "process_result"):
+                    self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
@@ -1550,6 +1555,8 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        from sglang.srt.hardware_backend.tpu import offload_trace as _ot
+
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -1557,7 +1564,8 @@ class Scheduler(
         def pop_and_process():
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
+            with _ot.trace("sched", "process_result"):
+                self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
             # Receive requests
@@ -1567,7 +1575,8 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
-            batch = self.get_next_batch_to_run()
+            with _ot.trace("sched", "get_next_batch"):
+                batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
@@ -1578,7 +1587,8 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                batch_result = self.run_batch(batch)
+                with _ot.trace("sched", "run_batch"):
+                    batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -1594,7 +1604,8 @@ class Scheduler(
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
-                self.launch_batch_sample_if_needed(batch_result)
+                with _ot.trace("sched", "sample"):
+                    self.launch_batch_sample_if_needed(batch_result)
 
             # Update last_batch
             self.last_batch = batch
@@ -3790,6 +3801,10 @@ def run_scheduler_process(
         elif server_args.disaggregation_mode == "decode":
             thread_label = "Decode Scheduler"
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
+
+    from sglang.srt.hardware_backend.tpu import offload_trace as _ot
+
+    _ot.set_label(f"sgl-tp{tp_rank}")
 
     # Create a scheduler and run the event loop
     scheduler = None
