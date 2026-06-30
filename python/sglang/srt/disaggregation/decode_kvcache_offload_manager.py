@@ -19,9 +19,9 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
-    MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import ceil_align
 
@@ -57,7 +57,8 @@ class DecodeKVCacheOffloadManager:
             )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         if isinstance(kv_cache, MHATokenToKVPool):
-            self.decode_host_mem_pool = MHATokenToKVPoolHost(
+            host_pool_cls = current_platform.get_mha_kv_pool_host_cls(kv_cache)
+            self.decode_host_mem_pool = host_pool_cls(
                 kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
@@ -89,7 +90,7 @@ class DecodeKVCacheOffloadManager:
                     f"Invalid hicache storage backend extra config JSON: {e}"
                 )
 
-        self.cache_controller = HiCacheController(
+        self.cache_controller = HiCacheController.create_for_backend(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             mem_pool_host=self.decode_host_mem_pool,
             page_size=self.page_size,

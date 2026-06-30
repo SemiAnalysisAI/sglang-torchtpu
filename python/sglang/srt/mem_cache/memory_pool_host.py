@@ -9,6 +9,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
     from sglang.srt.mem_cache.hicache_storage import PoolName
 
 import numpy as np
@@ -37,7 +38,15 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_tpu, is_xpu
+from sglang.srt.utils import (
+    is_cuda,
+    is_hip,
+    is_mps,
+    is_npu,
+    is_tpu,
+    is_xpu,
+    next_power_of_2,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -208,11 +217,30 @@ def alloc_with_pin_memory(
     return buffer
 
 
+def alloc_tpu_host(
+    dims,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: None,
+) -> torch.Tensor:
+    """
+    Allocate plain unpinned host memory for the TPU KV offload pool.
+
+    TPU host<->device staging goes through libtpu's premapped pool
+    (TPU_PREMAPPED_BUFFER_SIZE); self-pinning hundreds of GB here would starve
+    that region, so we always allocate plain unpinned host memory regardless of
+    ``pin_memory``
+    """
+    return torch.empty(dims, dtype=dtype, device="cpu")
+
+
 ALLOC_MEMORY_FUNCS = defaultdict(
     lambda: alloc_with_host_register,
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,
+        "tpu": alloc_tpu_host,
     },
 )
 
@@ -848,6 +876,243 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+
+class TpuFusedMHATokenToKVPoolHost(HostKVCache):
+    """Host (L2) pool for the TPU fused MHA device pool (rpa_v3).
+
+    Stores the device's fused 5D row VERBATIM, page-major (``page_first_fused``)::
+
+        kv_buffer[page_num, layer_num, page_size, kv_heads_packed,
+                  kv_packing, padded_head_dim]
+
+    so a page's all-layer KV round-trips as a contiguous per-page copy with no
+    de-interleave / un-pad.
+
+    DATA PLANE: plain torch indexing -- no Pallas kernels and no pre-allocated
+    staging buffer. Reload (``load_to_device_all``) runs on the
+    controller's producer thread: one bulk CPU gather of all layers, one H2D,
+    then a native in-place ``index_put`` scatter into each live per-layer device
+    buffer (the device pool is a per-layer list, so the write is the only
+    per-layer step). One barrier materialises every scatter before the round is
+    signalled (no-stale); CompiledForwardShim gates the whole forward on it. The
+    H2D overlaps the prior batch's forward (needs TPU_PREMAPPED_BUFFER_SIZE).
+    Backup mirrors it: per-layer gather stacked on device, then one D2H + one
+    host scatter. pow2 padding keeps the scatter/gather HLOs shape-bucketed.
+    """
+
+    device_pool: "TpuFusedMHATokenToKVPool"
+
+    def __init__(
+        self,
+        device_pool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = False,
+        device: str = "cpu",
+        allocator_type: str = "default",
+    ):
+        assert layout == "page_first_fused", layout
+        assert not pin_memory
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            pin_memory=pin_memory,
+            device=device,
+            allocator_type=allocator_type,
+        )
+
+    def get_size_per_token(self):
+        dp = self.device_pool
+        self.layer_num = dp.layer_num
+        self.kv_packing = dp.kv_packing
+        self.kv_heads_packed = dp.num_kv_heads_x2 // dp.kv_packing
+        self.padded_head_dim = dp.padded_head_dim
+        self.fused_row_elems = dp.num_kv_heads_x2 * dp.padded_head_dim
+        return self.fused_row_elems * self.layer_num * self.dtype.itemsize
+
+    def init_kv_buffer(self):
+        # layout is asserted page_first_fused in __init__, so no re-check here.
+        dims = (
+            self.page_num,
+            self.layer_num,
+            self.page_size,
+            self.kv_heads_packed,
+            self.kv_packing,
+            self.padded_head_dim,
+        )
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        return alloc_func(
+            dims,
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+        )
+
+    def _to_page_ids(self, token_indices: torch.Tensor) -> torch.Tensor:
+        """token-granular, page-aligned indices -> page-granular ids."""
+        return token_indices[:: self.page_size] // self.page_size
+
+    def _padded_ids(self, device_indices: torch.Tensor):
+        # Page-id prep with NO device->host round-trip. device_indices is
+        # host-born allocator output that was pushed to the device; pulling it
+        # back with .cpu() forced a hard sync (single in-order PJRT queue must
+        # flush behind the running forward)
+        pages = device_indices[:: self.page_size] // self.page_size
+        num_pages = pages.shape[0]
+        if num_pages == 0:
+            return None, 0, 0
+        num_padded_pages = next_power_of_2(num_pages)
+        if num_padded_pages > num_pages:
+            pages = torch.cat(
+                [
+                    pages,
+                    pages[num_pages - 1 : num_pages].expand(
+                        num_padded_pages - num_pages
+                    ),
+                ],
+                dim=0,
+            )
+        return pages, num_pages, num_padded_pages
+
+    def load_to_device_all(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+    ):
+        """Reload evicted KV host->device in ONE bulk pass, on the HiCache
+        producer thread.
+
+        One CPU gather of all layers, one H2D, then a native in-place
+        ``index_put`` scatter into each live per-layer device buffer (the device
+        pool is a per-layer list, so the write is the only per-layer step -- no
+        Pallas kernel, no staging). One barrier materialises every scatter
+        before the round is signalled (no-stale); CompiledForwardShim gates the
+        whole forward on it. Runs while the prior batch's forward executes, so
+        the H2D overlaps that compute (needs TPU_PREMAPPED_BUFFER_SIZE set).
+        pow2 padding keeps the scatter HLO shape-bucketed (no per-page-count
+        recompile).
+        """
+        if io_backend != "torch_tpu":
+            raise ValueError(
+                "TpuFusedMHATokenToKVPoolHost.load_to_device_all only "
+                f"supports io_backend='torch_tpu', got {io_backend!r}"
+            )
+
+        dst_ids, num_pages, num_padded_pages = self._padded_ids(device_indices)
+        if num_pages == 0:
+            return
+
+        # host_indices is host-born (move_indices keeps it on CPU); index the
+        # CPU host buffer directly. ``.cpu()`` is a no-op here (no sync).
+        host_pages = self._to_page_ids(host_indices).cpu()
+
+        # One bulk gather of ALL layers from the host pool + one H2D. The padded
+        # tail repeats the last page so the scatter rewrites it idempotently.
+        host_all = self.kv_buffer[host_pages]  # [num_pages, layer_num, page, ...]
+        if num_padded_pages > num_pages:
+            pad = host_all[-1:].expand(
+                (num_padded_pages - num_pages,) + tuple(host_all.shape[1:])
+            )
+            host_all = torch.cat([host_all, pad], dim=0)  # [num_padded_pages, ...]
+        # Single async H2D (DMA engine, overlaps the prior forward). host_all /
+        # src_all stay alive until the barrier below (DMA in flight).
+        src_all = host_all.to(device_pool.kv_buffer[0].device, non_blocking=True)
+
+        # Native in-place scatter into each live per-layer buffer -- src_all[:, L]
+        # is the source for layer L. No Pallas, no staging.
+        for layer_id in range(self.layer_num):
+            device_pool.kv_buffer[layer_id][dst_ids] = src_all[:, layer_id]
+
+        # One barrier: every scatter (and the H2D feeding it) lands before the
+        # worker signals this batch's done-event (no-stale).
+        torch.tpu.synchronize()
+        del host_all, src_all
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        # The torch_tpu path uses load_to_device_all (threaded, all
+        # layers at once). This per-layer entry point is kept to satisfy the
+        # abstract base class; it is not called on this backend.
+        raise NotImplementedError(
+            "TpuFusedMHATokenToKVPoolHost uses load_to_device_all; "
+            "load_to_device_per_layer is not supported on the torch_tpu backend."
+        )
+
+    def backup_gather(self, device_pool, device_indices):
+        """Gather the evicted pages off-device into ONE
+        ``[num_padded_pages, layer_num, ...]`` donation-safe HBM tensor and
+        return it for backup_copy_d2h(), or None if nothing to back up.
+
+        Runs INLINE on the scheduler thread (start_writing), so it must not
+        block: the donation-safety is provided by PJRT queue ordering, not a
+        host sync (see below).
+        """
+        src_ids, num_pages, num_padded_pages = self._padded_ids(device_indices)
+        if num_pages == 0:
+            return None
+        # Native gather per layer, stacked into one tensor matching the host
+        # layout. The stack is the donation-safe HBM copy -- a fresh HBM buffer
+        # (advanced-index + stack both copy), decoupled from kv_buffer, so a
+        # later forward overwriting those KV slots can't touch it.
+        gathered = torch.stack(
+            [
+                device_pool.kv_buffer[layer_id][src_ids]
+                for layer_id in range(self.layer_num)
+            ],
+            dim=1,
+        )
+        return gathered, num_pages, num_padded_pages
+
+    def backup_copy_d2h(self, staged, host_indices):
+        """Copy the staged (donation-safe) HBM tensor host-ward in ONE D2H and
+        scatter it into the host pool. This D2H overlaps the running forward.
+        """
+        gathered, num_pages, num_padded_pages = staged  # [num_padded_pages, ...]
+        host_pages = self._to_page_ids(host_indices).cpu()
+        host_all = gathered[:num_pages].to("cpu")  # single D2H, [num_pages, ...]
+        self.kv_buffer[host_pages] = host_all
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        # Synchronous gather+drain (tests / non-overlapped path); the controller
+        # calls the two phases directly to run the D2H async.
+        if io_backend != "torch_tpu":
+            raise ValueError(
+                "TpuFusedMHATokenToKVPoolHost supports io_backend='torch_tpu', "
+                f"got {io_backend!r}"
+            )
+        staged = self.backup_gather(device_pool, device_indices)
+        if staged is None:
+            return
+        self.backup_copy_d2h(staged, host_indices)
+
+    # -- L3 storage hooks (not supported in the 2-tier TPU phase) -------- #
+
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        raise NotImplementedError(
+            "L3 storage is not supported by the TPU fused host pool yet."
+        )
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        raise NotImplementedError(
+            "L3 storage is not supported by the TPU fused host pool yet."
+        )
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        raise NotImplementedError(
+            "L3 storage is not supported by the TPU fused host pool yet."
+        )
 
 
 class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):

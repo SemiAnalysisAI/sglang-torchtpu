@@ -44,8 +44,8 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
-    MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
+    TpuFusedMHATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -57,6 +57,7 @@ from sglang.srt.mem_cache.utils import (
     split_node_hash_value,
 )
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
+from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -74,7 +75,11 @@ class HiRadixCache(RadixCache):
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
-            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
+            # The host pool must mirror the device pool's layout (e.g. the TPU
+            # fused 5D pool needs the fused host pool); the platform hook returns
+            # the matching host class for the active device pool.
+            host_pool_cls = current_platform.get_mha_kv_pool_host_cls(self.kv_cache)
+            self.token_to_kv_pool_host = host_pool_cls(
                 self.kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
@@ -82,6 +87,13 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
+            if host_pool_cls is TpuFusedMHATokenToKVPoolHost:
+                # TPU fused host: pre-compile the native reload/backup XLA
+                from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+                    precompile_kv_offload,
+                )
+
+                precompile_kv_offload(self.token_to_kv_pool_host)
         elif isinstance(self.kv_cache, NSATokenToKVPool):
             # Filled by attach_hybrid_nsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
@@ -135,7 +147,7 @@ class HiRadixCache(RadixCache):
                 attn_tp_group=self.attn_tp_group,
             )
         else:
-            self.cache_controller = HiCacheController(
+            self.cache_controller = HiCacheController.create_for_backend(
                 params.token_to_kv_pool_allocator,
                 self.token_to_kv_pool_host,
                 self.page_size,
@@ -912,7 +924,8 @@ class HiRadixCache(RadixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
-        # GPU -> CPU demotion: block moves from device to host.
+        # Device demotion: KV is already on host (write-through), so eviction is
+        # just a device-allocator free + bookkeeping.
         # Emit remove(GPU) so downstream indexers stop scoring it as device-local.
         # The matching store(CPU) was emitted when write_backup() copied to host.
         self._record_remove_event(node, medium=StorageMedium.GPU)

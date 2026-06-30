@@ -21,6 +21,8 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+# Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
+_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 # Flush torch_tpu's lazy host->device weight-copy graph once this much work accumulates,
 # so it materializes in chunks rather than all at once, which may cause HBM OOMs.
 _LOAD_WEIGHT_SYNC_BYTES = 2 << 30  # 2 GiB
@@ -155,6 +157,17 @@ class TpuSRTPlatform(SRTPlatform):
 
         return MHATokenToKVPool
 
+    def get_mha_kv_pool_host_cls(self, device_pool) -> type:
+        from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang.srt.mem_cache.memory_pool_host import (
+            MHATokenToKVPoolHost,
+            TpuFusedMHATokenToKVPoolHost,
+        )
+
+        if isinstance(device_pool, TpuFusedMHATokenToKVPool):
+            return TpuFusedMHATokenToKVPoolHost
+        return MHATokenToKVPoolHost
+
     def get_mla_kv_pool_cls(self) -> type:
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
@@ -211,6 +224,20 @@ class TpuSRTPlatform(SRTPlatform):
         # disables that guardrail for SPMD TP graphs.
         os.environ.setdefault(
             "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false"
+        )
+
+        # Size libtpu's premapped (pinned, DMA-mapped) host staging pool. This is
+        # read by libtpu at init, so it MUST be set before `import torch_tpu`.
+        os.environ.setdefault(
+            "TPU_PREMAPPED_BUFFER_SIZE", str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE)
+        )
+        premapped_bytes = int(os.environ["TPU_PREMAPPED_BUFFER_SIZE"])
+        # Log the effective size so it's in hand when debugging KV-offload OOMs.
+        logger.info(
+            "libtpu premapped host staging pool: %.2f GiB "
+            "(TPU_PREMAPPED_BUFFER_SIZE=%d); raise it if KV-offload H2D OOMs.",
+            premapped_bytes / (1024 * 1024 * 1024),
+            premapped_bytes,
         )
 
         import torch_tpu  # noqa: F401

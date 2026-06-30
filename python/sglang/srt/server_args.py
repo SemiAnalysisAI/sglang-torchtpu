@@ -3479,6 +3479,15 @@ class ServerArgs:
             self._resolve_layout_io_compatibility()
 
     def _resolve_layout_io_compatibility(self):
+        if self.hicache_io_backend == "torch_tpu":
+            # The TPU fused host pool only supports the "page_first_fused"
+            if self.hicache_mem_layout != "page_first_fused":
+                raise ValueError(
+                    "torch_tpu io backend requires --hicache-mem-layout "
+                    f"page_first_fused, but got {self.hicache_mem_layout!r}. "
+                    "Re-run with --hicache-mem-layout page_first_fused."
+                )
+
         if (
             self.hicache_mem_layout == "page_first_direct"
             and self.hicache_io_backend == "kernel"
@@ -5895,7 +5904,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-io-backend",
             type=str,
-            choices=["direct", "kernel", "kernel_ascend"],
+            choices=["direct", "kernel", "kernel_ascend", "torch_tpu"],
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
         )
@@ -5908,6 +5917,7 @@ class ServerArgs:
                 "page_first_direct",
                 "page_first_kv_split",
                 "page_head",
+                "page_first_fused",
             ],
             default=ServerArgs.hicache_mem_layout,
             help="The layout of host memory pool for hierarchical cache.",

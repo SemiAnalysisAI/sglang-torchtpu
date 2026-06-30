@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import functools
 import inspect
-from typing import Callable
+import time
+from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.nn.functional as F
@@ -20,6 +21,10 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
+from sglang.srt.utils.common import next_power_of_2
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool_host import TpuFusedMHATokenToKVPoolHost
 
 logger = get_logger(__name__)
 
@@ -119,6 +124,61 @@ def _pad_forward_batch_inputs(
     return real_q, real_b
 
 
+# Warming above this many pow2 blocks is correct but means warmup runs a
+# (near-)full-pool transfer, so we surface it rather than silently clamp.
+_KV_OFFLOAD_WARMUP_WARN_BLOCKS: int = 2048
+
+
+def precompile_kv_offload(host_pool: "TpuFusedMHATokenToKVPoolHost") -> None:
+    """Dummy-run the real reload/backup transfer methods across pow2 block
+    buckets to pre-compile their XLA programs.
+    """
+    device_pool = host_pool.device_pool
+    page_size = host_pool.page_size
+    device = device_pool.kv_buffer[0].device
+
+    # Serving pads page counts UP to the next pow2
+    device_blocks = device_pool.kv_buffer[0].shape[0]
+    max_blocks = next_power_of_2(device_blocks)  # next pow2 >= capacity
+    if max_blocks > _KV_OFFLOAD_WARMUP_WARN_BLOCKS:
+        logger.warning(
+            "[kv-offload warmup] device pool has %d blocks; warming pow2 "
+            "buckets up to %d (a near-full-pool transfer). Startup will be "
+            "longer, but this avoids a mid-serve JIT recompile.",
+            device_blocks,
+            max_blocks,
+        )
+
+    start = time.perf_counter()
+    num_buckets = 0
+    n = 1
+    while n <= max_blocks:
+        num_tokens = n * page_size
+        # Page-aligned indices into page 0. Host indices are host-born (CPU),
+        # device indices live on-device -- matching what move_indices() yields.
+        host_indices = torch.zeros(num_tokens, dtype=torch.long)
+        device_indices = torch.zeros(num_tokens, dtype=torch.long, device=device)
+
+        # Run the ACTUAL transfer methods so the warmed HLOs == the served HLOs.
+        host_pool.load_to_device_all(
+            device_pool, host_indices, device_indices, "torch_tpu"
+        )
+        host_pool.backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, "torch_tpu"
+        )
+
+        num_buckets += 1
+        n <<= 1
+
+    logger.info(
+        "[kv-offload warmup] pre-compiled reload/backup HLOs for %d pow2 block "
+        "buckets (<= %d blocks) in %.1fs.",
+        num_buckets,
+        max_blocks,
+        time.perf_counter() - start,
+    )
+
+
 class CompiledForwardShim:
     """Adapt compiled forward calls and outputs for padded execution."""
 
@@ -143,6 +203,13 @@ class CompiledForwardShim:
         self._model_label = model_label
 
     def __call__(self, input_ids, positions, forward_batch, *args, **kwargs):
+        # HiCache reload no-stale gate: the producer's reload scatters aren't in the traced graph, so wait until they've landed before launching.
+        # TODO: rename layer_transfer_counter to transfer_counter or similar after integrating to upstream as it represents different things on tpu and other hardware backends.
+        pool = getattr(forward_batch, "token_to_kv_pool", None)
+        counter = getattr(pool, "layer_transfer_counter", None)
+        if counter is not None:
+            counter.wait()
+
         if self._default_kwargs and kwargs:
             # Dynamo treats omitted kwargs and explicit defaults as
             # different call shapes; drop explicit default values.
