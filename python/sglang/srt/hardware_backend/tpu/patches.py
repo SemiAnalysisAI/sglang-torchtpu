@@ -581,82 +581,6 @@ def _patch_req_to_token_pool_max_context_len() -> None:
     ReqToTokenPool.__init__ = wrapped_init
 
 
-# Active attention backend name. Set from two places:
-#   1. ``TpuSRTPlatform.apply_server_args_defaults`` — covers the parent
-#      process (tokenizer manager / engine) that finalises ``ServerArgs``.
-#   2. ``monkey_patch_torch_tpu_env`` in ``utils/patch_torch.py`` — covers
-#      each spawned scheduler child. ``apply_tpu_patches`` runs at
-#      model_runner module import time (long before the child reaches
-#      ``run_scheduler_process``), and ``mp.Process`` does not propagate
-#      module-level globals to children, so the child has to repopulate
-#      this and re-trigger the swap before ``ModelRunner._init_pools``.
-_active_attention_backend: str | None = None
-
-
-def set_active_attention_backend(name: str | None) -> None:
-    """Record the resolved attention backend so later patches can branch on it.
-
-    Called from :meth:`TpuSRTPlatform.apply_server_args_defaults` once the
-    backend has been resolved (either from ``--attention-backend`` or the
-    platform default). Idempotent; last write wins.
-    """
-    global _active_attention_backend
-    _active_attention_backend = name
-
-
-_mha_kv_pool_patched = False
-
-
-def _patch_mha_kv_pool_for_rpa_v3() -> None:
-    """Swap ``MHATokenToKVPool`` for the fused TPU pool when the active
-    attention backend is ``pallas_tpu_rpa_v3``.
-
-    The RPA v3 kernel reads/writes a single fused 5D KV buffer
-    (``[blocks, page_size, num_kv_heads*2 // packing, packing, head_dim]``)
-    that the stock :class:`MHATokenToKVPool` does not produce. Rather than
-    edit ``model_runner_kv_cache_mixin._init_pools`` (upstream code), we
-    rebind the ``MHATokenToKVPool`` symbol *in that module's namespace* to
-    :class:`TpuFusedMHATokenToKVPool` — the existing ``pool_cls = ...
-    MHATokenToKVPool`` lookup will resolve to the fused variant. This
-    matches the rest of this file's "patch around upstream" convention.
-
-    When the active backend is the flash variant (``pallas_tpu_flash``,
-    PR #5's design), the upstream pool is the correct one and no swap is
-    performed. The flash backend reads K and V via the standard
-    ``get_key_buffer`` / ``get_value_buffer`` accessors against that layout
-    and would silently mis-read the fused buffer if we swapped it in.
-
-    Ordering: depends on ``set_active_attention_backend`` having been
-    called first. ``apply_tpu_patches`` is invoked from
-    ``TpuSRTPlatform.init_backend`` (model_runner.py:237, module-import
-    time), which runs *after* ``apply_server_args_defaults`` has resolved
-    the backend name, so the flag is reliably populated by then.
-    """
-    global _mha_kv_pool_patched
-    if _mha_kv_pool_patched:
-        return
-
-    if _active_attention_backend != "pallas_tpu_rpa_v3":
-        # No swap needed for flash or torch_native. Leave the patched flag
-        # false so a later re-run (e.g. spawned worker that resolves a
-        # different backend) can still apply the swap if it lands on RPA v3.
-        return
-
-    _mha_kv_pool_patched = True
-
-    import sglang.srt.model_executor.model_runner_kv_cache_mixin as mix
-    from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
-
-    if mix.MHATokenToKVPool is TpuFusedMHATokenToKVPool:
-        return
-
-    mix.MHATokenToKVPool = TpuFusedMHATokenToKVPool
-    logger.info(
-        "TPU: swapped MHATokenToKVPool -> TpuFusedMHATokenToKVPool for the "
-        "pallas_tpu_rpa_v3 attention backend (fused 5D KV layout)."
-    )
-
-
 def apply_tpu_patches(world_size: int = 1) -> None:
     _prepare_tpu_env(world_size)
     _configure_eager_mode()
@@ -667,6 +591,5 @@ def apply_tpu_patches(world_size: int = 1) -> None:
     _patch_torch_native_attn_backend()
     _patch_support_triton_for_tpu()
     _patch_req_to_token_pool_max_context_len()
-    _patch_mha_kv_pool_for_rpa_v3()
     _register_aten_fallbacks()
     logger.info("TPU patches applied.")

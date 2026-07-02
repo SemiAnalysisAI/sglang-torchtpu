@@ -72,10 +72,7 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     def apply_server_args_defaults(self, server_args) -> None:
-        from sglang.srt.hardware_backend.tpu.patches import (
-            _prepare_tpu_env,
-            set_active_attention_backend,
-        )
+        from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
 
         _prepare_tpu_env(server_args.tp_size)
 
@@ -84,11 +81,6 @@ class TpuSRTPlatform(SRTPlatform):
 
         if server_args.attention_backend is None:
             server_args.attention_backend = self.get_default_attention_backend()
-
-        # Record for ``_patch_mha_kv_pool_for_rpa_v3``: the pool swap runs at
-        # model_runner module import (well after this point) and needs to
-        # know which TPU Pallas variant the server resolved to.
-        set_active_attention_backend(server_args.attention_backend)
 
         server_args.disable_cuda_graph = True
         server_args.disable_piecewise_cuda_graph = True
@@ -167,6 +159,19 @@ class TpuSRTPlatform(SRTPlatform):
         return TpuGraphRunner
 
     def get_mha_kv_pool_cls(self) -> type:
+        # RPA v3 uses the fused 5D KV layout; pallas_tpu_flash and torch_native
+        # read the flat MHATokenToKVPool. Pick per the resolved attention backend
+        # — it's on the (scheduler-child) global server args by pool-creation
+        # time (set in ModelRunner.__init__, before _init_pools).
+        from sglang.srt.server_args import get_global_server_args
+
+        if get_global_server_args().attention_backend == "pallas_tpu_rpa_v3":
+            from sglang.srt.hardware_backend.tpu.kv_pool import (
+                TpuFusedMHATokenToKVPool,
+            )
+
+            return TpuFusedMHATokenToKVPool
+
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
         return MHATokenToKVPool

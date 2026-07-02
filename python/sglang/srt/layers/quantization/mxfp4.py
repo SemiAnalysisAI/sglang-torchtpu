@@ -52,6 +52,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_tpu,
     is_triton_kernels_available,
     mxfp_supported,
     next_power_of_2,
@@ -479,6 +480,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, triton_kernels_padding_alignment
             )
+        elif is_tpu():
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, mxfp4_block
+            )
 
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
 
@@ -573,6 +578,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self._fi_kernel == "cutlass_sm90":
             self._process_weights_for_sm90_cutlass(layer)
+            return
+        if is_tpu():
+            from sglang.srt.layers.quantization.mxfp4_tpu_util import (
+                prepare_tpu_mxfp4_moe_weights,
+            )
+
+            prepare_tpu_mxfp4_moe_weights(layer)
             return
         if self.use_flashinfer:
             # TODO: these values are hardcoded for now, we need to get them from the model
@@ -1104,6 +1116,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        # TODO(qinghan): once the packed-FP4 fast path lands, gate this on a
+        # config flag instead of unconditionally taking the BF16 triage path.
+        if is_tpu():
+            # TODO(qinghan): support native packed-MXFP4 here
+            from sglang.srt.layers.quantization.unquant import (
+                UnquantizedFusedMoEMethod,
+            )
+
+            return UnquantizedFusedMoEMethod.forward_tpu(self, layer, dispatch_output)
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
