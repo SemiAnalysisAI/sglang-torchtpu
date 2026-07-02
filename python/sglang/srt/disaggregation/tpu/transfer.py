@@ -194,17 +194,12 @@ def gather_pages_to_stage_async(layer_buffers, page_indices, pool):
 
 
 def scatter_stage_from_host(layer_buffers, page_indices, layer_blobs, specs, pool):
-    """TPU pooled H2D (#1): one batched ``batch_transfer_h2d`` from pinned+aligned
-    staging into device shards, then scatter into the block positions
-    (index_copy_ on the main thread — donated kv_buffer). The staging buffers are
-    released to the pool afterwards.
+    """H2D scatter via pooled pinned staging: batch_transfer_h2d into device
+    shards, then index_copy_ into the KV pool block positions.
 
-    ``layer_blobs`` is either a list of pre-staged :class:`StageBuf`s — the
-    common case, where the recv thread already copied the wire bytes straight
-    into pinned staging (``conn._recv_layers``), so there is **no copy here** —
-    or raw bytes/memoryviews, in which case we acquire staging and copy into it
-    (used by the on-device unit test). Either way the pinned pool replaces the
-    naive path's per-transfer alloc + ``clone()``."""
+    ``layer_blobs`` is either a list of :class:`StageBuf`s (pre-staged by the
+    recv thread — no copy here) or raw bytes/memoryviews (acquire staging and
+    copy). Staging buffers are released to the pool when done."""
     from sglang.srt.disaggregation.tpu.host_staging import StageBuf
 
     if len(layer_buffers) == 0:

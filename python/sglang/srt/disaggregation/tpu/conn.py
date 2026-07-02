@@ -95,14 +95,14 @@ def _kv_stats_every() -> int:
 
 
 def _kv_async() -> bool:
-    """#7: issue the prefill D2H asynchronously. Set ``SGLANG_TPU_KV_ASYNC=0`` to fall back to the
+    """issue the prefill D2H asynchronously. Set ``SGLANG_TPU_KV_ASYNC=0`` to fall back to the
     synchronous batched D2H. See gather_pages_to_stage_async for the
     donation-safety reasoning."""
     return os.environ.get("SGLANG_TPU_KV_ASYNC", "1").lower() not in ("0", "", "false")
 
 
 def _kv_channels() -> int:
-    """#3: number of parallel PUSH streams the prefill shards layer frames over
+    """number of parallel PUSH streams the prefill shards layer frames over
     (default **2**). Each TP rank already pushes its own shard on its own
     socket, so the effective stream count is ``tp_size * channels`` — hence a
     small default rather than torchtpu-vllm's per-rank ``tp_size``. Set

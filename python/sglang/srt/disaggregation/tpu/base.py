@@ -224,7 +224,7 @@ class TpuKVManagerBase(CommonKVManager):
             daemon=True,
         ).start()
 
-    def _handle_trsfr(self, msg: List[bytes]) -> None:
+    def _handle_transfer(self, msg: List[bytes]) -> None:
         """Prefill side: a decode signalled it is ready for room R. Record the
         decode's control endpoint and advance to WaitingForInput once every
         expected decode rank has reported. Shared across backends; subclasses
