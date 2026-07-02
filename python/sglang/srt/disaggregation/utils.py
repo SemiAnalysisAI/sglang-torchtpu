@@ -318,6 +318,7 @@ class TransferBackend(Enum):
     MORI = "mori"
     NIXL = "nixl"
     ASCEND = "ascend"
+    TPU = "tpu"
     FAKE = "fake"
 
 
@@ -422,6 +423,23 @@ def get_kv_class(
             KVClassType.SENDER: NixlKVSender,
             KVClassType.RECEIVER: (NixlKVReceiver),
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
+        }
+        return class_mapping.get(class_type)
+    elif transfer_backend == TransferBackend.TPU:
+        from sglang.srt.disaggregation.base import KVArgs
+        from sglang.srt.disaggregation.tpu import (
+            TpuKVBootstrapServer,
+            TpuKVManager,
+            TpuKVReceiver,
+            TpuKVSender,
+        )
+
+        class_mapping = {
+            KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: TpuKVManager,
+            KVClassType.SENDER: TpuKVSender,
+            KVClassType.RECEIVER: (TpuKVReceiver),
+            KVClassType.BOOTSTRAP_SERVER: TpuKVBootstrapServer,
         }
         return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.FAKE:
