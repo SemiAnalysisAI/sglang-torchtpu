@@ -34,7 +34,11 @@ def _configure_eager_mode() -> None:
     from torch_tpu._internal import execution_mode
 
     mode_name = envs.SGLANG_TPU_EAGER_MODE.get()
-    execution_mode.eager_mode = getattr(execution_mode.EagerMode, mode_name)
+    # NOTE: use set_eager_mode(), NOT `execution_mode.eager_mode = ...`.
+    # `eager_mode` is the name of the eager_mode() context-manager function;
+    # overwriting it with an EagerMode value breaks torch_tpu fx_to_mlir
+    # (`with execution_mode.eager_mode(...)`) -> torch.compile(backend=tpu).
+    execution_mode.set_eager_mode(getattr(execution_mode.EagerMode, mode_name))
     logger.info("TorchTPU eager mode set to %s.", mode_name)
 
 
