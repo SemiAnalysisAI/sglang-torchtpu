@@ -244,6 +244,59 @@ class TestSWA(unittest.TestCase):
         result = alloc.translate_loc_from_full_to_swa(index)
         print(result)
 
+    def test_free_swa_tpu_host_mapping_device(self):
+        # Regression: free_swa must align free_index to the SWA mapping device.
+        # On TPU the full_to_swa_index_mapping is host-resident (CPU, via
+        # mapping_device = cpu when _is_tpu) while freed token indices live on
+        # the TPU. free_swa indexed the CPU mapping with TPU indices directly and
+        # raised: indices should be either on cpu or on the same device as the
+        # indexed tensor (cpu). This exercises the real TPU host/device split.
+        if get_device() != "tpu":
+            self.skipTest("TPU-only: host-mapping vs TPU-index device split")
+        size = size_swa = 16
+        page_size = 1
+        num_layers = 48
+        global_interval = 4
+        full_ids = list(range(0, num_layers, global_interval))
+        full_set = set(full_ids)
+        swa_ids = [i for i in range(num_layers) if i not in full_set]
+        pool = SWAKVPool(
+            size=size,
+            size_swa=size_swa,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            head_num=8,
+            head_dim=128,
+            swa_attention_layer_ids=swa_ids,
+            full_attention_layer_ids=full_ids,
+            enable_kvcache_transpose=False,
+            device="tpu",
+        )
+        alloc = SWATokenToKVPoolAllocator(
+            size=size,
+            size_swa=size_swa,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            device="tpu",
+            kvcache=pool,
+            need_sort=False,
+        )
+        # mapping is host-resident (CPU) on TPU -- that is the split that broke.
+        self.assertEqual(str(alloc.full_to_swa_index_mapping.device), "cpu")
+        # Populate two full->swa entries directly (alloc() exercises an
+        # unrelated path); stub the sub-allocator free to isolate free_swa.
+        alloc.full_to_swa_index_mapping[torch.tensor([2, 3])] = torch.tensor([5, 6])
+        freed = []
+        alloc.swa_attn_allocator.free = lambda idx: freed.append(idx)
+        # Freed token indices come from the TPU; free_swa must align devices
+        # before indexing the host mapping (was: cpu/tpu index mismatch).
+        free_index = torch.tensor([2, 3], device="tpu")
+        alloc.free_swa(free_index)  # must not raise
+        self.assertEqual(
+            alloc.full_to_swa_index_mapping[torch.tensor([2, 3])].tolist(), [0, 0]
+        )
+        self.assertTrue(freed and sorted(freed[0].tolist()) == [5, 6])
+
     def test_swa_radix_cache_1(self):
         # args
         req_size = 10
