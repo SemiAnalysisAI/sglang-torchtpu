@@ -581,6 +581,18 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if forward_batch.forward_mode.is_idle():
+            # An IDLE batch (dp-attention rank with no tokens this step) is
+            # padded to a positive batch size for the DP collectives, but its
+            # attention metadata describes zero real tokens; the paged-KV
+            # gather kernel asserts on an empty range. The attention output
+            # of an idle rank is never consumed (its DP-gather contribution
+            # is zero-scaled), so return zeros instead of running the kernel.
+            return torch.zeros(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                dtype=q.dtype,
+                device=q.device,
+            )
         assert self.forward_metadata is not None, (
             "Pallas attention backend was not initialised for this forward pass; "
             "did you forget to call init_forward_metadata()?"

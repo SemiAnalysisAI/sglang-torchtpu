@@ -100,11 +100,11 @@ class _DpGatheredBufferWrapper:
     _hidden_size: int
     _dtype: torch.dtype
     _device: torch.device
-    _global_dp_buffer_len: int
-    _local_dp_buffer_len: int
-    _dp_max_padding: bool
-    _global_num_tokens: Optional[List[int]]
-    _is_extend_in_batch: bool
+    _global_dp_buffer_len: int = 0
+    _local_dp_buffer_len: int = 0
+    _dp_max_padding: bool = False
+    _global_num_tokens: Optional[List[int]] = None
+    _is_extend_in_batch: bool = False
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -389,12 +389,29 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
     dp_rank = get_attention_dp_rank()
 
     if forward_batch.dp_local_start_pos is None:
-        cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
-        if dp_rank == 0:
-            local_start_pos = torch.zeros_like(cumtokens[0])
+        gnt = forward_batch.global_num_tokens_gpu
+        if gnt.device.type == "tpu":
+            # Rank-uniform form of the rank-conditional branch below: every
+            # rank builds the same graph and reads its own slot through a
+            # runtime rank-index tensor. With a baked-in python dp_rank the
+            # ranks compile structurally different programs (rank 0 folds the
+            # start position to a constant zero), and XLA then fuses/rounds
+            # the surrounding bf16 ops differently per rank, so identical
+            # inputs stop producing identical outputs across the DP groups.
+            cumtokens = torch.cumsum(gnt, dim=0)
+            padded = torch.cat([torch.zeros_like(cumtokens[:1]), cumtokens])
+            idx = forward_batch.tpu_dp_rank_idx
+            if idx is None:
+                idx = _dp_rank_index_tensor(gnt.device)
+            local_start_pos = padded.index_select(0, idx).squeeze(0)
+            local_num_tokens = gnt.index_select(0, idx).squeeze(0)
         else:
-            local_start_pos = cumtokens[dp_rank - 1]
-        local_num_tokens = forward_batch.global_num_tokens_gpu[dp_rank]
+            cumtokens = torch.cumsum(gnt, dim=0)
+            if dp_rank == 0:
+                local_start_pos = torch.zeros_like(cumtokens[0])
+            else:
+                local_start_pos = cumtokens[dp_rank - 1]
+            local_num_tokens = gnt[dp_rank]
 
         forward_batch.dp_local_start_pos = local_start_pos
         forward_batch.dp_local_num_tokens = local_num_tokens
@@ -450,6 +467,27 @@ def prod(x):
 
 
 def memcpy_triton(dst, src, dim, offset, sz, offset_src):
+    assert dim == 0, "dim != 0 unsupported"
+    if not (dst.device.type == "tpu" or src.device.type == "tpu"):
+        _memcpy_triton_impl(dst, src, dim, offset, sz, offset_src)
+        return
+    n_dst = dst.shape[0]
+    n_src = src.shape[0]
+    view_shape = (-1,) + (1,) * (dst.dim() - 1)
+    row = torch.arange(n_dst, device=dst.device)
+    if offset_src:
+        src_idx = torch.clamp(offset + row, 0, n_src - 1)
+        gathered = src.index_select(0, src_idx)
+        mask = (row < sz).reshape(view_shape)
+        dst.copy_(torch.where(mask, gathered, torch.zeros_like(dst)))
+    else:
+        src_idx = torch.clamp(row - offset, 0, n_src - 1)
+        gathered = src.index_select(0, src_idx)
+        mask = ((row >= offset) & (row < offset + sz)).reshape(view_shape)
+        dst.copy_(torch.where(mask, gathered, dst))
+
+
+def _memcpy_triton_impl(dst, src, dim, offset, sz, offset_src):
     max_size = min(src.numel(), dst.numel())
     assert dim == 0, "dim != 0 unsupported"
     assert src.shape[1:] == dst.shape[1:], "src and dst must have same shape"
@@ -468,6 +506,27 @@ def _dp_gather_via_all_reduce(
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
+    if global_tokens.device.type == "tpu":
+        # Functional form of the fill_/memcpy/in-place-all-reduce sequence
+        # below, ending in a single copy_ into the caller's buffer. The
+        # persistent gather buffer lives across steps; chaining several
+        # in-place mutations on it inside the compiled region lets a read
+        # bind to a stale version of the buffer (the reduce then sums fresh
+        # rows with the previous step's contents), so all intermediate
+        # values here are fresh functional tensors.
+        scale = 1.0 if is_partial else _attn_rank0_scale(local_tokens)
+        contrib = torch.zeros_like(global_tokens)
+        if local_tokens.shape[0] > 0:
+            n_dst = global_tokens.shape[0]
+            row = torch.arange(n_dst, device=global_tokens.device)
+            src_idx = torch.clamp(row - local_start_pos, 0, local_tokens.shape[0] - 1)
+            gathered = (local_tokens * scale).index_select(0, src_idx)
+            mask = (
+                (row >= local_start_pos) & (row < local_start_pos + local_num_tokens)
+            ).reshape((-1,) + (1,) * (global_tokens.dim() - 1))
+            contrib = torch.where(mask, gathered, contrib)
+        global_tokens.copy_(tensor_model_parallel_all_reduce(contrib))
+        return
     global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
@@ -506,8 +565,26 @@ def _dp_gather_via_all_gather(
         return
 
     if not is_partial:
-        if get_attention_tp_rank() != 0:
+        if local_tokens.device.type == "tpu":
+            # Rank-uniform form of the fill_(0) below; see
+            # _dp_gather_via_all_reduce for why the rank conditional cannot
+            # appear in the compiled graph.
+            local_tokens = local_tokens * _attn_rank0_scale(local_tokens)
+        elif get_attention_tp_rank() != 0:
             local_tokens.fill_(0)
+    if global_tokens.device.type == "tpu":
+        # Same functional rewrite as _dp_gather_via_all_reduce: collective
+        # outputs land in fresh tensors (no view aliasing into local_tokens,
+        # no in-place write into the persistent buffer until the final
+        # copy_).
+        scattered = torch.empty_like(
+            local_tokens.tensor_split(get_attention_tp_size())[0]
+        )
+        get_attention_tp_group().reduce_scatter_tensor(scattered, local_tokens)
+        gathered_out = torch.empty_like(global_tokens)
+        get_tp_group().all_gather_into_tensor(gathered_out, scattered)
+        global_tokens.copy_(gathered_out)
+        return
     scattered_local_tokens = local_tokens.tensor_split(get_attention_tp_size())[
         get_attention_tp_rank()
     ]
@@ -521,7 +598,10 @@ def _dp_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    if forward_batch.dp_padding_mode.is_max_len():
+    # Enum comparison instead of the is_max_len() helper: this function is
+    # traced under torch.compile on TPU, and dynamo cannot wrap bound enum
+    # methods.
+    if forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN:
         _dp_gather_via_all_gather(
             global_tokens, local_tokens, forward_batch, is_partial
         )
@@ -560,9 +640,12 @@ def dp_scatter(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between local_tokens and global_tokens not allowed"
+        if local_tokens.device.type != "tpu":
+            # untyped_storage() is host-only; the TPU path traces this
+            # function under torch.compile, where it cannot run.
+            assert (
+                local_tokens.untyped_storage() is not global_tokens.untyped_storage()
+            ), "aliasing between local_tokens and global_tokens not allowed"
 
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
@@ -627,3 +710,21 @@ def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
+
+
+@functools.lru_cache(maxsize=None)
+def _attn_rank_scale_cached(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    return torch.tensor(
+        1.0 if get_attention_tp_rank() == 0 else 0.0, device=device, dtype=dtype
+    )
+
+
+def _attn_rank0_scale(ref: torch.Tensor) -> torch.Tensor:
+    """0/1 device scalar: 1 on attn-TP rank 0, 0 elsewhere."""
+    return _attn_rank_scale_cached(ref.device, ref.dtype)
+
+
+@functools.lru_cache(maxsize=None)
+def _dp_rank_index_tensor(device: torch.device) -> torch.Tensor:
+    """This rank's attention-DP rank as a device tensor for uniform indexing."""
+    return torch.tensor([get_attention_dp_rank()], device=device, dtype=torch.int64)

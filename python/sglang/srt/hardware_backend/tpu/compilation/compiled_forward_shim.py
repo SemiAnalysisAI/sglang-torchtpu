@@ -96,7 +96,29 @@ def _pad_forward_batch_inputs(
     real_q = forward_batch.input_ids.shape[0]
     real_b = forward_batch.seq_lens.shape[0]
 
-    if is_decode:
+    gnt = forward_batch.global_num_tokens_cpu
+    if gnt is not None and len(gnt) > 1:
+        # DP attention: the slice launches one program, so every rank must
+        # pad to shapes derived from the same synced values, not from its
+        # local batch. A group that padded only to its local count would
+        # compile e.g. a 1024-token program while its peer compiles an
+        # 8-token one, and the in-graph collectives between them never
+        # match (device stall) or mismatch silently.
+        pad_target = max(real_q, max(gnt))
+        pad_t = (
+            b_bucketer if pad_target <= b_bucketer.max_val else t_bucketer
+        ).next_bucket(pad_target)
+        pad_b_target = real_b
+        gbs = forward_batch.global_batch_sizes_cpu
+        gl = forward_batch.global_num_tokens_for_logprob_cpu
+        if gbs is not None and len(gbs) > 1:
+            pad_b_target = max(pad_b_target, max(gbs))
+        elif gl is not None and len(gl) > 1:
+            # Fallback: logprob token counts are synced and >= the group's
+            # batch size (every running sequence contributes at least one).
+            pad_b_target = max(pad_b_target, max(gl))
+        pad_b = b_bucketer.next_bucket(pad_b_target)
+    elif is_decode:
         pad_t = b_bucketer.next_bucket(real_q)
         pad_b = b_bucketer.next_bucket(real_b)
     else:
@@ -222,6 +244,18 @@ class CompiledForwardShim:
                     and _matches_default(v, self._default_kwargs[k])
                 )
             }
+        from sglang.srt.layers.dp_attention import (
+            _dp_rank_index_tensor,
+            get_attention_dp_size,
+        )
+
+        if get_attention_dp_size() > 1 and forward_batch.input_ids is not None:
+            # The DP rank index must reach the compiled graph as a runtime
+            # tensor input; traced as a python constant it bakes a different
+            # program per rank (see get_dp_local_info).
+            forward_batch.tpu_dp_rank_idx = _dp_rank_index_tensor(
+                forward_batch.input_ids.device
+            )
         out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
 
         real_q = getattr(forward_batch, _REAL_Q_KEY, None)

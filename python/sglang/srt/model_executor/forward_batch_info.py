@@ -383,12 +383,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    # Per-DP-group running batch sizes from the MLP sync gather.
+    global_batch_sizes_cpu: Optional[List[int]] = None
     # The padding mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
     # for extend, local start pos and num tokens is different in logits processor
     # this will be computed in get_dp_local_info
     # this will be recomputed in LogitsMetadata.from_forward_batch
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
+    # This rank's attention-DP rank as a device tensor. Supplied by the host
+    # each step so compiled graphs read it as a runtime input instead of a
+    # baked constant (which would make the programs differ across ranks).
+    tpu_dp_rank_idx: Optional[torch.Tensor] = None
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
     is_extend_in_batch: bool = False
@@ -590,6 +596,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
                 global_num_tokens_for_logprob, dtype=torch.int64
             ).to(device, non_blocking=True)
+            ret.global_batch_sizes_cpu = getattr(batch, "global_batch_sizes", None)
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -915,6 +922,32 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         for i in range(sync_group_size):
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)
 
+        # TPU: the compiled_forward_shim pads token tensors to its compile
+        # bucket. Size the DP gather/scatter buffers to the same bucket so
+        # the (shim-padded) hidden/residual and the DP buffers agree across
+        # layers; otherwise they mismatch (e.g. 8 vs 1024) at the next
+        # layer's layernorm. Mirrors the shim's own pad_t formula.
+        _shim = getattr(model_runner, "compiled_forward_shim", None)
+        if _shim is not None:
+            # Every slot pads to the same bucket (the global max): the slice
+            # launches one program, so each rank's local tensors and its DP
+            # buffer slice must have the shape the busiest group compiles.
+            _t = max(global_num_tokens)
+            _t = (
+                _shim.b_bucketer.next_bucket(_t)
+                if _t <= _shim.b_bucketer.max_val
+                else _shim.t_bucketer.next_bucket(_t)
+            )
+            for i in range(sync_group_size):
+                global_num_tokens[i] = _t
+            # The logprob token counts size the logits DP gather the same
+            # way global_num_tokens sizes the hidden-state buffers; every
+            # slot must use one shared value or the two groups compile and
+            # run different programs whenever one side is idle.
+            _lt = max(max(self.global_num_tokens_for_logprob_cpu), 1)
+            for i in range(sync_group_size):
+                self.global_num_tokens_for_logprob_cpu[i] = _lt
+
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )
@@ -978,6 +1011,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_cpu = global_num_tokens
         global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
         self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
+        if getattr(model_runner, "compiled_forward_shim", None) is not None:
+            self.global_num_tokens_gpu.tolist()  # commit DP metadata before compiled forward (cf. PR #100)
+        if (
+            getattr(model_runner, "compiled_forward_shim", None) is not None
+            and self.global_num_tokens_for_logprob_gpu is not None
+        ):
+            _lp_pinned = torch.tensor(
+                self.global_num_tokens_for_logprob_cpu, pin_memory=True
+            )
+            self.global_num_tokens_for_logprob_gpu.copy_(_lp_pinned, non_blocking=True)
+            self.global_num_tokens_for_logprob_gpu.tolist()
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker

@@ -3154,6 +3154,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
 
+        if (
+            getattr(self, "compiled_forward_shim", None) is not None
+            and self.server_args.enable_dp_attention
+        ):
+            _tpu_coerce_dp_attention_batch(forward_batch)
+
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = (
@@ -3520,3 +3526,70 @@ class LocalSerializedTensor:
 
     def get(self, rank: int):
         return MultiprocessingSerializer.deserialize(self.values[rank])
+
+
+# Any valid vocab id works for the idle-rank dummy token; its output is never
+# consumed (the rank's DP-gather contribution is zero-scaled).
+_TPU_IDLE_DUMMY_TOKEN_ID = 785
+
+
+def _tpu_coerce_dp_attention_batch(forward_batch: ForwardBatch) -> None:
+    """Coerce every dp-attention forward to a single MIXED program shape.
+
+    The TPU runtime launches one XLA program across all chips of the slice;
+    a step in which the two DP groups dispatch different compiled programs
+    (prefill vs decode vs idle, or differently padded shapes) never assembles
+    a launch and stalls the device. Representing decode requests as 1-token
+    extends and an idle rank as a single dummy extend keeps the traced
+    program kind identical on every rank; the compile shim's padding then
+    makes the shapes identical as well.
+    """
+    mode = forward_batch.forward_mode
+    device = forward_batch.input_ids.device
+    if mode.is_extend() and not mode.is_draft_extend():
+        # Real extends already carry full extend metadata; MIXED is the same
+        # program family. Every dp-attention step must run one program kind on
+        # both groups (see the decode/idle coercions below), so prefills join
+        # the MIXED family as well.
+        forward_batch.forward_mode = ForwardMode.MIXED
+        return
+    if mode.is_decode() and os.environ.get("SGLANG_TPU_COERCE_DECODE", "1") == "1":
+        bs = forward_batch.seq_lens.shape[0]
+        forward_batch.forward_mode = ForwardMode.MIXED
+        forward_batch.extend_seq_lens = torch.ones(bs, dtype=torch.int32, device=device)
+        forward_batch.extend_prefix_lens = (forward_batch.seq_lens - 1).to(torch.int32)
+        forward_batch.extend_start_loc = torch.arange(
+            bs, dtype=torch.int32, device=device
+        )
+        forward_batch.extend_num_tokens = bs
+        forward_batch.extend_seq_lens_cpu = [1] * bs
+        if forward_batch.seq_lens_cpu is not None:
+            forward_batch.extend_prefix_lens_cpu = [
+                int(v) - 1 for v in forward_batch.seq_lens_cpu
+            ]
+    elif mode.is_idle() and os.environ.get("SGLANG_TPU_COERCE_IDLE", "1") == "1":
+        forward_batch.forward_mode = ForwardMode.MIXED
+        forward_batch.batch_size = 1
+        forward_batch.input_ids = torch.full(
+            (1,), _TPU_IDLE_DUMMY_TOKEN_ID, dtype=torch.int64, device=device
+        )
+        forward_batch.positions = torch.zeros(1, dtype=torch.int64, device=device)
+        forward_batch.seq_lens = torch.ones(1, dtype=torch.int64, device=device)
+        forward_batch.seq_lens_cpu = torch.ones(1, dtype=torch.int64)
+        forward_batch.seq_lens_sum = 1
+        forward_batch.req_pool_indices = torch.zeros(
+            1, dtype=torch.int64, device=device
+        )
+        # KV for the dummy token lands in slot 0, the pad slot the pool
+        # reserves in front of the allocatable region.
+        forward_batch.out_cache_loc = torch.zeros(1, dtype=torch.int64, device=device)
+        forward_batch.extend_seq_lens = torch.ones(1, dtype=torch.int32, device=device)
+        forward_batch.extend_prefix_lens = torch.zeros(
+            1, dtype=torch.int32, device=device
+        )
+        forward_batch.extend_start_loc = torch.zeros(
+            1, dtype=torch.int32, device=device
+        )
+        forward_batch.extend_num_tokens = 1
+        forward_batch.extend_seq_lens_cpu = [1]
+        forward_batch.extend_prefix_lens_cpu = [0]

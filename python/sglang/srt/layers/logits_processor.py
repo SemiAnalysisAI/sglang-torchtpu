@@ -141,6 +141,7 @@ class LogitsMetadata:
     # Number of tokens to sample per DP rank
     global_num_tokens_for_logprob_cpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    tpu_dp_rank_idx: Optional[torch.Tensor] = None
     # The gather mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
     # for padding
@@ -200,23 +201,38 @@ class LogitsMetadata:
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
+            tpu_dp_rank_idx=forward_batch.tpu_dp_rank_idx,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
         )
 
     def compute_dp_attention_metadata(self):
 
-        cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
+        gnt = self.global_num_tokens_for_logprob_gpu
+        cumtokens = torch.cumsum(gnt, dim=0)
         dp_rank = get_attention_dp_rank()
-        if dp_rank == 0:
-            dp_local_start_pos = torch.zeros_like(
-                self.global_num_tokens_for_logprob_gpu[0]
-            )
+        if gnt.device.type == "tpu":
+            # Rank-uniform form of the rank-conditional branch below; see
+            # get_dp_local_info in dp_attention.py. Every rank builds the same
+            # graph and reads its own slot through a runtime rank-index
+            # tensor, so all ranks compile (and round) identically.
+            from sglang.srt.layers.dp_attention import _dp_rank_index_tensor
+
+            padded = torch.cat([torch.zeros_like(cumtokens[:1]), cumtokens])
+            idx = self.tpu_dp_rank_idx
+            if idx is None:
+                idx = _dp_rank_index_tensor(gnt.device)
+            dp_local_start_pos = padded.index_select(0, idx).squeeze(0)
+            dp_local_num_tokens = gnt.index_select(0, idx).squeeze(0)
+        elif dp_rank == 0:
+            dp_local_start_pos = torch.zeros_like(gnt[0])
+            dp_local_num_tokens = gnt[dp_rank]
         else:
             dp_local_start_pos = cumtokens[dp_rank - 1]
+            dp_local_num_tokens = gnt[dp_rank]
 
         self.dp_local_start_pos = dp_local_start_pos
-        self.dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
+        self.dp_local_num_tokens = dp_local_num_tokens
 
         hidden_size = get_dp_hidden_size()
         dtype = get_dp_dtype()

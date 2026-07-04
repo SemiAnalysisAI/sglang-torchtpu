@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import functools
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
@@ -707,7 +709,9 @@ class LayerCommunicator:
         ):
             if should_use_dp_reduce_scatterv():
                 return True
-            if forward_batch.dp_padding_mode.is_max_len():
+            # Enum comparison: traced under torch.compile on TPU, and
+            # dynamo cannot wrap bound enum methods.
+            if forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN:
                 return True
         if nsa_use_prefill_cp(forward_batch):
             return True
@@ -982,6 +986,18 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     disabled=not is_allocation_symmetric(),
                 ):
                     hidden_states, residual = layernorm(hidden_states, residual)
+            elif hidden_states.device.type == "tpu":
+                # Rank-uniform form of the attn_tp_rank==0 residual add below:
+                # under torch.compile the rank conditional bakes different
+                # graphs per rank, and torch_tpu's lowering then folds away
+                # collectives on the ranks whose branch is absent, which
+                # desynchronizes the in-graph collective schedule across the
+                # attention group. Scaling by a runtime 0/1 tensor keeps the
+                # graph identical on every rank while only attn_tp_rank 0
+                # contributes the residual to the partial sum.
+                hidden_states = hidden_states + residual * _attn_rank0_scale(
+                    hidden_states
+                )
             elif context.attn_tp_rank == 0:
                 hidden_states += residual
 
@@ -1228,7 +1244,10 @@ class CommunicateSummableTensorPairFn:
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),
             )
-        elif allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
+        elif (
+            allow_reduce_scatter
+            and forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN
+        ):
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
@@ -1316,3 +1335,17 @@ class CommunicateSummableTensorPairFn:
             hidden_states = hidden_states_output
 
         return hidden_states, residual
+
+
+@functools.lru_cache(maxsize=None)
+def _attn_rank0_scale_cached(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    from sglang.srt.layers.dp_attention import get_attention_tp_rank
+
+    return torch.tensor(
+        1.0 if get_attention_tp_rank() == 0 else 0.0, device=device, dtype=dtype
+    )
+
+
+def _attn_rank0_scale(ref: torch.Tensor) -> torch.Tensor:
+    """0/1 device scalar selecting the attn-TP rank-0 residual contribution."""
+    return _attn_rank0_scale_cached(ref.device, ref.dtype)

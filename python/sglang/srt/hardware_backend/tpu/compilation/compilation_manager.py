@@ -67,6 +67,17 @@ class CompilationManager:
 
     def precompile_all(self) -> None:
         """Run precompilation for all valid extend and decode bucket shapes."""
+        if getattr(self.model_runner.server_args, "enable_dp_attention", False):
+            # Precompile dummy batches carry no synced DP metadata
+            # (global_num_tokens), so under dp-attention they would trace
+            # programs without the DP collectives and at shapes the serving
+            # path never uses. Compile lazily from real (synced) batches
+            # instead.
+            logger.warning(
+                "[compilation manager] dp-attention enabled: skipping static "
+                "precompile; shapes compile lazily on first use."
+            )
+            return
         overall = time.perf_counter()
         self._precompile_extend()
         self._precompile_decode()
