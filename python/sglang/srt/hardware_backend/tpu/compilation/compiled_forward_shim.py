@@ -32,8 +32,11 @@ logger = get_logger(__name__)
 
 DEFAULT_TPU_COMPILE_MAX_BS = 64
 
-# Fields whose token dim gets padded to the token bucket.
-_TOKEN_FIELDS = ("input_ids", "positions")
+# Fields whose token dim gets padded to the token bucket. out_cache_loc must be
+# padded too so backends that write KV inside the compiled forward
+# (v_cache[out_cache_loc] = v) see matching token counts; zero-pad is safe
+# because KV slot 0 is the reserved dummy-padding slot (allocator_tpu.py).
+_TOKEN_FIELDS = ("input_ids", "positions", "out_cache_loc")
 
 # Fields whose batch dim gets padded to the bs bucket.
 _BS_FIELDS = (
