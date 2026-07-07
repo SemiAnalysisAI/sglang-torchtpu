@@ -100,6 +100,14 @@ def _pad_forward_batch_inputs(
     if is_decode:
         pad_t = b_bucketer.next_bucket(real_q)
         pad_b = b_bucketer.next_bucket(real_b)
+    elif (
+        forward_batch.forward_mode.is_target_verify()
+        and forward_batch.spec_info is not None
+    ):
+        # Verify is decode-like: batch follows the bs bucket (not pinned to the
+        # cap), with a fixed draft_token_num query tokens per request.
+        pad_b = b_bucketer.next_bucket(real_b)
+        pad_t = pad_b * forward_batch.spec_info.draft_token_num
     else:
         # Prefill/extend is precompiled at a fixed batch cap to avoid compiling
         # the full token_bucket x batch_bucket cross product.
@@ -133,6 +141,18 @@ def _pad_forward_batch_inputs(
     mm_inputs = getattr(forward_batch, "mm_inputs", None)
     if isinstance(mm_inputs, list) and len(mm_inputs) < pad_b:
         forward_batch.mm_inputs = mm_inputs + [None] * (pad_b - len(mm_inputs))
+
+    # Pad spec_info tensors whose token dim must match input_ids after padding
+    # (spec target verify/extend feeds spec_info.hidden_states through the
+    # compiled forward). Guarded so non-spec runs are unaffected.
+    spec_info = forward_batch.spec_info
+    if spec_info is not None:
+        hs = getattr(spec_info, "hidden_states", None)
+        if isinstance(hs, torch.Tensor) and hs.ndim >= 1 and hs.shape[0] < pad_t:
+            pad_rows = pad_t - hs.shape[0]
+            spec_info.hidden_states = F.pad(
+                hs, (0,) * (2 * (hs.ndim - 1)) + (0, pad_rows)
+            )
 
     forward_batch.batch_size = pad_b
 
@@ -298,12 +318,28 @@ def resolve_compile_caps(
     return min(candidates), max_b
 
 
-def build_bucketers(server_args: Any, max_t: int, max_b: int) -> tuple[Bucketer, Bucketer]:
+def build_bucketers(
+    server_args: Any, max_t: int, max_b: int
+) -> tuple[Bucketer, Bucketer]:
     """Build token and batch size bucketers."""
     token_paddings = server_args.tpu_compile_tokens
     if token_paddings:
+        # Token buckets are consumed only by the EXTEND path, and extend never
+        # runs longer than max_t (= min(chunked_prefill_size, max_prefill_tokens,
+        # context_len)). Drop any user buckets above it -- they'd compile dead
+        # shapes that serving can never reach.
+        capped = [t for t in token_paddings if t <= max_t]
+        dropped = [t for t in token_paddings if t > max_t]
+        if dropped:
+            logger.warning(
+                "[compiled forward shim] Dropping --tpu-compile-tokens %s above the "
+                "max extend length %d; extend is capped there (chunked prefill / "
+                "context), so those buckets would never be used.",
+                dropped,
+                max_t,
+            )
         token_bucketer: Bucketer = Bucketer(
-            name="TokenBucketer", buckets=list(token_paddings)
+            name="TokenBucketer", buckets=sorted(capped) or [max_t]
         )
     else:
         token_bucketer = PowerBucketer(

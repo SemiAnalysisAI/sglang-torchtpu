@@ -14,9 +14,9 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
-    CompiledForwardShim,
     _REAL_B_KEY,
     _REAL_Q_KEY,
+    CompiledForwardShim,
     _pad_forward_batch_inputs,
     build_bucketers,
     resolve_compile_caps,
@@ -134,11 +134,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
 
     def install(self) -> bool:
         """Install runtime compile wrappers for the annotated decoder target."""
-        if (
-            self.model_runner is None
-            or self.owner is None
-            or self.method_name is None
-        ):
+        if self.model_runner is None or self.owner is None or self.method_name is None:
             logger.warning(
                 "[decoder compile policy] missing model_runner/owner/method; "
                 "cannot install."
@@ -195,7 +191,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
 
         self.compiled_forward_shim = CompiledForwardShim(compiled, policy=self)
         setattr(self.owner, self.method_name, self.compiled_forward_shim)
-        self.model_runner.compiled_forward_shim = self
+        self.model_runner.compile_policy = self
 
         logger.info(
             "[decoder compile policy] Installed %s on %s.%s "
@@ -422,9 +418,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         """Whether to warm ``target`` via the Qwen3-VL input_embeds path."""
         outer = getattr(self.model_runner, "model", None)
         is_multimodal = hasattr(outer, "get_image_feature")
-        return is_multimodal and callable(
-            getattr(target, "get_input_embeddings", None)
-        )
+        return is_multimodal and callable(getattr(target, "get_input_embeddings", None))
 
     def _precompile_extend(self) -> None:
         if not self._uses_input_embeds(self.owner):
@@ -552,11 +546,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
         call_kwargs: dict[str, Any] = {}
         num_deepstack = self._num_deepstack
-        if (
-            variant == "deepstack"
-            and mode == ForwardMode.EXTEND
-            and num_deepstack > 0
-        ):
+        if variant == "deepstack" and mode == ForwardMode.EXTEND and num_deepstack > 0:
             call_kwargs["input_deepstack_embeds"] = torch.zeros(
                 input_embeds.shape[0],
                 input_embeds.shape[1] * num_deepstack,
@@ -574,9 +564,11 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 "input_ids=None, input_embeds=%s, input_deepstack_embeds=%s",
                 logged_variant,
                 tuple(input_embeds.shape),
-                tuple(call_kwargs["input_deepstack_embeds"].shape)
-                if "input_deepstack_embeds" in call_kwargs
-                else None,
+                (
+                    tuple(call_kwargs["input_deepstack_embeds"].shape)
+                    if "input_deepstack_embeds" in call_kwargs
+                    else None
+                ),
             )
 
         call_kwargs["input_embeds"] = input_embeds
