@@ -14,11 +14,12 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
 ]
 
-# torch_tpu and libtpu are pinned to specific wheels published to a private
-# package server (workload-identity auth on CI; gcloud ADC on dev); see the
-# [[tool.uv.index]] block below. torch and jax[tpu] are installed alongside by
-# scripts/ci/tpu/tpu_ci_install_dependency.sh. Installing this pyproject
-# requires credentials for the torch-tpu virtual registry.
+# torch_tpu is pinned here (plus libtpu, see below); torch/jax/jaxlib are NOT
+# pinned -- they come warm from the torch-tpu-base image at the versions
+# torch_tpu was built against, and torch_tpu's dependency floors keep them
+# consistent. The torch_tpu wheel comes from a private package server
+# (workload-identity auth on CI; gcloud ADC on dev); see the [[tool.uv.index]]
+# block below. Installing this pyproject requires credentials for the registry.
 dependencies = [
   "IPython",
   "aiohttp",
@@ -69,9 +70,18 @@ dependencies = [
   "uvloop",
   "xgrammar==0.2.0",
   "smg-grpc-servicer>=0.5.0",
-  "torch-tpu==0.1.1.dev20260616090158",
-  # Keep libtpu (PJRT runtime) pinned with the torch-tpu wheel. libtpu 0.0.41
-  # regresses GDN compilation with scoped VMEM OOMs in CI.
+  # --- TPU runtime stack ---
+  # Only torch_tpu is pinned here. torch, jax and jaxlib are deliberately NOT
+  # pinned: they come warm from the torch-tpu-base image (docker/tpu.Dockerfile)
+  # at the versions torch_tpu was built/locked against, and torch_tpu's own
+  # dependency floors keep them consistent -- re-pinning them would only risk
+  # fighting the base image. torch_tpu itself is not in the base image, so it is
+  # pinned and pulled from the torch-tpu virtual registry (see [[tool.uv.index]]).
+  # dev20260630090312 is a post-torch-2.11-uprev wheel (torch_tpu moved to torch
+  # 2.11 in commit 66c5996a, 2026-06-16), also the version torchtpu-vllm uses.
+  "torch-tpu==0.1.1.dev20260630090312",
+  # libtpu (PJRT runtime) stays pinned: torch_tpu only floors it at >=0.0.40, and
+  # libtpu 0.0.41 regresses GDN compilation with scoped VMEM OOMs in CI.
   "libtpu==0.0.40",
 ]
 
@@ -98,8 +108,8 @@ test = [
   "tabulate",
 ]
 
-# Mirrors srt_npu / all_npu / dev_npu shape. torch_tpu and libtpu are
-# pinned in `dependencies`; jax[tpu] is installed by the CI script. See header.
+# Mirrors srt_npu / all_npu / dev_npu shape. torch_tpu (and libtpu) are pinned
+# in `dependencies`; torch/jax/jaxlib come from torch-tpu-base. See header.
 srt_tpu = []
 all_tpu = []
 dev_tpu = ["sglang[all_tpu]", "sglang[test]"]
