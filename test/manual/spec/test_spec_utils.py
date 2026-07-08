@@ -469,6 +469,114 @@ class TestAssignDraftCacheLocs(unittest.TestCase):
         )
         torch.testing.assert_close(table, expected)
 
+    def test_oversized_inputs(self):
+        """Input tensors longer than batch_size; trailing entries must be ignored."""
+        device = "cpu"
+        bs, pool_len, topk, steps = 2, 100, 1, 5
+        copy_len = topk * steps
+        # 2 active requests + 1 trailing garbage entry.
+        req_pool_indices = torch.tensor([0, 1, 99], dtype=torch.int32, device=device)
+        req_to_token = torch.zeros((3, pool_len), dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([7, 3, 999], dtype=torch.int32, device=device)
+        # out_cache_loc has room for 3 requests but only 2 should be used.
+        out_cache_loc = torch.arange(
+            100, 100 + 3 * copy_len, device=device, dtype=torch.int32
+        )
+
+        ref_table = req_to_token.clone()
+        self._ref(
+            req_pool_indices[:bs],
+            ref_table,
+            seq_lens[:bs],
+            out_cache_loc[: bs * copy_len],
+            topk,
+            steps,
+            bs,
+        )
+
+        got_table = req_to_token.clone()
+        _assign_draft_cache_locs_torch(
+            req_pool_indices,
+            got_table,
+            seq_lens,
+            None,
+            None,
+            out_cache_loc,
+            None,
+            None,
+            None,
+            0,
+            pool_len,
+            topk,
+            steps,
+            1,
+            bs,
+        )
+
+        torch.testing.assert_close(got_table, ref_table)
+
+    def test_minimal_copy_len(self):
+        """topk=1, steps=1: single slot written per request."""
+        device = "cpu"
+        bs, pool_len, topk, steps = 2, 64, 1, 1
+        copy_len = topk * steps  # 1
+        req_pool_indices = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        req_to_token = torch.zeros((bs, pool_len), dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([10, 20], dtype=torch.int32, device=device)
+        out_cache_loc = torch.tensor([77, 88], dtype=torch.int32, device=device)
+
+        ref_table = req_to_token.clone()
+        self._ref(req_pool_indices, ref_table, seq_lens, out_cache_loc, topk, steps, bs)
+
+        got_table = req_to_token.clone()
+        _assign_draft_cache_locs_torch(
+            req_pool_indices,
+            got_table,
+            seq_lens,
+            None,
+            None,
+            out_cache_loc,
+            None,
+            None,
+            None,
+            0,
+            pool_len,
+            topk,
+            steps,
+            1,
+            bs,
+        )
+
+        torch.testing.assert_close(got_table, ref_table)
+
+    def test_unsupported_page_size_topk(self):
+        """page_size>1 and topk>1 must raise NotImplementedError."""
+        device = "cpu"
+        bs, pool_len, topk, steps, page_size = 1, 64, 2, 3, 4
+        req_pool_indices = torch.tensor([0], dtype=torch.int32, device=device)
+        req_to_token = torch.zeros((1, pool_len), dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([5], dtype=torch.int32, device=device)
+        out_cache_loc = torch.arange(100, 100 + topk * steps, dtype=torch.int32)
+
+        with self.assertRaises(NotImplementedError):
+            _assign_draft_cache_locs_torch(
+                req_pool_indices,
+                req_to_token,
+                seq_lens,
+                None,
+                None,
+                out_cache_loc,
+                None,
+                None,
+                None,
+                0,
+                pool_len,
+                topk,
+                steps,
+                page_size,
+                bs,
+            )
+
 
 class TestAssignReqToTokenPool(unittest.TestCase):
     """Verify _assign_req_to_token_pool_torch against a naive reference loop."""
@@ -525,6 +633,90 @@ class TestAssignReqToTokenPool(unittest.TestCase):
         )
         torch.testing.assert_close(table, expected)
 
+    def test_oversized_inputs(self):
+        """Input tensors longer than batch_size; trailing entries must be ignored."""
+        device = "cpu"
+        batch_size = 2
+        pool_len = 64
+        num_rows = 8
+        # Pad inputs with 3 extra trailing entries that should be ignored.
+        req_pool_indices = torch.tensor([1, 3, 5, 6, 7], dtype=torch.long)
+        start_offset = torch.tensor([2, 4, 99, 99, 99], dtype=torch.long)
+        end_offset = torch.tensor([5, 7, 99, 99, 99], dtype=torch.long)
+        out_cache_loc = torch.tensor([10, 11, 12, 20, 21, 22], dtype=torch.int64)
+
+        ref = torch.full((num_rows, pool_len), -1, dtype=torch.int64)
+        self._ref(
+            req_pool_indices[:batch_size],
+            ref,
+            start_offset[:batch_size],
+            end_offset[:batch_size],
+            out_cache_loc,
+        )
+
+        got = torch.full((num_rows, pool_len), -1, dtype=torch.int64)
+        _assign_req_to_token_pool_torch(
+            req_pool_indices, got, start_offset, end_offset, out_cache_loc, batch_size
+        )
+        torch.testing.assert_close(got, ref)
+
+    def test_zero_length_request(self):
+        """Mixed zero/nonzero lengths: zero-length requests must not write."""
+        device = "cpu"
+        pool_len = 32
+        num_rows = 4
+        req_pool_indices = torch.tensor([1, 2], dtype=torch.long)
+        start_offset = torch.tensor([2, 5], dtype=torch.long)
+        end_offset = torch.tensor([2, 8], dtype=torch.long)
+        out_cache_loc = torch.tensor([20, 21, 22], dtype=torch.int64)
+
+        ref = torch.full((num_rows, pool_len), -1, dtype=torch.int64)
+        self._ref(req_pool_indices, ref, start_offset, end_offset, out_cache_loc)
+
+        got = torch.full((num_rows, pool_len), -1, dtype=torch.int64)
+        _assign_req_to_token_pool_torch(
+            req_pool_indices, got, start_offset, end_offset, out_cache_loc, 2
+        )
+        torch.testing.assert_close(got, ref)
+
+    def test_length_one_per_request(self):
+        """Each request writes exactly 1 token — almost every column is masked."""
+        device = "cpu"
+        batch_size = 4
+        pool_len = 64
+        num_rows = batch_size + 2
+        req_pool_indices = torch.tensor([0, 1, 3, 5], dtype=torch.long)
+        start_offset = torch.tensor([10, 20, 30, 40], dtype=torch.long)
+        end_offset = start_offset + 1
+        out_cache_loc = torch.tensor([500, 501, 502, 503], dtype=torch.int64)
+
+        ref = torch.full((num_rows, pool_len), -1, dtype=torch.int64)
+        self._ref(req_pool_indices, ref, start_offset, end_offset, out_cache_loc)
+
+        got = torch.full((num_rows, pool_len), -1, dtype=torch.int64)
+        _assign_req_to_token_pool_torch(
+            req_pool_indices, got, start_offset, end_offset, out_cache_loc, batch_size
+        )
+        torch.testing.assert_close(got, ref)
+
+    def test_full_row_fill(self):
+        """Single request fills the entire row — no masked padding at all."""
+        device = "cpu"
+        pool_len = 16
+        req_pool_indices = torch.tensor([0], dtype=torch.long)
+        start_offset = torch.tensor([0], dtype=torch.long)
+        end_offset = torch.tensor([pool_len], dtype=torch.long)
+        out_cache_loc = torch.arange(pool_len, dtype=torch.int64)
+
+        ref = torch.full((1, pool_len), -1, dtype=torch.int64)
+        self._ref(req_pool_indices, ref, start_offset, end_offset, out_cache_loc)
+
+        got = torch.full((1, pool_len), -1, dtype=torch.int64)
+        _assign_req_to_token_pool_torch(
+            req_pool_indices, got, start_offset, end_offset, out_cache_loc, 1
+        )
+        torch.testing.assert_close(got, ref)
+
 
 class TestCreateExtendAfterDecodeSpecInfo(unittest.TestCase):
     """Verify _create_extend_after_decode_spec_info_torch against a naive reference."""
@@ -541,21 +733,26 @@ class TestCreateExtendAfterDecodeSpecInfo(unittest.TestCase):
             bonus_tokens[pid] = accept_tokens[offset + accept_len - 1]
             offset += accept_len
 
-    def _run_case(self, seq_vals, accept_vals):
+    def _run_case(self, seq_vals, accept_vals, pad_to=None):
         device = "cpu"
         bs = len(seq_vals)
         seq_lens = torch.tensor(seq_vals, dtype=torch.int32, device=device)
         accept_lens = torch.tensor(accept_vals, dtype=torch.int32, device=device)
         total_tokens = sum(accept_vals)
+        # ``pad_to`` mimics serving padding positions up to the compiled token
+        # bucket: rows beyond sum(accept_lens) are padding (real_mask is False)
+        # and must be left at 0.
+        n_pos = total_tokens if pad_to is None else pad_to
+        self.assertGreaterEqual(n_pos, total_tokens)
         accept_tokens = torch.arange(
             100, 100 + total_tokens, dtype=torch.int32, device=device
         )
 
-        ref_pos = torch.zeros(total_tokens, dtype=torch.long, device=device)
+        ref_pos = torch.zeros(n_pos, dtype=torch.long, device=device)
         ref_bonus = torch.zeros(bs, dtype=torch.int32, device=device)
         self._ref(accept_tokens, seq_lens, accept_lens, ref_pos, ref_bonus)
 
-        got_pos = torch.zeros(total_tokens, dtype=torch.long, device=device)
+        got_pos = torch.zeros(n_pos, dtype=torch.long, device=device)
         got_bonus = torch.zeros(bs, dtype=torch.int32, device=device)
         _create_extend_after_decode_spec_info_torch(
             accept_tokens,
@@ -584,6 +781,13 @@ class TestCreateExtendAfterDecodeSpecInfo(unittest.TestCase):
         """3 requests with different accept counts."""
         self._run_case(seq_vals=[10, 20, 30], accept_vals=[1, 4, 2])
 
+    def test_padded_positions_leave_padding_rows_zero(self):
+        """positions padded past sum(accept_lens): real_mask has False rows
+        (serving pads to the compiled token bucket). Those padding rows must
+        stay 0 and not pick up out-of-range req_id garbage."""
+        # 7 real tokens (1+4+2); pad the positions buffer to 12.
+        self._run_case(seq_vals=[10, 20, 30], accept_vals=[1, 4, 2], pad_to=12)
+
     def test_empty_batch(self):
         device = "cpu"
         positions = torch.zeros(0, dtype=torch.long, device=device)
@@ -597,6 +801,22 @@ class TestCreateExtendAfterDecodeSpecInfo(unittest.TestCase):
         )
         assert positions.numel() == 0
         assert bonus.numel() == 0
+
+    def test_large_batch(self):
+        """32 requests with random accept counts (stress test for vectorized path)."""
+        torch.manual_seed(7)
+        bs = 32
+        seq_vals = torch.randint(10, 200, (bs,)).tolist()
+        accept_vals = torch.randint(1, 7, (bs,)).tolist()
+        self._run_case(seq_vals, accept_vals)
+
+    def test_all_accept_one(self):
+        """All requests accept exactly 1 token (bonus-only, no position range)."""
+        self._run_case(seq_vals=[5, 10, 15, 20], accept_vals=[1, 1, 1, 1])
+
+    def test_all_accept_max(self):
+        """All requests accept the maximum number of tokens."""
+        self._run_case(seq_vals=[50, 60, 70], accept_vals=[6, 6, 6])
 
 
 class TestAlignEvictMaskToPageSize(unittest.TestCase):
