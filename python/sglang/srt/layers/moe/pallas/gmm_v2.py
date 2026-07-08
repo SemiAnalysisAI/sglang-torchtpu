@@ -965,14 +965,27 @@ def calculate_tiling(
     tile_m = bf16_bf16_tile_m * lhs_mod // rhs_mod
     tile_m = min(tile_m, dims.size_m)
 
-    # Per-buffer VMEM target for triple-buffered RHS. Matches ullm reference;
-    # the pre-#157 overhead subtraction + 5MiB spill + scale-bytes inflation
-    # shrank rhs_vmem_target unnecessarily.
+    # Per-buffer VMEM target for triple-buffered RHS.
     num_rhs_buffers = 3
-    rhs_vmem_target = vmem_limit_bytes // num_rhs_buffers
     base_rhs_size_bytes = (
         dims.size_k * dims.size_n * rhs_bits // 8 * base_rhs_bytes_multiplier
     )
+
+    scratch_reserve_bytes = 0
+    if fuse_act:
+        acc_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4  # bf16 vs f32 acc
+        out_bytes = 2  # bf16 output / partial-out tile
+        lhs_bytes = lhs_bits // 8
+        scratch_reserve_bytes = (
+            tile_m * 2 * dims.size_n * acc_bytes  # gate||up accumulator
+            + 2 * tile_m * dims.size_k * lhs_bytes  # lhs tile + double buffer
+            + 2 * tile_m * dims.size_n * out_bytes  # out tile + double buffer
+        )
+        # ~1.5x headroom for vreg spills / 128-align padding / scale buffers,
+        # mirroring the explicit spill factor in torchtpu-vllm's get_vmem_limit.
+        scratch_reserve_bytes = scratch_reserve_bytes * 3 // 2
+
+    rhs_vmem_target = (vmem_limit_bytes - scratch_reserve_bytes) // num_rhs_buffers
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
     # smaller than 2x of mxu_column_size.
