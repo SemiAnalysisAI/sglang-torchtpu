@@ -21,6 +21,7 @@ from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import print_warning_once
 
 
@@ -58,8 +59,14 @@ def _get_tpu_fp8_runtime() -> str:
 
 def _quantize_moe_weight_channelwise(
     weight: torch.Tensor,
+    out_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    dtype = weight.dtype
+    # ``weight`` is the float32 dequant of a block-FP8 weight (expanded from fp8
+    # so a fresh per-output-channel scale can be computed; see the caller), and
+    # ``out_dtype`` is the fp8 dtype to requantize it back to. The two differ on
+    # purpose: the input is the high-precision intermediate, the output is fp8
+    # storage.
+    dtype = out_dtype
     dtype_max = torch.finfo(dtype).max
     weight_scale = torch.clamp(
         weight.abs().amax(dim=2, keepdim=True).float() / dtype_max,
@@ -77,27 +84,47 @@ def _requantize_tpu_fp8_moe_block_to_channelwise(
     layer: torch.nn.Module,
     block_size: list[int] | tuple[int, int],
 ) -> None:
-    w13 = block_quant_dequant(
-        layer.w13_weight.data,
-        layer.w13_weight_scale_inv.data,
-        block_size,
-        torch.float32,
+    # Convert block-FP8 MoE weights to channelwise-FP8 one expert-chunk at a
+    # time, overwriting the weight in place. Chunking (with a drain between
+    # chunks) keeps the float32 dequant transient small -- the whole [E, N, K]
+    # stack is ~2GB at tp8/ep8 and OOMs the thin post-load HBM headroom. It's
+    # exact because the channelwise scale is per-(expert, out-channel), so each
+    # expert converts independently of the rest.
+    #
+    # Size the per-chunk scratch to a fraction of free HBM: headroom-rich setups
+    # get bigger chunks (fewer syncs -> faster load), tight ones stay small.
+    # Clamp to [256 MiB, 2 GiB] -- below 256 MiB the per-chunk sync overhead
+    # dominates; above 2 GiB risks the thin post-load headroom.
+    free_bytes = current_platform.get_available_memory()[0]
+    target_transient_bytes = int(
+        min(2 * 1024**3, max(256 * 1024**2, free_bytes // 4))
     )
-    w2 = block_quant_dequant(
-        layer.w2_weight.data,
-        layer.w2_weight_scale_inv.data,
-        block_size,
-        torch.float32,
-    )
-    w13_q, w13_scale = _quantize_moe_weight_channelwise(w13)
-    w2_q, w2_scale = _quantize_moe_weight_channelwise(w2)
-
-    copy_or_rebind_param(layer, "w13_weight", w13_q)
-    copy_or_rebind_param(layer, "w2_weight", w2_q)
-    copy_or_rebind_param(layer, "w13_weight_scale", w13_scale)
-    copy_or_rebind_param(layer, "w2_weight_scale", w2_scale)
-    _clear_replaced_param(layer, "w13_weight_scale_inv")
-    _clear_replaced_param(layer, "w2_weight_scale_inv")
+    for w_name, scale_inv_name in (
+        ("w13_weight", "w13_weight_scale_inv"),
+        ("w2_weight", "w2_weight_scale_inv"),
+    ):
+        w_param = getattr(layer, w_name)
+        scale_inv = getattr(layer, scale_inv_name).data
+        fp8_dtype = w_param.data.dtype  # capture FP8 target before any dequant
+        num_experts, n, k = w_param.shape
+        chunk = max(1, target_transient_bytes // max(1, n * k * 4))
+        scales = []
+        for c0 in range(0, num_experts, chunk):
+            c1 = min(c0 + chunk, num_experts)
+            # Dequant only this expert-chunk's blocks (its K axis is complete,
+            # so its channelwise amax is exact); the rest stay FP8 on device.
+            w_chunk = block_quant_dequant(
+                w_param.data[c0:c1], scale_inv[c0:c1], block_size, torch.float32
+            )
+            q_chunk, s_chunk = _quantize_moe_weight_channelwise(w_chunk, fp8_dtype)
+            del w_chunk
+            w_param.data[c0:c1].copy_(q_chunk)
+            del q_chunk
+            scales.append(s_chunk)
+            # Drain so this chunk's float32 transient frees before the next.
+            torch.tpu.synchronize()
+        copy_or_rebind_param(layer, f"{w_name}_scale", torch.cat(scales, dim=0))
+        _clear_replaced_param(layer, scale_inv_name)
     layer.weight_block_size = None
 
 
@@ -280,6 +307,11 @@ def prepare_tpu_fp8_moe_weights(
         copy_or_rebind_param(layer, "w2_weight_scale", w2_scale)
         _free_replaced_storage(old_w13_scale, layer.w13_weight_scale.data)
         _free_replaced_storage(old_w2_scale, layer.w2_weight_scale.data)
+
+    # No per-layer drain here: the requantize loop above already syncs per
+    # expert-chunk (bounding the float32 dequant transient), and the loader
+    # drains once more via _drain_device_transients_after_module_load() right
+    # after this layer's process_weights_after_loading returns.
 
 
 def apply_tpu_fp8_moe(

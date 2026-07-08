@@ -137,7 +137,14 @@ RUN_DIR=${RUN_DIR:-./profile/${MODEL_SLUG}-tpu/$TS}
 
 ENABLE_HLO_DUMP=${ENABLE_HLO_DUMP:-0}
 ENABLE_TORCH_COMPILE_DEBUG=${ENABLE_TORCH_COMPILE_DEBUG:-0}
+# 1 (default) → pass --enable-torch-compile. Set 0 to run eager (debugging:
+# isolate compile bugs and allow .item() probes without graph breaks).
+ENABLE_TORCH_COMPILE=${ENABLE_TORCH_COMPILE:-1}
 ENABLE_PROFILER_ENDPOINT=${ENABLE_PROFILER_ENDPOINT:-1}
+# Optional JSON merged into the HF config via --json-model-override-args, e.g.
+# '{"vision_config":null,"audio_config":null}' to serve a multimodal checkpoint
+# text-only. Passed as one quoted argv element (see the args+= block below).
+JSON_MODEL_OVERRIDE=${JSON_MODEL_OVERRIDE:-}
 
 PROFILER_DIR=${PROFILER_DIR:-$RUN_DIR}
 HLO_DUMP_DIR=${HLO_DUMP_DIR:-./hlo_dump/${MODEL_SLUG}-tpu/$TS}
@@ -325,7 +332,6 @@ args=(
     --attention-backend "$ATTENTION_BACKEND"
     --tp-size "$TP_SIZE"
     --grammar-backend none
-    --enable-torch-compile
     --host "$HOST"
     --port "$PORT"
     --max-running-requests "$MAX_RUNNING"
@@ -343,6 +349,8 @@ args=(
 [[ -n "$MAX_PREFILL_TOKENS" ]] && args+=(--max-prefill-tokens "$MAX_PREFILL_TOKENS")
 [[ -n "$MAX_TOTAL_TOKENS" ]] && args+=(--max-total-tokens "$MAX_TOTAL_TOKENS")
 [[ "$DISABLE_RADIX_CACHE" == "1" ]] && args+=(--disable-radix-cache)
+[[ "$ENABLE_TORCH_COMPILE" == "1" ]] && args+=(--enable-torch-compile)
+[[ -n "${JSON_MODEL_OVERRIDE:-}" ]] && args+=(--json-model-override-args "$JSON_MODEL_OVERRIDE")
 [[ "${DISABLE_OVERLAP_SCHEDULE:-0}" == "1" ]] && args+=(--disable-overlap-schedule)
 # Multinode: pass sglang's rendezvous flags only when fanned across hosts.
 [[ "$ENABLE_MULTIHOST" == "1" ]] && args+=(--nnodes "$NNODES" --node-rank "$NODE_RANK" --dist-init-addr "$DIST_INIT_ADDR")
