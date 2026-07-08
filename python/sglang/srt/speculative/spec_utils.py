@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import time
@@ -626,6 +627,56 @@ def align_evict_mask_to_page_size(
     start = (seq_len + num_false - 1) // page_size * page_size - seq_len
     for i in range(max(start, 0), min(start + page_size, num_draft_tokens)):
         tl.store(evict_mask + bid * num_draft_tokens + i, False)
+
+
+@functools.lru_cache(maxsize=None)
+def _draft_token_cols(num_draft_tokens: int, device: torch.device) -> torch.Tensor:
+    """Cached ``[1, num_draft_tokens]`` arange (num_draft_tokens is static per run)."""
+    return torch.arange(num_draft_tokens, device=device).unsqueeze(0)
+
+
+def _align_evict_mask_to_page_size_torch(
+    seq_lens: torch.Tensor,
+    evict_mask: torch.Tensor,
+    page_size: int,
+    num_draft_tokens: int,
+):
+    """Vectorized torch equivalent of ``align_evict_mask_to_page_size``."""
+    bs = seq_lens.shape[0]
+    device = evict_mask.device
+    mask2d = evict_mask.view(bs, num_draft_tokens)
+    num_false = (~mask2d).sum(dim=1).to(seq_lens.dtype)  # accepted tokens / req
+    start = (
+        torch.div(seq_lens + num_false - 1, page_size, rounding_mode="floor")
+        * page_size
+        - seq_lens
+    )
+    lo = torch.clamp(start, min=0)
+    hi = torch.clamp(start + page_size, max=num_draft_tokens)
+    cols = _draft_token_cols(num_draft_tokens, device)
+    keep = (cols >= lo.unsqueeze(1)) & (cols < hi.unsqueeze(1))
+    mask2d &= ~keep
+
+
+def align_evict_mask_to_page_size_func(
+    seq_lens: torch.Tensor,
+    evict_mask: torch.Tensor,
+    page_size: int,
+    num_draft_tokens: int,
+):
+    """Dispatch to the torch fallback on TPU, triton kernel otherwise."""
+    if _use_torch_native:
+        _align_evict_mask_to_page_size_torch(
+            seq_lens, evict_mask, page_size, num_draft_tokens
+        )
+        return
+    align_evict_mask_to_page_size[len(seq_lens),](
+        seq_lens,
+        evict_mask,
+        page_size,
+        num_draft_tokens,
+        next_power_of_2(num_draft_tokens),
+    )
 
 
 @triton.jit
