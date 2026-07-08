@@ -35,6 +35,7 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     TREE_SPEC_KERNEL_AVAILABLE,
+    _align_evict_mask_to_page_size_torch,
     align_evict_mask_to_page_size_func,
     assign_req_to_token_pool_func,
     create_extend_after_decode_spec_info_func,
@@ -98,6 +99,35 @@ def _flatten_accept_index(accept_index, num_accept_tokens_list, topk):
         return accept_index_flat, total_accept
     accept_index_flat = accept_index[accept_index != -1]
     return accept_index_flat, int(accept_index_flat.shape[0])
+
+
+def _page_aligned_free_count_topk1(
+    seq_lens_cpu, num_accept_tokens_list, page_size, num_draft_tokens
+):
+    """Host count of KV slots freed by page-aligned eviction at ``topk == 1``.
+
+    The device free path does ``out_cache_loc[align(evict_mask)]`` — a boolean-mask
+    gather whose output length is a runtime value, forcing a device->host sync on TPU.
+    To keep that free statically shaped we need the freed count as a host int. It is
+    host-derivable here: at ``topk == 1`` the accepted slots are a front-packed prefix
+    (``num_accept_tokens_list[i]`` slots per request), and at the verify free point
+    ``batch.seq_lens`` still equals ``batch.seq_lens_cpu`` (prepare_for_verify does not
+    mutate ``seq_lens``; the post-accept ``+= num_accept`` happens later). So replay the
+    *identical* ``_align_evict_mask_to_page_size_torch`` on a host-built front-packed
+    mask and count — no formula duplication, no device sync.
+    """
+    bs = len(num_accept_tokens_list)
+    mask2d = torch.ones((bs, num_draft_tokens), dtype=torch.bool)
+    for _i, _c in enumerate(num_accept_tokens_list):
+        if _c:
+            mask2d[_i, :_c] = False
+    _align_evict_mask_to_page_size_torch(
+        seq_lens_cpu[:bs].to("cpu"),
+        mask2d.view(-1),
+        page_size,
+        num_draft_tokens,
+    )
+    return int(mask2d.sum())
 
 
 @dataclass
@@ -570,7 +600,26 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     page_size,
                     self.draft_token_num,
                 )
-                token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+                # Static-shape free: `out_cache_loc[evict_mask]` is a boolean-mask gather
+                # whose output length is a runtime value (a device->host sync on TPU).
+                # The post-align freed count is host-derivable at topk==1, so compact the
+                # rejected cache locations into a fixed-size buffer and free a static
+                # slice (mirrors the page_size==1 branch above; only the freed count is
+                # derived differently -- via replaying the page-align on host).
+                free_count = _page_aligned_free_count_topk1(
+                    batch.seq_lens_cpu,
+                    num_accept_tokens_list,
+                    page_size,
+                    self.draft_token_num,
+                )
+                n_slots = evict_mask.shape[0]
+                dense_pos = torch.cumsum(evict_mask.to(torch.int32), dim=0) - 1
+                scatter_pos = torch.where(
+                    evict_mask, dense_pos, dense_pos.new_full((), n_slots)
+                ).to(torch.int64)
+                packed = batch.out_cache_loc.new_empty((n_slots + 1,))
+                packed.scatter_(0, scatter_pos, batch.out_cache_loc)
+                token_to_kv_pool_allocator.free(packed[:free_count])
             else:
                 # Shift the accepted tokens to the beginning.
                 # Only evict the last part
