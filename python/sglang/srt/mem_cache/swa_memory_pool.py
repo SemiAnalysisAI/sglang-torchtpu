@@ -656,10 +656,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
-        # Gather on the mapping's device (TPU stages free_index on CPU); free()
-        # handles placement itself. No-op on CUDA/CPU.
         mapping = self.full_to_swa_index_mapping
-        idx = free_index.to(mapping.device)
+        # TPU keeps the mapping host-resident (mapping_device="cpu" for _is_tpu),
+        # so align free_index to it before indexing. The _is_npu arm mirrors
+        # set_full_to_swa_mapping / the other guards here and is a no-op on NPU
+        # (there the mapping stays on-device). main's free_swa omitted this.
+        idx = free_index.to(mapping.device) if (_is_npu or _is_tpu) else free_index
         swa_indices = mapping[idx]
         swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
