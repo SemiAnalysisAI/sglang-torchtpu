@@ -756,7 +756,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         topk_weights, topk_ids, _ = topk_output
         topk_weights = topk_weights.to(x.dtype)
         topk_ids = topk_ids.to(torch.int32)
-        topk_weights, topk_ids = mask_tpu_moe_non_local_experts(topk_weights, topk_ids)
+        if moe_runner_config.num_fused_shared_experts:
+            raise NotImplementedError(
+                "Fused shared experts are not supported on the TPU MoE path."
+            )
+        from sglang.srt.distributed import get_moe_expert_parallel_rank
+
+        topk_weights, topk_ids = mask_tpu_moe_non_local_experts(
+            topk_weights,
+            topk_ids,
+            moe_runner_config.num_local_experts,
+            get_moe_expert_parallel_rank(),
+        )
 
         # Weights are already in gmm_v2's (num_experts, k, n) layout — the swap
         # from SGLang's (num_experts, n, k) happens once in

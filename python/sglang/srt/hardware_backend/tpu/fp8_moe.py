@@ -331,7 +331,18 @@ def apply_tpu_fp8_moe(
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)
-    topk_weights, topk_ids = mask_tpu_moe_non_local_experts(topk_weights, topk_ids)
+    if layer.num_fused_shared_experts:
+        raise NotImplementedError(
+            "Fused shared experts are not supported on the TPU MoE path."
+        )
+    from sglang.srt.distributed import get_moe_expert_parallel_rank
+
+    topk_weights, topk_ids = mask_tpu_moe_non_local_experts(
+        topk_weights,
+        topk_ids,
+        layer.w13_weight.shape[0],
+        get_moe_expert_parallel_rank(),
+    )
 
     w1_scale = layer.w13_weight_scale_inv if block_quant else layer.w13_weight_scale
     w2_scale = layer.w2_weight_scale_inv if block_quant else layer.w2_weight_scale
