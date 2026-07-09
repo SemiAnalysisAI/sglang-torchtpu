@@ -7,6 +7,7 @@ from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -501,6 +502,54 @@ def _dp_gather_via_all_reduce(
         global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
+def _dp_gather_tpu_all_reduce(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    is_partial: bool,
+):
+    """Combine per-group contributions with one functional all-reduce.
+
+    Used on TPU instead of fill_(0) + reduce-scatter + all-gather:
+
+    - The rank conditional around fill_(0) traces different graphs per rank,
+      which the in-graph collectives cannot tolerate; a runtime 0/1 scale
+      (attn_rank0_scale) keeps the traced graph rank-uniform.
+    - Functional collectives return fresh result tensors with one terminal
+      copy_ into the caller's buffer; collectives that mutate the persistent
+      buffer in place can bind a stale buffer version in the compiled
+      lowering.
+    - The reduce-scatter + all-gather decomposition would move fewer bytes
+      for large buffers, but requires the slot rows to divide evenly by the
+      attention group size, which hybrid shapes violate; left as a follow-up
+      optimization.
+
+    MAX_LEN layout: every group's slot holds global_rows / dp_size rows.
+    A rank whose batch produced fewer rows (e.g. no sampled rows this step)
+    is padded with zero rows; more rows than the slot is a buffer-sizing bug
+    and fails loudly.
+    """
+    if not is_partial:
+        local_tokens = local_tokens * attn_rank0_scale(local_tokens)
+    expected_rows = global_tokens.shape[0] // get_attention_dp_size()
+    if local_tokens.shape[0] > expected_rows:
+        raise ValueError(
+            f"dp gather: local contribution has {local_tokens.shape[0]} rows "
+            f"but the global buffer slot holds {expected_rows}."
+        )
+    # Rows and offsets are Python ints (constant per compiled bucket), so the
+    # slot placement is a single statically-shaped pad.
+    start = get_attention_dp_rank() * expected_rows
+    contrib = F.pad(
+        local_tokens,
+        (0, 0, start, global_tokens.shape[0] - start - local_tokens.shape[0]),
+    )
+    gathered_out = torch.ops._c10d_functional.all_reduce.default(
+        contrib, "sum", get_tp_group().device_group.group_name
+    )
+    gathered_out = torch.ops._c10d_functional.wait_tensor.default(gathered_out)
+    global_tokens.copy_(gathered_out)
+
+
 def _dp_gather_via_all_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -511,9 +560,11 @@ def _dp_gather_via_all_gather(
         get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
         return
 
-    if not is_partial:
-        if get_attention_tp_rank() != 0:
-            local_tokens.fill_(0)
+    if _is_tpu:
+        _dp_gather_tpu_all_reduce(global_tokens, local_tokens, is_partial)
+        return
+    if not is_partial and get_attention_tp_rank() != 0:
+        local_tokens.fill_(0)
     scattered_local_tokens = local_tokens.tensor_split(get_attention_tp_size())[
         get_attention_tp_rank()
     ]
@@ -527,7 +578,10 @@ def _dp_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    if forward_batch.dp_padding_mode.is_max_len():
+    # Enum comparison instead of the is_max_len() helper: this function
+    # is traced under torch.compile on TPU, and dynamo (torch 2.10)
+    # cannot wrap bound enum methods.
+    if forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN:
         _dp_gather_via_all_gather(
             global_tokens, local_tokens, forward_batch, is_partial
         )
@@ -646,3 +700,17 @@ def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
+
+
+@functools.lru_cache(maxsize=None)
+def _attn_rank0_scale_cached_impl(
+    device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    return torch.tensor(
+        1.0 if get_attention_tp_rank() == 0 else 0.0, device=device, dtype=dtype
+    )
+
+
+def attn_rank0_scale(ref: torch.Tensor) -> torch.Tensor:
+    """0/1 device scalar: 1 on attn-TP rank 0, 0 elsewhere."""
+    return _attn_rank0_scale_cached_impl(ref.device, ref.dtype)

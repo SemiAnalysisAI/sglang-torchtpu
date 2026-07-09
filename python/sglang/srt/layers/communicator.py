@@ -38,6 +38,8 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
+    attn_rank0_scale,
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
@@ -77,9 +79,11 @@ from sglang.srt.utils import (
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
+    is_tpu,
 )
 
 _is_cuda = is_cuda()
+_is_tpu = is_tpu()
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()
@@ -426,6 +430,21 @@ def enable_moe_dense_fully_dp():
     return get_global_server_args().moe_dense_tp_size == 1
 
 
+def _tpu_hybrid_reduce_scatter_unsupported() -> bool:
+    """Whether the MLP scatter must avoid reduce-scatter on this platform.
+
+    On TPU with hybrid DP attention (attention TP size > 1), the registered
+    reduce-scatter op mis-binds its arguments under compiled replay
+    (torch_tpu reg_reduce_scatter_tensor), so the scatter goes through
+    all-reduce + dp_scatter instead. Remove this opt-out once the torch_tpu
+    op is fixed and the reduce-scatter path is validated for
+    attn_tp_size > 1. should_use_reduce_scatter and _scatter_hidden_states
+    must agree on this predicate: the first sizes the attention output, the
+    second picks the collective.
+    """
+    return _is_tpu and get_attention_tp_size() > 1
+
+
 class LayerCommunicator:
     def __init__(
         self,
@@ -701,13 +720,17 @@ class LayerCommunicator:
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
             return False
+        if _tpu_hybrid_reduce_scatter_unsupported():
+            return False
         if (
             self._communicate_summable_tensor_pair_fn
             is CommunicateSummableTensorPairFn._scatter_hidden_states
         ):
             if should_use_dp_reduce_scatterv():
                 return True
-            if forward_batch.dp_padding_mode.is_max_len():
+            # Enum comparison: traced under torch.compile on TPU;
+            # dynamo (torch 2.10) cannot wrap bound enum methods.
+            if forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN:
                 return True
         if nsa_use_prefill_cp(forward_batch):
             return True
@@ -982,6 +1005,18 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     disabled=not is_allocation_symmetric(),
                 ):
                     hidden_states, residual = layernorm(hidden_states, residual)
+            elif _is_tpu:
+                # Rank-uniform form of the attn_tp_rank==0 residual add
+                # below: a rank conditional traces different graphs per
+                # rank, and the ranks whose graph lacks the consumer lose
+                # the upstream collective at emission, desynchronizing the
+                # in-graph collective schedule across the attention group.
+                # Scaling by a runtime 0/1 tensor keeps every rank's graph
+                # identical while only attn-TP rank 0 contributes the
+                # residual to the partial sum.
+                hidden_states = hidden_states + residual * attn_rank0_scale(
+                    hidden_states
+                )
             elif context.attn_tp_rank == 0:
                 hidden_states += residual
 
@@ -1228,7 +1263,11 @@ class CommunicateSummableTensorPairFn:
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),
             )
-        elif allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
+        elif (
+            allow_reduce_scatter
+            and forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN
+            and not _tpu_hybrid_reduce_scatter_unsupported()
+        ):
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
