@@ -210,14 +210,43 @@ class TestPadForwardBatchInputs(CustomTestCase):
         )
         self.assertIsNone(fb.extend_seq_lens)
 
-    def test_return_logprob_raises(self):
+    def test_input_logprob_rejected(self):
+        # An extend request that also asks for INPUT/prompt (echo) logprobs
+        # (start_len < extend_len) still can't run on the compiled backend: the
+        # LogitsProcessor would compute them over dynamically-pruned states.
         fb = _forward_batch(real_t=4, real_b=1, return_logprob=True)
-        with self.assertRaisesRegex(NotImplementedError, "return_logprob"):
+        fb.extend_logprob_start_lens_cpu = [0]  # extend_len(4) - start_len(0) > 0
+        with self.assertRaisesRegex(NotImplementedError, "input/prompt logprobs"):
             _pad_forward_batch_inputs(
                 fb,
                 t_bucketer=_bucketer("Token", [64]),
                 b_bucketer=_bucketer("Bs", [1]),
             )
+
+    def test_output_logprob_passes(self):
+        # OUTPUT (next-token) logprobs only: start_len == extend_len, so there
+        # are no prompt positions to score inside the compiled forward. The
+        # guard must let it through (the eager Sampler produces them afterwards).
+        fb = _forward_batch(real_t=4, real_b=1, return_logprob=True)
+        fb.extend_logprob_start_lens_cpu = [4]  # extend_len - start_len == 0
+        real_q, real_b = _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [8, 64]),
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        self.assertEqual((real_q, real_b), (4, 1))
+        self.assertEqual(fb.input_ids.shape[0], 8)
+
+    def test_decode_output_logprob_passes(self):
+        # Decode-mode logprob requests are output-only (not an extend batch), so
+        # the input-logprob path never triggers and the request must pass.
+        fb = _forward_batch(real_t=2, real_b=2, mode="decode", return_logprob=True)
+        _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [16]),
+            b_bucketer=_bucketer("Bs", [4]),
+        )
+        self.assertEqual(fb.input_ids.shape[0], 4)
 
 
 class TestDefaultKwargHelpers(CustomTestCase):
