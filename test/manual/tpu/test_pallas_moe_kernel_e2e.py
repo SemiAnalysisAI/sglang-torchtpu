@@ -52,6 +52,7 @@ def _ref_moe_torch(
     topk_weights: torch.Tensor,  # [m, topk]   bf16
     topk_ids: torch.Tensor,  # [m, topk]   int32
     activation: str,
+    no_combine: bool = False,
 ) -> torch.Tensor:
     """Plain MoE reference, one (token, expert) at a time.
 
@@ -70,7 +71,11 @@ def _ref_moe_torch(
     n = two_n // 2
     topk = int(topk_ids.shape[-1])
 
-    out = torch.zeros(m, k, dtype=torch.float32)
+    out = (
+        torch.zeros(m, topk, k, dtype=torch.float32)
+        if no_combine
+        else torch.zeros(m, k, dtype=torch.float32)
+    )
     for i in range(m):
         x = hidden_states[i].float()
         for j in range(topk):
@@ -86,7 +91,11 @@ def _ref_moe_torch(
                     f"unsupported activation in reference: {activation}"
                 )
             o = act @ w2[e].float()  # [k]
-            out[i] += float(topk_weights[i, j].item()) * o
+            if no_combine:
+                if float(topk_weights[i, j].item()) != 0:
+                    out[i, j] = o
+            else:
+                out[i] += float(topk_weights[i, j].item()) * o
     return out.to(hidden_states.dtype)
 
 
@@ -152,7 +161,16 @@ class TestPallasFusedMoEEager(unittest.TestCase):
         cls.device = "tpu"
         cls.dtype = torch.bfloat16
 
-    def _run(self, hidden, w1, w2, topk_weights, topk_ids, activation):
+    def _run(
+        self,
+        hidden,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        activation,
+        no_combine=False,
+    ):
         from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 
         return fused_moe_call(
@@ -163,6 +181,7 @@ class TestPallasFusedMoEEager(unittest.TestCase):
             topk_ids=topk_ids,
             topk=int(topk_ids.shape[-1]),
             activation=activation,
+            no_combine=no_combine,
         )
 
     def test_silu_aligned_shape_matches_reference(self):
@@ -233,6 +252,39 @@ class TestPallasFusedMoEEager(unittest.TestCase):
 
         max_diff = (out - ref).abs().max().item()
         self.assertLess(max_diff, 5e-2, f"gelu vs reference max diff = {max_diff}")
+
+    def test_silu_no_combine_matches_reference(self):
+        """Pin raw per-slot output used by post-expert-norm MoE models."""
+        m, k, n, g, topk = 8, 64, 64, 4, 3
+        hidden, w1, w2, w_tk, ids = _make_inputs(
+            m, k, n, g, topk, self.device, self.dtype, seed=8
+        )
+        w_tk_cpu = w_tk.cpu()
+        w_tk_cpu[0, 1] = 0
+        w_tk = w_tk_cpu.to(self.device)
+
+        out = self._run(
+            hidden, w1, w2, w_tk, ids, "silu", no_combine=True
+        ).cpu().float()
+        torch.tpu.synchronize()
+
+        ref = _ref_moe_torch(
+            hidden.cpu(),
+            w1.cpu(),
+            w2.cpu(),
+            w_tk.cpu(),
+            ids.cpu(),
+            "silu",
+            no_combine=True,
+        ).float()
+
+        self.assertEqual(out.shape, (m, topk, k))
+        self.assertTrue(torch.isfinite(out).all().item())
+        self.assertTrue((out[0, 1] == 0).all().item())
+        max_diff = (out - ref).abs().max().item()
+        self.assertLess(
+            max_diff, 5e-2, f"no_combine vs reference max diff = {max_diff}"
+        )
 
     def test_silu_through_process_weights_after_loading(self):
         """Pin the full ``process_weights_after_loading`` -> ``fused_moe_call`` contract.

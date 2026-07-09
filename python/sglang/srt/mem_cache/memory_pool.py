@@ -1547,6 +1547,14 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
 
+    def get_fused_kv_buffer(self, layer_id: int):
+        # Fused-KV backends (e.g. TPU RPA-v3) read the fused K|V buffer;
+        # delegate to the full-attention pool after remapping the layer id,
+        # mirroring get_kv_buffer above.
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_fused_kv_buffer(layer_id)
+
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):
 

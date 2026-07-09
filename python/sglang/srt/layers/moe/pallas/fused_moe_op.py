@@ -151,7 +151,7 @@ def _fused_moe_jax(
     w2_bias,  # Optional[g, 1, k] f32
     topk,
     activation_name,
-    no_combine,
+    no_combine=False,
 ):
     """Production fused-MoE kernel body. Exported by ``_build_fused_moe_op``.
 
@@ -260,24 +260,24 @@ def _fused_moe_jax(
         tile_info=_lookup_tile_info(gmm1_out, w2, w2_scale, num_experts),
     )  # [m*topk, k]
 
-    # Un-permute back to token-major order and reduce across the top-k
-    # experts with the routing weights.
+    # Un-permute back to token-major order. Models that apply a post-expert
+    # norm ask the runner for no_combine output so they can RMSNorm each top-k
+    # slot before the weighted reduction.
     # TODO (Qinghan): check performance against scatter
     unsort_idx = jnp.argsort(argsort_idx)
     unsorted = gmm2_out[unsort_idx].reshape(m, topk, hidden_size)
+    unsorted = unsorted[:m_orig].astype(out_dtype)
     if no_combine:
-        # Return per-expert outputs [m, topk, hidden] without the weighted
-        # reduce. Models that do their own post-expert-norm + combine
-        # (e.g. llama4x) need the un-combined tensor. Slice off pad tokens.
-        # Note: the per-expert output is returned at out_dtype precision; the
-        # caller performs the weighted reduce in out_dtype, whereas the
-        # combined branch below reduces in unsorted.dtype before the final
-        # cast. The caller should upcast first if it needs bit-parity.
-        return unsorted[:m_orig].astype(out_dtype)
-    weights = topk_weights.reshape(m, topk, 1).astype(unsorted.dtype)
+        # EP non-local slots are routed to local expert 0 for kernel legality
+        # and have zero kernel weights. Zero their raw per-slot output so the
+        # caller's later post-norm + weighted-sum path cannot consume expert-0
+        # garbage with the original, unmasked router weights.
+        valid_slots = topk_weights[:m_orig].reshape(m_orig, topk, 1) != 0
+        return jnp.where(valid_slots, unsorted, jnp.zeros_like(unsorted))
+
+    weights = topk_weights[:m_orig].reshape(m_orig, topk, 1).astype(unsorted.dtype)
     out = (unsorted * weights).sum(axis=1).astype(out_dtype)
-    # Slice off the padded tokens added at entry.
-    return out[:m_orig]
+    return out
 
 
 def _build_fused_moe_op():
@@ -330,7 +330,7 @@ def _build_fused_moe_op():
             no_combine,
         )
 
-    custom_op = _torch_pallas.jax_op(op_name, _wrapped, keep_unused=True)
+    custom_op = _torch_pallas.jax_op(op_name, _wrapped)
 
     def _fake_impl(
         hidden_states: torch.Tensor,
@@ -346,13 +346,13 @@ def _build_fused_moe_op():
         activation: str = "silu",
         no_combine: bool = False,
     ):
-        # Output is [m, hidden] in the dtype of hidden_states, or the
-        # un-combined per-expert [m, topk, hidden] when no_combine is set.
-        # Using ``empty``/``empty_like`` lets ``torch.compile`` thread the
-        # dynamic token dimension without invoking the JAX tracer.
         if no_combine:
-            m, hidden = hidden_states.shape
-            return hidden_states.new_empty((m, topk, hidden))
+            return hidden_states.new_empty(
+                (hidden_states.shape[0], topk, hidden_states.shape[1])
+            )
+        # Output is [m, hidden] in the dtype of hidden_states. Using
+        # ``empty_like`` on a slice lets ``torch.compile`` thread the
+        # dynamic token dimension without invoking the JAX tracer.
         return torch.empty_like(hidden_states)
 
     custom_op.register_fake(_fake_impl)
@@ -385,9 +385,9 @@ def fused_moe_call(
       * ``topk_weights``: ``[num_tokens, topk]``  (routing scores, dtype of x)
       * ``topk_ids``: ``[num_tokens, topk]``  (int32 expert ids)
 
-    Returns ``[num_tokens, hidden_size]`` in ``hidden_states.dtype``,
-    or the un-combined per-expert ``[num_tokens, topk, hidden_size]``
-    when ``no_combine`` is True.
+    Returns ``[num_tokens, hidden_size]`` in ``hidden_states.dtype`` by default.
+    With ``no_combine=True``, returns raw per-slot expert outputs with shape
+    ``[num_tokens, topk, hidden_size]`` for callers that combine separately.
     """
     op = _build_fused_moe_op()
     return op(

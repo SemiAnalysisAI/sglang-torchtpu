@@ -50,6 +50,7 @@ def _call_production_kernel(
     topk_ids,
     *,
     activation: str,
+    no_combine: bool = False,
 ):
     """Invoke the production ``_fused_moe_jax`` for the unquant path.
 
@@ -74,6 +75,7 @@ def _call_production_kernel(
         None,  # w2_bias
         topk,
         activation,
+        no_combine,
     )
 
 
@@ -84,6 +86,7 @@ def _jax_reference_moe(
     topk_weights,
     topk_ids,
     activation: str,
+    no_combine: bool = False,
 ):
     """Pure-JAX MoE reference -- dense einsum over a one-hot expert mask.
 
@@ -117,6 +120,11 @@ def _jax_reference_moe(
         raise AssertionError(f"unsupported activation in reference: {activation}")
 
     gmm2 = jnp.einsum("mjg,mjn,gnk->mjk", onehot, act, w2f)  # [m, topk, k]
+    if no_combine:
+        valid_slots = topk_weights.reshape(m, topk, 1) != 0
+        return jnp.where(valid_slots, gmm2, jnp.zeros_like(gmm2)).astype(
+            hidden_states.dtype
+        )
     return jnp.einsum("mj,mjk->mk", tw, gmm2)
 
 
@@ -146,15 +154,41 @@ class TestFusedMoEJaxKernelVsReference(unittest.TestCase):
     independent of the torch_tpu bridge.
     """
 
-    def _run_and_diff(self, *, m, k, n, g, topk, activation, seed, tol, force_ids=None):
+    def _run_and_diff(
+        self,
+        *,
+        m,
+        k,
+        n,
+        g,
+        topk,
+        activation,
+        seed,
+        tol,
+        force_ids=None,
+        force_weights=None,
+        no_combine=False,
+    ):
         hidden, w1, w2, w_tk, ids = _make_inputs(m, k, n, g, topk, seed)
         if force_ids is not None:
             ids = force_ids
+        if force_weights is not None:
+            w_tk = force_weights
 
         out = jax.block_until_ready(
-            _call_production_kernel(hidden, w1, w2, w_tk, ids, activation=activation)
+            _call_production_kernel(
+                hidden,
+                w1,
+                w2,
+                w_tk,
+                ids,
+                activation=activation,
+                no_combine=no_combine,
+            )
         )
-        ref = _jax_reference_moe(hidden, w1, w2, w_tk, ids, activation)
+        ref = _jax_reference_moe(
+            hidden, w1, w2, w_tk, ids, activation, no_combine=no_combine
+        )
 
         out32 = jnp.asarray(out).astype(jnp.float32)
         ref32 = ref.astype(jnp.float32)
@@ -278,6 +312,46 @@ class TestFusedMoEJaxKernelVsReference(unittest.TestCase):
             tol=5e-2,
             force_ids=ids,
         )
+
+    def test_silu_no_combine_matches_reference(self):
+        """Post-expert-norm MoE models need raw [T, topk, H] expert slots."""
+        self._run_and_diff(
+            m=8,
+            k=64,
+            n=64,
+            g=4,
+            topk=3,
+            activation="silu",
+            seed=6,
+            tol=5e-2,
+            no_combine=True,
+        )
+
+    def test_silu_no_combine_zero_weight_slots_are_zeroed(self):
+        """EP-masked slots are routed to expert 0 with zero kernel weights.
+
+        The no_combine path must not return expert-0 garbage for those slots,
+        because such models apply a post-expert norm before their later weighted sum.
+        """
+        m, k, n, g, topk = 8, 64, 64, 4, 3
+        hidden, w1, w2, w_tk, ids = _make_inputs(m, k, n, g, topk, seed=7)
+        del hidden, w1, w2
+        w_tk = w_tk.at[0, 1].set(jnp.asarray(0, dtype=w_tk.dtype))
+        out, ref, _ = self._run_and_diff(
+            m=m,
+            k=k,
+            n=n,
+            g=g,
+            topk=topk,
+            activation="silu",
+            seed=7,
+            tol=5e-2,
+            force_ids=ids,
+            force_weights=w_tk,
+            no_combine=True,
+        )
+        self.assertTrue(bool(jnp.all(out[0, 1] == 0)))
+        self.assertTrue(bool(jnp.all(ref[0, 1] == 0)))
 
 
 @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
