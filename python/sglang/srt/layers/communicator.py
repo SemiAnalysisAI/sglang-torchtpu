@@ -431,18 +431,26 @@ def enable_moe_dense_fully_dp():
 
 
 def _tpu_hybrid_reduce_scatter_unsupported() -> bool:
-    """Whether the MLP scatter must avoid reduce-scatter on this platform.
+    """Whether the DP-attention MLP scatter must avoid reduce-scatter here.
 
-    On TPU with hybrid DP attention (attention TP size > 1), the registered
-    reduce-scatter op mis-binds its arguments under compiled replay
-    (torch_tpu reg_reduce_scatter_tensor), so the scatter goes through
-    all-reduce + dp_scatter instead. Remove this opt-out once the torch_tpu
-    op is fixed and the reduce-scatter path is validated for
-    attn_tp_size > 1. should_use_reduce_scatter and _scatter_hidden_states
-    must agree on this predicate: the first sizes the attention output, the
-    second picks the collective.
+    Applies only to hybrid DP attention on TPU: DP attention enabled with an
+    attention-TP group spanning more than one rank (tp_size > dp_size).
+    Plain TP without DP groups never takes the DP scatter paths this gates.
+
+    On that configuration, the reduce-scatter op registered for compiled
+    mode (reg_reduce_scatter_tensor, srt/distributed/parallel_state.py)
+    fails when an already-compiled graph is replayed at a different bucket
+    shape: it re-binds its recorded operands and raises, e.g. "input tensor
+    shape must be either [8, 2048] or [1, 2048], but got [2, 2048]". The
+    scatter goes through all-reduce + dp_scatter instead. Remove this
+    opt-out once the registered op replays correctly and the reduce-scatter
+    path is validated for attention TP > 1.
+
+    should_use_reduce_scatter and _scatter_hidden_states must agree on this
+    predicate: the first sizes the attention output, the second picks the
+    collective.
     """
-    return _is_tpu and get_attention_tp_size() > 1
+    return _is_tpu and is_dp_attention_enabled() and get_attention_tp_size() > 1
 
 
 class LayerCommunicator:
