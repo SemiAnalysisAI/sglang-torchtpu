@@ -286,6 +286,16 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # kernel launched only after that H2D finished.
         device = forward_batch.seq_lens.device
         real_bs = self._real_batch_size(forward_batch)
+        # Under DP attention the MLP sync pads a rank's batch to the
+        # cross-rank max with zero-length rows, and that padded count reaches
+        # real_bs. Zero-kv rows must not be presented to the kernel as
+        # active: clip the active count to the live prefix (padding rows sit
+        # contiguously at the tail).
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is not None and real_bs > 0:
+            live = int(torch.count_nonzero(seq_lens_cpu[:real_bs]).item())
+            if live < real_bs and not torch.any(seq_lens_cpu[:live] == 0):
+                real_bs = live
         is_decode = forward_batch.forward_mode.is_decode()
         distribution = self._get_cached_rpa_distribution(is_decode, real_bs, device)
         self.forward_metadata = self._build_metadata(forward_batch, distribution)
