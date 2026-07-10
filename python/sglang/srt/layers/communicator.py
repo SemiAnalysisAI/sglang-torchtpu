@@ -736,8 +736,9 @@ class LayerCommunicator:
         ):
             if should_use_dp_reduce_scatterv():
                 return True
-            # Enum comparison: traced under torch.compile on TPU;
-            # dynamo (torch 2.10) cannot wrap bound enum methods.
+            # TODO: revert to dp_padding_mode.is_max_len() once the torch
+            # pin is >= 2.14; the pinned torch's dynamo cannot trace methods
+            # of enums computed inside the graph (fixed upstream).
             if forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN:
                 return True
         if nsa_use_prefill_cp(forward_batch):
@@ -1273,6 +1274,9 @@ class CommunicateSummableTensorPairFn:
             )
         elif (
             allow_reduce_scatter
+            # TODO: revert to dp_padding_mode.is_max_len() once the torch
+            # pin is >= 2.14; the pinned torch's dynamo cannot trace methods
+            # of enums computed inside the graph (fixed upstream).
             and forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN
             and not _tpu_hybrid_reduce_scatter_unsupported()
         ):

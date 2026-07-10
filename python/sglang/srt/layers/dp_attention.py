@@ -578,9 +578,10 @@ def _dp_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    # Enum comparison instead of the is_max_len() helper: this function
-    # is traced under torch.compile on TPU, and dynamo (torch 2.10)
-    # cannot wrap bound enum methods.
+    # TODO: revert to dp_padding_mode.is_max_len() once the torch pin is
+    # >= 2.14. This function is traced under torch.compile on TPU, and the
+    # pinned torch's dynamo cannot trace methods of enums computed inside
+    # the graph (fixed upstream).
     if forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN:
         _dp_gather_via_all_gather(
             global_tokens, local_tokens, forward_batch, is_partial
