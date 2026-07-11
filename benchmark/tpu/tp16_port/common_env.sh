@@ -15,7 +15,7 @@
 # --- paths (override per host if different) ---
 export SGLANG_TPU_ROOT=${SGLANG_TPU_ROOT:-/cache/work/sglang-torchtpu}
 export LAUNCHER_DIR=${LAUNCHER_DIR:-$SGLANG_TPU_ROOT/benchmark/tpu}
-export PYTHON=${PYTHON:-/cache/work/.venv/bin/python}
+export PYTHON=${PYTHON:-$SGLANG_TPU_ROOT/.venv/bin/python}
 export MODEL=${MODEL:-/cache/models/MiMo-V2.5}      # local path — NOT /gcs (GCS-FUSE mmap SIGBUS)
 
 # --- HF: fully offline, cache on local disk (never /gcs) ---
