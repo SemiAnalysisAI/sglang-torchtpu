@@ -21,6 +21,10 @@ cd "$LAUNCHER_DIR"
 
 NODE_RANK="${1:-${NODE_RANK:-}}"
 
+# MEM_FRACTION_STATIC=0.7: the 1T fp8 weights occupy ~1/3 of each chip's HBM, so
+# the old 0.3 default produced a NEGATIVE KV budget ("Not enough memory. Please
+# try to increase --mem-fraction-static"). 0.7 fits weights + KV with headroom
+# for compile scratch. Applies to real and dummy weights (same HBM footprint).
 exec env \
 MODEL="$MODEL" \
 NNODES=2 ${NODE_RANK:+NODE_RANK="$NODE_RANK"} ${RANK0_HOST:+RANK0_HOST="$RANK0_HOST"} \
@@ -30,7 +34,7 @@ TP_SIZE=16 EP_SIZE="${EP_SIZE:-16}" \
 QUANTIZATION= KV_CACHE_DTYPE=fp8_e4m3 \
 CONTEXT_LEN=131072 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-140288}" \
 MAX_RUNNING="${MAX_RUNNING:-2}" TORCH_COMPILE_MAX_BS="${TORCH_COMPILE_MAX_BS:-8}" \
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.3}" \
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.7}" \
 CHUNKED_PREFILL_SIZE=4096 MAX_PREFILL_TOKENS=4096 \
 TPU_COMPILE_TOKENS="64 128 256 512 1024 2048 4096" \
 ENABLE_TORCH_COMPILE=1 \
