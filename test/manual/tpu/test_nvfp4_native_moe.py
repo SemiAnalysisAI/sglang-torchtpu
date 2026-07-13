@@ -1,22 +1,10 @@
-"""Unit tests for the TPU NVFP4 (``modelopt_fp4``) fused-MoE path.
+"""On-device test for the TPU NVFP4 (``modelopt_fp4``) fused-MoE path.
 
-Two tests:
-
-1. ``TestNvfp4ScaleFold`` — **pure CPU, no TPU required.** Validates
-   ``prepare_tpu_nvfp4_moe_weights``: the two-level scale fold
-   (``fp8_block * global``, per gate/up half for W13; single global for W2),
-   the gmm_v2 ``(E, num_blocks, 1, N)`` fp32 scale layout, the packed-weight
-   transpose to ``(E, K_packed, N)``, and that the unused CUDA/global/input
-   params are cleared. This pins the highest-risk correctness detail (the
-   gate/up-half global mapping) without a device.
-
-2. ``TestNativeNvfp4FusedMoE`` — **requires torch_tpu + a TPU device.**
-   Quantizes fp32 weights to NVFP4 (packed uint8 codes + fp8-e4m3 per-16-block
-   scales + fp32 per-tensor globals), runs them through
-   ``prepare_tpu_nvfp4_moe_weights`` + ``fused_moe_call``, and compares against
-   a bf16-dequant-of-the-same-codes reference. Both paths consume identical
-   codes and identical effective scales, so they must match within bf16 MXU
-   rounding — mirrors ``test_mxfp4_native_moe.py``.
+Requires torch_tpu + a TPU device. Quantizes fp32 weights to NVFP4, runs them
+through ``prepare_tpu_nvfp4_moe_weights`` + ``fused_moe_call``, and compares
+against a bf16-dequant-of-the-same-codes reference (W4A8 vs W4A16). The CPU-only
+fold/layout check runs in per-commit CI as
+``test/registered/unit/layers/quantization/test_nvfp4_tpu_moe_fold.py``.
 """
 
 from __future__ import annotations
@@ -75,7 +63,7 @@ def _quantize_rows_nvfp4(x, g, block_size=NVFP4_BLOCK):
     q = (blocks / eff).clamp(-E2M1_MAX, E2M1_MAX)
     sign = torch.sign(q)
     sign_bit = ((2 - sign) // 2).to(torch.uint8)  # 0 for +, 1 for -
-    ord_ = (((q.abs().unsqueeze(-1) - E2M1_BOUNDS) > 0).sum(dim=-1)).to(torch.uint8)
+    ord_ = torch.bucketize(q.abs(), E2M1_BOUNDS).to(torch.uint8)  # e2m1 magnitude
     codes = sign_bit * 0b1000 + ord_  # (E, R, nb, block_size)
     low = codes[..., 0::2]
     high = codes[..., 1::2] << 4
@@ -161,58 +149,8 @@ def _build_fake_layer(data, extra_params=True):
     return layer
 
 
-class TestNvfp4ScaleFold(unittest.TestCase):
-    """CPU-only: verify the scale fold + gmm_v2 layout in prepare_tpu_nvfp4_moe_weights."""
-
-    def test_fold_and_layout(self):
-        from sglang.srt.hardware_backend.tpu.fp4_moe import (
-            prepare_tpu_nvfp4_moe_weights,
-        )
-
-        E, hidden, intermediate = 2, 256, 128  # 128-aligned => pad_n == 0
-        data = _make_nvfp4_moe_layer(E, hidden, intermediate, seed=0)
-        layer = _build_fake_layer(data)
-
-        # Expected fold, computed independently.
-        I = intermediate
-        gg = data["w13_weight_scale_2"][:, 0]
-        gu = data["w13_weight_scale_2"][:, 1]
-        g2 = data["w2_weight_scale_2"]
-        exp_w13_s = data["w13_weight_scale"].float().clone()
-        exp_w13_s[:, :I, :] *= gg[:, None, None]
-        exp_w13_s[:, I:, :] *= gu[:, None, None]
-        exp_w13_s = exp_w13_s.permute(0, 2, 1).contiguous().unsqueeze(2)
-        exp_w2_s = (
-            data["w2_weight_scale"].float() * g2[:, None, None]
-        ).permute(0, 2, 1).contiguous().unsqueeze(2)
-        exp_w13_w = data["w13_weight"].permute(0, 2, 1).contiguous()
-        exp_w2_w = data["w2_weight"].permute(0, 2, 1).contiguous()
-
-        prepare_tpu_nvfp4_moe_weights(layer, group_size=NVFP4_BLOCK)
-
-        # Shapes: gmm_v2 (E, K_packed, N) weights + (E, num_blocks, 1, N) fp32 scales.
-        self.assertEqual(tuple(layer.w13_weight.shape), (E, hidden // 2, 2 * I))
-        self.assertEqual(tuple(layer.w2_weight.shape), (E, I // 2, hidden))
-        self.assertEqual(
-            tuple(layer.w13_weight_scale.shape), (E, hidden // NVFP4_BLOCK, 1, 2 * I)
-        )
-        self.assertEqual(
-            tuple(layer.w2_weight_scale.shape), (E, I // NVFP4_BLOCK, 1, hidden)
-        )
-        self.assertEqual(layer.w13_weight_scale.dtype, torch.float32)
-        self.assertEqual(layer.w2_weight_scale.dtype, torch.float32)
-        self.assertEqual(layer.w13_weight.dtype, torch.uint8)
-
-        # Values.
-        self.assertTrue(torch.equal(layer.w13_weight.data, exp_w13_w))
-        self.assertTrue(torch.equal(layer.w2_weight.data, exp_w2_w))
-        torch.testing.assert_close(layer.w13_weight_scale.data, exp_w13_s)
-        torch.testing.assert_close(layer.w2_weight_scale.data, exp_w2_s)
-
-        # Unused params cleared.
-        for name in ("w13_weight_scale_2", "w2_weight_scale_2",
-                     "w13_input_scale", "w2_input_scale"):
-            self.assertIsNone(getattr(layer, name, None), f"{name} not cleared")
+# The CPU-only scale-fold/layout check lives in per-commit CI:
+# test/registered/unit/layers/quantization/test_nvfp4_tpu_moe_fold.py
 
 
 @unittest.skipUnless(_has_tpu_device(), _SKIP_REASON)
@@ -241,15 +179,18 @@ class TestNativeNvfp4FusedMoE(unittest.TestCase):
         ).to(torch.bfloat16)
         return hs, topk_ids, topk_w
 
-    def test_small_layer_native_matches_bf16(self):
+    def test_native_matches_bf16(self):
         from sglang.srt.hardware_backend.tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
         )
         from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 
-        E, hidden, intermediate = 4, 256, 128
+        # Real routed-MoE expert shapes: hidden 4096, intermediate 4096, top-8.
+        # E is a small subset of the full expert count (the kernel loops over
+        # experts identically, so a subset exercises the same code paths).
+        E, hidden, intermediate, topk = 8, 4096, 4096, 8
         data = _make_nvfp4_moe_layer(E, hidden, intermediate, seed=3)
-        hs, topk_ids, topk_w = self._inputs(32, hidden, 2, E, seed=4)
+        hs, topk_ids, topk_w = self._inputs(64, hidden, topk, E, seed=4)
         gg, gu, g2 = data["globals"]
 
         # --- bf16 reference: dequant the same codes+scales, run bf16 path ---
@@ -270,7 +211,7 @@ class TestNativeNvfp4FusedMoE(unittest.TestCase):
             w2=w2_bf16.to(self.device),
             topk_weights=topk_w.to(self.device),
             topk_ids=topk_ids.to(self.device),
-            topk=2,
+            topk=topk,
             activation="silu",
         ).cpu().float()
 
@@ -285,27 +226,25 @@ class TestNativeNvfp4FusedMoE(unittest.TestCase):
             w2_scale=layer.w2_weight_scale.to(self.device),
             topk_weights=topk_w.to(self.device),
             topk_ids=topk_ids.to(self.device),
-            topk=2,
+            topk=topk,
             activation="silu",
         ).cpu().float()
         torch.tpu.synchronize()
 
         self.assertEqual(native.shape, ref.shape)
         self.assertTrue(torch.isfinite(native).all().item(), "native NaN/Inf")
-        # native is W4A8 (fp4 weights, activations quantized to fp8 in-kernel by
-        # gmm_v2); the bf16 ref is W4A16 (dequantized weights, bf16 activations).
-        # The gap is dominated by fp8 activation quantization compounded over the
-        # two GMMs + SwiGLU, NOT a wiring bug. Tight kernel numerics are proven
-        # separately by the gmm_v2 packed_nvfp4 probes (single-GMM ~1.4e-2,
-        # fused-SwiGLU ~3e-2 mean vs full precision). So assert a modest relative
-        # error + strong correlation as a wiring/sanity guard.
+        # Both paths use the same fp4 codes; native is W4A8, the ref W4A16, so the
+        # only divergence is fp8 activation rounding over GMM1 -> SwiGLU -> GMM2.
+        # Measured on tpu7x at these shapes: rel_mean ~= 0.049, cos ~= 0.9988;
+        # bounds sit ~1.5x above that so a real wiring regression (rel_mean -> ~0.3,
+        # cos < 0.99) trips them. (Recalibrate if a legit run exceeds them.)
         denom = ref.abs().mean().item() + 1e-6
         rel_mean = (native - ref).abs().mean().item() / denom
         cos = torch.nn.functional.cosine_similarity(
             native.flatten(), ref.flatten(), dim=0
         ).item()
-        self.assertLess(rel_mean, 0.35, f"native vs bf16 ref rel mean err={rel_mean}")
-        self.assertGreater(cos, 0.98, f"native vs bf16 ref cosine={cos}")
+        self.assertLess(rel_mean, 0.08, f"native vs bf16 ref rel mean err={rel_mean}")
+        self.assertGreater(cos, 0.995, f"native vs bf16 ref cosine={cos}")
 
 
 if __name__ == "__main__":

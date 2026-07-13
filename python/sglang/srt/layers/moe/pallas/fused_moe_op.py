@@ -200,9 +200,11 @@ def _fused_moe_jax(
     num_experts = w1.shape[0]
     out_dtype = hidden_states.dtype
 
-    # Packed NVFP4 weights arrive as uint8 (2 float4 codes per byte along K).
-    # gmm_v2 unpacks them to float4_e2m1fn in-kernel when told packed_nvfp4=True
-    # (real K = shape[1] * 2). bf16/fp8 weights pass through unchanged.
+    # uint8 rhs = packed FP4 (2 float4 codes/byte along K); gmm_v2 unpacks to
+    # float4_e2m1fn in-kernel when told packed_fp4=True (real K = shape[1] * 2).
+    # This governs *any* packed-float4 rhs: today only NVFP4 emits uint8, but the
+    # MXFP4-native path (not yet wired) would flow through here too — correct
+    # (block size is data-driven from the scale), just untested.
     w1_packed = w1.dtype == jnp.uint8
     w2_packed = w2.dtype == jnp.uint8
 
@@ -295,7 +297,7 @@ def _fused_moe_jax(
         # when fused); compact FP8 pins an unfused tile.
         tile_info=gmm1_tiling,
         fuse_act=gmm1_fuse_act,
-        packed_nvfp4=w1_packed,
+        packed_fp4=w1_packed,
     )
     if unfused_gmm1:
         gmm1_out = apply_act_fn(
@@ -327,15 +329,15 @@ def _fused_moe_jax(
         rhs_bias=w2_bias,
         preferred_element_type=out_dtype,
         tile_info=gmm2_tiling,
-        packed_nvfp4=w2_packed,
+        packed_fp4=w2_packed,
     )[
         :,
         :hidden_size,
     ]  # [m*topk, k]
 
-    # Un-permute back to token-major order. Llama4x post-expert-norm MoE asks
-    # the runner for no_combine output so it can RMSNorm each top-k slot before
-    # weighted reduction.
+    # Un-permute back to token-major order. Models with a post-expert norm ask
+    # the runner for no_combine output so they can RMSNorm each top-k slot before
+    # the weighted reduction.
     # TODO (Qinghan): check performance against scatter
     unsort_idx = jnp.argsort(argsort_idx)
     unsorted = gmm2_out[unsort_idx].reshape(m, topk, hidden_size)
@@ -343,8 +345,8 @@ def _fused_moe_jax(
     if no_combine:
         # EP non-local slots are routed to local expert 0 for kernel legality
         # and have zero kernel weights. Zero their raw per-slot output so the
-        # later Llama4x post-norm + weighted-sum path cannot consume expert-0
-        # garbage with the original, unmasked router weights.
+        # later post-norm + weighted-sum path cannot consume expert-0 garbage
+        # with the original, unmasked router weights.
         valid_slots = topk_weights[:m_orig].reshape(m_orig, topk, 1) != 0
         return jnp.where(valid_slots, unsorted, jnp.zeros_like(unsorted))
 

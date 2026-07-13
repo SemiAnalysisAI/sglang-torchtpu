@@ -1,33 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TPU NVFP4 MoE helpers.
+"""TPU NVFP4 (``modelopt_fp4``) MoE helpers.
 
-Serves ModelOpt NVFP4 (``modelopt_fp4``) MoE-expert weights through the same
-Pallas ``gmm_v2`` fused grouped-GEMM backend that the TPU FP8 MoE path uses
-(:mod:`sglang.srt.hardware_backend.tpu.fp8_moe`).
+Serves NVFP4 MoE weights through the packed-FP4 path of the Pallas ``gmm_v2``
+grouped-GEMM kernel (uint8 weights + per-block ``rhs_scale``). NVFP4 carries a
+two-level scale (fp8 per-16-block + fp32 per-tensor global), but ``gmm_v2`` takes
+only one per-block scale, so at load we fold the global into the block scale
+(``real = fp4_code * fp8_block_scale * global``) — format conversion only.
 
-Why this is glue, not a new kernel
-----------------------------------
-``gmm_v2`` already consumes **packed FP4** RHS weights (uint8, 2 codes/byte,
-bitcast to ``float4_e2m1fn`` in VMEM) plus a per-block ``rhs_scale`` of shape
-``(E, num_blocks_K, 1, N)`` — exactly the format produced for GPT-OSS MXFP4 by
-:func:`sglang.srt.layers.quantization.mxfp4_tpu_util.process_mxfp4_moe_weights_native`.
-NVFP4 differs from MXFP4 only in:
-
-* **block size 16** (MXFP4 is 32),
-* **two-level scales**: an fp8-e4m3 per-16-block scale *and* an fp32 per-tensor
-  "global" scale (``weight_scale_2``); MXFP4 has a single e8m0 block scale, and
-* **no gate/up interleave** (NVFP4 stores W13 as contiguous ``[Gate, Up]``).
-
-The sglang-torchtpu ``gmm_v2`` port has no separate global-scale argument, so we
-**fold the fp32 global into the fp8 block scale** at load, producing a single
-fp32 ``rhs_scale`` (``real = fp4_code * fp8_block_scale * global``). This fold
-matches msl-tpu-kernel's ``requantize_nvfp4_no_global.py`` and its NVFP4 MoE
-method (format-conversion only, no dequant/requant).
-
-On TPU there is no native fp4 MXU: ``gmm_v2`` unpacks the fp4 weight to fp8 and
-quantizes the bf16 activation to fp8 in-kernel, so this is effectively W4-stored
-/ A8-compute. The checkpoint's ``input_scale`` is therefore unused (activations
-are dynamically quantized inside the kernel, exactly like the FP8 MoE path).
+There is no native fp4 MXU on TPU: the kernel unpacks fp4 weights to fp8 and
+quantizes activations to fp8 in-kernel (W4-stored / A8-compute), so the
+checkpoint's ``input_scale`` is unused.
 """
 
 from __future__ import annotations
@@ -73,22 +55,26 @@ def _fold_w13_global_scale(
     global_scale: torch.Tensor,
     is_gated: bool,
 ) -> torch.Tensor:
-    """Fold the per-tensor global scale into the fp8 W13 block scale (fp32).
+    """Pre-multiply NVFP4's per-tensor global into the fp8 per-block scale.
 
-    ``block_scale`` is ``(E, 2I, H/16)`` fp8-e4m3 (rows are ``[Gate(I), Up(I)]``
-    because TPU never sets ``load_up_proj_weight_first``). ``global_scale`` is
-    ``(E, 2)`` (``[:,0]`` = gate/w1 global, ``[:,1]`` = up/w3 global) or ``(E,)``
-    when the checkpoint shares one global across gate/up. Mirrors
-    ``requantize_nvfp4_no_global.requantize_packed_cpu`` (w13 branch).
+    NVFP4 stores two scale levels (fp8 per-16-block + fp32 per-tensor global),
+    but gmm_v2 accepts only one per-block scale. We fold them into a single fp32
+    block scale (``real = fp4_code * fp8_block_scale * global``) so the kernel
+    stays single-scale. Gate and up carry different globals, so W13 folds per
+    half.
+
+    ``block_scale`` is ``(E, 2I, H/16)`` fp8-e4m3, rows ``[Gate(I), Up(I)]``;
+    ``global_scale`` is ``(E, 2)`` (gate, up) or ``(E,)`` if shared.
     """
     s = block_scale.float()
     g = global_scale.float()
-    if is_gated and g.dim() == 2:
+    # Only the true per-half form (E, 2) gets the split fold; (E,) or a 2-D
+    # single-column (E, 1) shared global takes the scalar-per-expert branch.
+    if is_gated and g.dim() == 2 and g.shape[1] == 2:
         half = s.shape[1] // 2
         s[:, :half, :] *= g[:, 0:1, None]
         s[:, half:, :] *= g[:, 1:2, None]
     else:
-        # Shared global (or non-gated): a single scalar per expert.
         g_flat = g if g.dim() == 1 else g[:, 0]
         s *= g_flat[:, None, None]
     return s
@@ -110,8 +96,7 @@ def prepare_tpu_nvfp4_moe_weights(
     Keeps weights packed (uint8), folds the two-level scales into a single fp32
     per-block scale, and transposes both into gmm_v2's ``(E, K_packed, N)`` /
     ``(E, num_blocks_K, 1, N)`` layout. Intermediate is padded to ``align_to``
-    (gate/up-symmetric for W13, K-matched for W2), mirroring the proven MXFP4
-    native path.
+    (gate/up-symmetric for W13, K-matched for W2).
 
     Layout in (checkpoint) -> out (gmm_v2):
       * ``w13_weight``       (E, 2I, H/2) u8  -> (E, H/2, 2*I_pad) u8
@@ -140,8 +125,9 @@ def prepare_tpu_nvfp4_moe_weights(
         :, None, None
     ]  # (E, H, I/16) f32
 
-    # Pad the intermediate dim to align_to. pad_n is a multiple of group_size
-    # (align_to % group_size == 0), so scale blocks and packed bytes stay whole.
+    # Pad the intermediate dim to align_to. pad_n stays a multiple of group_size
+    # and PACKING (both divide align_to and intermediate), keeping scale blocks
+    # and packed bytes whole; the check below enforces it.
     pad_n = (align_to - intermediate % align_to) % align_to
     if pad_n % group_size != 0 or pad_n % PACKING != 0:
         raise ValueError(
@@ -195,8 +181,7 @@ def apply_tpu_nvfp4_moe(
 
     With ``no_combine=True`` the kernel returns the raw per-slot expert outputs
     ``[num_tokens, topk, hidden]`` (non-local EP slots zeroed) so a caller doing
-    post-expert-norm (e.g. Llama4x ``FusedPostExpertNormWeightedSum``) can
-    RMS-norm each slot before the weighted reduction. Mirrors the bf16 TPU path.
+    a post-expert norm can RMS-norm each slot before the weighted reduction.
     """
     if apply_router_weight_on_input:
         raise NotImplementedError(
