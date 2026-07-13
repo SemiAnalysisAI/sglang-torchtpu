@@ -18,6 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from sglang.srt.speculative.eagle_info import gather_for_draft_extend
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -48,6 +49,11 @@ def _model_runner(device="cpu"):
         attn_backend=_FakeAttnBackend(),
         req_to_token_pool=SimpleNamespace(),
         token_to_kv_pool=SimpleNamespace(),
+        server_args=SimpleNamespace(
+            speculative_algorithm=None,
+            page_size=1,
+            dp_size=1,
+        ),
     )
 
 
@@ -322,8 +328,7 @@ class TestSpecPrecompileLoops(CustomTestCase):
 
 
 class TestSpecDummyForwardBatch(CustomTestCase):
-    """Spec dummy batches carry spec_info + slot-1 KV seeding, and TARGET_VERIFY
-    sizes extend metadata to draft_token_num tokens per request."""
+    """Spec dummy batches carry spec_info and slot-1 KV seeding."""
 
     def test_target_verify_batch_shapes_and_capture_mode(self):
         policy = _make_spec_policy(num_steps=3)  # draft_token_num = 4
@@ -337,9 +342,10 @@ class TestSpecDummyForwardBatch(CustomTestCase):
         )
         self.assertEqual(fb.capture_hidden_mode, CaptureHiddenMode.FULL)
         self.assertIsNotNone(fb.spec_info)
-        # draft_token_num (=4) tokens per request.
-        self.assertEqual(fb.extend_seq_lens.tolist(), [4, 4, 4, 4])
-        self.assertEqual(fb.extend_num_tokens, 16)
+        # Runtime TARGET_VERIFY is decode-like and leaves extend metadata unset.
+        self.assertIsNone(fb.extend_seq_lens)
+        self.assertIsNone(fb.extend_prefix_lens)
+        self.assertIsNone(fb.extend_num_tokens)
         # Slot-1 KV seeding (avoids draft/target pool conflicts): not slot 0.
         self.assertEqual(fb.out_cache_loc.tolist(), [1] * 16)
         self.assertEqual(fb.req_pool_indices.tolist(), [1, 1, 1, 1])
@@ -357,6 +363,27 @@ class TestSpecDummyForwardBatch(CustomTestCase):
             spec_info=policy._make_null_spec_info(),
         )
         self.assertIsNotNone(fb.spec_info)
+
+
+class TestSpecAcceptIndex(CustomTestCase):
+    def test_unfinished_subset_is_packed_to_fixed_width(self):
+        policy = _make_spec_policy(num_steps=3)
+        accept_index_matrix = torch.tensor(
+            [[0, 1, -1, -1], [4, -1, -1, -1]], dtype=torch.int32
+        )
+        padded = policy.pack_spec_accept_index(accept_index_matrix)
+
+        gathered = gather_for_draft_extend(
+            torch.arange(8),
+            accept_index_matrix[accept_index_matrix != -1],
+            padded,
+        )
+
+        self.assertEqual(gathered.tolist(), [0, 1, 4, 0, 0, 0, 0, 0])
+        self.assertEqual(
+            padded.valid_mask.tolist(),
+            [True, True, True, False, False, False, False, False],
+        )
 
 
 class TestSpecUnpadOutputs(CustomTestCase):

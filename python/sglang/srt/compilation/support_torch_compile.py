@@ -63,9 +63,60 @@ class CompilePolicy(ABC):
     def pad_draft_decode(self, forward_batch: Any) -> None:
         """Shape the speculative draft-decode batch for the compiled forward."""
 
+    def pad_draft_extend(self, forward_batch: Any) -> None:
+        """Shape the speculative draft-extend batch for the compiled forward."""
+
     def unpad_draft_outputs(self, outputs: Any, forward_batch: Any) -> Any:
         """Undo ``pad_draft_decode`` on the draft outputs (default: passthrough)."""
         return outputs
+
+    def precompile_draft(
+        self, draft_attn_backend: Any, draft_extend_attn_backend: Any
+    ) -> None:
+        """Warm the draft model's compiled graphs once the spec worker's
+        attention backends exist.
+
+        The draft forwards run on worker-owned backends created after
+        ``precompile()``, so policies that precompile draft shapes implement
+        this second, deferred phase. Base is a no-op.
+        """
+
+    def pad_spec_verify(
+        self,
+        vi: Any,
+        logits_output: Any,
+        bs: int,
+        candidates: Any,
+        predict: Any,
+        accept_index: Any,
+        nums: Any,
+    ) -> Any:
+        """Pad the greedy-verify *inputs* to a static shape"""
+        return (
+            logits_output.next_token_logits,
+            candidates,
+            vi.retrieve_index,
+            predict,
+            accept_index,
+            nums,
+            bs,
+        )
+
+    def unpad_spec_verify(
+        self, predict: Any, accept_index: Any, nums: Any, real_bs: int
+    ):
+        """Trim the greedy-verify *outputs* back to the real bs. Base: passthrough."""
+        return predict, accept_index, nums
+
+    def pack_spec_accept_index(self, accept_index: Any) -> Any:
+        """Static-shape packed accept index (a ``PaddedAcceptIndex``) for the
+        draft-extend gathers. Base: ``None`` (the variable path is used)."""
+        return None
+
+    def pad_spec_draft_extend_input(
+        self, di: Any, batch: Any, speculative_num_steps: int
+    ) -> None:
+        """Pad the draft-extend input tensors to a static token shape. Base: no-op."""
 
 
 class NoopCompilePolicy(CompilePolicy):
