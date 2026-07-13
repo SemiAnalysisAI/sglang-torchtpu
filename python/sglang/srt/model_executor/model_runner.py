@@ -3332,12 +3332,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         self.compile_policy.pad_draft_decode(forward_batch)
 
+    def pad_spec_draft_extend(self, forward_batch: ForwardBatch) -> None:
+        """Pad the speculative draft-extend batch."""
+        self.compile_policy.pad_draft_extend(forward_batch)
+
     def unpad_spec_draft_outputs(self, outputs, forward_batch: ForwardBatch):
         """Trim this runner's draft-decode outputs back to the real batch size,
         undoing ``pad_spec_draft_decode``. Delegates to the installed compile
         policy; the default ``NoopCompilePolicy`` passes outputs through.
         """
         return self.compile_policy.unpad_draft_outputs(outputs, forward_batch)
+
+    def precompile_spec_draft(
+        self, draft_attn_backend, draft_extend_attn_backend
+    ) -> None:
+        """Warm this (draft) runner's compiled graphs on the spec worker's
+        attention backends. Called by the EAGLE worker right after it wires
+        them. Draft backend doesn't exist yet when the graph runner precompiles.
+        """
+        self.compile_policy.precompile_draft(
+            draft_attn_backend, draft_extend_attn_backend
+        )
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo

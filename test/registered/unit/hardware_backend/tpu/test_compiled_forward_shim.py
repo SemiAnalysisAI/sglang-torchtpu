@@ -59,6 +59,9 @@ class _ForwardModeMock:
     def is_target_verify(self):
         return self._mode == "target_verify"
 
+    def is_draft_extend(self):
+        return self._mode == "draft_extend"
+
 
 def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
     """Synthetic ForwardBatch carrying the fields the padder touches."""

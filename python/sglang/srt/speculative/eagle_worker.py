@@ -49,6 +49,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
     EagleVerifyOutput,
+    gather_accepted,
 )
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
@@ -263,6 +264,9 @@ class EAGLEWorker(TpModelWorker):
         )
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+        self.draft_model_runner.precompile_spec_draft(
+            self.draft_attn_backend, self.draft_extend_attn_backend
+        )
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
@@ -972,17 +976,9 @@ class EAGLEWorker(TpModelWorker):
             self.token_to_kv_pool_allocator,
             self.page_size,
             vocab_mask,
+            self.draft_model_runner.compile_policy,
         )
-
-        # Post process based on verified outputs.
-        # Pick indices that we care (accepted)
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accept_indices
-        ]
-        if logits_output.hidden_states is not None:
-            logits_output.hidden_states = logits_output.hidden_states[
-                res.accept_indices
-            ]
+        gather_accepted(res, logits_output)
 
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None
@@ -1165,6 +1161,7 @@ class EAGLEWorker(TpModelWorker):
         draft_extend_input.prepare_extend_after_decode(
             batch,
             speculative_num_steps=self.speculative_num_steps,
+            compile_policy=self.draft_model_runner.compile_policy,
         )
         batch.forward_mode = (
             ForwardMode.DRAFT_EXTEND
@@ -1200,6 +1197,12 @@ class EAGLEWorker(TpModelWorker):
         else:
             forward_batch.can_run_dp_cuda_graph = False
             if not forward_batch.forward_mode.is_idle():
+                # Bucket the draft-extend inputs BEFORE the custom attn
+                # metadata is built, so the metadata matches the padded batch
+                # and the compiled draft forward reuses one static shape per
+                # bs bucket instead of JIT recompiling per batch size. No-op
+                # when the draft model isn't compiled.
+                self.draft_model_runner.pad_spec_draft_extend(forward_batch)
                 attn_backend = (
                     self.draft_extend_attn_backend
                     or self.draft_model_runner.attn_backend
@@ -1225,6 +1228,9 @@ class EAGLEWorker(TpModelWorker):
             if self.speculative_algorithm.is_standalone()
             else CaptureHiddenMode.LAST
         )
+        # TODO(pyc96): Carry bucketed top-k and hidden-state outputs directly into the
+        # next compiled draft-decode loop. Keep scheduler/KV metadata real-sized
+        # and unpad only the final draft tree before target verification.
         next_draft_input = EagleDraftInput(
             bonus_tokens=draft_extend_input.bonus_tokens,
             hidden_states=hidden_states,

@@ -1,7 +1,7 @@
 import logging
 from copy import copy
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -44,9 +44,10 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_musa, is_tpu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
 
-_is_tpu = is_tpu()
+if TYPE_CHECKING:
+    from sglang.srt.compilation.support_torch_compile import CompilePolicy
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -68,6 +69,46 @@ def _draft_runner_of(worker):
     return (
         worker.draft_runner if hasattr(worker, "draft_runner") else worker.model_runner
     )
+
+
+@dataclass
+class PaddedAcceptIndex:
+    """A fixed-shape (padded) accept index + its validity mask for TPU."""
+
+    indices: torch.Tensor  # [(spec_steps+1)*bs] accepted packed to front, 0-padded
+    valid_mask: torch.Tensor  # [(spec_steps+1)*bs] bool: True where real (not pad)
+
+
+def gather_accepted(res, logits_output) -> None:
+    """Slice ``logits_output`` to the accepted tokens.
+
+    When a padded accept index is present (TPU verify path), use it and SKIP the
+    next_token_logits gather.
+    """
+    if res.padded_accept_index is not None:
+        accept_indices = res.padded_accept_index.indices
+    else:
+        accept_indices = res.accept_indices
+        logits_output.next_token_logits = logits_output.next_token_logits[
+            accept_indices
+        ]
+    if logits_output.hidden_states is not None:
+        logits_output.hidden_states = logits_output.hidden_states[accept_indices]
+
+
+def gather_for_draft_extend(
+    padded_src: torch.Tensor,
+    accept_index: torch.Tensor,
+    padded: Optional["PaddedAcceptIndex"],
+) -> torch.Tensor:
+    """Gather the accepted rows/ids that seed the draft-extend forward."""
+    if padded is None:
+        return padded_src[accept_index]
+    gathered = padded_src[padded.indices]
+    mask = padded.valid_mask
+    if gathered.ndim > mask.ndim:  # 2-D hidden_states: broadcast the [n] mask
+        mask = mask.unsqueeze(-1)
+    return torch.where(mask, gathered, 0)
 
 
 @dataclass
@@ -237,6 +278,50 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
+    def _pad_greedy_verify(
+        self,
+        logits_output,
+        bs,
+        candidates,
+        predict,
+        accept_index,
+        num_correct_drafts,
+        compile_policy,
+    ):
+        """Pad the greedy tree-verify inputs to a compile bucket."""
+        if compile_policy is None:
+            return bs, candidates, predict, accept_index, num_correct_drafts
+        (
+            ntl,
+            candidates,
+            retrieve_index,
+            predict,
+            accept_index,
+            num_correct_drafts,
+            bs,
+        ) = compile_policy.pad_spec_verify(
+            self,
+            logits_output,
+            bs,
+            candidates,
+            predict,
+            accept_index,
+            num_correct_drafts,
+        )
+        logits_output.next_token_logits = ntl
+        self.retrieve_index = retrieve_index
+        return bs, candidates, predict, accept_index, num_correct_drafts
+
+    def _unpad_greedy_verify(
+        self, predict, accept_index, num_correct_drafts, real_bs, compile_policy
+    ):
+        """Trim padded greedy tree-verify outputs back to the real batch size."""
+        if compile_policy is None:
+            return predict, accept_index, num_correct_drafts
+        return compile_policy.unpad_spec_verify(
+            predict, accept_index, num_correct_drafts, real_bs
+        )
+
     def verify(
         self,
         batch: ScheduleBatch,
@@ -244,6 +329,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
+        compile_policy: Optional["CompilePolicy"] = None,
     ) -> torch.Tensor:
         """
         Verify and find accepted tokens based on logits output and batch
@@ -331,6 +417,20 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
+            # Pad to a compile bucket (no-op off-TPU); the kernel call stays in
+            # upstream form. real_bs restores bs for the shared post-verify code.
+            real_bs = bs
+            bs, candidates, predict, accept_index, num_correct_drafts = (
+                self._pad_greedy_verify(
+                    logits_output,
+                    bs,
+                    candidates,
+                    predict,
+                    accept_index,
+                    num_correct_drafts,
+                    compile_policy,
+                )
+            )
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -344,7 +444,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 target_predict=target_predict,
                 topk=self.topk,
             )
-
+            predict, accept_index, num_correct_drafts = self._unpad_greedy_verify(
+                predict, accept_index, num_correct_drafts, real_bs, compile_policy
+            )
+            bs = real_bs
         else:
             # apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(
@@ -478,8 +581,19 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if has_finished:
             num_correct_drafts = (accept_index != -1).sum(dim=1) - 1
 
+        # Fixed-shape accepted-index for the draft-extend input (None unless a
+        # static shape is required, i.e. compiled TPU).
+        padded_accept_index = (
+            None
+            if compile_policy is None
+            else compile_policy.pack_spec_accept_index(accept_index)
+        )
+
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them
+        # 2-D [bs, spec_steps+1] form, kept because accept_index is flattened to
+        # accepted-only next; the has_finished branch re-packs its unfinished rows.
+        accept_index_2d = accept_index
         accept_index = accept_index[accept_index != -1]
         accept_tokens = predict[accept_index]
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
@@ -567,14 +681,22 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
             draft_extend_input = EagleDraftExtendInput(
                 hidden_states=(
-                    batch.spec_info.hidden_states[accept_index]
+                    gather_for_draft_extend(
+                        batch.spec_info.hidden_states,
+                        accept_index,
+                        padded_accept_index,
+                    )
                     if batch.spec_info.hidden_states is not None
                     else None
                 ),
                 num_correct_drafts=num_correct_drafts,
                 num_accept_tokens=num_correct_drafts + 1,
                 num_accept_tokens_cpu=num_accept_tokens_list,
-                input_ids=accept_tokens,
+                input_ids=gather_for_draft_extend(
+                    predict,
+                    accept_index,
+                    padded_accept_index,
+                ),
                 seq_lens=batch.seq_lens,
                 seq_lens_cpu=batch.seq_lens_cpu,
                 req_pool_indices=batch.req_pool_indices,
@@ -586,6 +708,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 accept_tokens=accept_tokens,
                 num_correct_drafts_per_req_cpu=num_correct_drafts_list,
                 accept_indices=accept_index,
+                padded_accept_index=padded_accept_index,
             )
         else:
             if page_size == 1 or self.topk == 1:
@@ -637,16 +760,31 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 unfinished_num_correct_drafts = num_correct_drafts[
                     unfinished_index_device
                 ]
+                unfinished_padded_accept_index = (
+                    None
+                    if compile_policy is None
+                    else compile_policy.pack_spec_accept_index(
+                        accept_index_2d[unfinished_index_device]
+                    )
+                )
                 draft_extend_input = EagleDraftExtendInput(
                     hidden_states=(
-                        batch.spec_info.hidden_states[unfinished_accept_index]
+                        gather_for_draft_extend(
+                            batch.spec_info.hidden_states,
+                            unfinished_accept_index,
+                            unfinished_padded_accept_index,
+                        )
                         if batch.spec_info.hidden_states is not None
                         else None
                     ),
                     num_accept_tokens_cpu=draft_input_num_accept_tokens_cpu,
                     num_correct_drafts=unfinished_num_correct_drafts,
                     num_accept_tokens=unfinished_num_correct_drafts + 1,
-                    input_ids=predict[unfinished_accept_index],
+                    input_ids=gather_for_draft_extend(
+                        predict,
+                        unfinished_accept_index,
+                        unfinished_padded_accept_index,
+                    ),
                     seq_lens=batch.seq_lens[unfinished_index_device],
                     seq_lens_cpu=batch.seq_lens_cpu[unfinished_index],
                     req_pool_indices=batch.req_pool_indices[unfinished_index_device],
@@ -667,6 +805,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 accept_tokens=accept_tokens,
                 num_correct_drafts_per_req_cpu=num_correct_drafts_list,
                 accept_indices=accept_index,
+                padded_accept_index=padded_accept_index,
             )
 
 
@@ -934,56 +1073,21 @@ class EagleDraftExtendInput(SpecInput):
             capture_hidden_mode=capture_hidden_mode,
         )
 
-    def _pad_draft_extend_for_tpu(
-        self, batch: ScheduleBatch, speculative_num_steps: int
-    ):
-        """Pad draft-extend tensors to a fixed size for XLA shape stability.
-
-        XLA/torch.compile traces tensor shapes at compile time. Without
-        padding, every different accept count produces a different total
-        token count, triggering recompilation. Pad to the worst case
-        (speculative_num_steps + 1) * bs so one compiled graph is reused.
-        """
-        bs = len(self.seq_lens)
-        padded_len = (speculative_num_steps + 1) * bs
-        actual_len = self.input_ids.numel()
-        pad_size = max(padded_len - actual_len, 0)
-        if pad_size > 0:
-            self.input_ids = torch.nn.functional.pad(
-                self.input_ids, (0, pad_size), value=0
-            )
-            if batch.out_cache_loc is not None:
-                batch.out_cache_loc = torch.nn.functional.pad(
-                    batch.out_cache_loc, (0, pad_size), value=0
-                )
-            if self.hidden_states is not None:
-                self.hidden_states = torch.nn.functional.pad(
-                    self.hidden_states,
-                    (0, 0, 0, pad_size),  # pad first dim only
-                    value=0,
-                )
-        elif batch.out_cache_loc is not None:
-            oc_len = batch.out_cache_loc.numel()
-            target_len = self.input_ids.numel()
-            if oc_len > target_len:
-                batch.out_cache_loc = batch.out_cache_loc[:target_len]
-            elif oc_len < target_len:
-                batch.out_cache_loc = torch.nn.functional.pad(
-                    batch.out_cache_loc, (0, target_len - oc_len), value=0
-                )
-
     def prepare_extend_after_decode(
         self,
         batch: ScheduleBatch,
         speculative_num_steps: int,
+        compile_policy: Optional["CompilePolicy"] = None,
     ):
         # Caller must have installed `self` as `batch.spec_info` before calling.
         assert batch.spec_info is self
         if batch.forward_mode.is_idle():
             return
 
-        if _is_tpu:
-            self._pad_draft_extend_for_tpu(batch, speculative_num_steps)
+        if compile_policy is not None:
+            compile_policy.pad_spec_draft_extend_input(
+                self, batch, speculative_num_steps
+            )
 
         # The function below populates `self.positions` and `self.bonus_tokens`;
         # the worker reads `self.bonus_tokens` to construct next iter's
@@ -1061,6 +1165,8 @@ class EagleVerifyOutput:
     # the worker after `EagleVerifyInput.sample` returns; default kept so
     # idle / direct constructions don't have to pass it.
     can_run_cuda_graph: bool = False
+    # Fixed-shape padded ((spec_steps+1)*bs) counterpart of accept_indices.
+    padded_accept_index: Optional[PaddedAcceptIndex] = None
 
     @classmethod
     def create_idle(
