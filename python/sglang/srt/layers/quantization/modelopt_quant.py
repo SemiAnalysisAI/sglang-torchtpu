@@ -61,6 +61,7 @@ from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_
 from sglang.srt.utils.common import (
     is_cuda,
     is_sm120_supported,
+    is_tpu,
     next_power_of_2,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -107,6 +108,8 @@ except ImportError:
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
+
+_is_tpu = is_tpu()
 
 
 def _sglang_fp4_gemm_fake(
@@ -1521,7 +1524,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
-        if not is_blackwell_supported():
+        # TPU serves NVFP4 MoE via the Pallas gmm_v2 packed-FP4 path
+        # (hardware_backend/tpu/fp4_moe.py); the Blackwell requirement is
+        # CUDA/cutlass/trtllm-only.
+        if not _is_tpu and not is_blackwell_supported():
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization. Please use Blackwell and"
@@ -1638,10 +1644,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-        # Only use `swizzle_blockscale` for shapes, not for real content
-        layer.w13_blockscale_swizzled = Parameter(
-            swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
-        )
+        # Only use `swizzle_blockscale` for shapes, not for real content.
+        # CUDA-only placeholder — the TPU gmm_v2 path never reads it.
+        if not _is_tpu:
+            layer.w13_blockscale_swizzled = Parameter(
+                swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
+            )
 
         w2_weight_scale = ModelWeightParameter(
             data=torch.empty(
@@ -1656,9 +1664,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        layer.w2_blockscale_swizzled = Parameter(
-            swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
-        )
+        # CUDA-only placeholder — the TPU gmm_v2 path never reads it.
+        if not _is_tpu:
+            layer.w2_blockscale_swizzled = Parameter(
+                swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
+            )
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
@@ -1707,6 +1717,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
+        if _is_tpu:
+            # Fold the two-level scales into a single fp32 per-block scale and
+            # transpose weights/scales into the Pallas gmm_v2 packed-FP4 layout.
+            from sglang.srt.hardware_backend.tpu.fp4_moe import (
+                prepare_tpu_nvfp4_moe_weights,
+            )
+
+            prepare_tpu_nvfp4_moe_weights(
+                layer, group_size=self.quant_config.group_size
+            )
+            return
+
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
             if layer.w13_weight_scale_2.dim() == 1:
@@ -1994,6 +2016,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if _is_tpu:
+            # TPU bypasses MoeRunner entirely; apply() dispatches straight to the
+            # Pallas fused grouped-GEMM. --moe-runner-backend is a no-op here.
+            return
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
@@ -2013,6 +2039,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        if _is_tpu:
+            from sglang.srt.hardware_backend.tpu.fp4_moe import apply_tpu_nvfp4_moe
+
+            return apply_tpu_nvfp4_moe(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation=self.moe_runner_config.activation,
+                apply_router_weight_on_input=(
+                    self.moe_runner_config.apply_router_weight_on_input
+                ),
+                no_combine=getattr(self.moe_runner_config, "no_combine", False),
+            )
 
         # Note: dispatch_output may be a DeepEPLLDispatchOutput (no topk_output
         # attribute -- topk_ids/topk_weights live directly on the dispatch

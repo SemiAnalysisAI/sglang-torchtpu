@@ -1039,16 +1039,19 @@ def validate_inputs(
     group_sizes: jax.Array,
     group_offset: jax.Array,
     fuse_act: str | None = None,
+    packed_nvfp4: bool = False,
 ) -> Dimensions:
     """Validates the inputs for the GMM kernel."""
 
     size_m = lhs.shape[0]
-    size_group, size_k, size_n = rhs.shape
+    size_group, size_k_raw, size_n = rhs.shape
+    # NVFP4: rhs is uint8 packed (2 float4 per byte), so real K = shape[1] * 2.
+    size_k = size_k_raw * 2 if packed_nvfp4 else size_k_raw
     size_lhs_group = group_sizes.shape[0]
 
     assert size_group <= size_lhs_group
     assert lhs.shape == (size_m, size_k)
-    assert rhs.shape == (size_group, size_k, size_n)
+    assert rhs.shape == (size_group, size_k_raw, size_n)
     if rhs_bias is not None:
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
@@ -1143,16 +1146,25 @@ def make_gmm_configs(
     maybe_quantize_lhs: bool,
     zero_initialize: bool,
     fuse_act: str | None = None,
+    packed_nvfp4: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
     dims = validate_inputs(
-        lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset, fuse_act
+        lhs,
+        rhs,
+        rhs_scale,
+        rhs_bias,
+        group_sizes,
+        group_offset,
+        fuse_act,
+        packed_nvfp4=packed_nvfp4,
     )
 
     if rhs_scale is not None:
         has_scale = True
-        rhs_quant_dtype = rhs.dtype
+        # NVFP4: rhs is uint8-packed float4; the kernel unpacks to float4_e2m1fn.
+        rhs_quant_dtype = jnp.float4_e2m1fn.dtype if packed_nvfp4 else rhs.dtype
         num_blocks = rhs_scale.shape[1]
         scale_size_n = rhs_scale.shape[3]
         block_size = dims.size_k // num_blocks
@@ -1163,8 +1175,8 @@ def make_gmm_configs(
         # When rhs is quantized, pack elements into uint32 along the K axis.
         # In kernel_main we bitcast [G, K, N] -> [G, K//packing, N] uint32,
         # and in inner_kernel we unpack back to the original dtype via
-        # pltpu.bitcast.
-        rhs_packing = 32 // jax.dtypes.itemsize_bits(rhs.dtype)
+        # pltpu.bitcast. NVFP4 stores 8 float4 per uint32.
+        rhs_packing = 8 if packed_nvfp4 else 32 // jax.dtypes.itemsize_bits(rhs.dtype)
     else:
         has_scale = False
         rhs_quant_dtype = None
@@ -1307,6 +1319,7 @@ def get_metadata(cfgs: GmmConfigs):
         "maybe_quantize_lhs",
         "zero_initialize",
         "fuse_act",
+        "packed_nvfp4",
     ]
 )
 def gmm_v2(
@@ -1325,6 +1338,7 @@ def gmm_v2(
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
     fuse_act: str | None = None,
+    packed_nvfp4: bool = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1377,6 +1391,7 @@ def gmm_v2(
         maybe_quantize_lhs=maybe_quantize_lhs,
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
+        packed_nvfp4=packed_nvfp4,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles

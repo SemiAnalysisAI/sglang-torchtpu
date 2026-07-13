@@ -200,6 +200,12 @@ def _fused_moe_jax(
     num_experts = w1.shape[0]
     out_dtype = hidden_states.dtype
 
+    # Packed NVFP4 weights arrive as uint8 (2 float4 codes per byte along K).
+    # gmm_v2 unpacks them to float4_e2m1fn in-kernel when told packed_nvfp4=True
+    # (real K = shape[1] * 2). bf16/fp8 weights pass through unchanged.
+    w1_packed = w1.dtype == jnp.uint8
+    w2_packed = w2.dtype == jnp.uint8
+
     # gmm_v2 needs the routed-row count ``m*topk`` to be a
     # multiple of the bf16 sublane (16). Padding the *input* tokens here keeps
     # the permute/gather operating on an already-aligned, fixed-bucket shape
@@ -244,7 +250,13 @@ def _fused_moe_jax(
     # halves, so run an unfused GMM1 and apply the activation in JAX for
     # correctness.
     compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
-    gmm1_fuse_act = None if compact_block_scales else _fuse_act_name(activation_name)
+    # The in-kernel fused SwiGLU is numerically off for packed-FP4 rhs in this
+    # gmm_v2 (bf16 fused act is exact, but packed-FP4 fused act drifts to ~cos
+    # 0.95 while the raw packed-FP4 matmul is exact). So for packed FP4 — as for
+    # compact block scales — run an unfused GMM1 and apply the activation
+    # separately in JAX on the correct 2*n accumulator.
+    unfused_gmm1 = compact_block_scales or w1_packed
+    gmm1_fuse_act = None if unfused_gmm1 else _fuse_act_name(activation_name)
 
     gmm1_tile_info = None
     if compact_block_scales:
@@ -283,8 +295,9 @@ def _fused_moe_jax(
         # when fused); compact FP8 pins an unfused tile.
         tile_info=gmm1_tiling,
         fuse_act=gmm1_fuse_act,
+        packed_nvfp4=w1_packed,
     )
-    if compact_block_scales:
+    if unfused_gmm1:
         gmm1_out = apply_act_fn(
             gmm1_out, int(gmm1_out.shape[-1] // 2), _fuse_act_name(activation_name)
         )
@@ -299,8 +312,12 @@ def _fused_moe_jax(
             f"{gmm1_out.shape[1]}, hidden {hidden_size}) is unsupported: "
             "pad weights AND scales jointly at load time."
         )
+    # Packed FP4 w2 has a halved (packed) K; the tuned-block lookup keys on
+    # unpacked K, so fall back to gmm_v2's heuristic tiling for that case.
     gmm2_tiling = _dividing_tile_k(
-        _lookup_tile_info(gmm1_out, w2, w2_scale, num_experts)
+        calculate_tiling
+        if w2_packed
+        else _lookup_tile_info(gmm1_out, w2, w2_scale, num_experts)
     )
     gmm2_out = gmm_v2(
         lhs=gmm1_out,
@@ -310,14 +327,15 @@ def _fused_moe_jax(
         rhs_bias=w2_bias,
         preferred_element_type=out_dtype,
         tile_info=gmm2_tiling,
+        packed_nvfp4=w2_packed,
     )[
         :,
         :hidden_size,
     ]  # [m*topk, k]
 
-    # Un-permute back to token-major order. Models that apply a post-expert
-    # norm ask the runner for no_combine output so they can RMSNorm each top-k
-    # slot before the weighted reduction.
+    # Un-permute back to token-major order. Llama4x post-expert-norm MoE asks
+    # the runner for no_combine output so it can RMSNorm each top-k slot before
+    # weighted reduction.
     # TODO (Qinghan): check performance against scatter
     unsort_idx = jnp.argsort(argsort_idx)
     unsorted = gmm2_out[unsort_idx].reshape(m, topk, hidden_size)
@@ -325,7 +343,7 @@ def _fused_moe_jax(
     if no_combine:
         # EP non-local slots are routed to local expert 0 for kernel legality
         # and have zero kernel weights. Zero their raw per-slot output so the
-        # caller's later post-norm + weighted-sum path cannot consume expert-0
+        # later Llama4x post-norm + weighted-sum path cannot consume expert-0
         # garbage with the original, unmasked router weights.
         valid_slots = topk_weights[:m_orig].reshape(m_orig, topk, 1) != 0
         return jnp.where(valid_slots, unsorted, jnp.zeros_like(unsorted))
