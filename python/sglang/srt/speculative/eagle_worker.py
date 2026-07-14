@@ -780,9 +780,14 @@ class EAGLEWorker(TpModelWorker):
             ):
                 self.draft_model_runner.pad_spec_draft_decode(forward_batch)
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
+                forward_batch.defer_output_unpad = True
+            try:
+                draft_outputs = self.draft_forward(forward_batch)
+            finally:
+                forward_batch.defer_output_unpad = False
             parent_list, top_scores_index, draft_tokens = (
                 self.draft_model_runner.unpad_spec_draft_outputs(
-                    self.draft_forward(forward_batch), forward_batch
+                    draft_outputs, forward_batch
                 )
             )
 
@@ -1209,9 +1214,13 @@ class EAGLEWorker(TpModelWorker):
                 )
                 attn_backend.init_forward_metadata(forward_batch)
                 forward_batch.attn_backend = attn_backend
-            logits_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+                forward_batch.defer_output_unpad = True
+            try:
+                logits_output = self.draft_model_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                ).logits_output
+            finally:
+                forward_batch.defer_output_unpad = False
             # Non-cuda-graph path: compute topk_p / topk_index inline.
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
@@ -1228,9 +1237,6 @@ class EAGLEWorker(TpModelWorker):
             if self.speculative_algorithm.is_standalone()
             else CaptureHiddenMode.LAST
         )
-        # TODO(pyc96): Carry bucketed top-k and hidden-state outputs directly into the
-        # next compiled draft-decode loop. Keep scheduler/KV metadata real-sized
-        # and unpad only the final draft tree before target verification.
         next_draft_input = EagleDraftInput(
             bonus_tokens=draft_extend_input.bonus_tokens,
             hidden_states=hidden_states,

@@ -457,9 +457,8 @@ class CompiledForwardShim:
             out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
-        # TODO(pyc96): Support a call-scoped deferred-unpad mode for chained compiled
-        # forwards such as EAGLE draft decode.
-        out = self.policy.unpad_outputs(out, forward_batch)
+        if not forward_batch.defer_output_unpad:
+            out = self.policy.unpad_outputs(out, forward_batch)
 
         # Check for serving-time XLA recompilation (once per forward call).
         # Gated by SGLANG_TPU_CHECK_RECOMPILATION=1 (off by default).

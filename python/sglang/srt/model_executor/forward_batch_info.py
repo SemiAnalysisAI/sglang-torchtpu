@@ -443,6 +443,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
+    # For TPU padding
+    # Keep bucketed compiled outputs between internal chained forwards. The
+    # caller must clear this and unpad once at its logical output boundary.
+    defer_output_unpad: bool = False
+
     @classmethod
     def init_new(
         cls,

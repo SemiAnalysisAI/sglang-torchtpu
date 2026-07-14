@@ -524,29 +524,41 @@ class SpecDecodeCompilePolicyMixin:
         self.model_runner.model.prepare_forward_batch(forward_batch)
 
     def pad_spec_verify(
-        self, vi, logits_output, bs, candidates, predict, accept_index, nums
+        self,
+        next_token_logits,
+        candidates,
+        retrieve_index,
+        predict,
+        accept_index,
+        nums,
     ):
         # Pad the verify inputs/outputs to a bs bucket so verify_tree_greedy runs
         # one static shape per bucket instead of recompiling per real batch size.
-        dtn = vi.draft_token_num
-        real_q = logits_output.next_token_logits.shape[0]
-        bkt = self.b_bucketer
-        pad_bs = bkt.next_bucket(min(-(-real_q // dtn), bkt.max_val))
-        pad_q = pad_bs * dtn
-        device = logits_output.next_token_logits.device
-        ntl = logits_output.next_token_logits
-        cand = candidates
-        ri = vi.retrieve_index
-        if pad_bs > bs:
-            ntl = F.pad(ntl, (0, 0, 0, pad_q - real_q))
-            cand = F.pad(candidates, (0, 0, 0, pad_bs - bs))
-            ri = F.pad(vi.retrieve_index, (0, 0, 0, pad_bs - bs), value=-1)
-            predict = torch.empty((pad_q + 1,), dtype=torch.int32, device=device)
-            accept_index = torch.full(
-                (pad_bs, vi.spec_steps + 1), -1, dtype=torch.int32, device=device
+        bs, dtn = candidates.shape
+        real_q = next_token_logits.shape[0]
+        if real_q != bs * dtn:
+            raise ValueError(
+                "Greedy verify logits must contain one row per candidate: "
+                f"got {real_q} rows for candidates shape {tuple(candidates.shape)}."
             )
-            nums = torch.empty((pad_bs,), dtype=torch.int32, device=device)
-        return ntl, cand, ri, predict, accept_index, nums, pad_bs
+
+        pad_bs = self.b_bucketer.next_bucket(bs)
+        pad_q = pad_bs * dtn
+        if pad_bs > bs:
+            next_token_logits = F.pad(next_token_logits, (0, 0, 0, pad_q - real_q))
+            candidates = F.pad(candidates, (0, 0, 0, pad_bs - bs))
+            retrieve_index = F.pad(retrieve_index, (0, 0, 0, pad_bs - bs), value=-1)
+            predict = predict.new_empty((pad_q + 1,))
+            accept_index = accept_index.new_full((pad_bs, accept_index.shape[1]), -1)
+            nums = nums.new_empty((pad_bs,))
+        return (
+            next_token_logits,
+            candidates,
+            retrieve_index,
+            predict,
+            accept_index,
+            nums,
+        )
 
     def unpad_spec_verify(self, predict, accept_index, nums, real_bs):
         return predict, accept_index[:real_bs], nums[:real_bs]
@@ -596,6 +608,7 @@ class SpecDecodeCompilePolicyMixin:
         real_bs = getattr(forward_batch, _REAL_B_KEY, None)
         if real_bs is None:
             return outputs
+        forward_batch.batch_size = real_bs
         return tuple(t[:real_bs] for t in outputs)
 
 

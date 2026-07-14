@@ -386,6 +386,54 @@ class TestSpecAcceptIndex(CustomTestCase):
         )
 
 
+class TestSpecVerifyPadding(CustomTestCase):
+    @staticmethod
+    def _inputs(bs=2, draft_token_num=4, vocab_size=8):
+        num_tokens = bs * draft_token_num
+        return (
+            torch.zeros((num_tokens, vocab_size)),
+            torch.arange(num_tokens, dtype=torch.int32).reshape(bs, draft_token_num),
+            torch.arange(num_tokens, dtype=torch.int32).reshape(bs, draft_token_num),
+            torch.empty((num_tokens + 1,), dtype=torch.int32),
+            torch.full((bs, draft_token_num), -1, dtype=torch.int32),
+            torch.empty((bs,), dtype=torch.int32),
+        )
+
+    def test_pads_only_verify_tensors_to_batch_bucket(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+
+        logits, candidates, retrieve_index, predict, accept_index, nums = (
+            policy.pad_spec_verify(*self._inputs(bs=2))
+        )
+
+        self.assertEqual(logits.shape, (16, 8))
+        self.assertEqual(candidates.shape, (4, 4))
+        self.assertEqual(retrieve_index.shape, (4, 4))
+        self.assertEqual(predict.shape, (17,))
+        self.assertEqual(accept_index.shape, (4, 4))
+        self.assertEqual(nums.shape, (4,))
+        self.assertTrue(torch.all(retrieve_index[2:] == -1))
+        self.assertTrue(torch.all(accept_index == -1))
+
+    def test_at_bucket_returns_the_original_tensors(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+        inputs = self._inputs(bs=4)
+
+        outputs = policy.pad_spec_verify(*inputs)
+
+        self.assertTrue(
+            all(output is input_ for output, input_ in zip(outputs, inputs))
+        )
+
+    def test_rejects_logits_candidate_shape_mismatch(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+        inputs = list(self._inputs(bs=2))
+        inputs[0] = inputs[0][:-1]
+
+        with self.assertRaisesRegex(ValueError, "one row per candidate"):
+            policy.pad_spec_verify(*inputs)
+
+
 class TestSpecUnpadOutputs(CustomTestCase):
     """Spec output slicing: TARGET_VERIFY logits use real_q; capture-LAST hidden
     uses real_b; everything else matches the base decoder policy."""
@@ -444,6 +492,16 @@ class TestSpecUnpadOutputs(CustomTestCase):
         policy.unpad_outputs(out, fb)
         self.assertEqual(out.next_token_logits.shape[0], 4)
         self.assertEqual(out.hidden_states.shape[0], 4)
+
+    def test_final_draft_outputs_restore_real_batch_size(self):
+        policy = _make_spec_policy()
+        fb = SimpleNamespace(_tpu_real_b=2, batch_size=4)
+        outputs = (torch.arange(4), torch.arange(8).reshape(4, 2))
+
+        unpadded = policy.unpad_draft_outputs(outputs, fb)
+
+        self.assertEqual([t.shape[0] for t in unpadded], [2, 2])
+        self.assertEqual(fb.batch_size, 2)
 
 
 if __name__ == "__main__":
