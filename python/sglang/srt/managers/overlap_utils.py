@@ -206,6 +206,9 @@ class FutureMap:
         cheaper slice assign.
         """
         if self._use_dynamic_index:
+            # The TPU sampler returns next_token_ids as int32 while token_ids_buf
+            # is int64; index_copy_ requires matching dtypes (the slice-assign
+            # branch below casts implicitly, so this only bites the dynamic path).
             if values.dtype != buf.dtype:
                 values = values.to(buf.dtype)
             buf.index_copy_(0, fi.indices, values)
