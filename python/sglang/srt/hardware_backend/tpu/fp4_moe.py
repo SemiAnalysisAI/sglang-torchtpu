@@ -110,20 +110,26 @@ def prepare_tpu_nvfp4_moe_weights(
             f"got {group_size}."
         )
 
-    is_gated = layer.moe_runner_config.is_gated
+    if not layer.moe_runner_config.is_gated:
+        # The Pallas fused-MoE GMM1 always splits its output in half for the
+        # gated SwiGLU (``apply_act_fn`` on ``shape[-1] // 2``), so a non-gated
+        # expert would be mis-activated downstream. Reject it here rather than
+        # silently miscompute.
+        raise NotImplementedError("TPU NVFP4 MoE only supports gated (SwiGLU) experts.")
 
     w13 = layer.w13_weight.data  # (E, 2I, H/2) uint8
     w2 = layer.w2_weight.data  # (E, H, I/2) uint8
-    E, two_I, _hidden_packed = w13.shape
-    intermediate = two_I // 2 if is_gated else two_I
+    _E, two_I, _hidden_packed = w13.shape
+    intermediate = two_I // 2
 
     # Fold the per-tensor global scale into the fp8 block scale (-> fp32).
     w13_s = _fold_w13_global_scale(
-        layer.w13_weight_scale.data, layer.w13_weight_scale_2.data, is_gated
+        layer.w13_weight_scale.data, layer.w13_weight_scale_2.data, is_gated=True
     )  # (E, 2I, H/16) f32
-    w2_s = layer.w2_weight_scale.data.float() * layer.w2_weight_scale_2.data.float()[
-        :, None, None
-    ]  # (E, H, I/16) f32
+    w2_s = (
+        layer.w2_weight_scale.data.float()
+        * layer.w2_weight_scale_2.data.float()[:, None, None]
+    )  # (E, H, I/16) f32
 
     # Pad the intermediate dim to align_to. pad_n stays a multiple of group_size
     # and PACKING (both divide align_to and intermediate), keeping scale blocks
@@ -135,19 +141,10 @@ def prepare_tpu_nvfp4_moe_weights(
             f"pad_n={pad_n} must be a multiple of both {group_size} and {PACKING}."
         )
 
-    if is_gated:
-        # W13: pad gate/up halves independently (weights along the packed axis,
-        # scales along the block axis), then transpose to gmm_v2 (E, K, N).
-        w13_w = _pad_gate_up_halves_axis1(w13, intermediate, pad_n)
-        w13_s = _pad_gate_up_halves_axis1(w13_s, intermediate, pad_n)
-    elif pad_n:
-        # Non-gated: pad the single intermediate (axis-1) with zeros.
-        w13_w = torch.cat(
-            [w13, w13.new_zeros((E, pad_n, w13.shape[2]))], dim=1
-        )
-        w13_s = torch.cat([w13_s, w13_s.new_zeros((E, pad_n, w13_s.shape[2]))], dim=1)
-    else:
-        w13_w = w13
+    # W13: pad gate/up halves independently (weights along the packed axis,
+    # scales along the block axis), then transpose to gmm_v2 (E, K, N).
+    w13_w = _pad_gate_up_halves_axis1(w13, intermediate, pad_n)
+    w13_s = _pad_gate_up_halves_axis1(w13_s, intermediate, pad_n)
     w13_w = w13_w.permute(0, 2, 1).contiguous()  # (E, H/2, 2*I_pad) u8
     w13_scale = _to_gmm_v2_scale_layout(w13_s)  # (E, H/16, 1, 2*I_pad) f32
 
@@ -155,7 +152,9 @@ def prepare_tpu_nvfp4_moe_weights(
     # intermediate, then transpose so N = hidden.
     pad_k_packed = pad_n // PACKING
     pad_k_blocks = pad_n // group_size
-    w2_w = _pad_last_axis(w2, pad_k_packed).permute(0, 2, 1).contiguous()  # (E, I/2, H)
+    w2_w = (
+        _pad_last_axis(w2, pad_k_packed).permute(0, 2, 1).contiguous()
+    )  # (E, I_pad/2, H)
     w2_s = _pad_last_axis(w2_s, pad_k_blocks)  # (E, H, I_pad/16)
     w2_scale = _to_gmm_v2_scale_layout(w2_s)  # (E, I_pad/16, 1, H) f32
 
