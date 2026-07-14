@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """TPU NVFP4 (``modelopt_fp4``) MoE helpers.
 
-Serves NVFP4 MoE weights through the packed-FP4 path of the Pallas ``gmm_v2``
-grouped-GEMM kernel (uint8 weights + per-block ``rhs_scale``). NVFP4 carries a
-two-level scale (fp8 per-16-block + fp32 per-tensor global), but ``gmm_v2`` takes
-only one per-block scale, so at load we fold the global into the block scale
-(``real = fp4_code * fp8_block_scale * global``) — format conversion only.
-
-There is no native fp4 MXU on TPU: the kernel unpacks fp4 weights to fp8 and
-quantizes activations to fp8 in-kernel (W4-stored / A8-compute), so the
-checkpoint's ``input_scale`` is unused.
+Serves NVFP4 MoE weights via the packed-FP4 path of the Pallas ``gmm_v2`` kernel.
+NVFP4's two-level scale (fp8 per-16-block + fp32 per-tensor global) is folded at
+load into gmm_v2's single per-block scale (``real = fp4 * fp8_block * global``).
+No native fp4 MXU on TPU: weights unpack fp4->fp8 and activations quantize to fp8
+in-kernel (W4-stored / A8-compute), so ``input_scale`` is unused.
 """
 
 from __future__ import annotations
@@ -30,10 +26,8 @@ from sglang.srt.layers.utils import copy_or_rebind_param
 NVFP4_GROUP_SIZE = 16
 PACKING = 2  # two FP4 codes per uint8 byte
 
-# Extra params NVFP4 create_weights registers that the TPU gmm_v2 path does not
-# consume (globals are folded into the block scale; input scales are unused
-# because activations are quantized dynamically in-kernel; the *_swizzled and
-# cutlass/cutedsl placeholders are CUDA-only).
+# NVFP4 create_weights params the TPU gmm_v2 path doesn't consume (globals folded
+# into the block scale; input scales unused; *_swizzled / *_mma are CUDA-only).
 _UNUSED_NVFP4_MOE_PARAMS = (
     "w13_weight_scale_2",
     "w2_weight_scale_2",
@@ -55,21 +49,15 @@ def _fold_w13_global_scale(
     global_scale: torch.Tensor,
     is_gated: bool,
 ) -> torch.Tensor:
-    """Pre-multiply NVFP4's per-tensor global into the fp8 per-block scale.
+    """Fold NVFP4's per-tensor global into the fp8 per-block scale (-> fp32).
 
-    NVFP4 stores two scale levels (fp8 per-16-block + fp32 per-tensor global),
-    but gmm_v2 accepts only one per-block scale. We fold them into a single fp32
-    block scale (``real = fp4_code * fp8_block_scale * global``) so the kernel
-    stays single-scale. Gate and up carry different globals, so W13 folds per
-    half.
-
-    ``block_scale`` is ``(E, 2I, H/16)`` fp8-e4m3, rows ``[Gate(I), Up(I)]``;
-    ``global_scale`` is ``(E, 2)`` (gate, up) or ``(E,)`` if shared.
+    Gate and up carry different globals, so W13 folds per half. ``block_scale`` is
+    ``(E, 2I, H/16)`` fp8-e4m3, rows ``[Gate(I), Up(I)]``; ``global_scale`` is
+    ``(E, 2)`` (gate, up) or ``(E,)`` if shared.
     """
     s = block_scale.float()
     g = global_scale.float()
-    # Only the true per-half form (E, 2) gets the split fold; (E,) or a 2-D
-    # single-column (E, 1) shared global takes the scalar-per-expert branch.
+    # (E, 2) folds per half; (E,) or (E, 1) shared global folds per expert.
     if is_gated and g.dim() == 2 and g.shape[1] == 2:
         half = s.shape[1] // 2
         s[:, :half, :] *= g[:, 0:1, None]
@@ -91,12 +79,10 @@ def prepare_tpu_nvfp4_moe_weights(
     group_size: int = NVFP4_GROUP_SIZE,
     align_to: int = 128,
 ) -> None:
-    """Format NVFP4 MoE weights/scales for the TPU Pallas gmm_v2 backend.
+    """Format NVFP4 MoE weights/scales for the TPU gmm_v2 backend.
 
-    Keeps weights packed (uint8), folds the two-level scales into a single fp32
-    per-block scale, and transposes both into gmm_v2's ``(E, K_packed, N)`` /
-    ``(E, num_blocks_K, 1, N)`` layout. Intermediate is padded to ``align_to``
-    (gate/up-symmetric for W13, K-matched for W2).
+    Keeps weights packed (uint8), folds the two-level scale to one fp32 per-block
+    scale, transposes to gmm_v2 layout, and pads the intermediate to ``align_to``.
 
     Layout in (checkpoint) -> out (gmm_v2):
       * ``w13_weight``       (E, 2I, H/2) u8  -> (E, H/2, 2*I_pad) u8
@@ -111,10 +97,8 @@ def prepare_tpu_nvfp4_moe_weights(
         )
 
     if not layer.moe_runner_config.is_gated:
-        # The Pallas fused-MoE GMM1 always splits its output in half for the
-        # gated SwiGLU (``apply_act_fn`` on ``shape[-1] // 2``), so a non-gated
-        # expert would be mis-activated downstream. Reject it here rather than
-        # silently miscompute.
+        # GMM1 always splits its output in half for the gated SwiGLU, so a
+        # non-gated expert would be mis-activated. Reject rather than miscompute.
         raise NotImplementedError("TPU NVFP4 MoE only supports gated (SwiGLU) experts.")
 
     w13 = layer.w13_weight.data  # (E, 2I, H/2) uint8
@@ -131,9 +115,8 @@ def prepare_tpu_nvfp4_moe_weights(
         * layer.w2_weight_scale_2.data.float()[:, None, None]
     )  # (E, H, I/16) f32
 
-    # Pad the intermediate dim to align_to. pad_n stays a multiple of group_size
-    # and PACKING (both divide align_to and intermediate), keeping scale blocks
-    # and packed bytes whole; the check below enforces it.
+    # Pad intermediate to align_to; pad_n must stay a multiple of group_size and
+    # PACKING to keep scale blocks and packed bytes whole (enforced below).
     pad_n = (align_to - intermediate % align_to) % align_to
     if pad_n % group_size != 0 or pad_n % PACKING != 0:
         raise ValueError(
@@ -141,15 +124,13 @@ def prepare_tpu_nvfp4_moe_weights(
             f"pad_n={pad_n} must be a multiple of both {group_size} and {PACKING}."
         )
 
-    # W13: pad gate/up halves independently (weights along the packed axis,
-    # scales along the block axis), then transpose to gmm_v2 (E, K, N).
+    # W13: pad gate/up halves independently, then transpose to gmm_v2 (E, K, N).
     w13_w = _pad_gate_up_halves_axis1(w13, intermediate, pad_n)
     w13_s = _pad_gate_up_halves_axis1(w13_s, intermediate, pad_n)
     w13_w = w13_w.permute(0, 2, 1).contiguous()  # (E, H/2, 2*I_pad) u8
     w13_scale = _to_gmm_v2_scale_layout(w13_s)  # (E, H/16, 1, 2*I_pad) f32
 
-    # W2: pad the (packed) K dim and scale blocks to match the padded
-    # intermediate, then transpose so N = hidden.
+    # W2: pad packed-K and scale blocks to match, then transpose so N = hidden.
     pad_k_packed = pad_n // PACKING
     pad_k_blocks = pad_n // group_size
     w2_w = (
@@ -176,11 +157,11 @@ def apply_tpu_nvfp4_moe(
     apply_router_weight_on_input: bool,
     no_combine: bool = False,
 ):
-    """Run TPU NVFP4 MoE through the Pallas fused grouped-GEMM backend.
+    """Run TPU NVFP4 MoE through the Pallas grouped-GEMM backend.
 
-    With ``no_combine=True`` the kernel returns the raw per-slot expert outputs
-    ``[num_tokens, topk, hidden]`` (non-local EP slots zeroed) so a caller doing
-    a post-expert norm can RMS-norm each slot before the weighted reduction.
+    With ``no_combine=True`` returns raw per-slot outputs ``[num_tokens, topk,
+    hidden]`` (non-local EP slots zeroed) for a caller doing its own post-expert
+    norm + combine.
     """
     if apply_router_weight_on_input:
         raise NotImplementedError(
