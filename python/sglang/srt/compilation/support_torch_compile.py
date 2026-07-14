@@ -83,23 +83,21 @@ class CompilePolicy(ABC):
 
     def pad_spec_verify(
         self,
-        vi: Any,
-        logits_output: Any,
-        bs: int,
+        next_token_logits: Any,
         candidates: Any,
+        retrieve_index: Any,
         predict: Any,
         accept_index: Any,
         nums: Any,
     ) -> Any:
         """Pad the greedy-verify *inputs* to a static shape"""
         return (
-            logits_output.next_token_logits,
+            next_token_logits,
             candidates,
-            vi.retrieve_index,
+            retrieve_index,
             predict,
             accept_index,
             nums,
-            bs,
         )
 
     def unpad_spec_verify(

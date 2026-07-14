@@ -280,9 +280,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
     def _pad_greedy_verify(
         self,
-        logits_output,
-        bs,
+        next_token_logits,
         candidates,
+        retrieve_index,
         predict,
         accept_index,
         num_correct_drafts,
@@ -290,27 +290,22 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     ):
         """Pad the greedy tree-verify inputs to a compile bucket."""
         if compile_policy is None:
-            return bs, candidates, predict, accept_index, num_correct_drafts
-        (
-            ntl,
+            return (
+                next_token_logits,
+                candidates,
+                retrieve_index,
+                predict,
+                accept_index,
+                num_correct_drafts,
+            )
+        return compile_policy.pad_spec_verify(
+            next_token_logits,
             candidates,
             retrieve_index,
             predict,
             accept_index,
             num_correct_drafts,
-            bs,
-        ) = compile_policy.pad_spec_verify(
-            self,
-            logits_output,
-            bs,
-            candidates,
-            predict,
-            accept_index,
-            num_correct_drafts,
         )
-        logits_output.next_token_logits = ntl
-        self.retrieve_index = retrieve_index
-        return bs, candidates, predict, accept_index, num_correct_drafts
 
     def _unpad_greedy_verify(
         self, predict, accept_index, num_correct_drafts, real_bs, compile_policy
@@ -420,25 +415,31 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             # Pad to a compile bucket (no-op off-TPU); the kernel call stays in
             # upstream form. real_bs restores bs for the shared post-verify code.
             real_bs = bs
-            bs, candidates, predict, accept_index, num_correct_drafts = (
-                self._pad_greedy_verify(
-                    logits_output,
-                    bs,
-                    candidates,
-                    predict,
-                    accept_index,
-                    num_correct_drafts,
-                    compile_policy,
-                )
+            (
+                next_token_logits,
+                candidates,
+                retrieve_index,
+                predict,
+                accept_index,
+                num_correct_drafts,
+            ) = self._pad_greedy_verify(
+                logits_output.next_token_logits,
+                candidates,
+                self.retrieve_index,
+                predict,
+                accept_index,
+                num_correct_drafts,
+                compile_policy,
             )
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
-            target_predict = target_predict.reshape(bs, self.draft_token_num)
+            padded_bs = candidates.shape[0]
+            target_predict = torch.argmax(next_token_logits, dim=-1)
+            target_predict = target_predict.reshape(padded_bs, self.draft_token_num)
             predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=num_correct_drafts,  # mutable
                 candidates=candidates,
-                retrieve_index=self.retrieve_index,
+                retrieve_index=retrieve_index,
                 retrieve_next_token=self.retrieve_next_token,
                 retrieve_next_sibling=self.retrieve_next_sibling,
                 target_predict=target_predict,
@@ -447,7 +448,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             predict, accept_index, num_correct_drafts = self._unpad_greedy_verify(
                 predict, accept_index, num_correct_drafts, real_bs, compile_policy
             )
-            bs = real_bs
         else:
             # apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(
