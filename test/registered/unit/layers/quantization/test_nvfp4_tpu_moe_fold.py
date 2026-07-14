@@ -83,9 +83,7 @@ def _build_fake_layer(data):
     layer.moe_runner_config = types.SimpleNamespace(is_gated=True, activation="silu")
     E = data["w13_weight"].shape[0]
     for name, tensor in data.items():
-        layer.register_parameter(
-            name, torch.nn.Parameter(tensor, requires_grad=False)
-        )
+        layer.register_parameter(name, torch.nn.Parameter(tensor, requires_grad=False))
     # Params the TPU path must clear.
     layer.w13_input_scale = torch.nn.Parameter(torch.ones(E, 2), requires_grad=False)
     layer.w2_input_scale = torch.nn.Parameter(torch.ones(E), requires_grad=False)
@@ -172,7 +170,8 @@ class TestNvfp4ScaleFold(CustomTestCase):
         self.assertEqual(tuple(layer.w13_weight.shape), (E, hidden // 2, 2 * I_pad))
         self.assertEqual(tuple(layer.w2_weight.shape), (E, I_pad // 2, hidden))
         self.assertEqual(
-            tuple(layer.w13_weight_scale.shape), (E, hidden // NVFP4_BLOCK, 1, 2 * I_pad)
+            tuple(layer.w13_weight_scale.shape),
+            (E, hidden // NVFP4_BLOCK, 1, 2 * I_pad),
         )
         self.assertEqual(
             tuple(layer.w2_weight_scale.shape), (E, I_pad // NVFP4_BLOCK, 1, hidden)

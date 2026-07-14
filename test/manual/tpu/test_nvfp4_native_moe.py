@@ -174,9 +174,9 @@ class TestNativeNvfp4FusedMoE(unittest.TestCase):
         g = torch.Generator().manual_seed(seed)
         hs = (torch.randn(m, hidden, generator=g) * 0.5).to(torch.bfloat16)
         topk_ids = torch.randint(0, E, (m, topk), generator=g, dtype=torch.int32)
-        topk_w = torch.softmax(
-            torch.randn(m, topk, generator=g).float(), dim=-1
-        ).to(torch.bfloat16)
+        topk_w = torch.softmax(torch.randn(m, topk, generator=g).float(), dim=-1).to(
+            torch.bfloat16
+        )
         return hs, topk_ids, topk_w
 
     def test_native_matches_bf16(self):
@@ -202,33 +202,43 @@ class TestNativeNvfp4FusedMoE(unittest.TestCase):
             data["w13_weight"][:, I:], data["w13_weight_scale"][:, I:], gu
         )
         w13_bf16 = torch.cat([w1, w3], dim=1).permute(0, 2, 1).contiguous()
-        w2_bf16 = _dequant_rows_nvfp4(
-            data["w2_weight"], data["w2_weight_scale"], g2
-        ).permute(0, 2, 1).contiguous()
-        ref = fused_moe_call(
-            hidden_states=hs.to(self.device),
-            w1=w13_bf16.to(self.device),
-            w2=w2_bf16.to(self.device),
-            topk_weights=topk_w.to(self.device),
-            topk_ids=topk_ids.to(self.device),
-            topk=topk,
-            activation="silu",
-        ).cpu().float()
+        w2_bf16 = (
+            _dequant_rows_nvfp4(data["w2_weight"], data["w2_weight_scale"], g2)
+            .permute(0, 2, 1)
+            .contiguous()
+        )
+        ref = (
+            fused_moe_call(
+                hidden_states=hs.to(self.device),
+                w1=w13_bf16.to(self.device),
+                w2=w2_bf16.to(self.device),
+                topk_weights=topk_w.to(self.device),
+                topk_ids=topk_ids.to(self.device),
+                topk=topk,
+                activation="silu",
+            )
+            .cpu()
+            .float()
+        )
 
         # --- native packed-FP4 path ---
         layer = _build_fake_layer(data)
         prepare_tpu_nvfp4_moe_weights(layer, group_size=NVFP4_BLOCK)
-        native = fused_moe_call(
-            hidden_states=hs.to(self.device),
-            w1=layer.w13_weight.to(self.device),
-            w2=layer.w2_weight.to(self.device),
-            w1_scale=layer.w13_weight_scale.to(self.device),
-            w2_scale=layer.w2_weight_scale.to(self.device),
-            topk_weights=topk_w.to(self.device),
-            topk_ids=topk_ids.to(self.device),
-            topk=topk,
-            activation="silu",
-        ).cpu().float()
+        native = (
+            fused_moe_call(
+                hidden_states=hs.to(self.device),
+                w1=layer.w13_weight.to(self.device),
+                w2=layer.w2_weight.to(self.device),
+                w1_scale=layer.w13_weight_scale.to(self.device),
+                w2_scale=layer.w2_weight_scale.to(self.device),
+                topk_weights=topk_w.to(self.device),
+                topk_ids=topk_ids.to(self.device),
+                topk=topk,
+                activation="silu",
+            )
+            .cpu()
+            .float()
+        )
         torch.tpu.synchronize()
 
         self.assertEqual(native.shape, ref.shape)
