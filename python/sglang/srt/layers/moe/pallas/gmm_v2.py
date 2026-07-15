@@ -236,6 +236,9 @@ class InputConfigs:
     num_quant_blocks: int = 1
     scale_size_n: int = 0
     scale_block_n: int = 1
+    # dtype of the per-block scale tensor (fp32/bf16/fp8); drives the scale's
+    # share of the cost-model byte estimate. None when the rhs is unscaled.
+    scale_dtype: jnp.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1111,11 +1114,16 @@ def get_cost_estimate(cfgs: GmmConfigs):
         * jax.dtypes.itemsize_bits(rhs_dtype)
     ) // 8
     if cfgs.rhs_cfgs.has_scale:
+        # Honor the scale's real dtype (fp8/bf16/fp32) so the cost model reflects
+        # a narrower per-block scale stream instead of assuming fp32.
+        scale_itemsize = jnp.dtype(
+            cfgs.rhs_cfgs.scale_dtype or jnp.float32
+        ).itemsize
         rhs_bytes += (
             dims.size_group
             * cfgs.rhs_cfgs.num_quant_blocks
             * dims.size_n
-            * jnp.dtype(jnp.float32).itemsize
+            * scale_itemsize
         )
     if cfgs.rhs_cfgs.has_bias:
         rhs_bytes += dims.size_group * dims.size_n * jnp.dtype(jnp.float32).itemsize
@@ -1206,6 +1214,7 @@ def make_gmm_configs(
         num_quant_blocks=num_blocks,
         scale_size_n=scale_size_n,
         scale_block_n=scale_block_n,
+        scale_dtype=rhs_scale.dtype if has_scale else None,
     )
 
     lhs_q_dtype = None
@@ -1409,7 +1418,12 @@ def gmm_v2(
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = None
     if rhs_scale is not None:
-        rhs_scale = rhs_scale.astype(jnp.float32)
+        # Keep a narrow (fp8/bf16) per-block scale narrow through HBM/VMEM so its
+        # stream isn't inflated to fp32; the inner kernel upcasts to the
+        # accumulator dtype at multiply time (see ``block_acc *= ...astype``).
+        # fp32 scales are unchanged; any non-float scale normalizes to fp32.
+        if not jnp.issubdtype(rhs_scale.dtype, jnp.floating):
+            rhs_scale = rhs_scale.astype(jnp.float32)
         rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     if rhs_bias is not None:
         rhs_bias = rhs_bias.astype(jnp.float32)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -1718,14 +1719,28 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
         if _is_tpu:
-            # Fold the two-level scales into a single fp32 per-block scale and
+            # Fold the two-level scales into a single per-block scale and
             # transpose weights/scales into the Pallas gmm_v2 packed-FP4 layout.
             from sglang.srt.hardware_backend.tpu.fp4_moe import (
                 prepare_tpu_nvfp4_moe_weights,
             )
 
+            # Per-block scale storage dtype. fp32 (default) is exact; bf16/fp8
+            # halve/quarter the scale stream (perf lever; accuracy-gated by the
+            # on-device parity test). Selected via env so an A/B needs no reload
+            # code change.
+            _scale_dtypes = {
+                "fp32": torch.float32,
+                "bf16": torch.bfloat16,
+                "fp8": torch.float8_e4m3fn,
+            }
+            scale_dtype = _scale_dtypes[
+                os.environ.get("SGLANG_TPU_NVFP4_SCALE_DTYPE", "fp32").lower()
+            ]
             prepare_tpu_nvfp4_moe_weights(
-                layer, group_size=self.quant_config.group_size
+                layer,
+                group_size=self.quant_config.group_size,
+                scale_dtype=scale_dtype,
             )
             return
 

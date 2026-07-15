@@ -78,14 +78,22 @@ _PALLAS_MOE_OP = None
 # TPU pre-warm hook).
 
 
-def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups):
+def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups, packed_fp4=False):
     """Pick a ``TileSizes`` for this gmm_v2 call.
 
     ``get_tuned_block_sizes`` is a pure-Python lookup keyed on static
     shapes / dtypes, so it runs at JAX trace time (not at device exec
-    time). On a hit we pin the kernel's tile sizes to the tuned
-    triple; on a miss we hand ``None`` back to gmm_v2, which falls
-    through to its built-in ``calculate_tiling`` heuristic.
+    time). On a hit we pin the kernel's tile sizes to the tuned triple;
+    on a miss it returns ``get_default_gmm_block_sizes`` (a heuristic that
+    respects the shapes) — either way this returns a concrete
+    ``TileSizes``.
+
+    ``packed_fp4`` marks a uint8-packed FP4 rhs (2 codes/byte along K):
+    its stored K is half the real contracting dim, so the lookup keys on
+    the real K (``= lhs.shape[1]``) and on the ``float4_e2m1fn`` dtype the
+    kernel actually contracts in — matching how ``gmm_v2`` derives its own
+    tiling. Without this, the packed rhs would mismatch the lhs K and force
+    a fall-back to the kernel's internal heuristic.
 
     ``num_current_groups`` is set equal to ``num_total_groups``
     because this bridge is single-host (no expert parallelism); when
@@ -100,9 +108,12 @@ def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups):
     )
 
     m, k = lhs.shape
-    _g, _k, n = rhs.shape
+    _g, _k_raw, n = rhs.shape
+    # Packed FP4 stores 2 codes/byte along K, so real K = stored K * 2.
+    _k = _k_raw * 2 if packed_fp4 else _k_raw
     assert _k == k, f"gmm_v2 lhs/rhs k mismatch: {k=} vs {_k=}"
     quant_block_size = k if rhs_scale is None else k // rhs_scale.shape[1]
+    rhs_dtype = "float4_e2m1fn" if packed_fp4 else str(jnp.dtype(rhs.dtype).name)
     tm, tk, tn = get_tuned_block_sizes(
         m=int(m),
         k=int(k),
@@ -110,7 +121,7 @@ def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups):
         num_total_groups=int(num_total_groups),
         num_current_groups=int(num_total_groups),
         lhs_dtype=str(jnp.dtype(lhs.dtype).name),
-        rhs_dtype=str(jnp.dtype(rhs.dtype).name),
+        rhs_dtype=rhs_dtype,
         quant_block_size=quant_block_size,
     )
     return TileSizes(tile_m=tm, tile_k=tk, tile_n=tn)
@@ -315,12 +326,11 @@ def _fused_moe_jax(
             f"{gmm1_out.shape[1]}, hidden {hidden_size}) is unsupported: "
             "pad weights AND scales jointly at load time."
         )
-    # Packed FP4 w2 has a halved (packed) K; the tuned-block lookup keys on
-    # unpacked K, so fall back to gmm_v2's heuristic tiling for that case.
+    # Packed FP4 w2 has a halved (packed) K; ``_lookup_tile_info`` is packed-aware
+    # (keys on the real K + the float4 dtype), so packed and bf16 w2 both go
+    # through the tuned lookup (tuned triple on a hit, heuristic on a miss).
     gmm2_tiling = _dividing_tile_k(
-        calculate_tiling
-        if w2_packed
-        else _lookup_tile_info(gmm1_out, w2, w2_scale, num_experts)
+        _lookup_tile_info(gmm1_out, w2, w2_scale, num_experts, packed_fp4=w2_packed)
     )
     gmm2_out = gmm_v2(
         lhs=gmm1_out,

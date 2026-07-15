@@ -51,8 +51,12 @@ def _quantize_rows_nvfp4(x, g, block_size=NVFP4_BLOCK):
     return packed, fp8.squeeze(-1)
 
 
-def _make_nvfp4_moe_layer(E, hidden, intermediate, seed):
-    """Build synthetic NVFP4 MoE tensors matching ModelOpt checkpoint params."""
+def _make_nvfp4_moe_layer(E, hidden, intermediate, seed, block_size=NVFP4_BLOCK):
+    """Build synthetic NVFP4 MoE tensors matching ModelOpt checkpoint params.
+
+    ``block_size`` is the per-block scale granularity (16 = native NVFP4; 512 =
+    a coarsened / requantized checkpoint).
+    """
     g = torch.Generator().manual_seed(seed)
     I = intermediate
     w1f = (torch.randn(E, I, hidden, generator=g) * 0.1).float()  # gate
@@ -63,14 +67,14 @@ def _make_nvfp4_moe_layer(E, hidden, intermediate, seed):
     g_up = 0.07 + 0.01 * torch.rand(E, generator=g)
     g_down = 0.05 + 0.01 * torch.rand(E, generator=g)
 
-    w1_p, w1_s = _quantize_rows_nvfp4(w1f, g_gate)
-    w3_p, w3_s = _quantize_rows_nvfp4(w3f, g_up)
-    w2_p, w2_s = _quantize_rows_nvfp4(w2f, g_down)
+    w1_p, w1_s = _quantize_rows_nvfp4(w1f, g_gate, block_size)
+    w3_p, w3_s = _quantize_rows_nvfp4(w3f, g_up, block_size)
+    w2_p, w2_s = _quantize_rows_nvfp4(w2f, g_down, block_size)
 
     return {
         "w13_weight": torch.cat([w1_p, w3_p], dim=1),  # (E, 2I, H/2) u8, [Gate, Up]
         "w2_weight": w2_p,
-        "w13_weight_scale": torch.cat([w1_s, w3_s], dim=1),  # (E, 2I, H/16) fp8
+        "w13_weight_scale": torch.cat([w1_s, w3_s], dim=1),  # (E, 2I, H/G) fp8
         "w2_weight_scale": w2_s,
         "w13_weight_scale_2": torch.stack([g_gate, g_up], dim=1),  # (E, 2) fp32
         "w2_weight_scale_2": g_down,
@@ -188,6 +192,78 @@ class TestNvfp4ScaleFold(CustomTestCase):
         # W2 K-axis padded: packed rows past I/2 and scale blocks past I/16.
         self.assertTrue((layer.w2_weight[:, I // 2 :, :] == 0).all())
         self.assertTrue((layer.w2_weight_scale[:, I // NVFP4_BLOCK :, :, :] == 0).all())
+
+    def test_group_size_512(self):
+        """A coarsened block-512 checkpoint (yaochengji's MXU lever) must fold and
+        lay out identically to block-16, just with 32x fewer scale blocks along K.
+        Real dims (hidden/intermediate 4096) are 512-aligned so pad_n == 0."""
+        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+            prepare_tpu_nvfp4_moe_weights,
+        )
+
+        G = 512
+        E, hidden, I = REAL_E, REAL_HIDDEN, REAL_INTERMEDIATE
+        data = _make_nvfp4_moe_layer(E, hidden, I, seed=2, block_size=G)
+        layer = _build_fake_layer(data)
+
+        gg = data["w13_weight_scale_2"][:, 0]
+        gu = data["w13_weight_scale_2"][:, 1]
+        g2 = data["w2_weight_scale_2"]
+        exp_w13_s = data["w13_weight_scale"].float().clone()
+        exp_w13_s[:, :I, :] *= gg[:, None, None]
+        exp_w13_s[:, I:, :] *= gu[:, None, None]
+        exp_w13_s = exp_w13_s.permute(0, 2, 1).contiguous().unsqueeze(2)
+        exp_w2_s = (
+            (data["w2_weight_scale"].float() * g2[:, None, None])
+            .permute(0, 2, 1)
+            .contiguous()
+            .unsqueeze(2)
+        )
+
+        prepare_tpu_nvfp4_moe_weights(layer, group_size=G)
+
+        # Scale K-axis now has hidden/512 (=8) and I/512 (=8) blocks, not /16.
+        self.assertEqual(
+            tuple(layer.w13_weight_scale.shape), (E, hidden // G, 1, 2 * I)
+        )
+        self.assertEqual(tuple(layer.w2_weight_scale.shape), (E, I // G, 1, hidden))
+        # Packed weights are unchanged by block size.
+        self.assertEqual(tuple(layer.w13_weight.shape), (E, hidden // 2, 2 * I))
+        self.assertEqual(tuple(layer.w2_weight.shape), (E, I // 2, hidden))
+        torch.testing.assert_close(layer.w13_weight_scale.data, exp_w13_s)
+        torch.testing.assert_close(layer.w2_weight_scale.data, exp_w2_s)
+
+    def test_scale_dtype_narrow(self):
+        """``scale_dtype`` re-quantizes the folded per-block scale to a narrower
+        type (fp8 = 4x / bf16 = 2x less scale traffic). The stored dtype must
+        match, and values stay within that dtype's rounding of the fp32 fold."""
+        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+            prepare_tpu_nvfp4_moe_weights,
+        )
+
+        E, hidden, I = REAL_E, REAL_HIDDEN, REAL_INTERMEDIATE
+
+        # fp32 reference fold.
+        ref_layer = _build_fake_layer(_make_nvfp4_moe_layer(E, hidden, I, seed=5))
+        prepare_tpu_nvfp4_moe_weights(ref_layer)
+        ref_w13_s = ref_layer.w13_weight_scale.data
+        ref_w2_s = ref_layer.w2_weight_scale.data
+
+        # bf16 has 7 mantissa bits (~2^-8 step); fp8-e4m3 has 3 (~2^-3 worst-case
+        # relative step) — a coarse but bounded per-block-scale re-quantization.
+        for dtype, rtol in ((torch.bfloat16, 8e-3), (torch.float8_e4m3fn, 1.3e-1)):
+            layer = _build_fake_layer(_make_nvfp4_moe_layer(E, hidden, I, seed=5))
+            prepare_tpu_nvfp4_moe_weights(layer, scale_dtype=dtype)
+            self.assertEqual(layer.w13_weight_scale.dtype, dtype)
+            self.assertEqual(layer.w2_weight_scale.dtype, dtype)
+            # Weights are untouched by the scale dtype.
+            self.assertEqual(layer.w13_weight.dtype, torch.uint8)
+            torch.testing.assert_close(
+                layer.w13_weight_scale.data.float(), ref_w13_s, rtol=rtol, atol=0.0
+            )
+            torch.testing.assert_close(
+                layer.w2_weight_scale.data.float(), ref_w2_s, rtol=rtol, atol=0.0
+            )
 
     def test_shared_global_2d_single_column(self):
         """A gated ``(E, 1)`` global folds via the shared-scalar branch, not the

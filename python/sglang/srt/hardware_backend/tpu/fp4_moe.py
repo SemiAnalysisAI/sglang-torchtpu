@@ -68,9 +68,19 @@ def _fold_w13_global_scale(
     return s
 
 
-def _to_gmm_v2_scale_layout(scale: torch.Tensor) -> torch.Tensor:
-    """``(E, OUT, num_blocks_K)`` -> gmm_v2 ``(E, num_blocks_K, 1, OUT)`` fp32."""
-    return scale.permute(0, 2, 1).contiguous().unsqueeze(2).to(torch.float32)
+def _to_gmm_v2_scale_layout(
+    scale: torch.Tensor, dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """``(E, OUT, num_blocks_K)`` -> gmm_v2 ``(E, num_blocks_K, 1, OUT)``.
+
+    The stored scale ``dtype`` defaults to fp32 (the folded ``fp8_block *
+    global`` product held at full precision). Passing ``torch.float8_e4m3fn``
+    (or ``torch.bfloat16``) re-quantizes the folded scale to a narrower type,
+    cutting the per-block scale stream 4x (fp8) / 2x (bf16) — gmm_v2 sizes its
+    scale traffic from the tensor's own dtype, so no kernel change is needed
+    beyond honoring ``scale.dtype``.
+    """
+    return scale.permute(0, 2, 1).contiguous().unsqueeze(2).to(dtype)
 
 
 def prepare_tpu_nvfp4_moe_weights(
@@ -78,24 +88,26 @@ def prepare_tpu_nvfp4_moe_weights(
     *,
     group_size: int = NVFP4_GROUP_SIZE,
     align_to: int = 128,
+    scale_dtype: torch.dtype = torch.float32,
 ) -> None:
     """Format NVFP4 MoE weights/scales for the TPU gmm_v2 backend.
 
-    Keeps weights packed (uint8), folds the two-level scale to one fp32 per-block
-    scale, transposes to gmm_v2 layout, and pads the intermediate to ``align_to``.
+    Keeps weights packed (uint8), folds the two-level scale to one per-block
+    scale (``scale_dtype``, default fp32), transposes to gmm_v2 layout, and pads
+    the intermediate to ``align_to``.
 
-    Layout in (checkpoint) -> out (gmm_v2):
+    ``group_size`` is the per-block scale granularity along the contracting dim
+    (16 = native NVFP4; a coarsened checkpoint, e.g. block-512 via
+    ``requantize_nvfp4.py``, deepens the kernel's K-tile toward the MXU depth).
+    A coarser ``group_size`` requires the intermediate padding ``pad_n`` to stay
+    a whole number of scale blocks — enforced below.
+
+    Layout in (checkpoint) -> out (gmm_v2), with ``G = group_size``:
       * ``w13_weight``       (E, 2I, H/2) u8  -> (E, H/2, 2*I_pad) u8
-      * ``w13_weight_scale`` (E, 2I, H/16) f8 -> (E, H/16, 1, 2*I_pad) f32
+      * ``w13_weight_scale`` (E, 2I, H/G) f8  -> (E, H/G, 1, 2*I_pad) scale_dtype
       * ``w2_weight``        (E, H, I/2) u8   -> (E, I_pad/2, H) u8
-      * ``w2_weight_scale``  (E, H, I/16) f8  -> (E, I_pad/16, 1, H) f32
+      * ``w2_weight_scale``  (E, H, I/G) f8   -> (E, I_pad/G, 1, H) scale_dtype
     """
-    if group_size != NVFP4_GROUP_SIZE:
-        raise NotImplementedError(
-            f"TPU NVFP4 MoE only supports group_size={NVFP4_GROUP_SIZE}, "
-            f"got {group_size}."
-        )
-
     if not layer.moe_runner_config.is_gated:
         # GMM1 always splits its output in half for the gated SwiGLU, so a
         # non-gated expert would be mis-activated. Reject rather than miscompute.
@@ -106,17 +118,20 @@ def prepare_tpu_nvfp4_moe_weights(
     _E, two_I, _hidden_packed = w13.shape
     intermediate = two_I // 2
 
-    # Fold the per-tensor global scale into the fp8 block scale (-> fp32).
+    # Fold the per-tensor global scale into the fp8 block scale (computed in fp32;
+    # re-quantized to scale_dtype in the layout step below).
     w13_s = _fold_w13_global_scale(
         layer.w13_weight_scale.data, layer.w13_weight_scale_2.data, is_gated=True
-    )  # (E, 2I, H/16) f32
+    )  # (E, 2I, H/G) f32
     w2_s = (
         layer.w2_weight_scale.data.float()
         * layer.w2_weight_scale_2.data.float()[:, None, None]
-    )  # (E, H, I/16) f32
+    )  # (E, H, I/G) f32
 
     # Pad intermediate to align_to; pad_n must stay a multiple of group_size and
-    # PACKING to keep scale blocks and packed bytes whole (enforced below).
+    # PACKING to keep scale blocks and packed bytes whole (enforced below). A
+    # coarser group_size (e.g. 512) needs align_to (or a pre-aligned intermediate)
+    # large enough that any padding is a whole number of scale blocks.
     pad_n = (align_to - intermediate % align_to) % align_to
     if pad_n % group_size != 0 or pad_n % PACKING != 0:
         raise ValueError(
@@ -128,7 +143,7 @@ def prepare_tpu_nvfp4_moe_weights(
     w13_w = _pad_gate_up_halves_axis1(w13, intermediate, pad_n)
     w13_s = _pad_gate_up_halves_axis1(w13_s, intermediate, pad_n)
     w13_w = w13_w.permute(0, 2, 1).contiguous()  # (E, H/2, 2*I_pad) u8
-    w13_scale = _to_gmm_v2_scale_layout(w13_s)  # (E, H/16, 1, 2*I_pad) f32
+    w13_scale = _to_gmm_v2_scale_layout(w13_s, scale_dtype)  # (E, H/G, 1, 2*I_pad)
 
     # W2: pad packed-K and scale blocks to match, then transpose so N = hidden.
     pad_k_packed = pad_n // PACKING
@@ -136,8 +151,8 @@ def prepare_tpu_nvfp4_moe_weights(
     w2_w = (
         _pad_last_axis(w2, pad_k_packed).permute(0, 2, 1).contiguous()
     )  # (E, I_pad/2, H)
-    w2_s = _pad_last_axis(w2_s, pad_k_blocks)  # (E, H, I_pad/16)
-    w2_scale = _to_gmm_v2_scale_layout(w2_s)  # (E, I_pad/16, 1, H) f32
+    w2_s = _pad_last_axis(w2_s, pad_k_blocks)  # (E, H, I_pad/G)
+    w2_scale = _to_gmm_v2_scale_layout(w2_s, scale_dtype)  # (E, I_pad/G, 1, H)
 
     copy_or_rebind_param(layer, "w13_weight", w13_w)
     copy_or_rebind_param(layer, "w2_weight", w2_w)

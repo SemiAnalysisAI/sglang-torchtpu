@@ -90,8 +90,12 @@ def _dequant_rows_nvfp4(packed, fp8_scale, g, dtype=torch.bfloat16):
     return (sign * absv * eff).reshape(E, R, K).to(dtype)
 
 
-def _make_nvfp4_moe_layer(E, hidden, intermediate, seed):
-    """Build a synthetic NVFP4 MoE layer matching ModelOpt checkpoint params."""
+def _make_nvfp4_moe_layer(E, hidden, intermediate, seed, block_size=NVFP4_BLOCK):
+    """Build a synthetic NVFP4 MoE layer matching ModelOpt checkpoint params.
+
+    ``block_size`` is the per-block scale granularity (16 = native NVFP4; 512 =
+    a coarsened / requantized checkpoint).
+    """
     g = torch.Generator().manual_seed(seed)
     I = intermediate
     w1f = (torch.randn(E, I, hidden, generator=g) * 0.1).float()  # gate
@@ -102,12 +106,12 @@ def _make_nvfp4_moe_layer(E, hidden, intermediate, seed):
     g_up = 0.07 + 0.01 * torch.rand(E, generator=g)
     g_down = 0.05 + 0.01 * torch.rand(E, generator=g)
 
-    w1_p, w1_s = _quantize_rows_nvfp4(w1f, g_gate)
-    w3_p, w3_s = _quantize_rows_nvfp4(w3f, g_up)
-    w2_p, w2_s = _quantize_rows_nvfp4(w2f, g_down)
+    w1_p, w1_s = _quantize_rows_nvfp4(w1f, g_gate, block_size)
+    w3_p, w3_s = _quantize_rows_nvfp4(w3f, g_up, block_size)
+    w2_p, w2_s = _quantize_rows_nvfp4(w2f, g_down, block_size)
 
     w13_weight = torch.cat([w1_p, w3_p], dim=1)  # (E, 2I, H/2) u8, [Gate, Up]
-    w13_scale = torch.cat([w1_s, w3_s], dim=1)  # (E, 2I, H/16) fp8
+    w13_scale = torch.cat([w1_s, w3_s], dim=1)  # (E, 2I, H/G) fp8
     w13_scale_2 = torch.stack([g_gate, g_up], dim=1)  # (E, 2) fp32
 
     return {
