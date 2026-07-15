@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_tpu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_tpu = is_tpu()
 
 
 def _resolve_future_token_ids_native(input_ids, future_token_ids_map):
@@ -179,7 +180,12 @@ class FutureMap:
             # holding this tensor will lose all Python references (replaced at
             # batch.spec_info), so the caching allocator (torch GC) could
             # reclaim the memory before the GPU finishes reading it.
-            indices.record_stream(torch.get_device_module(self.device).current_stream())
+            if not _is_tpu:
+                # record_stream is a CUDA caching-allocator cross-stream primitive;
+                # on TPU's single PJRT queue it is not supported.
+                indices.record_stream(
+                    torch.get_device_module(self.device).current_stream()
+                )
             draft_input.topk_p = self.topk_p_buf[indices]
             draft_input.topk_index = self.topk_index_buf[indices]
             draft_input.bonus_tokens = self.bonus_tokens_buf[indices]

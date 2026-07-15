@@ -468,6 +468,11 @@ class TpModelWorker(BaseTpWorker):
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)
 
+        # Compilation policies may pad ForwardBatch in-place during forward.
+        # Keep the scheduler-visible batch size so sampled padding rows can be
+        # removed before the result reaches overlap bookkeeping such as FutureMap.
+        real_batch_size = forward_batch.batch_size
+
         if self.pp_group.is_last_rank:
             out = self.model_runner.forward(
                 forward_batch,
@@ -496,7 +501,7 @@ class TpModelWorker(BaseTpWorker):
                 def sample_batch_func():
                     batch_result.next_token_ids = self.model_runner.sample(
                         logits_output, forward_batch
-                    )
+                    )[:real_batch_size]
                     return batch_result
 
                 batch_result.delay_sample_func = sample_batch_func
@@ -506,12 +511,12 @@ class TpModelWorker(BaseTpWorker):
                 # For normal requests, sample the next token ids.
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
-                )
+                )[:real_batch_size]
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
                 batch_result.next_token_ids = torch.zeros(
-                    len(forward_batch.seq_lens),
+                    real_batch_size,
                     dtype=torch.long,
                     device=forward_batch.input_ids.device,
                 )

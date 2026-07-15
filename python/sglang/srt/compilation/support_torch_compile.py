@@ -116,6 +116,11 @@ class CompilePolicy(ABC):
     ) -> None:
         """Pad the draft-extend input tensors to a static token shape. Base: no-op."""
 
+    def pad_draft_extend_v2(
+        self, forward_batch: Any, model_runner: Any, num_draft_tokens: int
+    ) -> None:
+        """Shape the speculative draft-extend batch for the compiled forward."""
+
 
 class NoopCompilePolicy(CompilePolicy):
     """Default noop policy a runner carries until a real one installs itself."""

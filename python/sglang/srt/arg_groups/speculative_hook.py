@@ -338,6 +338,11 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
             server_args.speculative_num_draft_tokens,
         ) = auto_choose_speculative_params(server_args)
 
+    if server_args.device == "tpu" and server_args.speculative_eagle_topk > 1:
+        raise ValueError(
+            "TPU speculative decoding only supports speculative_eagle_topk == 1."
+        )
+
     if (
         server_args.attention_backend == "trtllm_mha"
         or server_args.decode_attention_backend == "trtllm_mha"

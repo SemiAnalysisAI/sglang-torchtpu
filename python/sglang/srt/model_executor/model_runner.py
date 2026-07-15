@@ -3354,6 +3354,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             draft_attn_backend, draft_extend_attn_backend
         )
 
+    def pad_spec_draft_extend_v2(
+        self, forward_batch: ForwardBatch, num_draft_tokens: int
+    ) -> None:
+        """Shape the speculative draft-extend (DRAFT_EXTEND_V2) batch for this
+        runner's compiled forward.
+        """
+        self.compile_policy.pad_draft_extend_v2(forward_batch, self, num_draft_tokens)
+
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
     ):

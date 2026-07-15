@@ -140,6 +140,12 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             "cpu",
         )
         out_indices = out_indices_cpu.to(self.device, non_blocking=True)
+        # Host shadow of the allocation just shipped to the device. Callers
+        # that need the values on the host (e.g. the host-resident
+        # req_to_token assignment in eagle_info_v2.prepare_for_decode) read
+        # this instead of paying a D2H roundtrip on the device tensor.
+        # Valid until the next alloc_extend call.
+        self.last_alloc_extend_cpu = out_indices_cpu
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)

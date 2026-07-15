@@ -5,8 +5,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
@@ -19,18 +17,12 @@ from sglang.srt.managers.schedule_batch import (
     set_mamba_track_indices_from_reqs,
 )
 from sglang.srt.managers.utils import get_alloc_len_per_decode
-from sglang.srt.mem_cache.common import (
-    alloc_paged_token_slots_extend,
-    alloc_token_slots,
-    get_last_loc,
-)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
@@ -38,15 +30,26 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.speculative.spec_utils_v2 import (
+    allocate_and_assign_decode_cache,
+    assign_draft_cache_locs_page_size_1_func,
+    assign_extend_cache_locs_func,
+)
+from sglang.srt.utils.common import (
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    is_tpu,
+)
 
-_is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
-_is_musa = is_musa()
+_is_tpu = is_tpu()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
         EAGLEDraftCudaGraphRunner,
     )
@@ -60,39 +63,17 @@ if is_cuda() or is_musa():
     )
 
 
-@triton.jit
-def assign_draft_cache_locs_page_size_1(
-    req_pool_indices,
-    req_to_token,
-    seq_lens,
-    out_cache_loc,
-    pool_len: tl.constexpr,
-    topk: tl.constexpr,
-    speculative_num_steps: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 128
-    pid = tl.program_id(axis=0)
-
-    copy_len = topk * speculative_num_steps
-    out_cache_ptr = out_cache_loc + pid * topk * speculative_num_steps
-
-    # Copy from req_to_token to out_cache_loc
-    kv_start = tl.load(seq_lens + pid)
-    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
-    num_loop = tl.cdiv(copy_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        copy_offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = copy_offset < copy_len
-        data = tl.load(token_pool + kv_start + copy_offset, mask=mask)
-        tl.store(out_cache_ptr + copy_offset, data, mask=mask)
+def _req_pool_indices_cpu(batch: ScheduleBatch) -> torch.Tensor:
+    """Rebuild req_pool_indices on the host from the per-req Python ints."""
+    return torch.tensor(
+        [r.req_pool_idx for r in batch.reqs], dtype=torch.int64, device="cpu"
+    )
 
 
 @dataclass
 class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
         batch.maybe_evict_swa()
-
-        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         bs = batch.batch_size()
 
@@ -118,7 +99,6 @@ class EagleDraftInputV2Mixin:
                 output_ids
             )
 
-        page_size = batch.token_to_kv_pool_allocator.page_size
         alloc_len_per_decode = get_alloc_len_per_decode()
         double_alloc = alloc_len_per_decode + alloc_len_per_decode
 
@@ -144,33 +124,16 @@ class EagleDraftInputV2Mixin:
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
-        if page_size == 1:
-            out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
-        else:
-            cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device)
-            nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device)
-            last_loc = get_last_loc(
-                batch.req_to_token_pool.req_to_token,
-                batch.req_pool_indices,
-                cur_kv_lens,
-            )
-            out_cache_loc = alloc_paged_token_slots_extend(
-                batch.tree_cache,
-                cur_kv_lens,
-                cur_kv_lens_cpu,
-                nxt_kv_lens,
-                nxt_kv_lens_cpu,
-                last_loc,
-                num_needed_tokens,
-            )
-
-        assign_req_to_token_pool_func(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            cur_kv_lens_cpu.to(device=batch.device),
-            nxt_kv_lens_cpu.to(device=batch.device),
-            out_cache_loc,
-            bs,
+        allocate_and_assign_decode_cache(
+            tree_cache=batch.tree_cache,
+            req_to_token_pool=batch.req_to_token_pool,
+            req_pool_indices=batch.req_pool_indices,
+            cur_kv_lens_cpu=cur_kv_lens_cpu,
+            nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+            num_needed_tokens=num_needed_tokens,
+            batch_size=bs,
+            device=batch.device,
+            host_req_pool_indices=lambda: _req_pool_indices_cpu(batch),
         )
 
         # FIXME(lsyin): make this sync optional
@@ -195,15 +158,15 @@ class EagleDraftInputV2Mixin:
                 dtype=torch.int64,
                 device=batch.input_ids.device,
             )
-            # FIXME(lsyin): align with the default code path
-            assign_draft_cache_locs_page_size_1[(bs,)](
+            assign_draft_cache_locs_page_size_1_func(
                 batch.req_pool_indices,
                 req_to_token_pool.req_to_token,
                 batch.seq_lens,
                 batch.out_cache_loc,
-                req_to_token_pool.req_to_token.shape[1],
                 topk,
                 num_steps,
+                host_req_pool_indices=lambda: _req_pool_indices_cpu(batch),
+                host_seq_lens=batch.seq_lens_cpu,
             )
 
         # Get a forward batch
@@ -251,6 +214,15 @@ class EagleDraftInputV2Mixin:
         )
         batch.capture_hidden_mode = capture_mode
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        if not batch.forward_mode.is_idle():
+            # Pad to the compile bs bucket BEFORE building attention metadata:
+            # unpadded DRAFT_EXTEND_V2 compositions compile per-rank-divergent
+            # eager graphs whose count drift wedges the TP collective stream
+            # at bs>1 (see SpecDecodeCompilePolicyMixin.pad_draft_extend_v2).
+            # No-op for policies without draft-extend shaping.
+            draft_model_runner.pad_spec_draft_extend_v2(
+                forward_batch, num_draft_tokens
+            )
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
@@ -273,11 +245,12 @@ class EagleVerifyInputV2Mixin:
             batch.out_cache_loc = assign_extend_cache_locs_func(
                 req_pool_indices=batch.req_pool_indices,
                 req_to_token=req_to_token_pool.req_to_token,
-                start_offset=batch.seq_lens,
-                end_offset=batch.seq_lens + self.draft_token_num,
+                seq_lens=batch.seq_lens,
                 batch_size=bs,
                 draft_token_num=self.draft_token_num,
                 device=device,
+                host_req_pool_indices=lambda: _req_pool_indices_cpu(batch),
+                host_seq_lens=batch.seq_lens_cpu,
             )
 
             if get_global_server_args().enable_mamba_extra_buffer():
@@ -382,7 +355,7 @@ class EagleVerifyInputV2Mixin:
         num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
         # Sample tokens
-        if sampling_info.is_all_greedy or _is_npu or _is_hip:
+        if sampling_info.is_all_greedy or _is_npu or _is_hip or _is_tpu:
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -474,118 +447,3 @@ class EagleVerifyInputV2Mixin:
         # tensor includes the trailing/bonus token via out-of-place +1 so the
         # name no longer flips semantics mid-function (naming doc C2).
         return predict, num_correct_drafts + 1, accept_index
-
-
-@triton.jit
-def fill_bonus_tokens(
-    accept_tokens,
-    accept_lens,
-    bonus_tokens_ptr,
-    num_draft_tokens: tl.constexpr,
-):
-    # NOTE: we cannot fuse any in-place operations of `accept_lens` inside this kernel
-    # because this kernel reads accept_lens
-    pid = tl.program_id(axis=0)
-    # `accept_lens` includes the bonus token; the last accepted slot is at -1.
-    accept_len = tl.load(accept_lens + pid)
-
-    bonus_token_idx = num_draft_tokens * pid + accept_len - 1
-    bonus_token = tl.load(accept_tokens + bonus_token_idx)
-    tl.store(bonus_tokens_ptr + pid, bonus_token)
-
-
-@triton.jit
-def fill_accepted_out_cache_loc(
-    accept_index,
-    out_cache_loc,
-    accepted_out_cache_loc,
-    size_upper: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    offset = tl.arange(0, size_upper)
-
-    masks = (tl.load(accept_index + offset, offset < pid, other=-1) != -1).to(tl.int64)
-    dst = tl.sum(masks)
-    src = tl.load(accept_index + pid)
-    if src > -1:
-        value = tl.load(out_cache_loc + src)
-        tl.store(accepted_out_cache_loc + dst, value)
-
-
-@triton.jit
-def assign_extend_cache_locs(
-    req_pool_indices,
-    req_to_token,
-    start_offset,
-    end_offset,
-    out_cache_loc,
-    pool_len: tl.constexpr,
-    bs_upper: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 32
-    pid = tl.program_id(axis=0)
-    kv_start = tl.load(start_offset + pid)
-    kv_end = tl.load(end_offset + pid)
-    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
-
-    length_offset = tl.arange(0, bs_upper)
-    start = tl.load(start_offset + length_offset, mask=length_offset < pid, other=0)
-    end = tl.load(end_offset + length_offset, mask=length_offset < pid, other=0)
-    out_offset = tl.sum(end - start, axis=0)
-
-    out_cache_ptr = out_cache_loc + out_offset
-
-    load_offset = tl.arange(0, BLOCK_SIZE) + kv_start
-    save_offset = tl.arange(0, BLOCK_SIZE)
-
-    num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
-    for _ in range(num_loop):
-        mask = load_offset < kv_end
-        data = tl.load(token_pool + load_offset, mask=mask)
-        tl.store(out_cache_ptr + save_offset, data, mask=mask)
-        load_offset += BLOCK_SIZE
-        save_offset += BLOCK_SIZE
-
-
-def assign_extend_cache_locs_func(
-    req_pool_indices: torch.Tensor,
-    req_to_token: torch.Tensor,
-    start_offset: torch.Tensor,
-    end_offset: torch.Tensor,
-    batch_size: int,
-    draft_token_num: int,
-    device,
-) -> torch.Tensor:
-    if _is_cuda or _is_hip or _is_musa:
-        out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
-            dtype=torch.int64,
-            device=device,
-        )
-        assign_extend_cache_locs[(batch_size,)](
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-            req_to_token.shape[1],
-            next_power_of_2(batch_size),
-        )
-
-        return out_cache_loc
-
-    elif _is_npu:
-        out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
-            dtype=torch.int32,
-            device=device,
-        )
-        torch.ops.npu.cache_loc_update(
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-        )
-
-        return out_cache_loc

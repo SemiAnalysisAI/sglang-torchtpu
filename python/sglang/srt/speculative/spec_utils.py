@@ -809,7 +809,8 @@ def _select_top_k_tokens_first(
     topk: int,
 ):
     input_ids = topk_index.flatten()
-    if hidden_states is not None:
+    if hidden_states is not None and topk > 1:
+        # Skip the no-op ``repeat_interleave(1)`` when topk=1.
         hidden_states = hidden_states.repeat_interleave(topk, dim=0)
 
     tree_info = (

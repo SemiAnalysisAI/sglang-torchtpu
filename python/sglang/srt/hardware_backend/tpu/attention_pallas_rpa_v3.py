@@ -280,6 +280,13 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
     # Metadata
     # ------------------------------------------------------------------ #
 
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info, cuda_graph_bs: Optional[int] = None
+    ):
+        # TPU rebuilds attention metadata for verify and has no graph-capture
+        # buffers to refresh after draft generation.
+        pass
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # Look up the cached RPA ``distribution`` on TPU, so we don't build it,
         # don't H2D it per step, and don't need the barrier that ensured the RPA
@@ -372,7 +379,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             extend_seq_lens = torch.full(
                 (bs,), draft_token_num, dtype=torch.int32, device=device
             )
-        elif forward_batch.forward_mode.is_draft_extend():
+        elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
             # DRAFT_EXTEND: batch.prefix_lens may be stale from the
             # initial prefill; seq_lens and extend_seq_lens are current.
             seq_lens = forward_batch.seq_lens.to(torch.int32)
@@ -475,8 +482,8 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             draft_token_num = forward_batch.spec_info.draft_token_num
             kv_lens = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
             extend_seq_lens = torch.full((bs,), draft_token_num, dtype=torch.int32)
-        elif forward_batch.forward_mode.is_extend():
-            # EXTEND and DRAFT_EXTEND: seq_lens / extend_seq_lens are current.
+        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            # EXTEND and both DRAFT_EXTEND modes use current lengths.
             assert forward_batch.extend_seq_lens is not None
             kv_lens = forward_batch.seq_lens.to(torch.int32)
             extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)

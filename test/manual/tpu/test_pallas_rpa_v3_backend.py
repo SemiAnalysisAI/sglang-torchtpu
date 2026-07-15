@@ -356,6 +356,25 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
         expected_cu_q = torch.tensor([0, 3, 4, 6], dtype=torch.int32)
         self.assertTrue(torch.equal(meta.cu_q_lens, expected_cu_q))
 
+    def test_draft_extend_v2_uses_extend_seq_lens(self):
+        backend = _BackendUnderTest(self.PAGE_SIZE, self.req_to_token)
+        extend_seq_lens = torch.tensor([2, 3, 1], dtype=torch.int32)
+        fb = _make_forward_batch(
+            seq_lens=self.seq_lens,
+            req_pool_indices=self.req_pool_indices,
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            extend_seq_lens=extend_seq_lens,
+            spec_info=self.spec_info,
+        )
+        meta = _build_meta(backend, fb)
+        self.assertTrue(torch.equal(meta.kv_lens, self.seq_lens.to(torch.int32)))
+        self.assertTrue(
+            torch.equal(
+                meta.cu_q_lens,
+                torch.tensor([0, 2, 5, 6], dtype=torch.int32),
+            )
+        )
+
     def test_spec_page_indices_match_non_spec(self):
         # The page-indices gather is mode-independent; spec modes must produce
         # the same rectangular layout as plain decode.

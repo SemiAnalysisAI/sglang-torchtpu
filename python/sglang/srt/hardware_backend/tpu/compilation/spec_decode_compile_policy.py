@@ -611,6 +611,40 @@ class SpecDecodeCompilePolicyMixin:
         forward_batch.batch_size = real_bs
         return tuple(t[:real_bs] for t in outputs)
 
+    def pad_draft_extend_v2(
+        self, forward_batch: Any, model_runner: Any, num_draft_tokens: int
+    ) -> None:
+        """Pad an EAGLE DRAFT_EXTEND_V2 ForwardBatch to a torch.compile bs bucket."""
+        b_bucketer = self.b_bucketer
+        if b_bucketer is None:
+            return
+        real_bs = int(forward_batch.seq_lens.shape[0])
+        pad_b = b_bucketer.next_bucket(real_bs)
+        if pad_b == real_bs:
+            return
+        # ForwardBatch already knows how to pad itself (the DP-attention
+        # MLP-sync machinery), including spec_info hidden_states and the
+        # slot-0 pad conventions for out_cache_loc / req_pool_indices.
+        forward_batch._pad_inputs_to_size(
+            model_runner, pad_b * num_draft_tokens, pad_b
+        )
+        # The RPA metadata builder prefers the CPU list mirror of
+        # extend_seq_lens when its length matches bs; pad it too so each ghost
+        # row claims num_draft_tokens query slots in the rectangular cu_q
+        # layout, matching the zero-padded input_ids tail.
+        esl_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if isinstance(esl_cpu, list) and len(esl_cpu) == real_bs:
+            forward_batch.extend_seq_lens_cpu = esl_cpu + [num_draft_tokens] * (
+                pad_b - real_bs
+            )
+        forward_batch.batch_size = pad_b
+        # Mark only the real rows active for the RPA kernel distribution. Do
+        # NOT set _REAL_Q_KEY: the compiled-forward shim would then slice the
+        # logits to real_b rows, but the draft-extend consumer needs the full
+        # real_b * num_draft_tokens rows (it gathers the last accepted row per
+        # request itself).
+        setattr(forward_batch, _REAL_B_KEY, real_bs)
+
 
 class SpecDecoderTpuCompilePolicy(
     SpecDecodeCompilePolicyMixin, DecoderTpuCompilePolicy

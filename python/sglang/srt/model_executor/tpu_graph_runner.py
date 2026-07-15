@@ -119,6 +119,12 @@ class TpuGraphRunner:
         if hasattr(torch._dynamo.config, "fail_on_recompile_limit_hit"):
             torch._dynamo.config.fail_on_recompile_limit_hit = True
 
+        # flashinfer_backend's module body sets suppress_errors=True when
+        # torch compile is enabled (it gets imported on the speculative
+        # path even on TPU); dynamo asserts if both flags are active, so
+        # force it back off — on TPU we want loud dynamo failures anyway.
+        torch._dynamo.config.suppress_errors = False
+
         _register_tpu_compile_backend()
 
         modules = (
