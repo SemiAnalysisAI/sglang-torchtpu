@@ -924,7 +924,15 @@ def kernel_main(
         # Up half = sub-view of rhs_ref at column size_n.
         rhs_up_ref = WeightsRef(
             weight=rhs_ref.weight.at[..., cfgs.dims.size_n :],
-            scale=rhs_ref.scale,
+            # Slice the up-half's per-column scale to match its weight sub-view.
+            # Without this, the up projection reuses the gate columns' scale,
+            # which is correct-looking for the raw matmul but corrupts the fused
+            # SwiGLU on packed FP4 (drops cos to ~0.95); slicing restores ~0.999.
+            scale=(
+                rhs_ref.scale.at[..., cfgs.dims.size_n :]
+                if rhs_ref.scale is not None
+                else None
+            ),
             bias=(
                 rhs_ref.bias.at[..., cfgs.dims.size_n :]
                 if rhs_ref.bias is not None

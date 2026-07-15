@@ -252,12 +252,13 @@ def _fused_moe_jax(
     # halves, so run an unfused GMM1 and apply the activation in JAX for
     # correctness.
     compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
-    # The in-kernel fused SwiGLU is numerically off for packed-FP4 rhs in this
-    # gmm_v2 (bf16 fused act is exact, but packed-FP4 fused act drifts to ~cos
-    # 0.95 while the raw packed-FP4 matmul is exact). So for packed FP4 — as for
-    # compact block scales — run an unfused GMM1 and apply the activation
-    # separately in JAX on the correct 2*n accumulator.
-    unfused_gmm1 = compact_block_scales or w1_packed
+    # Packed-FP4 rhs now fuses the SwiGLU in-kernel: the earlier ~cos 0.95 drift
+    # was the fused-act up-half reusing the gate columns' per-block scale; slicing
+    # the up scale sub-view in gmm_v2's kernel_main (mirroring the weight/bias
+    # sub-views) restores parity (~cos 0.999), so only compact block scales — which
+    # need distinct gate/up scale *offsets* the fused path can't express — still
+    # run an unfused GMM1 with a separate JAX activation on the 2*n accumulator.
+    unfused_gmm1 = compact_block_scales
     gmm1_fuse_act = None if unfused_gmm1 else _fuse_act_name(activation_name)
 
     gmm1_tile_info = None
