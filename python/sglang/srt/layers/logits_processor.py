@@ -377,7 +377,14 @@ class LogitsProcessor(nn.Module):
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=False, floor=128
             ),
-            enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
+            # The multimem all-gather is a CUDA triton symmetric-memory path
+            # (create_state -> torch.cuda.current_device()); disable on TPU so the
+            # logits gather falls back to tensor_model_parallel_all_gather.
+            enabled=(
+                self.do_tensor_parallel_all_gather
+                and not self.use_attn_tp_group
+                and not _is_tpu
+            ),
             skip_entry_sync=True,
         )
 
