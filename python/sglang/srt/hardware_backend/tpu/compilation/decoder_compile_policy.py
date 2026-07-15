@@ -219,24 +219,37 @@ class DecoderTpuCompilePolicy(CompilePolicy):
 
         An idle rank may take a different code path than decode, but with DP
         attention all ranks must run the same code. Relabel idle as DECODE.
+
+        Upstream removed ``ModelRunner.forward_idle`` (idle now flows through
+        ``ModelRunner.forward`` -> the eager runner), so hook ``forward`` and
+        relabel idle batches at entry; the ``is_idle()`` guard keeps decode /
+        extend batches untouched.
         """
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         model_runner = self.model_runner
         # Idempotent: a re-install (tests, warmups) must not nest a second
-        # wrapper around an already-wrapped forward_idle.
-        if getattr(model_runner.forward_idle, "_tpu_idle_as_decode", False):
+        # wrapper around an already-wrapped forward.
+        if getattr(model_runner.forward, "_tpu_idle_as_decode", False):
             return
-        orig_forward_idle = model_runner.forward_idle
+        orig_forward = model_runner.forward
 
-        def forward_idle(forward_batch, pp_proxy_tensors=None):
-            if forward_batch.batch_size > 0 and is_dp_attention_enabled():
+        def forward(forward_batch, *args, **kwargs):
+            # Relabel only; forward()'s decode path (eager runner) runs
+            # prepare_forward_batch exactly once. Do NOT prepare here — the
+            # shim's _prepare is not idempotent, and a second call overwrites
+            # _REAL_Q/_REAL_B with the already-padded size, so outputs never get
+            # unpadded (garbage decode under DP attention).
+            if (
+                forward_batch.forward_mode.is_idle()
+                and forward_batch.batch_size > 0
+                and is_dp_attention_enabled()
+            ):
                 forward_batch.forward_mode = ForwardMode.DECODE
-                model_runner.model.prepare_forward_batch(forward_batch)
-            return orig_forward_idle(forward_batch, pp_proxy_tensors)
+            return orig_forward(forward_batch, *args, **kwargs)
 
-        forward_idle._tpu_idle_as_decode = True
-        model_runner.forward_idle = forward_idle
+        forward._tpu_idle_as_decode = True
+        model_runner.forward = forward
 
     def set_recompilation_checker(self, checker: Any, model_label: str = "") -> None:
         """Forward serving-time recompilation checks to the installed shim."""
