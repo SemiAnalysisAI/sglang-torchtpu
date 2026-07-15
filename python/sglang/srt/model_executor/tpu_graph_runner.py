@@ -177,7 +177,7 @@ class TpuGraphRunner:
             if callable(set_checker):
                 set_checker(checker, model_label=label)
 
-    def can_run(self, forward_batch: ForwardBatch) -> bool:
+    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.
 
         PJRT/libtpu caches HLO compilations internally and dispatches
@@ -185,7 +185,7 @@ class TpuGraphRunner:
         normal ``self.model.forward(...)`` call path, not through a
         replay step. This method exists because ModelRunner.forward
         gates the replay branch on
-        ``self.graph_runner and self.graph_runner.can_run(...)`` —
+        ``self.<decode|prefill>_cuda_graph_runner.can_run_graph(...)`` —
         returning False keeps that branch off on TPU.
         """
         return False

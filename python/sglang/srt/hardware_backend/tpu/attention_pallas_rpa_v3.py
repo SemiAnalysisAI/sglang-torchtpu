@@ -610,7 +610,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         if layer.v_head_dim < layer.qk_head_dim:
             v = torch.nn.functional.pad(v, (0, layer.qk_head_dim - layer.v_head_dim))
 
-        kv_cache = forward_batch.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
+        kv_cache = self._token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
 
         op = self._op
 

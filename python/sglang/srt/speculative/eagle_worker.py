@@ -17,14 +17,14 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
     get_last_loc,
 )
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -113,6 +113,14 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+
+        # Idempotency guards for the scheduler-facing init facade. V1 eagerly
+        # runs init_attention_backend() / init_cuda_graphs() inside __init__, so
+        # the current scheduler's later init_attention_backends() /
+        # init_cuda_graphs() calls must no-op. Real instance attrs (checked by
+        # truthiness, never getattr) so the first eager call flips them.
+        self._attn_backends_initialized = False
+        self._cuda_graphs_initialized = False
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
@@ -246,6 +254,11 @@ class EAGLEWorker(TpModelWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
     def init_attention_backend(self):
+        # Idempotent: __init__ runs this eagerly; the scheduler's later
+        # init_attention_backends() must no-op.
+        if self._attn_backends_initialized:
+            return
+        self._attn_backends_initialized = True
         # Create multi-step attn backends and cuda graph runners
         draft_backend_factory = DraftBackendFactory(
             self.server_args,
@@ -264,8 +277,17 @@ class EAGLEWorker(TpModelWorker):
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
 
+    def init_attention_backends(self):
+        # Scheduler-facing plural alias; V1 uses the singular form internally.
+        self.init_attention_backend()
+
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
+        # Idempotent: __init__ runs this eagerly; the scheduler's later
+        # init_cuda_graphs() must no-op.
+        if self._cuda_graphs_initialized:
+            return
+        self._cuda_graphs_initialized = True
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
@@ -370,7 +392,7 @@ class EAGLEWorker(TpModelWorker):
 
             target_graph_runner = None
             if not self.server_args.disable_cuda_graph:
-                target_graph_runner = CudaGraphRunner(
+                target_graph_runner = DecodeCudaGraphRunner(
                     target_model_runner,
                     attn_backend=target_attn_backend,
                     speculative_num_steps=speculative_num_steps,
@@ -441,7 +463,44 @@ class EAGLEWorker(TpModelWorker):
     def draft_model_runner(self):
         return self.model_runner
 
-    def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
+    def alloc_memory_pool(
+        self,
+        *,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        # No-op: V1 acquires the target worker's pool in __init__ (it must be
+        # in place before super().__init__ loads the draft model). The
+        # scheduler hands back that same target pool, so there is nothing more
+        # to allocate here.
+        pass
+
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
+        # Scheduler-facing hook (batch_result_processor) that feeds the adaptive
+        # controller off the hot path. Mirrors EAGLEWorkerV2.
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.on_verify_complete(
+                num_correct_drafts_per_req, batch_size=batch_size
+            )
+
+    @property
+    def draft_worker(self):
+        # PD-disaggregation compat: the scheduler reaches the draft runner via
+        # `scheduler.draft_worker.draft_worker.draft_runner`. V1 is its own
+        # draft worker, so this returns self. (PD-disagg path is untested.)
+        return self
+
+    @property
+    def draft_runner(self):
+        # PD-disaggregation compat accessor; see `draft_worker`.
+        return self.draft_model_runner
+
+    def forward_batch_generation(
+        self, batch: ScheduleBatch, on_publish=None
+    ) -> GenerationBatchResult:
         """Run speculative decoding forward.
 
         NOTE: Many states of batch is modified as you go through. It is not guaranteed that
