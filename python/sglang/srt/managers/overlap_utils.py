@@ -321,6 +321,10 @@ class FutureMap:
         static across steps (offset is a runtime tensor value, not a shape).
         Ported from fork PR #78; elsewhere keep the cheaper setitem.
         """
+        # Cast to the buffer dtype before storing (main #134: the sampler now
+        # returns int64 token ids that must land in the buffer's dtype).
+        if values.dtype != buf.dtype:
+            values = values.to(buf.dtype)
         if self._use_dynamic_index:
             buf.index_copy_(0, indices, values)
         else:

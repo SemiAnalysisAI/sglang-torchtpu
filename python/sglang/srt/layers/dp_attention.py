@@ -606,10 +606,14 @@ def _dp_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
+    # NOTE: compare against DpPaddingMode.MAX_LEN directly rather than calling
+    # dp_padding_mode.is_max_len() — this runs inside a compiled forward, where
+    # the enum's bound method can cause tracing errors under full compilation
+    # (main #147). Equivalent, and applied to both checks below.
     if (
         is_dp_gatherv_active()
         and forward_batch.dp_padding_mode is not None
-        and not forward_batch.dp_padding_mode.is_max_len()
+        and forward_batch.dp_padding_mode != DpPaddingMode.MAX_LEN
     ):
         # The gatherv per-rank sizes MUST sum to the pre-allocated global buffer
         # (the MoE runs on the whole buffer, so any unfilled tail = garbage).
@@ -629,7 +633,7 @@ def _dp_gather(
                 global_tokens, local_tokens, forward_batch, is_partial, _gatherv_sizes
             )
             return
-    if forward_batch.dp_padding_mode.is_max_len():
+    if forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN:
         _dp_gather_via_all_gather(
             global_tokens, local_tokens, forward_batch, is_partial
         )
@@ -668,9 +672,10 @@ def dp_scatter(
         )
         n = local_tokens.shape[0]
         if n > 0:
-            rows = torch.arange(n, dtype=torch.int64, device=global_tokens.device)
-            idx = rows + get_attention_dp_rank() * n
-            local_tokens.copy_(global_tokens.index_select(0, idx))
+            # MAX_LEN gives equal-length per-rank blocks, so this rank's rows
+            # are the contiguous range [dp_rank * n, (dp_rank + 1) * n).
+            start = get_attention_dp_rank() * n
+            local_tokens.copy_(global_tokens[start : start + n])
         return
 
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
