@@ -989,7 +989,6 @@ class ModelRunnerKVCacheMixin:
                     swa_head_num=swa_head_num,
                     swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
-                    enable_kvcache_transpose=False,
                     device=self.device,
                     token_to_kv_pool_class=PoolCls,
                 )
