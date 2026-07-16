@@ -68,7 +68,6 @@ def build_topk1_tree(
     )
 
 
-
 def _future_map_store_one(
     buf: torch.Tensor, indices: torch.Tensor, values: torch.Tensor
 ) -> torch.Tensor:

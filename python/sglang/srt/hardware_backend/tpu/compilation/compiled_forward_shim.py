@@ -490,18 +490,22 @@ class CompiledForwardShim:
             return None
         spec_info = getattr(forward_batch, "spec_info", None)
         static_args = tuple(
-            (type(value), value)
-            if isinstance(value, _DEFAULT_KWARG_TYPES)
-            else type(value)
+            (
+                (type(value), value)
+                if isinstance(value, _DEFAULT_KWARG_TYPES)
+                else type(value)
+            )
             for value in args
         )
         static_kwargs = tuple(
             sorted(
                 (
                     name,
-                    (type(value), value)
-                    if isinstance(value, _DEFAULT_KWARG_TYPES)
-                    else type(value),
+                    (
+                        (type(value), value)
+                        if isinstance(value, _DEFAULT_KWARG_TYPES)
+                        else type(value)
+                    ),
                 )
                 for name, value in kwargs.items()
             )
@@ -598,9 +602,7 @@ class CompiledForwardShim:
                 input_ids, positions, forward_batch, args, kwargs
             )
             replay = (
-                self._target_replays.get(replay_key)
-                if replay_key is not None
-                else None
+                self._target_replays.get(replay_key) if replay_key is not None else None
             )
             if self._target_replay_active and replay is not None:
                 out = replay(input_ids, positions, forward_batch, *args, **kwargs)

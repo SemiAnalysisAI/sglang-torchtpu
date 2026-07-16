@@ -28,15 +28,15 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.hardware_backend.tpu.spec_utils_v2 import (
+    store_future_map_spec,
+    store_future_map_spec_hidden,
+)
 from sglang.srt.managers.overlap_utils import (
     _DYNAMIC_INDEX_DEVICE_TYPES,
     FutureMap,
     _device_use_dynamic_index,
     _select_device_accept_cache_locs,
-)
-from sglang.srt.hardware_backend.tpu.spec_utils_v2 import (
-    store_future_map_spec,
-    store_future_map_spec_hidden,
 )
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")

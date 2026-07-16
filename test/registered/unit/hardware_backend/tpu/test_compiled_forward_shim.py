@@ -521,12 +521,8 @@ class TestCompiledForwardShim(CustomTestCase):
 
         input_ids = torch.zeros(16, dtype=torch.int32)
         positions = torch.zeros(16, dtype=torch.int32)
-        key_bs2 = shim._target_replay_key(
-            input_ids, positions, make_fb(8, 2), (), {}
-        )
-        key_bs3 = shim._target_replay_key(
-            input_ids, positions, make_fb(12, 3), (), {}
-        )
+        key_bs2 = shim._target_replay_key(input_ids, positions, make_fb(8, 2), (), {})
+        key_bs3 = shim._target_replay_key(input_ids, positions, make_fb(12, 3), (), {})
         self.assertEqual(key_bs2, key_bs3)
 
     def test_pins_is_prefill_only_for_compiled_call_and_restores(self):
