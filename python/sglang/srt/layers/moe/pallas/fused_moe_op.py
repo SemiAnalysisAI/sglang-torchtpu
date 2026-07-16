@@ -50,11 +50,20 @@ mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS.
 # strings and validation would reject them.
 
 import logging
+import os
 from typing import Optional
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+# Fold the per-block RHS scale into the dequantized (bf16) weight tile before the
+# matmul for packed-FP4 experts, so a single deep matmul replaces one tiny
+# ``[m, block] @ [block, n]`` matmul per quant block (native NVFP4 block-16
+# otherwise leaves the 256-deep MXU mostly idle). Only affects packed-FP4 rhs
+# (bf16/fp8/mxfp4 pass ``rhs_prescale=False``). Set to "0" for the pre-scale-off
+# A/B baseline.
+_NVFP4_PRESCALE = os.environ.get("SGLANG_TPU_NVFP4_PRESCALE", "1") == "1"
 
 # Singleton: one ``torch.library`` op for the whole process. The JaxCallable
 # beneath does its own per-(static_arg, input-shape) trace caching, so a
@@ -310,6 +319,7 @@ def _fused_moe_jax(
         tile_info=gmm1_tiling,
         fuse_act=gmm1_fuse_act,
         packed_fp4=w1_packed,
+        rhs_prescale=w1_packed and _NVFP4_PRESCALE,
     )
     if unfused_gmm1:
         gmm1_out = apply_act_fn(
@@ -341,6 +351,7 @@ def _fused_moe_jax(
         preferred_element_type=out_dtype,
         tile_info=gmm2_tiling,
         packed_fp4=w2_packed,
+        rhs_prescale=w2_packed and _NVFP4_PRESCALE,
     )[
         :,
         :hidden_size,

@@ -251,6 +251,12 @@ class GmmConfigs:
     acc_dtype: jnp.dtype
     zero_init: bool
     fuse_act: str | None = None
+    # When True, the per-block RHS scale is folded into the dequantized weight
+    # tile BEFORE the matmul so a single ``tile_k``-deep matmul replaces one tiny
+    # matmul per quant block. Used for packed-FP4 (native block-16) rhs, whose
+    # tiny scale blocks otherwise force ``[m, 16] @ [16, n]`` ops that leave the
+    # 256-deep MXU mostly idle. Implies an unquantized (bf16) lhs (W4A16).
+    rhs_prescale: bool = False
 
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
@@ -451,7 +457,62 @@ def inner_kernel(
             mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
             tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
 
-        if cfgs.lhs_cfgs.quant_dtype is None:
+        if cfgs.rhs_prescale:
+            # Pre-scaled deep-matmul path (packed-FP4 W4A16).
+            #
+            # The default quantized/unquantized paths walk K in
+            # ``quant_block_size`` steps and issue one MXU matmul per quant
+            # block, applying the per-block RHS scale to the accumulator *after*
+            # each matmul. For native NVFP4 (block size 16) that is a stream of
+            # ``[tile_m, 16] @ [16, n]`` matmuls that contract only 16 of the
+            # 256-deep MXU -> the systolic array is mostly fill/drain overhead.
+            #
+            # Instead, dequantize the whole rhs tile to bf16 (unpack + fold the
+            # per-block scale into the weights) and run a single ``tile_k``-deep
+            # matmul in ``mxu_size`` output-column chunks. The scale is applied to
+            # the operand before the matmul, so the MXU contracting dim is no
+            # longer welded to the 16-wide scale block.
+            mxu_size = pltpu.get_tpu_info().mxu_column_size
+            rhs_qbs = cfgs.rhs_cfgs.quant_block_size
+            rhs_cols = tiled_rhs.shape[1]
+
+            rhs_deq = tiled_rhs.astype(jnp.float32)
+            if cfgs.rhs_cfgs.has_scale:
+                # Broadcast each block's [1, n] column scale across its
+                # ``rhs_qbs`` K rows to a full [tile_k, n] weight scale, then
+                # fold it into the dequantized weights.
+                scale_blocks = jnp.concatenate(
+                    [
+                        tiled_rhs_ref.get_scale(
+                            b_id,
+                            cfgs.rhs_cfgs.scale_block_n,
+                            cfgs.dims.size_n,
+                        )
+                        for b_id in range(num_quant_blocks_per_tile_k)
+                    ],
+                    axis=0,
+                )  # [num_quant_blocks_per_tile_k, rhs_cols]
+                # [num_blocks * rhs_qbs, cols] -> slice to tile_k so a quant block
+                # wider than tile_k (e.g. block-512 with a 128 tile) still lands a
+                # single constant scale over the tile.
+                scale_k = jnp.repeat(scale_blocks, rhs_qbs, axis=0)[
+                    : cfgs.tiles.tile_k
+                ]
+                rhs_deq = rhs_deq * scale_k.astype(rhs_deq.dtype)
+            rhs_mm = rhs_deq.astype(jnp.bfloat16)
+            lhs_mm = tiled_lhs.astype(jnp.bfloat16)
+
+            acc_list = []
+            for start_n in range(0, rhs_cols, mxu_size):
+                end_n = min(rhs_cols, start_n + mxu_size)
+                acc_n = jnp.matmul(
+                    lhs_mm,
+                    rhs_mm[:, start_n:end_n],
+                    preferred_element_type=jnp.float32,
+                ).astype(acc_ref.dtype)
+                acc_list.append(acc_n)
+            acc = jnp.concatenate(acc_list, axis=1)
+        elif cfgs.lhs_cfgs.quant_dtype is None:
             # Unquantized matmul path.
             acc_list = []
             mxu_size = pltpu.get_tpu_info().mxu_column_size
@@ -1164,6 +1225,7 @@ def make_gmm_configs(
     zero_initialize: bool,
     fuse_act: str | None = None,
     packed_fp4: bool = False,
+    rhs_prescale: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
@@ -1218,7 +1280,7 @@ def make_gmm_configs(
     )
 
     lhs_q_dtype = None
-    if maybe_quantize_lhs and rhs_quant_dtype is not None:
+    if maybe_quantize_lhs and rhs_quant_dtype is not None and not rhs_prescale:
         # Choose lhs quantization dtype based on TPU hardware support.
         is_rhs_float = jnp.issubdtype(rhs_quant_dtype, jnp.floating)
         tpu_info = pltpu.get_tpu_info()
@@ -1305,6 +1367,7 @@ def make_gmm_configs(
         acc_dtype=acc_dtype,
         zero_init=zero_initialize,
         fuse_act=fuse_act,
+        rhs_prescale=rhs_prescale,
     )
 
 
@@ -1339,6 +1402,7 @@ def get_metadata(cfgs: GmmConfigs):
         "zero_initialize",
         "fuse_act",
         "packed_fp4",
+        "rhs_prescale",
     ]
 )
 def gmm_v2(
@@ -1358,6 +1422,7 @@ def gmm_v2(
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     packed_fp4: bool = False,
+    rhs_prescale: bool = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1411,6 +1476,7 @@ def gmm_v2(
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
         packed_fp4=packed_fp4,
+        rhs_prescale=rhs_prescale,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles

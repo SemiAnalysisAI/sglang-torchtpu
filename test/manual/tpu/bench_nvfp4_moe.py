@@ -2,13 +2,20 @@
 
 Reproduces the reviewer microbench (hidden = intermediate = 4096, top-8) that
 flagged the FP4 MoE as 5-8x slower than bf16, and reports the fp4/bf16 latency
-ratio per token count so each perf lever (fused-act GMM1, packed-w2 tuned
-tiling, narrow scale dtype, block-512 coarsening) can be measured before/after.
+ratio per token count so each perf lever (RHS-scale pre-scale / deep matmul,
+fused-act GMM1, packed-w2 tuned tiling, narrow scale dtype, block-512
+coarsening) can be measured before/after.
 
 Requires torch_tpu + a TPU device. Run on-pod:
 
     SGLANG_TPU_NVFP4_SCALE_DTYPE=fp32 \\
     python test/manual/tpu/bench_nvfp4_moe.py --block-size 16
+
+The centerpiece A/B (yaochengji's MXU-underutilization fix) toggles the
+pre-scale deep-matmul path with an env var (default on); run both:
+
+    SGLANG_TPU_NVFP4_PRESCALE=0 python .../bench_nvfp4_moe.py  # per-16-block baseline
+    SGLANG_TPU_NVFP4_PRESCALE=1 python .../bench_nvfp4_moe.py  # single deep matmul
 
 Flags let the same harness cover each lever:
   --block-size {16,512}   per-block scale granularity (512 = coarsened ckpt)
