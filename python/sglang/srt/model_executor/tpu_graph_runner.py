@@ -192,9 +192,7 @@ class TpuGraphRunner:
                 installed_any = True
                 installed_policies.append(policy)
                 policy.precompile()
-                compiled_forward_shim = getattr(
-                    policy, "compiled_forward_shim", None
-                )
+                compiled_forward_shim = getattr(policy, "compiled_forward_shim", None)
                 if compiled_forward_shim is not None:
                     compiled_forward_shim.enable_target_replay()
 

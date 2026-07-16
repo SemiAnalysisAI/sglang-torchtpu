@@ -1403,6 +1403,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
+    @staticmethod
+    def _tpu_flush_deferred_ops():
+        """Cut pending TorchTPU ops at a deterministic TP step boundary."""
+        from torch_tpu._internal.sync.sync import synchronize as _tpu_sync
+
+        _tpu_sync(None, wait=False)
+
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
@@ -1438,6 +1445,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.mm_input_embeds,
                     )
                 )
+                if _is_tpu:
+                    self._tpu_flush_deferred_ops()
                 return batch_output
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
@@ -1495,6 +1504,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
+            if _is_tpu:
+                self._tpu_flush_deferred_ops()
             return batch_output
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:

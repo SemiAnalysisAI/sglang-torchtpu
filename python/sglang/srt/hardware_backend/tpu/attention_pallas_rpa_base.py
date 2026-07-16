@@ -566,17 +566,13 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
         if q_tokens_per_req is None:
             cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32, device=device)
-            cu_q_lens[1:] = torch.cumsum(
-                extend_seq_lens, dim=0, dtype=torch.int32
-            )
+            cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
         else:
             cu_q_lens = self._cached_ramp(bs + 1, q_tokens_per_req, device)
 
         # cu_kv_lens[i] = i * pages_per_seq * page_size so the kernel addresses
         # ``page_indices[i * pages_per_seq + j]`` for token j of seq i.
-        cu_kv_lens = self._cached_ramp(
-            bs + 1, pages_per_seq * page_size, device
-        )
+        cu_kv_lens = self._cached_ramp(bs + 1, pages_per_seq * page_size, device)
 
         per_seq = req_to_token[req_pool_indices]  # [bs, max_ctx]
         # ``req_to_token.shape[1]`` may not be an exact multiple of
@@ -699,15 +695,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
         if q_tokens_per_req is None:
             cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32)
-            cu_q_lens[1:] = torch.cumsum(
-                extend_seq_lens, dim=0, dtype=torch.int32
-            )
+            cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
             cu_q_lens_device = cu_q_lens.to(device, non_blocking=True)
         else:
             cu_q_lens_device = self._cached_ramp(bs + 1, q_tokens_per_req, device)
-        cu_kv_lens_device = self._cached_ramp(
-            bs + 1, pages_per_seq * page_size, device
-        )
+        cu_kv_lens_device = self._cached_ramp(bs + 1, pages_per_seq * page_size, device)
 
         req_key = tuple(int(index) for index in req_pool_indices.tolist())
         page_key = (str(device), bs, pages_per_seq, req_key)
@@ -868,8 +860,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             if kv_lens is None:
                 assert forward_batch.spec_info is not None
                 kv_lens = (
-                    forward_batch.seq_lens
-                    + forward_batch.spec_info.draft_token_num
+                    forward_batch.seq_lens + forward_batch.spec_info.draft_token_num
                 ).to(torch.int32)
                 forward_batch.rpa_target_kv_lens = kv_lens
         else:
