@@ -193,45 +193,19 @@ class TestNvfp4ScaleFold(CustomTestCase):
         self.assertTrue((layer.w2_weight[:, I // 2 :, :] == 0).all())
         self.assertTrue((layer.w2_weight_scale[:, I // NVFP4_BLOCK :, :, :] == 0).all())
 
-    def test_group_size_512(self):
-        """A coarsened block-512 checkpoint (yaochengji's MXU lever) must fold and
-        lay out identically to block-16, just with 32x fewer scale blocks along K.
-        Real dims (hidden/intermediate 4096) are 512-aligned so pad_n == 0."""
+    def test_rejects_non_native_group_size(self):
+        """Only native NVFP4 block-16 is supported — the pre-scale kernel path
+        fills the MXU without coarsening, so a wider block (e.g. 512) is rejected
+        rather than silently degrading numerics."""
         from sglang.srt.hardware_backend.tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
         )
 
-        G = 512
         E, hidden, I = REAL_E, REAL_HIDDEN, REAL_INTERMEDIATE
-        data = _make_nvfp4_moe_layer(E, hidden, I, seed=2, block_size=G)
+        data = _make_nvfp4_moe_layer(E, hidden, I, seed=2, block_size=NVFP4_BLOCK)
         layer = _build_fake_layer(data)
-
-        gg = data["w13_weight_scale_2"][:, 0]
-        gu = data["w13_weight_scale_2"][:, 1]
-        g2 = data["w2_weight_scale_2"]
-        exp_w13_s = data["w13_weight_scale"].float().clone()
-        exp_w13_s[:, :I, :] *= gg[:, None, None]
-        exp_w13_s[:, I:, :] *= gu[:, None, None]
-        exp_w13_s = exp_w13_s.permute(0, 2, 1).contiguous().unsqueeze(2)
-        exp_w2_s = (
-            (data["w2_weight_scale"].float() * g2[:, None, None])
-            .permute(0, 2, 1)
-            .contiguous()
-            .unsqueeze(2)
-        )
-
-        prepare_tpu_nvfp4_moe_weights(layer, group_size=G)
-
-        # Scale K-axis now has hidden/512 (=8) and I/512 (=8) blocks, not /16.
-        self.assertEqual(
-            tuple(layer.w13_weight_scale.shape), (E, hidden // G, 1, 2 * I)
-        )
-        self.assertEqual(tuple(layer.w2_weight_scale.shape), (E, I // G, 1, hidden))
-        # Packed weights are unchanged by block size.
-        self.assertEqual(tuple(layer.w13_weight.shape), (E, hidden // 2, 2 * I))
-        self.assertEqual(tuple(layer.w2_weight.shape), (E, I // 2, hidden))
-        torch.testing.assert_close(layer.w13_weight_scale.data, exp_w13_s)
-        torch.testing.assert_close(layer.w2_weight_scale.data, exp_w2_s)
+        with self.assertRaises(NotImplementedError):
+            prepare_tpu_nvfp4_moe_weights(layer, group_size=512)
 
     def test_scale_dtype_narrow(self):
         """``scale_dtype`` re-quantizes the folded per-block scale to a narrower

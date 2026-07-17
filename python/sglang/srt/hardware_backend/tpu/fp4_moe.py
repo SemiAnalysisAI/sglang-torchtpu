@@ -96,18 +96,25 @@ def prepare_tpu_nvfp4_moe_weights(
     scale (``scale_dtype``, default fp32), transposes to gmm_v2 layout, and pads
     the intermediate to ``align_to``.
 
-    ``group_size`` is the per-block scale granularity along the contracting dim
-    (16 = native NVFP4; a coarsened checkpoint, e.g. block-512 via
-    ``requantize_nvfp4.py``, deepens the kernel's K-tile toward the MXU depth).
-    A coarser ``group_size`` requires the intermediate padding ``pad_n`` to stay
-    a whole number of scale blocks — enforced below.
+    ``group_size`` is the per-block scale granularity along the contracting dim.
+    Only native NVFP4 block-16 is supported: the kernel reaches full MXU depth by
+    pre-scaling the weights before the matmul (``gmm_v2`` ``rhs_prescale``), so
+    coarsening the block (e.g. 512) is unnecessary and would only lose accuracy.
 
-    Layout in (checkpoint) -> out (gmm_v2), with ``G = group_size``:
+    Layout in (checkpoint) -> out (gmm_v2), with ``G = group_size = 16``:
       * ``w13_weight``       (E, 2I, H/2) u8  -> (E, H/2, 2*I_pad) u8
       * ``w13_weight_scale`` (E, 2I, H/G) f8  -> (E, H/G, 1, 2*I_pad) scale_dtype
       * ``w2_weight``        (E, H, I/2) u8   -> (E, I_pad/2, H) u8
       * ``w2_weight_scale``  (E, H, I/G) f8   -> (E, I_pad/G, 1, H) scale_dtype
     """
+    if group_size != NVFP4_GROUP_SIZE:
+        # Native NVFP4 is block-16; the pre-scale kernel path fills the MXU
+        # without coarsening, so a wider block would only degrade numerics.
+        raise NotImplementedError(
+            f"TPU NVFP4 MoE only supports group_size={NVFP4_GROUP_SIZE}, "
+            f"got {group_size}."
+        )
+
     if not layer.moe_runner_config.is_gated:
         # GMM1 always splits its output in half for the gated SwiGLU, so a
         # non-gated expert would be mis-activated. Reject rather than miscompute.
@@ -129,9 +136,7 @@ def prepare_tpu_nvfp4_moe_weights(
     )  # (E, H, I/G) f32
 
     # Pad intermediate to align_to; pad_n must stay a multiple of group_size and
-    # PACKING to keep scale blocks and packed bytes whole (enforced below). A
-    # coarser group_size (e.g. 512) needs align_to (or a pre-aligned intermediate)
-    # large enough that any padding is a whole number of scale blocks.
+    # PACKING to keep scale blocks and packed bytes whole (enforced below).
     pad_n = (align_to - intermediate % align_to) % align_to
     if pad_n % group_size != 0 or pad_n % PACKING != 0:
         raise ValueError(

@@ -492,9 +492,8 @@ def inner_kernel(
                     ],
                     axis=0,
                 )  # [num_quant_blocks_per_tile_k, rhs_cols]
-                # [num_blocks * rhs_qbs, cols] -> slice to tile_k so a quant block
-                # wider than tile_k (e.g. block-512 with a 128 tile) still lands a
-                # single constant scale over the tile.
+                # Native NVFP4 block-16 always divides tile_k, so the repeat fills
+                # exactly tile_k rows; slice defensively in case tile_k < a block.
                 scale_k = jnp.repeat(scale_blocks, rhs_qbs, axis=0)[
                     : cfgs.tiles.tile_k
                 ]
