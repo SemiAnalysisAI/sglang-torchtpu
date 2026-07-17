@@ -1725,17 +1725,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 prepare_tpu_nvfp4_moe_weights,
             )
 
-            # Per-block scale storage dtype. fp32 (default) is exact; bf16/fp8
-            # halve/quarter the scale stream (perf lever; accuracy-gated by the
-            # on-device parity test). Selected via env so an A/B needs no reload
-            # code change.
+            # Per-block scale storage dtype. Default bf16: an fp32 block-16 scale
+            # is ~half the fp4 weight bytes on HBM, so bf16 halves that stream at
+            # near-zero accuracy cost (cos 0.99998 vs fp32 in the on-device parity
+            # test). fp8 quarters it (~25% less weight+scale HBM) and still passes
+            # the 0.995 gate (cos 0.9988), but the per-tensor global can make the
+            # fold lossy, so it stays opt-in. fp32 is the exact fallback. Selected
+            # via env so an A/B needs no reload code change.
             _scale_dtypes = {
                 "fp32": torch.float32,
                 "bf16": torch.bfloat16,
                 "fp8": torch.float8_e4m3fn,
             }
             scale_dtype = _scale_dtypes[
-                os.environ.get("SGLANG_TPU_NVFP4_SCALE_DTYPE", "fp32").lower()
+                os.environ.get("SGLANG_TPU_NVFP4_SCALE_DTYPE", "bf16").lower()
             ]
             prepare_tpu_nvfp4_moe_weights(
                 layer,
