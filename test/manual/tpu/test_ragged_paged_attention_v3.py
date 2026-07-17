@@ -465,5 +465,151 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         self._run_and_compare(inputs, distribution=(1, 1, 1), tolerance=0.2)
 
 
+class _DFlashRpaHarness(TestRaggedPagedAttentionV3):
+    """Non-collected helper: reuses ``_build_inputs`` with a larger page table
+    (prefix + block up to ~81 tokens at page_size 16). ``__test__ = False`` keeps
+    pytest from collecting it, and ``runTest`` lets it construct standalone."""
+
+    __test__ = False
+    PAGE_SIZE = 16
+    PAGES_PER_SEQ = 6  # 96 tokens per seq
+    TOTAL_NUM_PAGES = 8
+
+    def runTest(self):  # pragma: no cover - construction-only helper
+        pass
+
+
+@unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
+class TestDFlashNonCausalBlockAttention(unittest.TestCase):
+    """AC-2: the RPA-v3 kernel run non-causally (causal=0 + all-ones custom_mask)
+    computes full bidirectional attention over [prefix + block], matching the
+    in-file reference. This is exactly what the DFlash draft block needs (an
+    ENCODER_ONLY forward where every block query attends to the whole prefix
+    and to every block token). A causal run over the same block differs, which
+    guards against silently reusing causal=1 for the draft block.
+
+    ``custom_mask`` uses 1 = allow, 0 = block (the reference masks where the
+    value is < 1). For a fully-visible block the mask is all ones.
+    """
+
+    HEAD_DIM = _DFlashRpaHarness.HEAD_DIM
+    TOLERANCE = _DFlashRpaHarness.TOLERANCE
+
+    # (prefix_len, block_size): DFlash draft-block shapes, incl. page boundaries.
+    CASES = [
+        (0, 4),
+        (1, 4),
+        (17, 4),
+        (63, 4),
+        (64, 4),
+        (65, 4),
+        (17, 16),
+        (64, 16),
+    ]
+
+    def setUp(self):
+        self._harness = _DFlashRpaHarness()
+
+    def _run_refs_and_kernel(self, prefix_len, block_size, seed=0):
+        import jax.numpy as jnp
+
+        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+            ragged_paged_attention,
+            ref_ragged_paged_attention,
+        )
+
+        kv_len = prefix_len + block_size
+        inputs = self._harness._build_inputs([(kv_len, block_size)], seed=seed)
+        sm_scale = 1.0 / float(np.sqrt(self.HEAD_DIM))
+        # All-ones ragged mask, one [block_size, kv_len] block for the one seq.
+        allow_mask = jnp.ones((block_size * kv_len,), dtype=jnp.int32)
+        # A single prefill/extend sequence: distribution = [decode=0, prefill, mixed].
+        distribution = jnp.asarray([0, 1, 1], dtype=jnp.int32)
+
+        ref_noncausal = ref_ragged_paged_attention(
+            inputs["q"][: inputs["total_q_tokens"]],
+            inputs["ref_kpages"],
+            inputs["ref_vpages"],
+            inputs["kv_lens"],
+            inputs["ref_page_indices"],
+            inputs["cu_q_lens"],
+            jnp.array([inputs["num_seqs"]], dtype=jnp.int32),
+            custom_mask=allow_mask,
+            causal=False,
+            sm_scale=sm_scale,
+        )
+        ref_causal = ref_ragged_paged_attention(
+            inputs["q"][: inputs["total_q_tokens"]],
+            inputs["ref_kpages"],
+            inputs["ref_vpages"],
+            inputs["kv_lens"],
+            inputs["ref_page_indices"],
+            inputs["cu_q_lens"],
+            jnp.array([inputs["num_seqs"]], dtype=jnp.int32),
+            causal=True,
+            sm_scale=sm_scale,
+        )
+        kernel_noncausal, _ = ragged_paged_attention(
+            inputs["q"],
+            inputs["new_k"],
+            inputs["new_v"],
+            inputs["kv_fused"],
+            inputs["kv_lens"],
+            inputs["page_indices_flat"],
+            inputs["cu_q_lens"],
+            inputs["cu_kv_lens"],
+            distribution,
+            allow_mask,  # custom_mask
+            None,  # attention_sink
+            causal=0,
+            sm_scale=sm_scale,
+        )
+        kernel_noncausal = kernel_noncausal[: inputs["total_q_tokens"]]
+        return ref_noncausal, ref_causal, kernel_noncausal
+
+    def test_noncausal_kernel_matches_reference(self):
+        """Positive: kernel(causal=0, all-ones mask) == full-attention reference."""
+        import jax.numpy as jnp
+
+        for prefix_len, block_size in self.CASES:
+            with self.subTest(prefix_len=prefix_len, block_size=block_size):
+                ref_nc, _, kern_nc = self._run_refs_and_kernel(prefix_len, block_size)
+                diff = float(
+                    jnp.abs(
+                        ref_nc.astype(jnp.float32) - kern_nc.astype(jnp.float32)
+                    ).max()
+                )
+                self.assertLess(
+                    diff,
+                    self.TOLERANCE,
+                    f"prefix={prefix_len} block={block_size}: non-causal kernel "
+                    f"vs reference max diff {diff} >= {self.TOLERANCE}",
+                )
+
+    def test_noncausal_differs_from_causal(self):
+        """Negative: a causal run over the block differs from the bidirectional
+        reference, so reusing causal=1 for the draft block would be wrong."""
+        import jax.numpy as jnp
+
+        for prefix_len, block_size in self.CASES:
+            if block_size <= 1:
+                continue
+            with self.subTest(prefix_len=prefix_len, block_size=block_size):
+                ref_nc, ref_causal, _ = self._run_refs_and_kernel(
+                    prefix_len, block_size
+                )
+                diff = float(
+                    jnp.abs(
+                        ref_nc.astype(jnp.float32) - ref_causal.astype(jnp.float32)
+                    ).max()
+                )
+                self.assertGreater(
+                    diff,
+                    self.TOLERANCE,
+                    f"prefix={prefix_len} block={block_size}: non-causal and "
+                    f"causal should differ, max diff {diff} <= {self.TOLERANCE}",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
