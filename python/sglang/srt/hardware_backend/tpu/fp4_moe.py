@@ -4,8 +4,11 @@
 Serves NVFP4 MoE weights via the packed-FP4 path of the Pallas ``gmm_v2`` kernel.
 NVFP4's two-level scale (fp8 per-16-block + fp32 per-tensor global) is folded at
 load into gmm_v2's single per-block scale (``real = fp4 * fp8_block * global``).
-No native fp4 MXU on TPU: weights unpack fp4->fp8 and activations quantize to fp8
-in-kernel (W4-stored / A8-compute), so ``input_scale`` is unused.
+No native fp4 MXU on TPU. By default gmm_v2 folds that block scale into the weights
+before the matmul, so they unpack fp4->bf16 and multiply against bf16 activations
+(W4-stored / A16-compute); the static ``input_scale`` is unused. (Setting
+``SGLANG_TPU_NVFP4_PRESCALE=0`` falls back to the legacy path: unpack fp4->fp8,
+quantize activations to fp8, apply the block scale per 16 after the matmul.)
 """
 
 from __future__ import annotations
@@ -93,8 +96,9 @@ def prepare_tpu_nvfp4_moe_weights(
     """Format NVFP4 MoE weights/scales for the TPU gmm_v2 backend.
 
     Keeps weights packed (uint8), folds the two-level scale to one per-block
-    scale (``scale_dtype``, default fp32), transposes to gmm_v2 layout, and pads
-    the intermediate to ``align_to``.
+    scale stored as ``scale_dtype``, transposes to gmm_v2 layout, and pads the
+    intermediate to ``align_to``. (Serving passes ``scale_dtype=bf16``; the fp32
+    default here keeps the fold exact for the unit tests.)
 
     ``group_size`` is the per-block scale granularity along the contracting dim.
     Only native NVFP4 block-16 is supported: the kernel reaches full MXU depth by
