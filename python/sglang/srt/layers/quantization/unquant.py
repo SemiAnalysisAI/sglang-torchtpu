@@ -249,7 +249,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 old = getattr(layer, name).data
                 new = old.transpose(1, 2).contiguous()
                 copy_or_rebind_param(layer, name, new)
-                old.untyped_storage().resize_(0)
+                # NOTE: do NOT free `old` here. On torch_tpu, `.contiguous()`
+                # above is a *deferred* copy whose materialization still reads
+                # `old` at the first forward. Freeing its storage now
+                # (resize_(0)) makes the pallas MoE kernel read a 0-byte buffer
+                # -> "cannot read N bytes from a storage buffer with 0 bytes"
+                # for the bf16 (modelopt-excluded) MoE layers. `old` is released
+                # naturally once `new` materializes on the first forward.
             return
 
         _should_use_aiter_moe = _use_aiter and (
