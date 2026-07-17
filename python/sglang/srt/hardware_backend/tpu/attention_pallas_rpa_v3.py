@@ -698,7 +698,9 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # test_ragged_paged_attention_v3.py::TestDFlashNonCausalBlockAttention.
         if getattr(layer, "attn_type", None) == AttentionType.ENCODER_ONLY:
             causal = 0
-            custom_mask = self._get_encoder_only_allow_mask(num_tokens, q.device)
+            custom_mask = self._get_encoder_only_allow_mask(
+                num_tokens, self.forward_metadata.kv_lens, q.device
+            )
         else:
             causal = 1
             custom_mask = None
@@ -730,42 +732,37 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         out = out.reshape(num_tokens, layer.tp_q_head_num, -1)[..., : layer.v_head_dim]
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
-    def _kv_capacity_per_seq(self) -> int:
-        """Max KV a sequence can hold in the rectangular page layout.
-
-        ``_build_metadata`` uses ``pages_per_seq * page_size`` (floor-trimmed) as
-        the per-seq ``cu_kv_lens`` stride, so this is the exact upper bound on any
-        sequence's ``kv_len``. Derived from tensor shapes only (no D2H sync).
-        """
-        max_context_len = int(self.req_to_token_pool.req_to_token.shape[1])
-        return (max_context_len // self.page_size) * self.page_size
-
     def _get_encoder_only_allow_mask(
-        self, num_tokens: int, device: torch.device
+        self, num_tokens: int, kv_lens: torch.Tensor, device: torch.device
     ) -> torch.Tensor:
-        """Fixed-shape all-ones 'allow' mask for a non-causal (ENCODER_ONLY) forward.
+        """Bounded fixed-shape all-ones 'allow' mask for a non-causal
+        (ENCODER_ONLY) forward.
 
         The kernel reads a per-sequence ragged mask ``[sum_i q_len_i * kv_len_i]``
         where 1 == allow, indexing it via runtime ``cu_q_lens``/``kv_lens`` and
         touching only the exact ``sum_i q_len_i * kv_len_i`` prefix. An all-ones
-        tensor sized to any upper bound therefore yields identical output while
-        keeping the mask a **fixed shape** (so the Pallas op does not specialize
-        per live prefix length -- see AC-7). Verified equal to the exact-length
-        mask on TPU.
+        tensor sized to any upper bound yields identical output (verified on TPU),
+        so we size it to a **bucketed** upper bound that keeps both the shape and
+        the memory bounded:
 
-        The bound ``num_tokens * kv_capacity`` depends only on the (already
-        bucketed) padded query-token count and the fixed per-seq KV capacity, not
-        on any per-request prefix length:
-        ``sum_i q_len_i * kv_len_i <= (sum_i q_len_i) * kv_capacity
-        <= num_tokens * kv_capacity``. Masks are cached per (device, num_tokens,
-        kv_capacity).
+        ``mask_len = num_tokens * kv_len_bucket`` where
+        ``kv_len_bucket = round_up(max_i kv_len_i, page_size)``.
+
+        This bounds ``sum_i q_len_i * kv_len_i <= (sum_i q_len_i) * max_kv
+        <= num_tokens * kv_len_bucket``, keeps the mask shape stable across
+        prefixes inside a page bucket (so the Pallas op is not re-specialized as
+        context grows within a page), and keeps memory proportional to the
+        *current* context rather than the full max-context capacity. Masks are
+        cached per ``(device, num_tokens, kv_len_bucket)``.
         """
-        kv_capacity = self._kv_capacity_per_seq()
-        key = (device, int(num_tokens), kv_capacity)
+        max_kv = int(kv_lens.max().item()) if kv_lens.numel() else 0
+        page = self.page_size
+        kv_len_bucket = max(((max_kv + page - 1) // page) * page, page)
+        key = (device, int(num_tokens), kv_len_bucket)
         mask = self._encoder_only_mask_cache.get(key)
         if mask is None:
             mask = torch.ones(
-                int(num_tokens) * kv_capacity, dtype=torch.int32, device=device
+                int(num_tokens) * kv_len_bucket, dtype=torch.int32, device=device
             )
             self._encoder_only_mask_cache[key] = mask
         return mask

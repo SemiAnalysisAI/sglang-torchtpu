@@ -447,55 +447,59 @@ class TestNonEmptyBatchSize(CustomTestCase):
 
 
 class TestEncoderOnlyAllowMaskBucketing(CustomTestCase):
-    """The ENCODER_ONLY (non-causal) all-ones mask must be a FIXED shape that does
-    not specialize per live prefix length, so the Pallas op is not recompiled as
-    context grows. Its length depends only on the padded query-token count and
-    the fixed per-seq KV capacity; masks are cached and reused.
+    """The ENCODER_ONLY (non-causal) all-ones mask is a BOUNDED fixed shape:
+    ``num_tokens * round_up(max_kv_len, page_size)``. It is stable across live
+    prefixes inside one page bucket (so the Pallas op is not re-specialized as
+    context grows within a page) and its memory scales with the *current*
+    context, not the full max-context capacity.
     """
 
     PAGE_SIZE = 16
-    MAX_CONTEXT_LEN = 96  # pages_per_seq = 6 -> kv_capacity = 96
 
     def _backend(self):
-        req_to_token = _build_req_to_token(
-            num_reqs=8, max_context_len=self.MAX_CONTEXT_LEN
-        )
+        req_to_token = _build_req_to_token(num_reqs=8, max_context_len=4096)
         backend = _BackendUnderTest(self.PAGE_SIZE, req_to_token)
         backend._encoder_only_mask_cache = {}
         return backend
 
-    def test_kv_capacity_from_shapes(self):
-        backend = self._backend()
-        self.assertEqual(backend._kv_capacity_per_seq(), 96)
+    def _mask(self, backend, num_tokens, max_kv):
+        kv_lens = torch.tensor([max_kv], dtype=torch.int32)
+        return backend._get_encoder_only_allow_mask(num_tokens, kv_lens, torch.device("cpu"))
 
-    def test_shape_depends_only_on_num_tokens_not_prefix(self):
+    def test_bucket_rounds_kv_len_up_to_page(self):
         backend = self._backend()
-        dev = torch.device("cpu")
-        # Same num_tokens -> identical shape and the SAME cached object, no
-        # matter what the (unseen) prefix lengths are.
-        m1 = backend._get_encoder_only_allow_mask(8, dev)
-        m2 = backend._get_encoder_only_allow_mask(8, dev)
-        self.assertEqual(tuple(m1.shape), (8 * 96,))
-        self.assertIs(m1, m2)  # cache hit -> same tensor
-        self.assertTrue(torch.all(m1 == 1))
-        self.assertEqual(m1.dtype, torch.int32)
+        # max_kv 100 -> bucket 112 (7 pages of 16).
+        m = self._mask(backend, 8, 100)
+        self.assertEqual(m.numel(), 8 * 112)
+        self.assertTrue(torch.all(m == 1))
+        self.assertEqual(m.dtype, torch.int32)
+
+    def test_shape_stable_within_one_page_bucket(self):
+        backend = self._backend()
+        # 97..112 all round to 112 -> identical shape AND same cached object.
+        m1 = self._mask(backend, 8, 97)
+        m2 = self._mask(backend, 8, 112)
+        self.assertEqual(tuple(m1.shape), tuple(m2.shape))
+        self.assertIs(m1, m2)
+
+    def test_shape_changes_across_buckets(self):
+        backend = self._backend()
+        self.assertEqual(self._mask(backend, 8, 112).numel(), 8 * 112)
+        self.assertEqual(self._mask(backend, 8, 113).numel(), 8 * 128)  # next bucket
+
+    def test_memory_scales_with_context_not_max_capacity(self):
+        backend = self._backend()  # max context 4096
+        # A short prefix must NOT allocate a 4096-wide mask.
+        short = self._mask(backend, 8, 40)  # bucket 48
+        self.assertEqual(short.numel(), 8 * 48)
+        self.assertLess(short.numel(), 8 * 4096)
 
     def test_upper_bounds_exact_ragged_length(self):
-        # For any live composition, sum_i q_len_i * kv_len_i <= num_tokens *
-        # kv_capacity, so the fixed mask always covers the exact prefix the
-        # kernel reads.
+        # sum_i q_len_i * kv_len_i <= num_tokens * round_up(max_kv, page).
         backend = self._backend()
-        num_tokens = 8
-        kv_capacity = backend._kv_capacity_per_seq()
-        mask = backend._get_encoder_only_allow_mask(num_tokens, torch.device("cpu"))
-        # Worst case: all query tokens in one seq at full kv capacity.
-        self.assertGreaterEqual(mask.numel(), num_tokens * kv_capacity)
-
-    def test_different_num_tokens_distinct_shapes(self):
-        backend = self._backend()
-        dev = torch.device("cpu")
-        self.assertEqual(backend._get_encoder_only_allow_mask(4, dev).numel(), 4 * 96)
-        self.assertEqual(backend._get_encoder_only_allow_mask(16, dev).numel(), 16 * 96)
+        num_tokens, max_kv = 8, 100
+        mask = self._mask(backend, num_tokens, max_kv)
+        self.assertGreaterEqual(mask.numel(), num_tokens * max_kv)
 
 
 if __name__ == "__main__":
