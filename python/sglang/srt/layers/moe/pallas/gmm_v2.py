@@ -251,11 +251,8 @@ class GmmConfigs:
     acc_dtype: jnp.dtype
     zero_init: bool
     fuse_act: str | None = None
-    # When True, the per-block RHS scale is folded into the dequantized weight
-    # tile BEFORE the matmul so a single ``tile_k``-deep matmul replaces one tiny
-    # matmul per quant block. Used for packed-FP4 (native block-16) rhs, whose
-    # tiny scale blocks otherwise force ``[m, 16] @ [16, n]`` ops that leave the
-    # 256-deep MXU mostly idle. Implies an unquantized (bf16) lhs (W4A16).
+    # Fold the per-block rhs scale into the weights before the matmul (W4A16) so
+    # a single deep matmul replaces one tiny matmul per quant block. Packed-FP4 only.
     rhs_prescale: bool = False
 
     @property
@@ -458,29 +455,17 @@ def inner_kernel(
             tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
 
         if cfgs.rhs_prescale:
-            # Pre-scaled deep-matmul path (packed-FP4 W4A16).
-            #
-            # The default quantized/unquantized paths walk K in
-            # ``quant_block_size`` steps and issue one MXU matmul per quant
-            # block, applying the per-block RHS scale to the accumulator *after*
-            # each matmul. For native NVFP4 (block size 16) that is a stream of
-            # ``[tile_m, 16] @ [16, n]`` matmuls that contract only 16 of the
-            # 256-deep MXU -> the systolic array is mostly fill/drain overhead.
-            #
-            # Instead, dequantize the whole rhs tile to bf16 (unpack + fold the
-            # per-block scale into the weights) and run a single ``tile_k``-deep
-            # matmul in ``mxu_size`` output-column chunks. The scale is applied to
-            # the operand before the matmul, so the MXU contracting dim is no
-            # longer welded to the 16-wide scale block.
+            # W4A16: dequant the whole rhs tile and fold the per-block scale into
+            # the weights, then one tile_k-deep bf16 matmul -- instead of the
+            # default's one matmul per quant block with the scale applied after
+            # (which pins K to 16 and starves the 256-deep MXU).
             mxu_size = pltpu.get_tpu_info().mxu_column_size
             rhs_qbs = cfgs.rhs_cfgs.quant_block_size
             rhs_cols = tiled_rhs.shape[1]
 
             rhs_deq = tiled_rhs.astype(jnp.float32)
             if cfgs.rhs_cfgs.has_scale:
-                # Broadcast each block's [1, n] column scale across its
-                # ``rhs_qbs`` K rows to a full [tile_k, n] weight scale, then
-                # fold it into the dequantized weights.
+                # tile each block's [1, n] scale over its rhs_qbs K rows -> [tile_k, n]
                 scale_blocks = jnp.concatenate(
                     [
                         tiled_rhs_ref.get_scale(
@@ -491,9 +476,7 @@ def inner_kernel(
                         for b_id in range(num_quant_blocks_per_tile_k)
                     ],
                     axis=0,
-                )  # [num_quant_blocks_per_tile_k, rhs_cols]
-                # Native NVFP4 block-16 always divides tile_k, so the repeat fills
-                # exactly tile_k rows; slice defensively in case tile_k < a block.
+                )
                 scale_k = jnp.repeat(scale_blocks, rhs_qbs, axis=0)[
                     : cfgs.tiles.tile_k
                 ]

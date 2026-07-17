@@ -57,12 +57,8 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Fold the per-block RHS scale into the dequantized (bf16) weight tile before the
-# matmul for packed-FP4 experts, so a single deep matmul replaces one tiny
-# ``[m, block] @ [block, n]`` matmul per quant block (native NVFP4 block-16
-# otherwise leaves the 256-deep MXU mostly idle). Only affects packed-FP4 rhs
-# (bf16/fp8/mxfp4 pass ``rhs_prescale=False``). Set to "0" for the pre-scale-off
-# A/B baseline.
+# W4A16 pre-scale for packed-FP4 experts (fills the MXU vs per-16 scale-after-matmul).
+# Packed-FP4 only; set "0" for the pre-scale-off A/B baseline.
 _NVFP4_PRESCALE = os.environ.get("SGLANG_TPU_NVFP4_PRESCALE", "1") == "1"
 
 # Singleton: one ``torch.library`` op for the whole process. The JaxCallable
@@ -97,12 +93,9 @@ def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups, packed_fp4=False):
     respects the shapes) — either way this returns a concrete
     ``TileSizes``.
 
-    ``packed_fp4`` marks a uint8-packed FP4 rhs (2 codes/byte along K):
-    its stored K is half the real contracting dim, so the lookup keys on
-    the real K (``= lhs.shape[1]``) and on the ``float4_e2m1fn`` dtype the
-    kernel actually contracts in — matching how ``gmm_v2`` derives its own
-    tiling. Without this, the packed rhs would mismatch the lhs K and force
-    a fall-back to the kernel's internal heuristic.
+    ``packed_fp4`` marks a uint8-packed FP4 rhs (stored K is half the real K),
+    so we key the lookup on the real K and the float4 dtype the kernel contracts
+    in -- otherwise packed w2 mismatches lhs K and falls back to the heuristic.
 
     ``num_current_groups`` is set equal to ``num_total_groups``
     because this bridge is single-host (no expert parallelism); when
@@ -272,12 +265,9 @@ def _fused_moe_jax(
     # halves, so run an unfused GMM1 and apply the activation in JAX for
     # correctness.
     compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
-    # Packed-FP4 rhs now fuses the SwiGLU in-kernel: the earlier ~cos 0.95 drift
-    # was the fused-act up-half reusing the gate columns' per-block scale; slicing
-    # the up scale sub-view in gmm_v2's kernel_main (mirroring the weight/bias
-    # sub-views) restores parity (~cos 0.999), so only compact block scales — which
-    # need distinct gate/up scale *offsets* the fused path can't express — still
-    # run an unfused GMM1 with a separate JAX activation on the 2*n accumulator.
+    # Packed FP4 fuses the SwiGLU in-kernel (gmm_v2 slices the up-half's per-block
+    # scale). Only compact block scales, which need distinct gate/up scale offsets,
+    # still run unfused with a separate JAX activation.
     unfused_gmm1 = compact_block_scales
     gmm1_fuse_act = None if unfused_gmm1 else _fuse_act_name(activation_name)
 
