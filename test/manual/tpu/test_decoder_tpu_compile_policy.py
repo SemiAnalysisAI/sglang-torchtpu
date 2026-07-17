@@ -18,6 +18,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
+    EagleVerifyInput,
+)
+from sglang.srt.speculative.eagle_utils import verify_tree_greedy_from_logits
+from sglang.srt.speculative.spec_info import AcceptIndices
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -48,6 +54,11 @@ def _model_runner(device="cpu"):
         attn_backend=_FakeAttnBackend(),
         req_to_token_pool=SimpleNamespace(),
         token_to_kv_pool=SimpleNamespace(),
+        server_args=SimpleNamespace(
+            speculative_algorithm=None,
+            page_size=1,
+            dp_size=1,
+        ),
     )
 
 
@@ -322,8 +333,7 @@ class TestSpecPrecompileLoops(CustomTestCase):
 
 
 class TestSpecDummyForwardBatch(CustomTestCase):
-    """Spec dummy batches carry spec_info + slot-1 KV seeding, and TARGET_VERIFY
-    sizes extend metadata to draft_token_num tokens per request."""
+    """Spec dummy batches carry spec_info and slot-1 KV seeding."""
 
     def test_target_verify_batch_shapes_and_capture_mode(self):
         policy = _make_spec_policy(num_steps=3)  # draft_token_num = 4
@@ -337,9 +347,10 @@ class TestSpecDummyForwardBatch(CustomTestCase):
         )
         self.assertEqual(fb.capture_hidden_mode, CaptureHiddenMode.FULL)
         self.assertIsNotNone(fb.spec_info)
-        # draft_token_num (=4) tokens per request.
-        self.assertEqual(fb.extend_seq_lens.tolist(), [4, 4, 4, 4])
-        self.assertEqual(fb.extend_num_tokens, 16)
+        # Runtime TARGET_VERIFY is decode-like and leaves extend metadata unset.
+        self.assertIsNone(fb.extend_seq_lens)
+        self.assertIsNone(fb.extend_prefix_lens)
+        self.assertIsNone(fb.extend_num_tokens)
         # Slot-1 KV seeding (avoids draft/target pool conflicts): not slot 0.
         self.assertEqual(fb.out_cache_loc.tolist(), [1] * 16)
         self.assertEqual(fb.req_pool_indices.tolist(), [1, 1, 1, 1])
@@ -359,6 +370,258 @@ class TestSpecDummyForwardBatch(CustomTestCase):
         self.assertIsNotNone(fb.spec_info)
 
 
+class TestSpecAcceptIndex(CustomTestCase):
+    def test_unpadded_indices_gather_logical_rows(self):
+        accept_indices = AcceptIndices.from_per_request(torch.tensor([[1, 3, 4]]))
+
+        self.assertFalse(accept_indices.is_padded)
+        self.assertEqual(
+            accept_indices.gather(torch.arange(6)).tolist(), [1, 3, 4]
+        )
+
+    def test_unfinished_subset_is_packed_to_fixed_width(self):
+        policy = _make_spec_policy(num_steps=3)
+        accept_index_matrix = torch.tensor(
+            [[0, 1, -1, -1], [4, -1, -1, -1]], dtype=torch.int32
+        )
+        accept_indices = policy.build_accepted_indices(accept_index_matrix)
+
+        gathered = accept_indices.gather(torch.arange(8))
+
+        self.assertIs(accept_indices.per_request, accept_index_matrix)
+        self.assertEqual(gathered.tolist(), [0, 1, 4, 0, 0, 0, 0, 0])
+        self.assertEqual(
+            accept_indices.valid_mask.tolist(),
+            [True, True, True, False, False, False, False, False],
+        )
+
+
+class TestSpecVerifyPadding(CustomTestCase):
+    @staticmethod
+    def _spec_info():
+        return EagleVerifyInput.create_idle_input(
+            topk=1,
+            spec_steps=3,
+            num_verify_tokens=4,
+            device="cpu",
+        )
+
+    @staticmethod
+    def _inputs(bs=2, draft_token_num=4, vocab_size=8):
+        num_tokens = bs * draft_token_num
+        return (
+            torch.zeros((num_tokens, vocab_size)),
+            torch.arange(num_tokens, dtype=torch.int32).reshape(bs, draft_token_num),
+            torch.arange(num_tokens, dtype=torch.int32).reshape(bs, draft_token_num),
+            torch.empty((num_tokens + 1,), dtype=torch.int32),
+            torch.full((bs, draft_token_num), -1, dtype=torch.int32),
+            torch.empty((bs,), dtype=torch.int32),
+        )
+
+    def test_pads_only_verify_tensors_to_batch_bucket(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+
+        logits, candidates, retrieve_index, predict, accept_index, nums = (
+            policy.prepare_spec_verify(
+                *self._inputs(bs=2), spec_info=self._spec_info()
+            )
+        )
+
+        self.assertEqual(logits.shape, (16, 8))
+        self.assertEqual(candidates.shape, (4, 4))
+        self.assertEqual(retrieve_index.shape, (4, 4))
+        self.assertEqual(predict.shape, (17,))
+        self.assertEqual(accept_index.shape, (4, 4))
+        self.assertEqual(nums.shape, (4,))
+        self.assertTrue(torch.all(retrieve_index[2:] == -1))
+        self.assertTrue(torch.all(accept_index == -1))
+
+    def test_at_bucket_returns_the_original_tensors(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+        inputs = self._inputs(bs=4)
+
+        outputs = policy.prepare_spec_verify(*inputs, spec_info=self._spec_info())
+
+        self.assertTrue(
+            all(output is input_ for output, input_ in zip(outputs, inputs))
+        )
+
+    def test_rejects_logits_candidate_shape_mismatch(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+        inputs = list(self._inputs(bs=2))
+        inputs[0] = inputs[0][:-1]
+
+        with self.assertRaisesRegex(ValueError, "one row per candidate"):
+            policy.prepare_spec_verify(*inputs, spec_info=self._spec_info())
+
+    def test_records_padding_state(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+        spec_info = self._spec_info()
+
+        outputs = policy.prepare_spec_verify(
+            *self._inputs(bs=2), spec_info=spec_info
+        )
+
+        state = spec_info.padding_state
+        self.assertEqual(state.logical_batch_size, 2)
+        self.assertEqual(state.physical_batch_size, 4)
+        self.assertEqual(state.logical_num_tokens, 8)
+        self.assertEqual(state.physical_num_tokens, 16)
+        self.assertTrue(state.is_padded)
+        self.assertTrue(state.outputs_padded)
+
+        policy.finalize_spec_verify(
+            outputs[3], outputs[4], outputs[5], 2, spec_info=spec_info
+        )
+        self.assertFalse(spec_info.padding_state.outputs_padded)
+
+    def test_reuses_deferred_padded_logits(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+        spec_info = EagleVerifyInput.create_idle_input(
+            topk=1,
+            spec_steps=3,
+            num_verify_tokens=4,
+            device="cpu",
+        )
+        spec_info.record_padding(
+            logical_batch_size=2,
+            physical_batch_size=4,
+            logical_num_tokens=8,
+            physical_num_tokens=16,
+            outputs_padded=True,
+        )
+        inputs = list(self._inputs(bs=2))
+        padded_logits = torch.zeros((16, 8))
+        inputs[0] = padded_logits
+
+        outputs = policy.prepare_spec_verify(*inputs, spec_info=spec_info)
+
+        self.assertIs(outputs[0], padded_logits)
+        self.assertEqual(outputs[1].shape, (4, 4))
+        self.assertEqual(outputs[2].shape, (4, 4))
+        self.assertEqual(outputs[3].shape, (17,))
+
+    def test_rejects_deferred_logits_from_a_different_bucket(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+        spec_info = EagleVerifyInput.create_idle_input(
+            topk=1,
+            spec_steps=3,
+            num_verify_tokens=4,
+            device="cpu",
+        )
+        spec_info.record_padding(
+            logical_batch_size=2,
+            physical_batch_size=3,
+            logical_num_tokens=8,
+            physical_num_tokens=12,
+            outputs_padded=True,
+        )
+        inputs = list(self._inputs(bs=2))
+        inputs[0] = torch.zeros((12, 8))
+
+        with self.assertRaisesRegex(ValueError, "do not match the verify bucket"):
+            policy.prepare_spec_verify(*inputs, spec_info=spec_info)
+
+    def test_greedy_verify_operation_hides_deferred_padding(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+        spec_info = EagleVerifyInput.create_idle_input(
+            topk=1,
+            spec_steps=3,
+            num_verify_tokens=4,
+            device="cpu",
+        )
+        spec_info.record_padding(
+            logical_batch_size=2,
+            physical_batch_size=4,
+            logical_num_tokens=8,
+            physical_num_tokens=16,
+            outputs_padded=True,
+        )
+        candidates = torch.tensor(
+            [[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.int32
+        )
+        logits = torch.zeros((16, 10))
+        target_tokens = torch.tensor([2, 3, 4, 9, 6, 7, 8, 9])
+        logits[torch.arange(8), target_tokens] = 1
+        retrieve_index = torch.arange(8, dtype=torch.int32).reshape(2, 4)
+
+        predict, accept_index, num_correct = verify_tree_greedy_from_logits(
+            next_token_logits=logits,
+            candidates=candidates,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=torch.empty(0, dtype=torch.int32),
+            retrieve_next_sibling=torch.empty(0, dtype=torch.int32),
+            spec_steps=3,
+            topk=1,
+            compile_policy=policy,
+            spec_info=spec_info,
+        )
+
+        self.assertEqual(accept_index.tolist(), [[0, 1, 2, 3], [4, 5, 6, 7]])
+        self.assertEqual(num_correct.tolist(), [3, 3])
+        self.assertEqual(predict[:8].tolist(), target_tokens.tolist())
+        self.assertFalse(spec_info.padding_state.outputs_padded)
+
+    def test_deferred_unpad_survives_padding_update(self):
+        spec_info = EagleVerifyInput.create_idle_input(
+            topk=1,
+            spec_steps=3,
+            num_verify_tokens=4,
+            device="cpu",
+        )
+        spec_info.record_padding(
+            logical_batch_size=2,
+            physical_batch_size=2,
+            logical_num_tokens=5,
+            physical_num_tokens=8,
+            outputs_padded=False,
+            defer_output_unpad=True,
+        )
+        state = spec_info.record_padding(
+            logical_batch_size=2,
+            physical_batch_size=4,
+            logical_num_tokens=5,
+            physical_num_tokens=16,
+            outputs_padded=True,
+        )
+        self.assertEqual(state.logical_num_tokens, 5)
+        self.assertEqual(state.physical_num_tokens, 16)
+        self.assertTrue(state.defer_output_unpad)
+
+        spec_info.mark_outputs_unpadded()
+        state = spec_info.record_padding(
+            logical_batch_size=3,
+            physical_batch_size=4,
+            logical_num_tokens=12,
+            physical_num_tokens=16,
+            outputs_padded=True,
+        )
+        self.assertEqual(state.logical_batch_size, 3)
+        self.assertEqual(state.logical_num_tokens, 12)
+        self.assertFalse(state.defer_output_unpad)
+
+    def test_mark_outputs_unpadded_clears_defer_intent(self):
+        spec_info = EagleVerifyInput.create_idle_input(
+            topk=1,
+            spec_steps=3,
+            num_verify_tokens=4,
+            device="cpu",
+        )
+        spec_info.record_padding(
+            logical_batch_size=2,
+            physical_batch_size=4,
+            logical_num_tokens=8,
+            physical_num_tokens=16,
+            outputs_padded=True,
+            defer_output_unpad=True,
+        )
+
+        spec_info.mark_outputs_unpadded()
+
+        self.assertFalse(spec_info.padding_state.outputs_padded)
+        self.assertFalse(spec_info.padding_state.defer_output_unpad)
+
+
 class TestSpecUnpadOutputs(CustomTestCase):
     """Spec output slicing: TARGET_VERIFY logits use real_q; capture-LAST hidden
     uses real_b; everything else matches the base decoder policy."""
@@ -372,6 +635,7 @@ class TestSpecUnpadOutputs(CustomTestCase):
             forward_mode=forward_mode,
             capture_hidden_mode=capture,
             batch_size=rows,
+            spec_info=None,
             _tpu_real_q=real_q,
             _tpu_real_b=real_b,
         )
@@ -386,7 +650,7 @@ class TestSpecUnpadOutputs(CustomTestCase):
             real_b=4,
             rows=32,
         )
-        policy.unpad_outputs(out, fb)
+        policy.finalize_forward_outputs(out, fb)
         # Verify emits one logit per draft token -> real_q, not real_b.
         self.assertEqual(out.next_token_logits.shape[0], 16)
         self.assertEqual(out.hidden_states.shape[0], 16)  # FULL -> real_q
@@ -401,7 +665,7 @@ class TestSpecUnpadOutputs(CustomTestCase):
             real_b=4,
             rows=16,
         )
-        policy.unpad_outputs(out, fb)
+        policy.finalize_forward_outputs(out, fb)
         self.assertEqual(out.next_token_logits.shape[0], 4)  # not verify -> real_b
         self.assertEqual(out.hidden_states.shape[0], 4)  # LAST -> real_b
 
@@ -414,9 +678,108 @@ class TestSpecUnpadOutputs(CustomTestCase):
             real_b=4,
             rows=8,
         )
-        policy.unpad_outputs(out, fb)
+        policy.finalize_forward_outputs(out, fb)
         self.assertEqual(out.next_token_logits.shape[0], 4)
         self.assertEqual(out.hidden_states.shape[0], 4)
+
+    def test_final_draft_outputs_restore_real_batch_size(self):
+        policy = _make_spec_policy()
+        fb = SimpleNamespace(_tpu_real_b=2, batch_size=4, spec_info=None)
+        outputs = (torch.arange(4), torch.arange(8).reshape(4, 2))
+
+        unpadded = policy.finalize_spec_forward_batch(outputs, fb)
+
+        self.assertEqual([t.shape[0] for t in unpadded], [2, 2])
+        self.assertEqual(fb.batch_size, 2)
+
+
+class TestSpecV1ForwardBatchPreparation(CustomTestCase):
+    @staticmethod
+    def _policy():
+        policy = _make_spec_policy()
+        policy._pad_draft_decode = MagicMock()
+        policy._pad_draft_extend = MagicMock()
+        return policy
+
+    def test_draft_decode_dispatches(self):
+        policy = self._policy()
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+        policy.prepare_spec_forward_batch(forward_batch)
+
+        policy._pad_draft_decode.assert_called_once_with(forward_batch)
+
+    def test_draft_extend_dispatches(self):
+        policy = self._policy()
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND)
+
+        policy.prepare_spec_forward_batch(forward_batch)
+
+        policy._pad_draft_extend.assert_called_once_with(forward_batch)
+
+    def test_idle_is_noop(self):
+        policy = self._policy()
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.IDLE)
+
+        policy.prepare_spec_forward_batch(forward_batch)
+
+        policy._pad_draft_decode.assert_not_called()
+        policy._pad_draft_extend.assert_not_called()
+
+    def test_target_verify_is_noop(self):
+        policy = self._policy()
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+
+        policy.prepare_spec_forward_batch(forward_batch)
+
+        policy._pad_draft_decode.assert_not_called()
+        policy._pad_draft_extend.assert_not_called()
+
+    def test_draft_extend_padding_is_internal_to_prepare(self):
+        policy = _make_spec_policy(num_steps=3)
+        di = EagleDraftExtendInput(
+            hidden_states=torch.zeros((5, 8)),
+            num_correct_drafts=torch.tensor([2, 1], dtype=torch.int32),
+            num_accept_tokens=torch.tensor([3, 2], dtype=torch.int32),
+            num_accept_tokens_cpu=[3, 2],
+            input_ids=torch.arange(5),
+            seq_lens=torch.tensor([8, 7], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([8, 7], dtype=torch.int32),
+            req_pool_indices=torch.tensor([0, 1]),
+            positions=torch.arange(5),
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            spec_info=di,
+            input_ids=di.input_ids,
+            positions=di.positions,
+            out_cache_loc=torch.arange(5),
+            seq_lens=di.seq_lens,
+        )
+
+        def generic_prepare(fb):
+            # bs=2 maps to bucket 4, so draft-extend tokens map directly to
+            # 4 * (spec_steps + 1) = 16 without an intermediate 8-token pad.
+            fb.input_ids = torch.nn.functional.pad(fb.input_ids, (0, 11))
+            fb.positions = torch.nn.functional.pad(fb.positions, (0, 11))
+            fb.out_cache_loc = torch.nn.functional.pad(fb.out_cache_loc, (0, 11))
+            fb.seq_lens = torch.nn.functional.pad(fb.seq_lens, (0, 2))
+
+        policy.model_runner.model.prepare_forward_batch.side_effect = generic_prepare
+
+        policy.prepare_spec_forward_batch(forward_batch)
+
+        self.assertEqual(forward_batch.input_ids.shape[0], 16)
+        self.assertEqual(forward_batch.positions.shape[0], 16)
+        self.assertEqual(forward_batch.out_cache_loc.shape[0], 16)
+        self.assertEqual(di.hidden_states.shape[0], 16)
+        self.assertIs(di.input_ids, forward_batch.input_ids)
+        self.assertEqual(di.padding_state.logical_num_tokens, 5)
+        self.assertEqual(di.padding_state.physical_num_tokens, 16)
+        self.assertEqual(di.padding_state.physical_batch_size, 4)
+        policy.model_runner.model.prepare_forward_batch.assert_called_once_with(
+            forward_batch
+        )
 
 
 if __name__ == "__main__":

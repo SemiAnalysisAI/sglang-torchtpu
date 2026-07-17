@@ -63,6 +63,9 @@ class _ForwardModeMock:
     def is_target_verify(self):
         return self._mode == "target_verify"
 
+    def is_draft_extend(self):
+        return self._mode == "draft_extend"
+
 
 def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
     """Synthetic ForwardBatch carrying the fields the padder touches."""
@@ -298,6 +301,16 @@ class TestDefaultKwargHelpers(CustomTestCase):
 class TestCompiledForwardShim(CustomTestCase):
     """Adapts compiled forward calls and outputs."""
 
+    @staticmethod
+    def _forward_batch(**kwargs):
+        defaults = {
+            "is_prefill_only": False,
+            "seq_lens": torch.zeros(4, dtype=torch.int32),
+            "spec_info": None,
+        }
+        defaults.update(kwargs)
+        return SimpleNamespace(**defaults)
+
     def test_slices_logits_and_hidden_states(self):
         padded_logits = torch.arange(4 * 10, dtype=torch.float32).reshape(4, 10)
         padded_hidden = torch.arange(8 * 5, dtype=torch.float32).reshape(8, 5)
@@ -308,27 +321,41 @@ class TestCompiledForwardShim(CustomTestCase):
             )
         )
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
-        fb = SimpleNamespace(
-            _tpu_real_q=4,
-            _tpu_real_b=2,
-            is_prefill_only=False,
-            seq_lens=torch.zeros(4, dtype=torch.int32),
-        )
+        fb = self._forward_batch(_tpu_real_q=4, _tpu_real_b=2)
         out = shim(None, None, fb)
         self.assertEqual(out.next_token_logits.shape, (2, 10))
         self.assertEqual(out.hidden_states.shape, (4, 5))
         self.assertTrue(torch.equal(out.next_token_logits, padded_logits[:2]))
         self.assertTrue(torch.equal(out.hidden_states, padded_hidden[:4]))
 
+    def test_defers_output_unpadding_for_chained_forwards(self):
+        padded = SimpleNamespace(
+            next_token_logits=torch.zeros(4, 10),
+            hidden_states=torch.zeros(8, 5),
+        )
+        shim = CompiledForwardShim(
+            MagicMock(return_value=padded), policy=DecoderTpuCompilePolicy()
+        )
+        fb = self._forward_batch(
+            _tpu_real_q=4,
+            _tpu_real_b=2,
+            batch_size=4,
+            spec_info=SimpleNamespace(
+                padding_state=SimpleNamespace(defer_output_unpad=True)
+            ),
+        )
+
+        out = shim(None, None, fb)
+
+        self.assertIs(out, padded)
+        self.assertEqual(out.next_token_logits.shape, (4, 10))
+        self.assertEqual(out.hidden_states.shape, (8, 5))
+        self.assertEqual(fb.batch_size, 4)
+
     def test_passes_args_through(self):
         compiled = MagicMock(return_value=SimpleNamespace())
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
-        fb = SimpleNamespace(
-            _tpu_real_q=4,
-            _tpu_real_b=2,
-            is_prefill_only=False,
-            seq_lens=torch.zeros(4, dtype=torch.int32),
-        )
+        fb = self._forward_batch(_tpu_real_q=4, _tpu_real_b=2)
         shim("ids", "pos", fb, "extra1", kw="extra2")
         compiled.assert_called_once_with("ids", "pos", fb, "extra1", kw="extra2")
 
@@ -348,12 +375,7 @@ class TestCompiledForwardShim(CustomTestCase):
         compiled = MagicMock(return_value=SimpleNamespace())
         compiled.__signature__ = inspect.signature(forward)
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
-        fb = SimpleNamespace(
-            _tpu_real_q=4,
-            _tpu_real_b=2,
-            is_prefill_only=False,
-            seq_lens=torch.zeros(4, dtype=torch.int32),
-        )
+        fb = self._forward_batch(_tpu_real_q=4, _tpu_real_b=2)
         shim("ids", "pos", fb, pp_proxy_tensors=None)
         compiled.assert_called_once_with("ids", "pos", fb)
 
@@ -364,12 +386,7 @@ class TestCompiledForwardShim(CustomTestCase):
         compiled = MagicMock(return_value=SimpleNamespace())
         compiled.__signature__ = inspect.signature(forward)
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
-        fb = SimpleNamespace(
-            _tpu_real_q=4,
-            _tpu_real_b=2,
-            is_prefill_only=False,
-            seq_lens=torch.zeros(4, dtype=torch.int32),
-        )
+        fb = self._forward_batch(_tpu_real_q=4, _tpu_real_b=2)
         shim("ids", "pos", fb, get_embedding=True)
         compiled.assert_called_once_with("ids", "pos", fb, get_embedding=True)
 
@@ -382,7 +399,7 @@ class TestCompiledForwardShim(CustomTestCase):
         shim = CompiledForwardShim(
             MagicMock(return_value=out_obj), policy=DecoderTpuCompilePolicy()
         )
-        out = shim(None, None, SimpleNamespace(is_prefill_only=False))
+        out = shim(None, None, self._forward_batch())
         self.assertIs(out, out_obj)
 
     def test_no_op_when_already_at_real_shape(self):
@@ -394,12 +411,7 @@ class TestCompiledForwardShim(CustomTestCase):
         shim = CompiledForwardShim(
             MagicMock(return_value=out_obj), policy=DecoderTpuCompilePolicy()
         )
-        fb = SimpleNamespace(
-            _tpu_real_q=4,
-            _tpu_real_b=2,
-            is_prefill_only=False,
-            seq_lens=torch.zeros(4, dtype=torch.int32),
-        )
+        fb = self._forward_batch(_tpu_real_q=4, _tpu_real_b=2)
         out = shim(None, None, fb)
         self.assertEqual(out.next_token_logits.shape, (2, 10))
         self.assertEqual(out.hidden_states.shape, (4, 5))
@@ -412,20 +424,14 @@ class TestCompiledForwardShim(CustomTestCase):
             return_value=SimpleNamespace(next_token_logits=torch.zeros(4, 10))
         )
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
-        fb = SimpleNamespace(
-            _tpu_real_q=8,
-            _tpu_real_b=2,
-            batch_size=4,
-            is_prefill_only=False,
-            seq_lens=torch.zeros(4, dtype=torch.int32),
-        )
+        fb = self._forward_batch(_tpu_real_q=8, _tpu_real_b=2, batch_size=4)
         shim(None, None, fb)
         self.assertEqual(fb.batch_size, 2)
 
     def test_does_not_touch_batch_size_when_real_keys_missing(self):
         # forward_idle / split_prefill skip the pad hook, so the slicer
         # must not mutate batch_size in that case.
-        fb = SimpleNamespace(batch_size=4, is_prefill_only=False)
+        fb = self._forward_batch(batch_size=4)
         compiled = MagicMock(return_value=SimpleNamespace())
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
         shim(None, None, fb)
@@ -442,7 +448,7 @@ class TestCompiledForwardShim(CustomTestCase):
             return SimpleNamespace()
 
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
-        fb = SimpleNamespace(batch_size=0, is_prefill_only=True)
+        fb = self._forward_batch(batch_size=0, is_prefill_only=True)
         shim(None, None, fb)
         self.assertIs(seen["during"], False)
         self.assertIs(fb.is_prefill_only, True)

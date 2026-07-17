@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.compilation.support_torch_compile import (
     CompilePolicy,
     support_torch_compile,
@@ -24,7 +26,7 @@ from sglang.srt.model_executor.tpu_graph_runner import (
     TpuGraphRunner,
     _augment_spec_policy,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_info import AcceptIndices, SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 
 DECODER_POLICY_PRECOMPILE = (
@@ -252,8 +254,13 @@ class TestTpuGraphRunner(CustomTestCase):
             def precompile(self) -> None:
                 self.owner.precompiled = True
 
-            def unpad_outputs(self, out: Any, context: Any) -> Any:
+            def finalize_forward_outputs(self, out: Any, context: Any) -> Any:
                 return out
+
+            def build_accepted_indices(
+                self, per_request: torch.Tensor
+            ) -> AcceptIndices:
+                return AcceptIndices.from_per_request(per_request)
 
         class _VisionModule:
             def forward(self):

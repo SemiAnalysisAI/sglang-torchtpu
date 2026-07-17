@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, replace
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
@@ -228,9 +229,106 @@ class SpecInputType(IntEnum):
     NGRAM_VERIFY = auto()
 
 
+@dataclass(frozen=True)
+class AcceptIndices:
+    """Per-request accept indices and their logical/platform gather views."""
+
+    # Greedy-verify output shaped [batch_size, spec_steps + 1]. Each row lists
+    # the accepted positions for one request; unused slots contain -1.
+    per_request: torch.Tensor
+    # Valid per-request entries flattened in request order for logical indexing.
+    logical: torch.Tensor
+    # Optional fixed-shape platform gather indices and their validity mask.
+    physical: Optional[torch.Tensor] = None
+    valid_mask: Optional[torch.Tensor] = None
+
+    def __post_init__(self) -> None:
+        if (self.physical is None) != (self.valid_mask is None):
+            raise ValueError("physical indices and valid_mask must be set together")
+
+    @classmethod
+    def from_per_request(cls, per_request: torch.Tensor) -> "AcceptIndices":
+        return cls(
+            per_request=per_request,
+            logical=per_request[per_request != -1],
+        )
+
+    @property
+    def is_padded(self) -> bool:
+        return self.physical is not None
+
+    def gather(self, source: torch.Tensor) -> torch.Tensor:
+        if self.physical is None:
+            return source[self.logical]
+
+        gathered = source[self.physical]
+        mask = self.valid_mask
+        assert mask is not None
+        if gathered.ndim > mask.ndim:
+            mask = mask.unsqueeze(-1)
+        return torch.where(mask, gathered, 0)
+
+
+@dataclass(frozen=True)
+class SpecPaddingState:
+    """Logical and physical shapes for one speculative execution phase."""
+
+    phase: SpecInputType
+    logical_batch_size: int
+    physical_batch_size: int
+    logical_num_tokens: int
+    physical_num_tokens: int
+    outputs_padded: bool = False
+    defer_output_unpad: bool = False
+
+    @property
+    def is_padded(self) -> bool:
+        return (
+            self.logical_batch_size != self.physical_batch_size
+            or self.logical_num_tokens != self.physical_num_tokens
+        )
+
 class SpecInput(ABC):
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
+        self.padding_state: Optional[SpecPaddingState] = None
+
+    def record_padding(
+        self,
+        *,
+        logical_batch_size: int,
+        physical_batch_size: int,
+        logical_num_tokens: int,
+        physical_num_tokens: int,
+        outputs_padded: bool,
+        defer_output_unpad: bool = False,
+    ) -> SpecPaddingState:
+        previous = self.padding_state
+        if (
+            previous is not None
+            and previous.phase == self.spec_input_type
+        ):
+            # Deferred unpadding is a phase-level intent. Shape preparation may
+            # update this state after bucketing, but only finalization clears it.
+            defer_output_unpad |= previous.defer_output_unpad
+        self.padding_state = SpecPaddingState(
+            phase=self.spec_input_type,
+            logical_batch_size=logical_batch_size,
+            physical_batch_size=physical_batch_size,
+            logical_num_tokens=logical_num_tokens,
+            physical_num_tokens=physical_num_tokens,
+            outputs_padded=outputs_padded,
+            defer_output_unpad=defer_output_unpad,
+        )
+        return self.padding_state
+
+    def mark_outputs_unpadded(self) -> None:
+        if self.padding_state is not None:
+            self.padding_state = replace(
+                self.padding_state,
+                outputs_padded=False,
+                defer_output_unpad=False,
+            )
 
     # Cross-algorithm phase guards. Used by attention backends and
     # ForwardBatch padding logic to dispatch on phase without hardcoding the

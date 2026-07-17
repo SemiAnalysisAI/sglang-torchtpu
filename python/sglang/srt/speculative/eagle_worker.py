@@ -49,6 +49,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
     EagleVerifyOutput,
+    gather_accepted,
 )
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
@@ -263,6 +264,9 @@ class EAGLEWorker(TpModelWorker):
         )
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+        self.draft_model_runner.compile_policy.precompile_draft(
+            self.draft_attn_backend, self.draft_extend_attn_backend
+        )
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
@@ -774,11 +778,22 @@ class EAGLEWorker(TpModelWorker):
                 not forward_batch.forward_mode.is_idle()
                 and self.speculative_num_steps > 1
             ):
-                self.draft_model_runner.pad_spec_draft_decode(forward_batch)
+                spec_info.record_padding(
+                    logical_batch_size=forward_batch.batch_size,
+                    physical_batch_size=forward_batch.batch_size,
+                    logical_num_tokens=int(forward_batch.input_ids.shape[0]),
+                    physical_num_tokens=int(forward_batch.input_ids.shape[0]),
+                    outputs_padded=False,
+                    defer_output_unpad=True,
+                )
+                self.draft_model_runner.compile_policy.prepare_spec_forward_batch(
+                    forward_batch
+                )
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
+            draft_outputs = self.draft_forward(forward_batch)
             parent_list, top_scores_index, draft_tokens = (
-                self.draft_model_runner.unpad_spec_draft_outputs(
-                    self.draft_forward(forward_batch), forward_batch
+                self.draft_model_runner.compile_policy.finalize_spec_forward_batch(
+                    draft_outputs, forward_batch
                 )
             )
 
@@ -935,6 +950,23 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward
         batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
+        target_compile_policy = self.target_worker.model_runner.compile_policy
+        sampling_info = batch.sampling_info
+        defer_output_unpad = (
+            sampling_info.is_all_greedy
+            and not batch.has_grammar
+            and not sampling_info.has_custom_logit_processor
+            and not sampling_info.penalizer_orchestrator.is_required
+            and sampling_info.logit_bias is None
+        )
+        spec_info.record_padding(
+            logical_batch_size=len(batch.seq_lens),
+            physical_batch_size=len(batch.seq_lens),
+            logical_num_tokens=int(batch.input_ids.shape[0]),
+            physical_num_tokens=int(batch.input_ids.shape[0]),
+            outputs_padded=False,
+            defer_output_unpad=defer_output_unpad,
+        )
         batch_result = self.target_worker.forward_batch_generation(
             batch, is_verify=True
         )
@@ -970,19 +1002,11 @@ class EAGLEWorker(TpModelWorker):
             batch,
             logits_output,
             self.token_to_kv_pool_allocator,
-            self.page_size,
-            vocab_mask,
+            page_size=self.page_size,
+            compile_policy=target_compile_policy,
+            vocab_mask=vocab_mask,
         )
-
-        # Post process based on verified outputs.
-        # Pick indices that we care (accepted)
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accept_indices
-        ]
-        if logits_output.hidden_states is not None:
-            logits_output.hidden_states = logits_output.hidden_states[
-                res.accept_indices
-            ]
+        gather_accepted(res, logits_output)
 
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None
@@ -1043,8 +1067,9 @@ class EAGLEWorker(TpModelWorker):
         )
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        # res.accept_indices.shape[0] > 0 skips DP attn idle batch
-        if spec_info.topk > 1 and res.accept_indices.shape[0] > 0:
+        accept_indices = res.accept_indices
+        # accept_indices.shape[0] > 0 skips DP attn idle batch
+        if spec_info.topk > 1 and accept_indices.shape[0] > 0:
             # accept_indices=[0,2,3,4,5,7,9,10,11], num_accept_tokens=[4, 3, 2], cumulative_num_accept_tokens=[4, 7, 9]
             # first_token_indices_per_req=prepend(0, accept_indices[cumulative_num_accept_tokens[:-1]]) = [0, 5, 10]
             # last_token_indices_per_req=accept_indices[cumulative_num_accept_tokens - 1] = [4, 9, 11] (last token ID of each req)
@@ -1052,7 +1077,7 @@ class EAGLEWorker(TpModelWorker):
             # equivalent: last_correct_step_indices = last_token_indices_per_req - first_token_indices_per_req;
             # `accepted_indices_offset` equals `first_token_indices_per_req` because the first accepted slot of each req is its "current token" at logical position i * draft_token_num.
             last_correct_step_indices = (
-                res.accept_indices[cumulative_num_accept_tokens - 1]
+                accept_indices[cumulative_num_accept_tokens - 1]
                 - accepted_indices_offset
             )
         else:
@@ -1072,7 +1097,7 @@ class EAGLEWorker(TpModelWorker):
             to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
             mamba_steps_to_track = torch.where(
                 to_track_mask,
-                res.accept_indices[to_track_ith + accepted_indices_start]
+                accept_indices[to_track_ith + accepted_indices_start]
                 - accepted_indices_offset,
                 -1,
             )
@@ -1200,6 +1225,11 @@ class EAGLEWorker(TpModelWorker):
         else:
             forward_batch.can_run_dp_cuda_graph = False
             if not forward_batch.forward_mode.is_idle():
+                # Bucket the draft-extend inputs BEFORE the custom attn
+                # metadata is built.
+                self.draft_model_runner.compile_policy.prepare_spec_forward_batch(
+                    forward_batch
+                )
                 attn_backend = (
                     self.draft_extend_attn_backend
                     or self.draft_model_runner.attn_backend

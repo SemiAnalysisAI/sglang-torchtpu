@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Callable
 
 import torch
+import torch.nn.functional as F
 import tqdm
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -22,9 +23,15 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
+    EagleDraftInput,
+    EagleVerifyInput,
+)
+from sglang.srt.speculative.spec_info import AcceptIndices, SpecInput
 
 logger = get_logger(__name__)
 
@@ -66,6 +73,16 @@ class SpecDecodeCompilePolicyMixin:
         # Width of ``spec_info.hidden_states`` the EAGLE3 draft model expects.
         # 0 for non-draft workers (the target never reads it).
         self.eagle_hidden_size = self._infer_eagle_hidden_size()
+
+    def prepare_spec_forward_batch(self, forward_batch: ForwardBatch) -> None:
+        """Bucket a V1 draft forward before constructing attention metadata."""
+        mode = forward_batch.forward_mode
+        if mode.is_idle():
+            return
+        if mode.is_decode():
+            self._pad_draft_decode(forward_batch)
+        elif mode.is_draft_extend():
+            self._pad_draft_extend(forward_batch)
 
     def _infer_eagle_hidden_size(self) -> int:
         """Derive the hidden-state width the EAGLE3 draft model's forward expects.
@@ -186,7 +203,7 @@ class SpecDecodeCompilePolicyMixin:
                     f" in {elapsed:.1f}s{hbm_str}"
                 )
 
-    def _make_null_spec_info(self) -> Any:
+    def _make_null_spec_info(self) -> EagleDraftInput:
         """Build a minimal idle spec_info stub for non-spec forward modes.
 
         Carries the attributes Dynamo probes without affecting the forward
@@ -200,7 +217,7 @@ class SpecDecodeCompilePolicyMixin:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
-    def _make_verify_spec_info(self) -> Any:
+    def _make_verify_spec_info(self) -> EagleVerifyInput:
         """Build an ``EagleVerifyInput`` for TARGET_VERIFY precompilation."""
         return EagleVerifyInput.create_idle_input(
             topk=self.speculative_eagle_topk,
@@ -208,6 +225,191 @@ class SpecDecodeCompilePolicyMixin:
             num_verify_tokens=self.draft_token_num,
             device=self.model_runner.device,
         )
+
+    def precompile_draft(
+        self,
+        draft_attn_backend: Any,
+        draft_extend_attn_backend: Any,
+    ) -> None:
+        """Compile every DRAFT-model forward family at server warmup.
+
+        Invoked by the EAGLE worker after its custom draft attention backends
+        are wired, which don't exist yet when the graph runner calls
+        ``precompile()``, so the draft precompile is deferred to here. Covers
+        the three families the draft model runs at serving:
+
+        * ``EXTEND(LAST)`` -- draft prefill right after target prefill
+        * ``DECODE(LAST)`` -- the multi-step draft loop (per step backend)
+        * ``DRAFT_EXTEND(LAST)`` -- post-verify draft extend
+        """
+        if not self.is_draft_worker or self.b_bucketer is None:
+            return
+        overall = time.perf_counter()
+        self._precompile_draft_prefill_extend()
+        self._precompile_draft_decode(draft_attn_backend)
+        self._precompile_draft_extend(draft_extend_attn_backend)
+        logger.info(
+            "[spec compile policy] DRAFT precompile done in %.1fs.",
+            time.perf_counter() - overall,
+        )
+        # The serving-time recompilation checker snapped its baseline at
+        # graph-runner init, before this deferred precompile; re-snapshot so
+        # the graphs compiled here aren't reported as serving-time recompiles
+        # on the first draft forward.
+        checker = getattr(
+            getattr(self, "compiled_forward_shim", None),
+            "_recompilation_checker",
+            None,
+        )
+        if checker is not None:
+            checker.snapshot_baseline()
+
+    def _precompile_shapes(
+        self, desc: str, items: list[Any], run: Callable[[Any], str]
+    ) -> None:
+        compile_range = (
+            tqdm.tqdm(items, desc=f"Compiling {desc}", bar_format=_COMPILE_BAR_FORMAT)
+            if get_tensor_model_parallel_rank() == 0
+            else items
+        )
+        for item in compile_range:
+            hbm_before = _get_hbm_usage_mb()
+            start = time.perf_counter()
+            shape_desc = run(item)
+            if get_tensor_model_parallel_rank() == 0:
+                elapsed = time.perf_counter() - start
+                hbm_str = _hbm_delta_str(hbm_before, _get_hbm_usage_mb())
+                compile_range.set_description(
+                    f"Compiled {desc} ({shape_desc}) in {elapsed:.1f}s{hbm_str}"
+                )
+
+    def _precompile_draft_prefill_extend(self) -> None:
+        """Compile draft prefill EXTEND(LAST) token buckets at the batch cap."""
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+        bs = self.b_bucketer.max_val
+        valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
+        logger.info(
+            "[spec compile policy] DRAFT EXTEND(LAST): %d shapes "
+            "(bs=%d, token_buckets=%s)",
+            len(valid_shapes),
+            bs,
+            list(self.t_bucketer.buckets),
+        )
+
+        def run(shape: tuple[int, int]) -> str:
+            num_tokens, bs = shape
+            self._run_one(
+                num_tokens=num_tokens,
+                bs=bs,
+                mode=ForwardMode.EXTEND,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+                spec_info=self._make_draft_prefill_spec_info(),
+            )
+            return f"tokens={num_tokens}, bs={bs}"
+
+        self._precompile_shapes("DRAFT EXTEND(LAST)", valid_shapes, run)
+
+    def _precompile_draft_decode(self, draft_attn_backend: Any) -> None:
+        """Compile the multi-step draft DECODE(LAST) across the bs buckets."""
+        if draft_attn_backend is None:
+            return
+        assert self.b_bucketer is not None
+        step_backends = list(draft_attn_backend.attn_backends)
+        bs_buckets = list(self.b_bucketer.buckets)
+        shapes = [(bs, step) for bs in bs_buckets for step in range(len(step_backends))]
+        logger.info(
+            "[spec compile policy] DRAFT DECODE: %d shapes (bs=%s, steps=%d, topk=%d)",
+            len(shapes),
+            bs_buckets,
+            len(step_backends),
+            self.speculative_eagle_topk,
+        )
+
+        def run(shape: tuple[int, int]) -> str:
+            bs, step = shape
+            self._run_one(
+                num_tokens=bs * self.speculative_eagle_topk,
+                bs=bs,
+                mode=ForwardMode.DECODE,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+                spec_info=self._make_draft_decode_spec_info(),
+                attn_backend=step_backends[step],
+            )
+            return f"bs={bs}, step={step}"
+
+        self._precompile_shapes("DRAFT DECODE", shapes, run)
+
+    def _precompile_draft_extend(self, attn_backend: Any) -> None:
+        """Compile DRAFT_EXTEND(LAST) across the bs buckets."""
+        assert self.b_bucketer is not None
+        bs_buckets = list(self.b_bucketer.buckets)
+        tokens_per_req = self.speculative_num_steps + 1
+        logger.info(
+            "[spec compile policy] DRAFT_EXTEND(LAST): %d shapes "
+            "(bs=%s, tokens_per_req=%d)",
+            len(bs_buckets),
+            bs_buckets,
+            tokens_per_req,
+        )
+
+        def run(bs: int) -> str:
+            num_tokens = bs * tokens_per_req
+            self._run_one(
+                num_tokens=num_tokens,
+                bs=bs,
+                mode=ForwardMode.DRAFT_EXTEND,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+                spec_info=self._make_draft_extend_spec_info(),
+                attn_backend=attn_backend,
+            )
+            return f"bs={bs}, tokens={num_tokens}"
+
+        self._precompile_shapes("DRAFT_EXTEND(LAST)", bs_buckets, run)
+
+    def _make_draft_prefill_spec_info(self) -> EagleDraftInput:
+        """``EagleDraftInput`` stub for draft prefill EXTEND(LAST)."""
+        spec_info = EagleDraftInput.create_idle_input(
+            device=self.model_runner.device,
+            hidden_size=self.eagle_hidden_size or 1,
+            dtype=self.model_runner.dtype,
+            topk=self.speculative_eagle_topk,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+        spec_info.num_tokens_per_req = 1
+        spec_info.num_tokens_for_logprob_per_req = 1
+        return spec_info
+
+    def _make_draft_decode_spec_info(self) -> EagleDraftInput:
+        """``EagleDraftInput`` stub for the multi-step draft DECODE(LAST)."""
+        model_config = self.model_runner.model_config
+        hidden_size = (
+            getattr(model_config, "spec_hidden_size", 0)
+            or getattr(model_config, "hidden_size", 0)
+            or 1
+        )
+        spec_info = EagleDraftInput.create_idle_input(
+            device=self.model_runner.device,
+            hidden_size=hidden_size,
+            dtype=self.model_runner.dtype,
+            topk=self.speculative_eagle_topk,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+        spec_info.num_tokens_per_req = self.speculative_eagle_topk
+        spec_info.num_tokens_for_logprob_per_req = self.speculative_eagle_topk
+        return spec_info
+
+    def _make_draft_extend_spec_info(self) -> EagleDraftExtendInput:
+        """``EagleDraftExtendInput`` stub for DRAFT_EXTEND precompilation."""
+        spec_info = EagleDraftExtendInput.create_idle_input(
+            device=self.model_runner.device,
+            hidden_size=self.eagle_hidden_size or 1,
+            dtype=self.model_runner.dtype,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+        spec_info.num_tokens_per_req = self.speculative_num_steps + 1
+        spec_info.num_tokens_for_logprob_per_req = 1
+        return spec_info
 
     def _dummy_kv_slot(self) -> int:
         # Row 0 of the req_to_token pool is the reserved padding row: free_slots
@@ -220,26 +422,36 @@ class SpecDecodeCompilePolicyMixin:
         # transient (overwritten by the first real request).
         return 1
 
-    def _dummy_tokens_per_req(self, mode: ForwardMode, spec_info: Any | None) -> int:
+    def _dummy_tokens_per_req(
+        self, mode: ForwardMode, spec_info: SpecInput | None
+    ) -> int:
         # TARGET_VERIFY verifies draft_token_num tokens per request;
-        # DRAFT_EXTEND extends by the same width. Other extend modes use 1.
+        # DRAFT_EXTEND extends by num_steps+1 (what verify() sets as
+        # num_tokens_per_req). Other extend modes use 1.
         if mode.is_target_verify() and spec_info is not None:
             return spec_info.draft_token_num
-        if mode.is_draft_extend() and self.draft_token_num:
-            return self.draft_token_num
+        if mode.is_draft_extend() and self.speculative_num_steps:
+            return self.speculative_num_steps + 1
         return 1
 
-    def _dummy_mm_inputs(self, bs: int) -> Any:
+    def _dummy_mm_inputs(self, bs: int) -> list[None]:
         # Text-only spec requests produce mm_inputs=[None]*bs at runtime.
         return [None] * bs
 
-    def _seed_dummy_req_to_token(self, num_tokens: int) -> None:
-        # Spec verify/extend precompile needs the page table to hold a valid,
-        # in-range page mapping.
+    def _seed_dummy_req_to_token(self, forward_batch: ForwardBatch) -> None:
+        # Seed the page table so attention reads valid, in-range KV token indices.
         req_to_token = self.model_runner.req_to_token_pool.req_to_token
-        req_to_token[1, :num_tokens] = 1
+        if forward_batch.forward_mode.is_draft_extend():
+            rows = forward_batch.req_pool_indices.to("cpu")
+            ctx = int(forward_batch.seq_lens[0].item())
+            cols = torch.arange(ctx, dtype=req_to_token.dtype)
+            vals = rows.to(req_to_token.dtype).view(-1, 1) * ctx + cols.view(1, -1)
+            req_to_token[rows, :ctx] = vals
+        else:
+            num_tokens = int(forward_batch.input_ids.shape[0])
+            req_to_token[1, :num_tokens] = 1
 
-    def unpad_outputs(self, out: Any, forward_batch: Any) -> Any:
+    def finalize_forward_outputs(self, out: Any, forward_batch: ForwardBatch) -> Any:
         """Slice padded spec outputs back to real request shapes.
 
         Differs from the base decoder unpad: TARGET_VERIFY emits one logit row
@@ -276,20 +488,18 @@ class SpecDecodeCompilePolicyMixin:
         # Restore real batch_size so downstream consumers (sampler, logprob,
         # scheduler hooks) don't iterate over ghost slots.
         forward_batch.batch_size = real_b
+        spec_info = forward_batch.spec_info
+        if spec_info is not None:
+            spec_info.mark_outputs_unpadded()
         return out
 
-    def pad_draft_decode(self, forward_batch: Any) -> None:
-        """Pad the speculative draft-decode batch to a torch.compile bs bucket.
-
-        Stashes the real (pre-pad) batch size on ``forward_batch`` (``_REAL_B_KEY``),
-        which ``unpad_draft_outputs`` reads to trim the draft outputs. No-op when
-        this policy has no batch bucketer (torch.compile off) or the batch is
-        already at a bucket.
-        """
+    def _pad_draft_decode(self, forward_batch: ForwardBatch) -> None:
+        """Pad the speculative draft-decode batch to a torch.compile bs bucket."""
         b_bucketer = self.b_bucketer
         if b_bucketer is None:
             return
         real_bs = int(forward_batch.seq_lens.shape[0])
+        real_tokens = int(forward_batch.input_ids.shape[0])
         pad_b = b_bucketer.next_bucket(real_bs)
         if pad_b == real_bs:
             return
@@ -307,6 +517,14 @@ class SpecDecodeCompilePolicyMixin:
             forward_batch.out_cache_loc.shape[0] // real_bs * pad_b,
         )
 
+        # mm_inputs is a per-request Python list. contains_mm_inputs() unrolls a
+        # loop over it in the compiled forward, so its length becomes a Dynamo
+        # guard. Pad to the bucket (matching the [None] * bs precompile dummy) or
+        # the real-bs list guard-fails against the precompiled slot and re-traces.
+        mm_inputs = getattr(forward_batch, "mm_inputs", None)
+        if isinstance(mm_inputs, list) and len(mm_inputs) < pad_b:
+            forward_batch.mm_inputs = mm_inputs + [None] * (pad_b - len(mm_inputs))
+
         # EagleDraftInput seeds consumed by select_top_k_tokens.
         spec_info = forward_batch.spec_info
         if spec_info is not None:
@@ -314,19 +532,168 @@ class SpecDecodeCompilePolicyMixin:
             spec_info.topk_index = _pad_first_dim(spec_info.topk_index, pad_b)
             spec_info.hidden_states = _pad_first_dim(spec_info.hidden_states, pad_b)
 
+            spec_info.record_padding(
+                logical_batch_size=real_bs,
+                physical_batch_size=pad_b,
+                logical_num_tokens=real_tokens,
+                physical_num_tokens=int(forward_batch.input_ids.shape[0]),
+                outputs_padded=True,
+            )
+
         forward_batch.batch_size = pad_b
         setattr(forward_batch, _REAL_B_KEY, real_bs)
 
-    def unpad_draft_outputs(self, outputs: tuple, forward_batch: Any) -> tuple:
-        """Trim draft-decode outputs back to the real (pre-pad) batch size.
+    def _pad_draft_extend(self, forward_batch: ForwardBatch) -> None:
+        """Bucket the draft-extend batch for the compiled draft forward."""
+        draft_extend_input = forward_batch.spec_info
+        actual_len = int(forward_batch.input_ids.numel())
+        if (
+            isinstance(draft_extend_input, EagleDraftExtendInput)
+            and forward_batch.out_cache_loc is not None
+            and forward_batch.out_cache_loc.numel() > actual_len
+        ):
+            forward_batch.out_cache_loc = forward_batch.out_cache_loc[:actual_len]
 
-        ``pad_draft_decode`` stashes the real batch size on ``forward_batch``
-        (``_REAL_B_KEY``); trim back to it here. No-op when the batch was not
-        padded (torch.compile off, or already at a bucket).
-        """
+        self.model_runner.model.prepare_forward_batch(forward_batch)
+
+        if isinstance(draft_extend_input, EagleDraftExtendInput):
+            physical_len = int(forward_batch.input_ids.numel())
+            if (
+                draft_extend_input.hidden_states is not None
+                and draft_extend_input.hidden_states.shape[0] < physical_len
+            ):
+                draft_extend_input.hidden_states = _pad_first_dim(
+                    draft_extend_input.hidden_states, physical_len
+                )
+            draft_extend_input.input_ids = forward_batch.input_ids
+            draft_extend_input.positions = forward_batch.positions
+            draft_extend_input.record_padding(
+                logical_batch_size=len(draft_extend_input.seq_lens),
+                physical_batch_size=int(forward_batch.seq_lens.shape[0]),
+                logical_num_tokens=actual_len,
+                physical_num_tokens=physical_len,
+                outputs_padded=True,
+            )
+
+    def prepare_spec_verify(
+        self,
+        next_token_logits: torch.Tensor,
+        candidates: torch.Tensor,
+        retrieve_index: torch.Tensor,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+        nums: torch.Tensor,
+        spec_info: SpecInput,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        # Pad the verify inputs/outputs to a bs bucket so verify_tree_greedy runs
+        # one static shape per bucket instead of recompiling per real batch size.
+        bs, dtn = candidates.shape
+        logical_q = bs * dtn
+        padding_state = spec_info.padding_state
+        reuse_padded_logits = (
+            padding_state is not None
+            and padding_state.outputs_padded
+            and padding_state.logical_batch_size == bs
+            and padding_state.logical_num_tokens == logical_q
+        )
+
+        pad_bs = self.b_bucketer.next_bucket(bs)
+        pad_q = pad_bs * dtn
+        logits_q = next_token_logits.shape[0]
+        if reuse_padded_logits:
+            if (
+                padding_state.physical_batch_size != pad_bs
+                or padding_state.physical_num_tokens != pad_q
+                or logits_q != pad_q
+            ):
+                raise ValueError(
+                    "Deferred greedy verify logits do not match the verify bucket: "
+                    f"state={padding_state}, logits rows={logits_q}, "
+                    f"expected ({pad_bs=}, {pad_q=})."
+                )
+        elif logits_q != logical_q:
+            raise ValueError(
+                "Greedy verify logits must contain one row per candidate: "
+                f"got {logits_q} rows for candidates shape {tuple(candidates.shape)}."
+            )
+
+        if pad_bs > bs:
+            if not reuse_padded_logits:
+                next_token_logits = F.pad(
+                    next_token_logits, (0, 0, 0, pad_q - logical_q)
+                )
+            candidates = F.pad(candidates, (0, 0, 0, pad_bs - bs))
+            retrieve_index = F.pad(retrieve_index, (0, 0, 0, pad_bs - bs), value=-1)
+            predict = predict.new_empty((pad_q + 1,))
+            accept_index = accept_index.new_full((pad_bs, accept_index.shape[1]), -1)
+            nums = nums.new_empty((pad_bs,))
+        spec_info.record_padding(
+            logical_batch_size=bs,
+            physical_batch_size=pad_bs,
+            logical_num_tokens=logical_q,
+            physical_num_tokens=pad_q,
+            outputs_padded=True,
+        )
+        return (
+            next_token_logits,
+            candidates,
+            retrieve_index,
+            predict,
+            accept_index,
+            nums,
+        )
+
+    def finalize_spec_verify(
+        self,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+        nums: torch.Tensor,
+        real_bs: int,
+        spec_info: SpecInput,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        spec_info.mark_outputs_unpadded()
+        return predict, accept_index[:real_bs], nums[:real_bs]
+
+    def build_accepted_indices(
+        self, per_request: torch.Tensor
+    ) -> AcceptIndices:
+        # Pack the accepted (>=0) entries to the front and 0-pad -> one static
+        # shape ((spec_steps+1)*bs) instead of one XLA program per accept-count.
+        flat = per_request.flatten()
+        n = flat.numel()
+        valid = flat >= 0
+        # Rank valid entries by original position, push invalid past the end so
+        # argsort compacts valid-first in row-major order (keys unique).
+        pos = torch.arange(n, device=flat.device)
+        order = torch.argsort(torch.where(valid, pos, pos + n))
+        valid_mask = valid[order]
+        return AcceptIndices(
+            per_request=per_request,
+            logical=flat[valid],
+            physical=torch.where(valid_mask, flat[order], 0),
+            valid_mask=valid_mask,
+        )
+
+    def finalize_spec_forward_batch(
+        self, outputs: tuple[torch.Tensor, ...], forward_batch: ForwardBatch
+    ) -> tuple[torch.Tensor, ...]:
+        """Restore draft outputs and padding state at the logical boundary."""
         real_bs = getattr(forward_batch, _REAL_B_KEY, None)
+        spec_info = forward_batch.spec_info
         if real_bs is None:
+            if spec_info is not None:
+                spec_info.mark_outputs_unpadded()
             return outputs
+        forward_batch.batch_size = real_bs
+        if spec_info is not None:
+            spec_info.mark_outputs_unpadded()
         return tuple(t[:real_bs] for t in outputs)
 
 

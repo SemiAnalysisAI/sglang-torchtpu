@@ -1,10 +1,14 @@
 import math
 from enum import IntEnum
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_tpu
+
+if TYPE_CHECKING:
+    from sglang.srt.compilation.support_torch_compile import CompilePolicy
+    from sglang.srt.speculative.spec_info import SpecInput
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -122,6 +126,10 @@ def build_tree_kernel_efficient(
             dtype=packed_dtypes[packed_dtype_idx],
             device=device,
         )
+    elif tree_mask_mode == TreeMaskMode.FULL_MASK and _use_torch_native:
+        # TPU: the pallas attention masks causally (custom_mask=None) and never
+        # reads this dense mask.
+        tree_mask = torch.empty((0,), dtype=torch.bool, device=device)
     elif tree_mask_mode == TreeMaskMode.FULL_MASK:
         tree_mask = torch.full(
             (
@@ -309,6 +317,87 @@ def verify_tree_greedy_func(
             topk,
         )
     return predicts, accept_index, accept_token_num
+
+
+def verify_tree_greedy_from_logits(
+    *,
+    next_token_logits: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    spec_steps: int,
+    topk: int,
+    spec_info: "SpecInput",
+    compile_policy: Optional["CompilePolicy"] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run greedy tree verification behind one logical-shape operation.
+
+    Platform compile policies may internally reuse padded model outputs and
+    shape the auxiliary buffers. Callers only provide logical candidates and
+    receive logical per-request results.
+    """
+    bs, draft_token_num = candidates.shape
+    logical_num_tokens = bs * draft_token_num
+    predict = torch.empty(
+        (logical_num_tokens + 1,),
+        dtype=torch.int32,
+        device=next_token_logits.device,
+    )
+    accept_index = torch.full(
+        (bs, spec_steps + 1),
+        -1,
+        dtype=torch.int32,
+        device=next_token_logits.device,
+    )
+    num_correct_drafts = torch.empty(
+        (bs,), dtype=torch.int32, device=next_token_logits.device
+    )
+
+    if compile_policy is not None:
+        (
+            next_token_logits,
+            candidates,
+            retrieve_index,
+            predict,
+            accept_index,
+            num_correct_drafts,
+        ) = compile_policy.prepare_spec_verify(
+            next_token_logits,
+            candidates,
+            retrieve_index,
+            predict,
+            accept_index,
+            num_correct_drafts,
+            spec_info=spec_info,
+        )
+
+    physical_bs = candidates.shape[0]
+    target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
+        physical_bs, draft_token_num
+    )
+    predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+        predicts=predict,
+        accept_index=accept_index,
+        accept_token_num=num_correct_drafts,
+        candidates=candidates,
+        retrieve_index=retrieve_index,
+        retrieve_next_token=retrieve_next_token,
+        retrieve_next_sibling=retrieve_next_sibling,
+        target_predict=target_predict,
+        topk=topk,
+    )
+
+    if compile_policy is not None:
+        result = compile_policy.finalize_spec_verify(
+            predict,
+            accept_index,
+            num_correct_drafts,
+            bs,
+            spec_info=spec_info,
+        )
+        predict, accept_index, num_correct_drafts = result
+    return predict, accept_index, num_correct_drafts
 
 
 def _top_k_renorm_prob_torch(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:

@@ -264,6 +264,13 @@ def _pad_forward_batch_inputs(
         pad_b = b_bucketer.next_bucket(real_b)
         pad_t = pad_b * forward_batch.spec_info.draft_token_num
         real_q_out, real_b_out = real_q, real_b
+    elif (
+        forward_batch.forward_mode.is_draft_extend()
+        and forward_batch.spec_info is not None
+    ):
+        pad_b = b_bucketer.next_bucket(real_b)
+        pad_t = pad_b * forward_batch.spec_info.num_tokens_per_req
+        real_q_out, real_b_out = real_q, real_b
     else:
         # Prefill/extend is precompiled at a fixed batch cap to avoid compiling
         # the full token_bucket x batch_bucket cross product.
@@ -282,6 +289,11 @@ def _pad_forward_batch_inputs(
         forward_batch.mrope_positions = F.pad(
             mrope_pos, (0, pad_t - mrope_pos.shape[-1])
         )
+
+    if forward_batch.forward_mode.is_draft_extend():
+        occ = forward_batch.out_cache_loc
+        if isinstance(occ, torch.Tensor) and occ.shape[0] < pad_t:
+            forward_batch.out_cache_loc = _zero_pad_1d(occ, pad_t)
 
     for field in _BS_FIELDS:
         val = getattr(forward_batch, field, None)
@@ -445,7 +457,10 @@ class CompiledForwardShim:
             out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
-        out = self.policy.unpad_outputs(out, forward_batch)
+        spec_info = forward_batch.spec_info
+        padding_state = spec_info.padding_state if spec_info is not None else None
+        if padding_state is None or not padding_state.defer_output_unpad:
+            out = self.policy.finalize_forward_outputs(out, forward_batch)
 
         # Check for serving-time XLA recompilation (once per forward call).
         # Gated by SGLANG_TPU_CHECK_RECOMPILATION=1 (off by default).
