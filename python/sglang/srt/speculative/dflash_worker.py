@@ -35,6 +35,58 @@ _IS_TPU = is_tpu()
 
 logger = logging.getLogger(__name__)
 
+_TPU_DFLASH_DRAFT_BACKENDS = ("pallas_tpu_rpa_v3",)
+_GPU_DFLASH_DRAFT_BACKENDS = ("flashinfer", "fa3", "fa4", "triton")
+
+
+def resolve_dflash_draft_attention_backend(
+    candidate: Optional[str], *, is_tpu: bool, is_hip: bool
+) -> str:
+    """Resolve the DFlash draft attention backend.
+
+    The DFlash draft block attention is non-causal (``ENCODER_ONLY``).
+
+    - On TPU only ``pallas_tpu_rpa_v3`` supports it (causal=0 + an all-ones
+      custom_mask, wired in ``attention_pallas_rpa_v3.py``). GPU backends
+      (flashinfer/fa3/fa4/triton) do not run on TPU, so an explicit unsupported
+      choice is rejected with a clear error rather than silently falling back.
+    - On GPU/ROCm, fall back to flashinfer (CUDA) / triton (ROCm) for a missing,
+      ``trtllm_mha`` (needs non-causal), or otherwise-unsupported backend.
+    """
+    if is_tpu:
+        if candidate is None:
+            return _TPU_DFLASH_DRAFT_BACKENDS[0]
+        if candidate not in _TPU_DFLASH_DRAFT_BACKENDS:
+            raise ValueError(
+                "DFLASH on TPU requires a non-causal (ENCODER_ONLY) draft "
+                f"attention backend; only {_TPU_DFLASH_DRAFT_BACKENDS} is "
+                f"supported, got {candidate!r}. GPU backends "
+                "(flashinfer/fa3/fa4/triton) do not run on TPU."
+            )
+        return candidate
+
+    fallback = "triton" if is_hip else "flashinfer"
+    if candidate is None:
+        return fallback
+    if candidate == "trtllm_mha":
+        logger.warning(
+            "DFLASH draft worker does not support 'trtllm_mha' because the draft "
+            "path requires non-causal attention. Falling back to '%s'.",
+            fallback,
+        )
+        return fallback
+    if candidate not in _GPU_DFLASH_DRAFT_BACKENDS:
+        logger.warning(
+            "DFLASH draft worker only supports attention_backend in %s for now, "
+            "but got %r. Falling back to '%s'.",
+            _GPU_DFLASH_DRAFT_BACKENDS,
+            candidate,
+            fallback,
+        )
+        return fallback
+    return candidate
+
+
 _FusedKVMaterializeHelper = None
 
 
@@ -99,55 +151,14 @@ class DFlashWorker:
         )
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
+        import torch as _torch
+
         draft_backend = draft_server_args.speculative_draft_attention_backend
         if draft_backend is None:
             draft_backend, _ = draft_server_args.get_attention_backends()
-        if _IS_TPU:
-            # The DFlash draft block attention is non-causal (ENCODER_ONLY); on
-            # TPU only the RPA-v3 Pallas backend supports it (causal=0 + an
-            # all-ones custom_mask, wired in attention_pallas_rpa_v3.py). The GPU
-            # backends (flashinfer/fa3/fa4/triton) do not run on TPU, so reject
-            # an unsupported choice explicitly rather than silently falling back.
-            supported_tpu_draft_backends = ("pallas_tpu_rpa_v3",)
-            if draft_backend is None:
-                draft_backend = "pallas_tpu_rpa_v3"
-            if draft_backend not in supported_tpu_draft_backends:
-                raise ValueError(
-                    "DFLASH on TPU requires a non-causal (ENCODER_ONLY) draft "
-                    f"attention backend; only {supported_tpu_draft_backends} is "
-                    f"supported, got {draft_backend!r}. GPU backends "
-                    "(flashinfer/fa3/fa4/triton) do not run on TPU."
-                )
-        else:
-            supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton")
-            if draft_backend is None:
-                # Use triton on ROCm (no FlashInfer), flashinfer on CUDA
-                import torch as _torch
-
-                draft_backend = "triton" if _torch.version.hip else "flashinfer"
-            elif draft_backend == "trtllm_mha":
-                import torch as _torch
-
-                _fb = "triton" if _torch.version.hip else "flashinfer"
-                logger.warning(
-                    "DFLASH draft worker does not support 'trtllm_mha' because the "
-                    "draft path requires non-causal attention. Falling back to "
-                    "'%s'.",
-                    _fb,
-                )
-                draft_backend = _fb
-            elif draft_backend not in supported_draft_backends:
-                import torch as _torch
-
-                _fb = "triton" if _torch.version.hip else "flashinfer"
-                logger.warning(
-                    "DFLASH draft worker only supports attention_backend in %s for now, "
-                    "but got %r. Falling back to '%s'.",
-                    supported_draft_backends,
-                    draft_backend,
-                    _fb,
-                )
-                draft_backend = _fb
+        draft_backend = resolve_dflash_draft_attention_backend(
+            draft_backend, is_tpu=_IS_TPU, is_hip=bool(_torch.version.hip)
+        )
         # Make the draft worker backend explicit and self-contained (no further overrides).
         draft_server_args.speculative_draft_attention_backend = None
         draft_server_args.prefill_attention_backend = None

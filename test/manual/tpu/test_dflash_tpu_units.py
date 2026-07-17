@@ -1,51 +1,81 @@
 """CPU-runnable unit tests for DFlash-on-TPU host-side helpers.
 
-Covers:
-* ``build_dflash_draft_block_allow_mask`` — the ragged all-ones "allow" mask for
-  the non-causal draft block (1 == allow), whose semantics are validated against
-  the RPA-v3 kernel on TPU in ``test_ragged_paged_attention_v3.py``.
-* ``validate_dflash_request`` TPU greedy-only admission — non-greedy
-  (temperature/top-k/top-p) requests must be rejected on TPU rather than
-  silently degrading to greedy argmax, while greedy (top_k == 1) is admitted.
-
-These need no JAX / TPU device.
+Covers ``validate_dflash_request`` TPU greedy-only admission — non-greedy
+(temperature/top-k/top-p) requests must be rejected on TPU rather than silently
+degrading to greedy argmax, while greedy (top_k == 1) is admitted. Needs no JAX
+/ TPU device. The non-causal draft-block "allow" mask is a fixed-shape all-ones
+cache inside the RPA-v3 backend and is validated on TPU in
+``test_ragged_paged_attention_v3.py``.
 """
 
 import types
 import unittest
 
-import torch
-
 import sglang.srt.speculative.dflash_utils as du
-from sglang.srt.speculative.dflash_utils import (
-    build_dflash_draft_block_allow_mask,
-    validate_dflash_request,
+from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.dflash_worker import (
+    resolve_dflash_draft_attention_backend,
 )
 from sglang.test.test_utils import CustomTestCase
 
 
-class TestBuildDraftBlockAllowMask(CustomTestCase):
-    def test_length_dtype_and_all_ones(self):
-        # kv_lens = prefix + block per sequence.
-        kv_lens = torch.tensor([21, 8, 80], dtype=torch.int32)
-        block_size = 4
-        mask = build_dflash_draft_block_allow_mask(kv_lens, block_size)
-        self.assertEqual(mask.dtype, torch.int32)
-        self.assertEqual(mask.numel(), block_size * int(kv_lens.sum()))
-        self.assertTrue(torch.all(mask == 1))
+class TestResolveDflashDraftBackend(CustomTestCase):
+    """DFlash draft attention backend selection (the ENCODER_ONLY path)."""
 
-    def test_single_sequence(self):
-        mask = build_dflash_draft_block_allow_mask(
-            torch.tensor([10], dtype=torch.int32), block_size=4
+    def test_tpu_defaults_to_rpa_v3(self):
+        self.assertEqual(
+            resolve_dflash_draft_attention_backend(None, is_tpu=True, is_hip=False),
+            "pallas_tpu_rpa_v3",
         )
-        self.assertEqual(mask.numel(), 4 * 10)
-        self.assertTrue(torch.all(mask == 1))
 
-    def test_rejects_nonpositive_block(self):
-        with self.assertRaises(ValueError):
-            build_dflash_draft_block_allow_mask(
-                torch.tensor([10], dtype=torch.int32), block_size=0
-            )
+    def test_tpu_explicit_rpa_v3_ok(self):
+        self.assertEqual(
+            resolve_dflash_draft_attention_backend(
+                "pallas_tpu_rpa_v3", is_tpu=True, is_hip=False
+            ),
+            "pallas_tpu_rpa_v3",
+        )
+
+    def test_tpu_rejects_gpu_backends(self):
+        for bad in ("flashinfer", "fa3", "fa4", "triton", "trtllm_mha"):
+            with self.subTest(backend=bad):
+                with self.assertRaises(ValueError):
+                    resolve_dflash_draft_attention_backend(
+                        bad, is_tpu=True, is_hip=False
+                    )
+
+    def test_gpu_defaults_and_fallbacks(self):
+        self.assertEqual(
+            resolve_dflash_draft_attention_backend(None, is_tpu=False, is_hip=False),
+            "flashinfer",
+        )
+        self.assertEqual(
+            resolve_dflash_draft_attention_backend(None, is_tpu=False, is_hip=True),
+            "triton",
+        )
+        # trtllm_mha (causal-only) and unknown backends fall back on GPU.
+        self.assertEqual(
+            resolve_dflash_draft_attention_backend(
+                "trtllm_mha", is_tpu=False, is_hip=False
+            ),
+            "flashinfer",
+        )
+        self.assertEqual(
+            resolve_dflash_draft_attention_backend(
+                "unknown_backend", is_tpu=False, is_hip=False
+            ),
+            "flashinfer",
+        )
+
+    def test_gpu_supported_backends_passthrough(self):
+        for good in ("flashinfer", "fa3", "fa4", "triton"):
+            with self.subTest(backend=good):
+                self.assertEqual(
+                    resolve_dflash_draft_attention_backend(
+                        good, is_tpu=False, is_hip=False
+                    ),
+                    good,
+                )
 
 
 def _make_req(top_k: int, return_logprob: bool = False):

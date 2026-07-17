@@ -473,8 +473,8 @@ class _DFlashRpaHarness(TestRaggedPagedAttentionV3):
 
     __test__ = False
     PAGE_SIZE = 16
-    PAGES_PER_SEQ = 6  # 96 tokens per seq
-    TOTAL_NUM_PAGES = 8
+    PAGES_PER_SEQ = 18  # 288 tokens per seq (covers prefix 255 + block 16)
+    TOTAL_NUM_PAGES = 18
 
     def runTest(self):  # pragma: no cover - construction-only helper
         pass
@@ -482,7 +482,7 @@ class _DFlashRpaHarness(TestRaggedPagedAttentionV3):
 
 @unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
 class TestDFlashNonCausalBlockAttention(unittest.TestCase):
-    """AC-2: the RPA-v3 kernel run non-causally (causal=0 + all-ones custom_mask)
+    """The RPA-v3 kernel run non-causally (causal=0 + all-ones custom_mask)
     computes full bidirectional attention over [prefix + block], matching the
     in-file reference. This is exactly what the DFlash draft block needs (an
     ENCODER_ONLY forward where every block query attends to the whole prefix
@@ -496,7 +496,8 @@ class TestDFlashNonCausalBlockAttention(unittest.TestCase):
     HEAD_DIM = _DFlashRpaHarness.HEAD_DIM
     TOLERANCE = _DFlashRpaHarness.TOLERANCE
 
-    # (prefix_len, block_size): DFlash draft-block shapes, incl. page boundaries.
+    # (prefix_len, block_size): DFlash draft-block shapes, incl. page boundaries
+    # and a long prefix.
     CASES = [
         (0, 4),
         (1, 4),
@@ -504,8 +505,10 @@ class TestDFlashNonCausalBlockAttention(unittest.TestCase):
         (63, 4),
         (64, 4),
         (65, 4),
+        (255, 4),
         (17, 16),
         (64, 16),
+        (255, 16),
     ]
 
     def setUp(self):
@@ -614,7 +617,7 @@ class TestDFlashNonCausalBlockAttention(unittest.TestCase):
 
 @unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
 class TestRpaV3OpBoundaryCausalMask(unittest.TestCase):
-    """task7: the torch custom-op boundary threads `causal` and `custom_mask`.
+    """The torch custom-op boundary threads `causal` and `custom_mask`.
 
     Drives the registered ``sglang_tpu_pallas::ragged_paged_attention`` op end to
     end on TPU with (a) causal=0 + an all-ones custom_mask (the DFlash draft
@@ -703,6 +706,31 @@ class TestRpaV3OpBoundaryCausalMask(unittest.TestCase):
         # one, proving the threaded flag/mask actually reaches the kernel.
         diff = float((out_noncausal[:q] - out_causal[:q]).abs().max())
         self.assertGreater(diff, 1e-2)
+
+    def test_oversized_allow_mask_matches_exact(self):
+        """An all-ones mask sized to an upper bound gives identical output to the
+        exact-length one: the kernel reads only the exact cu_mask_lens prefix.
+        This underpins the fixed-shape (bucketed) mask used by the backend to
+        avoid per-prefix Pallas specialization.
+        """
+        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
+            _build_pallas_kernel_op,
+        )
+
+        op = _build_pallas_kernel_op()
+        q = self.Q_LEN
+        exact_len = q * self.KV_LEN
+
+        inp = self._build_op_inputs()
+        out_exact = self._call(
+            op, inp, causal=0, custom_mask=torch.ones_like(inp["mask"])[:exact_len]
+        )
+        inp = self._build_op_inputs()  # fresh donated kv buffer
+        oversized = torch.ones(exact_len * 3 + 37, dtype=torch.int32, device=inp["q"].device)
+        out_over = self._call(op, inp, causal=0, custom_mask=oversized)
+
+        diff = float((out_exact[:q].float() - out_over[:q].float()).abs().max())
+        self.assertEqual(diff, 0.0)
 
 
 if __name__ == "__main__":

@@ -109,36 +109,6 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
     return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
 
 
-def build_dflash_draft_block_allow_mask(
-    kv_lens: torch.Tensor, block_size: int
-) -> torch.Tensor:
-    """Ragged "allow" mask for the non-causal DFlash draft-block attention.
-
-    The DFlash draft block is fully visible: each of the ``block_size`` query
-    tokens attends to the whole prefix KV and to every block token
-    (bidirectional / ``ENCODER_ONLY``). The RPA-v3 kernel reads a per-sequence
-    ragged mask laid out flat as ``[sum_i block_size * kv_lens[i]]`` where 1 ==
-    allow and 0 == block (positions with value < 1 are masked). A fully-visible
-    block is therefore all ones.
-
-    Semantics validated against the kernel on TPU in
-    ``test/manual/tpu/test_ragged_paged_attention_v3.py::TestDFlashNonCausalBlockAttention``.
-
-    Args:
-        kv_lens: int tensor ``[bs]``; each entry is ``prefix_len + block_size``
-            (the total KV the block attends over for that sequence).
-        block_size: number of draft-block query tokens per sequence.
-
-    Returns:
-        int32 tensor ``[sum_i block_size * kv_lens[i]]`` of ones, on
-        ``kv_lens.device``.
-    """
-    if block_size <= 0:
-        raise ValueError(f"block_size must be positive, got {block_size}.")
-    total = int(block_size) * int(kv_lens.to(torch.int64).sum().item())
-    return torch.ones(total, dtype=torch.int32, device=kv_lens.device)
-
-
 def _get_or_create_chain_verify_buffers(
     *,
     bs: int,

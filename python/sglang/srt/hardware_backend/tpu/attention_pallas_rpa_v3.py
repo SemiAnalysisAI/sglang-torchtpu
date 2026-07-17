@@ -280,6 +280,12 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         self._distribution_cache: dict[tuple[bool, int, torch.device], torch.Tensor] = (
             {}
         )
+        # Fixed-shape all-ones "allow" masks for ENCODER_ONLY (non-causal)
+        # layers, keyed by (device, num_tokens, kv_capacity). See
+        # _get_encoder_only_allow_mask.
+        self._encoder_only_mask_cache: dict[
+            tuple[torch.device, int, int], torch.Tensor
+        ] = {}
         # Register the custom op eagerly so the (Python-introspection-heavy)
         # ``jax_op`` registration does not happen inside a ``torch.compile``
         # traced region — dynamo can't handle ``inspect.signature`` on the
@@ -692,7 +698,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # test_ragged_paged_attention_v3.py::TestDFlashNonCausalBlockAttention.
         if getattr(layer, "attn_type", None) == AttentionType.ENCODER_ONLY:
             causal = 0
-            custom_mask = self._build_full_attention_allow_mask(q.device)
+            custom_mask = self._get_encoder_only_allow_mask(num_tokens, q.device)
         else:
             causal = 1
             custom_mask = None
@@ -724,18 +730,45 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         out = out.reshape(num_tokens, layer.tp_q_head_num, -1)[..., : layer.v_head_dim]
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
-    def _build_full_attention_allow_mask(self, device: torch.device) -> torch.Tensor:
-        """All-ones ragged 'allow' mask for a fully-visible (ENCODER_ONLY) forward.
+    def _kv_capacity_per_seq(self) -> int:
+        """Max KV a sequence can hold in the rectangular page layout.
 
-        Layout matches the kernel's per-sequence ragged mask
-        ``[sum_i q_len_i * kv_len_i]`` where 1 == allow (positions with value < 1
-        are masked). Length is derived from the current forward metadata; padded
-        sequences have ``q_len == 0`` and contribute nothing.
+        ``_build_metadata`` uses ``pages_per_seq * page_size`` (floor-trimmed) as
+        the per-seq ``cu_kv_lens`` stride, so this is the exact upper bound on any
+        sequence's ``kv_len``. Derived from tensor shapes only (no D2H sync).
         """
-        meta = self.forward_metadata
-        q_lens = (meta.cu_q_lens[1:] - meta.cu_q_lens[:-1]).to(torch.int64)
-        total = int((q_lens * meta.kv_lens.to(torch.int64)).sum().item())
-        return torch.ones(total, dtype=torch.int32, device=device)
+        max_context_len = int(self.req_to_token_pool.req_to_token.shape[1])
+        return (max_context_len // self.page_size) * self.page_size
+
+    def _get_encoder_only_allow_mask(
+        self, num_tokens: int, device: torch.device
+    ) -> torch.Tensor:
+        """Fixed-shape all-ones 'allow' mask for a non-causal (ENCODER_ONLY) forward.
+
+        The kernel reads a per-sequence ragged mask ``[sum_i q_len_i * kv_len_i]``
+        where 1 == allow, indexing it via runtime ``cu_q_lens``/``kv_lens`` and
+        touching only the exact ``sum_i q_len_i * kv_len_i`` prefix. An all-ones
+        tensor sized to any upper bound therefore yields identical output while
+        keeping the mask a **fixed shape** (so the Pallas op does not specialize
+        per live prefix length -- see AC-7). Verified equal to the exact-length
+        mask on TPU.
+
+        The bound ``num_tokens * kv_capacity`` depends only on the (already
+        bucketed) padded query-token count and the fixed per-seq KV capacity, not
+        on any per-request prefix length:
+        ``sum_i q_len_i * kv_len_i <= (sum_i q_len_i) * kv_capacity
+        <= num_tokens * kv_capacity``. Masks are cached per (device, num_tokens,
+        kv_capacity).
+        """
+        kv_capacity = self._kv_capacity_per_seq()
+        key = (device, int(num_tokens), kv_capacity)
+        mask = self._encoder_only_mask_cache.get(key)
+        if mask is None:
+            mask = torch.ones(
+                int(num_tokens) * kv_capacity, dtype=torch.int32, device=device
+            )
+            self._encoder_only_mask_cache[key] = mask
+        return mask
 
     # ------------------------------------------------------------------ #
     # Capability flags
