@@ -264,6 +264,9 @@ class EAGLEWorker(TpModelWorker):
         )
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+        self.draft_model_runner.compile_policy.precompile_draft(
+            self.draft_attn_backend, self.draft_extend_attn_backend
+        )
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""

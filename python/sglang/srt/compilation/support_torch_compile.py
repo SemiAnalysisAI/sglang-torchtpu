@@ -57,6 +57,18 @@ class CompilePolicy(ABC):
     def precompile(self) -> None:
         """Warm compile artifacts for this policy."""
 
+    def precompile_draft(
+        self, draft_attn_backend: Any, draft_extend_attn_backend: Any
+    ) -> None:
+        """Run the delayed speculative-draft warmup phase.
+
+        Target and ordinary model warmup belongs in ``precompile()``. Draft
+        forwards use attention backends owned by the speculative worker, which
+        are created only after the model runner's initial ``precompile()`` call.
+        Policies that compile draft shapes therefore implement this second-stage
+        hook once those backends are available. Base is a no-op.
+        """
+
     @abstractmethod
     def finalize_forward_outputs(self, out: Any, context: Any) -> Any:
         """Adapt padded compiled outputs back to the caller-visible shape."""
