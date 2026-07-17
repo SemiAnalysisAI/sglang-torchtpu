@@ -6,6 +6,10 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.compilation.support_torch_compile import (
+    CompilePolicy,
+    NoopCompilePolicy,
+)
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
@@ -34,9 +38,14 @@ from sglang.srt.speculative.eagle_utils import (
     top_k_renorm_prob_func,
     top_p_renorm_prob_func,
     tree_speculative_sampling_target_only_func,
-    verify_tree_greedy_func,
+    verify_tree_greedy_from_logits,
 )
-from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_info import (
+    AcceptIndices,
+    SpecInput,
+    SpecInputType,
+    SpecPaddingState,
+)
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     TREE_SPEC_KERNEL_AVAILABLE,
@@ -54,6 +63,7 @@ from sglang.srt.utils import is_tpu, next_power_of_2
 _is_tpu = is_tpu()
 
 logger = logging.getLogger(__name__)
+_NOOP_COMPILE_POLICY = NoopCompilePolicy()
 
 
 def _draft_runner_of(worker):
@@ -66,6 +76,26 @@ def _draft_runner_of(worker):
     return (
         worker.draft_runner if hasattr(worker, "draft_runner") else worker.model_runner
     )
+
+
+def gather_accepted(
+    res: "EagleVerifyOutput", logits_output: LogitsProcessorOutput
+) -> None:
+    """Gather verify outputs for accepted tokens.
+
+    GPU gathers logits and hidden states with the variable-length accept index.
+    TPU uses a fixed-size index for hidden states to avoid dynamic XLA shapes and
+    leaves logits unchanged. Logprob callers must gather TPU logits separately.
+    """
+    accepted_indices = res.accepted_indices
+    if not accepted_indices.is_padded:
+        logits_output.next_token_logits = logits_output.next_token_logits[
+            accepted_indices.logical
+        ]
+    if logits_output.hidden_states is not None:
+        logits_output.hidden_states = accepted_indices.gather(
+            logits_output.hidden_states
+        )
 
 
 @dataclass
@@ -242,7 +272,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
-    ) -> torch.Tensor:
+        compile_policy: CompilePolicy = _NOOP_COMPILE_POLICY,
+    ) -> "EagleVerifyOutput":
         """
         Verify and find accepted tokens based on logits output and batch
         (which contains spec decoding information).
@@ -273,14 +304,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         bs = self.retrieve_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
-
-        predict_shape = list(logits_output.next_token_logits.shape)[:-1]
-        predict_shape[-1] += 1
-        predict = torch.empty(predict_shape, dtype=torch.int32, device=batch.device)
-        accept_index = torch.full(
-            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=batch.device
-        )
-        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=batch.device)
 
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
@@ -332,21 +355,34 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         if is_all_greedy or not tree_sample_available:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
-            target_predict = target_predict.reshape(bs, self.draft_token_num)
-            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
-                predicts=predict,  # mutable
-                accept_index=accept_index,  # mutable
-                accept_token_num=num_correct_drafts,  # mutable
+            result = verify_tree_greedy_from_logits(
+                next_token_logits=logits_output.next_token_logits,
                 candidates=candidates,
                 retrieve_index=self.retrieve_index,
                 retrieve_next_token=self.retrieve_next_token,
                 retrieve_next_sibling=self.retrieve_next_sibling,
-                target_predict=target_predict,
+                spec_steps=self.spec_steps,
                 topk=self.topk,
+                compile_policy=compile_policy,
+                spec_info=self,
+            )
+            predict, accept_index, num_correct_drafts = result
+        else:
+            predict_shape = list(logits_output.next_token_logits.shape)[:-1]
+            predict_shape[-1] += 1
+            predict = torch.empty(
+                predict_shape, dtype=torch.int32, device=batch.device
+            )
+            accept_index = torch.full(
+                (bs, self.spec_steps + 1),
+                -1,
+                dtype=torch.int32,
+                device=batch.device,
+            )
+            num_correct_drafts = torch.empty(
+                (bs,), dtype=torch.int32, device=batch.device
             )
 
-        else:
             # apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(
                 sampling_info.temperatures, self.draft_token_num, dim=0
@@ -427,7 +463,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         unfinished_index = []
-        unfinished_accept_index = []
         accept_index_cpu = accept_index.tolist()
         predict_cpu = predict.tolist()
         has_finished = False
@@ -468,10 +503,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             req.kv_allocated_len = req.kv_committed_len
             if not req.finished():
                 unfinished_index.append(i)
-                if idx == -1:
-                    unfinished_accept_index.append(accept_index[i, :j])
-                else:
-                    unfinished_accept_index.append(accept_index[i])
             req.spec_verify_ct += 1
             num_accepted_drafts = num_accept_tokens - 1
             num_correct_drafts_list.append(num_accepted_drafts)
@@ -483,7 +514,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them
-        accept_index = accept_index[accept_index != -1]
+        accept_indices = compile_policy.build_accepted_indices(accept_index)
+        accept_index = accept_indices.logical
         accept_tokens = predict[accept_index]
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
@@ -570,14 +602,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
             draft_extend_input = EagleDraftExtendInput(
                 hidden_states=(
-                    batch.spec_info.hidden_states[accept_index]
+                    accept_indices.gather(batch.spec_info.hidden_states)
                     if batch.spec_info.hidden_states is not None
                     else None
                 ),
                 num_correct_drafts=num_correct_drafts,
                 num_accept_tokens=num_correct_drafts + 1,
                 num_accept_tokens_cpu=num_accept_tokens_list,
-                input_ids=accept_tokens,
+                input_ids=accept_indices.gather(predict),
                 seq_lens=batch.seq_lens,
                 seq_lens_cpu=batch.seq_lens_cpu,
                 req_pool_indices=batch.req_pool_indices,
@@ -588,7 +620,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
                 num_correct_drafts_per_req_cpu=num_correct_drafts_list,
-                accept_indices=accept_index,
+                accepted_indices=accept_indices,
+                padding_state=self.padding_state,
             )
         else:
             if page_size == 1 or self.topk == 1:
@@ -603,11 +636,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 batch.seq_lens.add_(num_correct_drafts + 1)
                 batch.seq_lens_cpu.add_(num_accept_tokens_cpu)
 
-            if len(unfinished_accept_index) > 0:
-                unfinished_accept_index = torch.cat(unfinished_accept_index)
+            if unfinished_index:
                 unfinished_index_device = torch.tensor(
                     unfinished_index, dtype=torch.int64, device=predict.device
                 )
+                unfinished_accept_indices = compile_policy.build_accepted_indices(
+                    accept_indices.per_request[unfinished_index_device],
+                )
+                unfinished_accept_index = unfinished_accept_indices.logical
                 draft_input_num_correct_drafts_cpu = [
                     num_correct_drafts_list[i] for i in unfinished_index
                 ]
@@ -642,14 +678,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 ]
                 draft_extend_input = EagleDraftExtendInput(
                     hidden_states=(
-                        batch.spec_info.hidden_states[unfinished_accept_index]
+                        unfinished_accept_indices.gather(
+                            batch.spec_info.hidden_states
+                        )
                         if batch.spec_info.hidden_states is not None
                         else None
                     ),
                     num_accept_tokens_cpu=draft_input_num_accept_tokens_cpu,
                     num_correct_drafts=unfinished_num_correct_drafts,
                     num_accept_tokens=unfinished_num_correct_drafts + 1,
-                    input_ids=predict[unfinished_accept_index],
+                    input_ids=unfinished_accept_indices.gather(predict),
                     seq_lens=batch.seq_lens[unfinished_index_device],
                     seq_lens_cpu=batch.seq_lens_cpu[unfinished_index],
                     req_pool_indices=batch.req_pool_indices[unfinished_index_device],
@@ -669,7 +707,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
                 num_correct_drafts_per_req_cpu=num_correct_drafts_list,
-                accept_indices=accept_index,
+                accepted_indices=accept_indices,
+                padding_state=self.padding_state,
             )
 
 
@@ -937,44 +976,6 @@ class EagleDraftExtendInput(SpecInput):
             capture_hidden_mode=capture_hidden_mode,
         )
 
-    def _pad_draft_extend_for_tpu(
-        self, batch: ScheduleBatch, speculative_num_steps: int
-    ):
-        """Pad draft-extend tensors to a fixed size for XLA shape stability.
-
-        XLA/torch.compile traces tensor shapes at compile time. Without
-        padding, every different accept count produces a different total
-        token count, triggering recompilation. Pad to the worst case
-        (speculative_num_steps + 1) * bs so one compiled graph is reused.
-        """
-        bs = len(self.seq_lens)
-        padded_len = (speculative_num_steps + 1) * bs
-        actual_len = self.input_ids.numel()
-        pad_size = max(padded_len - actual_len, 0)
-        if pad_size > 0:
-            self.input_ids = torch.nn.functional.pad(
-                self.input_ids, (0, pad_size), value=0
-            )
-            if batch.out_cache_loc is not None:
-                batch.out_cache_loc = torch.nn.functional.pad(
-                    batch.out_cache_loc, (0, pad_size), value=0
-                )
-            if self.hidden_states is not None:
-                self.hidden_states = torch.nn.functional.pad(
-                    self.hidden_states,
-                    (0, 0, 0, pad_size),  # pad first dim only
-                    value=0,
-                )
-        elif batch.out_cache_loc is not None:
-            oc_len = batch.out_cache_loc.numel()
-            target_len = self.input_ids.numel()
-            if oc_len > target_len:
-                batch.out_cache_loc = batch.out_cache_loc[:target_len]
-            elif oc_len < target_len:
-                batch.out_cache_loc = torch.nn.functional.pad(
-                    batch.out_cache_loc, (0, target_len - oc_len), value=0
-                )
-
     def prepare_extend_after_decode(
         self,
         batch: ScheduleBatch,
@@ -984,9 +985,6 @@ class EagleDraftExtendInput(SpecInput):
         assert batch.spec_info is self
         if batch.forward_mode.is_idle():
             return
-
-        if _is_tpu:
-            self._pad_draft_extend_for_tpu(batch, speculative_num_steps)
 
         # The function below populates `self.positions` and `self.bonus_tokens`;
         # the worker reads `self.bonus_tokens` to construct next iter's
@@ -1058,12 +1056,20 @@ class EagleVerifyOutput:
     accept_tokens: torch.Tensor
     # Accepted token length per sequence in a batch in CPU (full set).
     num_correct_drafts_per_req_cpu: List[int]
-    # Accepted indices from logits_output.next_token_logits
-    accept_indices: torch.Tensor
+    # Logical accepted rows plus the platform's gather representation.
+    accepted_indices: AcceptIndices
     # Whether the target verify forward ran a captured cuda graph. Set by
     # the worker after `EagleVerifyInput.sample` returns; default kept so
     # idle / direct constructions don't have to pass it.
     can_run_cuda_graph: bool = False
+    # Shape state at the verify output boundary. Tensor payloads may remain
+    # physically padded even after scheduler-visible outputs are restored.
+    padding_state: Optional[SpecPaddingState] = None
+
+    @property
+    def accept_indices(self) -> torch.Tensor:
+        """Return the logical accepted rows used by shared output processing."""
+        return self.accepted_indices.logical
 
     @classmethod
     def create_idle(
@@ -1079,7 +1085,10 @@ class EagleVerifyOutput:
             logits_output=logits_output,
             accept_tokens=torch.empty(0, dtype=torch.long, device=device),
             num_correct_drafts_per_req_cpu=[],
-            accept_indices=torch.full(
-                (0, spec_steps + 1), -1, dtype=torch.int32, device=device
+            accepted_indices=AcceptIndices(
+                per_request=torch.empty(
+                    (0, spec_steps + 1), dtype=torch.int32, device=device
+                ),
+                logical=torch.empty(0, dtype=torch.int32, device=device)
             ),
         )
