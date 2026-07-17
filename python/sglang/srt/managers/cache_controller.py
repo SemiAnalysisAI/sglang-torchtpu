@@ -128,6 +128,17 @@ class BatchDoneCounter:
         self.events = [None] * num_counters
         self.producer_index = -1
         self.consumer_index = -1
+        self._pending_commits = []
+
+    def add_commit(self, event, closure) -> None:
+        self._pending_commits.append((event, closure))
+
+    def drain_commits(self) -> None:
+        """Run all pending reload commits (scheduler thread only)."""
+        while self._pending_commits:
+            ev, fn = self._pending_commits.pop(0)
+            ev.synchronize()  # staging enqueued (gather done, H2D issued)
+            fn()
 
     def update_producer(self) -> int:
         next_index = (self.producer_index + 1) % self.num_counters
@@ -145,7 +156,6 @@ class BatchDoneCounter:
         self.consumer_index = index
 
     def wait(self) -> None:
-        # Whole-batch gate: block until this batch's reload has landed.
         if self.consumer_index < 0:
             return
         ev = self.events[self.consumer_index]
@@ -153,6 +163,19 @@ class BatchDoneCounter:
             ev.synchronize()
 
     def reset(self) -> None:
+        """Reset lifecycle: land pending commits, then clear every slot.
+
+        Staged reloads are committed rather than dropped — their nodes were
+        already acked loadable, so dropping would leave stale device pages
+        behind an ack. Commit failures downgrade to drop-with-log so a
+        flush/reset can always recover the counter.
+        """
+        try:
+            self.drain_commits()
+        except Exception:
+            logger.exception("[kv-offload] dropping pending reload commits on reset")
+            self._pending_commits.clear()
+        self.events = [None] * self.num_counters
         self.producer_index = -1
         self.consumer_index = -1
 
@@ -822,6 +845,8 @@ class HiCacheController:
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
             return None
+        if self.io_backend == "torch_tpu":
+            device_indices = device_indices.cpu()
         self.load_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
@@ -847,7 +872,7 @@ class HiCacheController:
         elif self.io_backend == "kernel_ascend":
             return host_indices, device_indices.cpu()
         elif self.io_backend == "torch_tpu":
-            return host_indices.cpu(), device_indices
+            return host_indices.cpu(), device_indices.to(self.device, non_blocking=True)
         else:
             raise ValueError(f"Unsupported io backend")
 
@@ -1282,6 +1307,17 @@ class TpuHiCacheController(HiCacheController):
         self.layer_done_counter.reset()
         super().reset()
 
+    def evict_device(self, device_indices: torch.Tensor) -> int:
+        """Eviction lifecycle: land all pending reload commits, then free.
+
+        Ordering invariant (commit-before-free): a staged-but-uncommitted
+        reload targeting these pages must scatter into the kv_buffers while
+        the pages are still owned by their node; freeing first would let a
+        later commit write stale bytes over whoever reallocates them.
+        """
+        self.layer_done_counter.drain_commits()
+        return super().evict_device(device_indices)
+
     def start_writing(self) -> None:
         if len(self.write_queue) == 0:
             return
@@ -1297,6 +1333,11 @@ class TpuHiCacheController(HiCacheController):
         # the previous backup first to bound in-flight gathered HBM.
         if self._backup_inflight is not None:
             self._backup_inflight.synchronize()
+
+        # Write-back lifecycle: land pending reload commits, then gather.
+        # Ordering invariant (commit-before-read): backing up a just-reloaded
+        # node must gather post-reload bytes, so its scatter lands first.
+        self.layer_done_counter.drain_commits()
 
         staged = self.mem_pool_host.backup_gather(self.mem_pool_device, device_indices)
         # Draft KV shares the target's slot indices; gather it inline too
@@ -1342,21 +1383,36 @@ class TpuHiCacheController(HiCacheController):
         has_draft = self.has_draft
         mem_pool_host_draft = self.mem_pool_host_draft
         mem_pool_device_draft = self.mem_pool_device_draft
-        io_backend = self.io_backend
+
+        # Reload lifecycle: the worker thread STAGES (host gather + H2D into
+        # fresh tensors); the scatter into live kv_buffers is deferred as a
+        # commit closure that BatchDoneCounter runs at its gate points on the
+        # scheduler thread. Donation safety: worker threads never touch the
+        # (donatable) kv_buffer handles — only the dispatch thread commits.
+        # Values are load_stage's (src_all staging tensor, padded dst page ids).
+        staged: dict[str, Optional[tuple[torch.Tensor, torch.Tensor]]] = {}
 
         def _producer():
-            mem_pool_host.load_to_device_all(
-                mem_pool_device, host_indices, device_indices, io_backend
+            staged["target"] = mem_pool_host.load_stage(
+                mem_pool_device, host_indices, device_indices
             )
             if has_draft:
-                mem_pool_host_draft.load_to_device_all(
-                    mem_pool_device_draft, host_indices, device_indices, io_backend
+                staged["draft"] = mem_pool_host_draft.load_stage(
+                    mem_pool_device_draft, host_indices, device_indices
                 )
 
-        # The worker event is set only after the reload barrier (load_to_device_all
-        # reads the source host pages, runs the H2D, and syncs).
+        def _commit():
+            mem_pool_host.load_commit(mem_pool_device, staged.get("target"))
+            if has_draft:
+                mem_pool_host_draft.load_commit(
+                    mem_pool_device_draft, staged.get("draft")
+                )
+
+        # Worker event = staging enqueued (gather done, async H2D issued); the
+        # commit scatter's operand dependency covers the DMA landing.
         worker_done = self._load_worker.submit(_producer)
         self.layer_done_counter.set_event(producer_id, worker_done)
+        self.layer_done_counter.add_commit(worker_done, _commit)
         self.ack_load_queue.append(
             HiCacheAck(
                 start_event=worker_done,
