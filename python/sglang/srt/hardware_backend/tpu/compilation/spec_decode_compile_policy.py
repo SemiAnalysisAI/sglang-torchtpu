@@ -51,11 +51,19 @@ class SpecDecodeCompilePolicyMixin:
         self.speculative_eagle_topk = server_args.speculative_eagle_topk or 1
         self.is_draft_worker = self.model_runner.is_draft_worker
 
-        if self.speculative_algorithm and self.speculative_algorithm != "EAGLE3":
+        if self.speculative_algorithm and self.speculative_algorithm not in (
+            "EAGLE3",
+            "DFLASH",
+        ):
             raise ValueError(
-                f"TPU torch.compile precompilation only supports EAGLE3, "
-                f"got {self.speculative_algorithm!r}."
+                f"TPU torch.compile precompilation only supports EAGLE3 and "
+                f"DFLASH, got {self.speculative_algorithm!r}."
             )
+        # DFlash reuses the EAGLE3 TARGET_VERIFY(FULL) + EXTEND(FULL) precompile
+        # shapes: the RPA-v3 backend reads only ``spec_info.draft_token_num`` for
+        # verify metadata, and the captured-hidden width is set by the target's
+        # ``set_dflash_layers_to_capture`` config, not the spec_info type. Its
+        # verify width is ``speculative_num_draft_tokens`` (the DFlash block size).
 
         # Draft tokens verified per request = the TARGET_VERIFY width. This
         # equals speculative_num_steps + 1 only for a topk=1 chain; use the

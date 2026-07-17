@@ -9,7 +9,9 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.utils import is_cuda, is_musa
+from sglang.srt.utils import is_cuda, is_musa, is_tpu
+
+_IS_TPU = is_tpu()
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -22,6 +24,12 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "FlashAttentionBackend",
         "TRTLLMHAAttnBackend",
         "TRTLLMMLABackend",
+        # TPU: the RPA-v3 backend builds its own verify metadata in
+        # _build_metadata (reads only spec_info.draft_token_num) and applies a
+        # causal mask internally. DFlash verify is a linear (topk==1) chain, so
+        # the causal mask is correct and no DFlash custom mask is needed; this
+        # also keeps the flashinfer/Triton kv-indices path unreached on TPU.
+        "TpuPallasRpaV3AttnBackend",
     }
 )
 
@@ -642,6 +650,19 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
 def validate_dflash_request(req: Req) -> Optional[str]:
     if req.return_logprob:
         return "DFLASH speculative decoding does not support return_logprob yet."
+
+    if _IS_TPU and req.sampling_params.top_k > 1:
+        # On TPU the sampling (non-greedy) verify path is unavailable: it relies
+        # on sgl-kernel ops (tree_speculative_sampling_target_only, top_k/p
+        # renorm) that are CUDA/MUSA-only, so it would silently degrade to
+        # greedy argmax. Reject explicitly instead of changing sampling
+        # semantics behind the caller's back. (top_k == 1 is greedy after
+        # SamplingParams normalization.)
+        return (
+            "DFLASH on TPU currently supports greedy decoding only "
+            "(non-greedy sampling verify is CUDA-only). Use temperature 0 / "
+            "top_k 1, or run DFLASH on GPU."
+        )
 
     if (
         req.sampling_params.json_schema is not None

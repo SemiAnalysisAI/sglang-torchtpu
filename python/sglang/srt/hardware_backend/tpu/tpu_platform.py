@@ -128,7 +128,7 @@ class TpuSRTPlatform(SRTPlatform):
         # axis. SGLang's global page_size=1 default is valid for token-granular
         # GPU kernels, but is inefficient here: it makes page_indices
         # token-granular and turns KV fetches into many tiny DMAs.
-        # Only EAGLE3 spec decoding is supported on TPU, and only with topk == 1
+        # EAGLE3 and DFLASH spec decoding are supported on TPU (both topk == 1).
         spec_algo = server_args.speculative_algorithm
         if spec_algo is not None:
             if spec_algo == "EAGLE3":
@@ -136,10 +136,35 @@ class TpuSRTPlatform(SRTPlatform):
                     raise NotImplementedError(
                         "EAGLE3 topk > 1 is not supported on TPU yet."
                     )
+            elif spec_algo == "DFLASH":
+                # DFlash is block-parallel (linear, topk == 1) spec decoding and
+                # runs the v1 DFlashWorker (its arg hook forces
+                # disable_overlap_schedule). Only the greedy, paged, non-DP/PP
+                # configuration is supported on TPU. Per-request non-greedy
+                # rejection and draft-checkpoint validation live in the DFlash
+                # worker / scheduler admission path, not here.
+                if server_args.enable_dp_attention:
+                    raise NotImplementedError(
+                        "DFLASH speculative decoding is not supported with DP "
+                        "attention on TPU."
+                    )
+                if (server_args.pp_size or 1) > 1:
+                    raise NotImplementedError(
+                        "DFLASH speculative decoding is not supported with "
+                        "pipeline parallelism (pp_size > 1) on TPU."
+                    )
+                if (
+                    server_args.page_size is not None
+                    and server_args.page_size != 64
+                ):
+                    raise NotImplementedError(
+                        "DFLASH on TPU requires page_size == 64 (the paged "
+                        f"RPA-v3 cache); got page_size={server_args.page_size}."
+                    )
             else:
                 raise NotImplementedError(
                     f"Speculative algorithm {spec_algo!r} is not supported on TPU "
-                    "yet (only EAGLE3)."
+                    "yet (only EAGLE3, DFLASH)."
                 )
 
         if server_args.page_size is None:
