@@ -28,6 +28,7 @@ import unittest
 from typing import Optional
 
 import numpy as np
+import torch
 
 
 def _has_jax_tpu() -> bool:
@@ -609,6 +610,99 @@ class TestDFlashNonCausalBlockAttention(unittest.TestCase):
                     f"prefix={prefix_len} block={block_size}: non-causal and "
                     f"causal should differ, max diff {diff} <= {self.TOLERANCE}",
                 )
+
+
+@unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
+class TestRpaV3OpBoundaryCausalMask(unittest.TestCase):
+    """task7: the torch custom-op boundary threads `causal` and `custom_mask`.
+
+    Drives the registered ``sglang_tpu_pallas::ragged_paged_attention`` op end to
+    end on TPU with (a) causal=0 + an all-ones custom_mask (the DFlash draft
+    path) and (b) causal=1 / mask=None (the existing EAGLE3/target path), and
+    asserts both run and produce finite output whose values differ (the block
+    bidirectional path is not the causal one). Kernel numerics are covered by
+    ``TestDFlashNonCausalBlockAttention``; this guards the op-registration
+    argnum/schema plumbing.
+    """
+
+    P, PS, HD, NKV, NQ = 4, 16, 128, 1, 4
+    KV_LEN, Q_LEN = 17, 4
+
+    def _build_op_inputs(self):
+        import jax.numpy as jnp
+
+        from sglang.srt.layers.attention.pallas.util import get_dtype_packing
+
+        packing = get_dtype_packing(jnp.bfloat16)
+        dev = torch.device("tpu")
+        torch.manual_seed(0)
+        q = torch.randn(8, self.NQ, self.HD, dtype=torch.bfloat16, device=dev)
+        new_k = torch.randn(8, self.NKV, self.HD, dtype=torch.bfloat16, device=dev)
+        new_v = torch.randn(8, self.NKV, self.HD, dtype=torch.bfloat16, device=dev)
+        kv_fused = torch.randn(
+            self.P,
+            self.PS,
+            (self.NKV * 2) // packing,
+            packing,
+            self.HD,
+            dtype=torch.bfloat16,
+            device=dev,
+        )
+        return {
+            "q": q,
+            "new_k": new_k,
+            "new_v": new_v,
+            "kv_fused": kv_fused,
+            "kv_lens": torch.tensor([self.KV_LEN], dtype=torch.int32, device=dev),
+            "page_indices": torch.arange(self.P, dtype=torch.int32, device=dev),
+            "cu_q_lens": torch.tensor([0, self.Q_LEN], dtype=torch.int32, device=dev),
+            "cu_kv_lens": torch.tensor(
+                [0, self.P * self.PS], dtype=torch.int32, device=dev
+            ),
+            "distribution": torch.tensor([0, 1, 1], dtype=torch.int32, device=dev),
+            "mask": torch.ones(self.Q_LEN * self.KV_LEN, dtype=torch.int32, device=dev),
+        }
+
+    def _call(self, op, inp, *, causal, custom_mask):
+        sm = 1.0 / (self.HD**0.5)
+        return op(
+            inp["q"],
+            inp["new_k"],
+            inp["new_v"],
+            inp["kv_fused"],
+            inp["kv_lens"],
+            inp["page_indices"],
+            inp["cu_q_lens"],
+            inp["cu_kv_lens"],
+            inp["distribution"],
+            None,  # attention_sink
+            sm,
+            None,  # sliding_window
+            None,  # soft_cap
+            None,  # k_scale
+            None,  # v_scale
+            causal,
+            custom_mask,
+        )
+
+    def test_op_threads_causal_and_custom_mask(self):
+        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
+            _build_pallas_kernel_op,
+        )
+
+        op = _build_pallas_kernel_op()
+        inp = self._build_op_inputs()
+
+        out_noncausal = self._call(op, inp, causal=0, custom_mask=inp["mask"])
+        out_causal = self._call(op, inp, causal=1, custom_mask=None)
+
+        q = self.Q_LEN
+        self.assertTrue(torch.isfinite(out_noncausal[:q]).all())
+        self.assertTrue(torch.isfinite(out_causal[:q]).all())
+        # The bidirectional (causal=0) block result must differ from the causal
+        # one, proving the threaded flag/mask actually reaches the kernel.
+        diff = float((out_noncausal[:q] - out_causal[:q]).abs().max())
+        self.assertGreater(diff, 1e-2)
 
 
 if __name__ == "__main__":

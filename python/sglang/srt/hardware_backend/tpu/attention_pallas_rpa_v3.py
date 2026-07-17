@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
@@ -128,6 +129,8 @@ def _build_pallas_kernel_op():
         soft_cap: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        causal: int = 1,
+        custom_mask: Optional[jax.Array] = None,
     ) -> tuple[jax.Array, jax.Array]:
         return _jax_rpa(
             queries,
@@ -139,9 +142,9 @@ def _build_pallas_kernel_op():
             cu_q_lens,
             cu_kv_lens,
             distribution,
-            None,  # custom_mask
+            custom_mask,
             attention_sink,
-            causal=1,
+            causal=causal,
             sm_scale=sm_scale,
             sliding_window=sliding_window,
             soft_cap=soft_cap,
@@ -157,7 +160,10 @@ def _build_pallas_kernel_op():
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
-        static_argnums=(10, 11, 12, 13, 14),
+        # 10-14: sm_scale, sliding_window, soft_cap, k_scale, v_scale.
+        # 15: causal (static int). ``custom_mask`` (16) is a dynamic array like
+        # ``attention_sink`` (9) and is None on the causal path.
+        static_argnums=(10, 11, 12, 13, 14, 15),
         donate_argnums=(3,),
         input_output_aliases={3: 1},
         warn_deprecated=False,
@@ -184,6 +190,8 @@ def _build_pallas_kernel_op():
         soft_cap: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        causal: int = 1,
+        custom_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         output, _updated_kv = jax_kernel(
             queries,
@@ -201,6 +209,8 @@ def _build_pallas_kernel_op():
             soft_cap,
             k_scale,
             v_scale,
+            causal,
+            custom_mask,
         )
         return output
 
@@ -673,6 +683,20 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             k_scale = None
             v_scale = None
 
+        # Non-causal (ENCODER_ONLY) layers — e.g. the DFlash draft block, which
+        # attends bidirectionally over the whole prefix + block. The kernel has
+        # no built-in bidirectional mode, so run causal=0 with an all-ones
+        # "allow" custom_mask laid out ragged as [sum_i q_len_i * kv_len_i]
+        # (1 == allow). Causal decoder layers keep causal=1 / mask=None (the
+        # existing EAGLE3/target path). Validated in
+        # test_ragged_paged_attention_v3.py::TestDFlashNonCausalBlockAttention.
+        if getattr(layer, "attn_type", None) == AttentionType.ENCODER_ONLY:
+            causal = 0
+            custom_mask = self._build_full_attention_allow_mask(q.device)
+        else:
+            causal = 1
+            custom_mask = None
+
         out = op(
             q,
             k,
@@ -689,6 +713,8 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             soft_cap,
             k_scale,
             v_scale,
+            causal,
+            custom_mask,
         )
 
         # The kernel emits output at the (padded) qk head_dim. For asymmetric
@@ -697,6 +723,19 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # When qk == v this view+slice is a no-op reshape.
         out = out.reshape(num_tokens, layer.tp_q_head_num, -1)[..., : layer.v_head_dim]
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _build_full_attention_allow_mask(self, device: torch.device) -> torch.Tensor:
+        """All-ones ragged 'allow' mask for a fully-visible (ENCODER_ONLY) forward.
+
+        Layout matches the kernel's per-sequence ragged mask
+        ``[sum_i q_len_i * kv_len_i]`` where 1 == allow (positions with value < 1
+        are masked). Length is derived from the current forward metadata; padded
+        sequences have ``q_len == 0`` and contribute nothing.
+        """
+        meta = self.forward_metadata
+        q_lens = (meta.cu_q_lens[1:] - meta.cu_q_lens[:-1]).to(torch.int64)
+        total = int((q_lens * meta.kv_lens.to(torch.int64)).sum().item())
+        return torch.ones(total, dtype=torch.int32, device=device)
 
     # ------------------------------------------------------------------ #
     # Capability flags
