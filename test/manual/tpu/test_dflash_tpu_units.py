@@ -353,6 +353,33 @@ class TestDflashMissingWeightKeys(CustomTestCase):
         missing = du.dflash_missing_weight_keys(self.PARAMS, direct, packed)
         self.assertTrue(any("qkv_proj" in m for m in missing), missing)
 
+    def test_fused_on_disk_packed_params_accepted(self):
+        # A native/SGLang checkpoint may store qkv_proj/gate_up_proj FUSED on disk;
+        # the direct branch loads them (into loaded_direct) and the linear layer's
+        # weight_loader splits internally. Empty packed_shards_seen must NOT flag
+        # them missing.
+        qkv = "layers.0.self_attn.qkv_proj.weight"
+        gate_up = "layers.0.mlp.gate_up_proj.weight"
+        direct = {
+            p for p in self.PARAMS if "qkv_proj" not in p and "gate_up_proj" not in p
+        }
+        direct |= {qkv, gate_up}  # fused-on-disk direct loads
+        self.assertEqual(du.dflash_missing_weight_keys(self.PARAMS, direct, {}), [])
+
+    def test_fused_qkv_does_not_mask_missing_gate_up_shard(self):
+        # Fused-on-disk qkv accepted, but gate_up still needs its shards: a missing
+        # gate/up shard must still be reported.
+        qkv = "layers.0.self_attn.qkv_proj.weight"
+        gate_up = "layers.0.mlp.gate_up_proj.weight"
+        direct = {
+            p for p in self.PARAMS if "qkv_proj" not in p and "gate_up_proj" not in p
+        }
+        direct |= {qkv}  # only qkv fused-on-disk
+        packed = {gate_up: {0}}  # gate_up split but missing shard 1 (up)
+        missing = du.dflash_missing_weight_keys(self.PARAMS, direct, packed)
+        self.assertTrue(any("gate_up_proj" in m for m in missing), missing)
+        self.assertFalse(any("qkv_proj" in m for m in missing), missing)
+
 
 class TestDflashConfigEarlyBoundaryFailures(CustomTestCase):
     """Config failures caught EARLIER than validate_dflash_draft_startup in the

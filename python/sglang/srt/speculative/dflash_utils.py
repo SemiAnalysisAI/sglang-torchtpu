@@ -481,6 +481,13 @@ def dflash_missing_weight_keys(
     for pname in param_names:
         group = _dflash_packed_group(pname)
         if group is not None:
+            # A packed param is complete either when the checkpoint stored it
+            # FUSED ON DISK (a single `qkv_proj.weight`/`gate_up_proj.weight`
+            # loaded through the direct branch, which the linear layer's
+            # weight_loader splits internally) -> it lands in `loaded_direct`; or
+            # when every split shard (q/k/v, gate/up) was loaded separately.
+            if pname in loaded_direct:
+                continue
             expected = _DFLASH_PACKED_EXPECTED_SHARDS[group]
             seen = packed_shards_seen.get(pname, set())
             if seen != expected:
