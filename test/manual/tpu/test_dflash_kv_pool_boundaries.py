@@ -24,7 +24,10 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
-from sglang.srt.speculative.dflash_info import _compute_paged_keep_slots
+from sglang.srt.speculative.dflash_info import (
+    _compute_paged_keep_slots,
+    compact_verify_out_cache_loc,
+)
 from sglang.test.test_utils import CustomTestCase
 
 PAGE_SIZE = 64
@@ -311,6 +314,90 @@ class TestPagedExtendNonAlignedPrefix(CustomTestCase):
             for commit in [0, 1, 64, 65, block]:
                 with self.subTest(prefix=prefix, commit=commit):
                     self._run_case(prefix, commit, block)
+
+
+class TestCompactVerifyOutCacheLoc(CustomTestCase):
+    """int64 gather-coordinate hygiene + correctness for verify()'s KV compaction
+    (``compact_verify_out_cache_loc``), the exact helper ``DFlashVerifyInput.verify``
+    calls to split a verify block into freed vs kept KV slots.
+    """
+
+    def _ocl(self, bs, dtn, dtype=torch.int64):
+        # Distinct positive slot ids so free/keep sets are checkable by value.
+        return torch.arange(PAGE_SIZE, PAGE_SIZE + bs * dtn, dtype=dtype)
+
+    def test_page_size_1_frees_all_uncommitted(self):
+        dtn = 4
+        ocl = self._ocl(2, dtn)  # req0: 64..67, req1: 68..71
+        commit = torch.tensor([2, 0], dtype=torch.int32)
+        free, keep = compact_verify_out_cache_loc(ocl, commit, dtn, page_size=1)
+        self.assertEqual(keep.tolist(), [64, 65])  # req0's first 2
+        self.assertEqual(sorted(free.tolist()), [66, 67, 68, 69, 70, 71])
+        # kept ∪ freed partitions the whole block, no overlap.
+        self.assertEqual(
+            sorted(free.tolist() + keep.tolist()), list(range(64, 72))
+        )
+
+    def test_paged_keeps_page_granular_tail(self):
+        dtn = 4
+        ocl = self._ocl(2, dtn)
+        commit = torch.tensor([2, 0], dtype=torch.int32)
+        # keep_slots rounds the kept region up to a page, so req0 keeps ALL 4 draft
+        # slots (page-granular) while committing only 2; req1 keeps none.
+        keep_slots = torch.tensor([4, 0], dtype=torch.int64)
+        free, keep = compact_verify_out_cache_loc(
+            ocl, commit, dtn, page_size=64, keep_slots=keep_slots
+        )
+        self.assertEqual(keep.tolist(), [64, 65])  # committed prefix only
+        self.assertEqual(sorted(free.tolist()), [68, 69, 70, 71])  # req1's page
+        # Paged mode frees FEWER slots than page_size==1 (66,67 stay resident).
+        self.assertNotIn(66, free.tolist())
+
+    def test_int64_coordinates_even_from_int32_input(self):
+        # The lock-in: torch_tpu gather rejects mixed i32/i64, so the helper must
+        # coerce coordinates to int64 regardless of the input dtype.
+        dtn = 4
+        commit = torch.tensor([3, 1], dtype=torch.int32)
+        for page_size, ks in ((1, None), (64, torch.tensor([4, 4], dtype=torch.int64))):
+            free, keep = compact_verify_out_cache_loc(
+                self._ocl(2, dtn, dtype=torch.int32),
+                commit,
+                dtn,
+                page_size=page_size,
+                keep_slots=ks,
+            )
+            self.assertEqual(keep.dtype, torch.int64, f"keep dtype (page={page_size})")
+            self.assertEqual(free.dtype, torch.int64, f"free dtype (page={page_size})")
+
+    def test_paged_requires_keep_slots(self):
+        with self.assertRaises(ValueError):
+            compact_verify_out_cache_loc(
+                self._ocl(1, 4), torch.tensor([1], dtype=torch.int32), 4, page_size=64
+            )
+
+    def test_freed_slots_feed_real_allocator_without_leak(self):
+        # End-to-end with a real allocator: the freed coordinates from the helper
+        # release exactly the expected pages and reclaim fully.
+        dtn = PAGE_SIZE  # one page per draft slot-row group
+        bs = 2
+        alloc = _make_allocator(num_pages=16)
+        base = alloc.available_size()
+        block_locs = alloc.alloc(bs * dtn)  # 2 pages
+        commit = torch.tensor([dtn, 0], dtype=torch.int32)  # req0 full, req1 reject
+        keep_slots = _compute_paged_keep_slots(
+            prefix_lens=torch.tensor([PAGE_SIZE, PAGE_SIZE], dtype=torch.int32),
+            commit_lens=commit,
+            draft_token_num=dtn,
+            page_size=PAGE_SIZE,
+        )
+        free, keep = compact_verify_out_cache_loc(
+            block_locs, commit, dtn, page_size=PAGE_SIZE, keep_slots=keep_slots
+        )
+        alloc.free(free)
+        # req0 keeps its page, req1's page is freed -> exactly one page resident.
+        self.assertEqual(alloc.available_size(), base - PAGE_SIZE)
+        alloc.free(keep)
+        self.assertEqual(alloc.available_size(), base)
 
 
 if __name__ == "__main__":

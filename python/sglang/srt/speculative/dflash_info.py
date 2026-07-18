@@ -57,6 +57,41 @@ def _compute_paged_keep_slots(
     return keep_slots
 
 
+def compact_verify_out_cache_loc(
+    out_cache_loc: torch.Tensor,
+    commit_lens: torch.Tensor,
+    draft_token_num: int,
+    *,
+    page_size: int,
+    keep_slots: torch.Tensor | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Split a verify block's ``out_cache_loc`` into (free, keep) KV slots.
+
+    Eager boolean-mask compaction (same pattern as main's EAGLE3), kept as-is
+    because ``@torch.compile`` is disabled for spec glue on TPU. The KV slot
+    coordinates are forced to ``int64``: torch_tpu advanced-indexing / gather
+    rejects mixed i32/i64 index/operand dtypes, so a stray int32 ``out_cache_loc``
+    would break the free/keep gather on device. Returns ``(free_locs, keep_locs)``,
+    both int64.
+
+    ``keep_locs`` is always the committed prefix (``row < commit_lens``). The freed
+    set differs by mode: ``page_size == 1`` frees every uncommitted slot; paged
+    mode frees only whole pages past ``keep_slots`` (page-granular retention), so
+    ``keep_slots`` is required there.
+    """
+    out_cache_loc = out_cache_loc.to(torch.int64).view(-1, draft_token_num)
+    device = out_cache_loc.device
+    row_offsets = torch.arange(draft_token_num, device=device)[None, :]
+    keep_mask = row_offsets < commit_lens[:, None]
+    if page_size == 1:
+        free_mask = ~keep_mask
+    else:
+        if keep_slots is None:
+            raise ValueError("keep_slots is required for paged (page_size > 1) compaction.")
+        free_mask = row_offsets >= keep_slots[:, None]
+    return out_cache_loc[free_mask], out_cache_loc[keep_mask]
+
+
 @dataclass
 class DFlashDraftInput(SpecInput):
     """Per-batch DFlash draft state for spec-v1 (non-overlap) scheduling.
@@ -444,29 +479,27 @@ class DFlashVerifyInput(SpecInput):
             new_bonus_tokens_list, dtype=torch.int64, device=device
         )
 
-        # Free uncommitted KV cache slots and compact out_cache_loc.
-        if page_size == 1:
-            out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
-            keep_mask = (
-                torch.arange(self.draft_token_num, device=device)[None, :]
-                < commit_lens[:, None]
-            )
-            batch.token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask])
-            batch.out_cache_loc = out_cache_loc[keep_mask]
-        else:
-            out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
-            row_offsets = torch.arange(self.draft_token_num, device=device)[None, :]
-            keep_slots = _compute_paged_keep_slots(
+        # Free uncommitted KV cache slots and compact out_cache_loc. int64
+        # gather-coordinate hygiene lives in compact_verify_out_cache_loc.
+        keep_slots = (
+            None
+            if page_size == 1
+            else _compute_paged_keep_slots(
                 prefix_lens=batch.seq_lens,
                 commit_lens=commit_lens,
                 draft_token_num=self.draft_token_num,
                 page_size=page_size,
             )
-            free_mask = row_offsets >= keep_slots[:, None]
-            batch.token_to_kv_pool_allocator.free(out_cache_loc[free_mask])
-
-            keep_mask = row_offsets < commit_lens[:, None]
-            batch.out_cache_loc = out_cache_loc[keep_mask]
+        )
+        free_locs, kept_locs = compact_verify_out_cache_loc(
+            batch.out_cache_loc,
+            commit_lens,
+            self.draft_token_num,
+            page_size=page_size,
+            keep_slots=keep_slots,
+        )
+        batch.token_to_kv_pool_allocator.free(free_locs)
+        batch.out_cache_loc = kept_locs
 
         # Update req-level KV cache accounting.
         for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
