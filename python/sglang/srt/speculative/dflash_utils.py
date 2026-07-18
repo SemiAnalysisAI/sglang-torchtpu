@@ -965,3 +965,30 @@ def dflash_tp_ranks_agree(
         return True, None
     bad = int((~eq).nonzero(as_tuple=False)[0].item())  # lowest differing rank
     return False, bad
+
+
+def dflash_precompile_bucket_plan(
+    bs_buckets: Iterable[int],
+    mask_stride: int,
+    max_context: int,
+    block_size: int,
+) -> List[Tuple[int, int]]:
+    """Plan the ``(bs, prefix_len)`` shapes the DFlash draft precompile must warm.
+
+    For every batch bucket (deduped, always including bs=1) and every mask bucket
+    that is a multiple of ``mask_stride`` up to ``max_context``, the draft block
+    forward at ``prefix_len = kv_bucket - block_size`` makes the metadata build
+    prepare exactly that ``encoder_only_kv_len_bucket`` — so warming this plan
+    covers all draft/custom_mask compile shapes serving hits within the envelope.
+    Pure / CPU-testable (no device / model state). Skips buckets whose prefix
+    would be non-positive.
+    """
+    bs_list = sorted({int(b) for b in bs_buckets} | {1})
+    kv_buckets = range(int(mask_stride), int(max_context) + 1, int(mask_stride))
+    plan: List[Tuple[int, int]] = []
+    for bs in bs_list:
+        for kv in kv_buckets:
+            prefix = int(kv) - int(block_size)
+            if prefix > 0:
+                plan.append((bs, prefix))
+    return plan

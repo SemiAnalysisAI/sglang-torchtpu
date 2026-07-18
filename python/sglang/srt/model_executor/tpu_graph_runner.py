@@ -87,6 +87,9 @@ class TpuGraphRunner:
 
         self.model_runner = model_runner
         self.model = model_runner.model
+        # Compile policies installed below; published for downstream readers
+        # (default empty so the _can_torch_compile early-return path is safe).
+        self.installed_compile_policies: list[Any] = []
 
         # Per-model opt-out, matching the CUDA path in
         # ModelRunner.kernel_warmup: some Transformers-backend models
@@ -136,6 +139,10 @@ class TpuGraphRunner:
         )
         installed_any = False
         installed_policies: list[Any] = []
+        # Published so downstream code (e.g. the DFlash draft-bucket precompile)
+        # can read the real batch-size buckets the compile policy installed
+        # (`policy.b_bucketer.buckets`) rather than re-deriving them.
+        self.installed_compile_policies = installed_policies
         for module in modules:
             policy_cls = get_torch_compile_policy(module)
             if policy_cls is None:

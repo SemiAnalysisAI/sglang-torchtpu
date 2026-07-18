@@ -3,7 +3,7 @@ import math
 import os
 import time
 from copy import deepcopy
-from typing import Optional
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 
@@ -26,6 +26,7 @@ from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInp
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     dflash_fused_kv_materialize_decision,
+    dflash_precompile_bucket_plan,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
     resolve_dflash_verify_mask_policy,
@@ -622,39 +623,99 @@ class DFlashWorker:
         # / verify D2H). Cap at a moderate context that covers typical decodes;
         # longer contexts warm lazily (a bounded documented compile budget).
         precompile_max = min(context_len, _DFLASH_PRECOMPILE_MAX_CONTEXT)
-        # bs buckets serving will use (dedup + always cover bs=1).
-        bs_cfg = getattr(self.server_args, "tpu_compile_bs", None) or [1]
-        bs_buckets = sorted({int(b) for b in bs_cfg} | {1})
-        kv_buckets = list(range(stride, precompile_max + 1, stride))
+        # Batch buckets: use the ones the draft compile policy actually installed
+        # (`b_bucketer.buckets`) so precompile shapes match serving exactly; fall
+        # back to --tpu-compile-bs, then [1].
+        bs_buckets = self._resolve_precompile_bs_buckets()
+        # Pure planner derives the (bs, prefix_len) shapes to warm. prefix_len =
+        # kv_bucket - block_size makes the metadata build prepare exactly that
+        # encoder_only_kv_len_bucket.
+        plan = dflash_precompile_bucket_plan(
+            bs_buckets=bs_buckets,
+            mask_stride=stride,
+            max_context=precompile_max,
+            block_size=int(self.block_size),
+        )
+        expected = len(plan)
         t0 = time.perf_counter()
-        compiled = 0
-        for bs in bs_buckets:
-            for kv_bucket in kv_buckets:
-                prefix_len = max(kv_bucket - int(self.block_size), 0)
-                if prefix_len <= 0:
-                    continue
-                try:
-                    self._run_draft_block_forward_for_precompile(bs, prefix_len)
-                    compiled += 1
-                except Exception as e:  # best-effort: never break bring-up
-                    if self.tp_rank == 0:
-                        logger.warning(
-                            "DFLASH draft precompile skipped bs=%s prefix=%s: %s",
-                            bs,
-                            prefix_len,
-                            e,
-                        )
-                    break  # stop this bs on first failure
+        completed = 0
+        skipped: List[Tuple[int, int, str]] = []
+        for bs, prefix_len in plan:
+            try:
+                self._run_draft_block_forward_for_precompile(bs, prefix_len)
+                completed += 1
+            except Exception as e:  # best-effort: never break bring-up
+                skipped.append((bs, prefix_len, repr(e)))
+                if self.tp_rank == 0:
+                    logger.warning(
+                        "DFLASH draft precompile skipped bs=%s prefix=%s: %s",
+                        bs,
+                        prefix_len,
+                        e,
+                    )
         if self.tp_rank == 0:
+            mask_bucket_ct = len(range(stride, precompile_max + 1, stride))
             logger.info(
-                "DFLASH draft precompile: %d shapes (bs=%s, %d mask buckets up to "
-                "context %d; buckets beyond warm lazily) in %.1fs",
-                compiled,
+                "DFLASH draft precompile: %d/%d shapes completed "
+                "(bs_buckets=%s, %d mask buckets up to context %d; buckets beyond "
+                "warm lazily) in %.1fs; %d skipped%s",
+                completed,
+                expected,
                 bs_buckets,
-                len(kv_buckets),
+                mask_bucket_ct,
                 precompile_max,
                 time.perf_counter() - t0,
+                len(skipped),
+                (
+                    ": " + ", ".join(f"(bs={b},prefix={p})" for b, p, _ in skipped)
+                    if skipped
+                    else ""
+                ),
             )
+        # Re-baseline the recompilation checker AFTER precompile so its
+        # serving-time evidence is unambiguous: the draft checker's baseline was
+        # snapshotted during draft-runner construction (before this hook ran), so
+        # without this the first serving forward would count every precompiled
+        # graph as "new". Re-snapshotting makes any checker warning during a
+        # post-warmup decode a real gap in precompile coverage (AC-7 evidence).
+        self._resnapshot_draft_recompilation_baseline()
+
+    def _resnapshot_draft_recompilation_baseline(self) -> None:
+        """Re-snapshot the draft compile policies' recompilation-checker baseline
+        (no-op unless ``SGLANG_TPU_CHECK_RECOMPILATION=1`` wired a checker)."""
+        graph_runner = getattr(self.draft_model_runner, "graph_runner", None)
+        policies = getattr(graph_runner, "installed_compile_policies", None) or []
+        seen: set = set()
+        for policy in policies:
+            shim = getattr(policy, "compiled_forward_shim", None)
+            checker = getattr(shim, "_recompilation_checker", None)
+            if checker is None or id(checker) in seen:
+                continue
+            seen.add(id(checker))
+            checker.snapshot_baseline()
+
+    def _resolve_precompile_bs_buckets(self) -> List[int]:
+        """Batch-size buckets to precompile the draft over.
+
+        Prefer the buckets the draft compile policy actually installed
+        (``policy.b_bucketer.buckets``) so precompile shapes match what serving
+        pads to; fall back to ``--tpu-compile-bs``, then ``[1]``. Always includes
+        bs=1 (single-request decode) and dedups.
+        """
+        buckets: Optional[Iterable[int]] = None
+        graph_runner = getattr(self.draft_model_runner, "graph_runner", None)
+        policies = getattr(graph_runner, "installed_compile_policies", None) or []
+        for policy in policies:
+            b_bucketer = getattr(policy, "b_bucketer", None)
+            policy_buckets = getattr(b_bucketer, "buckets", None)
+            if policy_buckets:
+                buckets = policy_buckets
+                break
+        if not buckets:
+            buckets = getattr(self.server_args, "tpu_compile_bs", None)
+        if not buckets:
+            buckets = [1]
+        return sorted({int(b) for b in buckets} | {1})
 
     def _run_draft_block_forward_for_precompile(
         self, bs: int, prefix_len: int
@@ -663,7 +724,8 @@ class DFlashWorker:
         compiled graph. Mirrors the compilable part of
         ``_prepare_for_speculative_decoding`` (block ids -> input_embeds -> block
         KV alloc -> draft forward) with in-range garbage prefix KV; outputs are
-        discarded and allocator state is restored."""
+        discarded and both the KV allocator and the touched req_to_token rows are
+        restored (safe for bs>1 where those rows alias real request slots)."""
         device = self.device
         self._ensure_draft_block_buffers(bs)
         target_model = self.target_worker.model_runner.model
@@ -691,6 +753,14 @@ class DFlashWorker:
 
         req_pool_indices = torch.arange(bs, dtype=torch.int64, device=device)
         req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
+        # This routine writes the req_to_token table in two places: the prefix
+        # seed below (`[:bs, :prefix_len]`) and `assign_req_to_token_pool_func`
+        # (`[:bs, prefix_len:prefix_len+block_size]`). Those rows may belong to
+        # real request slots (bs>1 precompile touches rows 0..bs-1), so back up
+        # the exact touched region and restore it in the finally alongside the KV
+        # allocator — otherwise precompile corrupts live req_to_token entries.
+        restore_width = min(prefix_len + int(self.block_size), int(req_to_token.shape[1]))
+        req_to_token_backup = req_to_token[:bs, :restore_width].clone()
         # Seed the prefix columns with an in-range KV slot (garbage contents, valid
         # page) so the attention read never goes out of bounds. Transient: real
         # requests overwrite these rows.
@@ -741,6 +811,9 @@ class DFlashWorker:
                 self.draft_model_runner.forward(forward_batch)
         finally:
             allocator.restore_state(backup)
+            # Restore the req_to_token rows this routine overwrote so a bs>1
+            # precompile can never leave garbage in a live request's slot.
+            req_to_token[:bs, :restore_width] = req_to_token_backup
 
     def _prepare_for_speculative_decoding(
         self, batch: ScheduleBatch, draft_input: DFlashDraftInput

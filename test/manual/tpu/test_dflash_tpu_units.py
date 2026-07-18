@@ -1178,6 +1178,83 @@ class TestDflashDraftCellSize(CustomTestCase):
         self.assertEqual(captured.get("draft_cell_size_per_token"), 999)
 
 
+class TestDflashPrecompileBucketPlan(CustomTestCase):
+    """The draft-precompile shape planner is a pure function (no device/model
+    state) deriving (bs, prefix_len) from the configured batch buckets x the
+    512-mask buckets up to the context envelope. CPU-testable so the precompile
+    coverage/accounting can be verified without a TPU.
+    """
+
+    def test_covers_every_bs_x_mask_bucket(self):
+        from sglang.srt.speculative.dflash_utils import (
+            dflash_precompile_bucket_plan,
+        )
+
+        # bs buckets [1, 8, 16], mask stride 512, context 2048, block 512.
+        plan = dflash_precompile_bucket_plan(
+            bs_buckets=[1, 8, 16],
+            mask_stride=512,
+            max_context=2048,
+            block_size=512,
+        )
+        # kv buckets 512,1024,1536,2048 -> prefix = kv-512 = 0,512,1024,1536.
+        # prefix<=0 dropped -> 3 mask shapes per bs; 3 bs -> 9 shapes.
+        self.assertEqual(len(plan), 9)
+        by_bs = {}
+        for bs, prefix in plan:
+            by_bs.setdefault(bs, []).append(prefix)
+        self.assertEqual(sorted(by_bs), [1, 8, 16])
+        for bs in (1, 8, 16):
+            self.assertEqual(sorted(by_bs[bs]), [512, 1024, 1536])
+
+    def test_prefix_makes_mask_bucket_exact(self):
+        # Every planned (bs, prefix) must land prefix+block on a mask-bucket
+        # boundary (the metadata build rounds kv_len up to the 512 stride), so
+        # each planned shape warms exactly one distinct mask bucket.
+        from sglang.srt.speculative.dflash_utils import (
+            dflash_precompile_bucket_plan,
+        )
+
+        stride, block = 512, 512
+        plan = dflash_precompile_bucket_plan(
+            bs_buckets=[1], mask_stride=stride, max_context=2048, block_size=block
+        )
+        for _bs, prefix in plan:
+            self.assertEqual((prefix + block) % stride, 0)
+            self.assertGreater(prefix, 0)
+
+    def test_always_includes_bs1_and_dedups(self):
+        from sglang.srt.speculative.dflash_utils import (
+            dflash_precompile_bucket_plan,
+        )
+
+        # bs=1 injected even if not listed; duplicates collapse.
+        plan = dflash_precompile_bucket_plan(
+            bs_buckets=[8, 8, 16],
+            mask_stride=512,
+            max_context=1024,
+            block_size=512,
+        )
+        bss = sorted({bs for bs, _ in plan})
+        self.assertEqual(bss, [1, 8, 16])
+        # kv buckets 512,1024 -> prefix 0(drop),512 -> 1 shape per bs, 3 bs.
+        self.assertEqual(len(plan), 3)
+
+    def test_empty_when_context_below_first_prefix(self):
+        # context 512 with block 512: only kv bucket 512 -> prefix 0 -> dropped.
+        from sglang.srt.speculative.dflash_utils import (
+            dflash_precompile_bucket_plan,
+        )
+
+        plan = dflash_precompile_bucket_plan(
+            bs_buckets=[1, 8],
+            mask_stride=512,
+            max_context=512,
+            block_size=512,
+        )
+        self.assertEqual(plan, [])
+
+
 class TestDflashVerifyMaskPolicyAvoidsTriton(CustomTestCase):
     """Verify-routing guard: on the TPU RPA-v3 backend, DFlash verify skips its custom mask,
     so it uses RPA-v3's own metadata builder and never reaches
