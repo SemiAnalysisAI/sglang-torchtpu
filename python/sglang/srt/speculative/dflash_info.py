@@ -25,6 +25,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dflash_utils import (
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    dflash_num_correct_drafts,
     is_dflash_sampling_verify_available,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -470,7 +471,9 @@ class DFlashVerifyInput(SpecInput):
 
             commit_lens_cpu.append(appended)
             new_bonus_tokens_list.append(new_bonus_token)
-            num_correct_drafts_per_req_cpu.append(max(0, appended - 1))
+            num_correct_drafts_per_req_cpu.append(
+                dflash_num_correct_drafts(acc_len, appended)
+            )
             req.spec_verify_ct += 1
             req.spec_num_correct_drafts += num_correct_drafts_per_req_cpu[-1]
 

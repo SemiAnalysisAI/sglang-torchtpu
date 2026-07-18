@@ -454,6 +454,22 @@ def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
     return True, ""
 
 
+def dflash_num_correct_drafts(accept_len: int, appended: int) -> int:
+    """Number of accepted *draft* tokens actually committed this verify step.
+
+    ``appended`` counts every token committed (accepted drafts and, normally, the
+    trailing bonus). Correct drafts exclude the bonus, so the count is
+    ``appended - 1`` in the common case. But if a finishing token (EOS/stop) was
+    an accepted *draft*, the commit loop breaks BEFORE appending the bonus, so all
+    ``appended`` tokens are drafts and the count is ``appended``. ``accept_len``
+    (from ``compute_dflash_correct_drafts_and_bonus``) is the number of accepted
+    drafts, so the committed correct-draft count is ``min(accept_len, appended)``:
+    it stays ``accept_len`` when the bonus is appended and drops to ``appended``
+    when the loop stopped early on a draft.
+    """
+    return min(int(accept_len), int(appended))
+
+
 def compute_dflash_correct_drafts_and_bonus(
     *,
     candidates: torch.Tensor,
@@ -696,6 +712,29 @@ def validate_dflash_request(req: Req) -> Optional[str]:
             "DFLASH on TPU currently supports greedy decoding only "
             "(non-greedy sampling verify is CUDA-only). Use temperature 0 / "
             "top_k 1, or run DFLASH on GPU."
+        )
+
+    if _IS_TPU and (
+        req.sampling_params.repetition_penalty != 1.0
+        or req.sampling_params.frequency_penalty != 0.0
+        or req.sampling_params.presence_penalty != 0.0
+    ):
+        # The DFlash block-verify path cannot apply these penalizers correctly, so
+        # reject rather than silently produce a token stream that diverges from the
+        # non-speculative target (AC-1: explicit rejection, not silent change):
+        #   * multiplicative repetition_penalty is DROPPED entirely -- verify()
+        #     runs SamplingBatchInfo.apply_logits_bias() on a zero tensor and adds
+        #     the result back, but scaling penalties applied to zeros stay zero;
+        #   * additive frequency/presence penalties are broadcast unchanged to all
+        #     draft_token_num positions, so they are not advanced per within-block
+        #     position as tokens are accepted.
+        # logit_bias is intentionally allowed: it is a static, position-independent
+        # additive bias, so the uniform broadcast is exact.
+        return (
+            "DFLASH on TPU currently supports greedy decoding without "
+            "repetition/frequency/presence penalties (the block-verify path "
+            "cannot apply them correctly). Disable those penalties, or run "
+            "DFLASH on GPU."
         )
 
     if (

@@ -78,7 +78,14 @@ class TestResolveDflashDraftBackend(CustomTestCase):
                 )
 
 
-def _make_req(top_k: int, return_logprob: bool = False):
+def _make_req(
+    top_k: int,
+    return_logprob: bool = False,
+    *,
+    repetition_penalty: float = 1.0,
+    frequency_penalty: float = 0.0,
+    presence_penalty: float = 0.0,
+):
     """Minimal Req stand-in exposing only the fields validate_dflash_request reads."""
     sampling_params = types.SimpleNamespace(
         top_k=top_k,
@@ -86,6 +93,9 @@ def _make_req(top_k: int, return_logprob: bool = False):
         regex=None,
         ebnf=None,
         structural_tag=None,
+        repetition_penalty=repetition_penalty,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
     )
     return types.SimpleNamespace(
         return_logprob=return_logprob,
@@ -122,6 +132,28 @@ class TestValidateDflashRequestTPUGreedyOnly(CustomTestCase):
         err = validate_dflash_request(_make_req(top_k=1, return_logprob=True))
         self.assertIn("return_logprob", err)
 
+    def test_greedy_with_repetition_penalty_rejected(self):
+        # Multiplicative repetition_penalty is dropped by the block-verify path
+        # (applied to a zero tensor), so a greedy request with it must be rejected
+        # rather than silently diverging from the non-spec target.
+        err = validate_dflash_request(_make_req(top_k=1, repetition_penalty=1.2))
+        self.assertIsInstance(err, str)
+        self.assertIn("penalt", err.lower())
+
+    def test_greedy_with_frequency_penalty_rejected(self):
+        err = validate_dflash_request(_make_req(top_k=1, frequency_penalty=0.5))
+        self.assertIsInstance(err, str)
+        self.assertIn("penalt", err.lower())
+
+    def test_greedy_with_presence_penalty_rejected(self):
+        err = validate_dflash_request(_make_req(top_k=1, presence_penalty=0.5))
+        self.assertIsInstance(err, str)
+        self.assertIn("penalt", err.lower())
+
+    def test_plain_greedy_without_penalties_admitted(self):
+        # Defaults (repetition 1.0, frequency/presence 0.0) stay admitted.
+        self.assertIsNone(validate_dflash_request(_make_req(top_k=1)))
+
 
 class TestValidateDflashRequestNonTPU(CustomTestCase):
     def setUp(self):
@@ -134,6 +166,34 @@ class TestValidateDflashRequestNonTPU(CustomTestCase):
     def test_non_tpu_admits_sampling(self):
         # Off TPU, sampling verify is available; non-greedy is not rejected here.
         self.assertIsNone(validate_dflash_request(_make_req(top_k=50)))
+
+    def test_non_tpu_admits_penalties(self):
+        # The penalizer reject is TPU-scoped (matches the greedy-only reject).
+        self.assertIsNone(
+            validate_dflash_request(_make_req(top_k=1, repetition_penalty=1.3))
+        )
+
+
+class TestDflashNumCorrectDrafts(CustomTestCase):
+    """The verify() correct-draft metric (``dflash_num_correct_drafts``): correct
+    drafts exclude the bonus, except when a finishing draft stops the commit loop
+    before the bonus is appended.
+    """
+
+    def test_bonus_appended_common_case(self):
+        # accept_len drafts + 1 bonus committed -> correct = accept_len.
+        for acc in (0, 1, 3):
+            self.assertEqual(du.dflash_num_correct_drafts(acc, acc + 1), acc)
+
+    def test_finishing_draft_before_bonus(self):
+        # Loop broke on an accepted draft (no bonus): all appended are drafts.
+        # acc_len=3 but only 2 committed before the finishing draft -> 2, not 1.
+        self.assertEqual(du.dflash_num_correct_drafts(3, 2), 2)
+        self.assertEqual(du.dflash_num_correct_drafts(3, 3), 3)
+
+    def test_zero_drafts_only_bonus(self):
+        # No drafts accepted, only the bonus committed -> 0 correct drafts.
+        self.assertEqual(du.dflash_num_correct_drafts(0, 1), 0)
 
 
 class TestDflashKvCellSizing(CustomTestCase):
