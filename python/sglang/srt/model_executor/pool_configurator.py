@@ -120,6 +120,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers),
+                    # Exact draft KV bytes/token when derivable from the draft
+                    # config (task12); None => layer-count scaling fallback.
+                    draft_cell_size_per_token=getattr(
+                        mr, "dflash_draft_cell_size_per_token", None
+                    ),
                 )
 
     def _compute_cell_size(self, mr: ModelRunner, num_layers: int) -> int:

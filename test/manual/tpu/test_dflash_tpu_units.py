@@ -136,6 +136,57 @@ class TestValidateDflashRequestNonTPU(CustomTestCase):
         self.assertIsNone(validate_dflash_request(_make_req(top_k=50)))
 
 
+class TestDflashKvCellSizing(CustomTestCase):
+    """task12/AC-8: the shared target+draft KV pool must be sized from the DRAFT
+    config, not by assuming the draft's per-layer KV bytes equal the target's.
+    """
+
+    def test_explicit_draft_cell_size_is_summed(self):
+        from sglang.srt.speculative.dflash_utils import (
+            scale_kv_cell_size_per_token_for_dflash,
+        )
+
+        got = scale_kv_cell_size_per_token_for_dflash(
+            target_cell_size_per_token=1000,
+            target_num_layers=32,
+            draft_num_layers=5,
+            draft_cell_size_per_token=200,
+        )
+        self.assertEqual(got, 1200)
+
+    def test_layer_count_fallback_when_draft_cell_size_none(self):
+        from sglang.srt.speculative.dflash_utils import (
+            scale_kv_cell_size_per_token_for_dflash,
+        )
+
+        # Layer-count scaling: ceil(1000 * (32+5) / 32) = 1157.
+        got = scale_kv_cell_size_per_token_for_dflash(
+            target_cell_size_per_token=1000,
+            target_num_layers=32,
+            draft_num_layers=5,
+        )
+        self.assertEqual(got, 1157)
+
+    def test_wider_draft_not_undersized_vs_layer_count(self):
+        # A draft with larger per-token KV (e.g. more KV heads / bigger head_dim)
+        # must be sized from its real bytes, which exceed the layer-count estimate
+        # that assumes draft==target per-layer.
+        from sglang.srt.speculative.dflash_utils import (
+            scale_kv_cell_size_per_token_for_dflash,
+        )
+
+        layer_count = scale_kv_cell_size_per_token_for_dflash(
+            target_cell_size_per_token=1000, target_num_layers=32, draft_num_layers=5
+        )
+        exact_wide = scale_kv_cell_size_per_token_for_dflash(
+            target_cell_size_per_token=1000,
+            target_num_layers=32,
+            draft_num_layers=5,
+            draft_cell_size_per_token=2000,  # a wide draft
+        )
+        self.assertGreater(exact_wide, layer_count)
+
+
 class TestDflashVerifyMaskPolicyAvoidsTriton(CustomTestCase):
     """AC-3 guard: on the TPU RPA-v3 backend, DFlash verify skips its custom mask,
     so it uses RPA-v3's own metadata builder and never reaches
