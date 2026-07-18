@@ -502,6 +502,76 @@ class TestEncoderOnlyAllowMaskBucketing(CustomTestCase):
         self.assertGreaterEqual(mask.numel(), num_tokens * max_kv)
 
 
+class TestEncoderOnlyMaskPageSize64Boundaries(CustomTestCase):
+    """Paged-boundary coverage for the ENCODER_ONLY mask bucket at the CANONICAL
+    ``page_size=64`` (the config the DFlash bring-up targets). The bucket is
+    ``round_up(max_kv, 64)`` floored at one page, so the compiled Pallas op sees
+    a stable shape within each 64-wide band and steps exactly at page edges.
+    """
+
+    PAGE_SIZE = 64
+
+    def _backend(self):
+        req_to_token = _build_req_to_token(num_reqs=8, max_context_len=8192)
+        backend = _BackendUnderTest(self.PAGE_SIZE, req_to_token)
+        backend._encoder_only_mask_cache = {}
+        return backend
+
+    def _bucket(self, backend, num_tokens, max_kv):
+        kv_lens = torch.tensor([max_kv], dtype=torch.int32)
+        mask = backend._get_encoder_only_allow_mask(
+            num_tokens, kv_lens, torch.device("cpu")
+        )
+        self.assertTrue(torch.all(mask == 1))
+        self.assertEqual(mask.dtype, torch.int32)
+        self.assertEqual(mask.numel() % num_tokens, 0)
+        return mask.numel() // num_tokens
+
+    def test_page_edge_buckets(self):
+        # (max_kv -> expected bucket width) straddling each page boundary.
+        cases = [
+            (0, 64),  # empty prefix still gets one page (floor).
+            (1, 64),
+            (63, 64),  # just below page 1 edge.
+            (64, 64),  # exactly on the page edge -> no extra page.
+            (65, 128),  # one past the edge -> next page.
+            (127, 128),
+            (128, 128),  # exact 2-page multiple.
+            (129, 192),  # one past -> third page.
+        ]
+        backend = self._backend()
+        for max_kv, expected in cases:
+            with self.subTest(max_kv=max_kv):
+                self.assertEqual(self._bucket(backend, 8, max_kv), expected)
+
+    def test_stable_within_band_and_steps_at_edge(self):
+        # Every prefix in 1..64 shares ONE cached mask object (no op re-specialize
+        # as context grows within a page); crossing 64->65 allocates a new shape.
+        backend = self._backend()
+        kv = lambda n: torch.tensor([n], dtype=torch.int32)
+        dev = torch.device("cpu")
+        m_lo = backend._get_encoder_only_allow_mask(8, kv(1), dev)
+        m_hi = backend._get_encoder_only_allow_mask(8, kv(64), dev)
+        self.assertIs(m_lo, m_hi)  # same bucket -> cached identity.
+        m_next = backend._get_encoder_only_allow_mask(8, kv(65), dev)
+        self.assertIsNot(m_lo, m_next)
+        self.assertEqual(m_next.numel(), 8 * 128)
+
+    def test_batch_max_drives_bucket(self):
+        # With a batch of prefixes, the bucket is driven by the MAX kv_len,
+        # rounded to the page — 64 stays one page, 65 steps to two.
+        backend = self._backend()
+        dev = torch.device("cpu")
+        at_edge = backend._get_encoder_only_allow_mask(
+            8, torch.tensor([10, 64, 33], dtype=torch.int32), dev
+        )
+        self.assertEqual(at_edge.numel(), 8 * 64)
+        past_edge = backend._get_encoder_only_allow_mask(
+            8, torch.tensor([10, 65, 33], dtype=torch.int32), dev
+        )
+        self.assertEqual(past_edge.numel(), 8 * 128)
+
+
 class TestDflashVerifyMetadataAvoidsTriton(CustomTestCase):
     """DFlash TARGET_VERIFY on RPA-v3 builds correct verify metadata WITHOUT
     reaching the flashinfer/Triton kv-indices path. Monkeypatches both
