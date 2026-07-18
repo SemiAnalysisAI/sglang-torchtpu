@@ -237,5 +237,25 @@ class TestDFlashAttentionLayerParity(unittest.TestCase):
                 )
 
 
+@unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
+class TestDFlashAttentionLayerParityTP2Shard(TestDFlashAttentionLayerParity):
+    """Per-rank shard shapes seen at TP=2 from the 4-q / 2-kv model: 2 q heads and
+    1 kv head per rank (GQA 2:1 with a single kv head). Runs the SAME real
+    DFlashAttention layer path (qkv/q-k norm/RoPE/RadixAttention(ENCODER_ONLY)/
+    RPA-v3/o_proj) with the sharded head layout and checks parity against the
+    dense reference, validating that the TP=2 per-rank head configuration is
+    correct on TPU.
+
+    Note: the cross-rank RowParallel(o_proj) all-reduce is a generic SGLang
+    collective already exercised by the working EAGLE3-TPU TP server path; a
+    *standalone* 2-rank launch wedges this torch_tpu stack (see
+    run_dflash_tp2_layer_parity.py), so the full multi-rank collective is
+    validated end-to-end via the server (task16), not in-process here.
+    """
+
+    NUM_Q_HEADS = 2
+    NUM_KV_HEADS = 1
+
+
 if __name__ == "__main__":
     unittest.main()
