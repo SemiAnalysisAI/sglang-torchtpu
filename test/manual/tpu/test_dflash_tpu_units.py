@@ -793,6 +793,56 @@ class TestDflashVerifyHostSemantics(CustomTestCase):
         self.assertEqual(num_correct, [])
 
 
+class TestDflashStreamParityVerdict(CustomTestCase):
+    """The token-ID greedy stream-parity verdict (`dflash_greedy_parity.diff_token_streams`),
+    used by the e2e harness to diff DFlash vs non-spec output token IDs.
+    """
+
+    def _diff(self, a, b):
+        import importlib.util
+        import pathlib
+
+        # Import the manual harness by path (it lives under test/manual/tpu).
+        p = pathlib.Path(__file__).parent / "dflash_greedy_parity.py"
+        spec = importlib.util.spec_from_file_location("dflash_greedy_parity", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.diff_token_streams(a, b)
+
+    def test_identical_streams_match(self):
+        v = self._diff([1, 2, 3, 4], [1, 2, 3, 4])
+        self.assertTrue(v["match"])
+        self.assertEqual(v["first_divergence"], -1)
+
+    def test_first_divergence_index(self):
+        v = self._diff([1, 2, 9, 4], [1, 2, 3, 4])
+        self.assertFalse(v["match"])
+        self.assertEqual(v["first_divergence"], 2)
+
+    def test_prefix_but_shorter_is_divergence(self):
+        # spec stopped early (e.g. EOS) but ref continued -> not a match; divergence
+        # reported at the shorter length.
+        v = self._diff([1, 2, 3], [1, 2, 3, 4, 5])
+        self.assertFalse(v["match"])
+        self.assertEqual(v["first_divergence"], 3)
+        self.assertEqual(v["spec_len"], 3)
+        self.assertEqual(v["ref_len"], 5)
+
+    def test_longer_spec_is_divergence(self):
+        v = self._diff([1, 2, 3, 4, 5], [1, 2, 3])
+        self.assertFalse(v["match"])
+        self.assertEqual(v["first_divergence"], 3)
+
+    def test_empty_streams_match(self):
+        v = self._diff([], [])
+        self.assertTrue(v["match"])
+
+    def test_first_token_divergence(self):
+        v = self._diff([7], [8])
+        self.assertFalse(v["match"])
+        self.assertEqual(v["first_divergence"], 0)
+
+
 class TestDflashKvCellSizing(CustomTestCase):
     """The shared target+draft KV pool must be sized from the DRAFT config, not
     by assuming the draft's per-layer KV bytes equal the target's.
