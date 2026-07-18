@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -34,6 +36,15 @@ from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils import is_tpu
 
 _IS_TPU = is_tpu()
+
+# Optional AC-5 diagnostic: when SGLANG_DFLASH_VERIFY_TRACE names a file, rank 0
+# appends one JSONL record per verify step capturing, for each committed token,
+# the DFlash *verify-forward* top-2 (token id + fp32 logit) at the block position
+# that produced it. This lets the parity harness prove a greedy divergence is a
+# bf16 tie-break (the verify top-1 == the emitted token, and the verify top-2 ==
+# the non-spec decode top-1) rather than a verify/materialization bug. Off by
+# default; adds a per-step topk + D2H only when set.
+_VERIFY_TRACE_PATH = os.environ.get("SGLANG_DFLASH_VERIFY_TRACE")
 
 
 def _compute_paged_keep_slots(
@@ -436,6 +447,18 @@ class DFlashVerifyInput(SpecInput):
                 target_predict=target_predict,
             )
 
+        # AC-5 verifier trace (env-gated): capture the verify-forward top-2
+        # (fp32) at every block position. `_ti[i*T + k]` is the top-2 for the
+        # k-th committed token of request i (proposed[k] == target argmax there).
+        trace_top2_ids: List[List[int]] = []
+        trace_top2_vals: List[List[float]] = []
+        if _VERIFY_TRACE_PATH:
+            _tv, _ti = torch.topk(
+                logits_output.next_token_logits.float(), k=2, dim=-1
+            )
+            trace_top2_ids = _ti.cpu().tolist()
+            trace_top2_vals = _tv.cpu().tolist()
+
         # Host request state and the next iteration's tensor shapes are derived
         # from these values independently in every TP process.  Make rank 0
         # authoritative: even a last-ulp logits discrepancy must not fork
@@ -455,12 +478,30 @@ class DFlashVerifyInput(SpecInput):
         num_correct_drafts_per_req_cpu: List[int] = []
         commit_lens_cpu: List[int] = []
         new_bonus_tokens_list: List[int] = []
+        trace_records: List[dict] = []
 
         for i, req in enumerate(batch.reqs):
             acc_len = int(packed[i, max_acc].item())
             proposed = packed[i, :acc_len].tolist() + [
                 int(packed[i, max_acc + 1].item())
             ]
+
+            if _VERIFY_TRACE_PATH and trace_top2_ids:
+                base = i * self.draft_token_num
+                trace_records.append(
+                    {
+                        "req": i,
+                        "start_pos": len(req.output_ids),  # before this step's append
+                        "committed": [int(t) for t in proposed],
+                        "verify_top2": [
+                            [
+                                [int(trace_top2_ids[base + k][0]), trace_top2_vals[base + k][0]],
+                                [int(trace_top2_ids[base + k][1]), trace_top2_vals[base + k][1]],
+                            ]
+                            for k in range(len(proposed))
+                        ],
+                    }
+                )
 
             appended = 0
             for token_id in proposed:
@@ -490,6 +531,17 @@ class DFlashVerifyInput(SpecInput):
             )
             req.spec_verify_ct += 1
             req.spec_num_correct_drafts += num_correct_drafts_per_req_cpu[-1]
+
+        if _VERIFY_TRACE_PATH and trace_records:
+            # Best-effort diagnostics: rank 0 appends; never let a trace I/O error
+            # perturb decode. All TP ranks hold identical (gathered) verify logits.
+            try:
+                if get_tp_group().rank_in_group == 0:
+                    with open(_VERIFY_TRACE_PATH, "a") as _tf:
+                        for _rec in trace_records:
+                            _tf.write(json.dumps(_rec) + "\n")
+            except Exception:
+                pass
 
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
         new_bonus_tokens = torch.tensor(

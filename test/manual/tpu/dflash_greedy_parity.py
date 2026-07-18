@@ -127,14 +127,47 @@ def _cmd_collect(args) -> int:
     return 0
 
 
-def _tolerated_divergence(manifest: Dict[str, object], prompt: str, idx: int) -> bool:
-    """True iff the tolerance manifest confirms this exact divergence is a
-    bf16 tie-break (rank-1 swap within noise). Any mismatch of prompt/index or
-    a non-tie verdict is NOT tolerated."""
+def _tolerated_divergence(
+    manifest: Dict[str, object],
+    prompt: str,
+    idx: int,
+    spec_tok: int,
+    ref_tok: int,
+) -> Tuple[bool, str]:
+    """Decide tolerance by RECOMPUTING the policy from manifest evidence and
+    binding it to the CURRENT dumps — never trust the stored ``verdict``.
+
+    Rejects (returns False + reason) unless ALL hold: the manifest entry exists
+    and its ``index`` matches; its recorded ``epsilon`` is not looser than the
+    code's ``TIE_MARGIN_EPS``; its ``dflash_token``/``nospec_token`` equal the
+    current spec/ref dump tokens at ``idx``; and re-running
+    :func:`classify_divergence` on the recorded ``nospec_topk`` + ``verify_top2``
+    reproduces a ``bf16-tie`` verdict. So a stale, forged, or looser-epsilon
+    manifest cannot make a different current run pass.
+    """
     entry = manifest.get(prompt)
     if not isinstance(entry, dict):
-        return False
-    return entry.get("verdict") == "bf16-tie" and int(entry.get("index", -1)) == idx
+        return False, "no manifest entry for prompt"
+    if int(entry.get("index", -1)) != idx:
+        return False, f"manifest index {entry.get('index')} != current divergence {idx}"
+    eps = entry.get("epsilon")
+    if eps is None or float(eps) > TIE_MARGIN_EPS + 1e-9:
+        return False, f"manifest epsilon {eps} looser than code eps {TIE_MARGIN_EPS}"
+    if int(entry.get("dflash_token", -1)) != int(spec_tok):
+        return False, f"manifest dflash_token {entry.get('dflash_token')} != current {spec_tok}"
+    if int(entry.get("nospec_token", -1)) != int(ref_tok):
+        return False, f"manifest nospec_token {entry.get('nospec_token')} != current {ref_tok}"
+    topk = entry.get("nospec_topk")
+    if not topk:
+        return False, "manifest missing nospec_topk evidence"
+    recomputed = classify_divergence(
+        topk, idx, int(spec_tok), verify_top2=entry.get("verify_top2")
+    )
+    if recomputed.get("verdict") != "bf16-tie":
+        return False, "recomputed verdict is not bf16-tie: " + "; ".join(
+            recomputed.get("reasons", [])
+        )
+    return True, "bf16-tie (recomputed from evidence)"
 
 
 def _cmd_compare(args) -> int:
@@ -157,12 +190,16 @@ def _cmd_compare(args) -> int:
             print(f"PASS  {prompt!r}  (len={v['spec_len']})")
             continue
         idx = int(v["first_divergence"])
-        if manifest and _tolerated_divergence(manifest, prompt, idx):
-            print(
-                f"TOLERATED  {prompt!r}  bf16 tie-break @ {idx} "
-                f"(margin={manifest[prompt].get('top2_margin')}, "
-                f"dflash=target runner-up)"
+        tolerated = False
+        if manifest and idx < len(spec[prompt]) and idx < len(ref[prompt]):
+            tolerated, why = _tolerated_divergence(
+                manifest, prompt, idx, int(spec[prompt][idx]), int(ref[prompt][idx])
             )
+            if tolerated:
+                print(f"TOLERATED  {prompt!r}  @ {idx}  ({why})")
+                continue
+            print(f"FAIL  {prompt!r}  divergence @ {idx} NOT tolerated: {why}")
+            all_ok = False
             continue
         all_ok = False
         print(
@@ -227,14 +264,27 @@ def _greedy_top_logprobs(
 
 
 def classify_divergence(
-    ranked: List[List[float]], index: int, spec_token: int
+    ranked: List[List[float]],
+    index: int,
+    spec_token: int,
+    verify_top2: Optional[List[List[float]]] = None,
 ) -> Dict[str, object]:
-    """Pure classification of one divergent position (no server).
+    """Pure, DECISIVE classification of one divergent position (no server).
 
-    ``ranked`` is the target's top-k at ``index`` as ``[(token_id, logprob), ...]``
-    sorted by logprob descending. Verdict is ``bf16-tie`` iff the DFlash-emitted
-    ``spec_token`` is the target's rank-1 runner-up AND the top-2 margin is within
-    the bf16 forward-noise scale (:data:`TIE_MARGIN_EPS`); otherwise ``MISMATCH``.
+    ``ranked`` is the NON-SPEC decode top-k at ``index`` as ``[(token_id, logprob),
+    ...]`` sorted descending; log-softmax preserves differences, so the top-2
+    logprob gap is the raw top-2 LOGIT margin. ``verify_top2`` is DFlash's OWN
+    verify-forward top-2 at that position as ``[(token_id, logit), (token_id,
+    logit)]`` (from the env-gated verifier trace).
+
+    Verdict is ``bf16-tie`` ONLY when ALL hold (else ``MISMATCH`` with reasons):
+      - non-spec: the DFlash-emitted ``spec_token`` is the non-spec RUNNER-UP
+        (rank 1) and the non-spec top-2 margin ≤ :data:`TIE_MARGIN_EPS`;
+      - verify: DFlash's verify top-1 == the emitted token (correct accept), the
+        verify top-2 == the non-spec top-1 (SAME token pair, swapped order), and
+        the verify top-2 margin ≤ :data:`TIE_MARGIN_EPS`.
+    The verify side rules out a materialization-degraded flip; requiring the
+    verify trace means a no-spec-only manifest cannot yield ``bf16-tie``.
     CPU-unit-tested in test_dflash_tpu_units.py::TestDflashDivergenceClassifier.
     """
     ranked = [(int(t), float(lp)) for t, lp in ranked]
@@ -243,31 +293,83 @@ def classify_divergence(
     margin = top1_lp - top2_lp
     spec_rank = next((r for r, (tid, _) in enumerate(ranked) if tid == spec_token), None)
     spec_lp = next((lp for tid, lp in ranked if tid == spec_token), None)
-    is_tie = spec_rank == 1 and margin <= TIE_MARGIN_EPS
-    return {
+
+    reasons: List[str] = []
+    if spec_rank != 1:
+        reasons.append(f"dflash token rank in non-spec top-k is {spec_rank}, not 1")
+    if margin > TIE_MARGIN_EPS:
+        reasons.append(f"non-spec top-2 margin {margin:.4f} > eps {TIE_MARGIN_EPS}")
+
+    out: Dict[str, object] = {
         "index": index,
-        "nospec_top1": [top1_id, round(top1_lp, 5)],
-        "nospec_top2": [top2_id, round(top2_lp, 5)],
-        "top2_margin": round(margin, 6),
+        "policy": "rank1-runner-up-swap-within-2sigma-bf16-noise",
+        "epsilon": TIE_MARGIN_EPS,
         "dflash_token": spec_token,
+        "nospec_token": top1_id,
+        "nospec_topk": [[t, round(lp, 5)] for t, lp in ranked],
+        "top2_margin": round(margin, 6),
         "dflash_rank_in_nospec_topk": spec_rank,
         "dflash_logprob": round(spec_lp, 5) if spec_lp is not None else None,
-        "verdict": "bf16-tie" if is_tie else "MISMATCH",
     }
+
+    if verify_top2 is None:
+        reasons.append("no DFlash verify-forward top-2 evidence (verifier trace missing)")
+        out["verify_top2"] = None
+    else:
+        vt = [(int(t), float(v)) for t, v in verify_top2]
+        v1_id, v1_v = vt[0]
+        v2_id, v2_v = vt[1]
+        vmargin = v1_v - v2_v
+        out["verify_top2"] = [[v1_id, round(v1_v, 5)], [v2_id, round(v2_v, 5)]]
+        out["verify_margin"] = round(vmargin, 6)
+        if v1_id != spec_token:
+            reasons.append(f"verify top-1 {v1_id} != emitted token {spec_token} (accept bug)")
+        if v2_id != top1_id:
+            reasons.append(f"verify top-2 {v2_id} != non-spec top-1 {top1_id} (not a swap)")
+        if vmargin > TIE_MARGIN_EPS:
+            reasons.append(f"verify top-2 margin {vmargin:.4f} > eps {TIE_MARGIN_EPS}")
+
+    out["reasons"] = reasons
+    out["verdict"] = "bf16-tie" if not reasons else "MISMATCH"
+    return out
+
+
+def _load_verify_posmap(path: str) -> Dict[int, List[List[float]]]:
+    """Load the env-gated DFlash verifier trace (JSONL) into {abs_position:
+    verify_top2}. Each record commits tokens at ``start_pos + k`` whose verify
+    top-2 is ``verify_top2[k]``. Assumes the trace covers a single request's
+    stream (run one prompt with SGLANG_DFLASH_VERIFY_TRACE set)."""
+    posmap: Dict[int, List[List[float]]] = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            start = int(rec["start_pos"])
+            for k, t2 in enumerate(rec["verify_top2"]):
+                posmap[start + k] = t2
+    return posmap
 
 
 def _diagnose_position(
-    base_url: str, prompt: str, index: int, spec_token: int, top_k: int
+    base_url: str,
+    prompt: str,
+    index: int,
+    spec_token: int,
+    top_k: int,
+    verify_posmap: Optional[Dict[int, List[List[float]]]] = None,
 ) -> Dict[str, object]:
     """Query the non-spec target for its top-k at ``index`` (given the shared
-    greedy prefix, which both runners reproduce deterministically) and classify
-    the divergence."""
+    greedy prefix, which both runners reproduce deterministically), merge the
+    DFlash verify-forward top-2 from the trace, and classify decisively."""
     otl = _greedy_top_logprobs(base_url, prompt, index + 1, top_k)
     if index >= len(otl):
         return {"error": f"non-spec produced only {len(otl)} tokens; need index {index}"}
     # each entry: [logprob, token_id, (decoded)] sorted desc by logprob
     ranked = [[int(e[1]), float(e[0])] for e in otl[index]]
-    return classify_divergence(ranked, index, spec_token)
+    verify_top2 = verify_posmap.get(index) if verify_posmap else None
+    return classify_divergence(ranked, index, spec_token, verify_top2=verify_top2)
 
 
 def _cmd_diagnose(args) -> int:
@@ -275,6 +377,9 @@ def _cmd_diagnose(args) -> int:
         spec = json.load(f)
     with open(args.ref_json) as f:
         ref = json.load(f)
+    verify_posmap = (
+        _load_verify_posmap(args.verify_trace) if args.verify_trace else None
+    )
     any_mismatch = False
     manifest: Dict[str, Dict[str, object]] = {}
     for prompt in spec:
@@ -289,7 +394,9 @@ def _cmd_diagnose(args) -> int:
             print(f"LENGTH-ONLY divergence {prompt!r} @ {idx} (no token to diagnose)")
         else:
             spec_token = int(spec[prompt][idx])
-            d = _diagnose_position(args.base_url, prompt, idx, spec_token, args.top_k)
+            d = _diagnose_position(
+                args.base_url, prompt, idx, spec_token, args.top_k, verify_posmap
+            )
             print(f"--- {prompt!r} @ token {idx} ---")
             print(json.dumps(d, indent=2))
         manifest[prompt] = d
@@ -335,6 +442,11 @@ def main() -> int:
     dg.add_argument("--top-k", type=int, default=5)
     dg.add_argument(
         "--out-manifest", help="write the tie/mismatch classification JSON here"
+    )
+    dg.add_argument(
+        "--verify-trace",
+        help="DFlash verifier trace JSONL (SGLANG_DFLASH_VERIFY_TRACE output from a "
+        "single-prompt DFlash run) to merge the verify-forward top-2 evidence",
     )
     dg.set_defaults(func=_cmd_diagnose)
     args = ap.parse_args()

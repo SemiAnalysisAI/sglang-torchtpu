@@ -844,12 +844,19 @@ class TestDflashStreamParityVerdict(CustomTestCase):
 
 
 class TestDflashDivergenceClassifier(CustomTestCase):
-    """The bf16 tie-break tolerance policy (`dflash_greedy_parity.classify_divergence`
-    and `_tolerated_divergence`): a greedy divergence is an accepted numerical
-    tie-break ONLY when DFlash emitted the target's rank-1 runner-up AND the
-    target top-2 logit margin is within the bf16 forward-noise scale. Anything
-    else (lower rank, absent token, or too-large margin) is a real MISMATCH.
+    """The DECISIVE bf16 tie-break tolerance policy (`classify_divergence` +
+    `_tolerated_divergence`): a divergence is an accepted tie-break ONLY when the
+    non-spec decode top-2 and DFlash's own verify-forward top-2 are the SAME token
+    pair in swapped order, both margins are within the bf16 noise scale, and the
+    emitted token is DFlash's verify top-1. `_tolerated_divergence` recomputes this
+    from manifest evidence bound to the current dumps — never trusting a stored
+    verdict — so stale/forged/looser-epsilon manifests are rejected.
     """
+
+    # Observed live case: non-spec top-1=706(-0.670), top-2=374(-0.795), margin
+    # 0.125; DFlash verify top-1=374, top-2=706, margin 0.10 -> a swapped-pair tie.
+    NOSPEC_TOPK = [[706, -0.66965], [374, -0.79465]]
+    VERIFY_TOP2 = [[374, -0.10], [706, -0.20]]
 
     def _mod(self):
         import importlib.util
@@ -861,49 +868,82 @@ class TestDflashDivergenceClassifier(CustomTestCase):
         spec.loader.exec_module(mod)
         return mod
 
-    def test_runner_up_swap_within_noise_is_tie(self):
-        # Observed live case: target top-1=706(-0.670), top-2=374(-0.795),
-        # margin=0.125 <= ~0.18; DFlash emitted 374 (the runner-up).
+    def _tie_entry(self, m):
+        return m.classify_divergence(self.NOSPEC_TOPK, 26, 374, verify_top2=self.VERIFY_TOP2)
+
+    def test_decisive_swapped_pair_is_tie(self):
         m = self._mod()
-        d = m.classify_divergence([[706, -0.66965], [374, -0.79465]], 26, 374)
+        d = self._tie_entry(m)
         self.assertEqual(d["verdict"], "bf16-tie")
+        self.assertEqual(d["reasons"], [])
         self.assertEqual(d["dflash_rank_in_nospec_topk"], 1)
+        self.assertEqual(d["nospec_token"], 706)
         self.assertAlmostEqual(d["top2_margin"], 0.125, places=5)
 
-    def test_large_margin_runner_up_is_mismatch(self):
-        # DFlash emitted the runner-up but the target is not close -> a degraded
-        # verify forward, NOT a tie-break.
+    def test_no_verify_trace_is_not_tie(self):
+        # Non-spec runner-up evidence alone is not decisive.
         m = self._mod()
-        d = m.classify_divergence([[706, -0.10], [374, -1.60]], 26, 374)
+        d = m.classify_divergence(self.NOSPEC_TOPK, 26, 374)
+        self.assertEqual(d["verdict"], "MISMATCH")
+
+    def test_verify_top1_not_emitted_is_mismatch(self):
+        # DFlash verify argmax is 706 but it emitted 374 -> accept bug.
+        m = self._mod()
+        d = m.classify_divergence(self.NOSPEC_TOPK, 26, 374, verify_top2=[[706, -0.1], [374, -0.2]])
+        self.assertEqual(d["verdict"], "MISMATCH")
+
+    def test_verify_pair_not_a_swap_is_mismatch(self):
+        # verify top-2 is a third token, not the non-spec top-1 -> not a swap.
+        m = self._mod()
+        d = m.classify_divergence(self.NOSPEC_TOPK, 26, 374, verify_top2=[[374, -0.1], [999, -0.2]])
+        self.assertEqual(d["verdict"], "MISMATCH")
+
+    def test_verify_margin_too_large_is_mismatch(self):
+        m = self._mod()
+        d = m.classify_divergence(self.NOSPEC_TOPK, 26, 374, verify_top2=[[374, -0.1], [706, -1.6]])
+        self.assertEqual(d["verdict"], "MISMATCH")
+
+    def test_nospec_large_margin_is_mismatch(self):
+        m = self._mod()
+        d = m.classify_divergence([[706, -0.10], [374, -1.60]], 26, 374, verify_top2=self.VERIFY_TOP2)
         self.assertEqual(d["verdict"], "MISMATCH")
 
     def test_lower_rank_token_is_mismatch(self):
-        # DFlash emitted the target's rank-2 token -> real mismatch.
         m = self._mod()
-        d = m.classify_divergence([[706, -0.10], [374, -0.15], [999, -0.20]], 5, 999)
+        d = m.classify_divergence(
+            [[706, -0.10], [374, -0.15], [999, -0.20]], 5, 999, verify_top2=[[999, -0.1], [706, -0.2]]
+        )
         self.assertEqual(d["dflash_rank_in_nospec_topk"], 2)
         self.assertEqual(d["verdict"], "MISMATCH")
 
-    def test_token_absent_from_topk_is_mismatch(self):
+    def test_tolerated_recomputes_and_binds_to_current_dumps(self):
         m = self._mod()
-        d = m.classify_divergence([[706, -0.10], [374, -0.15]], 5, 12345)
-        self.assertIsNone(d["dflash_rank_in_nospec_topk"])
-        self.assertEqual(d["verdict"], "MISMATCH")
-
-    def test_tolerated_divergence_manifest_gating(self):
-        m = self._mod()
-        manifest = {
-            "P": {"index": 26, "verdict": "bf16-tie", "top2_margin": 0.125},
-            "Q": {"index": 4, "verdict": "MISMATCH"},
-        }
-        # confirmed tie at the exact index -> tolerated
-        self.assertTrue(m._tolerated_divergence(manifest, "P", 26))
-        # right prompt, wrong index -> NOT tolerated
-        self.assertFalse(m._tolerated_divergence(manifest, "P", 25))
-        # non-tie verdict -> NOT tolerated
-        self.assertFalse(m._tolerated_divergence(manifest, "Q", 4))
+        manifest = {"P": self._tie_entry(m)}
+        # exact match to current dumps -> tolerated
+        ok, _ = m._tolerated_divergence(manifest, "P", 26, 374, 706)
+        self.assertTrue(ok)
+        # current DFlash token changed -> NOT tolerated
+        self.assertFalse(m._tolerated_divergence(manifest, "P", 26, 999, 706)[0])
+        # current non-spec token changed -> NOT tolerated
+        self.assertFalse(m._tolerated_divergence(manifest, "P", 26, 374, 999)[0])
+        # stale index -> NOT tolerated
+        self.assertFalse(m._tolerated_divergence(manifest, "P", 25, 374, 706)[0])
         # unknown prompt -> NOT tolerated
-        self.assertFalse(m._tolerated_divergence(manifest, "Z", 0))
+        self.assertFalse(m._tolerated_divergence(manifest, "Z", 0, 1, 2)[0])
+
+    def test_tolerated_rejects_oversized_epsilon(self):
+        m = self._mod()
+        entry = self._tie_entry(m)
+        entry = dict(entry)
+        entry["epsilon"] = 10.0  # forged looser epsilon
+        self.assertFalse(m._tolerated_divergence({"P": entry}, "P", 26, 374, 706)[0])
+
+    def test_tolerated_rejects_forged_topk(self):
+        m = self._mod()
+        entry = dict(self._tie_entry(m))
+        # tamper nospec_topk so the margin blows past eps; recompute must reject
+        entry["nospec_topk"] = [[706, -0.10], [374, -1.60]]
+        self.assertFalse(m._tolerated_divergence({"P": entry}, "P", 26, 374, 706)[0])
 
 
 class TestDflashKvCellSizing(CustomTestCase):
