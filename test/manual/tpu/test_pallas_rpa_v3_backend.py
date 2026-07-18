@@ -446,130 +446,83 @@ class TestNonEmptyBatchSize(CustomTestCase):
         self.assertEqual(self.backend._non_empty_batch_size(fb), 2)
 
 
-class TestEncoderOnlyAllowMaskBucketing(CustomTestCase):
-    """The ENCODER_ONLY (non-causal) all-ones mask is a BOUNDED fixed shape:
-    ``num_tokens * round_up(max_kv_len, page_size)``. It is stable across live
-    prefixes inside one page bucket (so the Pallas op is not re-specialized as
-    context grows within a page) and its memory scales with the *current*
-    context, not the full max-context capacity.
+class TestEncoderOnlyMaskBucketMath(CustomTestCase):
+    """The ENCODER_ONLY mask bucket is computed HOST-SIDE in the metadata build
+    (`_compute_encoder_only_kv_len_bucket`) as ``round_up(max_i kv_len_i,
+    page_size)`` floored at one page — so the compiled forward carries no
+    data-dependent ``.item()``. Bucket math: page round-up, batch-max driven,
+    page edges, empty floored at one page.
     """
 
-    PAGE_SIZE = 16
+    def _bucket(self, page, kv_list):
+        req_to_token = _build_req_to_token(num_reqs=8, max_context_len=8192)
+        backend = _BackendUnderTest(page, req_to_token)
+        return backend._compute_encoder_only_kv_len_bucket(
+            torch.tensor(kv_list, dtype=torch.int32)
+        )
 
-    def _backend(self):
-        req_to_token = _build_req_to_token(num_reqs=8, max_context_len=4096)
-        backend = _BackendUnderTest(self.PAGE_SIZE, req_to_token)
-        backend._encoder_only_mask_cache = {}
-        return backend
+    def test_rounds_up_to_page(self):
+        self.assertEqual(self._bucket(16, [100]), 112)  # 7 pages of 16
 
-    def _mask(self, backend, num_tokens, max_kv):
-        kv_lens = torch.tensor([max_kv], dtype=torch.int32)
-        return backend._get_encoder_only_allow_mask(num_tokens, kv_lens, torch.device("cpu"))
+    def test_page64_edges(self):
+        cases = [(0, 64), (1, 64), (63, 64), (64, 64), (65, 128),
+                 (127, 128), (128, 128), (129, 192)]
+        for max_kv, expected in cases:
+            with self.subTest(max_kv=max_kv):
+                self.assertEqual(self._bucket(64, [max_kv]), expected)
 
-    def test_bucket_rounds_kv_len_up_to_page(self):
-        backend = self._backend()
-        # max_kv 100 -> bucket 112 (7 pages of 16).
-        m = self._mask(backend, 8, 100)
+    def test_batch_max_drives_bucket(self):
+        self.assertEqual(self._bucket(64, [10, 64, 33]), 64)
+        self.assertEqual(self._bucket(64, [10, 65, 33]), 128)
+
+    def test_empty_floors_at_one_page(self):
+        self.assertEqual(self._bucket(64, []), 64)
+
+
+class TestEncoderOnlyMaskShape(CustomTestCase):
+    """`_get_encoder_only_allow_mask` reads the prepared host-side bucket from
+    ``forward_metadata.encoder_only_kv_len_bucket`` (NOT ``kv_lens.max().item()``)
+    and returns an all-ones int32 mask of ``num_tokens * bucket`` — bounded
+    memory (scales with the bucket, not full context), no device-derived key.
+    """
+
+    def _mask(self, num_tokens, bucket):
+        import types
+
+        req_to_token = _build_req_to_token(num_reqs=8, max_context_len=8192)
+        backend = _BackendUnderTest(64, req_to_token)
+        backend.forward_metadata = types.SimpleNamespace(
+            encoder_only_kv_len_bucket=bucket
+        )
+        return backend._get_encoder_only_allow_mask(num_tokens, torch.device("cpu"))
+
+    def test_shape_is_num_tokens_times_bucket(self):
+        m = self._mask(8, 112)
         self.assertEqual(m.numel(), 8 * 112)
         self.assertTrue(torch.all(m == 1))
         self.assertEqual(m.dtype, torch.int32)
 
-    def test_shape_stable_within_one_page_bucket(self):
-        backend = self._backend()
-        # 97..112 all round to 112 -> identical shape AND same cached object.
-        m1 = self._mask(backend, 8, 97)
-        m2 = self._mask(backend, 8, 112)
-        self.assertEqual(tuple(m1.shape), tuple(m2.shape))
-        self.assertIs(m1, m2)
+    def test_shape_stable_within_bucket_changes_across(self):
+        # same bucket -> same shape; a larger bucket -> larger shape.
+        self.assertEqual(tuple(self._mask(8, 128).shape), tuple(self._mask(8, 128).shape))
+        self.assertEqual(self._mask(8, 128).numel(), 8 * 128)
+        self.assertEqual(self._mask(8, 192).numel(), 8 * 192)
 
-    def test_shape_changes_across_buckets(self):
-        backend = self._backend()
-        self.assertEqual(self._mask(backend, 8, 112).numel(), 8 * 112)
-        self.assertEqual(self._mask(backend, 8, 113).numel(), 8 * 128)  # next bucket
-
-    def test_memory_scales_with_context_not_max_capacity(self):
-        backend = self._backend()  # max context 4096
-        # A short prefix must NOT allocate a 4096-wide mask.
-        short = self._mask(backend, 8, 40)  # bucket 48
+    def test_memory_scales_with_bucket_not_full_context(self):
+        short = self._mask(8, 48)  # small live context
         self.assertEqual(short.numel(), 8 * 48)
-        self.assertLess(short.numel(), 8 * 4096)
+        self.assertLess(short.numel(), 8 * 8192)  # not full max-context
 
-    def test_upper_bounds_exact_ragged_length(self):
-        # sum_i q_len_i * kv_len_i <= num_tokens * round_up(max_kv, page).
-        backend = self._backend()
-        num_tokens, max_kv = 8, 100
-        mask = self._mask(backend, num_tokens, max_kv)
-        self.assertGreaterEqual(mask.numel(), num_tokens * max_kv)
+    def test_missing_bucket_fails_loud(self):
+        import types
 
-
-class TestEncoderOnlyMaskPageSize64Boundaries(CustomTestCase):
-    """Paged-boundary coverage for the ENCODER_ONLY mask bucket at the CANONICAL
-    ``page_size=64`` (the config the DFlash bring-up targets). The bucket is
-    ``round_up(max_kv, 64)`` floored at one page, so the compiled Pallas op sees
-    a stable shape within each 64-wide band and steps exactly at page edges.
-    """
-
-    PAGE_SIZE = 64
-
-    def _backend(self):
         req_to_token = _build_req_to_token(num_reqs=8, max_context_len=8192)
-        backend = _BackendUnderTest(self.PAGE_SIZE, req_to_token)
-        backend._encoder_only_mask_cache = {}
-        return backend
-
-    def _bucket(self, backend, num_tokens, max_kv):
-        kv_lens = torch.tensor([max_kv], dtype=torch.int32)
-        mask = backend._get_encoder_only_allow_mask(
-            num_tokens, kv_lens, torch.device("cpu")
+        backend = _BackendUnderTest(64, req_to_token)
+        backend.forward_metadata = types.SimpleNamespace(
+            encoder_only_kv_len_bucket=None
         )
-        self.assertTrue(torch.all(mask == 1))
-        self.assertEqual(mask.dtype, torch.int32)
-        self.assertEqual(mask.numel() % num_tokens, 0)
-        return mask.numel() // num_tokens
-
-    def test_page_edge_buckets(self):
-        # (max_kv -> expected bucket width) straddling each page boundary.
-        cases = [
-            (0, 64),  # empty prefix still gets one page (floor).
-            (1, 64),
-            (63, 64),  # just below page 1 edge.
-            (64, 64),  # exactly on the page edge -> no extra page.
-            (65, 128),  # one past the edge -> next page.
-            (127, 128),
-            (128, 128),  # exact 2-page multiple.
-            (129, 192),  # one past -> third page.
-        ]
-        backend = self._backend()
-        for max_kv, expected in cases:
-            with self.subTest(max_kv=max_kv):
-                self.assertEqual(self._bucket(backend, 8, max_kv), expected)
-
-    def test_stable_within_band_and_steps_at_edge(self):
-        # Every prefix in 1..64 shares ONE cached mask object (no op re-specialize
-        # as context grows within a page); crossing 64->65 allocates a new shape.
-        backend = self._backend()
-        kv = lambda n: torch.tensor([n], dtype=torch.int32)
-        dev = torch.device("cpu")
-        m_lo = backend._get_encoder_only_allow_mask(8, kv(1), dev)
-        m_hi = backend._get_encoder_only_allow_mask(8, kv(64), dev)
-        self.assertIs(m_lo, m_hi)  # same bucket -> cached identity.
-        m_next = backend._get_encoder_only_allow_mask(8, kv(65), dev)
-        self.assertIsNot(m_lo, m_next)
-        self.assertEqual(m_next.numel(), 8 * 128)
-
-    def test_batch_max_drives_bucket(self):
-        # With a batch of prefixes, the bucket is driven by the MAX kv_len,
-        # rounded to the page — 64 stays one page, 65 steps to two.
-        backend = self._backend()
-        dev = torch.device("cpu")
-        at_edge = backend._get_encoder_only_allow_mask(
-            8, torch.tensor([10, 64, 33], dtype=torch.int32), dev
-        )
-        self.assertEqual(at_edge.numel(), 8 * 64)
-        past_edge = backend._get_encoder_only_allow_mask(
-            8, torch.tensor([10, 65, 33], dtype=torch.int32), dev
-        )
-        self.assertEqual(past_edge.numel(), 8 * 128)
+        with self.assertRaises(AssertionError):
+            backend._get_encoder_only_allow_mask(8, torch.device("cpu"))
 
 
 class TestDflashVerifyMetadataAvoidsTriton(CustomTestCase):

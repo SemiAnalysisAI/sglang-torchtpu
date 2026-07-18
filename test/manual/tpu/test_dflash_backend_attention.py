@@ -77,7 +77,6 @@ class TestDflashBackendEncoderOnlyParity(unittest.TestCase):
         backend.kv_cache_quant_dtype = None
         backend.forward_metadata = None
         backend._distribution_cache = {}
-        backend._encoder_only_mask_cache = {}
         backend._op = _build_pallas_kernel_op()
         return backend
 
@@ -118,6 +117,9 @@ class TestDflashBackendEncoderOnlyParity(unittest.TestCase):
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens=torch.tensor([block_size], dtype=torch.int32, device=dev),
             spec_info=None,
+            # The DFlash draft block forward passes input_embeds; setting it makes
+            # the backend prepare the ENCODER_ONLY mask bucket host-side.
+            input_embeds=torch.zeros(1),
             seq_lens_cpu=torch.tensor([kv_len], dtype=torch.int32),
             token_to_kv_pool=types.SimpleNamespace(
                 get_fused_kv_buffer=lambda layer_id: kv_fused
@@ -186,7 +188,12 @@ class TestDflashBackendEncoderOnlyParity(unittest.TestCase):
         builds its own metadata (never DFlashVerifyInput.generate_attn_arg_prefill,
         the sole caller of the kernel), the forward must complete untouched.
         """
-        import sglang.srt.speculative.dflash_info as di
+        # Patch the SOURCE module: dflash_info imports the kernel lazily via
+        # `from sglang.srt.layers.attention.utils import
+        # create_flashinfer_kv_indices_triton` inside generate_attn_arg_prefill,
+        # so it is not a dflash_info attribute — patching the source makes any
+        # reach through that lazy import raise.
+        import sglang.srt.layers.attention.utils as au
 
         def _boom(*a, **k):  # pragma: no cover - must never be called
             raise AssertionError(
@@ -194,12 +201,12 @@ class TestDflashBackendEncoderOnlyParity(unittest.TestCase):
                 "RPA-v3 verify path"
             )
 
-        saved = di.create_flashinfer_kv_indices_triton
-        di.create_flashinfer_kv_indices_triton = _boom
+        saved = au.create_flashinfer_kv_indices_triton
+        au.create_flashinfer_kv_indices_triton = _boom
         try:
             out, ref = self._run_case(17, 4)
         finally:
-            di.create_flashinfer_kv_indices_triton = saved
+            au.create_flashinfer_kv_indices_triton = saved
         self.assertLess(float((out - ref).abs().max()), self.TOLERANCE)
 
 

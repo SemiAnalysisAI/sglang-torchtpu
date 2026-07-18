@@ -951,7 +951,7 @@ def dflash_tp_ranks_agree(
     first_diff_rank)``: ``agree`` is True iff every rank's slice equals rank 0's;
     otherwise ``first_diff_rank`` is the lowest rank index whose slice differs.
 
-    Pure / CPU-testable. Used by the DFlash verify TP>1 invariant (AC-6) to prove
+    Pure / CPU-testable. Used by the DFlash verify TP>1 determinism invariant to prove
     all ranks observe identical post-broadcast accept state (``correct_len``,
     rebuilt ``commit_lens``, ``new_bonus_tokens``) rather than relying on the
     rank-0 broadcast implicitly.

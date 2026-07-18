@@ -966,7 +966,7 @@ class TestDflashDivergenceClassifier(CustomTestCase):
 
 
 class TestDflashTpVerifyInvariant(CustomTestCase):
-    """AC-6 all-ranks-identical invariant helper (`dflash_tp_ranks_agree`): after
+    """All-ranks-identical invariant helper (`dflash_tp_ranks_agree`): after
     the rank-0 broadcast + host rebuild, an all-gathered per-rank vector
     (correct_len | commit_lens | new_bonus_tokens) must be identical across TP
     ranks. The helper is pure and CPU-testable; the live verify path all-gathers
@@ -1005,6 +1005,17 @@ class TestDflashTpVerifyInvariant(CustomTestCase):
     def test_world_size_one_trivially_agrees(self):
         agree = self._fn()
         self.assertEqual(agree(torch.tensor([1, 2, 3]), 1), (True, None))
+
+    def test_world_size_two(self):
+        # Dedicated ws=2 case: live TP=2 is infra-blocked (torch_tpu set_device),
+        # so the helper's TP=2 behavior is only covered here.
+        agree = self._fn()
+        local = torch.tensor([3, 2, 5], dtype=torch.int64)  # cl|commit|bonus
+        self.assertEqual(agree(local.repeat(2), 2), (True, None))
+        diff = torch.tensor([3, 2, 6], dtype=torch.int64)  # rank 1 bonus differs
+        ok, bad = agree(torch.cat([local, diff]), 2)
+        self.assertFalse(ok)
+        self.assertEqual(bad, 1)
 
 
 class TestDflashKvCellSizing(CustomTestCase):

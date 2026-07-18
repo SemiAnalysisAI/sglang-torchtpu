@@ -74,7 +74,6 @@ def _make_backend(page_size, pages_per_seq, device):
     backend.kv_cache_quant_dtype = None
     backend.forward_metadata = None
     backend._distribution_cache = {}
-    backend._encoder_only_mask_cache = {}
     backend._op = _build_pallas_kernel_op()
     return backend
 

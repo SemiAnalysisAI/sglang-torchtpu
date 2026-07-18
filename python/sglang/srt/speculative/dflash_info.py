@@ -38,7 +38,7 @@ from sglang.srt.utils import is_tpu
 
 _IS_TPU = is_tpu()
 
-# Optional AC-5 diagnostic: when SGLANG_DFLASH_VERIFY_TRACE names a file, rank 0
+# Optional greedy-parity diagnostic: when SGLANG_DFLASH_VERIFY_TRACE names a file, rank 0
 # appends one JSONL record per verify step capturing, for each committed token,
 # the DFlash *verify-forward* top-2 (token id + fp32 logit) at the block position
 # that produced it. This lets the parity harness prove a greedy divergence is a
@@ -448,7 +448,7 @@ class DFlashVerifyInput(SpecInput):
                 target_predict=target_predict,
             )
 
-        # AC-5 verifier trace (env-gated): capture the verify-forward top-2
+        # Verifier trace (env-gated): capture the verify-forward top-2
         # (fp32) at every block position. `_ti[i*T + k]` is the top-2 for the
         # k-th committed token of request i (proposed[k] == target argmax there).
         trace_top2_ids: List[List[int]] = []
@@ -549,7 +549,7 @@ class DFlashVerifyInput(SpecInput):
             new_bonus_tokens_list, dtype=torch.int64, device=device
         )
 
-        # AC-6 invariant: after the rank-0 broadcast of correct_len/bonus and the
+        # TP>1 determinism invariant: after the rank-0 broadcast of correct_len/bonus and the
         # host rebuild of commit_lens/new_bonus_tokens, every TP rank must observe
         # IDENTICAL accept state. Prove it (do not merely rely on the broadcast):
         # all-gather the three vectors and raise on any per-rank divergence — a

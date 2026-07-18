@@ -51,7 +51,6 @@ def _make_backend(page_size, pages_per_seq):
     backend.kv_cache_quant_dtype = None
     backend.forward_metadata = None
     backend._distribution_cache = {}
-    backend._encoder_only_mask_cache = {}
     backend._op = _build_pallas_kernel_op()
     return backend
 
@@ -153,6 +152,9 @@ class TestDFlashAttentionLayerParity(unittest.TestCase):
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens=torch.tensor([block_size], dtype=torch.int32, device=dev),
             spec_info=None,
+            # The DFlash draft block forward passes input_embeds; setting it makes
+            # the backend prepare the ENCODER_ONLY mask bucket host-side.
+            input_embeds=torch.zeros(1),
             seq_lens_cpu=torch.tensor([kv_len], dtype=torch.int32),
             token_to_kv_pool=types.SimpleNamespace(
                 get_fused_kv_buffer=lambda layer_id: kv_fused

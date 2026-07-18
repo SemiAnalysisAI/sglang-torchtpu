@@ -67,6 +67,11 @@ class PallasForwardMetadata:
     distribution: torch.Tensor
     # i32[max_num_seqs * pages_per_seq]  page indices
     swa_page_indices: Optional[torch.Tensor] = None
+    # Page-aligned upper bound on max_i kv_len_i, computed HOST-SIDE in the
+    # (eager) metadata build so the ENCODER_ONLY all-ones mask shape carries no
+    # data-dependent `.item()` into the compiled forward. None for backends/
+    # forwards that never run a non-causal block (the causal path ignores it).
+    encoder_only_kv_len_bucket: Optional[int] = None
 
 
 _PALLAS_RPA_OP = None
@@ -280,12 +285,6 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         self._distribution_cache: dict[tuple[bool, int, torch.device], torch.Tensor] = (
             {}
         )
-        # Fixed-shape all-ones "allow" masks for ENCODER_ONLY (non-causal)
-        # layers, keyed by (device, num_tokens, kv_capacity). See
-        # _get_encoder_only_allow_mask.
-        self._encoder_only_mask_cache: dict[
-            tuple[torch.device, int, int], torch.Tensor
-        ] = {}
         # Register the custom op eagerly so the (Python-introspection-heavy)
         # ``jax_op`` registration does not happen inside a ``torch.compile``
         # traced region — dynamo can't handle ``inspect.signature`` on the
@@ -486,6 +485,12 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
                 .to(device)
             )
 
+        encoder_only_kv_len_bucket = (
+            self._compute_encoder_only_kv_len_bucket(seq_lens)
+            if getattr(forward_batch, "input_embeds", None) is not None
+            else None
+        )
+
         return PallasForwardMetadata(
             kv_lens=seq_lens,
             cu_q_lens=cu_q_lens,
@@ -493,6 +498,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             page_indices=page_indices,
             distribution=distribution,
             swa_page_indices=swa_page_indices,
+            encoder_only_kv_len_bucket=encoder_only_kv_len_bucket,
         )
 
     def _build_metadata_host(
@@ -580,6 +586,15 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
                 .to(device, non_blocking=True)
             )
 
+        # Only the DFlash draft block runs ENCODER_ONLY layers on TPU, and it is
+        # the only forward that passes input_embeds. Compute the mask bucket only
+        # there so the target/EAGLE3/non-spec paths keep their sync-free build.
+        encoder_only_kv_len_bucket = (
+            self._compute_encoder_only_kv_len_bucket(kv_lens)
+            if getattr(forward_batch, "input_embeds", None) is not None
+            else None
+        )
+
         # H2D for host-built cu-lens / page_indices; kv_lens already on device,
         # distribution is the caller's cached buffer.
         return PallasForwardMetadata(
@@ -589,6 +604,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             page_indices=page_indices.to(device, non_blocking=True),
             distribution=distribution,
             swa_page_indices=swa_page_indices,
+            encoder_only_kv_len_bucket=encoder_only_kv_len_bucket,
         )
 
     # ------------------------------------------------------------------ #
@@ -698,9 +714,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # test_ragged_paged_attention_v3.py::TestDFlashNonCausalBlockAttention.
         if getattr(layer, "attn_type", None) == AttentionType.ENCODER_ONLY:
             causal = 0
-            custom_mask = self._get_encoder_only_allow_mask(
-                num_tokens, self.forward_metadata.kv_lens, q.device
-            )
+            custom_mask = self._get_encoder_only_allow_mask(num_tokens, q.device)
         else:
             causal = 1
             custom_mask = None
@@ -732,8 +746,18 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         out = out.reshape(num_tokens, layer.tp_q_head_num, -1)[..., : layer.v_head_dim]
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _compute_encoder_only_kv_len_bucket(self, kv_lens: torch.Tensor) -> int:
+        """Page-aligned upper bound on ``max_i kv_len_i``. Called ONLY from the
+        eager metadata build (never the compiled forward), so the ``.item()``
+        D2H here is safe; it removes the data-dependent bucket from the compiled
+        region. ``round_up(max_kv, page_size)`` keeps the ENCODER_ONLY mask shape
+        stable within a page and memory proportional to the current context."""
+        max_kv = int(kv_lens.max().item()) if kv_lens.numel() else 0
+        page = self.page_size
+        return max(((max_kv + page - 1) // page) * page, page)
+
     def _get_encoder_only_allow_mask(
-        self, num_tokens: int, kv_lens: torch.Tensor, device: torch.device
+        self, num_tokens: int, device: torch.device
     ) -> torch.Tensor:
         """Bounded fixed-shape all-ones 'allow' mask for a non-causal
         (ENCODER_ONLY) forward.
@@ -742,30 +766,22 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         where 1 == allow, indexing it via runtime ``cu_q_lens``/``kv_lens`` and
         touching only the exact ``sum_i q_len_i * kv_len_i`` prefix. An all-ones
         tensor sized to any upper bound yields identical output (verified on TPU),
-        so we size it to a **bucketed** upper bound that keeps both the shape and
-        the memory bounded:
-
-        ``mask_len = num_tokens * kv_len_bucket`` where
-        ``kv_len_bucket = round_up(max_i kv_len_i, page_size)``.
-
-        This bounds ``sum_i q_len_i * kv_len_i <= (sum_i q_len_i) * max_kv
-        <= num_tokens * kv_len_bucket``, keeps the mask shape stable across
-        prefixes inside a page bucket (so the Pallas op is not re-specialized as
-        context grows within a page), and keeps memory proportional to the
-        *current* context rather than the full max-context capacity. Masks are
-        cached per ``(device, num_tokens, kv_len_bucket)``.
+        so we size it to ``num_tokens * kv_len_bucket`` where ``kv_len_bucket``
+        is the page-aligned upper bound computed **host-side** in the metadata
+        build (:attr:`PallasForwardMetadata.encoder_only_kv_len_bucket`). Reading
+        a prepared int (not ``kv_lens.max().item()``) keeps the compiled draft
+        forward free of a data-dependent unbacked SymInt while preserving the
+        bounded page-bucket memory behaviour.
         """
-        max_kv = int(kv_lens.max().item()) if kv_lens.numel() else 0
-        page = self.page_size
-        kv_len_bucket = max(((max_kv + page - 1) // page) * page, page)
-        key = (device, int(num_tokens), kv_len_bucket)
-        mask = self._encoder_only_mask_cache.get(key)
-        if mask is None:
-            mask = torch.ones(
-                int(num_tokens) * kv_len_bucket, dtype=torch.int32, device=device
-            )
-            self._encoder_only_mask_cache[key] = mask
-        return mask
+        assert self.forward_metadata is not None
+        kv_len_bucket = self.forward_metadata.encoder_only_kv_len_bucket
+        assert kv_len_bucket is not None, (
+            "encoder_only_kv_len_bucket was not prepared in the metadata build; "
+            "an ENCODER_ONLY layer ran on a backend/forward that did not set it."
+        )
+        return torch.ones(
+            num_tokens * kv_len_bucket, dtype=torch.int32, device=device
+        )
 
     # ------------------------------------------------------------------ #
     # Capability flags
