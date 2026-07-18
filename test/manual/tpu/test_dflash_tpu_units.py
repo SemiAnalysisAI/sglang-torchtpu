@@ -945,6 +945,25 @@ class TestDflashDivergenceClassifier(CustomTestCase):
         entry["nospec_topk"] = [[706, -0.10], [374, -1.60]]
         self.assertFalse(m._tolerated_divergence({"P": entry}, "P", 26, 374, 706)[0])
 
+    def test_tolerated_rejects_scalar_nospec_token_forgery(self):
+        # Codex R2 forgery: edit ONLY the scalar nospec_token to a changed current
+        # ref token (999) while leaving nospec_topk top-1 as the old 706. The
+        # recomputed-evidence binding must reject it (recomputed top-1 706 != 999).
+        m = self._mod()
+        entry = dict(self._tie_entry(m))
+        entry["nospec_token"] = 999
+        ok, why = m._tolerated_divergence({"P": entry}, "P", 26, 374, 999)
+        self.assertFalse(ok)
+        self.assertIn("top-1", why)
+
+    def test_tolerated_rejects_runner_up_not_current_dflash(self):
+        # nospec_topk runner-up is a third token, not the current DFlash token.
+        m = self._mod()
+        entry = dict(self._tie_entry(m))
+        entry["nospec_topk"] = [[706, -0.66965], [555, -0.79465]]
+        entry["verify_top2"] = [[374, -0.10], [706, -0.20]]
+        self.assertFalse(m._tolerated_divergence({"P": entry}, "P", 26, 374, 706)[0])
+
 
 class TestDflashKvCellSizing(CustomTestCase):
     """The shared target+draft KV pool must be sized from the DRAFT config, not

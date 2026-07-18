@@ -167,7 +167,23 @@ def _tolerated_divergence(
         return False, "recomputed verdict is not bf16-tie: " + "; ".join(
             recomputed.get("reasons", [])
         )
-    return True, "bf16-tie (recomputed from evidence)"
+    # Bind the recomputed top-k EVIDENCE (not just the manifest's scalar fields)
+    # to BOTH current dump tokens: the target top-1 must be the current non-spec
+    # token and the runner-up must be the current DFlash token. This defeats a
+    # manifest whose scalar `nospec_token` was edited to a changed ref token while
+    # its `nospec_topk` still carries the old top-1.
+    if int(recomputed.get("nospec_token", -1)) != int(ref_tok):
+        return False, (
+            f"recomputed non-spec top-1 {recomputed.get('nospec_token')} "
+            f"!= current ref token {ref_tok}"
+        )
+    if int(recomputed.get("dflash_rank_in_nospec_topk", -1)) != 1:
+        return False, "recomputed DFlash token is not the non-spec runner-up"
+    if int(topk[1][0]) != int(spec_tok):
+        return False, (
+            f"recomputed non-spec runner-up {topk[1][0]} != current DFlash token {spec_tok}"
+        )
+    return True, "bf16-tie (recomputed from evidence, bound to current dumps)"
 
 
 def _cmd_compare(args) -> int:
