@@ -1,5 +1,7 @@
 import logging
 import math
+import os
+import time
 from copy import deepcopy
 from typing import Optional
 
@@ -152,6 +154,14 @@ class DFlashWorker:
         )
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
+        # Experimental (SGLANG_DFLASH_COMPILE_DRAFT=1): compile the DFlash draft
+        # block forward on TPU. By default the draft runs eager (the DFlash
+        # compile policy is target-only), which profiling shows costs ~1.3s/step
+        # (>90% of decode). Enabling torch.compile for the *draft worker only*
+        # lets TpuGraphRunner install a bucketed compiled forward on
+        # DFlashDraftModel.forward without touching the target's own policy.
+        if _IS_TPU and os.environ.get("SGLANG_DFLASH_COMPILE_DRAFT") == "1":
+            draft_server_args.enable_torch_compile = True
         import torch as _torch
 
         draft_backend = draft_server_args.speculative_draft_attention_backend
@@ -711,10 +721,14 @@ class DFlashWorker:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
             )
 
+            _dprof = self._prof_on()
+            _dt = time.perf_counter() if _dprof else 0.0
             with torch.inference_mode():
                 draft_logits_output = self.draft_model_runner.forward(
                     forward_batch
                 ).logits_output
+            if _dprof:
+                self._prof_lap("draft_fwd", _dt)
         finally:
             # Drop the speculative block from the shared allocator (EAGLE3-style).
             allocator.restore_state(token_to_kv_pool_state_backup)
@@ -1288,6 +1302,36 @@ class DFlashWorker:
             model=self.target_worker.model_runner.model,
         )
 
+    # ---- Optional per-phase decode profiling (env SGLANG_DFLASH_PROFILE=1) ---- #
+    def _prof_on(self) -> bool:
+        enabled = getattr(self, "_prof_enabled", None)
+        if enabled is None:
+            enabled = os.environ.get("SGLANG_DFLASH_PROFILE") == "1"
+            self._prof_enabled = enabled
+            self._prof_acc = {}
+            self._prof_steps = 0
+        return enabled
+
+    def _prof_lap(self, phase: str, t0: float) -> float:
+        # Force a device flush so the elapsed time reflects completed device work,
+        # not just enqueue time (torch_tpu dispatch is async).
+        torch.zeros(1, device=self.device).cpu()
+        dt = (time.perf_counter() - t0) * 1000.0
+        acc = self._prof_acc.setdefault(phase, [0.0, 0])
+        acc[0] += dt
+        acc[1] += 1
+        return time.perf_counter()
+
+    def _prof_flush(self) -> None:
+        self._prof_steps += 1
+        if self._prof_steps % 16 != 0 or self.tp_rank != 0:
+            return
+        parts = []
+        for phase, (s, n) in self._prof_acc.items():
+            parts.append(f"{phase}={s / max(n, 1):.1f}ms")
+        logger.info("DFLASH decode phase avg (last window): %s", "  ".join(parts))
+        self._prof_acc = {}
+
     def forward_batch_generation(
         self, batch: ScheduleBatch, **kwargs
     ) -> GenerationBatchResult:
@@ -1354,7 +1398,12 @@ class DFlashWorker:
                 "This usually means the request did not complete the prefill stage."
             )
 
+        _prof = self._prof_on()
+        _pt = time.perf_counter() if _prof else 0.0
+
         self._prepare_for_speculative_decoding(batch, draft_input)
+        if _prof:
+            _pt = self._prof_lap("prep_total", _pt)
 
         assert batch.forward_mode.is_target_verify()
         verify_input = batch.spec_info
@@ -1374,6 +1423,8 @@ class DFlashWorker:
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
+        if _prof:
+            _pt = self._prof_lap("target_verify_fwd", _pt)
 
         (
             new_bonus_tokens,
@@ -1385,6 +1436,8 @@ class DFlashWorker:
             logits_output=logits_output,
             page_size=self.page_size,
         )
+        if _prof:
+            _pt = self._prof_lap("verify_glue", _pt)
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
@@ -1401,6 +1454,9 @@ class DFlashWorker:
         self._append_target_hidden_to_draft_kv(batch, draft_input)
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
+        if _prof:
+            self._prof_lap("kv_append_post", _pt)
+            self._prof_flush()
 
         num_correct_drafts = sum(num_correct_drafts_per_req_cpu)
         if not self._logged_first_verify and self.tp_rank == 0:
