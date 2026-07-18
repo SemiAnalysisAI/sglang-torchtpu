@@ -136,5 +136,55 @@ class TestValidateDflashRequestNonTPU(CustomTestCase):
         self.assertIsNone(validate_dflash_request(_make_req(top_k=50)))
 
 
+class TestDflashVerifyMaskPolicyAvoidsTriton(CustomTestCase):
+    """AC-3 guard: on the TPU RPA-v3 backend, DFlash verify skips its custom mask,
+    so it uses RPA-v3's own metadata builder and never reaches
+    DFlashVerifyInput.generate_attn_arg_prefill (the only caller of the Triton
+    create_flashinfer_kv_indices_triton kernel).
+    """
+
+    @staticmethod
+    def _named(name):
+        cls = type(name, (), {})
+        return cls()
+
+    def test_rpa_v3_backend_skips_custom_mask(self):
+        from sglang.srt.speculative.dflash_utils import (
+            resolve_dflash_verify_mask_policy,
+        )
+
+        backend = self._named("TpuPallasRpaV3AttnBackend")
+        backend_name, build_custom_mask = resolve_dflash_verify_mask_policy(backend)
+        self.assertEqual(backend_name, "TpuPallasRpaV3AttnBackend")
+        self.assertFalse(
+            build_custom_mask,
+            "RPA-v3 verify must skip the DFlash custom mask so it uses RPA-v3's "
+            "own metadata (not the flashinfer/Triton kv-indices path).",
+        )
+
+    def test_unknown_backend_still_builds_custom_mask(self):
+        from sglang.srt.speculative.dflash_utils import (
+            resolve_dflash_verify_mask_policy,
+        )
+
+        _, build_custom_mask = resolve_dflash_verify_mask_policy(
+            self._named("SomeGpuAttnBackend")
+        )
+        self.assertTrue(build_custom_mask)
+
+    def test_triton_kv_indices_only_reachable_via_generate_attn_arg_prefill(self):
+        # The Triton kernel is only invoked from generate_attn_arg_prefill, so
+        # skipping custom mask + using RPA-v3 metadata provably avoids it.
+        import inspect
+
+        import sglang.srt.speculative.dflash_info as di
+
+        src = inspect.getsource(di)
+        # It is imported and called exactly once, inside generate_attn_arg_prefill.
+        self.assertEqual(src.count("create_flashinfer_kv_indices_triton["), 1)
+        gen_src = inspect.getsource(di.DFlashVerifyInput.generate_attn_arg_prefill)
+        self.assertIn("create_flashinfer_kv_indices_triton[", gen_src)
+
+
 if __name__ == "__main__":
     unittest.main()
