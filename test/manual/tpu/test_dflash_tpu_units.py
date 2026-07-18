@@ -600,6 +600,199 @@ class TestDflashGreedyAcceptParity(CustomTestCase):
             )
 
 
+class _FakeReq:
+    """Minimal Req stand-in exposing only what DFlashVerifyInput.verify reads."""
+
+    def __init__(self, eos_id, origin_last=1):
+        self.output_ids = []
+        self.origin_input_ids = [origin_last]
+        self.grammar = None
+        self.spec_verify_ct = 0
+        self.spec_num_correct_drafts = 0
+        self.kv_committed_len = 0
+        self.kv_allocated_len = 0
+        self._eos = eos_id
+        self._finished = False
+
+    def update_finish_state(self):
+        # Finish exactly when the most recent output token is EOS.
+        self._finished = bool(self.output_ids) and self.output_ids[-1] == self._eos
+
+    def finished(self):
+        return self._finished
+
+
+class _FakeAllocator:
+    def __init__(self):
+        self.freed = []
+
+    def free(self, locs):
+        self.freed.append(locs)
+
+
+class TestDflashVerifyHostSemantics(CustomTestCase):
+    """CPU-runnable parity for ``DFlashVerifyInput.verify()`` host-side semantics
+    (commit_len, EOS early-stop, output_ids, new_bonus_tokens, num_correct_drafts,
+    hidden-segment selection, seq_lens/seq_lens_sum, req KV counters, free/keep +
+    out_cache_loc), driven with fakes and forced-argmax logits -- no TPU server.
+    """
+
+    EOS = 2
+    DTN = 4  # block size: current token + 3 drafts
+    VOCAB = 1000
+    H = 2
+    PAGE = 64
+
+    def _build(self):
+        import types as _types
+
+        # 5 rows: partial / zero / full / EOS-in-accepted-draft / EOS-as-bonus.
+        # candidates[:,0]=current token (100), [:,1:]=drafts.
+        cand_rows = [
+            [100, 7, 8, 9],  # 0 partial
+            [100, 7, 8, 9],  # 1 zero
+            [100, 7, 8, 9],  # 2 full
+            [100, 7, self.EOS, 9],  # 3 EOS is an accepted draft (before bonus)
+            [100, 7, 8, 9],  # 4 EOS is the bonus
+        ]
+        # target_predict per (row, pos) = argmax of the constructed logits.
+        tgt_rows = [
+            [7, 8, 55, 0],  # correct_len 2, bonus 55
+            [999, 1, 2, 3],  # correct_len 0, bonus 999
+            [7, 8, 9, 42],  # correct_len 3, bonus 42
+            [7, self.EOS, 9, 50],  # correct_len 3, bonus 50 -> EOS draft stops at 2
+            [self.EOS, 1, 2, 3],  # correct_len 0, bonus EOS
+        ]
+        bs = len(cand_rows)
+
+        draft_token = torch.tensor(
+            [t for row in cand_rows for t in row], dtype=torch.int64
+        )
+        logits = torch.zeros((bs * self.DTN, self.VOCAB), dtype=torch.float32)
+        hidden = torch.zeros((bs * self.DTN, self.H), dtype=torch.float32)
+        for r in range(bs):
+            for p in range(self.DTN):
+                logits[r * self.DTN + p, tgt_rows[r][p]] = 1.0
+                hidden[r * self.DTN + p, 0] = float(r)
+                hidden[r * self.DTN + p, 1] = float(p)
+
+        fake_self = _types.SimpleNamespace(
+            draft_token=draft_token, draft_token_num=self.DTN
+        )
+        logits_output = _types.SimpleNamespace(
+            next_token_logits=logits, hidden_states=hidden
+        )
+        reqs = [_FakeReq(self.EOS) for _ in range(bs)]
+        allocator = _FakeAllocator()
+        batch = _types.SimpleNamespace(
+            forward_mode=_types.SimpleNamespace(is_idle=lambda: False),
+            batch_size=lambda: bs,
+            sampling_info=None,
+            reqs=reqs,
+            seq_lens=torch.full((bs,), self.PAGE, dtype=torch.int64),
+            seq_lens_cpu=torch.full((bs,), self.PAGE, dtype=torch.int64),
+            seq_lens_sum=self.PAGE * bs,
+            out_cache_loc=torch.arange(
+                1000, 1000 + bs * self.DTN, dtype=torch.int64
+            ),
+            token_to_kv_pool_allocator=allocator,
+            req_pool_indices=torch.arange(bs, dtype=torch.int64),
+            req_to_token_pool=_types.SimpleNamespace(
+                req_to_token=torch.zeros((bs, 256), dtype=torch.int64)
+            ),
+            device="cpu",
+        )
+        return fake_self, batch, logits_output, reqs, allocator, bs
+
+    def test_verify_host_semantics_mixed_batch(self):
+        import sglang.srt.speculative.dflash_info as di
+
+        fake_self, batch, logits_output, reqs, allocator, bs = self._build()
+
+        # Patch the pool updater to a recorder (its effect is out of scope here;
+        # the paged free/keep accounting is covered by the KV-pool tests).
+        calls = []
+        orig = di.assign_req_to_token_pool_func
+        di.assign_req_to_token_pool_func = lambda *a, **k: calls.append((a, k))
+        try:
+            new_bonus, commit_lens, next_hidden, num_correct = (
+                di.DFlashVerifyInput.verify(
+                    fake_self,
+                    batch=batch,
+                    logits_output=logits_output,
+                    page_size=self.PAGE,
+                )
+            )
+        finally:
+            di.assign_req_to_token_pool_func = orig
+
+        # Accept accounting.
+        self.assertEqual(commit_lens.tolist(), [3, 1, 4, 2, 1])
+        self.assertEqual(num_correct, [2, 0, 3, 2, 0])
+        self.assertEqual(new_bonus.tolist(), [55, 999, 42, self.EOS, self.EOS])
+        self.assertEqual(commit_lens.dtype, torch.int32)
+        self.assertEqual(new_bonus.dtype, torch.int64)
+
+        # Per-req output_ids (EOS stops before the bonus in row 3; EOS is the only
+        # token in row 4).
+        self.assertEqual(reqs[0].output_ids, [7, 8, 55])
+        self.assertEqual(reqs[1].output_ids, [999])
+        self.assertEqual(reqs[2].output_ids, [7, 8, 9, 42])
+        self.assertEqual(reqs[3].output_ids, [7, self.EOS])  # stopped at EOS draft
+        self.assertEqual(reqs[4].output_ids, [self.EOS])
+
+        # Per-req counters.
+        for r, (cl, nc) in enumerate(zip([3, 1, 4, 2, 1], [2, 0, 3, 2, 0])):
+            self.assertEqual(reqs[r].spec_verify_ct, 1)
+            self.assertEqual(reqs[r].spec_num_correct_drafts, nc)
+            self.assertEqual(reqs[r].kv_committed_len, cl)
+            self.assertEqual(reqs[r].kv_allocated_len, cl)
+
+        # next_target_hidden = concat of hidden[i, :commit_i] rows (encoded (row,pos)).
+        expected_rows = []
+        for r, cl in enumerate([3, 1, 4, 2, 1]):
+            for p in range(cl):
+                expected_rows.append([float(r), float(p)])
+        self.assertEqual(next_hidden.shape[0], sum([3, 1, 4, 2, 1]))
+        self.assertEqual(next_hidden.tolist(), expected_rows)
+
+        # seq_lens advanced by commit; seq_lens_sum kept in sync.
+        self.assertEqual(batch.seq_lens.tolist(), [67, 65, 68, 66, 65])
+        self.assertEqual(batch.seq_lens_cpu.tolist(), [67, 65, 68, 66, 65])
+        self.assertEqual(batch.seq_lens_sum, self.PAGE * bs + 11)
+
+        # KV compaction: allocator.free called; out_cache_loc replaced with int64
+        # kept locs; pool updater invoked once.
+        self.assertTrue(allocator.freed, "allocator.free should be called")
+        self.assertEqual(batch.out_cache_loc.dtype, torch.int64)
+        self.assertEqual(len(calls), 1)
+
+        # hidden_states cleared to avoid confusing downstream consumers.
+        self.assertIsNone(logits_output.hidden_states)
+
+    def test_verify_idle_returns_empty(self):
+        import types as _types
+
+        import sglang.srt.speculative.dflash_info as di
+
+        fake_self = _types.SimpleNamespace(
+            draft_token=torch.empty((0,), dtype=torch.int64), draft_token_num=self.DTN
+        )
+        batch = _types.SimpleNamespace(
+            forward_mode=_types.SimpleNamespace(is_idle=lambda: True), device="cpu"
+        )
+        logits_output = _types.SimpleNamespace(
+            next_token_logits=torch.empty((0, self.VOCAB)), hidden_states=None
+        )
+        new_bonus, commit_lens, next_hidden, num_correct = di.DFlashVerifyInput.verify(
+            fake_self, batch=batch, logits_output=logits_output, page_size=self.PAGE
+        )
+        self.assertEqual(new_bonus.numel(), 0)
+        self.assertEqual(commit_lens.numel(), 0)
+        self.assertEqual(commit_lens.dtype, torch.int32)
+        self.assertEqual(num_correct, [])
+
+
 class TestDflashKvCellSizing(CustomTestCase):
     """The shared target+draft KV pool must be sized from the DRAFT config, not
     by assuming the draft's per-layer KV bytes equal the target's.
