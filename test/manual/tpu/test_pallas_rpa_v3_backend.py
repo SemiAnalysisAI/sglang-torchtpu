@@ -448,11 +448,15 @@ class TestNonEmptyBatchSize(CustomTestCase):
 
 class TestEncoderOnlyMaskBucketMath(CustomTestCase):
     """The ENCODER_ONLY mask bucket is computed HOST-SIDE in the metadata build
-    (`_compute_encoder_only_kv_len_bucket`) as ``round_up(max_i kv_len_i,
-    page_size)`` floored at one page — so the compiled forward carries no
-    data-dependent ``.item()``. Bucket math: page round-up, batch-max driven,
-    page edges, empty floored at one page.
+    (`_compute_encoder_only_kv_len_bucket`) as ``round_up(max_i kv_len_i, stride)``
+    where ``stride = max(page_size, _ENCODER_ONLY_MASK_BUCKET_STRIDE)`` (a coarse
+    512 multiple of the page) — so the compiled forward carries no data-dependent
+    ``.item()`` AND the draft recompiles only once per coarse bucket (not per
+    page). Bucket math: coarse round-up, batch-max driven, stride edges, empty
+    floored at one stride.
     """
+
+    STRIDE = 512  # mirrors _ENCODER_ONLY_MASK_BUCKET_STRIDE
 
     def _bucket(self, page, kv_list):
         req_to_token = _build_req_to_token(num_reqs=8, max_context_len=8192)
@@ -461,22 +465,24 @@ class TestEncoderOnlyMaskBucketMath(CustomTestCase):
             torch.tensor(kv_list, dtype=torch.int32)
         )
 
-    def test_rounds_up_to_page(self):
-        self.assertEqual(self._bucket(16, [100]), 112)  # 7 pages of 16
+    def test_rounds_up_to_coarse_stride(self):
+        # page 16/64 both floor to the 512 stride.
+        self.assertEqual(self._bucket(16, [100]), 512)
+        self.assertEqual(self._bucket(64, [600]), 1024)
 
-    def test_page64_edges(self):
-        cases = [(0, 64), (1, 64), (63, 64), (64, 64), (65, 128),
-                 (127, 128), (128, 128), (129, 192)]
+    def test_stride_edges(self):
+        cases = [(0, 512), (1, 512), (511, 512), (512, 512),
+                 (513, 1024), (1024, 1024), (1025, 1536)]
         for max_kv, expected in cases:
             with self.subTest(max_kv=max_kv):
                 self.assertEqual(self._bucket(64, [max_kv]), expected)
 
     def test_batch_max_drives_bucket(self):
-        self.assertEqual(self._bucket(64, [10, 64, 33]), 64)
-        self.assertEqual(self._bucket(64, [10, 65, 33]), 128)
+        self.assertEqual(self._bucket(64, [10, 500, 33]), 512)
+        self.assertEqual(self._bucket(64, [10, 513, 33]), 1024)
 
-    def test_empty_floors_at_one_page(self):
-        self.assertEqual(self._bucket(64, []), 64)
+    def test_empty_floors_at_one_stride(self):
+        self.assertEqual(self._bucket(64, []), 512)
 
 
 class TestEncoderOnlyMaskShape(CustomTestCase):

@@ -152,9 +152,13 @@ class TestDFlashAttentionLayerParity(unittest.TestCase):
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens=torch.tensor([block_size], dtype=torch.int32, device=dev),
             spec_info=None,
-            # The DFlash draft block forward passes input_embeds; setting it makes
-            # the backend prepare the ENCODER_ONLY mask bucket host-side.
+            # The DFlash draft block forward passes input_embeds AND
+            # spec_algorithm=DFLASH; both make the backend prepare the
+            # ENCODER_ONLY mask bucket host-side (and only for the draft path).
             input_embeds=torch.zeros(1),
+            spec_algorithm=__import__(
+                "sglang.srt.speculative.spec_info", fromlist=["SpeculativeAlgorithm"]
+            ).SpeculativeAlgorithm.DFLASH,
             seq_lens_cpu=torch.tensor([kv_len], dtype=torch.int32),
             token_to_kv_pool=types.SimpleNamespace(
                 get_fused_kv_buffer=lambda layer_id: kv_fused
@@ -252,7 +256,7 @@ class TestDFlashAttentionLayerParityTP2Shard(TestDFlashAttentionLayerParity):
     collective already exercised by the working EAGLE3-TPU TP server path; a
     *standalone* 2-rank launch wedges this torch_tpu stack (see
     run_dflash_tp2_layer_parity.py), so the full multi-rank collective is
-    validated end-to-end via the server (task16), not in-process here.
+    validated end-to-end via the server, not in-process here.
     """
 
     NUM_Q_HEADS = 2

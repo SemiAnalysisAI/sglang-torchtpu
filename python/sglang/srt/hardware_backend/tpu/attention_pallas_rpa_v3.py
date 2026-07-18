@@ -76,6 +76,14 @@ class PallasForwardMetadata:
 
 _PALLAS_RPA_OP = None
 
+# Coarse round-up stride for the DFlash ENCODER_ONLY draft custom_mask length.
+# The mask shape is a compile key for the Pallas op, so a per-page (64) bucket
+# recompiles the draft every 64 tokens of context growth. Coarsening to 512
+# bounds recompiles to once per 512 tokens (a bounded-length decode stays in one
+# bucket) while keeping the head_dim-expanded mask memory-safe for typical
+# contexts. Must be a multiple of page_size.
+_ENCODER_ONLY_MASK_BUCKET_STRIDE = 512
+
 
 def _quantize_kv_to_fp8(
     t: torch.Tensor, scale: float, fp8_dtype: torch.dtype
@@ -487,7 +495,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
 
         encoder_only_kv_len_bucket = (
             self._compute_encoder_only_kv_len_bucket(seq_lens)
-            if getattr(forward_batch, "input_embeds", None) is not None
+            if self._is_dflash_draft_forward(forward_batch)
             else None
         )
 
@@ -591,7 +599,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # there so the target/EAGLE3/non-spec paths keep their sync-free build.
         encoder_only_kv_len_bucket = (
             self._compute_encoder_only_kv_len_bucket(kv_lens)
-            if getattr(forward_batch, "input_embeds", None) is not None
+            if self._is_dflash_draft_forward(forward_batch)
             else None
         )
 
@@ -746,15 +754,36 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         out = out.reshape(num_tokens, layer.tp_q_head_num, -1)[..., : layer.v_head_dim]
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
+    @staticmethod
+    def _is_dflash_draft_forward(forward_batch) -> bool:
+        """True only for the DFlash draft block forward — the sole ENCODER_ONLY
+        forward on TPU. It uniquely carries BOTH ``input_embeds`` and
+        ``spec_algorithm == DFLASH``; gating the (D2H) mask-bucket prep on this
+        keeps causal multimodal forwards (which also pass ``input_embeds``) and
+        the target/EAGLE3/non-spec paths sync-free."""
+        if getattr(forward_batch, "input_embeds", None) is None:
+            return False
+        sa = getattr(forward_batch, "spec_algorithm", None)
+        return sa is not None and sa.is_dflash()
+
     def _compute_encoder_only_kv_len_bucket(self, kv_lens: torch.Tensor) -> int:
-        """Page-aligned upper bound on ``max_i kv_len_i``. Called ONLY from the
-        eager metadata build (never the compiled forward), so the ``.item()``
-        D2H here is safe; it removes the data-dependent bucket from the compiled
-        region. ``round_up(max_kv, page_size)`` keeps the ENCODER_ONLY mask shape
-        stable within a page and memory proportional to the current context."""
+        """Coarse upper bound on ``max_i kv_len_i`` for the ENCODER_ONLY mask.
+
+        Called ONLY from the eager metadata build (never the compiled forward),
+        so the ``.item()`` D2H here is safe — it removes the data-dependent bucket
+        from the compiled region. Rounds up to ``_ENCODER_ONLY_MASK_BUCKET_STRIDE``
+        (a coarse multiple of ``page_size``) instead of a single page: the draft
+        custom_mask is a compile key for the Pallas op, so a finer bucket
+        recompiles the draft every page (64 tokens) as context grows. Coarsening
+        to 512 cuts that ~8x (recompile only every 512 tokens) — a bounded-length
+        decode then stays in one bucket and is recompilation-clean — while the
+        mask (kernel-expanded by head_dim) stays memory-bounded for typical
+        contexts (bs=16 @ ctx<512 ~ 42MB). The all-ones oversized-mask output is
+        numerically identical (the kernel reads only the exact cu_mask_lens
+        prefix), so AC-2 parity is unaffected."""
         max_kv = int(kv_lens.max().item()) if kv_lens.numel() else 0
-        page = self.page_size
-        return max(((max_kv + page - 1) // page) * page, page)
+        stride = max(self.page_size, _ENCODER_ONLY_MASK_BUCKET_STRIDE)
+        return max(((max_kv + stride - 1) // stride) * stride, stride)
 
     def _get_encoder_only_allow_mask(
         self, num_tokens: int, device: torch.device

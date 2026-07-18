@@ -12,7 +12,7 @@ torch_tpu stack -- the spawn children hang on the ``tpu_dist`` collective
 rendezvous and lock the chips until the processes are killed (consistent with
 the project's TP>1 wedge notes). SGLang's real server brings TP up correctly
 (the EAGLE3-TPU TP path works), so the authoritative multi-rank collective
-validation for DFlash is the end-to-end server run (task16), not this script.
+validation for DFlash is the end-to-end server run, not this script.
 This file is kept as a documented harness; it is guarded behind
 ``DFLASH_TP2_MANUAL=1`` so it cannot accidentally wedge the device, and the
 DFlash-specific TP=2 head-sharding correctness is covered safely in-process by
@@ -218,7 +218,7 @@ def main():
             "stack. Set DFLASH_TP2_MANUAL=1 to force (have a process-kill recovery "
             "plan). DFlash TP=2 head-sharding is covered safely by "
             "test_dflash_layer_attention.py::TestDFlashAttentionLayerParityTP2Shard; "
-            "the full multi-rank collective is validated by the e2e server (task16)."
+            "the full multi-rank collective is validated by the e2e server."
         )
         sys.exit(2)
 

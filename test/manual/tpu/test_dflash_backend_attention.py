@@ -117,9 +117,13 @@ class TestDflashBackendEncoderOnlyParity(unittest.TestCase):
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens=torch.tensor([block_size], dtype=torch.int32, device=dev),
             spec_info=None,
-            # The DFlash draft block forward passes input_embeds; setting it makes
-            # the backend prepare the ENCODER_ONLY mask bucket host-side.
+            # The DFlash draft block forward passes input_embeds AND
+            # spec_algorithm=DFLASH; both make the backend prepare the
+            # ENCODER_ONLY mask bucket host-side (and only for the draft path).
             input_embeds=torch.zeros(1),
+            spec_algorithm=__import__(
+                "sglang.srt.speculative.spec_info", fromlist=["SpeculativeAlgorithm"]
+            ).SpeculativeAlgorithm.DFLASH,
             seq_lens_cpu=torch.tensor([kv_len], dtype=torch.int32),
             token_to_kv_pool=types.SimpleNamespace(
                 get_fused_kv_buffer=lambda layer_id: kv_fused
