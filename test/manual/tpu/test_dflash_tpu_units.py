@@ -357,9 +357,10 @@ class TestDflashVerifyMaskPolicyAvoidsTriton(CustomTestCase):
         # Robust, deterministic (no subprocess, no framework backend init) proof
         # that DFlash's OWN source files add no Triton import: none of the
         # DFlash-owned modules may import Triton (or the flashinfer kv-indices
-        # kernel) at module scope. This is the DFlash-controllable half of AC-3;
-        # any Triton in sys.modules on the verify route comes from shared
-        # framework deps (torch itself, logits_processor, ...), not from DFlash.
+        # kernel) at module scope. This is the DFlash-controllable half of the
+        # no-Triton requirement; any Triton in sys.modules on the verify route
+        # comes from shared framework deps (torch itself, logits_processor, ...),
+        # not from DFlash.
         import ast
         import pathlib
 
@@ -405,13 +406,14 @@ class TestDflashVerifyMaskPolicyAvoidsTriton(CustomTestCase):
         # modules it already depends on. We assert that against a deterministic,
         # CPU-runnable baseline: `torch` + `sglang.srt.layers.logits_processor`.
         #
-        # Baseline choice rationale (robustness): logits_processor is a MODULE-SCOPE
-        # import of dflash_info (so it is guaranteed importable wherever dflash_info
-        # is), it is import-light (unlike eagle_info, whose import triggers TPU
-        # backend/port init and raises portpicker.NoFreePortFoundError in a
-        # constrained env), and it is the module that pulls the sole non-torch
-        # Triton module on the route (triton.tools.tensor_descriptor, via
-        # vocab_parallel_embedding -> quantization -> fp8_kernel).
+        # Baseline choice rationale (robustness): dflash_info imports
+        # logits_processor at module scope, so logits_processor is guaranteed
+        # importable wherever dflash_info is. It is also import-light (unlike
+        # eagle_info, whose import triggers TPU backend/port init and raises
+        # portpicker.NoFreePortFoundError in a constrained env), and it is the
+        # module that pulls the sole non-torch Triton module on the route
+        # (triton.tools.tensor_descriptor, via vocab_parallel_embedding ->
+        # quantization -> fp8_kernel).
         import json
         import subprocess
         import sys
