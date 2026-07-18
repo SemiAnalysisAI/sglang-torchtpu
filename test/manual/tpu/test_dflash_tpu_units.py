@@ -843,6 +843,69 @@ class TestDflashStreamParityVerdict(CustomTestCase):
         self.assertEqual(v["first_divergence"], 0)
 
 
+class TestDflashDivergenceClassifier(CustomTestCase):
+    """The bf16 tie-break tolerance policy (`dflash_greedy_parity.classify_divergence`
+    and `_tolerated_divergence`): a greedy divergence is an accepted numerical
+    tie-break ONLY when DFlash emitted the target's rank-1 runner-up AND the
+    target top-2 logit margin is within the bf16 forward-noise scale. Anything
+    else (lower rank, absent token, or too-large margin) is a real MISMATCH.
+    """
+
+    def _mod(self):
+        import importlib.util
+        import pathlib
+
+        p = pathlib.Path(__file__).parent / "dflash_greedy_parity.py"
+        spec = importlib.util.spec_from_file_location("dflash_greedy_parity", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_runner_up_swap_within_noise_is_tie(self):
+        # Observed live case: target top-1=706(-0.670), top-2=374(-0.795),
+        # margin=0.125 <= ~0.18; DFlash emitted 374 (the runner-up).
+        m = self._mod()
+        d = m.classify_divergence([[706, -0.66965], [374, -0.79465]], 26, 374)
+        self.assertEqual(d["verdict"], "bf16-tie")
+        self.assertEqual(d["dflash_rank_in_nospec_topk"], 1)
+        self.assertAlmostEqual(d["top2_margin"], 0.125, places=5)
+
+    def test_large_margin_runner_up_is_mismatch(self):
+        # DFlash emitted the runner-up but the target is not close -> a degraded
+        # verify forward, NOT a tie-break.
+        m = self._mod()
+        d = m.classify_divergence([[706, -0.10], [374, -1.60]], 26, 374)
+        self.assertEqual(d["verdict"], "MISMATCH")
+
+    def test_lower_rank_token_is_mismatch(self):
+        # DFlash emitted the target's rank-2 token -> real mismatch.
+        m = self._mod()
+        d = m.classify_divergence([[706, -0.10], [374, -0.15], [999, -0.20]], 5, 999)
+        self.assertEqual(d["dflash_rank_in_nospec_topk"], 2)
+        self.assertEqual(d["verdict"], "MISMATCH")
+
+    def test_token_absent_from_topk_is_mismatch(self):
+        m = self._mod()
+        d = m.classify_divergence([[706, -0.10], [374, -0.15]], 5, 12345)
+        self.assertIsNone(d["dflash_rank_in_nospec_topk"])
+        self.assertEqual(d["verdict"], "MISMATCH")
+
+    def test_tolerated_divergence_manifest_gating(self):
+        m = self._mod()
+        manifest = {
+            "P": {"index": 26, "verdict": "bf16-tie", "top2_margin": 0.125},
+            "Q": {"index": 4, "verdict": "MISMATCH"},
+        }
+        # confirmed tie at the exact index -> tolerated
+        self.assertTrue(m._tolerated_divergence(manifest, "P", 26))
+        # right prompt, wrong index -> NOT tolerated
+        self.assertFalse(m._tolerated_divergence(manifest, "P", 25))
+        # non-tie verdict -> NOT tolerated
+        self.assertFalse(m._tolerated_divergence(manifest, "Q", 4))
+        # unknown prompt -> NOT tolerated
+        self.assertFalse(m._tolerated_divergence(manifest, "Z", 0))
+
+
 class TestDflashKvCellSizing(CustomTestCase):
     """The shared target+draft KV pool must be sized from the DRAFT config, not
     by assuming the draft's per-layer KV bytes equal the target's.
