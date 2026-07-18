@@ -721,7 +721,7 @@ def validate_dflash_request(req: Req) -> Optional[str]:
     ):
         # The DFlash block-verify path cannot apply these penalizers correctly, so
         # reject rather than silently produce a token stream that diverges from the
-        # non-speculative target (AC-1: explicit rejection, not silent change):
+        # non-speculative target (explicit rejection, not a silent semantics change):
         #   * multiplicative repetition_penalty is DROPPED entirely -- verify()
         #     runs SamplingBatchInfo.apply_logits_bias() on a zero tensor and adds
         #     the result back, but scaling penalties applied to zeros stay zero;
