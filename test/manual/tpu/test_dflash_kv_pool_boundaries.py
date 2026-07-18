@@ -47,7 +47,10 @@ class TestComputePagedKeepSlots(CustomTestCase):
     """The DFlash page-granular keep/free accounting math (``_compute_paged_keep_slots``).
 
     keep_slots = clamp(min(round_up(prefix+commit, page), prefix+block) - prefix,
-                       0, block). Prefixes are page-aligned in paged mode.
+                       0, block). Prefixes are arbitrary in steady state (seq_lens
+                       advances by the accepted commit length each step), so this
+                       is exercised for both page-aligned and non-page-aligned
+                       prefixes.
     """
 
     def _keep(self, prefix, commit, block):
@@ -175,6 +178,139 @@ class TestPagedAllocatorLeakReuse(CustomTestCase):
             alloc.free(loc[PAGE_SIZE:])
             alloc.free(loc[:PAGE_SIZE])
         self.assertEqual(alloc.available_size(), base)
+
+
+def _build_paged_extend(alloc, prefix_len, block, page=PAGE_SIZE):
+    """Model DFlash's paged-extend ``out_cache_loc`` layout using ONLY plain
+    (page-aligned) ``alloc`` calls -- no ``alloc_extend``/Triton.
+
+    In paged mode a request's committed prefix occupies ``ceil(prefix/page)``
+    pages; the last page is partial when ``prefix % page != 0``. A draft block of
+    ``block`` new tokens is laid out as:
+      1. the unused suffix ("tail") of that partial prefix page -- reused in place,
+         NOT newly allocated, because the page is already owned by the request;
+      2. newly allocated full pages for the remaining ``block - len(tail)`` tokens.
+    ``out_cache_loc = concat(tail, new_page_slots)[:block]``.
+
+    Returns ``(out_cache_loc, all_alloc, prefix_slots)`` where ``all_alloc`` is
+    every slot the request holds (prefix pages + new pages).
+    """
+    prefix_pages = (prefix_len + page - 1) // page
+    prefix_slots = alloc.alloc(prefix_pages * page)
+    assert prefix_slots is not None
+    tail = prefix_slots[prefix_len:]  # unused suffix of the last (partial) prefix page
+    remaining = block - int(tail.numel())
+    if remaining > 0:
+        new_pages = (remaining + page - 1) // page
+        new_slots = alloc.alloc(new_pages * page)
+        assert new_slots is not None
+    else:
+        new_slots = prefix_slots.new_empty((0,))
+    out_cache_loc = torch.cat([tail, new_slots])[:block]
+    all_alloc = torch.cat([prefix_slots, new_slots])
+    return out_cache_loc, all_alloc, prefix_slots
+
+
+class TestPagedExtendNonAlignedPrefix(CustomTestCase):
+    """Real-allocator leak/reuse for the STEADY-STATE DFlash path, where the
+    committed prefix (``batch.seq_lens``) is arbitrary -- usually NOT page-aligned.
+
+    Models the true paged-extend layout (partial-prefix-page tail + new full
+    pages), frees the rejected tail exactly as ``dflash_info.verify`` does
+    (``out_cache_loc[keep_slots:]`` with page-granular reclamation), and checks
+    the page-boundary lengths {63,64,65,127,128,129} the plan calls for.
+    """
+
+    NUM_PAGES = 64
+
+    def _run_case(self, prefix, commit, block):
+        page = PAGE_SIZE
+        alloc = _make_allocator(num_pages=self.NUM_PAGES)
+        base = alloc.available_size()
+
+        out_cache_loc, all_alloc, prefix_slots = _build_paged_extend(
+            alloc, prefix, block
+        )
+        self.assertEqual(out_cache_loc.numel(), block)
+
+        keep = int(
+            _compute_paged_keep_slots(
+                prefix_lens=torch.tensor([prefix], dtype=torch.int32),
+                commit_lens=torch.tensor([commit], dtype=torch.int32),
+                draft_token_num=block,
+                page_size=page,
+            )[0].item()
+        )
+
+        # Invariant: the partial prefix page's tail slots are always kept (freeing
+        # them would corrupt the still-resident prefix).
+        tail_len = ((prefix + page - 1) // page) * page - prefix
+        self.assertGreaterEqual(
+            keep, tail_len, f"would free the partial prefix page (p={prefix},c={commit})"
+        )
+
+        to_free = out_cache_loc[keep:]
+        prefix_pages = set((prefix_slots // page).tolist())
+        freed_pages = (
+            set((to_free // page).unique().tolist()) if to_free.numel() else set()
+        )
+        # Never free a page that holds prefix data.
+        self.assertTrue(
+            freed_pages.isdisjoint(prefix_pages),
+            f"freed a prefix page (p={prefix}, c={commit})",
+        )
+
+        alloc.free(to_free)
+
+        # Exact page accounting: resident pages == ceil((prefix+commit)/page)
+        # clamped by the allocated draft window ceil((prefix+block)/page).
+        expected_resident = min(
+            -(-(prefix + commit) // page), -(-(prefix + block) // page)
+        )
+        self.assertEqual(
+            alloc.available_size(),
+            base - expected_resident * page,
+            f"page leak/over-free (p={prefix}, c={commit})",
+        )
+
+        # Slots the request still holds (prefix + kept draft), = non-freed pages.
+        page_of = all_alloc // page
+        if freed_pages:
+            freed_t = torch.tensor(sorted(freed_pages), dtype=all_alloc.dtype)
+            outstanding = all_alloc[~torch.isin(page_of, freed_t)]
+        else:
+            outstanding = all_alloc
+
+        # Reuse: reallocating the freed capacity must hand back exactly the freed
+        # pages (need_sort=False prepends them), unique, page-0-reserved, and
+        # never colliding with a still-outstanding prefix/kept slot.
+        freed_capacity = len(freed_pages) * page
+        if freed_capacity > 0:
+            reused = alloc.alloc(freed_capacity)
+            self.assertIsNotNone(reused)
+            self.assertEqual(len(torch.unique(reused)), reused.numel())
+            self.assertTrue(torch.all(reused >= 1))  # page 0 reserved for padding
+            self.assertEqual(
+                set((reused // page).tolist()),
+                freed_pages,
+                "reuse handed back pages other than the freed ones",
+            )
+            self.assertFalse(
+                bool(torch.isin(reused, outstanding).any()),
+                f"reused a still-outstanding slot (p={prefix}, c={commit})",
+            )
+            alloc.free(reused)
+
+        # Free everything the request holds -> full reclamation, no leak.
+        alloc.free(outstanding)
+        self.assertEqual(alloc.available_size(), base)
+
+    def test_page_boundary_prefixes_reject_partial_full(self):
+        block = 2 * PAGE_SIZE  # 128: makes commit==65 a valid past-page-edge case
+        for prefix in [63, 64, 65, 127, 128, 129]:
+            for commit in [0, 1, 64, 65, block]:
+                with self.subTest(prefix=prefix, commit=commit):
+                    self._run_case(prefix, commit, block)
 
 
 if __name__ == "__main__":
