@@ -527,15 +527,17 @@ class TestDflashVerifyMetadataAvoidsTriton(CustomTestCase):
         self.spec_info = types.SimpleNamespace(draft_token_num=self.DRAFT)
 
     def test_target_verify_metadata_equivalent_and_triton_free(self):
-        import sglang.srt.speculative.dflash_info as di
+        import sglang.srt.layers.attention.utils as attn_utils
         from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
         def _boom(*a, **k):  # pragma: no cover - must never run
             raise AssertionError("flashinfer/Triton verify metadata path reached")
 
-        saved_kernel = di.create_flashinfer_kv_indices_triton
+        # dflash_info imports the Triton kv-indices kernel lazily now, so patch it
+        # at its source module; also patch the sole DFlash caller.
+        saved_kernel = attn_utils.create_flashinfer_kv_indices_triton
         saved_gen = DFlashVerifyInput.generate_attn_arg_prefill
-        di.create_flashinfer_kv_indices_triton = _boom
+        attn_utils.create_flashinfer_kv_indices_triton = _boom
         DFlashVerifyInput.generate_attn_arg_prefill = _boom
         try:
             fb = _make_forward_batch(
@@ -553,7 +555,7 @@ class TestDflashVerifyMetadataAvoidsTriton(CustomTestCase):
             )
             meta_ref = _build_meta(self.backend, fb_ref)
         finally:
-            di.create_flashinfer_kv_indices_triton = saved_kernel
+            attn_utils.create_flashinfer_kv_indices_triton = saved_kernel
             DFlashVerifyInput.generate_attn_arg_prefill = saved_gen
 
         # kv_lens = seq_lens + draft_token_num (draft tokens already in cache).

@@ -332,6 +332,31 @@ class TestDflashVerifyMaskPolicyAvoidsTriton(CustomTestCase):
         )
         self.assertTrue(build_custom_mask)
 
+    def test_dflash_info_does_not_import_triton_kv_indices_at_module_scope(self):
+        # AC-3 (import level, DFlash-owned): the Triton kv-indices kernel must NOT
+        # be imported at dflash_info module scope (that eagerly loads Triton). It
+        # is imported lazily inside generate_attn_arg_prefill, which the TPU
+        # RPA-v3 verify path never calls. (Note: base SGLang modules such as
+        # sglang.srt.utils import Triton framework-wide on this stack -- that is
+        # out of DFlash scope and affects EAGLE3 equally; this guard covers the
+        # DFlash-specific import only.)
+        import inspect
+
+        import sglang.srt.speculative.dflash_info as di
+
+        self.assertNotIn(
+            "create_flashinfer_kv_indices_triton",
+            vars(di),
+            "dflash_info must not import create_flashinfer_kv_indices_triton at "
+            "module scope (import it lazily inside generate_attn_arg_prefill).",
+        )
+        # ...and it is imported lazily inside the only method that uses it.
+        gen_src = inspect.getsource(di.DFlashVerifyInput.generate_attn_arg_prefill)
+        self.assertIn(
+            "from sglang.srt.layers.attention.utils import", gen_src
+        )
+        self.assertIn("create_flashinfer_kv_indices_triton[", gen_src)
+
     def test_triton_kv_indices_only_reachable_via_generate_attn_arg_prefill(self):
         # The Triton kernel is only invoked from generate_attn_arg_prefill, so
         # skipping custom mask + using RPA-v3 metadata provably avoids it.

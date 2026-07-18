@@ -5,7 +5,11 @@ from typing import List, Tuple
 
 import torch
 
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+# NOTE: `create_flashinfer_kv_indices_triton` is imported lazily inside
+# `generate_attn_arg_prefill` (the only use) rather than at module scope, because
+# that import eagerly loads Triton. The TPU DFlash verify path routes through the
+# RPA-v3 backend's own metadata builder and never calls `generate_attn_arg_prefill`,
+# so keeping the import lazy leaves the TPU verify route Triton-import-free (AC-3).
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -258,6 +262,13 @@ class DFlashVerifyInput(SpecInput):
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
     ):
+        # Lazy import: this is the only Triton use in DFlash verify, and it is
+        # only reached by flashinfer-family backends (never on the TPU RPA-v3
+        # path). Importing at module scope would eagerly load Triton on TPU.
+        from sglang.srt.layers.attention.utils import (
+            create_flashinfer_kv_indices_triton,
+        )
+
         device = req_pool_indices.device
         bs = len(req_pool_indices)
 
