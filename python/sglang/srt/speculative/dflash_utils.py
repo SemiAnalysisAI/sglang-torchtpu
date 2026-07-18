@@ -737,6 +737,22 @@ def validate_dflash_request(req: Req) -> Optional[str]:
             "DFLASH on GPU."
         )
 
+    if _IS_TPU and req.sampling_params.min_new_tokens > 0:
+        # min_new_tokens is enforced by BatchedMinNewTokensPenalizer through the
+        # same penalizer_orchestrator path: it masks stop/EOS tokens with -inf
+        # while len_output_tokens < min_new_tokens. The block-verify path applies
+        # that mask once (pre-block state) and broadcasts it to every verify
+        # position, so it keeps suppressing EOS/stop at positions the sequential
+        # target would allow once the request crosses min_new_tokens within the
+        # block -- diverging from the non-speculative stream. Reject explicitly
+        # (per-position penalizer advancement is out of greedy-bring-up scope).
+        return (
+            "DFLASH on TPU currently supports greedy decoding without "
+            "min_new_tokens (the block-verify path cannot advance the EOS/stop "
+            "suppression per within-block position). Set min_new_tokens 0, or "
+            "run DFLASH on GPU."
+        )
+
     if (
         req.sampling_params.json_schema is not None
         or req.sampling_params.regex is not None

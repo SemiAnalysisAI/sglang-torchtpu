@@ -85,6 +85,7 @@ def _make_req(
     repetition_penalty: float = 1.0,
     frequency_penalty: float = 0.0,
     presence_penalty: float = 0.0,
+    min_new_tokens: int = 0,
 ):
     """Minimal Req stand-in exposing only the fields validate_dflash_request reads."""
     sampling_params = types.SimpleNamespace(
@@ -96,6 +97,7 @@ def _make_req(
         repetition_penalty=repetition_penalty,
         frequency_penalty=frequency_penalty,
         presence_penalty=presence_penalty,
+        min_new_tokens=min_new_tokens,
     )
     return types.SimpleNamespace(
         return_logprob=return_logprob,
@@ -150,8 +152,17 @@ class TestValidateDflashRequestTPUGreedyOnly(CustomTestCase):
         self.assertIsInstance(err, str)
         self.assertIn("penalt", err.lower())
 
+    def test_greedy_with_min_new_tokens_rejected(self):
+        # min_new_tokens is enforced by BatchedMinNewTokensPenalizer (masks EOS
+        # while output_len < min_new_tokens) through the same broadcast-once block
+        # path, so it must be rejected on TPU.
+        err = validate_dflash_request(_make_req(top_k=1, min_new_tokens=8))
+        self.assertIsInstance(err, str)
+        self.assertIn("min_new_tokens", err)
+
     def test_plain_greedy_without_penalties_admitted(self):
-        # Defaults (repetition 1.0, frequency/presence 0.0) stay admitted.
+        # Defaults (repetition 1.0, frequency/presence 0.0, min_new_tokens 0) stay
+        # admitted.
         self.assertIsNone(validate_dflash_request(_make_req(top_k=1)))
 
 
@@ -171,6 +182,12 @@ class TestValidateDflashRequestNonTPU(CustomTestCase):
         # The penalizer reject is TPU-scoped (matches the greedy-only reject).
         self.assertIsNone(
             validate_dflash_request(_make_req(top_k=1, repetition_penalty=1.3))
+        )
+
+    def test_non_tpu_admits_min_new_tokens(self):
+        # min_new_tokens reject is also TPU-scoped.
+        self.assertIsNone(
+            validate_dflash_request(_make_req(top_k=1, min_new_tokens=8))
         )
 
 
