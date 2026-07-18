@@ -98,6 +98,33 @@ def scale_kv_cell_size_per_token_for_dflash(
     ) // int(target_num_layers)
 
 
+def compute_dflash_draft_cell_size_per_token(
+    draft_model_config: Any,
+    draft_num_layers: Optional[int],
+    kv_cache_dtype: Any,
+    attention_tp_size: int,
+) -> Optional[int]:
+    """Per-token KV cache cell size (bytes) for the DFlash draft model.
+
+    Mirrors ``TokenToKVPoolConfigurator._compute_cell_size`` (non-MLA branch) but
+    for the draft config, so the shared target+draft pool is sized from the
+    draft's real KV dims/dtype rather than assuming draft==target per-layer.
+
+    Import-light on purpose (no ``model_runner`` import) so it stays CPU-testable.
+    Returns ``None`` for a missing config/layer count or an MLA draft (the caller
+    then falls back to layer-count scaling).
+    """
+    if draft_model_config is None or draft_num_layers is None:
+        return None
+    if getattr(draft_model_config, "use_mla_backend", False):
+        return None
+    kv_size = torch._utils._element_size(kv_cache_dtype)
+    kv_heads = draft_model_config.get_num_kv_heads(attention_tp_size)
+    head_dim = int(draft_model_config.head_dim)
+    v_head_dim = int(getattr(draft_model_config, "v_head_dim", head_dim))
+    return int(kv_heads * (head_dim + v_head_dim) * int(draft_num_layers) * kv_size)
+
+
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
     backend = attn_backend
     for _ in range(4):

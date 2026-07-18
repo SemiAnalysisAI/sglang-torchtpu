@@ -2205,22 +2205,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         the KV pool is built. Non-MLA only (DFlash drafts are dense decoders);
         leaves the value None (layer-count fallback) for MLA drafts.
         """
-        draft_cfg = self._dflash_draft_model_config
-        if draft_cfg is None or self.dflash_draft_num_layers is None:
-            return
-        if getattr(draft_cfg, "use_mla_backend", False):
+        if self._dflash_draft_model_config is None:
             return
         from sglang.srt.layers.dp_attention import get_attention_tp_size
+        from sglang.srt.speculative.dflash_utils import (
+            compute_dflash_draft_cell_size_per_token,
+        )
 
-        kv_elt = torch._utils._element_size(self.kv_cache_dtype)
-        draft_kv_heads = draft_cfg.get_num_kv_heads(get_attention_tp_size())
-        head_dim = int(draft_cfg.head_dim)
-        v_head_dim = int(getattr(draft_cfg, "v_head_dim", head_dim))
-        self.dflash_draft_cell_size_per_token = int(
-            draft_kv_heads
-            * (head_dim + v_head_dim)
-            * int(self.dflash_draft_num_layers)
-            * kv_elt
+        self.dflash_draft_cell_size_per_token = (
+            compute_dflash_draft_cell_size_per_token(
+                self._dflash_draft_model_config,
+                self.dflash_draft_num_layers,
+                self.kv_cache_dtype,
+                get_attention_tp_size(),
+            )
         )
 
     def configure_kv_cache_dtype(self):

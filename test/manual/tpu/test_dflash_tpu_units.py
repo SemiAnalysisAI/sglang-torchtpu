@@ -187,16 +187,13 @@ class TestDflashKvCellSizing(CustomTestCase):
         self.assertGreater(exact_wide, layer_count)
 
 
-class TestDflashDraftCellSizeIntegration(CustomTestCase):
-    """Integration-level guard for ModelRunner._compute_dflash_draft_cell_size:
-    it must produce a real (non-None) draft KV cell size for a mismatched draft,
-    and it must run only after the KV cache dtype is resolved. This is what the
-    pure-function tests above did NOT catch: an earlier version ran before
-    configure_kv_cache_dtype() and silently fell back to None.
+class TestDflashDraftCellSize(CustomTestCase):
+    """The draft KV cell size is derived from the DRAFT config (import-light
+    helper, no model_runner import) and needs the resolved KV cache dtype.
     """
 
     @staticmethod
-    def _fake_draft_cfg(kv_heads, head_dim, v_head_dim=None, mla=False):
+    def _draft_cfg(kv_heads, head_dim, v_head_dim=None, mla=False):
         return types.SimpleNamespace(
             use_mla_backend=mla,
             head_dim=head_dim,
@@ -204,58 +201,99 @@ class TestDflashDraftCellSizeIntegration(CustomTestCase):
             get_num_kv_heads=lambda tp, _n=kv_heads: _n,
         )
 
-    def _fake_runner(self, draft_cfg, kv_cache_dtype, num_layers=5):
-        return types.SimpleNamespace(
-            _dflash_draft_model_config=draft_cfg,
-            dflash_draft_num_layers=num_layers,
-            kv_cache_dtype=kv_cache_dtype,
-            dflash_draft_cell_size_per_token=None,
+    def test_computes_exact_bytes(self):
+        import torch
+
+        from sglang.srt.speculative.dflash_utils import (
+            compute_dflash_draft_cell_size_per_token,
         )
 
-    def test_computes_real_value_after_dtype_set(self):
+        got = compute_dflash_draft_cell_size_per_token(
+            self._draft_cfg(kv_heads=8, head_dim=128), 5, torch.bfloat16, 1
+        )
+        self.assertEqual(got, 8 * (128 + 128) * 5 * 2)  # bf16 = 2 bytes
+
+    def test_requires_resolved_kv_dtype(self):
+        # The Round-5 bug ran this before configure_kv_cache_dtype() with an
+        # unset dtype; the helper must fail loudly, not silently return a wrong
+        # value (guarding the init-order fix in ModelRunner).
+        from sglang.srt.speculative.dflash_utils import (
+            compute_dflash_draft_cell_size_per_token,
+        )
+
+        with self.assertRaises(Exception):
+            compute_dflash_draft_cell_size_per_token(
+                self._draft_cfg(kv_heads=8, head_dim=128), 5, None, 1
+            )
+
+    def test_mla_and_missing_return_none(self):
+        import torch
+
+        from sglang.srt.speculative.dflash_utils import (
+            compute_dflash_draft_cell_size_per_token,
+        )
+
+        self.assertIsNone(
+            compute_dflash_draft_cell_size_per_token(
+                self._draft_cfg(kv_heads=8, head_dim=128, mla=True),
+                5,
+                torch.bfloat16,
+                1,
+            )
+        )
+        self.assertIsNone(
+            compute_dflash_draft_cell_size_per_token(None, 5, torch.bfloat16, 1)
+        )
+        self.assertIsNone(
+            compute_dflash_draft_cell_size_per_token(
+                self._draft_cfg(kv_heads=8, head_dim=128), None, torch.bfloat16, 1
+            )
+        )
+
+    def test_pool_configurator_passes_draft_cell_size_through(self):
+        # Prove DefaultPoolConfigurator forwards mr.dflash_draft_cell_size_per_token
+        # into scale_kv_cell_size_per_token_for_dflash (not just that the scale
+        # function sums correctly). Import-light: pool_configurator does not pull
+        # in model_runner.
         import torch
         from unittest import mock
 
-        from sglang.srt.model_executor.model_runner import ModelRunner
+        import sglang.srt.model_executor.pool_configurator as pc
 
-        runner = self._fake_runner(
-            self._fake_draft_cfg(kv_heads=8, head_dim=128), torch.bfloat16
+        fake_model_config = types.SimpleNamespace(
+            get_num_kv_heads=lambda tp: 8,
+            head_dim=128,
+            v_head_dim=128,
+            hf_config=types.SimpleNamespace(architectures=["LlamaForCausalLM"]),
         )
-        with mock.patch(
-            "sglang.srt.layers.dp_attention.get_attention_tp_size", return_value=1
+        fake_mr = types.SimpleNamespace(
+            mambaish_config=None,
+            num_effective_layers=32,
+            model_config=fake_model_config,
+            kv_cache_dtype=torch.bfloat16,
+            use_mla_backend=False,
+            spec_algorithm=types.SimpleNamespace(is_dflash=lambda: True),
+            is_draft_worker=False,
+            dflash_draft_num_layers=5,
+            dflash_draft_cell_size_per_token=999,
+        )
+        captured = {}
+
+        def _spy(**kwargs):
+            captured.update(kwargs)
+            return kwargs["target_cell_size_per_token"] + (
+                kwargs.get("draft_cell_size_per_token") or 0
+            )
+
+        with mock.patch.object(
+            pc, "get_attention_tp_size", return_value=1
+        ), mock.patch(
+            "sglang.srt.speculative.dflash_utils.scale_kv_cell_size_per_token_for_dflash",
+            side_effect=_spy,
         ):
-            ModelRunner._compute_dflash_draft_cell_size(runner)
-        # 8 kv heads * (128 + 128) * 5 layers * 2 bytes (bf16).
-        self.assertEqual(
-            runner.dflash_draft_cell_size_per_token, 8 * (128 + 128) * 5 * 2
-        )
+            pc.DefaultPoolConfigurator(fake_mr)
 
-    def test_bug_regression_requires_dtype_resolved(self):
-        # Running before configure_kv_cache_dtype() (kv_cache_dtype unset) must
-        # fail loudly rather than silently fall back to None -- guarding the
-        # init-order fix.
-        from unittest import mock
-
-        from sglang.srt.model_executor.model_runner import ModelRunner
-
-        runner = self._fake_runner(
-            self._fake_draft_cfg(kv_heads=8, head_dim=128), kv_cache_dtype=None
-        )
-        with mock.patch(
-            "sglang.srt.layers.dp_attention.get_attention_tp_size", return_value=1
-        ):
-            with self.assertRaises(Exception):
-                ModelRunner._compute_dflash_draft_cell_size(runner)
-
-    def test_mla_draft_left_none(self):
-        from sglang.srt.model_executor.model_runner import ModelRunner
-
-        runner = self._fake_runner(
-            self._fake_draft_cfg(kv_heads=8, head_dim=128, mla=True),
-            kv_cache_dtype=None,
-        )
-        ModelRunner._compute_dflash_draft_cell_size(runner)
-        self.assertIsNone(runner.dflash_draft_cell_size_per_token)
+        self.assertEqual(captured.get("draft_cell_size_per_token"), 999)
 
 
 class TestDflashVerifyMaskPolicyAvoidsTriton(CustomTestCase):

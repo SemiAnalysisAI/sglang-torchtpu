@@ -181,7 +181,7 @@ class TestDflashBackendEncoderOnlyParity(unittest.TestCase):
                 )
 
     def test_rpa_v3_forward_never_calls_triton_kv_indices(self):
-        """Dynamic AC-3 guard: run a real RPA-v3 backend forward with the
+        """Dynamic guard: run a real RPA-v3 backend forward with the
         flashinfer Triton kv-indices kernel monkeypatched to raise. Since RPA-v3
         builds its own metadata (never DFlashVerifyInput.generate_attn_arg_prefill,
         the sole caller of the kernel), the forward must complete untouched.

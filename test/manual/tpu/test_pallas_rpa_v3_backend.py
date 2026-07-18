@@ -502,5 +502,75 @@ class TestEncoderOnlyAllowMaskBucketing(CustomTestCase):
         self.assertGreaterEqual(mask.numel(), num_tokens * max_kv)
 
 
+class TestDflashVerifyMetadataAvoidsTriton(CustomTestCase):
+    """DFlash TARGET_VERIFY on RPA-v3 builds correct verify metadata WITHOUT
+    reaching the flashinfer/Triton kv-indices path. Monkeypatches both
+    DFlashVerifyInput.generate_attn_arg_prefill and
+    create_flashinfer_kv_indices_triton to raise, drives the RPA-v3 metadata
+    builder for ForwardMode.TARGET_VERIFY, and compares kv_lens/cu_q_lens/
+    cu_kv_lens/page_indices to a CPU reference. CPU-runnable (no op).
+    """
+
+    PAGE_SIZE = 16
+    PAGES_PER_SEQ = 4
+    MAX_CONTEXT_LEN = PAGE_SIZE * PAGES_PER_SEQ  # 64
+    DRAFT = 4
+
+    def setUp(self):
+        self.bs = 3
+        self.req_to_token = _build_req_to_token(
+            num_reqs=8, max_context_len=self.MAX_CONTEXT_LEN
+        )
+        self.backend = _BackendUnderTest(self.PAGE_SIZE, self.req_to_token)
+        self.req_pool_indices = torch.tensor([5, 2, 7], dtype=torch.int64)
+        self.seq_lens = torch.tensor([10, 24, 33], dtype=torch.int32)
+        self.spec_info = types.SimpleNamespace(draft_token_num=self.DRAFT)
+
+    def test_target_verify_metadata_equivalent_and_triton_free(self):
+        import sglang.srt.speculative.dflash_info as di
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        def _boom(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("flashinfer/Triton verify metadata path reached")
+
+        saved_kernel = di.create_flashinfer_kv_indices_triton
+        saved_gen = DFlashVerifyInput.generate_attn_arg_prefill
+        di.create_flashinfer_kv_indices_triton = _boom
+        DFlashVerifyInput.generate_attn_arg_prefill = _boom
+        try:
+            fb = _make_forward_batch(
+                seq_lens=self.seq_lens,
+                req_pool_indices=self.req_pool_indices,
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                spec_info=self.spec_info,
+            )
+            meta = _build_meta(self.backend, fb)
+            # Reference for the mode-independent page layout: a plain DECODE build.
+            fb_ref = _make_forward_batch(
+                seq_lens=self.seq_lens,
+                req_pool_indices=self.req_pool_indices,
+                forward_mode=ForwardMode.DECODE,
+            )
+            meta_ref = _build_meta(self.backend, fb_ref)
+        finally:
+            di.create_flashinfer_kv_indices_triton = saved_kernel
+            DFlashVerifyInput.generate_attn_arg_prefill = saved_gen
+
+        # kv_lens = seq_lens + draft_token_num (draft tokens already in cache).
+        self.assertTrue(
+            torch.equal(meta.kv_lens, (self.seq_lens + self.DRAFT).to(torch.int32))
+        )
+        # Each sequence verifies draft_token_num query tokens.
+        self.assertTrue(
+            torch.equal(
+                meta.cu_q_lens,
+                (torch.arange(self.bs + 1) * self.DRAFT).to(torch.int32),
+            )
+        )
+        # Page layout is mode-independent: matches the DECODE reference.
+        self.assertTrue(torch.equal(meta.page_indices, meta_ref.page_indices))
+        self.assertTrue(torch.equal(meta.cu_kv_lens, meta_ref.cu_kv_lens))
+
+
 if __name__ == "__main__":
     unittest.main()
