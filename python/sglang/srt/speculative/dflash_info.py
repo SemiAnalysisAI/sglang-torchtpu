@@ -29,6 +29,7 @@ from sglang.srt.speculative.dflash_utils import (
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
     dflash_num_correct_drafts,
+    dflash_tp_ranks_agree,
     is_dflash_sampling_verify_available,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -547,6 +548,38 @@ class DFlashVerifyInput(SpecInput):
         new_bonus_tokens = torch.tensor(
             new_bonus_tokens_list, dtype=torch.int64, device=device
         )
+
+        # AC-6 invariant: after the rank-0 broadcast of correct_len/bonus and the
+        # host rebuild of commit_lens/new_bonus_tokens, every TP rank must observe
+        # IDENTICAL accept state. Prove it (do not merely rely on the broadcast):
+        # all-gather the three vectors and raise on any per-rank divergence — a
+        # forked commit length would otherwise desync the collective streams and
+        # wedge the schedulers. Always enforced on TPU TP>1; the [3*bs] all-gather
+        # is negligible next to the model forward. Only the error detail (rare) is
+        # formatted on failure.
+        if _IS_TPU and device.type == "tpu":
+            _tp = get_tp_group()
+            if _tp.world_size > 1:
+                _local = torch.cat(
+                    [
+                        correct_len.to(torch.int64),
+                        commit_lens.to(torch.int64),
+                        new_bonus_tokens.to(torch.int64),
+                    ]
+                ).contiguous()
+                _gathered = torch.empty(
+                    _tp.world_size * _local.numel(), dtype=torch.int64, device=device
+                )
+                _tp.all_gather_into_tensor(_gathered, _local)
+                _agree, _bad = dflash_tp_ranks_agree(_gathered, _tp.world_size)
+                if not _agree:
+                    _g = _gathered.reshape(_tp.world_size, -1).cpu().tolist()
+                    raise RuntimeError(
+                        "DFLASH TP>1 verify invariant violated: post-broadcast "
+                        "accept state differs across ranks "
+                        "(layout = correct_len | commit_lens | new_bonus_tokens). "
+                        f"rank0={_g[0]} rank{_bad}={_g[_bad]}"
+                    )
 
         # Free uncommitted KV cache slots and compact out_cache_loc. int64
         # gather-coordinate hygiene lives in compact_verify_out_cache_loc.

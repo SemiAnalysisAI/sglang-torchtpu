@@ -965,6 +965,48 @@ class TestDflashDivergenceClassifier(CustomTestCase):
         self.assertFalse(m._tolerated_divergence({"P": entry}, "P", 26, 374, 706)[0])
 
 
+class TestDflashTpVerifyInvariant(CustomTestCase):
+    """AC-6 all-ranks-identical invariant helper (`dflash_tp_ranks_agree`): after
+    the rank-0 broadcast + host rebuild, an all-gathered per-rank vector
+    (correct_len | commit_lens | new_bonus_tokens) must be identical across TP
+    ranks. The helper is pure and CPU-testable; the live verify path all-gathers
+    and raises on any divergence flagged here.
+    """
+
+    def _fn(self):
+        from sglang.srt.speculative.dflash_utils import dflash_tp_ranks_agree
+
+        return dflash_tp_ranks_agree
+
+    def test_all_ranks_agree(self):
+        agree = self._fn()
+        local = torch.tensor([2, 1, 0, 5, 7], dtype=torch.int64)  # cl|commit|bonus
+        gathered = local.repeat(4)  # 4 identical ranks
+        self.assertEqual(agree(gathered, 4), (True, None))
+
+    def test_divergent_rank_is_flagged(self):
+        agree = self._fn()
+        local = torch.tensor([2, 1, 0, 5, 7], dtype=torch.int64)
+        diff = torch.tensor([2, 1, 0, 5, 8], dtype=torch.int64)  # bonus differs
+        gathered = torch.cat([local, local, diff, local])  # rank 2 diverges
+        ok, bad = agree(gathered, 4)
+        self.assertFalse(ok)
+        self.assertEqual(bad, 2)
+
+    def test_lowest_differing_rank_reported(self):
+        agree = self._fn()
+        local = torch.tensor([1, 1], dtype=torch.int64)
+        d = torch.tensor([1, 9], dtype=torch.int64)
+        gathered = torch.cat([local, d, d])  # ranks 1 and 2 differ; report 1
+        ok, bad = agree(gathered, 3)
+        self.assertFalse(ok)
+        self.assertEqual(bad, 1)
+
+    def test_world_size_one_trivially_agrees(self):
+        agree = self._fn()
+        self.assertEqual(agree(torch.tensor([1, 2, 3]), 1), (True, None))
+
+
 class TestDflashKvCellSizing(CustomTestCase):
     """The shared target+draft KV pool must be sized from the DRAFT config, not
     by assuming the draft's per-layer KV bytes equal the target's.

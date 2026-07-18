@@ -939,3 +939,29 @@ def validate_dflash_request(req: Req) -> Optional[str]:
         )
 
     return None
+
+
+def dflash_tp_ranks_agree(
+    gathered: torch.Tensor, world_size: int
+) -> Tuple[bool, Optional[int]]:
+    """Check that an all-gathered per-rank vector is identical across TP ranks.
+
+    ``gathered`` is the concatenation of each rank's local vector, shape
+    ``[world_size * n]`` (or ``[world_size, n]``). Returns ``(agree,
+    first_diff_rank)``: ``agree`` is True iff every rank's slice equals rank 0's;
+    otherwise ``first_diff_rank`` is the lowest rank index whose slice differs.
+
+    Pure / CPU-testable. Used by the DFlash verify TP>1 invariant (AC-6) to prove
+    all ranks observe identical post-broadcast accept state (``correct_len``,
+    rebuilt ``commit_lens``, ``new_bonus_tokens``) rather than relying on the
+    rank-0 broadcast implicitly.
+    """
+    if world_size <= 1:
+        return True, None
+    g = gathered.reshape(world_size, -1)
+    # per-rank "equals rank 0" flags; fast path is a single reduction/D2H.
+    eq = (g == g[0]).all(dim=1)
+    if bool(eq.all().item()):
+        return True, None
+    bad = int((~eq).nonzero(as_tuple=False)[0].item())  # lowest differing rank
+    return False, bad
