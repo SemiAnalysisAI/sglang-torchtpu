@@ -36,6 +36,10 @@ from sglang.srt.utils import is_cuda, is_tpu
 
 _IS_TPU = is_tpu()
 
+# Precompile the draft mask buckets only up to this context (covers typical
+# decodes). Precompiling every bucket up to a large context_len exhausts HBM.
+_DFLASH_PRECOMPILE_MAX_CONTEXT = 2048
+
 logger = logging.getLogger(__name__)
 
 _TPU_DFLASH_DRAFT_BACKENDS = ("pallas_tpu_rpa_v3",)
@@ -279,6 +283,10 @@ class DFlashWorker:
             logger.info(
                 "DFLASH fused KV materialization disabled: %s", _fused_kv_off_reason
             )
+
+        # Precompile the draft block forward across mask buckets so serving is
+        # recompilation-clean after startup (only when the draft compile is on).
+        self._precompile_draft_buckets()
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -584,6 +592,155 @@ class DFlashWorker:
             )
 
         return int(resolved_id)
+
+    def _precompile_draft_buckets(self) -> None:
+        """Warm the draft block forward for every (bs, mask-bucket) shape so that,
+        after startup, serving hits no first-touch draft/custom_mask compile.
+
+        The draft custom_mask length (num_tokens * encoder_only_kv_len_bucket) is a
+        Pallas compile key that steps once per bucket as context grows, so without
+        this a decode crossing a bucket boundary recompiles the draft. We drive the
+        REAL draft ``model_runner.forward`` (mirroring the draft-block construction
+        in ``_prepare_for_speculative_decoding``) with in-range synthetic prefix
+        state at each bucket, then restore allocator state. Best-effort: any error
+        is logged and skipped (serving falls back to lazy compile); only runs when
+        the draft compile is enabled.
+        """
+        if not (_IS_TPU and os.environ.get("SGLANG_DFLASH_COMPILE_DRAFT") == "1"):
+            return
+        try:
+            from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
+                _ENCODER_ONLY_MASK_BUCKET_STRIDE as _STRIDE,
+            )
+        except Exception:
+            return
+        stride = int(_STRIDE)
+        context_len = int(self.draft_model_runner.model_config.context_len)
+        # Precompile only the low mask buckets: each compiled draft graph + its
+        # (head_dim-expanded) coarse mask costs HBM, and precompiling every bucket
+        # up to a large context exhausts it (leaving too little for the serving KV
+        # / verify D2H). Cap at a moderate context that covers typical decodes;
+        # longer contexts warm lazily (a bounded documented compile budget).
+        precompile_max = min(context_len, _DFLASH_PRECOMPILE_MAX_CONTEXT)
+        # bs buckets serving will use (dedup + always cover bs=1).
+        bs_cfg = getattr(self.server_args, "tpu_compile_bs", None) or [1]
+        bs_buckets = sorted({int(b) for b in bs_cfg} | {1})
+        kv_buckets = list(range(stride, precompile_max + 1, stride))
+        t0 = time.perf_counter()
+        compiled = 0
+        for bs in bs_buckets:
+            for kv_bucket in kv_buckets:
+                prefix_len = max(kv_bucket - int(self.block_size), 0)
+                if prefix_len <= 0:
+                    continue
+                try:
+                    self._run_draft_block_forward_for_precompile(bs, prefix_len)
+                    compiled += 1
+                except Exception as e:  # best-effort: never break bring-up
+                    if self.tp_rank == 0:
+                        logger.warning(
+                            "DFLASH draft precompile skipped bs=%s prefix=%s: %s",
+                            bs,
+                            prefix_len,
+                            e,
+                        )
+                    break  # stop this bs on first failure
+        if self.tp_rank == 0:
+            logger.info(
+                "DFLASH draft precompile: %d shapes (bs=%s, %d mask buckets up to "
+                "context %d; buckets beyond warm lazily) in %.1fs",
+                compiled,
+                bs_buckets,
+                len(kv_buckets),
+                precompile_max,
+                time.perf_counter() - t0,
+            )
+
+    def _run_draft_block_forward_for_precompile(
+        self, bs: int, prefix_len: int
+    ) -> None:
+        """Run one draft block forward at a synthetic (bs, prefix_len) to warm its
+        compiled graph. Mirrors the compilable part of
+        ``_prepare_for_speculative_decoding`` (block ids -> input_embeds -> block
+        KV alloc -> draft forward) with in-range garbage prefix KV; outputs are
+        discarded and allocator state is restored."""
+        device = self.device
+        self._ensure_draft_block_buffers(bs)
+        target_model = self.target_worker.model_runner.model
+        embed_module = target_model.get_input_embeddings()
+
+        block_ids = self._draft_block_ids_buf[:bs]
+        block_ids.fill_(int(self._mask_token_id))  # col 0 (bonus) uses mask too (dummy)
+        noise_embedding = embed_module(block_ids)
+        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+
+        draft_prefix_lens = torch.full(
+            (bs,), int(prefix_len), dtype=torch.int32, device=device
+        )
+        positions_2d = self._draft_block_positions_buf[:bs]
+        torch.add(
+            draft_prefix_lens.unsqueeze(1), self._block_pos_offsets, out=positions_2d
+        )
+        positions = positions_2d.reshape(-1)
+
+        block_start = draft_prefix_lens
+        block_end = self._draft_block_end_buf[:bs]
+        torch.add(block_start, int(self.block_size), out=block_end)
+        seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
+        seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
+
+        req_pool_indices = torch.arange(bs, dtype=torch.int64, device=device)
+        req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
+        # Seed the prefix columns with an in-range KV slot (garbage contents, valid
+        # page) so the attention read never goes out of bounds. Transient: real
+        # requests overwrite these rows.
+        req_to_token[:bs, :prefix_len] = 1
+
+        allocator = self.draft_model_runner.token_to_kv_pool_allocator
+        backup = allocator.backup_state()
+        try:
+            block_end_cpu = seq_lens_cpu + int(self.block_size)
+            last_loc = get_last_loc(req_to_token, req_pool_indices, block_start)
+            block_cache_loc = allocator.alloc_extend(
+                block_start,
+                seq_lens_cpu,
+                block_end,
+                block_end_cpu,
+                last_loc,
+                bs * int(self.block_size),
+            )
+            if block_cache_loc is None:
+                raise RuntimeError("draft KV alloc returned None during precompile")
+            assign_req_to_token_pool_func(
+                req_pool_indices,
+                req_to_token,
+                block_start,
+                block_end,
+                block_cache_loc,
+                bs,
+            )
+            forward_batch = ForwardBatch(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                batch_size=bs,
+                input_ids=block_ids.flatten(),
+                req_pool_indices=req_pool_indices,
+                seq_lens=draft_prefix_lens,
+                out_cache_loc=block_cache_loc,
+                seq_lens_sum=int(draft_prefix_lens.sum().item()),
+                seq_lens_cpu=seq_lens_cpu,
+                positions=positions,
+                req_to_token_pool=self.draft_model_runner.req_to_token_pool,
+                token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
+                attn_backend=self.draft_model_runner.attn_backend,
+                input_embeds=input_embeds,
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                spec_info=self._draft_block_spec_info,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
+            with torch.inference_mode():
+                self.draft_model_runner.forward(forward_batch)
+        finally:
+            allocator.restore_state(backup)
 
     def _prepare_for_speculative_decoding(
         self, batch: ScheduleBatch, draft_input: DFlashDraftInput

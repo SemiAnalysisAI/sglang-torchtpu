@@ -780,7 +780,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         mask (kernel-expanded by head_dim) stays memory-bounded for typical
         contexts (bs=16 @ ctx<512 ~ 42MB). The all-ones oversized-mask output is
         numerically identical (the kernel reads only the exact cu_mask_lens
-        prefix), so AC-2 parity is unaffected."""
+        prefix), so the non-causal block attention stays numerically exact."""
         max_kv = int(kv_lens.max().item()) if kv_lens.numel() else 0
         stride = max(self.page_size, _ENCODER_ONLY_MASK_BUCKET_STRIDE)
         return max(((max_kv + stride - 1) // stride) * stride, stride)
