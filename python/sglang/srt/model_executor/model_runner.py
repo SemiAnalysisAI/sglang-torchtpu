@@ -459,6 +459,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import (
                 parse_dflash_draft_config,
+                validate_dflash_draft_startup,
             )
 
             # Select target layers to capture for building DFlash context features.
@@ -506,6 +507,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 target_num_layers=int(target_num_layers),
                 draft_num_layers=int(draft_num_layers),
             )
+
+            # Aggregate config-level draft/target compatibility checks into one
+            # clear startup error (weight-shape/state-dict checks stay at load
+            # time in the DFlash model).
+            _draft_text_cfg = getattr(
+                draft_model_config, "hf_text_config", draft_model_config.hf_config
+            )
+            _target_text_cfg = self.model_config.hf_text_config
+            _draft_heads = int(getattr(_draft_text_cfg, "num_attention_heads"))
+            _dflash_errors = validate_dflash_draft_startup(
+                target_vocab_size=int(self.model_config.vocab_size),
+                target_hidden_size=int(getattr(_target_text_cfg, "hidden_size")),
+                target_num_layers=int(target_num_layers),
+                draft_hidden_size=int(getattr(_draft_text_cfg, "hidden_size")),
+                draft_num_layers=int(draft_num_layers),
+                draft_total_num_heads=_draft_heads,
+                draft_total_num_kv_heads=int(
+                    getattr(_draft_text_cfg, "num_key_value_heads", _draft_heads)
+                ),
+                tp_size=int(server_args.tp_size),
+                block_size=dflash_draft_config.block_size,
+                target_layer_ids=list(self.dflash_target_layer_ids),
+                mask_token_id=dflash_draft_config.mask_token_id,
+            )
+            if _dflash_errors:
+                raise ValueError(
+                    "DFLASH draft/target compatibility validation failed:\n- "
+                    + "\n- ".join(_dflash_errors)
+                )
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:

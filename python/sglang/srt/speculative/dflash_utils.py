@@ -346,6 +346,102 @@ class DFlashDraftConfig:
         return resolved
 
 
+def validate_dflash_draft_startup(
+    *,
+    target_vocab_size: int,
+    target_hidden_size: int,
+    target_num_layers: int,
+    draft_hidden_size: int,
+    draft_num_layers: Optional[int],
+    draft_total_num_heads: int,
+    draft_total_num_kv_heads: int,
+    tp_size: int,
+    block_size: Optional[int],
+    target_layer_ids: List[int],
+    mask_token_id: Optional[int],
+) -> List[str]:
+    """Aggregate DFlash draft/target compatibility checks into one startup pass.
+
+    Returns a list of human-readable error strings (empty == compatible) so the
+    caller can surface ALL mismatches at once as a clear startup error, instead
+    of letting them fail as deep asserts during model construction. Covers the
+    config-derivable checks only; weight-shape (``fc.weight``) and state-dict key
+    mapping are validated at load time in the DFlash model, and the KV dtype is
+    resolved by ``configure_kv_cache_dtype``.
+    """
+    errors: List[str] = []
+
+    # The DFlash draft reuses the TARGET embedding and lm_head, so the mask token
+    # must be a valid id in the target vocabulary and the hidden sizes must match.
+    if mask_token_id is None:
+        errors.append(
+            "DFLASH draft config is missing mask_token_id (needed to seed the "
+            "draft block from the target embedding)."
+        )
+    elif not (0 <= int(mask_token_id) < int(target_vocab_size)):
+        errors.append(
+            f"DFLASH mask_token_id={mask_token_id} is out of range for the target "
+            f"vocabulary [0, {int(target_vocab_size)})."
+        )
+    if int(draft_hidden_size) != int(target_hidden_size):
+        errors.append(
+            f"DFLASH draft hidden_size={int(draft_hidden_size)} must equal target "
+            f"hidden_size={int(target_hidden_size)} (the draft reuses the target "
+            "embedding/lm_head and projects concatenated target features back to "
+            "this width)."
+        )
+
+    if draft_num_layers is None or int(draft_num_layers) <= 0:
+        errors.append(
+            f"DFLASH draft num_hidden_layers must be a positive int, got "
+            f"{draft_num_layers!r}."
+        )
+    if block_size is not None and int(block_size) <= 0:
+        errors.append(
+            f"DFLASH draft block_size must be positive when set, got {block_size!r}."
+        )
+
+    if not target_layer_ids:
+        errors.append(
+            "DFLASH resolved target_layer_ids is empty (no target layers selected "
+            "to build draft context features)."
+        )
+    else:
+        for idx, val in enumerate(target_layer_ids):
+            if not (0 <= int(val) < int(target_num_layers)):
+                errors.append(
+                    "DFLASH target_layer_ids contains an out-of-range layer id: "
+                    f"target_layer_ids[{idx}]={val}, target_num_layers="
+                    f"{int(target_num_layers)}."
+                )
+
+    # Draft-attention tensor-parallel sharding must be valid (mirrors the asserts
+    # in DFlashAttention.__init__, surfaced earlier here with a clear message).
+    if int(tp_size) <= 0:
+        errors.append(f"DFLASH tp_size must be positive, got {tp_size!r}.")
+    else:
+        tp = int(tp_size)
+        if int(draft_total_num_heads) % tp != 0:
+            errors.append(
+                f"DFLASH draft total attention heads={int(draft_total_num_heads)} "
+                f"is not divisible by tp_size={tp}."
+            )
+        n_kv = int(draft_total_num_kv_heads)
+        if n_kv >= tp:
+            if n_kv % tp != 0:
+                errors.append(
+                    f"DFLASH draft total_num_kv_heads={n_kv} is not divisible by "
+                    f"tp_size={tp}."
+                )
+        elif n_kv <= 0 or tp % n_kv != 0:
+            errors.append(
+                f"DFLASH draft total_num_kv_heads={n_kv} must positively divide "
+                f"tp_size={tp} when it is smaller than tp_size."
+            )
+
+    return errors
+
+
 def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     """Parse and validate DFLASH draft config fields from HF config/dict."""
     dflash_cfg = _get_dflash_config(draft_hf_config)

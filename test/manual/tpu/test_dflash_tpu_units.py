@@ -12,7 +12,10 @@ import types
 import unittest
 
 import sglang.srt.speculative.dflash_utils as du
-from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.dflash_utils import (
+    validate_dflash_draft_startup,
+    validate_dflash_request,
+)
 from sglang.srt.speculative.dflash_worker import (
     resolve_dflash_draft_attention_backend,
 )
@@ -189,6 +192,96 @@ class TestValidateDflashRequestNonTPU(CustomTestCase):
         self.assertIsNone(
             validate_dflash_request(_make_req(top_k=1, min_new_tokens=8))
         )
+
+
+def _valid_dflash_startup_kwargs(**overrides):
+    """A canonical-shaped (Llama-3.1-8B + z-lab DFlash draft) compatible set."""
+    kwargs = dict(
+        target_vocab_size=128256,
+        target_hidden_size=4096,
+        target_num_layers=32,
+        draft_hidden_size=4096,
+        draft_num_layers=1,
+        draft_total_num_heads=32,
+        draft_total_num_kv_heads=8,
+        tp_size=4,
+        block_size=8,
+        target_layer_ids=[0, 15, 31],
+        mask_token_id=128002,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+class TestValidateDflashDraftStartup(CustomTestCase):
+    """Aggregate startup draft/target compatibility validation
+    (``validate_dflash_draft_startup``): every failure returns a clear message.
+    """
+
+    def _errs(self, **overrides):
+        return validate_dflash_draft_startup(**_valid_dflash_startup_kwargs(**overrides))
+
+    def test_compatible_config_has_no_errors(self):
+        self.assertEqual(self._errs(), [])
+
+    def test_missing_mask_token_id(self):
+        errs = self._errs(mask_token_id=None)
+        self.assertTrue(any("mask_token_id" in e for e in errs), errs)
+
+    def test_mask_token_id_out_of_vocab(self):
+        errs = self._errs(mask_token_id=128256)  # == vocab_size -> out of range
+        self.assertTrue(any("out of range" in e for e in errs), errs)
+
+    def test_hidden_size_mismatch(self):
+        errs = self._errs(draft_hidden_size=2048)
+        self.assertTrue(any("hidden_size" in e for e in errs), errs)
+
+    def test_nonpositive_draft_layers(self):
+        self.assertTrue(any("num_hidden_layers" in e for e in self._errs(draft_num_layers=0)))
+        self.assertTrue(
+            any("num_hidden_layers" in e for e in self._errs(draft_num_layers=None))
+        )
+
+    def test_nonpositive_block_size(self):
+        errs = self._errs(block_size=0)
+        self.assertTrue(any("block_size" in e for e in errs), errs)
+        # None block_size is allowed (resolved elsewhere).
+        self.assertEqual(self._errs(block_size=None), [])
+
+    def test_empty_target_layer_ids(self):
+        errs = self._errs(target_layer_ids=[])
+        self.assertTrue(any("empty" in e for e in errs), errs)
+
+    def test_out_of_range_target_layer_ids(self):
+        errs = self._errs(target_layer_ids=[0, 99])  # 99 >= 32
+        self.assertTrue(any("out-of-range layer id" in e for e in errs), errs)
+
+    def test_heads_not_divisible_by_tp(self):
+        errs = self._errs(draft_total_num_heads=30, tp_size=4)
+        self.assertTrue(any("attention heads" in e for e in errs), errs)
+
+    def test_kv_heads_ge_tp_not_divisible(self):
+        errs = self._errs(draft_total_num_kv_heads=6, tp_size=4)
+        self.assertTrue(any("num_kv_heads" in e for e in errs), errs)
+
+    def test_kv_heads_lt_tp_not_dividing(self):
+        errs = self._errs(draft_total_num_kv_heads=3, tp_size=4)
+        self.assertTrue(any("num_kv_heads" in e for e in errs), errs)
+
+    def test_kv_heads_lt_tp_dividing_ok(self):
+        # 2 < 4 and 4 % 2 == 0 -> valid.
+        self.assertEqual(self._errs(draft_total_num_kv_heads=2, tp_size=4), [])
+
+    def test_nonpositive_tp(self):
+        errs = self._errs(tp_size=0)
+        self.assertTrue(any("tp_size" in e for e in errs), errs)
+
+    def test_multiple_errors_aggregated(self):
+        # Several independent problems must all be reported in one pass.
+        errs = self._errs(
+            mask_token_id=None, draft_hidden_size=1, target_layer_ids=[]
+        )
+        self.assertGreaterEqual(len(errs), 3)
 
 
 class TestDflashFusedKvMaterializeDecision(CustomTestCase):
