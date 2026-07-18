@@ -316,25 +316,48 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     # Writes
     # ------------------------------------------------------------------ #
 
-    def set_kv_buffer(self, *args, **kwargs):
-        """The Pallas RPA v3 kernel owns KV cache writes (via the donated
-        ``kv_cache_fused`` argument), so this method must never be called.
+    def set_kv_buffer(
+        self,
+        layer,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ) -> None:
+        """Write explicit K/V rows into the fused RPA-v3 cache.
 
-        Same precedent as :class:`NoOpMHATokenToKVPool.set_kv_buffer` in
-        ``mem_cache/memory_pool.py`` and ``MLATokenToKVPool.set_kv_buffer`` in
-        sglang-jax — pools whose writes are owned by the attention kernel
-        reject out-of-band writes loudly rather than silently scattering data
-        that the next kernel call would overwrite.
+        Steady-state attention writes are owned by the donated Pallas kernel,
+        but DFlash must materialize target hidden-state features before the
+        next draft forward.  This is the device-side counterpart of
+        :meth:`load_cpu_copy`: interleave K/V in the fused physical layout and
+        update only the requested rows so the next donated kernel observes
+        them.
         """
-        raise NotImplementedError(
-            "TpuFusedMHATokenToKVPool.set_kv_buffer was called. The Pallas "
-            "ragged-paged-attention v3 kernel writes the fused KV buffer "
-            "itself via the donated kv_cache_fused argument; any out-of-band "
-            "write here would be overwritten on the next forward. If you hit "
-            "this, the calling code path is incompatible with the rpa_v3 "
-            "backend — either skip the write or switch to --attention-backend "
-            "pallas_tpu_flash (which uses the unfused MHATokenToKVPool)."
+        layer_id = layer_id_override if layer_id_override is not None else layer.layer_id
+        layer_kv = self.kv_buffer[layer_id - self.start_layer].flatten(0, 1).view(
+            -1, self.num_kv_heads_x2, self.padded_head_dim
         )
+        loc = loc.to(device=layer_kv.device, dtype=torch.long)
+
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k = cache_k / k_scale
+            if v_scale is not None:
+                cache_v = cache_v / v_scale
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        num_rows = int(cache_k.shape[0])
+        fused_rows = torch.zeros(
+            (num_rows, self.num_kv_heads_x2, self.padded_head_dim),
+            dtype=self.store_dtype,
+            device=layer_kv.device,
+        )
+        fused_rows[:, 0 : 2 * self.head_num : 2, : self.head_dim] = cache_k
+        fused_rows[:, 1 : 2 * self.head_num : 2, : self.v_head_dim] = cache_v
+        layer_kv.index_copy_(0, loc, fused_rows)
 
     # ------------------------------------------------------------------ #
     # Misc compatibility

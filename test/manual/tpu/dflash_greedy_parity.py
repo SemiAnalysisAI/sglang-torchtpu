@@ -79,15 +79,14 @@ def _generate_token_ids(
 ) -> List[int]:
     """Greedy-generate and return the output token IDs from one SGLang server.
 
-    Uses the native /generate endpoint with return_logprob=True; token IDs are
-    element [1] of each ``meta_info.output_token_logprobs`` entry
-    ([logprob, token_id, token_text]). Falls back to ``meta_info.output_ids``.
+    Uses the native /generate endpoint, which returns generated token IDs in
+    the top-level ``output_ids`` field.  Do not request logprobs: DFlash
+    intentionally rejects ``return_logprob=True``.
     """
     body = json.dumps(
         {
             "text": prompt,
             "sampling_params": {"temperature": 0.0, "max_new_tokens": max_new_tokens},
-            "return_logprob": True,
             "stream": False,
         }
     ).encode()
@@ -98,6 +97,8 @@ def _generate_token_ids(
     )
     with urllib.request.urlopen(req, timeout=600) as r:
         out = json.loads(r.read())
+    if out.get("output_ids") is not None:
+        return [int(t) for t in out["output_ids"]]
     meta = out.get("meta_info", {})
     otl = meta.get("output_token_logprobs")
     if otl:

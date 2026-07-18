@@ -133,13 +133,44 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
     # path a launcher (e.g. torchrun) may have set MASTER_ADDR correctly, so only
     # fill it in when unset (defaulting to hosts[0] for multihost, else loopback).
     hosts = [h for h in os.environ.get("TPU_WORKER_HOSTNAMES", "").split(",") if h]
-    if server_args.use_ray and len(hosts) > 1:
+    if getattr(server_args, "use_ray", False) and len(hosts) > 1:
         os.environ["MASTER_ADDR"] = hosts[0]
     else:
         os.environ.setdefault(
             "MASTER_ADDR", hosts[0] if len(hosts) > 1 else "127.0.0.1"
         )
     os.environ.setdefault("MASTER_PORT", "29500")
+
+    # torch_tpu's tier-2 cache is process-shared by default.  TP ranks can
+    # therefore race on the same first-touch compilation: one rank observes a
+    # cache hit while another compiles, their enqueued program counts diverge,
+    # and the next collective launch group never assembles.  Give every rank a
+    # deterministic private namespace before torch_tpu performs any compile.
+    tier2_base = (
+        os.environ.get("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE") or "default"
+    )
+    tier2_suffix = f"_r{tp_rank}"
+    if not tier2_base.endswith(tier2_suffix):
+        os.environ["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = (
+            tier2_base + tier2_suffix
+        )
+
+    # The repeated-ops heuristic re-cuts eager graphs from rank-local timing
+    # and op history.  Different cuts skew the TP program streams even when
+    # the logical operation sequence is identical, so disable it for TP.
+    if world_size > 1:
+        os.environ.setdefault("TORCH_TPU_INTERNAL_DETECT_REPEATED_OPS", "0")
+
+    # Optional per-rank dumps make any remaining cross-rank HLO differences
+    # directly inspectable without making dumps the default (they are large).
+    hlo_dump_dir = os.environ.get("SGLANG_TPU_HLO_DUMP_DIR")
+    if hlo_dump_dir:
+        rank_dir = os.path.join(hlo_dump_dir, f"rank{tp_rank}")
+        os.makedirs(rank_dir, exist_ok=True)
+        dump_flags = f"--xla_dump_to={rank_dir} --xla_dump_hlo_as_text"
+        existing = os.environ.get("XLA_FLAGS", "")
+        if "--xla_dump_to" not in existing:
+            os.environ["XLA_FLAGS"] = (existing + " " + dump_flags).strip()
 
 
 def monkey_patch_torch_compile():

@@ -411,6 +411,18 @@ class DFlashWorker:
         if mask.dtype != torch.bool:
             mask = mask.to(torch.bool)
 
+        # TPU keeps req_to_token on the host to avoid recompiling the table
+        # update/gather path.  Advanced indexing requires every index tensor
+        # to reside with the indexed table, so gather on CPU and transfer only
+        # the compact cache-location result back to the worker device.
+        table_device = req_to_token.device
+        if req_pool_indices.device != table_device:
+            req_pool_indices = req_pool_indices.to(table_device)
+        if pos2d.device != table_device:
+            pos2d = pos2d.to(table_device)
+        if mask.device != table_device:
+            mask = mask.to(table_device)
+
         table_width = int(req_to_token.shape[1])
         if table_width <= 0:
             if bool(mask.any().item()):
@@ -423,7 +435,12 @@ class DFlashWorker:
         # ragged-batch case. Replace those don't-care columns with a valid in-range
         # position before the gather so the kernel only sees real positions.
         safe_pos2d = pos2d.masked_fill(~mask, 0)
-        return req_to_token[req_pool_indices[:, None], safe_pos2d][mask].to(torch.int64)
+        result = req_to_token[req_pool_indices[:, None], safe_pos2d][mask].to(
+            torch.int64
+        )
+        if result.device != self.device:
+            result = result.to(self.device, non_blocking=True)
+        return result
 
     def _gather_req_to_token_segments(
         self,
@@ -762,6 +779,14 @@ class DFlashWorker:
                 "DFLASH greedy sampling requires a vocab-parallel head with `weight` and `shard_indices`."
             )
 
+        if _IS_TPU and hidden_states.device.type == "tpu" and tp_size > 1:
+            return self._greedy_sample_from_vocab_parallel_head_tpu(
+                hidden_states=hidden_states,
+                lm_head=lm_head,
+                tp_group=tp_group,
+                chunk_size=chunk_size,
+            )
+
         shard = lm_head.shard_indices
         weight = lm_head.weight  # [local_vocab_padded, hidden]
         weight_dtype = weight.dtype
@@ -911,6 +936,117 @@ class DFlashWorker:
 
         return out_tokens
 
+    def _greedy_sample_from_vocab_parallel_head_tpu(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        lm_head,
+        tp_group,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        """Rank-uniform TPU implementation of sharded greedy projection.
+
+        The generic path branches on rank-local Python shard sizes and adds a
+        rank-local Python vocab offset immediately before TP all-gathers.  On
+        torch_tpu those values are folded into eager HLO, yielding different
+        program streams across ranks.  This path always projects the complete
+        padded local shard and supplies rank-varying bounds as device data.
+        """
+        if not hasattr(lm_head, "tpu_shard_bounds"):
+            raise RuntimeError(
+                "DFLASH TPU greedy sampling requires rank-uniform "
+                "`lm_head.tpu_shard_bounds`."
+            )
+
+        weight = lm_head.weight
+        weight_dtype = weight.dtype
+        tp_size = int(tp_group.world_size)
+        num_tokens = int(hidden_states.shape[0])
+        local_vocab_padded = int(weight.shape[0])
+        num_org_padded = int(lm_head.shard_indices.num_org_elements_padded)
+        bounds = lm_head._tpu_shard_bound_tensors(hidden_states.device)
+        local_indices = torch.arange(
+            local_vocab_padded, dtype=torch.int64, device=hidden_states.device
+        )
+        num_org = bounds[1] - bounds[0]
+        num_added = bounds[3] - bounds[2]
+        valid = (local_indices < num_org) | (
+            (local_indices >= num_org_padded)
+            & (local_indices < num_org_padded + num_added)
+        )
+
+        out_tokens = torch.empty(
+            (num_tokens,), dtype=torch.long, device=hidden_states.device
+        )
+        for start in range(0, num_tokens, int(chunk_size)):
+            end = min(num_tokens, start + int(chunk_size))
+            hs = hidden_states[start:end]
+            if hs.dtype != weight_dtype:
+                hs = hs.to(weight_dtype)
+            chunk_len = int(hs.shape[0])
+
+            logits = torch.matmul(hs, weight.T)
+            logits.masked_fill_(~valid.unsqueeze(0), torch.finfo(weight_dtype).min)
+            local_max, local_arg = torch.max(logits, dim=-1)
+            global_ids = torch.where(
+                local_arg < num_org_padded,
+                bounds[0] + local_arg,
+                bounds[2] + local_arg - num_org_padded,
+            ).to(torch.int64)
+
+            needed = tp_size * chunk_len
+            chunk_cap = int(chunk_size)
+            if (
+                self._draft_greedy_gather_cap < needed
+                or self._draft_greedy_gathered_max_buf is None
+                or self._draft_greedy_gathered_ids_buf is None
+                or self._draft_greedy_gathered_max_buf.dtype != local_max.dtype
+                or self._draft_greedy_gathered_max_buf.device != hs.device
+            ):
+                cap = tp_size * chunk_cap
+                self._draft_greedy_gathered_max_buf = torch.empty(
+                    (cap,), dtype=local_max.dtype, device=hs.device
+                )
+                self._draft_greedy_gathered_ids_buf = torch.empty(
+                    (cap,), dtype=torch.int64, device=hs.device
+                )
+                self._draft_greedy_gather_cap = cap
+
+            if (
+                self._draft_greedy_index_cap < chunk_len
+                or self._draft_greedy_best_rank_buf is None
+                or self._draft_greedy_rank_index_buf is None
+                or self._draft_greedy_selected_ids_buf is None
+                or self._draft_greedy_best_rank_buf.device != hs.device
+            ):
+                self._draft_greedy_best_rank_buf = torch.empty(
+                    (chunk_cap,), dtype=torch.int64, device=hs.device
+                )
+                self._draft_greedy_rank_index_buf = torch.empty(
+                    (1, chunk_cap), dtype=torch.int64, device=hs.device
+                )
+                self._draft_greedy_selected_ids_buf = torch.empty(
+                    (1, chunk_cap), dtype=torch.int64, device=hs.device
+                )
+                self._draft_greedy_index_cap = chunk_cap
+
+            gathered_max = self._draft_greedy_gathered_max_buf[:needed]
+            gathered_ids = self._draft_greedy_gathered_ids_buf[:needed]
+            tp_group.all_gather_into_tensor(gathered_max, local_max.contiguous())
+            tp_group.all_gather_into_tensor(gathered_ids, global_ids.contiguous())
+            gathered_max = gathered_max.view(tp_size, chunk_len)
+            gathered_ids = gathered_ids.view(tp_size, chunk_len)
+
+            best_rank = self._draft_greedy_best_rank_buf[:chunk_len]
+            torch.argmax(gathered_max, dim=0, out=best_rank)
+            rank_index = self._draft_greedy_rank_index_buf[:, :chunk_len]
+            rank_index[0].copy_(best_rank)
+            selected_ids = self._draft_greedy_selected_ids_buf[:, :chunk_len]
+            torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
+            out_tokens[start:end].copy_(selected_ids.view(-1))
+
+        return out_tokens
+
     def _append_target_hidden_to_draft_kv(
         self,
         batch: ScheduleBatch,
@@ -966,8 +1102,13 @@ class DFlashWorker:
             else:
                 r = torch.arange(max_ctx, device=device, dtype=torch.int64)
             pos2d = ctx_start[:, None] + r[None, :]  # [1, ctx]
-            cache2d = target_req_to_token[req_pool_indices[:, None], pos2d]  # [1, ctx]
-            ctx_cache_loc = cache2d.reshape(-1).to(torch.int64)  # [ctx]
+            ctx_cache_loc = self._gather_req_to_token_masked(
+                req_to_token=target_req_to_token,
+                req_pool_indices=req_pool_indices,
+                pos2d=pos2d,
+                mask=torch.ones_like(pos2d, dtype=torch.bool),
+                context="DFLASH target hidden KV append",
+            )  # [ctx]
             ctx_positions = pos2d.reshape(-1)  # [ctx]
         else:
             # In decode mode, ctx_lens <= block_size so we can skip the .item() sync.

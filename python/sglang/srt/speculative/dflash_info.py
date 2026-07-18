@@ -5,6 +5,7 @@ from typing import List, Tuple
 
 import torch
 
+from sglang.srt.distributed import get_tp_group
 # NOTE: `create_flashinfer_kv_indices_triton` is imported lazily inside
 # `generate_attn_arg_prefill` (the only use) rather than at module scope, because
 # that import eagerly loads Triton. The TPU DFlash verify path routes through the
@@ -30,6 +31,9 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.utils import is_tpu
+
+_IS_TPU = is_tpu()
 
 
 def _compute_paged_keep_slots(
@@ -431,6 +435,16 @@ class DFlashVerifyInput(SpecInput):
                 candidates=candidates,
                 target_predict=target_predict,
             )
+
+        # Host request state and the next iteration's tensor shapes are derived
+        # from these values independently in every TP process.  Make rank 0
+        # authoritative: even a last-ulp logits discrepancy must not fork
+        # commit lengths, allocator state, or subsequent collective streams.
+        if _IS_TPU and device.type == "tpu":
+            tp_group = get_tp_group()
+            if tp_group.world_size > 1:
+                tp_group.broadcast(correct_len, src=0)
+                tp_group.broadcast(bonus, src=0)
 
         # Single D2H transfer: candidates[1:] + correct_len + bonus
         packed = torch.cat(

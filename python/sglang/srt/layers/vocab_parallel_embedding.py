@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     get_compiler_backend,
     is_cpu,
     is_npu,
+    is_tpu,
     set_weight_attrs,
 )
 
@@ -46,6 +47,7 @@ DEFAULT_VOCAB_PADDING_SIZE = 64
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_tpu = is_tpu()
 _is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
@@ -130,6 +132,38 @@ class VocabParallelEmbeddingShardIndices:
 
         assert self.num_org_elements <= self.num_org_elements_padded
         assert self.num_added_elements <= self.num_added_elements_padded
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def _get_masked_input_and_mask_rank_uniform(
+    input_: torch.Tensor,
+    shard_bounds: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build a vocab-shard mask without baking rank values into TPU HLO.
+
+    torch_tpu traces Python integer arguments by value.  Passing the per-rank
+    shard window as integers therefore creates different programs on different
+    TP ranks immediately before the embedding all-reduce.  Keeping all five
+    values in one eagerly-created device buffer makes the graph rank-uniform;
+    only runtime data differs.
+    """
+    org_vocab_start_index = shard_bounds[0]
+    org_vocab_end_index = shard_bounds[1]
+    added_vocab_start_index = shard_bounds[2]
+    added_vocab_end_index = shard_bounds[3]
+    added_offset = shard_bounds[4]
+    org_vocab_mask = (input_ >= org_vocab_start_index) & (
+        input_ < org_vocab_end_index
+    )
+    added_vocab_mask = (input_ >= added_vocab_start_index) & (
+        input_ < added_vocab_end_index
+    )
+    valid_offset = (org_vocab_start_index * org_vocab_mask) + (
+        added_offset * added_vocab_mask
+    )
+    vocab_mask = org_vocab_mask | added_vocab_mask
+    input_ = vocab_mask * (input_ - valid_offset)
+    return input_, ~vocab_mask
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
@@ -265,6 +299,31 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.tp_size,
         )
         self.embedding_dim = embedding_dim
+
+        if _is_tpu:
+            si = self.shard_indices
+            added_offset = (
+                si.added_vocab_start_index
+                - (si.org_vocab_end_index - si.org_vocab_start_index)
+                - si.num_org_vocab_padding
+            )
+            # This must be created during module initialization.  A tensor
+            # created lazily in forward retains trace-time constant provenance
+            # on torch_tpu and reintroduces rank-specific HLO.
+            self.register_buffer(
+                "tpu_shard_bounds",
+                torch.tensor(
+                    [
+                        si.org_vocab_start_index,
+                        si.org_vocab_end_index,
+                        si.added_vocab_start_index,
+                        si.added_vocab_end_index,
+                        added_offset,
+                    ],
+                    dtype=torch.int64,
+                ),
+                persistent=False,
+            )
 
         quant_method = None
         if quant_config is not None:
@@ -470,17 +529,28 @@ class VocabParallelEmbedding(torch.nn.Module):
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 
+    def _tpu_shard_bound_tensors(self, device) -> torch.Tensor:
+        bounds = self.tpu_shard_bounds
+        if bounds.device != device:
+            bounds = bounds.to(device)
+        return bounds
+
     def forward(self, input_):
         if self.tp_size > 1:
             # Build the mask.
-            masked_input, input_mask = get_masked_input_and_mask(
-                input_,
-                self.shard_indices.org_vocab_start_index,
-                self.shard_indices.org_vocab_end_index,
-                self.shard_indices.num_org_vocab_padding,
-                self.shard_indices.added_vocab_start_index,
-                self.shard_indices.added_vocab_end_index,
-            )
+            if _is_tpu:
+                masked_input, input_mask = _get_masked_input_and_mask_rank_uniform(
+                    input_, self._tpu_shard_bound_tensors(input_.device)
+                )
+            else:
+                masked_input, input_mask = get_masked_input_and_mask(
+                    input_,
+                    self.shard_indices.org_vocab_start_index,
+                    self.shard_indices.org_vocab_end_index,
+                    self.shard_indices.num_org_vocab_padding,
+                    self.shard_indices.added_vocab_start_index,
+                    self.shard_indices.added_vocab_end_index,
+                )
         else:
             masked_input = input_
 

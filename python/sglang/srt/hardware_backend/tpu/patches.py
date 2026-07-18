@@ -19,6 +19,10 @@ logger = get_logger(__name__)
 
 _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
     ("sglang.srt.layers.vocab_parallel_embedding", "get_masked_input_and_mask"),
+    (
+        "sglang.srt.layers.vocab_parallel_embedding",
+        "_get_masked_input_and_mask_rank_uniform",
+    ),
     ("sglang.srt.layers.rotary_embedding.utils", "apply_rotary_pos_emb_native"),
 ]
 
