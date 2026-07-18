@@ -655,7 +655,10 @@ def compute_dflash_correct_drafts_and_bonus(
             Shape: [bs, block_size]. target_predict[:, t] corresponds to argmax at position t.
 
     Returns:
-        correct_len: int32 tensor [bs], number of accepted *draft* tokens (excluding current token and bonus token).
+        correct_len: int64 tensor [bs], number of accepted *draft* tokens (excluding current token and bonus token).
+            (int64 because ``torch.sum`` promotes the int32 cumprod, and it is
+            required int64 so ``verify()`` can ``torch.cat`` it with the int64
+            ``candidates`` in the packed D2H transfer.)
         bonus: int64 tensor [bs], the target-predicted token at index correct_len (the "bonus" token to append).
 
     Notes:

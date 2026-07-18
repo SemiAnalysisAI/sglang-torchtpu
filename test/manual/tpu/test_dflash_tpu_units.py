@@ -11,6 +11,8 @@ cache inside the RPA-v3 backend and is validated on TPU in
 import types
 import unittest
 
+import torch
+
 import sglang.srt.speculative.dflash_utils as du
 from sglang.srt.speculative.dflash_utils import (
     validate_dflash_draft_startup,
@@ -458,6 +460,144 @@ class TestDflashNumCorrectDrafts(CustomTestCase):
     def test_zero_drafts_only_bonus(self):
         # No drafts accepted, only the bonus committed -> 0 correct drafts.
         self.assertEqual(du.dflash_num_correct_drafts(0, 1), 0)
+
+
+def _ref_accept(candidates_row, target_row):
+    """Independent Python reference for the DFlash greedy accept rule.
+
+    Accept drafts while candidates[i+1] == target_predict[i], stopping at the
+    first mismatch; bonus is the target prediction at the first non-accepted
+    position (== len(accepted) drafts).
+    """
+    block = len(candidates_row)
+    correct = 0
+    for i in range(block - 1):
+        if candidates_row[i + 1] == target_row[i]:
+            correct += 1
+        else:
+            break
+    return correct, target_row[correct]
+
+
+class TestDflashGreedyAcceptParity(CustomTestCase):
+    """Forced-logit greedy accept parity for ``compute_dflash_correct_drafts_and_bonus``
+    (the core DFlash verify rule producing accept_len + bonus), checked against an
+    independent Python reference across zero / partial / full / mixed-batch accepts.
+    candidates[:, 0] is the current token; candidates[:, 1:] are the drafts;
+    target_predict[:, t] is the target argmax at block position t.
+    """
+
+    def _run(self, candidates, target_predict):
+        c = torch.tensor(candidates, dtype=torch.int64)
+        t = torch.tensor(target_predict, dtype=torch.int64)
+        correct_len, bonus = du.compute_dflash_correct_drafts_and_bonus(
+            candidates=c, target_predict=t
+        )
+        return correct_len, bonus
+
+    def test_zero_accept(self):
+        # First draft (candidates[1]) mismatches target_predict[0] -> 0 accepted;
+        # bonus is target_predict[0].
+        candidates = [[100, 7, 8, 9]]
+        target = [[999, 55, 66, 77]]  # target_predict[0]=999 != draft 7
+        correct_len, bonus = self._run(candidates, target)
+        self.assertEqual(correct_len.tolist(), [0])
+        self.assertEqual(bonus.tolist(), [999])
+
+    def test_partial_accept(self):
+        # drafts [7,8,9]; target_predict[:3]=[7,8,55] -> first two match, third
+        # mismatches -> correct_len=2, bonus=target_predict[2]=55.
+        candidates = [[100, 7, 8, 9]]
+        target = [[7, 8, 55, 77]]
+        correct_len, bonus = self._run(candidates, target)
+        self.assertEqual(correct_len.tolist(), [2])
+        self.assertEqual(bonus.tolist(), [55])
+
+    def test_full_accept(self):
+        # All block-1 drafts match -> correct_len = block-1; bonus is the last
+        # target prediction (target_predict[block-1]).
+        candidates = [[100, 7, 8, 9]]
+        target = [[7, 8, 9, 42]]
+        correct_len, bonus = self._run(candidates, target)
+        self.assertEqual(correct_len.tolist(), [3])  # block_size 4 -> 3 drafts
+        self.assertEqual(bonus.tolist(), [42])
+
+    def test_first_mismatch_stops_cumprod(self):
+        # A later match AFTER an earlier mismatch must NOT count: drafts [7,8,9],
+        # target_predict[:3]=[7,999,9] -> stop at pos1 -> correct_len=1, bonus=999.
+        candidates = [[100, 7, 8, 9]]
+        target = [[7, 999, 9, 11]]
+        correct_len, bonus = self._run(candidates, target)
+        self.assertEqual(correct_len.tolist(), [1])
+        self.assertEqual(bonus.tolist(), [999])
+
+    def test_mixed_batch(self):
+        # One call, rows with zero / partial / full accept lengths.
+        candidates = [
+            [100, 7, 8, 9],  # zero: draft 7 != target 999
+            [100, 7, 8, 9],  # partial: [7,8] match, 9 vs 55 mismatch -> 2
+            [100, 7, 8, 9],  # full: [7,8,9] all match -> 3
+        ]
+        target = [
+            [999, 1, 2, 3],
+            [7, 8, 55, 4],
+            [7, 8, 9, 42],
+        ]
+        correct_len, bonus = self._run(candidates, target)
+        self.assertEqual(correct_len.tolist(), [0, 2, 3])
+        self.assertEqual(bonus.tolist(), [999, 55, 42])
+
+    def test_matches_independent_reference_exhaustively(self):
+        # Enumerate a small deterministic space and compare accept_len + bonus to
+        # the independent Python reference row-by-row.
+        block = 4
+        vocab = [5, 6, 7]  # small alphabet so accepts/mismatches both occur
+        rows_c, rows_t, ref = [], [], []
+        # Deterministic sweep: vary each draft/target position over the alphabet.
+        for a in vocab:
+            for b in vocab:
+                for tt0 in vocab:
+                    for tt1 in vocab:
+                        cand = [0, a, b, 6]  # current token + 3 drafts
+                        targ = [tt0, tt1, a, b]
+                        rows_c.append(cand)
+                        rows_t.append(targ)
+                        ref.append(_ref_accept(cand, targ))
+        correct_len, bonus = self._run(rows_c, rows_t)
+        self.assertEqual(correct_len.tolist(), [r[0] for r in ref])
+        self.assertEqual(bonus.tolist(), [r[1] for r in ref])
+
+    def test_bonus_index_in_range_and_dtypes(self):
+        candidates = [[100, 7, 8, 9], [100, 1, 2, 3]]
+        target = [[7, 8, 9, 42], [999, 5, 6, 7]]
+        correct_len, bonus = self._run(candidates, target)
+        # correct_len is int64 (torch.sum promotes int32->int64), and int64 is
+        # REQUIRED: verify() cats it with the int64 `candidates` in the packed D2H
+        # transfer, so an int32 would raise a dtype-mismatch in torch.cat.
+        self.assertEqual(correct_len.dtype, torch.int64)
+        self.assertEqual(bonus.dtype, torch.int64)
+        # bonus[i] == target_predict[i, correct_len[i]] and index in [0, block).
+        for i in range(2):
+            k = int(correct_len[i].item())
+            self.assertTrue(0 <= k < 4)
+            self.assertEqual(int(bonus[i].item()), target[i][k])
+
+    def test_validation_errors(self):
+        with self.assertRaises(ValueError):  # not 2D
+            du.compute_dflash_correct_drafts_and_bonus(
+                candidates=torch.tensor([1, 2, 3]),
+                target_predict=torch.tensor([1, 2, 3]),
+            )
+        with self.assertRaises(ValueError):  # shape mismatch
+            du.compute_dflash_correct_drafts_and_bonus(
+                candidates=torch.tensor([[1, 2, 3]]),
+                target_predict=torch.tensor([[1, 2]]),
+            )
+        with self.assertRaises(ValueError):  # bs == 0
+            du.compute_dflash_correct_drafts_and_bonus(
+                candidates=torch.zeros((0, 4), dtype=torch.int64),
+                target_predict=torch.zeros((0, 4), dtype=torch.int64),
+            )
 
 
 class TestDflashKvCellSizing(CustomTestCase):
