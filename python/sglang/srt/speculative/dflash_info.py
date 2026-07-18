@@ -9,7 +9,10 @@ import torch
 # `generate_attn_arg_prefill` (the only use) rather than at module scope, because
 # that import eagerly loads Triton. The TPU DFlash verify path routes through the
 # RPA-v3 backend's own metadata builder and never calls `generate_attn_arg_prefill`,
-# so keeping the import lazy leaves the TPU verify route Triton-import-free (AC-3).
+# so keeping the import lazy means DFlash adds no Triton dependency of its own to
+# the TPU verify route. (A bare `import torch` already pulls Triton into
+# sys.modules via torch._inductor on this stack, so a literal zero-Triton import
+# is a torch/framework property, not something DFlash can control.)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ScheduleBatch

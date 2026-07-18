@@ -333,13 +333,9 @@ class TestDflashVerifyMaskPolicyAvoidsTriton(CustomTestCase):
         self.assertTrue(build_custom_mask)
 
     def test_dflash_info_does_not_import_triton_kv_indices_at_module_scope(self):
-        # AC-3 (import level, DFlash-owned): the Triton kv-indices kernel must NOT
-        # be imported at dflash_info module scope (that eagerly loads Triton). It
-        # is imported lazily inside generate_attn_arg_prefill, which the TPU
-        # RPA-v3 verify path never calls. (Note: base SGLang modules such as
-        # sglang.srt.utils import Triton framework-wide on this stack -- that is
-        # out of DFlash scope and affects EAGLE3 equally; this guard covers the
-        # DFlash-specific import only.)
+        # The Triton kv-indices kernel must NOT be imported at dflash_info module
+        # scope (that eagerly loads Triton). It is imported lazily inside
+        # generate_attn_arg_prefill, which the TPU RPA-v3 verify path never calls.
         import inspect
 
         import sglang.srt.speculative.dflash_info as di
@@ -356,6 +352,73 @@ class TestDflashVerifyMaskPolicyAvoidsTriton(CustomTestCase):
             "from sglang.srt.layers.attention.utils import", gen_src
         )
         self.assertIn("create_flashinfer_kv_indices_triton[", gen_src)
+
+    def test_dflash_verify_route_adds_no_triton_beyond_framework_baseline(self):
+        # Strongest ACHIEVABLE "no Triton import" guard for the DFlash verify
+        # route on this stack, checked in CLEAN subprocesses via sys.modules.
+        #
+        # A literal "zero Triton modules" is impossible here: a bare `import torch`
+        # already pulls Triton into sys.modules (torch._inductor.runtime imports
+        # triton.language.extra.libdevice at import-torch time). Every SGLang
+        # module -- and the already-shipped EAGLE3 spec path -- therefore imports
+        # Triton transitively. What DFlash CAN guarantee is that it introduces no
+        # Triton dependency of its own beyond what the framework baseline (the
+        # accepted EAGLE3 verify path) already imports. We assert exactly that.
+        import json
+        import subprocess
+        import sys
+
+        probe = (
+            "import sys, json\n"
+            "{stmt}\n"
+            "tri = sorted(m for m in sys.modules "
+            "if m == 'triton' or m.startswith('triton.'))\n"
+            "sys.stderr.write('TRITONSET:' + json.dumps(tri) + '\\n')\n"
+        )
+
+        def triton_modules(stmt):
+            out = subprocess.run(
+                [sys.executable, "-c", probe.format(stmt=stmt)],
+                capture_output=True,
+                text=True,
+            )
+            for line in out.stderr.splitlines():
+                if line.startswith("TRITONSET:"):
+                    return set(json.loads(line[len("TRITONSET:") :]))
+            self.fail(
+                "probe did not report a triton set; stderr tail:\n"
+                + "\n".join(out.stderr.splitlines()[-15:])
+            )
+
+        torch_only = triton_modules("import torch")
+        dflash = triton_modules("import sglang.srt.speculative.dflash_info")
+        eagle = triton_modules("import sglang.srt.speculative.eagle_info")
+
+        # 1. A bare `import torch` already loads Triton -> literal zero is impossible.
+        self.assertGreater(
+            len(torch_only),
+            0,
+            "expected `import torch` to load Triton on this stack (documents that a "
+            "literal zero-Triton-import guard is a torch property, not DFlash's).",
+        )
+        # 2. DFlash introduces NO Triton module that EAGLE3 (the accepted baseline)
+        #    does not already introduce. i.e. DFlash adds nothing of its own.
+        dflash_beyond_eagle = dflash - eagle
+        self.assertEqual(
+            dflash_beyond_eagle,
+            set(),
+            "DFlash verify route imports Triton module(s) that the EAGLE3 baseline "
+            f"does not: {sorted(dflash_beyond_eagle)}. DFlash must add no Triton of "
+            "its own.",
+        )
+        # 3. And it introduces nothing beyond torch that EAGLE3 doesn't also pull
+        #    (the residual is framework-shared, not DFlash-owned).
+        self.assertEqual(
+            dflash - torch_only,
+            eagle - torch_only,
+            "DFlash and EAGLE3 must have identical Triton footprints beyond the "
+            "bare-torch baseline (any residual is framework-shared, not DFlash's).",
+        )
 
     def test_triton_kv_indices_only_reachable_via_generate_attn_arg_prefill(self):
         # The Triton kernel is only invoked from generate_attn_arg_prefill, so
