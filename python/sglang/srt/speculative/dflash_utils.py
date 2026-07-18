@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -371,14 +371,16 @@ def validate_dflash_draft_startup(
     """
     errors: List[str] = []
 
-    # The DFlash draft reuses the TARGET embedding and lm_head, so the mask token
-    # must be a valid id in the target vocabulary and the hidden sizes must match.
-    if mask_token_id is None:
-        errors.append(
-            "DFLASH draft config is missing mask_token_id (needed to seed the "
-            "draft block from the target embedding)."
-        )
-    elif not (0 <= int(mask_token_id) < int(target_vocab_size)):
+    # The DFlash draft reuses the TARGET embedding and lm_head, so a config-level
+    # mask_token_id (when present) must be a valid id in the target vocabulary,
+    # and the hidden sizes must match. A missing mask_token_id is NOT an error
+    # here: the worker resolves it from the tokenizer's mask_token
+    # (DFlashWorker._resolve_mask_token_id), which fails clearly on its own if it
+    # cannot be resolved. Validating only-when-present preserves that fallback
+    # (and non-TPU checkpoints that rely on it).
+    if mask_token_id is not None and not (
+        0 <= int(mask_token_id) < int(target_vocab_size)
+    ):
         errors.append(
             f"DFLASH mask_token_id={mask_token_id} is out of range for the target "
             f"vocabulary [0, {int(target_vocab_size)})."
@@ -440,6 +442,53 @@ def validate_dflash_draft_startup(
             )
 
     return errors
+
+
+_DFLASH_PACKED_EXPECTED_SHARDS: Dict[str, Set] = {
+    "qkv_proj": {"q", "k", "v"},
+    "gate_up_proj": {0, 1},
+}
+
+
+def _dflash_packed_group(param_name: str) -> Optional[str]:
+    for group in _DFLASH_PACKED_EXPECTED_SHARDS:
+        if group in param_name:
+            return group
+    return None
+
+
+def dflash_missing_weight_keys(
+    param_names: Iterable[str],
+    loaded_direct: Set[str],
+    packed_shards_seen: Dict[str, Set],
+) -> List[str]:
+    """Return DFlash draft parameters that did not receive their weight(s).
+
+    Used by ``DFlashDraftModel.load_weights`` to fail clearly on a
+    missing/incomplete draft checkpoint instead of silently leaving parameters at
+    their initialization values.
+
+    - ``param_names``: every model parameter name (from ``named_parameters()``).
+    - ``loaded_direct``: resolved names of directly-loaded (non-packed) params.
+    - ``packed_shards_seen``: resolved packed-param name -> set of shard ids
+      actually loaded. A packed attention/MLP projection (``qkv_proj`` needs
+      ``q``/``k``/``v``; ``gate_up_proj`` needs ``0``/``1``) is complete only when
+      all its shards were loaded.
+
+    Returns a sorted list of human-readable missing entries (empty == complete).
+    """
+    missing: List[str] = []
+    for pname in param_names:
+        group = _dflash_packed_group(pname)
+        if group is not None:
+            expected = _DFLASH_PACKED_EXPECTED_SHARDS[group]
+            seen = packed_shards_seen.get(pname, set())
+            if seen != expected:
+                miss = sorted(str(s) for s in (expected - seen))
+                missing.append(f"{pname} (missing packed shard(s): {miss})")
+        elif pname not in loaded_direct:
+            missing.append(pname)
+    return sorted(missing)
 
 
 def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:

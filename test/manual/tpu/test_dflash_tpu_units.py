@@ -224,9 +224,10 @@ class TestValidateDflashDraftStartup(CustomTestCase):
     def test_compatible_config_has_no_errors(self):
         self.assertEqual(self._errs(), [])
 
-    def test_missing_mask_token_id(self):
-        errs = self._errs(mask_token_id=None)
-        self.assertTrue(any("mask_token_id" in e for e in errs), errs)
+    def test_none_mask_token_id_allowed(self):
+        # A missing config mask_token_id is NOT an error: the worker resolves it
+        # from the tokenizer (preserves the non-TPU tokenizer-fallback path).
+        self.assertEqual(self._errs(mask_token_id=None), [])
 
     def test_mask_token_id_out_of_vocab(self):
         errs = self._errs(mask_token_id=128256)  # == vocab_size -> out of range
@@ -279,9 +280,115 @@ class TestValidateDflashDraftStartup(CustomTestCase):
     def test_multiple_errors_aggregated(self):
         # Several independent problems must all be reported in one pass.
         errs = self._errs(
-            mask_token_id=None, draft_hidden_size=1, target_layer_ids=[]
+            mask_token_id=999999, draft_hidden_size=1, target_layer_ids=[]
         )
         self.assertGreaterEqual(len(errs), 3)
+
+
+class TestDflashMissingWeightKeys(CustomTestCase):
+    """The draft-checkpoint completeness check (``dflash_missing_weight_keys``):
+    every required parameter (direct + all packed q/k/v and gate/up shards) must
+    receive a weight, else it is reported as missing.
+    """
+
+    # A minimal but representative DFlash draft param set: one attention block
+    # (packed qkv/gate_up + direct o_proj/down_proj + norms) and the DFlash head.
+    PARAMS = [
+        "layers.0.self_attn.qkv_proj.weight",
+        "layers.0.self_attn.o_proj.weight",
+        "layers.0.mlp.gate_up_proj.weight",
+        "layers.0.mlp.down_proj.weight",
+        "layers.0.input_layernorm.weight",
+        "layers.0.post_attention_layernorm.weight",
+        "fc.weight",
+        "hidden_norm.weight",
+        "norm.weight",
+    ]
+
+    def _all_loaded(self):
+        qkv = "layers.0.self_attn.qkv_proj.weight"
+        gate_up = "layers.0.mlp.gate_up_proj.weight"
+        direct = {
+            p
+            for p in self.PARAMS
+            if "qkv_proj" not in p and "gate_up_proj" not in p
+        }
+        packed = {qkv: {"q", "k", "v"}, gate_up: {0, 1}}
+        return direct, packed
+
+    def test_all_present_no_missing(self):
+        direct, packed = self._all_loaded()
+        self.assertEqual(du.dflash_missing_weight_keys(self.PARAMS, direct, packed), [])
+
+    def test_missing_direct_fc_weight(self):
+        direct, packed = self._all_loaded()
+        direct.discard("fc.weight")
+        missing = du.dflash_missing_weight_keys(self.PARAMS, direct, packed)
+        self.assertIn("fc.weight", missing)
+
+    def test_missing_hidden_norm_and_norm(self):
+        direct, packed = self._all_loaded()
+        direct.discard("hidden_norm.weight")
+        direct.discard("norm.weight")
+        missing = du.dflash_missing_weight_keys(self.PARAMS, direct, packed)
+        self.assertIn("hidden_norm.weight", missing)
+        self.assertIn("norm.weight", missing)
+
+    def test_missing_qkv_shard(self):
+        direct, packed = self._all_loaded()
+        packed["layers.0.self_attn.qkv_proj.weight"] = {"q", "k"}  # missing v
+        missing = du.dflash_missing_weight_keys(self.PARAMS, direct, packed)
+        self.assertTrue(any("qkv_proj" in m and "v" in m for m in missing), missing)
+
+    def test_missing_gate_up_shard(self):
+        direct, packed = self._all_loaded()
+        packed["layers.0.mlp.gate_up_proj.weight"] = {0}  # missing up (1)
+        missing = du.dflash_missing_weight_keys(self.PARAMS, direct, packed)
+        self.assertTrue(any("gate_up_proj" in m for m in missing), missing)
+
+    def test_fully_absent_packed_param_reported(self):
+        # A packed param that received NO shard at all is missing, not silently ok.
+        direct, packed = self._all_loaded()
+        packed.pop("layers.0.self_attn.qkv_proj.weight")
+        missing = du.dflash_missing_weight_keys(self.PARAMS, direct, packed)
+        self.assertTrue(any("qkv_proj" in m for m in missing), missing)
+
+
+class TestDflashConfigEarlyBoundaryFailures(CustomTestCase):
+    """Config failures caught EARLIER than validate_dflash_draft_startup in the
+    real ModelRunner path (parse_dflash_draft_config -> require_num_layers ->
+    resolve_target_layer_ids all raise before the aggregate validator).
+    """
+
+    def _cfg(self, **overrides):
+        from sglang.srt.speculative.dflash_utils import DFlashDraftConfig
+
+        base = dict(
+            num_hidden_layers=1,
+            num_target_layers=32,
+            block_size=8,
+            target_layer_ids=[0, 15, 31],
+            mask_token="<mask>",
+            mask_token_id=128002,
+        )
+        base.update(overrides)
+        return DFlashDraftConfig(**base)
+
+    def test_require_num_layers_raises_on_none(self):
+        with self.assertRaises(ValueError):
+            self._cfg(num_hidden_layers=None).require_num_layers()
+
+    def test_resolve_target_layer_ids_raises_on_empty(self):
+        with self.assertRaises(ValueError):
+            self._cfg(target_layer_ids=[]).resolve_target_layer_ids(
+                target_num_layers=32, draft_num_layers=1
+            )
+
+    def test_resolve_target_layer_ids_raises_on_out_of_range(self):
+        with self.assertRaises(ValueError):
+            self._cfg(target_layer_ids=[0, 99]).resolve_target_layer_ids(
+                target_num_layers=32, draft_num_layers=1
+            )
 
 
 class TestDflashFusedKvMaterializeDecision(CustomTestCase):

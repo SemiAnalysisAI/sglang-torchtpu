@@ -28,6 +28,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
+    dflash_missing_weight_keys,
     parse_dflash_draft_config,
 )
 
@@ -364,6 +365,11 @@ class DFlashDraftModel(nn.Module):
                     return prefixed_name
             return None
 
+        # Track what actually got loaded so a missing/incomplete draft checkpoint
+        # fails clearly instead of leaving parameters at initialization values.
+        loaded_direct: set = set()
+        packed_shards_seen: dict = {}
+
         for name, loaded_weight in weights:
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:
@@ -375,6 +381,7 @@ class DFlashDraftModel(nn.Module):
                 param = params_dict[resolved_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
+                packed_shards_seen.setdefault(resolved_name, set()).add(shard_id)
                 break
             else:
                 resolved_name = resolve_param_name(name)
@@ -394,6 +401,17 @@ class DFlashDraftModel(nn.Module):
                     )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                loaded_direct.add(resolved_name)
+
+        missing = dflash_missing_weight_keys(
+            params_dict.keys(), loaded_direct, packed_shards_seen
+        )
+        if missing:
+            raise ValueError(
+                "DFLASH draft checkpoint is missing required weights (likely a "
+                "mismatched or incomplete draft checkpoint):\n- "
+                + "\n- ".join(missing)
+            )
 
 
 EntryClass = DFlashDraftModel
