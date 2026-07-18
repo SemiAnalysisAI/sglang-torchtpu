@@ -180,6 +180,28 @@ class TestDflashBackendEncoderOnlyParity(unittest.TestCase):
                     f"reference max diff {diff} >= {self.TOLERANCE}",
                 )
 
+    def test_rpa_v3_forward_never_calls_triton_kv_indices(self):
+        """Dynamic AC-3 guard: run a real RPA-v3 backend forward with the
+        flashinfer Triton kv-indices kernel monkeypatched to raise. Since RPA-v3
+        builds its own metadata (never DFlashVerifyInput.generate_attn_arg_prefill,
+        the sole caller of the kernel), the forward must complete untouched.
+        """
+        import sglang.srt.speculative.dflash_info as di
+
+        def _boom(*a, **k):  # pragma: no cover - must never be called
+            raise AssertionError(
+                "create_flashinfer_kv_indices_triton was reached on the TPU "
+                "RPA-v3 verify path"
+            )
+
+        saved = di.create_flashinfer_kv_indices_triton
+        di.create_flashinfer_kv_indices_triton = _boom
+        try:
+            out, ref = self._run_case(17, 4)
+        finally:
+            di.create_flashinfer_kv_indices_triton = saved
+        self.assertLess(float((out - ref).abs().max()), self.TOLERANCE)
+
 
 if __name__ == "__main__":
     unittest.main()
