@@ -191,6 +191,26 @@ class TestValidateDflashRequestNonTPU(CustomTestCase):
         )
 
 
+class TestDflashFusedKvMaterializeDecision(CustomTestCase):
+    """The fused-vs-sequential KV-materialization gate (``dflash_fused_kv_materialize_decision``).
+
+    The fused path is a CUDA Triton kernel; on TPU (non-CUDA) it must be disabled
+    with an observable reason so the worker falls back to the sequential
+    pure-torch path intentionally, not silently.
+    """
+
+    def test_non_cuda_disabled_with_reason(self):
+        enabled, reason = du.dflash_fused_kv_materialize_decision(is_cuda=False)
+        self.assertFalse(enabled)
+        self.assertIsInstance(reason, str)
+        self.assertIn("sequential", reason.lower())
+
+    def test_cuda_enabled_no_reason(self):
+        enabled, reason = du.dflash_fused_kv_materialize_decision(is_cuda=True)
+        self.assertTrue(enabled)
+        self.assertIsNone(reason)
+
+
 class TestDflashNumCorrectDrafts(CustomTestCase):
     """The verify() correct-draft metric (``dflash_num_correct_drafts``): correct
     drafts exclude the bonus, except when a finishing draft stops the commit loop

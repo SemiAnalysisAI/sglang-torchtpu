@@ -23,6 +23,7 @@ from sglang.srt.server_args import (
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
+    dflash_fused_kv_materialize_decision,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
     resolve_dflash_verify_mask_policy,
@@ -256,10 +257,18 @@ class DFlashWorker:
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
 
-        self._use_fused_kv_materialize = is_cuda()
+        self._use_fused_kv_materialize, _fused_kv_off_reason = (
+            dflash_fused_kv_materialize_decision(is_cuda())
+        )
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+        elif _fused_kv_off_reason is not None and self.tp_rank == 0:
+            # Make the intentional fallback (e.g. TPU -> sequential pure-torch
+            # materialization) observable rather than silent.
+            logger.info(
+                "DFLASH fused KV materialization disabled: %s", _fused_kv_off_reason
+            )
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""

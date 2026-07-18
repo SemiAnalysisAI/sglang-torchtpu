@@ -454,6 +454,25 @@ def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
     return True, ""
 
 
+def dflash_fused_kv_materialize_decision(is_cuda: bool) -> Tuple[bool, Optional[str]]:
+    """Decide whether DFlash may use the fused KV-materialization path.
+
+    The fused path is a CUDA Triton kernel (``triton_ops.fused_kv_materialize``).
+    On any non-CUDA platform -- notably TPU -- it is disabled and DFlash falls
+    back to the sequential pure-torch materialization, mirroring main's
+    ``_use_torch_native`` idiom (no Triton/sgl-kernel on the TPU path). Returns
+    ``(enabled, disable_reason)``; the worker logs ``disable_reason`` so the
+    intentional fallback is observable rather than silent. On CUDA the fused path
+    is enabled here and further gated per-layer by ``can_dflash_use_fused_qkv_proj``.
+    """
+    if not is_cuda:
+        return False, (
+            "target platform is not CUDA; using sequential pure-torch KV "
+            "materialization (the fused path is a CUDA Triton kernel)"
+        )
+    return True, None
+
+
 def dflash_num_correct_drafts(accept_len: int, appended: int) -> int:
     """Number of accepted *draft* tokens actually committed this verify step.
 
