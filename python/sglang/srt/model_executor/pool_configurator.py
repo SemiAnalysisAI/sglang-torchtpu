@@ -121,7 +121,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers),
                     # Exact draft KV bytes/token when derivable from the draft
-                    # config (task12); None => layer-count scaling fallback.
+                    # config; None => layer-count scaling fallback.
                     draft_cell_size_per_token=getattr(
                         mr, "dflash_draft_cell_size_per_token", None
                     ),

@@ -137,8 +137,8 @@ class TestValidateDflashRequestNonTPU(CustomTestCase):
 
 
 class TestDflashKvCellSizing(CustomTestCase):
-    """task12/AC-8: the shared target+draft KV pool must be sized from the DRAFT
-    config, not by assuming the draft's per-layer KV bytes equal the target's.
+    """The shared target+draft KV pool must be sized from the DRAFT config, not
+    by assuming the draft's per-layer KV bytes equal the target's.
     """
 
     def test_explicit_draft_cell_size_is_summed(self):
@@ -187,8 +187,79 @@ class TestDflashKvCellSizing(CustomTestCase):
         self.assertGreater(exact_wide, layer_count)
 
 
+class TestDflashDraftCellSizeIntegration(CustomTestCase):
+    """Integration-level guard for ModelRunner._compute_dflash_draft_cell_size:
+    it must produce a real (non-None) draft KV cell size for a mismatched draft,
+    and it must run only after the KV cache dtype is resolved. This is what the
+    pure-function tests above did NOT catch: an earlier version ran before
+    configure_kv_cache_dtype() and silently fell back to None.
+    """
+
+    @staticmethod
+    def _fake_draft_cfg(kv_heads, head_dim, v_head_dim=None, mla=False):
+        return types.SimpleNamespace(
+            use_mla_backend=mla,
+            head_dim=head_dim,
+            v_head_dim=head_dim if v_head_dim is None else v_head_dim,
+            get_num_kv_heads=lambda tp, _n=kv_heads: _n,
+        )
+
+    def _fake_runner(self, draft_cfg, kv_cache_dtype, num_layers=5):
+        return types.SimpleNamespace(
+            _dflash_draft_model_config=draft_cfg,
+            dflash_draft_num_layers=num_layers,
+            kv_cache_dtype=kv_cache_dtype,
+            dflash_draft_cell_size_per_token=None,
+        )
+
+    def test_computes_real_value_after_dtype_set(self):
+        import torch
+        from unittest import mock
+
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        runner = self._fake_runner(
+            self._fake_draft_cfg(kv_heads=8, head_dim=128), torch.bfloat16
+        )
+        with mock.patch(
+            "sglang.srt.layers.dp_attention.get_attention_tp_size", return_value=1
+        ):
+            ModelRunner._compute_dflash_draft_cell_size(runner)
+        # 8 kv heads * (128 + 128) * 5 layers * 2 bytes (bf16).
+        self.assertEqual(
+            runner.dflash_draft_cell_size_per_token, 8 * (128 + 128) * 5 * 2
+        )
+
+    def test_bug_regression_requires_dtype_resolved(self):
+        # Running before configure_kv_cache_dtype() (kv_cache_dtype unset) must
+        # fail loudly rather than silently fall back to None -- guarding the
+        # init-order fix.
+        from unittest import mock
+
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        runner = self._fake_runner(
+            self._fake_draft_cfg(kv_heads=8, head_dim=128), kv_cache_dtype=None
+        )
+        with mock.patch(
+            "sglang.srt.layers.dp_attention.get_attention_tp_size", return_value=1
+        ):
+            with self.assertRaises(Exception):
+                ModelRunner._compute_dflash_draft_cell_size(runner)
+
+    def test_mla_draft_left_none(self):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        runner = self._fake_runner(
+            self._fake_draft_cfg(kv_heads=8, head_dim=128, mla=True),
+            kv_cache_dtype=None,
+        )
+        ModelRunner._compute_dflash_draft_cell_size(runner)
+        self.assertIsNone(runner.dflash_draft_cell_size_per_token)
+
+
 class TestDflashVerifyMaskPolicyAvoidsTriton(CustomTestCase):
-    """AC-3 guard: on the TPU RPA-v3 backend, DFlash verify skips its custom mask,
+    """Verify-routing guard: on the TPU RPA-v3 backend, DFlash verify skips its custom mask,
     so it uses RPA-v3's own metadata builder and never reaches
     DFlashVerifyInput.generate_attn_arg_prefill (the only caller of the Triton
     create_flashinfer_kv_indices_triton kernel).

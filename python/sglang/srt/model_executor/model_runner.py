@@ -427,8 +427,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Draft KV cell size (bytes/token) derived from the DRAFT config, used to
         # size the shared target+draft KV pool exactly even when the draft's KV
         # dims/dtype differ from the target. None => fall back to layer-count
-        # scaling (correct when draft per-layer KV bytes == target's).
+        # scaling (correct when draft per-layer KV bytes == target's). Computed in
+        # _compute_dflash_draft_cell_size() after the KV cache dtype is resolved.
         self.dflash_draft_cell_size_per_token = None
+        self._dflash_draft_model_config = None
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             # load draft config
             draft_model_config = ModelConfig.from_server_args(
@@ -495,37 +497,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             self.dflash_use_aux_hidden_state = True
             self.dflash_draft_num_layers = int(draft_num_layers)
-            # Derive the draft's per-token KV cell size from the DRAFT config
-            # (mirrors the target formula in TokenToKVPoolConfigurator) so the
-            # shared pool is sized correctly for a draft whose head_dim / KV-head
-            # count / dtype differ from the target (task12 / AC-8). Non-MLA only,
-            # which DFlash drafts are (dense decoder). Falls back to layer-count
-            # scaling on any error.
-            try:
-                from sglang.srt.distributed import get_attention_tp_size
-
-                if not getattr(draft_model_config, "use_mla_backend", False):
-                    kv_elt = torch._utils._element_size(self.kv_cache_dtype)
-                    draft_kv_heads = draft_model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    )
-                    draft_head_dim = int(draft_model_config.head_dim)
-                    draft_v_head_dim = int(
-                        getattr(draft_model_config, "v_head_dim", draft_head_dim)
-                    )
-                    self.dflash_draft_cell_size_per_token = int(
-                        draft_kv_heads
-                        * (draft_head_dim + draft_v_head_dim)
-                        * int(draft_num_layers)
-                        * kv_elt
-                    )
-            except Exception as e:  # pragma: no cover - defensive
-                logger.warning(
-                    "DFLASH: could not derive draft KV cell size from draft "
-                    "config (%s); using layer-count scaling.",
-                    e,
-                )
-                self.dflash_draft_cell_size_per_token = None
+            # Keep the draft ModelConfig so the shared KV pool can be sized from
+            # the draft's real KV dims/dtype. The byte size is computed later in
+            # _compute_dflash_draft_cell_size(), after configure_kv_cache_dtype()
+            # has resolved self.kv_cache_dtype (it is unset here).
+            self._dflash_draft_model_config = draft_model_config
             self.dflash_target_layer_ids = dflash_draft_config.resolve_target_layer_ids(
                 target_num_layers=int(target_num_layers),
                 draft_num_layers=int(draft_num_layers),
@@ -793,6 +769,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
+
+        # DFLASH: now that the KV cache dtype is known, derive the draft's
+        # per-token KV cell size from the draft config so the shared pool is
+        # sized correctly for a draft whose KV dims/dtype differ from the target.
+        self._compute_dflash_draft_cell_size()
 
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
@@ -2216,6 +2197,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return existing
         result = self._get_linear_attn_registry_result()
         return result[1] if result else None
+
+    def _compute_dflash_draft_cell_size(self):
+        """Derive the DFlash draft's per-token KV cell size (bytes) from the draft
+        config, mirroring TokenToKVPoolConfigurator's target formula. Must run
+        after configure_kv_cache_dtype() (needs self.kv_cache_dtype) and before
+        the KV pool is built. Non-MLA only (DFlash drafts are dense decoders);
+        leaves the value None (layer-count fallback) for MLA drafts.
+        """
+        draft_cfg = self._dflash_draft_model_config
+        if draft_cfg is None or self.dflash_draft_num_layers is None:
+            return
+        if getattr(draft_cfg, "use_mla_backend", False):
+            return
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+        kv_elt = torch._utils._element_size(self.kv_cache_dtype)
+        draft_kv_heads = draft_cfg.get_num_kv_heads(get_attention_tp_size())
+        head_dim = int(draft_cfg.head_dim)
+        v_head_dim = int(getattr(draft_cfg, "v_head_dim", head_dim))
+        self.dflash_draft_cell_size_per_token = int(
+            draft_kv_heads
+            * (head_dim + v_head_dim)
+            * int(self.dflash_draft_num_layers)
+            * kv_elt
+        )
 
     def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
