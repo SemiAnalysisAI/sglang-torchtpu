@@ -2538,5 +2538,52 @@ class TestDflashVerifyMaskPolicyAvoidsTriton(CustomTestCase):
         self.assertIn("create_flashinfer_kv_indices_triton[", gen_src)
 
 
+class TestDflashTpuDeviceProbe(CustomTestCase):
+    """`dflash_tpu_device_probe.interpret_probe`: the pure verdict logic for the
+    reboot-gated device-state re-check. Order-sensitive per the R28 degradation
+    signature (holders first, then single-chip op, then the residual multi-worker
+    question), and multi-worker status is always UNVERIFIED without a TP=4 launch.
+    """
+
+    def _mod(self):
+        import importlib.util
+        import pathlib
+
+        p = pathlib.Path(__file__).parent / "dflash_tpu_device_probe.py"
+        spec = importlib.util.spec_from_file_location("dflash_tpu_device_probe", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_holders_present_takes_priority(self):
+        m = self._mod()
+        # a live holder invalidates the op probe even if single-chip "looks" ok
+        v = m.interpret_probe(["... launch_server ..."], [], True)
+        self.assertEqual(v["state"], "holders-present")
+        v2 = m.interpret_probe([], [30000], True)
+        self.assertEqual(v2["state"], "holders-present")
+
+    def test_single_chip_failed(self):
+        m = self._mod()
+        v = m.interpret_probe([], [], False)
+        self.assertEqual(v["state"], "single-chip-failed")
+        self.assertEqual(v["multiworker_status"], "UNVERIFIED")
+
+    def test_unprobed_when_op_skipped(self):
+        m = self._mod()
+        v = m.interpret_probe([], [], None)
+        self.assertEqual(v["state"], "single-chip-unprobed")
+
+    def test_healthy_no_holders_leaves_multiworker_unverified(self):
+        # The current live reading: clean env + single-chip ok. Must NOT claim
+        # recovery -- multi-worker status stays UNVERIFIED and the recommendation
+        # points at an owner reboot or a bounded TP=4 attempt.
+        m = self._mod()
+        v = m.interpret_probe([], [], True)
+        self.assertEqual(v["state"], "single-chip-healthy-no-holders")
+        self.assertEqual(v["multiworker_status"], "UNVERIFIED")
+        self.assertIn("reboot", v["recommendation"])
+
+
 if __name__ == "__main__":
     unittest.main()
