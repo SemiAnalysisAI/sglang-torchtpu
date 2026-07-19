@@ -1328,6 +1328,67 @@ class TestParseCheckerLog(CustomTestCase):
         self.assertEqual(s["verify_glue"]["steps"], 0)
 
 
+class TestCompareConcurrentStreams(CustomTestCase):
+    """`dflash_concurrent_parity.compare_concurrent_streams`: per-request
+    exact / tolerated (via a bound manifest) / fail / missing classification.
+    Hermetic -- injected diff/tolerance predicates, no live server.
+    """
+
+    @staticmethod
+    def _diff(spec, ref):
+        n = min(len(spec), len(ref))
+        for i in range(n):
+            if spec[i] != ref[i]:
+                return {"match": False, "first_divergence": i,
+                        "spec_len": len(spec), "ref_len": len(ref)}
+        if len(spec) != len(ref):
+            return {"match": False, "first_divergence": n,
+                    "spec_len": len(spec), "ref_len": len(ref)}
+        return {"match": True, "first_divergence": -1,
+                "spec_len": len(spec), "ref_len": len(ref)}
+
+    @staticmethod
+    def _tolerated(manifest, prompt, idx, spec_tok, ref_tok):
+        return (manifest.get(prompt) == "tie", "tie")
+
+    def _mod(self):
+        import importlib.util
+        import pathlib
+
+        p = pathlib.Path(__file__).parent / "dflash_concurrent_parity.py"
+        spec = importlib.util.spec_from_file_location("dflash_concurrent_parity", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _cmp(self, dflash, nospec, manifest=None):
+        return self._mod().compare_concurrent_streams(
+            dflash, nospec, manifest, diff_fn=self._diff, tolerated_fn=self._tolerated
+        )
+
+    def test_all_exact_is_pass(self):
+        d = {"a": [1, 2, 3], "b": [4, 5, 6]}
+        s = self._cmp(d, dict(d))
+        self.assertEqual(s["counts"]["exact"], 2)
+        self.assertTrue(s["counts"]["all_ok"])
+
+    def test_tolerated_vs_fail(self):
+        dflash = {"a": [1, 2, 3], "b": [1, 9, 3], "c": [1, 8, 3]}
+        nospec = {"a": [1, 2, 3], "b": [1, 5, 3], "c": [1, 5, 3]}
+        s = self._cmp(dflash, nospec, manifest={"b": "tie"})
+        c = s["counts"]
+        self.assertEqual(c["exact"], 1)      # a
+        self.assertEqual(c["tolerated"], 1)   # b (manifest tie)
+        self.assertEqual(c["fail"], 1)        # c (untolerated)
+        self.assertFalse(c["all_ok"])
+        self.assertEqual(s["per_prompt"]["c"]["index"], 1)
+
+    def test_missing_prompt_fails_all_ok(self):
+        s = self._cmp({"a": [1], "d": [2]}, {"a": [1]})
+        self.assertEqual(s["counts"]["missing"], 1)
+        self.assertFalse(s["counts"]["all_ok"])
+
+
 class TestDflashTpVerifyInvariant(CustomTestCase):
     """All-ranks-identical invariant helper (`dflash_tp_ranks_agree`): after
     the rank-0 broadcast + host rebuild, an all-gathered per-rank vector
