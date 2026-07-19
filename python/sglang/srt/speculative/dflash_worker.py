@@ -1443,8 +1443,8 @@ class DFlashWorker:
             # (invalid/padded cells -> reserved dummy slot 0); index_select the
             # compacted [pad_n, feat] rows into the [bs*bucket_ctx, feat] grid. So the
             # gather + project matmul + scatter all compile ONCE PER POW2 BUCKET
-            # instead of once per exact prompt length (the R10 post-hoc pad bounded
-            # only the matmul, not the gather). Committed cells write byte-identical
+            # instead of once per exact prompt length (an earlier post-hoc pad
+            # bounded only the matmul, not the gather). Committed cells write byte-identical
             # KV; uncommitted cells are zero-hidden writes to slot 0 (inert).
             max_ctx = int(ctx_lens.max().item())
             if max_ctx <= 0:

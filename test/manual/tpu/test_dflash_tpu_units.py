@@ -1189,7 +1189,7 @@ class TestDflashDivergenceClassifier(CustomTestCase):
         self.assertFalse(m._tolerated_divergence({"P": entry}, "P", 26, 374, 706)[0])
 
     def test_tolerated_rejects_scalar_nospec_token_forgery(self):
-        # Codex R2 forgery: edit ONLY the scalar nospec_token to a changed current
+        # Forgery case: edit ONLY the scalar nospec_token to a changed current
         # ref token (999) while leaving nospec_topk top-1 as the old 706. The
         # recomputed-evidence binding must reject it (recomputed top-1 706 != 999).
         m = self._mod()
@@ -1392,7 +1392,8 @@ class TestCompareConcurrentStreams(CustomTestCase):
 
     def test_missing_from_dflash_fails_closed(self):
         # A request present in the no-spec reference but DROPPED by DFlash must
-        # fail closed (the R28 fail-open bug: the union iteration catches it).
+        # fail closed (the previously-uncaught direction: the union iteration
+        # catches it).
         s = self._cmp({"a": [1]}, {"a": [1], "b": [2]})
         self.assertEqual(s["counts"]["missing"], 1)
         self.assertEqual(s["per_prompt"]["b"]["missing_from"], "dflash")
@@ -1934,7 +1935,7 @@ class TestDflashDraftForwardInputEmbeds(CustomTestCase):
     `forward_batch.input_embeds` (whose row count matches the padded input_ids /
     positions / attention metadata), not the stale pre-pad `input_embeds` kwarg
     that model_runner captured before padding — otherwise a real bs != compile
-    bucket crashes the compiled draft attention (bs>1 fix, R15).
+    bucket crashes the compiled draft attention (the bs>1 draft-forward fix).
     """
 
     class _IdNorm:
