@@ -196,9 +196,23 @@ def _cmd_compare(args) -> int:
         with open(args.tolerance_manifest) as f:
             manifest = json.load(f)
     all_ok = True
-    for prompt in spec:
-        if prompt not in ref:
-            print(f"MISSING in ref: {prompt!r}")
+    # Iterate the UNION of prompt keys so a request missing from EITHER dump fails
+    # closed: a DFlash request dropped from the spec dump (present only in ref) must
+    # never be silently omitted and still report PASS.
+    for prompt in sorted(set(spec) | set(ref)):
+        in_spec, in_ref = prompt in spec, prompt in ref
+        if not in_spec or not in_ref:
+            print(f"MISSING in {'spec' if not in_spec else 'ref'}: {prompt!r}")
+            all_ok = False
+            continue
+        # An empty token stream is absence of evidence, not proof of parity:
+        # diff_token_streams([], []) would otherwise `match` and report PASS.
+        if not spec[prompt] or not ref[prompt]:
+            empty_on = (
+                "both" if not spec[prompt] and not ref[prompt]
+                else ("spec" if not spec[prompt] else "ref")
+            )
+            print(f"EMPTY stream ({empty_on}): {prompt!r}")
             all_ok = False
             continue
         v = diff_token_streams(spec[prompt], ref[prompt])

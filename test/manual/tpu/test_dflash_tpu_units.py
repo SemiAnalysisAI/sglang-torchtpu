@@ -1086,6 +1086,73 @@ class TestDflashStreamParityVerdict(CustomTestCase):
         self.assertEqual(v["first_divergence"], 0)
 
 
+class TestGreedyParityCompareFailClosed(CustomTestCase):
+    """`dflash_greedy_parity._cmd_compare` (the single-stream bs=1 AC-5 proof CLI)
+    must fail closed: a prompt missing from EITHER dump, or an empty stream on
+    either side, must force FAIL (exit 1) rather than silently PASS -- the same
+    fail-closed semantics the concurrent comparator got, applied to the primary
+    single-stream harness.
+    """
+
+    def _mod(self):
+        import importlib.util
+        import pathlib
+
+        p = pathlib.Path(__file__).parent / "dflash_greedy_parity.py"
+        spec = importlib.util.spec_from_file_location("dflash_greedy_parity", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _compare(self, spec_dump, ref_dump):
+        import argparse
+        import contextlib
+        import io
+        import json
+        import os
+        import shutil
+        import tempfile
+
+        m = self._mod()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        sp = os.path.join(tmp, "spec.json")
+        rf = os.path.join(tmp, "ref.json")
+        with open(sp, "w") as f:
+            json.dump(spec_dump, f)
+        with open(rf, "w") as f:
+            json.dump(ref_dump, f)
+        args = argparse.Namespace(spec_json=sp, ref_json=rf, tolerance_manifest=None)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = m._cmd_compare(args)
+        return rc, buf.getvalue()
+
+    def test_all_exact_passes(self):
+        rc, out = self._compare({"a": [1, 2], "b": [3]}, {"a": [1, 2], "b": [3]})
+        self.assertEqual(rc, 0)
+        self.assertIn("PASS", out)
+
+    def test_prompt_dropped_from_spec_fails_closed(self):
+        # Present only in ref (the DFlash spec dump dropped it): the old
+        # `for prompt in spec` loop never examined it and reported PASS.
+        rc, out = self._compare({"a": [1, 2]}, {"a": [1, 2], "b": [3]})
+        self.assertEqual(rc, 1)
+        self.assertIn("MISSING in spec", out)
+
+    def test_prompt_missing_from_ref_fails_closed(self):
+        rc, out = self._compare({"a": [1, 2], "b": [3]}, {"a": [1, 2]})
+        self.assertEqual(rc, 1)
+        self.assertIn("MISSING in ref", out)
+
+    def test_empty_stream_fails_closed(self):
+        rc, out = self._compare({"a": [], "b": [3]}, {"a": [1, 2], "b": [3]})
+        self.assertEqual(rc, 1)
+        self.assertIn("EMPTY", out)
+        rc2, _ = self._compare({"a": [], "b": [3]}, {"a": [], "b": [3]})
+        self.assertEqual(rc2, 1)  # both empty is not a PASS
+
+
 class TestDflashDivergenceClassifier(CustomTestCase):
     """The DECISIVE bf16 tie-break tolerance policy (`classify_divergence` +
     `_tolerated_divergence`): a divergence is an accepted tie-break ONLY when the
