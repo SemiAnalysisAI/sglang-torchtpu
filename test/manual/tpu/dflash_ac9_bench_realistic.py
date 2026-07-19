@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AC-9 realistic-workload throughput probe for DFlash-on-TPU.
+"""Realistic-workload throughput probe for DFlash-on-TPU.
 
 The synthetic filler-token bench (dflash_ac9_bench.py) is a BEST-CASE for spec
 decoding: a repetitive input makes the draft accept ~all draft_token_num tokens
@@ -57,7 +57,7 @@ def gen(port, prompt, max_new):
 def main():
     port = int(sys.argv[1])
     label = sys.argv[2]
-    print(f"### AC-9 realistic bench: label={label} port={port} max_new={MAX_NEW}")
+    print(f"### realistic bench: label={label} port={port} max_new={MAX_NEW}")
     print("| prompt | tok/s | accept_len | completion | s |")
     print("|--------|-------|------------|------------|---|")
     # Warm the decode shape once (discarded).

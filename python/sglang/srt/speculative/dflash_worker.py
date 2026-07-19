@@ -31,7 +31,6 @@ from sglang.srt.speculative.dflash_utils import (
     dflash_fused_kv_materialize_decision,
     dflash_precompile_bucket_plan,
     dflash_round_up_pow2,
-    is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
     resolve_dflash_verify_mask_policy,
 )
@@ -890,19 +889,22 @@ class DFlashWorker:
                 "Invariant broken: DFLASH batch has grammar constraints, but scheduler should have rejected this request."
             )
         if (
-            batch.sampling_info is not None
+            _IS_TPU
+            and batch.sampling_info is not None
             and not batch.sampling_info.is_all_greedy
-            and not is_dflash_sampling_verify_available()
         ):
-            # DEC-4: non-greedy verify is unavailable on this build/device, so the
-            # scheduler admission path (validate_dflash_request) rejects such
-            # requests up front. Reaching here means that guard was bypassed;
-            # raise instead of silently degrading to greedy (mirrors the grammar
-            # invariant check above), so semantics never change behind the caller.
+            # On TPU the sampling (non-greedy) verify path is unavailable, so the
+            # scheduler admission path (validate_dflash_request) rejects non-greedy
+            # DFlash requests up front (only under _IS_TPU). Reaching here means
+            # that guard was bypassed; raise instead of silently degrading to
+            # greedy (mirrors the grammar invariant check above), so semantics
+            # never change behind the caller. Scoped to _IS_TPU to match exactly
+            # where admission guarantees the rejection; on non-TPU builds where
+            # sampling verify is available the non-greedy path runs normally.
             raise RuntimeError(
-                "Invariant broken: DFLASH non-greedy batch reached the worker on a "
-                "build/device without sampling verify, but the scheduler should "
-                "have rejected it (validate_dflash_request)."
+                "Invariant broken: DFLASH non-greedy batch reached the worker on "
+                "TPU, but the scheduler should have rejected it "
+                "(validate_dflash_request)."
             )
 
         bs = batch.batch_size()

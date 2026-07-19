@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AC-9 throughput benchmark for DFlash-on-TPU vs a no-spec target baseline.
+"""Throughput benchmark for DFlash-on-TPU vs a no-spec target baseline.
 
 Measures warmed steady-state OUTPUT (decode) throughput at a real batch size N by
 sending N concurrent equal-length `input_ids` requests (`ignore_eos`, temperature 0
@@ -74,7 +74,7 @@ def main():
     batch_sizes = (
         [int(x) for x in sys.argv[3].split(",")] if len(sys.argv) > 3 else [1, 8]
     )
-    print(f"### AC-9 bench: label={label} port={port} "
+    print(f"### throughput bench: label={label} port={port} "
           f"prompt_len={PROMPT_LEN} max_new={MAX_NEW}")
     print("| bs | warmup? | agg_tok/s | per_req_tok/s | mean_accept_len | "
           "sum_completion | wall_s |")

@@ -57,6 +57,31 @@ def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
 
 
+# TPU DFlash bring-up is validated for these tensor-parallel sizes only (TP 1->4).
+# TP=1 is single-chip; 2 and 4 are the powers-of-two v5e meshes whose head
+# sharding and topology are covered. Other sizes (e.g. 3, 8) are rejected at
+# startup rather than failing deep in mesh/topology setup.
+DFLASH_TPU_SUPPORTED_TP_SIZES = (1, 2, 4)
+
+
+def validate_dflash_tpu_tp_size(tp_size: int) -> Optional[str]:
+    """Return an error string if ``tp_size`` is outside the DFlash-on-TPU
+    bring-up scope, else ``None``.
+
+    Pure and CPU-testable so the startup guard (in the TPU platform gate) has
+    focused coverage independent of the live-TPU launch path.
+    """
+    if int(tp_size) not in DFLASH_TPU_SUPPORTED_TP_SIZES:
+        return (
+            "DFLASH on TPU is validated only for tp_size in "
+            f"{{{', '.join(str(s) for s in DFLASH_TPU_SUPPORTED_TP_SIZES)}}} "
+            "(the greedy bring-up scope, TP 1->4); got "
+            f"tp_size={tp_size}. Draft/target head sharding and the TPU mesh are "
+            "only covered for those sizes."
+        )
+    return None
+
+
 def scale_kv_cell_size_per_token_for_dflash(
     *,
     target_cell_size_per_token: int,

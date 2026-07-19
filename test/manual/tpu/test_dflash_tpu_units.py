@@ -287,6 +287,29 @@ class TestValidateDflashDraftStartup(CustomTestCase):
         self.assertGreaterEqual(len(errs), 3)
 
 
+class TestValidateDflashTpuTpSize(CustomTestCase):
+    """The TPU startup tp_size guard (``validate_dflash_tpu_tp_size``): the
+    supported bring-up sizes {1,2,4} pass; everything else returns a clear error.
+    This is the pure predicate the TPU platform gate raises on, tested here
+    independent of the live-TPU launch path.
+    """
+
+    def test_supported_sizes_pass(self):
+        from sglang.srt.speculative.dflash_utils import validate_dflash_tpu_tp_size
+
+        for tp in (1, 2, 4):
+            self.assertIsNone(validate_dflash_tpu_tp_size(tp), tp)
+
+    def test_unsupported_sizes_rejected(self):
+        from sglang.srt.speculative.dflash_utils import validate_dflash_tpu_tp_size
+
+        for tp in (3, 5, 6, 8, 16):
+            err = validate_dflash_tpu_tp_size(tp)
+            self.assertIsNotNone(err, tp)
+            self.assertIn("tp_size", err)
+            self.assertIn(str(tp), err)
+
+
 class TestDflashMissingWeightKeys(CustomTestCase):
     """The draft-checkpoint completeness check (``dflash_missing_weight_keys``):
     every required parameter (direct + all packed q/k/v and gate/up shards) must
