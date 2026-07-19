@@ -311,6 +311,39 @@ class TestValidateDflashTpuTpSize(CustomTestCase):
             self.assertIn(str(tp), err)
 
 
+class TestDflashDraftCompileEnabled(CustomTestCase):
+    """`dflash_draft_compile_enabled`: the standard --enable-torch-compile flag is
+    the first-class trigger for compiling the DFlash draft; the legacy env override
+    still enables the draft-only path; both are gated to TPU.
+    """
+
+    def _fn(self):
+        from sglang.srt.speculative.dflash_utils import dflash_draft_compile_enabled
+
+        return dflash_draft_compile_enabled
+
+    def test_flag_enables_on_tpu(self):
+        f = self._fn()
+        self.assertTrue(f(True, True, None))       # --enable-torch-compile
+        self.assertTrue(f(True, True, "0"))        # flag wins even if env=0
+
+    def test_env_override_enables_draft_only(self):
+        f = self._fn()
+        # flag off but env override on -> draft compiled (target stays eager)
+        self.assertTrue(f(False, True, "1"))
+
+    def test_disabled_when_neither(self):
+        f = self._fn()
+        self.assertFalse(f(False, True, None))
+        self.assertFalse(f(False, True, "0"))
+
+    def test_gated_to_tpu(self):
+        f = self._fn()
+        # never compiles the DFlash draft off-TPU, regardless of flag/env
+        self.assertFalse(f(True, False, "1"))
+        self.assertFalse(f(True, False, None))
+
+
 class TestUnsupportedTpuWorldSizeError(CustomTestCase):
     """The startup topology guard (`unsupported_tpu_world_size_error`) that turns
     the cryptic TP=2-on-v5e PJRT abort into a clear message. Uses an injected

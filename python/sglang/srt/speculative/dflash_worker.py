@@ -27,6 +27,7 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     dflash_assert_extend_hidden_rows,
     dflash_decode_materialize_grid,
+    dflash_draft_compile_enabled,
     dflash_extend_materialize_plan,
     dflash_fused_kv_materialize_decision,
     dflash_precompile_bucket_plan,
@@ -166,13 +167,20 @@ class DFlashWorker:
         )
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
-        # Experimental (SGLANG_DFLASH_COMPILE_DRAFT=1): compile the DFlash draft
-        # block forward on TPU. By default the draft runs eager (the DFlash
-        # compile policy is target-only), which profiling shows costs ~1.3s/step
-        # (>90% of decode). Enabling torch.compile for the *draft worker only*
-        # lets TpuGraphRunner install a bucketed compiled forward on
-        # DFlashDraftModel.forward without touching the target's own policy.
-        if _IS_TPU and os.environ.get("SGLANG_DFLASH_COMPILE_DRAFT") == "1":
+        # Compile the DFlash draft block forward on TPU. By default the draft runs
+        # eager, which profiling shows costs ~1.3s/step (>90% of decode); enabling
+        # torch.compile for the draft worker lets TpuGraphRunner install a bucketed
+        # compiled forward on DFlashDraftModel.forward. The first-class trigger is
+        # the standard --enable-torch-compile flag (which also compiles the target
+        # via its own TpuGraphRunner); SGLANG_DFLASH_COMPILE_DRAFT=1 remains a
+        # back-compat override that compiles the draft only, leaving the target
+        # eager -> XLA. See dflash_draft_compile_enabled().
+        self._compile_draft = dflash_draft_compile_enabled(
+            server_args.enable_torch_compile,
+            _IS_TPU,
+            os.environ.get("SGLANG_DFLASH_COMPILE_DRAFT"),
+        )
+        if self._compile_draft:
             draft_server_args.enable_torch_compile = True
         import torch as _torch
 
@@ -670,7 +678,7 @@ class DFlashWorker:
         is logged and skipped (serving falls back to lazy compile); only runs when
         the draft compile is enabled.
         """
-        if not (_IS_TPU and os.environ.get("SGLANG_DFLASH_COMPILE_DRAFT") == "1"):
+        if not getattr(self, "_compile_draft", False):
             return
         try:
             from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (

@@ -86,6 +86,27 @@ def validate_dflash_tpu_tp_size(tp_size: int) -> Optional[str]:
     return None
 
 
+def dflash_draft_compile_enabled(
+    enable_torch_compile: bool, is_tpu: bool, env_override: Optional[str]
+) -> bool:
+    """Whether to torch.compile (and precompile) the DFlash draft block forward.
+
+    On TPU the target forward already compiles whenever ``enable_torch_compile`` is
+    set (its own ``TpuGraphRunner`` composes the spec-aware policy); this predicate
+    governs the *draft* worker, which needs an explicit opt-in plus the bucketed
+    precompile warmup to be recompilation-clean.
+
+    The first-class trigger is the standard ``--enable-torch-compile`` server flag.
+    ``SGLANG_DFLASH_COMPILE_DRAFT=1`` is retained as a back-compat override that
+    enables the draft compile *without* globally enabling torch.compile (i.e. draft
+    compiled while the target stays eager -> XLA, the earlier benchmark config).
+
+    Pure and CPU-testable so the gate has focused coverage independent of a live
+    TPU launch.
+    """
+    return bool(is_tpu and (enable_torch_compile or env_override == "1"))
+
+
 def scale_kv_cell_size_per_token_for_dflash(
     *,
     target_cell_size_per_token: int,
