@@ -17,6 +17,7 @@ Usage:
 """
 import argparse
 import concurrent.futures
+import hashlib
 import importlib.util
 import json
 import pathlib
@@ -200,6 +201,34 @@ def compare_concurrent_streams(
     return {"counts": counts, "per_prompt": per_prompt}
 
 
+def collection_config(prompts: List[str], max_new_tokens: int) -> Dict:
+    """Deterministic fingerprint of a collect invocation's config. The two
+    sequential collects (dflash server, then no-spec server) MUST share this so
+    their dumps are comparable; a mismatch (different max_new_tokens, or a
+    harness-version / prompt-set skew) turns into length/content divergences whose
+    cause is otherwise invisible. Pure + CPU-testable."""
+    h = hashlib.sha256()
+    for p in prompts:
+        h.update(p.encode("utf-8"))
+        h.update(b"\x00")  # length-independent separator
+    return {
+        "max_new_tokens": int(max_new_tokens),
+        "num_prompts": len(prompts),
+        "prompt_sha": h.hexdigest(),
+    }
+
+
+def config_mismatch(cfg_a: Dict, cfg_b: Dict) -> List[str]:
+    """Field names that differ between two collection configs (only keys present
+    in BOTH are compared; an absent key is not a mismatch, preserving back-compat
+    with dumps that carry no config). Empty list => configs are consistent."""
+    return sorted(k for k in set(cfg_a) & set(cfg_b) if cfg_a[k] != cfg_b[k])
+
+
+def _config_path(out_json: str) -> str:
+    return out_json + ".config"
+
+
 def _cmd_collect(args) -> int:
     # Record the server-log line offset BEFORE the collect so observed batching is
     # windowed to the concurrent collection, not any earlier warmup/probe traffic.
@@ -213,6 +242,11 @@ def _cmd_collect(args) -> int:
     with open(args.out_json, "w") as f:
         json.dump(streams, f)  # streams-only dump: `compare` reads this
     print(f"collected {len(streams)} concurrent streams -> {args.out_json}")
+    # Companion config (optional consumer): lets `compare` flag a mismatch between
+    # the two sequential collects. Does NOT alter the streams dump above.
+    cfg = collection_config(DEFAULT_PROMPTS, args.max_new_tokens)
+    with open(_config_path(args.out_json), "w") as f:
+        json.dump(cfg, f)
     if args.meta_out:
         with open(args.meta_out, "w") as f:
             json.dump(meta, f)
@@ -236,6 +270,21 @@ def _cmd_compare(args) -> int:
     if args.tolerance_manifest:
         with open(args.tolerance_manifest) as f:
             manifest = json.load(f)
+    # If both dumps carry a companion config, surface a mismatch: the two
+    # sequential collects must share max_new_tokens / prompt set, else divergences
+    # below may be config artifacts rather than model divergence. Non-fatal.
+    df_cfg_path, ns_cfg_path = _config_path(args.dflash_json), _config_path(args.nospec_json)
+    if pathlib.Path(df_cfg_path).exists() and pathlib.Path(ns_cfg_path).exists():
+        with open(df_cfg_path) as f:
+            df_cfg = json.load(f)
+        with open(ns_cfg_path) as f:
+            ns_cfg = json.load(f)
+        diff = config_mismatch(df_cfg, ns_cfg)
+        if diff:
+            print(
+                f"WARNING: collection config mismatch ({', '.join(diff)}) -- "
+                f"divergences may be config artifacts, not model divergence"
+            )
     summary = compare_concurrent_streams(dflash, nospec, manifest)
     c = summary["counts"]
     for prompt, d in summary["per_prompt"].items():

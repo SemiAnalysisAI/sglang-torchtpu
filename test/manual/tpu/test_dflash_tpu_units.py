@@ -1420,6 +1420,38 @@ class TestCompareConcurrentStreams(CustomTestCase):
         self.assertEqual(s2["per_prompt"]["a"]["empty_on"], "nospec")
         self.assertFalse(s2["counts"]["all_ok"])
 
+    def test_collection_config_is_deterministic_and_sensitive(self):
+        m = self._mod()
+        prompts = ["a", "b", "c"]
+        c1 = m.collection_config(prompts, 96)
+        c2 = m.collection_config(list(prompts), 96)
+        self.assertEqual(c1, c2)  # deterministic
+        self.assertEqual(c1["num_prompts"], 3)
+        self.assertEqual(c1["max_new_tokens"], 96)
+        # a max_new_tokens change and a prompt-set change each change the config
+        self.assertNotEqual(c1["max_new_tokens"], m.collection_config(prompts, 50)["max_new_tokens"])
+        self.assertNotEqual(c1["prompt_sha"], m.collection_config(["a", "b", "d"], 96)["prompt_sha"])
+        # order matters (a reordered prompt set is a different collection)
+        self.assertNotEqual(c1["prompt_sha"], m.collection_config(["b", "a", "c"], 96)["prompt_sha"])
+
+    def test_config_mismatch_reports_differing_fields(self):
+        m = self._mod()
+        base = m.collection_config(["a", "b"], 96)
+        self.assertEqual(m.config_mismatch(base, dict(base)), [])  # identical -> consistent
+        # differing max_new_tokens is reported
+        self.assertEqual(
+            m.config_mismatch(base, m.collection_config(["a", "b"], 50)),
+            ["max_new_tokens"],
+        )
+        # differing prompt set is reported
+        self.assertEqual(
+            m.config_mismatch(base, m.collection_config(["a", "x"], 96)),
+            ["prompt_sha"],
+        )
+        # partial-key inputs don't raise; only shared keys compared
+        self.assertEqual(m.config_mismatch({"max_new_tokens": 1}, {"num_prompts": 2}), [])
+        self.assertEqual(m.config_mismatch({"max_new_tokens": 1}, {"max_new_tokens": 2}), ["max_new_tokens"])
+
     def test_summarize_accept_meta_mean_over_present(self):
         m = self._mod()
         s = m.summarize_accept_meta(
