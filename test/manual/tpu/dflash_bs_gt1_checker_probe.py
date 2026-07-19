@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bs>1 recompilation-checker probe for DFlash-on-TPU (AC-7 compile stability).
+"""bs>1 recompilation-checker probe for DFlash-on-TPU (compile stability at bs>1).
 
 Forces a steady real batch of N requests (concurrent, equal-length `input_ids`,
 `ignore_eos`, same `max_new_tokens` -> they prefill and decode together at bs=N)
@@ -7,10 +7,14 @@ and measures, per run, the decode-phase XLA-cache deltas (via the worker's
 per-phase probes) and the global recompilation-checker delta.
 
 For each N it does a COLD run (first time this real bs is seen) then a WARM REPEAT
-(identical batch). If the DFlash decode glue (kv_append_post / verify_glue /
-prep_total) is bounded by the compile bucket, the WARM REPEAT's decode-phase and
-checker deltas are 0; a per-REAL-bs recompile shows a nonzero warm-repeat decode
-delta (attributable to a `batch.batch_size()`-keyed eager op).
+(identical batch). The compile-bucketed phases -- prep_total (draft forward),
+target_verify_fwd (target-verify forward), and kv_append_post (the decode
+materialize grid) -- are 0 on the warm repeat because they pad to the compile
+bucket; a nonzero warm-repeat delta in one of THOSE would be a per-REAL-bs
+recompile (a `batch.batch_size()`-keyed eager op). verify_glue is expected to be
+NONZERO here and is NOT a per-real-bs recompile: it is the eager free-cache-loc
+compaction keyed on the data-dependent `free_locs` count (bs-INDEPENDENT -- it
+recompiles the same way at real bs=1), a bounded, plan-accepted eager budget.
 
 Server: SGLANG_TPU_CHECK_RECOMPILATION=1 SGLANG_DFLASH_VERIFY_SHAPE_TRACE=1
         ... --tpu-compile-bs 1 8 --disable-radix-cache --max-running-requests >=N
@@ -97,9 +101,11 @@ def main():
                    str(checker)]
             print("| " + " | ".join(row) + " |")
     print()
-    print("Reading: a WARM_REPEAT row with kv_app=verify_glue=prep_total=0 means the")
-    print("DFlash decode glue is checker-clean for that real bs after warmup. A nonzero")
-    print("warm_repeat decode-phase delta = a per-real-bs recompile (batch.batch_size()-keyed).")
+    print("Reading: a WARM_REPEAT row with kv_app=target_verify=prep_total=0 means the")
+    print("compile-bucketed path is checker-clean for that real bs after warmup. A nonzero")
+    print("kv_app/target_verify/prep_total warm-repeat delta = a per-real-bs recompile")
+    print("(batch.batch_size()-keyed). verify_glue is EXPECTED nonzero and bs-independent")
+    print("(eager free_locs-keyed compaction, a bounded plan-accepted budget), NOT a regression.")
 
 
 if __name__ == "__main__":

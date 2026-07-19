@@ -161,6 +161,14 @@ class TpuSRTPlatform(SRTPlatform):
                         "DFLASH on TPU requires page_size == 64 (the paged "
                         f"RPA-v3 cache); got page_size={server_args.page_size}."
                     )
+                if server_args.tp_size not in (1, 2, 4):
+                    raise NotImplementedError(
+                        "DFLASH on TPU is validated only for tp_size in {1, 2, 4} "
+                        "(the greedy bring-up scope, TP 1->4); got "
+                        f"tp_size={server_args.tp_size}. Draft/target head "
+                        "sharding and the TPU mesh are only covered for those "
+                        "sizes."
+                    )
             else:
                 raise NotImplementedError(
                     f"Speculative algorithm {spec_algo!r} is not supported on TPU "

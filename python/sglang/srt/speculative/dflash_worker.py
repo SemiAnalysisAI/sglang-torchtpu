@@ -151,7 +151,6 @@ class DFlashWorker:
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
 
-        self._warned_sampling_fallback = False
         self._logged_first_verify = False
 
         # Draft runner (separate KV cache + attention backend).
@@ -890,17 +889,21 @@ class DFlashWorker:
             raise RuntimeError(
                 "Invariant broken: DFLASH batch has grammar constraints, but scheduler should have rejected this request."
             )
-        if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
-            if (
-                not is_dflash_sampling_verify_available()
-                and not self._warned_sampling_fallback
-                and self.tp_rank == 0
-            ):
-                logger.warning(
-                    "DFLASH non-greedy verification is unavailable on this build/device; "
-                    "falling back to greedy argmax verification."
-                )
-                self._warned_sampling_fallback = True
+        if (
+            batch.sampling_info is not None
+            and not batch.sampling_info.is_all_greedy
+            and not is_dflash_sampling_verify_available()
+        ):
+            # DEC-4: non-greedy verify is unavailable on this build/device, so the
+            # scheduler admission path (validate_dflash_request) rejects such
+            # requests up front. Reaching here means that guard was bypassed;
+            # raise instead of silently degrading to greedy (mirrors the grammar
+            # invariant check above), so semantics never change behind the caller.
+            raise RuntimeError(
+                "Invariant broken: DFLASH non-greedy batch reached the worker on a "
+                "build/device without sampling verify, but the scheduler should "
+                "have rejected it (validate_dflash_request)."
+            )
 
         bs = batch.batch_size()
 
