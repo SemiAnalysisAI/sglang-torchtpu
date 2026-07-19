@@ -2540,10 +2540,14 @@ class TestDflashVerifyMaskPolicyAvoidsTriton(CustomTestCase):
 
 class TestDflashTpuDeviceProbe(CustomTestCase):
     """`dflash_tpu_device_probe.interpret_probe`: the pure verdict logic for the
-    reboot-gated device-state re-check. Order-sensitive per the R28 degradation
-    signature (holders first, then single-chip op, then the residual multi-worker
-    question), and multi-worker status is always UNVERIFIED without a TP=4 launch.
+    reboot-gated device-state re-check. Order-sensitive across all blocker classes
+    (SGLang/port holders, then vfio/PJRT holders, then TPU node presence/count, then
+    the single-chip op), it emits the healthy verdict ONLY when every holder/node
+    check is affirmatively clear, and multi-worker status is always UNVERIFIED
+    without a TP=4 launch.
     """
+
+    NODES = [0, 1, 2, 3]  # a clear 4-node slice
 
     def _mod(self):
         import importlib.util
@@ -2555,31 +2559,52 @@ class TestDflashTpuDeviceProbe(CustomTestCase):
         spec.loader.exec_module(mod)
         return mod
 
-    def test_holders_present_takes_priority(self):
+    def test_sglang_or_port_holders_take_priority(self):
         m = self._mod()
-        # a live holder invalidates the op probe even if single-chip "looks" ok
-        v = m.interpret_probe(["... launch_server ..."], [], True)
+        # a live holder invalidates the op probe even if everything else "looks" ok
+        v = m.interpret_probe(["... launch_server ..."], [], [], self.NODES, True)
         self.assertEqual(v["state"], "holders-present")
-        v2 = m.interpret_probe([], [30000], True)
+        v2 = m.interpret_probe([], [30000], [], self.NODES, True)
         self.assertEqual(v2["state"], "holders-present")
+
+    def test_vfio_holder_present(self):
+        m = self._mod()
+        v = m.interpret_probe([], [], ["python 123 ... /dev/vfio/0"], self.NODES, True)
+        self.assertEqual(v["state"], "vfio-holders-present")
+        self.assertEqual(v["multiworker_status"], "UNVERIFIED")
+
+    def test_tpu_nodes_missing_or_wrong_count(self):
+        m = self._mod()
+        v = m.interpret_probe([], [], [], [0, 1, 2], True)  # 3 != expected 4
+        self.assertEqual(v["state"], "tpu-nodes-mismatch")
+        self.assertIn("expected 4", v["blocker"])
+
+    def test_unknown_holder_state_refuses_healthy(self):
+        # A scanner that could not run (None) must NOT yield a healthy/no-holders
+        # verdict -- unprobed holder/node state is not "clear".
+        m = self._mod()
+        v = m.interpret_probe([], [], None, self.NODES, True)  # vfio UNKNOWN
+        self.assertEqual(v["state"], "holder-state-unknown")
+        v2 = m.interpret_probe([], [], [], None, True)  # nodes UNKNOWN
+        self.assertEqual(v2["state"], "holder-state-unknown")
 
     def test_single_chip_failed(self):
         m = self._mod()
-        v = m.interpret_probe([], [], False)
+        v = m.interpret_probe([], [], [], self.NODES, False)
         self.assertEqual(v["state"], "single-chip-failed")
         self.assertEqual(v["multiworker_status"], "UNVERIFIED")
 
     def test_unprobed_when_op_skipped(self):
         m = self._mod()
-        v = m.interpret_probe([], [], None)
+        v = m.interpret_probe([], [], [], self.NODES, None)
         self.assertEqual(v["state"], "single-chip-unprobed")
 
-    def test_healthy_no_holders_leaves_multiworker_unverified(self):
-        # The current live reading: clean env + single-chip ok. Must NOT claim
-        # recovery -- multi-worker status stays UNVERIFIED and the recommendation
-        # points at an owner reboot or a bounded TP=4 attempt.
+    def test_healthy_only_when_all_clear_leaves_multiworker_unverified(self):
+        # Clean env (no SGLang/port/vfio holders, 4 nodes) + single-chip ok. Must NOT
+        # claim recovery -- multi-worker status stays UNVERIFIED and the
+        # recommendation points at an owner reboot or a bounded TP=4 attempt.
         m = self._mod()
-        v = m.interpret_probe([], [], True)
+        v = m.interpret_probe([], [], [], self.NODES, True)
         self.assertEqual(v["state"], "single-chip-healthy-no-holders")
         self.assertEqual(v["multiworker_status"], "UNVERIFIED")
         self.assertIn("reboot", v["recommendation"])
