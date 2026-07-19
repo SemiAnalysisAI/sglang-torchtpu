@@ -4,7 +4,7 @@
 Turns the raw lines emitted by a server launched with
 ``SGLANG_TPU_CHECK_RECOMPILATION=1`` (and optionally
 ``SGLANG_DFLASH_VERIFY_SHAPE_TRACE=1``) into a machine-readable dict, replacing
-the ad-hoc grep pipelines used to build AC-7 compile-cleanliness evidence.
+the ad-hoc grep pipelines used to build compile-cleanliness evidence.
 
 Recognized lines (exact formats):
   * ``DFLASH xla-attrib: phase=<name> compiled <N> new XLA program(s) (<a> -> <b>)``
