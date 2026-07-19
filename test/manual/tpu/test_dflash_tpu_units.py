@@ -748,13 +748,18 @@ class TestDflashVerifyHostSemantics(CustomTestCase):
             self.assertEqual(reqs[r].kv_committed_len, cl)
             self.assertEqual(reqs[r].kv_allocated_len, cl)
 
-        # next_target_hidden = concat of hidden[i, :commit_i] rows (encoded (row,pos)).
-        expected_rows = []
+        # next_target_hidden is now the FULL fixed-width [bs*draft_token_num, feat]
+        # grid (row r*DTN+p == verify hidden[r, p]); the decode materialization
+        # masks uncommitted rows (p >= commit_r) to the reserved dummy KV slot.
+        # Fixed shape regardless of accept count (was sum(commit_lens) -> the
+        # dominant AC-7 recompile source). Committed rows carry the same encoded
+        # (row, pos) the old compacted path wrote.
+        self.assertEqual(next_hidden.shape[0], bs * self.DTN)
         for r, cl in enumerate([3, 1, 4, 2, 1]):
             for p in range(cl):
-                expected_rows.append([float(r), float(p)])
-        self.assertEqual(next_hidden.shape[0], sum([3, 1, 4, 2, 1]))
-        self.assertEqual(next_hidden.tolist(), expected_rows)
+                self.assertEqual(
+                    next_hidden[r * self.DTN + p, :2].tolist(), [float(r), float(p)]
+                )
 
         # seq_lens advanced by commit; seq_lens_sum kept in sync.
         self.assertEqual(batch.seq_lens.tolist(), [67, 65, 68, 66, 65])
@@ -1253,6 +1258,66 @@ class TestDflashPrecompileBucketPlan(CustomTestCase):
             block_size=512,
         )
         self.assertEqual(plan, [])
+
+
+class TestDflashDecodeMaterializeGrid(CustomTestCase):
+    """The decode KV-materialization position grid is a pure function so it stays
+    a single static [bs, block] shape regardless of accept count. Committed cells
+    (valid==True) must map to exactly the (req, position) pairs the old
+    accept-count-compacted path produced; uncommitted cells are masked to the
+    reserved dummy slot by the worker.
+    """
+
+    def test_grid_positions_and_validity(self):
+        from sglang.srt.speculative.dflash_utils import (
+            dflash_decode_materialize_grid,
+        )
+
+        ctx_start = torch.tensor([5, 20], dtype=torch.int64)
+        commit_lens = torch.tensor([3, 1], dtype=torch.int32)
+        pos2d, valid = dflash_decode_materialize_grid(ctx_start, commit_lens, 4)
+        self.assertEqual(pos2d.tolist(), [[5, 6, 7, 8], [20, 21, 22, 23]])
+        self.assertEqual(
+            valid.tolist(),
+            [[True, True, True, False], [True, False, False, False]],
+        )
+
+    def test_all_reject_and_full_accept(self):
+        from sglang.srt.speculative.dflash_utils import (
+            dflash_decode_materialize_grid,
+        )
+
+        # all-reject: commit_lens=0 -> no valid cells (worker sends all to slot 0).
+        _pos, valid = dflash_decode_materialize_grid(
+            torch.tensor([7], dtype=torch.int64),
+            torch.tensor([0], dtype=torch.int32),
+            4,
+        )
+        self.assertFalse(bool(valid.any()))
+        # full-accept: commit_lens==block -> every cell valid.
+        _pos, valid_full = dflash_decode_materialize_grid(
+            torch.tensor([7], dtype=torch.int64),
+            torch.tensor([4], dtype=torch.int32),
+            4,
+        )
+        self.assertTrue(bool(valid_full.all()))
+
+    def test_committed_cells_match_old_compaction(self):
+        # The old path emitted, per req, positions ctx_start+[0..commit_len) as a
+        # flat cat. The fixed grid's committed cells (row-major) must equal that.
+        from sglang.srt.speculative.dflash_utils import (
+            dflash_decode_materialize_grid,
+        )
+
+        ctx_start = torch.tensor([5, 20, 100], dtype=torch.int64)
+        commit_lens = torch.tensor([2, 4, 1], dtype=torch.int32)
+        block = 4
+        pos2d, valid = dflash_decode_materialize_grid(ctx_start, commit_lens, block)
+        fixed_committed = pos2d[valid].tolist()
+        old_compacted = []
+        for i, cl in enumerate(commit_lens.tolist()):
+            old_compacted.extend(int(ctx_start[i]) + j for j in range(cl))
+        self.assertEqual(fixed_committed, old_compacted)
 
 
 class TestDflashVerifyMaskPolicyAvoidsTriton(CustomTestCase):

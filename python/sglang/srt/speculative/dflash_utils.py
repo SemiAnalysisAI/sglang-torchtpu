@@ -992,3 +992,40 @@ def dflash_precompile_bucket_plan(
             if prefix > 0:
                 plan.append((bs, prefix))
     return plan
+
+
+def dflash_xla_graph_count() -> int:
+    """Number of compiled XLA programs in the torch_tpu cache (-1 if unavailable).
+
+    Used by the env-gated DFlash verify-shape trace to attribute per-step
+    recompilations to the DFlash glue (materialize/compaction) vs the model
+    forwards — the RecompilationChecker counts the same global cache but only
+    at the compiled-shim boundary, so sampling it around the eager glue localizes
+    which data-dependent shape churns.
+    """
+    try:
+        stats = torch.tpu._get_cache_stats()
+        return len(stats.per_entry_stats)
+    except (AttributeError, RuntimeError):
+        return -1
+
+
+def dflash_decode_materialize_grid(
+    ctx_start: torch.Tensor,
+    commit_lens: torch.Tensor,
+    block_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fixed ``[bs, block_size]`` position grid + validity mask for the DFlash
+    decode KV materialization.
+
+    ``pos2d[i, j] = ctx_start[i] + j`` and ``valid[i, j] = j < commit_lens[i]``.
+    The worker gathers a KV slot for EVERY grid cell (a single static ``[bs*block]``
+    shape) and sends invalid cells (``valid == False``) to the reserved dummy KV
+    slot, so the project / gather / scatter no longer recompile per accept-count
+    (``sum(commit_lens)``). Pure / CPU-testable (no device or model state).
+    """
+    device = ctx_start.device
+    r = torch.arange(int(block_size), device=device, dtype=torch.int64)[None, :]
+    pos2d = ctx_start.to(torch.int64)[:, None] + r
+    valid = r < commit_lens.to(torch.int64)[:, None]
+    return pos2d, valid

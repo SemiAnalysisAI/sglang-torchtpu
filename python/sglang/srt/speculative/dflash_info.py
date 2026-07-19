@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -30,6 +31,7 @@ from sglang.srt.speculative.dflash_utils import (
     compute_dflash_sampling_correct_drafts_and_bonus,
     dflash_num_correct_drafts,
     dflash_tp_ranks_agree,
+    dflash_xla_graph_count,
     is_dflash_sampling_verify_available,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -46,6 +48,17 @@ _IS_TPU = is_tpu()
 # the non-spec decode top-1) rather than a verify/materialization bug. Off by
 # default; adds a per-step topk + D2H only when set.
 _VERIFY_TRACE_PATH = os.environ.get("SGLANG_DFLASH_VERIFY_TRACE")
+
+# Optional recompilation-attribution diagnostic: when SGLANG_DFLASH_VERIFY_SHAPE_TRACE=1, rank 0
+# logs one line per verify step with the accept-count-dependent shapes
+# (sum(commit_lens), next_target_hidden rows, free/kept KV slot counts) and the
+# global XLA-program-cache delta since the previous verify step. This localizes
+# which data-dependent glue shape churns the compiler (the RecompilationChecker
+# only samples at the compiled-shim boundary). Off by default.
+_VERIFY_SHAPE_TRACE = os.environ.get("SGLANG_DFLASH_VERIFY_SHAPE_TRACE") == "1"
+_verify_shape_trace_prev_xla = -1
+
+logger = logging.getLogger(__name__)
 
 
 def _compute_paged_keep_slots(
@@ -633,12 +646,34 @@ class DFlashVerifyInput(SpecInput):
             raise RuntimeError(
                 "DFLASH verify requires target hidden states, but got None."
             )
+        # Return the FULL fixed-width [bs*draft_token_num, feat] grid (row i*T+j ==
+        # hidden[i, j]) rather than the accept-count-compacted cat. The decode KV
+        # materialization masks uncommitted rows (j >= commit_lens[i]) to the
+        # reserved dummy slot, so committed rows write byte-identical KV while the
+        # materialization keeps a single static shape. The old torch.cat produced
+        # [sum(commit_lens), feat], which recompiled the project/gather/scatter per
+        # accept-count (the dominant serving-time recompilation source).
         hidden = hidden.view(bs, self.draft_token_num, -1)
-        segments: List[torch.Tensor] = []
-        for i, ln in enumerate(commit_lens_cpu):
-            if ln > 0:
-                segments.append(hidden[i, :ln, :])
-        next_target_hidden = torch.cat(segments, dim=0) if segments else hidden[:0]
+        next_target_hidden = hidden.reshape(bs * self.draft_token_num, -1)
+
+        if _VERIFY_SHAPE_TRACE and get_tp_group().rank_in_group == 0:
+            global _verify_shape_trace_prev_xla
+            xla = dflash_xla_graph_count()
+            delta = xla - _verify_shape_trace_prev_xla if _verify_shape_trace_prev_xla >= 0 else 0
+            _verify_shape_trace_prev_xla = xla
+            logger.info(
+                "DFLASH verify-shape-trace: bs=%d draft_token_num=%d "
+                "sum_commit=%d next_target_hidden_rows=%d free_locs=%d kept_locs=%d "
+                "xla_cache=%d xla_delta_since_prev_verify=%d",
+                bs,
+                self.draft_token_num,
+                sum(commit_lens_cpu),
+                int(next_target_hidden.shape[0]),
+                int(free_locs.numel()),
+                int(kept_locs.numel()),
+                xla,
+                delta,
+            )
 
         # Avoid confusing downstream consumers (spec-v1 decode doesn't use this).
         logits_output.hidden_states = None

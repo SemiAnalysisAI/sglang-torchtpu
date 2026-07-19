@@ -25,6 +25,7 @@ from sglang.srt.server_args import (
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
+    dflash_decode_materialize_grid,
     dflash_fused_kv_materialize_decision,
     dflash_precompile_bucket_plan,
     is_dflash_sampling_verify_available,
@@ -461,6 +462,41 @@ class DFlashWorker:
             result = result.to(self.device, non_blocking=True)
         return result
 
+    def _gather_req_to_token_fixed(
+        self,
+        *,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        pos2d: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fixed-shape ``[bs*T]`` gather of KV slots for the full position grid.
+
+        Unlike ``_gather_req_to_token_masked`` (which compacts to ``[num_valid]``),
+        this keeps the full ``[bs*T]`` shape and routes invalid cells
+        (``valid == False``) to the reserved dummy KV slot 0 (never read as real
+        KV). That makes the DFlash decode materialization a single static shape
+        instead of one keyed on ``sum(commit_lens)`` (the dominant serving-time recompile
+        source).
+        """
+        if req_pool_indices.dtype != torch.int64:
+            req_pool_indices = req_pool_indices.to(torch.int64)
+        table_device = req_to_token.device
+        if req_pool_indices.device != table_device:
+            req_pool_indices = req_pool_indices.to(table_device)
+        if pos2d.device != table_device:
+            pos2d = pos2d.to(table_device)
+        valid = valid.to(device=table_device, dtype=torch.bool)
+        table_width = int(req_to_token.shape[1])
+        # Uncommitted grid cells can index past the committed region; clamp to a
+        # valid column (their gathered slot is discarded via the valid mask below).
+        safe_pos2d = pos2d.clamp(min=0, max=max(table_width - 1, 0))
+        gathered = req_to_token[req_pool_indices[:, None], safe_pos2d].to(torch.int64)
+        gathered = torch.where(valid, gathered, gathered.new_zeros(())).reshape(-1)
+        if gathered.device != self.device:
+            gathered = gathered.to(self.device, non_blocking=True)
+        return gathered
+
     def _gather_req_to_token_segments(
         self,
         *,
@@ -677,7 +713,7 @@ class DFlashWorker:
         # snapshotted during draft-runner construction (before this hook ran), so
         # without this the first serving forward would count every precompiled
         # graph as "new". Re-snapshotting makes any checker warning during a
-        # post-warmup decode a real gap in precompile coverage (AC-7 evidence).
+        # post-warmup decode a real gap in precompile coverage.
         self._resnapshot_draft_recompilation_baseline()
 
     def _resnapshot_draft_recompilation_baseline(self) -> None:
@@ -839,8 +875,13 @@ class DFlashWorker:
 
         bs = batch.batch_size()
 
+        _xtrace = self._xla_trace_on()
+        _xc = self._xla_count() if _xtrace else -1
+
         # --- 1) Append any newly committed tokens into the draft KV cache.
         self._append_target_hidden_to_draft_kv(batch, draft_input)
+        if _xtrace:
+            _xc = self._xla_lap("materialize_kv_append", _xc)
 
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
@@ -959,6 +1000,8 @@ class DFlashWorker:
                 ).logits_output
             if _dprof:
                 self._prof_lap("draft_fwd", _dt)
+            if _xtrace:
+                _xc = self._xla_lap("draft_block_fwd", _xc)
         finally:
             # Drop the speculative block from the shared allocator (EAGLE3-style).
             allocator.restore_state(token_to_kv_pool_state_backup)
@@ -1338,8 +1381,28 @@ class DFlashWorker:
             ctx_lens = ctx_lens.to(device, non_blocking=True)
         ctx_start = batch.seq_lens.to(torch.int64) - ctx_lens.to(torch.int64)
 
-        if bs == 1:
-            # Fast path for single request.
+        is_extend = batch.forward_mode.is_extend() or batch.is_extend_in_batch
+        if not is_extend:
+            # DECODE fixed-width path. `target_hidden` is the FULL [bs*block, feat]
+            # grid (row i*block+j == verify hidden[i, j]); `ctx_lens` == commit_lens.
+            # Gather a KV slot for every grid cell (static [bs*block] shape) and
+            # route uncommitted cells (j >= commit_lens[i]) to the reserved dummy
+            # slot 0 so their KV write is inert. This removes the dominant serving-time
+            # recompile source: the old boolean-mask compaction produced tensors
+            # keyed on sum(commit_lens), recompiling the project/gather/scatter per
+            # accept-count. Committed cells write byte-identical KV to before.
+            pos2d, valid = dflash_decode_materialize_grid(
+                ctx_start, ctx_lens, int(self.block_size)
+            )  # [bs, block], [bs, block]
+            ctx_positions = pos2d.reshape(-1)  # [bs*block]
+            ctx_cache_loc = self._gather_req_to_token_fixed(
+                req_to_token=target_req_to_token,
+                req_pool_indices=req_pool_indices,
+                pos2d=pos2d,
+                valid=valid,
+            )  # [bs*block], invalid cells -> slot 0
+        elif bs == 1:
+            # Fast path for single-request EXTEND (all context tokens committed).
             max_ctx = int(total_ctx)
             if max_ctx <= self._block_pos_offsets.numel():
                 r = self._block_pos_offsets[:max_ctx]
@@ -1355,11 +1418,8 @@ class DFlashWorker:
             )  # [ctx]
             ctx_positions = pos2d.reshape(-1)  # [ctx]
         else:
-            # In decode mode, ctx_lens <= block_size so we can skip the .item() sync.
-            if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-                max_ctx = int(ctx_lens.max().item())
-            else:
-                max_ctx = int(self.block_size)
+            # EXTEND, bs > 1: ragged prompt lengths, token-bucketed elsewhere.
+            max_ctx = int(ctx_lens.max().item())
             if max_ctx <= 0:
                 raise RuntimeError(f"DFLASH invalid max_ctx={max_ctx} for KV append.")
 
@@ -1562,6 +1622,34 @@ class DFlashWorker:
         logger.info("DFLASH decode phase avg (last window): %s", "  ".join(parts))
         self._prof_acc = {}
 
+    # ---- Optional XLA-recompile attribution (env SGLANG_DFLASH_VERIFY_SHAPE_TRACE=1) ---- #
+    def _xla_trace_on(self) -> bool:
+        enabled = getattr(self, "_xla_trace_enabled", None)
+        if enabled is None:
+            enabled = os.environ.get("SGLANG_DFLASH_VERIFY_SHAPE_TRACE") == "1"
+            self._xla_trace_enabled = enabled
+        return enabled
+
+    def _xla_count(self) -> int:
+        """Global XLA program-cache count (or -1) when the shape trace is on."""
+        from sglang.srt.speculative.dflash_utils import dflash_xla_graph_count
+
+        return dflash_xla_graph_count()
+
+    def _xla_lap(self, phase: str, prev: int) -> int:
+        """Log the XLA-cache delta the given decode phase compiled, return new count."""
+        cur = self._xla_count()
+        if self.tp_rank == 0 and cur >= 0 and prev >= 0 and cur - prev > 0:
+            logger.info(
+                "DFLASH xla-attrib: phase=%s compiled %d new XLA program(s) "
+                "(%d -> %d)",
+                phase,
+                cur - prev,
+                prev,
+                cur,
+            )
+        return cur
+
     def forward_batch_generation(
         self, batch: ScheduleBatch, **kwargs
     ) -> GenerationBatchResult:
@@ -1630,10 +1718,14 @@ class DFlashWorker:
 
         _prof = self._prof_on()
         _pt = time.perf_counter() if _prof else 0.0
+        _xtrace = self._xla_trace_on()
+        _xc = self._xla_count() if _xtrace else -1
 
         self._prepare_for_speculative_decoding(batch, draft_input)
         if _prof:
             _pt = self._prof_lap("prep_total", _pt)
+        if _xtrace:
+            _xc = self._xla_lap("prep_total", _xc)
 
         assert batch.forward_mode.is_target_verify()
         verify_input = batch.spec_info
@@ -1655,6 +1747,8 @@ class DFlashWorker:
         )
         if _prof:
             _pt = self._prof_lap("target_verify_fwd", _pt)
+        if _xtrace:
+            _xc = self._xla_lap("target_verify_fwd", _xc)
 
         (
             new_bonus_tokens,
@@ -1668,6 +1762,8 @@ class DFlashWorker:
         )
         if _prof:
             _pt = self._prof_lap("verify_glue", _pt)
+        if _xtrace:
+            _xc = self._xla_lap("verify_glue", _xc)
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
@@ -1687,6 +1783,8 @@ class DFlashWorker:
         if _prof:
             self._prof_lap("kv_append_post", _pt)
             self._prof_flush()
+        if _xtrace:
+            self._xla_lap("kv_append_post", _xc)
 
         num_correct_drafts = sum(num_correct_drafts_per_req_cpu)
         if not self._logged_first_verify and self.tp_rank == 0:
