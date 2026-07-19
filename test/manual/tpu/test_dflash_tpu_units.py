@@ -1500,6 +1500,59 @@ class TestDflashExtendMaterializePlan(CustomTestCase):
         self.assertEqual(p1.shape, p2.shape)  # identical grid shape -> one compile
 
 
+class TestDflashDraftForwardInputEmbeds(CustomTestCase):
+    """The draft model must consume the compile-policy-PADDED
+    `forward_batch.input_embeds` (whose row count matches the padded input_ids /
+    positions / attention metadata), not the stale pre-pad `input_embeds` kwarg
+    that model_runner captured before padding — otherwise a real bs != compile
+    bucket crashes the compiled draft attention (bs>1 fix, R15).
+    """
+
+    class _IdNorm:
+        def __call__(self, x, residual=None):
+            return x if residual is None else (x, residual)
+
+    def _fake_self(self):
+        import types as _t
+
+        return _t.SimpleNamespace(layers=[], norm=self._IdNorm())
+
+    def test_prefers_padded_batch_input_embeds(self):
+        import types as _t
+
+        from sglang.srt.models.dflash import DFlashDraftModel
+
+        param_embeds = torch.ones(6, 4)  # stale, real-bs rows
+        padded_embeds = torch.ones(8, 4) * 2.0  # padded to the compile bucket
+        fb = _t.SimpleNamespace(input_embeds=padded_embeds)
+        out = DFlashDraftModel.forward(
+            self._fake_self(), None, None, fb, input_embeds=param_embeds
+        )
+        # Returned hidden must come from the PADDED batch tensor (8 rows, value 2).
+        self.assertEqual(out.hidden_states.shape[0], 8)
+        self.assertEqual(out.hidden_states[0, 0].item(), 2.0)
+
+    def test_falls_back_to_param_when_batch_absent(self):
+        import types as _t
+
+        from sglang.srt.models.dflash import DFlashDraftModel
+
+        param_embeds = torch.ones(6, 4) * 3.0
+        # forward_batch.input_embeds is None -> use the parameter.
+        fb_none = _t.SimpleNamespace(input_embeds=None)
+        out = DFlashDraftModel.forward(
+            self._fake_self(), None, None, fb_none, input_embeds=param_embeds
+        )
+        self.assertEqual(out.hidden_states.shape[0], 6)
+        self.assertEqual(out.hidden_states[0, 0].item(), 3.0)
+        # forward_batch has no input_embeds attribute at all -> use the parameter.
+        fb_missing = _t.SimpleNamespace()
+        out2 = DFlashDraftModel.forward(
+            self._fake_self(), None, None, fb_missing, input_embeds=param_embeds
+        )
+        self.assertEqual(out2.hidden_states.shape[0], 6)
+
+
 class TestDflashVerifyMaskPolicyAvoidsTriton(CustomTestCase):
     """Verify-routing guard: on the TPU RPA-v3 backend, DFlash verify skips its custom mask,
     so it uses RPA-v3's own metadata builder and never reaches
