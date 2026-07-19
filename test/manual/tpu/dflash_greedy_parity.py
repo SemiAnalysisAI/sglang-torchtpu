@@ -318,6 +318,22 @@ def classify_divergence(
     CPU-unit-tested in test_dflash_tpu_units.py::TestDflashDivergenceClassifier.
     """
     ranked = [(int(t), float(lp)) for t, lp in ranked]
+    if not ranked:
+        # A bf16-tie requires COMPLETE two-sided evidence; with no non-spec top-k
+        # there is nothing to classify. Fail closed (MISMATCH), never crash and
+        # never tie -- a degenerate position must not abort the whole diagnose run.
+        return {
+            "index": index,
+            "policy": "rank1-runner-up-swap-within-2sigma-bf16-noise",
+            "epsilon": TIE_MARGIN_EPS,
+            "dflash_token": spec_token,
+            "nospec_token": None,
+            "nospec_topk": [],
+            "dflash_rank_in_nospec_topk": None,
+            "verify_top2": None,
+            "reasons": ["non-spec top-k is empty (no evidence to classify)"],
+            "verdict": "MISMATCH",
+        }
     top1_id, top1_lp = ranked[0]
     top2_id, top2_lp = ranked[1] if len(ranked) > 1 else (None, float("-inf"))
     margin = top1_lp - top2_lp
@@ -345,6 +361,14 @@ def classify_divergence(
     if verify_top2 is None:
         reasons.append("no DFlash verify-forward top-2 evidence (verifier trace missing)")
         out["verify_top2"] = None
+    elif len(verify_top2) < 2:
+        # A swap check needs BOTH verify top-2 entries; with fewer the verify
+        # evidence is insufficient -> fail closed (MISMATCH), never index vt[1].
+        vt = [(int(t), float(v)) for t, v in verify_top2]
+        out["verify_top2"] = [[t, round(v, 5)] for t, v in vt]
+        reasons.append(
+            f"verify top-2 has {len(verify_top2)} entry(ies) (need 2 for a swap check)"
+        )
     else:
         vt = [(int(t), float(v)) for t, v in verify_top2]
         v1_id, v1_v = vt[0]

@@ -1196,6 +1196,24 @@ class TestDflashDivergenceClassifier(CustomTestCase):
         d = m.classify_divergence(self.NOSPEC_TOPK, 26, 374)
         self.assertEqual(d["verdict"], "MISMATCH")
 
+    def test_empty_nospec_topk_fails_closed(self):
+        # Degenerate evidence (empty non-spec top-k) must classify MISMATCH without
+        # crashing -- one bad position must not abort the whole diagnose run, and
+        # a bf16-tie must never be granted on absent evidence.
+        m = self._mod()
+        d = m.classify_divergence([], 26, 374, verify_top2=self.VERIFY_TOP2)
+        self.assertEqual(d["verdict"], "MISMATCH")
+        self.assertEqual(d["index"], 26)
+        self.assertTrue(any("empty" in r for r in d["reasons"]))
+
+    def test_short_verify_top2_fails_closed(self):
+        # A verify top-2 with fewer than 2 entries is insufficient for a swap check:
+        # MISMATCH, no IndexError on vt[1], and never a bf16-tie.
+        m = self._mod()
+        d = m.classify_divergence(self.NOSPEC_TOPK, 26, 374, verify_top2=[[374, -0.10]])
+        self.assertEqual(d["verdict"], "MISMATCH")
+        self.assertTrue(any("need 2" in r for r in d["reasons"]))
+
     def test_verify_top1_not_emitted_is_mismatch(self):
         # DFlash verify argmax is 706 but it emitted 374 -> accept bug.
         m = self._mod()
