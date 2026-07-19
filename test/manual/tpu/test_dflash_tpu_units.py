@@ -375,6 +375,48 @@ class TestUnsupportedTpuWorldSizeError(CustomTestCase):
         err = self._err(2)
         self.assertNotIn("On a v5e 2x2 slice tp_size=2 is not a valid", err)
 
+    @staticmethod
+    def _raising_scan():
+        raise RuntimeError("simulated _scan_pci_tpus failure")
+
+    def test_scan_failure_does_not_skip_validation(self):
+        # A supported-count (scan) failure must NOT suppress the real
+        # get_topology(2) rejection -- else the original TP=2 bug re-opens.
+        from sglang.srt.hardware_backend.tpu.patches import (
+            unsupported_tpu_world_size_error,
+        )
+
+        err = unsupported_tpu_world_size_error(
+            2, get_topology=self._fake_v5e_topology, scan=self._raising_scan
+        )
+        self.assertIsNotNone(err, "scan failure must not skip validation")
+        self.assertIn("tp_size=2", err)
+
+    def test_scan_failure_supported_size_still_passes(self):
+        from sglang.srt.hardware_backend.tpu.patches import (
+            unsupported_tpu_world_size_error,
+        )
+
+        # scan fails but the tp_size is valid -> still None (no false reject).
+        self.assertIsNone(
+            unsupported_tpu_world_size_error(
+                4, get_topology=self._fake_v5e_topology, scan=self._raising_scan
+            )
+        )
+
+    def test_scan_success_folds_counts_into_message(self):
+        from sglang.srt.hardware_backend.tpu.patches import (
+            unsupported_tpu_world_size_error,
+        )
+
+        err = unsupported_tpu_world_size_error(
+            2,
+            get_topology=self._fake_v5e_topology,
+            scan=lambda: (4, {1: "1,1,1", 4: "2,2,1", 8: "2,2,2"}),
+        )
+        self.assertIsNotNone(err)
+        self.assertIn("[1, 4, 8]", err)
+
 
 class TestSingleHostTpuEnvOrRaise(CustomTestCase):
     """`single_host_tpu_env_or_raise` must validate the tp_size topology and raise

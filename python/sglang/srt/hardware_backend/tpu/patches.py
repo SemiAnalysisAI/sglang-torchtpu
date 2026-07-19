@@ -174,7 +174,9 @@ def compute_single_host_tpu_env(world_size: int) -> dict:
     return env
 
 
-def unsupported_tpu_world_size_error(world_size, get_topology=None, supported_counts=None):
+def unsupported_tpu_world_size_error(
+    world_size, get_topology=None, supported_counts=None, scan=None
+):
     """Return a CLEAR error string if ``world_size`` has no valid TPU topology on
     the attached hardware, else ``None``.
 
@@ -186,26 +188,40 @@ def unsupported_tpu_world_size_error(world_size, get_topology=None, supported_co
     (``FAILED_PRECONDITION: missing ... TORCH_TPU_TOPOLOGY``). Calling this at
     orchestrator startup converts that deep crash into a clear message.
 
-    ``supported_counts`` (the attached generation's valid chip counts) is folded
-    into the message when known; it is auto-derived from the topology table on the
-    real-hardware path and can be injected for tests.
+    The topology probe (``get_topology``) is REQUIRED; supported-count discovery
+    (``scan`` / ``_scan_pci_tpus``) is a BEST-EFFORT message hint only. A scan
+    failure must never suppress the real ``get_topology(world_size)`` rejection --
+    the two are resolved independently so a diagnostic-helper error cannot re-open
+    the original bug. ``get_topology``/``scan``/``supported_counts`` are injectable
+    for hermetic CPU tests without a live TPU.
 
-    Pure + injectable (``get_topology``) so it is CPU-testable without a live TPU.
-    Returns ``None`` when ``world_size <= 1`` (single chip always valid) or when no
-    TPU / topology can be resolved (e.g. a CPU test box) so normal init proceeds.
+    Returns ``None`` when ``world_size <= 1`` (single chip always valid) or when the
+    topology probe cannot be resolved (e.g. torch_tpu absent on a CPU box).
     """
     if world_size is None or int(world_size) <= 1:
         return None
     if get_topology is None:
+        # REQUIRED: resolving the topology probe. If torch_tpu is unavailable we
+        # cannot validate here (e.g. a CPU box) -> defer to normal init.
         try:
             from torch_tpu._internal.utils import hardware
 
             get_topology = hardware.get_tpu_topology
-            if supported_counts is None:
-                _, tmap = hardware._scan_pci_tpus()
-                supported_counts = sorted(tmap) if tmap else None
         except Exception:
-            return None  # torch_tpu unavailable (e.g. CPU test env)
+            return None
+        if scan is None:
+            # getattr (not attribute access) so an absent private helper cannot
+            # raise and skip validation below.
+            scan = getattr(hardware, "_scan_pci_tpus", None)
+    # BEST-EFFORT: supported-count hint for the message. A failure here leaves
+    # supported_counts=None and MUST NOT return early / skip the probe below.
+    if supported_counts is None and scan is not None:
+        try:
+            _, tmap = scan()
+            supported_counts = sorted(tmap) if tmap else None
+        except Exception:
+            supported_counts = None
+    # ALWAYS probe the topology; this is the actual validation.
     try:
         topo = get_topology(int(world_size))
     except Exception as e:
