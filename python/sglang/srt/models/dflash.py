@@ -317,6 +317,20 @@ class DFlashDraftModel(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
+        # Prefer forward_batch.input_embeds when present: the TPU compile policy's
+        # prepare_forward_batch pads forward_batch.input_embeds (and input_ids /
+        # positions / attention metadata) to the batch-size compile bucket before
+        # this forward runs, but the `input_embeds` PARAMETER is the pre-pad tensor
+        # (model_runner captured it from kwargs before padding). Using the padded
+        # batch copy keeps the block Q/K/V row count equal to the padded attention
+        # metadata (num_tokens) — otherwise a real bs not equal to the compile
+        # bucket (e.g. bs=6 padded to 8) crashes the compiled draft attention at
+        # `key.view(num_tokens, -1, head_size)`. The padded rows are zero and are
+        # sliced back to real_q by the spec policy's unpad_outputs. bs=1 (no pad)
+        # is unchanged.
+        fb_input_embeds = getattr(forward_batch, "input_embeds", None)
+        if fb_input_embeds is not None:
+            input_embeds = fb_input_embeds
         if input_embeds is None:
             raise ValueError(
                 "DFlashDraftModel requires `input_embeds` (use the target embedding)."

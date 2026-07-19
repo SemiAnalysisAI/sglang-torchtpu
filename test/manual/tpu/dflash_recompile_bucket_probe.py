@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Rigorous, self-validating per-pow2-bucket recompilation probe for the DFlash
-extend materialization (AC-7).
+extend materialization (compile stability).
 
 For each REQUIRED pow2 token bucket in the configured ctx-2048 envelope
 ({64,128,256,512,1024,2048}) it sends three validated requests:
