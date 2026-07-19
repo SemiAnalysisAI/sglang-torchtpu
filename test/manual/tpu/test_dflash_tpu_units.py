@@ -468,6 +468,62 @@ class TestSingleHostTpuEnvOrRaise(CustomTestCase):
         self.assertIs(out, sentinel)
 
 
+class TestResolveSingleHostTpuEnv(CustomTestCase):
+    """`resolve_single_host_tpu_env` (the Ray single-host path's topology
+    resolution): honors + preserves an explicit --torch-tpu-topology override,
+    else validates and uses the auto-derived topology. Hermetic (injected fakes).
+    """
+
+    @staticmethod
+    def _compute(ws):
+        # Fake compute_single_host_tpu_env: 2 slicebuilder ports + an auto topo.
+        return {
+            "TORCH_TPU_SLICEBUILDER_ADDRESSES": "localhost:1,localhost:2",
+            "TORCH_TPU_TOPOLOGY": "2,2,1",
+        }
+
+    def test_explicit_override_skips_validation_and_is_preserved(self):
+        from sglang.srt.hardware_backend.tpu.patches import (
+            resolve_single_host_tpu_env,
+        )
+
+        def _must_not_validate(ws):
+            raise AssertionError("explicit topology must skip validation")
+
+        sb, topo = resolve_single_host_tpu_env(
+            2,
+            explicit_topology="1,2,1",  # a forced 2-chip v5e slice
+            validate=_must_not_validate,
+            compute=self._compute,
+        )
+        self.assertEqual(sb, "localhost:1,localhost:2")
+        self.assertEqual(topo, "1,2,1")  # explicit value preserved, not the auto "2,2,1"
+
+    def test_no_override_supported_uses_auto_topology(self):
+        from sglang.srt.hardware_backend.tpu.patches import (
+            resolve_single_host_tpu_env,
+        )
+
+        sb, topo = resolve_single_host_tpu_env(
+            4, explicit_topology=None, validate=lambda ws: None, compute=self._compute
+        )
+        self.assertEqual(sb, "localhost:1,localhost:2")
+        self.assertEqual(topo, "2,2,1")  # auto-derived
+
+    def test_no_override_unsupported_raises(self):
+        from sglang.srt.hardware_backend.tpu.patches import (
+            resolve_single_host_tpu_env,
+        )
+
+        with self.assertRaises(NotImplementedError):
+            resolve_single_host_tpu_env(
+                2,
+                explicit_topology=None,
+                validate=lambda ws: "tp_size=2 has no valid TPU topology ...",
+                compute=self._compute,
+            )
+
+
 class TestDflashMissingWeightKeys(CustomTestCase):
     """The draft-checkpoint completeness check (``dflash_missing_weight_keys``):
     every required parameter (direct + all packed q/k/v and gate/up shards) must

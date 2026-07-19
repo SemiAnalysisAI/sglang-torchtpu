@@ -223,19 +223,20 @@ class RayEngine(Engine):
             # ordered host list and each actor rebuilds them itself.
             if server_args.nnodes <= 1:
                 from sglang.srt.hardware_backend.tpu.patches import (
-                    single_host_tpu_env_or_raise,
+                    resolve_single_host_tpu_env,
                 )
 
-                # Validate the tp_size topology BEFORE building the env / placement
-                # group: an unsupported count (e.g. tp_size=2 on a v5e 2x2 slice)
-                # otherwise stashes an empty TORCH_TPU_TOPOLOGY and every actor
-                # SIGABRTs in PJRT init. Raises a clear NotImplementedError here.
-                # An explicit --torch-tpu-topology is a user override: honor it
-                # (skip the auto-check) and preserve it, so otherwise-unauto-
-                # derivable slices (e.g. a 2-chip v5e slice) can be forced.
-                _explicit_topo = bool(server_args.torch_tpu_topology)
-                single_host_env = single_host_tpu_env_or_raise(
-                    server_args.tp_size, skip_validate=_explicit_topo
+                # Resolve (slicebuilder, topology) BEFORE building the env /
+                # placement group: an unsupported count (e.g. tp_size=2 on a v5e
+                # 2x2 slice) otherwise stashes an empty TORCH_TPU_TOPOLOGY and
+                # every actor SIGABRTs in PJRT init -> raises a clear
+                # NotImplementedError here. An explicit --torch-tpu-topology is a
+                # user override: it is honored (auto-check skipped) and preserved,
+                # so otherwise-unauto-derivable slices (e.g. a 2-chip v5e slice)
+                # can be forced. See resolve_single_host_tpu_env.
+                _sb_addrs, _resolved_topo = resolve_single_host_tpu_env(
+                    server_args.tp_size,
+                    explicit_topology=server_args.torch_tpu_topology,
                 )
                 server_args = dataclasses.replace(
                     server_args,
@@ -246,13 +247,8 @@ class RayEngine(Engine):
                     # len(hosts) > 1, take the multihost branch, discard the
                     # injected single-host slicebuilder, and hang at rendezvous.
                     tpu_worker_hostnames="",
-                    torch_tpu_slicebuilder_addresses=single_host_env[
-                        "TORCH_TPU_SLICEBUILDER_ADDRESSES"
-                    ],
-                    torch_tpu_topology=(
-                        server_args.torch_tpu_topology
-                        or single_host_env.get("TORCH_TPU_TOPOLOGY")
-                    ),
+                    torch_tpu_slicebuilder_addresses=_sb_addrs,
+                    torch_tpu_topology=_resolved_topo,
                 )
             else:
                 tpu_worker_hostnames = discover_tpu_worker_hostnames(server_args.nnodes)

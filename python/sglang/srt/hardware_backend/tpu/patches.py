@@ -272,6 +272,32 @@ def single_host_tpu_env_or_raise(
     return compute(world_size)
 
 
+def resolve_single_host_tpu_env(
+    world_size, explicit_topology=None, validate=None, compute=None
+):
+    """Resolve the single-host TPU (slicebuilder_addresses, topology) for the Ray
+    single-host launch path.
+
+    An explicit ``explicit_topology`` (a ``--torch-tpu-topology`` override) is
+    honored: the auto-topology validation is skipped (the user owns the value,
+    enabling otherwise-unauto-derivable slices, e.g. a 2-chip v5e slice) and the
+    explicit value is PRESERVED as the resolved topology. Otherwise the tp_size
+    topology is validated (raising ``NotImplementedError`` for an unsupported
+    count) and the auto-derived topology is used.
+
+    Returns ``(slicebuilder_addresses, resolved_topology)``. ``validate``/``compute``
+    are injectable so all three branches are hermetically CPU-testable.
+    """
+    env = single_host_tpu_env_or_raise(
+        world_size,
+        validate=validate,
+        compute=compute,
+        skip_validate=bool(explicit_topology),
+    )
+    resolved_topology = explicit_topology or env.get("TORCH_TPU_TOPOLOGY")
+    return env["TORCH_TPU_SLICEBUILDER_ADDRESSES"], resolved_topology
+
+
 def _set_torch_tpu_topology_env_single(world_size: int) -> None:
     """Set the slicebuilder + topology env for a single-host process group.
 
