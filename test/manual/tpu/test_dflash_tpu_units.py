@@ -449,6 +449,24 @@ class TestSingleHostTpuEnvOrRaise(CustomTestCase):
         )
         self.assertIs(out, sentinel)
 
+    def test_skip_validate_bypasses_the_check(self):
+        # An explicit --torch-tpu-topology override (skip_validate=True) must NOT
+        # validate -- it computes the env even for an otherwise-rejected tp_size
+        # (e.g. a forced 2-chip v5e slice via TORCH_TPU_TOPOLOGY="1,2,1").
+        from sglang.srt.hardware_backend.tpu.patches import (
+            single_host_tpu_env_or_raise,
+        )
+
+        sentinel = {"TORCH_TPU_SLICEBUILDER_ADDRESSES": "localhost:1"}
+
+        def _must_not_run(ws):
+            raise AssertionError("validate must not run when skip_validate=True")
+
+        out = single_host_tpu_env_or_raise(
+            2, validate=_must_not_run, compute=lambda ws: sentinel, skip_validate=True
+        )
+        self.assertIs(out, sentinel)
+
 
 class TestDflashMissingWeightKeys(CustomTestCase):
     """The draft-checkpoint completeness check (``dflash_missing_weight_keys``):

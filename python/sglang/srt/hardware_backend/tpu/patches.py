@@ -241,7 +241,9 @@ def unsupported_tpu_world_size_error(
     return None
 
 
-def single_host_tpu_env_or_raise(world_size, validate=None, compute=None):
+def single_host_tpu_env_or_raise(
+    world_size, validate=None, compute=None, skip_validate=False
+):
     """Validate the single-host TPU ``world_size`` topology, then compute its env.
 
     Raises ``NotImplementedError`` with a clear message (from
@@ -251,16 +253,22 @@ def single_host_tpu_env_or_raise(world_size, validate=None, compute=None):
     worker would SIGABRT in PJRT init. On success returns
     ``compute_single_host_tpu_env(world_size)``.
 
+    ``skip_validate=True`` bypasses the auto-topology check — used when the caller
+    supplied an explicit ``--torch-tpu-topology`` override (the user then owns the
+    value, and it enables otherwise-unauto-derivable slices, e.g. a 2-chip v5e
+    slice via ``TORCH_TPU_TOPOLOGY="1,2,1"``).
+
     ``validate``/``compute`` are injectable so the raise-before-compute ordering is
     hermetically CPU-testable without Ray or a live TPU.
     """
-    if validate is None:
-        validate = unsupported_tpu_world_size_error
     if compute is None:
         compute = compute_single_host_tpu_env
-    err = validate(world_size)
-    if err is not None:
-        raise NotImplementedError(err)
+    if not skip_validate:
+        if validate is None:
+            validate = unsupported_tpu_world_size_error
+        err = validate(world_size)
+        if err is not None:
+            raise NotImplementedError(err)
     return compute(world_size)
 
 

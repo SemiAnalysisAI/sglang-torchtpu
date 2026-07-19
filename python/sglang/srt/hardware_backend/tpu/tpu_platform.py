@@ -92,7 +92,11 @@ class TpuSRTPlatform(SRTPlatform):
         # stays unset and every worker's PJRT init aborts cryptically before any
         # model code (e.g. tp_size=2 on a v5e 2x2 slice). Multi-host (Ray) derives
         # its topology per-node later, so only validate the single-host path.
-        if not server_args.use_ray:
+        # An explicit --torch-tpu-topology is a user override: honor it and skip
+        # the auto-derivation topology check (which would otherwise reject any
+        # tp_size torch_tpu's table can't auto-derive, e.g. a forced 2-chip v5e
+        # slice). The user then owns the correctness of the value they provided.
+        if not server_args.use_ray and not server_args.torch_tpu_topology:
             from sglang.srt.hardware_backend.tpu.patches import (
                 unsupported_tpu_world_size_error,
             )
