@@ -1554,6 +1554,89 @@ class TestCompareConcurrentStreams(CustomTestCase):
         self.assertTrue(r["all_ok"])  # parity still passes
         self.assertEqual(r["config"]["mismatch"], ["max_new_tokens"])
 
+    def test_build_report_includes_batching(self):
+        m = self._mod()
+        streams = {"a": [1, 2]}
+        # default (not supplied) -> present but None on both sides
+        r0 = m.build_report(streams, dict(streams))
+        self.assertEqual(r0["batching"], {"dflash": None, "nospec": None})
+        # supplied collect-window values carried through, informational (no all_ok flip)
+        r1 = m.build_report(
+            streams, dict(streams), dflash_batching=16, nospec_batching=15
+        )
+        self.assertEqual(r1["batching"], {"dflash": 16, "nospec": 15})
+        self.assertTrue(r1["all_ok"])
+
+    def test_cmd_collect_persists_windowed_batching_sidecar(self):
+        # Command-path: _cmd_collect with --server-log must persist the COLLECT-WINDOW
+        # observed max (excluding a larger pre-window #running-req) to the sidecar, so
+        # `report` can consume it without re-parsing the whole log.
+        import argparse
+        import contextlib
+        import io
+        import json
+        import os
+        import shutil
+        import tempfile
+
+        m = self._mod()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        server_log = os.path.join(tmp, "server.log")
+        out_json = os.path.join(tmp, "dflash.json")
+        with open(server_log, "w") as f:
+            f.write("[TP0] warmup Prefill batch, #running-req: 16\n")  # pre-window
+
+        def fake_collect(base_url, prompts, max_new):
+            with open(server_log, "a") as fh:
+                fh.write("[TP0] collect Decode batch, #running-req: 4\n")
+            return ({p: [1, 2, 3] for p in prompts}, {p: {"accept_length": 2.0} for p in prompts})
+
+        m.collect_concurrent = fake_collect
+        args = argparse.Namespace(
+            base_url="http://x", out_json=out_json, max_new_tokens=8,
+            meta_out=None, server_log=server_log,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = m._cmd_collect(args)
+        self.assertEqual(rc, 0)
+        side = json.load(open(m._batching_path(out_json)))
+        # the collect-window value (4), NOT the pre-window 16
+        self.assertEqual(side["observed_max_running"], 4)
+
+    def test_cmd_report_surfaces_batching_sidecar(self):
+        # Command-path: _cmd_report auto-loads the .batching sidecars and includes the
+        # values in both stdout and the --out JSON.
+        import argparse
+        import contextlib
+        import io
+        import json
+        import os
+        import shutil
+        import tempfile
+
+        m = self._mod()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        df, ns = os.path.join(tmp, "df.json"), os.path.join(tmp, "ns.json")
+        streams = {"a": [1, 2, 3], "b": [4, 5]}
+        json.dump(streams, open(df, "w"))
+        json.dump(streams, open(ns, "w"))
+        json.dump({"observed_max_running": 16, "from_line": 3}, open(m._batching_path(df), "w"))
+        json.dump({"observed_max_running": 15, "from_line": 5}, open(m._batching_path(ns), "w"))
+        out = os.path.join(tmp, "report.json")
+        args = argparse.Namespace(
+            dflash_json=df, nospec_json=ns, tolerance_manifest=None,
+            dflash_meta=None, nospec_meta=None, out=out,
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = m._cmd_report(args)
+        self.assertEqual(rc, 0)
+        self.assertIn("dflash=16 nospec=15", buf.getvalue())
+        rep = json.load(open(out))
+        self.assertEqual(rep["batching"], {"dflash": 16, "nospec": 15})
+
     def test_config_mismatch_reports_differing_fields(self):
         m = self._mod()
         base = m.collection_config(["a", "b"], 96)

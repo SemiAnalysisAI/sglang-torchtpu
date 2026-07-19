@@ -229,6 +229,10 @@ def _config_path(out_json: str) -> str:
     return out_json + ".config"
 
 
+def _batching_path(out_json: str) -> str:
+    return out_json + ".batching"
+
+
 def _cmd_collect(args) -> int:
     # Record the server-log line offset BEFORE the collect so observed batching is
     # windowed to the concurrent collection, not any earlier warmup/probe traffic.
@@ -258,6 +262,11 @@ def _cmd_collect(args) -> int:
     if args.server_log:
         mx = observed_max_running(args.server_log, from_line=from_line)
         print(f"observed max #running-req during collect: {mx}")
+        # Persist the ALREADY-WINDOWED value (computed with the pre-collect offset)
+        # to a companion sidecar so `report` can include it WITHOUT re-parsing the
+        # whole log later (which would over-report earlier warmup/probe traffic).
+        with open(_batching_path(args.out_json), "w") as f:
+            json.dump({"observed_max_running": mx, "from_line": from_line}, f)
     return 0
 
 
@@ -306,15 +315,20 @@ def build_report(
     nospec_meta: Optional[Dict] = None,
     dflash_cfg: Optional[Dict] = None,
     nospec_cfg: Optional[Dict] = None,
+    dflash_batching: Optional[int] = None,
+    nospec_batching: Optional[int] = None,
 ) -> Dict:
     """Assemble the reboot-gated concurrent artifact's full evidence set into ONE
     consolidated document, composing the already-tested pure helpers:
 
-      * ``parity``  -> per-request compare counts (exact/tolerated/fail/missing/empty)
-      * ``config``  -> {"mismatch": [fields]} between the two collects (if both cfgs)
-      * ``accept``  -> per-side accept-length summary (if the meta sidecars are given)
-      * ``all_ok``  -> the PARITY verdict only; a config mismatch or accept summary is
-                       informational and does NOT flip it (matches ``compare``).
+      * ``parity``   -> per-request compare counts (exact/tolerated/fail/missing/empty)
+      * ``config``   -> {"mismatch": [fields]} between the two collects (if both cfgs)
+      * ``accept``   -> per-side accept-length summary (if the meta sidecars are given)
+      * ``batching`` -> per-side COLLECT-WINDOW observed max #running-req (the real
+                        concurrent batch size), taken from the collect-time sidecar
+                        so the pre-collect windowing is preserved (no whole-log parse)
+      * ``all_ok``   -> the PARITY verdict only; config / accept / batching are
+                        informational and do NOT flip it (matches ``compare``).
 
     Pure (no I/O) so it is hermetically CPU-testable."""
     summary = compare_concurrent_streams(dflash, nospec, manifest)
@@ -332,6 +346,7 @@ def build_report(
         "per_prompt": summary["per_prompt"],
         "config": config,
         "accept": accept,
+        "batching": {"dflash": dflash_batching, "nospec": nospec_batching},
         "all_ok": bool(counts["all_ok"]),
     }
 
@@ -355,8 +370,15 @@ def _cmd_report(args) -> int:
     df_cfg_path, ns_cfg_path = _config_path(args.dflash_json), _config_path(args.nospec_json)
     dflash_cfg = _maybe_load(df_cfg_path) if pathlib.Path(df_cfg_path).exists() else None
     nospec_cfg = _maybe_load(ns_cfg_path) if pathlib.Path(ns_cfg_path).exists() else None
+    # Auto-pick up the companion collect-window observed-batching sidecars (written
+    # by `collect --server-log`); the value is already windowed at collect time.
+    df_b = _maybe_load(_batching_path(args.dflash_json)) if pathlib.Path(_batching_path(args.dflash_json)).exists() else None
+    ns_b = _maybe_load(_batching_path(args.nospec_json)) if pathlib.Path(_batching_path(args.nospec_json)).exists() else None
+    dflash_batching = df_b.get("observed_max_running") if df_b else None
+    nospec_batching = ns_b.get("observed_max_running") if ns_b else None
     report = build_report(
-        dflash, nospec, manifest, dflash_meta, nospec_meta, dflash_cfg, nospec_cfg
+        dflash, nospec, manifest, dflash_meta, nospec_meta, dflash_cfg, nospec_cfg,
+        dflash_batching, nospec_batching,
     )
     if args.out:
         with open(args.out, "w") as f:
@@ -377,6 +399,12 @@ def _cmd_report(args) -> int:
         print(
             f"  accept[{side}]: mean_accept_length={s['mean_accept_length']} "
             f"over {s['n_with_accept']}/{s['n']} requests"
+        )
+    b = report["batching"]
+    if b["dflash"] is not None or b["nospec"] is not None:
+        print(
+            f"  batching (collect-window max #running-req): "
+            f"dflash={b['dflash']} nospec={b['nospec']}"
         )
     return 0 if report["all_ok"] else 1
 
