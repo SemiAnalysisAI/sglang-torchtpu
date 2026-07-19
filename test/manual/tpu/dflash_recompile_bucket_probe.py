@@ -110,18 +110,19 @@ def main():
     log = sys.argv[1]
     with open(log) as f:
         pos = len(f.readlines())
-    hdr = ["request", "exp_bkt", "row_type", "newtok", "cached", "obs_bkt",
+    hdr = ["request", "input_len", "exp_bkt", "row_type", "newtok", "cached", "obs_bkt",
            "pf_tgt_ext", "pf_mat", "vglue", "kv_app", "ckr", "ct", "VALID?"]
     print("| " + " | ".join(hdr) + " |")
     print("|" + "|".join("---" for _ in hdr) + "|")
     seen = set()
     failures = []
     for label, exp_bkt, row_type, ids in build_requests():
+        input_len = len(ids)
         try:
             ct = send(ids)
         except Exception as e:  # bucket may exceed context for the top bucket
             failures.append(f"{label}: request error {e!r}")
-            print(f"| {label} | {exp_bkt} | {row_type} | ? | ? | ? | - | - | - | - | - | - | FAIL(req) |")
+            print(f"| {label} | {input_len} | {exp_bkt} | {row_type} | ? | ? | ? | - | - | - | - | - | - | FAIL(req) |")
             continue
         time.sleep(2)
         with open(log) as f:
@@ -143,7 +144,7 @@ def main():
             failures.append(f"{label}: {reason}")
         else:
             seen.add((exp_bkt, row_type))
-        row = [label, str(exp_bkt), row_type, str(newtok), str(cached), str(obs_bkt),
+        row = [label, str(input_len), str(exp_bkt), row_type, str(newtok), str(cached), str(obs_bkt),
                str(phase["prefill_target_extend_fwd"]), str(phase["prefill_extend_materialize"]),
                str(phase["verify_glue"]), str(phase["kv_append_post"]),
                str(checker), str(ct), reason]

@@ -1479,10 +1479,27 @@ class DFlashWorker:
                 th = th[:pad_n]
             # Expand the [pad_n, feat] rows into the fixed grid; zero the invalid
             # cells (their KV write targets slot 0 regardless).
+            th_post_rows = int(th.shape[0])
             target_hidden = th.index_select(0, source_row.reshape(-1))
             target_hidden = target_hidden * valid.reshape(-1, 1).to(
                 target_hidden.dtype
             )
+            if self._xla_trace_on() and self.tp_rank == 0:
+                # Log the extend-materialize shapes so a reviewer can confirm that,
+                # for same-pow2-bucket prompts of DIFFERENT length, every GRID shape
+                # is identical and only `total_ctx` (the base target-extend hidden
+                # row count, pre-pad `th`) differs — pinning any same-bucket recompile
+                # to the total_ctx-keyed `th` pad/slice, not the DFlash grid.
+                logger.info(
+                    "DFLASH extend-mat-shapes: bs=%d max_ctx=%d expected_ctx=%d "
+                    "total_ctx=%d bucket_ctx=%d pad_n=%d pos2d=%s valid=%s "
+                    "source_row=%s ctx_cache_loc=%s ctx_positions=%s "
+                    "th_pre_rows=%d th_post_rows=%d target_hidden=%s",
+                    bs, max_ctx, expected_ctx, int(total_ctx), bucket_ctx, pad_n,
+                    tuple(pos2d.shape), tuple(valid.shape), tuple(source_row.shape),
+                    tuple(ctx_cache_loc.shape), tuple(ctx_positions.shape),
+                    int(total_ctx), th_post_rows, tuple(target_hidden.shape),
+                )
 
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(
