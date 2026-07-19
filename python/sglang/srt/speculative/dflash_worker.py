@@ -28,6 +28,7 @@ from sglang.srt.speculative.dflash_utils import (
     dflash_decode_materialize_grid,
     dflash_fused_kv_materialize_decision,
     dflash_precompile_bucket_plan,
+    dflash_round_up_pow2,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
     resolve_dflash_verify_mask_policy,
@@ -41,6 +42,11 @@ _IS_TPU = is_tpu()
 # Precompile the draft mask buckets only up to this context (covers typical
 # decodes). Precompiling every bucket up to a large context_len exhausts HBM.
 _DFLASH_PRECOMPILE_MAX_CONTEXT = 2048
+
+# The prefill/extend KV materialization pads its token dim up to a pow2 stride
+# (floored here) so the project matmul + KV scatter compile once per bucket, not
+# once per exact prompt length. Bounds the prefill compile budget.
+_DFLASH_EXTEND_MATERIALIZE_MIN_BUCKET = 64
 
 logger = logging.getLogger(__name__)
 
@@ -1441,10 +1447,27 @@ class DFlashWorker:
             )  # [sum(ctx_lens)]
             ctx_positions = pos2d[mask]  # [sum(ctx_lens)]
 
+        target_hidden = draft_input.target_hidden
+        if is_extend:
+            # Bucket the extend (prefill) materialization to a pow2 token stride so
+            # the project matmul + KV scatter compile once per bucket rather than
+            # once per exact prompt length. Pad the extra rows with zeros and route
+            # their KV write to the reserved dummy slot 0 (inert). Committed rows
+            # are untouched. The decode branch is already a single static shape.
+            n = int(target_hidden.shape[0])
+            bucket = dflash_round_up_pow2(n, _DFLASH_EXTEND_MATERIALIZE_MIN_BUCKET)
+            if bucket > n:
+                pad = bucket - n
+                target_hidden = torch.nn.functional.pad(
+                    target_hidden, (0, 0, 0, pad)
+                )
+                ctx_cache_loc = torch.nn.functional.pad(ctx_cache_loc, (0, pad))
+                ctx_positions = torch.nn.functional.pad(ctx_positions, (0, pad))
+
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(
-                draft_input.target_hidden
-            )  # [sum(ctx), hidden]
+                target_hidden
+            )  # [bucket, hidden]
             if ctx_hidden.shape[0] != ctx_cache_loc.numel():
                 raise RuntimeError(
                     f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
@@ -1659,8 +1682,12 @@ class DFlashWorker:
             )
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            _xtrace = self._xla_trace_on()
+            _xc = self._xla_count() if _xtrace else -1
             batch.capture_hidden_mode = CaptureHiddenMode.FULL
             batch_result = self.target_worker.forward_batch_generation(batch, **kwargs)
+            if _xtrace:
+                _xc = self._xla_lap("prefill_target_extend_fwd", _xc)
             logits_output, next_token_ids = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,
@@ -1699,6 +1726,8 @@ class DFlashWorker:
                 ),
             )
             self._append_target_hidden_to_draft_kv(batch, draft_input)
+            if _xtrace:
+                self._xla_lap("prefill_extend_materialize", _xc)
             batch.spec_info = draft_input
 
             return GenerationBatchResult(

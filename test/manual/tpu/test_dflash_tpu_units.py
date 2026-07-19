@@ -752,8 +752,8 @@ class TestDflashVerifyHostSemantics(CustomTestCase):
         # grid (row r*DTN+p == verify hidden[r, p]); the decode materialization
         # masks uncommitted rows (p >= commit_r) to the reserved dummy KV slot.
         # Fixed shape regardless of accept count (was sum(commit_lens) -> the
-        # dominant AC-7 recompile source). Committed rows carry the same encoded
-        # (row, pos) the old compacted path wrote.
+        # dominant serving-time recompile source). Committed rows carry the same
+        # encoded (row, pos) the old compacted path wrote.
         self.assertEqual(next_hidden.shape[0], bs * self.DTN)
         for r, cl in enumerate([3, 1, 4, 2, 1]):
             for p in range(cl):
@@ -1301,6 +1301,68 @@ class TestDflashDecodeMaterializeGrid(CustomTestCase):
             4,
         )
         self.assertTrue(bool(valid_full.all()))
+
+    def test_round_up_pow2_bucketing(self):
+        # The prefill materialize pads its token dim to a pow2 stride (floored)
+        # so it compiles once per bucket, not per exact prompt length.
+        from sglang.srt.speculative.dflash_utils import dflash_round_up_pow2
+
+        self.assertEqual(dflash_round_up_pow2(10, 64), 64)  # below floor
+        self.assertEqual(dflash_round_up_pow2(64, 64), 64)  # exactly floor
+        self.assertEqual(dflash_round_up_pow2(65, 64), 128)
+        self.assertEqual(dflash_round_up_pow2(200, 64), 256)
+        self.assertEqual(dflash_round_up_pow2(256, 64), 256)
+        self.assertEqual(dflash_round_up_pow2(257, 64), 512)
+        # distinct prompt lengths in the same pow2 window share a bucket:
+        self.assertEqual(
+            dflash_round_up_pow2(130, 64), dflash_round_up_pow2(255, 64)
+        )
+
+    def test_gather_req_to_token_fixed_routes_invalid_to_slot0(self):
+        # The fixed-width gather keeps the full [bs*block] shape and routes
+        # uncommitted cells (valid==False) to the reserved dummy slot 0, with
+        # duplicate slot-0 writes allowed (they are inert). Called unbound with a
+        # CPU fake-self so it needs no device/model state.
+        import types as _t
+
+        from sglang.srt.speculative.dflash_worker import DFlashWorker
+
+        table = torch.tensor(
+            [[10, 11, 12, 13, 14], [20, 21, 22, 23, 24]], dtype=torch.int32
+        )
+        req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
+        pos2d = torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.int64)
+        valid = torch.tensor(
+            [[True, True, False], [True, False, False]], dtype=torch.bool
+        )
+        fake = _t.SimpleNamespace(device=torch.device("cpu"))
+        out = DFlashWorker._gather_req_to_token_fixed(
+            fake,
+            req_to_token=table,
+            req_pool_indices=req_pool_indices,
+            pos2d=pos2d,
+            valid=valid,
+        )
+        # Row-major [bs*3]; committed cells keep their gathered slot, invalid -> 0.
+        self.assertEqual(out.tolist(), [10, 11, 0, 20, 0, 0])
+        self.assertEqual(out.dtype, torch.int64)
+
+    def test_gather_req_to_token_fixed_clamps_out_of_range_positions(self):
+        # Uncommitted cells can index past the table width; they must be clamped
+        # (no OOB) and then zeroed, never producing a stray real slot.
+        import types as _t
+
+        from sglang.srt.speculative.dflash_worker import DFlashWorker
+
+        table = torch.tensor([[10, 11, 12]], dtype=torch.int32)  # width 3
+        out = DFlashWorker._gather_req_to_token_fixed(
+            _t.SimpleNamespace(device=torch.device("cpu")),
+            req_to_token=table,
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            pos2d=torch.tensor([[0, 99]], dtype=torch.int64),  # col 99 out of range
+            valid=torch.tensor([[True, False]], dtype=torch.bool),
+        )
+        self.assertEqual(out.tolist(), [10, 0])  # committed col 0 kept; invalid -> 0
 
     def test_committed_cells_match_old_compaction(self):
         # The old path emitted, per req, positions ctx_start+[0..commit_len) as a

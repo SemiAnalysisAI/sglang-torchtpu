@@ -401,7 +401,11 @@ class DFlashVerifyInput(SpecInput):
         Returns:
             new_bonus_tokens: int64 tensor [bs] (the new current token per request)
             commit_lens: int32 tensor [bs] (how many verify-input tokens are committed)
-            next_target_hidden: tensor [sum(commit_lens), feature_dim]
+            next_target_hidden: tensor [bs * draft_token_num, feature_dim] — the
+                FULL fixed-width verify-hidden grid (row i*draft_token_num+j ==
+                hidden[i, j]); the decode KV materialization masks uncommitted
+                rows (j >= commit_lens[i]) to the reserved dummy slot. Fixed shape
+                (independent of accept count) to avoid per-accept recompiles.
             num_correct_drafts_per_req_cpu: list[int] (accepted draft tokens per request)
         """
         if batch.forward_mode.is_idle():

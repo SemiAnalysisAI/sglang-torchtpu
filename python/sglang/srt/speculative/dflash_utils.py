@@ -1029,3 +1029,18 @@ def dflash_decode_materialize_grid(
     pos2d = ctx_start.to(torch.int64)[:, None] + r
     valid = r < commit_lens.to(torch.int64)[:, None]
     return pos2d, valid
+
+
+def dflash_round_up_pow2(n: int, min_bucket: int) -> int:
+    """Round ``n`` up to the next power of two, floored at ``min_bucket`` (itself
+    rounded up to a power of two).
+
+    Used to bucket the DFlash prefill/extend KV materialization to a small set of
+    token strides so the project matmul + KV scatter compile once per bucket
+    instead of once per exact prompt length (a bounded compile budget). Pure /
+    CPU-testable.
+    """
+    floor = 1 << max(int(min_bucket) - 1, 0).bit_length()
+    if n <= floor:
+        return floor
+    return 1 << (int(n) - 1).bit_length()
