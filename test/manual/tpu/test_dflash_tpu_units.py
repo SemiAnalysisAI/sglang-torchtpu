@@ -1399,6 +1399,24 @@ class TestCompareConcurrentStreams(CustomTestCase):
         self.assertEqual(s["per_prompt"]["b"]["missing_from"], "dflash")
         self.assertFalse(s["counts"]["all_ok"])
 
+    def test_summarize_accept_meta_mean_over_present(self):
+        m = self._mod()
+        s = m.summarize_accept_meta(
+            {
+                "a": {"accept_length": 3.0, "completion_tokens": 96},
+                "b": {"accept_length": 2.0, "completion_tokens": 96},
+                "c": {"accept_length": None},  # no accept reported
+            }
+        )
+        self.assertEqual(s["n"], 3)
+        self.assertEqual(s["n_with_accept"], 2)
+        self.assertAlmostEqual(s["mean_accept_length"], 2.5, places=6)
+
+    def test_summarize_accept_meta_empty(self):
+        s = self._mod().summarize_accept_meta({})
+        self.assertEqual(s["n"], 0)
+        self.assertIsNone(s["mean_accept_length"])
+
 
 class TestDflashTpVerifyInvariant(CustomTestCase):
     """All-ranks-identical invariant helper (`dflash_tp_ranks_agree`): after

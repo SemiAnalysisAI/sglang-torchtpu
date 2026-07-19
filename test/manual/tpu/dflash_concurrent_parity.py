@@ -54,7 +54,8 @@ def _sibling():
     return mod
 
 
-def _generate(base_url: str, prompt: str, max_new: int) -> List[int]:
+def _generate(base_url: str, prompt: str, max_new: int):
+    """Return ``(output_ids, meta)`` where meta = {completion_tokens, accept_length}."""
     body = json.dumps(
         {
             "text": prompt,
@@ -72,21 +73,55 @@ def _generate(base_url: str, prompt: str, max_new: int) -> List[int]:
             timeout=1800,
         ).read()
     )
+    mi = r.get("meta_info", {})
     if r.get("output_ids") is not None:
-        return [int(t) for t in r["output_ids"]]
-    otl = r.get("meta_info", {}).get("output_token_logprobs")
-    return [int(e[1]) for e in otl] if otl else []
+        ids = [int(t) for t in r["output_ids"]]
+    else:
+        otl = mi.get("output_token_logprobs")
+        ids = [int(e[1]) for e in otl] if otl else []
+    meta = {
+        "completion_tokens": mi.get("completion_tokens"),
+        "accept_length": mi.get("spec_accept_length") or mi.get("accept_length"),
+    }
+    return ids, meta
 
 
-def collect_concurrent(
-    base_url: str, prompts: List[str], max_new: int
-) -> Dict[str, List[int]]:
-    """Send all prompts CONCURRENTLY (one request each) so they batch together."""
+def collect_concurrent(base_url: str, prompts: List[str], max_new: int):
+    """Send all prompts CONCURRENTLY (one request each) so they batch together.
+
+    Returns ``(streams, meta)``: ``streams`` = {prompt: output_ids} (the dump
+    `compare` reads), ``meta`` = {prompt: {completion_tokens, accept_length}}."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as ex:
-        streams = list(
-            ex.map(lambda p: _generate(base_url, p, max_new), prompts)
-        )
-    return {p: s for p, s in zip(prompts, streams)}
+        results = list(ex.map(lambda p: _generate(base_url, p, max_new), prompts))
+    streams = {p: r[0] for p, r in zip(prompts, results)}
+    meta = {p: r[1] for p, r in zip(prompts, results)}
+    return streams, meta
+
+
+def summarize_accept_meta(meta: Dict[str, Dict]) -> Dict:
+    """Pure summary of per-request metadata: mean accept length over the requests
+    that reported one, and the count. CPU-testable (no I/O)."""
+    accepts = [
+        float(d["accept_length"])
+        for d in meta.values()
+        if d.get("accept_length") is not None
+    ]
+    return {
+        "n": len(meta),
+        "n_with_accept": len(accepts),
+        "mean_accept_length": (sum(accepts) / len(accepts)) if accepts else None,
+    }
+
+
+def observed_max_running(server_log_path: str) -> int:
+    """Max #running-req observed in a server log (the collect's concurrent batch
+    size), via the committed compile-checker parser."""
+    p = pathlib.Path(__file__).parent / "dflash_parse_checker_log.py"
+    spec = importlib.util.spec_from_file_location("dflash_parse_checker_log", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    with open(server_log_path) as f:
+        return mod.parse_checker_log(f.readlines())["max_running"]
 
 
 def compare_concurrent_streams(
@@ -145,10 +180,22 @@ def compare_concurrent_streams(
 
 
 def _cmd_collect(args) -> int:
-    result = collect_concurrent(args.base_url, DEFAULT_PROMPTS, args.max_new_tokens)
+    streams, meta = collect_concurrent(
+        args.base_url, DEFAULT_PROMPTS, args.max_new_tokens
+    )
     with open(args.out_json, "w") as f:
-        json.dump(result, f)
-    print(f"collected {len(result)} concurrent streams -> {args.out_json}")
+        json.dump(streams, f)  # streams-only dump: `compare` reads this
+    print(f"collected {len(streams)} concurrent streams -> {args.out_json}")
+    if args.meta_out:
+        with open(args.meta_out, "w") as f:
+            json.dump(meta, f)
+        s = summarize_accept_meta(meta)
+        print(
+            f"meta -> {args.meta_out} | mean accept_length="
+            f"{s['mean_accept_length']} over {s['n_with_accept']}/{s['n']} requests"
+        )
+    if args.server_log:
+        print(f"observed max #running-req (batch): {observed_max_running(args.server_log)}")
     return 0
 
 
@@ -181,6 +228,13 @@ def main() -> int:
     c.add_argument("base_url")
     c.add_argument("out_json")
     c.add_argument("--max-new-tokens", type=int, default=96)
+    c.add_argument(
+        "--meta-out", help="also write {prompt: {completion_tokens, accept_length}}"
+    )
+    c.add_argument(
+        "--server-log",
+        help="server log to report observed max #running-req (concurrent batch)",
+    )
     c.set_defaults(func=_cmd_collect)
     cmp = sub.add_parser("compare")
     cmp.add_argument("dflash_json")
