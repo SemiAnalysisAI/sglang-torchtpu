@@ -25,6 +25,7 @@ from sglang.srt.server_args import (
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
+    dflash_assert_extend_hidden_rows,
     dflash_decode_materialize_grid,
     dflash_extend_materialize_plan,
     dflash_fused_kv_materialize_decision,
@@ -495,9 +496,21 @@ class DFlashWorker:
             pos2d = pos2d.to(table_device)
         valid = valid.to(device=table_device, dtype=torch.bool)
         table_width = int(req_to_token.shape[1])
-        # Uncommitted grid cells can index past the committed region; clamp to a
-        # valid column (their gathered slot is discarded via the valid mask below).
-        safe_pos2d = pos2d.clamp(min=0, max=max(table_width - 1, 0))
+        # A VALID (committed) cell out of table range is a real bug, not a
+        # don't-care pad — fail loudly rather than silently redirecting it to the
+        # last column (which would corrupt that committed token's KV). Only
+        # INVALID/padded cells are sanitized (their gathered slot is discarded via
+        # the valid mask and their KV write targets slot 0).
+        oob = (pos2d < 0) | (pos2d >= table_width)
+        valid_oob = valid & oob
+        if bool(valid_oob.any().item()):
+            raise RuntimeError(
+                f"DFLASH fixed KV gather: {int(valid_oob.sum().item())} valid "
+                f"committed position(s) are out of req_to_token range "
+                f"[0, {table_width}); this would corrupt real KV. "
+                f"max_pos={int(pos2d.max().item())}."
+            )
+        safe_pos2d = pos2d.masked_fill(~valid, 0).clamp(min=0, max=max(table_width - 1, 0))
         gathered = req_to_token[req_pool_indices[:, None], safe_pos2d].to(torch.int64)
         gathered = torch.where(valid, gathered, gathered.new_zeros(())).reshape(-1)
         if gathered.device != self.device:
@@ -1422,11 +1435,19 @@ class DFlashWorker:
             max_ctx = int(ctx_lens.max().item())
             if max_ctx <= 0:
                 raise RuntimeError(f"DFLASH invalid max_ctx={max_ctx} for KV append.")
+            # `source_row` maps grid cells into `target_hidden` by exclusive-cumsum
+            # offsets over its first `expected_ctx = sum(ctx_lens)` rows (the
+            # committed tokens in request order). A SHORTER hidden tensor is a real
+            # corruption (fail loud); a LONGER one is fine — the target extend
+            # forward captures padded/bucketed hidden with real tokens contiguous
+            # at the front and trailing padding, which is never indexed.
+            expected_ctx = int(ctx_lens.to(torch.int64).sum().item())
+            dflash_assert_extend_hidden_rows(int(total_ctx), expected_ctx)
             bucket_ctx = dflash_round_up_pow2(
                 max_ctx, _DFLASH_EXTEND_MATERIALIZE_MIN_BUCKET
             )
             pad_n = dflash_round_up_pow2(
-                int(total_ctx), _DFLASH_EXTEND_MATERIALIZE_MIN_BUCKET
+                expected_ctx, _DFLASH_EXTEND_MATERIALIZE_MIN_BUCKET
             )
             pos2d, valid, source_row = dflash_extend_materialize_plan(
                 ctx_start, ctx_lens, bucket_ctx, pad_n
@@ -1438,11 +1459,17 @@ class DFlashWorker:
                 pos2d=pos2d,
                 valid=valid,
             )  # [bs*bucket_ctx], invalid -> slot 0
+            # Force target_hidden to exactly pad_n rows so index_select's input is
+            # also bucketed. All committed rows live at source_row < expected_ctx
+            # <= pad_n, so padding up (short) or truncating the trailing pad (long)
+            # both preserve every committed hidden row.
             th = draft_input.target_hidden
-            if pad_n > int(total_ctx):
+            if int(total_ctx) < pad_n:
                 th = torch.nn.functional.pad(th, (0, 0, 0, pad_n - int(total_ctx)))
-            # Expand the compacted [pad_n, feat] rows into the fixed grid; zero the
-            # invalid cells (their KV write targets slot 0 regardless).
+            elif int(total_ctx) > pad_n:
+                th = th[:pad_n]
+            # Expand the [pad_n, feat] rows into the fixed grid; zero the invalid
+            # cells (their KV write targets slot 0 regardless).
             target_hidden = th.index_select(0, source_row.reshape(-1))
             target_hidden = target_hidden * valid.reshape(-1, 1).to(
                 target_hidden.dtype

@@ -1347,9 +1347,9 @@ class TestDflashDecodeMaterializeGrid(CustomTestCase):
         self.assertEqual(out.tolist(), [10, 11, 0, 20, 0, 0])
         self.assertEqual(out.dtype, torch.int64)
 
-    def test_gather_req_to_token_fixed_clamps_out_of_range_positions(self):
-        # Uncommitted cells can index past the table width; they must be clamped
-        # (no OOB) and then zeroed, never producing a stray real slot.
+    def test_gather_req_to_token_fixed_invalid_oob_routes_to_slot0(self):
+        # An INVALID cell may index past the table width; it must be sanitized to
+        # slot 0, never producing a stray real slot or raising.
         import types as _t
 
         from sglang.srt.speculative.dflash_worker import DFlashWorker
@@ -1360,9 +1360,40 @@ class TestDflashDecodeMaterializeGrid(CustomTestCase):
             req_to_token=table,
             req_pool_indices=torch.tensor([0], dtype=torch.int64),
             pos2d=torch.tensor([[0, 99]], dtype=torch.int64),  # col 99 out of range
-            valid=torch.tensor([[True, False]], dtype=torch.bool),
+            valid=torch.tensor([[True, False]], dtype=torch.bool),  # 99 is invalid
         )
         self.assertEqual(out.tolist(), [10, 0])  # committed col 0 kept; invalid -> 0
+
+    def test_gather_req_to_token_fixed_valid_oob_raises(self):
+        # A VALID (committed) cell out of table range must RAISE, not be silently
+        # clamped to the last column (which would corrupt that token's KV).
+        import types as _t
+
+        from sglang.srt.speculative.dflash_worker import DFlashWorker
+
+        table = torch.tensor([[10, 11, 12]], dtype=torch.int32)  # width 3
+        with self.assertRaises(RuntimeError):
+            DFlashWorker._gather_req_to_token_fixed(
+                _t.SimpleNamespace(device=torch.device("cpu")),
+                req_to_token=table,
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                pos2d=torch.tensor([[0, 99]], dtype=torch.int64),
+                valid=torch.tensor([[True, True]], dtype=torch.bool),  # 99 VALID -> raise
+            )
+
+    def test_extend_hidden_rows_mismatch_raises(self):
+        # The extend materialize must fail loud if target_hidden rows !=
+        # sum(ctx_lens) (would silently misalign committed hidden rows).
+        from sglang.srt.speculative.dflash_utils import (
+            dflash_assert_extend_hidden_rows,
+        )
+
+        dflash_assert_extend_hidden_rows(5, 5)  # exact match: no raise
+        # Longer is allowed: padded/bucketed hidden capture (real tokens at the
+        # front, trailing pad never indexed).
+        dflash_assert_extend_hidden_rows(10, 2)  # longer: no raise
+        with self.assertRaises(RuntimeError):
+            dflash_assert_extend_hidden_rows(4, 5)  # SHORTER -> real corruption
 
     def test_committed_cells_match_old_compaction(self):
         # The old path emitted, per req, positions ctx_start+[0..commit_len) as a

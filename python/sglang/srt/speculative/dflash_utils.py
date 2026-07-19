@@ -1080,3 +1080,24 @@ def dflash_extend_materialize_plan(
         offset[1:] = torch.cumsum(cl, dim=0)[:-1]
     source_row = (offset[:, None] + r).clamp_(min=0, max=max(int(pad_n) - 1, 0))
     return pos2d, valid, source_row
+
+
+def dflash_assert_extend_hidden_rows(total_ctx: int, ctx_lens_sum: int) -> None:
+    """Fail loud if the extend-materialize ``target_hidden`` has FEWER rows than
+    ``sum(ctx_lens)``.
+
+    The fixed-grid materialization maps grid cells into ``target_hidden`` by
+    exclusive-cumsum offsets over the first ``sum(ctx_lens)`` rows, which must be
+    the committed tokens in request order. A SHORTER tensor would make committed
+    cells read the wrong/zeroed row or index out of range — a real corruption, so
+    raise. A LONGER tensor is allowed: the target extend forward captures hidden
+    for the padded/bucketed token count (real tokens contiguous at the front,
+    trailing padding), and the extra trailing rows are simply never indexed. Pure
+    / CPU-testable.
+    """
+    if int(total_ctx) < int(ctx_lens_sum):
+        raise RuntimeError(
+            f"DFLASH extend materialize: target_hidden rows {int(total_ctx)} < "
+            f"sum(ctx_lens) {int(ctx_lens_sum)}; committed hidden rows would be "
+            f"misaligned / out of range."
+        )
