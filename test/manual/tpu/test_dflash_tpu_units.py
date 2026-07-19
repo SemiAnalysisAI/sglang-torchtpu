@@ -1382,6 +1382,68 @@ class TestDflashDecodeMaterializeGrid(CustomTestCase):
         self.assertEqual(fixed_committed, old_compacted)
 
 
+class TestDflashExtendMaterializePlan(CustomTestCase):
+    """The extend/prefill materialization plan is a pure function that yields a
+    fixed [bs, bucket_ctx] grid so the whole extend materialize (gather + project
+    matmul + scatter) compiles once per pow2 bucket, not per exact prompt length.
+    Committed cells must map to the same compacted target_hidden rows / KV
+    positions the old per-length path used.
+    """
+
+    def _plan(self, ctx_start, ctx_lens, bucket_ctx, pad_n):
+        from sglang.srt.speculative.dflash_utils import (
+            dflash_extend_materialize_plan,
+        )
+
+        return dflash_extend_materialize_plan(
+            torch.tensor(ctx_start, dtype=torch.int64),
+            torch.tensor(ctx_lens, dtype=torch.int32),
+            bucket_ctx,
+            pad_n,
+        )
+
+    def test_bs1_positions_validity_and_source(self):
+        # bs=1, ctx_len=3 @ start 10, bucket_ctx=4 (rounded from 3), pad_n=4.
+        pos, valid, src = self._plan([10], [3], 4, 4)
+        self.assertEqual(pos.tolist(), [[10, 11, 12, 13]])
+        self.assertEqual(valid.tolist(), [[True, True, True, False]])
+        # bs=1: source_row == column index (offset 0), padded cell clamped in-range.
+        self.assertEqual(src.tolist(), [[0, 1, 2, 3]])
+
+    def test_bs_gt1_ragged_committed_equivalence(self):
+        # bs=2 ragged: committed grid cells (valid) must map, row-major, to exactly
+        # the (req, position) pairs and compacted rows the old per-length path used.
+        ctx_start, ctx_lens = [10, 20], [2, 3]
+        pos, valid, src = self._plan(ctx_start, ctx_lens, 4, 8)
+        old_positions, old_source = [], []
+        off = [0, 2]  # exclusive cumsum of ctx_lens
+        for i, cl in enumerate(ctx_lens):
+            for j in range(cl):
+                old_positions.append(ctx_start[i] + j)
+                old_source.append(off[i] + j)
+        self.assertEqual(pos[valid].tolist(), old_positions)
+        self.assertEqual(src[valid].tolist(), old_source)
+
+    def test_source_row_clamped_in_range(self):
+        # Padded/uncommitted cells must never index past pad_n-1 (they read a zeroed
+        # row and their KV write targets slot 0 anyway).
+        _pos, _valid, src = self._plan([0, 0], [1, 1], 8, 4)
+        self.assertLessEqual(int(src.max()), 3)  # pad_n-1
+        self.assertGreaterEqual(int(src.min()), 0)
+
+    def test_bucket_widths_are_pow2(self):
+        from sglang.srt.speculative.dflash_utils import dflash_round_up_pow2
+
+        # Two different prompt lengths in the same pow2 window share bucket_ctx,
+        # so the extend materialize compiles once for both.
+        self.assertEqual(
+            dflash_round_up_pow2(70, 64), dflash_round_up_pow2(120, 64)
+        )
+        p1, _v, _s = self._plan([0], [70], dflash_round_up_pow2(70, 64), 128)
+        p2, _v2, _s2 = self._plan([0], [120], dflash_round_up_pow2(120, 64), 128)
+        self.assertEqual(p1.shape, p2.shape)  # identical grid shape -> one compile
+
+
 class TestDflashVerifyMaskPolicyAvoidsTriton(CustomTestCase):
     """Verify-routing guard: on the TPU RPA-v3 backend, DFlash verify skips its custom mask,
     so it uses RPA-v3's own metadata builder and never reaches

@@ -26,6 +26,7 @@ from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInp
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     dflash_decode_materialize_grid,
+    dflash_extend_materialize_plan,
     dflash_fused_kv_materialize_decision,
     dflash_precompile_bucket_plan,
     dflash_round_up_pow2,
@@ -1407,67 +1408,50 @@ class DFlashWorker:
                 pos2d=pos2d,
                 valid=valid,
             )  # [bs*block], invalid cells -> slot 0
-        elif bs == 1:
-            # Fast path for single-request EXTEND (all context tokens committed).
-            max_ctx = int(total_ctx)
-            if max_ctx <= self._block_pos_offsets.numel():
-                r = self._block_pos_offsets[:max_ctx]
-            else:
-                r = torch.arange(max_ctx, device=device, dtype=torch.int64)
-            pos2d = ctx_start[:, None] + r[None, :]  # [1, ctx]
-            ctx_cache_loc = self._gather_req_to_token_masked(
-                req_to_token=target_req_to_token,
-                req_pool_indices=req_pool_indices,
-                pos2d=pos2d,
-                mask=torch.ones_like(pos2d, dtype=torch.bool),
-                context="DFLASH target hidden KV append",
-            )  # [ctx]
-            ctx_positions = pos2d.reshape(-1)  # [ctx]
+            target_hidden = draft_input.target_hidden  # [bs*block, feat]
         else:
-            # EXTEND, bs > 1: ragged prompt lengths, token-bucketed elsewhere.
+            # EXTEND / prefill: FULLY bucketed materialization (bs=1 and bs>1). Round
+            # both the grid width (max prompt length) AND the compacted target_hidden
+            # row count up to pow2 token strides; gather a KV slot for every grid cell
+            # (invalid/padded cells -> reserved dummy slot 0); index_select the
+            # compacted [pad_n, feat] rows into the [bs*bucket_ctx, feat] grid. So the
+            # gather + project matmul + scatter all compile ONCE PER POW2 BUCKET
+            # instead of once per exact prompt length (the R10 post-hoc pad bounded
+            # only the matmul, not the gather). Committed cells write byte-identical
+            # KV; uncommitted cells are zero-hidden writes to slot 0 (inert).
             max_ctx = int(ctx_lens.max().item())
             if max_ctx <= 0:
                 raise RuntimeError(f"DFLASH invalid max_ctx={max_ctx} for KV append.")
-
-            if max_ctx <= self._block_pos_offsets.numel():
-                r = self._block_pos_offsets[:max_ctx]
-            else:
-                r = torch.arange(max_ctx, device=device, dtype=torch.int64)
-            r = r[None, :]  # [1, max_ctx]
-            pos2d = ctx_start[:, None] + r  # [bs, max_ctx]
-            mask = r < ctx_lens[:, None]
-
-            # Batched gather of cache locations and positions.
-            ctx_cache_loc = self._gather_req_to_token_masked(
+            bucket_ctx = dflash_round_up_pow2(
+                max_ctx, _DFLASH_EXTEND_MATERIALIZE_MIN_BUCKET
+            )
+            pad_n = dflash_round_up_pow2(
+                int(total_ctx), _DFLASH_EXTEND_MATERIALIZE_MIN_BUCKET
+            )
+            pos2d, valid, source_row = dflash_extend_materialize_plan(
+                ctx_start, ctx_lens, bucket_ctx, pad_n
+            )  # [bs, bucket_ctx] x3
+            ctx_positions = pos2d.reshape(-1)  # [bs*bucket_ctx]
+            ctx_cache_loc = self._gather_req_to_token_fixed(
                 req_to_token=target_req_to_token,
                 req_pool_indices=req_pool_indices,
                 pos2d=pos2d,
-                mask=mask,
-                context="DFLASH target hidden KV append",
-            )  # [sum(ctx_lens)]
-            ctx_positions = pos2d[mask]  # [sum(ctx_lens)]
-
-        target_hidden = draft_input.target_hidden
-        if is_extend:
-            # Bucket the extend (prefill) materialization to a pow2 token stride so
-            # the project matmul + KV scatter compile once per bucket rather than
-            # once per exact prompt length. Pad the extra rows with zeros and route
-            # their KV write to the reserved dummy slot 0 (inert). Committed rows
-            # are untouched. The decode branch is already a single static shape.
-            n = int(target_hidden.shape[0])
-            bucket = dflash_round_up_pow2(n, _DFLASH_EXTEND_MATERIALIZE_MIN_BUCKET)
-            if bucket > n:
-                pad = bucket - n
-                target_hidden = torch.nn.functional.pad(
-                    target_hidden, (0, 0, 0, pad)
-                )
-                ctx_cache_loc = torch.nn.functional.pad(ctx_cache_loc, (0, pad))
-                ctx_positions = torch.nn.functional.pad(ctx_positions, (0, pad))
+                valid=valid,
+            )  # [bs*bucket_ctx], invalid -> slot 0
+            th = draft_input.target_hidden
+            if pad_n > int(total_ctx):
+                th = torch.nn.functional.pad(th, (0, 0, 0, pad_n - int(total_ctx)))
+            # Expand the compacted [pad_n, feat] rows into the fixed grid; zero the
+            # invalid cells (their KV write targets slot 0 regardless).
+            target_hidden = th.index_select(0, source_row.reshape(-1))
+            target_hidden = target_hidden * valid.reshape(-1, 1).to(
+                target_hidden.dtype
+            )
 
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(
                 target_hidden
-            )  # [bucket, hidden]
+            )  # [bs*bucket_ctx or bs*block, hidden]
             if ctx_hidden.shape[0] != ctx_cache_loc.numel():
                 raise RuntimeError(
                     f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."

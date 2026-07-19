@@ -1044,3 +1044,39 @@ def dflash_round_up_pow2(n: int, min_bucket: int) -> int:
     if n <= floor:
         return floor
     return 1 << (int(n) - 1).bit_length()
+
+
+def dflash_extend_materialize_plan(
+    ctx_start: torch.Tensor,
+    ctx_lens: torch.Tensor,
+    bucket_ctx: int,
+    pad_n: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Rectangular ``[bs, bucket_ctx]`` plan for the DFlash extend/prefill KV
+    materialization, fully bucketed for bs=1 and bs>1.
+
+    Returns ``(pos2d, valid, source_row)``:
+      - ``pos2d[i, j]      = ctx_start[i] + j``      — KV *position* to gather.
+      - ``valid[i, j]      = j < ctx_lens[i]``       — committed prompt token?
+      - ``source_row[i, j] = offset[i] + j``         — row in the compacted
+        ``target_hidden`` (``offset`` = exclusive cumsum of ``ctx_lens``), clamped
+        to ``[0, pad_n-1]`` so padded/uncommitted cells read an in-range (zeroed)
+        row.
+
+    The worker gathers a KV slot for every grid cell (fixed ``[bs*bucket_ctx]``
+    shape) and routes uncommitted cells (``valid == False``) to the reserved dummy
+    slot 0, so the whole extend materialization (gather + project matmul + scatter)
+    compiles once per pow2 bucket instead of once per exact prompt length. Pure /
+    CPU-testable (torch tensors, no device/model state).
+    """
+    device = ctx_lens.device
+    bs = int(ctx_lens.shape[0])
+    r = torch.arange(int(bucket_ctx), device=device, dtype=torch.int64)[None, :]
+    cl = ctx_lens.to(torch.int64)
+    pos2d = ctx_start.to(torch.int64)[:, None] + r
+    valid = r < cl[:, None]
+    offset = torch.zeros(bs, device=device, dtype=torch.int64)
+    if bs > 1:
+        offset[1:] = torch.cumsum(cl, dim=0)[:-1]
+    source_row = (offset[:, None] + r).clamp_(min=0, max=max(int(pad_n) - 1, 0))
+    return pos2d, valid, source_row
