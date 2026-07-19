@@ -298,6 +298,89 @@ def _cmd_compare(args) -> int:
     return 0 if c["all_ok"] else 1
 
 
+def build_report(
+    dflash: Dict[str, List[int]],
+    nospec: Dict[str, List[int]],
+    manifest: Optional[Dict] = None,
+    dflash_meta: Optional[Dict] = None,
+    nospec_meta: Optional[Dict] = None,
+    dflash_cfg: Optional[Dict] = None,
+    nospec_cfg: Optional[Dict] = None,
+) -> Dict:
+    """Assemble the reboot-gated concurrent artifact's full evidence set into ONE
+    consolidated document, composing the already-tested pure helpers:
+
+      * ``parity``  -> per-request compare counts (exact/tolerated/fail/missing/empty)
+      * ``config``  -> {"mismatch": [fields]} between the two collects (if both cfgs)
+      * ``accept``  -> per-side accept-length summary (if the meta sidecars are given)
+      * ``all_ok``  -> the PARITY verdict only; a config mismatch or accept summary is
+                       informational and does NOT flip it (matches ``compare``).
+
+    Pure (no I/O) so it is hermetically CPU-testable."""
+    summary = compare_concurrent_streams(dflash, nospec, manifest)
+    counts = summary["counts"]
+    config = None
+    if dflash_cfg is not None and nospec_cfg is not None:
+        config = {"mismatch": config_mismatch(dflash_cfg, nospec_cfg)}
+    accept = {}
+    if dflash_meta is not None:
+        accept["dflash"] = summarize_accept_meta(dflash_meta)
+    if nospec_meta is not None:
+        accept["nospec"] = summarize_accept_meta(nospec_meta)
+    return {
+        "parity": counts,
+        "per_prompt": summary["per_prompt"],
+        "config": config,
+        "accept": accept,
+        "all_ok": bool(counts["all_ok"]),
+    }
+
+
+def _maybe_load(path: Optional[str]) -> Optional[Dict]:
+    if not path:
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def _cmd_report(args) -> int:
+    with open(args.dflash_json) as f:
+        dflash = json.load(f)
+    with open(args.nospec_json) as f:
+        nospec = json.load(f)
+    manifest = _maybe_load(args.tolerance_manifest)
+    dflash_meta = _maybe_load(args.dflash_meta)
+    nospec_meta = _maybe_load(args.nospec_meta)
+    # Auto-pick up the companion collect configs if present (written by `collect`).
+    df_cfg_path, ns_cfg_path = _config_path(args.dflash_json), _config_path(args.nospec_json)
+    dflash_cfg = _maybe_load(df_cfg_path) if pathlib.Path(df_cfg_path).exists() else None
+    nospec_cfg = _maybe_load(ns_cfg_path) if pathlib.Path(ns_cfg_path).exists() else None
+    report = build_report(
+        dflash, nospec, manifest, dflash_meta, nospec_meta, dflash_cfg, nospec_cfg
+    )
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(report, f, indent=2)
+        print(f"# wrote consolidated evidence report -> {args.out}")
+    c = report["parity"]
+    print("=" * 60)
+    print("CONSOLIDATED DFLASH CONCURRENT-PARITY EVIDENCE")
+    print(
+        f"  parity: exact={c['exact']} tolerated={c['tolerated']} fail={c['fail']} "
+        f"missing={c['missing']} empty={c['empty']} -> "
+        f"{'PASS' if c['all_ok'] else 'FAIL'}"
+    )
+    if report["config"] is not None:
+        mm = report["config"]["mismatch"]
+        print(f"  config: {'consistent' if not mm else 'MISMATCH ' + ','.join(mm)}")
+    for side, s in report["accept"].items():
+        print(
+            f"  accept[{side}]: mean_accept_length={s['mean_accept_length']} "
+            f"over {s['n_with_accept']}/{s['n']} requests"
+        )
+    return 0 if report["all_ok"] else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(required=True)
@@ -318,6 +401,16 @@ def main() -> int:
     cmp.add_argument("nospec_json")
     cmp.add_argument("--tolerance-manifest")
     cmp.set_defaults(func=_cmd_compare)
+    rp = sub.add_parser(
+        "report", help="one consolidated evidence doc: parity + config + accept"
+    )
+    rp.add_argument("dflash_json")
+    rp.add_argument("nospec_json")
+    rp.add_argument("--tolerance-manifest")
+    rp.add_argument("--dflash-meta", help="dflash --meta-out sidecar (accept-length)")
+    rp.add_argument("--nospec-meta", help="no-spec --meta-out sidecar (accept-length)")
+    rp.add_argument("--out", help="write the consolidated report JSON here")
+    rp.set_defaults(func=_cmd_report)
     args = ap.parse_args()
     return args.func(args)
 

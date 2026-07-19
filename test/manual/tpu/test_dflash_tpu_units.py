@@ -1519,6 +1519,41 @@ class TestCompareConcurrentStreams(CustomTestCase):
         # order matters (a reordered prompt set is a different collection)
         self.assertNotEqual(c1["prompt_sha"], m.collection_config(["b", "a", "c"], 96)["prompt_sha"])
 
+    def test_build_report_all_ok_with_accept_and_config(self):
+        m = self._mod()
+        streams = {"a": [1, 2, 3], "b": [4, 5]}
+        meta = {"a": {"accept_length": 3.0}, "b": {"accept_length": 2.0}}
+        cfg = m.collection_config(["a", "b"], 96)
+        r = m.build_report(
+            streams, dict(streams), None, meta, dict(meta), cfg, dict(cfg)
+        )
+        self.assertTrue(r["all_ok"])
+        self.assertEqual(r["parity"]["exact"], 2)
+        self.assertEqual(r["config"]["mismatch"], [])  # matching configs
+        self.assertAlmostEqual(r["accept"]["dflash"]["mean_accept_length"], 2.5, places=6)
+        self.assertAlmostEqual(r["accept"]["nospec"]["mean_accept_length"], 2.5, places=6)
+
+    def test_build_report_fail_sets_all_ok_false(self):
+        m = self._mod()
+        # a dropped request -> missing -> fail-closed
+        r = m.build_report({"a": [1]}, {"a": [1], "b": [2]})
+        self.assertFalse(r["all_ok"])
+        self.assertEqual(r["parity"]["missing"], 1)
+        self.assertEqual(r["config"], None)  # no cfgs supplied
+        self.assertEqual(r["accept"], {})    # no meta supplied
+
+    def test_build_report_config_mismatch_is_informational(self):
+        m = self._mod()
+        # streams match exactly, but the two collect configs differ: the report
+        # surfaces the mismatch WITHOUT flipping the parity verdict (matches compare).
+        streams = {"a": [1, 2]}
+        r = m.build_report(
+            streams, dict(streams), None, None, None,
+            m.collection_config(["a"], 96), m.collection_config(["a"], 50),
+        )
+        self.assertTrue(r["all_ok"])  # parity still passes
+        self.assertEqual(r["config"]["mismatch"], ["max_new_tokens"])
+
     def test_config_mismatch_reports_differing_fields(self):
         m = self._mod()
         base = m.collection_config(["a", "b"], 96)
