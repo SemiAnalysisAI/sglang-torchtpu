@@ -1274,6 +1274,60 @@ class TestLoadVerifyPosmap(CustomTestCase):
             m._load_verify_posmap(path)
 
 
+class TestParseCheckerLog(CustomTestCase):
+    """`dflash_parse_checker_log.parse_checker_log`: turns raw compile-checker log
+    lines into a structured summary (per-phase compiles, checker total, verify-glue
+    residual, max running). Pins the parse against the exact live log formats.
+    """
+
+    SAMPLE = [
+        "[2026-07-19 TP0] DFLASH xla-attrib: phase=prefill_target_extend_fwd "
+        "compiled 52 new XLA program(s) (121 -> 173)",
+        "[2026-07-19 TP0] DFLASH xla-attrib: phase=verify_glue compiled 2 new "
+        "XLA program(s) (1813 -> 1815)",
+        "[2026-07-19 TP0] DFLASH xla-attrib: phase=verify_glue compiled 2 new "
+        "XLA program(s) (1815 -> 1817)",
+        "[2026-07-19 TP0] [recompilation checker] 28 new XLA program(s) since last",
+        "[2026-07-19 TP0] Prefill batch, #new-seq: 1, #running-req: 6, ...",
+        "[2026-07-19 TP0] DFLASH verify-shape-trace: bs=1 draft_token_num=10 "
+        "sum_commit=2 next_target_hidden_rows=10 free_locs=7 kept_locs=2 "
+        "xla_cache=361 xla_delta_since_prev_verify=2",
+        "[2026-07-19 TP0] DFLASH verify-shape-trace: bs=1 draft_token_num=10 "
+        "sum_commit=1 next_target_hidden_rows=10 free_locs=3 kept_locs=1 "
+        "xla_cache=363 xla_delta_since_prev_verify=0",
+    ]
+
+    def _mod(self):
+        import importlib.util
+        import pathlib
+
+        p = pathlib.Path(__file__).parent / "dflash_parse_checker_log.py"
+        spec = importlib.util.spec_from_file_location("dflash_parse_checker_log", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_parses_all_line_families(self):
+        s = self._mod().parse_checker_log(self.SAMPLE)
+        # per-phase compiles aggregate across lines
+        self.assertEqual(s["phase_compiles"]["prefill_target_extend_fwd"], 52)
+        self.assertEqual(s["phase_compiles"]["verify_glue"], 4)  # 2 + 2
+        self.assertEqual(s["checker_total"], 28)
+        self.assertEqual(s["max_running"], 6)
+        vg = s["verify_glue"]
+        self.assertEqual(vg["steps"], 2)
+        self.assertEqual(vg["total_delta"], 2)  # 2 + 0
+        self.assertEqual(vg["max_free_locs"], 7)
+        self.assertEqual(vg["recompiling_steps"], 1)  # only the delta=2 step
+
+    def test_empty_log_is_all_zero(self):
+        s = self._mod().parse_checker_log([])
+        self.assertEqual(s["phase_compiles"], {})
+        self.assertEqual(s["checker_total"], 0)
+        self.assertEqual(s["max_running"], 0)
+        self.assertEqual(s["verify_glue"]["steps"], 0)
+
+
 class TestDflashTpVerifyInvariant(CustomTestCase):
     """All-ranks-identical invariant helper (`dflash_tp_ranks_agree`): after
     the rank-0 broadcast + host rebuild, an all-gathered per-rank vector
