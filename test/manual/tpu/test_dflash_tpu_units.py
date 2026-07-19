@@ -1434,6 +1434,81 @@ class TestCompareConcurrentStreams(CustomTestCase):
         # whole log would over-report the earlier 16
         self.assertEqual(m.observed_max_running(f.name, from_line=0), 16)
 
+    def test_cmd_collect_and_compare_end_to_end(self):
+        # Drive the ACTUAL CLI command functions (_cmd_collect / _cmd_compare) --
+        # the exact code the reboot-gated live run invokes -- with collect_concurrent
+        # injected (no live server). Covers the pre-collect server-log offset
+        # snapshot + windowed observed-batching report, the --meta-out sidecar, the
+        # streams-dump round-trip that `compare` consumes, and the PASS/fail-closed
+        # exit-code contract.
+        import argparse
+        import contextlib
+        import io
+        import json
+        import shutil
+        import tempfile
+
+        m = self._mod()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        server_log = os.path.join(tmp, "server.log")
+        out_json = os.path.join(tmp, "dflash.json")
+        meta_out = os.path.join(tmp, "meta.json")
+        # Pre-window warmup traffic that must NOT contaminate observed batching.
+        with open(server_log, "w") as f:
+            f.write("[TP0] warmup Prefill batch, #running-req: 16\n")
+
+        # Injected collect: append a smaller collect-window #running-req to the log
+        # (simulating the server processing the concurrent batch) and return
+        # deterministic streams + metadata for the supplied prompts.
+        def fake_collect(base_url, prompts, max_new):
+            with open(server_log, "a") as fh:
+                fh.write("[TP0] collect Decode batch, #running-req: 4\n")
+            streams = {p: [1, 2, 3] for p in prompts}
+            meta = {p: {"completion_tokens": 3, "accept_length": 2.0} for p in prompts}
+            return streams, meta
+
+        m.collect_concurrent = fake_collect
+
+        collect_args = argparse.Namespace(
+            base_url="http://x",
+            out_json=out_json,
+            max_new_tokens=8,
+            meta_out=meta_out,
+            server_log=server_log,
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = m._cmd_collect(collect_args)
+        self.assertEqual(rc, 0)
+        # Observed batching reflects the COLLECT window (4), not the pre-window 16.
+        self.assertIn("observed max #running-req during collect: 4", buf.getvalue())
+        # Streams dump written, shaped over the full prompt set, and `compare`-readable.
+        streams = json.load(open(out_json))
+        self.assertEqual(len(streams), len(m.DEFAULT_PROMPTS))
+        # Metadata sidecar carries accept_length for every request.
+        meta = json.load(open(meta_out))
+        self.assertTrue(all(v.get("accept_length") == 2.0 for v in meta.values()))
+
+        # compare: identical dumps -> PASS (exit 0).
+        nospec_json = os.path.join(tmp, "nospec.json")
+        with open(nospec_json, "w") as f:
+            json.dump(streams, f)
+        compare_args = argparse.Namespace(
+            dflash_json=out_json, nospec_json=nospec_json, tolerance_manifest=None
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc_ok = m._cmd_compare(compare_args)
+        self.assertEqual(rc_ok, 0)
+
+        # compare: a dropped request -> fail-closed missing (exit 1).
+        partial = dict(list(streams.items())[:-1])
+        with open(nospec_json, "w") as f:
+            json.dump(partial, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc_fail = m._cmd_compare(compare_args)
+        self.assertEqual(rc_fail, 1)
+
 
 class TestDflashTpVerifyInvariant(CustomTestCase):
     """All-ranks-identical invariant helper (`dflash_tp_ranks_agree`): after
