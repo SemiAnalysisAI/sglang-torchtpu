@@ -1383,9 +1383,19 @@ class TestCompareConcurrentStreams(CustomTestCase):
         self.assertFalse(c["all_ok"])
         self.assertEqual(s["per_prompt"]["c"]["index"], 1)
 
-    def test_missing_prompt_fails_all_ok(self):
+    def test_missing_from_nospec_fails_closed(self):
+        # DFlash has an extra prompt not in the no-spec reference.
         s = self._cmp({"a": [1], "d": [2]}, {"a": [1]})
         self.assertEqual(s["counts"]["missing"], 1)
+        self.assertEqual(s["per_prompt"]["d"]["missing_from"], "nospec")
+        self.assertFalse(s["counts"]["all_ok"])
+
+    def test_missing_from_dflash_fails_closed(self):
+        # A request present in the no-spec reference but DROPPED by DFlash must
+        # fail closed (the R28 fail-open bug: the union iteration catches it).
+        s = self._cmp({"a": [1]}, {"a": [1], "b": [2]})
+        self.assertEqual(s["counts"]["missing"], 1)
+        self.assertEqual(s["per_prompt"]["b"]["missing_from"], "dflash")
         self.assertFalse(s["counts"]["all_ok"])
 
 

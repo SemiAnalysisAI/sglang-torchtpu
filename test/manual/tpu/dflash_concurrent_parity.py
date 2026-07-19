@@ -99,20 +99,30 @@ def compare_concurrent_streams(
 ) -> Dict:
     """Pure per-request comparison. Each prompt is exact / tolerated / fail /
     missing. Returns counts + per-prompt detail + ``all_ok`` (no untolerated
-    divergence). ``diff_fn``/``tolerated_fn`` are injectable for hermetic tests;
-    they default to the ratified `dflash_greedy_parity` predicates."""
+    divergence AND no missing request). ``diff_fn``/``tolerated_fn`` are injectable
+    for hermetic tests; they default to the ratified `dflash_greedy_parity`
+    predicates.
+
+    Iterates the UNION of prompt keys so a request missing from EITHER dump fails
+    closed (a dropped DFlash request must never be silently omitted and still
+    report ``all_ok``)."""
     if diff_fn is None or tolerated_fn is None:
         m = _sibling()
         diff_fn = diff_fn or m.diff_token_streams
         tolerated_fn = tolerated_fn or m._tolerated_divergence
     counts = {"exact": 0, "tolerated": 0, "fail": 0, "missing": 0}
     per_prompt: Dict[str, Dict] = {}
-    for prompt, spec in dflash.items():
-        if prompt not in nospec:
+    for prompt in sorted(set(dflash) | set(nospec)):
+        in_dflash = prompt in dflash
+        in_nospec = prompt in nospec
+        if not in_dflash or not in_nospec:
             counts["missing"] += 1
-            per_prompt[prompt] = {"status": "missing"}
+            per_prompt[prompt] = {
+                "status": "missing",
+                "missing_from": "dflash" if not in_dflash else "nospec",
+            }
             continue
-        ref = nospec[prompt]
+        spec, ref = dflash[prompt], nospec[prompt]
         v = diff_fn(spec, ref)
         if v["match"]:
             counts["exact"] += 1
