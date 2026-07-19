@@ -1087,11 +1087,11 @@ class TestDflashStreamParityVerdict(CustomTestCase):
 
 
 class TestGreedyParityCompareFailClosed(CustomTestCase):
-    """`dflash_greedy_parity._cmd_compare` (the single-stream bs=1 AC-5 proof CLI)
-    must fail closed: a prompt missing from EITHER dump, or an empty stream on
-    either side, must force FAIL (exit 1) rather than silently PASS -- the same
-    fail-closed semantics the concurrent comparator got, applied to the primary
-    single-stream harness.
+    """`dflash_greedy_parity._cmd_compare` (the single-stream bs=1 greedy-parity
+    proof CLI) must fail closed: a prompt missing from EITHER dump, or an empty
+    stream on either side, must force FAIL (exit 1) rather than silently PASS --
+    the same fail-closed semantics the concurrent comparator got, applied to the
+    primary single-stream harness.
     """
 
     def _mod(self):
