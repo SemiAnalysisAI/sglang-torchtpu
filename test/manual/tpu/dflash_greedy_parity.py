@@ -353,18 +353,35 @@ def classify_divergence(
 def _load_verify_posmap(path: str) -> Dict[int, List[List[float]]]:
     """Load the env-gated DFlash verifier trace (JSONL) into {abs_position:
     verify_top2}. Each record commits tokens at ``start_pos + k`` whose verify
-    top-2 is ``verify_top2[k]``. Assumes the trace covers a single request's
-    stream (run one prompt with SGLANG_DFLASH_VERIFY_TRACE set)."""
+    top-2 is ``verify_top2[k]``.
+
+    The posmap keys on ABSOLUTE position, which is unambiguous only for a
+    SINGLE request's stream (positions from different requests collide). Each
+    record carries a stable ``rid`` (request id); if the trace covers more than
+    one request this FAILS CLOSED with a clear error rather than silently
+    mis-mapping a divergence to the wrong request's verify top-2. Trace one
+    prompt at a time with SGLANG_DFLASH_VERIFY_TRACE."""
     posmap: Dict[int, List[List[float]]] = {}
+    rids = set()
     with open(path) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             rec = json.loads(line)
+            # `rid` is the stable identity; older traces only had `req` (batch
+            # index) -- fall back to it so both formats load.
+            rids.add(rec.get("rid", rec.get("req")))
             start = int(rec["start_pos"])
             for k, t2 in enumerate(rec["verify_top2"]):
                 posmap[start + k] = t2
+    if len(rids) > 1:
+        raise ValueError(
+            f"verify trace {path!r} covers {len(rids)} distinct requests "
+            f"(ids={sorted(map(str, rids))}); the tolerance posmap keys on "
+            "absolute position, which collides across requests. Trace ONE prompt "
+            "at a time with SGLANG_DFLASH_VERIFY_TRACE and diagnose per-prompt."
+        )
     return posmap
 
 

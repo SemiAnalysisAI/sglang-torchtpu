@@ -509,6 +509,11 @@ class DFlashVerifyInput(SpecInput):
                 trace_records.append(
                     {
                         "req": i,
+                        # Stable per-request identity so the offline tolerance
+                        # posmap can detect (and reject) a multi-request trace,
+                        # whose absolute positions would otherwise collide. `req`
+                        # (batch index) is not stable across steps; `rid` is.
+                        "rid": getattr(req, "rid", None),
                         "start_pos": len(req.output_ids),  # before this step's append
                         "committed": [int(t) for t in proposed],
                         "verify_top2": [

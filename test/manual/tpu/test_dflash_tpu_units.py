@@ -8,6 +8,7 @@ cache inside the RPA-v3 backend and is validated on TPU in
 ``test_ragged_paged_attention_v3.py``.
 """
 
+import os
 import types
 import unittest
 
@@ -1205,6 +1206,72 @@ class TestDflashDivergenceClassifier(CustomTestCase):
         entry["nospec_topk"] = [[706, -0.66965], [555, -0.79465]]
         entry["verify_top2"] = [[374, -0.10], [706, -0.20]]
         self.assertFalse(m._tolerated_divergence({"P": entry}, "P", 26, 374, 706)[0])
+
+
+class TestLoadVerifyPosmap(CustomTestCase):
+    """`_load_verify_posmap` keys on absolute position, unambiguous only for a
+    SINGLE request. A single-request trace loads; a multi-request trace (whose
+    positions collide) must FAIL CLOSED with a clear error rather than silently
+    mapping a divergence to the wrong request's verify top-2.
+    """
+
+    def _mod(self):
+        import importlib.util
+        import pathlib
+
+        p = pathlib.Path(__file__).parent / "dflash_greedy_parity.py"
+        spec = importlib.util.spec_from_file_location("dflash_greedy_parity", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _write_trace(self, records):
+        import json
+        import tempfile
+
+        f = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+        f.close()
+        self.addCleanup(lambda: os.path.exists(f.name) and os.remove(f.name))
+        return f.name
+
+    def test_single_request_trace_loads(self):
+        m = self._mod()
+        path = self._write_trace(
+            [
+                {"rid": "r0", "start_pos": 25, "verify_top2": [[[374, 22.75], [706, 22.75]]]},
+                {"rid": "r0", "start_pos": 26, "verify_top2": [[[9, 1.0], [8, 0.9]]]},
+            ]
+        )
+        posmap = m._load_verify_posmap(path)
+        self.assertIn(25, posmap)
+        self.assertIn(26, posmap)
+        self.assertEqual(posmap[25], [[374, 22.75], [706, 22.75]])
+
+    def test_multi_request_trace_raises(self):
+        m = self._mod()
+        path = self._write_trace(
+            [
+                {"rid": "r0", "start_pos": 25, "verify_top2": [[[374, 22.75], [706, 22.75]]]},
+                {"rid": "r1", "start_pos": 25, "verify_top2": [[[9, 1.0], [8, 0.9]]]},
+            ]
+        )
+        with self.assertRaises(ValueError) as cm:
+            m._load_verify_posmap(path)
+        self.assertIn("distinct requests", str(cm.exception))
+
+    def test_legacy_trace_without_rid_falls_back_to_req(self):
+        # Older traces only had `req` (batch index) -- still loads / detects.
+        m = self._mod()
+        path = self._write_trace(
+            [
+                {"req": 0, "start_pos": 25, "verify_top2": [[[1, 1.0], [2, 0.9]]]},
+                {"req": 1, "start_pos": 25, "verify_top2": [[[3, 1.0], [4, 0.9]]]},
+            ]
+        )
+        with self.assertRaises(ValueError):
+            m._load_verify_posmap(path)
 
 
 class TestDflashTpVerifyInvariant(CustomTestCase):
