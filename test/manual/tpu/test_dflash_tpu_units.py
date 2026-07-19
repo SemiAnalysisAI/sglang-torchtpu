@@ -1381,6 +1381,31 @@ class TestDflashDecodeMaterializeGrid(CustomTestCase):
                 valid=torch.tensor([[True, True]], dtype=torch.bool),  # 99 VALID -> raise
             )
 
+    def test_gather_req_to_token_fixed_empty_table(self):
+        # Empty req_to_token: all-invalid grid -> all slot 0; any valid cell raises.
+        import types as _t
+
+        from sglang.srt.speculative.dflash_worker import DFlashWorker
+
+        empty = torch.zeros((1, 0), dtype=torch.int32)  # width 0
+        fake = _t.SimpleNamespace(device=torch.device("cpu"))
+        out = DFlashWorker._gather_req_to_token_fixed(
+            fake,
+            req_to_token=empty,
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            pos2d=torch.tensor([[0, 1]], dtype=torch.int64),
+            valid=torch.tensor([[False, False]], dtype=torch.bool),  # all invalid
+        )
+        self.assertEqual(out.tolist(), [0, 0])
+        with self.assertRaises(RuntimeError):
+            DFlashWorker._gather_req_to_token_fixed(
+                fake,
+                req_to_token=empty,
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                pos2d=torch.tensor([[0, 1]], dtype=torch.int64),
+                valid=torch.tensor([[True, False]], dtype=torch.bool),  # a valid cell
+            )
+
     def test_extend_hidden_rows_mismatch_raises(self):
         # The extend materialize must fail loud if target_hidden rows !=
         # sum(ctx_lens) (would silently misalign committed hidden rows).

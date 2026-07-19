@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""Self-validating per-pow2-bucket recompilation probe for the DFlash extend
-materialization (AC-7).
+"""Rigorous, self-validating per-pow2-bucket recompilation probe for the DFlash
+extend materialization (AC-7).
 
-Sends DISTINCT-content prompts of varying length that span the configured pow2
-token buckets. For each request it parses the server log window and emits a row
-with the OBSERVED prefill ``#new-token`` and ``#cached-token`` (not a guess), the
-pow2 bucket, and the per-phase XLA-cache deltas. Rows are grouped by observed
-bucket so a reviewer can read, per bucket: a cold first-touch, then further
-distinct prompts in the SAME bucket whose ``pf_extend_materialize`` should be a
-small bounded residual (ideally 0), never a fresh per-length compile.
+For each REQUIRED pow2 token bucket in the configured ctx-2048 envelope
+({64,128,256,512,1024,2048}) it sends three validated requests:
+  - cold           : first prompt of a distinct length in the bucket
+  - same_bucket    : a SECOND distinct length in the SAME bucket
+  - repeat         : identical input_ids to `cold` (a true uncached repeat)
 
-Self-validation: launch the server with ``--disable-radix-cache`` so every
-prefill is uncached; the probe FAILS any row whose observed ``#cached-token != 0``
-(radix reuse would change the extend length and invalidate the bucket probe) —
-that was the R11 evidence defect. Distinct prompt content also avoids dedup.
+Exact lengths are controlled by sending `input_ids` (not approximate text), so
+the observed prefill ``#new-token`` lands deterministically in the intended
+bucket. The server MUST run ``--disable-radix-cache`` so every prefill is
+uncached; each row asserts observed ``#cached-token == 0``.
+
+The probe FAILS (exit 1) if any row: has no parsed prefill line, is radix-cached
+(``#cached-token != 0``), lands in a bucket other than expected, or if any
+required (bucket x row_type) is missing. It prints the per-row deltas so a
+reviewer can confirm the DFlash extend materialize (``pf_extend_materialize``)
+first-touches at most once per bucket and same_bucket/repeat rows are 0 (or an
+attributed residual).
 
 Usage: dflash_recompile_bucket_probe.py <server_log_path>
   (server: SGLANG_TPU_CHECK_RECOMPILATION=1 SGLANG_DFLASH_VERIFY_SHAPE_TRACE=1
@@ -32,6 +37,10 @@ PHASES = [
     "verify_glue",
     "kv_append_post",
 ]
+REQUIRED_BUCKETS = [64, 128, 256, 512, 1024, 2048]
+# Distinct filler / marker token ids well inside the Llama-3.1 vocab, avoiding
+# special tokens (>=128000) and 0.
+_FILLER = 1000
 
 
 def _pow2(n, floor=64):
@@ -39,20 +48,10 @@ def _pow2(n, floor=64):
     return f if n <= f else 1 << (n - 1).bit_length()
 
 
-# Distinct-content prompts (unique leading token per prompt -> no dedup/radix
-# reuse) whose lengths intentionally span several pow2 buckets, with >=2 distinct
-# lengths per bucket so a bucket's 2nd+ prompt exercises the already-warmed shape.
-_UNIQUE = ["zeta", "eta", "theta", "iota", "kappa", "lam", "mu", "nu", "xi", "pi", "rho", "tau"]
-_LENGTHS = [30, 50, 80, 110, 200, 230, 400, 450]  # -> buckets 64,64,128,128,256,256,512,512
-
-
-def _build_requests():
-    reqs = []
-    for i, ln in enumerate(_LENGTHS):
-        # Unique first word guarantees distinct content (no radix reuse).
-        text = _UNIQUE[i % len(_UNIQUE)] + " " + ("word%d " % i) * ln
-        reqs.append((f"len{ln}_uniq{i}", text))
-    return reqs
+def _lengths_for(bucket):
+    # Two distinct lengths comfortably inside (bucket/2, bucket], away from the
+    # boundary so a possible +1 BOS can't spill into the next bucket.
+    return bucket * 3 // 4, bucket * 5 // 8
 
 
 _attrib = re.compile(r"xla-attrib: phase=([a-z_]+) compiled (\d+)")
@@ -62,7 +61,8 @@ _prefill = re.compile(r"#new-token: (\d+), #cached-token: (\d+)")
 
 def parse(lines):
     phase = {p: 0 for p in PHASES}
-    checker = newtok = cached = 0
+    checker = 0
+    newtok = cached = None
     for ln in lines:
         m = _prefill.search(ln)
         if m:
@@ -78,9 +78,9 @@ def parse(lines):
     return phase, checker, newtok, cached
 
 
-def send(text):
+def send(input_ids):
     d = json.dumps(
-        {"text": text, "sampling_params": {"temperature": 0.0, "max_new_tokens": 40, "ignore_eos": True}}
+        {"input_ids": input_ids, "sampling_params": {"temperature": 0.0, "max_new_tokens": 4, "ignore_eos": True}}
     ).encode()
     r = json.loads(
         urllib.request.urlopen(
@@ -91,40 +91,77 @@ def send(text):
     return r["meta_info"].get("completion_tokens")
 
 
+def build_requests():
+    reqs = []  # (label, expected_bucket, row_type, input_ids)
+    marker = 2000
+    for b in REQUIRED_BUCKETS:
+        la, lb = _lengths_for(b)
+        cold_ids = [marker] + [_FILLER] * (la - 1)
+        marker += 1
+        same_ids = [marker] + [_FILLER] * (lb - 1)
+        marker += 1
+        reqs.append((f"b{b}_cold", b, "cold", cold_ids))
+        reqs.append((f"b{b}_same", b, "same_bucket", same_ids))
+        reqs.append((f"b{b}_repeat", b, "repeat", list(cold_ids)))  # identical to cold
+    return reqs
+
+
 def main():
     log = sys.argv[1]
     with open(log) as f:
         pos = len(f.readlines())
-    hdr = ["request", "newtok", "cached", "bucket", "pf_tgt_ext", "pf_mat", "vglue", "kv_app", "ckr", "ct", "VALID?"]
+    hdr = ["request", "exp_bkt", "row_type", "newtok", "cached", "obs_bkt",
+           "pf_tgt_ext", "pf_mat", "vglue", "kv_app", "ckr", "ct", "VALID?"]
     print("| " + " | ".join(hdr) + " |")
     print("|" + "|".join("---" for _ in hdr) + "|")
-    seen_bucket = {}
-    any_fail = False
-    for label, text in _build_requests():
-        ct = send(text)
+    seen = set()
+    failures = []
+    for label, exp_bkt, row_type, ids in build_requests():
+        try:
+            ct = send(ids)
+        except Exception as e:  # bucket may exceed context for the top bucket
+            failures.append(f"{label}: request error {e!r}")
+            print(f"| {label} | {exp_bkt} | {row_type} | ? | ? | ? | - | - | - | - | - | - | FAIL(req) |")
+            continue
         time.sleep(2)
         with open(log) as f:
             lines = f.readlines()
         window, pos = lines[pos:], len(lines)
         phase, checker, newtok, cached = parse(window)
-        bucket = _pow2(newtok)
-        # Self-validation: uncached probe required; flag radix reuse.
-        ok = cached == 0
-        if not ok:
-            any_fail = True
-        first_in_bucket = bucket not in seen_bucket
-        seen_bucket.setdefault(bucket, label)
-        note = "OK" if ok else "FAIL(cached!=0)"
-        note += " cold" if first_in_bucket else " same-bkt"
-        row = [
-            label, str(newtok), str(cached), str(bucket),
-            str(phase["prefill_target_extend_fwd"]), str(phase["prefill_extend_materialize"]),
-            str(phase["verify_glue"]), str(phase["kv_append_post"]),
-            str(checker), str(ct), note,
-        ]
+        row_ok = True
+        reason = "OK"
+        if newtok is None or cached is None:
+            row_ok, reason = False, "no-prefill-parse"
+        else:
+            obs = _pow2(newtok)
+            if cached != 0:
+                row_ok, reason = False, f"cached={cached}"
+            elif obs != exp_bkt:
+                row_ok, reason = False, f"obs_bkt={obs}!=exp"
+        obs_bkt = _pow2(newtok) if newtok is not None else "?"
+        if not row_ok:
+            failures.append(f"{label}: {reason}")
+        else:
+            seen.add((exp_bkt, row_type))
+        row = [label, str(exp_bkt), row_type, str(newtok), str(cached), str(obs_bkt),
+               str(phase["prefill_target_extend_fwd"]), str(phase["prefill_extend_materialize"]),
+               str(phase["verify_glue"]), str(phase["kv_append_post"]),
+               str(checker), str(ct), reason]
         print("| " + " | ".join(row) + " |")
+    # Coverage: every required (bucket x row_type) present & valid.
+    missing = [
+        (b, rt) for b in REQUIRED_BUCKETS for rt in ("cold", "same_bucket", "repeat")
+        if (b, rt) not in seen
+    ]
     print()
-    print(f"HARNESS_RESULT: {'FAIL (a probe was radix-cached)' if any_fail else 'PASS (all probes uncached)'}")
+    if missing:
+        failures.append("missing coverage: " + ", ".join(f"{b}/{rt}" for b, rt in missing))
+    if failures:
+        print("HARNESS_RESULT: FAIL")
+        for f_ in failures:
+            print("  - " + f_)
+        sys.exit(1)
+    print("HARNESS_RESULT: PASS (all required buckets x {cold,same_bucket,repeat} uncached, in-bucket)")
 
 
 if __name__ == "__main__":

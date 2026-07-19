@@ -496,6 +496,15 @@ class DFlashWorker:
             pos2d = pos2d.to(table_device)
         valid = valid.to(device=table_device, dtype=torch.bool)
         table_width = int(req_to_token.shape[1])
+        if table_width <= 0:
+            # Empty table: any committed cell is unsatisfiable (fail loud), else
+            # every cell is a slot-0 dummy write.
+            if bool(valid.any().item()):
+                raise RuntimeError(
+                    "DFLASH fixed KV gather: req_to_token table is empty but the "
+                    f"grid has {int(valid.sum().item())} valid committed cell(s)."
+                )
+            return torch.zeros(valid.numel(), dtype=torch.int64, device=self.device)
         # A VALID (committed) cell out of table range is a real bug, not a
         # don't-care pad — fail loudly rather than silently redirecting it to the
         # last column (which would corrupt that committed token's KV). Only
