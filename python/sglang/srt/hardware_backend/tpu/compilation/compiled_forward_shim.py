@@ -322,6 +322,22 @@ def _pad_forward_batch_inputs(
                 hs, (0,) * (2 * (hs.ndim - 1)) + (0, pad_rows)
             )
 
+    # Pad input_embeds along its token dim. The DFlash draft block forward feeds
+    # embeddings (not input_ids) through the compiled forward, so its row count
+    # must match the padded input_ids / pad_t; without this the draft graph
+    # compiled at a larger bs bucket sees real-bs rows and the internal reshape
+    # fails (e.g. bs=2 padded to bs=8). Guarded so non-embeds runs are unaffected.
+    input_embeds = getattr(forward_batch, "input_embeds", None)
+    if (
+        isinstance(input_embeds, torch.Tensor)
+        and input_embeds.ndim >= 1
+        and input_embeds.shape[0] < pad_t
+    ):
+        pad_rows = pad_t - input_embeds.shape[0]
+        forward_batch.input_embeds = F.pad(
+            input_embeds, (0,) * (2 * (input_embeds.ndim - 1)) + (0, pad_rows)
+        )
+
     forward_batch.batch_size = pad_b
 
     return real_q_out, real_b_out

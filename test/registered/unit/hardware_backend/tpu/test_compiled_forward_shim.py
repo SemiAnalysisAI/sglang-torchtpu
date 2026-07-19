@@ -160,6 +160,38 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual(fb.seq_lens.shape[0], 4)
         self.assertEqual(fb.batch_size, 4)
 
+    def test_target_verify_pads_input_embeds_to_token_dim(self):
+        # The DFlash draft block forward feeds input_embeds (not input_ids)
+        # through the compiled graph, so it must be padded to pad_t. Without this
+        # a draft graph compiled at a larger bs bucket sees real-bs rows and its
+        # internal reshape fails (the bs=2 -> pad-8 crash).
+        fb = _forward_batch(real_t=8, real_b=2, mode="target_verify")  # bs=2, dtn=4
+        fb.spec_info = SimpleNamespace(draft_token_num=4)
+        hidden = 16
+        fb.input_embeds = torch.ones(8, hidden, dtype=torch.float32)  # [real_b*dtn, H]
+        _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [64, 128]),
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        # pad_t = pad_b(4) * draft_token_num(4) = 16; input_embeds padded 8 -> 16.
+        self.assertEqual(fb.input_embeds.shape[0], 16)
+        self.assertEqual(fb.input_embeds.shape[1], hidden)
+        self.assertTrue(torch.equal(fb.input_embeds[:8], torch.ones(8, hidden)))
+        self.assertTrue(torch.equal(fb.input_embeds[8:], torch.zeros(8, hidden)))
+
+    def test_input_embeds_left_alone_when_absent(self):
+        # Non-embeds runs are unaffected (input_embeds None -> untouched).
+        fb = _forward_batch(real_t=8, real_b=2, mode="target_verify")
+        fb.spec_info = SimpleNamespace(draft_token_num=4)
+        fb.input_embeds = None
+        _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [64, 128]),
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        self.assertIsNone(fb.input_embeds)
+
     def test_decode_uses_bs_bucketer_for_tokens(self):
         # In DECODE, token-axis tensors share the bs bucketer
         # (one query token per running seq).
