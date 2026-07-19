@@ -358,6 +358,55 @@ class TestUnsupportedTpuWorldSizeError(CustomTestCase):
             unsupported_tpu_world_size_error(4, get_topology=lambda ws: None)
         )
 
+    def test_supported_counts_folded_into_message(self):
+        # The attached generation's valid counts appear in the error hint.
+        from sglang.srt.hardware_backend.tpu.patches import (
+            unsupported_tpu_world_size_error,
+        )
+
+        err = unsupported_tpu_world_size_error(
+            2, get_topology=self._fake_v5e_topology, supported_counts=[1, 4, 8]
+        )
+        self.assertIsNotNone(err)
+        self.assertIn("[1, 4, 8]", err)
+
+    def test_message_is_generic_not_hardcoded_v5e_only(self):
+        # The message must not assert every failure is a v5e 2x2 slice.
+        err = self._err(2)
+        self.assertNotIn("On a v5e 2x2 slice tp_size=2 is not a valid", err)
+
+
+class TestSingleHostTpuEnvOrRaise(CustomTestCase):
+    """`single_host_tpu_env_or_raise` must validate the tp_size topology and raise
+    BEFORE computing the env (so the single-host Ray path fails fast instead of
+    launching actors that SIGABRT in PJRT init). Injected fakes -> hermetic.
+    """
+
+    def test_raises_before_compute_when_unsupported(self):
+        from sglang.srt.hardware_backend.tpu.patches import (
+            single_host_tpu_env_or_raise,
+        )
+
+        calls = []
+        with self.assertRaises(NotImplementedError):
+            single_host_tpu_env_or_raise(
+                2,
+                validate=lambda ws: "tp_size=2 has no valid TPU topology ...",
+                compute=lambda ws: calls.append(ws),
+            )
+        self.assertEqual(calls, [], "compute must NOT run when validation fails")
+
+    def test_computes_env_when_supported(self):
+        from sglang.srt.hardware_backend.tpu.patches import (
+            single_host_tpu_env_or_raise,
+        )
+
+        sentinel = {"TORCH_TPU_SLICEBUILDER_ADDRESSES": "localhost:1234"}
+        out = single_host_tpu_env_or_raise(
+            4, validate=lambda ws: None, compute=lambda ws: sentinel
+        )
+        self.assertIs(out, sentinel)
+
 
 class TestDflashMissingWeightKeys(CustomTestCase):
     """The draft-checkpoint completeness check (``dflash_missing_weight_keys``):

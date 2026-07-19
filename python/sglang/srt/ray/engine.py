@@ -223,10 +223,14 @@ class RayEngine(Engine):
             # ordered host list and each actor rebuilds them itself.
             if server_args.nnodes <= 1:
                 from sglang.srt.hardware_backend.tpu.patches import (
-                    compute_single_host_tpu_env,
+                    single_host_tpu_env_or_raise,
                 )
 
-                single_host_env = compute_single_host_tpu_env(server_args.tp_size)
+                # Validate the tp_size topology BEFORE building the env / placement
+                # group: an unsupported count (e.g. tp_size=2 on a v5e 2x2 slice)
+                # otherwise stashes an empty TORCH_TPU_TOPOLOGY and every actor
+                # SIGABRTs in PJRT init. Raises a clear NotImplementedError here.
+                single_host_env = single_host_tpu_env_or_raise(server_args.tp_size)
                 server_args = dataclasses.replace(
                     server_args,
                     # Force TPU_WORKER_HOSTNAMES="" into every actor. On a

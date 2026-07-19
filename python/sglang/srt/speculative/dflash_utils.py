@@ -57,10 +57,14 @@ def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
 
 
-# TPU DFlash bring-up is validated for these tensor-parallel sizes only (TP 1->4).
-# TP=1 is single-chip; 2 and 4 are the powers-of-two v5e meshes whose head
-# sharding and topology are covered. Other sizes (e.g. 3, 8) are rejected at
-# startup rather than failing deep in mesh/topology setup.
+# TPU DFlash bring-up is validated for these tensor-parallel sizes only (TP 1->4)
+# at the ALGORITHM / head-sharding level. This is separate from attached-hardware
+# TOPOLOGY validation: whether a given tp_size can actually form a TPU slice is
+# checked at startup by `unsupported_tpu_world_size_error` against the torch_tpu
+# per-generation topology table (e.g. v5e supports chip counts {1, 4, 8}, so
+# tp_size=2 has no valid v5e sub-slice even though it is in this algorithm scope).
+# Sizes outside this set (e.g. 3) are rejected here; the topology check handles the
+# hardware side. TP=2 stays in-scope for a future generation whose table has count 2.
 DFLASH_TPU_SUPPORTED_TP_SIZES = (1, 2, 4)
 
 

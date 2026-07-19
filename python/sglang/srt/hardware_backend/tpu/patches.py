@@ -174,16 +174,21 @@ def compute_single_host_tpu_env(world_size: int) -> dict:
     return env
 
 
-def unsupported_tpu_world_size_error(world_size, get_topology=None):
+def unsupported_tpu_world_size_error(world_size, get_topology=None, supported_counts=None):
     """Return a CLEAR error string if ``world_size`` has no valid TPU topology on
     the attached hardware, else ``None``.
 
     torch_tpu only supports the chip-count sub-slices listed in its per-generation
-    topology table (e.g. v5e = {1, 4, 8}); a v5e 2x2 slice has NO valid 2-chip
-    sub-slice. When ``get_tpu_topology(world_size)`` raises, ``TORCH_TPU_TOPOLOGY``
-    is left unset and each worker's PJRT init aborts cryptically before any model
-    code runs (``FAILED_PRECONDITION: missing ... TORCH_TPU_TOPOLOGY``). Calling
-    this at orchestrator startup converts that deep crash into a clear message.
+    topology table (e.g. v5e = {1, 4, 8}, so a v5e 2x2 slice has NO valid 2-chip
+    sub-slice; other generations differ — v4/v5p include count 2). When
+    ``get_tpu_topology(world_size)`` raises, ``TORCH_TPU_TOPOLOGY`` is left unset
+    and each worker's PJRT init aborts cryptically before any model code runs
+    (``FAILED_PRECONDITION: missing ... TORCH_TPU_TOPOLOGY``). Calling this at
+    orchestrator startup converts that deep crash into a clear message.
+
+    ``supported_counts`` (the attached generation's valid chip counts) is folded
+    into the message when known; it is auto-derived from the topology table on the
+    real-hardware path and can be injected for tests.
 
     Pure + injectable (``get_topology``) so it is CPU-testable without a live TPU.
     Returns ``None`` when ``world_size <= 1`` (single chip always valid) or when no
@@ -196,20 +201,51 @@ def unsupported_tpu_world_size_error(world_size, get_topology=None):
             from torch_tpu._internal.utils import hardware
 
             get_topology = hardware.get_tpu_topology
+            if supported_counts is None:
+                _, tmap = hardware._scan_pci_tpus()
+                supported_counts = sorted(tmap) if tmap else None
         except Exception:
             return None  # torch_tpu unavailable (e.g. CPU test env)
     try:
         topo = get_topology(int(world_size))
     except Exception as e:
+        hint = (
+            f" The attached TPU supports chip counts {list(supported_counts)}."
+            if supported_counts
+            else ""
+        )
         return (
             f"tp_size={world_size} has no valid TPU topology on the attached "
-            f"hardware (torch_tpu: {type(e).__name__}: {e}). On a v5e 2x2 slice "
-            "tp_size=2 is not a valid sub-slice (v5e supports chip counts "
-            "{1, 4, 8}); use tp_size in {1, 4}. This is a torch_tpu/hardware "
-            "topology limitation, surfaced at startup instead of a deep PJRT abort."
+            f"hardware (torch_tpu: {type(e).__name__}: {e}).{hint} Use a tp_size "
+            "whose chip count has a valid TPU topology on this hardware. This is a "
+            "torch_tpu/hardware topology limitation (e.g. a v5e 2x2 slice has no "
+            "2-chip sub-slice), surfaced at startup instead of a deep PJRT abort."
         )
     # topo is None -> no TPU detected here (e.g. CPU box); cannot validate, defer.
     return None
+
+
+def single_host_tpu_env_or_raise(world_size, validate=None, compute=None):
+    """Validate the single-host TPU ``world_size`` topology, then compute its env.
+
+    Raises ``NotImplementedError`` with a clear message (from
+    :func:`unsupported_tpu_world_size_error`) if ``world_size`` has no valid TPU
+    topology on the attached hardware, BEFORE any env/actor setup — otherwise the
+    Ray single-host path would stash an empty ``TORCH_TPU_TOPOLOGY`` and each
+    worker would SIGABRT in PJRT init. On success returns
+    ``compute_single_host_tpu_env(world_size)``.
+
+    ``validate``/``compute`` are injectable so the raise-before-compute ordering is
+    hermetically CPU-testable without Ray or a live TPU.
+    """
+    if validate is None:
+        validate = unsupported_tpu_world_size_error
+    if compute is None:
+        compute = compute_single_host_tpu_env
+    err = validate(world_size)
+    if err is not None:
+        raise NotImplementedError(err)
+    return compute(world_size)
 
 
 def _set_torch_tpu_topology_env_single(world_size: int) -> None:
