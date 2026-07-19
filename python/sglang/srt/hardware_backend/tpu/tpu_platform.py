@@ -87,6 +87,20 @@ class TpuSRTPlatform(SRTPlatform):
             server_args.tp_size, setup_slicebuilder=not server_args.use_ray
         )
 
+        # Fail fast with a clear message when the requested tp_size has no valid
+        # topology on the attached TPU (single-host). Otherwise TORCH_TPU_TOPOLOGY
+        # stays unset and every worker's PJRT init aborts cryptically before any
+        # model code (e.g. tp_size=2 on a v5e 2x2 slice). Multi-host (Ray) derives
+        # its topology per-node later, so only validate the single-host path.
+        if not server_args.use_ray:
+            from sglang.srt.hardware_backend.tpu.patches import (
+                unsupported_tpu_world_size_error,
+            )
+
+            _tp_topo_err = unsupported_tpu_world_size_error(server_args.tp_size)
+            if _tp_topo_err is not None:
+                raise NotImplementedError(_tp_topo_err)
+
         if server_args.dtype is None or server_args.dtype == "auto":
             server_args.dtype = "bfloat16"
 

@@ -174,6 +174,44 @@ def compute_single_host_tpu_env(world_size: int) -> dict:
     return env
 
 
+def unsupported_tpu_world_size_error(world_size, get_topology=None):
+    """Return a CLEAR error string if ``world_size`` has no valid TPU topology on
+    the attached hardware, else ``None``.
+
+    torch_tpu only supports the chip-count sub-slices listed in its per-generation
+    topology table (e.g. v5e = {1, 4, 8}); a v5e 2x2 slice has NO valid 2-chip
+    sub-slice. When ``get_tpu_topology(world_size)`` raises, ``TORCH_TPU_TOPOLOGY``
+    is left unset and each worker's PJRT init aborts cryptically before any model
+    code runs (``FAILED_PRECONDITION: missing ... TORCH_TPU_TOPOLOGY``). Calling
+    this at orchestrator startup converts that deep crash into a clear message.
+
+    Pure + injectable (``get_topology``) so it is CPU-testable without a live TPU.
+    Returns ``None`` when ``world_size <= 1`` (single chip always valid) or when no
+    TPU / topology can be resolved (e.g. a CPU test box) so normal init proceeds.
+    """
+    if world_size is None or int(world_size) <= 1:
+        return None
+    if get_topology is None:
+        try:
+            from torch_tpu._internal.utils import hardware
+
+            get_topology = hardware.get_tpu_topology
+        except Exception:
+            return None  # torch_tpu unavailable (e.g. CPU test env)
+    try:
+        topo = get_topology(int(world_size))
+    except Exception as e:
+        return (
+            f"tp_size={world_size} has no valid TPU topology on the attached "
+            f"hardware (torch_tpu: {type(e).__name__}: {e}). On a v5e 2x2 slice "
+            "tp_size=2 is not a valid sub-slice (v5e supports chip counts "
+            "{1, 4, 8}); use tp_size in {1, 4}. This is a torch_tpu/hardware "
+            "topology limitation, surfaced at startup instead of a deep PJRT abort."
+        )
+    # topo is None -> no TPU detected here (e.g. CPU box); cannot validate, defer.
+    return None
+
+
 def _set_torch_tpu_topology_env_single(world_size: int) -> None:
     """Set the slicebuilder + topology env for a single-host process group.
 

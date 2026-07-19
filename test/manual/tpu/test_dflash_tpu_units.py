@@ -310,6 +310,55 @@ class TestValidateDflashTpuTpSize(CustomTestCase):
             self.assertIn(str(tp), err)
 
 
+class TestUnsupportedTpuWorldSizeError(CustomTestCase):
+    """The startup topology guard (`unsupported_tpu_world_size_error`) that turns
+    the cryptic TP=2-on-v5e PJRT abort into a clear message. Uses an injected
+    fake `get_topology` so it runs without a live TPU. Models the real v5e table
+    {1:'1,1,1', 4:'2,2,1', 8:'2,2,2'} (no count=2 -> `get_tpu_topology(2)` raises).
+    """
+
+    @staticmethod
+    def _fake_v5e_topology(world_size):
+        table = {1: "1,1,1", 4: "2,2,1", 8: "2,2,2"}
+        if world_size in table:
+            return table[world_size]
+        raise RuntimeError(f"No TPU topology found for count: {world_size}")
+
+    def _err(self, world_size):
+        from sglang.srt.hardware_backend.tpu.patches import (
+            unsupported_tpu_world_size_error,
+        )
+
+        return unsupported_tpu_world_size_error(
+            world_size, get_topology=self._fake_v5e_topology
+        )
+
+    def test_tp2_on_v5e_rejected_with_clear_message(self):
+        err = self._err(2)
+        self.assertIsNotNone(err)
+        self.assertIn("tp_size=2", err)
+        self.assertIn("no valid TPU topology", err)
+
+    def test_supported_sizes_pass(self):
+        for ws in (1, 4, 8):
+            self.assertIsNone(self._err(ws), ws)
+
+    def test_single_chip_always_ok(self):
+        # world_size <= 1 short-circuits before probing topology.
+        self.assertIsNone(self._err(1))
+        self.assertIsNone(self._err(0))
+
+    def test_no_tpu_detected_defers(self):
+        # get_topology returning None (no TPU, e.g. CPU box) must not raise.
+        from sglang.srt.hardware_backend.tpu.patches import (
+            unsupported_tpu_world_size_error,
+        )
+
+        self.assertIsNone(
+            unsupported_tpu_world_size_error(4, get_topology=lambda ws: None)
+        )
+
+
 class TestDflashMissingWeightKeys(CustomTestCase):
     """The draft-checkpoint completeness check (``dflash_missing_weight_keys``):
     every required parameter (direct + all packed q/k/v and gate/up shards) must
