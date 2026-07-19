@@ -1417,6 +1417,23 @@ class TestCompareConcurrentStreams(CustomTestCase):
         self.assertEqual(s["n"], 0)
         self.assertIsNone(s["mean_accept_length"])
 
+    def test_observed_max_running_windows_to_collect(self):
+        # Observed batching must reflect the collect window only -- an earlier
+        # #running-req: 16 (warmup/probe) must NOT be reported when the concurrent
+        # collect only reached #running-req: 3.
+        import tempfile
+
+        m = self._mod()
+        f = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
+        f.write("[TP0] pre-window Prefill batch, #running-req: 16\n")   # line 0
+        f.write("[TP0] collect Decode batch, #running-req: 3\n")        # line 1
+        f.close()
+        self.addCleanup(lambda: os.path.exists(f.name) and os.remove(f.name))
+        # window starting AFTER the pre-window line -> only the collect window
+        self.assertEqual(m.observed_max_running(f.name, from_line=1), 3)
+        # whole log would over-report the earlier 16
+        self.assertEqual(m.observed_max_running(f.name, from_line=0), 16)
+
 
 class TestDflashTpVerifyInvariant(CustomTestCase):
     """All-ranks-identical invariant helper (`dflash_tp_ranks_agree`): after

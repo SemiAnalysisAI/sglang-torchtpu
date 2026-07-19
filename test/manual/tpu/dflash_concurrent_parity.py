@@ -113,15 +113,21 @@ def summarize_accept_meta(meta: Dict[str, Dict]) -> Dict:
     }
 
 
-def observed_max_running(server_log_path: str) -> int:
-    """Max #running-req observed in a server log (the collect's concurrent batch
-    size), via the committed compile-checker parser."""
+def observed_max_running(server_log_path: str, from_line: int = 0) -> int:
+    """Max #running-req observed in a server log, over lines ``[from_line:]`` only,
+    via the committed compile-checker parser.
+
+    ``from_line`` windows the parse to the concurrent-collect window (the log line
+    count captured BEFORE the collect): whole-log parsing (``from_line=0``) can
+    over-report a batch size reached by an EARLIER warmup / probe / failed-launch
+    window rather than the actual concurrent collection."""
     p = pathlib.Path(__file__).parent / "dflash_parse_checker_log.py"
     spec = importlib.util.spec_from_file_location("dflash_parse_checker_log", p)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     with open(server_log_path) as f:
-        return mod.parse_checker_log(f.readlines())["max_running"]
+        lines = f.readlines()[from_line:]
+    return mod.parse_checker_log(lines)["max_running"]
 
 
 def compare_concurrent_streams(
@@ -180,6 +186,12 @@ def compare_concurrent_streams(
 
 
 def _cmd_collect(args) -> int:
+    # Record the server-log line offset BEFORE the collect so observed batching is
+    # windowed to the concurrent collection, not any earlier warmup/probe traffic.
+    from_line = 0
+    if args.server_log:
+        with open(args.server_log) as f:
+            from_line = sum(1 for _ in f)
     streams, meta = collect_concurrent(
         args.base_url, DEFAULT_PROMPTS, args.max_new_tokens
     )
@@ -195,7 +207,8 @@ def _cmd_collect(args) -> int:
             f"{s['mean_accept_length']} over {s['n_with_accept']}/{s['n']} requests"
         )
     if args.server_log:
-        print(f"observed max #running-req (batch): {observed_max_running(args.server_log)}")
+        mx = observed_max_running(args.server_log, from_line=from_line)
+        print(f"observed max #running-req during collect: {mx}")
     return 0
 
 
