@@ -1399,6 +1399,27 @@ class TestCompareConcurrentStreams(CustomTestCase):
         self.assertEqual(s["per_prompt"]["b"]["missing_from"], "dflash")
         self.assertFalse(s["counts"]["all_ok"])
 
+    def test_both_empty_streams_fail_closed(self):
+        # Two empty streams would diff as `match` (empty prefix of empty) and count
+        # `exact` -- a false parity PASS for a request that produced no tokens on
+        # BOTH servers. It must fail closed as `empty`.
+        s = self._cmp({"a": [], "b": [1, 2]}, {"a": [], "b": [1, 2]})
+        self.assertEqual(s["counts"]["empty"], 1)
+        self.assertEqual(s["counts"]["exact"], 1)  # b still exact
+        self.assertEqual(s["per_prompt"]["a"]["status"], "empty")
+        self.assertEqual(s["per_prompt"]["a"]["empty_on"], "both")
+        self.assertFalse(s["counts"]["all_ok"])
+
+    def test_one_side_empty_stream_attributed(self):
+        # An empty stream on ONE side is `empty` with the correct attribution.
+        s = self._cmp({"a": [], "b": [7]}, {"a": [1, 2], "b": [7]})
+        self.assertEqual(s["counts"]["empty"], 1)
+        self.assertEqual(s["per_prompt"]["a"]["empty_on"], "dflash")
+        self.assertFalse(s["counts"]["all_ok"])
+        s2 = self._cmp({"a": [1, 2], "b": [7]}, {"a": [], "b": [7]})
+        self.assertEqual(s2["per_prompt"]["a"]["empty_on"], "nospec")
+        self.assertFalse(s2["counts"]["all_ok"])
+
     def test_summarize_accept_meta_mean_over_present(self):
         m = self._mod()
         s = m.summarize_accept_meta(

@@ -139,19 +139,25 @@ def compare_concurrent_streams(
     tolerated_fn=None,
 ) -> Dict:
     """Pure per-request comparison. Each prompt is exact / tolerated / fail /
-    missing. Returns counts + per-prompt detail + ``all_ok`` (no untolerated
-    divergence AND no missing request). ``diff_fn``/``tolerated_fn`` are injectable
-    for hermetic tests; they default to the ratified `dflash_greedy_parity`
-    predicates.
+    missing / empty. Returns counts + per-prompt detail + ``all_ok`` (no untolerated
+    divergence AND no missing request AND no empty stream). ``diff_fn``/``tolerated_fn``
+    are injectable for hermetic tests; they default to the ratified
+    `dflash_greedy_parity` predicates.
 
     Iterates the UNION of prompt keys so a request missing from EITHER dump fails
     closed (a dropped DFlash request must never be silently omitted and still
-    report ``all_ok``)."""
+    report ``all_ok``).
+
+    An EMPTY token stream (``[]``) on either side fails closed as ``empty``: two
+    empty streams would otherwise diff as ``match`` (an empty prefix of an empty
+    stream) and count ``exact``, so a request that errored-to-empty / was rejected /
+    truncated to zero tokens on both servers could report a FALSE parity PASS. An
+    empty stream is absence of evidence, not proof of parity."""
     if diff_fn is None or tolerated_fn is None:
         m = _sibling()
         diff_fn = diff_fn or m.diff_token_streams
         tolerated_fn = tolerated_fn or m._tolerated_divergence
-    counts = {"exact": 0, "tolerated": 0, "fail": 0, "missing": 0}
+    counts = {"exact": 0, "tolerated": 0, "fail": 0, "missing": 0, "empty": 0}
     per_prompt: Dict[str, Dict] = {}
     for prompt in sorted(set(dflash) | set(nospec)):
         in_dflash = prompt in dflash
@@ -164,6 +170,13 @@ def compare_concurrent_streams(
             }
             continue
         spec, ref = dflash[prompt], nospec[prompt]
+        if not spec or not ref:
+            counts["empty"] += 1
+            empty_on = (
+                "both" if not spec and not ref else ("dflash" if not spec else "nospec")
+            )
+            per_prompt[prompt] = {"status": "empty", "empty_on": empty_on}
+            continue
         v = diff_fn(spec, ref)
         if v["match"]:
             counts["exact"] += 1
@@ -181,7 +194,9 @@ def compare_concurrent_streams(
         else:
             counts["fail"] += 1
             per_prompt[prompt] = {"status": "fail", "index": idx}
-    counts["all_ok"] = counts["fail"] == 0 and counts["missing"] == 0
+    counts["all_ok"] = (
+        counts["fail"] == 0 and counts["missing"] == 0 and counts["empty"] == 0
+    )
     return {"counts": counts, "per_prompt": per_prompt}
 
 
@@ -229,7 +244,7 @@ def _cmd_compare(args) -> int:
     print(
         f"CONCURRENT PER-REQUEST PARITY: exact={c['exact']} "
         f"tolerated={c['tolerated']} fail={c['fail']} missing={c['missing']} "
-        f"-> {'PASS' if c['all_ok'] else 'FAIL'}"
+        f"empty={c['empty']} -> {'PASS' if c['all_ok'] else 'FAIL'}"
     )
     return 0 if c["all_ok"] else 1
 
