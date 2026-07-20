@@ -469,5 +469,3 @@ def add_output_logprobs_for_spec_v1(
                         token_ids_logprobs_idx[pt]
                     )
             pt += 1
-
-

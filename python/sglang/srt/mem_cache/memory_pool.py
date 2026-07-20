@@ -3483,7 +3483,9 @@ if triton is not None:
             key = tl.load(k_ptr + pid * k_stride_B + row * k_stride_H + col, mask=mask)
             tl.store(k_buffer_ptr + loc * H * D + idx, key, mask=mask)
 
-            value = tl.load(v_ptr + pid * v_stride_B + row * v_stride_H + col, mask=mask)
+            value = tl.load(
+                v_ptr + pid * v_stride_B + row * v_stride_H + col, mask=mask
+            )
             tl.store(v_buffer_ptr + loc * H * D + idx, value, mask=mask)
 
 

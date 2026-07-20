@@ -55,7 +55,7 @@ from sglang.srt.utils import (
     is_xpu,
     next_power_of_2,
 )
-from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
+from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.nvtx_utils import profile_range
 
 _is_cuda = is_cuda()

@@ -101,7 +101,7 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
     host scatter. pow2 padding keeps the scatter/gather HLOs shape-bucketed.
     """
 
-    device_pool: "TpuFusedMHATokenToKVPool"
+    device_pool: TpuFusedMHATokenToKVPool
 
     def __init__(
         self,

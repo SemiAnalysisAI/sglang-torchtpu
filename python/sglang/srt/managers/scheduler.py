@@ -1531,9 +1531,8 @@ class Scheduler(
         # unconditionally (before the single-stream early return) so
         # _apply_war_barrier can always read it; it is a no-op on the
         # single-stream (TPU) path, which has no schedule stream to fence.
-        self._war_barrier_enabled = (
-            self.use_overlap_streams
-            and (is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get())
+        self._war_barrier_enabled = self.use_overlap_streams and (
+            is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
         )
 
         if use_mlx() or not self.use_overlap_streams:

@@ -380,7 +380,7 @@ class HiCacheController:
                 raise ValueError(f"Failed to create storage backend: {e}") from e
 
     @classmethod
-    def create_for_backend(cls, *args, **kwargs) -> "HiCacheController":
+    def create_for_backend(cls, *args, **kwargs) -> HiCacheController:
         """Instantiate the backend-appropriate controller. The torch_tpu data
         plane uses the TpuHiCacheController subclass (batch-granular gating +
         copy-worker threads instead of device streams)."""

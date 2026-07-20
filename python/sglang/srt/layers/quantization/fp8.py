@@ -14,7 +14,6 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
