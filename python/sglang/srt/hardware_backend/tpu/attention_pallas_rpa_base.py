@@ -817,7 +817,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 ).to(torch.int32)
                 forward_batch.rpa_target_kv_lens = kv_lens
         else:
-            kv_lens = self.forward_metadata.kv_lens
+            kv_lens = (
+                forward_batch.rpa_draft_kv_lens
+                if forward_batch.rpa_draft_kv_lens is not None
+                else self.forward_metadata.kv_lens
+            )
         out = op(
             q,
             k,

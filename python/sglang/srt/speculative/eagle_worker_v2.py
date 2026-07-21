@@ -207,6 +207,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        # Compiled on the first fused draft step; None until then.
+        self._compiled_fused_steps = None
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
@@ -563,7 +565,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
                     forward_batch.mark_forward_metadata_ready()
-                draft_outputs = self.draft_forward(forward_batch)
+                if self._fused_draft_eligible(batch, forward_batch):
+                    draft_outputs = self._fused_draft_forward(forward_batch)
+                else:
+                    draft_outputs = self.draft_forward(forward_batch)
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_runner.compile_policy.finalize_spec_forward_batch(
                         outputs=draft_outputs,
@@ -635,6 +640,161 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             seq_lens_cpu=None,
             draft_probs=draft_probs,
         )
+
+    # ------------------------------------------------------------------ #
+    # Fused multi-step draft (TPU, topk == 1)
+    #
+    # ``draft_forward`` mutates forward_batch.input_ids / .out_cache_loc and
+    # spec_info.hidden_states between steps, and swaps the per-step attention
+    # backend via a ForwardContext. Those writes stop torch.compile from
+    # fusing the loop, so every step pays its own dispatch chain. The fused
+    # version threads the per-step values as tensor-valued fields
+    # (rpa_draft_kv_lens, spec_draft_hidden_states) and binds one stable
+    # backend, leaving the body free of host-visible state writes.
+    # ------------------------------------------------------------------ #
+    def _fused_draft_eligible(
+        self, batch: ScheduleBatch, forward_batch: ForwardBatch
+    ) -> bool:
+        """Whether this draft step can take the fused path."""
+        if not _is_tpu or not envs.SGLANG_TPU_ENABLE_FUSED_DRAFT.get():
+            return False
+        if forward_batch.forward_mode.is_idle():
+            return False
+        # topk > 1 tree shapes vary per step and break dynamic=False compile.
+        if self.topk != 1:
+            return False
+        # One step dispatches once either way.
+        if self.speculative_num_steps <= 1:
+            return False
+        # Grammar / logprob paths mutate forward_batch state mid-loop.
+        if batch.has_grammar or batch.return_logprob:
+            return False
+        # Rejection sampling needs per-step draft_probs, which the fused
+        # accumulator does not thread through.
+        if self.server_args.speculative_use_rejection_sampling:
+            return False
+        # The DSA index-share path writes spec_info between steps.
+        if self.index_share_for_mtp_iteration:
+            return False
+        # Canary instruments each per-step forward individually.
+        if self.draft_runner.canary_manager is not None:
+            return False
+        # The fused body indexes a stacked kv_lens, so every step's backend
+        # must have published its metadata.
+        return all(
+            getattr(b, "forward_metadata", None) is not None
+            for b in self.draft_attn_backend.attn_backends
+        )
+
+    def _fused_draft_forward(self, forward_batch: ForwardBatch):
+        """Fused multi-step draft: one compiled inter-step orchestration."""
+        spec_info: EagleDraftInput = forward_batch.spec_info
+        topk_p, topk_index, hidden_states = (
+            spec_info.topk_p,
+            spec_info.topk_index,
+            spec_info.hidden_states,
+        )
+        maybe_detect_nan(topk_p, "fused_draft: NaN in initial topk_p")
+        if self.hot_token_id is not None:
+            topk_index = self.hot_token_id[topk_index]
+
+        attn_backends = self.draft_attn_backend.attn_backends
+        kv_lens_stack = torch.stack([b.forward_metadata.kv_lens for b in attn_backends])
+        out_cache_loc = per_step_draft_out_cache_loc(
+            forward_batch.out_cache_loc,
+            forward_batch.batch_size,
+            self.topk,
+            self.speculative_num_steps,
+        )
+
+        steps_fn = self._compiled_fused_steps
+        if steps_fn is None:
+            # fullgraph=False on purpose: each model.forward is already its
+            # own compiled HLO behind the shim, so re-inlining them into one
+            # graph triggers a multi-minute JIT on torch_tpu. This fuses only
+            # the small inter-step orchestration and compiles in seconds.
+            steps_fn = torch.compile(
+                self._fused_draft_steps,
+                backend="tpu",
+                fullgraph=False,
+                dynamic=False,
+            )
+            self._compiled_fused_steps = steps_fn
+
+        # The model's attention layers resolve their backend from the active
+        # ForwardContext. Bind ONE stable backend for every step here (outside
+        # the compiled body); the per-step lengths arrive via
+        # rpa_draft_kv_lens rather than by swapping the backend.
+        with forward_context(ForwardContext(attn_backend=attn_backends[0])):
+            score_list, token_list, parents_list = steps_fn(
+                forward_batch,
+                topk_p,
+                topk_index,
+                hidden_states,
+                kv_lens_stack,
+                out_cache_loc,
+            )
+        forward_batch.rpa_draft_kv_lens = None
+        forward_batch.spec_draft_hidden_states = None
+
+        if (
+            self.topk == 1
+            and token_list[0].shape[0] <= self._topk1_parents_prealloc.shape[0]
+        ):
+            bs = token_list[0].shape[0]
+            return (
+                self._topk1_parents_prealloc[:bs],
+                self._topk1_score_indices_prealloc[:bs],
+                torch.cat(list(token_list), dim=1),
+                None,
+            )
+        parent_list, top_scores_index, draft_tokens = organize_draft_results(
+            list(score_list),
+            list(token_list),
+            list(parents_list),
+            self.speculative_num_draft_tokens,
+        )
+        return parent_list, top_scores_index, draft_tokens, None
+
+    def _fused_draft_steps(
+        self,
+        forward_batch: ForwardBatch,
+        topk_p: torch.Tensor,
+        topk_index: torch.Tensor,
+        hidden_states: torch.Tensor,
+        kv_lens_stack: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+    ):
+        """Unrolled draft steps; no host-visible forward_batch writes."""
+        num_steps = self.speculative_num_steps
+        model = self.draft_runner.model
+        base_positions = forward_batch.positions
+        score_acc: tuple = ()
+        token_acc: tuple = ()
+        parents_acc: tuple = ()
+        scores = None
+        for i in range(num_steps):
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, topk_p, topk_index, hidden_states, scores, self.topk
+            )
+            score_acc = score_acc + (tree_info[0],)
+            token_acc = token_acc + (tree_info[1],)
+            parents_acc = parents_acc + (tree_info[2],)
+            if i == num_steps - 1:
+                break
+
+            # Tensor-valued per-step inputs: a data dependency on the loop
+            # index rather than a graph-break-inducing state write.
+            forward_batch.rpa_draft_kv_lens = kv_lens_stack[i]
+            forward_batch.spec_draft_hidden_states = hidden_states
+            forward_batch.out_cache_loc = out_cache_loc[i]
+            logits_output = model.forward(input_ids, base_positions + i, forward_batch)
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.hot_token_id is not None:
+                topk_index = self.hot_token_id[topk_index]
+            hidden_states = logits_output.hidden_states
+        return score_acc, token_acc, parents_acc
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args

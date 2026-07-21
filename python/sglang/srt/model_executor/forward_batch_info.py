@@ -530,8 +530,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
 
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
+    # Per-step KV lengths for the fused multi-step draft loop.
+    rpa_draft_kv_lens: Optional[torch.Tensor] = None
     # TARGET_VERIFY KV lengths, derived once inside the compiled target graph.
     rpa_target_kv_lens: Optional[torch.Tensor] = None
+    # Per-step target hidden states for the fused multi-step draft loop.
+    # Threaded as a tensor-valued field (like rpa_draft_kv_lens) instead of
+    # mutating spec_info.hidden_states, so the loop body stays free of
+    # host-visible object-state writes. None everywhere else.
+    spec_draft_hidden_states: Optional[torch.Tensor] = None
+
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
 
