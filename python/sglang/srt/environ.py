@@ -338,6 +338,9 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_ENABLE_PERFETTO_TRACING = EnvBool(False)
+    # TPU P/D: use the fused multi-layer Pallas scatter kernel on the decode
+    # side instead of the per-layer index_copy_ loop.
+    SGLANG_ENABLE_TPU_FUSED_KV_SCATTER = EnvBool(False)
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.

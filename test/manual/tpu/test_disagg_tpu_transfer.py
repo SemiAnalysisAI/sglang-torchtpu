@@ -108,6 +108,58 @@ class TestTpuTransferDataPlane(CustomTestCase):
     def test_roundtrip_fp8(self):
         self._roundtrip_for_dtype(torch.float8_e4m3fn)
 
+    def _make_scatter_inputs(self, layers=3):
+        dst = _FakePool(8, 4, (2, 2, 16), layers=layers, dtype=torch.bfloat16)
+        dbufs = T.get_layer_page_buffers(dst)
+        idx = torch.tensor([7, 0, 3], dtype=torch.long)
+        tail = tuple(dbufs[0].shape[1:])
+        shards = [
+            torch.randn((3, *tail), dtype=torch.float32).to(torch.bfloat16)
+            for _ in range(layers)
+        ]
+        return dbufs, idx, shards
+
+    def test_scatter_into_index_copy_path(self):
+        """``_scatter_into(fused=False)`` scatters in place and returns None."""
+        dbufs, idx, shards = self._make_scatter_inputs()
+        out = T._scatter_into(dbufs, idx, shards, fused=False)
+        self.assertIsNone(out)
+        for li in range(len(dbufs)):
+            for i, dp in enumerate(idx.tolist()):
+                self.assertTrue(torch.equal(dbufs[li][dp], shards[li][i]))
+
+    def test_scatter_into_fused_requires_kernel(self):
+        """``_scatter_into(fused=True)`` fails loud when the Pallas kernel is
+        unavailable (CPU / no torch_tpu). Availability is gated upstream in
+        ``_maybe_enable_fused_scatter``, so reaching here with an unusable
+        kernel is a misuse."""
+        dbufs, idx, shards = self._make_scatter_inputs()
+        self.assertIsNone(T._fused_scatter())  # kernel unavailable on this host
+        with self.assertRaises(ValueError):
+            T._scatter_into(dbufs, idx, shards, fused=True)
+
+    def test_scatter_pages_from_host_fused_tolerated_on_cpu(self):
+        """Setting ``fused=True`` must not break the CPU path: with no
+        batch_transfer, ``scatter_pages_from_host`` takes the per-layer
+        ``index_copy_`` fallback (never reaching the fused kernel) and returns
+        None with correct contents."""
+        src = _FakePool(8, 4, (2, 2, 16), layers=3, dtype=torch.bfloat16)
+        dst = _FakePool(8, 4, (2, 2, 16), layers=3, dtype=torch.bfloat16)
+        _fill_random(src)
+        sbufs = T.get_layer_page_buffers(src)
+        dbufs = T.get_layer_page_buffers(dst)
+        specs = T.layer_page_specs(sbufs)
+        src_pages = np.array([1, 4, 6], dtype=np.int64)
+        dst_pages = np.array([7, 0, 3], dtype=np.int64)
+        blobs = T.gather_pages_to_host(sbufs, src_pages)
+        out = T.scatter_pages_from_host(dbufs, dst_pages, blobs, specs, fused=True)
+        self.assertIsNone(out)  # CPU fallback, no adoption needed
+        for li in range(3):
+            for sp, dp in zip(src_pages, dst_pages):
+                self.assertTrue(
+                    torch.equal(src.kv_buffer[li][sp], dst.kv_buffer[li][dp])
+                )
+
     def test_rejects_non_fused_pool(self):
         class TokenPool:  # k_buffer/v_buffer style, no kv_buffer
             k_buffer = [torch.zeros(4, 2, 8)]
@@ -518,6 +570,60 @@ class TestTpuTransferOnDevice(CustomTestCase):
                 a = src.kv_buffer[li][sp].to("cpu").float()
                 b = dst.kv_buffer[li][dp].to("cpu").float()
                 self.assertTrue(torch.equal(a, b), f"layer {li} page {sp}->{dp}")
+
+    def test_fused_scatter_roundtrip(self):
+        """Fused multi-layer Pallas scatter: gather -> scatter_pages_from_host
+        with ``fused=True``, adopt the returned (donated/aliased) buffers, and
+        verify byte-exact contents per layer."""
+        from sglang.srt.disaggregation.tpu import kv_scatter
+        from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        if not kv_scatter.scatter_available():
+            self.skipTest("kv_scatter kernel unavailable")
+
+        kwargs = dict(
+            size=64,
+            page_size=32,
+            dtype=torch.bfloat16,
+            head_num=2,
+            head_dim=128,
+            layer_num=2,
+            device="tpu",
+            enable_memory_saver=False,
+        )
+        src = TpuFusedMHATokenToKVPool(**kwargs)
+        dst = TpuFusedMHATokenToKVPool(**kwargs)
+        for buf in src.kv_buffer:
+            buf.copy_(
+                torch.randn(buf.shape, dtype=torch.float32).to(buf.dtype).to("tpu")
+            )
+
+        sbufs = T.get_layer_page_buffers(src)
+        dbufs = T.get_layer_page_buffers(dst)
+        specs = T.layer_page_specs(sbufs)
+        src_pages = np.array([0, 1], dtype=np.int64)
+        dst_pages = np.array([1, 0], dtype=np.int64)
+
+        blobs = T.gather_pages_to_host(sbufs, src_pages)
+        new_bufs = T.scatter_pages_from_host(dbufs, dst_pages, blobs, specs, fused=True)
+        # Fused path returns the donated/aliased buffers to adopt; the in-place
+        # path would return None.
+        self.assertIsNotNone(new_bufs)
+        for li in range(2):
+            for sp, dp in zip(src_pages, dst_pages):
+                a = src.kv_buffer[li][sp].to("cpu").float()
+                b = new_bufs[li][dp].to("cpu").float()
+                self.assertTrue(torch.equal(a, b), f"fused layer {li} {sp}->{dp}")
+
+    def test_kv_scatter_smoke_test(self):
+        """The module's own smoke test round-trips on device."""
+        from sglang.srt.disaggregation.tpu import kv_scatter
+
+        if not kv_scatter.scatter_available():
+            self.skipTest("kv_scatter kernel unavailable")
+        self.assertTrue(
+            kv_scatter.smoke_test_multi_layer_scatter(device=torch.device("tpu"))
+        )
 
     def test_stage_path_roundtrip(self):
         """Zero-copy pinned-staging path (#1/#4): gather_pages_to_stage ->

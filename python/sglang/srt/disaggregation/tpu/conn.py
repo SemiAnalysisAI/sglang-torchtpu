@@ -48,6 +48,7 @@ from typing import Deque, Dict, List, Optional
 
 import numpy as np
 import numpy.typing as npt
+import torch
 import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
@@ -69,6 +70,7 @@ from sglang.srt.disaggregation.tpu.host_staging import (
     StageBuf,
     default_pool_max_bytes,
 )
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +255,12 @@ class TpuKVManager(TpuKVManagerBase):
         self.decode_pending: Dict[int, Deque[_PendingChunk]] = defaultdict(deque)
         self.decode_pending_lock = threading.Lock()
         self._scatter_stats = _KvStats("scatter", _kv_stats_every())
+        self._use_fused_scatter = envs.SGLANG_ENABLE_TPU_FUSED_KV_SCATTER.get()
+        if self._use_fused_scatter:
+            logger.info(
+                "TpuKVManager: fused multi-layer KV scatter enabled "
+                "(SGLANG_ENABLE_TPU_FUSED_KV_SCATTER=1)"
+            )
         # Pinned/aligned reusable host staging for pooled H2D (#1).
         self._stage_pool = PinnedHostPool(max_bytes=self._stage_pool_budget())
         # Multi-channel reassembly buffer (#3), keyed by (room, index_start).
@@ -267,6 +275,18 @@ class TpuKVManager(TpuKVManagerBase):
             len(self.layer_buffers),
             self.layer_specs[0][1] if self.layer_specs else None,
         )
+
+    def _update_donated_scattered_buffers_handle(
+        self, new_bufs: List[torch.Tensor]
+    ) -> None:
+        """Updates kv_pool and layer buffers to use the new buffs.
+
+        New bufs and old bufs point to the same physically location. It's just
+        that old handle has been marked as donated and non-readable.
+        """
+        for layer_idx, buf in enumerate(new_bufs):
+            self.kv_pool.kv_buffer[layer_idx] = buf
+        self.layer_buffers = new_bufs
 
     # ---- prefill side ---------------------------------------------------
 
@@ -747,20 +767,24 @@ class TpuKVManager(TpuKVManagerBase):
                     and self.layer_buffers
                     and self.layer_buffers[0].device.type != "cpu"
                 ):
-                    tpu_transfer.scatter_stage_from_host(
+                    new_bufs = tpu_transfer.scatter_stage_from_host(
                         self.layer_buffers,
                         dst_pages,
                         chunk.layer_blobs,
                         self.layer_specs,
                         pool,
+                        fused=self._use_fused_scatter,
                     )
                 else:
-                    tpu_transfer.scatter_pages_from_host(
+                    new_bufs = tpu_transfer.scatter_pages_from_host(
                         self.layer_buffers,
                         dst_pages,
                         chunk.layer_blobs,
                         self.layer_specs,
+                        fused=self._use_fused_scatter,
                     )
+                if self._use_fused_scatter and new_bufs is not None:
+                    self._update_donated_scattered_buffers_handle(new_bufs)
                 stats = getattr(self, "_scatter_stats", None)
                 if stats is not None:
                     stats.record(

@@ -52,6 +52,7 @@ from collections import defaultdict
 from typing import List, Optional
 
 import numpy as np
+import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -62,6 +63,7 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.tpu import transfer as tpu_transfer
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -107,8 +109,8 @@ class TpuKVManagerBase(CommonKVManager):
 
         # Filled in later by the scheduler via attach_kv_pool(); the bootstrap
         # queue owns the pool object and only it knows the concrete tensors.
-        self.kv_pool = None
-        self.layer_buffers: Optional[List] = None
+        self.kv_pool: Optional[TpuFusedMHATokenToKVPool] = None
+        self.layer_buffers: Optional[List[torch.Tensor]] = None
         self.layer_specs = None
 
         # Per-endpoint send locks (a single zmq PUSH socket must not be used
@@ -130,7 +132,7 @@ class TpuKVManagerBase(CommonKVManager):
 
     # ---- pool attachment (shared) ---------------------------------------
 
-    def attach_kv_pool(self, kv_pool) -> None:
+    def attach_kv_pool(self, kv_pool: TpuFusedMHATokenToKVPool) -> None:
         """Give the manager the concrete per-layer KV tensors it will transfer.
         Extracts the block-indexed per-layer buffers + their dtype/shape specs
         (shared), then defers backend-specific setup to ``_on_pool_attached``.

@@ -132,10 +132,42 @@ def _dp_attn_apply_bucket_metadata(forward_batch, pad_t: int, pad_b: int) -> Non
         (dp_size,), pad_t, dtype=torch.int64, device=device
     )
     if forward_batch.global_num_tokens_for_logprob_cpu is not None:
-        forward_batch.global_num_tokens_for_logprob_cpu = [pad_b] * dp_size
-        forward_batch.global_num_tokens_for_logprob_gpu = torch.full(
-            (dp_size,), pad_b, dtype=torch.int64, device=device
+        # The logprob gather buffer must hold as many rows as _get_pruned_states
+        # actually produces. decode/idle, target_verify and draft_extend_v2 do
+        # NOT prune (pruned_states == hidden_states == pad_t rows), so the buffer
+        # must be sized to pad_t; only last-token-pruned extend/prefill uses the
+        # batch axis pad_b. (For decode pad_t == pad_b, so this is a no-op there;
+        # idle with is_extend_in_batch is where pad_t != pad_b and pad_b crashed
+        # the DP logits gather.)
+        fm = forward_batch.forward_mode
+        no_prune = (
+            fm.is_decode_or_idle()
+            or fm.is_target_verify()
+            or fm.is_draft_extend_v2()
         )
+        logprob_pad = pad_t if no_prune else pad_b
+        forward_batch.global_num_tokens_for_logprob_cpu = [logprob_pad] * dp_size
+        forward_batch.global_num_tokens_for_logprob_gpu = torch.full(
+            (dp_size,), logprob_pad, dtype=torch.int64, device=device
+        )
+        # DEBUG: pad_t != pad_b is the only case that can crash the idle DP
+        # logits gather. Log each rank's mode + chosen logprob pad so the
+        # crashing step shows which rank drove is_extend_in_batch and whether
+        # the per-rank logprob buffers stay consistent across DP ranks.
+        if pad_t != pad_b:
+            from sglang.srt.layers.dp_attention import get_attention_dp_rank
+
+            logger.warning(
+                "[dp-logprob] dp_rank=%s mode=%s is_extend_in_batch=%s "
+                "pad_t=%s pad_b=%s logprob_pad=%s dp_size=%s",
+                get_attention_dp_rank(),
+                forward_batch.forward_mode,
+                forward_batch.is_extend_in_batch,
+                pad_t,
+                pad_b,
+                logprob_pad,
+                dp_size,
+            )
     # Clear cached local offsets so they recompute from the padded counts.
     forward_batch.dp_local_start_pos = None
     forward_batch.dp_local_num_tokens = None

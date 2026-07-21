@@ -34,6 +34,8 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.tpu import kv_scatter
+
 logger = logging.getLogger(__name__)
 
 # torch_tpu's batched host<->device DMA primitive. One call moves *all* layers'
@@ -66,6 +68,25 @@ def _batch_transfer():
             logger.debug("batch_transfer unavailable, using per-layer fallback: %s", e)
             _BATCH_TRANSFER = False
     return _BATCH_TRANSFER or None
+
+
+# The fused multi-layer Pallas scatter kernel (decode side). Loaded lazily +
+# cached; absent on plain CPU / hosts without jax+pallas, where the caller falls
+# back to the per-layer ``index_copy_`` path.
+_FUSED_SCATTER = None  # kv_scatter module or False
+
+
+def _fused_scatter():
+    """Return the ``kv_scatter`` module if its Pallas kernel is importable, else
+    ``None`` (CPU-only test env / no jax+pallas / no torch_tpu)."""
+    global _FUSED_SCATTER
+    if _FUSED_SCATTER is None:
+        try:
+            _FUSED_SCATTER = kv_scatter if kv_scatter.scatter_available() else False
+        except Exception as e:  # pragma: no cover - depends on torch_tpu build
+            logger.debug("fused kv scatter unavailable: %s", e)
+            _FUSED_SCATTER = False
+    return _FUSED_SCATTER or None
 
 
 def get_layer_page_buffers(kv_pool) -> List[torch.Tensor]:
@@ -193,13 +214,20 @@ def gather_pages_to_stage_async(layer_buffers, page_indices, pool):
     return future, stages
 
 
-def scatter_stage_from_host(layer_buffers, page_indices, layer_blobs, specs, pool):
+def scatter_stage_from_host(
+    layer_buffers, page_indices, layer_blobs, specs, pool, *, fused: bool = False
+):
     """H2D scatter via pooled pinned staging: batch_transfer_h2d into device
-    shards, then index_copy_ into the KV pool block positions.
+    shards, then scatter into the KV pool block positions.
 
     ``layer_blobs`` is either a list of :class:`StageBuf`s (pre-staged by the
     recv thread — no copy here) or raw bytes/memoryviews (acquire staging and
-    copy). Staging buffers are released to the pool when done."""
+    copy). Staging buffers are released to the pool when done.
+
+    When ``fused`` is set the fused Pallas scatter kernel is used; because it
+    donates the destination buffers, the returned list of new (aliased) buffers
+    MUST be adopted by the caller (see :func:`_scatter_into`). Returns ``None``
+    for the in-place ``index_copy_`` path."""
     from sglang.srt.disaggregation.tpu.host_staging import StageBuf
 
     if len(layer_buffers) == 0:
@@ -229,8 +257,7 @@ def scatter_stage_from_host(layer_buffers, page_indices, layer_blobs, specs, poo
             for (dtype, tail) in specs
         ]
         h2d_sync(host_srcs, dev_shards)
-        for buf, shard in zip(layer_buffers, dev_shards):
-            _index_copy_pages(buf, idx, shard)
+        return _scatter_into(layer_buffers, idx, dev_shards, fused=fused)
     finally:
         for st in stages:
             st.release()
@@ -241,7 +268,9 @@ def scatter_pages_from_host(
     page_indices: np.ndarray,
     layer_blobs: Sequence[bytes],
     specs=None,
-) -> None:
+    *,
+    fused: bool = False,
+) -> Optional[List[torch.Tensor]]:
     """H2D: scatter per-layer byte blobs into ``page_indices`` (block ids) of
     every layer buffer, writing onto whatever device the buffers live on.
     Runs on the decode side."""
@@ -277,13 +306,12 @@ def scatter_pages_from_host(
             for (dtype, tail) in specs
         ]
         h2d_sync(aligned_srcs, dev_shards)
-        for buf, shard in zip(layer_buffers, dev_shards):
-            _index_copy_pages(buf, idx, shard)
-        return
+        return _scatter_into(layer_buffers, idx, dev_shards, fused=fused)
 
     # Per-layer fallback (CPU / batch_transfer unavailable).
     for buf, host in zip(layer_buffers, host_srcs):
         _index_copy_pages(buf, idx, host.to(device))
+    return None
 
 
 def _index_copy_pages(buf: torch.Tensor, idx: torch.Tensor, src: torch.Tensor) -> None:
@@ -298,6 +326,38 @@ def _index_copy_pages(buf: torch.Tensor, idx: torch.Tensor, src: torch.Tensor) -
         buf.index_copy_(0, idx, src)
     except (NotImplementedError, RuntimeError):
         buf.view(torch.uint8).index_copy_(0, idx, src.contiguous().view(torch.uint8))
+
+
+def _sync_scattered(caches: List[torch.Tensor]) -> List[torch.Tensor]:
+    """Syncs every returned cache."""
+    from torch_tpu._internal.sync import sync as tpu_sync
+
+    for c in caches:
+        tpu_sync.synchronize(c)
+    return caches
+
+
+def _scatter_into(
+    dest_layer_buffers: Sequence[torch.Tensor],
+    dest_block_idx: torch.Tensor,
+    dev_shards: Sequence[torch.Tensor],
+    *,
+    fused: bool,
+) -> Optional[List[torch.Tensor]]:
+    """Scatters each dev_shards into layer_buffers by dest_block_idx."""
+    if fused:
+        if not _fused_scatter():
+            raise ValueError(
+                "Cannot use fused scatter mode."
+            )
+        return _sync_scattered(
+            kv_scatter.multi_layer_scatter_into(
+                list(dev_shards), list(dest_layer_buffers), dest_block_idx
+            )
+        )
+    for buf, shard in zip(dest_layer_buffers, dev_shards):
+        _index_copy_pages(buf, dest_block_idx, shard)
+    return None
 
 
 # --------------------------------------------------------------------------
