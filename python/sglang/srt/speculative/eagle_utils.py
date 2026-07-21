@@ -571,6 +571,32 @@ def greedy_verify_fused_func(
     return predicts, accept_index, accept_len.to(torch.int32)
 
 
+@tpu_fused_spec_op
+def verify_post_fused_func(
+    seq_lens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_width: int,
+):
+    """Fused post-verify bookkeeping: new seq_lens + bonus-token gather.
+
+    Combines ``seq_lens + accept_lens``, the ``predict[accept_index]`` gather
+    and the bonus-token offset math into one dispatch. ``accept_lens``
+    includes the bonus token, so the bonus for request ``i`` sits at flat
+    position ``accept_width * i + accept_lens[i] - 1``.
+
+    ``accept_width`` is ``accept_index.shape[1]`` (spec_steps + 1), NOT
+    num_draft_tokens -- those differ for topk > 1 trees.
+    """
+    new_seq_lens = seq_lens + accept_lens
+    accept_tokens = predict[accept_index]
+    bs = accept_lens.shape[0]
+    idx = accept_width * torch.arange(bs, device=accept_lens.device) + accept_lens - 1
+    bonus_tokens = accept_tokens.reshape(-1)[idx].to(torch.int32)
+    return new_seq_lens, bonus_tokens
+
+
 def verify_tree_greedy_from_logits(
     *,
     next_token_logits: torch.Tensor,
