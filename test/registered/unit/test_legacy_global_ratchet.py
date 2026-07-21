@@ -25,7 +25,10 @@ _SRT_ROOT = Path(next(iter(sglang.srt.__path__)))
 # Baselines counted over python/sglang/srt/**/*.py, including each function's
 # own def line. Ratchet: decrease-only.
 _RATCHETS = [
-    ("get_global_server_args", r"\bget_global_server_args\s*\(", 279),
+    # 279 -> 287: the upstream sync merged new call-sites in upstream-owned code
+    # (distributed/device_communicators, npu & mlx backends, dsa indexer); those
+    # are not fork code to migrate here. Fork TPU sites are unchanged.
+    ("get_global_server_args", r"\bget_global_server_args\s*\(", 287),
     (
         "set_global_server_args_for_*",
         r"\bset_global_server_args_for_(?:scheduler|tokenizer)\s*\(",

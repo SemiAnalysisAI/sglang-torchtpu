@@ -28,6 +28,14 @@ concurrency:
 env:
   SGLANG_IS_IN_CI: true
 
+# The gate job runs dorny/paths-filter, which lists the PR's changed files via
+# the GitHub API on `pull_request` events. Without an explicit grant the default
+# token can't read PR resources ("Resource not accessible by integration", 403).
+# Mirrors pr-test.yml. Read-only; the tiers below need no write scope.
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   # Stage 0 — decide whether to run the heavy tiers. Always runs
   # (cheap, ubuntu-latest), and emits a single `should_run` output

@@ -45,6 +45,7 @@ from sglang.srt.layers.dp_attention import (
     dp_reduce_scatter_tensor,
     dp_scatter,
     get_attention_tp_group,
+    get_attention_tp_size,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,

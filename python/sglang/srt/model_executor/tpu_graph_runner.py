@@ -101,7 +101,9 @@ class TpuGraphRunner:
             # flag (kernel_warmup pre-compile loops on the CUDA side;
             # any future TPU equivalent should follow the same
             # convention).
-            model_runner.server_args.enable_torch_compile = False
+            model_runner.server_args.override(
+                "tpu_graph_runner", enable_torch_compile=False
+            )
             return
 
         # Raise dynamo's recompile ceiling. torch.compile builds a fresh graph

@@ -130,12 +130,15 @@ class EAGLEWorker(TpModelWorker):
             )
 
         # Override the context length of the draft model to be the same as the target model.
-        server_args.context_length = target_worker.model_runner.model_config.context_len
+        server_args.override(
+            "eagle_worker.__init__",
+            context_length=target_worker.model_runner.model_config.context_len,
+        )
 
         # Do not capture cuda graph in `super().__init__()`
         # It will be captured later.
         backup_disable_cuda_graph = server_args.disable_cuda_graph
-        server_args.disable_cuda_graph = True
+        server_args.override("eagle_worker.__init__", disable_cuda_graph=True)
         # Share the allocator with a target worker.
         # Draft and target worker own their own KV cache pools.
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -151,8 +154,9 @@ class EAGLEWorker(TpModelWorker):
             self.hot_token_id = None
         elif server_args.speculative_token_map is not None:
             self.hot_token_id = load_token_map(server_args.speculative_token_map)
-            server_args.json_model_override_args = (
-                f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
+            server_args.override(
+                "eagle_worker.__init__",
+                json_model_override_args=f'{{"hot_vocab_size": {len(self.hot_token_id)}}}',
             )
         else:
             self.hot_token_id = None
@@ -210,8 +214,8 @@ class EAGLEWorker(TpModelWorker):
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
         # Init attention backend and cuda graphs
-        self.draft_model_runner.server_args.disable_cuda_graph = (
-            backup_disable_cuda_graph
+        self.draft_model_runner.server_args.override(
+            "eagle_worker.__init__", disable_cuda_graph=backup_disable_cuda_graph
         )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
@@ -361,9 +365,10 @@ class EAGLEWorker(TpModelWorker):
             state.cuda_graph_runner_for_draft_extend
         )
         # Sync server_args
-        self.server_args.speculative_num_steps = state.speculative_num_steps
-        self.server_args.speculative_num_draft_tokens = (
-            state.speculative_num_draft_tokens
+        self.server_args.override(
+            "eagle_worker.apply_runtime_state",
+            speculative_num_steps=state.speculative_num_steps,
+            speculative_num_draft_tokens=state.speculative_num_draft_tokens,
         )
 
     def build_adaptive_runtime_state(
@@ -442,8 +447,11 @@ class EAGLEWorker(TpModelWorker):
         )
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
-        sa.speculative_num_steps = speculative_num_steps
-        sa.speculative_num_draft_tokens = speculative_num_draft_tokens
+        sa.override(
+            "eagle_worker._override_worker_state",
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
         try:
             yield
         finally:
@@ -455,9 +463,14 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner.draft_attn_backend,
                 self.cuda_graph_runner,
                 self.cuda_graph_runner_for_draft_extend,
-                sa.speculative_num_steps,
-                sa.speculative_num_draft_tokens,
+                prev_sa_num_steps,
+                prev_sa_num_draft_tokens,
             ) = backup
+            sa.override(
+                "eagle_worker._override_worker_state",
+                speculative_num_steps=prev_sa_num_steps,
+                speculative_num_draft_tokens=prev_sa_num_draft_tokens,
+            )
 
     @property
     def draft_model_runner(self):
