@@ -33,6 +33,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.common import tpu_fused_spec_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -519,6 +520,57 @@ def verify_tree_greedy_func(
     return predicts, accept_index, accept_token_num
 
 
+@tpu_fused_spec_op
+def greedy_verify_fused_func(
+    next_token_logits: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+):
+    """Fused greedy tree verification for EAGLE (topk=1, linear chain).
+
+    Combines the target argmax with the vectorized accept-length computation
+    of ``_verify_tree_greedy_torch`` into one compiled dispatch, and produces
+    its outputs functionally instead of writing into caller-staged buffers.
+
+    Returns ``(predicts, accept_index, accept_lens)`` where ``accept_lens``
+    includes the bonus token (``num_correct_drafts + 1``).
+    """
+    bs, num_verify_tokens = candidates.shape
+    target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
+        bs, num_verify_tokens
+    )
+    predicts = target_predict.flatten().to(torch.int32)
+
+    if num_verify_tokens > 1:
+        matches = target_predict[:, :-1] == candidates[:, 1:]
+        all_match = matches.all(dim=1)
+        first_mismatch = (~matches).to(torch.int32).argmax(dim=1)
+        num_correct = torch.where(all_match, num_verify_tokens - 1, first_mismatch)
+    else:
+        num_correct = torch.zeros((bs,), dtype=torch.long, device=candidates.device)
+    accept_len = num_correct + 1
+
+    # Clamp at the first invalid (-1) retrieve_index entry inside the accepted
+    # prefix, mirroring step 2 of ``_verify_tree_greedy_torch``.
+    ri_valid = retrieve_index != -1
+    col_idx = torch.arange(
+        num_verify_tokens, device=candidates.device, dtype=torch.long
+    )
+    within_accept = col_idx.unsqueeze(0) < accept_len.unsqueeze(1)
+    invalid_within = within_accept & ~ri_valid
+    has_invalid = invalid_within.any(dim=1)
+    first_invalid = invalid_within.to(torch.int32).argmax(dim=1)
+    accept_len = torch.where(has_invalid, first_invalid, accept_len)
+
+    copy_mask = col_idx.unsqueeze(0) < accept_len.unsqueeze(1)
+    accept_index = torch.where(
+        copy_mask,
+        retrieve_index.to(torch.int32),
+        torch.tensor(-1, dtype=torch.int32, device=candidates.device),
+    )
+    return predicts, accept_index, accept_len.to(torch.int32)
+
+
 def verify_tree_greedy_from_logits(
     *,
     next_token_logits: torch.Tensor,
@@ -564,21 +616,31 @@ def verify_tree_greedy_from_logits(
             spec_info=spec_info,
         )
 
-    physical_bs = candidates.shape[0]
-    target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
-        physical_bs, draft_token_num
-    )
-    predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
-        predicts=predict,  # mutable
-        accept_index=accept_index,  # mutable
-        accept_token_num=num_correct_drafts,  # mutable
-        candidates=candidates,
-        retrieve_index=retrieve_index,
-        retrieve_next_token=retrieve_next_token,
-        retrieve_next_sibling=retrieve_next_sibling,
-        target_predict=target_predict,
-        topk=topk,
-    )
+    if _use_torch_native and topk == 1:
+        # One compiled dispatch instead of the argmax plus ~25 eager ops of
+        # the torch fallback. Bucketing already ran, so the inputs are at
+        # their static padded shapes.
+        predict, accept_index, accept_lens = greedy_verify_fused_func(
+            next_token_logits, candidates, retrieve_index
+        )
+        # verify_tree_greedy_func's contract counts drafts only.
+        num_correct_drafts = accept_lens - 1
+    else:
+        physical_bs = candidates.shape[0]
+        target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
+            physical_bs, draft_token_num
+        )
+        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+            predicts=predict,  # mutable
+            accept_index=accept_index,  # mutable
+            accept_token_num=num_correct_drafts,  # mutable
+            candidates=candidates,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            target_predict=target_predict,
+            topk=topk,
+        )
 
     if compile_policy is not None and _use_torch_native:
         predict, accept_index, num_correct_drafts = compile_policy.finalize_spec_verify(

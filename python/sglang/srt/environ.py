@@ -976,6 +976,8 @@ class Envs:
 
     # TPU
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
+    # Compile each pure spec-decode helper into a single tt_jit dispatch.
+    SGLANG_TPU_ENABLE_FUSED_SPEC_OPS = EnvBool(True)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
