@@ -70,6 +70,7 @@ from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
+    draft_extend_select_argmax_fused_func,
     eagle_prepare_for_verify,
     eagle_sample,
     get_draft_recurrent_hidden_state_spec,
@@ -1008,7 +1009,37 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Fancy indexing returns a fresh tensor (detached from the buffer).
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
-        # Reorganize the spec info for the next batch
+        # Reorganize the spec info for the next batch. On the greedy topk==1
+        # TPU path the row select and the argmax fuse into one dispatch, which
+        # also avoids materializing the strided gather out of the vocab-wide
+        # logits.
+        fused_select = (
+            _is_tpu
+            and self.topk == 1
+            and not self.server_args.speculative_use_rejection_sampling
+        )
+        if fused_select:
+            (
+                draft_logits_output.next_token_logits,
+                draft_logits_output.hidden_states,
+                ret_topk_p,
+                ret_topk_index,
+            ) = draft_extend_select_argmax_fused_func(
+                draft_logits_output.next_token_logits,
+                draft_logits_output.hidden_states,
+                select_index,
+            )
+            ret_draft_probs = None
+            ret_hidden_states = draft_logits_output.hidden_states
+            return self._finish_draft_extend_for_decode(
+                batch_result,
+                ret_topk_p,
+                ret_topk_index,
+                ret_hidden_states,
+                ret_draft_probs,
+                dsa_seed_topk_indices,
+            )
+
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
             select_index
         ]
@@ -1041,7 +1072,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_draft_probs = None
         ret_hidden_states = draft_logits_output.hidden_states
 
-        # Construct the return values
+        return self._finish_draft_extend_for_decode(
+            batch_result,
+            ret_topk_p,
+            ret_topk_index,
+            ret_hidden_states,
+            ret_draft_probs,
+            dsa_seed_topk_indices,
+        )
+
+    def _finish_draft_extend_for_decode(
+        self,
+        batch_result,
+        ret_topk_p,
+        ret_topk_index,
+        ret_hidden_states,
+        ret_draft_probs,
+        dsa_seed_topk_indices,
+    ):
+        """Publish the draft-extend outputs onto the next iteration's input."""
         next_draft_input = batch_result.next_draft_input
         (
             next_draft_input.topk_p,
