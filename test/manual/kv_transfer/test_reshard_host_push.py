@@ -22,6 +22,9 @@ Covers:
     the same offset -- redundant but idempotent.
   * mixed replication+concat at ratio 4 (8TP -> 2TP attention, 4 kv-heads):
     the 2TP x 4DP decode topology, four writers per decode rank.
+  * fp8 packed layout (kv_packing=4): head pairs addressed at plane
+    granularity inside shared granules — mid-granule destination offsets,
+    granule-aligned strides, and dummy planes that are never read or written.
   * partial pages: tokens past ``live_tokens`` stay untouched.
 
 Requires the tpu_raiden host bindings (no TPU or torch_tpu runtime):
@@ -42,16 +45,17 @@ except ImportError as e:  # pragma: no cover - environment-dependent
     pb2 = None
     _RAIDEN_IMPORT_ERROR = e
 
-HP_BYTES = 512  # one kv-head's K+V granule: kv_packing(2) * head_dim(128) * bf16
+HP_BYTES = 512  # one kv-head's K+V plane pair: 2 * head_dim(128) * bf16
 TOKENS_PER_BLOCK = 16
 NUM_LAYERS = 3
 NUM_HOST_BLOCKS = 4
 DEST_NODE_ID = 100
 POISON = 0xAA
+SRC_DUMMY = 0x55  # source dummy-plane filler; must never reach a destination
 ROOM = 0x51E135
 
 
-def _head_pattern(layer, block, token, global_head):
+def _head_pattern(layer, block, token, global_head, hp_bytes):
     """One kv-head's bytes for one token, addressed by GLOBAL head index.
 
     Sharding-independent ground truth: a source rank's block content and the
@@ -62,19 +66,28 @@ def _head_pattern(layer, block, token, global_head):
     """
     return bytes(
         (global_head * 131 + layer * 37 + block * 17 + token * 7 + i) % 251
-        for i in range(HP_BYTES)
+        for i in range(hp_bytes)
     )
 
 
-def _block_payload(layer, block, global_heads, live_tokens):
-    """Block bytes for a rank holding ``global_heads``, poison past live."""
+def _block_payload(
+    layer, block, global_heads, live_tokens, token_bytes, hp_bytes, pad_byte
+):
+    """Block bytes for a rank holding ``global_heads`` in ``token_bytes``-wide
+    tokens: the real head pairs, then ``pad_byte`` dummy planes up to the
+    granule-aligned token width. Tokens past ``live_tokens`` are POISON
+    throughout.
+    """
     out = bytearray()
     for token in range(TOKENS_PER_BLOCK):
-        for head in global_heads:
-            if token < live_tokens:
-                out += _head_pattern(layer, block, token, head)
-            else:
-                out += bytes([POISON]) * HP_BYTES
+        if token < live_tokens:
+            tok = bytearray()
+            for head in global_heads:
+                tok += _head_pattern(layer, block, token, head, hp_bytes)
+            tok += bytes([pad_byte]) * (token_bytes - len(tok))
+            out += tok
+        else:
+            out += bytes([POISON]) * token_bytes
     return bytes(out)
 
 
@@ -109,17 +122,23 @@ class ReshardHostPushTest(unittest.TestCase):
         src_block_ids,
         dst_block_ids,
         live_tokens,
+        hp_bytes=HP_BYTES,
+        kv_packing=2,
     ):
-        geom = rs.ReshardGeometry(src_tp, dst_tp, HP_BYTES, total_kv_heads)
+        geom = rs.ReshardGeometry(
+            src_tp, dst_tp, hp_bytes, total_kv_heads, kv_packing=kv_packing
+        )
         src_hpr = max(1, total_kv_heads // src_tp)
         dst_hpr = max(1, total_kv_heads // dst_tp)
+        src_token = geom.token_stride_bytes(src_hpr)
+        dst_token = geom.token_stride_bytes(dst_hpr)
         source_ranks = rs.source_ranks_for(decode_rank, geom.ratio)
 
         sources = {
             p: kv_cache_manager_host.HostKVCacheManager(
                 num_layers=NUM_LAYERS,
                 num_shards=1,
-                slice_byte_size=TOKENS_PER_BLOCK * src_hpr * HP_BYTES,
+                slice_byte_size=TOKENS_PER_BLOCK * src_token,
                 node_id=p,
                 local_port=0,
                 host_blocks=NUM_HOST_BLOCKS,
@@ -130,14 +149,14 @@ class ReshardHostPushTest(unittest.TestCase):
         dest = kv_cache_manager_host.HostKVCacheManager(
             num_layers=NUM_LAYERS,
             num_shards=1,
-            slice_byte_size=TOKENS_PER_BLOCK * dst_hpr * HP_BYTES,
+            slice_byte_size=TOKENS_PER_BLOCK * dst_token,
             node_id=DEST_NODE_ID,
             local_port=0,
             host_blocks=NUM_HOST_BLOCKS,
             parallelism=1,
         )
 
-        dst_slot = TOKENS_PER_BLOCK * dst_hpr * HP_BYTES
+        dst_slot = TOKENS_PER_BLOCK * dst_token
         for layer in range(NUM_LAYERS):
             for block in range(NUM_HOST_BLOCKS):
                 dest.write_block_bytes(layer, block, bytes([POISON]) * dst_slot)
@@ -145,7 +164,11 @@ class ReshardHostPushTest(unittest.TestCase):
                 heads = _prefill_heads(p, src_tp, total_kv_heads)
                 for block, live in zip(src_block_ids, live_tokens):
                     mgr.write_block_bytes(
-                        layer, block, _block_payload(layer, block, heads, live)
+                        layer,
+                        block,
+                        _block_payload(
+                            layer, block, heads, live, src_token, hp_bytes, SRC_DUMMY
+                        ),
                     )
 
         peer = dest.transfer_address
@@ -195,7 +218,11 @@ class ReshardHostPushTest(unittest.TestCase):
             for src_block, dst_block, live in zip(
                 src_block_ids, dst_block_ids, live_tokens
             ):
-                expected = _block_payload(layer, src_block, decode_heads, live)
+                # Destination dummy planes are never written, so they must
+                # still hold the dest poison — never the sources' SRC_DUMMY.
+                expected = _block_payload(
+                    layer, src_block, decode_heads, live, dst_token, hp_bytes, POISON
+                )
                 actual = dest.read_block_bytes(layer, dst_block)
                 self.assertEqual(
                     actual,
@@ -251,6 +278,41 @@ class ReshardHostPushTest(unittest.TestCase):
             src_block_ids=[2],
             dst_block_ids=[1],
             live_tokens=[TOKENS_PER_BLOCK],
+        )
+
+    def test_fp8_replication_dummy_planes_stay_untouched(self):
+        # fp8 layout (kv_packing=4, head-pair 256B): one real head per rank on
+        # both sides, so every granule is [K, V, dummy, dummy]. The 256B pair
+        # is copied out of a 512B-stride source token; the destination's dummy
+        # planes must keep the dest poison and the sources' SRC_DUMMY filler
+        # must never appear.
+        self._run_reshard(
+            src_tp=8,
+            dst_tp=4,
+            total_kv_heads=4,
+            decode_rank=1,
+            src_block_ids=[0, 2],
+            dst_block_ids=[3, 1],
+            live_tokens=[TOKENS_PER_BLOCK, TOKENS_PER_BLOCK // 2],
+            hp_bytes=256,
+            kv_packing=4,
+        )
+
+    def test_fp8_concat_interleaves_mid_granule(self):
+        # fp8, 8 kv-heads at 8TP -> 4TP: each source granule is
+        # [K_h, V_h, dummy, dummy]; the decode granule packs both heads
+        # [K_2, V_2, K_3, V_3], so writer 1's pair lands mid-granule at byte
+        # 256 and no dummy planes exist on the destination.
+        self._run_reshard(
+            src_tp=8,
+            dst_tp=4,
+            total_kv_heads=8,
+            decode_rank=1,
+            src_block_ids=[1, 3],
+            dst_block_ids=[2, 0],
+            live_tokens=[TOKENS_PER_BLOCK, TOKENS_PER_BLOCK],
+            hp_bytes=256,
+            kv_packing=4,
         )
 
 

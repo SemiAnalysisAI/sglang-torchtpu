@@ -32,8 +32,15 @@ Handshake (decode-initiated, data flows prefill→decode): `RESHARD_REQ` (decode
 endpoint + blocks + tp) → `RESHARD_BLOCKS` (prefill blocks) → decode registers its
 receiver plan → `RESHARD_READY` → prefill `d2h`-stages and `push_registered_plan`.
 Schedules are built in `reshard_schedule.py` (unit-tested in
-`test/manual/kv_transfer/test_reshard_schedule.py`). Requires `ratio` to divide
-the total kv-head count evenly; the byte granule is one kv-head's contiguous K+V.
+`test/manual/kv_transfer/test_reshard_schedule.py`; executed against real raiden
+host managers in `test/manual/kv_transfer/test_reshard_host_push.py`). Requires
+`ratio` to divide the total kv-head count evenly. The byte unit is one kv-head's
+contiguous K+V plane pair (`head_pair_bytes`); per-token strides are the fused
+pool's granule-aligned widths (`kv_packing` planes per 32-bit granule), so packed
+sub-16-bit KV (e.g. fp8, two heads per granule) is addressed at plane
+granularity — mid-granule destination offsets, dummy planes never copied. A
+packed pool without `kv_args.total_kv_head_num` is rejected (the real head count
+is not derivable from a padded tensor shape).
 
 DP-attention replicas that co-locate on a decode host get distinct raiden control
 ports via `base + 2*(attn_dp_rank*attn_tp_size + attn_tp_rank)` (reduces to

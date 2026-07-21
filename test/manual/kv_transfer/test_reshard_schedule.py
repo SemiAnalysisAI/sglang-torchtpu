@@ -95,6 +95,54 @@ class ReshardGeometryTest(unittest.TestCase):
             self.assertEqual(dst_off, 0)  # both replicas -> offset 0
             self.assertEqual(dst_stride, 512)  # decode 1 head/token
 
+    def test_head_pair_bytes_fp8_is_plane_pair_not_granule(self):
+        # fp8 (kv_packing=4), hd=128: head-pair = 2 planes = 2*128*1 = 256B,
+        # half the 4-plane granule. Same on a 1-head (padded) and 2-head
+        # (full-granule) tensor.
+        prefill_t = _Tensor((100, 1024, 1, 4, 128), 1)
+        decode_t = _Tensor((100, 1024, 1, 4, 128), 1)
+        self.assertEqual(rs.head_pair_bytes(prefill_t), 256)
+        self.assertEqual(rs.head_pair_bytes(decode_t), 256)
+        self.assertEqual(rs.kv_packing_of(prefill_t), 4)
+
+    def test_geometry_fp8_replication_skips_dummy_planes(self):
+        # fp8, total_kv_heads=4, 8TP -> 4TP: one real head per rank on both
+        # sides, so each side's granule is [K, V, dummy, dummy]. The copy is
+        # the 256B real pair inside a 512B granule-aligned token stride — the
+        # dummy planes are never inside a copied range on either side.
+        geom = rs.ReshardGeometry(
+            src_tp=8, dst_tp=4, hp_bytes=256, total_kv_heads=4, kv_packing=4
+        )
+        for p, r in [(0, 0), (1, 0), (6, 3), (7, 3)]:
+            self.assertEqual(geom.entry_bytes(p, r), (0, 256, 512, 0, 512))
+
+    def test_geometry_fp8_concat_lands_mid_granule(self):
+        # fp8, total_kv_heads=8, 8TP -> 4TP: decode packs its two heads into
+        # one full granule [K0, V0, K1, V1]; writer 1's pair lands mid-granule
+        # at byte 256. Source granules are [K, V, dummy, dummy] (512B stride).
+        geom = rs.ReshardGeometry(
+            src_tp=8, dst_tp=4, hp_bytes=256, total_kv_heads=8, kv_packing=4
+        )
+        for p, r, exp_dst_off in [(0, 0, 0), (1, 0, 256), (6, 3, 0), (7, 3, 256)]:
+            src_off, size, src_stride, dst_off, dst_stride = geom.entry_bytes(p, r)
+            self.assertEqual((src_off, size, src_stride), (0, 256, 512))
+            self.assertEqual(dst_off, exp_dst_off)
+            self.assertEqual(dst_stride, 512)  # one full granule, no dummies
+
+    def test_token_stride_rounds_up_to_whole_granules(self):
+        geom = rs.ReshardGeometry(
+            src_tp=8, dst_tp=4, hp_bytes=256, total_kv_heads=8, kv_packing=4
+        )
+        # 3 heads = 6 planes -> 2 granules of 4 planes = 8 * 128B.
+        self.assertEqual(geom.token_stride_bytes(3), 1024)
+        # 2 heads = 4 planes -> exactly 1 granule.
+        self.assertEqual(geom.token_stride_bytes(2), 512)
+        # 16-bit KV: stride is exactly heads * head-pair, no padding ever.
+        bf16 = rs.ReshardGeometry(
+            src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8, kv_packing=2
+        )
+        self.assertEqual(bf16.token_stride_bytes(3), 1536)
+
     def test_rank_mapping(self):
         self.assertEqual(rs.reshard_ratio(8, 4), 2)
         self.assertEqual(rs.source_ranks_for(0, 2), [0, 1])

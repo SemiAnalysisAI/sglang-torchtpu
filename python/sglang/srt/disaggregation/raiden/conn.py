@@ -158,18 +158,30 @@ class RaidenKVManager(CommonKVManager):
         from sglang.srt.disaggregation.raiden.reshard_schedule import (
             ReshardGeometry,
             head_pair_bytes,
+            kv_packing_of,
             per_rank_head_count,
         )
 
         tensor = self._kv_caches[0]
         hp = head_pair_bytes(tensor)
+        packing = kv_packing_of(tensor)
         # total kv-heads: prefer kv_args, else derive from the local per-rank
         # count (this rank's fused tensor holds total/local_attn_tp heads, and
-        # self.attn_tp_size is the local attention TP).
+        # self.attn_tp_size is the local attention TP). The shape-derived count
+        # is only exact for 16-bit KV; a packed pool's trailing dummy planes
+        # make it an overcount, so refuse rather than build wrong schedules.
         total_kv_heads = int(getattr(self.kv_args, "total_kv_head_num", 0) or 0)
         if total_kv_heads <= 0:
+            if packing != 2:
+                raise NotImplementedError(
+                    "raiden reshard: total kv-head count unavailable from "
+                    f"kv_args and not derivable from a packed KV pool "
+                    f"(kv_packing={packing}); populate kv_args.total_kv_head_num"
+                )
             total_kv_heads = per_rank_head_count(tensor) * self.attn_tp_size
-        return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, int(total_kv_heads))
+        return ReshardGeometry(
+            src_attn_tp, dst_attn_tp, hp, int(total_kv_heads), kv_packing=packing
+        )
 
     def _host_slot_blocks(self, room: int, n: int) -> List[int]:
         """Host staging block-ids for ``room`` (n blocks) in a round-robin slot.

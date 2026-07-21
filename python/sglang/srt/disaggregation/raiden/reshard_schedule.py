@@ -17,12 +17,18 @@ Both are captured by ``head_slice_params`` (the same math as sglang's
 module stays free of torch/triton and the byte-math is unit-testable anywhere.
 
 The fused KV pool stores one ``[num_blocks, page_size, kv_heads_packed,
-kv_packing, padded_head_dim]`` tensor per layer. One kv-head's K and V are a
-single contiguous run (``kv_packing`` is outer to ``padded_head_dim``), so a
-per-token head slice is a contiguous ``num_heads * head_pair_bytes`` granule that
-lands strided (period ``dst_heads_per_rank * head_pair_bytes``) in the decode
-token. These builders turn that geometry into
-``raiden_service_pb2.StartTransferRequest`` push schedules.
+kv_packing, padded_head_dim]`` tensor per layer, laid out as a sequence of
+head-dim-length PLANES in order ``K_0, V_0, K_1, V_1, ...`` — head ``h``'s K+V
+is always the contiguous plane pair at plane index ``2h`` (``kv_packing`` is
+outer to ``padded_head_dim``), so a per-token slice of ``num_heads`` heads is a
+contiguous ``num_heads * head_pair_bytes`` run. ``kv_packing = 32 // dtype_bits``
+groups planes into 32-bit-aligned granules: for 16-bit KV a granule is exactly
+one head's pair, while sub-16-bit KV (e.g. fp8, packing 4) packs two heads per
+granule and pads a partly-filled last granule with dummy planes. The dummy
+planes carry no payload — they widen the per-token stride
+(``token_stride_bytes``) but are never inside a copied range. These builders
+turn that geometry into ``raiden_service_pb2.StartTransferRequest`` push
+schedules.
 """
 
 from __future__ import annotations
@@ -55,19 +61,33 @@ def source_ranks_for(decode_rank: int, ratio: int) -> List[int]:
 
 
 def head_pair_bytes(fused_layer_tensor) -> int:
-    """Bytes of one kv-head's contiguous K+V run in a fused KV layer tensor.
+    """Bytes of one kv-head's contiguous K+V plane pair in a fused KV layer
+    tensor.
 
-    Independent of the per-rank kv-head count, so it matches on prefill and
-    decode. ``tensor.shape = [num_blocks, page_size, kv_heads_packed,
-    kv_packing, padded_head_dim]``.
+    Two ``padded_head_dim`` planes (K and V), independent of the per-rank
+    kv-head count and of ``kv_packing``, so it matches on prefill and decode.
+    ``tensor.shape = [num_blocks, page_size, kv_heads_packed, kv_packing,
+    padded_head_dim]``.
     """
     shape = fused_layer_tensor.shape
-    return int(shape[3]) * int(shape[4]) * fused_layer_tensor.element_size()
+    return 2 * int(shape[4]) * fused_layer_tensor.element_size()
+
+
+def kv_packing_of(fused_layer_tensor) -> int:
+    """kv_packing (planes per 32-bit granule) of a fused KV layer tensor."""
+    return int(fused_layer_tensor.shape[3])
 
 
 def per_rank_head_count(fused_layer_tensor) -> int:
-    """kv_heads_packed (this rank's kv-head count) of a fused KV layer tensor."""
-    return int(fused_layer_tensor.shape[2])
+    """This rank's kv-head count from a fused KV layer tensor's plane capacity.
+
+    Exact for 16-bit KV (``kv_packing == 2``: every granule is one head's K+V
+    pair). For sub-16-bit KV the trailing dummy planes of a partly-filled last
+    granule are indistinguishable from real heads, so this overcounts; the
+    real count must then come from model config, not the tensor shape.
+    """
+    shape = fused_layer_tensor.shape
+    return int(shape[2]) * int(shape[3]) // 2
 
 
 def head_slice_params(
@@ -108,27 +128,62 @@ def head_slice_params(
 
 
 class ReshardGeometry:
-    """Byte geometry for one (src_tp -> dst_tp) reshard over ``total_kv_heads``."""
+    """Byte geometry for one (src_tp -> dst_tp) reshard over ``total_kv_heads``.
 
-    def __init__(self, src_tp: int, dst_tp: int, hp_bytes: int, total_kv_heads: int):
+    ``hp_bytes`` is one head's K+V plane pair (``head_pair_bytes``);
+    ``kv_packing`` is the fused pool's planes-per-granule (``kv_packing_of``),
+    which sets the granule-aligned per-token stride on each side.
+    """
+
+    def __init__(
+        self,
+        src_tp: int,
+        dst_tp: int,
+        hp_bytes: int,
+        total_kv_heads: int,
+        kv_packing: int = 2,
+    ):
+        if hp_bytes % 2 != 0:
+            raise ValueError(f"hp_bytes ({hp_bytes}) must be even (K+V planes)")
+        if kv_packing < 2 or kv_packing % 2 != 0:
+            raise ValueError(f"kv_packing ({kv_packing}) must be a positive even")
         self.src_tp = src_tp
         self.dst_tp = dst_tp
         self.ratio = reshard_ratio(src_tp, dst_tp)
         self.hp_bytes = hp_bytes
         self.total_kv_heads = total_kv_heads
+        self.kv_packing = kv_packing
+
+    def token_stride_bytes(self, heads_per_rank: int) -> int:
+        """Per-token byte width of a rank holding ``heads_per_rank`` kv-heads.
+
+        The rank's ``2 * heads`` planes rounded up to whole ``kv_packing``
+        granules; the round-up covers the trailing dummy planes of a
+        partly-filled last granule (sub-16-bit KV with fewer real planes than
+        the granule holds), which pad the stride but carry no payload.
+        """
+        planes = 2 * heads_per_rank
+        granules = -(-planes // self.kv_packing)
+        return granules * self.kv_packing * (self.hp_bytes // 2)
 
     def entry_bytes(self, prefill_rank: int, decode_rank: int):
         """Byte (src_offset, size, src_stride, dst_offset, dst_stride) for the
-        prefill_rank -> decode_rank contribution, per token."""
+        prefill_rank -> decode_rank contribution, per token.
+
+        Offsets and size address real head pairs only (head ``h`` starts at
+        ``h * hp_bytes`` — for packed sub-16-bit KV that can be mid-granule);
+        the strides are granule-aligned token widths, so dummy planes are
+        skipped over, never copied.
+        """
         sh_start, num_heads, dh_start, src_hpr, dst_hpr = head_slice_params(
             self.src_tp, self.dst_tp, prefill_rank, decode_rank, self.total_kv_heads
         )
         return (
             sh_start * self.hp_bytes,  # src_offset
             num_heads * self.hp_bytes,  # size
-            src_hpr * self.hp_bytes,  # src_stride (src per-token width)
+            self.token_stride_bytes(src_hpr),  # src_stride (src per-token width)
             dh_start * self.hp_bytes,  # dst_offset
-            dst_hpr * self.hp_bytes,  # dst_stride (dst per-token width)
+            self.token_stride_bytes(dst_hpr),  # dst_stride (dst per-token width)
         )
 
 
