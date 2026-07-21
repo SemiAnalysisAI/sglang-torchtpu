@@ -192,9 +192,13 @@ class TpuSRTPlatform(SRTPlatform):
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
         from sglang.srt.mem_cache.memory_pool_host import (
-            MHATokenToKVPoolHost,
             TpuFusedMHATokenToKVPoolHost,
         )
+
+        # Upstream relocated MHATokenToKVPoolHost from mem_cache.memory_pool_host
+        # into the mem_cache.pool_host package; TpuFusedMHATokenToKVPoolHost is the
+        # fork's own class and still lives in memory_pool_host.
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
         from sglang.srt.server_args import get_global_server_args
 
         # raiden offloads through tpu-raiden's DMA-pinned host pool instead of the
