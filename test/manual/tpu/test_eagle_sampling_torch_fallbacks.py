@@ -338,5 +338,82 @@ class TestEagleSamplingTorchFallbacks(unittest.TestCase):
         self.assertTrue(torch.allclose(out, expected, atol=1e-6))
 
 
+class TestGreedyVerifyFusedEquivalence(unittest.TestCase):
+    """The fused greedy verify must match the staged-buffer implementation."""
+
+    @staticmethod
+    def _reference(next_token_logits, candidates, retrieve_index):
+        from sglang.srt.speculative.eagle_utils import _verify_tree_greedy_torch
+
+        bs, ntv = candidates.shape
+        predicts = torch.zeros((bs * ntv,), dtype=torch.int32)
+        accept_index = torch.full((bs, ntv), -1, dtype=torch.int32)
+        accept_token_num = torch.empty((bs,), dtype=torch.int32)
+        target_predict = torch.argmax(next_token_logits, dim=-1).reshape(bs, ntv)
+        _verify_tree_greedy_torch(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrieve_index,
+            target_predict,
+            1,
+        )
+        return predicts, accept_index, accept_token_num
+
+    def test_matches_reference_on_random_cases(self):
+        from sglang.srt.speculative.eagle_utils import greedy_verify_fused_func
+
+        torch.manual_seed(0)
+        vocab = 32
+        # ntv == 1 is excluded: the reference crashes there (see
+        # test_fused_handles_single_verify_token).
+        for bs, ntv in ((1, 4), (2, 4), (3, 2), (2, 8)):
+            for trial in range(8):
+                logits = torch.randn(bs * ntv, vocab)
+                candidates = torch.randint(0, vocab, (bs, ntv), dtype=torch.int32)
+                retrieve_index = torch.arange(bs * ntv, dtype=torch.int32).reshape(
+                    bs, ntv
+                )
+                if trial % 3 == 1 and ntv > 1:
+                    # Exercise the -1 clamp inside the accepted prefix.
+                    retrieve_index[:, -1] = -1
+
+                want_p, want_ai, want_n = self._reference(
+                    logits, candidates, retrieve_index
+                )
+                got_p, got_ai, got_lens = greedy_verify_fused_func(
+                    logits, candidates, retrieve_index
+                )
+
+                with self.subTest(bs=bs, ntv=ntv, trial=trial):
+                    self.assertTrue(torch.equal(got_p, want_p))
+                    self.assertTrue(torch.equal(got_ai, want_ai))
+                    # fused returns accept_len (incl. bonus); reference counts drafts
+                    self.assertTrue(torch.equal(got_lens - 1, want_n))
+
+    def test_fused_handles_single_verify_token(self):
+        # num_verify_tokens == 1 makes the staged-buffer reference do
+        # argmax() over an empty reduction dim and raise; the fused version
+        # takes an explicit zero branch instead.
+        from sglang.srt.speculative.eagle_utils import greedy_verify_fused_func
+
+        logits = torch.randn(3, 16)
+        candidates = torch.randint(0, 16, (3, 1), dtype=torch.int32)
+        retrieve_index = torch.arange(3, dtype=torch.int32).reshape(3, 1)
+
+        predicts, accept_index, accept_lens = greedy_verify_fused_func(
+            logits, candidates, retrieve_index
+        )
+
+        self.assertEqual(predicts.shape, (3,))
+        self.assertEqual(accept_index.shape, (3, 1))
+        # Only the bonus token is ever accepted when there are no drafts.
+        self.assertEqual(accept_lens.tolist(), [1, 1, 1])
+
+        with self.assertRaises(IndexError):
+            self._reference(logits, candidates, retrieve_index)
+
+
 if __name__ == "__main__":
     unittest.main()
