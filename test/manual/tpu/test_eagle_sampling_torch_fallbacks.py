@@ -462,5 +462,49 @@ class TestVerifyPostFusedEquivalence(unittest.TestCase):
         self.assertEqual(bonus.tolist(), [2, 5])
 
 
+class TestDraftExtendSelectFused(unittest.TestCase):
+    """Fused draft-extend select must match the eager gather + argmax."""
+
+    def test_matches_eager_select_and_argmax(self):
+        from sglang.srt.speculative.eagle_utils import (
+            draft_extend_select_argmax_fused_func,
+        )
+
+        torch.manual_seed(3)
+        for bs, ndt, vocab, hdim in ((1, 4, 64, 8), (3, 4, 128, 16), (2, 6, 32, 4)):
+            logits = torch.randn(bs * ndt, vocab)
+            hidden = torch.randn(bs * ndt, hdim)
+            accept_lens = torch.randint(1, ndt + 1, (bs,), dtype=torch.int32)
+            select_index = (
+                torch.arange(0, bs * ndt, ndt, dtype=torch.int32) + accept_lens - 1
+            ).long()
+
+            sel_l, sel_h, tp, ti = draft_extend_select_argmax_fused_func(
+                logits, hidden, select_index
+            )
+
+            want_l = logits[select_index]
+            want_h = hidden[select_index]
+            want_ti = torch.argmax(want_l, dim=-1, keepdim=True)
+            with self.subTest(bs=bs, ndt=ndt):
+                self.assertTrue(torch.equal(sel_l, want_l))
+                self.assertTrue(torch.equal(sel_h, want_h))
+                self.assertTrue(torch.equal(ti, want_ti))
+                self.assertTrue(torch.all(tp == 1.0))
+                self.assertEqual(tp.shape, want_ti.shape)
+
+    def test_none_hidden_states_passes_through(self):
+        from sglang.srt.speculative.eagle_utils import (
+            draft_extend_select_argmax_fused_func,
+        )
+
+        logits = torch.randn(8, 16)
+        sel_l, sel_h, _, _ = draft_extend_select_argmax_fused_func(
+            logits, None, torch.tensor([1, 5])
+        )
+        self.assertIsNone(sel_h)
+        self.assertEqual(sel_l.shape, (2, 16))
+
+
 if __name__ == "__main__":
     unittest.main()

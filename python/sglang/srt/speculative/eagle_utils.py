@@ -597,6 +597,29 @@ def verify_post_fused_func(
     return new_seq_lens, bonus_tokens
 
 
+@tpu_fused_spec_op
+def draft_extend_select_argmax_fused_func(
+    next_token_logits: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
+    select_index: torch.Tensor,
+):
+    """Fused draft-extend row select + greedy next-draft pick (topk == 1).
+
+    Fusing matters beyond dispatch count here: the eager row-gather out of
+    the vocab-wide logits materializes a large strided intermediate before
+    the argmax. Compiled, XLA fuses gather+argmax and never materializes it.
+
+    Mirrors the eager topk==1 path (argmax + ones_like), NOT the
+    softmax+fast_topk of the general path -- argmax over the selected rows
+    is strictly cheaper and is what this worker already does.
+    """
+    sel_logits = next_token_logits[select_index]
+    sel_hidden = hidden_states[select_index] if hidden_states is not None else None
+    topk_index = torch.argmax(sel_logits, dim=-1, keepdim=True)
+    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+    return sel_logits, sel_hidden, topk_p, topk_index
+
+
 def verify_tree_greedy_from_logits(
     *,
     next_token_logits: torch.Tensor,
