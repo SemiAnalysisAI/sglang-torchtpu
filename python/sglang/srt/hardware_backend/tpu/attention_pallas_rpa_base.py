@@ -333,6 +333,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         )
 
         self.forward_metadata: Optional[PallasForwardMetadata] = None
+        # (count, stride) -> device ramp; see ``_cached_ramp``.
+        self._ramp_cache: dict[tuple[int, int], torch.Tensor] = {}
         # Cached ``distribution`` tensors on TPU, keyed by
         # (is_decode, real_batch, device) -- it depends only on those, so a
         # cached buffer is reused every step (see init_forward_metadata).
@@ -494,12 +496,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             extend_seq_lens = torch.full(
                 (bs,), draft_token_num, dtype=torch.int32, device=device
             )
+            q_tokens_per_req = draft_token_num
         elif self._is_draft_extend(forward_batch.forward_mode):
             # DRAFT_EXTEND: batch.prefix_lens may be stale from the
             # initial prefill; seq_lens and extend_seq_lens are current.
             seq_lens = forward_batch.seq_lens.to(torch.int32)
             assert forward_batch.extend_seq_lens is not None
             extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+            q_tokens_per_req = None
         elif forward_batch.forward_mode.is_extend():
             assert forward_batch.extend_seq_lens is not None, (
                 "extend_seq_lens is required for the Pallas attention backend in "
@@ -507,6 +511,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             )
             seq_lens = forward_batch.seq_lens.to(torch.int32)
             extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+            q_tokens_per_req = None
         else:
             # Decode (including draft decode).
             seq_lens = forward_batch.seq_lens.to(torch.int32)
@@ -519,16 +524,22 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 # kernel sees KV entries from prior draft steps.
                 seq_lens = seq_lens + self.speculative_step_id + 1
             extend_seq_lens = torch.ones(bs, dtype=torch.int32, device=device)
+            q_tokens_per_req = 1
 
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
 
-        cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32, device=device)
-        cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
+        if q_tokens_per_req is None:
+            cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+            cu_q_lens[1:] = torch.cumsum(
+                extend_seq_lens, dim=0, dtype=torch.int32
+            )
+        else:
+            cu_q_lens = self._cached_ramp(bs + 1, q_tokens_per_req, device)
 
         # cu_kv_lens[i] = i * pages_per_seq * page_size so the kernel addresses
         # ``page_indices[i * pages_per_seq + j]`` for token j of seq i.
-        cu_kv_lens = torch.arange(bs + 1, dtype=torch.int32, device=device) * (
-            pages_per_seq * page_size
+        cu_kv_lens = self._cached_ramp(
+            bs + 1, pages_per_seq * page_size, device
         )
 
         per_seq = req_to_token[req_pool_indices]  # [bs, max_ctx]
@@ -573,6 +584,15 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             distribution=distribution,
             swa_page_indices=swa_page_indices,
         )
+
+    def _cached_ramp(self, count: int, stride: int, device) -> torch.Tensor:
+        """Return a shared ``arange(count, int32) * stride`` tensor."""
+        key = (count, stride)
+        ramp = self._ramp_cache.get(key)
+        if ramp is None:
+            ramp = torch.arange(count, dtype=torch.int32, device=device) * stride
+            self._ramp_cache[key] = ramp
+        return ramp
 
     def _build_metadata_host(
         self,
