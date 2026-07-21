@@ -75,6 +75,7 @@ from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
+    verify_post_fused_func,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -106,12 +107,14 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_tpu,
     is_xpu,
     log_info_on_rank0,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
@@ -1702,7 +1705,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
             logits_output = target_compile_policy.finalize_forward_batch(
                 logits_output, verify_forward_batch
             )
-        new_seq_lens = batch.seq_lens + accept_lens
+        if _is_tpu and not batch.forward_mode.is_idle():
+            # One dispatch for seq-len bookkeeping + the bonus-token gather.
+            new_seq_lens, bonus_tokens = verify_post_fused_func(
+                batch.seq_lens,
+                accept_lens,
+                predict,
+                accept_index,
+                accept_index.shape[1],
+            )
+        else:
+            new_seq_lens = batch.seq_lens + accept_lens
+            bonus_tokens = None
         clear_unaccepted_c128 = getattr(
             self.token_to_kv_pool_allocator.get_kvcache(),
             "clear_unaccepted_c128_draft_states",
@@ -1725,19 +1739,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.speculative_num_draft_tokens,
         )
 
-        if not batch.forward_mode.is_idle():
-            accept_tokens = predict[accept_index]
-            bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
-            # stride = accept_tokens per-req width = accept_index.shape[1]
-            # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
-            fill_bonus_tokens_func(
-                accept_tokens,
-                accept_lens,
-                bonus_tokens,
-                accept_index.shape[1],
-            )
-        else:
-            bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
+        if bonus_tokens is None:
+            if not batch.forward_mode.is_idle():
+                accept_tokens = predict[accept_index]
+                bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+                # stride = accept_tokens per-req width = accept_index.shape[1]
+                # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
+                fill_bonus_tokens_func(
+                    accept_tokens,
+                    accept_lens,
+                    bonus_tokens,
+                    accept_index.shape[1],
+                )
+            else:
+                bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         if batch.return_logprob and not batch.forward_mode.is_idle():
             compute_spec_v2_logprobs(

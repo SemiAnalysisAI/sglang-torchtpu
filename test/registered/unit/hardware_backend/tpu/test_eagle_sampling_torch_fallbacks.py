@@ -419,5 +419,52 @@ class TestGreedyVerifyFusedEquivalence(unittest.TestCase):
             self._reference(logits, candidates, retrieve_index)
 
 
+class TestVerifyPostFusedEquivalence(unittest.TestCase):
+    """Fused post-verify must match seq-len add + gather + bonus fill."""
+
+    def test_matches_the_unfused_sequence(self):
+        from sglang.srt.speculative.eagle_utils import verify_post_fused_func
+
+        torch.manual_seed(1)
+        for bs, width, ndt in ((1, 4, 4), (3, 4, 4), (2, 3, 6)):
+            seq_lens = torch.randint(8, 64, (bs,), dtype=torch.int32)
+            accept_lens = torch.randint(1, width + 1, (bs,), dtype=torch.int32)
+            predict = torch.randint(0, 1000, (bs * ndt,), dtype=torch.int32)
+            accept_index = torch.randint(0, bs * ndt, (bs, width), dtype=torch.int32)
+
+            got_seq, got_bonus = verify_post_fused_func(
+                seq_lens, accept_lens, predict, accept_index, width
+            )
+
+            want_seq = seq_lens + accept_lens
+            accept_tokens = predict[accept_index]
+            want_bonus = torch.empty_like(accept_lens, dtype=torch.int32)
+            for i in range(bs):
+                want_bonus[i] = accept_tokens.reshape(-1)[
+                    width * i + int(accept_lens[i]) - 1
+                ]
+
+            with self.subTest(bs=bs, width=width):
+                self.assertTrue(torch.equal(got_seq, want_seq))
+                self.assertTrue(torch.equal(got_bonus, want_bonus))
+
+    def test_uses_accept_width_not_num_draft_tokens(self):
+        # For topk > 1 trees accept_index.shape[1] (spec_steps + 1) differs
+        # from num_draft_tokens; the stride must follow the former.
+        from sglang.srt.speculative.eagle_utils import verify_post_fused_func
+
+        bs, width, ndt = 2, 3, 6
+        seq_lens = torch.zeros(bs, dtype=torch.int32)
+        accept_lens = torch.tensor([3, 3], dtype=torch.int32)
+        predict = torch.arange(bs * ndt, dtype=torch.int32)
+        accept_index = torch.arange(bs * width, dtype=torch.int32).reshape(bs, width)
+
+        _, bonus = verify_post_fused_func(
+            seq_lens, accept_lens, predict, accept_index, width
+        )
+        # flat positions width*i + accept_lens[i]-1 = 2 and 5
+        self.assertEqual(bonus.tolist(), [2, 5])
+
+
 if __name__ == "__main__":
     unittest.main()
