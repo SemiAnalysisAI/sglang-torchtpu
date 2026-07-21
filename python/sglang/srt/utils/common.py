@@ -4396,3 +4396,41 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+def tpu_fused_spec_op(fn):
+    """Lazily ``torch.compile(backend="tpu")`` a pure spec-decoding helper.
+
+    On torch_tpu every eager op on a device tensor is one serialized
+    ``tt_jit_*`` dispatch (~50-100us of host latency), and the spec-decode
+    step spends much of its device-idle time in these dispatch chains.
+    Wrapping a pure tensor->tensor helper compiles its ops into ONE dispatch.
+
+    The compile applies only when the inputs actually live on a ``tpu``
+    device -- CPU unit tests keep exercising the identical eager path -- and
+    can be disabled with ``SGLANG_TPU_ENABLE_FUSED_SPEC_OPS=0``. The wrapped
+    helper must be compile-safe: no ``.item()`` / ``.cpu()`` / data-dependent
+    Python branching, and every shape-determining argument static per compile
+    bucket.
+    """
+    compiled_holder: List[Any] = []
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        device_type = None
+        for a in args:
+            if isinstance(a, torch.Tensor):
+                device_type = a.device.type
+                break
+            if isinstance(a, (list, tuple)) and a and isinstance(a[0], torch.Tensor):
+                device_type = a[0].device.type
+                break
+        if device_type != "tpu" or not envs.SGLANG_TPU_ENABLE_FUSED_SPEC_OPS.get():
+            return fn(*args, **kwargs)
+        if not compiled_holder:
+            compiled_holder.append(
+                torch.compile(fn, backend="tpu", fullgraph=False, dynamic=False)
+            )
+        return compiled_holder[0](*args, **kwargs)
+
+    return wrapper
