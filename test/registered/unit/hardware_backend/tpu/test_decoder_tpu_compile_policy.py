@@ -760,6 +760,7 @@ class TestSpecUnpadOutputs(CustomTestCase):
             capture_hidden_mode=capture,
             batch_size=rows,
             seq_lens=torch.zeros(rows, dtype=torch.int32),
+            spec_info=None,
             _tpu_real_q=real_q,
             _tpu_real_b=real_b,
         )

@@ -423,6 +423,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         setattr(forward_batch, _REAL_Q_KEY, real_q)
         setattr(forward_batch, _REAL_B_KEY, real_b)
+        spec_info = forward_batch.spec_info
+        if spec_info is not None:
+            spec_info.record_padding(
+                logical_batch_size=real_b,
+                physical_batch_size=int(forward_batch.seq_lens.shape[0]),
+                logical_num_tokens=real_q,
+                physical_num_tokens=int(forward_batch.input_ids.shape[0]),
+            )
 
     def _install_dp_idle_as_decode(self) -> None:
         """Run idle DP batches as DECODE.
