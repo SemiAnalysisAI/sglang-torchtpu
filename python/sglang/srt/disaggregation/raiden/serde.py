@@ -13,8 +13,24 @@ from typing import List
 import numpy as np
 
 # ZMQ multipart headers exchanged over the existing per-rank PULL sockets.
+# Symmetric-TP pull path (decode TP == prefill TP):
 PULL_REQ = b"RAIDEN_PULL_REQ"  # decode -> prefill: "send me room R's blocks"
 BLOCKS = b"RAIDEN_BLOCKS"  # prefill -> decode: block-ids + endpoint + aux
+
+# Asymmetric-TP push-resharding path (decode TP < prefill TP)
+RESHARD_REQ = b"RAIDEN_RESHARD_REQ"  # decode -> prefill: decode endpoint + blocks + tp
+RESHARD_BLOCKS = b"RAIDEN_RESHARD_BLOCKS"  # prefill -> decode: prefill blocks + rank
+RESHARD_READY = (
+    b"RAIDEN_RESHARD_READY"  # decode -> prefill: receiver registered, push now
+)
+
+
+def pack_ints(values: List[int]) -> bytes:
+    return np.asarray(values, dtype=np.int64).tobytes()
+
+
+def unpack_ints(buf: bytes) -> List[int]:
+    return np.frombuffer(buf, dtype=np.int64).tolist()
 
 
 def pack_blocks(block_ids: List[int]) -> bytes:

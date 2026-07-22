@@ -464,6 +464,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # (H2D); hand it the pool so it can index_copy_ into the buffers.
         if hasattr(kv_manager, "attach_kv_pool"):
             kv_manager.attach_kv_pool(self.token_to_kv_pool)
+        # Global kv-head count from model config: the local pool tensor cannot
+        # provide it (packed sub-16-bit layouts pad the head dimension, and
+        # replicated GQA holds fewer distinct heads than head_num * attn_tp).
+        if not self.is_mla_backend:
+            kv_args.total_kv_head_num = (
+                self.scheduler.model_config.get_total_num_kv_heads()
+            )
         # Staging buffer setup (only when heterogeneous TP staging is enabled)
         if self.enable_staging and not self.is_mla_backend:
             kv_pool_for_heads = self.token_to_kv_pool
