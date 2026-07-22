@@ -4,7 +4,7 @@ import logging
 import math
 from collections import defaultdict
 from enum import IntEnum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
+    from sglang.srt.speculative.spec_info import SpecInput
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -217,6 +218,10 @@ def build_tree_kernel_efficient(
             dtype=packed_dtypes[packed_dtype_idx],
             device=device,
         )
+    elif tree_mask_mode == TreeMaskMode.FULL_MASK and _use_torch_native:
+        # TPU: the pallas attention masks causally (custom_mask=None) and never
+        # reads this dense mask.
+        tree_mask = torch.empty((0,), dtype=torch.bool, device=device)
     elif tree_mask_mode == TreeMaskMode.FULL_MASK:
         tree_mask = torch.full(
             (
@@ -514,6 +519,78 @@ def verify_tree_greedy_func(
     return predicts, accept_index, accept_token_num
 
 
+def verify_tree_greedy_from_logits(
+    *,
+    next_token_logits: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    max_tree_depth: int,
+    topk: int,
+    spec_info: SpecInput,
+    compile_policy: Any = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run greedy tree verification behind one logical-shape operation.
+
+    Platform compile policies may internally reuse padded model outputs and
+    shape the auxiliary buffers. Callers only provide logical candidates and
+    receive logical per-request results.
+    """
+    bs, draft_token_num = candidates.shape
+    logical_num_tokens = bs * draft_token_num
+    device = next_token_logits.device
+    predict = torch.zeros((logical_num_tokens,), dtype=torch.int32, device=device)
+    accept_index = torch.full(
+        (bs, max_tree_depth), -1, dtype=torch.int32, device=device
+    )
+    num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
+
+    if compile_policy is not None and _use_torch_native:
+        (
+            next_token_logits,
+            candidates,
+            retrieve_index,
+            predict,
+            accept_index,
+            num_correct_drafts,
+        ) = compile_policy.prepare_spec_verify(
+            next_token_logits,
+            candidates,
+            retrieve_index,
+            predict,
+            accept_index,
+            num_correct_drafts,
+            spec_info=spec_info,
+        )
+
+    physical_bs = candidates.shape[0]
+    target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
+        physical_bs, draft_token_num
+    )
+    predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+        predicts=predict,  # mutable
+        accept_index=accept_index,  # mutable
+        accept_token_num=num_correct_drafts,  # mutable
+        candidates=candidates,
+        retrieve_index=retrieve_index,
+        retrieve_next_token=retrieve_next_token,
+        retrieve_next_sibling=retrieve_next_sibling,
+        target_predict=target_predict,
+        topk=topk,
+    )
+
+    if compile_policy is not None and _use_torch_native:
+        predict, accept_index, num_correct_drafts = compile_policy.finalize_spec_verify(
+            predict,
+            accept_index,
+            num_correct_drafts,
+            bs,
+            spec_info=spec_info,
+        )
+    return predict, accept_index, num_correct_drafts
+
+
 def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
     """Width of the target hidden states fed into the draft model.
 
@@ -652,6 +729,7 @@ def eagle_sample(
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
     vocab_mask: torch.Tensor = None,
+    compile_policy: Any = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -720,30 +798,28 @@ def eagle_sample(
         )
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
-    predict_shape = list(next_token_logits.shape)[:-1]
-    predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
-    accept_index = torch.full(
-        (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
-    )
-    num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
     # Sample tokens
     target_predict = None
     if sampling_info.is_all_greedy or _is_npu or _is_hip or _is_xpu:
-        target_predict = torch.argmax(next_token_logits, dim=-1)
-        target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
-        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
-            predicts=predict,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=num_correct_drafts,  # mutable
+        predict, accept_index, num_correct_drafts = verify_tree_greedy_from_logits(
+            next_token_logits=next_token_logits,
             candidates=candidates,
             retrieve_index=verify_input.retrieve_index,
             retrieve_next_token=verify_input.retrieve_next_token,
             retrieve_next_sibling=verify_input.retrieve_next_sibling,
-            target_predict=target_predict,
+            max_tree_depth=verify_input.max_tree_depth,
             topk=verify_input.tree_topk,
+            compile_policy=compile_policy,
+            spec_info=verify_input,
         )
     else:
+        predict_shape = list(next_token_logits.shape)[:-1]
+        predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
+        accept_index = torch.full(
+            (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
+        )
+        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
         if _use_torch_native:
             top_k_renorm_prob = top_k_renorm_prob_func
             top_p_renorm_prob = top_p_renorm_prob_func

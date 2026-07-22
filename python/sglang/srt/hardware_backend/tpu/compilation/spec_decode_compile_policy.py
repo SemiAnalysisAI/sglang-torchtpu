@@ -6,6 +6,7 @@ import time
 from typing import Any, Callable
 
 import torch
+import torch.nn.functional as F
 import tqdm
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -579,7 +580,7 @@ class SpecDecodeCompilePolicyMixin:
             spec_info.topk_index = _pad_first_dim(spec_info.topk_index, pad_b)
             spec_info.hidden_states = _pad_first_dim(spec_info.hidden_states, pad_b)
 
-            # input_ids is built later by the per-step draft loop.
+            # Each draft step builds input_ids from these padded top-k tensors.
             spec_info.record_padding(
                 logical_batch_size=real_bs,
                 physical_batch_size=pad_b,
@@ -637,6 +638,103 @@ class SpecDecodeCompilePolicyMixin:
                 logical_num_tokens=real_tokens,
                 physical_num_tokens=pad_tokens,
             )
+
+    def prepare_spec_verify(
+        self,
+        next_token_logits: torch.Tensor,
+        candidates: torch.Tensor,
+        retrieve_index: torch.Tensor,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+        nums: torch.Tensor,
+        spec_info: SpecInput,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        # Pad the verify inputs/outputs to a bs bucket so verify_tree_greedy runs
+        # one static shape per bucket instead of recompiling per real batch size.
+        if self.b_bucketer is None:
+            return (
+                next_token_logits,
+                candidates,
+                retrieve_index,
+                predict,
+                accept_index,
+                nums,
+            )
+        bs, dtn = candidates.shape
+        logical_q = bs * dtn
+        padding_state = spec_info.padding_state
+        pad_bs = self.b_bucketer.next_bucket(bs)
+        pad_q = pad_bs * dtn
+        logits_q = next_token_logits.shape[0]
+        reuse_padded_logits = (
+            padding_state is not None
+            and logits_q == padding_state.physical_num_tokens
+            and logits_q != logical_q
+        )
+        if reuse_padded_logits:
+            if (
+                padding_state.logical_batch_size != bs
+                or padding_state.logical_num_tokens != logical_q
+                or padding_state.physical_batch_size != pad_bs
+                or padding_state.physical_num_tokens != pad_q
+            ):
+                raise ValueError(
+                    "Deferred greedy verify logits do not match the verify bucket: "
+                    f"state={padding_state}, logits rows={logits_q}, "
+                    f"expected ({pad_bs=}, {pad_q=})."
+                )
+        elif logits_q != logical_q:
+            raise ValueError(
+                "Greedy verify logits must contain one row per candidate: "
+                f"got {logits_q} rows for candidates shape {tuple(candidates.shape)}."
+            )
+
+        if pad_bs > bs:
+            if not reuse_padded_logits:
+                next_token_logits = F.pad(
+                    next_token_logits, (0, 0, 0, pad_q - logical_q)
+                )
+            candidates = F.pad(candidates, (0, 0, 0, pad_bs - bs))
+            retrieve_index = F.pad(retrieve_index, (0, 0, 0, pad_bs - bs), value=-1)
+            predict = predict.new_zeros((pad_q,))
+            accept_index = accept_index.new_full((pad_bs, accept_index.shape[1]), -1)
+            nums = nums.new_empty((pad_bs,))
+        spec_info.record_padding(
+            logical_batch_size=bs,
+            physical_batch_size=pad_bs,
+            logical_num_tokens=logical_q,
+            physical_num_tokens=pad_q,
+        )
+        return (
+            next_token_logits,
+            candidates,
+            retrieve_index,
+            predict,
+            accept_index,
+            nums,
+        )
+
+    def finalize_spec_verify(
+        self,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+        nums: torch.Tensor,
+        real_bs: int,
+        spec_info: SpecInput,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        state = spec_info.padding_state
+        logical_num_tokens = (
+            state.logical_num_tokens if state is not None else predict.shape[0]
+        )
+        spec_info.keep_outputs_padded = False
+        return predict[:logical_num_tokens], accept_index[:real_bs], nums[:real_bs]
 
 
 class SpecDecoderTpuCompilePolicy(
