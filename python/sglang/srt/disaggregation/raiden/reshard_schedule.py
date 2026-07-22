@@ -170,14 +170,34 @@ class ReshardGeometry:
         """Byte (src_offset, size, src_stride, dst_offset, dst_stride) for the
         prefill_rank -> decode_rank contribution, per token.
 
-        Offsets and size address real head pairs only (head ``h`` starts at
-        ``h * hp_bytes`` — for packed sub-16-bit KV that can be mid-granule);
-        the strides are granule-aligned token widths, so dummy planes are
-        skipped over, never copied.
+        Offsets and size address real head pairs (head ``h`` starts at
+        ``h * hp_bytes``); the strides are granule-aligned token widths, so
+        dummy planes are skipped over, never copied.
+
+        Every offset and the size must land on whole granules: the device pool
+        stores a granule TILED — its ``kv_packing`` planes interleaved into
+        32-bit lane words — so raw DMA bytes are in that tiled order, and only
+        granule-aligned ranges hold the same bytes in tiled and plane order.
+        A sub-granule range (one head of an fp8 two-head granule) is a byte
+        interleave of several heads and cannot be expressed as a single-stride
+        copy; such splits raise instead of building silently corrupt schedules.
         """
         sh_start, num_heads, dh_start, src_hpr, dst_hpr = head_slice_params(
             self.src_tp, self.dst_tp, prefill_rank, decode_rank, self.total_kv_heads
         )
+        for name, heads in (
+            ("src head offset", sh_start),
+            ("dst head offset", dh_start),
+            ("head count", num_heads),
+        ):
+            if (2 * heads) % self.kv_packing != 0:
+                raise NotImplementedError(
+                    f"raiden reshard: {name} of {heads} kv-head(s) splits a "
+                    f"{self.kv_packing}-plane granule (device granules are "
+                    "lane-tiled; sub-granule slices need a strided byte gather)."
+                    " Requires granule-aligned head splits — for fp8 an even "
+                    "kv-head count per rank on both sides."
+                )
         return (
             sh_start * self.hp_bytes,  # src_offset
             num_heads * self.hp_bytes,  # size

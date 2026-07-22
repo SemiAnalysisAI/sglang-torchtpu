@@ -105,29 +105,30 @@ class ReshardGeometryTest(unittest.TestCase):
         self.assertEqual(rs.head_pair_bytes(decode_t), 256)
         self.assertEqual(rs.kv_packing_of(prefill_t), 4)
 
-    def test_geometry_fp8_replication_skips_dummy_planes(self):
-        # fp8, total_kv_heads=4, 8TP -> 4TP: one real head per rank on both
-        # sides, so each side's granule is [K, V, dummy, dummy]. The copy is
-        # the 256B real pair inside a 512B granule-aligned token stride — the
-        # dummy planes are never inside a copied range on either side.
-        geom = rs.ReshardGeometry(
-            src_tp=8, dst_tp=4, hp_bytes=256, total_kv_heads=4, kv_packing=4
-        )
-        for p, r in [(0, 0), (1, 0), (6, 3), (7, 3)]:
-            self.assertEqual(geom.entry_bytes(p, r), (0, 256, 512, 0, 512))
+    def test_geometry_fp8_sub_granule_split_raises(self):
+        # fp8 with one real head per rank: the head is half of a lane-tiled
+        # granule, which a single-stride byte copy cannot extract. Both the
+        # replication shape (4 heads at 8TP) and the concat shape (8 heads at
+        # 8TP -> 4TP, mid-granule destination) must refuse.
+        for total in (4, 8):
+            geom = rs.ReshardGeometry(
+                src_tp=8, dst_tp=4, hp_bytes=256, total_kv_heads=total, kv_packing=4
+            )
+            with self.assertRaises(NotImplementedError):
+                geom.entry_bytes(1, 0)
 
-    def test_geometry_fp8_concat_lands_mid_granule(self):
-        # fp8, total_kv_heads=8, 8TP -> 4TP: decode packs its two heads into
-        # one full granule [K0, V0, K1, V1]; writer 1's pair lands mid-granule
-        # at byte 256. Source granules are [K, V, dummy, dummy] (512B stride).
+    def test_geometry_fp8_granule_aligned_concat(self):
+        # fp8, total_kv_heads=16, 8TP -> 4TP: each prefill rank owns one full
+        # granule (2 heads), each decode rank two; writers land at whole-granule
+        # offsets 0 and 512, so the lane-tiled granule content is moved intact.
         geom = rs.ReshardGeometry(
-            src_tp=8, dst_tp=4, hp_bytes=256, total_kv_heads=8, kv_packing=4
+            src_tp=8, dst_tp=4, hp_bytes=256, total_kv_heads=16, kv_packing=4
         )
-        for p, r, exp_dst_off in [(0, 0, 0), (1, 0, 256), (6, 3, 0), (7, 3, 256)]:
+        for p, r, exp_dst_off in [(0, 0, 0), (1, 0, 512), (6, 3, 0), (7, 3, 512)]:
             src_off, size, src_stride, dst_off, dst_stride = geom.entry_bytes(p, r)
-            self.assertEqual((src_off, size, src_stride), (0, 256, 512))
+            self.assertEqual((src_off, size, src_stride), (0, 512, 512))
             self.assertEqual(dst_off, exp_dst_off)
-            self.assertEqual(dst_stride, 512)  # one full granule, no dummies
+            self.assertEqual(dst_stride, 1024)  # two granules per decode token
 
     def test_token_stride_rounds_up_to_whole_granules(self):
         geom = rs.ReshardGeometry(

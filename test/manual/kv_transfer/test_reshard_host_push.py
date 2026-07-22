@@ -22,9 +22,9 @@ Covers:
     the same offset -- redundant but idempotent.
   * mixed replication+concat at ratio 4 (8TP -> 2TP attention, 4 kv-heads):
     the 2TP x 4DP decode topology, four writers per decode rank.
-  * fp8 packed layout (kv_packing=4): head pairs addressed at plane
-    granularity inside shared granules — mid-granule destination offsets,
-    granule-aligned strides, and dummy planes that are never read or written.
+  * fp8 packed layout (kv_packing=4): granule-aligned head splits move whole
+    lane-tiled granules as opaque payload (dummy planes never read or
+    written); sub-granule splits are refused at schedule build.
   * partial pages: tokens past ``live_tokens`` stay untouched.
 
 Requires the tpu_raiden host bindings (no TPU or torch_tpu runtime):
@@ -280,37 +280,36 @@ class ReshardHostPushTest(unittest.TestCase):
             live_tokens=[TOKENS_PER_BLOCK],
         )
 
-    def test_fp8_replication_dummy_planes_stay_untouched(self):
-        # fp8 layout (kv_packing=4, head-pair 256B): one real head per rank on
-        # both sides, so every granule is [K, V, dummy, dummy]. The 256B pair
-        # is copied out of a 512B-stride source token; the destination's dummy
-        # planes must keep the dest poison and the sources' SRC_DUMMY filler
-        # must never appear.
-        self._run_reshard(
-            src_tp=8,
-            dst_tp=4,
-            total_kv_heads=4,
-            decode_rank=1,
-            src_block_ids=[0, 2],
-            dst_block_ids=[3, 1],
-            live_tokens=[TOKENS_PER_BLOCK, TOKENS_PER_BLOCK // 2],
-            hp_bytes=256,
-            kv_packing=4,
-        )
+    def test_fp8_sub_granule_split_refused(self):
+        # fp8 with one real head per rank on either side: the head is half of
+        # a lane-tiled device granule, which single-stride byte entries cannot
+        # extract, so schedule building must refuse before any bytes move.
+        with self.assertRaises(NotImplementedError):
+            self._run_reshard(
+                src_tp=8,
+                dst_tp=4,
+                total_kv_heads=8,
+                decode_rank=1,
+                src_block_ids=[1],
+                dst_block_ids=[2],
+                live_tokens=[TOKENS_PER_BLOCK],
+                hp_bytes=256,
+                kv_packing=4,
+            )
 
-    def test_fp8_concat_interleaves_mid_granule(self):
-        # fp8, 8 kv-heads at 8TP -> 4TP: each source granule is
-        # [K_h, V_h, dummy, dummy]; the decode granule packs both heads
-        # [K_2, V_2, K_3, V_3], so writer 1's pair lands mid-granule at byte
-        # 256 and no dummy planes exist on the destination.
+    def test_fp8_granule_aligned_concat(self):
+        # fp8, 16 kv-heads at 8TP -> 4TP: every rank's slice is whole granules
+        # (source 1 granule/token, decode 2), writers land at granule offsets
+        # 0 and 512. Granule-aligned entries move tiled granules as opaque
+        # payload, so this geometry is valid on-device as well.
         self._run_reshard(
             src_tp=8,
             dst_tp=4,
-            total_kv_heads=8,
+            total_kv_heads=16,
             decode_rank=1,
             src_block_ids=[1, 3],
             dst_block_ids=[2, 0],
-            live_tokens=[TOKENS_PER_BLOCK, TOKENS_PER_BLOCK],
+            live_tokens=[TOKENS_PER_BLOCK, TOKENS_PER_BLOCK // 2],
             hp_bytes=256,
             kv_packing=4,
         )

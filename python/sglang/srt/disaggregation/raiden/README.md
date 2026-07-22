@@ -36,11 +36,18 @@ Schedules are built in `reshard_schedule.py` (unit-tested in
 host managers in `test/manual/kv_transfer/test_reshard_host_push.py`). Requires
 `ratio` to divide the total kv-head count evenly. The byte unit is one kv-head's
 contiguous K+V plane pair (`head_pair_bytes`); per-token strides are the fused
-pool's granule-aligned widths (`kv_packing` planes per 32-bit granule), so packed
-sub-16-bit KV (e.g. fp8, two heads per granule) is addressed at plane
-granularity — mid-granule destination offsets, dummy planes never copied. A
-packed pool without `kv_args.total_kv_head_num` is rejected (the real head count
-is not derivable from a padded tensor shape).
+pool's granule-aligned widths (`kv_packing` planes per 32-bit granule), and dummy
+planes of a partly-filled granule are never copied. Head splits must be
+granule-aligned: the device pool stores each granule lane-tiled (its planes
+interleaved into 32-bit words — byte-interleaved for fp8, 2-byte for bf16), so
+raw DMA moves granules as opaque tiled payload and only whole-granule ranges are
+byte-portable. For 16-bit KV every split is granule-aligned (granule == one
+head's pair); for fp8 both sides need an even kv-head count per rank, and
+sub-granule splits (e.g. 1 head/rank) raise at schedule build — extracting one
+head from a two-head fp8 granule needs a strided byte gather no single-stride
+copy can express (the ZMQ backend has the same restriction). A packed pool
+without `kv_args.total_kv_head_num` is rejected (the real head count is not
+derivable from a padded tensor shape).
 
 DP-attention replicas that co-locate on a decode host get distinct raiden control
 ports via `base + 2*(attn_dp_rank*attn_tp_size + attn_tp_rank)` (reduces to
