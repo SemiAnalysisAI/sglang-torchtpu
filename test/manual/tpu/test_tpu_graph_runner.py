@@ -33,6 +33,12 @@ DECODER_POLICY_PRECOMPILE = (
 )
 
 
+class _ServerArgs(SimpleNamespace):
+    def override(self, _source: str, **fields: Any) -> None:
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+
 def _model_with(**attrs: Any) -> Any:
     """Return a bare object with the given attributes.
 
@@ -106,7 +112,7 @@ class TestTpuGraphRunner(CustomTestCase):
             model_config=SimpleNamespace(context_len=2048),
             max_running_requests=1,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            server_args=SimpleNamespace(
+            server_args=_ServerArgs(
                 enable_torch_compile=enable_torch_compile,
                 tpu_compile_tokens=None,
                 tpu_compile_bs=None,
@@ -158,6 +164,25 @@ class TestTpuGraphRunner(CustomTestCase):
         TpuGraphRunner(self._runner_for(model))
         self.assertEqual(self.mock_compile.call_count, 1)
         self.assertIs(model.forward_split_prefill, original_split)
+
+    def test_prepare_forward_batch_composes_model_and_policy_hooks(self):
+        model_prepare = MagicMock()
+        model = self._annotate(
+            _model_with(
+                forward=MagicMock(),
+                prepare_forward_batch=model_prepare,
+            )
+        )
+        runner = self._runner_for(model)
+        TpuGraphRunner(runner)
+        policy_prepare = MagicMock()
+        runner.compile_policy.prepare_forward_batch = policy_prepare
+        forward_batch = object()
+
+        model.prepare_forward_batch(forward_batch)
+
+        model_prepare.assert_called_once_with(forward_batch)
+        policy_prepare.assert_called_once_with(forward_batch)
 
     def test_respects_can_torch_compile_false(self):
         original = MagicMock()
@@ -254,9 +279,6 @@ class TestTpuGraphRunner(CustomTestCase):
             def precompile(self) -> None:
                 self.owner.precompiled = True
 
-            def unpad_outputs(self, out: Any, context: Any) -> Any:
-                return out
-
         class _VisionModule:
             def forward(self):
                 pass
@@ -285,9 +307,6 @@ class TestTpuGraphRunner(CustomTestCase):
 
             def precompile(self) -> None:
                 self.owner.precompiled = True
-
-            def unpad_outputs(self, out: Any, context: Any) -> Any:
-                return out
 
         foreign_module = _model_with(forward=MagicMock())
         support_torch_compile(foreign_module, policy=_CudaPolicy)
@@ -330,13 +349,126 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertIs(getattr(modules[sampling_path], target), eager)
 
     def test_can_run_is_always_false(self):
-        # ModelRunner.forward branches on `graph_runner.can_run(...)`
+        # ModelRunner.forward branches on `graph_runner.can_run_graph(...)`
         # to decide whether to replay a captured graph. TPU has no
         # captured graph (PJRT caches HLO internally), so this must
         # be False for every forward mode so the replay path stays off.
         model = self._annotate(_model_with(forward=MagicMock()))
         runner = TpuGraphRunner(self._runner_for(model))
-        self.assertFalse(runner.can_run(MagicMock()))
+        self.assertFalse(runner.can_run_graph(MagicMock()))
+
+
+class TestDraftTorchCompileInstall(CustomTestCase):
+    """A runner that skips decode-graph capture must still be compiled on TPU.
+
+    Speculative draft runners pass ``capture_decode_cuda_graph=False`` (they
+    capture their own decode-style graphs). On TPU ``init_decode_cuda_graph``
+    performs no capture — it only installs torch.compile — so that flag must
+    not switch compilation off for the draft model.
+    """
+
+    @staticmethod
+    def _runner(device="tpu"):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.device = device
+        runner.init_decode_cuda_graph = MagicMock()
+        return runner
+
+    def _call(self, device, enable_torch_compile):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        runner = self._runner(device)
+        with patch(
+            "sglang.srt.model_executor.model_runner.get_flags",
+            return_value=SimpleNamespace(
+                capture=SimpleNamespace(enable_torch_compile=enable_torch_compile)
+            ),
+        ), patch(
+            "sglang.srt.model_executor.model_runner."
+            "GraphSharedOutput.create_for_model_runner"
+        ), patch(
+            "sglang.srt.model_executor.model_runner.EagerRunner"
+        ):
+            runner.init_prefill_cuda_graph = MagicMock()
+            runner.server_args = SimpleNamespace(forward_hooks=[])
+            runner.prealloc_symmetric_memory_pool = MagicMock()
+            runner.canary_manager = None
+            ModelRunner.init_cuda_graphs(runner, capture_decode_cuda_graph=False)
+        return runner
+
+    def test_installs_on_tpu_when_compile_enabled(self):
+        runner = self._call("tpu", True)
+        runner.init_decode_cuda_graph.assert_called_once_with()
+
+    def test_noop_when_torch_compile_disabled(self):
+        runner = self._call("tpu", False)
+        runner.init_decode_cuda_graph.assert_not_called()
+
+    def test_noop_off_tpu(self):
+        runner = self._call("cuda", True)
+        runner.init_decode_cuda_graph.assert_not_called()
+
+
+class TestDraftPrecompileOrdering(CustomTestCase):
+    """Draft precompile must run after the policy is installed.
+
+    The scheduler runs every worker's ``init_attention_backends()`` before any
+    ``init_cuda_graphs()``, and the draft policy is installed by the latter.
+    Warming draft shapes from ``init_attention_backend`` would therefore always
+    hit ``NoopCompilePolicy``.
+    """
+
+    def test_precompile_runs_after_draft_init_cuda_graphs(self):
+        import contextlib
+
+        from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+        events = []
+        worker = object.__new__(EagleDraftWorker)
+        worker.draft_tp_context = lambda _group: contextlib.nullcontext()
+        worker.draft_runner = SimpleNamespace(
+            tp_group=object(),
+            canary_manager=None,
+            init_prefill_cuda_graph=MagicMock(),
+            compile_policy=SimpleNamespace(
+                precompile_draft=MagicMock(
+                    side_effect=lambda *_args: events.append("precompile")
+                )
+            ),
+        )
+        worker.draft_attn_backend = object()
+        worker.draft_extend_attn_backend = object()
+        worker.draft_worker = SimpleNamespace(
+            init_cuda_graphs=MagicMock(
+                side_effect=lambda **_kwargs: events.append("install")
+            )
+        )
+        worker._capture_cuda_graphs = MagicMock(
+            side_effect=lambda: events.append("capture")
+        )
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2." "speculative_moe_backend_context",
+            side_effect=contextlib.nullcontext,
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_v2."
+            "speculative_moe_a2a_backend_context",
+            side_effect=contextlib.nullcontext,
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_v2.check_cuda_graph_backend",
+            return_value=False,
+        ):
+            worker.init_cuda_graphs()
+
+        self.assertEqual(events, ["install", "precompile", "capture"])
+        worker.draft_worker.init_cuda_graphs.assert_called_once_with(
+            capture_decode_cuda_graph=False
+        )
+        worker.draft_runner.compile_policy.precompile_draft.assert_called_once_with(
+            worker.draft_attn_backend, worker.draft_extend_attn_backend
+        )
 
 
 if __name__ == "__main__":
