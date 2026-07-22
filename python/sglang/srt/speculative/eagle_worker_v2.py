@@ -550,6 +550,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     not forward_batch.forward_mode.is_idle()
                     and self.speculative_num_steps > 1
                 ):
+                    spec_info: EagleDraftInput = forward_batch.spec_info
+                    spec_info.keep_outputs_padded = True
                     self.draft_runner.compile_policy.prepare_spec_forward_batch(
                         forward_batch
                     )
