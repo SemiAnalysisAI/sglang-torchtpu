@@ -1573,6 +1573,31 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
+        target_compile_policy = self.target_worker.model_runner.compile_policy
+        # Greedy verify consumes the target logits directly, so the padded rows
+        # can stay padded through the forward. Every other sampling path reshapes
+        # per-request sampling metadata against the logits and needs real shapes.
+        sampling_info = batch.sampling_info
+        defer_output_unpad = (
+            not batch.forward_mode.is_idle()
+            and sampling_info.is_all_greedy
+            and not batch.has_grammar
+            and not batch.return_logprob
+            and sampling_info.acc_additive_penalties is None
+            and sampling_info.acc_scaling_penalties is None
+            and sampling_info.logit_bias is None
+        )
+        # The verify token count is known before eagle_prepare_for_verify
+        # replaces batch.input_ids with the draft tokens.
+        verify_num_tokens = bs * self.speculative_num_draft_tokens
+        verify_input.record_padding(
+            logical_batch_size=bs,
+            physical_batch_size=bs,
+            logical_num_tokens=verify_num_tokens,
+            physical_num_tokens=verify_num_tokens,
+        )
+        if defer_output_unpad:
+            verify_input.keep_outputs_padded = True
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
@@ -1664,7 +1689,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
             predict,
             accept_lens,
             accept_index,
-        ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+        ) = eagle_sample(
+            verify_input,
+            batch,
+            logits_output,
+            vocab_mask,
+            compile_policy=target_compile_policy,
+        )
+        if defer_output_unpad:
+            # The compiled forward left the target outputs at their padded
+            # shape for greedy verify; restore them now that verify is done.
+            logits_output = target_compile_policy.finalize_forward_batch(
+                logits_output, verify_forward_batch
+            )
         new_seq_lens = batch.seq_lens + accept_lens
         clear_unaccepted_c128 = getattr(
             self.token_to_kv_pool_allocator.get_kvcache(),

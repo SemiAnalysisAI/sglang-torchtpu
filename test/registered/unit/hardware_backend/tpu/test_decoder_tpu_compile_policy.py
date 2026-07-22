@@ -27,7 +27,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
+    EagleDraftInput,
+    EagleVerifyInput,
+)
+from sglang.srt.speculative.eagle_utils import verify_tree_greedy_from_logits
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -982,6 +987,362 @@ class TestSpecUnpadOutputs(CustomTestCase):
         policy.finalize_forward_batch(out, fb)
         self.assertEqual(out.next_token_logits.shape[0], 4)
         self.assertEqual(out.hidden_states.shape[0], 4)
+
+    def test_final_draft_outputs_restore_real_batch_size(self):
+        policy = _make_spec_policy()
+        fb = SimpleNamespace(_tpu_real_b=2, batch_size=4, spec_info=None)
+        outputs = (torch.arange(4), torch.arange(8).reshape(4, 2), None)
+
+        unpadded = policy.finalize_spec_forward_batch(outputs, fb)
+
+        self.assertEqual([t.shape[0] for t in unpadded[:2]], [2, 2])
+        self.assertIsNone(unpadded[2])
+        self.assertEqual(fb.batch_size, 2)
+
+
+class TestSpecVerifyPadding(CustomTestCase):
+    """Greedy verify runs at a bs bucket and hands back logical-shaped results."""
+
+    @staticmethod
+    def _spec_info():
+        return EagleVerifyInput.create_idle_input(
+            topk=1,
+            spec_steps=3,
+            num_verify_tokens=4,
+            device="cpu",
+        )
+
+    @staticmethod
+    def _inputs(bs=2, draft_token_num=4, vocab_size=8):
+        num_tokens = bs * draft_token_num
+        return (
+            torch.zeros((num_tokens, vocab_size)),
+            torch.arange(num_tokens, dtype=torch.int32).reshape(bs, draft_token_num),
+            torch.arange(num_tokens, dtype=torch.int32).reshape(bs, draft_token_num),
+            torch.zeros((num_tokens,), dtype=torch.int32),
+            torch.full((bs, draft_token_num), -1, dtype=torch.int32),
+            torch.empty((bs,), dtype=torch.int32),
+        )
+
+    def test_pads_only_verify_tensors_to_batch_bucket(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+
+        logits, candidates, retrieve_index, predict, accept_index, nums = (
+            policy.prepare_spec_verify(*self._inputs(bs=2), spec_info=self._spec_info())
+        )
+
+        self.assertEqual(logits.shape, (16, 8))
+        self.assertEqual(candidates.shape, (4, 4))
+        self.assertEqual(retrieve_index.shape, (4, 4))
+        self.assertEqual(predict.shape, (16,))
+        self.assertEqual(accept_index.shape, (4, 4))
+        self.assertEqual(nums.shape, (4,))
+        self.assertTrue(torch.all(retrieve_index[2:] == -1))
+        self.assertTrue(torch.all(accept_index == -1))
+
+    def test_at_bucket_returns_the_original_tensors(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+        inputs = self._inputs(bs=4)
+
+        outputs = policy.prepare_spec_verify(*inputs, spec_info=self._spec_info())
+
+        self.assertTrue(
+            all(output is input_ for output, input_ in zip(outputs, inputs))
+        )
+
+    def test_rejects_logits_candidate_shape_mismatch(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+        inputs = list(self._inputs(bs=2))
+        inputs[0] = inputs[0][:-1]
+
+        with self.assertRaisesRegex(ValueError, "one row per candidate"):
+            policy.prepare_spec_verify(*inputs, spec_info=self._spec_info())
+
+    def test_records_padding_state(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+        spec_info = self._spec_info()
+
+        outputs = policy.prepare_spec_verify(*self._inputs(bs=2), spec_info=spec_info)
+
+        state = spec_info.padding_state
+        self.assertEqual(state.logical_batch_size, 2)
+        self.assertEqual(state.physical_batch_size, 4)
+        self.assertEqual(state.logical_num_tokens, 8)
+        self.assertEqual(state.physical_num_tokens, 16)
+
+        predict, accept_index, nums = policy.finalize_spec_verify(
+            outputs[3], outputs[4], outputs[5], 2, spec_info=spec_info
+        )
+        # predict is the batch's next_token_ids: back to the logical width.
+        self.assertEqual(predict.shape, (8,))
+        self.assertEqual(accept_index.shape, (2, 4))
+        self.assertEqual(nums.shape, (2,))
+
+    def test_reuses_deferred_padded_logits(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+        spec_info = self._spec_info()
+        spec_info.record_padding(
+            logical_batch_size=2,
+            physical_batch_size=4,
+            logical_num_tokens=8,
+            physical_num_tokens=16,
+        )
+        inputs = list(self._inputs(bs=2))
+        padded_logits = torch.zeros((16, 8))
+        inputs[0] = padded_logits
+
+        outputs = policy.prepare_spec_verify(*inputs, spec_info=spec_info)
+
+        self.assertIs(outputs[0], padded_logits)
+        self.assertEqual(outputs[1].shape, (4, 4))
+        self.assertEqual(outputs[2].shape, (4, 4))
+        self.assertEqual(outputs[3].shape, (16,))
+
+    def test_rejects_deferred_logits_from_a_different_bucket(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+        spec_info = self._spec_info()
+        spec_info.record_padding(
+            logical_batch_size=2,
+            physical_batch_size=3,
+            logical_num_tokens=8,
+            physical_num_tokens=12,
+        )
+        inputs = list(self._inputs(bs=2))
+        inputs[0] = torch.zeros((12, 8))
+
+        with self.assertRaisesRegex(ValueError, "do not match the verify bucket"):
+            policy.prepare_spec_verify(*inputs, spec_info=spec_info)
+
+    def test_greedy_verify_operation_hides_deferred_padding(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+        spec_info = self._spec_info()
+        spec_info.record_padding(
+            logical_batch_size=2,
+            physical_batch_size=4,
+            logical_num_tokens=8,
+            physical_num_tokens=16,
+        )
+        candidates = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.int32)
+        logits = torch.zeros((16, 10))
+        target_tokens = torch.tensor([2, 3, 4, 9, 6, 7, 8, 9])
+        logits[torch.arange(8), target_tokens] = 1
+        retrieve_index = torch.arange(8, dtype=torch.int32).reshape(2, 4)
+
+        predict, accept_index, num_correct = verify_tree_greedy_from_logits(
+            next_token_logits=logits,
+            candidates=candidates,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=torch.empty(0, dtype=torch.int32),
+            retrieve_next_sibling=torch.empty(0, dtype=torch.int32),
+            max_tree_depth=4,
+            topk=1,
+            compile_policy=policy,
+            spec_info=spec_info,
+        )
+
+        self.assertEqual(accept_index.tolist(), [[0, 1, 2, 3], [4, 5, 6, 7]])
+        self.assertEqual(num_correct.tolist(), [3, 3])
+        self.assertEqual(predict.tolist(), target_tokens.tolist())
+
+    def test_keep_outputs_padded_survives_padding_update(self):
+        spec_info = self._spec_info()
+        spec_info.keep_outputs_padded = True
+        spec_info.record_padding(
+            logical_batch_size=2,
+            physical_batch_size=2,
+            logical_num_tokens=5,
+            physical_num_tokens=8,
+        )
+        state = spec_info.record_padding(
+            logical_batch_size=2,
+            physical_batch_size=4,
+            logical_num_tokens=5,
+            physical_num_tokens=16,
+        )
+        self.assertEqual(state.logical_num_tokens, 5)
+        self.assertEqual(state.physical_num_tokens, 16)
+        self.assertTrue(spec_info.keep_outputs_padded)
+
+        spec_info.keep_outputs_padded = False
+        state = spec_info.record_padding(
+            logical_batch_size=3,
+            physical_batch_size=4,
+            logical_num_tokens=12,
+            physical_num_tokens=16,
+        )
+        self.assertEqual(state.logical_batch_size, 3)
+        self.assertEqual(state.logical_num_tokens, 12)
+        self.assertFalse(spec_info.keep_outputs_padded)
+
+    def test_finalize_spec_verify_clears_keep_outputs_padded(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+        spec_info = self._spec_info()
+        spec_info.keep_outputs_padded = True
+        spec_info.record_padding(
+            logical_batch_size=2,
+            physical_batch_size=4,
+            logical_num_tokens=8,
+            physical_num_tokens=16,
+        )
+
+        outputs = policy.prepare_spec_verify(*self._inputs(bs=2), spec_info=spec_info)
+        policy.finalize_spec_verify(
+            outputs[3], outputs[4], outputs[5], 2, spec_info=spec_info
+        )
+
+        self.assertFalse(spec_info.keep_outputs_padded)
+
+
+class TestSpecForwardBatchPreparation(CustomTestCase):
+    """``prepare_spec_forward_batch`` dispatches on the draft forward mode."""
+
+    @staticmethod
+    def _policy():
+        policy = _make_spec_policy()
+        policy._pad_draft_decode = MagicMock()
+        policy._pad_draft_extend = MagicMock()
+        return policy
+
+    def test_draft_decode_dispatches(self):
+        policy = self._policy()
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+        policy.prepare_spec_forward_batch(forward_batch)
+
+        policy._pad_draft_decode.assert_called_once_with(forward_batch)
+
+    def test_draft_extend_dispatches(self):
+        policy = self._policy()
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2)
+
+        policy.prepare_spec_forward_batch(forward_batch)
+
+        policy._pad_draft_extend.assert_called_once_with(forward_batch)
+
+    def test_idle_is_noop(self):
+        policy = self._policy()
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.IDLE)
+
+        policy.prepare_spec_forward_batch(forward_batch)
+
+        policy._pad_draft_decode.assert_not_called()
+        policy._pad_draft_extend.assert_not_called()
+
+    def test_target_verify_is_noop(self):
+        policy = self._policy()
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+
+        policy.prepare_spec_forward_batch(forward_batch)
+
+        policy._pad_draft_decode.assert_not_called()
+        policy._pad_draft_extend.assert_not_called()
+
+    def test_draft_decode_buckets_before_input_ids_are_built(self):
+        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
+        draft_input = EagleDraftInput(
+            topk_p=torch.zeros((2, 1)),
+            topk_index=torch.zeros((2, 1), dtype=torch.int64),
+            hidden_states=torch.zeros((2, 16)),
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            spec_info=draft_input,
+            input_ids=None,
+            seq_lens=torch.tensor([8, 7], dtype=torch.int32),
+            req_pool_indices=torch.tensor([0, 1]),
+            positions=torch.arange(2),
+            out_cache_loc=torch.arange(2),
+            mm_inputs=None,
+            batch_size=2,
+        )
+
+        policy.prepare_spec_forward_batch(forward_batch)
+
+        self.assertEqual(forward_batch.batch_size, 4)
+        self.assertEqual(forward_batch._tpu_real_b, 2)
+        self.assertEqual(forward_batch.seq_lens.shape[0], 4)
+        self.assertEqual(draft_input.topk_p.shape[0], 4)
+        state = draft_input.padding_state
+        self.assertEqual(state.logical_batch_size, 2)
+        self.assertEqual(state.physical_batch_size, 4)
+        self.assertEqual(state.logical_num_tokens, 2)
+        self.assertEqual(state.physical_num_tokens, 4)
+
+    def test_draft_extend_buckets_to_the_full_tree_width(self):
+        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
+        draft_extend_input = EagleDraftExtendInput(
+            hidden_states=torch.zeros((8, 8)),
+            num_correct_drafts=torch.tensor([2, 1], dtype=torch.int32),
+            num_accept_tokens=torch.tensor([3, 2], dtype=torch.int32),
+            num_accept_tokens_cpu=[3, 2],
+            input_ids=torch.arange(8),
+            seq_lens=torch.tensor([8, 7], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([8, 7], dtype=torch.int32),
+            req_pool_indices=torch.tensor([0, 1]),
+            positions=torch.arange(8),
+        )
+        pad_calls = []
+
+        def fake_pad_inputs_to_size(model_runner, num_tokens, bs):
+            pad_calls.append((num_tokens, bs))
+
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            spec_info=draft_extend_input,
+            input_ids=draft_extend_input.input_ids,
+            seq_lens=draft_extend_input.seq_lens,
+            batch_size=2,
+            _pad_inputs_to_size=fake_pad_inputs_to_size,
+        )
+
+        policy.prepare_spec_forward_batch(forward_batch)
+
+        # bs=2 buckets to 4; draft extend fills draft_token_num (=4) per request.
+        self.assertEqual(pad_calls, [(16, 4)])
+        self.assertEqual(forward_batch.batch_size, 4)
+        self.assertEqual(forward_batch._tpu_real_b, 2)
+        state = draft_extend_input.padding_state
+        self.assertEqual(state.logical_batch_size, 2)
+        self.assertEqual(state.physical_batch_size, 4)
+        self.assertEqual(state.logical_num_tokens, 8)
+        self.assertEqual(state.physical_num_tokens, 16)
+
+
+class TestDraftPrecompile(CustomTestCase):
+    """``precompile_draft`` warms the three draft forward families."""
+
+    def test_draft_worker_compiles_prefill_decode_and_extend(self):
+        mr = _spec_model_runner(is_draft_worker=True, num_steps=3)
+        policy = _make_spec_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
+        step_backends = [_FakeAttnBackend() for _ in range(3)]
+        draft_attn_backend = SimpleNamespace(attn_backends=step_backends)
+        draft_extend_attn_backend = _FakeAttnBackend()
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy."
+            "get_tensor_model_parallel_rank",
+            return_value=1,
+        ):
+            policy.precompile_draft(draft_attn_backend, draft_extend_attn_backend)
+
+        # EXTEND(LAST) 2 token buckets at the bs cap + DECODE 2 bs x 3 steps
+        # + DRAFT_EXTEND_V2 2 bs buckets.
+        self.assertEqual(mr.model.forward.call_count, 2 + 6 + 2)
+        # Draft decode warms each step's own backend, not the runner's.
+        self.assertEqual([len(b.calls) for b in step_backends], [2, 2, 2])
+        self.assertEqual(step_backends[0].calls, [(1, 1), (4, 4)])
+        # DRAFT_EXTEND_V2: bs * draft_token_num tokens per shape.
+        self.assertEqual(draft_extend_attn_backend.calls, [(4, 1), (16, 4)])
+        # Only the draft-prefill EXTEND shapes go to the runner's own backend.
+        self.assertEqual(mr.attn_backend.calls, [(8, 4), (64, 4)])
+
+    def test_target_worker_skips_draft_precompile(self):
+        mr = _spec_model_runner(is_draft_worker=False)
+        policy = _make_spec_policy(mr)
+
+        policy.precompile_draft(SimpleNamespace(attn_backends=[]), _FakeAttnBackend())
+
+        self.assertEqual(mr.model.forward.call_count, 0)
 
 
 if __name__ == "__main__":
