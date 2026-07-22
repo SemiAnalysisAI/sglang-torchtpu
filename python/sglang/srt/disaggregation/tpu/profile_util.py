@@ -35,10 +35,11 @@ def fmt_bytes(n: float) -> str:
 class _TraceSpan:
     """Trace span objects. Use slots for minimum memory consumption."""
 
-    __slots__ = ("name",)
+    __slots__ = ("name", "args")
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, **kwargs):
         self.name = name
+        self.args = kwargs
 
 
 def perfetto_kv_manager_pid(manager: TpuKVManagerBase) -> str:
@@ -64,13 +65,15 @@ def perfetto_kv_manager_page_shape_str(manager: TpuKVManagerBase, n_pages: int) 
     return f"{n_pages}x{int(s[1])}x{num_lanes}x{int(s[3])}x{int(s[4])}"
 
 
+# FIXME(junyanxu): Consider integrating with sglang/srt/observability/trace.py (OTEL)
+# in the future if we can bypass the microsecond-level OTEL overhead for high-frequency data planes.
 @contextlib.contextmanager
-def perfetto_trace(manager: TpuKVManagerBase, name: str):
+def perfetto_trace(manager: TpuKVManagerBase, name: str, **kwargs):
     """Perfetto trace context manager."""
     if not _PERFETTO:
-        yield _TraceSpan(name)
+        yield _TraceSpan(name, **kwargs)
         return
-    span = _TraceSpan(name)
+    span = _TraceSpan(name, **kwargs)
     t_wall = time.time()
     t0 = time.perf_counter()
     try:
@@ -80,8 +83,16 @@ def perfetto_trace(manager: TpuKVManagerBase, name: str):
         dur_us = int((time.perf_counter() - t0) * 1e6)
         tid = threading.current_thread().name
         pid = getattr(manager, "_trace_pid", None) or perfetto_kv_manager_pid(manager)
-        print(
-            f"trace-event: name={span.name} ts={ts_us} dur={dur_us} "
-            f"pid={pid} tid={tid}",
-            flush=True,
-        )
+        if span.args:
+            args_str = " ".join(f"{k}={v}" for k, v in span.args.items())
+            print(
+                f"trace-event: name={span.name} ts={ts_us} dur={dur_us} "
+                f"pid={pid} tid={tid} {args_str}",
+                flush=True,
+            )
+        else:
+            print(
+                f"trace-event: name={span.name} ts={ts_us} dur={dur_us} "
+                f"pid={pid} tid={tid}",
+                flush=True,
+            )

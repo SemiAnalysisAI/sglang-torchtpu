@@ -362,10 +362,12 @@ class TpuKVManager(TpuKVManagerBase):
                 if stats is not None:
                     stats.record(time.perf_counter() - _t0, nbytes)
                 if _PERFETTO:
-                    _sp.name = (
-                        f"gather/r{room}/i{index_start}/"
-                        f"{perfetto_kv_manager_page_shape_str(self, n_pages)}/{n_layers}L/"
-                        f"{fmt_bytes(nbytes)}"
+                    _sp.args.update(
+                        {
+                            "shape": perfetto_kv_manager_page_shape_str(self, n_pages),
+                            "layers": f"{n_layers}L",
+                            "size": fmt_bytes(nbytes),
+                        }
                     )
 
             aux_blobs: List[bytes] = []
@@ -383,10 +385,8 @@ class TpuKVManager(TpuKVManagerBase):
             )
             _size = fmt_bytes(nbytes) if _PERFETTO else ""
             _push_word = f"pushch{n_ch}" if n_ch > 1 else "push"
-            push_name = (
-                f"{_push_word}/r{room}/i{index_start}/{_shape}/{n_layers}L/{_size}"
-            )
-            wait_name = f"gatherwait/r{room}/i{index_start}/{_size}"
+            push_name = f"{_push_word}/r{room}/i{index_start}"
+            wait_name = f"gatherwait/r{room}/i{index_start}"
 
             if n_ch > 1:
                 # Parallel path (#3): shard the layers across N streams.
@@ -403,6 +403,9 @@ class TpuKVManager(TpuKVManagerBase):
                     n_ch,
                     push_name,
                     wait_name,
+                    _shape,
+                    f"{n_layers}L",
+                    _size,
                 )
             else:
                 payload = (
@@ -426,6 +429,9 @@ class TpuKVManager(TpuKVManagerBase):
                     d2h_future,
                     push_name,
                     wait_name,
+                    _shape,
+                    f"{n_layers}L",
+                    _size,
                 )
         except Exception as e:
             logger.exception("KV gather failed for room %s", room)
@@ -443,6 +449,9 @@ class TpuKVManager(TpuKVManagerBase):
         d2h_future=None,
         push_name: str = "push",
         wait_name: str = "gatherwait",
+        shape: str = "",
+        layers: str = "",
+        size: str = "",
     ):
         """Background thread: host-only ZMQ send of the gathered KV bytes.
 
@@ -454,9 +463,9 @@ class TpuKVManager(TpuKVManagerBase):
         thread — before the bytes are read for sending."""
         try:
             if d2h_future is not None:
-                with perfetto_trace(self, wait_name):
+                with perfetto_trace(self, wait_name, size=size):
                     d2h_future.wait()
-            with perfetto_trace(self, push_name):
+            with perfetto_trace(self, push_name, shape=shape, layers=layers, size=size):
                 trackers = []
                 for endpoint in endpoints:
                     sock = self._connect(endpoint)
@@ -507,6 +516,9 @@ class TpuKVManager(TpuKVManagerBase):
         n_ch: int,
         push_name: str = "pushch",
         wait_name: str = "gatherwait",
+        shape: str = "",
+        layers: str = "",
+        size: str = "",
     ):
         """Background thread (#3): send the chunk as ``n_ch`` messages over
         ``n_ch`` parallel sockets, each carrying a contiguous layer slice. Aux
@@ -514,9 +526,9 @@ class TpuKVManager(TpuKVManagerBase):
         ch, n_ch, layer_lo, num_layers, num_aux] + aux + layer_slice``."""
         try:
             if d2h_future is not None:
-                with perfetto_trace(self, wait_name):
+                with perfetto_trace(self, wait_name, size=size):
                     d2h_future.wait()
-            with perfetto_trace(self, push_name):
+            with perfetto_trace(self, push_name, shape=shape, layers=layers, size=size):
                 n_layers = len(layer_frames)
                 bounds = [(c * n_layers) // n_ch for c in range(n_ch + 1)]
                 copy_false = stages is not None
