@@ -4,7 +4,7 @@ import functools
 import logging
 from contextlib import contextmanager
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -324,6 +324,10 @@ def initialize_dp_attention(
         dtype=model_config.dtype,
         device=torch.device(server_args.device),
     )
+    if enable_dp_attention:
+        attn_rank0_scale_prewarm(
+            device=torch.device(server_args.device), dtype=model_config.dtype
+        )
 
 
 def is_dp_attention_enabled() -> bool:
@@ -910,24 +914,45 @@ def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
 
 
-@functools.lru_cache(maxsize=None)
-def _attn_rank0_scale_cached_impl(
-    device: torch.device, dtype: torch.dtype
-) -> torch.Tensor:
-    return torch.tensor(
-        1.0 if get_attention_tp_rank() == 0 else 0.0, device=device, dtype=dtype
-    )
+_ATTN_RANK0_SCALE: Dict[Tuple[str, torch.dtype], torch.Tensor] = {}
+
+
+def attn_rank0_scale_prewarm(device: torch.device, dtype: torch.dtype) -> None:
+    """Build the per-rank 0/1 scale tensor for (device type, dtype) eagerly.
+
+    Must run before any torch.compile trace that calls attn_rank0_scale:
+    Dynamo inlines through plain function calls (including functools.lru_cache
+    wrappers), so a tensor constructed inside a traced region folds the
+    per-rank Python scalar into the graph as a constant.
+    """
+    key = (device.type, dtype)
+    if key not in _ATTN_RANK0_SCALE:
+        _ATTN_RANK0_SCALE[key] = torch.tensor(
+            1.0 if get_attention_tp_rank() == 0 else 0.0, device=device, dtype=dtype
+        )
 
 
 def attn_rank0_scale(ref: torch.Tensor) -> torch.Tensor:
     """0/1 device scalar: 1 on attn-TP rank 0, 0 elsewhere.
 
-    A cached device tensor (not a Python float) so torch.compile lifts it as
-    a runtime graph input rather than folding the per-rank value — folding
-    would diverge each rank's graph, the collective drop this avoids. The
-    multiply also keeps the residual consumer (and its upstream collective)
-    live on the zero ranks.
+    A pre-built device tensor (not a Python float, never constructed under
+    tracing) so torch.compile lifts it as a runtime graph input rather than
+    folding the per-rank value — folding diverges each rank's graph and lets
+    XLA constant-fold the zero ranks' multiply, dropping their collective
+    contributions. The multiply also keeps the residual consumer (and its
+    upstream collective) live on the zero ranks.
 
     TODO: remove once torch_tpu keeps rank-divergent in-graph collectives.
     """
-    return _attn_rank0_scale_cached_impl(ref.device, ref.dtype)
+    key = (ref.device.type, ref.dtype)
+    scale = _ATTN_RANK0_SCALE.get(key)
+    if scale is None:
+        if torch.compiler.is_compiling():
+            raise RuntimeError(
+                f"attn_rank0_scale cache is cold for {key} under torch.compile; "
+                "call attn_rank0_scale_prewarm at init so the per-rank value "
+                "is not folded into the traced graph."
+            )
+        attn_rank0_scale_prewarm(device=ref.device, dtype=ref.dtype)
+        scale = _ATTN_RANK0_SCALE[key]
+    return scale
