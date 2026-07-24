@@ -351,6 +351,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The sum of all sequence lengths
     seq_lens_sum: int
 
+    # Host mirror used by TPU attention metadata without a device sync.
+    req_pool_indices_cpu: Optional[torch.Tensor] = None
+
     # === Borrowed from ScheduleBatch: GPU tensors (cross-stream; clone targets for stream isolation) ===
     # FIXME(lsyin): these are currently aliased by reference from ScheduleBatch. Once
     # they are cloned/relayed into FB-owned copies at the boundary, move them out of
@@ -533,6 +536,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
 
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
+    # TARGET_VERIFY KV lengths, derived once inside the compiled target graph.
+    rpa_target_kv_lens: Optional[torch.Tensor] = None
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
 
@@ -697,6 +702,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             batch_size=len(batch.seq_lens),
             input_ids=batch.input_ids,
             req_pool_indices=batch.req_pool_indices,
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
