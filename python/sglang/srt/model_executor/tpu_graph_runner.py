@@ -190,6 +190,11 @@ class TpuGraphRunner:
                 installed_any = True
                 installed_policies.append(policy)
                 policy.precompile()
+                compiled_forward_shim = getattr(
+                    policy, "compiled_forward_shim", None
+                )
+                if compiled_forward_shim is not None:
+                    compiled_forward_shim.enable_target_replay()
 
         if not installed_any:
             fallback_cls = _augment_spec_policy(DecoderTpuCompilePolicy, model_runner)
@@ -210,6 +215,11 @@ class TpuGraphRunner:
                 installed_any = True
                 installed_policies.append(fallback_policy)
                 fallback_policy.precompile()
+                compiled_forward_shim = getattr(
+                    fallback_policy, "compiled_forward_shim", None
+                )
+                if compiled_forward_shim is not None:
+                    compiled_forward_shim.enable_target_replay()
 
         if not installed_any:
             return

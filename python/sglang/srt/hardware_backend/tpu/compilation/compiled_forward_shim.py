@@ -12,6 +12,7 @@ from __future__ import annotations
 import functools
 import inspect
 import time
+import types
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
@@ -461,7 +462,95 @@ class CompiledForwardShim:
         if signature is not None:
             self.__signature__ = signature
         self._default_kwargs = _static_default_kwargs(compiled_fn)
+        self._target_replay_active = False
+        self._target_replays: dict[tuple[Any, ...], Callable[..., Any]] = {}
+        self._dynamo_orig_callable = getattr(
+            compiled_fn, "_torchdynamo_orig_callable", None
+        )
         functools.update_wrapper(self, compiled_fn)
+
+    def enable_target_replay(self) -> None:
+        """Use captured TARGET_VERIFY code after precompilation completes."""
+        self._target_replay_active = True
+
+    def _target_replay_key(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        forward_batch: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> tuple[Any, ...] | None:
+        mode = getattr(forward_batch, "forward_mode", None)
+        if mode is None or not mode.is_target_verify():
+            return None
+        if not isinstance(input_ids, torch.Tensor) or not isinstance(
+            positions, torch.Tensor
+        ):
+            return None
+        spec_info = getattr(forward_batch, "spec_info", None)
+        static_args = tuple(
+            (type(value), value)
+            if isinstance(value, _DEFAULT_KWARG_TYPES)
+            else type(value)
+            for value in args
+        )
+        static_kwargs = tuple(
+            sorted(
+                (
+                    name,
+                    (type(value), value)
+                    if isinstance(value, _DEFAULT_KWARG_TYPES)
+                    else type(value),
+                )
+                for name, value in kwargs.items()
+            )
+        )
+        return (
+            tuple(input_ids.shape),
+            input_ids.dtype,
+            tuple(positions.shape),
+            positions.dtype,
+            tuple(forward_batch.seq_lens.shape),
+            forward_batch.seq_lens.dtype,
+            getattr(forward_batch, "capture_hidden_mode", None),
+            type(spec_info),
+            getattr(spec_info, "draft_token_num", None),
+            static_args,
+            static_kwargs,
+        )
+
+    def _dynamo_cache_codes(self) -> list[Any]:
+        if self._dynamo_orig_callable is None:
+            return []
+        get_entries = getattr(
+            torch._dynamo.eval_frame, "_debug_get_cache_entry_list", None
+        )
+        if get_entries is None:
+            return []
+        return [entry.code for entry in get_entries(self._dynamo_orig_callable)]
+
+    def _capture_target_replay(
+        self, key: tuple[Any, ...], before_codes: set[Any]
+    ) -> None:
+        new_codes = [
+            code for code in self._dynamo_cache_codes() if code not in before_codes
+        ]
+        if len(new_codes) != 1 or self._dynamo_orig_callable is None:
+            return
+        original = self._dynamo_orig_callable
+        replay = types.FunctionType(
+            new_codes[0],
+            original.__globals__,
+            original.__name__,
+            original.__defaults__,
+            original.__closure__,
+        )
+        replay.__kwdefaults__ = original.__kwdefaults__
+        self._target_replays[key] = replay
+        logger.info(
+            "Captured direct Dynamo code replay for TARGET_VERIFY shape %s.", key[:6]
+        )
 
     def set_recompilation_checker(self, checker: Any, model_label: str = "") -> None:
         """Set the serving-time recompilation checker."""
@@ -505,7 +594,25 @@ class CompiledForwardShim:
         orig_prefill_only = forward_batch.is_prefill_only
         forward_batch.is_prefill_only = False
         try:
-            out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
+            replay_key = self._target_replay_key(
+                input_ids, positions, forward_batch, args, kwargs
+            )
+            replay = (
+                self._target_replays.get(replay_key)
+                if replay_key is not None
+                else None
+            )
+            if self._target_replay_active and replay is not None:
+                out = replay(input_ids, positions, forward_batch, *args, **kwargs)
+            else:
+                before_codes = (
+                    set(self._dynamo_cache_codes())
+                    if replay_key is not None and replay is None
+                    else set()
+                )
+                out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
+                if replay_key is not None and replay is None:
+                    self._capture_target_replay(replay_key, before_codes)
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
         spec_info = forward_batch.spec_info
