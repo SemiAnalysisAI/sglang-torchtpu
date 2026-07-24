@@ -27,6 +27,9 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
+from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
+    SpecDecodeCompilePolicyMixin,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -80,8 +83,11 @@ def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
         positions=torch.arange(real_t, dtype=torch.int32),
         out_cache_loc=torch.arange(real_t, dtype=torch.int32),
         seq_lens=torch.full((real_b,), 100, dtype=torch.int32),
+        seq_lens_cpu=torch.full((real_b,), 100, dtype=torch.int32),
         orig_seq_lens=torch.full((real_b,), 100, dtype=torch.int32),
         req_pool_indices=torch.arange(real_b, dtype=torch.int64),
+        req_pool_indices_cpu=torch.arange(real_b, dtype=torch.int64),
+        mrope_positions=None,
         extend_seq_lens=(
             torch.full((real_b,), real_t // real_b, dtype=torch.int32)
             if extend
@@ -142,6 +148,7 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual(fb.input_ids.shape[0], 16)
         self.assertEqual(fb.seq_lens.shape[0], 4)
         self.assertEqual(fb.req_pool_indices.shape[0], 4)
+        self.assertEqual(fb.req_pool_indices_cpu.tolist(), [0, 1, 2, 0])
         self.assertEqual(fb.extend_seq_lens.shape[0], 4)
         self.assertEqual(fb.seq_lens[:3].tolist(), [100, 100, 100])
         self.assertEqual(fb.seq_lens[3].item(), 0)
@@ -383,6 +390,20 @@ class TestPadForwardBatchInputs(CustomTestCase):
         )
         self.assertEqual((real_q, real_b), (6, 3))
         self.assertEqual(fb.input_ids.shape[0], 8)  # pad_b(4) * draft_token_num(2)
+
+
+class TestSpecDecodeCompilePolicyPadding(CustomTestCase):
+    def test_draft_decode_pads_req_pool_indices_cpu_to_bucket(self):
+        policy = object.__new__(SpecDecodeCompilePolicyMixin)
+        policy.b_bucketer = _bucketer("Bs", [1, 2, 4])
+        fb = _forward_batch(real_t=3, real_b=3, mode="decode")
+
+        policy._pad_draft_decode(fb)
+
+        self.assertEqual(fb.seq_lens.shape[0], 4)
+        self.assertEqual(fb.req_pool_indices.tolist(), [0, 1, 2, 0])
+        self.assertEqual(fb.req_pool_indices_cpu.tolist(), [0, 1, 2, 0])
+        self.assertEqual(fb.batch_size, 4)
 
 
 class TestDefaultKwargHelpers(CustomTestCase):

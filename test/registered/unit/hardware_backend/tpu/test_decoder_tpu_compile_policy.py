@@ -681,6 +681,7 @@ class TestSpecDraftDecodePadding(CustomTestCase):
             seq_lens=torch.tensor([8, 7, 6], dtype=torch.int32),
             seq_lens_cpu=torch.tensor([8, 7, 6], dtype=torch.int32),
             req_pool_indices=torch.tensor([0, 1, 2]),
+            req_pool_indices_cpu=torch.tensor([0, 1, 2]),
             positions=torch.arange(3),
             mrope_positions=torch.arange(9).reshape(3, 3),
             out_cache_loc=torch.arange(3),
@@ -694,6 +695,7 @@ class TestSpecDraftDecodePadding(CustomTestCase):
         self.assertEqual(forward_batch._tpu_real_b, 3)
         self.assertEqual(forward_batch.seq_lens.shape, (4,))
         self.assertEqual(forward_batch.seq_lens_cpu.tolist(), [8, 7, 6, 0])
+        self.assertEqual(forward_batch.req_pool_indices_cpu.tolist(), [0, 1, 2, 0])
         self.assertEqual(forward_batch.mrope_positions.shape, (3, 4))
         self.assertTrue(
             torch.equal(

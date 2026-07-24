@@ -67,6 +67,16 @@ class TestTboFilterBatchMarker(CustomTestCase):
         self.assertFalse(child.forward_metadata_ready)
         self.assertFalse(child.forward_metadata_replan_equivalent)
 
+    def test_filter_slices_req_pool_indices_cpu_with_device_mirror(self):
+        parent = _make_target_verify_batch(8)
+        parent.req_pool_indices = torch.arange(8, dtype=torch.long)
+        parent.req_pool_indices_cpu = parent.req_pool_indices.cpu().clone()
+
+        child = _filter(parent, lo=2, hi=6)
+
+        self.assertEqual(child.req_pool_indices.tolist(), [2, 3, 4, 5])
+        self.assertEqual(child.req_pool_indices_cpu.tolist(), [2, 3, 4, 5])
+
 
 def _make_valued_batch(bs: int) -> ForwardBatch:
     # Distinct per-position values so a filtered slice is unambiguous.
