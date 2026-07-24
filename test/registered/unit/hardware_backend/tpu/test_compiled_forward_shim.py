@@ -565,6 +565,59 @@ class TestCompiledForwardShim(CustomTestCase):
         shim(None, None, fb)
         self.assertEqual(fb.batch_size, 4)
 
+    def test_target_replay_bypasses_dynamo_guard_dispatch(self):
+        def forward(input_ids, positions, forward_batch):
+            return input_ids + positions + forward_batch.seq_lens[0]
+
+        compiled = torch.compile(
+            forward, backend="eager", fullgraph=True, dynamic=False
+        )
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        fb = SimpleNamespace(
+            forward_mode=_ForwardModeMock("target_verify"),
+            seq_lens=torch.tensor([3]),
+            spec_info=SimpleNamespace(
+                draft_token_num=4,
+                padding_state=None,
+                keep_outputs_padded=False,
+            ),
+            capture_hidden_mode="full",
+            is_prefill_only=False,
+        )
+
+        expected = shim(torch.tensor([1, 2]), torch.tensor([4, 5]), fb)
+        self.assertEqual(len(shim._target_replays), 1)
+
+        shim.enable_target_replay()
+        shim.fn = MagicMock(side_effect=AssertionError("guard dispatch used"))
+        actual = shim(torch.tensor([2, 3]), torch.tensor([6, 7]), fb)
+        self.assertTrue(torch.equal(expected, torch.tensor([8, 10])))
+        self.assertTrue(torch.equal(actual, torch.tensor([11, 13])))
+        shim.fn.assert_not_called()
+
+    def test_target_replay_key_uses_bucketed_not_real_shape(self):
+        shim = CompiledForwardShim(MagicMock(), policy=DecoderTpuCompilePolicy())
+
+        def make_fb(real_q, real_b):
+            return SimpleNamespace(
+                forward_mode=_ForwardModeMock("target_verify"),
+                seq_lens=torch.zeros(4, dtype=torch.int32),
+                spec_info=SimpleNamespace(draft_token_num=4),
+                capture_hidden_mode="full",
+                _tpu_real_q=real_q,
+                _tpu_real_b=real_b,
+            )
+
+        input_ids = torch.zeros(16, dtype=torch.int32)
+        positions = torch.zeros(16, dtype=torch.int32)
+        key_bs2 = shim._target_replay_key(
+            input_ids, positions, make_fb(8, 2), (), {}
+        )
+        key_bs3 = shim._target_replay_key(
+            input_ids, positions, make_fb(12, 3), (), {}
+        )
+        self.assertEqual(key_bs2, key_bs3)
+
     def test_pins_is_prefill_only_for_compiled_call_and_restores(self):
         # The compiled graph must see a batch-invariant is_prefill_only
         # (pinned False); the worker's sampling gate reads the true value
