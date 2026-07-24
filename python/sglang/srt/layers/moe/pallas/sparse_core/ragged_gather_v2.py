@@ -10,6 +10,16 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+import inspect as _inspect
+_COMPILER_PARAMS_SUPPORTS_LAYOUT = (
+    'needs_layout_passes' in _inspect.signature(pltpu.CompilerParams).parameters
+)
+def _layout_kwargs(needs_layout_passes: bool) -> dict:
+    if _COMPILER_PARAMS_SUPPORTS_LAYOUT:
+        return {'needs_layout_passes': needs_layout_passes}
+    return {}
+
+
 from sglang.srt.layers.moe.pallas.sparse_core import core_map_helper
 
 
@@ -269,7 +279,7 @@ def ragged_gather_v2(
         ),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=True,
-            needs_layout_passes=True,
+            **(_layout_kwargs(True)),
             disable_bounds_checks=True,
         ),
         scratch_types=[

@@ -17,6 +17,16 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+import inspect as _inspect
+_COMPILER_PARAMS_SUPPORTS_LAYOUT = (
+    'needs_layout_passes' in _inspect.signature(pltpu.CompilerParams).parameters
+)
+def _layout_kwargs(needs_layout_passes: bool) -> dict:
+    if _COMPILER_PARAMS_SUPPORTS_LAYOUT:
+        return {'needs_layout_passes': needs_layout_passes}
+    return {}
+
+
 
 def is_compatible(
     op: jax.Array,
@@ -117,7 +127,7 @@ def _sc_gather_reduce(
         ),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=True,
-            needs_layout_passes=True,
+            **(_layout_kwargs(True)),
         ),
     )
     def kernel(in_hbm_ref, idx_hbm_ref, weights_hbm_ref, out_hbm_ref):
