@@ -85,6 +85,7 @@ def _make_forward_batch(
     return types.SimpleNamespace(
         seq_lens=seq_lens,
         req_pool_indices=req_pool_indices,
+        req_pool_indices_cpu=req_pool_indices.cpu(),
         forward_mode=forward_mode,
         extend_seq_lens=extend_seq_lens,
         spec_info=spec_info,
@@ -302,7 +303,7 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
         self.seq_lens = torch.tensor([10, 24, 33], dtype=torch.int32)
         self.spec_info = types.SimpleNamespace(draft_token_num=self.DRAFT_TOKEN_NUM)
 
-    def test_target_verify_bumps_kv_lens_and_cu_q_lens(self):
+    def test_target_verify_defers_kv_bump_and_scales_cu_q_lens(self):
         backend = _BackendUnderTest(self.PAGE_SIZE, self.req_to_token)
         fb = _make_forward_batch(
             seq_lens=self.seq_lens,
@@ -311,9 +312,10 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
             spec_info=self.spec_info,
         )
         meta = _build_meta(backend, fb)
-        # KV cache already holds the draft tokens: kv_lens = seq_lens + draft.
-        expected_kv = (self.seq_lens + self.DRAFT_TOKEN_NUM).to(torch.int32)
-        self.assertTrue(torch.equal(meta.kv_lens, expected_kv))
+        # Metadata retains the base tensor. The first attention layer performs
+        # seq_lens + draft_token_num inside the compiled target graph and shares
+        # that value with subsequent layers through rpa_target_kv_lens.
+        self.assertTrue(torch.equal(meta.kv_lens, self.seq_lens))
         # Each sequence verifies draft_token_num query tokens.
         expected_cu_q = (torch.arange(self.bs + 1) * self.DRAFT_TOKEN_NUM).to(
             torch.int32
