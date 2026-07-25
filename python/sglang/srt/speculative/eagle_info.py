@@ -720,6 +720,12 @@ class EagleDraftInput(SpecInput):
     # V2 overlap worker only: req_pool_indices used as buf slot keys.
     future_indices: Optional[torch.Tensor] = None
 
+    # TPU V2 overlap: acceptance stays on device while the scheduler reserves a
+    # bounded host page-table window for every possible next logical start.
+    accept_lens_device: Optional[torch.Tensor] = None
+    device_accept_candidate_locs: Optional[torch.Tensor] = None
+    device_accept_selected_cache_locs: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
 
@@ -788,6 +794,16 @@ class EagleDraftInput(SpecInput):
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
+            if self.accept_lens_device is not None:
+                self.accept_lens_device = self.accept_lens_device[new_indices]
+            if self.device_accept_candidate_locs is not None:
+                self.device_accept_candidate_locs = self.device_accept_candidate_locs[
+                    new_indices
+                ]
+            if self.device_accept_selected_cache_locs is not None:
+                self.device_accept_selected_cache_locs = (
+                    self.device_accept_selected_cache_locs[new_indices]
+                )
             return
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
@@ -808,6 +824,16 @@ class EagleDraftInput(SpecInput):
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[: len(new_indices)]
             self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
+            if self.accept_lens_device is not None:
+                self.accept_lens_device = self.accept_lens_device[: len(new_indices)]
+            if self.device_accept_candidate_locs is not None:
+                self.device_accept_candidate_locs = self.device_accept_candidate_locs[
+                    : len(new_indices)
+                ]
+            if self.device_accept_selected_cache_locs is not None:
+                self.device_accept_selected_cache_locs = (
+                    self.device_accept_selected_cache_locs[: len(new_indices)]
+                )
             if self.dsa_topk_indices is not None:
                 self.dsa_topk_indices = self.dsa_topk_indices[: len(new_indices)]
         else:
@@ -819,6 +845,16 @@ class EagleDraftInput(SpecInput):
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[new_indices]
             self.bonus_tokens = self.bonus_tokens[new_indices]
+            if self.accept_lens_device is not None:
+                self.accept_lens_device = self.accept_lens_device[new_indices]
+            if self.device_accept_candidate_locs is not None:
+                self.device_accept_candidate_locs = self.device_accept_candidate_locs[
+                    new_indices
+                ]
+            if self.device_accept_selected_cache_locs is not None:
+                self.device_accept_selected_cache_locs = (
+                    self.device_accept_selected_cache_locs[new_indices]
+                )
             if self.dsa_topk_indices is not None:
                 self.dsa_topk_indices = self.dsa_topk_indices[new_indices]
 
@@ -828,6 +864,25 @@ class EagleDraftInput(SpecInput):
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]
             )
+            if (
+                self.accept_lens_device is not None
+                and spec_info.accept_lens_device is not None
+                and self.device_accept_candidate_locs is not None
+                and spec_info.device_accept_candidate_locs is not None
+            ):
+                self.accept_lens_device = torch.cat(
+                    [self.accept_lens_device, spec_info.accept_lens_device]
+                )
+                self.device_accept_candidate_locs = torch.cat(
+                    [
+                        self.device_accept_candidate_locs,
+                        spec_info.device_accept_candidate_locs,
+                    ]
+                )
+            else:
+                self.accept_lens_device = None
+                self.device_accept_candidate_locs = None
+            self.device_accept_selected_cache_locs = None
             return
 
         # Detect idle stub by `topk_index` length (idle inputs have
@@ -840,6 +895,11 @@ class EagleDraftInput(SpecInput):
             self.topk_index = spec_info.topk_index
             self.draft_probs = spec_info.draft_probs
             self.dsa_topk_indices = spec_info.dsa_topk_indices
+            self.accept_lens_device = spec_info.accept_lens_device
+            self.device_accept_candidate_locs = spec_info.device_accept_candidate_locs
+            self.device_accept_selected_cache_locs = (
+                spec_info.device_accept_selected_cache_locs
+            )
             return
         if len(spec_info.topk_index) == 0:
             return
@@ -852,6 +912,25 @@ class EagleDraftInput(SpecInput):
         )
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if (
+            self.accept_lens_device is not None
+            and spec_info.accept_lens_device is not None
+            and self.device_accept_candidate_locs is not None
+            and spec_info.device_accept_candidate_locs is not None
+        ):
+            self.accept_lens_device = torch.cat(
+                [self.accept_lens_device, spec_info.accept_lens_device]
+            )
+            self.device_accept_candidate_locs = torch.cat(
+                [
+                    self.device_accept_candidate_locs,
+                    spec_info.device_accept_candidate_locs,
+                ]
+            )
+        else:
+            self.accept_lens_device = None
+            self.device_accept_candidate_locs = None
+        self.device_accept_selected_cache_locs = None
         if self.dsa_topk_indices is not None and spec_info.dsa_topk_indices is not None:
             self.dsa_topk_indices = torch.cat(
                 [self.dsa_topk_indices, spec_info.dsa_topk_indices]

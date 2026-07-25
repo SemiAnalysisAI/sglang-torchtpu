@@ -199,22 +199,56 @@ class EagleDraftWorkerBase(ABC):
             # Assign cache locations (draft-write targets).
             page_size = batch.token_to_kv_pool_allocator.page_size
             if page_size == 1 or topk == 1:
-                batch.out_cache_loc = torch.empty(
-                    (bs * topk * num_steps,),
-                    dtype=torch.int64,
-                    device=batch.device,
+                from sglang.srt.utils import is_tpu
+
+                draft_width = topk * num_steps
+                num_verify_tokens = (
+                    draft_model_runner.server_args.speculative_num_draft_tokens
                 )
-                # FIXME(lsyin): align with the default code path
-                assign_draft_cache_locs_contiguous_func(
-                    batch.req_pool_indices,
-                    req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    topk,
-                    num_steps,
-                    host_req_pool_indices=batch.req_pool_indices_cpu,
-                    host_seq_lens=batch.seq_lens_cpu,
+                host_resident_tpu = (
+                    is_tpu() and req_to_token_pool.req_to_token.device.type == "cpu"
                 )
+                selected = draft_input.device_accept_selected_cache_locs
+                if (
+                    host_resident_tpu
+                    and selected is not None
+                    and selected.shape[0] == bs
+                    and selected.shape[1] >= max(draft_width, num_verify_tokens)
+                ):
+                    shared = selected
+                elif host_resident_tpu:
+                    shared_width = max(draft_width, num_verify_tokens)
+                    rows = batch.req_pool_indices_cpu.to(torch.int64)[:, None]
+                    starts = batch.seq_lens_cpu.to(torch.int64)[:, None]
+                    offsets = torch.arange(shared_width, dtype=torch.int64)[None, :]
+                    shared = req_to_token_pool.req_to_token[rows, starts + offsets].to(
+                        batch.device, dtype=torch.int64, non_blocking=True
+                    )
+                else:
+                    shared = None
+
+                if shared is not None:
+                    batch.out_cache_loc = shared[:, :draft_width].reshape(-1)
+                    batch._tpu_verify_out_cache_loc = shared[
+                        :, :num_verify_tokens
+                    ].reshape(-1)
+                else:
+                    batch.out_cache_loc = torch.empty(
+                        (bs * draft_width,),
+                        dtype=torch.int64,
+                        device=batch.device,
+                    )
+                    # FIXME(lsyin): align with the default code path
+                    assign_draft_cache_locs_contiguous_func(
+                        batch.req_pool_indices,
+                        req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.out_cache_loc,
+                        topk,
+                        num_steps,
+                        host_req_pool_indices=batch.req_pool_indices_cpu,
+                        host_seq_lens=batch.seq_lens_cpu,
+                    )
             else:
                 # page_size > 1 + topk > 1: per-branch page-aligned draft pages.
                 # Reduce out_cache_loc from the page-aligned tree region down to the

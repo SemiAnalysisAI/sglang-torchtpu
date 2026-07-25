@@ -32,6 +32,7 @@ from sglang.srt.managers.overlap_utils import (
     _DYNAMIC_INDEX_DEVICE_TYPES,
     FutureMap,
     _device_use_dynamic_index,
+    _select_device_accept_cache_locs,
 )
 from sglang.srt.hardware_backend.tpu.spec_utils_v2 import (
     store_future_map_spec,
@@ -133,6 +134,20 @@ class TestDynamicIndexEquivalence(CustomTestCase):
         fm._store(buf, torch.tensor([1, 2]), torch.tensor([5, 6], dtype=torch.int32))
         self.assertEqual(buf[1].item(), 5)
         self.assertEqual(buf[2].item(), 6)
+
+
+class TestDeviceAcceptCacheSelection(CustomTestCase):
+    def test_selects_window_from_accepted_length(self):
+        candidates = torch.tensor(
+            [[10, 11, 12, 13, 14, 15, 16], [20, 21, 22, 23, 24, 25, 26]]
+        )
+        # Accepted lengths include the bonus token. Length one starts at the
+        # first candidate; length four starts three columns later.
+        actual = _select_device_accept_cache_locs(
+            candidates, torch.tensor([1, 4], dtype=torch.int32), width=4
+        )
+        expected = torch.tensor([[10, 11, 12, 13], [23, 24, 25, 26]])
+        self.assertTrue(torch.equal(actual, expected))
 
 
 class TestFusedFutureMapStore(CustomTestCase):
