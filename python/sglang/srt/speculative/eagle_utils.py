@@ -107,6 +107,7 @@ def _eagle_prefill_tail_tokens(
     return tail_tokens
 
 
+@tpu_fused_spec_op
 def organize_draft_results(
     score_list: List[torch.Tensor],
     token_list: List[torch.Tensor],
@@ -143,6 +144,7 @@ class TreeMaskMode(IntEnum):
     QLEN_ONLY_BITPACKING = 2
 
 
+@tpu_fused_spec_op
 def _build_tree_kernel_efficient_torch(
     topk: int,
     tree_mask_mode: TreeMaskMode,
@@ -186,11 +188,22 @@ def build_tree_kernel_efficient(
     tree_mask_buf: Optional[torch.Tensor] = None,
     position_buf: Optional[torch.Tensor] = None,
 ):
-    draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
-
     # seq_lens_sum == sum(seq_lens); seq_lens: sequence length without draft tokens
     bs = seq_lens.numel()
     device = seq_lens.device
+
+    if (
+        _use_torch_native
+        and topk == 1
+        and tree_mask_mode == TreeMaskMode.FULL_MASK
+        and tree_mask_buf is None
+        and position_buf is None
+    ):
+        from sglang.srt.hardware_backend.tpu.spec_utils_v2 import build_topk1_tree
+
+        return build_topk1_tree(bonus_tokens, draft_tokens, seq_lens, num_verify_tokens)
+
+    draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
     # e.g. for bs=1, tree_mask: num_draft_token, seq_lens_sum + num_draft_token (flattened)
     # where each row indicates the attending pattern of each draft token
     # if use_partial_packed_tree_mask is True, tree_mask: num_draft_token (flattened, packed)
