@@ -66,3 +66,52 @@ def build_topk1_tree(
         retrieve_next_sibling,
         tokens,
     )
+
+
+
+def _future_map_store_one(
+    buf: torch.Tensor, indices: torch.Tensor, values: torch.Tensor
+) -> torch.Tensor:
+    values = values[: indices.shape[0]].to(buf.dtype)
+    return torch.index_copy(buf, 0, indices, values)
+
+
+@tpu_fused_spec_op
+def store_future_map_spec(
+    indices: torch.Tensor,
+    output_tokens_buf: torch.Tensor,
+    topk_p_buf: torch.Tensor,
+    topk_index_buf: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Store the common SpecV2 relay payload in one TPU program."""
+    rows = indices.to(torch.int64)
+    return (
+        _future_map_store_one(output_tokens_buf, rows, bonus_tokens),
+        _future_map_store_one(topk_p_buf, rows, topk_p),
+        _future_map_store_one(topk_index_buf, rows, topk_index),
+    )
+
+
+@tpu_fused_spec_op
+def store_future_map_spec_hidden(
+    indices: torch.Tensor,
+    output_tokens_buf: torch.Tensor,
+    topk_p_buf: torch.Tensor,
+    topk_index_buf: torch.Tensor,
+    hidden_states_buf: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    hidden_states: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Store the EAGLE SpecV2 relay payload in one TPU program."""
+    rows = indices.to(torch.int64)
+    return (
+        _future_map_store_one(output_tokens_buf, rows, bonus_tokens),
+        _future_map_store_one(topk_p_buf, rows, topk_p),
+        _future_map_store_one(topk_index_buf, rows, topk_index),
+        _future_map_store_one(hidden_states_buf, rows, hidden_states),
+    )

@@ -421,27 +421,66 @@ class FutureMap:
             return
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(payload)
-        self._store(
-            self.output_tokens_buf,
-            indices,
-            payload.bonus_tokens.to(self.output_tokens_buf.dtype),
-        )
+        if _is_tpu and self.need_topk:
+            from sglang.srt.hardware_backend.tpu.spec_utils_v2 import (
+                store_future_map_spec,
+                store_future_map_spec_hidden,
+            )
 
-        if self.need_topk:
+            if self.need_hidden_states:
+                (
+                    self.output_tokens_buf,
+                    self.topk_p_buf,
+                    self.topk_index_buf,
+                    self.hidden_states_buf,
+                ) = store_future_map_spec_hidden(
+                    indices,
+                    self.output_tokens_buf,
+                    self.topk_p_buf,
+                    self.topk_index_buf,
+                    self.hidden_states_buf,
+                    payload.bonus_tokens,
+                    payload.topk_p,
+                    payload.topk_index,
+                    payload.hidden_states,
+                )
+            else:
+                (
+                    self.output_tokens_buf,
+                    self.topk_p_buf,
+                    self.topk_index_buf,
+                ) = store_future_map_spec(
+                    indices,
+                    self.output_tokens_buf,
+                    self.topk_p_buf,
+                    self.topk_index_buf,
+                    payload.bonus_tokens,
+                    payload.topk_p,
+                    payload.topk_index,
+                )
+        else:
             self._store(
-                self.topk_p_buf, indices, payload.topk_p.to(self.topk_p_buf.dtype)
-            )
-            self._store(
-                self.topk_index_buf,
+                self.output_tokens_buf,
                 indices,
-                payload.topk_index.to(self.topk_index_buf.dtype),
+                payload.bonus_tokens.to(self.output_tokens_buf.dtype),
             )
-        if self.need_hidden_states:
-            self._store(
-                self.hidden_states_buf,
-                indices,
-                payload.hidden_states.to(self.hidden_states_buf.dtype),
-            )
+            if self.need_topk:
+                self._store(
+                    self.topk_p_buf,
+                    indices,
+                    payload.topk_p.to(self.topk_p_buf.dtype),
+                )
+                self._store(
+                    self.topk_index_buf,
+                    indices,
+                    payload.topk_index.to(self.topk_index_buf.dtype),
+                )
+            if self.need_hidden_states:
+                self._store(
+                    self.hidden_states_buf,
+                    indices,
+                    payload.hidden_states.to(self.hidden_states_buf.dtype),
+                )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self._store(self.draft_probs_buf, indices, payload.draft_probs)
         if (

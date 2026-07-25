@@ -33,6 +33,10 @@ from sglang.srt.managers.overlap_utils import (
     FutureMap,
     _device_use_dynamic_index,
 )
+from sglang.srt.hardware_backend.tpu.spec_utils_v2 import (
+    store_future_map_spec,
+    store_future_map_spec_hidden,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -129,6 +133,50 @@ class TestDynamicIndexEquivalence(CustomTestCase):
         fm._store(buf, torch.tensor([1, 2]), torch.tensor([5, 6], dtype=torch.int32))
         self.assertEqual(buf[1].item(), 5)
         self.assertEqual(buf[2].item(), 6)
+
+
+class TestFusedFutureMapStore(CustomTestCase):
+    def test_stores_spec_payload_at_dynamic_rows(self):
+        indices = torch.tensor([3, 1], dtype=torch.int32)
+        output, topk_p, topk_index = store_future_map_spec(
+            indices,
+            torch.zeros(5, dtype=torch.int64),
+            torch.zeros((5, 2), dtype=torch.float32),
+            torch.zeros((5, 2), dtype=torch.int64),
+            torch.tensor([7, 8], dtype=torch.int32),
+            torch.tensor([[0.7, 0.3], [0.6, 0.4]]),
+            torch.tensor([[10, 11], [12, 13]], dtype=torch.int32),
+        )
+        self.assertTrue(torch.equal(output[[3, 1]], torch.tensor([7, 8])))
+        self.assertTrue(
+            torch.equal(topk_p[[3, 1]], torch.tensor([[0.7, 0.3], [0.6, 0.4]]))
+        )
+        self.assertTrue(
+            torch.equal(topk_index[[3, 1]], torch.tensor([[10, 11], [12, 13]]))
+        )
+
+    def test_stores_hidden_states_with_common_payload(self):
+        indices = torch.tensor([2, 0], dtype=torch.int64)
+        output, topk_p, topk_index, hidden = store_future_map_spec_hidden(
+            indices,
+            torch.zeros(4, dtype=torch.int64),
+            torch.zeros((4, 1)),
+            torch.zeros((4, 1), dtype=torch.int64),
+            torch.zeros((4, 3)),
+            torch.tensor([4, 5]),
+            torch.tensor([[0.9], [0.8]]),
+            torch.tensor([[14], [15]]),
+            torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+        )
+        self.assertTrue(torch.equal(output[[2, 0]], torch.tensor([4, 5])))
+        self.assertTrue(torch.equal(topk_p[[2, 0]], torch.tensor([[0.9], [0.8]])))
+        self.assertTrue(torch.equal(topk_index[[2, 0]], torch.tensor([[14], [15]])))
+        self.assertTrue(
+            torch.equal(
+                hidden[[2, 0]],
+                torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            )
+        )
 
 
 if __name__ == "__main__":
