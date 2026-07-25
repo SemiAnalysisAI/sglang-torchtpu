@@ -110,7 +110,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import flatten_nested_list
+from sglang.srt.utils import flatten_nested_list, is_tpu
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 if TYPE_CHECKING:
@@ -129,6 +129,7 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
+_is_tpu = is_tpu()
 
 
 @lru_cache(maxsize=1)
@@ -1756,6 +1757,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    _tpu_verify_out_cache_loc: Optional[torch.Tensor] = None
+    _tpu_device_accept_kv_active: bool = False
+    _tpu_spec_extras_resolved: bool = False
     # DSV4-NPU: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator (None
     # elsewhere); c4/c128 state lens ride on ``batch.dsv4_state_lens``.
     out_cache_loc_dsv4: Optional[Any] = None
@@ -2444,7 +2448,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
         """Tight estimate matching eagle_utils.eagle_prepare_for_decode allocation."""
-        reserve = get_alloc_reserve_per_decode()
+        reserve = get_alloc_reserve_per_decode() + int(_is_tpu and self.enable_overlap)
         total = 0
         for r in requests:
             x = max(0, r.kv_committed_len + reserve - r.kv_allocated_len)

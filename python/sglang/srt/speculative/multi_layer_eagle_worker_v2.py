@@ -883,7 +883,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
             )
 
-        next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
+        next_draft_input = EagleDraftInput(
+            bonus_tokens=bonus_tokens,
+            accept_lens_device=accept_lens,
+        )
         # verify_forward_batch transitively holds verify-time GPU tensors that
         # must outlive the imminent batch.input_ids rebind; scheduler pins it
         # in batch_record_buf via extra_keep_alive_refs. See EAGLEWorkerV2.verify.

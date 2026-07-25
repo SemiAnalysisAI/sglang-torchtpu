@@ -1975,7 +1975,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch, accept_index, accept_lens, predict, logits_output, bs
             )
 
-        next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
+        next_draft_input = EagleDraftInput(
+            bonus_tokens=bonus_tokens,
+            accept_lens_device=accept_lens,
+        )
 
         # verify_forward_batch transitively holds verify-time GPU tensors
         # (draft_token / out_cache_loc / ...) that must outlive the imminent
