@@ -1,3 +1,7 @@
+import torch
+import torch.nn as nn
+
+
 class RMSNormGated(nn.Module):
     """Pure-torch gated RMSNorm for TPU (``norm_before_gate=True``).
 

@@ -158,13 +158,15 @@ if _is_npu:
         split_qkvgate_gemma_rmsnorm_rope,
     )
 
-def dispatchRMSNormGated():
-    if _is_tpu:
-        from sglang.srt.layers.attention.native_torch.layernorm_gated import RMSNormGated
-    else:
-        from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
-
-dispatchRMSNormGated()
+# FLA's gated RMSNorm is a CUDA/Triton kernel (it calls
+# torch.cuda.get_device_properties), so TPU uses the pure-torch equivalent.
+# NOTE: these must be module-level imports -- doing them inside a function
+# binds the name in that function's local scope only, leaving RMSNormGated
+# undefined at the call sites below.
+if _is_tpu:
+    from sglang.srt.layers.attention.native_torch.layernorm_gated import RMSNormGated
+else:
+    from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -286,6 +288,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             dt_bias=self.dt_bias,
         )
 
+        _gate_act = (
+            {"activation": self.output_gate_type}
+            if self.output_gate_type is not None
+            else {}
+        )
+        if _is_tpu:
+            # The pure-torch norm is always norm-before-gate and ungrouped, and
+            # takes no device arg (torch.get_device_module() has no TPU
+            # current_device), so those FLA-only kwargs are dropped here.
+            self.norm = RMSNormGated(
+                self.head_v_dim,
+                eps=self.layer_norm_epsilon,
+                dtype=config.torch_dtype,
+                **_gate_act,
+            )
+        else:
             self.norm = RMSNormGated(
                 self.head_v_dim,
                 eps=self.layer_norm_epsilon,
@@ -293,11 +311,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 norm_before_gate=True,
                 device=torch.get_device_module().current_device(),
                 dtype=config.torch_dtype,
-                **(
-                    {"activation": self.output_gate_type}
-                    if self.output_gate_type is not None
-                    else {}
-                ),
+                **_gate_act,
             )
 
         self.out_proj = RowParallelLinear(
@@ -2261,25 +2275,35 @@ class Qwen3_5TextForCausalLM(nn.Module):
         # namespace and delegate (the backbone loader fuses q/k/v and the GDN
         # in-projections via its stacked_params_mapping).
         lm_prefix = "model.language_model."
-        backbone_weights = []
-        for name, w in weights:
-            if (
-                name.startswith("model.visual")
-                or name.startswith("visual")
-                or name.startswith("mtp.")
-            ):
-                continue
-            if name.startswith("lm_head."):
-                param = self.lm_head.weight
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, w)
-            elif name.startswith(lm_prefix):
-                backbone_weights.append((name[len(lm_prefix) :], w))
-            elif name.startswith("model."):
-                backbone_weights.append((name[len("model.") :], w))
-            else:
-                backbone_weights.append((name, w))
-        self.model.load_weights(backbone_weights)
+
+        # Remap lazily. Buffering into a list would drain the incoming stream
+        # before a single parameter is copied, which defeats the platform's
+        # periodic load-time drain (see TpuSRTPlatform._sync_weight_stream) --
+        # every copy then lands in one deferred program. On the 397B MoE that is
+        # 23k+ parameters per EP rank and libtpu aborts with
+        # "Parameter number N causes underflow" once it passes its limit.
+        def _remapped() -> Iterable[Tuple[str, torch.Tensor]]:
+            for name, w in weights:
+                if (
+                    name.startswith("model.visual")
+                    or name.startswith("visual")
+                    or name.startswith("mtp.")
+                ):
+                    continue
+                if name.startswith("lm_head."):
+                    param = self.lm_head.weight
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, w)
+                elif name.startswith(lm_prefix):
+                    yield name[len(lm_prefix) :], w
+                elif name.startswith("model."):
+                    yield name[len("model.") :], w
+                else:
+                    yield name, w
+
+        self.model.load_weights(_remapped())
         # Tied embeddings: no lm_head weight in the checkpoint.
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head.weight.data.copy_(self.model.embed_tokens.weight.data)
