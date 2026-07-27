@@ -47,12 +47,20 @@ def configure_jax_export_env(world_size: int) -> None:
     )
     configured_counts = [int(value) for value in pattern.findall(xla_flags)]
     if configured_counts:
-        if len(configured_counts) != 1 or configured_counts[0] != world_size:
+        if len(configured_counts) != 1:
             raise RuntimeError(
-                f"{_CPU_DEVICE_COUNT_FLAG} must equal WORLD_SIZE={world_size}; "
+                f"Expected one {_CPU_DEVICE_COUNT_FLAG} setting; "
                 f"XLA_FLAGS={xla_flags!r}."
             )
-        return
+        if configured_counts[0] == world_size:
+            return
+        if _jax_backend_initialized():
+            raise RuntimeError(
+                f"Cannot change {_CPU_DEVICE_COUNT_FLAG} from "
+                f"{configured_counts[0]} to WORLD_SIZE={world_size} after the "
+                "JAX backend initialized."
+            )
+        xla_flags = pattern.sub("", xla_flags).strip()
 
     if _jax_backend_initialized():
         raise RuntimeError(
