@@ -9,8 +9,8 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
-    _prepare_post_expert_norm_contract,
     apply_fp8_fused_rs,
+    prepare_tpu_fused_rs_post_expert_norm,
     should_use_fp8_fused_rs,
     supports_fp8_fused_rs,
 )
@@ -110,7 +110,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
             finalize_tpu_fused_rs_fallback=lambda output, dispatch: output,
         )
 
-        _prepare_post_expert_norm_contract(layer)
+        prepare_tpu_fused_rs_post_expert_norm(layer)
 
         self.assertTrue(layer._tpu_fused_rs_has_post_expert_norm)
         self.assertIs(layer._tpu_fused_rs_post_expert_norm_weight, weight)
@@ -124,7 +124,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
         )
 
         with self.assertRaisesRegex(TypeError, "model-provided"):
-            _prepare_post_expert_norm_contract(layer)
+            prepare_tpu_fused_rs_post_expert_norm(layer)
 
     def test_large_prefill_finalizes_then_reduces_once(self):
         tokens, topk, hidden = 129, 2, 4

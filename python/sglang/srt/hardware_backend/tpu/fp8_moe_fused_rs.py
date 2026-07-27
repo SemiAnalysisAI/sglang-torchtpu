@@ -25,13 +25,13 @@ _POST_EXPERT_NORM_WEIGHT_GETTER = "tpu_fused_rs_post_expert_norm_weight"
 _POST_EXPERT_NORM_FALLBACK = "finalize_tpu_fused_rs_fallback"
 
 
-def _has_post_expert_norm_contract(layer: torch.nn.Module) -> bool:
+def has_tpu_fused_rs_post_expert_norm(layer: torch.nn.Module) -> bool:
     return bool(getattr(layer, _POST_EXPERT_NORM_CAPABILITY, False))
 
 
-def _prepare_post_expert_norm_contract(layer: torch.nn.Module) -> None:
+def prepare_tpu_fused_rs_post_expert_norm(layer: torch.nn.Module) -> None:
     """Validate and cache the model-owned post-expert norm contract."""
-    has_post_expert_norm = _has_post_expert_norm_contract(layer)
+    has_post_expert_norm = has_tpu_fused_rs_post_expert_norm(layer)
     layer.__dict__["_tpu_fused_rs_has_post_expert_norm"] = has_post_expert_norm
     if not has_post_expert_norm:
         return
@@ -123,7 +123,7 @@ def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
     parallel = get_parallel()
     server_args = get_server_args()
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    has_post_expert_norm = _has_post_expert_norm_contract(layer)
+    has_post_expert_norm = has_tpu_fused_rs_post_expert_norm(layer)
     if not supports_fp8_fused_rs(
         ep_size=ep_size,
         tp_size=get_tp_group().world_size,
@@ -143,7 +143,7 @@ def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
     ):
         return False
 
-    _prepare_post_expert_norm_contract(layer)
+    prepare_tpu_fused_rs_post_expert_norm(layer)
 
     # prepare_tpu_fp8_moe_weights already stores weights as (E, K, N) and
     # channelwise scales as (E, 1, 1, N), exactly as fused-RS expects.
