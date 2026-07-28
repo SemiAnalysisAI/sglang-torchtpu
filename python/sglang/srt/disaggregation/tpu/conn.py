@@ -117,7 +117,6 @@ def _kv_channels() -> int:
 # Emit one ``trace-event`` line to stdout per KV transfer phase (gather / push /
 # receive / scatter).
 from sglang.srt.disaggregation.tpu.profile_util import (  # noqa: E402
-    _PERFETTO,
     fmt_bytes,
     perfetto_trace,
 )
@@ -342,8 +341,6 @@ class TpuKVManager(TpuKVManagerBase):
                 and self.layer_buffers
                 and self.layer_buffers[0].device.type != "cpu"
             )
-            n_layers = len(self.layer_buffers)
-            n_pages = len(page_indices)
             with perfetto_trace(
                 self.trace_pid, f"gather/r{room}/i{index_start}"
             ) as _sp:
@@ -371,14 +368,13 @@ class TpuKVManager(TpuKVManagerBase):
                 stats = getattr(self, "_gather_stats", None)
                 if stats is not None:
                     stats.record(time.perf_counter() - _t0, nbytes)
-                if _PERFETTO:
-                    _sp.args.update(
-                        {
-                            "shape": self._get_page_shape_str(n_pages),
-                            "layers": f"{n_layers}L",
-                            "size": fmt_bytes(nbytes),
-                        }
-                    )
+                _sp.args.update(
+                    {
+                        "shape": lambda: self._get_page_shape_str(len(page_indices)),
+                        "layers": f"{len(self.layer_buffers)}L",
+                        "size": lambda: fmt_bytes(nbytes),
+                    }
+                )
 
             aux_blobs: List[bytes] = []
             if is_last_chunk and aux_index is not None:
@@ -451,9 +447,6 @@ class TpuKVManager(TpuKVManagerBase):
         issued async (#7), ``d2h_future`` is waited here — off the scheduler
         thread — before the bytes are read for sending."""
         n_layers = len(self.layer_buffers)
-        shape = (
-            self._get_page_shape_str(n_pages) if _PERFETTO else ""
-        )
         push_name = f"push/r{room}/i{index_start}"
         wait_name = f"gatherwait/r{room}/i{index_start}"
         try:
@@ -461,7 +454,10 @@ class TpuKVManager(TpuKVManagerBase):
                 with perfetto_trace(self.trace_pid, wait_name):
                     d2h_future.wait()
             with perfetto_trace(
-                self.trace_pid, push_name, shape=shape, layers=f"{n_layers}L"
+                self.trace_pid,
+                push_name,
+                shape=lambda: self._get_page_shape_str(n_pages),
+                layers=f"{n_layers}L",
             ):
                 trackers = []
                 for endpoint in endpoints:
@@ -519,9 +515,6 @@ class TpuKVManager(TpuKVManagerBase):
 
         n_ch = getattr(self, "_n_channels", 1)
         n_layers = len(layer_frames)
-        shape = (
-            self._get_page_shape_str(num_pages) if _PERFETTO else ""
-        )
         push_word = f"pushch{n_ch}" if n_ch > 1 else "push"
         push_name = f"{push_word}/r{room}/i{index_start}"
         wait_name = f"gatherwait/r{room}/i{index_start}"
@@ -530,7 +523,11 @@ class TpuKVManager(TpuKVManagerBase):
                 with perfetto_trace(self.trace_pid, wait_name):
                     d2h_future.wait()
             with perfetto_trace(
-                self.trace_pid, push_name, shape=shape, layers=f"{n_layers}L"):
+                self.trace_pid,
+                push_name,
+                shape=lambda: self._get_page_shape_str(num_pages),
+                layers=f"{n_layers}L",
+            ):
                 n_layers = len(layer_frames)
                 bounds = [(c * n_layers) // n_ch for c in range(n_ch + 1)]
                 copy_false = stages is not None
@@ -665,7 +662,6 @@ class TpuKVManager(TpuKVManagerBase):
         with perfetto_trace(self.trace_pid, f"recv_{room}_{ch}"):
             index_start = int(bytes(msg[2]).decode())
             num_pages = int(bytes(msg[3]).decode())
-            ch = int(bytes(msg[4]).decode())
             n_ch = int(bytes(msg[5]).decode())
             lo = int(bytes(msg[6]).decode())
             n_layers = int(bytes(msg[7]).decode())
