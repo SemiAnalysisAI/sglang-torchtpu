@@ -48,18 +48,24 @@ def enable_cp_v2() -> bool:
 
 
 def is_cp_v2_active(forward_batch) -> bool:
-    """Return whether the current forward batch is running through CP-v2."""
+    """Return whether the current forward batch is running through CP-v2.
+
+    Each strategy decides whether it can handle the current batch via
+    :meth:`ContextParallelStrategy.can_apply` — PCP streaming supports
+    both prefill (``is_context_parallel_extend``) and decode
+    (``is_decode``), while Zigzag and Interleave gate to prefill only.
+    """
     if not enable_cp_v2():
         return False
-    forward_mode = getattr(forward_batch, "forward_mode", None)
-    if forward_mode is None or not forward_mode.is_context_parallel_extend():
+    forward_mode = forward_batch.forward_mode
+    if forward_mode is None:
         return False
 
     strategy = get_cp_strategy()
     if strategy is None:
         return False
 
-    input_ids = getattr(forward_batch, "input_ids", None)
+    input_ids = forward_batch.input_ids
     if input_ids is None:
         return False
 
@@ -67,18 +73,29 @@ def is_cp_v2_active(forward_batch) -> bool:
 
 
 def prepare_cp_forward(forward_batch) -> None:
-    """Build CP-v2 metadata for an active context-parallel prefill batch."""
+    """Build CP-v2 metadata for an active context-parallel batch.
+
+    Builds ``forward_batch.attn_cp_metadata`` via
+    ``strategy.build_metadata`` and then calls
+    ``strategy.build_extra_metadata`` (PCP populates the sequence-layout
+    plan + Dynamo-safe scalar mirrors there; Zigzag/Interleave no-op).
+    """
     assert is_cp_v2_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
     num_tokens = len(forward_batch.input_ids)
 
-    seq_lens_cpu = _to_int_list(getattr(forward_batch, "seq_lens_cpu", None))
-    extend_lens_cpu = _to_int_list(getattr(forward_batch, "extend_seq_lens_cpu", None))
+    seq_lens_cpu = _to_int_list(forward_batch.seq_lens_cpu)
+    extend_lens_cpu = _to_int_list(forward_batch.extend_seq_lens_cpu)
     forward_batch.attn_cp_metadata = strategy.build_metadata(
         num_tokens=num_tokens,
         seqs_len=seq_lens_cpu,
         extend_seqs_len=extend_lens_cpu,
+    )
+    strategy.build_extra_metadata(
+        forward_batch=forward_batch,
+        seq_lens_cpu=seq_lens_cpu,
+        extend_lens_cpu=extend_lens_cpu,
     )
 
 
@@ -92,7 +109,7 @@ def cp_split_before_forward(
     strategy = get_cp_strategy()
     assert strategy is not None
     assert complete_hidden_states is not None
-    assert getattr(forward_batch, "attn_cp_metadata", None) is not None
+    assert forward_batch.attn_cp_metadata is not None
     return (
         strategy.shard_hidden_states(complete_hidden_states, forward_batch),
         strategy.shard_position_ids(complete_position_ids, forward_batch),
@@ -118,7 +135,9 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
 def _to_int_list(values) -> Optional[list[int]]:
     if values is None:
         return None
-    if hasattr(values, "tolist"):
+    import torch as _torch
+
+    if isinstance(values, _torch.Tensor):
         values = values.tolist()
     return [int(x) for x in values]
 
