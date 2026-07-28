@@ -851,7 +851,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
-
         return hidden_states, residual
 
     def op_comm_prepare_attn(
@@ -1238,6 +1237,27 @@ class Qwen3MoeForCausalLM(nn.Module):
             num_logical_experts=config.num_experts,
             num_groups=None,
         )
+
+
+from sglang.srt.compilation.support_torch_compile import support_torch_compile
+from sglang.srt.platforms import current_platform
+
+if current_platform.supports_torch_compile():
+    # Compile the inner ``Qwen3MoeModel.forward`` (not the outer CausalLM
+    # forward). The CP-v2 eager runner bypasses ``Qwen3MoeForCausalLM.forward``
+    # and calls ``model.model(...)`` directly to interpose the CP all-gather
+    # between the final decoder layer and ``logits_processor`` — installing the
+    # compile boundary on the inner model makes both the non-CP path (via
+    # CausalLM → model()) AND the CP-v2 path (direct model() call) hit the same
+    # compiled decoder graph.
+    from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+        DecoderTpuCompilePolicy,
+    )
+
+    support_torch_compile(
+        Qwen3MoeModel,
+        policy=DecoderTpuCompilePolicy,
+    )
 
 
 EntryClass = Qwen3MoeForCausalLM
