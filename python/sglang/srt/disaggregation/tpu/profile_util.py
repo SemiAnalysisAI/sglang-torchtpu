@@ -1,6 +1,10 @@
 # Emit one ``trace-event`` line to stdout per KV transfer phase (gather / push /
 # receive / scatter).
-"""Lightweight Perfetto trace-event instrumentation for TPU P/D KV transfer."""
+"""Lightweight Perfetto trace-event instrumentation for TPU P/D KV transfer.
+
+FIXME: Refactor this module to use OpenTelemetry (OTEL) tracing, matching the
+Mooncake disaggregation tracing path.
+"""
 
 import contextlib
 import logging
