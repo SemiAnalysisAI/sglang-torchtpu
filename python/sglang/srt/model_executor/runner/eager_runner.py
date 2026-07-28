@@ -64,8 +64,8 @@ def _reset_cp_v2_state(forward_batch: ForwardBatch) -> None:
     ForwardBatch instances are pooled/reused across forwards; leaving stale
     CP-v2 mirrors here (msgspec metadata + plain-scalar Dynamo-safe copies)
     lets the next non-CP forward wrongly enter the ``moe_cp_allgather``
-    branch or the PCP attention dispatch. All 6 fields must be reset — the
-    2 msgspec/optional objects PLUS the 4 plain-scalar defaults.
+    branch or the PCP attention dispatch. All 7 fields must be reset — the
+    2 msgspec/optional objects PLUS the 5 plain-scalar defaults.
     """
     forward_batch.attn_cp_metadata = None
     forward_batch.pcp_layout_plan = None
@@ -73,6 +73,7 @@ def _reset_cp_v2_state(forward_batch: ForwardBatch) -> None:
     forward_batch.moe_cp_active = False
     forward_batch.moe_cp_pad_max_tokens = 0
     forward_batch.moe_cp_local_tokens = 0
+    forward_batch.pcp_cache_pages = 0
 
 
 def _pcp_dump_hs_slot0(*, tag: str, hidden_states: Any) -> None:

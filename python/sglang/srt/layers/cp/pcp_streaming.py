@@ -284,6 +284,12 @@ class PCPStreamingCPStrategy(ContextParallelStrategy):
         forward_batch.moe_cp_local_tokens = int(plan.local_padded_num_tokens)
         forward_batch.moe_cp_active = True
         forward_batch.pcp_attn_active = True
+        # NB: forward_batch.pcp_cache_pages is intentionally NOT set here.
+        # The backend (attention_pallas_rpa_v3_cp._forward_pcp) computes it
+        # from forward_batch's per-request state + the KV pool's page_size
+        # and max_num_blocks_per_req. The compile policy overrides it
+        # directly per bucket in _run_one_pcp. Setting it here would create
+        # a two-writer race between eager strategy and compile-time policy.
 
 
 def pcp_streaming_attention(

@@ -35,7 +35,9 @@ plain-scalar mirrors for the compiled forward).
 
 from __future__ import annotations
 
-from typing import Optional
+import functools
+import math
+from typing import Optional, Tuple
 
 import msgspec
 import numpy as np
@@ -282,3 +284,98 @@ def gather_and_unpack_pcp(x: torch.Tensor, forward_batch) -> torch.Tensor:
     device = gathered.device
     inv = torch.as_tensor(plan.inverse_order, dtype=torch.int64, device=device)
     return gathered[inv]
+
+
+# ---------------------------------------------------------------------------
+# PCP cache-page bucketization (for the gather-KV cache phase).
+#
+# The gather-KV path of the PCP attention op all-gathers a request's live KV
+# pages across CP ranks. That all-gather is bounded by a static
+# ``cache_pages`` field so a short request served by a server with a large
+# ``max_model_len`` does not move the whole KV cache (which is sized for
+# ``max_model_len``). To keep precompile from exploding, ``cache_pages`` is
+# quantized to a small number of log-spaced power-of-two buckets that include
+# 0 (first chunk, no cached tokens) and ``max_num_blocks_per_req`` (the full
+# block-table width).
+#
+# Ported verbatim (algorithm-wise) from vllm-project/tpu-inference PR #3260
+# (tpu_inference/layers/common/attention_metadata.py::pcp_cache_page_buckets
+# and round_up_pcp_cache_pages). Kept here alongside the sequence-layout
+# planner because that's where all the PCP-shape quantization math already
+# lives.
+# ---------------------------------------------------------------------------
+
+PCP_CACHE_PAGE_BUCKET_COUNT = 5
+
+
+@functools.lru_cache(maxsize=None)
+def _pcp_cache_page_buckets_cached(max_num_blocks_per_req: int) -> Tuple[int, ...]:
+    """Immutable, hashable form of :func:`pcp_cache_page_buckets` for caching.
+
+    ``max_num_blocks_per_req`` is a process-lifetime constant per PCP
+    strategy, so this cache holds at most a handful of entries. The cache
+    only matters because :func:`round_up_pcp_cache_pages` calls the bucket
+    generator on every request.
+    """
+    if max_num_blocks_per_req < 0:
+        raise ValueError(
+            f"max_num_blocks_per_req must be >= 0, got {max_num_blocks_per_req}"
+        )
+    buckets = {0, max_num_blocks_per_req}
+    n = PCP_CACHE_PAGE_BUCKET_COUNT - len(buckets)
+    if n > 0 and max_num_blocks_per_req > 1:
+        step = math.log(max_num_blocks_per_req) / (n + 1)
+        for i in range(1, n + 1):
+            v = 1 << max(0, round(math.exp(step * i)).bit_length() - 1)
+            buckets.add(min(max(v, 1), max_num_blocks_per_req))
+    return tuple(sorted(buckets))
+
+
+def pcp_cache_page_buckets(max_num_blocks_per_req: int) -> list[int]:
+    """Buckets for the static ``pcp_cache_pages`` field, including 0.
+
+    Returns a sorted list of at most ``PCP_CACHE_PAGE_BUCKET_COUNT`` unique
+    ints. Always includes ``0`` (first-chunk skip case where no KV is cached
+    yet) and ``max_num_blocks_per_req`` (the full block-table width, the
+    loosest legal bound). Intermediate values are log-spaced, each rounded to
+    a power of two so ``lax.all_gather`` on a page-count of that size stays
+    on a nice compile shape.
+
+    A short request whose live page count falls under a small bucket compiles
+    a graph that gathers only that many pages, avoiding the full-cache
+    all-gather.
+    """
+    return list(_pcp_cache_page_buckets_cached(max_num_blocks_per_req))
+
+
+def round_up_pcp_cache_pages(
+    *,
+    num_computed_tokens: int,
+    page_size: int,
+    max_num_blocks_per_req: int,
+) -> int:
+    """Quantize ``num_computed_tokens`` up to the smallest bucket.
+
+    Returns 0 when the request has no cached tokens (first chunk of a chunked
+    prefill), or the smallest bucket from ``pcp_cache_page_buckets`` that
+    covers ``ceil(num_computed_tokens / page_size)``. Falling off the end
+    returns ``max_num_blocks_per_req``.
+
+    Keyword-only args match the "prefer keyword arguments" style rule and
+    prevent argument-order confusion — the three ints look interchangeable
+    at a glance and one transposition here would silently return the wrong
+    bucket for every forward.
+    """
+    if page_size <= 0:
+        raise ValueError(f"page_size must be > 0, got {page_size}")
+    if max_num_blocks_per_req < 0:
+        raise ValueError(
+            f"max_num_blocks_per_req must be >= 0, got {max_num_blocks_per_req}"
+        )
+    if num_computed_tokens <= 0:
+        return 0
+    live_pages = (num_computed_tokens + page_size - 1) // page_size
+    for b in _pcp_cache_page_buckets_cached(max_num_blocks_per_req):
+        if b >= live_pages:
+            return b
+    return max_num_blocks_per_req

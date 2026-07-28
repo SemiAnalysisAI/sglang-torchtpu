@@ -526,6 +526,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     moe_cp_active: bool = False
     moe_cp_pad_max_tokens: int = 0
     moe_cp_local_tokens: int = 0
+    # gather-KV cache-phase bound: number of KV pages the request's cached
+    # tokens occupy, quantized to a compile bucket. 0 = first chunk (no
+    # cached tokens); non-zero drives the all-gather size in the PCP
+    # gather-KV path. Populated by PCPStreamingCPStrategy.build_extra_metadata.
+    pcp_cache_pages: int = 0
     # PCPStreamingSequenceLayoutPlan; declared as Any because the concrete
     # type lives under layers/cp/pcp_sequence_layout.py which we don't want
     # to import at forward_batch construction time.

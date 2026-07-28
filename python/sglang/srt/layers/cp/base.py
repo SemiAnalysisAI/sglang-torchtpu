@@ -90,7 +90,8 @@ class CPAttentionBackendKind(IntEnum):
     FLASH_ATTENTION = 0
     # PALLAS_TPU_RPA_V3_CP: sglang's Pallas RPA v3 CP backend on torch_tpu.
     # PCP_STREAMING strategy uses this — the backend subclass
-    # ``TpuPallasRpaV3CpAttnBackend._forward_pcp`` invokes the # PCP streaming kernel via ``pcp_streaming_attention``.
+    # ``TpuPallasRpaV3CpAttnBackend._forward_pcp`` invokes the PCP
+    # streaming kernel via ``pcp_streaming_attention``.
     PALLAS_TPU_RPA_V3_CP = 1
 
     @classmethod
