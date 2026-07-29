@@ -19,6 +19,7 @@ from diffusers.schedulers.scheduling_utils import (
 from diffusers.utils import deprecate
 
 from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
@@ -223,7 +224,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
 
         self.sigmas = torch.from_numpy(sigmas).to(device=device)
         self.timesteps = torch.from_numpy(timesteps).to(
-            device=device, dtype=torch.int64
+            device=device, dtype=current_platform.get_index_dtype()
         )
 
         self.num_inference_steps = len(timesteps)

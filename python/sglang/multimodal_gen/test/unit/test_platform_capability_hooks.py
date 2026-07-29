@@ -28,6 +28,18 @@ class TestCapabilityHookDefaults(unittest.TestCase):
             Platform.worker_spawn_env(rank=0, world_size=8, master_port=1234), {}
         )
 
+    def test_index_dtype_defaults_to_int64(self):
+        import torch
+
+        self.assertEqual(Platform.get_index_dtype(), torch.int64)
+
+    def test_tpu_index_dtype_is_int32(self):
+        import torch
+
+        from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
+
+        self.assertEqual(TpuPlatform.get_index_dtype(), torch.int32)
+
 
 class TestCapabilityHookConsumers(unittest.TestCase):
     def test_spatial_shard_decode_disabled_without_p2p(self):

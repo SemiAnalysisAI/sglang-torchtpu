@@ -986,7 +986,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             token_start,
             token_start + local_len,
             device=device,
-            dtype=torch.long,
+            dtype=current_platform.get_index_dtype(),
         )
         t_idx = token_indices // frame_stride_local
         rem = token_indices % frame_stride_local

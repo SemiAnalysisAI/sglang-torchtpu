@@ -216,6 +216,14 @@ class Platform:
         return True
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def get_index_dtype(cls) -> torch.dtype:
+        """Dtype for device-side index/position tensors (timesteps, rope
+        positions). Platforms whose 64-bit integer ops are emulated override
+        to int32; values at these sites fit int32 comfortably."""
+        return torch.int64
+
+    @classmethod
     def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
         return None
 

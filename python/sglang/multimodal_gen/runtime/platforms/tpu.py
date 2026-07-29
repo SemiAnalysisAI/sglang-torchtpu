@@ -217,6 +217,12 @@ class TpuPlatform(Platform):
         return False  # TPUs have no f64 compute units.
 
     @classmethod
+    def get_index_dtype(cls) -> torch.dtype:
+        # int64 is emulated on TPU (srt pins positions to int32 for the same
+        # reason: forward_batch_info.py positions_dtype, patches.py cumsum).
+        return torch.int32
+
+    @classmethod
     def inference_mode(cls):
         # torch_tpu's lazy tensors do not support torch.inference_mode.
         return torch.no_grad()
