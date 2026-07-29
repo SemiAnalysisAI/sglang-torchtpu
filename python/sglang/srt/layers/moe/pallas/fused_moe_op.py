@@ -338,18 +338,22 @@ def _fused_moe_jax(
             )
 
             if use_group_offset:
-                combined = ragged_gather_reduce(
+                valid_mask = _valid_rows_mask(
+                    group_sizes,
+                    expert_group_offset,
+                    num_experts,
+                    unsort_idx,
+                )
+                masked_topk_weights = topk_weights * valid_mask.reshape(
+                    topk_weights.shape
+                )
+                combined = dense_gather_reduce(
                     gmm2_out,
                     unsort_idx.astype(jnp.int32),
-                    topk_weights.reshape(-1),
-                    _valid_rows_mask(
-                        group_sizes,
-                        expert_group_offset,
-                        num_experts,
-                        unsort_idx,
-                    ),
+                    masked_topk_weights,
                     topk,
                 )
+
             else:
                 # All experts local: every row is valid, so use the maskless
                 # dense variant.
@@ -362,20 +366,11 @@ def _fused_moe_jax(
             return combined[:m_orig].astype(out_dtype)
 
         # no_combine: just gather, without the weighted top-k sum.
-        from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_v2 import (
-            ragged_gather_v2,
-        )
-
-        n_sorted = unsort_idx.shape[0]
-        unsorted = ragged_gather_v2(
-            gmm2_out,
-            unsort_idx.astype(jnp.int32),
-            jnp.array([0], dtype=jnp.int32),
-            jnp.array([n_sorted], dtype=jnp.int32),
-        )
-    else:
-        # Gather on the TensorCore.
         unsorted = gmm2_out[unsort_idx]
+    else:
+        unsorted = gmm2_out[unsort_idx]
+
+
     unsorted = unsorted.reshape(m, topk, hidden_size)
     unsorted = unsorted[:m_orig].astype(out_dtype)
     if no_combine:

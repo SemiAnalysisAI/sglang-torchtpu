@@ -17,6 +17,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from sglang.srt.layers.moe.pallas.utils import Indirect, make_compiler_params
+
 
 def is_compatible(
     op: jax.Array,
@@ -115,7 +117,7 @@ def _sc_gather_reduce(
             subcore_axis_name="subcore",
             num_cores=1 if single_sc else sc_info.num_cores,
         ),
-        compiler_params=pltpu.CompilerParams(
+        compiler_params=make_compiler_params(
             use_tc_tiling_on_sc=True,
             needs_layout_passes=True,
         ),
@@ -159,12 +161,21 @@ def _sc_gather_reduce(
                 pltpu.emit_pipeline,
                 grid=(num_row_subchunks, num_col_chunks),
                 in_specs=pl.BlockSpec(
-                    (pl.Indirect(row_subchunk_size), col_chunk_size),
+                    (Indirect(row_subchunk_size), col_chunk_size),
                     lambda r, c: (
-                        lax.div(
-                            idx_ref[pl.ds(r * row_subchunk_size, row_subchunk_size)],
-                            packing,
+                        (
+                            idx_ref[
+                                pl.ds(r * row_subchunk_size, row_subchunk_size)
+                            ]
+                            if packing == 1
+                            else jnp.right_shift(
+                                idx_ref[
+                                    pl.ds(r * row_subchunk_size, row_subchunk_size)
+                                ],
+                                1,
+                            )
                         ),
+
                         c,
                     ),
                 ),
@@ -180,14 +191,12 @@ def _sc_gather_reduce(
                 row_slice = pl.ds(
                     pl.program_id(0) * row_subchunk_size, row_subchunk_size
                 )
-                subchunk_idxs = idx_ref[row_slice]
-                weights = (
-                    None
-                    if weights_ref is None
-                    else weights_ref[row_slice].astype(jnp.float32)
-                )
+                unpack_col_chunk = 16  # 16 matches SparseCore SIMD vector lane width in JAX 0.9.2
+                if weights_ref is not None:
+                    w_vec = weights_ref[row_slice].astype(jnp.float32)
+                else:
+                    w_vec = None
 
-                unpack_col_chunk = 32  # 32 seems to works best when tuning.
 
                 @plsc.parallel_loop(0, col_chunk_size, step=unpack_col_chunk)
                 def _(col_base):
@@ -196,27 +205,36 @@ def _sc_gather_reduce(
                         row_datas = []
                         for row_in_group in range(reduce_group_size):
                             row = reduce_group * reduce_group_size + row_in_group
-                            row_data = gather_ref[
-                                pl.ds(row * packing, packing),
-                                pl.ds(col_base, unpack_col_chunk),
-                            ].astype(jnp.float32)
+                            col_slice = pl.ds(col_base, unpack_col_chunk)
                             if packing == 1:
-                                row_data = row_data[0]
+                                row_data = gather_ref[row, col_slice].astype(jnp.float32)
                             else:
-                                assert packing == 2
-                                row_data = jnp.where(
-                                    lax.bitwise_and(subchunk_idxs[row], 1) == 0,
-                                    row_data[0],
-                                    row_data[1],
-                                )
-                            if weights is not None:
-                                row_data *= weights[row]
+                                val_u32 = gather_ref[reduce_group, col_slice]
+                                if row_in_group % 2 == 0:
+                                    shifted = jnp.bitwise_and(
+                                        jnp.left_shift(val_u32, 16), jnp.uint32(0xFFFF0000)
+                                    )
+                                else:
+                                    shifted = jnp.bitwise_and(
+                                        val_u32, jnp.uint32(0xFFFF0000)
+                                    )
+                                row_data = plsc.bitcast(shifted, jnp.float32)
+
+
+
+
+                            if w_vec is not None:
+                                w_val = w_vec[row]
+                                w_row = jnp.full((unpack_col_chunk,), w_val)
+                                row_data *= w_row
                                 if topk_wgt_zero_nan:
                                     row_data = jnp.where(
-                                        weights[row] == 0.0,
+                                        w_row == 0.0,
                                         jnp.zeros_like(row_data),
                                         row_data,
                                     )
+
+
                             row_datas.append(row_data)
 
                         # Tree reduction to reduce critical path and stalls

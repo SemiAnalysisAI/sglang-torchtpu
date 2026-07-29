@@ -55,7 +55,6 @@ from sglang.srt.utils.common import ceil_align, require_mlp_sync
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
-_is_tpu = is_tpu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -174,7 +173,7 @@ class EagerRunner(BaseRunner):
         """Copy the live batch into the fixed-max eager static buffers (sliced to
         this batch's shape) — the eager counterpart of the cuda-graph runners'
         load_batch."""
-        if envs.SGLANG_EAGER_INPUT_NO_COPY.get() or _is_tpu:
+        if envs.SGLANG_EAGER_INPUT_NO_COPY.get() or is_tpu() or str(self.model_runner.device).startswith(("tpu", "xla", "privateuseone")):
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
         if forward_batch.input_ids is not None:
@@ -233,11 +232,13 @@ class EagerRunner(BaseRunner):
         attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
         if not enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
-        if forward_batch.needs_forward_metadata_init():
+        is_tpu_dev = is_tpu() or str(model_runner.device).startswith(("tpu", "xla", "privateuseone"))
+        if forward_batch.needs_forward_metadata_init() or is_tpu_dev:
             if hasattr(model_runner.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
+        if forward_batch.needs_forward_metadata_init():
             attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
@@ -285,10 +286,13 @@ class EagerRunner(BaseRunner):
                         create_chunked_prefix_cache_kv_indices,
                     )
                 )
+        is_tpu_dev = is_tpu() or str(model_runner.device).startswith(("tpu", "xla", "privateuseone"))
+        if forward_batch.needs_forward_metadata_init() or is_tpu_dev:
             if hasattr(model_runner.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
+        if forward_batch.needs_forward_metadata_init():
             model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         cp_v2_active = is_cp_v2_active(forward_batch)

@@ -11,6 +11,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
 from sglang.srt.layers.moe.pallas.sparse_core import core_map_helper
+from sglang.srt.layers.moe.pallas.utils import Indirect, make_compiler_params
 
 
 def calculate_col_size(hidden_size: int, packing: int) -> int:
@@ -73,17 +74,19 @@ def main_kernel_v2(
     row_chunk_size = row_subchunk_size * num_row_subchunks
     block_size = row_chunk_size * num_cores
 
-    recv_sem = sem_ref.at[0]
+    sem_start = sem_ref.at[0]
+    sem_end = sem_ref.at[1]
 
-    copy_start = pltpu.make_async_copy(start_ref, start_vmem_ref.at[:1], recv_sem)
-    copy_end = pltpu.make_async_copy(end_ref, end_vmem_ref.at[:1], recv_sem)
+    copy_start = pltpu.make_async_copy(start_ref, start_vmem_ref, sem_start)
+    copy_end = pltpu.make_async_copy(end_ref, end_vmem_ref, sem_end)
+
     copy_start.start()
     copy_end.start()
     copy_start.wait()
     copy_end.wait()
 
-    start = start_vmem_ref[...][0]
-    end = end_vmem_ref[...][0]
+    start = start_vmem_ref[0]
+    end = end_vmem_ref[0]
 
     block_start = start // block_size
     block_end = pl.cdiv(end, block_size)
@@ -128,19 +131,24 @@ def main_kernel_v2(
             mask = (1 << dtype_bits) - 1
             shift_multiplier = dtype_bits.bit_length() - 1
             for i in range(num_simd_lanes // packing):
-                packed_row = jnp.zeros((1, unpack_col_chunk), dtype=jnp.int32)
+                packed_row = jnp.zeros((unpack_col_chunk,), dtype=jnp.int32)
                 for j in range(packing):
                     k = i * packing + j
                     dynamic_shift = jnp.left_shift(idx_rem[k], shift_multiplier)
                     val = jnp.bitwise_right_shift(
-                        gather_ref[pl.ds(k, 1), col_slice], dynamic_shift
+                        gather_ref[k, col_slice], dynamic_shift
                     )
                     val = jnp.bitwise_and(val, mask)
                     pack_shift = j * dtype_bits
                     packed_row = jnp.bitwise_or(
                         packed_row, jnp.left_shift(val, pack_shift)
                     )
-                out_ref[pl.ds(i, 1), col_slice] = packed_row
+                out_ref[i, col_slice] = packed_row
+
+
+
+
+
 
     def inner_pipeline(gather_ref, out_ref, idx_ref, unpack_col_chunk):
         row_slice = pl.ds(pl.program_id(0) * row_subchunk_size, row_subchunk_size)
@@ -164,8 +172,9 @@ def main_kernel_v2(
         b = pl.program_id(0)
         b_global = b + block_start
 
-        unpack_col_chunk = 128
+        unpack_col_chunk = 16
         assert num_phys_cols % unpack_col_chunk == 0
+
         shift_amount = packing.bit_length() - 1
         pltpu.emit_pipeline(
             functools.partial(
@@ -173,7 +182,7 @@ def main_kernel_v2(
             ),
             grid=(num_row_subchunks, num_cols),
             in_specs=pl.BlockSpec(
-                (pl.Indirect(row_subchunk_size), num_phys_cols),
+                (Indirect(row_subchunk_size), num_phys_cols),
                 lambda r, col_id: (
                     jnp.bitwise_right_shift(
                         idx_ref[pl.ds(r * row_subchunk_size, row_subchunk_size)],
@@ -181,6 +190,8 @@ def main_kernel_v2(
                     ),
                     col_id,
                 ),
+
+
             ),
             out_specs=pl.BlockSpec(
                 (row_subchunk_size // packing, num_phys_cols),
@@ -240,9 +251,9 @@ def ragged_gather_v2(
     base_block_size = num_simd_lanes * num_cores
 
     # Calculate ideal num_row_subchunks to avoid too much padding overhead.
-    num_row_subchunks = max(
-        1, min(4, (out_size + base_block_size - 1) // base_block_size)
-    )
+    raw_subchunks = (out_size + base_block_size - 1) // base_block_size
+    # Enforce even num_row_subchunks (2 or 4) so subcore 0 and subcore 1 receive equal row chunks
+    num_row_subchunks = max(2, min(4, ((raw_subchunks + 1) // 2) * 2))
 
     row_subchunk_size = num_simd_lanes
     row_chunk_size = row_subchunk_size * num_row_subchunks
@@ -250,6 +261,8 @@ def ragged_gather_v2(
 
     out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size
     indices = jnp.pad(indices, ((0, out_pad_size)))
+
+
 
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
@@ -267,7 +280,7 @@ def ragged_gather_v2(
         out_type=jax.ShapeDtypeStruct(
             (out_size + out_pad_size, aligned_hidden_size), dtype
         ),
-        compiler_params=pltpu.CompilerParams(
+        compiler_params=make_compiler_params(
             use_tc_tiling_on_sc=True,
             needs_layout_passes=True,
             disable_bounds_checks=True,
@@ -275,8 +288,16 @@ def ragged_gather_v2(
         scratch_types=[
             pltpu.VMEM((16,), jnp.int32),
             pltpu.VMEM((16,), jnp.int32),
-            pltpu.SemaphoreType.DMA((1,)),
+            pltpu.SemaphoreType.DMA((2,)),
         ],
+
         mesh=vector_mesh,
         name="sc_ragged_gather_v2",
-    )(start, end, x, indices)[:out_size, :hidden_size]
+    )(
+        jnp.pad(jnp.reshape(start, (-1,)), (0, 15))[:16],
+        jnp.pad(jnp.reshape(end, (-1,)), (0, 15))[:16],
+        x,
+        indices,
+    )[:out_size, :hidden_size]
+
+

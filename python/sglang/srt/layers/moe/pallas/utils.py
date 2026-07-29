@@ -19,9 +19,95 @@
 kernel (``gmm_v2.py``).
 """
 
+import inspect
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+
+def make_compiler_params(**kwargs):
+    """Safely construct pltpu.CompilerParams filtering out deprecated or unsupported kwargs."""
+    sig = inspect.signature(pltpu.CompilerParams.__init__)
+    valid_params = set(sig.parameters.keys())
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
+    return pltpu.CompilerParams(**filtered_kwargs)
+
+
+def get_pallas_indirect():
+    """Safely resolve Indirect/Blocked block spec class across JAX/Pallas versions."""
+    if hasattr(pltpu, "Indirect"):
+        return pltpu.Indirect
+    if hasattr(pl, "tpu") and hasattr(pl.tpu, "Indirect"):
+        return pl.tpu.Indirect
+    if hasattr(pl, "Indirect"):
+        return pl.Indirect
+    if hasattr(pl, "Blocked"):
+        return pl.Blocked
+    raise AttributeError("Could not find Indirect or Blocked class in jax.experimental.pallas.")
+
+
+
+Indirect = get_pallas_indirect()
+
+
+# Patch pl.when, lax.select, and lax.cond to handle non-scalar conditions (e.g. bool[16]) in JAX 0.9.2
+try:
+    from jax import lax
+    from jax._src.lax import control_flow
+
+    _orig_select = lax.select
+    def _safe_select(pred, on_true, on_false):
+        if hasattr(on_true, "shape") and getattr(on_true, "ndim", 0) > 0:
+            pred_shape = getattr(pred, "shape", ())
+            if pred_shape != on_true.shape:
+                if pred_shape == ():
+                    pred = jnp.broadcast_to(pred, on_true.shape)
+                else:
+                    pred = jnp.any(pred)
+        elif hasattr(pred, "shape") and getattr(pred, "ndim", 0) > 0:
+            pred = jnp.any(pred)
+        return _orig_select(pred, on_true, on_false)
+
+
+    lax.select = _safe_select
+    control_flow.select = _safe_select
+
+    _orig_cond = lax.cond
+    def _safe_cond(pred, true_fun, false_fun, *operands, **kwargs):
+        if hasattr(pred, "shape") and getattr(pred, "ndim", 0) > 0:
+            pred = jnp.any(pred)
+        return _orig_cond(pred, true_fun, false_fun, *operands, **kwargs)
+
+    lax.cond = _safe_cond
+    control_flow.cond = _safe_cond
+
+    from jax._src.pallas import helpers as pallas_helpers
+    _orig_when = pallas_helpers.when
+
+    def _safe_when(condition):
+        if hasattr(condition, "shape") and getattr(condition, "ndim", 0) > 0:
+            condition = jnp.any(condition)
+        return _orig_when(condition)
+
+    pallas_helpers.when = _safe_when
+    pl.when = _safe_when
+
+    # Patch sc_core.supported_shapes in JAX 0.9.2 to accept (1, 16) 2D vector shapes
+    import jax._src.pallas.mosaic.sc_core as sc_core
+    _orig_supported_shapes = sc_core.supported_shapes
+    def _safe_supported_shapes(dtype):
+        res = _orig_supported_shapes(dtype)
+        if (16,) in res and (1, 16) not in res:
+            res = list(res) + [(1, 16)]
+        return res
+    sc_core.supported_shapes = _safe_supported_shapes
+except Exception:
+    pass
+
+
+
+
 
 
 def swigluoai(
