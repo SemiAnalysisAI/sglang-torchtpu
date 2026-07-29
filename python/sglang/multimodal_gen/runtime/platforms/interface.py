@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import enum
+import os
 import random
 from collections.abc import Callable
 from functools import lru_cache
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
         AttentionImpl,
     )
+    from sglang.multimodal_gen.runtime.utils.perf_logger import MemorySnapshot
 
 logger = init_logger(__name__)
 
@@ -397,6 +399,60 @@ class Platform:
         Return the available memory in GiB.
         """
         raise NotImplementedError
+
+    @classmethod
+    def empty_cache(cls) -> None:
+        """Release cached device memory back to the allocator."""
+        torch.get_device_module().empty_cache()
+
+    @classmethod
+    def reset_peak_memory_stats(cls) -> None:
+        """Reset the peak device-memory counters for the current device."""
+        torch.get_device_module().reset_peak_memory_stats()
+
+    @classmethod
+    def get_memory_snapshot(cls) -> MemorySnapshot:
+        """Capture current/peak allocated and reserved device memory."""
+        # Local import: perf_logger imports current_platform at module level.
+        from sglang.multimodal_gen.runtime.utils.perf_logger import MemorySnapshot
+
+        device_module = torch.get_device_module()
+        if not device_module.is_available():
+            return MemorySnapshot(
+                allocated_mb=0.0,
+                reserved_mb=0.0,
+                peak_allocated_mb=0.0,
+                peak_reserved_mb=0.0,
+            )
+        mib = 1024**2
+        return MemorySnapshot(
+            allocated_mb=device_module.memory_allocated() / mib,
+            reserved_mb=device_module.memory_reserved() / mib,
+            peak_allocated_mb=device_module.max_memory_allocated() / mib,
+            peak_reserved_mb=device_module.max_memory_reserved() / mib,
+        )
+
+    @classmethod
+    def init_worker_device_env(
+        cls,
+        *,
+        local_rank: int,
+        rank: int,
+        world_size: int,
+        master_addr: str = "127.0.0.1",
+        master_port: int,
+    ) -> None:
+        """Bind the worker process to its device and export the
+        torch.distributed rendezvous environment."""
+        # Local import: current_platform lives in the package __init__.
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        cls.set_device(current_platform.get_device(local_rank))
+        os.environ["MASTER_ADDR"] = master_addr
+        os.environ["MASTER_PORT"] = str(master_port)
+        os.environ["LOCAL_RANK"] = str(local_rank)
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
