@@ -175,6 +175,8 @@ class DecodingStage(PipelineStage):
         decode_fn = decode_fn or vae.decode
         if not server_args.enable_torch_compile or not isinstance(vae, nn.Module):
             return decode_fn
+        if not current_platform.supports_vae_decode_torch_compile():
+            return decode_fn
 
         compiled_callable = compiled_callable or self._compiled_vae_decode
 
@@ -224,6 +226,7 @@ class DecodingStage(PipelineStage):
             Decoded video tensor with shape (batch, channels, frames, height, width),
             normalized to [0, 1] range and moved to CPU as float32
         """
+        pipeline = self.pipeline() if self.pipeline else None
         latents = latents.to(get_local_torch_device())
         # The caller resolves the decode-only override before component use so
         # residency and execution agree on the target dtype.
@@ -240,7 +243,10 @@ class DecodingStage(PipelineStage):
             torch.mps.empty_cache()
 
         # Decode latents
-        with autocast_context(vae_dtype, server_args.disable_autocast):
+        with (
+            current_platform.vae_decode_context(pipeline),
+            autocast_context(vae_dtype, server_args.disable_autocast),
+        ):
             try:
                 # TODO: make it more specific
                 if server_args.pipeline_config.vae_tiling:

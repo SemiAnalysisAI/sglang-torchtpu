@@ -463,6 +463,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
             compile_kwargs = build_torch_compile_kwargs(mode=mode)
             logger.info(f"Compiling transformer with mode: {mode}")
+            module.forward = current_platform.wrap_forward_for_compile(module.forward)
 
         if getattr(self.server_args, "regional_compile", False):
             compiled_count = self._torch_compile_registry.compile_regions_once(
@@ -1691,6 +1692,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 enabled=ctx.autocast_enabled,
             ),
             maybe_nvtx_range("denoising_loop", use_nvtx),
+            current_platform.denoise_loop_context(),
         ):
             with self.progress_bar(
                 total=ctx.num_inference_steps, batch=batch
@@ -1731,6 +1733,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                                 step_index=step_index,
                             )
                         self._run_denoising_step(ctx, step, batch, server_args)
+                        current_platform.on_denoise_step_end()
                         self._record_trajectory(ctx, step, batch, server_args)
 
                         if step_index == num_timesteps - 1 or (
