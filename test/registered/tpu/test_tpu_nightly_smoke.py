@@ -24,11 +24,10 @@ register_tpu_ci(est_time=600, suite="nightly-tpu-4-v7", nightly=True)
 
 MODEL = "Qwen/Qwen3-0.6B"
 
-# (prompt, expected substring) -- small factual smoke set.
 _FACTS = (
     ("The capital of France is", "Paris"),
     ("The capital of Japan is", "Tokyo"),
-    ("The largest planet in the solar system is", "Jupiter"),
+    ("The chemical symbol for water is", "H2O"),
 )
 
 

@@ -58,7 +58,7 @@ _is_npu = is_npu()
 _DEBUG_ASSERT = envs.SGLANG_IS_IN_CI.get()
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=_is_npu or _is_tpu)
 def _assert_nonneg_and_invalidate(
     values: torch.Tensor, buf: torch.Tensor, indices: torch.Tensor
 ) -> None:
