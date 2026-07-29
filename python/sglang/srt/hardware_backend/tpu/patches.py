@@ -69,6 +69,27 @@ def _register_tpu_compile_backend() -> None:
     import torch_tpu._internal.compile  # noqa: F401
 
 
+def resolve_tpu_compile_backend(backend: str | None = None):
+    """Return the torch.compile backend for TPU compile policies.
+
+    Uses an explicit ``TpuBackend`` with serialization disabled instead of
+    the registered ``"tpu"`` string: the stock backend's serialized-executable
+    cache synthesizes its key from a graph string that is always ``None`` on
+    that path, so the key collapses to a per-process constant and distinct
+    graphs collide on reload (``e0102 RuntimeProgramInputMismatch``).
+    srt is currently shielded only by compiling one model per process; a
+    second compiled graph (e.g. a ViT alongside a decoder) shares the key.
+    A non-default/non-"tpu" ``backend`` override is returned unchanged.
+    # TODO: return "tpu" again once the torch_tpu cache key includes graph
+    # text + input shapes (reported upstream with a reproducing test).
+    """
+    if backend not in (None, "tpu"):
+        return backend
+    from torch_tpu._internal.compile import TpuBackend
+
+    return TpuBackend(enable_serialization=False)
+
+
 def _unwrap_dynamic_compile_fns() -> None:
     global _dynamic_compile_unwrapped
     if _dynamic_compile_unwrapped:

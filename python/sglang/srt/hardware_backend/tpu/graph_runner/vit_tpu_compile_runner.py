@@ -16,7 +16,10 @@ from torch_tpu._internal.sync.sync import synchronize as tpu_sync
 
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
-from sglang.srt.hardware_backend.tpu.patches import _register_tpu_compile_backend
+from sglang.srt.hardware_backend.tpu.patches import (
+    _register_tpu_compile_backend,
+    resolve_tpu_compile_backend,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +159,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
         compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
         self.compiled_fn = compiler(
             torch.no_grad()(method),
-            backend=self.backend,
+            backend=resolve_tpu_compile_backend(self.backend),
             fullgraph=self.fullgraph,
             dynamic=self.dynamic,
         )

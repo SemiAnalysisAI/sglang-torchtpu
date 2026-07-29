@@ -35,8 +35,18 @@ def _override_libtpu_flags(flags: tuple[str, ...]) -> list[str]:
     return to_append
 
 
+# Env exported by jax-based launchers; libtpu then initializes in JAX mode
+# and torch_tpu's multi-process PJRT init fails on the libtpu lockfile. srt
+# imports both jax (pallas kernels) and torch_tpu in one process, so these
+# must be scrubbed before the first device touch.
+_CONFLICTING_JAX_ENV = ("TPU_ML_PLATFORM", "TPU_ML_PLATFORM_VERSION")
+
+
 def apply_tpu_env_overrides() -> None:
     """Apply TPU env overrides."""
+    for name in _CONFLICTING_JAX_ENV:
+        if os.environ.pop(name, None) is not None:
+            logger.info("TPU env_override removed jax-owned env var %s", name)
     appended = _override_libtpu_flags(_SPARSE_CORE_OFFLOAD_OVERRIDES)
     if appended:
         logger.info(
