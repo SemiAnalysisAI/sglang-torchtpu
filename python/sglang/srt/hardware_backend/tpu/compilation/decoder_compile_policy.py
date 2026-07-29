@@ -10,6 +10,7 @@ import msgspec
 import torch
 import tqdm
 
+from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hardware_backend.tpu._logging import get_logger
@@ -331,9 +332,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
             return False
 
+        server_args = self.model_runner.server_args
         signature = inspect.signature(fn)
         backend = self.backend or current_platform.get_compile_backend()
-        compiled = torch.compile(
+        use_bundle = (
+            server_args.unsafe_save_torch_compile_bundle is not None
+            or server_args.unsafe_load_torch_compile_bundle is not None
+        )
+        compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
+        compiled = compiler(
             torch.no_grad()(fn),
             backend=backend,
             fullgraph=self.fullgraph,
@@ -342,7 +349,6 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         compiled.__signature__ = signature
         setattr(self.owner, self.method_name, compiled)
 
-        server_args = self.model_runner.server_args
         # max_t = smallest positive prefill/context limit (extend never runs
         # longer). max_b = the reconciled compile-batch ceiling, already grown to
         # cover the scheduler concurrency in ServerArgs.__post_init__ via
