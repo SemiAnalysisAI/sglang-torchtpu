@@ -463,7 +463,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
             compile_kwargs = build_torch_compile_kwargs(mode=mode)
             logger.info(f"Compiling transformer with mode: {mode}")
-            module.forward = current_platform.wrap_forward_for_compile(module.forward)
 
         if getattr(self.server_args, "regional_compile", False):
             compiled_count = self._torch_compile_registry.compile_regions_once(
