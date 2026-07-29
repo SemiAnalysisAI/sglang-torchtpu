@@ -324,12 +324,17 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertIsInstance(runner.compile_policy, DecoderTpuCompilePolicy)
         self.mock_compile.assert_called_once()
 
-    def test_dynamic_compile_unwrap_updates_repetition_penalty_alias(self):
+    def test_dynamic_compile_unwrap_updates_target_aliases(self):
         from sglang.srt.hardware_backend.tpu import patches as tpu_patches
 
+        overlap_path = "sglang.srt.managers.overlap_utils"
         repetition_path = "sglang.srt.sampling.penaltylib.repetition_penalty"
         sampling_path = "sglang.srt.sampling.sampling_batch_info"
-        target = "apply_scaling_penalties"
+        target_fns = {
+            overlap_path: "_assert_nonneg_and_invalidate",
+            repetition_path: "apply_scaling_penalties",
+            sampling_path: "apply_scaling_penalties",
+        }
 
         def eager(logits, penalties):
             return logits, penalties
@@ -337,6 +342,7 @@ class TestTpuGraphRunner(CustomTestCase):
         compiled = MagicMock()
         compiled.__wrapped__ = eager
         modules = {
+            overlap_path: SimpleNamespace(_assert_nonneg_and_invalidate=compiled),
             repetition_path: SimpleNamespace(apply_scaling_penalties=compiled),
             sampling_path: SimpleNamespace(apply_scaling_penalties=compiled),
         }
@@ -349,8 +355,8 @@ class TestTpuGraphRunner(CustomTestCase):
         ), patch.object(tpu_patches, "_dynamic_compile_unwrapped", False):
             tpu_patches._unwrap_dynamic_compile_fns()
 
-        self.assertIs(getattr(modules[repetition_path], target), eager)
-        self.assertIs(getattr(modules[sampling_path], target), eager)
+        for module_path, target in target_fns.items():
+            self.assertIs(getattr(modules[module_path], target), eager)
 
     def test_can_run_is_always_false(self):
         # ModelRunner.forward branches on `graph_runner.can_run_graph(...)`

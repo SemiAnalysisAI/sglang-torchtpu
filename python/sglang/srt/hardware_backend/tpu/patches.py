@@ -18,6 +18,7 @@ from sglang.srt.hardware_backend.tpu._logging import get_logger
 logger = get_logger(__name__)
 
 _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
+    ("sglang.srt.managers.overlap_utils", "_assert_nonneg_and_invalidate"),
     ("sglang.srt.layers.vocab_parallel_embedding", "get_masked_input_and_mask"),
     ("sglang.srt.layers.rotary_embedding.utils", "apply_rotary_pos_emb_native"),
     (
