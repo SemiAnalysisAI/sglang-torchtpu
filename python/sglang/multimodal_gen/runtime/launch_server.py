@@ -214,16 +214,19 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     scheduler_pipe_readers = []
     scheduler_pipe_writers = []
 
+    # Spawn-time env: exported before each child's start() because the child
+    # snapshots os.environ, and some runtimes latch these variables during
+    # import before the worker's own setup runs. Parent values are restored
+    # after the loop so the parent doesn't keep the last child's rank identity.
+    spawn_env_saved: dict[str, str | None] = {}
     for i in range(local_num_gpus):
         rank = rank_offset + i
-        # Exported before each spawn: the child snapshots os.environ at
-        # start(), and some runtimes latch these variables during import,
-        # before the worker's own env setup runs.
-        os.environ.update(
-            current_platform.worker_spawn_env(
-                rank=rank, world_size=num_gpus, master_port=master_port
-            )
+        spawn_env = current_platform.worker_spawn_env(
+            rank=rank, world_size=num_gpus, master_port=master_port
         )
+        for key in spawn_env:
+            spawn_env_saved.setdefault(key, os.environ.get(key))
+        os.environ.update(spawn_env)
         reader, writer = mp.Pipe(duplex=False)
         scheduler_pipe_writers.append(writer)
         if i == 0:  # This node's local pipe master
@@ -263,6 +266,12 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         scheduler_pipe_readers.append(reader)
         process.start()
         processes.append(process)
+
+    for key, value in spawn_env_saved.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
     # Wait for all workers to be ready
     scheduler_infos = []

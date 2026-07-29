@@ -29,6 +29,7 @@ from sglang.multimodal_gen.test.unit.test_tpu_pallas_backend import (  # noqa: F
     TestNumericParity,
 )
 from sglang.multimodal_gen.test.unit.test_tpu_platform import (  # noqa: F401
+    TestDitEvictionContext,
     TestTpuPlatformPlugin,
     TestTpuPlatformSurface,
 )
