@@ -13,6 +13,7 @@ from torch.distributed._composable.fsdp import (
 )
 from torch.distributed.tensor import DTensor
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_tp_rank,
@@ -82,7 +83,7 @@ class BaseLayerWithLoRA(nn.Module):
     def bias(self):
         return getattr(self.base_layer, "bias", None)
 
-    @torch.compile()
+    @torch.compile(disable=not current_platform.supports_op_level_torch_compile())
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         lora_A = self.lora_A
         lora_B = self.lora_B
@@ -670,7 +671,7 @@ class LinearWithLoRA(BaseLayerWithLoRA):
     ) -> None:
         super().__init__(base_layer, lora_rank, lora_alpha)
 
-    @torch.compile()
+    @torch.compile(disable=not current_platform.supports_op_level_torch_compile())
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         lora_A = self.lora_A
         lora_B = self.lora_B

@@ -229,6 +229,13 @@ class TpuPlatform(Platform):
         return self.get_local_torch_device()
 
     def get_torch_distributed_backend_str(self) -> str:
+        # tpu_dist bootstrap requires exactly one TPU device per process; at
+        # world size 1 on a multi-chip host PJRT sees every chip and raises.
+        # Match the srt TPU integration (model_runner.py): gloo for
+        # single-rank runs. WORLD_SIZE is the same env the distributed-init
+        # call site reads as its world-size authority.
+        if os.environ.get("WORLD_SIZE", "1") == "1":
+            return "gloo"
         # torch_tpu's native c10d backend: collectives become deferred
         # in-graph StableHLO ops matching the SPMD programs torch_tpu
         # compiles per process.

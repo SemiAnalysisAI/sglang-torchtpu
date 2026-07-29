@@ -77,6 +77,17 @@ class TestTpuPlatformSurface(unittest.TestCase):
             },
         )
 
+    def test_distributed_backend_is_gloo_for_single_rank(self):
+        import os
+
+        platform = TpuPlatform()
+        with patch.dict(os.environ, {"WORLD_SIZE": "1"}):
+            self.assertEqual(platform.get_torch_distributed_backend_str(), "gloo")
+        with patch.dict(os.environ, {"WORLD_SIZE": "8"}):
+            self.assertEqual(
+                platform.get_torch_distributed_backend_str(), "tpu_dist"
+            )
+
     def test_inference_mode_is_no_grad(self):
         with TpuPlatform.inference_mode():
             self.assertFalse(torch.is_grad_enabled())
