@@ -94,6 +94,34 @@ handling so the workaround can be deleted when the upstream fix lands.
 | VAE frame-loop recompiles per chunk shape under compile | `supports_vae_decode_torch_compile() → False`: VAE always decodes eagerly |
 | torch.profiler cannot see TPU device activity | `create_aux_profiler` runs a torch_tpu xprof session alongside; captures >2 GiB abort (upstream protobuf cap) — keep captures to few steps |
 
+## Alignment with the srt (LLM) TPU integration
+
+The srt engine's TPU integration (`python/sglang/srt/hardware_backend/tpu/`)
+is the incumbent torch_tpu consumer in this repo. The diffusion platform
+follows the same strategy wherever the same torch_tpu behavior applies, and
+documents each deliberate divergence:
+
+| Concern | srt strategy | Diffusion | Why the divergence |
+|---|---|---|---|
+| Platform activation | `find_spec("torch_tpu")`, never import in the probe | same | — |
+| Memory accounting | `torch.accelerator.get_memory_info` bridge; `empty_cache()` no-op | same, plus `torch.tpu.is_initialized()` gating | diffusion's server-args processing queries memory in the parent pre-spawn; ungated queries would initialize PJRT there |
+| Process groups | no `device_id`; gloo cpu_group; CUDA-only communicators disabled for `tpu_dist` | same | — |
+| Traceable collectives | registered custom all-reduce op (dynamo-traceable) | functional-collectives all-to-all | same principle, different collective |
+| P2P | avoided entirely (P/D moves bytes D2H → network → H2D) | avoided (`supports_p2p_communication() → False`) | — |
+| Bulk transfers | `batch_transfer` + mlock'd 32B-aligned staging pool for KV pages | plain `.cpu()`/`.to()` for DiT eviction | modules are shape-heterogeneous; the staged variant measured slower e2e — revisit with srt's staging-pool pattern |
+| Eager mode | process-global `DEFER_NEVER` (steady state is compiled; eager covers only glue ops) | loop-scoped `DEFER_AND_FUSE` (steady state is lazy; fusion is the throughput) | measured: 10.5 vs 13.5 s/step |
+| Steady-state syncs | never device-wide; targeted tensor syncs only | one `synchronize()` per denoising step | bounds the lazy queue (HBM exhaustion without it); migrating to targeted tensor sync is planned |
+| Compile backend | `backend="tpu"` string (serialization ON) | `TpuBackend(enable_serialization=False)` | the serialized-cache key is a per-process constant; multi-graph processes (DiT + encoders) collide and crash (`e0102`). srt is latently exposed — masked by its single-compiled-model-per-process shape |
+| Compile discipline | 4 layers: post-warmup `set_stance("fail_on_recompile")`, dynamo limits, XLA-graph-count checker, strict shape/flag determinism | not yet adopted | planned (Phase A) |
+| Pallas custom ops | prewarm outside dynamo; call the `CustomOpDef` directly | prewarm outside dynamo; call the `OpOverload` (`.default`) | measured: dynamo inlined the `jax_op` `CustomOpDef.__call__` into the trace and broke on jax internals; the overload traces cleanly |
+
+Gaps found on the srt side during this audit (tracked for follow-up, not
+changed from here): serialization-ON exposure above; six unguarded
+`float64` casts in `sampler.py` (emulated f64 on TPU); the hot path uses
+raw `torch.inference_mode()` instead of the platform hook (unsupported on
+torch_tpu lazy tensors); no jax `TPU_ML_PLATFORM` env scrub despite
+importing jax and torch_tpu in one process.
+
 ## Testing
 
 - Unit tests: `python/sglang/multimodal_gen/test/unit/test_tpu_*.py`,

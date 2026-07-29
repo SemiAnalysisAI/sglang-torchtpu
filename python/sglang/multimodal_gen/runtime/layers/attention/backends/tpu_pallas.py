@@ -105,6 +105,9 @@ def _get_tpu_flash_op(sm_scale: float, block_q: int, block_kv: int):
     registered.register_fake(_fake)
     # Return the OpOverload, not the CustomOpDef: dynamo inlines the latter's
     # python __call__ into the traced graph and breaks on the jax internals.
+    # (srt's TPU kernels call their CustomOpDef directly; for jax_op-created
+    # ops we measured the inlining break, hence the overload. Divergence
+    # documented in docs/diffusion/tpu.md.)
     overload = getattr(torch.ops.sglang_diffusion, op_name.split("::", 1)[1]).default
     _TPU_FLASH_OPS[key] = overload
     return overload
