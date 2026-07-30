@@ -183,8 +183,7 @@ class SchedulerBatchResultProcessor:
         skip_stream_req = None
 
         if self.is_generation:
-            if result.copy_done is not None:
-                result.copy_done.synchronize()
+            result.sync_copy()
             if result.routed_experts_output is not None:
                 result.routed_experts_output.finalize()
                 result.routed_experts_output = None
@@ -293,8 +292,7 @@ class SchedulerBatchResultProcessor:
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
         else:  # embedding or reward model
-            if result.copy_done is not None:
-                result.copy_done.synchronize()
+            result.sync_copy()
 
             embeddings = self._convert_embeddings(result=result)
             phs = result.pooled_hidden_states
@@ -619,8 +617,7 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
+        result.sync_copy()
 
         self.output_streamer._stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
@@ -631,8 +628,7 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
+        result.sync_copy()
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None

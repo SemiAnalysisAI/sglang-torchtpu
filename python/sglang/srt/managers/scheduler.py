@@ -1256,6 +1256,16 @@ class Scheduler(
             not use_mlx() and current_platform.supports_overlap_streams()
         )
 
+        # Without a copy stream the result D2H cannot overlap the next forward:
+        # `_async_d2h` degrades to a blocking `.to("cpu")`, so calling it inside
+        # `run_batch` parks the scheduler on the forward it just launched.
+        # Defer it to the consumer instead (`GenerationBatchResult.sync_copy`),
+        # which runs one iteration later in `pop_and_process` — after the next
+        # forward is enqueued. Only meaningful when overlap is on; the
+        # non-overlap loop processes results immediately anyway. Set before the
+        # use_mlx() early return below so every path has the attribute.
+        self.defer_result_d2h = self.enable_overlap and not self.use_overlap_streams
+
         # FutureMap is always-on: input_ids relay used in both modes.
         # Workers without the spec_v2_attn_backends override fall back to
         # target-only so the helper still produces a safe decision (no
@@ -3329,16 +3339,25 @@ class Scheduler(
                                 # Result D2H on copy_stream overlaps the next forward
                                 # instead of serializing on forward_stream; it's a leaf
                                 # gated by copy_done, so nothing on forward_stream waits.
-                                # TPU single-queue: no copy_stream exists, so skip the
-                                # cross-stream wait; copy_stream_ctx is nullcontext there
-                                # and the D2H runs on the default stream.
-                                if self.use_overlap_streams:
-                                    self.copy_stream.wait_stream(self.forward_stream)
-                                with self.copy_stream_ctx:
-                                    batch_result.copy_to_cpu(
+                                # TPU single-queue: no copy_stream exists, so the D2H
+                                # would run inline on the default stream and block the
+                                # scheduler on the forward just launched. Defer it to
+                                # the consumer's sync_copy() instead.
+                                if self.defer_result_d2h:
+                                    batch_result.defer_copy_to_cpu(
                                         return_logprob=batch.return_logprob,
                                         return_hidden_states=batch.return_hidden_states,
                                     )
+                                else:
+                                    if self.use_overlap_streams:
+                                        self.copy_stream.wait_stream(
+                                            self.forward_stream
+                                        )
+                                    with self.copy_stream_ctx:
+                                        batch_result.copy_to_cpu(
+                                            return_logprob=batch.return_logprob,
+                                            return_hidden_states=batch.return_hidden_states,
+                                        )
                         else:
                             batch_result.future_indices = future_indices
 

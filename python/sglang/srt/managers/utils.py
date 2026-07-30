@@ -85,6 +85,14 @@ class GenerationBatchResult:
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
 
+    # Deferred D2H (single-queue backends, e.g. torch_tpu). ``_async_d2h`` is
+    # only genuinely async on CUDA; elsewhere it degrades to a blocking
+    # ``.to("cpu")``. Running it inside ``run_batch`` therefore parks the
+    # scheduler on the forward it just launched and destroys overlap. When these
+    # kwargs are set, the copy has NOT happened yet — the consumer triggers it
+    # via ``sync_copy()``, by which point the next forward is already enqueued.
+    pending_copy_kwargs: Optional[dict] = None
+
     @property
     def has_sampled_token_ids(self) -> bool:
         """True when this iter sampled token ids; False when none were produced
@@ -142,6 +150,35 @@ class GenerationBatchResult:
                 holder.map_device_tensors(_async_d2h)
 
         self.copy_done.record()
+
+    def defer_copy_to_cpu(
+        self, return_logprob: bool, return_hidden_states: bool = True
+    ) -> None:
+        """Record what ``copy_to_cpu`` should do without doing it yet.
+
+        See ``pending_copy_kwargs``. Paired with :meth:`sync_copy`, which every
+        result consumer already calls (it replaced the bare
+        ``copy_done.synchronize()``), so the copy lands at the same point the
+        host previously waited — just one scheduler iteration later.
+        """
+        self.pending_copy_kwargs = {
+            "return_logprob": return_logprob,
+            "return_hidden_states": return_hidden_states,
+        }
+
+    def sync_copy(self) -> None:
+        """Make host-side result tensors valid to read.
+
+        Runs a deferred copy first if one is pending, then waits on
+        ``copy_done``. Idempotent: the second call is a no-op plus a
+        already-completed event wait.
+        """
+        if self.pending_copy_kwargs is not None:
+            kwargs = self.pending_copy_kwargs
+            self.pending_copy_kwargs = None
+            self.copy_to_cpu(**kwargs)
+        if self.copy_done is not None:
+            self.copy_done.synchronize()
 
     @classmethod
     def from_pp_proxy(
@@ -264,6 +301,16 @@ class EmbeddingBatchResult:
     @property
     def can_run_cuda_graph(self) -> bool:
         return False
+
+    def sync_copy(self) -> None:
+        """Mirror of ``GenerationBatchResult.sync_copy``.
+
+        Embedding results are copied eagerly (there is no deferral path), so
+        this is just the ``copy_done`` wait — it exists so result consumers can
+        call one method on either result type.
+        """
+        if self.copy_done is not None:
+            self.copy_done.synchronize()
 
     @torch.profiler.record_function("copy_embedding_to_cpu")
     def copy_to_cpu(self):
