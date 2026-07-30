@@ -180,6 +180,20 @@ def _ensure_tensor_model_output(model_output):
     return model_output
 
 
+def _timesteps_for_device(timesteps: torch.Tensor) -> torch.Tensor:
+    """Pin integer timesteps to the platform index dtype for device compute.
+
+    The scheduler's public ``timesteps`` stays int64 on every platform; only
+    the loop-internal copy is narrowed (int64 is emulated on TPU — same
+    pattern as srt's ``positions_dtype``). Float timestep schedules
+    (flow-match euler) pass through untouched; the default platform dtype is
+    int64, making this a no-op off-TPU.
+    """
+    if timesteps.dtype == torch.int64:
+        return timesteps.to(current_platform.get_index_dtype())
+    return timesteps
+
+
 @dataclass(slots=True)
 class DenoisingContext:
     """Loop-scoped state shared across the denoising skeleton and its hooks."""
@@ -1061,7 +1075,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             extra_step_kwargs=extra_step_kwargs,
             target_dtype=target_dtype,
             autocast_enabled=autocast_enabled,
-            timesteps=timesteps,
+            timesteps=_timesteps_for_device(timesteps),
             num_inference_steps=num_inference_steps,
             num_warmup_steps=num_warmup_steps,
             image_kwargs=image_kwargs,

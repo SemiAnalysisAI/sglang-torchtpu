@@ -74,6 +74,13 @@ class _DitEvictionContext:
                 self._evicted.append(module)
         if self._evicted:
             torch.tpu.synchronize()
+        else:
+            logger.warning(
+                "TPU decode eviction found no DiT-class component among %s; "
+                "decode runs with all components resident and may exhaust "
+                "HBM. Extend is_dit_component_name for this pipeline.",
+                sorted(self._pipeline.modules.keys()),
+            )
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -82,6 +89,11 @@ class _DitEvictionContext:
             device = TpuPlatform.get_local_torch_device()
             for module in self._evicted:
                 module.to(device)
+            # Drain the restore transfers before returning control: dynamo
+            # fakeifies these weights when the next request re-traces, and
+            # pending lazy H2D state yields bogus tensor metadata
+            # (fake-tensor "b must be 2D" on the second compiled request).
+            torch.tpu.synchronize()
             self._evicted.clear()
 
 
