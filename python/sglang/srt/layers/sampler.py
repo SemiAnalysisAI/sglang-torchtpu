@@ -382,6 +382,18 @@ class Sampler(nn.Module):
     def _sync_token_ids_across_tp(
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
     ):
+        # TPU sampling must stay synchronized across ranks. Small numerical
+        # differences can otherwise produce different stop tokens and deadlock
+        # the next tensor-parallel collective.
+        if batch_next_token_ids.device.type == "tpu":
+            tp_group = (
+                get_attention_tp_group()
+                if is_dp_attention_enabled()
+                else get_tp_group()
+            )
+            tp_group.broadcast(batch_next_token_ids, src=0)
+            return
+
         if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
@@ -390,16 +402,6 @@ class Sampler(nn.Module):
             # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
             # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
             #
-            # Use broadcast because TPU MIN all-reduce is unsupported.
-            if batch_next_token_ids.device.type == "tpu":
-                tp_group = (
-                    get_attention_tp_group()
-                    if is_dp_attention_enabled()
-                    else get_tp_group()
-                )
-                tp_group.broadcast(batch_next_token_ids, src=0)
-                return
-
             torch.distributed.all_reduce(
                 batch_next_token_ids,
                 op=dist.ReduceOp.MIN,
