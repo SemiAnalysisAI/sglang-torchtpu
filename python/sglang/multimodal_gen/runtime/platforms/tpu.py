@@ -17,6 +17,7 @@ Execution model notes (torch_tpu is a lazy/deferred backend):
 
 from __future__ import annotations
 
+import contextlib
 import os
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -385,6 +386,10 @@ class TpuPlatform(Platform):
 
     @classmethod
     def vae_decode_context(cls, pipeline: Any) -> Any:
+        from sglang.multimodal_gen import envs
+
+        if envs.SGLANG_DIFFUSION_TPU_DISABLE_DECODE_EVICTION:
+            return contextlib.nullcontext()
         return _DitEvictionContext(pipeline)
 
     @classmethod

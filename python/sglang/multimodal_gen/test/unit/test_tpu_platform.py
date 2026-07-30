@@ -115,7 +115,9 @@ class TestDitEvictionContext(unittest.TestCase):
             ):
                 with ctx:
                     self.assertEqual(len(ctx._evicted), 2)  # both DiTs, not the VAE
-        self.assertEqual(tpu_mock.synchronize.call_count, 2)  # enter + exit
+        # enter + pre-restore + post-restore drain (dynamo fakeifies these
+        # weights on the next request's re-trace).
+        self.assertEqual(tpu_mock.synchronize.call_count, 3)
 
 
 @unittest.skipUnless(hasattr(torch, "tpu"), "requires torch_tpu")

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     SGLANG_DIFFUSION_TPU_EAGER_MODE: str = "DEFER_AND_FUSE"
+    SGLANG_DIFFUSION_TPU_DISABLE_DECODE_EVICTION: bool = False
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
@@ -214,6 +215,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fused default is the validated fast configuration.
     "SGLANG_DIFFUSION_TPU_EAGER_MODE": _lazy_str(
         "SGLANG_DIFFUSION_TPU_EAGER_MODE", "DEFER_AND_FUSE"
+    ),
+    # Keeps DiT components resident during VAE decode instead of evicting to
+    # host. For HBM-rich configurations, and for isolating eviction-related
+    # issues (weight round-trips invalidate dynamo guards on the next
+    # compiled request).
+    "SGLANG_DIFFUSION_TPU_DISABLE_DECODE_EVICTION": _lazy_bool(
+        "SGLANG_DIFFUSION_TPU_DISABLE_DECODE_EVICTION"
     ),
     # Enables torch profiler if set. Path to the directory where torch profiler
     # traces are saved. Note that it must be an absolute path.
