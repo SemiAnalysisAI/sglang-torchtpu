@@ -38,6 +38,7 @@ from sglang.srt.layers.attention.pallas.pcp_streaming_rpa.reference import (
     execute_pcp_streaming_reference,
 )
 from sglang.srt.layers.attention.pallas.pcp_streaming_rpa.schedule import (
+    _validate_pcp_streaming_schedule_ring_source,
     generate_pcp_streaming_schedule,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -292,6 +293,114 @@ class TestPcpStreamingReferenceParity(unittest.TestCase):
             num_lanes=1,
             bq_sz=2,
         )
+
+
+class TestMultiRequestSchedule(unittest.TestCase):
+    """Coverage for the multi-request lockstep-compact schedule path.
+
+    The single-request test class above always trips
+    ``_generate_pcp_streaming_schedule_vectorized_aligned``'s
+    single-active-request fast path
+    (``_generate_pcp_streaming_schedule_single_aligned``). Real batched
+    prefill routes through ``_generate_pcp_streaming_schedule_lockstep_compact``
+    when the vectorized dispatcher sees more than one active request. Any
+    regression there would slip past the single-request tests silently, so
+    exercise it here.
+
+    These are structural smoke tests: they run the multi-request scheduler
+    end-to-end and assert the produced schedule satisfies the ring-source
+    invariant (every step's source rank matches across ranks; the schedule
+    is padded to a PCP page group). Building a full multi-request numeric
+    oracle would need per-request Q/KV packing that duplicates real serve
+    plumbing; that's deferred to a manual TPU test.
+    """
+
+    def _make_multi_req_schedule(
+        self,
+        *,
+        q_lens: list[int],
+        kv_lens: list[int],
+        q_start_offsets: list[int],
+        pcp_size: int,
+        page_size: int,
+        interleave_size: int,
+        num_lanes: int = 1,
+        bq_sz: int = 2,
+    ):
+        """Build a valid multi-request schedule and return it."""
+        pages_per_req = [
+            (kv + page_size * pcp_size - 1) // (page_size * pcp_size)
+            for kv in kv_lens
+        ]
+        max_pages = max(pages_per_req)
+        # 2D block_tables: [num_reqs, pages_per_seq]; disjoint page ranges
+        # per request so page ownership doesn't overlap. -1 pads out to
+        # ``max_pages`` for shorter requests.
+        block_tables = np.full((len(kv_lens), max_pages), -1, dtype=np.int32)
+        next_page = 0
+        for i, n in enumerate(pages_per_req):
+            block_tables[i, :n] = np.arange(next_page, next_page + n, dtype=np.int32)
+            next_page += n
+        cu_q_lens = np.concatenate([[0], np.cumsum(q_lens, dtype=np.int64)])
+        return generate_pcp_streaming_schedule(
+            kv_lens=kv_lens,
+            cu_q_lens=cu_q_lens.tolist(),
+            q_start_offsets=q_start_offsets,
+            block_tables=block_tables,
+            page_size=page_size,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+            num_lanes=num_lanes,
+            bq_sz=bq_sz,
+            pad_kv_pages_to_pcp_group=True,
+        )
+
+    def test_two_reqs_full_prefill(self) -> None:
+        """Two concurrent full-prefill requests at pcp_size=4."""
+        schedule = self._make_multi_req_schedule(
+            q_lens=[8, 8],
+            kv_lens=[8, 8],
+            q_start_offsets=[0, 0],
+            pcp_size=4,
+            page_size=2,
+            interleave_size=2,
+            bq_sz=2,
+        )
+        _validate_pcp_streaming_schedule_ring_source(schedule)
+        # Ring-source invariant is satisfied; schedule shape reflects both reqs.
+        # Every rank participates: total load_q markers > 0 for each rank.
+        for consumer_rank in range(schedule.pcp_size):
+            self.assertGreater(
+                int(schedule.load_q[consumer_rank].sum()),
+                0,
+                msg=f"rank {consumer_rank} has no Q loads in multi-req schedule",
+            )
+
+    def test_two_reqs_uneven_q_lens(self) -> None:
+        """Uneven per-req Q counts hit the compact tile builder's mixed sizes."""
+        schedule = self._make_multi_req_schedule(
+            q_lens=[16, 8],
+            kv_lens=[16, 8],
+            q_start_offsets=[0, 0],
+            pcp_size=4,
+            page_size=2,
+            interleave_size=2,
+            bq_sz=2,
+        )
+        _validate_pcp_streaming_schedule_ring_source(schedule)
+
+    def test_three_reqs_mixed_chunked_prefill(self) -> None:
+        """One continuation req (nonzero q_global_base) alongside two fresh reqs."""
+        schedule = self._make_multi_req_schedule(
+            q_lens=[8, 8, 8],
+            kv_lens=[16, 8, 8],
+            q_start_offsets=[8, 0, 0],  # req 0 continues from position 8
+            pcp_size=2,
+            page_size=2,
+            interleave_size=2,
+            bq_sz=2,
+        )
+        _validate_pcp_streaming_schedule_ring_source(schedule)
 
 
 if __name__ == "__main__":

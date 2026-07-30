@@ -14,8 +14,7 @@
 # limitations under the License.
 """Host-side schedules for PCP streaming prefill RPA."""
 
-import dataclasses
-
+import msgspec
 import numpy as np
 
 from sglang.srt.layers.attention.pallas.pcp_streaming_rpa.pcp_layout import (
@@ -226,8 +225,7 @@ def _iter_pcp_q_tiles(
         yield tile_global_start, tile_len
 
 
-@dataclasses.dataclass(frozen=True)
-class PcpStreamingSchedule:
+class PcpStreamingSchedule(msgspec.Struct, frozen=True):
     """PCP streaming schedule arrays.
 
     All per-step fields have shape [pcp_size, max_steps, num_lanes]. The first

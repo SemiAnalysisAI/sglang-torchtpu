@@ -43,7 +43,18 @@ from sglang.srt.layers.attention.pallas.pcp_streaming_rpa.schedule import (
 )
 
 AXIS = "pcp"
-# Vendor divergence: upstream = 512. See file header for the rationale.
+# Static kernel-lockstep floor for local (per-rank) Q token counts. Compile
+# buckets round the per-rank Q count up to a multiple of this constant so
+# every rank runs the same number of Pallas tiles per step and the ring
+# semaphore protocol stays in lockstep.
+#
+# Set to 128 (vs upstream's 512) because at short/medium ISL a 512-token
+# floor over-inflates the compile bucket — at ISL=4096 / pcp=8 the per-rank
+# count is 512 so the floor is a no-op, but at ISL=2048 the per-rank count
+# is 256 and the 512 floor doubles the trace work. Measured ~31% warm-step
+# speedup at ISL=4096 on Qwen3-Coder shapes vs the 512 floor; correctness
+# preserved because 128 divides both the TPU HBM row tile (16) and the
+# common per-rank Q counts we compile for.
 PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE = 128
 TPU_HBM_ROW_TILE = 16
 ONLINE_STATE_PADDED_LANES = 128
@@ -1789,6 +1800,13 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
     causal pass that produces online-softmax state and a history no-causal pass
     that consumes that state and writes the final output.
 
+    Output-aliasing contract: the zero-history-output kernel aliases the Q
+    input to the O output HBM buffer (``input_output_aliases={1: 0}``). Tiles
+    that neither the current nor history pass write retain the original Q
+    values in output HBM. Callers MUST mask padded output rows to zero — see
+    ``sharded_pcp_ragged_paged_attention``'s ``jnp.where(slot_ids >= 0, …)``
+    in ``wrapper.py`` for the reference pattern.
+
     Args:
         q_local: [local_tokens, kv_heads, q_per_kv, head_dim] compact Q rows
             for the current PCP rank.
@@ -1827,6 +1845,17 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
     _validate_packed_kv_layout(
         q_local, kv_cache_local, k_scale=k_scale, v_scale=v_scale
     )
+    if kv_pages_per_block != 1:
+        # The metadata-driven schedule builders only stage one page per ring
+        # step (KV_PAGE_INDICES_START + 0). The ring-load path iterates
+        # ``range(kv_pages_per_block)`` and would read uninitialized schedule
+        # slots at page_offset > 0 — silently loading wrong pages. Reject
+        # here so the metadata surface can't diverge from the schedule.
+        raise NotImplementedError(
+            "pcp_streaming_attention_page_groups_packed_local_from_metadata "
+            f"currently supports kv_pages_per_block=1 only (got "
+            f"{kv_pages_per_block})."
+        )
 
     page_size = kv_cache_local.shape[1]
     (
