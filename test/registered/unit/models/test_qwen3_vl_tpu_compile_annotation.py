@@ -47,6 +47,11 @@ class FakeQwen3VLDecoderTpuCompilePolicy(CompilePolicy):
 
 
 def _stub_tpu_modules():
+    attention_module = types.ModuleType(
+        "sglang.srt.hardware_backend.tpu.attention_pallas"
+    )
+    attention_module._get_vision_flash_op = lambda: None
+
     vit_module = types.ModuleType(
         "sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner"
     )
@@ -62,6 +67,7 @@ def _stub_tpu_modules():
     )
 
     return {
+        attention_module.__name__: attention_module,
         vit_module.__name__: vit_module,
         decoder_policy_module.__name__: decoder_policy_module,
     }
@@ -95,6 +101,31 @@ class TestQwen3VLTpuCompileAnnotation(CustomTestCase):
                 self.assertIs(
                     qwen3_vl.graph_runners_dict["tpu"], FakeViTTpuCompileRunner
                 )
+
+                vision = sys.modules["sglang.srt.layers.attention.vision"]
+                attention = object.__new__(vision.VisionAttention)
+                with (
+                    patch.object(
+                        vision,
+                        "get_global_server_args",
+                        return_value=types.SimpleNamespace(mm_attention_backend=None),
+                    ),
+                    patch.object(vision, "is_cuda", return_value=False),
+                    patch.multiple(
+                        vision,
+                        _is_tpu=True,
+                        _is_musa=False,
+                        _is_hip=False,
+                        _is_cpu=False,
+                        _is_xpu=False,
+                    ),
+                ):
+                    self.assertEqual(
+                        attention._determine_attention_backend(None), "tpu"
+                    )
+                    self.assertEqual(
+                        attention._determine_attention_backend("sdpa"), "sdpa"
+                    )
         finally:
             sys.modules.pop(module_name, None)
             if old_module is not None:
@@ -102,29 +133,6 @@ class TestQwen3VLTpuCompileAnnotation(CustomTestCase):
             common.is_cpu.cache_clear()
             common.is_npu.cache_clear()
             common.is_tpu.cache_clear()
-
-    def test_tpu_platform_selects_tpu_vision_backend(self):
-        import sglang.srt.layers.attention.vision as vision
-
-        attention = object.__new__(vision.VisionAttention)
-        with (
-            patch.object(
-                vision,
-                "get_global_server_args",
-                return_value=types.SimpleNamespace(mm_attention_backend=None),
-            ),
-            patch.object(vision, "is_cuda", return_value=False),
-            patch.multiple(
-                vision,
-                _is_tpu=True,
-                _is_musa=False,
-                _is_hip=False,
-                _is_cpu=False,
-                _is_xpu=False,
-            ),
-        ):
-            self.assertEqual(attention._determine_attention_backend(None), "tpu")
-            self.assertEqual(attention._determine_attention_backend("sdpa"), "sdpa")
 
 
 if __name__ == "__main__":

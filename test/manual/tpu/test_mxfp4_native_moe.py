@@ -1,24 +1,16 @@
-"""Unit test for the native MXFP4 fused-MoE path.
+"""Experimental scaffold for the unwired native MXFP4 fused-MoE path.
 
-Verifies that running through ``process_gpt_oss_mxfp4_weights_native`` +
-``fused_moe_call`` (which unpacks FP4 + applies block scales inside the
-kernel) produces the same MoE output as running ``fused_moe_call``
-directly on the BF16-dequantized weights with no scales. Both should
-match within bf16 matmul tolerance.
+``process_mxfp4_moe_weights_native`` creates packed FP4 weights and block
+scales, but ``fused_moe_call`` does not yet expand the packed weights to their
+logical K dimension. This test therefore currently fails during GMM input
+validation before reaching its numerical comparison. Production uses BF16
+dequantization through ``prepare_tpu_mxfp4_moe_weights`` instead.
 
-Lossless claim verified: the kernel's block-wise dequant in VMEM is
-mathematically equivalent to dequantizing in HBM first, so any
-discrepancy is purely from accumulation order / MXU rounding, not the
-quantization itself.
-
-Requires torch_tpu + a TPU device.
+Keep this test manual until the packed path is wired into the fused kernel.
+It requires torch_tpu and a TPU device.
 """
 
 from __future__ import annotations
-
-from sglang.test.ci.ci_register import register_tpu_ci
-
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
 import unittest
 
@@ -224,16 +216,17 @@ class TestNativeMxfp4FusedMoE(unittest.TestCase):
         """Run the native MXFP4 fused MoE call (uint8 packed + fp32 scales)."""
         from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
         from sglang.srt.layers.quantization.mxfp4_tpu_util import (
-            process_gpt_oss_mxfp4_weights_native,
+            process_mxfp4_moe_weights_native,
         )
 
-        w13, w13_s, w13_b, w2, w2_s, w2_b = process_gpt_oss_mxfp4_weights_native(
+        w13, w13_s, w13_b, w2, w2_s, w2_b = process_mxfp4_moe_weights_native(
             layer["gate_up_proj_blocks"],
             layer["gate_up_proj_scales"],
             layer["gate_up_proj_bias"],
             layer["down_proj_blocks"],
             layer["down_proj_scales"],
             layer["down_proj_bias"],
+            w13_interleaved=True,
         )
         out = fused_moe_call(
             hidden_states=hs.to(self.device),

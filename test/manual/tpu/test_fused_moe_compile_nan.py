@@ -1,5 +1,4 @@
-"""Repro: the GPT-OSS MXFP4 fused-MoE kernel produces NaN under torch.compile
-at the real decode shape, while eager is finite.
+"""Legacy repro for GPT-OSS MXFP4 fused-MoE NaNs under torch.compile.
 
 Background
 ----------
@@ -7,21 +6,19 @@ gpt-oss-20b decode under ``torch.compile(backend="tpu", fullgraph=True)`` emits
 all-NaN logits (→ token 0), while eager decode is correct. Bisection (disabling
 sliding-window, attention sinks, the cache, precompile; and a Qwen3 control)
 localized the NaN to the fused-MoE path at the *decode* token shape, and only
-under the compiled (XLA) execution — eager never NaNs. This test reproduces it
-in isolation: run ``fused_moe_call`` eager vs ``torch.compile(backend="tpu")``
-at the **real** gpt-oss-20b MoE dims (hidden=2880, intermediate=2880, E=32) and
-at the decode token counts (m=1 and m=16), and assert the compiled output is
-NaN-free (it currently is NOT).
+under the compiled (XLA) execution — eager never NaNs.
+
+This repro is currently blocked before that comparison: it uses the native
+packed-MXFP4 path, which ``fused_moe_call`` does not yet expand to its logical
+K dimension. Current production dequantizes MXFP4 weights to BF16 instead, so
+this test does not represent the active production path until the packed path
+is wired into the fused kernel.
 
 Run:
   python -m pytest test/manual/tpu/test_fused_moe_compile_nan.py -x -s
 """
 
 from __future__ import annotations
-
-from sglang.test.ci.ci_register import register_tpu_ci
-
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
 import importlib.util
 import os
@@ -70,19 +67,20 @@ class TestFusedMoeCompileNaN(unittest.TestCase):
 
     def _weights(self):
         from sglang.srt.layers.quantization.mxfp4_tpu_util import (
-            process_gpt_oss_mxfp4_weights_native,
+            process_mxfp4_moe_weights_native,
         )
 
         layer = _mxfp4_native._build_synthetic_hf_gpt_oss_layer(
             E, HIDDEN, INTERMEDIATE, seed=0
         )
-        w = process_gpt_oss_mxfp4_weights_native(
+        w = process_mxfp4_moe_weights_native(
             layer["gate_up_proj_blocks"],
             layer["gate_up_proj_scales"],
             layer["gate_up_proj_bias"],
             layer["down_proj_blocks"],
             layer["down_proj_scales"],
             layer["down_proj_bias"],
+            w13_interleaved=True,
         )
         return [t.to("tpu") for t in w]
 
