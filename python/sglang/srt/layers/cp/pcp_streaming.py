@@ -138,6 +138,14 @@ class PCPStreamingCPStrategy(ContextParallelStrategy):
         from sglang.srt.environ import envs
 
         interleave_size = envs.SGLANG_TPU_PCP_INTERLEAVE_SIZE.get()
+        # seqs_len == [] is a caller-side bug (empty batch dispatched into
+        # build_metadata); the len/sum fallbacks would silently produce
+        # bs=0 / total_seq_lens=num_tokens. Fail loudly.
+        if seqs_len is not None and len(seqs_len) == 0:
+            raise ValueError(
+                "PCPStreamingCPStrategy.build_metadata received an empty "
+                "seqs_len list — caller dispatched an empty batch."
+            )
         bs = len(seqs_len) if seqs_len is not None else 1
         total_seq_lens = int(sum(seqs_len)) if seqs_len else int(num_tokens)
         return PCPStreamingContextParallelMetadata(

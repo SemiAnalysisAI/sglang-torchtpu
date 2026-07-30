@@ -87,6 +87,23 @@ class TpuPcpFusedMHATokenToKVPool(TpuFusedMHATokenToKVPool):
                 f"cp_group_size must be >= 1 for TpuPcpFusedMHATokenToKVPool, "
                 f"got {cp_group_size!r}"
             )
+        # Caller contract: ``size`` is the GLOBAL logical capacity (across
+        # all cp_group ranks). Per-rank size is derived below by dividing
+        # by cp_group_size. If size < page_size * cp_group_size, the
+        # per-rank allocation would round to 0 pages, so the caller either
+        # (a) passed per-rank size by mistake or (b) allocated below the
+        # PCP minimum. Fail loudly here rather than in the parent's
+        # buffer-alloc path.
+        min_size = page_size * cp_group_size
+        if size < min_size:
+            raise ValueError(
+                f"TpuPcpFusedMHATokenToKVPool size={size} is below the PCP "
+                f"minimum page_size*cp_group_size={min_size}. The caller "
+                "must pass GLOBAL logical capacity (per-rank size is "
+                "derived from cp_group_size internally). Check the "
+                "get_mha_kv_pool_extra_kwargs path in tpu_platform.py + "
+                "model_runner_kv_cache_mixin."
+            )
         if page_size % cp_group_size != 0:
             # The CP kernel's strided writer requires ``bkv_sz % cp_group_size == 0``,
             # which in turn requires ``page_size % cp_group_size == 0`` because

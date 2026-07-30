@@ -138,7 +138,7 @@ def _fallback_tpu_global_device_id() -> int:
     local_devices = jax.local_devices()
     if not local_devices:
         return 0
-    return int(getattr(local_devices[0], "id", 0))
+    return int(local_devices[0].id)
 
 
 def _collect_rank_to_device_id(
@@ -243,10 +243,7 @@ def get_or_create_pcp_mesh(axis_name: str = "pcp") -> Any:
         import numpy as np
         from jax.sharding import Mesh
 
-        devices_by_id = {
-            int(getattr(device, "id", idx)): device
-            for idx, device in enumerate(jax.devices())
-        }
+        devices_by_id = {int(device.id): device for device in jax.devices()}
         mesh_devices = np.asarray(
             [devices_by_id[device_id] for device_id in layout.device_ids]
         )

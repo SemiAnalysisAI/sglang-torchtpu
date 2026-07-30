@@ -32,7 +32,7 @@ def _mesh_fingerprint(mesh) -> tuple:
     without depending on ``id(mesh)`` (mesh instances may be rebuilt).
     """
     devices = mesh.devices
-    device_ids = tuple(int(getattr(d, "id", -1)) for d in devices.flat)
+    device_ids = tuple(int(d.id) for d in devices.flat)
     return (tuple(mesh.axis_names), tuple(devices.shape), device_ids)
 
 

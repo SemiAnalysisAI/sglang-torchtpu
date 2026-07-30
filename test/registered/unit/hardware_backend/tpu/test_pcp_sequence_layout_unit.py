@@ -205,5 +205,83 @@ class GatherAndUnpackTest(CustomTestCase):
         self.assertIs(out, x)
 
 
+class InterleaveAndBoundaryCrossingTest(CustomTestCase):
+    """Coverage the reference-parity tests don't hit: interleave > 1 and
+    the boundary-crossing (prompt/decode mixed in one forward) rejection.
+    """
+
+    def test_interleave_gt_1_planner(self) -> None:
+        # pcp_size=2, interleave_size=2 → cycle=4. 8 tokens map to
+        # {rank 0: positions 0,1,4,5} and {rank 1: positions 2,3,6,7}.
+        plan = plan_pcp_sequence_layout(
+            num_scheduled_tokens_per_req=np.array([8]),
+            prompt_tokens_per_req=np.array([8]),
+            computed_tokens_per_req=np.array([0]),
+            padded_num_tokens=8,
+            pcp_size=2,
+            pcp_rank=0,
+            interleave_size=2,
+        )
+        # local_token_counts = 4 per rank (byte-symmetric under this layout).
+        np.testing.assert_array_equal(
+            plan.local_token_counts, np.array([4, 4], dtype=np.int32)
+        )
+        self.assertEqual(plan.local_padded_num_tokens, 4)
+        # token_order[0:4] = rank 0's slots (positions 0,1,4,5), byte-order.
+        np.testing.assert_array_equal(
+            plan.token_order[:4], np.array([0, 1, 4, 5], dtype=np.int64)
+        )
+        # token_order[4:8] = rank 1's slots (positions 2,3,6,7).
+        np.testing.assert_array_equal(
+            plan.token_order[4:], np.array([2, 3, 6, 7], dtype=np.int64)
+        )
+
+    def test_boundary_crossing_rejected(self) -> None:
+        # Request 0: prompt_tokens=8, computed=6, scheduled=4 → span [6, 10)
+        # crosses the prompt boundary at position 8 (6 < 8 < 10).
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "prompt/decode boundary-crossing",
+        ):
+            plan_pcp_sequence_layout(
+                num_scheduled_tokens_per_req=np.array([4]),
+                prompt_tokens_per_req=np.array([8]),
+                computed_tokens_per_req=np.array([6]),
+                padded_num_tokens=8,
+                pcp_size=2,
+                pcp_rank=0,
+                interleave_size=1,
+            )
+
+
+class GatherUnpackRoundTripTest(CustomTestCase):
+    """Round-trip: apply_pcp_local_shard(x) then gather_and_unpack_pcp of
+    the reassembled shards must reproduce x. Guards against off-by-one in
+    inverse_order interpretation."""
+
+    def test_pcp_size_2_identity_permutation(self) -> None:
+        # Identity token_order for pcp_size=2 with 8 tokens: rank 0 owns
+        # positions [0..3], rank 1 owns [4..7]. Round-trip must yield x.
+        pcp_size = 2
+        num_tokens = 8
+        plan = PcpSequenceLayoutPlan(
+            pcp_size=pcp_size,
+            interleave_size=1,
+            pcp_rank=0,
+            token_order=np.arange(num_tokens, dtype=np.int64),
+            inverse_order=np.arange(num_tokens, dtype=np.int64),
+            local_token_counts=np.array([4, 4], dtype=np.int32),
+            global_num_tokens=num_tokens,
+            global_padded_num_tokens=num_tokens,
+            local_num_tokens=4,
+            local_padded_num_tokens=4,
+        )
+        x = torch.arange(num_tokens * 3, dtype=torch.float32).reshape(num_tokens, 3)
+        fb = _fake_forward_batch(plan)
+        local = apply_pcp_local_shard(x, fb, axis=0)
+        # Rank 0's slice = rows [0..3].
+        torch.testing.assert_close(local, x[:4])
+
+
 if __name__ == "__main__":
     unittest.main()
