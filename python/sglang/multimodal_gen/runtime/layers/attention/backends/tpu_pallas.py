@@ -106,6 +106,11 @@ def _get_tpu_flash_op(sm_scale: float, block_q: int, block_kv: int):
     # (srt's TPU kernels call their CustomOpDef directly; for jax_op-created
     # ops we measured the inlining break, hence the overload. Divergence
     # documented in docs_new/docs/hardware-platforms/tpu_diffusion.mdx.)
+    # TODO: revert to calling the CustomOpDef once dynamo traces
+    # CustomOpDef.__call__ without inlining (torch fix), and replace the
+    # `torch_tpu._internal.pallas` import when torch_tpu publishes a stable
+    # jax_op surface — the srt TPU backend shares this _internal dependency
+    # (17 import sites), so the migration is repo-wide, not diffusion-only.
     overload = getattr(torch.ops.sglang_diffusion, op_name.split("::", 1)[1]).default
     _TPU_FLASH_OPS[key] = overload
     return overload
