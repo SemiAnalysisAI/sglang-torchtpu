@@ -67,7 +67,18 @@ def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None
 
     if isinstance(out, torch.Tensor):
         tensors.append(out)
+    elif isinstance(out, PPProxyTensors):
+        # Non-last PP rank: out is a proxy holding the pipeline stage's
+        # tensor payload. Sync every constituent so peak HBM stays bounded
+        # (same accounting reason as the LogitsProcessorOutput branch).
+        for t in out.tensors.values():
+            if isinstance(t, torch.Tensor):
+                tensors.append(t)
     else:
+        # LogitsProcessorOutput path. Optional fields access via getattr
+        # to accommodate SimpleNamespace stubs in unit tests that mock a
+        # partial output — real LogitsProcessorOutput declares both fields
+        # as Optional[torch.Tensor].
         next_token_logits = getattr(out, "next_token_logits", None)
         if isinstance(next_token_logits, torch.Tensor):
             tensors.append(next_token_logits)
@@ -103,10 +114,25 @@ def _hbm_delta_str(
     before: Optional[tuple[float, float]],
     after: Optional[tuple[float, float]],
 ) -> str:
-    """Format HBM delta + total as a suffix string, or empty if unavailable."""
+    """Format HBM delta + total as a suffix string, or empty if unavailable.
+
+    Also emits a WARNING when the after-bucket HBM usage exceeds 90% of
+    total — PCP precompile bakes many shapes and a runaway warmup would
+    otherwise OOM mid-loop without an actionable message.
+    """
     if before is None or after is None:
         return " HBM: N/A"
     delta = after[0] - before[0]
+    used_pct = after[0] / max(after[1], 1.0)
+    if used_pct > 0.9:
+        logger.warning(
+            "[decoder compile policy] HBM usage %.1f%% (%.0f/%.0f MB) — "
+            "warmup nearing OOM. Consider SGLANG_TPU_PCP_KEEP_NONCP_COMPILE=0 "
+            "if it's set, or reducing --mem-fraction-static.",
+            100.0 * used_pct,
+            after[0],
+            after[1],
+        )
     return f" HBM: +{delta:.0f} MB ({after[0]:.0f}/{after[1]:.0f} MB)"
 
 
@@ -388,7 +414,9 @@ class DecoderTpuCompilePolicy(CompilePolicy):
             if t >= bs and not (t % kernel_bucket == 0 and t % bs == 0)
         ]
         if dropped:
-            logger.info(
+            # WARNING (not INFO) because dropped buckets = ignored
+            # user-configured shapes. Operators should see this by default.
+            logger.warning(
                 "[decoder compile policy] EXTEND-PCP: dropping %d buckets "
                 "not aligned to pcp_size*q_block_size=%d or bs=%d: %s",
                 len(dropped),
@@ -536,6 +564,13 @@ class DecoderTpuCompilePolicy(CompilePolicy):
             # ``tt_jit_all``, ``tt_jit_index``, etc. — verified via TPU
             # profile diff).
             model = self.model_runner.model
+            # capture_aux_hidden_states=True (EAGLE-3): the model forward
+            # returns (hidden_states, aux_hidden_states) tuple instead of
+            # a single tensor. Mirror the eager_runner CP-v2 branch unpack
+            # so the precompile shape matches serve time.
+            aux_hidden_states = None
+            if model.capture_aux_hidden_states:
+                hidden_states, aux_hidden_states = hidden_states
             if model.pp_group.is_last_rank:
                 gathered = cp_gather_after_forward(
                     hidden_states,
@@ -547,16 +582,18 @@ class DecoderTpuCompilePolicy(CompilePolicy):
                     gathered,
                     model.lm_head,
                     forward_batch,
-                    None,  # aux_hidden_states
+                    aux_hidden_states,
                 )
                 # Warm the sampler-side kernels (argmax + validity check)
                 # that fire in every serve request but aren't triggered
                 # by the model forward chain. Without this, the first
                 # serve pays ~185ms of ``tt_jit_argmax`` JIT compile.
-                next_token_logits = getattr(out, "next_token_logits", None)
-                if isinstance(next_token_logits, torch.Tensor):
-                    _ = torch.argmax(next_token_logits, dim=-1)
-                    _ = torch.all(torch.isfinite(next_token_logits))
+                # LogitsProcessorOutput.next_token_logits is Optional; the
+                # isinstance narrows the None branch (LM head can return
+                # None when spec-decode is off; see logits_processor.py).
+                if isinstance(out.next_token_logits, torch.Tensor):
+                    _ = torch.argmax(out.next_token_logits, dim=-1)
+                    _ = torch.all(torch.isfinite(out.next_token_logits))
             else:
                 out = hidden_states
             _materialize_out(
