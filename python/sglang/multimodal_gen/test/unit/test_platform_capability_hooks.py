@@ -1,4 +1,3 @@
-import contextlib
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -67,9 +66,7 @@ class TestCapabilityHookConsumers(unittest.TestCase):
         with patch.object(decoding, "current_platform", platform):
             # nn.Module isinstance check passes for MagicMock spec-less objects
             # only via the capability early-return; assert we got the raw fn.
-            self.assertIs(
-                stage._get_vae_decode_fn(vae, server_args), vae.decode
-            )
+            self.assertIs(stage._get_vae_decode_fn(vae, server_args), vae.decode)
 
     def test_distributed_attention_uses_functional_path_when_selected(self):
         from sglang.multimodal_gen.runtime.layers.attention import turbo_layer

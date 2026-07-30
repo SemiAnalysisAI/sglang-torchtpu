@@ -92,11 +92,9 @@ def _get_tpu_flash_op(sm_scale: float, block_q: int, block_kv: int):
         "return": jax.Array,
     }
 
-    op_name = (
-        f"sglang_diffusion::flash_s{sm_scale!r}_q{block_q}_kv{block_kv}".replace(
-            ".", "_"
-        ).replace("-", "m")
-    )
+    op_name = f"sglang_diffusion::flash_s{sm_scale!r}_q{block_q}_kv{block_kv}".replace(
+        ".", "_"
+    ).replace("-", "m")
     registered = pallas.jax_op(op_name, _jax_flash)
 
     def _fake(q, k, v, q_seg, kv_seg):
@@ -160,7 +158,7 @@ class TpuPallasAttentionBackend(AttentionBackend):
         return AttentionBackendEnum.TPU_PALLAS_FLASH
 
     @staticmethod
-    def get_impl_cls() -> type["TpuPallasAttentionImpl"]:
+    def get_impl_cls() -> type[TpuPallasAttentionImpl]:
         return TpuPallasAttentionImpl
 
 

@@ -10,13 +10,9 @@ from sglang.multimodal_gen.runtime.entrypoints.cli.generate import (
 class TestVerifyGenerationOutput(unittest.TestCase):
     def test_missing_result_exits_nonzero(self):
         with self.assertRaises(SystemExit):
-            verify_generation_output(
-                results=None, output_file_path=None, num_outputs=1
-            )
+            verify_generation_output(results=None, output_file_path=None, num_outputs=1)
         with self.assertRaises(SystemExit):
-            verify_generation_output(
-                results=[], output_file_path=None, num_outputs=1
-            )
+            verify_generation_output(results=[], output_file_path=None, num_outputs=1)
 
     def test_missing_output_file_exits_nonzero(self):
         with tempfile.TemporaryDirectory() as tmp:

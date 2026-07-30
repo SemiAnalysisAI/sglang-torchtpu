@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import os
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -60,7 +60,7 @@ class _DitEvictionContext:
         self._pipeline = pipeline
         self._evicted: list[torch.nn.Module] = []
 
-    def __enter__(self) -> "_DitEvictionContext":
+    def __enter__(self) -> _DitEvictionContext:
         if self._pipeline is None:
             return self
         # Evict every DiT-class component (model-agnostic: covers Wan's
@@ -109,7 +109,7 @@ class _XprofSession:
         self._log_dir = log_dir
         self._session: Any = None
 
-    def __enter__(self) -> "_XprofSession":
+    def __enter__(self) -> _XprofSession:
         from torch_tpu._internal.profiler import profiler_api
 
         self._session = profiler_api.profile(

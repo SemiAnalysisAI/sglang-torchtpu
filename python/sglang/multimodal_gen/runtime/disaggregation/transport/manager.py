@@ -259,8 +259,8 @@ class DiffusionTransferManager:
         return pending
 
     def register_prealloc_as_receive(
-        self, request_id: str, slot: "SlotHandle"
-    ) -> "PendingReceive":
+        self, request_id: str, slot: SlotHandle
+    ) -> PendingReceive:
         """Register a pre-allocated slot as a pending receive (fast path)."""
         pending = PendingReceive(request_id=request_id, slot=slot)
         with self._lock:

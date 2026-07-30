@@ -123,9 +123,7 @@ def verify_generation_output(
     # runs derive per-sample names, so only the single-output contract is
     # checked here.
     if output_file_path and num_outputs == 1 and not os.path.exists(output_file_path):
-        raise SystemExit(
-            f"generation finished without writing {output_file_path}"
-        )
+        raise SystemExit(f"generation finished without writing {output_file_path}")
 
 
 def maybe_dump_performance(

@@ -28,9 +28,7 @@ class TestBackendInterface(unittest.TestCase):
             TpuPallasAttentionBackend.get_enum(),
             AttentionBackendEnum.TPU_PALLAS_FLASH,
         )
-        self.assertIs(
-            TpuPallasAttentionBackend.get_impl_cls(), TpuPallasAttentionImpl
-        )
+        self.assertIs(TpuPallasAttentionBackend.get_impl_cls(), TpuPallasAttentionImpl)
 
     def test_causal_is_rejected(self):
         with self.assertRaises(NotImplementedError):
@@ -62,9 +60,7 @@ class TestNumericParity(unittest.TestCase):
         k = torch.randn(batch, seq, heads, head_dim, dtype=torch.bfloat16)
         v = torch.randn(batch, seq, heads, head_dim, dtype=torch.bfloat16)
 
-        out = impl.forward(
-            q.to("tpu"), k.to("tpu"), v.to("tpu"), attn_metadata=None
-        )
+        out = impl.forward(q.to("tpu"), k.to("tpu"), v.to("tpu"), attn_metadata=None)
         torch.tpu.synchronize()
 
         expected = torch.nn.functional.scaled_dot_product_attention(
@@ -73,9 +69,7 @@ class TestNumericParity(unittest.TestCase):
             v.float().transpose(1, 2),
             scale=scale,
         ).transpose(1, 2)
-        torch.testing.assert_close(
-            out.cpu().float(), expected, atol=2e-2, rtol=2e-2
-        )
+        torch.testing.assert_close(out.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":

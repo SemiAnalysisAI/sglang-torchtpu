@@ -27,9 +27,7 @@ class TestTpuPlatformPlugin(unittest.TestCase):
             self.assertIsNone(platforms.tpu_platform_plugin())
 
     def test_forced_override_resolves_tpu(self):
-        with patch.dict(
-            "os.environ", {"SGLANG_DIFFUSION_PLATFORM_OVERRIDE": "tpu"}
-        ):
+        with patch.dict("os.environ", {"SGLANG_DIFFUSION_PLATFORM_OVERRIDE": "tpu"}):
             self.assertEqual(
                 platforms.resolve_current_platform_cls_qualname(), _TPU_QUALNAME
             )
@@ -84,9 +82,7 @@ class TestTpuPlatformSurface(unittest.TestCase):
         with patch.dict(os.environ, {"WORLD_SIZE": "1"}):
             self.assertEqual(platform.get_torch_distributed_backend_str(), "gloo")
         with patch.dict(os.environ, {"WORLD_SIZE": "8"}):
-            self.assertEqual(
-                platform.get_torch_distributed_backend_str(), "tpu_dist"
-            )
+            self.assertEqual(platform.get_torch_distributed_backend_str(), "tpu_dist")
 
     def test_inference_mode_is_no_grad(self):
         with TpuPlatform.inference_mode():
@@ -136,16 +132,12 @@ class TestDenoiseLoopEagerMode(unittest.TestCase):
 
         from torch_tpu._internal import execution_mode
 
-        with patch.dict(
-            os.environ, {"SGLANG_DIFFUSION_TPU_EAGER_MODE": "DEFER_NEVER"}
-        ):
+        with patch.dict(os.environ, {"SGLANG_DIFFUSION_TPU_EAGER_MODE": "DEFER_NEVER"}):
             with TpuPlatform.denoise_loop_context():
                 self.assertEqual(
                     execution_mode.eager_mode, execution_mode.EagerMode.DEFER_NEVER
                 )
-        with patch.dict(
-            os.environ, {"SGLANG_DIFFUSION_TPU_EAGER_MODE": "NOT_A_MODE"}
-        ):
+        with patch.dict(os.environ, {"SGLANG_DIFFUSION_TPU_EAGER_MODE": "NOT_A_MODE"}):
             with self.assertRaises(ValueError):
                 TpuPlatform.denoise_loop_context()
 
