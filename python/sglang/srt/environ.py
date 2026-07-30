@@ -976,6 +976,11 @@ class Envs:
 
     # TPU
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
+    # Defer the overlap-scheduler result D2H out of run_batch and into the
+    # result consumer. Helps only if the backend's transfer engine is
+    # independent of the compute queue; on torch_tpu's single PJRT queue it
+    # measured slower overall (better tail, worse median). See Scheduler.
+    SGLANG_TPU_DEFER_RESULT_D2H = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)

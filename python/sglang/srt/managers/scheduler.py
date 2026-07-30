@@ -1256,15 +1256,27 @@ class Scheduler(
             not use_mlx() and current_platform.supports_overlap_streams()
         )
 
-        # Without a copy stream the result D2H cannot overlap the next forward:
-        # `_async_d2h` degrades to a blocking `.to("cpu")`, so calling it inside
-        # `run_batch` parks the scheduler on the forward it just launched.
-        # Defer it to the consumer instead (`GenerationBatchResult.sync_copy`),
-        # which runs one iteration later in `pop_and_process` — after the next
-        # forward is enqueued. Only meaningful when overlap is on; the
-        # non-overlap loop processes results immediately anyway. Set before the
-        # use_mlx() early return below so every path has the attribute.
-        self.defer_result_d2h = self.enable_overlap and not self.use_overlap_streams
+        # Defer the result D2H to the consumer (`GenerationBatchResult.sync_copy`)
+        # instead of running it inline in `run_batch`. The motivation: without a
+        # copy stream `_async_d2h` degrades to a blocking `.to("cpu")`, so the
+        # inline copy parks the scheduler on the forward it just launched.
+        #
+        # OFF BY DEFAULT — measured a regression on torch_tpu. At CONC=8 on
+        # Qwen3.5-397B it took 339 -> 288 tok/s and median ITL 20.5 -> 25.2 ms,
+        # and an xprof capture put the host gap at 51% of the step (12.2 ms
+        # device against a 25 ms ITL) versus ~30% before. The likely reason is
+        # that a single PJRT queue orders the deferred transfer *behind* the
+        # newly-enqueued forward, so the host ends up waiting for step N-1's
+        # copy and step N's forward instead of just the copy. It did help the
+        # tail (p99 ITL 77 -> 52 ms, median TTFT 184 -> 148 ms), so it is worth
+        # keeping available for backends whose transfer engine is independent of
+        # the compute queue. Set before the use_mlx() early return so every path
+        # has the attribute.
+        self.defer_result_d2h = (
+            envs.SGLANG_TPU_DEFER_RESULT_D2H.get()
+            and self.enable_overlap
+            and not self.use_overlap_streams
+        )
 
         # FutureMap is always-on: input_ids relay used in both modes.
         # Workers without the spec_v2_attn_backends override fall back to
