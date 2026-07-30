@@ -285,6 +285,13 @@ def pcp_streaming_jax_op(
             request_distribution,
         )
 
+    # DO NOT CHANGE mutates_args=(). See the file docstring for
+    # _PcpStreamingJaxCallable + the invoke_pcp_streaming_op docstring:
+    # KV writeback happens at the caller via kv_cache.copy_(new_kv_cache);
+    # switching to mutates_args=("kv_cache",) forces functionalization
+    # (clone + copy-back-at-graph-exit), which caused ~50% wrong first-
+    # token output at ISL=4096 on the previous PCP path (M-series
+    # investigation).
     result = torch.library.custom_op(
         name,
         _pcp_streaming_custom_op,
@@ -345,6 +352,11 @@ def invoke_pcp_streaming_op(
         query_start_loc,
         request_distribution,
     )
+    # DO NOT CHANGE the copy_ + tuple return pattern. This is the load-
+    # bearing half of the mutates_args=() aliasing contract; see docstring
+    # above + pcp_streaming_jax_op's mutates_args comment. Moving the
+    # copy_ up into the caller frame caused warm-probe recompiles
+    # (~3x latency regression); removing it silently drops KV writes.
     kv_cache.copy_(new_kv_cache)
     return output
 

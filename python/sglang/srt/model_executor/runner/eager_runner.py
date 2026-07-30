@@ -539,6 +539,13 @@ class EagerRunner(BaseRunner):
         else:
             model_runner.attn_backend.forward_metadata = None
 
+        # Idle forwards are never CP-v2 (no attention over KV). Clear the
+        # CP-v2 plain-scalar mirrors so a stale ``pcp_attn_active=True`` /
+        # ``moe_cp_active=True`` from a prior CP-v2 forward doesn't leak
+        # into the compiled model.forward (which would re-enter _forward_pcp
+        # without a valid pcp_op / layout plan).
+        _reset_cp_v2_state(forward_batch)
+
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
         ctx = (
             model_runner.device_timer.wrap(metadata={"category": "idle"})

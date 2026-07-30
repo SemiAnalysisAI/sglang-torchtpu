@@ -170,14 +170,23 @@ def _cp_strategy_is_pcp() -> bool:
 
 
 def _ensure_language_model(model_runner: "ModelRunner") -> Any:
-    """Resolve and cache ``model.model`` = language backbone. One-shot mutation
-    that mirrors what ``ModelRunner`` does on the CUDA-graph path (disabled
-    on TPU), so we do it here before the layer walk.
+    """Resolve and return the language backbone. One-shot mirror of what
+    ``ModelRunner`` does on the CUDA-graph path (disabled on TPU) so the
+    subsequent layer walk sees the resolved backbone.
+
+    Idempotent: if ``model_runner.model.model`` was already set (by an
+    earlier init path) to the same resolved backbone, the assignment is a
+    no-op. If it was set to a DIFFERENT object (e.g. multi-modal wrappers
+    like Qwen3OmniMoeForConditionalGeneration where the outer model
+    exposes a distinct ``.model``), preserve it and just return the
+    resolved backbone.
     """
     from sglang.srt.model_executor.model_runner import resolve_language_model
 
     resolved = resolve_language_model(model_runner.model)
-    model_runner.model.model = resolved
+    existing = getattr(model_runner.model, "model", None)
+    if existing is None or existing is resolved:
+        model_runner.model.model = resolved
     return resolved
 
 
@@ -241,12 +250,27 @@ def _warm_pcp_streaming_op_registry(
     # model.
     max_model_len = int(model_runner.model_config.context_len)
     language_model = _ensure_language_model(model_runner)
+    warned_missing_scales = False
     for layer in _iter_attention_layers(language_model):
         if kv_cache_quant_dtype is not None:
             # PCP FP8 kernel rejects None / non-finite scales at trace time.
             # Default to 1.0 when the checkpoint has no scales (bf16-weight
-            # model run under --kv-cache-dtype fp8_e4m3), matching the runtime
-            # default in the pre-per-layer-op version of pcp_streaming_attention.
+            # model run under --kv-cache-dtype fp8_e4m3), matching the
+            # runtime default in the pre-per-layer-op version of
+            # pcp_streaming_attention. Log once if the fallback fires — a
+            # FP8-checkpoint model missing scales at warm time is a load-
+            # order bug and would silently bake wrong scales into the op.
+            if layer.k_scale_float is None or layer.v_scale_float is None:
+                if not warned_missing_scales:
+                    logger.warning(
+                        "PCP streaming warm: layer %s has None k/v scale — "
+                        "defaulting to 1.0. Expected for bf16-weight + "
+                        "fp8_e4m3 KV cache; unexpected for FP8-weight "
+                        "checkpoints and indicates scales weren't loaded "
+                        "before backend init.",
+                        layer.layer_id,
+                    )
+                    warned_missing_scales = True
             k_scale = layer.k_scale_float if layer.k_scale_float is not None else 1.0
             v_scale = layer.v_scale_float if layer.v_scale_float is not None else 1.0
         else:
@@ -268,3 +292,14 @@ def _warm_pcp_streaming_op_registry(
             max_model_len=max_model_len,
         )
         op_by_layer_id[int(layer.layer_id)] = op
+    if not op_by_layer_id:
+        # _iter_attention_layers yielded nothing — model shape doesn't
+        # match the ``.model[.model[...]].layers`` chain the walker
+        # expects. Fail loudly at warm rather than letting the first
+        # serve request KeyError from _pcp_op_by_layer_id[layer_id].
+        raise RuntimeError(
+            f"PCP streaming warm produced no per-layer ops. "
+            f"_iter_attention_layers walked from {type(language_model).__name__} "
+            "and found no RadixAttention layers — check the model's "
+            "layer-chain shape matches ``.model.layers`` traversal."
+        )
