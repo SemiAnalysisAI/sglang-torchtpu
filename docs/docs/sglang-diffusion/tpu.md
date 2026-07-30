@@ -119,8 +119,9 @@ Gaps found on the srt side during this audit (tracked for follow-up, not
 changed from here): serialization-ON exposure above; six unguarded
 `float64` casts in `sampler.py` (emulated f64 on TPU); the hot path uses
 raw `torch.inference_mode()` instead of the platform hook (unsupported on
-torch_tpu lazy tensors); no jax `TPU_ML_PLATFORM` env scrub despite
-importing jax and torch_tpu in one process.
+torch_tpu lazy tensors). The one srt change this series does carry is the
+jax `TPU_ML_PLATFORM` env scrub in `env_override.py` — inert unless a jax
+launcher left the vars behind, in which case PJRT init deadlocks.
 
 ## Testing
 
