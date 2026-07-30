@@ -30,3 +30,9 @@ def test_tpu_sampled_tokens_are_broadcast_across_tp() -> None:
 
         expected_group = attention_tp_group if dp_attention_enabled else tp_group
         expected_group.broadcast.assert_called_once_with(token_ids, src=0)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__, "-v"]))
