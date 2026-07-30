@@ -69,7 +69,7 @@ class SRTPlatform(DeviceMixin):
         """Extra constructor kwargs for the MHA KV pool class.
 
         Default is an empty dict. Platforms whose pool subclass takes
-        additional keyword arguments (e.g. TPU's DCP-sharded pool needing
+        additional keyword arguments (e.g. TPU's PCP-sharded pool needing
         ``cp_group_size``) override this and return the kwargs to splat
         into the constructor at pool-creation time.
         """
@@ -150,12 +150,12 @@ class SRTPlatform(DeviceMixin):
         return False
 
     def supports_attn_cp(self) -> bool:
-        """Whether this platform can run CP-v2 attention (zigzag / DCP).
+        """Whether this platform can run CP-v2 attention (zigzag / interleave / PCP).
 
         Gates the ``--attn-cp-size N`` server-arg on platforms that have
         not wired up the required strategy/backend + collective helpers.
-        CUDA and TPU are the current supported platforms; other backends
-        override this to ``True`` as they land support.
+        Backends override this to ``True`` as they land support (CUDA
+        already; TPU when the PCP strategy + backend land).
         """
         return False
 

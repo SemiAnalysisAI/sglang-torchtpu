@@ -515,13 +515,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_children: Optional[List[ForwardBatch]] = None
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
-    # Plain scalar mirrors for the PCP streaming path. Populated by
-    # ``sglang.srt.layers.cp.utils._build_pcp_layout_plan`` from the
-    # msgspec-backed ``attn_cp_metadata``. Reading msgspec.Struct
-    # attributes inside a compiled PCP forward produces non-deterministic
-    # wrong output on TPU (see memory/pcp_compile_msgspec.md), so the
-    # attention backend + moe communicator read these plain fields
-    # instead of touching ``attn_cp_metadata``.
+    # Plain scalar mirrors for the PCP streaming path. Populated by the
+    # PCP strategy's ``build_extra_metadata`` (lands with the PCP
+    # infrastructure PR). Reading msgspec.Struct attributes inside a
+    # compiled PCP forward produces non-deterministic wrong output on TPU
+    # (see memory/pcp_compile_msgspec.md), so the attention backend + moe
+    # communicator read these plain fields instead of touching
+    # ``attn_cp_metadata``.
     pcp_attn_active: bool = False
     moe_cp_active: bool = False
     moe_cp_pad_max_tokens: int = 0

@@ -19,14 +19,17 @@ The strategy implementation is split across:
 * ``base.py``: base ABC, base metadata struct, enums, and singleton helpers.
 * ``zigzag.py``: in-seq-split strategy and zigzag metadata.
 * ``interleave.py``: round-robin-split strategy and interleave metadata.
+* ``utils.py``: public re-exports, ``is_cp_v2_active``, ``prepare_cp_forward``,
+  ``cp_split_before_forward`` / ``cp_gather_after_forward``.
+
+Downstream PRs in the PCP series add:
+
 * ``pcp_streaming.py``: TPU Prefill-Context-Parallel via the PCP
   streaming Pallas kernel; strategy + attention driver.
 * ``pcp_sequence_layout.py``: host-side rank-major compact-Q layout planner
   consumed by the PCP streaming path.
 * ``pcp_streaming_op_registry.py``: process-scoped registry that caches one
   torch custom op per (sm_scale, sliding_window, ...) tuple for the PCP path.
-* ``utils.py``: public re-exports, ``is_cp_v2_active``, ``prepare_cp_forward``,
-  ``cp_split_before_forward`` / ``cp_gather_after_forward``.
 """
 
 from __future__ import annotations
@@ -90,7 +93,8 @@ class CPAttentionBackendKind(IntEnum):
     FLASH_ATTENTION = 0
     # PALLAS_TPU_RPA_V3_CP: sglang's Pallas RPA v3 CP backend on torch_tpu.
     # PCP_STREAMING strategy uses this — the backend subclass
-    # ``TpuPallasRpaV3CpAttnBackend._forward_pcp`` invokes the # PCP streaming kernel via ``pcp_streaming_attention``.
+    # ``TpuPallasRpaV3CpAttnBackend._forward_pcp`` invokes the PCP streaming
+    # kernel via ``pcp_streaming_attention``.
     PALLAS_TPU_RPA_V3_CP = 1
 
     @classmethod
@@ -278,7 +282,17 @@ def init_cp_strategy(server_args: ServerArgs) -> None:
 
         _STRATEGY = InterleaveCPStrategy(cp_size=cp_size)
     elif kind == ContextParallelStrategyKind.PCP_STREAMING:
-        from sglang.srt.layers.cp.pcp_streaming import PCPStreamingCPStrategy
+        # The PCP strategy module lands with the PCP infrastructure PR.
+        # On a checkout that lacks it, raise with a clear pointer rather
+        # than a bare ImportError from the module load.
+        try:
+            from sglang.srt.layers.cp.pcp_streaming import PCPStreamingCPStrategy
+        except ImportError as e:
+            raise NotImplementedError(
+                "cp_strategy='pcp' requires the PCP strategy module "
+                "(sglang.srt.layers.cp.pcp_streaming), which lands with "
+                "the PCP infrastructure PR."
+            ) from e
 
         _STRATEGY = PCPStreamingCPStrategy(cp_size=cp_size)
     else:

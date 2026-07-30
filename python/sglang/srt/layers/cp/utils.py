@@ -16,6 +16,8 @@
 
 from typing import Any, Optional, Tuple
 
+import torch
+
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
@@ -59,6 +61,8 @@ def is_cp_v2_active(forward_batch) -> bool:
         return False
     forward_mode = forward_batch.forward_mode
     if forward_mode is None:
+        # Real ForwardBatch always has forward_mode; branch exists for
+        # SimpleNamespace-based unit-test stubs that mock the field.
         return False
 
     strategy = get_cp_strategy()
@@ -135,9 +139,7 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
 def _to_int_list(values) -> Optional[list[int]]:
     if values is None:
         return None
-    import torch as _torch
-
-    if isinstance(values, _torch.Tensor):
+    if isinstance(values, torch.Tensor):
         values = values.tolist()
     return [int(x) for x in values]
 

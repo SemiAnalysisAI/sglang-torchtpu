@@ -750,11 +750,11 @@ class TboForwardBatchPreparer:
         ]:
             output_dict[key] = getattr(batch, key)
 
-        # PCP + TBO would require splitting the layout plan and cp metadata
-        # across children — not implemented. Fail loudly instead of silently
-        # sharing the parent's plan.
+        # TBO + CP-v2 (any strategy) would require splitting the CP
+        # metadata across children — not implemented. Fail loudly instead
+        # of silently sharing the parent's plan / metadata.
         assert batch.attn_cp_metadata is None and batch.pcp_layout_plan is None, (
-            "TBO + CP-v2 (PCP) is not supported yet: attn_cp_metadata / "
+            "TBO + CP-v2 is not supported yet: attn_cp_metadata / "
             "pcp_layout_plan cannot be split across TBO children."
         )
         output_dict["attn_cp_metadata"] = None
