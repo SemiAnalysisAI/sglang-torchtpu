@@ -73,7 +73,14 @@ compiled), so it measures warmup cost rather than steady throughput.
 | Compiled with torch_tpu stock serialization | — | — | — | **crashes** (`e0102: RuntimeProgramInputMismatch`) — see limitations |
 
 Guidance: fused eager for cold one-shot generation; compiled for warm/long
-serving (warmup amortizes, decode is faster).
+serving (warmup amortizes, decode is faster). For compiled serving, pass
+`--offload-during-compile false`: the default offload-during-compile path
+(a shared-runtime CUDA-VRAM measure, not TPU code) leaves layerwise
+placeholder parameters observable to a later dynamo re-trace, and every
+request after the first fails; with the flag off, warm compiled serving is
+verified (three sequential requests, distinct prompts). TPU HBM absorbs
+the unmitigated compile-warmup peak. Tracked for an upstream lifecycle
+fix.
 
 Output parity: all green modes produce frame-statistics-identical videos
 (compiled numerics differ within tolerance).
