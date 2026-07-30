@@ -139,7 +139,46 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         )
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
+        self.extend_bs: int | None = None
         self._logged_vl_warmup_variants: set[str] = set()
+
+    def _extend_compile_cap(self) -> int:
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+        return _extend_batch_cap(self.t_bucketer, self.b_bucketer, self.extend_bs)
+
+    def _extend_compile_cases(self) -> list[tuple[int, int, ForwardMode]]:
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+
+        mode_caps = [(ForwardMode.EXTEND, self._extend_compile_cap())]
+        server_args = getattr(self.model_runner, "server_args", None)
+        if getattr(server_args, "enable_mixed_chunk", False):
+            mode_caps.append(
+                (
+                    ForwardMode.MIXED,
+                    _extend_batch_cap(
+                        self.t_bucketer,
+                        self.b_bucketer,
+                        self.b_bucketer.max_val,
+                    ),
+                )
+            )
+
+        return [
+            (num_tokens, batch_size, mode)
+            for mode, batch_size in mode_caps
+            for num_tokens in self.t_bucketer.buckets
+            if num_tokens >= batch_size
+        ]
+
+    def _extend_compile_shapes(self) -> list[tuple[int, int]]:
+        return list(
+            dict.fromkeys(
+                (num_tokens, batch_size)
+                for num_tokens, batch_size, _ in self._extend_compile_cases()
+            )
+        )
 
     def install(self) -> bool:
         """Install runtime compile wrappers for the annotated decoder target."""
@@ -196,6 +235,13 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         t_bucketer, b_bucketer = build_bucketers(server_args, max_t=max_t, max_b=max_b)
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
+        if is_dp_attention_enabled():
+            self.extend_bs = b_bucketer.max_val
+        else:
+            self.extend_bs = min(
+                server_args.prefill_max_requests or b_bucketer.max_val,
+                b_bucketer.max_val,
+            )
 
         outer_model = self.model_runner.model
         existing_prep = getattr(outer_model, "prepare_forward_batch", None)
@@ -204,7 +250,10 @@ class DecoderTpuCompilePolicy(CompilePolicy):
             if existing_prep is not None:
                 existing_prep(forward_batch)
             real_q, real_b = _pad_forward_batch_inputs(
-                forward_batch, t_bucketer, b_bucketer
+                forward_batch,
+                t_bucketer,
+                b_bucketer,
+                extend_bs=self.extend_bs,
             )
             setattr(forward_batch, _REAL_Q_KEY, real_q)
             setattr(forward_batch, _REAL_B_KEY, real_b)
@@ -291,40 +340,40 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
 
-        bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer)
-        valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
-        if not valid_shapes:
+        compile_cases = self._extend_compile_cases()
+        if not compile_cases:
             raise ValueError(
                 "No TPU extend compile shapes are valid: token buckets "
                 f"{list(self.t_bucketer.buckets)} are all smaller than the "
-                f"extend batch cap {bs}."
+                f"extend batch cap {self._extend_compile_cap()}."
             )
 
         logger.info(
-            "[decoder compile policy] EXTEND: %d shapes (bs=%d, token_buckets=%s)",
-            len(valid_shapes),
-            bs,
+            "[decoder compile policy] EXTEND/MIXED: %d cases "
+            "(mode_caps=%s, token_buckets=%s)",
+            len(compile_cases),
+            sorted({(mode.name, batch_size) for _, batch_size, mode in compile_cases}),
             list(self.t_bucketer.buckets),
         )
         compile_range = (
             tqdm.tqdm(
-                valid_shapes,
-                desc="Compiling EXTEND",
+                compile_cases,
+                desc="Compiling EXTEND/MIXED",
                 bar_format=_COMPILE_BAR_FORMAT,
             )
             if get_tensor_model_parallel_rank() == 0
-            else valid_shapes
+            else compile_cases
         )
-        for num_tokens, bs in compile_range:
+        for num_tokens, bs, mode in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
-            self._run_one(num_tokens=num_tokens, bs=bs, mode=ForwardMode.EXTEND)
+            self._run_one(num_tokens=num_tokens, bs=bs, mode=mode)
             if get_tensor_model_parallel_rank() == 0:
                 elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
-                    f"Compiled EXTEND (tokens={num_tokens}, bs={bs}) "
+                    f"Compiled {mode.name} (tokens={num_tokens}, bs={bs}) "
                     f"in {elapsed:.1f}s{hbm_str}"
                 )
 
@@ -622,13 +671,12 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
 
-        bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer)
-        valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
-        if not valid_shapes:
+        compile_cases = self._extend_compile_cases()
+        if not compile_cases:
             raise ValueError(
                 "No TPU extend compile shapes are valid: token buckets "
                 f"{list(self.t_bucketer.buckets)} are all smaller than the "
-                f"extend batch cap {bs}."
+                f"extend batch cap {self._extend_compile_cap()}."
             )
 
         variants = ["text_only"]
@@ -637,15 +685,15 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
         logger.info(
             "[decoder compile policy] VL EXTEND: %d shapes x %d variants "
-            "(bs=%d, token_buckets=%s)",
-            len(valid_shapes),
+            "(batch_caps=%s, token_buckets=%s)",
+            len(compile_cases),
             len(variants),
-            bs,
+            sorted({(mode.name, batch_size) for _, batch_size, mode in compile_cases}),
             list(self.t_bucketer.buckets),
         )
         compile_items = [
-            (num_tokens, bs, variant)
-            for num_tokens, bs in valid_shapes
+            (num_tokens, bs, mode, variant)
+            for num_tokens, bs, mode in compile_cases
             for variant in variants
         ]
         compile_range = (
@@ -657,13 +705,13 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             if get_tensor_model_parallel_rank() == 0
             else compile_items
         )
-        for num_tokens, bs, variant in compile_range:
+        for num_tokens, bs, mode, variant in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
-                mode=ForwardMode.EXTEND,
+                mode=mode,
                 variant=variant,
             )
             if get_tensor_model_parallel_rank() == 0:
@@ -671,7 +719,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
-                    f"Compiled VL EXTEND (tokens={num_tokens}, bs={bs}, "
+                    f"Compiled VL {mode.name} (tokens={num_tokens}, bs={bs}, "
                     f"variant={variant}) in {elapsed:.1f}s{hbm_str}"
                 )
 

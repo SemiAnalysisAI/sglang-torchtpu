@@ -57,9 +57,17 @@ _REAL_B_KEY = "_tpu_real_b"
 _DEFAULT_KWARG_TYPES = (type(None), bool, int, float, str)
 
 
-def _extend_batch_cap(t_bucketer: Bucketer, b_bucketer: Bucketer) -> int:
+def _extend_batch_cap(
+    t_bucketer: Bucketer,
+    b_bucketer: Bucketer,
+    configured_cap: int | None = None,
+) -> int:
     """Return the largest reachable fixed batch shape for EXTEND."""
-    return min(t_bucketer.max_val, b_bucketer.max_val)
+    return min(
+        t_bucketer.max_val,
+        b_bucketer.max_val,
+        configured_cap or b_bucketer.max_val,
+    )
 
 
 def _static_default_kwargs(fn: Callable[..., Any]) -> dict[str, Any]:
@@ -220,6 +228,7 @@ def _pad_forward_batch_inputs(
     forward_batch: Any,
     t_bucketer: Bucketer,
     b_bucketer: Bucketer,
+    extend_bs: int | None = None,
 ) -> tuple[int, int]:
     """Pad ForwardBatch tensors to next bucket shape and return original sizes."""
     if forward_batch.return_logprob:
@@ -261,6 +270,17 @@ def _pad_forward_batch_inputs(
         pad_t = b_bucketer.next_bucket(real_q)
         pad_b = b_bucketer.next_bucket(real_b)
         real_q_out, real_b_out = real_q, real_b
+    elif forward_batch.forward_mode.is_mixed():
+        extend_cap = _extend_batch_cap(t_bucketer, b_bucketer, extend_bs)
+        mixed_cap = _extend_batch_cap(t_bucketer, b_bucketer, b_bucketer.max_val)
+        pad_b = extend_cap if real_b <= extend_cap else mixed_cap
+        if real_b > pad_b:
+            raise ValueError(
+                f"TPU mixed batch size {real_b} exceeds its compile cap {pad_b}. "
+                "Increase --torch-compile-max-bs to cover the largest mixed batch."
+            )
+        pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
+        real_q_out, real_b_out = real_q, real_b
     elif (
         forward_batch.forward_mode.is_target_verify()
         and forward_batch.spec_info is not None
@@ -282,7 +302,12 @@ def _pad_forward_batch_inputs(
     else:
         # Prefill/extend is precompiled at a fixed batch cap to avoid compiling
         # the full token_bucket x batch_bucket cross product.
-        pad_b = _extend_batch_cap(t_bucketer, b_bucketer)
+        pad_b = _extend_batch_cap(t_bucketer, b_bucketer, extend_bs)
+        if real_b > pad_b:
+            raise ValueError(
+                f"TPU extend batch size {real_b} exceeds its compile cap {pad_b}. "
+                "Set --prefill-max-requests to at least the largest extend batch."
+            )
         pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
         real_q_out, real_b_out = real_q, real_b
 
