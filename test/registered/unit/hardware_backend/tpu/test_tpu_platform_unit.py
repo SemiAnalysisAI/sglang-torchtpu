@@ -390,6 +390,14 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             )
         )
 
+    def test_batched_rpa_spec_defaults(self):
+        args = self._args(
+            attention_backend="pallas_tpu_rpa_batched",
+            speculative_algorithm="EAGLE3",
+        )
+        self._apply(args)
+        self.assertEqual(args.page_size, 256)
+
     def test_explicit_dtype_not_overridden(self):
         args = self._args(dtype="float32")
         self._apply(args)

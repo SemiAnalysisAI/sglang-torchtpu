@@ -80,5 +80,51 @@ class TestMHAKVPoolSelection(CustomTestCase):
                 self.assertIs(self._pool_cls_for(backend), MHATokenToKVPool)
 
 
+class TestBatchedRpaSpecBackend(CustomTestCase):
+    def _factory(self):
+        from sglang.srt.speculative.draft_utils import DraftBackendFactory
+
+        self.backend_context = patch(
+            "sglang.srt.speculative.draft_utils.attention_backends",
+            return_value=("pallas_tpu_rpa_batched", "pallas_tpu_rpa_batched"),
+        )
+        self.backend_context.start()
+        self.addCleanup(self.backend_context.stop)
+        spec_context = patch(
+            "sglang.srt.speculative.draft_utils.get_spec",
+            return_value=types.SimpleNamespace(speculative_attention_mode="prefill"),
+        )
+        spec_context.start()
+        self.addCleanup(spec_context.stop)
+        return DraftBackendFactory(
+            types.SimpleNamespace(
+                draft_attention_backend=None,
+                model_config=types.SimpleNamespace(hf_config=object()),
+            ),
+            topk=1,
+            speculative_num_steps=3,
+        )
+
+    def test_decode_backend_registered(self):
+        factory = self._factory()
+        expected = types.SimpleNamespace(attn_backends=[])
+        with patch.object(
+            factory,
+            "_create_tpu_pallas_rpa_batched_decode_backend",
+            return_value=("tpu_pallas_rpa_batched", expected),
+        ):
+            self.assertIs(factory.create_decode_backend(), expected)
+
+    def test_draft_extend_backend_registered(self):
+        factory = self._factory()
+        expected = types.SimpleNamespace(attn_backends=[])
+        with patch.object(
+            factory,
+            "_create_tpu_pallas_rpa_batched_prefill_backend",
+            return_value=("tpu_pallas_rpa_batched", expected),
+        ):
+            self.assertIs(factory.create_draft_extend_backend(), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
