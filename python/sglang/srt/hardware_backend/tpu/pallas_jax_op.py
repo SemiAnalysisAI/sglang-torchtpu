@@ -59,12 +59,7 @@ class _CpuExportJaxCallable(pallas_impl.JaxCallable):
                 jax._src.config.export_ignore_forward_compatibility(True),
             ):
                 lowered = self.exported(*jax_args, **kwargs)
-            register_custom_kernel = getattr(
-                pallas_impl.tpu_torch_pallas,
-                "_sglang_original_register_custom_kernel",
-                pallas_impl.tpu_torch_pallas.register_custom_kernel,
-            )
-            register_custom_kernel(
+            pallas_impl.tpu_torch_pallas.register_custom_kernel(
                 self.name,
                 kernel_key,
                 serialized_mlir_module=lowered.mlir_module_serialized,
@@ -82,12 +77,7 @@ class _CpuExportJaxCallable(pallas_impl.JaxCallable):
             for index, arg in enumerate(args)
             if arg is not None and index not in self.static_argnums
         ]
-        call_custom_kernel = getattr(
-            pallas_impl.tpu_torch_pallas,
-            "_sglang_original_call_custom_kernel",
-            pallas_impl.tpu_torch_pallas.call_custom_kernel,
-        )
-        results = call_custom_kernel(
+        results = pallas_impl.tpu_torch_pallas.call_custom_kernel(
             self.name,
             kernel_key,
             inputs=tensor_args,
