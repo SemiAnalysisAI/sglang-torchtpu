@@ -79,6 +79,7 @@ def _make_forward_batch(
     extend_seq_lens: Optional[torch.Tensor] = None,
     spec_info=None,
     seq_lens_cpu: Optional[torch.Tensor] = None,
+    req_pool_indices_cpu: Optional[torch.Tensor] = None,
 ):
     """Minimal fake ForwardBatch for ``_build_metadata``.
 
@@ -86,9 +87,13 @@ def _make_forward_batch(
     ``SimpleNamespace`` (instead of a real ``ForwardBatch``) keeps the test
     independent of the model-runner construction graph.
     """
+    if req_pool_indices_cpu is None:
+        req_pool_indices_cpu = req_pool_indices.clone()
+
     return types.SimpleNamespace(
         seq_lens=seq_lens,
         req_pool_indices=req_pool_indices,
+        req_pool_indices_cpu=req_pool_indices_cpu,
         forward_mode=forward_mode,
         extend_seq_lens=extend_seq_lens,
         spec_info=spec_info,
@@ -191,6 +196,25 @@ class TestPallasRpaV3MetadataDecode(CustomTestCase):
                     expected,
                     f"seq {i} page {j}: page_indices mismatch",
                 )
+
+    def test_host_metadata_uses_req_pool_indices_cpu(self):
+        # The host-resident RPA metadata path must use req_pool_indices_cpu, not
+        # req_pool_indices, which is TPU-resident in production. Give them
+        # different values so this CPU-only test can identify which tensor was read.
+        host_indices = torch.tensor([5, 2, 7], dtype=torch.int64)
+        device_indices = torch.tensor([0, 0, 0], dtype=torch.int64)
+        fb = _make_forward_batch(
+            seq_lens=self.seq_lens,
+            req_pool_indices=device_indices,
+            req_pool_indices_cpu=host_indices,
+            forward_mode=ForwardMode.DECODE,
+        )
+
+        meta = _build_meta(self.backend, fb)
+
+        for i, pool_idx in enumerate(host_indices.tolist()):
+            expected = int(self.req_to_token[pool_idx, 0]) // self.PAGE_SIZE
+            self.assertEqual(int(meta.page_indices[i * self.PAGES_PER_SEQ]), expected)
 
     def test_distribution_decode_all_active(self):
         # Decode: every sequence is in the [0,bs) decode range.

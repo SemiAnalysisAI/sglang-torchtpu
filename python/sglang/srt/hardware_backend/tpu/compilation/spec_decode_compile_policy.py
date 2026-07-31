@@ -538,6 +538,9 @@ class SpecDecodeCompilePolicyMixin:
         forward_batch.req_pool_indices = _pad_first_dim(
             forward_batch.req_pool_indices, pad_b
         )
+        forward_batch.req_pool_indices_cpu = _pad_first_dim(
+            forward_batch.req_pool_indices_cpu, pad_b
+        )
         forward_batch.positions = _pad_first_dim(
             forward_batch.positions,
             forward_batch.positions.shape[0] // real_bs * pad_b,

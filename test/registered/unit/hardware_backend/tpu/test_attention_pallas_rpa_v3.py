@@ -67,6 +67,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens.clone(),
             req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
             forward_mode=forward_mode,
             extend_seq_lens=None,
             spec_info=spec_info,

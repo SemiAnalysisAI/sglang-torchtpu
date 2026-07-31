@@ -657,8 +657,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             max_kv_len = int(seq_lens_cpu[:bs].max().item()) + kv_len_bump
             _validate_kv_len_capacity(max_kv_len, pages_per_seq * page_size)
 
-        # Small per-batch tensors -> host.
-        req_pool_indices = forward_batch.req_pool_indices.to("cpu", torch.int64)
+        req_pool_indices = forward_batch.req_pool_indices_cpu
+        assert req_pool_indices is not None
+        assert req_pool_indices.device.type == "cpu"
+        assert req_pool_indices.shape[0] == bs
+        req_pool_indices = req_pool_indices.to(torch.int64)
 
         cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32)
         cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)

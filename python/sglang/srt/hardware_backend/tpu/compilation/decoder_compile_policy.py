@@ -124,6 +124,7 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
     orig_seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     req_pool_indices: torch.Tensor
+    req_pool_indices_cpu: torch.Tensor
     seq_lens_sum: int
     extend_num_tokens: Optional[int]
     extend_seq_lens: Optional[torch.Tensor]
@@ -193,6 +194,7 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
             orig_seq_lens=seq_lens,
             seq_lens_cpu=torch.ones(bs, dtype=torch.int64),
             req_pool_indices=torch.full((bs,), slot, dtype=torch.int64, device=device),
+            req_pool_indices_cpu=torch.full((bs,), slot, dtype=torch.int64),
             seq_lens_sum=bs,
             **cls._extend_metadata_fields(is_extend, bs, tokens_per_req, 0, device),
         )
@@ -235,6 +237,7 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
             orig_seq_lens=torch.full((bs,), de_ctx, dtype=torch.int32, device=device),
             seq_lens_cpu=torch.full((bs,), de_ctx, dtype=torch.int64),
             req_pool_indices=torch.arange(1, bs + 1, dtype=torch.int64, device=device),
+            req_pool_indices_cpu=torch.arange(1, bs + 1, dtype=torch.int64),
             seq_lens_sum=de_ctx * bs,
             # DRAFT_EXTEND_V2 always carries extend metadata (prefix = de_prefix).
             **cls._extend_metadata_fields(True, bs, tokens_per_req, de_prefix, device),
@@ -714,6 +717,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             batch_size=bs,
             input_ids=layout.input_ids,
             req_pool_indices=layout.req_pool_indices,
+            req_pool_indices_cpu=layout.req_pool_indices_cpu,
             seq_lens=layout.seq_lens,
             seq_lens_sum=layout.seq_lens_sum,
             orig_seq_lens=layout.orig_seq_lens,

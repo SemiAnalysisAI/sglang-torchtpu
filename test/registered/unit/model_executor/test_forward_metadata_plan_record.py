@@ -13,6 +13,7 @@ Pure dataclass logic — CPU only.
 
 import unittest
 import warnings
+from types import SimpleNamespace
 
 import torch
 
@@ -77,6 +78,45 @@ class TestForwardMetadataPlanRecord(CustomTestCase):
         fb.mark_forward_metadata_ready(replan_equivalent=True)
         self.assertFalse(fb.needs_forward_metadata_init())
         self.assertEqual(fb.forward_metadata_planned_bs, 4)
+
+
+class TestForwardBatchPadding(CustomTestCase):
+    def test_multiple_padding_rounds_keep_req_pool_indices_cpu_aligned(self):
+        fb = _make_batch(bs=2, num_tokens=2)
+        fb.req_pool_indices = torch.tensor([3, 7], dtype=torch.long)
+        fb.req_pool_indices_cpu = fb.req_pool_indices.cpu().clone()
+        fb.positions = torch.arange(2, dtype=torch.long)
+        fb.lora_ids = [None, None]
+        model_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(get_cuda_graph_seq_len_fill_value=lambda: 0)
+        )
+
+        fb._pad_inputs_to_size(model_runner, num_tokens=4, bs=4)
+        self.assertEqual(fb.req_pool_indices.tolist(), [3, 7, 0, 0])
+        self.assertEqual(fb.req_pool_indices_cpu.tolist(), [3, 7, 0, 0])
+
+        fb._pad_inputs_to_size(model_runner, num_tokens=8, bs=8)
+        self.assertEqual(fb.req_pool_indices.tolist(), [3, 7, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(fb.req_pool_indices_cpu.tolist(), [3, 7, 0, 0, 0, 0, 0, 0])
+
+    def test_spec_decode_restore_trims_req_pool_indices_cpu(self):
+        fb = _make_batch(bs=4, num_tokens=4)
+        fb.req_pool_indices = torch.tensor([3, 7, 0, 0], dtype=torch.long)
+        fb.req_pool_indices_cpu = fb.req_pool_indices.cpu().clone()
+        fb.positions = torch.arange(4, dtype=torch.long)
+        fb.seq_lens_cpu = fb.seq_lens.cpu().clone()
+        fb.spec_info = SimpleNamespace()
+        fb.hidden_states_backup = torch.zeros(2, 4)
+        fb._original_batch_size = 2
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.zeros(4, 8),
+            hidden_states=torch.zeros(4, 4),
+        )
+
+        fb.post_forward_mlp_sync_batch(logits_output)
+
+        self.assertEqual(fb.req_pool_indices.tolist(), [3, 7])
+        self.assertEqual(fb.req_pool_indices_cpu.tolist(), [3, 7])
 
 
 class TestDeprecatedSkipKwargShim(CustomTestCase):
