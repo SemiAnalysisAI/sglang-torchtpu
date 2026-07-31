@@ -1,13 +1,21 @@
 """Unit tests for the TPU xprof profile-options patch."""
 
 import dataclasses
+import gzip
+import json
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.profiler import _install_tpu_profile_options_patch
+from sglang.srt.hardware_backend.tpu.profiler import (
+    _install_tpu_profile_options_patch,
+    _normalize_tpu_event_source,
+    _normalize_tpu_profile_sources,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -45,6 +53,87 @@ def _fake_profiler_api(get_options=lambda activities: _BaseProfileOptions()):
     return module
 
 
+class TestNormalizeTpuProfileSources(CustomTestCase):
+    def test_event_source_promotes_first_non_shim_frame(self):
+        args = {
+            "source": "/tmp/src/sglang/srt/hardware_backend/tpu/patches.py:707",
+            "source_stack": "\n".join(
+                [
+                    "/tmp/src/sglang/srt/hardware_backend/tpu/patches.py:707:0",
+                    "/tmp/src/sglang/srt/hardware_backend/tpu/pallas_jax_op.py:80:0",
+                    "/tmp/src/sglang/srt/layers/moe/pallas/fused_moe_op.py:520:0",
+                ]
+            ),
+        }
+
+        self.assertTrue(_normalize_tpu_event_source(args))
+
+        self.assertEqual(
+            args["source"],
+            "/tmp/src/sglang/srt/hardware_backend/tpu/pallas_jax_op.py:80",
+        )
+        self.assertNotIn("patches.py", args["source_stack"])
+        self.assertIn("pallas_jax_op.py:80:0", args["source_stack"])
+
+    def test_event_source_preserves_existing_non_shim_source(self):
+        args = {
+            "source": "/tmp/src/sglang/srt/model_executor/model_runner.py:973",
+            "source_stack": "\n".join(
+                [
+                    "/tmp/src/sglang/srt/hardware_backend/tpu/patches.py:707:0",
+                    "/tmp/src/sglang/srt/hardware_backend/tpu/pallas_jax_op.py:80:0",
+                ]
+            ),
+        }
+
+        self.assertTrue(_normalize_tpu_event_source(args))
+
+        self.assertEqual(
+            args["source"], "/tmp/src/sglang/srt/model_executor/model_runner.py:973"
+        )
+        self.assertEqual(
+            args["source_stack"],
+            "/tmp/src/sglang/srt/hardware_backend/tpu/pallas_jax_op.py:80:0",
+        )
+
+    def test_profile_source_normalizer_rewrites_gzipped_traces(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            trace_path = Path(tmp_dir) / "decode.trace.json.gz"
+            trace = {
+                "traceEvents": [
+                    {
+                        "name": "kernel",
+                        "args": {
+                            "source": "/tmp/src/sglang/srt/hardware_backend/tpu/patches.py:707",
+                            "source_stack": "\n".join(
+                                [
+                                    "/tmp/src/sglang/srt/hardware_backend/tpu/patches.py:707:0",
+                                    "/tmp/src/sglang/srt/hardware_backend/tpu/attention_pallas_rpa_base.py:253:0",
+                                ]
+                            ),
+                        },
+                    }
+                ]
+            }
+            with gzip.open(trace_path, "wt", encoding="utf-8") as f:
+                json.dump(trace, f)
+
+            _normalize_tpu_profile_sources(Path(tmp_dir))
+
+            with gzip.open(trace_path, "rt", encoding="utf-8") as f:
+                rewritten = json.load(f)
+
+        args = rewritten["traceEvents"][0]["args"]
+        self.assertEqual(
+            args["source"],
+            "/tmp/src/sglang/srt/hardware_backend/tpu/attention_pallas_rpa_base.py:253",
+        )
+        self.assertEqual(
+            args["source_stack"],
+            "/tmp/src/sglang/srt/hardware_backend/tpu/attention_pallas_rpa_base.py:253:0",
+        )
+
+
 class TestInstallTpuProfileOptionsPatch(CustomTestCase):
     def _install(
         self,
@@ -52,7 +141,7 @@ class TestInstallTpuProfileOptionsPatch(CustomTestCase):
         *,
         num_chips,
         num_sparse_cores,
-        profile_options_cls=_BaseProfileOptions
+        profile_options_cls=_BaseProfileOptions,
     ):
         with (
             envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(num_chips),

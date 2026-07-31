@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+import gzip
+import json
 from contextlib import AbstractContextManager
 from pathlib import Path
 from types import ModuleType
@@ -11,6 +13,22 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 
 logger = get_logger(__name__)
+
+
+_TPU_PROFILE_SHIM_FRAMES = ("/sglang/srt/hardware_backend/tpu/patches.py:",)
+
+
+@dataclasses.dataclass
+class _TpuProfileSession(AbstractContextManager):
+    profiler: AbstractContextManager
+    output_dir: Path
+
+    def __enter__(self):
+        self.profiler.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self.profiler.__exit__(exc_type, exc, tb)
 
 
 def start_tpu_profile(
@@ -31,14 +49,103 @@ def start_tpu_profile(
     if with_cpu:
         activities.append(profiler_api.ProfilerActivity.CPU)
     profiler = profiler_api.profile(activities=activities, on_trace_ready=handler)
-    profiler.__enter__()
-    return profiler
+    session = _TpuProfileSession(profiler=profiler, output_dir=output_dir)
+    session.__enter__()
+    return session
 
 
 def stop_tpu_profile(profiler: AbstractContextManager) -> None:
     """Stop an xprof session started by :func:`start_tpu_profile`."""
     # Exiting the context stops the xprof session.
     profiler.__exit__(None, None, None)
+    if isinstance(profiler, _TpuProfileSession):
+        _normalize_tpu_profile_sources(profiler.output_dir)
+
+
+def _normalize_tpu_profile_sources(output_dir: Path) -> None:
+    """Promote xprof source attribution past SGLang's TPU shim frames.
+
+    TorchTPU records the direct Python caller of custom-kernel registration as
+    the HLO source. SGLang patches ``tpu_torch_pallas.call_custom_kernel`` for
+    a TorchTPU signature skew, so profiles otherwise group many kernels under
+    ``hardware_backend/tpu/patches.py`` even though the full stack already
+    contains the useful caller one frame lower.
+    """
+    for path in _tpu_trace_paths(output_dir):
+        if _normalize_tpu_trace_file(path):
+            logger.info("[TPU profiler] normalized shim source frames in %s", path)
+
+
+def _tpu_trace_paths(output_dir: Path) -> list[Path]:
+    return [
+        *output_dir.rglob("*.trace.json.gz"),
+        *output_dir.rglob("*.trace.json"),
+    ]
+
+
+def _normalize_tpu_trace_file(path: Path) -> bool:
+    opener = gzip.open if path.name.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as f:
+        trace = json.load(f)
+
+    events = trace.get("traceEvents", []) if isinstance(trace, dict) else []
+    changed = False
+    for event in events:
+        args = event.get("args")
+        if isinstance(args, dict):
+            changed = _normalize_tpu_event_source(args) or changed
+
+    if not changed:
+        return False
+
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    with opener(tmp_path, "wt", encoding="utf-8") as f:
+        json.dump(trace, f, separators=(",", ":"))
+    tmp_path.replace(path)
+    return True
+
+
+def _normalize_tpu_event_source(args: dict) -> bool:
+    source_stack = args.get("source_stack")
+    frames = _source_stack_frames(source_stack)
+    if not frames:
+        return False
+
+    filtered_frames = [
+        frame for frame in frames if not _is_tpu_profile_shim_frame(frame)
+    ]
+    if len(filtered_frames) == len(frames):
+        return False
+
+    source = args.get("source")
+    if filtered_frames and (
+        not isinstance(source, str) or _is_tpu_profile_shim_frame(source)
+    ):
+        args["source"] = _source_frame_location(filtered_frames[0])
+
+    args["source_stack"] = (
+        "\n".join(filtered_frames) if isinstance(source_stack, str) else filtered_frames
+    )
+    return True
+
+
+def _source_stack_frames(source_stack) -> list[str]:
+    if isinstance(source_stack, str):
+        return [frame for frame in source_stack.splitlines() if frame]
+    if isinstance(source_stack, list):
+        return [frame for frame in source_stack if isinstance(frame, str)]
+    return []
+
+
+def _is_tpu_profile_shim_frame(frame: str) -> bool:
+    return any(shim_frame in frame for shim_frame in _TPU_PROFILE_SHIM_FRAMES)
+
+
+def _source_frame_location(frame: str) -> str:
+    path_and_line, sep, column = frame.rpartition(":")
+    if sep and column.isdigit():
+        return path_and_line
+    return frame
 
 
 def _install_tpu_profile_options_patch(profiler_api: ModuleType) -> None:
