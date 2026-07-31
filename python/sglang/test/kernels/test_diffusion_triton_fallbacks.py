@@ -8,8 +8,8 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.diffusion.triton.rotary import apply_rotary_embedding
-from sglang.kernels.ops.diffusion.triton.scale_shift import fuse_scale_shift_kernel
+from sglang.kernels.ops.diffusion.rotary import apply_rotary_embedding
+from sglang.kernels.ops.diffusion.scale_shift import fuse_scale_shift_kernel
 
 
 def _reference_rotary(
