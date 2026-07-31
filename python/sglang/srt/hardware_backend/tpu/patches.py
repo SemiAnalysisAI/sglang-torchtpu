@@ -704,8 +704,18 @@ def _patch_tpu_torch_pallas_register_positional() -> None:
         from torch_tpu._internal.pallas import tpu_torch_pallas
     except ImportError:  # pragma: no cover - non-TPU host
         return
-    orig_register = tpu_torch_pallas.register_custom_kernel
-    orig_call = tpu_torch_pallas.call_custom_kernel
+    orig_register = getattr(
+        tpu_torch_pallas,
+        "_sglang_original_register_custom_kernel",
+        tpu_torch_pallas.register_custom_kernel,
+    )
+    orig_call = getattr(
+        tpu_torch_pallas,
+        "_sglang_original_call_custom_kernel",
+        tpu_torch_pallas.call_custom_kernel,
+    )
+    tpu_torch_pallas._sglang_original_register_custom_kernel = orig_register
+    tpu_torch_pallas._sglang_original_call_custom_kernel = orig_call
 
     try:
         orig_register("_sglang_signature_probe", "probe", b"")
