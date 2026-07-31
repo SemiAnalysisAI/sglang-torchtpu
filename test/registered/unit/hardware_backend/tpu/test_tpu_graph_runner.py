@@ -122,6 +122,8 @@ class TestTpuGraphRunner(CustomTestCase):
     ) -> SimpleNamespace:
         server_args = SimpleNamespace(
             enable_torch_compile=enable_torch_compile,
+            unsafe_save_torch_compile_bundle=None,
+            unsafe_load_torch_compile_bundle=None,
             tpu_compile_tokens=None,
             tpu_compile_bs=None,
             torch_compile_max_bs=8,

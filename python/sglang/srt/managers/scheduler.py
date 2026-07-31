@@ -25,6 +25,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
@@ -39,6 +40,7 @@ from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
+from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
@@ -841,10 +843,26 @@ class Scheduler(
             self.draft_worker.init_attention_backends()
 
     def init_all_cuda_graphs(self):
-        """Capture cuda graphs for all workers."""
+        """Initialize graph and compilation runners for all workers."""
+        save_bundle_dir = self.server_args.unsafe_save_torch_compile_bundle
+        load_bundle_dir = self.server_args.unsafe_load_torch_compile_bundle
+        bundle_dir = save_bundle_dir or load_bundle_dir
+        if bundle_dir is not None:
+            self._torch_compile_cache = torch_compile_bundle.set_fresh_compiler_cache()
+            bundle_path = Path(bundle_dir) / f"rank-{torch.distributed.get_rank()}.bin"
+            if load_bundle_dir is not None:
+                torch_compile_bundle.load(bundle_path)
+
         self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
+
+        # Independent DP groups repeat distributed ranks but run identical model
+        # replicas. DP0 writes their shared bundles; DP-attention ranks are unique.
+        if save_bundle_dir is not None and (
+            self.server_args.enable_dp_attention or self.ps.dp_rank in (None, 0)
+        ):
+            torch_compile_bundle.save(bundle_path)
 
     def init_model_worker(self):
         # Load model weights.
@@ -3838,6 +3856,16 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        save_bundle = self.server_args.unsafe_save_torch_compile_bundle
+        load_bundle = self.server_args.unsafe_load_torch_compile_bundle
+        if save_bundle is not None or load_bundle is not None:
+            counters = torch._dynamo.utils.counters
+            ret["torch_compile_bundle_dynamo_graphs"] = counters["stats"][
+                "unique_graphs"
+            ]
+            ret["torch_compile_bundle_aot_autograd_graphs"] = counters["aot_autograd"][
+                "total"
+            ]
 
         if (
             not self.spec_algorithm.is_none()

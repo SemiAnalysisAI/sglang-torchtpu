@@ -14,6 +14,7 @@ import torch._dynamo
 import torch.nn.functional as F
 from torch_tpu._internal.sync.sync import synchronize as tpu_sync
 
+from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
 from sglang.srt.hardware_backend.tpu.patches import _register_tpu_compile_backend
 
@@ -147,7 +148,13 @@ class VisionTpuCompilePolicy(CompilePolicy):
 
         _register_tpu_compile_backend()
         method = getattr(runner, self.method_name)
-        self.compiled_fn = torch.compile(
+        server_args = self.model_runner.server_args
+        use_bundle = (
+            server_args.unsafe_save_torch_compile_bundle is not None
+            or server_args.unsafe_load_torch_compile_bundle is not None
+        )
+        compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
+        self.compiled_fn = compiler(
             torch.no_grad()(method),
             backend=self.backend,
             fullgraph=self.fullgraph,

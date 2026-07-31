@@ -1625,6 +1625,19 @@ class ServerArgs:
     enable_torch_compile_debug_mode: A[bool, "Enable debug mode for torch compile"] = (
         False
     )
+    unsafe_save_torch_compile_bundle: A[
+        Optional[str],
+        "Directory in which to save per-rank torch.compile bundles after warmup. "
+        "Leave both bundle flags unset to use torch.compile normally.",
+    ] = None
+    unsafe_load_torch_compile_bundle: A[
+        Optional[str],
+        "Directory from which to load per-rank torch.compile bundles. It is the "
+        "user's responsibility to ensure the bundle is used "
+        "by an SGLang server with the same setup as the one in which it was saved. "
+        "Only load bundles from trusted sources because compiler artifacts may "
+        "execute arbitrary code.",
+    ] = None
     torch_compile_max_bs: A[
         Optional[int],
         "Set the maximum batch size when using torch compile.",
@@ -2766,6 +2779,7 @@ class ServerArgs:
 
         # Set missing default values.
         self._handle_missing_default_values()
+        self._handle_unsafe_torch_compile_bundle()
 
         # Validate PD disaggregation flags before CUDA graph config.
         self._handle_pd_disaggregation()
@@ -3231,6 +3245,24 @@ class ServerArgs:
             self._quantization_explicitly_unset = False
         if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
+
+    def _handle_unsafe_torch_compile_bundle(self) -> None:
+        save_dir = self.unsafe_save_torch_compile_bundle
+        load_dir = self.unsafe_load_torch_compile_bundle
+        if save_dir is not None and load_dir is not None:
+            raise ValueError(
+                "--unsafe-save-torch-compile-bundle and "
+                "--unsafe-load-torch-compile-bundle are mutually exclusive"
+            )
+        if save_dir is None and load_dir is None:
+            return
+        if self.device != "tpu":
+            raise ValueError(
+                "torch.compile bundles are currently supported only on TPU"
+            )
+        assert (
+            self.enable_torch_compile
+        ), "torch.compile bundles require --enable-torch-compile"
 
     def _handle_modelscope_paths(self):
         """Resolve model / tokenizer / speculative-draft paths from the local

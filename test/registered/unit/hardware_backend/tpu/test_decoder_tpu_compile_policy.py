@@ -104,6 +104,8 @@ class TestInstallExtendCap(CustomTestCase):
                 max_prefill_tokens=2048,
                 torch_compile_max_bs=64,
                 prefill_max_requests=prefill_max_requests,
+                unsafe_save_torch_compile_bundle=None,
+                unsafe_load_torch_compile_bundle=None,
             ),
         )
         t_bucketer = Bucketer(name="Token", buckets=[64, 2048])
