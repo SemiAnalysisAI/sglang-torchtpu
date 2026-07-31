@@ -90,36 +90,59 @@ def _normalize_tpu_trace_file(path: Path) -> bool:
         trace = json.load(f)
 
     events = trace.get("traceEvents", []) if isinstance(trace, dict) else []
+    source_track_tids = {
+        event.get("pid"): event.get("tid")
+        for event in events
+        if event.get("ph") == "M"
+        and event.get("name") == "thread_name"
+        and isinstance(event.get("args"), dict)
+        and event["args"].get("name") == "Source code"
+    }
     changed = False
-    source_replacements: dict[tuple[object, str], set[str]] = {}
+    rewritten_events = []
+    generated_source_events = []
     for event in events:
         args = event.get("args")
-        if not isinstance(args, dict):
-            continue
-        source = args.get("source")
-        if not _normalize_tpu_event_source(args):
-            continue
-        changed = True
-        promoted_source = args.get("source")
-        if isinstance(source, str) and isinstance(promoted_source, str):
-            key = (args.get("group_id"), source)
-            source_replacements.setdefault(key, set()).add(promoted_source)
+        event_changed = isinstance(args, dict) and _normalize_tpu_event_source(args)
+        changed = event_changed or changed
 
-    for event in events:
-        args = event.get("args")
-        if not isinstance(args, dict):
-            continue
+        pid = event.get("pid")
+        source_tid = source_track_tids.get(pid)
         name = event.get("name")
-        if not isinstance(name, str):
-            continue
-        replacements = source_replacements.get((args.get("group_id"), name), set())
-        if len(replacements) == 1:
-            event["name"] = next(iter(replacements))
+        if (
+            source_tid is not None
+            and event.get("tid") == source_tid
+            and event.get("ph") == "X"
+            and isinstance(name, str)
+            and _is_tpu_profile_generic_source(name)
+        ):
             changed = True
+            continue
+
+        rewritten_events.append(event)
+        if (
+            event_changed
+            and source_tid is not None
+            and event.get("tid") != source_tid
+            and event.get("ph") == "X"
+            and isinstance(args.get("source"), str)
+        ):
+            generated_source_events.append(
+                {
+                    "args": {"group_id": args.get("group_id", "")},
+                    "dur": event.get("dur", 0),
+                    "name": args["source"],
+                    "ph": "X",
+                    "pid": pid,
+                    "tid": source_tid,
+                    "ts": event.get("ts", 0),
+                }
+            )
 
     if not changed:
         return False
 
+    trace["traceEvents"] = rewritten_events + generated_source_events
     tmp_path = path.with_name(f"{path.name}.tmp")
     with opener(tmp_path, "wt", encoding="utf-8") as f:
         json.dump(trace, f, separators=(",", ":"))
@@ -136,16 +159,19 @@ def _normalize_tpu_event_source(args: dict) -> bool:
     filtered_frames = [
         frame for frame in frames if not _is_tpu_profile_shim_frame(frame)
     ]
-    if len(filtered_frames) == len(frames):
-        return False
-
     source = args.get("source")
     promoted_frame = _first_sglang_source_frame(filtered_frames)
-    if promoted_frame is not None and (
-        not isinstance(source, str) or _is_tpu_profile_shim_frame(source)
-    ):
-        args["source"] = _source_frame_location(promoted_frame)
+    source_changed = (
+        promoted_frame is not None
+        and (not isinstance(source, str) or _is_tpu_profile_generic_source(source))
+        and _source_frame_location(promoted_frame) != source
+    )
+    stack_changed = len(filtered_frames) != len(frames)
+    if not source_changed and not stack_changed:
+        return False
 
+    if source_changed:
+        args["source"] = _source_frame_location(promoted_frame)
     args["source_stack"] = (
         "\n".join(filtered_frames) if isinstance(source_stack, str) else filtered_frames
     )
@@ -154,7 +180,7 @@ def _normalize_tpu_event_source(args: dict) -> bool:
 
 def _first_sglang_source_frame(frames: list[str]) -> str | None:
     for frame in frames:
-        if "/sglang/" in frame:
+        if "/sglang/" in frame or "/sglang_meta_common/" in frame:
             return frame
     return frames[0] if frames else None
 
@@ -169,6 +195,10 @@ def _source_stack_frames(source_stack) -> list[str]:
 
 def _is_tpu_profile_shim_frame(frame: str) -> bool:
     return any(shim_frame in frame for shim_frame in _TPU_PROFILE_SHIM_FRAMES)
+
+
+def _is_tpu_profile_generic_source(frame: str) -> bool:
+    return _is_tpu_profile_shim_frame(frame) or "/site-packages/" in frame
 
 
 def _source_frame_location(frame: str) -> str:
