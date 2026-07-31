@@ -54,13 +54,14 @@ def _fake_profiler_api(get_options=lambda activities: _BaseProfileOptions()):
 
 
 class TestNormalizeTpuProfileSources(CustomTestCase):
-    def test_event_source_promotes_first_non_shim_frame(self):
+    def test_event_source_promotes_first_sglang_frame(self):
         args = {
             "source": "/tmp/src/sglang/srt/hardware_backend/tpu/patches.py:707",
             "source_stack": "\n".join(
                 [
                     "/tmp/src/sglang/srt/hardware_backend/tpu/patches.py:707:0",
                     "/tmp/src/sglang/srt/hardware_backend/tpu/pallas_jax_op.py:80:0",
+                    "/site-packages/torch/_library/custom_ops.py:382:0",
                     "/tmp/src/sglang/srt/layers/moe/pallas/fused_moe_op.py:520:0",
                 ]
             ),
@@ -70,10 +71,11 @@ class TestNormalizeTpuProfileSources(CustomTestCase):
 
         self.assertEqual(
             args["source"],
-            "/tmp/src/sglang/srt/hardware_backend/tpu/pallas_jax_op.py:80",
+            "/tmp/src/sglang/srt/layers/moe/pallas/fused_moe_op.py:520",
         )
         self.assertNotIn("patches.py", args["source_stack"])
-        self.assertIn("pallas_jax_op.py:80:0", args["source_stack"])
+        self.assertNotIn("pallas_jax_op.py", args["source_stack"])
+        self.assertIn("fused_moe_op.py:520:0", args["source_stack"])
 
     def test_event_source_preserves_existing_non_shim_source(self):
         args = {
@@ -93,7 +95,7 @@ class TestNormalizeTpuProfileSources(CustomTestCase):
         )
         self.assertEqual(
             args["source_stack"],
-            "/tmp/src/sglang/srt/hardware_backend/tpu/pallas_jax_op.py:80:0",
+            "",
         )
 
     def test_profile_source_normalizer_rewrites_gzipped_traces(self):
@@ -102,8 +104,13 @@ class TestNormalizeTpuProfileSources(CustomTestCase):
             trace = {
                 "traceEvents": [
                     {
+                        "name": "/tmp/src/sglang/srt/hardware_backend/tpu/patches.py:707",
+                        "args": {"group_id": "8"},
+                    },
+                    {
                         "name": "kernel",
                         "args": {
+                            "group_id": "8",
                             "source": "/tmp/src/sglang/srt/hardware_backend/tpu/patches.py:707",
                             "source_stack": "\n".join(
                                 [
@@ -112,7 +119,7 @@ class TestNormalizeTpuProfileSources(CustomTestCase):
                                 ]
                             ),
                         },
-                    }
+                    },
                 ]
             }
             with gzip.open(trace_path, "wt", encoding="utf-8") as f:
@@ -123,7 +130,12 @@ class TestNormalizeTpuProfileSources(CustomTestCase):
             with gzip.open(trace_path, "rt", encoding="utf-8") as f:
                 rewritten = json.load(f)
 
-        args = rewritten["traceEvents"][0]["args"]
+        source_event, kernel_event = rewritten["traceEvents"]
+        self.assertEqual(
+            source_event["name"],
+            "/tmp/src/sglang/srt/hardware_backend/tpu/attention_pallas_rpa_base.py:253",
+        )
+        args = kernel_event["args"]
         self.assertEqual(
             args["source"],
             "/tmp/src/sglang/srt/hardware_backend/tpu/attention_pallas_rpa_base.py:253",

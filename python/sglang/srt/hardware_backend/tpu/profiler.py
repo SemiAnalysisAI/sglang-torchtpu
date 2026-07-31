@@ -15,7 +15,10 @@ from sglang.srt.hardware_backend.tpu._logging import get_logger
 logger = get_logger(__name__)
 
 
-_TPU_PROFILE_SHIM_FRAMES = ("/sglang/srt/hardware_backend/tpu/patches.py:",)
+_TPU_PROFILE_SHIM_FRAMES = (
+    "/sglang/srt/hardware_backend/tpu/patches.py:",
+    "/sglang/srt/hardware_backend/tpu/pallas_jax_op.py:",
+)
 
 
 @dataclasses.dataclass
@@ -65,11 +68,9 @@ def stop_tpu_profile(profiler: AbstractContextManager) -> None:
 def _normalize_tpu_profile_sources(output_dir: Path) -> None:
     """Promote xprof source attribution past SGLang's TPU shim frames.
 
-    TorchTPU records the direct Python caller of custom-kernel registration as
-    the HLO source. SGLang patches ``tpu_torch_pallas.call_custom_kernel`` for
-    a TorchTPU signature skew, so profiles otherwise group many kernels under
-    ``hardware_backend/tpu/patches.py`` even though the full stack already
-    contains the useful caller one frame lower.
+    TorchTPU records generic signature and Pallas adapters as the HLO source.
+    The full stack contains the SGLang operation that invoked the adapter, so
+    promote that operation in both event metadata and Source Code tracks.
     """
     for path in _tpu_trace_paths(output_dir):
         if _normalize_tpu_trace_file(path):
@@ -90,10 +91,31 @@ def _normalize_tpu_trace_file(path: Path) -> bool:
 
     events = trace.get("traceEvents", []) if isinstance(trace, dict) else []
     changed = False
+    source_replacements: dict[tuple[object, str], set[str]] = {}
     for event in events:
         args = event.get("args")
-        if isinstance(args, dict):
-            changed = _normalize_tpu_event_source(args) or changed
+        if not isinstance(args, dict):
+            continue
+        source = args.get("source")
+        if not _normalize_tpu_event_source(args):
+            continue
+        changed = True
+        promoted_source = args.get("source")
+        if isinstance(source, str) and isinstance(promoted_source, str):
+            key = (args.get("group_id"), source)
+            source_replacements.setdefault(key, set()).add(promoted_source)
+
+    for event in events:
+        args = event.get("args")
+        if not isinstance(args, dict):
+            continue
+        name = event.get("name")
+        if not isinstance(name, str):
+            continue
+        replacements = source_replacements.get((args.get("group_id"), name), set())
+        if len(replacements) == 1:
+            event["name"] = next(iter(replacements))
+            changed = True
 
     if not changed:
         return False
@@ -118,15 +140,23 @@ def _normalize_tpu_event_source(args: dict) -> bool:
         return False
 
     source = args.get("source")
-    if filtered_frames and (
+    promoted_frame = _first_sglang_source_frame(filtered_frames)
+    if promoted_frame is not None and (
         not isinstance(source, str) or _is_tpu_profile_shim_frame(source)
     ):
-        args["source"] = _source_frame_location(filtered_frames[0])
+        args["source"] = _source_frame_location(promoted_frame)
 
     args["source_stack"] = (
         "\n".join(filtered_frames) if isinstance(source_stack, str) else filtered_frames
     )
     return True
+
+
+def _first_sglang_source_frame(frames: list[str]) -> str | None:
+    for frame in frames:
+        if "/sglang/" in frame:
+            return frame
+    return frames[0] if frames else None
 
 
 def _source_stack_frames(source_stack) -> list[str]:
