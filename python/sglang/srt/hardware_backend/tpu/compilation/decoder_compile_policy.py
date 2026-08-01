@@ -356,17 +356,6 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             "forward" if is_draft_worker else self.method_name,
             compiled,
         )
-        if is_draft_worker:
-            logits_fn = self.owner.logits_processor.forward
-            compiled_logits = torch.compile(
-                torch.no_grad()(logits_fn),
-                backend=backend,
-                fullgraph=self.fullgraph,
-                dynamic=self.dynamic,
-            )
-            compiled_logits.__signature__ = inspect.signature(logits_fn)
-            self.owner.logits_processor.forward = compiled_logits
-
         # max_t = smallest positive prefill/context limit (extend never runs
         # longer). max_b = the reconciled compile-batch ceiling, already grown to
         # cover the scheduler concurrency in ServerArgs.__post_init__ via
@@ -410,7 +399,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         outer_model.prepare_forward_batch = _prepare
 
         # Keep draft logits out of the compiled model-forward graph. The outer
-        # forward calls the separately compiled backbone and logits processor.
+        # forward calls the compiled backbone and the eager logits processor.
         shim_target = fn if is_draft_worker else compiled
         self.compiled_forward_shim = CompiledForwardShim(shim_target, policy=self)
         setattr(self.owner, self.method_name, self.compiled_forward_shim)

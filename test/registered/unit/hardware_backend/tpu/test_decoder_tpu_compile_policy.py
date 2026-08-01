@@ -201,7 +201,7 @@ class TestInstallExtendCap(CustomTestCase):
         compile_mock.assert_called_once()
         self.assertIs(compile_mock.call_args.args[0].__wrapped__, original_outer)
 
-    def test_draft_compiles_backbone_and_logits_as_separate_regions(self):
+    def test_draft_compiles_backbone_and_keeps_logits_eager(self):
         original_outer = MagicMock(name="outer_forward")
         original_backbone = MagicMock(name="backbone_forward")
         original_logits = MagicMock(name="logits_forward")
@@ -227,7 +227,6 @@ class TestInstallExtendCap(CustomTestCase):
         policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
         policy.backend = "eager"
         compiled_backbone = MagicMock(name="compiled_backbone")
-        compiled_logits = MagicMock(name="compiled_logits")
 
         with patch(
             "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
@@ -243,13 +242,13 @@ class TestInstallExtendCap(CustomTestCase):
         ), patch(
             "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
             "torch.compile",
-            side_effect=[compiled_backbone, compiled_logits],
+            return_value=compiled_backbone,
         ) as compile_mock:
             self.assertTrue(policy.install())
 
-        self.assertEqual(compile_mock.call_count, 2)
+        self.assertEqual(compile_mock.call_count, 1)
         self.assertIs(model.model.forward, compiled_backbone)
-        self.assertIs(logits_processor.forward, compiled_logits)
+        self.assertIs(logits_processor.forward, original_logits)
         self.assertIs(policy.compiled_forward_shim.fn, original_outer)
 
 class TestQwen3VLDecoderUnpadding(CustomTestCase):
