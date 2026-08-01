@@ -172,6 +172,8 @@ class TestInstallExtendCap(CustomTestCase):
                 max_prefill_tokens=2048,
                 torch_compile_max_bs=64,
                 prefill_max_requests=16,
+                unsafe_save_torch_compile_bundle=None,
+                unsafe_load_torch_compile_bundle=None,
             ),
         )
         policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
@@ -222,6 +224,8 @@ class TestInstallExtendCap(CustomTestCase):
                 max_prefill_tokens=2048,
                 torch_compile_max_bs=64,
                 prefill_max_requests=16,
+                unsafe_save_torch_compile_bundle=None,
+                unsafe_load_torch_compile_bundle=None,
             ),
         )
         policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
