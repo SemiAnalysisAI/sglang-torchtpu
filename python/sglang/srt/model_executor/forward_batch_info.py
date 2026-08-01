@@ -410,6 +410,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
+    # CPU mirror of req_pool_indices. With SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1,
+    # the RPA metadata builder uses it to construct page_indices without a
+    # device-to-host copy.
+    req_pool_indices_cpu: Optional[torch.Tensor] = None
 
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None
@@ -698,6 +702,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens_sum=batch.seq_lens_sum,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
             orig_seq_lens=batch.orig_seq_lens,
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             mamba_track_indices=batch.mamba_track_indices,
@@ -1316,6 +1321,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # padding
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
+        if self.req_pool_indices_cpu is not None:
+            self.req_pool_indices_cpu = self._pad_tensor_to_size(
+                self.req_pool_indices_cpu, bs
+            )
         self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
 
         seq_len_fill_value = (
@@ -1429,6 +1438,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.positions = self.positions[:num_tokens]
                 self.seq_lens = self.seq_lens[:bs]
                 self.req_pool_indices = self.req_pool_indices[:bs]
+                if self.req_pool_indices_cpu is not None:
+                    self.req_pool_indices_cpu = self.req_pool_indices_cpu[:bs]
                 if self.seq_lens_cpu is not None:
                     self.seq_lens_cpu = self.seq_lens_cpu[:bs]
                 logits_output.next_token_logits = logits_output.next_token_logits[

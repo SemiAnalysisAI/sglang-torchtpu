@@ -40,6 +40,7 @@ _BS_FIELDS = (
     "seq_lens",
     "orig_seq_lens",
     "req_pool_indices",
+    "req_pool_indices_cpu",
     "extend_seq_lens",
     "extend_prefix_lens",
     "encoder_lens",
