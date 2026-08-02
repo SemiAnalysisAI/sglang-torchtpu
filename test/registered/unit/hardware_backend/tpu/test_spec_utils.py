@@ -23,6 +23,32 @@ class _ForceTpu:
         kernels._is_tpu, kernels._use_torch_native = self.previous
 
 
+def test_simulated_accept_index_uses_accept_index_device():
+    accept_index = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32)
+    predict = torch.zeros(8, dtype=torch.int64)
+    num_correct_drafts = torch.zeros(2, dtype=torch.int32)
+
+    result = kernels.generate_simulated_accept_index(
+        accept_index=accept_index,
+        predict=predict,
+        num_correct_drafts=num_correct_drafts,
+        candidates=torch.zeros((2, 4), dtype=torch.int64),
+        target_predict=None,
+        bs=2,
+        spec_steps=3,
+        simulate_acc_len=3,
+        simulate_acc_method="constant",
+        simulate_acc_token_mode="fixed",
+    )
+
+    assert result.device == accept_index.device
+    assert torch.equal(
+        result,
+        torch.tensor([[0, 1, 2, -1], [4, 5, 6, -1]], dtype=torch.int32),
+    )
+    assert torch.equal(num_correct_drafts, torch.tensor([2, 2], dtype=torch.int32))
+
+
 def test_gather_spec_extras_matches_row_indexing():
     indices = torch.tensor([3, 0, 2], dtype=torch.int32)[::2]
     buffers = (
