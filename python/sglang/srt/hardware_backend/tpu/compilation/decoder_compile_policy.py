@@ -339,12 +339,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         compile_owner = self.owner.model if is_draft_worker else self.owner
         compile_fn = compile_owner.forward if is_draft_worker else fn
         backend = self.backend or current_platform.get_compile_backend()
-        use_bundle = (
-            server_args.unsafe_save_torch_compile_bundle is not None
-            or server_args.unsafe_load_torch_compile_bundle is not None
-        )
-        compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
-        compiled = compiler(
+        compiled = torch.compile(
             torch.no_grad()(compile_fn),
             backend=backend,
             fullgraph=self.fullgraph,
