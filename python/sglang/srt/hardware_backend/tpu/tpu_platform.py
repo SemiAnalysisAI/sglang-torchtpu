@@ -18,7 +18,7 @@ from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 
 if TYPE_CHECKING:
-    pass
+    from sglang.srt.server_args import ServerArgs
 
 logger = get_logger(__name__)
 
@@ -72,7 +72,7 @@ class TpuSRTPlatform(SRTPlatform):
     # Configuration lifecycle
     # ------------------------------------------------------------------
 
-    def apply_server_args_defaults(self, server_args) -> None:
+    def apply_server_args_defaults(self, server_args: ServerArgs) -> None:
         from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
 
         # Under Ray the slicebuilder/topology env is built per-rank after the
@@ -161,6 +161,15 @@ class TpuSRTPlatform(SRTPlatform):
                 raise NotImplementedError(
                     f"Speculative algorithm {spec_algo!r} is not supported on TPU "
                     "yet (only EAGLE3)."
+                )
+
+        if server_args.enable_dp_attention:
+            attn_tp_size = server_args.tp_size // server_args.dp_size
+            if attn_tp_size > 1 and not server_args.enable_dp_lm_head:
+                raise ValueError(
+                    f"When attention TP > 1 under DP attention on TPU (attn_tp_size={attn_tp_size} "
+                    f"from tp_size={server_args.tp_size} and dp_size={server_args.dp_size}), "
+                    "--enable-dp-lm-head must be enabled."
                 )
 
         if server_args.page_size is None:
