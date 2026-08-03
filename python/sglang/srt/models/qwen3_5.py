@@ -97,6 +97,9 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 
+from sglang.srt.environ import envs
+from sglang.srt.server_args import get_global_server_args
+
 # Utils
 from sglang.srt.utils import (
     LazyValue,
@@ -742,6 +745,25 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def _rope_cache_positions(max_position_embeddings: int) -> int:
+    """Rows to build the RoPE cos/sin cache with.
+
+    Qwen3.5 declares ``max_position_embeddings=262144`` while a serving context
+    is typically a few thousand tokens, so the cache is tens of MB of HBM that
+    each step gathers a handful of rows from. Under
+    ``SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE`` build it at the served context length
+    instead. ``RotaryEmbedding._ensure_cos_sin_cache_length`` regrows on demand,
+    so a shorter build stays correct -- but the regrow reallocates, so this is
+    only safe where positions really are bounded by the context length.
+    """
+    if not envs.SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE.get():
+        return max_position_embeddings
+    context_length = get_global_server_args().context_length
+    if not context_length:
+        return max_position_embeddings
+    return min(max_position_embeddings, context_length)
+
+
 class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
@@ -789,7 +811,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
-            max_position=self.max_position_embeddings,
+            max_position=_rope_cache_positions(self.max_position_embeddings),
             rope_scaling=rope_scaling,
             base=self.rope_theta,
             partial_rotary_factor=self.partial_rotary_factor,

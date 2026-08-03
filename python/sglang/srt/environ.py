@@ -981,6 +981,17 @@ class Envs:
     # independent of the compute queue; on torch_tpu's single PJRT queue it
     # measured slower overall (better tail, worse median). See Scheduler.
     SGLANG_TPU_DEFER_RESULT_D2H = EnvBool(False)
+    # Build the RoPE cos/sin cache at the served context length instead of the
+    # checkpoint's max_position_embeddings. Qwen3.5 declares 262144 positions
+    # against a 2068-token serving context, so the cache is ~33 MB of HBM that
+    # every step gathers a handful of rows from. The base class can regrow the
+    # cache on demand, so a shorter build stays correct if a longer position
+    # ever appears -- but the regrow reallocates, which on TPU means a
+    # serving-time recompile, so only enable this when positions are genuinely
+    # bounded by the context length (true for text; NOT for MRoPE video, whose
+    # positions are structural and can exceed it). Mirrors tpu-inference's
+    # SLICE_ROPE_CACHE, which for the same reason skips models using MRoPE.
+    SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
