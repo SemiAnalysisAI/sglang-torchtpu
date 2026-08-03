@@ -4397,6 +4397,14 @@ def get_or_create_event_loop():
         return loop
 
 
+_tpu_fused_spec_ops: Dict[str, Callable] = {}
+
+
+def get_tpu_fused_spec_ops() -> Tuple[Callable, ...]:
+    """Return the speculative helpers registered by ``tpu_fused_spec_op``."""
+    return tuple(_tpu_fused_spec_ops.values())
+
+
 def tpu_fused_spec_op(fn):
     """Lazily ``torch.compile(backend="tpu")`` a pure spec-decoding helper.
 
@@ -4432,4 +4440,6 @@ def tpu_fused_spec_op(fn):
             )
         return compiled_holder[0](*args, **kwargs)
 
+    op_name = f"{fn.__module__}.{fn.__qualname__}"
+    _tpu_fused_spec_ops[op_name] = wrapper
     return wrapper
