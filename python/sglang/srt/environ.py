@@ -976,6 +976,8 @@ class Envs:
 
     # TPU
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
+    # Raise instead of lazily compiling when torch.compile sees a new serving shape.
+    SGLANG_TPU_FAIL_ON_RECOMPILE = EnvBool(False)
     # Compile each pure spec-decode helper into a single tt_jit dispatch.
     SGLANG_TPU_ENABLE_FUSED_SPEC_OPS = EnvBool(True)
     # Compile the multi-step draft decode loop into one dispatch chain.

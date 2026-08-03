@@ -3601,6 +3601,12 @@ class Scheduler(
             return
         if not model_runner.server_args.enable_torch_compile:
             return
+        if not envs.SGLANG_TPU_FAIL_ON_RECOMPILE.get():
+            logger.info(
+                "[tpu] Serving-time torch.compile recompiles are allowed. "
+                "Set SGLANG_TPU_FAIL_ON_RECOMPILE=1 to fail on a new shape."
+            )
+            return
         torch.compiler.set_stance("fail_on_recompile")
         logger.info(
             "[tpu] Warmup complete; froze torch.compile via "
