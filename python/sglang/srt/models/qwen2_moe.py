@@ -27,10 +27,9 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul_add
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
-    get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_pp_indices,
     moe_expert_parallel_all_reduce,
@@ -50,7 +49,6 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.elementwise import fused_gate_sigmoid_mul_add
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -70,6 +68,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
     is_deepep_class_backend,
+    uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -93,8 +92,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -149,7 +147,7 @@ def can_fuse_shared_expert(
     Caller must still gate on the model/backend support flag.
     """
     if (
-        get_server_args().disable_shared_experts_fusion is True
+        get_exec().moe.disable_shared_experts_fusion is True
         or getattr(config, "shared_expert_intermediate_size", 0) <= 0
         or config.shared_expert_intermediate_size != config.moe_intermediate_size
         or get_moe_a2a_backend().is_deepep()
@@ -212,14 +210,10 @@ class Qwen2MoeMLP(nn.Module):
     def forward(
         self,
         x,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
-        )
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -256,6 +250,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 self.num_shared_experts > 0
                 and can_fuse_shared_expert(config, quant_config)
             )
+        if (
+            self.enable_shared_expert_fusion
+            and uses_per_rank_fused_shared_slots()
+            and get_parallel().moe_ep_size > 1
+        ):
+            logger.warning_once(
+                "Disabling Qwen shared-expert fusion: it uses a single global "
+                "shared slot with a per-token gate, which is incompatible with "
+                "per-rank EP shared-slot backends (e.g. DeepEP/MoRI) at "
+                "moe_ep_size=%d. Using the separate shared-expert MLP instead.",
+                get_parallel().moe_ep_size,
+            )
+            self.enable_shared_expert_fusion = False
+
         if self.enable_shared_expert_fusion:
             self.num_fused_shared_experts = self.num_shared_experts
 
@@ -278,10 +286,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 else config.num_experts_per_tok + self.num_fused_shared_experts
             ),
             num_experts=(
-                config.num_experts + get_global_server_args().ep_num_redundant_experts
+                config.num_experts + get_exec().moe.ep_num_redundant_experts
                 if not self.enable_shared_expert_fusion
                 else config.num_experts
-                + get_global_server_args().ep_num_redundant_experts
+                + get_exec().moe.ep_num_redundant_experts
                 + self.num_fused_shared_experts
             ),
             hidden_size=config.hidden_size,
@@ -340,7 +348,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.num_experts + get_global_server_args().ep_num_redundant_experts
+                config.num_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
@@ -399,7 +407,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             return topk_output
         shared_weights, shared_scale = shared
 
-        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+        from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
             fused_append_shared_experts_with_weights,
         )
 
@@ -436,7 +444,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         shared_output,
                     )
                 elif _is_hip:
-                    from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+                    from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
                         sigmoid_gate_mul_broadcast,
                     )
 
@@ -548,8 +556,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        use_reduce_scatter: bool = False,
-        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -594,8 +600,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.tp_size > 1
             and not should_skip_post_experts_all_reduce(
                 is_tp_path=True,
-                use_reduce_scatter=use_reduce_scatter,
-                should_allreduce_fusion=should_allreduce_fusion,
             )
             and not get_moe_a2a_backend().is_flashinfer()
         ):
@@ -813,11 +817,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+            hidden_states = self.mlp(hidden_states, forward_batch)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
@@ -955,9 +960,9 @@ class Qwen2MoeModel(nn.Module):
                 and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
-                if get_moe_expert_parallel_world_size() > 1:
+                if get_parallel().moe_ep_size > 1:
                     hidden_states = moe_expert_parallel_all_reduce(hidden_states)
-                if get_moe_tensor_parallel_world_size() > 1:
+                if get_parallel().moe_tp_size > 1:
                     hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
                 hidden_states._sglang_needs_allreduce_fusion = False
             return PPProxyTensors(
@@ -1018,7 +1023,7 @@ class Qwen2MoeForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support

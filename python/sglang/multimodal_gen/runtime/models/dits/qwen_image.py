@@ -74,6 +74,13 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
+
+def _attn_mask_meta_local_pad(attn_mask_meta) -> int:
+    if attn_mask_meta is None or isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
+        return 0
+    return attn_mask_meta.get("local_pad", 0)
+
+
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
 except Exception:
@@ -694,7 +701,7 @@ class QwenImageCrossAttention(nn.Module):
         # fully sequence-parallel, so no leading tokens are replicated.
         sp_text_sharded = cross_attention_kwargs.get("sp_text_sharded", False)
         # Rows of tail padding inside THIS rank's text chunk (sp_shard meta).
-        sp_txt_pad = (attn_mask_meta or {}).get("local_pad", 0)
+        sp_txt_pad = _attn_mask_meta_local_pad(attn_mask_meta)
 
         (
             img_query,
@@ -730,7 +737,7 @@ class QwenImageCrossAttention(nn.Module):
                 k=img_key,
                 q_norm=self.norm_q,
                 k_norm=self.norm_k,
-                head_dim=img_query.shape[-1],
+                head_dim=self.head_dim,
                 cos_sin_cache=img_cache,
                 is_neox=False,
                 allow_inplace=True,
@@ -740,7 +747,7 @@ class QwenImageCrossAttention(nn.Module):
                 k=txt_key,
                 q_norm=self.norm_added_q,
                 k_norm=self.norm_added_k,
-                head_dim=txt_query.shape[-1],
+                head_dim=self.head_dim,
                 cos_sin_cache=txt_cache,
                 is_neox=False,
                 allow_inplace=True,
@@ -755,9 +762,27 @@ class QwenImageCrossAttention(nn.Module):
 
         # Joint order [text, image]; join_seqs relocates any SP text tail-pad
         # behind the image (see sp_shard.join_seqs for why).
-        joint_query = join_seqs(txt_query, img_query, sp_txt_pad)
-        joint_key = join_seqs(txt_key, img_key, sp_txt_pad)
-        joint_value = join_seqs(txt_value, img_value, sp_txt_pad)
+        seg_qkv = None
+        if sp_text_sharded:
+            from sglang.multimodal_gen.runtime.layers.usp import (
+                _ipc_input_a2a_qkv_segmented,
+            )
+
+            seg_qkv = _ipc_input_a2a_qkv_segmented(
+                txt_query,
+                img_query,
+                txt_key,
+                img_key,
+                txt_value,
+                img_value,
+                sp_txt_pad,
+            )
+        if seg_qkv is not None:
+            joint_query, joint_key, joint_value = seg_qkv
+        else:
+            joint_query = join_seqs(txt_query, img_query, sp_txt_pad)
+            joint_key = join_seqs(txt_key, img_key, sp_txt_pad)
+            joint_value = join_seqs(txt_value, img_value, sp_txt_pad)
         if attn_mask is None and encoder_hidden_states_mask is not None:
             image_mask = torch.ones(
                 (hidden_states.shape[0], img_query.shape[1]),
@@ -777,6 +802,7 @@ class QwenImageCrossAttention(nn.Module):
             attn_mask=attn_mask,
             attn_mask_meta=attn_mask_meta,
             num_replicated_prefix=0 if sp_text_sharded else seq_len_txt,
+            qkv_pre_all_to_all=seg_qkv is not None,
         )
 
         # Reshape back
