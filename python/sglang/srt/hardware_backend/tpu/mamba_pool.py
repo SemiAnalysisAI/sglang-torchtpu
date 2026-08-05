@@ -32,6 +32,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -143,13 +144,39 @@ class TpuMambaPool(MambaPool):
         )
 
     def clear_slots(self, indices: torch.Tensor):
-        """No-op on TPU.
+        """Zero the conv/recurrent state of the given slots. Off by default.
 
-        The fused GDN kernel zeroes a slot's contribution whenever
-        ``has_initial_state`` is False (a fresh request), so reused slots need
-        no explicit clearing and we avoid a dynamic in-place device scatter.
+        Normally unnecessary: the fused GDN kernel zeroes a slot's contribution
+        whenever ``has_initial_state`` is False, which is the case for a fresh
+        request, so a reused slot needs no explicit clearing and we avoid a
+        dynamic in-place device scatter.
+
+        That masking briefly appeared to fail -- greedy decoding was
+        non-deterministic and request N returned content derived from request
+        N-1 -- and this was implemented in response. The real cause was
+        elsewhere: ``has_initial_state`` is derived as
+        ``(seq_lens - query_lens) > 0``, and a bug in the hybrid linear-attention
+        backend made ``query_start_loc`` all zeros on padded extend batches, so
+        ``query_lens`` collapsed to 0 and the predicate read
+        ``seq_lens > 0`` -- True even for a fresh request. Every new request
+        therefore consumed the previous occupant's state as its own. With that
+        fixed, a fresh request has ``seq_lens == query_lens``, the predicate is
+        False, and stale slot contents are masked out as designed. Verified:
+        clearing on and off give identical output, batch invariance, and
+        round-to-round determinism.
+
+        Kept behind ``SGLANG_TPU_CLEAR_MAMBA_SLOTS`` (default off) because
+        toggling it is a cheap way to test "is this stale recurrent state?" the
+        next time something looks contaminated.
         """
-        return
+        if not envs.SGLANG_TPU_CLEAR_MAMBA_SLOTS.get():
+            return
+        if indices is None or indices.numel() == 0:
+            return
+        idx = indices.to(device=self.mamba_cache.temporal.device, dtype=torch.long)
+        for conv in self.mamba_cache.conv:
+            conv[:, idx] = 0
+        self.mamba_cache.temporal[:, idx] = 0
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         raise NotImplementedError(

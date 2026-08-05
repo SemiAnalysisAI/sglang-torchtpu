@@ -97,7 +97,9 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 
+from sglang.srt.compilation.support_torch_compile import support_torch_compile
 from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import get_global_server_args
 
 # Utils
@@ -1682,6 +1684,33 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             loaded_params.add(name)
 
         return loaded_params
+
+
+if current_platform.supports_torch_compile() and envs.SGLANG_TPU_QWEN35_COMPILE.get():
+    from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+        Qwen3VLDecoderTpuCompilePolicy,
+    )
+
+    # Annotate the decoder boundary so TpuGraphRunner installs torch.compile on
+    # it. Qwen3_5MoeForCausalLM inherits the attribute, and it is the module
+    # both serving paths hold: Qwen3_5TextForCausalLM keeps it as `self.model`,
+    # and the multimodal wrapper takes it as `language_model_cls`. Annotating
+    # here rather than at either wrapper is what makes both paths compile.
+    #
+    # Without this the published checkpoint (Qwen3_5MoeForConditionalGeneration,
+    # served with --language-only) ran fully eager -- roughly 30x slower, with
+    # zero "Compiled DECODE" lines in the log despite --enable-torch-compile.
+    # (The absolute figures behind that ratio were measured before the
+    # query_start_loc fix and are not quotable; the ratio is.)
+    #
+    # Qwen3VLDecoderTpuCompilePolicy rather than the plain decoder policy: it
+    # subclasses it and only diverges when the owner actually exposes the VL
+    # input_embeds path (`_uses_input_embeds`), so it is correct for the text
+    # model standalone and for the same module under the VL wrapper.
+    support_torch_compile(
+        Qwen3_5ForCausalLM,
+        policy=Qwen3VLDecoderTpuCompilePolicy,
+    )
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):

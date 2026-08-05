@@ -992,6 +992,25 @@ class Envs:
     # positions are structural and can exceed it). Mirrors tpu-inference's
     # SLICE_ROPE_CACHE, which for the same reason skips models using MRoPE.
     SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE = EnvBool(False)
+    # Explicitly zero a mamba slot on reuse. Off by default: the GDN kernel
+    # already masks a fresh request's stale slot via has_initial_state, so this
+    # is only a diagnostic for suspected recurrent-state contamination. See
+    # TpuMambaPool.clear_slots.
+    SGLANG_TPU_CLEAR_MAMBA_SLOTS = EnvBool(False)
+    # Attach the TPU decoder compile policy to Qwen3.5. Set 0 to serve the same
+    # model eagerly, which is the only way to A/B compiled-vs-eager on this
+    # architecture: omitting --enable-torch-compile instead routes into a
+    # tc_piecewise prefill runner that is not implemented on TPU.
+    SGLANG_TPU_QWEN35_COMPILE = EnvBool(True)
+    # Let the fused GDN kernel write conv/recurrent state back through an
+    # input/output alias (buffer donation). Set 0 to drop donation and copy the
+    # returned states back explicitly -- slower, but it removes the cross-layer
+    # donation aliasing that TpuMambaPool's single shared pool tensor creates.
+    # Log the GDN conv/recurrent state magnitude once per forward, from the eager
+    # metadata hook. Debug aid for "is the state write landing at all" -- a norm
+    # that does not advance across decode steps means it is not. Forces a device
+    # sync per forward, so keep it off outside debugging.
+    SGLANG_TPU_DEBUG_GDN_STATE = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)

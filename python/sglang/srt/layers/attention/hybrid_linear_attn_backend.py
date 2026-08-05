@@ -166,21 +166,30 @@ class MambaAttnBackendBase(AttentionBackend):
                     if retrieve_next_token is not None:
                         retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
-                query_start_loc = torch.empty(
+                # Per-sequence token offsets (exclusive cumsum) plus a final
+                # total. Derive them from `extend_seq_lens` alone, the same way
+                # the TPU full-attention backend builds `cu_q_lens`
+                # (attention_pallas_rpa_base.py). That is padding-immune: the
+                # pad shim zero-pads `extend_seq_lens` and zeros contribute
+                # nothing to a cumsum, so padded rows describe zero-length
+                # queries for free.
+                #
+                # Do not reconstruct this from `extend_start_loc` plus a
+                # flat-filled tail. `extend_seq_lens` is in the shim's
+                # `_BS_FIELDS` and gets padded to the batch bucket;
+                # `extend_start_loc` is not. Mixing them means `[-1]` reads a
+                # padding zero: with 1 real request padded to 8 the tail became
+                # 0 + 0 = 0, the tensor came out all zeros, query_lens collapsed
+                # to 0, and the GDN kernel processed no tokens and stored no
+                # recurrent state -- compiled Qwen3.5 decoded from empty state
+                # and emitted fluent text unrelated to the prompt.
+                #
+                # cumsum promotes int32 -> int64, so pin the output dtype.
+                query_start_loc = torch.zeros(
                     (bs + 1,), dtype=torch.int32, device=self.device
                 )
-                # `bs` is the (possibly TPU-padded) batch size, but
-                # extend_start_loc only covers the real requests -- assigning it
-                # into [:bs] raises "expanded size of the tensor (8) must match
-                # the existing size (2)". Fill the real prefix, then flat-fill
-                # the padded tail with the running token total so padded rows
-                # describe zero-length queries. Backends that never pad have
-                # real_bs == bs, leaving behavior unchanged.
-                real_bs = forward_batch.extend_start_loc.shape[0]
-                query_start_loc[:real_bs] = forward_batch.extend_start_loc
-                query_start_loc[real_bs:] = (
-                    forward_batch.extend_start_loc[-1]
-                    + forward_batch.extend_seq_lens[-1]
+                query_start_loc[1:] = torch.cumsum(
+                    forward_batch.extend_seq_lens, dim=0, dtype=torch.int32
                 )
                 if (
                     forward_batch.mamba_track_mask is not None
