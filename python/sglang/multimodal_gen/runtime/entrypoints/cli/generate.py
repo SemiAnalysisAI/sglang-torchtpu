@@ -117,7 +117,7 @@ def verify_generation_output(
     itself exits cleanly; without this check the CLI reports success for a
     failed generation.
     """
-    if results is None or (isinstance(results, list) and not results):
+    if not results:
         raise SystemExit("generation produced no result")
     # With a single requested output the exact path must exist; multi-output
     # runs derive per-sample names, so only the single-output contract is

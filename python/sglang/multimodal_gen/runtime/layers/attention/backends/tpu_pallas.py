@@ -37,12 +37,6 @@ _SHORT_SEQ_BLOCKS = (1024, 512)
 _VMEM_LIMIT_BYTES = 128 * 1024 * 1024
 
 
-def _tpu_flash_blocks(kv_len: int) -> tuple[int, int]:
-    if kv_len <= 2048:
-        return _SHORT_SEQ_BLOCKS
-    return _LONG_SEQ_BLOCKS
-
-
 def _get_tpu_flash_op(sm_scale: float, block_q: int, block_kv: int):
     """Create (once) and return the custom-op overload for a configuration."""
     key = (sm_scale, block_q, block_kv)
@@ -126,7 +120,7 @@ def _tpu_flash_sdpa(
     """Non-causal SDPA on [batch, heads, seq, head_dim] via the pallas kernel."""
     batch, _, len_q, _ = query.shape
     len_kv = key.shape[-2]
-    block_q, block_kv = _tpu_flash_blocks(len_kv)
+    block_q, block_kv = _SHORT_SEQ_BLOCKS if len_kv <= 2048 else _LONG_SEQ_BLOCKS
     pad_q = (-len_q) % block_q
     pad_kv = (-len_kv) % block_kv
     query = torch.nn.functional.pad(query, (0, 0, 0, pad_q)).contiguous()

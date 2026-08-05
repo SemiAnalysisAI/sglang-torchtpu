@@ -37,17 +37,6 @@ logger = init_logger(__name__)
 
 _MIB = 1024**2
 
-# Env set by jax when it loads first (it is pulled in transitively by the
-# pallas custom-op path). libtpu then initializes in JAX mode and torch_tpu's
-# multi-process PJRT init fails on the libtpu lockfile.
-_CONFLICTING_JAX_ENV = ("TPU_ML_PLATFORM", "TPU_ML_PLATFORM_VERSION")
-
-
-def _scrub_conflicting_jax_env() -> None:
-    """Remove jax-owned libtpu env before the first TPU device touch."""
-    for name in _CONFLICTING_JAX_ENV:
-        os.environ.pop(name, None)
-
 
 class _DitEvictionContext:
     """Evicts the DiT(s) to host for the duration of the VAE decode.
@@ -98,37 +87,25 @@ class _DitEvictionContext:
             self._evicted.clear()
 
 
-class _XprofSession:
-    """torch_tpu xprof capture wrapped as a context manager.
-
-    torch.profiler cannot see TPU device activity; xprof runs alongside it and
-    writes a trace viewable with xprof/tensorboard into ``log_dir``.
+@contextlib.contextmanager
+def _xprof_session(log_dir: str):
+    """torch_tpu xprof capture, run alongside torch.profiler (which cannot
+    see TPU device activity); writes a trace viewable with xprof/tensorboard.
     """
+    from torch_tpu._internal.profiler import profiler_api
 
-    def __init__(self, log_dir: str) -> None:
-        self._log_dir = log_dir
-        self._session: Any = None
-
-    def __enter__(self) -> _XprofSession:
-        from torch_tpu._internal.profiler import profiler_api
-
-        self._session = profiler_api.profile(
-            activities=[
-                profiler_api.ProfilerActivity.TPU,
-                profiler_api.ProfilerActivity.CPU,
-            ],
-            on_trace_ready=profiler_api.xprof_trace_handler(dir_name=self._log_dir),
-        )
-        self._session.__enter__()
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        if self._session is None:
-            return
-        # Flush outstanding lazy work so device activity lands in the trace.
-        torch.tpu.synchronize()
-        self._session.__exit__(*exc_info)
-        self._session = None
+    with profiler_api.profile(
+        activities=[
+            profiler_api.ProfilerActivity.TPU,
+            profiler_api.ProfilerActivity.CPU,
+        ],
+        on_trace_ready=profiler_api.xprof_trace_handler(dir_name=log_dir),
+    ):
+        try:
+            yield
+        finally:
+            # Flush outstanding lazy work so device activity lands in the trace.
+            torch.tpu.synchronize()
 
 
 class TpuPlatform(Platform):
@@ -222,10 +199,6 @@ class TpuPlatform(Platform):
         )
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        return False
-
-    @classmethod
     def is_float64_supported(cls) -> bool:
         return False  # TPUs have no f64 compute units.
 
@@ -262,10 +235,10 @@ class TpuPlatform(Platform):
 
     @classmethod
     def prepare_server_environment(cls, *, world_size: int) -> None:
-        _scrub_conflicting_jax_env()
-        # Reuses the srt TPU launcher helper: applies LIBTPU_INIT_ARGS
-        # overrides and writes the single-host slicebuilder/topology env that
-        # spawned workers inherit so each binds its own chip via PJRT.
+        # Reuses the srt TPU launcher helper: scrubs jax-owned libtpu env,
+        # applies LIBTPU_INIT_ARGS overrides, and writes the single-host
+        # slicebuilder/topology env that spawned workers inherit so each
+        # binds its own chip via PJRT.
         from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
 
         _prepare_tpu_env(world_size=world_size)
@@ -288,9 +261,8 @@ class TpuPlatform(Platform):
     def init_worker_device_env(
         cls, *, local_rank: int, rank: int, world_size: int, master_port: int
     ) -> None:
-        # Order matters: env scrub and libtpu flag overrides must precede the
-        # first device touch (PJRT initialization is deferred until then).
-        _scrub_conflicting_jax_env()
+        # Order matters: the jax-env scrub and libtpu flag overrides must
+        # precede the first device touch (PJRT init is deferred until then).
         from sglang.srt.hardware_backend.tpu.env_override import (
             apply_tpu_env_overrides,
         )
@@ -421,4 +393,4 @@ class TpuPlatform(Platform):
 
     @classmethod
     def create_aux_profiler(cls, log_dir: str) -> Any | None:
-        return _XprofSession(log_dir)
+        return _xprof_session(log_dir)
