@@ -10,7 +10,9 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _is_cuda = current_platform.is_cuda()
 if _is_cuda:
-    from sglang.kernels.ops.diffusion.scale_shift import (
+    # cuda-only kernels with no torch-native fallback: import the triton
+    # module directly; the _is_cuda gate keeps non-triton backends off it.
+    from sglang.kernels.ops.diffusion.triton.scale_shift import (
         fuse_layernorm_scale_shift_gate_select01_kernel,
         fuse_residual_layernorm_scale_shift_gate_select01_kernel,
     )
