@@ -79,6 +79,10 @@ def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
     """Synthetic ForwardBatch carrying the fields the padder touches."""
     extend = mode in ("extend", "mixed", "draft_extend_v2")
     return SimpleNamespace(
+        # Real ForwardBatch always defines this (None unless DP attention set it);
+        # the padder now records the pre-padding batch size here so hybrid
+        # linear-attention can poison padded mamba rows.
+        _original_batch_size=None,
         input_ids=torch.arange(real_t, dtype=torch.int32),
         positions=torch.arange(real_t, dtype=torch.int32),
         out_cache_loc=torch.arange(real_t, dtype=torch.int32),
@@ -291,6 +295,33 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual(fb.input_ids.shape[0], 4)
         self.assertEqual(fb.positions.shape[0], 4)
         self.assertEqual(fb.seq_lens.shape[0], 4)
+
+    def test_records_original_batch_size_for_padded_decode(self):
+        # Hybrid linear-attention reads _original_batch_size to poison the padded
+        # rows of mamba_cache_indices. Only prepare_mlp_sync_batch used to set it,
+        # i.e. only under DP attention, so on the compiled TPU path it stayed None
+        # and padded rows kept a real request's mamba slot.
+        fb = _forward_batch(real_t=3, real_b=3, mode="decode")
+        _, real_b = _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [16, 64]),
+            b_bucketer=_bucketer("Bs", [1, 4, 8]),
+        )
+        self.assertEqual(fb.seq_lens.shape[0], 4)  # padded
+        self.assertEqual(fb._original_batch_size, real_b)  # pre-padding count
+        self.assertEqual(fb._original_batch_size, 3)
+
+    def test_does_not_clobber_an_existing_original_batch_size(self):
+        # Under DP attention prepare_mlp_sync_batch sets this first; the padder
+        # must not overwrite it.
+        fb = _forward_batch(real_t=3, real_b=3, mode="decode")
+        fb._original_batch_size = 99
+        _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [16, 64]),
+            b_bucketer=_bucketer("Bs", [1, 4, 8]),
+        )
+        self.assertEqual(fb._original_batch_size, 99)
 
     def test_no_op_when_at_bucket(self):
         # Shapes already at bucket: tensors unchanged (same identity).

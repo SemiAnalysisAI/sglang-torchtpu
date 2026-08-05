@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
@@ -70,7 +71,12 @@ def build_gdn_pallas_op():
     import jax  # noqa: F401  (force a loud failure if JAX is missing)
     from torch_tpu._internal import pallas as _torch_pallas
 
+    from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
     from sglang.srt.layers.attention.pallas.gdn import fused_conv1d_gdn
+
+    # Shapes whose kernel is already compiled, so the export guard below can be
+    # skipped on the hot path. Per-op (this builder runs once).
+    _exported_shapes: set = set()
 
     op_name = "sglang_tpu_pallas::gdn_attention"
 
@@ -94,30 +100,58 @@ def build_gdn_pallas_op():
         d_v: int,
         kernel_size: int,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        (new_conv_state, new_recurrent_state), output = fused_conv1d_gdn(
-            qkv,
-            b,
-            a,
-            conv_state,
-            recurrent_state,
-            conv_weight,
-            conv_bias,
-            a_log,
-            dt_bias,
-            query_start_loc,
-            state_indices,
-            distribution,
-            seq_lens,
-            n_kq=n_kq,
-            n_v=n_v,
-            d_k=d_k,
-            d_v=d_v,
-            kernel_size=kernel_size,
-        )
+        # The GDN kernel sizes its tiling from real hardware metadata
+        # (`pltpu.get_tpu_info().num_lanes` in gdn/wrapper.py), but distributed
+        # Pallas programs are exported through a *logical CPU mesh*, so at trace
+        # time JAX reports device_kind="cpu" and get_tpu_info() raises
+        # "Unsupported TPU device kind: cpu".
+        #
+        # This context manager substitutes the physical TPU metadata for the
+        # duration of the trace. Same treatment RPA uses
+        # (attention_pallas_rpa_base.py:266); the generic bridge in
+        # pallas_jax_op.py applies it automatically, but this op registers
+        # through torch_tpu's pallas helper directly and so has to opt in.
+        with tpu_info_for_cpu_export():
+            (new_conv_state, new_recurrent_state), output = fused_conv1d_gdn(
+                qkv,
+                b,
+                a,
+                conv_state,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                a_log,
+                dt_bias,
+                query_start_loc,
+                state_indices,
+                distribution,
+                seq_lens,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+            )
         # Flatten the ((conv, rec), out) return so the bridge can alias the two
         # state buffers (outputs 0, 1) back onto the donated inputs (args 3, 4).
         return new_conv_state, new_recurrent_state, output
 
+    # Buffer donation: the kernel writes the updated state straight back into
+    # the caller's conv/recurrent buffers via an input/output alias, so there is
+    # no extra copy.
+    #
+    # Note for anyone debugging state corruption here: donation is not the
+    # suspect it looks like. It cost a lot of time on the 2026-08 state bug,
+    # which turned out to be a zeroed `query_start_loc` upstream in
+    # hybrid_linear_attn_backend. Donation works.
+    #
+    # Until 2026-08 each GDN layer donated a *view* of one shared pool tensor
+    # (`State.at_layer_idx` returned `conv[layer]`), so 45 layers donated
+    # overlapping slices of the same storage inside one compiled program. That
+    # was correct but slow: the bridge's write-back (`pallas.py:545`) cannot
+    # alias a view, so every layer paid a slice-in and a dynamic-update-slice
+    # back out. `TpuPerLayerState` now allocates one tensor per layer, matching
+    # the KV cache, and the write-back aliases in place.
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
@@ -153,26 +187,97 @@ def build_gdn_pallas_op():
         d_v: int,
         kernel_size: int,
     ) -> torch.Tensor:
-        _new_conv, _new_rec, output = jax_kernel(
-            qkv,
-            b,
-            a,
-            conv_state,
-            recurrent_state,
-            conv_weight,
-            conv_bias,
-            a_log,
-            dt_bias,
-            query_start_loc,
-            state_indices,
-            distribution,
-            seq_lens,
-            n_kq,
-            n_v,
-            d_k,
-            d_v,
-            kernel_size,
-        )
+        # Second half of the CPU-mesh export guard (see `_wrapped`). The trace
+        # and the Pallas *lowering* query TPU metadata at different times, and
+        # the context in `_wrapped` only covers the trace:
+        #
+        #   trace    gdn/wrapper.py:383  pltpu.get_tpu_info().num_lanes
+        #   lowering jax .../mosaic/lowering.py:979
+        #            _check_block_mappings -> get_tpu_info().num_sublanes
+        #
+        # Lowering happens inside this call, outside `_wrapped`, so it needs its
+        # own guard or precompile dies with "Unsupported TPU device kind: cpu".
+        #
+        # ONLY ON THE COMPILING CALL. This is not optional hygiene -- entering
+        # the context per forward costs a lock plus four global monkeypatches,
+        # and `export_ignore_forward_compatibility` is a *JAX config* context,
+        # which participates in jit cache keys. Toggling it on every call thrashes
+        # those caches. The generic bridge is careful about this too and only
+        # enters the context when it is about to compile (pallas_jax_op.py:51-58).
+        #
+        # Keyed by shape because each token/batch bucket compiles separately, so
+        # a plain one-shot flag would leave later buckets unguarded.
+        key = (qkv.shape[0], n_kq, n_v, d_k, d_v, kernel_size)
+        if key in _exported_shapes:
+            _new_conv, _new_rec, output = jax_kernel(
+                qkv,
+                b,
+                a,
+                conv_state,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                a_log,
+                dt_bias,
+                query_start_loc,
+                state_indices,
+                distribution,
+                seq_lens,
+                n_kq,
+                n_v,
+                d_k,
+                d_v,
+                kernel_size,
+            )
+        else:
+            with (
+                tpu_info_for_cpu_export(),
+                jax._src.config.export_ignore_forward_compatibility(True),
+            ):
+                _new_conv, _new_rec, output = jax_kernel(
+                    qkv,
+                    b,
+                    a,
+                    conv_state,
+                    recurrent_state,
+                    conv_weight,
+                    conv_bias,
+                    a_log,
+                    dt_bias,
+                    query_start_loc,
+                    state_indices,
+                    distribution,
+                    seq_lens,
+                    n_kq,
+                    n_v,
+                    d_k,
+                    d_v,
+                    kernel_size,
+                )
+            _exported_shapes.add(key)
+        if envs.SGLANG_TPU_DEBUG_GDN_STATE.get():
+            # Separates "kernel produced nothing" from "kernel produced it but the
+            # write-back went astray". This body runs eagerly even under
+            # torch.compile -- the custom op is opaque to Dynamo -- so we can read
+            # both the returned state and the caller's buffer here.
+            #
+            # per real slot: what the kernel RETURNED vs what the buffer HOLDS.
+            # Equal and non-zero  -> write-back fine, look elsewhere.
+            # Returned non-zero, buffer zero -> write-back/aliasing is the bug.
+            # Both zero -> the kernel computed nothing for this shape.
+            slots = [int(s) for s in state_indices.detach().cpu().tolist() if s >= 0]
+            if slots:
+                s = slots[0]
+                logger.info(
+                    "[gdn-op] nseq=%d ret|rec[slot%d]|=%.4f buf|rec[slot%d]|=%.4f "
+                    "ret|rec_all|=%.4f",
+                    int(state_indices.shape[0]),
+                    s,
+                    float(_new_rec[s].abs().sum().item()),
+                    s,
+                    float(recurrent_state[s].abs().sum().item()),
+                    float(_new_rec.abs().sum().item()),
+                )
         return output
 
     def _fake_impl(
@@ -243,16 +348,43 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         key = (is_decode, bs, device)
         dist = self._distribution_cache.get(key)
         if dist is None:
-            # decode: every seq is one step -> [bs, bs, bs]; else no BATCHED
-            # decode seqs -> [0, bs, bs] (matches the RPA v3 distribution).
-            vals = [bs, bs, bs] if is_decode else [0, bs, bs]
+            # `distribution` is (i, j, k): seqs[:i] decode, seqs[i:j] prefill,
+            # seqs[j:k] mixed (kernels/causal_conv1d docstring). In practice the
+            # GDN wrapper reads only distribution[0] and distribution[-1] --
+            # decode range seqs[0:d[0]], everything-else range seqs[d[0]:d[-1]]
+            # -- so the middle element is inert and [0, bs, bs] and [0, 0, bs]
+            # behave identically here (verified: swapping them changed nothing).
+            #
+            # Written as [num_decode, num_decode, num_reqs] purely to match
+            # tpu-inference's tpu_runner.py, which is where this kernel came
+            # from, so the two call sites read the same rather than relying on
+            # the middle slot being ignored.
+            num_decode = bs if is_decode else 0
+            vals = [num_decode, num_decode, bs]
             dist = torch.tensor(vals, dtype=torch.int32, device=device)
             self._distribution_cache[key] = dist
         return dist
 
     def init_forward_metadata(self, forward_batch: "ForwardBatch"):
         super().init_forward_metadata(forward_batch)
-        bs = int(forward_batch.seq_lens.shape[0])
+        # `distribution` must carry the REAL sequence count, not the padded one.
+        # The kernel derives num_seqs from it and relies on that alone to bound
+        # which sequences it touches -- gdn/metadata.py is explicit that seq_lens
+        # and state_indices are deliberately NOT masked "since they will not be
+        # visited as long as num_tiles is correct".
+        #
+        # On the TPU compiled path `forward_batch.seq_lens` has been padded up to
+        # the batch bucket by the time we get here, so taking its length told the
+        # kernel there were e.g. 8 sequences when 1 was real, and it walked the
+        # ghost rows -- writing GDN state for them into whatever slot the
+        # zero-padded `req_pool_indices` resolved to (slot 0, a live request).
+        #
+        # NOTE: fixing this alone does NOT make the compiled path correct -- it was
+        # measured and the output was unchanged -- so this is a real latent bug
+        # rather than the cause of the compiled-vs-eager mismatch. Keep it fixed;
+        # do not read it as the explanation.
+        real_bs = forward_batch._original_batch_size
+        bs = int(real_bs if real_bs is not None else forward_batch.seq_lens.shape[0])
         device = forward_batch.seq_lens.device
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
         self._distribution = self._get_distribution(is_decode, bs, device)
@@ -262,8 +394,68 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # GDN layers) rather than per-layer in _run.
         self._seq_lens = forward_batch.seq_lens.to(torch.int32)
         md = self.forward_metadata
-        self._state_indices = md.mamba_cache_indices.to(torch.int32)
+        # Route padded rows to the null block (slot 0), not to -1.
+        #
+        # `hybrid_linear_attn_backend` poisons the padded tail of
+        # mamba_cache_indices to -1, which is the CUDA/Triton sentinel for "skip
+        # this row". The TPU Pallas kernel has no such guard -- gdn/metadata.py
+        # deliberately does not mask seq_lens or state_indices ("they will not be
+        # visited as long as num_tiles is correct"), so a -1 is just an
+        # out-of-bounds index into the state pool rather than a skip.
+        #
+        # Slot 0 is exactly the right destination: TpuMambaPool reserves it as a
+        # null block ("real slots are 1 .. size") and tpu-inference relies on the
+        # same convention -- its input_batch asserts the padded tail of
+        # mamba_state_indices_cpu is all zeros, with "slot 0 is the null block;
+        # usable slots start at base + 1".
+        self._state_indices = md.mamba_cache_indices.to(torch.int32).clamp(min=0)
         self._query_start_loc = md.query_start_loc.to(torch.int32)
+        self._log_state_norm(forward_batch)
+
+    def _log_state_norm(self, forward_batch: "ForwardBatch") -> None:
+        """Log the recurrent-state magnitude, to see whether GDN state advances.
+
+        Runs here because ``init_forward_metadata`` is outside the compiled
+        region, so it can read the pool without forcing a graph break. Answers
+        the question that output text cannot: is the state write landing at all?
+        A norm that stays flat across decode steps means every step re-derives
+        from empty state, which looks exactly like the degenerate repetition the
+        compiled path produces. Forces a device sync, so it is env-gated.
+        """
+        if not envs.SGLANG_TPU_DEBUG_GDN_STATE.get():
+            return
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        rank = get_tensor_model_parallel_rank()
+        if rank != 0:
+            return  # one rank is enough; 8 interleaved ranks are unreadable
+        pool = self.req_to_token_pool.mamba_pool
+        temporal = pool.mamba_cache.temporal
+        slots = self._state_indices.detach().cpu().tolist()
+        real = [s for s in slots if s >= 0]
+        # Per-slot norm is the number that matters: the whole-pool norm mixes in
+        # every other slot and hides whether THIS request's state advanced.
+        per_slot = {
+            s: round(float(temporal[:, s].abs().sum().item()), 3) for s in real[:4]
+        }
+        # query_start_loc / seq_lens / distribution drive the kernel's tile
+        # accounting: query_lens = diff(query_start_loc), masked to num_seqs from
+        # distribution, then num_tiles = cdiv(query_lens, chunk_size). If the real
+        # sequence's query_len or tile count comes out wrong under a padded batch,
+        # its final-state store is never emitted -- which is the remaining
+        # candidate for the lost prefill write.
+        logger.info(
+            "[gdn-state] rank0 mode=%-6s real_bs=%s pad_bs=%d slots=%s "
+            "PRE |rec|=%s dist=%s qsl=%s seq_lens=%s",
+            forward_batch.forward_mode.name,
+            forward_batch._original_batch_size,
+            int(forward_batch.seq_lens.shape[0]),
+            slots[:8],
+            per_slot,
+            self._distribution.detach().cpu().tolist(),
+            self._query_start_loc.detach().cpu().tolist()[:10],
+            self._seq_lens.detach().cpu().tolist()[:8],
+        )
 
     def _run(
         self,

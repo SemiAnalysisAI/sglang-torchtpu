@@ -368,6 +368,24 @@ def _pad_forward_batch_inputs(
                 hs, (0,) * (2 * (hs.ndim - 1)) + (0, pad_rows)
             )
 
+    # Record the pre-padding batch size where the rest of the runtime looks for
+    # it, not only in this shim's private _tpu_real_b. Hybrid linear-attention
+    # (GDN / mamba) reads `_original_batch_size` to poison the padded rows of
+    # `mamba_cache_indices` to -1 so the kernel skips them
+    # (hybrid_linear_attn_backend.py). Until now only `prepare_mlp_sync_batch`
+    # set that field, i.e. only under DP attention -- so on the TPU compiled path
+    # with DP off it stayed None, the poisoning never ran, and the ghost rows
+    # kept the mamba slot derived from a zero-padded `req_pool_indices`: slot 0,
+    # which belongs to a *real* request, so the GDN kernel could write ghost
+    # state into a live request's recurrent state.
+    #
+    # This is a latent correctness bug, not the cause of the 2026-08 "compiled
+    # Qwen3.5 emits fluent text unrelated to the prompt" failure -- that was a
+    # zeroed `query_start_loc` in hybrid_linear_attn_backend. Fixing this alone
+    # did not change that output. Qwen3 is unaffected either way: no mamba pool.
+    if forward_batch._original_batch_size is None:
+        forward_batch._original_batch_size = real_b_out
+
     forward_batch.batch_size = pad_b
 
     return real_q_out, real_b_out
