@@ -117,15 +117,27 @@ class CompileTracker:
             return
         self._unexpected += step.misses
         total = now.delta_from(self._baseline)
+        # Report the interval rate and the cumulative rate separately, and label
+        # both. Mixing a cumulative numerator with an interval denominator makes
+        # a decaying warmup tail look like a steady-state catastrophe.
+        #
+        # Reading these: a burst that decays to zero over the first seconds is
+        # shape space that warmup did not cover -- each new shape compiles once
+        # and is then cached. A rate that stays flat under sustained load is the
+        # real problem, because those compiles land mid-step and show up as p99
+        # TTFT/ITL spikes.
         logger.warning(
-            "[tpu] UNEXPECTED RECOMPILE%s: %d new XLA cache miss(es) "
-            "(%d since warmup, %d requests). A fresh compile at serving time "
-            "stalls the device and inflates p99 TTFT/ITL. Set "
+            "[tpu] XLA cache miss%s: %d new in this interval of %d exec(s) "
+            "(%.1f%%); %d/%d (%.1f%%) since warmup. Decaying to zero is warmup "
+            "residue; a sustained rate stalls the device mid-step. Set "
             "SGLANG_TPU_DUMP_ON_CACHE_MISS=1 to dump the offending graph.",
             f" [{context}]" if context else "",
             step.misses,
-            total.misses,
             step.reqs,
+            100.0 * step.misses / step.reqs if step.reqs else 0.0,
+            total.misses,
+            total.reqs,
+            100.0 * total.misses / total.reqs if total.reqs else 0.0,
         )
 
     def summary(self) -> str:
