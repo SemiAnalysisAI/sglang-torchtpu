@@ -60,6 +60,49 @@ def _get_tpu_fp8_runtime() -> str:
     return get_global_server_args().tpu_fp8_runtime
 
 
+def _is_dummy_weights() -> bool:
+    """True when serving --load-format dummy, i.e. weights are random already."""
+    from sglang.srt.server_args import get_global_server_args
+
+    return str(get_global_server_args().load_format) == "dummy"
+
+
+def _fake_channelwise_moe_for_dummy(layer: torch.nn.Module) -> None:
+    """Produce the channelwise runtime layout without doing the conversion math.
+
+    ``--load-format dummy`` exists for performance measurement, and what the
+    gmm_v2 kernel dispatches on is *layout*: fp8 weight dtype, ``[E, N, 1]``
+    float32 ``*_scale``, and ``*_scale_inv`` absent. The values are random either
+    way, so synthesize the post-conversion state and skip the per-expert-chunk
+    dequant + amax + ``torch.tpu.synchronize()``, which is the bulk of the ~350s
+    FP8 conversion on the 397B.
+
+    Must stay in sync with ``_requantize_tpu_fp8_moe_block_to_channelwise``: same
+    field names, shapes and dtypes. If the two diverge, a dummy-weight benchmark
+    silently measures the *blockwise* kernel instead of the channelwise one, and
+    reports a number for a code path we do not ship.
+    """
+    for w_name, scale_inv_name in (
+        ("w13_weight", "w13_weight_scale_inv"),
+        ("w2_weight", "w2_weight_scale_inv"),
+    ):
+        w_param = getattr(layer, w_name)
+        num_experts, n, _ = w_param.shape
+        # [E, N], NOT [E, N, 1]. _quantize_moe_weight_channelwise computes the
+        # amax with keepdim=True but returns `weight_scale.squeeze(-1)`, and
+        # _to_tpu_fp8_moe_scale_layout rejects rank 3. Getting this wrong is not
+        # subtle -- the server dies at load with "Unsupported TPU FP8 MoE scale
+        # rank: 3" -- but it is the exact drift this helper is prone to.
+        copy_or_rebind_param(
+            layer,
+            f"{w_name}_scale",
+            torch.ones(
+                (num_experts, n), dtype=torch.float32, device=w_param.data.device
+            ),
+        )
+        _clear_replaced_param(layer, scale_inv_name)
+
+
 def _quantize_moe_weight_channelwise(
     weight: torch.Tensor,
     out_dtype: torch.dtype,
@@ -271,7 +314,10 @@ def prepare_tpu_fp8_moe_weights(
             "--tpu-fp8-runtime=channelwise to make this explicit, or "
             "--tpu-fp8-runtime=blockwise to preserve blockwise runtime scales."
         )
-        _requantize_tpu_fp8_moe_block_to_channelwise(layer, weight_block_size)
+        if _is_dummy_weights():
+            _fake_channelwise_moe_for_dummy(layer)
+        else:
+            _requantize_tpu_fp8_moe_block_to_channelwise(layer, weight_block_size)
         block_quant = False
 
     # gmm_v2 consumes RHS weights as [expert, K, N]. SGLang loads MoE weights

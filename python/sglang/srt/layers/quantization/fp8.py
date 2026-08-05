@@ -802,6 +802,28 @@ class Fp8LinearMethod(LinearMethodBase):
         self._process_mxfp8_linear_weight_scale(layer)
         layer.input_scale = None
 
+    def _fake_channelwise_for_dummy(self, layer: Module) -> None:
+        """Channelwise runtime layout without the conversion math (dummy weights).
+
+        See the MoE twin in hardware_backend/tpu/fp8_moe.py. What the kernel
+        dispatches on is layout -- fp8 weight transposed to [K, N], float32
+        [N, 1] ``weight_scale``, no ``weight_scale_inv``, no
+        ``weight_block_size``. Under ``--load-format dummy`` the values are
+        random regardless, so skip the full-tensor dequant + amax.
+
+        Must stay in sync with ``_requantize_tpu_block_fp8_to_channelwise``.
+        """
+        weight = layer.weight.data
+        n_rows = weight.shape[0]
+        layer.weight = Parameter(weight.t().contiguous(), requires_grad=False)
+        layer.weight_scale = Parameter(
+            torch.ones((n_rows, 1), dtype=torch.float32, device=weight.device),
+            requires_grad=False,
+        )
+        _clear_replaced_param(layer, "weight_scale_inv")
+        layer.weight_block_size = None
+        layer.input_scale = None
+
     def _requantize_tpu_block_fp8_to_channelwise(self, layer: Module) -> None:
         weight = layer.weight.data
         weight_dequant = block_quant_dequant(
@@ -839,7 +861,14 @@ class Fp8LinearMethod(LinearMethodBase):
                         "this explicit, or --tpu-fp8-runtime=blockwise to preserve "
                         "blockwise runtime scales."
                     )
-                    self._requantize_tpu_block_fp8_to_channelwise(layer)
+                    from sglang.srt.hardware_backend.tpu.fp8_moe import (
+                        _is_dummy_weights,
+                    )
+
+                    if _is_dummy_weights():
+                        self._fake_channelwise_for_dummy(layer)
+                    else:
+                        self._requantize_tpu_block_fp8_to_channelwise(layer)
                 else:
                     layer.weight_block_size = self.quant_config.weight_block_size
         else:
