@@ -6,9 +6,13 @@ These tests mock torch_tpu so they can run on any machine without TPU hardware.
 import builtins
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
+
+import torch.compiler.config as compiler_config
 
 from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 from sglang.srt.platforms.device_mixin import PlatformEnum
@@ -90,6 +94,7 @@ class TestTpuPlatformInitialization(CustomTestCase):
         with (
             patch.dict(os.environ, {"WORLD_SIZE": "16"}, clear=False),
             patch.dict(sys.modules, {"torch_tpu": fake_torch_tpu}),
+            compiler_config.patch(cache_key_tag=""),
             patch(
                 "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env",
                 side_effect=lambda world_size, **kwargs: calls.append(
@@ -114,6 +119,44 @@ class TestTpuPlatformInitialization(CustomTestCase):
                 ("patch", None),
             ],
         )
+
+
+class TestTpuCompileCache(CustomTestCase):
+    def test_pallas_source_change_updates_compile_cache_key(self):
+        import sglang.srt.hardware_backend.tpu.compile_cache as compile_cache
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            srt_root = Path(temp_dir)
+            source_files = (
+                srt_root / "layers/attention/pallas/kernel.py",
+                srt_root / "layers/moe/pallas/kernel.py",
+                srt_root / "hardware_backend/tpu/attention_pallas.py",
+                srt_root / "hardware_backend/tpu/attention_pallas_rpa_base.py",
+                srt_root / "hardware_backend/tpu/attention_pallas_rpa_batched.py",
+                srt_root / "hardware_backend/tpu/attention_pallas_rpa_v3.py",
+                srt_root / "hardware_backend/tpu/kernels/kernel.py",
+                srt_root / "hardware_backend/tpu/pallas_export.py",
+                srt_root / "hardware_backend/tpu/pallas_jax_op.py",
+                srt_root / "hardware_backend/tpu/quantized_matmul.py",
+            )
+            for source_file in source_files:
+                source_file.parent.mkdir(parents=True, exist_ok=True)
+                source_file.write_text("original source\n")
+
+            module_path = srt_root / "hardware_backend/tpu/compile_cache.py"
+            with (
+                patch.object(compile_cache, "__file__", str(module_path)),
+                compiler_config.patch(cache_key_tag="user-tag"),
+            ):
+                compile_cache.add_pallas_kernel_sources_to_compile_cache_key()
+                original_key = compiler_config.cache_key_tag
+
+                source_files[0].write_text("changed source\n")
+                compile_cache.add_pallas_kernel_sources_to_compile_cache_key()
+                changed_key = compiler_config.cache_key_tag
+
+                self.assertTrue(original_key.startswith("user-tag|"))
+                self.assertNotEqual(changed_key, original_key)
 
 
 class TestTpuPlatformMemory(CustomTestCase):
