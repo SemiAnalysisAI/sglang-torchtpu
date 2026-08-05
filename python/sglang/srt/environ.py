@@ -1006,6 +1006,10 @@ class Envs:
     # input/output alias (buffer donation). Set 0 to drop donation and copy the
     # returned states back explicitly -- slower, but it removes the cross-layer
     # donation aliasing that TpuMambaPool's single shared pool tensor creates.
+    # Dump the aten graph + StableHLO for any program that misses the XLA compile
+    # cache. Very verbose; for identifying which graph is recompiling at serving
+    # time after compile_tracker reports an unexpected recompile.
+    SGLANG_TPU_DUMP_ON_CACHE_MISS = EnvBool(False)
     # Log the GDN conv/recurrent state magnitude once per forward, from the eager
     # metadata hook. Debug aid for "is the state write landing at all" -- a norm
     # that does not advance across decode steps means it is not. Forces a device

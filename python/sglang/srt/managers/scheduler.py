@@ -64,6 +64,10 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.hardware_backend.tpu.compile_tracker import (
+    CompileTracker,
+    maybe_enable_cache_miss_dump,
+)
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
@@ -510,6 +514,9 @@ class Scheduler(
 
         # Init profiler
         self.init_profiler()
+
+        # Init TPU XLA compile-cache tracking
+        self.init_tpu_compile_tracker()
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
@@ -3606,6 +3613,15 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
+    def init_tpu_compile_tracker(self) -> None:
+        """Watch the XLA compile cache; a post-warmup miss is a real recompile.
+
+        Inert on non-TPU backends -- the counters simply do not exist there, and
+        every call short-circuits.
+        """
+        self.tpu_compile_tracker = CompileTracker()
+        maybe_enable_cache_miss_dump()
+
     def _maybe_arm_fail_on_recompile(self) -> None:
         """TPU-only: freeze torch.compile so serving-time recompiles raise."""
         model_runner = self.tp_worker.model_runner
@@ -3619,6 +3635,10 @@ class Scheduler(
             "[tpu] Warmup complete; froze torch.compile via "
             "set_stance('fail_on_recompile')."
         )
+        # set_stance only guards the torch.compile frontend. Eager ops lowered by
+        # torch_tpu compile independently and can still miss the XLA cache mid-
+        # serve, so baseline the cache counters here and watch them from on_idle.
+        self.tpu_compile_tracker.arm()
 
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
@@ -3628,6 +3648,9 @@ class Scheduler(
         if self.forward_ct > 0 and not self.recompile_stance_set:
             self.recompile_stance_set = True
             self._maybe_arm_fail_on_recompile()
+
+        # Two integer reads; only warns when something actually compiled.
+        self.tpu_compile_tracker.poll(context="idle")
 
         if self.server_args.enable_unified_memory:
             try:
