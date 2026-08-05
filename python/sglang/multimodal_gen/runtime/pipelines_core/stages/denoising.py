@@ -181,14 +181,9 @@ def _ensure_tensor_model_output(model_output):
 
 
 def _timesteps_for_device(timesteps: torch.Tensor) -> torch.Tensor:
-    """Pin integer timesteps to the platform index dtype for device compute.
-
-    The scheduler's public ``timesteps`` stays int64 on every platform; only
-    the loop-internal copy is narrowed (int64 is emulated on TPU — same
-    pattern as srt's ``positions_dtype``). Float timestep schedules
-    (flow-match euler) pass through untouched; the default platform dtype is
-    int64, making this a no-op off-TPU.
-    """
+    """Cast int64 timesteps to the platform index dtype (int32 on TPU, where
+    int64 is emulated); float schedules pass through. The scheduler's public
+    ``timesteps`` stays int64; off-TPU this is a no-op."""
     if timesteps.dtype == torch.int64:
         return timesteps.to(current_platform.get_index_dtype())
     return timesteps

@@ -872,8 +872,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
-        # Resolved once here: the lru_cache-wrapped platform classmethod
-        # graph-breaks dynamo when called inside the traced forward.
+        # Resolved once: the lru_cache-wrapped classmethod graph-breaks dynamo.
         self._amp_supported = current_platform.is_amp_supported()
 
         inner_dim = config.num_attention_heads * config.attention_head_dim
@@ -1005,9 +1004,8 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         **kwargs,
     ) -> torch.Tensor:
         forward_batch = get_forward_context().forward_batch
-        # Read through the concrete sampling_params field: attribute access on
-        # the Req.__getattr__ delegation graph-breaks dynamo, and the resulting
-        # break makes dynamo skip compiling this entire forward.
+        # Read the concrete sampling_params field: Req.__getattr__ delegation
+        # graph-breaks dynamo and skips compiling this forward.
         sp = forward_batch.sampling_params if forward_batch is not None else None
         sequence_shard_enabled = (
             sp is not None and bool(sp.enable_sequence_shard) and self.sp_size > 1

@@ -28,11 +28,9 @@ def build_torch_compile_kwargs(*, mode: str | None) -> dict[str, object]:
     elif current_platform.is_tpu():
         from torch_tpu._internal.compile import TpuBackend
 
-        # Serialization off: torch_tpu's AOT cache synthesizes its key from a
-        # graph string that is always None on that path, so the key collapses
-        # to a per-process constant and distinct graphs collide on reload.
-        # dynamic=False: the DiT sees a fixed set of static shapes, and the
-        # backend rejects dynamic=True. `mode` is inductor-only.
+        # enable_serialization=False: the AOT cache key degenerates to a
+        # per-process constant and distinct graphs collide on reload.
+        # dynamic=False: static shapes only; the backend rejects True.
         compile_kwargs["backend"] = TpuBackend(enable_serialization=False)
         compile_kwargs["dynamic"] = False
     elif mode is not None:

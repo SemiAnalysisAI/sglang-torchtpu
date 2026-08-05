@@ -30,9 +30,8 @@ logger = init_logger(__name__)
 
 
 def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
-    # The native transformers encoder fallback returns a transformers
-    # ModelOutput without an attention_mask field; the tokenizer inputs
-    # carry the same mask.
+    # The native transformers fallback returns a ModelOutput without
+    # attention_mask; the tokenizer inputs carry the same mask.
     mask: torch.Tensor | None = (
         outputs.attention_mask if isinstance(outputs, BaseEncoderOutput) else None
     )

@@ -1,8 +1,7 @@
 # copy and modify from https://github.com/thu-ml/TurboDiffusion/blob/main/turbodiffusion/rcm/utils/a2a_cp.py and https://github.com/thu-ml/TurboDiffusion/blob/main/turbodiffusion/SLA/core.py
 
-# Defer annotation evaluation: the `cp_stream: torch.get_device_module().Stream`
-# signature annotations below would otherwise touch the accelerator runtime at
-# import time in every importing process.
+# Deferred annotations: `torch.get_device_module().Stream` in signatures
+# would touch the accelerator runtime at import time.
 from __future__ import annotations
 
 from typing import Any, Callable, List, Tuple, Type, Union
@@ -181,13 +180,9 @@ def async_a2a_communicate(
 def _functional_seq_all_to_all(
     input: Tensor, local_seq_2_local_head: bool, group: dist.ProcessGroup
 ) -> Tensor:
-    """Sequence-parallel all-to-all via functional collectives.
-
-    Inference-only alternative to the stream-overlapped autograd path below:
-    synchronous, stream-free, and traceable by dynamo (the collective stays in
-    the captured graph instead of graph-breaking on async_op + stream calls).
-    Selected via Platform.use_functional_seq_all_to_all().
-    """
+    """Sequence-parallel all-to-all via functional collectives: stream-free
+    and dynamo-traceable. Selected via
+    Platform.use_functional_seq_all_to_all()."""
     import torch.distributed._functional_collectives as funcol
 
     seq_world_size = dist.get_world_size(group)

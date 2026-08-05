@@ -38,9 +38,6 @@ class BasevLLMParameter(Parameter):
         :returns: a torch.nn.parameter
         """
 
-        # During weight loading, we often do something like:
-        # narrowed_tensor = param.data.narrow(0, offset, len)
-        # narrowed_tensor.copy_(real_weight)
         self._weight_loader = weight_loader
 
     @property

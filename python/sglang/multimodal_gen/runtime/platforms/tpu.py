@@ -1,18 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """TPU platform for sglang-diffusion, backed by torch_tpu (PrivateUse1/PJRT).
 
-All TPU-specific behavior for the diffusion runtime lives in this module; the
-shared runtime reaches it exclusively through the Platform hooks defined in
-`interface.py`. torch_tpu imports are deferred to call time so this module
-imports cleanly on machines without torch_tpu installed.
-
-Execution model notes (torch_tpu is a lazy/deferred backend):
-- One chip per process. The chip is chosen by the slicebuilder env computed in
-  the parent process (`prepare_server_environment`); the process-local device
-  index is always 0.
-- torch_tpu latches RANK/LOCAL_RANK/WORLD_SIZE at import (GetEnvOnce), and a
-  worker's import chain touches torch_tpu before the worker's own setup runs,
-  so those variables are exported at process birth via `worker_spawn_env`.
+All TPU behavior lives here, reached via the Platform hooks in
+`interface.py`; torch_tpu imports are deferred so this module imports
+without torch_tpu installed. One chip per process (chosen by the
+slicebuilder env from `prepare_server_environment`; local index always 0).
+torch_tpu latches RANK/LOCAL_RANK/WORLD_SIZE at import — hence
+`worker_spawn_env`.
 """
 
 from __future__ import annotations
@@ -39,11 +33,8 @@ _MIB = 1024**2
 
 
 class _DitEvictionContext:
-    """Evicts the DiT(s) to host for the duration of the VAE decode.
-
-    A 14B-class DiT plus decode activations exceed HBM at 720p; PJRT has no
-    swappable allocator, so the working set must be moved explicitly.
-    """
+    """Evicts DiTs to host during VAE decode: large DiTs plus decode
+    activations can exceed HBM, and PJRT has no swappable allocator."""
 
     def __init__(self, pipeline: Any) -> None:
         self._pipeline = pipeline
@@ -52,8 +43,6 @@ class _DitEvictionContext:
     def __enter__(self) -> _DitEvictionContext:
         if self._pipeline is None:
             return self
-        # Evict every DiT-class component (model-agnostic: covers Wan's
-        # transformer/transformer_2, video_dit, audio_dit, ...).
         from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
             is_dit_component_name,
         )
@@ -79,10 +68,8 @@ class _DitEvictionContext:
             device = TpuPlatform.get_local_torch_device()
             for module in self._evicted:
                 module.to(device)
-            # Drain the restore transfers before returning control: dynamo
-            # fakeifies these weights when the next request re-traces, and
-            # pending lazy H2D state yields bogus tensor metadata
-            # (fake-tensor "b must be 2D" on the second compiled request).
+            # Drain restores: the next request's dynamo re-trace fakeifies
+            # these weights, and pending lazy H2D yields bogus metadata.
             torch.tpu.synchronize()
             self._evicted.clear()
 
@@ -120,10 +107,8 @@ class TpuPlatform(Platform):
     # Device identity and memory
     # ------------------------------------------------------------------
 
-    # Identity and memory queries must NEVER initialize PJRT as a side
-    # effect: server-args processing calls them in the parent process before
-    # workers spawn, and the chips belong to the workers. Anything needing
-    # live allocator stats gates on torch.tpu.is_initialized().
+    # Identity/memory queries must not initialize PJRT: the parent process
+    # calls them before workers spawn, and the chips belong to the workers.
 
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
@@ -140,9 +125,8 @@ class TpuPlatform(Platform):
         if torch.tpu.is_initialized():
             _free, total = torch.accelerator.get_memory_info()
             return total
-        # Pre-initialization estimate for server-args threshold checks.
-        # ponytail: static floor for current targets (tpu7x ~95 GiB); replace
-        # with a topology lookup if smaller-HBM TPUs are targeted.
+        # ponytail: pre-init static floor (tpu7x ~95 GiB); topology lookup
+        # if smaller-HBM TPUs become targets.
         return 90 * (1 << 30)
 
     @classmethod
@@ -189,8 +173,7 @@ class TpuPlatform(Platform):
                 peak_reserved_mb=0.0,
             )
         stats = torch.accelerator.memory_stats()
-        # PJRT reports allocated/peak-allocated; bytes_reserved is not
-        # populated by the TPU client and reads as 0.
+        # reserved_bytes is not populated by the TPU PJRT client (reads 0).
         return MemorySnapshot(
             allocated_mb=stats.get("allocated_bytes.all.current", 0) / _MIB,
             reserved_mb=stats.get("reserved_bytes.all.current", 0) / _MIB,
@@ -204,8 +187,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def get_index_dtype(cls) -> torch.dtype:
-        # int64 is emulated on TPU (srt pins positions to int32 for the same
-        # reason: forward_batch_info.py positions_dtype, patches.py cumsum).
+        # int64 is emulated; srt pins positions to int32 for the same reason.
         return torch.int32
 
     @classmethod
@@ -221,24 +203,17 @@ class TpuPlatform(Platform):
         return self.get_local_torch_device()
 
     def get_torch_distributed_backend_str(self) -> str:
-        # tpu_dist bootstrap requires exactly one TPU device per process; at
-        # world size 1 on a multi-chip host PJRT sees every chip and raises.
-        # Match the srt TPU integration (model_runner.py): gloo for
-        # single-rank runs. WORLD_SIZE is the same env the distributed-init
-        # call site reads as its world-size authority.
+        # tpu_dist needs exactly one device per process; a single-rank run
+        # on a multi-chip host sees every chip and raises. srt does the
+        # same: gloo for world size 1.
         if os.environ.get("WORLD_SIZE", "1") == "1":
             return "gloo"
-        # torch_tpu's native c10d backend: collectives become deferred
-        # in-graph StableHLO ops matching the SPMD programs torch_tpu
-        # compiles per process.
-        return "tpu_dist"
+        return "tpu_dist"  # torch_tpu c10d backend: in-graph deferred collectives
 
     @classmethod
     def prepare_server_environment(cls, *, world_size: int) -> None:
-        # Reuses the srt TPU launcher helper: scrubs jax-owned libtpu env,
-        # applies LIBTPU_INIT_ARGS overrides, and writes the single-host
-        # slicebuilder/topology env that spawned workers inherit so each
-        # binds its own chip via PJRT.
+        # srt launcher helper: jax-env scrub, LIBTPU_INIT_ARGS overrides,
+        # single-host slicebuilder env for the spawned workers.
         from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
 
         _prepare_tpu_env(world_size=world_size)
@@ -247,8 +222,7 @@ class TpuPlatform(Platform):
     def worker_spawn_env(
         cls, *, rank: int, world_size: int, master_port: int
     ) -> dict[str, str]:
-        # torch_tpu latches these via GetEnvOnce during import, which the
-        # child's import chain reaches before init_worker_device_env runs.
+        # Latched via GetEnvOnce during the child's import of torch_tpu.
         return {
             "LOCAL_RANK": str(rank),
             "RANK": str(rank),
@@ -261,8 +235,7 @@ class TpuPlatform(Platform):
     def init_worker_device_env(
         cls, *, local_rank: int, rank: int, world_size: int, master_port: int
     ) -> None:
-        # Order matters: the jax-env scrub and libtpu flag overrides must
-        # precede the first device touch (PJRT init is deferred until then).
+        # Env overrides must precede the first device touch (deferred PJRT).
         from sglang.srt.hardware_backend.tpu.env_override import (
             apply_tpu_env_overrides,
         )
@@ -275,13 +248,11 @@ class TpuPlatform(Platform):
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
-        # One chip per process; the chip itself is selected by the
-        # slicebuilder env, so the local index is always 0.
+        # Chip selection comes from the slicebuilder env; local index is 0.
         torch.tpu.set_device(0)
 
-        # Touch the device now, while all ranks are at the same point in
-        # startup, so the single-host slicebuilder ranks rendezvous together
-        # instead of first touching the device mid-model-load.
+        # Touch the device now so all ranks rendezvous at the same startup
+        # point instead of mid-model-load.
         torch.zeros(1, device="tpu")
 
     # ------------------------------------------------------------------
@@ -318,19 +289,14 @@ class TpuPlatform(Platform):
 
     @classmethod
     def supports_vae_decode_torch_compile(cls) -> bool:
-        # The wanvae frame loop feeds its temporal feature-cache concat with
-        # per-chunk shapes; under torch.compile the graph-break resume regions
-        # recompile per shape on a static-shape backend. Lazy decode is the
-        # validated path.
+        # VAE frame loops feed caches with per-chunk shapes, which recompile
+        # per shape on a static-shape backend; lazy decode is the validated
+        # path.
         return False
 
-    # wrap_forward_for_compile deliberately stays the identity default:
-    # wrapping the whole forward in torch_tpu's spmd_safe marks it as a
-    # no-split region for SplitCompiler (split_compiler.py:363), forcing one
-    # program whose argument set (all weights) exceeds HBM at compile time
-    # (observed: CompileTimeHbmOom, arguments 282G vs 94.75G). The default
-    # materialize-collectives behavior partitions at collectives instead,
-    # which is the supported compiled-mode shape for large models.
+    # wrap_forward_for_compile stays the identity default: spmd_safe marks
+    # the forward no-split, forcing one program whose arguments (all
+    # weights) exceed HBM at compile time on large models.
 
     # ------------------------------------------------------------------
     # Distributed capabilities
@@ -338,14 +304,12 @@ class TpuPlatform(Platform):
 
     @classmethod
     def supports_p2p_communication(cls) -> bool:
-        # tpu_dist implements collectives; send/recv exists only as
-        # experimental ops and is not wired into the c10d backend.
+        # tpu_dist has no send/recv (experimental ops only).
         return False
 
     @classmethod
     def use_functional_seq_all_to_all(cls) -> bool:
-        # No CUDA-style streams on TPU, and the functional collective stays
-        # traceable in compiled graphs.
+        # No CUDA-style streams; the functional collective stays traceable.
         return True
 
     # ------------------------------------------------------------------
@@ -366,10 +330,8 @@ class TpuPlatform(Platform):
 
     @classmethod
     def denoise_loop_context(cls) -> Any:
-        # DEFER_AND_FUSE (default) batches the step's ops into fused programs.
-        # Scoped to the denoising loop: the VAE's feature-cache decode
-        # regresses under this mode. SGLANG_DIFFUSION_TPU_EAGER_MODE selects
-        # another torch_tpu EagerMode (e.g. DEFER_NEVER for op-by-op runs).
+        # DEFER_AND_FUSE fuses each step's ops; scoped to the loop because
+        # VAE decode regresses under it.
         from torch_tpu._internal.execution_mode import EagerMode, set_eager_mode
 
         from sglang.multimodal_gen import envs
@@ -387,8 +349,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def on_denoise_step_end(cls) -> None:
-        # Bound the in-flight lazy queue to one step's programs; letting it
-        # grow across steps exhausts HBM with pending intermediaries.
+        # Bound the lazy queue to one step; unbounded growth OOMs HBM.
         torch.tpu.synchronize()
 
     @classmethod

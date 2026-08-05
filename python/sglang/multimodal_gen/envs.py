@@ -210,16 +210,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
         "SGLANG_DIFFUSION_PLATFORM_OVERRIDE", ""
     ),
-    # TPU: torch_tpu eager mode for the denoising loop (EagerMode member
-    # name, e.g. DEFER_AND_FUSE or DEFER_NEVER). Scoped to the loop; the
-    # fused default is the validated fast configuration.
+    # torch_tpu EagerMode name for the denoising loop (e.g. DEFER_NEVER);
+    # the fused default is the validated fast configuration.
     "SGLANG_DIFFUSION_TPU_EAGER_MODE": _lazy_str(
         "SGLANG_DIFFUSION_TPU_EAGER_MODE", "DEFER_AND_FUSE"
     ),
-    # Keeps DiT components resident during VAE decode instead of evicting to
-    # host. For HBM-rich configurations, and for isolating eviction-related
-    # issues (weight round-trips invalidate dynamo guards on the next
-    # compiled request).
+    # Keep DiTs resident during VAE decode (HBM-rich configs; also isolates
+    # eviction-related dynamo guard issues).
     "SGLANG_DIFFUSION_TPU_DISABLE_DECODE_EVICTION": _lazy_bool(
         "SGLANG_DIFFUSION_TPU_DISABLE_DECODE_EVICTION"
     ),

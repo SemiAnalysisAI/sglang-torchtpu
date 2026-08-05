@@ -272,9 +272,8 @@ def init_distributed_environment(
                 or current_platform.is_npu()
                 or current_platform.is_cpu()
                 or current_platform.is_xpu()
-                # tpu: binding the default group to tpu:0 makes later gloo
-                # subgroup creation resolve a backend for device "tpu" and
-                # fail (RuntimeError: No backend type associated with tpu).
+                # tpu: a tpu:0-bound default group makes later gloo subgroup
+                # creation fail (no backend type for device "tpu").
                 or current_platform.is_tpu()
             )
             else dict(device_id=device_id)

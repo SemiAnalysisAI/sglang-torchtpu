@@ -214,10 +214,8 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     scheduler_pipe_readers = []
     scheduler_pipe_writers = []
 
-    # Spawn-time env: exported before each child's start() because the child
-    # snapshots os.environ, and some runtimes latch these variables during
-    # import before the worker's own setup runs. Parent values are restored
-    # after the loop so the parent doesn't keep the last child's rank identity.
+    # Exported before each child's start(): the child snapshots os.environ,
+    # and some runtimes latch these at import. Parent values restored after.
     spawn_env_saved: dict[str, str | None] = {}
     for i in range(local_num_gpus):
         rank = rank_offset + i

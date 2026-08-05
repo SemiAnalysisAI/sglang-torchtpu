@@ -1,9 +1,6 @@
-"""Torch-native scale/shift for backends without triton.
-
-Same math as the fused triton kernel
-(``kernels/ops/diffusion/triton/scale_shift.py``), relying on broadcasting;
-parity-tested against it in ``tests/test_diffusion_triton_fallbacks.py``.
-"""
+"""Torch-native scale/shift for backends without triton; same math as the
+fused triton kernel. Parity-tested in
+``tests/test_diffusion_triton_fallbacks.py``."""
 
 import torch
 

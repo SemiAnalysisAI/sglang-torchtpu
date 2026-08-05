@@ -1,15 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pallas flash-attention backend for TPU (torch_tpu).
 
-Wraps the srt TPU pallas flash-attention kernel as a torch custom op via
-``torch_tpu._internal.pallas.jax_op`` so it is usable from the diffusion
-attention layers both eagerly and under torch.compile.
-
-Constraints of the underlying kernel:
-- non-causal only (video DiT self/cross attention);
-- query/key/value must share the head count (no GQA);
-- sequence lengths are padded to the kernel block sizes, with segment ids
-  masking the padding out of the softmax.
+Wraps the srt TPU flash-attention kernel as a torch custom op via
+``torch_tpu._internal.pallas.jax_op``. Non-causal only, no GQA; sequences
+pad to the kernel block sizes with segment ids masking the padding.
 """
 
 from __future__ import annotations
@@ -23,17 +17,16 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 
-# Registered torch custom-op overloads, keyed by (sm_scale, block_q, block_kv).
-# One op per configuration: the pallas kernel bakes the scale and block sizes
-# into the traced program.
+# One overload per (sm_scale, block_q, block_kv): the trace bakes them in.
 _TPU_FLASH_OPS: dict[tuple[float, int, int], object] = {}
 
-# Block sizes from the Wan2.2 720p sweep: (2048, 1024) is fastest for long
-# sequences; the smaller pair serves short (<=2048) KV lengths without
-# excess padding. Larger block_q spills registers on current TPUs.
+# Swept defaults for long video-DiT sequences; larger block_q spills
+# registers. TODO: autotune per shape (splash-attention follow-up).
 _LONG_SEQ_BLOCKS = (2048, 1024)
-_SHORT_SEQ_BLOCKS = (1024, 512)
+_SHORT_SEQ_BLOCKS = (1024, 512)  # short (<=2048) KV without excess padding
 
+# Compiler budget, not a reservation — mosaic clamps to chip VMEM
+# (64 MiB measured); srt passes None.
 _VMEM_LIMIT_BYTES = 128 * 1024 * 1024
 
 
@@ -95,16 +88,10 @@ def _get_tpu_flash_op(sm_scale: float, block_q: int, block_kv: int):
         return torch.empty_like(q)
 
     registered.register_fake(_fake)
-    # Return the OpOverload, not the CustomOpDef: dynamo inlines the latter's
-    # python __call__ into the traced graph and breaks on the jax internals.
-    # (srt's TPU kernels call their CustomOpDef directly; for jax_op-created
-    # ops we measured the inlining break, hence the overload. Divergence
-    # documented in docs_new/docs/hardware-platforms/tpu_diffusion.mdx.)
-    # TODO: revert to calling the CustomOpDef once dynamo traces
-    # CustomOpDef.__call__ without inlining (torch fix), and replace the
-    # `torch_tpu._internal.pallas` import when torch_tpu publishes a stable
-    # jax_op surface — the srt TPU backend shares this _internal dependency
-    # (17 import sites), so the migration is repo-wide, not diffusion-only.
+    # Return the OpOverload, not the CustomOpDef: dynamo inlines the
+    # latter's __call__ and breaks on jax internals (measured). TODO: revert
+    # on the dynamo fix; drop `_internal.pallas` when a stable jax_op
+    # surface ships (dependency shared with srt, 17 import sites).
     overload = getattr(torch.ops.sglang_diffusion, op_name.split("::", 1)[1]).default
     _TPU_FLASH_OPS[key] = overload
     return overload
@@ -127,8 +114,7 @@ def _tpu_flash_sdpa(
     key = torch.nn.functional.pad(key, (0, 0, 0, pad_kv)).contiguous()
     value = torch.nn.functional.pad(value, (0, 0, 0, pad_kv)).contiguous()
     device = query.device
-    # Segment ids: 0 = real tokens, 1 = padding; mismatched segments are
-    # masked out of the softmax, so padding never attends or is attended to.
+    # Segment ids: 0 = real, 1 = padding; mismatched segments mask out.
     q_seg = torch.cat(
         [
             torch.zeros(batch, len_q, dtype=torch.int32, device=device),
@@ -186,9 +172,8 @@ class TpuPallasAttentionImpl(AttentionImpl):
         self.softmax_scale = (
             float(softmax_scale) if softmax_scale is not None else head_size**-0.5
         )
-        # Register both block variants now: creating the op involves a jax
-        # trace, which must not happen for the first time inside a
-        # dynamo-traced forward.
+        # Register now: the op-creating jax trace must not first run inside
+        # a dynamo-traced forward.
         for blocks in (_LONG_SEQ_BLOCKS, _SHORT_SEQ_BLOCKS):
             _get_tpu_flash_op(self.softmax_scale, *blocks)
 

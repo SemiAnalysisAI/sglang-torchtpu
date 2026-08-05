@@ -1,10 +1,6 @@
-"""Torch-native rotary embedding for backends without triton.
-
-Mirrors ``_rotary_embedding_kernel``
-(``kernels/ops/diffusion/triton/rotary.py``) — interleaved pairs rotated in
-fp32; parity-tested against it in
-``tests/test_diffusion_triton_fallbacks.py``.
-"""
+"""Torch-native rotary for backends without triton; mirrors the triton
+kernel (interleaved pairs, fp32 rotation). Parity-tested in
+``tests/test_diffusion_triton_fallbacks.py``."""
 
 import torch
 

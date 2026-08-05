@@ -111,19 +111,15 @@ def verify_generation_output(
     output_file_path: str | None,
     num_outputs: int = 1,
 ) -> None:
-    """Exit nonzero when the request produced no output artifact.
-
-    Worker-side failures surface as an empty result while the worker process
-    itself exits cleanly; without this check the CLI reports success for a
-    failed generation.
-    """
+    """Exit nonzero when the request produced no output artifact: worker
+    failures surface as empty results while the worker exits cleanly."""
     if not results:
-        raise SystemExit("generation produced no result")
-    # With a single requested output the exact path must exist; multi-output
-    # runs derive per-sample names, so only the single-output contract is
-    # checked here.
+        logger.error("Generation produced no result.")
+        raise SystemExit(1)
+    # Multi-output runs derive per-sample names; only single-output is checked.
     if output_file_path and num_outputs == 1 and not os.path.exists(output_file_path):
-        raise SystemExit(f"generation finished without writing {output_file_path}")
+        logger.error("Generation finished without writing %s.", output_file_path)
+        raise SystemExit(1)
 
 
 def maybe_dump_performance(
