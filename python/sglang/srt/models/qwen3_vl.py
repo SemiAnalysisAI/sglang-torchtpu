@@ -1246,6 +1246,13 @@ if current_platform.supports_torch_compile():
 
 
 class Qwen3VLForConditionalGeneration(nn.Module):
+    # Whether decode hands the language model raw ``input_ids`` rather than the
+    # ``input_embeds`` that ``general_mm_embed_routine`` precomputes. Subclasses
+    # that override ``forward`` to skip that routine in decode set this True.
+    # The TPU decoder compile policy reads it so warmup traces the same call
+    # shape serving uses; getting the two out of step is a serve-time recompile.
+    decode_embeds_in_language_model: bool = False
+
     # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={

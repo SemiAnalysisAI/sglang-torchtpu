@@ -1727,9 +1727,71 @@ if current_platform.supports_torch_compile() and envs.SGLANG_TPU_QWEN35_COMPILE.
     )
 
 
+def _decode_forward_embedding_in_language_model(
+    model: Qwen3VLForConditionalGeneration,
+    *,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    get_embedding: bool,
+):
+    """Run one decode step without ``general_mm_embed_routine``.
+
+    That routine always calls ``embed_tokens(input_ids)`` itself and hands the
+    language model ready-made ``input_embeds``. On TPU the language model *is*
+    the compiled boundary, so the embedding runs eagerly in front of it, and a
+    VocabParallelEmbedding is not one op: it is a shard-range mask, an
+    index_select, a zeroing multiply and a ``bf16[bs, hidden]`` cross-TP
+    all-reduce -- five separate device programs immediately before the decoder
+    graph. Profiled on Qwen3.5-397B at TP8 that cost ~650 us per decode step,
+    of which the all-reduce alone was 320 us: a barrier, not bandwidth.
+
+    Decode has one query token per sequence and can never splice multimodal
+    embeddings into it, so the routine's whole purpose is inert here. Hand
+    ``input_ids`` to the language model instead and let the compiled graph do
+    its own embedding.
+
+    Prefill still goes through the routine -- that is where image embeddings
+    actually get spliced.
+    """
+    if model.is_mrope_enabled:
+        positions = forward_batch.mrope_positions
+
+    hidden_states = model.model(input_ids, positions, forward_batch)
+
+    aux_hidden_states = None
+    if model.capture_aux_hidden_states:
+        hidden_states, aux_hidden_states = hidden_states
+
+    if get_embedding:
+        return model.pooler(hidden_states, forward_batch)
+    return model.logits_processor(
+        input_ids, hidden_states, model.lm_head, forward_batch, aux_hidden_states
+    )
+
+
+def _takes_decode_shortcut(
+    model: Qwen3VLForConditionalGeneration,
+    forward_batch: ForwardBatch,
+    pp_proxy_tensors,
+) -> bool:
+    """Whether this batch can skip the multimodal embed routine (see above).
+
+    Pipeline stages are excluded: a non-first stage consumes ``pp_proxy_tensors``
+    rather than embeddings, and a non-last stage must return a proxy instead of
+    logits, so neither matches the shortcut's shape.
+    """
+    return (
+        forward_batch.forward_mode.is_decode()
+        and pp_proxy_tensors is None
+        and model.pp_group.is_last_rank
+    )
+
+
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
+    decode_embeds_in_language_model = True
 
     supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 
@@ -1755,6 +1817,26 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             )
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        if _takes_decode_shortcut(self, forward_batch, pp_proxy_tensors):
+            return _decode_forward_embedding_in_language_model(
+                self,
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                get_embedding=get_embedding,
+            )
+        return super().forward(
+            input_ids, positions, forward_batch, get_embedding, pp_proxy_tensors
+        )
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
@@ -1895,6 +1977,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
+    decode_embeds_in_language_model = True
 
     supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 
@@ -1924,6 +2007,26 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
 
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        if _takes_decode_shortcut(self, forward_batch, pp_proxy_tensors):
+            return _decode_forward_embedding_in_language_model(
+                self,
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                get_embedding=get_embedding,
+            )
+        return super().forward(
+            input_ids, positions, forward_batch, get_embedding, pp_proxy_tensors
+        )
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
