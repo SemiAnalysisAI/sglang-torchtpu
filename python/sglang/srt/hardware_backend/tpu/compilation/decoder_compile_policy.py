@@ -826,6 +826,24 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         is_multimodal = hasattr(outer, "get_image_feature")
         return is_multimodal and callable(getattr(target, "get_input_embeddings", None))
 
+    def _decode_uses_input_ids(self) -> bool:
+        """Whether the wrapper hands decode raw ``input_ids``, skipping embed.
+
+        Wrappers that set ``decode_embeds_in_language_model`` bypass
+        ``general_mm_embed_routine`` in decode so the embedding lands inside the
+        compiled graph instead of running as eager device programs in front of
+        it. Warmup has to trace that same call shape -- ``input_embeds`` in
+        warmup and ``input_ids`` in serving is a serve-time recompile, which is
+        fatal once warmup freezes torch.compile with
+        ``set_stance('fail_on_recompile')``.
+
+        Only called once ``_uses_input_embeds`` has established that the runner's
+        model is a Qwen3-VL wrapper, and the base wrapper declares the attribute
+        (default False), so read it directly: a subclass that overrides decode
+        without declaring it should fail here, not silently warm the wrong shape.
+        """
+        return self.model_runner.model.decode_embeds_in_language_model
+
     @staticmethod
     def _trim_q(t: torch.Tensor, real_q: int) -> torch.Tensor:
         """Trim the token axis, but skip the slice when it would be a no-op.
@@ -998,6 +1016,12 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             if self._model_is_mrope
             else forward_batch.positions
         )
+
+        if mode.is_decode() and self._decode_uses_input_ids():
+            # Mirror the wrapper's decode shortcut: input_ids in, no
+            # input_embeds. Note this still uses the VL positions (mrope when
+            # enabled) -- only the embedding moves, not the position layout.
+            return (forward_batch.input_ids, positions, forward_batch), {}
 
         embed_tokens = self.owner.get_input_embeddings()
         input_embeds = embed_tokens(forward_batch.input_ids)
