@@ -591,6 +591,20 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         is_multimodal = hasattr(outer, "get_image_feature")
         return is_multimodal and callable(getattr(target, "get_input_embeddings", None))
 
+    @staticmethod
+    def _trim_q(t: torch.Tensor, real_q: int) -> torch.Tensor:
+        """Trim the token axis, but skip the slice when it would be a no-op.
+
+        ``super().unpad_outputs`` above has often already trimmed to ``real_q``,
+        so ``t[:real_q]`` here is frequently a no-op *slice* -- and a no-op slice
+        is still a strided view, which torch_tpu materializes as a **same-shape
+        identity copy** in a separate ``tt_jit_as_strided`` program between
+        decode steps. Those copies are the inter-step bubble: attaching this
+        policy moved the gap from 0.42 ms to 3.95 ms/step (-27% throughput).
+        See ab/INVESTIGATION.md.
+        """
+        return t if t.shape[0] == real_q else t[:real_q]
+
     def unpad_outputs(self, out: Any, forward_batch: Any) -> Any:
         """Slice the inner VL decoder output before outer logits processing."""
         real_q = getattr(forward_batch, _REAL_Q_KEY, None)
@@ -598,7 +612,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         if real_q is None:
             return out
         if isinstance(out, torch.Tensor):
-            return out[:real_q]
+            return self._trim_q(out, real_q)
         if isinstance(out, PPProxyTensors):
             # Intermediate pipeline stages must transmit the padded proxy. The
             # next stage pads ForwardBatch again but consumes this proxy as-is.
@@ -606,10 +620,14 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         if isinstance(out, tuple) and len(out) == 2:
             hidden_states, aux_hidden_states = out
             if isinstance(hidden_states, torch.Tensor):
-                hidden_states = hidden_states[:real_q]
+                hidden_states = self._trim_q(hidden_states, real_q)
             if isinstance(aux_hidden_states, (list, tuple)):
+                # One slice per element: with a per-layer collection this is
+                # where the bulk of the identity copies come from.
                 aux_hidden_states = type(aux_hidden_states)(
-                    value[:real_q] if isinstance(value, torch.Tensor) else value
+                    self._trim_q(value, real_q)
+                    if isinstance(value, torch.Tensor)
+                    else value
                     for value in aux_hidden_states
                 )
             return hidden_states, aux_hidden_states
