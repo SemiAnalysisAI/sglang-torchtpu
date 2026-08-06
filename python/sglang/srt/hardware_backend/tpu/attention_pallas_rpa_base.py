@@ -88,6 +88,7 @@ def should_use_split_k_run(
         and not has_sliding_window
     )
 
+
 logger = logging.getLogger(__name__)
 
 

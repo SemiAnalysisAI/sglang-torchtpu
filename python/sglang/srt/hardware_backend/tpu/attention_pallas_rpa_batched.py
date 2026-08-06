@@ -122,7 +122,7 @@ def _invoke_batched_kernel(
 _MIN_PAGE_SIZE = 256
 
 RPA_BATCHED_SPEC = RpaKernelSpec(
-    op_name="sglang_tpu_pallas::ragged_paged_attention_batched_v2",
+    op_name="sglang_tpu_pallas::ragged_paged_attention_batched_v3",
     import_kernel=_import_batched_kernel,
     invoke_kernel=_invoke_batched_kernel,
     supports_attention_sink=False,
