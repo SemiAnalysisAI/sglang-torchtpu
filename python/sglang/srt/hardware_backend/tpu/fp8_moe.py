@@ -61,10 +61,17 @@ def _get_tpu_fp8_runtime() -> str:
 
 
 def _is_dummy_weights() -> bool:
-    """True when serving --load-format dummy, i.e. weights are random already."""
+    """True when serving --load-format dummy, i.e. weights are random already.
+
+    ``load_format`` is ``Union[str, LoadFormat]``. Normalize through the enum:
+    ``str(LoadFormat.DUMMY)`` is ``'LoadFormat.DUMMY'``, not ``'dummy'``, so a
+    naive string compare silently never matches and the fast path below is dead
+    code.
+    """
+    from sglang.srt.configs.load_config import LoadFormat
     from sglang.srt.server_args import get_global_server_args
 
-    return str(get_global_server_args().load_format) == "dummy"
+    return LoadFormat(get_global_server_args().load_format) == LoadFormat.DUMMY
 
 
 def _fake_channelwise_moe_for_dummy(layer: torch.nn.Module) -> None:
