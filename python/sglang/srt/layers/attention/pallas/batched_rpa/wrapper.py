@@ -424,6 +424,9 @@ def calculate_block_sizes(
         "use_causal_mask",
         "skip_kv_update",
         "kv_layout",
+        "stacked",
+        "decode_only",
+        "split_k_run",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -453,6 +456,9 @@ def ragged_paged_attention(
     use_causal_mask: bool = True,
     skip_kv_update: bool = False,
     kv_layout: configs.KVLayout | None = None,
+    stacked: bool = False,
+    decode_only: bool = False,
+    split_k_run: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -493,6 +499,9 @@ def ragged_paged_attention(
             layer reads its entire K/V span from the cache slot written by its
             target layer earlier in the same forward pass, ignores its own k/v
             inputs, and does not write the cache back.
+        stacked: Whether decode splits each sequence's KV work across lanes.
+        decode_only: Whether to omit the mixed kernel for a decode-only batch.
+        split_k_run: Whether decode adaptively splits schedule-dominating KV runs.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -582,6 +591,10 @@ def ragged_paged_attention(
             serve=serve_cfgs,
             vmem_limit_bytes=vmem_limit_bytes,
             mode=mode,
+            stacked=stacked and mode == configs.RpaCase.DECODE,
+            split_k_run_min_benefit=(
+                4 if split_k_run and mode == configs.RpaCase.DECODE else None
+            ),
         )
         cfgs.validate_inputs(
             q=queries,
@@ -615,9 +628,10 @@ def ragged_paged_attention(
     o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(
         configs.RpaCase.DECODE, q_hbm, kv_cache
     )
-    o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(
-        configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache
-    )
+    if not decode_only:
+        o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(
+            configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache
+        )
 
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)

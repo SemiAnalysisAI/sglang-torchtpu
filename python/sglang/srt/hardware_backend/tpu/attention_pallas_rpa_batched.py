@@ -82,6 +82,9 @@ def _invoke_batched_kernel(
     soft_cap,
     k_scale,
     v_scale,
+    stacked,
+    decode_only,
+    split_k_run,
 ):
     # cu_kv_lens and attention_sink are not consumed by the batched kernel.
     # It builds its schedule inline and has no per-mode dispatch to skip, so
@@ -106,6 +109,9 @@ def _invoke_batched_kernel(
         # The kernel owns the KV write; the backend never writes out of band.
         skip_kv_update=False,
         kv_layout=kv_layout(),
+        stacked=stacked,
+        decode_only=decode_only,
+        split_k_run=split_k_run,
     )
 
 
@@ -116,13 +122,15 @@ def _invoke_batched_kernel(
 _MIN_PAGE_SIZE = 256
 
 RPA_BATCHED_SPEC = RpaKernelSpec(
-    op_name="sglang_tpu_pallas::ragged_paged_attention_batched",
+    op_name="sglang_tpu_pallas::ragged_paged_attention_batched_v2",
     import_kernel=_import_batched_kernel,
     invoke_kernel=_invoke_batched_kernel,
     supports_attention_sink=False,
     extend_distribution_mask=(0, 0, 1),  # [0, 0, n] (MIXED-only)
     uses_draft_extend_v2=False,
     min_page_size=_MIN_PAGE_SIZE,
+    supports_stacked_decode=True,
+    supports_decode_only=True,
 )
 
 

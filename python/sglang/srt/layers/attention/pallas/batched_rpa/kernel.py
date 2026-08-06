@@ -33,6 +33,17 @@ from sglang.srt.layers.attention.pallas.batched_rpa import (
 
 # yapf: enable
 
+
+def combine_stacked_partials(m_all, l_all, acc_all):
+    """Merge independent online-softmax states from split-K lanes."""
+    m_combined = jnp.max(m_all, axis=0)
+    alpha = jnp.exp(m_all - m_combined[None, ...])
+    l_combined = jnp.sum(alpha * l_all, axis=0)
+    acc_alpha = jax.vmap(lambda x: utils.broadcast_minor(x, acc_all.shape[1:]))(alpha)
+    acc_combined = jnp.sum(acc_alpha * acc_all, axis=0)
+    return m_combined, l_combined, acc_combined
+
+
 # Define inner kernel.
 
 
@@ -124,7 +135,7 @@ def calculate_and_store_out(
             )
 
 
-def rpa_body(
+def _rpa_compute_body(
     # Inputs.
     q_vref: jax.Ref,
     kv_in_vref: jax.Ref,
@@ -180,6 +191,11 @@ def rpa_body(
 
         bkv_sz_frm_cache_list.append(bkv_sz_frm_cache)
         new_kv_len_start_list.append(new_kv_len_start)
+
+        reset_cond = schedule_ref.reset_acc[step, b_idx] == 1
+        m_scratch_ref[b_idx] = jnp.where(reset_cond, -jnp.inf, m_scratch_ref[b_idx])
+        l_scratch_ref[b_idx] = jnp.where(reset_cond, 0.0, l_scratch_ref[b_idx])
+        acc_scratch_ref[b_idx] = jnp.where(reset_cond, 0.0, acc_scratch_ref[b_idx])
 
     # Step 2: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
@@ -347,6 +363,93 @@ def rpa_body(
     )
 
 
+def rpa_body(
+    q_vref: jax.Ref,
+    kv_in_vref: jax.Ref,
+    o_vref: jax.Ref,
+    schedule_ref: schedule.RpaSchedule,
+    m_scratch_ref: jax.Ref,
+    l_scratch_ref: jax.Ref,
+    acc_scratch_ref: jax.Ref,
+    *,
+    cu_q_lens_ref: jax.Ref,
+    kv_lens_ref: jax.Ref,
+    cfgs: configs.RpaConfigs,
+):
+    step = pl.program_id(0)
+    supports_finalize = cfgs.stacked or cfgs.split_k_run_min_benefit is not None
+    is_finalize = jnp.logical_and(
+        supports_finalize, schedule_ref.is_finalize[step, 0] == 1
+    )
+
+    @pl.when(jnp.logical_not(is_finalize))
+    def _compute():
+        _rpa_compute_body(
+            q_vref,
+            kv_in_vref,
+            o_vref,
+            schedule_ref,
+            m_scratch_ref,
+            l_scratch_ref,
+            acc_scratch_ref,
+            cu_q_lens_ref=cu_q_lens_ref,
+            kv_lens_ref=kv_lens_ref,
+            cfgs=cfgs,
+        )
+
+    @pl.when(is_finalize)
+    def _finalize():
+        source_mask = schedule_ref.finalize_source_mask[step, 0]
+
+        def is_source(lane):
+            return (source_mask & (1 << lane)) != 0
+
+        m_all = jnp.stack(
+            [
+                jnp.where(
+                    is_source(lane),
+                    m_scratch_ref[lane],
+                    -jnp.inf,
+                )
+                for lane in range(cfgs.batch_size)
+            ]
+        )
+        l_all = jnp.stack(
+            [
+                jnp.where(
+                    is_source(lane),
+                    l_scratch_ref[lane],
+                    0.0,
+                )
+                for lane in range(cfgs.batch_size)
+            ]
+        )
+        acc_all = jnp.stack(
+            [
+                jnp.where(
+                    is_source(lane),
+                    acc_scratch_ref[lane],
+                    0.0,
+                )
+                for lane in range(cfgs.batch_size)
+            ]
+        )
+        m_combined, l_combined, acc_combined = combine_stacked_partials(
+            m_all, l_all, acc_all
+        )
+        m_scratch_ref[0] = m_combined
+        l_scratch_ref[0] = l_combined
+        acc_scratch_ref[0] = acc_combined
+        calculate_and_store_out(
+            step,
+            schedule_ref,
+            [acc_scratch_ref[b] for b in range(cfgs.batch_size)],
+            [l_scratch_ref[b] for b in range(cfgs.batch_size)],
+            o_vref,
+            cfgs=cfgs,
+        )
+
+
 # Define main kernel.
 
 
@@ -410,6 +513,10 @@ def create_allocs(
 def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
     name = f"RPA{cfgs.mode.symbol}-p{cfgs.serve.page_size}"
     name += f"-b{cfgs.batch_size}-q{cfgs.bq_sz}-k{cfgs.bkv_sz}"
+    if cfgs.stacked:
+        name += "-stacked"
+    if cfgs.split_k_run_min_benefit is not None:
+        name += "-split-k-run"
     if cfgs.model.sliding_window:
         name += f"-sw{cfgs.model.sliding_window}"
     return name
@@ -467,6 +574,9 @@ def rpa_kernel(
             head_dim]. Result of new kv cache where k & vs are
             concatenated along num kv heads dim.
     """
+    schedule_leaf_count = len(jax.tree_util.tree_leaves(schedule_hbm))
+    q_hbm_alias_index = 3 + schedule_leaf_count
+    kv_cache_hbm_alias_index = q_hbm_alias_index + 2
 
     def ragged_paged_attention_pipeline(
         # Scalar prefetch.

@@ -54,7 +54,11 @@ def _invoke_v3_kernel(
     soft_cap,
     k_scale,
     v_scale,
+    stacked,
+    decode_only,
+    split_k_run,
 ):
+    del stacked, decode_only, split_k_run
     return jax_rpa(
         queries,
         keys,

@@ -200,6 +200,9 @@ class RpaSchedule:
     k_idx: SmemWrapper  # [steps, batch]
     is_last_k: SmemWrapper  # [steps, batch]
     do_writeback: SmemWrapper  # [steps, batch]
+    is_finalize: SmemWrapper  # [steps, batch]
+    finalize_source_mask: SmemWrapper  # [steps, batch]
+    reset_acc: SmemWrapper  # [steps, batch]
     dma_q: SmemWrapper  # [steps, batch, 2]
     dma_kv_cache: SmemWrapper  # [steps, batch, bkv_p_cache, 3]
     dma_kv_new: SmemArrayOfStructs  # [steps, batch, bkv_p_new]
@@ -227,6 +230,9 @@ class RpaSchedule:
             k_idx=idx_wrapper,
             is_last_k=idx_wrapper,
             do_writeback=idx_wrapper,
+            is_finalize=idx_wrapper,
+            finalize_source_mask=idx_wrapper,
+            reset_acc=idx_wrapper,
             dma_q=SmemWrapper.create_shape_dtype(
                 (effective_max_steps, cfgs.batch_size, 2)
             ),
@@ -317,6 +323,9 @@ def _mask_out_steps(
     schedule_smem.k_idx[step, b_idx] = 0
     schedule_smem.is_last_k[step, b_idx] = 0
     schedule_smem.do_writeback[step, b_idx] = 0
+    schedule_smem.is_finalize[step, b_idx] = 0
+    schedule_smem.finalize_source_mask[step, b_idx] = 0
+    schedule_smem.reset_acc[step, b_idx] = 0
 
     schedule_smem.dma_q[step, b_idx, 0] = 0
     schedule_smem.dma_q[step, b_idx, 1] = 0
@@ -500,6 +509,43 @@ class LoopCarry:
     count: jax.Array | int
 
 
+def stacked_lane_has_work(num_k, batch_size: int, lane: int):
+    """Whether a balanced split-K assignment gives this lane any KV blocks."""
+    del batch_size
+    return num_k > lane
+
+
+def split_k_chunk_bounds(start_k_idx, split_len, batch_size: int, lane: int):
+    """Return the contiguous KV-block range assigned to one split-K lane."""
+    base = split_len // batch_size
+    remainder = split_len % batch_size
+    chunk_start = start_k_idx + lane * base + jnp.minimum(lane, remainder)
+    chunk_len = base + jnp.where(lane < remainder, 1, 0)
+    return chunk_start, chunk_start + chunk_len
+
+
+def split_k_run_is_profitable(
+    *,
+    max_active_blocks,
+    comparable_long_count,
+    run_len,
+    split_len,
+    predicted_unsplit,
+    predicted_split,
+    batch_size: int,
+    min_long_blocks: int,
+    min_benefit: int,
+):
+    """Whether a cached-prefix run should use a split-K schedule."""
+    return (
+        (max_active_blocks >= min_long_blocks)
+        & (run_len * 2 >= max_active_blocks)
+        & (comparable_long_count <= max(1, batch_size // 2))
+        & (split_len >= batch_size)
+        & (predicted_unsplit - predicted_split >= min_benefit)
+    )
+
+
 def compute_metadata(
     cu_q_lens_ref: jax.Ref,
     kv_lens_ref: jax.Ref,
@@ -519,6 +565,36 @@ def compute_metadata(
     the kernel doesn't overwrite the source layer's cache contents.
     """
 
+    def clear_lane_step(step, _, *, lane):
+        _mask_out_steps(step, schedule_smem=schedule, b_idx=lane)
+
+    def advance(carry: LoopCarry) -> LoopCarry:
+        """Advance one flat schedule cell, flushing full SMEM windows."""
+
+        def flush(full_carry: LoopCarry):
+            new_hbm_offset, _ = flush_to_hbm(
+                full_carry.count,
+                schedule,
+                schedule_hbm_ref,
+                full_carry.hbm_offset,
+                dma_sem,
+                cfgs=cfgs,
+            )
+            return LoopCarry(new_hbm_offset, 0)
+
+        new_carry = LoopCarry(carry.hbm_offset, carry.count + 1)
+        return jax.lax.cond(
+            new_carry.count < cfgs.max_steps_ub * cfgs.batch_size,
+            lambda value: value,
+            flush,
+            new_carry,
+        )
+
+    def emit_gap(_, carry: LoopCarry) -> LoopCarry:
+        step, lane = divmod(carry.count, cfgs.batch_size)
+        clear_lane_step(step, None, lane=lane)
+        return advance(carry)
+
     @jax.named_scope("k_loop")
     def k_loop(
         k_idx,
@@ -531,6 +607,8 @@ def compute_metadata(
         q_sz_task,
         k_len,
         q_len,
+        reset_k_idx,
+        output_end_k_idx,
         end_k_idx,
     ):
         count = carry.count
@@ -540,8 +618,11 @@ def compute_metadata(
         schedule.q_idx[step, target_lane] = q_idx
         schedule.k_idx[step, target_lane] = k_idx
 
-        is_last_k = jnp.where(k_idx == end_k_idx - 1, 1, 0)
+        is_last_k = jnp.where(k_idx == output_end_k_idx - 1, 1, 0)
         schedule.is_last_k[step, target_lane] = is_last_k
+        schedule.reset_acc[step, target_lane] = jnp.where(k_idx == reset_k_idx, 1, 0)
+        schedule.is_finalize[step, target_lane] = 0
+        schedule.finalize_source_mask[step, target_lane] = 0
 
         schedule.dma_q[step, target_lane, 0] = q_src
         schedule.dma_q[step, target_lane, 1] = q_sz_task
@@ -657,28 +738,21 @@ def compute_metadata(
 
                 fill_dma_kv_new(i, dst_vmem, dma_sz, slot_start)
 
-        def flush(carry: LoopCarry):
-            hbm_offset = carry.hbm_offset
-            count = carry.count
-            new_hbm_offset, _ = flush_to_hbm(
-                count,
-                schedule,
-                schedule_hbm_ref,
-                hbm_offset,
-                dma_sem,
-                cfgs=cfgs,
+        return advance(carry)
+
+    max_active_blocks = jnp.array(0, dtype=jnp.int32)
+    comparable_long_count = jnp.array(0, dtype=jnp.int32)
+    if cfgs.split_k_run_min_benefit is not None:
+        active_seqs = distribution_ref[0]
+        for seq in range(cfgs.serve.num_seqs):
+            blocks = pl.cdiv(kv_lens_ref[seq], cfgs.bkv_sz)
+            max_active_blocks = jnp.maximum(
+                max_active_blocks, jnp.where(seq < active_seqs, blocks, 0)
             )
-            return LoopCarry(new_hbm_offset, 0)
-
-        hbm_offset = carry.hbm_offset
-        new_count = count + 1
-
-        return jax.lax.cond(
-            new_count < cfgs.max_steps_ub * cfgs.batch_size,
-            lambda carry: carry,
-            flush,
-            LoopCarry(hbm_offset, new_count),
-        )
+        for seq in range(cfgs.serve.num_seqs):
+            blocks = pl.cdiv(kv_lens_ref[seq], cfgs.bkv_sz)
+            is_comparable = (seq < active_seqs) & (blocks * 2 >= max_active_blocks)
+            comparable_long_count += jnp.where(is_comparable, 1, 0)
 
     @jax.named_scope("q_loop")
     def q_loop(q_idx, carry, *, s_idx, q_start, q_end, k_len, q_len, num_k):
@@ -695,19 +769,152 @@ def compute_metadata(
         ) // cfgs.bkv_sz + 1
         end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
 
-        k_loop_fn = functools.partial(
-            k_loop,
-            s_idx=s_idx,
-            q_idx=q_idx,
-            q_end=q_end,
-            q_src=q_src,
-            q_sz_task=q_sz_task,
-            k_len=k_len,
-            q_len=q_len,
-            end_k_idx=end_k_idx,
-        )
+        def emit_unsplit(current_carry):
+            k_loop_fn = functools.partial(
+                k_loop,
+                s_idx=s_idx,
+                q_idx=q_idx,
+                q_end=q_end,
+                q_src=q_src,
+                q_sz_task=q_sz_task,
+                k_len=k_len,
+                q_len=q_len,
+                reset_k_idx=start_k_idx,
+                output_end_k_idx=end_k_idx,
+                end_k_idx=end_k_idx,
+            )
+            return jax.lax.fori_loop(
+                start_k_idx, end_k_idx, k_loop_fn, current_carry
+            )
 
-        return jax.lax.fori_loop(start_k_idx, end_k_idx, k_loop_fn, carry)
+        if (
+            not cfgs.stacked
+            and (
+                cfgs.split_k_run_min_benefit is None
+                or cfgs.mode != configs.RpaCase.DECODE
+            )
+        ):
+            return emit_unsplit(carry)
+
+        run_len = end_k_idx - start_k_idx
+        if cfgs.stacked:
+            split_end_k_idx = end_k_idx
+        else:
+            cached_tokens = jnp.maximum(k_len - q_len, 0)
+            cached_full_blocks = cached_tokens // cfgs.bkv_sz
+            split_end_k_idx = jnp.clip(cached_full_blocks, start_k_idx, end_k_idx)
+        split_len = split_end_k_idx - start_k_idx
+        suffix_len = end_k_idx - split_end_k_idx
+
+        predicted_unsplit = run_len
+        predicted_split = pl.cdiv(split_len, cfgs.batch_size) + 1 + suffix_len
+        min_long_blocks = pl.cdiv(65536, cfgs.bkv_sz)
+        if cfgs.stacked:
+            should_split = jnp.array(True)
+        else:
+            should_split = split_k_run_is_profitable(
+                max_active_blocks=max_active_blocks,
+                comparable_long_count=comparable_long_count,
+                run_len=run_len,
+                split_len=split_len,
+                predicted_unsplit=predicted_unsplit,
+                predicted_split=predicted_split,
+                batch_size=cfgs.batch_size,
+                min_long_blocks=min_long_blocks,
+                min_benefit=cfgs.split_k_run_min_benefit,
+            )
+
+        def emit_split(current_carry):
+            gap_count = (-current_carry.count) % cfgs.batch_size
+            current_carry = jax.lax.fori_loop(
+                0, gap_count, emit_gap, current_carry
+            )
+
+            split_rows = pl.cdiv(split_len, cfgs.batch_size)
+
+            def emit_split_cell(cell, cell_carry):
+                row, lane = divmod(cell, cfgs.batch_size)
+                chunk_start, chunk_end = split_k_chunk_bounds(
+                    start_k_idx, split_len, cfgs.batch_size, lane
+                )
+                k_idx = chunk_start + row
+                valid = k_idx < chunk_end
+                return jax.lax.cond(
+                    valid,
+                    lambda value: k_loop(
+                        k_idx,
+                        value,
+                        s_idx=s_idx,
+                        q_idx=q_idx,
+                        q_end=q_end,
+                        q_src=q_src,
+                        q_sz_task=q_sz_task,
+                        k_len=k_len,
+                        q_len=q_len,
+                        reset_k_idx=chunk_start,
+                        output_end_k_idx=-1,
+                        end_k_idx=end_k_idx,
+                    ),
+                    lambda value: emit_gap(0, value),
+                    cell_carry,
+                )
+
+            current_carry = jax.lax.fori_loop(
+                0,
+                split_rows * cfgs.batch_size,
+                emit_split_cell,
+                current_carry,
+            )
+
+            source_mask = jnp.array(0, dtype=jnp.int32)
+            for lane in range(cfgs.batch_size):
+                chunk_start, chunk_end = split_k_chunk_bounds(
+                    start_k_idx, split_len, cfgs.batch_size, lane
+                )
+                source_mask |= jnp.where(chunk_start < chunk_end, 1 << lane, 0)
+
+            for lane in range(cfgs.batch_size):
+                step, target_lane = divmod(current_carry.count, cfgs.batch_size)
+                clear_lane_step(step, None, lane=target_lane)
+                if lane == 0:
+                    schedule.s_idx[step, target_lane] = s_idx
+                    schedule.q_idx[step, target_lane] = q_idx
+                    schedule.k_idx[step, target_lane] = jnp.maximum(
+                        split_end_k_idx - 1, 0
+                    )
+                    schedule.dma_q[step, target_lane, 0] = q_src
+                    schedule.dma_q[step, target_lane, 1] = q_sz_task
+                    schedule.is_last_k[step, target_lane] = jnp.where(
+                        suffix_len == 0, 1, 0
+                    )
+                    schedule.is_finalize[step, target_lane] = 1
+                    schedule.finalize_source_mask[step, target_lane] = source_mask
+                current_carry = advance(current_carry)
+
+            def emit_suffix(k_idx, suffix_carry):
+                suffix_carry = k_loop(
+                    k_idx,
+                    suffix_carry,
+                    s_idx=s_idx,
+                    q_idx=q_idx,
+                    q_end=q_end,
+                    q_src=q_src,
+                    q_sz_task=q_sz_task,
+                    k_len=k_len,
+                    q_len=q_len,
+                    reset_k_idx=-1,
+                    output_end_k_idx=end_k_idx,
+                    end_k_idx=end_k_idx,
+                )
+                return jax.lax.fori_loop(
+                    0, cfgs.batch_size - 1, emit_gap, suffix_carry
+                )
+
+            return jax.lax.fori_loop(
+                split_end_k_idx, end_k_idx, emit_suffix, current_carry
+            )
+
+        return jax.lax.cond(should_split, emit_split, emit_unsplit, carry)
 
     @jax.named_scope("seq_loop")
     def seq_loop(s_idx, carry):

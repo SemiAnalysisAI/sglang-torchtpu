@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Qwen3-30B long-context server for the skewed stacked-RPA benchmark.
+set -euo pipefail
+
+export MODEL=${MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507-FP8}
+export TP_SIZE=${TP_SIZE:-8}
+export EP_SIZE=${EP_SIZE:-8}
+export CONC=${CONC:-16}
+export MAX_RUNNING=${MAX_RUNNING:-$CONC}
+export DISABLE_RADIX_CACHE=0
+export CONTEXT_LEN=${CONTEXT_LEN:-262144}
+export MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-600000}
+export CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-32768}
+export MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-$CHUNKED_PREFILL_SIZE}
+export QUANTIZATION=${QUANTIZATION:-fp8}
+export KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8_e4m3}
+export ATTENTION_BACKEND=${ATTENTION_BACKEND:-pallas_tpu_rpa_batched}
+export PAGE_SIZE=${PAGE_SIZE:-256}
+export MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.85}
+export ENABLE_TORCH_COMPILE=1
+export TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$CONC}
+export TPU_COMPILE_TOKENS=${TPU_COMPILE_TOKENS:-"16 32768"}
+export TPU_COMPILE_BS=${TPU_COMPILE_BS:-"1 $CONC"}
+export ENABLE_PROFILER_ENDPOINT=1
+export SGLANG_USE_TPU_STACKED_RPA=${SGLANG_USE_TPU_STACKED_RPA:-1}
+
+# Required by the batched RPA DMA pipeline.
+export TORCH_TPU_INTERNAL_XLA_OPTIONS="xla_tpu_use_dynamic_smem_negotiation=true${TORCH_TPU_INTERNAL_XLA_OPTIONS:+ $TORCH_TPU_INTERNAL_XLA_OPTIONS}"
+
+cd "$(dirname "$0")/../.."
+exec ./launch_server.sh "$@"
