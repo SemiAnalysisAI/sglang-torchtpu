@@ -986,6 +986,22 @@ class Envs:
     # satisfies its contract, "0" forces the stock path, "1" additionally logs
     # the unmet requirements when the contract is not satisfied.
     SGLANG_TPU_FP4_FUSED_RS = EnvStr("auto")
+    # Accuracy A/B for block-512 NVFP4 fused-RS. Preserve the router's fp32
+    # top-k weights and post-expert normalization through the weighted top-k
+    # reduction, casting only the final MoE result back to the activation dtype.
+    # Default remains off until the end-to-end accuracy/performance experiment
+    # lands.
+    SGLANG_TPU_FP4_FUSED_RS_FP32_COMBINE = EnvBool(False)
+    # Accuracy/performance A/B for block-512 NVFP4 fused-RS. Keep the stored
+    # weight scale block at 512 while optionally using finer, dynamic FP8
+    # activation scales inside that block. Supported values are 256 and 512;
+    # 512 preserves the production contraction exactly.
+    SGLANG_TPU_FP4_FUSED_RS_ACTIVATION_GROUP_SIZE = EnvInt(512)
+    # Apply the finer activation group only to fused-RS calls at or below this
+    # token count. Decode buckets are <=64 on the Tier5 profile; 1024-token
+    # prefill therefore retains the faster 512-wide contraction. Zero removes
+    # the phase limit and applies the requested group size to every call.
+    SGLANG_TPU_FP4_FUSED_RS_ACTIVATION_GROUP_SIZE_MAX_TOKENS = EnvInt(64)
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
     # MoE: use onehot dense matmul for small permute and unpermute/combine

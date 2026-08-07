@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.fp8_moe import _clear_replaced_param
 from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -77,6 +78,28 @@ def prepare_tpu_fused_rs_post_expert_norm(layer: torch.nn.Module) -> None:
     # This is an alias of the model-owned parameter, not a second checkpoint
     # parameter, so bypass nn.Module registration.
     layer.__dict__["_tpu_fused_rs_post_expert_norm_weight"] = weight
+
+
+def _resolve_tpu_nvfp4_activation_group_size(
+    requested_group_size: int,
+    *,
+    num_tokens: int,
+    max_tokens: int,
+) -> int:
+    """Return the phase-selective dynamic activation group size."""
+    if requested_group_size not in (256, TPU_NVFP4_GROUP_SIZE):
+        raise ValueError(
+            "SGLANG_TPU_FP4_FUSED_RS_ACTIVATION_GROUP_SIZE must be 256 "
+            f"or {TPU_NVFP4_GROUP_SIZE}, got {requested_group_size}."
+        )
+    if max_tokens < 0:
+        raise ValueError(
+            "SGLANG_TPU_FP4_FUSED_RS_ACTIVATION_GROUP_SIZE_MAX_TOKENS must "
+            f"be non-negative, got {max_tokens}."
+        )
+    if max_tokens and num_tokens > max_tokens:
+        return TPU_NVFP4_GROUP_SIZE
+    return requested_group_size
 
 
 def _transpose_packed_fp4(matrix: torch.Tensor) -> torch.Tensor:
@@ -341,7 +364,30 @@ def apply_tpu_nvfp4_moe(
 
         hidden_states = dispatch_output.hidden_states
         topk_weights, topk_ids, _ = dispatch_output.topk_output
-        topk_weights = topk_weights.to(hidden_states.dtype)
+        requested_activation_group_size = (
+            envs.SGLANG_TPU_FP4_FUSED_RS_ACTIVATION_GROUP_SIZE.get()
+        )
+        activation_group_size_max_tokens = (
+            envs.SGLANG_TPU_FP4_FUSED_RS_ACTIVATION_GROUP_SIZE_MAX_TOKENS.get()
+        )
+        # Validate once before touching model-specific fused-RS state. The
+        # per-chunk call below resolves 256 for decode-sized calls and 512 for
+        # larger prefills.
+        _resolve_tpu_nvfp4_activation_group_size(
+            requested_activation_group_size,
+            num_tokens=0,
+            max_tokens=activation_group_size_max_tokens,
+        )
+        # select_experts produces fp32 router weights. The baseline fused-RS
+        # path narrows them to bf16 before the top-k weighted reduction. Keep
+        # them in fp32 for the controlled accuracy A/B; the JAX backend uses
+        # the input dtype to preserve post-expert normalization through an fp32
+        # reduction and casts only its final result back to the activation
+        # dtype.
+        if envs.SGLANG_TPU_FP4_FUSED_RS_FP32_COMBINE.get():
+            topk_weights = topk_weights.to(torch.float32)
+        else:
+            topk_weights = topk_weights.to(hidden_states.dtype)
         topk_ids = topk_ids.to(torch.int32)
         valid = topk_ids >= 0
         topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
@@ -363,6 +409,11 @@ def apply_tpu_nvfp4_moe(
                 token_start + _FUSED_RS_MAX_TOKENS_PER_CALL,
                 hidden_states.shape[0],
             )
+            activation_group_size = _resolve_tpu_nvfp4_activation_group_size(
+                requested_activation_group_size,
+                num_tokens=token_end - token_start,
+                max_tokens=activation_group_size_max_tokens,
+            )
             output = fused_moe_rs_gather(
                 hidden_states=hidden_states[token_start:token_end],
                 w1=layer.w13_weight,
@@ -381,6 +432,7 @@ def apply_tpu_nvfp4_moe(
                 # payload as fp8 as well would re-quantize an already-lossy
                 # intermediate for no bandwidth win, so keep the bf16 payload.
                 fp8_direct_write=False,
+                activation_group_size=activation_group_size,
                 physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
             )
             outputs.append(output[: token_end - token_start])

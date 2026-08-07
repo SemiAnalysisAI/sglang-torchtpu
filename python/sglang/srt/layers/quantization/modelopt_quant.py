@@ -2185,6 +2185,25 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             layer.handles_post_expert_finalize = True
         if self.handles_moe_reduction:
             logger.info("Using SGLang fused-RS for block-512 TPU NVFP4 MoE")
+            if envs.SGLANG_TPU_FP4_FUSED_RS_FP32_COMBINE.get():
+                logger.info(
+                    "Using FP32 post-expert norm, router weights, and top-k "
+                    "expert combine for block-512 TPU NVFP4 fused-RS"
+                )
+            activation_group_size = (
+                envs.SGLANG_TPU_FP4_FUSED_RS_ACTIVATION_GROUP_SIZE.get()
+            )
+            if activation_group_size != 512:
+                max_tokens = (
+                    envs.SGLANG_TPU_FP4_FUSED_RS_ACTIVATION_GROUP_SIZE_MAX_TOKENS.get()
+                )
+                logger.info(
+                    "Using dynamic FP8 activation group size %d for fused-RS "
+                    "calls up to %d tokens over block-512 TPU NVFP4 weights "
+                    "(0 means all calls)",
+                    activation_group_size,
+                    max_tokens,
+                )
         elif fused_rs_setting == "1":
             # An explicit opt-in that silently serves the stock path hides a
             # whole class of misconfiguration, so name the unmet contract.

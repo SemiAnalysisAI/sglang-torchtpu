@@ -507,6 +507,246 @@ class TestNvfp4Block512Contract(CustomTestCase):
         self.assertEqual(call["topk_weights"][1, 1].item(), 0)
         self.assertEqual(tuple(result.hidden_states.shape), (3, HIDDEN_SIZE))
 
+    def test_fused_apply_can_preserve_fp32_router_weights(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.hardware_backend.tpu import fp4_moe
+
+        hidden_states = torch.randn(2, HIDDEN_SIZE, dtype=torch.bfloat16)
+        topk_weights = torch.tensor(
+            [[0.1234567, 0.8765433], [0.3333333, 0.6666667]],
+            dtype=torch.float32,
+        )
+        topk_ids = torch.tensor([[0, 1], [1, -1]], dtype=torch.int64)
+        dispatch_output = types.SimpleNamespace(
+            hidden_states=hidden_states,
+            topk_output=(topk_weights, topk_ids, None),
+        )
+        layer = _make_block512_layer(include_unused_params=False)
+        layer._tpu_fused_rs_has_post_expert_norm = False
+        layer._tpu_fused_rs_group_offset = torch.tensor([0, 0], dtype=torch.int32)
+        layer._tpu_fused_rs_physical_order = torch.tensor([0], dtype=torch.int64)
+        fused_moe_rs_gather = mock.Mock(
+            return_value=torch.randn(2, HIDDEN_SIZE, dtype=torch.bfloat16)
+        )
+        fused_rs_module = types.SimpleNamespace(fused_moe_rs_gather=fused_moe_rs_gather)
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {"sglang.srt.layers.moe.pallas.fused_moe_rs_op": fused_rs_module},
+            ),
+            envs.SGLANG_TPU_FP4_FUSED_RS_FP32_COMBINE.override(True),
+            envs.SGLANG_TPU_FP4_FUSED_RS_ACTIVATION_GROUP_SIZE.override(256),
+        ):
+            fp4_moe.apply_tpu_nvfp4_moe(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+                apply_router_weight_on_input=False,
+                use_fused_rs=True,
+            )
+
+        actual = fused_moe_rs_gather.call_args.kwargs["topk_weights"]
+        self.assertEqual(actual.dtype, torch.float32)
+        self.assertEqual(
+            fused_moe_rs_gather.call_args.kwargs["activation_group_size"], 256
+        )
+        torch.testing.assert_close(
+            actual,
+            torch.tensor(
+                [[0.1234567, 0.8765433], [0.3333333, 0.0]], dtype=torch.float32
+            ),
+        )
+
+    def test_fused_apply_rejects_unsupported_activation_group_size(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.hardware_backend.tpu import fp4_moe
+
+        hidden_states = torch.randn(2, HIDDEN_SIZE, dtype=torch.bfloat16)
+        dispatch_output = types.SimpleNamespace(
+            hidden_states=hidden_states,
+            topk_output=(
+                torch.ones(2, 2, dtype=torch.float32),
+                torch.zeros(2, 2, dtype=torch.int64),
+                None,
+            ),
+        )
+        layer = _make_block512_layer(include_unused_params=False)
+
+        with envs.SGLANG_TPU_FP4_FUSED_RS_ACTIVATION_GROUP_SIZE.override(128):
+            with self.assertRaisesRegex(ValueError, "must be 256 or 512"):
+                fp4_moe.apply_tpu_nvfp4_moe(
+                    layer=layer,
+                    dispatch_output=dispatch_output,
+                    activation="silu",
+                    apply_router_weight_on_input=False,
+                    use_fused_rs=True,
+                )
+
+    def test_activation_group_size_is_decode_selective(self):
+        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+            _resolve_tpu_nvfp4_activation_group_size,
+        )
+
+        resolve = _resolve_tpu_nvfp4_activation_group_size
+        self.assertEqual(resolve(256, num_tokens=16, max_tokens=64), 256)
+        self.assertEqual(resolve(256, num_tokens=64, max_tokens=64), 256)
+        self.assertEqual(resolve(256, num_tokens=65, max_tokens=64), 512)
+        self.assertEqual(resolve(256, num_tokens=1024, max_tokens=64), 512)
+        self.assertEqual(resolve(256, num_tokens=1024, max_tokens=0), 256)
+        self.assertEqual(resolve(512, num_tokens=16, max_tokens=64), 512)
+        with self.assertRaisesRegex(ValueError, "must be non-negative"):
+            resolve(256, num_tokens=16, max_tokens=-1)
+
+    def test_fused_rs_threads_activation_group_size_to_both_gmms(self):
+        package_root = pathlib.Path(__file__).resolve().parents[5] / "python"
+        fused_driver = (
+            package_root / "sglang/srt/layers/moe/pallas/fused_rs/fused_moe.py"
+        ).read_text()
+        fused_kernel = (
+            package_root
+            / "sglang/srt/layers/moe/pallas/fused_rs/gmm_fused_rs_nodedup.py"
+        ).read_text()
+
+        self.assertIn("lhs_quant_block_size=activation_group_size", fused_driver)
+        self.assertIn(
+            "lhs_quant_block_size, rhs1_quant_block_size, size_k1",
+            fused_kernel,
+        )
+        self.assertIn(
+            "lhs_quant_block_size, rhs2_quant_block_size, size_k2",
+            fused_kernel,
+        )
+
+    def test_fused_rs_precision_contract_is_explicit(self):
+        """Pin the already-good production precision before changing numerics."""
+        package_root = pathlib.Path(__file__).resolve().parents[5] / "python"
+        fused_kernel = (
+            package_root
+            / "sglang/srt/layers/moe/pallas/fused_rs/gmm_v2_gather_scatter.py"
+        ).read_text()
+        fused_gmm = (
+            package_root
+            / "sglang/srt/layers/moe/pallas/fused_rs/gmm_fused_rs_nodedup.py"
+        ).read_text()
+
+        self.assertIn("block_f32 = block.astype(jnp.float32)", fused_kernel)
+        self.assertIn("acc_dtype=jnp.float32", fused_gmm)
+
+    def test_fp32_topk_reduce_rounds_once_at_the_output_boundary(self):
+        import jax.numpy as jnp
+
+        from sglang.srt.layers.moe.pallas.fused_rs.fused_moe import (
+            _weighted_topk_reduce,
+        )
+
+        expert_outputs = jnp.asarray(
+            [
+                [
+                    [0.99609375],
+                    [-13.0],
+                    [43.5],
+                    [22.25],
+                    [-52.5],
+                    [25.75],
+                    [-22.75],
+                    [2.609375],
+                ]
+            ],
+            dtype=jnp.bfloat16,
+        )
+        router_weights = jnp.asarray(
+            [
+                [
+                    0.0650680512,
+                    0.0966301709,
+                    0.0928555802,
+                    0.0770605952,
+                    0.1671119481,
+                    0.0065491507,
+                    0.2567018569,
+                    0.2380226403,
+                ]
+            ],
+            dtype=jnp.float32,
+        )
+        reference = jnp.sum(
+            expert_outputs.astype(jnp.float32) * router_weights[:, :, None],
+            axis=1,
+        )
+        expected = reference.astype(jnp.bfloat16)
+        bf16_baseline = jnp.sum(
+            expert_outputs * router_weights.astype(jnp.bfloat16)[:, :, None],
+            axis=1,
+        )
+
+        actual = _weighted_topk_reduce(expert_outputs, router_weights)
+
+        self.assertEqual(actual.dtype, jnp.bfloat16)
+        self.assertTrue(bool(jnp.array_equal(actual, expected)))
+        candidate_error = jnp.max(jnp.abs(actual.astype(jnp.float32) - reference))
+        baseline_error = jnp.max(jnp.abs(bf16_baseline.astype(jnp.float32) - reference))
+        self.assertLess(float(candidate_error), float(baseline_error))
+
+    def test_fp32_post_expert_norm_flows_directly_into_topk_reduce(self):
+        import jax.numpy as jnp
+
+        from sglang.srt.layers.moe.pallas.fused_rs.fused_moe import (
+            _post_expert_rms_norm,
+            _weighted_topk_reduce,
+        )
+
+        expert_outputs = jnp.asarray(
+            [
+                [
+                    [0.0, -7.0],
+                    [27.0, -9.0],
+                    [20.0, -26.0],
+                    [2.0, -15.0],
+                    [-5.0, 8.0],
+                    [-26.0, -25.0],
+                    [5.0, 10.0],
+                    [-27.0, 28.0],
+                ]
+            ],
+            dtype=jnp.bfloat16,
+        )
+        post_norm_weight = jnp.zeros(2, dtype=jnp.bfloat16)
+        router_weights = jnp.asarray(
+            [
+                [
+                    0.1004215255,
+                    0.1371912807,
+                    0.1998925060,
+                    0.0488788560,
+                    0.2164255679,
+                    0.0291497149,
+                    0.2073257864,
+                    0.0607147589,
+                ]
+            ],
+            dtype=jnp.float32,
+        )
+
+        normalized_f32 = _post_expert_rms_norm(expert_outputs, post_norm_weight)
+        reference = jnp.sum(normalized_f32 * router_weights[:, :, None], axis=1)
+        stacked = _weighted_topk_reduce(
+            normalized_f32,
+            router_weights,
+            output_dtype=jnp.bfloat16,
+        )
+        combine_only = _weighted_topk_reduce(
+            normalized_f32.astype(jnp.bfloat16), router_weights
+        )
+
+        self.assertEqual(stacked.dtype, jnp.bfloat16)
+        self.assertTrue(bool(jnp.array_equal(stacked, reference.astype(jnp.bfloat16))))
+        stacked_error = jnp.max(jnp.abs(stacked.astype(jnp.float32) - reference))
+        combine_only_error = jnp.max(
+            jnp.abs(combine_only.astype(jnp.float32) - reference)
+        )
+        self.assertLess(float(stacked_error), float(combine_only_error))
+
     def test_fused_apply_chunks_large_prefills(self):
         from sglang.srt.hardware_backend.tpu import fp4_moe
 

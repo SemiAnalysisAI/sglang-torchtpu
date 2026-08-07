@@ -110,6 +110,43 @@ def _compute_rs_routing(topk_indices, *, num_experts, topk):
     return lhs_indices, group_sizes, output_indices, topk_slot_indices
 
 
+def _weighted_topk_reduce(out_3d, topk_weights, *, output_dtype=None):
+    """Apply router weights and reduce experts at the requested precision.
+
+    The NVFP4 adapter signals the accuracy A/B by preserving its router weights
+    as fp32. In that case, convert the expert outputs before multiply/reduce and
+    round once to the model activation dtype at the boundary. Other callers
+    retain the established activation-dtype reduction exactly.
+    """
+    output_dtype = out_3d.dtype if output_dtype is None else output_dtype
+    if topk_weights.dtype == jnp.float32:
+        combined = jnp.sum(
+            out_3d.astype(jnp.float32) * topk_weights[:, :, None], axis=1
+        )
+        return combined.astype(output_dtype)
+    return jnp.sum(out_3d * topk_weights[:, :, None], axis=1)
+
+
+def _post_expert_rms_norm(out_3d, post_expert_norm_weight):
+    """Apply zero-centered post-expert RMSNorm and return its fp32 result."""
+    hidden_size = out_3d.shape[-1]
+    norm_size = post_expert_norm_weight.shape[0]
+    pnw_raw = post_expert_norm_weight.astype(jnp.float32) + 1.0
+    if hidden_size > norm_size:
+        col_idx = jnp.arange(hidden_size, dtype=jnp.int32)
+        valid_mask = (col_idx < norm_size)[None, None, :]
+        out_f32 = out_3d.astype(jnp.float32) * valid_mask
+        pnw = jnp.concatenate(
+            [pnw_raw, jnp.zeros(hidden_size - norm_size, dtype=jnp.float32)]
+        )
+    else:
+        out_f32 = out_3d.astype(jnp.float32)
+        pnw = pnw_raw
+    out_f32 = out_f32 * pnw[None, None, :]
+    var = jnp.sum(out_f32**2, axis=-1, keepdims=True) / norm_size
+    return out_f32 * jax.lax.rsqrt(var + 1e-8)
+
+
 # ============================================================================
 # Per-chip MoE body (nodedup kernel variant)
 # ============================================================================
@@ -137,6 +174,7 @@ def moe_gmm_local_rs_nodedup(
     has_post_norm: bool = False,
     sp_enabled: bool = True,
     fp8_direct_write: bool = False,
+    activation_group_size: int = 512,
 ) -> jax.Array:
     """Per-chip MoE using the nodedup gmm_fused_rs kernel.
 
@@ -233,10 +271,12 @@ def moe_gmm_local_rs_nodedup(
         max_num_gm=max_num_gm,
         top_k=topk,
         fp8_direct_write=fp8_direct_write,
+        lhs_quant_block_size=activation_group_size,
     )
 
-    # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
-    # (matches v1 — no fp32 cast needed for topk=8).
+    # Post-kernel: apply topk weights and reduce over top_k. A caller that
+    # preserves fp32 router weights requests the correctly rounded fp32
+    # reduction; bf16 weights retain the established v1 behavior.
     # SP off: topk_weights is replicated; slice this chip's [chunk_size] shard
     # to match out_3d (SP on already passes the local shard).
     local_topk_weights = (
@@ -247,29 +287,23 @@ def moe_gmm_local_rs_nodedup(
         )
     )
     out_3d = out_buf.reshape(chunk_size, topk, hidden_size)
+    output_dtype = out_3d.dtype
     post_expert_norm_weight = post_expert_norm_weight_input if has_post_norm else None
     if post_expert_norm_weight is not None:
-        norm_size = post_expert_norm_weight.shape[0]  # actual hidden_size (unpadded)
-        pnw_raw = post_expert_norm_weight.astype(jnp.float32) + 1.0
-        # Handle padded hidden: out_3d may have padded_hidden_size > norm_size
-        if hidden_size > norm_size:
-            # Zero out padded columns so they don't affect variance
-            col_idx = jnp.arange(hidden_size, dtype=jnp.int32)
-            valid_mask = (col_idx < norm_size)[None, None, :]  # (1, 1, hidden_size)
-            out_f32 = out_3d.astype(jnp.float32) * valid_mask
-            # Pad PNW to match hidden_size
-            pnw = jnp.concatenate(
-                [pnw_raw, jnp.zeros(hidden_size - norm_size, dtype=jnp.float32)]
-            )
-        else:
-            out_f32 = out_3d.astype(jnp.float32)
-            pnw = pnw_raw
-        out_f32 = out_f32 * pnw[None, None, :]
-        # Variance computed only over valid (unpadded) elements
-        var = jnp.sum(out_f32**2, axis=-1, keepdims=True) / norm_size
-        out_3d = (out_f32 * jax.lax.rsqrt(var + 1e-8)).astype(out_3d.dtype)
+        normalized_f32 = _post_expert_rms_norm(out_3d, post_expert_norm_weight)
+        # The fp32-router A/B can consume the normalization result directly.
+        # This removes an fp32 -> bf16 -> fp32 round trip for every one of the
+        # top-k expert vectors while leaving the final output and collective
+        # payload in bf16. Established callers retain the exact bf16 boundary.
+        out_3d = (
+            normalized_f32
+            if local_topk_weights.dtype == jnp.float32
+            else normalized_f32.astype(output_dtype)
+        )
 
-    token_hidden = jnp.sum(out_3d * local_topk_weights[:, :, None], axis=1)
+    token_hidden = _weighted_topk_reduce(
+        out_3d, local_topk_weights, output_dtype=output_dtype
+    )
 
     # Return the per-chip token shard (reduce-scattered output). The SP exit is
     # owned by the model: SP on keeps it token-sharded; SP off gathers it back to
@@ -305,6 +339,7 @@ def expert_parallel_gmm_rs(
     w1_global_scale: jax.Array | None = None,
     w2_global_scale: jax.Array | None = None,
     fp8_direct_write: bool = False,
+    activation_group_size: int = 512,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel.
 
@@ -368,6 +403,7 @@ def expert_parallel_gmm_rs(
             has_post_norm=_has_pn_rs,
             sp_enabled=sp_enabled,
             fp8_direct_write=fp8_direct_write,
+            activation_group_size=activation_group_size,
         ),
         mesh=mesh,
         in_specs=(
@@ -422,6 +458,7 @@ def expert_parallel_gmm_rs(
         "activation",
         "scoring_fn",
         "fp8_direct_write",
+        "activation_group_size",
     ),
     compiler_options={
         # "xla_enable_transpose_trace": True,
@@ -446,6 +483,7 @@ def fused_moe_func_rs(
     topk_indices: jax.Array | None = None,
     group_offset_input: jax.Array | None = None,
     fp8_direct_write: bool = False,
+    activation_group_size: int = 512,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel (gmm_fused_rs).
 
@@ -504,6 +542,7 @@ def fused_moe_func_rs(
         mesh=mesh,
         post_expert_norm_weight=post_expert_norm_weight,
         fp8_direct_write=fp8_direct_write,
+        activation_group_size=activation_group_size,
     )
 
     return result[:num_tokens, :hidden_size]

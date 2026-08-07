@@ -105,6 +105,7 @@ def _build_fused_moe_rs_op():
         activation: str,
         has_post_expert_norm: bool,
         fp8_direct_write: bool,
+        activation_group_size: int,
     ) -> jax.Array:
         num_tokens = hidden_states.shape[0]
         ep_size = mesh.shape["model"]
@@ -139,6 +140,7 @@ def _build_fused_moe_rs_op():
                 post_expert_norm_weight if has_post_expert_norm else None
             ),
             fp8_direct_write=fp8_direct_write,
+            activation_group_size=activation_group_size,
         )
         if not has_post_expert_norm:
             result = result + post_expert_norm_weight[0].astype(result.dtype) * 0
@@ -159,6 +161,7 @@ def _build_fused_moe_rs_op():
             P(),
             P(),
             P("model"),
+            None,
             None,
             None,
             None,
@@ -184,6 +187,7 @@ def fused_moe_rs_call(
     activation: str,
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
+    activation_group_size: int = 512,
 ) -> torch.Tensor:
     return _build_fused_moe_rs_op()(
         hidden_states,
@@ -199,6 +203,7 @@ def fused_moe_rs_call(
         activation,
         has_post_expert_norm,
         fp8_direct_write,
+        activation_group_size,
     )
 
 
@@ -219,6 +224,7 @@ def fused_moe_rs_gather(
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
     physical_order_to_tp_rank: torch.Tensor,
+    activation_group_size: int = 512,
 ) -> torch.Tensor:
     from sglang.srt.distributed import get_tp_group
 
@@ -236,6 +242,7 @@ def fused_moe_rs_gather(
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=fp8_direct_write,
+        activation_group_size=activation_group_size,
     )
     output = get_tp_group().all_gather(token_shard, dim=0)
     shard_tokens = token_shard.shape[0]

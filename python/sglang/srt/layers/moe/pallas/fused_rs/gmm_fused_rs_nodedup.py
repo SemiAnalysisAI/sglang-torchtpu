@@ -1523,6 +1523,7 @@ def kernel_main_fused_rs_fp8(
         "ep_axis_name",
         "top_k",
         "fp8_direct_write",
+        "lhs_quant_block_size",
         "use_in_kernel_recv_count",
     ],
 )
@@ -1551,6 +1552,7 @@ def gmm_v2_fused_rs(
     max_num_gm: jax.Array,
     top_k: int,
     fp8_direct_write: bool = False,
+    lhs_quant_block_size: int = 512,
     use_in_kernel_recv_count: bool | None = None,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
@@ -1573,10 +1575,38 @@ def gmm_v2_fused_rs(
         quant_block_size = rhs1_quant_block_size
         w1_scale = w1_scale.astype(jnp.float32)
         w2_scale = w2_scale.astype(jnp.float32)
+        if lhs_quant_block_size not in (256, 512):
+            raise ValueError(
+                "Fused-RS activation quantization block must be 256 or "
+                f"512, got {lhs_quant_block_size}."
+            )
+        # The requested group is an upper bound. Existing FP8 callers can have
+        # 256-wide weight-scale blocks, so a default request of 512 must retain
+        # their established 256-wide LHS quantization. Block-512 NVFP4 callers
+        # still get the requested 256 or 512 group exactly.
+        lhs1_quant_block_size = min(
+            lhs_quant_block_size, rhs1_quant_block_size, size_k1
+        )
+        lhs2_quant_block_size = min(
+            lhs_quant_block_size, rhs2_quant_block_size, size_k2
+        )
+        if (
+            rhs1_quant_block_size % lhs1_quant_block_size
+            or rhs2_quant_block_size % lhs2_quant_block_size
+        ):
+            raise ValueError(
+                "Fused-RS weight blocks must be multiples of the effective "
+                "dynamic activation blocks: "
+                f"requested_lhs={lhs_quant_block_size}, "
+                f"lhs1={lhs1_quant_block_size}, lhs2={lhs2_quant_block_size}, "
+                f"rhs1={rhs1_quant_block_size}, rhs2={rhs2_quant_block_size}."
+            )
     else:
         rhs1_quant_block_size = size_k1
         rhs2_quant_block_size = size_k2
         quant_block_size = None
+        lhs1_quant_block_size = min(lhs_quant_block_size, size_k1)
+        lhs2_quant_block_size = min(lhs_quant_block_size, size_k2)
     # Per-expert global_scale as scalar prefetch (SMEM): one scalar per expert,
     # indexed inside inner_kernel via metadata_ref.gm_id_to_group_id.
     if w1_global_scale is not None:
@@ -1761,9 +1791,6 @@ def gmm_v2_fused_rs(
 
     rhs1_packing = (32 // jax.dtypes.itemsize_bits(w1.dtype)) if is_quantized else 1
     rhs2_packing = (32 // jax.dtypes.itemsize_bits(w2.dtype)) if is_quantized else 1
-    lhs1_quant_block_size = min(256 if rhs1_quant_block_size < 512 else 512, size_k1)
-    lhs2_quant_block_size = min(256 if rhs2_quant_block_size < 512 else 512, size_k2)
-
     cfgs1 = GmmConfigs(
         dims=Dimensions(
             size_m=size_m,
@@ -2047,6 +2074,7 @@ def gmm_v2_fused_rs(
         f"gmm_v2_fused_rs-E_{size_group}-M_{size_m}"
         f"-K1_{size_k1}-N1_{size_n1}-K2_{size_k2}-N2_{size_n2}"
         f"-EP_{ep_size}-TK_{top_k}"
+        f"-AQ_{lhs_quant_block_size}"
         f"{'-packed' if pack_indices else ''}"
     )
     kernel_kwargs = dict(
