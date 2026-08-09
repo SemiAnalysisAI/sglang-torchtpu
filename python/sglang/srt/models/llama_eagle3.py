@@ -210,7 +210,14 @@ class LlamaModel(nn.Module):
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
-        hidden_states = forward_batch.spec_info.hidden_states
+        # The fused multi-step draft loop supplies the step's target hidden
+        # as a tensor field so the loop body performs no spec_info mutation;
+        # every other path reads it off spec_info.
+        hidden_states = (
+            forward_batch.spec_draft_hidden_states
+            if forward_batch.spec_draft_hidden_states is not None
+            else forward_batch.spec_info.hidden_states
+        )
         if hidden_states.shape[-1] != embeds.shape[-1]:
             if self.fc_norm is not None:
                 chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)

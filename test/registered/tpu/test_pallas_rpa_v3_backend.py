@@ -67,6 +67,7 @@ class _BackendUnderTest(TpuPallasRpaV3AttnBackend):
         self.req_to_token_pool = types.SimpleNamespace(req_to_token=req_to_token)
         self.forward_metadata = None
         self._op = None
+        self._ramp_cache = {}
         self._distribution_cache = {}
         # Non-SWA: skips the hybrid-SWA page remap in _build_metadata(_host).
         self._is_hybrid_swa = False
@@ -330,7 +331,7 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
         self.seq_lens = torch.tensor([10, 24, 33], dtype=torch.int32)
         self.spec_info = types.SimpleNamespace(draft_token_num=self.DRAFT_TOKEN_NUM)
 
-    def test_target_verify_bumps_kv_lens_and_cu_q_lens(self):
+    def test_target_verify_defers_kv_bump_and_scales_cu_q_lens(self):
         backend = _BackendUnderTest(self.PAGE_SIZE, self.req_to_token)
         fb = _make_forward_batch(
             seq_lens=self.seq_lens,
@@ -339,9 +340,10 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
             spec_info=self.spec_info,
         )
         meta = _build_meta(backend, fb)
-        # KV cache already holds the draft tokens: kv_lens = seq_lens + draft.
-        expected_kv = (self.seq_lens + self.DRAFT_TOKEN_NUM).to(torch.int32)
-        self.assertTrue(torch.equal(meta.kv_lens, expected_kv))
+        # Metadata retains the base tensor. The first attention layer performs
+        # seq_lens + draft_token_num inside the compiled target graph and shares
+        # that value with subsequent layers through rpa_target_kv_lens.
+        self.assertTrue(torch.equal(meta.kv_lens, self.seq_lens))
         # Each sequence verifies draft_token_num query tokens.
         expected_cu_q = (torch.arange(self.bs + 1) * self.DRAFT_TOKEN_NUM).to(
             torch.int32
@@ -481,6 +483,50 @@ class TestNonEmptyBatchSize(CustomTestCase):
         # than degrading to the padded count.
         fb = self._fb([10, 24, 0, 0], with_cpu=False)
         self.assertEqual(self.backend._non_empty_batch_size(fb), 2)
+
+
+class TestCachedRamp(CustomTestCase):
+    """``_cached_ramp`` memoizes the runtime-invariant cu_q/cu_kv ramps."""
+
+    @staticmethod
+    def _backend():
+        backend = TpuPallasRpaV3AttnBackend.__new__(TpuPallasRpaV3AttnBackend)
+        backend._ramp_cache = {}
+        return backend
+
+    def test_values_match_the_explicit_construction(self):
+        backend = self._backend()
+        got = backend._cached_ramp(5, 64, "cpu")
+        want = torch.arange(5, dtype=torch.int32) * 64
+        self.assertTrue(torch.equal(got, want))
+        self.assertEqual(got.dtype, torch.int32)
+
+    def test_stride_one_is_a_plain_arange(self):
+        # Decode: one query token per request -> cu_q_lens == arange(bs + 1).
+        backend = self._backend()
+        self.assertTrue(
+            torch.equal(
+                backend._cached_ramp(4, 1, "cpu"), torch.arange(4, dtype=torch.int32)
+            )
+        )
+
+    def test_repeat_call_returns_the_same_tensor(self):
+        backend = self._backend()
+        first = backend._cached_ramp(4, 8, "cpu")
+        second = backend._cached_ramp(4, 8, "cpu")
+        self.assertIs(first, second)
+        self.assertEqual(len(backend._ramp_cache), 1)
+
+    def test_distinct_keys_do_not_alias(self):
+        backend = self._backend()
+        a = backend._cached_ramp(4, 8, "cpu")
+        b = backend._cached_ramp(4, 16, "cpu")
+        c = backend._cached_ramp(5, 8, "cpu")
+        self.assertIsNot(a, b)
+        self.assertIsNot(a, c)
+        self.assertEqual(len(backend._ramp_cache), 3)
+        # The first entry must not have been clobbered by the later ones.
+        self.assertTrue(torch.equal(a, torch.arange(4, dtype=torch.int32) * 8))
 
 
 if __name__ == "__main__":

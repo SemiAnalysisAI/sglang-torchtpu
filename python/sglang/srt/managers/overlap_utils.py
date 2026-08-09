@@ -8,6 +8,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.speculative.spec_utils import gather_spec_extras_func
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
+from sglang.srt.utils.common import tpu_fused_spec_op
 
 _is_tpu = is_tpu()
 
@@ -119,6 +120,62 @@ def _device_use_dynamic_index(device: torch.device) -> bool:
     """
     dev_type = device.type if hasattr(device, "type") else str(device).split(":")[0]
     return any(dev_type == known for known in _DYNAMIC_INDEX_DEVICE_TYPES)
+
+
+def _select_device_accept_cache_locs(
+    candidate_locs: torch.Tensor,
+    accept_lens: torch.Tensor,
+    width: int,
+) -> torch.Tensor:
+    bs = accept_lens.shape[0]
+    offsets = torch.arange(width, device=candidate_locs.device, dtype=torch.int64)
+    cols = accept_lens.to(torch.int64)[:, None] - 1 + offsets[None, :]
+    rows = torch.arange(bs, device=candidate_locs.device, dtype=torch.int64)[:, None]
+    return candidate_locs[rows, cols]
+
+
+@tpu_fused_spec_op
+def _gather_spec_extras_and_cache_locs_tpu(
+    indices: torch.Tensor,
+    new_seq_lens_buf: torch.Tensor,
+    topk_p_buf: torch.Tensor,
+    topk_index_buf: torch.Tensor,
+    output_tokens_buf: torch.Tensor,
+    candidate_locs: torch.Tensor,
+    accept_lens: torch.Tensor,
+    cache_loc_width: int,
+):
+    rows = indices.to(torch.int64)
+    return (
+        torch.index_select(new_seq_lens_buf, 0, rows),
+        torch.index_select(topk_p_buf, 0, rows),
+        torch.index_select(topk_index_buf, 0, rows),
+        torch.index_select(output_tokens_buf, 0, rows),
+        _select_device_accept_cache_locs(candidate_locs, accept_lens, cache_loc_width),
+    )
+
+
+@tpu_fused_spec_op
+def _gather_spec_extras_hidden_and_cache_locs_tpu(
+    indices: torch.Tensor,
+    new_seq_lens_buf: torch.Tensor,
+    topk_p_buf: torch.Tensor,
+    topk_index_buf: torch.Tensor,
+    output_tokens_buf: torch.Tensor,
+    hidden_states_buf: torch.Tensor,
+    candidate_locs: torch.Tensor,
+    accept_lens: torch.Tensor,
+    cache_loc_width: int,
+):
+    rows = indices.to(torch.int64)
+    return (
+        torch.index_select(new_seq_lens_buf, 0, rows),
+        torch.index_select(topk_p_buf, 0, rows),
+        torch.index_select(topk_index_buf, 0, rows),
+        torch.index_select(output_tokens_buf, 0, rows),
+        torch.index_select(hidden_states_buf, 0, rows),
+        _select_device_accept_cache_locs(candidate_locs, accept_lens, cache_loc_width),
+    )
 
 
 @dataclass
@@ -264,7 +321,12 @@ class FutureMap:
                 device=self.device,
             )
 
-    def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
+    def _resolve_spec_extras(
+        self, batch: ScheduleBatch, *, fuse_seq_lens: bool = False
+    ) -> None:
+        if batch._tpu_spec_extras_resolved:
+            batch._tpu_spec_extras_resolved = False
+            return
         if self.spec_algo.is_ngram():
             # FIXME: remove once precomputed draft is supported.
             return
@@ -279,22 +341,75 @@ class FutureMap:
         # record_batch_in_overlap; record_stream here is redundant.
         if not _is_tpu:
             indices.record_stream(torch.get_device_module(self.device).current_stream())
+        candidate_locs = draft_input.device_accept_candidate_locs
+        accept_lens = draft_input.accept_lens_device
+        fuse_device_accept = bool(
+            _is_tpu
+            and candidate_locs is not None
+            and accept_lens is not None
+            and candidate_locs.ndim == 2
+            and candidate_locs.shape[0] == indices.shape[0]
+            and accept_lens.shape == (indices.shape[0],)
+        )
         if self.need_topk:
             hidden_states_buf = (
                 self.hidden_states_buf if self.need_hidden_states else None
             )
-            (
-                draft_input.topk_p,
-                draft_input.topk_index,
-                bonus_tokens,
-                hidden_states,
-            ) = gather_spec_extras_func(
-                indices,
-                self.topk_p_buf,
-                self.topk_index_buf,
-                self.output_tokens_buf,
-                hidden_states_buf,
-            )
+            if fuse_device_accept:
+                cache_loc_width = (candidate_locs.shape[1] + 1) // 2
+                if hidden_states_buf is not None:
+                    (
+                        resolved_seq_lens,
+                        draft_input.topk_p,
+                        draft_input.topk_index,
+                        bonus_tokens,
+                        hidden_states,
+                        draft_input.device_accept_selected_cache_locs,
+                    ) = _gather_spec_extras_hidden_and_cache_locs_tpu(
+                        indices,
+                        self.new_seq_lens_buf,
+                        self.topk_p_buf,
+                        self.topk_index_buf,
+                        self.output_tokens_buf,
+                        hidden_states_buf,
+                        candidate_locs,
+                        accept_lens,
+                        cache_loc_width,
+                    )
+                else:
+                    (
+                        resolved_seq_lens,
+                        draft_input.topk_p,
+                        draft_input.topk_index,
+                        bonus_tokens,
+                        draft_input.device_accept_selected_cache_locs,
+                    ) = _gather_spec_extras_and_cache_locs_tpu(
+                        indices,
+                        self.new_seq_lens_buf,
+                        self.topk_p_buf,
+                        self.topk_index_buf,
+                        self.output_tokens_buf,
+                        candidate_locs,
+                        accept_lens,
+                        cache_loc_width,
+                    )
+                    hidden_states = None
+                if fuse_seq_lens:
+                    batch.seq_lens = resolved_seq_lens
+                    batch._tpu_spec_extras_resolved = True
+            else:
+                (
+                    draft_input.topk_p,
+                    draft_input.topk_index,
+                    bonus_tokens,
+                    hidden_states,
+                ) = gather_spec_extras_func(
+                    indices,
+                    self.topk_p_buf,
+                    self.topk_index_buf,
+                    self.output_tokens_buf,
+                    hidden_states_buf,
+                )
             draft_input.bonus_tokens = bonus_tokens
             if hidden_states is not None:
                 draft_input.hidden_states = hidden_states
@@ -355,7 +470,33 @@ class FutureMap:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
-        batch.seq_lens = self.new_seq_lens_buf[fi]
+        # On the TPU device-accept path, resolve every FutureMap input in one
+        # compiled program. resolve_forward_inputs consumes the marker instead
+        # of submitting a second extras/cache-location gather.
+        if (
+            _is_tpu
+            and batch._tpu_device_accept_kv_active
+            and draft_input.accept_lens_device is not None
+            and draft_input.device_accept_candidate_locs is not None
+            and self.need_topk
+        ):
+            self._resolve_spec_extras(batch, fuse_seq_lens=True)
+        if not batch._tpu_spec_extras_resolved:
+            batch.seq_lens = self.new_seq_lens_buf[fi]
+
+        # The TPU device-accept path deliberately keeps the accepted length off
+        # host. eagle_prepare_for_decode installed the matching host logical
+        # base and candidate window; preserve that shadow instead of forcing a
+        # D2H synchronization here.
+        draft_input = batch.spec_info
+        if (
+            _is_tpu
+            and batch._tpu_device_accept_kv_active
+            and draft_input.accept_lens_device is not None
+            and draft_input.device_accept_candidate_locs is not None
+            and draft_input.accept_lens_device.shape == batch.seq_lens.shape
+        ):
+            return
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
@@ -421,27 +562,66 @@ class FutureMap:
             return
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(payload)
-        self._store(
-            self.output_tokens_buf,
-            indices,
-            payload.bonus_tokens.to(self.output_tokens_buf.dtype),
-        )
+        if _is_tpu and self.need_topk:
+            from sglang.srt.hardware_backend.tpu.spec_utils_v2 import (
+                store_future_map_spec,
+                store_future_map_spec_hidden,
+            )
 
-        if self.need_topk:
+            if self.need_hidden_states:
+                (
+                    self.output_tokens_buf,
+                    self.topk_p_buf,
+                    self.topk_index_buf,
+                    self.hidden_states_buf,
+                ) = store_future_map_spec_hidden(
+                    indices,
+                    self.output_tokens_buf,
+                    self.topk_p_buf,
+                    self.topk_index_buf,
+                    self.hidden_states_buf,
+                    payload.bonus_tokens,
+                    payload.topk_p,
+                    payload.topk_index,
+                    payload.hidden_states,
+                )
+            else:
+                (
+                    self.output_tokens_buf,
+                    self.topk_p_buf,
+                    self.topk_index_buf,
+                ) = store_future_map_spec(
+                    indices,
+                    self.output_tokens_buf,
+                    self.topk_p_buf,
+                    self.topk_index_buf,
+                    payload.bonus_tokens,
+                    payload.topk_p,
+                    payload.topk_index,
+                )
+        else:
             self._store(
-                self.topk_p_buf, indices, payload.topk_p.to(self.topk_p_buf.dtype)
-            )
-            self._store(
-                self.topk_index_buf,
+                self.output_tokens_buf,
                 indices,
-                payload.topk_index.to(self.topk_index_buf.dtype),
+                payload.bonus_tokens.to(self.output_tokens_buf.dtype),
             )
-        if self.need_hidden_states:
-            self._store(
-                self.hidden_states_buf,
-                indices,
-                payload.hidden_states.to(self.hidden_states_buf.dtype),
-            )
+            if self.need_topk:
+                self._store(
+                    self.topk_p_buf,
+                    indices,
+                    payload.topk_p.to(self.topk_p_buf.dtype),
+                )
+                self._store(
+                    self.topk_index_buf,
+                    indices,
+                    payload.topk_index.to(self.topk_index_buf.dtype),
+                )
+            if self.need_hidden_states:
+                self._store(
+                    self.hidden_states_buf,
+                    indices,
+                    payload.hidden_states.to(self.hidden_states_buf.dtype),
+                )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self._store(self.draft_probs_buf, indices, payload.draft_probs)
         if (

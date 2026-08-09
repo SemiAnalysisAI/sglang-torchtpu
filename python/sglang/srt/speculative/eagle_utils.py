@@ -107,6 +107,7 @@ def _eagle_prefill_tail_tokens(
     return tail_tokens
 
 
+@tpu_fused_spec_op
 def organize_draft_results(
     score_list: List[torch.Tensor],
     token_list: List[torch.Tensor],
@@ -143,6 +144,7 @@ class TreeMaskMode(IntEnum):
     QLEN_ONLY_BITPACKING = 2
 
 
+@tpu_fused_spec_op
 def _build_tree_kernel_efficient_torch(
     topk: int,
     tree_mask_mode: TreeMaskMode,
@@ -186,11 +188,22 @@ def build_tree_kernel_efficient(
     tree_mask_buf: Optional[torch.Tensor] = None,
     position_buf: Optional[torch.Tensor] = None,
 ):
-    draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
-
     # seq_lens_sum == sum(seq_lens); seq_lens: sequence length without draft tokens
     bs = seq_lens.numel()
     device = seq_lens.device
+
+    if (
+        _use_torch_native
+        and topk == 1
+        and tree_mask_mode == TreeMaskMode.FULL_MASK
+        and tree_mask_buf is None
+        and position_buf is None
+    ):
+        from sglang.srt.hardware_backend.tpu.spec_utils_v2 import build_topk1_tree
+
+        return build_topk1_tree(bonus_tokens, draft_tokens, seq_lens, num_verify_tokens)
+
+    draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
     # e.g. for bs=1, tree_mask: num_draft_token, seq_lens_sum + num_draft_token (flattened)
     # where each row indicates the attending pattern of each draft token
     # if use_partial_packed_tree_mask is True, tree_mask: num_draft_token (flattened, packed)
@@ -780,17 +793,26 @@ def eagle_prepare_for_verify(
             "v2 prepare_for_verify input_ids",
         )
         device = batch.device
-        batch.out_cache_loc = assign_extend_cache_locs_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=req_to_token_pool.req_to_token,
-            start_offset=batch.seq_lens,
-            end_offset=batch.seq_lens + verify_input.draft_token_num,
-            batch_size=bs,
-            draft_token_num=verify_input.draft_token_num,
-            device=device,
-            host_req_pool_indices=batch.req_pool_indices_cpu,
-            host_seq_lens=batch.seq_lens_cpu,
-        )
+        precomputed_cache_locs = batch._tpu_verify_out_cache_loc
+        if (
+            _use_torch_native
+            and precomputed_cache_locs is not None
+            and precomputed_cache_locs.shape[0] == bs * verify_input.draft_token_num
+        ):
+            batch.out_cache_loc = precomputed_cache_locs
+            batch._tpu_verify_out_cache_loc = None
+        else:
+            batch.out_cache_loc = assign_extend_cache_locs_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                end_offset=batch.seq_lens + verify_input.draft_token_num,
+                batch_size=bs,
+                draft_token_num=verify_input.draft_token_num,
+                device=device,
+                host_req_pool_indices=batch.req_pool_indices_cpu,
+                host_seq_lens=batch.seq_lens_cpu,
+            )
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
@@ -1094,6 +1116,10 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
 
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
+    # Honest SpecV2 bookkeeping commits the pending bonus in result processing,
+    # so req.seqlen is one ahead of kv_committed_len while the next batch is
+    # prepared. Reserve that slot in addition to the normal double buffer.
+    allocation_reserve = double_alloc + int(_use_torch_native and batch.enable_overlap)
 
     cur_kv_lens = [0] * bs
     nxt_kv_lens = [0] * bs
@@ -1103,7 +1129,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
         # kv_committed_len is honest (bonus committed in resolve, not here),
         # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
-        nxt = max(cur, r.kv_committed_len + double_alloc)
+        nxt = max(cur, r.kv_committed_len + allocation_reserve)
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
         num_needed_tokens += nxt - cur
@@ -1128,7 +1154,8 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
         )
 
-    if _use_torch_native and batch.req_to_token_pool.host_resident:
+    host_resident = batch.req_to_token_pool.host_resident
+    if _use_torch_native and host_resident:
         out_cache_loc = allocate_and_assign_decode_cache(
             tree_cache=batch.tree_cache,
             req_to_token_pool=batch.req_to_token_pool,
@@ -1175,6 +1202,62 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             out_cache_loc,
             bs,
         )
+    # TPU overlap can keep the preceding verify's accepted lengths on device.
+    # Reserve every possible next start on the host page table now; FutureMap
+    # selects the actual fixed-width window after the device accept resolves.
+    draft_input = batch.spec_info
+    batch._tpu_device_accept_kv_active = False
+    if draft_input is not None:
+        draft_input.device_accept_candidate_locs = None
+        draft_input.device_accept_selected_cache_locs = None
+
+    server_args = get_global_server_args()
+    accept_lens = draft_input.accept_lens_device if draft_input is not None else None
+    device_accept_kv = bool(
+        _use_torch_native
+        and batch.enable_overlap
+        and bs > 0
+        and host_resident
+        and isinstance(accept_lens, torch.Tensor)
+        and accept_lens.shape == (bs,)
+        and server_args.speculative_num_steps == 3
+        and server_args.speculative_eagle_topk == 1
+        and server_args.speculative_num_draft_tokens == 4
+        and page_size == 64
+        and not batch.return_logprob
+        and not batch.has_grammar
+        and all(req.lora_id is None for req in batch.reqs)
+    )
+    if device_accept_kv:
+        # Host result processing is one iteration behind the device accept.
+        # req.seqlen is therefore the logical length before that accept.
+        host_base = torch.tensor(
+            [req.seqlen for req in batch.reqs], dtype=torch.int64, device="cpu"
+        )
+        reservations_cover_window = all(
+            int(host_base[i]) + double_alloc <= req.kv_allocated_len
+            for i, req in enumerate(batch.reqs)
+        )
+        if reservations_cover_window:
+            shared_width = max(
+                server_args.speculative_eagle_topk * server_args.speculative_num_steps,
+                server_args.speculative_num_draft_tokens,
+            )
+            candidate_width = (
+                server_args.speculative_num_draft_tokens + shared_width - 1
+            )
+            offsets = torch.arange(candidate_width, dtype=torch.int64)
+            rows = batch.req_pool_indices_cpu.to(dtype=torch.int64)[:, None]
+            cols = host_base[:, None] + 1 + offsets[None, :]
+            candidates = batch.req_to_token_pool.req_to_token[rows, cols]
+            draft_input.device_accept_candidate_locs = candidates.to(
+                batch.device, dtype=torch.int64, non_blocking=True
+            )
+            # Attention metadata still needs a host logical-length shadow. This
+            # is the pre-accept base; device consumers use resolved seq_lens.
+            batch.seq_lens_cpu = host_base
+            batch.seq_lens_sum = int(host_base.sum())
+            batch._tpu_device_accept_kv_active = True
 
 
 def _top_k_renorm_prob_torch(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:

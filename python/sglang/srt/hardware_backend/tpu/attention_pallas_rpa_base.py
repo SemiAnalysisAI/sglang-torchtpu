@@ -35,7 +35,7 @@ Design notes
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import torch
@@ -359,6 +359,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         )
 
         self.forward_metadata: PallasForwardMetadata | None = None
+        # (count, stride) -> device ramp; see ``_cached_ramp``.
+        self._ramp_cache: dict[tuple[int, int], torch.Tensor] = {}
         # Cached ``distribution`` tensors on TPU, keyed by
         # (is_decode, real_batch, device) -- it depends only on those, so a
         # cached buffer is reused every step (see init_forward_metadata).
@@ -531,12 +533,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             extend_seq_lens = torch.full(
                 (bs,), draft_token_num, dtype=torch.int32, device=device
             )
+            q_tokens_per_req = draft_token_num
         elif self._is_draft_extend(forward_batch.forward_mode):
             # DRAFT_EXTEND: batch.prefix_lens may be stale from the
             # initial prefill; seq_lens and extend_seq_lens are current.
             seq_lens = forward_batch.seq_lens.to(torch.int32)
             assert forward_batch.extend_seq_lens is not None
             extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+            q_tokens_per_req = None
         elif forward_batch.forward_mode.is_extend():
             assert forward_batch.extend_seq_lens is not None, (
                 "extend_seq_lens is required for the Pallas attention backend in "
@@ -544,6 +548,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             )
             seq_lens = forward_batch.seq_lens.to(torch.int32)
             extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+            q_tokens_per_req = None
         else:
             # Decode (including draft decode).
             seq_lens = forward_batch.seq_lens.to(torch.int32)
@@ -557,6 +562,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 kv_len_bump = self.speculative_step_id + 1
                 seq_lens = seq_lens + kv_len_bump
             extend_seq_lens = torch.ones(bs, dtype=torch.int32, device=device)
+            q_tokens_per_req = 1
 
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is not None and bs > 0:
@@ -568,14 +574,15 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
 
-        cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32, device=device)
-        cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
+        if q_tokens_per_req is None:
+            cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+            cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
+        else:
+            cu_q_lens = self._cached_ramp(bs + 1, q_tokens_per_req, device)
 
         # cu_kv_lens[i] = i * pages_per_seq * page_size so the kernel addresses
         # ``page_indices[i * pages_per_seq + j]`` for token j of seq i.
-        cu_kv_lens = torch.arange(bs + 1, dtype=torch.int32, device=device) * (
-            pages_per_seq * page_size
-        )
+        cu_kv_lens = self._cached_ramp(bs + 1, pages_per_seq * page_size, device)
 
         per_seq = req_to_token[req_pool_indices]  # [bs, max_ctx]
         # ``req_to_token.shape[1]`` may not be an exact multiple of
@@ -620,6 +627,15 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             swa_page_indices=swa_page_indices,
         )
 
+    def _cached_ramp(self, count: int, stride: int, device) -> torch.Tensor:
+        """Return a shared ``arange(count, int32) * stride`` tensor."""
+        key = (count, stride)
+        ramp = self._ramp_cache.get(key)
+        if ramp is None:
+            ramp = torch.arange(count, dtype=torch.int32, device=device) * stride
+            self._ramp_cache[key] = ramp
+        return ramp
+
     def _build_metadata_host(
         self,
         forward_batch,
@@ -638,18 +654,18 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         """
         kv_len_bump = 0
         if forward_batch.forward_mode.is_target_verify():
-            # TARGET_VERIFY: the KV cache already includes the draft tokens,
-            # so bump seq_lens by draft_token_num (shape-stable device add).
             assert forward_batch.spec_info is not None
             draft_token_num = forward_batch.spec_info.draft_token_num
             kv_len_bump = draft_token_num
-            kv_lens = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
+            kv_lens = forward_batch.seq_lens
             extend_seq_lens = torch.full((bs,), draft_token_num, dtype=torch.int32)
+            q_tokens_per_req = int(draft_token_num)
         elif self._is_extend_including_draft(forward_batch.forward_mode):
             # EXTEND and DRAFT_EXTEND use current lengths.
             assert forward_batch.extend_seq_lens is not None
             kv_lens = forward_batch.seq_lens.to(torch.int32)
             extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
+            q_tokens_per_req = None
         else:
             kv_lens = forward_batch.seq_lens.to(torch.int32)
             if (
@@ -662,6 +678,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 kv_len_bump = self.speculative_step_id + 1
                 kv_lens = kv_lens + kv_len_bump
             extend_seq_lens = torch.ones(bs, dtype=torch.int32)
+            q_tokens_per_req = 1
 
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is not None and bs > 0:
@@ -686,55 +703,66 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         assert req_pool_indices.shape[0] == bs
         req_pool_indices = req_pool_indices.to(torch.int64)
 
-        cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32)
-        cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
-        cu_kv_lens = torch.arange(bs + 1, dtype=torch.int32) * (
-            pages_per_seq * page_size
+        if q_tokens_per_req is None:
+            cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32)
+            cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
+            cu_q_lens_device = cu_q_lens.to(device, non_blocking=True)
+        else:
+            cu_q_lens_device = self._cached_ramp(bs + 1, q_tokens_per_req, device)
+        cu_kv_lens_device = self._cached_ramp(bs + 1, pages_per_seq * page_size, device)
+
+        req_key = tuple(int(index) for index in req_pool_indices.tolist())
+        page_key = (str(device), bs, pages_per_seq, req_key)
+        page_version = req_to_token._version
+        page_cache = getattr(
+            self.req_to_token_pool, "_tpu_rpa_page_indices_cache", None
         )
+        if page_cache is None:
+            page_cache = {}
+            self.req_to_token_pool._tpu_rpa_page_indices_cache = page_cache
+        page_entry = page_cache.get(page_key)
+        if page_entry is not None and page_entry[0] == page_version:
+            page_indices_device, swa_page_indices = page_entry[1], page_entry[2]
+        else:
+            page_cols = getattr(self, "_host_page_cols", None)
+            if page_cols is None or page_cols.numel() != pages_per_seq:
+                page_cols = torch.arange(
+                    0, pages_per_seq * page_size, page_size, dtype=torch.long
+                )
+                self._host_page_cols = page_cols
+            per_seq = req_to_token[req_pool_indices[:, None], page_cols[None, :]]
+            page_indices = (per_seq // page_size).to(torch.int32)
+            page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
+            page_indices_device = page_indices.to(device, non_blocking=True)
 
-        # Gather only the strided page-slot columns [bs, pages_per_seq] (one
-        # slot per page), not the full [bs, max_ctx] row. page_cols is constant,
-        # so cache it.
-        page_cols = getattr(self, "_host_page_cols", None)
-        if page_cols is None or page_cols.numel() != pages_per_seq:
-            page_cols = torch.arange(
-                0, pages_per_seq * page_size, page_size, dtype=torch.long
-            )
-            self._host_page_cols = page_cols
-        per_seq = req_to_token[req_pool_indices[:, None], page_cols[None, :]]
-        page_indices = (per_seq // page_size).to(torch.int32)
-        page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
-
-        # Hybrid-SWA: translate full-pool pages to SWA-pool pages. The host path
-        # gates only on req_to_token residency, so this must mirror the device
-        # path or SWA layers would address the full pool.
-        # full_to_swa_index_mapping is host-resident (CPU) on TPU, so do the
-        # lookup here on the CPU page_indices and H2D the result once — keeping
-        # this builder free of on-device gathers.
-        swa_page_indices: torch.Tensor | None = None
-        if self._is_hybrid_swa:
-            full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping
-            assert full_to_swa is not None, (
-                "Hybrid-SWA model is configured but full_to_swa_index_mapping "
-                "has not been registered yet — did the allocator finish init?"
-            )
-            # First token index of each full-pool page (page_indices * page_size).
-            # page_indices and full_to_swa are both CPU here, so gather on CPU and
-            # H2D the small int32 result once.
-            full_token_starts = page_indices.to(torch.int64) * page_size
-            swa_page_indices = (
-                (full_to_swa[full_token_starts] // page_size)
-                .to(torch.int32)
-                .to(device, non_blocking=True)
+            swa_page_indices = None
+            if self._is_hybrid_swa:
+                full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping
+                assert full_to_swa is not None, (
+                    "Hybrid-SWA model is configured but full_to_swa_index_mapping "
+                    "has not been registered yet — did the allocator finish init?"
+                )
+                full_token_starts = page_indices.to(torch.int64) * page_size
+                swa_page_indices = (
+                    (full_to_swa[full_token_starts] // page_size)
+                    .to(torch.int32)
+                    .to(device, non_blocking=True)
+                )
+            previous = page_entry[1:3] if page_entry is not None else (None, None)
+            page_cache[page_key] = (
+                page_version,
+                page_indices_device,
+                swa_page_indices,
+                previous,
             )
 
         # H2D for host-built cu-lens / page_indices; kv_lens already on device,
         # distribution is the caller's cached buffer.
         return PallasForwardMetadata(
             kv_lens=kv_lens,
-            cu_q_lens=cu_q_lens.to(device, non_blocking=True),
-            cu_kv_lens=cu_kv_lens.to(device, non_blocking=True),
-            page_indices=page_indices.to(device, non_blocking=True),
+            cu_q_lens=cu_q_lens_device,
+            cu_kv_lens=cu_kv_lens_device,
+            page_indices=page_indices_device,
             distribution=distribution,
             swa_page_indices=swa_page_indices,
         )
@@ -837,12 +865,26 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             k_scale = None
             v_scale = None
 
+        if forward_batch.forward_mode.is_target_verify():
+            kv_lens = forward_batch.rpa_target_kv_lens
+            if kv_lens is None:
+                assert forward_batch.spec_info is not None
+                kv_lens = (
+                    forward_batch.seq_lens + forward_batch.spec_info.draft_token_num
+                ).to(torch.int32)
+                forward_batch.rpa_target_kv_lens = kv_lens
+        else:
+            kv_lens = (
+                forward_batch.rpa_draft_kv_lens
+                if forward_batch.rpa_draft_kv_lens is not None
+                else self.forward_metadata.kv_lens
+            )
         out = op(
             q,
             k,
             v,
             kv_cache,
-            self.forward_metadata.kv_lens,
+            kv_lens,
             page_indices,
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
@@ -904,8 +946,19 @@ class BaseTpuPallasRpaMultiStepDraftBackend:
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         assert forward_batch.spec_info is not None
-        for attn_backend in self.attn_backends:
-            attn_backend.init_forward_metadata(forward_batch)
+        if len(self.attn_backends) <= 1:
+            for attn_backend in self.attn_backends:
+                attn_backend.init_forward_metadata(forward_batch)
+            return
+
+        first_backend = self.attn_backends[0]
+        first_backend.init_forward_metadata(forward_batch)
+        base_metadata = first_backend.forward_metadata
+        assert base_metadata is not None
+        for step, attn_backend in enumerate(self.attn_backends[1:], start=1):
+            attn_backend.forward_metadata = replace(
+                base_metadata, kv_lens=base_metadata.kv_lens + step
+            )
 
     def init_cuda_graph_state(self, max_bs, max_num_tokens):
         pass
