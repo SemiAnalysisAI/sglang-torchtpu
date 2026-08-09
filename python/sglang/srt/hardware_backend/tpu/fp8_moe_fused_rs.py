@@ -10,6 +10,7 @@ caches physical-device ordering. Larger prefills retain the stock FP8 MoE path.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from collections.abc import Callable
 
@@ -21,6 +22,15 @@ from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 # https://github.com/sgl-project/sglang-torchtpu/issues/308
 # https://github.com/google-pytorch/torch_tpu/issues/2794
 _FUSED_RS_MAX_SIZE_M = 2048
+_FUSED_RS_RUNTIME_MODULE = "torch_tpu._internal.distributed.spmd_util"
+
+
+def _fused_rs_runtime_available() -> bool:
+    """Return whether the installed torch_tpu supports the fused-RS export."""
+    try:
+        return importlib.util.find_spec(_FUSED_RS_RUNTIME_MODULE) is not None
+    except ModuleNotFoundError:
+        return False
 
 
 def supports_fp8_fused_rs(
@@ -126,6 +136,12 @@ def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
 
 
 def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> bool:
+    if not _fused_rs_runtime_available():
+        layer.__dict__["_tpu_fused_rs_unsupported_reason"] = (
+            f"the installed torch_tpu is missing {_FUSED_RS_RUNTIME_MODULE}"
+        )
+        return False
+
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.distributed.parallel_state import (
         get_moe_expert_parallel_world_size,

@@ -10,15 +10,14 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
+    _fused_rs_runtime_available,
     apply_fp8_fused_rs,
     fp8_fused_rs_unsupported_reason,
+    prepare_fp8_fused_rs,
     should_use_fp8_fused_rs,
     supports_fp8_fused_rs,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
-    fused_moe_rs_padded_tokens,
-)
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
@@ -31,6 +30,20 @@ register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
 
 
 class TestFp8MoeFusedRs(CustomTestCase):
+    def test_missing_torch_tpu_runtime_falls_back_from_auto_backend(self):
+        layer = SimpleNamespace()
+        with patch(
+            "sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs."
+            "_fused_rs_runtime_available",
+            return_value=False,
+        ):
+            self.assertFalse(prepare_fp8_fused_rs(layer))
+
+        self.assertIn(
+            "torch_tpu._internal.distributed.spmd_util",
+            layer._tpu_fused_rs_unsupported_reason,
+        )
+
     def test_exposes_first_class_moe_runner_backend(self):
         backend = MoeRunnerBackend("pallas_tpu_fused_rs")
         self.assertTrue(backend.is_pallas_tpu_fused_rs())
@@ -115,6 +128,9 @@ class TestFp8MoeFusedRs(CustomTestCase):
         )
 
     def test_large_prefill_reduces_stock_output_once(self):
+        if not _fused_rs_runtime_available():
+            self.skipTest("installed torch_tpu does not include fused-RS support")
+
         tokens, hidden = 4097, 4
         x = torch.zeros(tokens, hidden)
         raw = torch.arange(tokens * hidden, dtype=torch.float32).reshape(tokens, hidden)
@@ -167,6 +183,13 @@ class TestFp8MoeFusedRs(CustomTestCase):
         self.assertFalse(should_use_fp8_fused_rs(65536))
 
     def test_padded_routed_rows_respect_inline_limit(self):
+        if not _fused_rs_runtime_available():
+            self.skipTest("installed torch_tpu does not include fused-RS support")
+
+        from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
+            fused_moe_rs_padded_tokens,
+        )
+
         padded_tokens = fused_moe_rs_padded_tokens(682, topk=3, ep_size=8)
         self.assertEqual(padded_tokens, 688)
         self.assertFalse(should_use_fp8_fused_rs(padded_tokens * 3))
