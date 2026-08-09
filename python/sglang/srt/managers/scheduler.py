@@ -518,6 +518,7 @@ class Scheduler(
 
         # Init overlap schedule
         self.init_overlap()
+        self.maybe_precompile_tpu_spec_ops()
 
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
@@ -1324,6 +1325,68 @@ class Scheduler(
 
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+
+    def maybe_precompile_tpu_spec_ops(self) -> None:
+        """Warm separately compiled Spec V2 helpers before serving begins."""
+        if (
+            not current_platform.is_tpu()
+            or not envs.SGLANG_TPU_ENABLE_FUSED_SPEC_OPS.get()
+            or self.draft_worker is None
+            or not self.spec_algorithm.is_eagle3()
+            or self.server_args.speculative_eagle_topk != 1
+            or not self.enable_overlap
+        ):
+            return
+
+        from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
+            SpecDecodeCompilePolicyMixin,
+        )
+        from sglang.srt.hardware_backend.tpu.spec_op_precompile import (
+            precompile_spec_v2_ops,
+        )
+
+        compile_policy = self.tp_worker.model_runner.compile_policy
+        if not isinstance(compile_policy, SpecDecodeCompilePolicyMixin):
+            return
+        assert compile_policy.b_bucketer is not None
+
+        eagle_worker = self.draft_worker.draft_worker
+        hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+            eagle_worker.draft_runner
+        )
+        if hidden_size is None or hidden_dtype is None:
+            return
+
+        # EAGLE3 drafts may project only a hot-token subset even though their
+        # model config retains the target vocabulary size.
+        draft_vocab_size = (
+            eagle_worker.hot_token_id.shape[0]
+            if eagle_worker.hot_token_id is not None
+            else eagle_worker.draft_runner.model_config.vocab_size
+        )
+
+        num_verify_tokens = self.server_args.speculative_num_draft_tokens
+        num_spec_steps = self.server_args.speculative_num_steps
+        precompile_spec_v2_ops(
+            device=torch.device(self.device),
+            physical_batch_buckets=compile_policy.b_bucketer.buckets,
+            num_verify_tokens=num_verify_tokens,
+            num_spec_steps=num_spec_steps,
+            verify_vocab_size=self.model_config.vocab_size,
+            draft_vocab_size=draft_vocab_size,
+            # TPU keeps both target and draft logits processing eager. The helper
+            # inputs are therefore FP32 even when model weights are BF16.
+            verify_logits_dtype=torch.float32,
+            draft_logits_dtype=torch.float32,
+            hidden_size=hidden_size,
+            hidden_dtype=hidden_dtype,
+            req_pool_size=self.future_map.req_pool_size,
+            warm_device_accept=(
+                num_spec_steps == 3
+                and num_verify_tokens == 4
+                and self.page_size == 64
+            ),
+        )
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding

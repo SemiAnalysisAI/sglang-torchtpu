@@ -41,7 +41,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -264,6 +268,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.compile_policy.precompile_draft(
                 self.draft_attn_backend, self.draft_extend_attn_backend
             )
+            self._precompile_fused_draft_steps()
             if check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
                 self.draft_runner.init_prefill_cuda_graph(force_for_draft_worker=True)
             self._capture_cuda_graphs()
@@ -755,6 +760,103 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.speculative_num_draft_tokens,
         )
         return parent_list, top_scores_index, draft_tokens, None
+
+    def _precompile_fused_draft_steps(self) -> None:
+        """Warm the fused draft loop for every static TPU batch bucket."""
+        if (
+            not _is_tpu
+            or not envs.SGLANG_TPU_ENABLE_FUSED_DRAFT.get()
+            or self.topk != 1
+            or self.speculative_num_steps <= 1
+            or self.server_args.speculative_use_rejection_sampling
+            or self.index_share_for_mtp_iteration
+            or self.draft_runner.canary_manager is not None
+        ):
+            return
+
+        policy = self.draft_runner.compile_policy
+        b_bucketer = getattr(policy, "b_bucketer", None)
+        if b_bucketer is None:
+            return
+
+        device = self.draft_runner.device
+        hidden_size = self.draft_runner.model_config.spec_hidden_size
+        logger.info(
+            "[spec compile policy] FUSED DRAFT: warming bs=%s",
+            list(b_bucketer.buckets),
+        )
+        for bs in b_bucketer.buckets:
+            spec_info = policy._make_draft_decode_spec_info()
+            spec_info.topk_p = torch.ones(
+                (bs, self.topk), device=device, dtype=torch.float32
+            )
+            spec_info.topk_index = torch.zeros(
+                (bs, self.topk), device=device, dtype=torch.int64
+            )
+            spec_info.hidden_states = torch.zeros(
+                (bs, hidden_size), device=device, dtype=self.draft_runner.dtype
+            )
+            forward_batch = policy._make_dummy_forward_batch(
+                num_tokens=bs,
+                bs=bs,
+                mode=ForwardMode.DECODE,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+                spec_info=spec_info,
+            )
+            forward_batch.out_cache_loc = torch.arange(
+                bs * self.topk * self.speculative_num_steps,
+                device=device,
+                dtype=torch.int64,
+            )
+            policy._seed_dummy_req_to_token(forward_batch)
+            # Mirror draft() exactly: fused serving keeps the padded model
+            # outputs and uses the spec-specific padding hook, rather than the
+            # normal model preparation hook used by standalone forwards.
+            spec_info.keep_outputs_padded = True
+            policy.prepare_spec_forward_batch(forward_batch)
+            self.draft_attn_backend.init_forward_metadata(forward_batch)
+            forward_batch.mark_forward_metadata_ready()
+            # The live draft ForwardBatch has already handed its tokens to
+            # EagleDraftInput and carries no input_ids field.  The fused loop
+            # derives each step's explicit input_ids from select_top_k_tokens;
+            # match the otherwise-unused container field's serving guard.
+            forward_batch.input_ids = None
+
+            # Serving enters through scheduler event loops decorated with
+            # torch.no_grad().  Match that global Dynamo guard here; otherwise
+            # these startup variants are unusable after serving traces bs=1
+            # under no-grad and arms fail_on_recompile.
+            with torch.no_grad():
+                outputs = self._fused_draft_forward(forward_batch)
+                # draft() immediately feeds these outputs into the TPU top-k=1
+                # tree finalizer.  It is a separately lazy-compiled helper, so
+                # warm its batch variants here as part of the same realistic
+                # serving pipeline rather than leaving only bs=1 to the server
+                # warmup request.
+                from sglang.srt.hardware_backend.tpu.spec_utils_v2 import (
+                    build_topk1_tree,
+                )
+
+                tree_outputs = build_topk1_tree(
+                    torch.zeros(bs, device=device, dtype=torch.int64),
+                    outputs[2],
+                    forward_batch.seq_lens,
+                    self.speculative_num_draft_tokens,
+                )
+            tensors = [
+                tensor
+                for output in (*outputs[:3], *tree_outputs)
+                if output is not None
+                for tensor in (
+                    output if isinstance(output, (tuple, list)) else (output,)
+                )
+                if isinstance(tensor, torch.Tensor)
+            ]
+            if tensors:
+                from torch_tpu._internal.sync.sync import synchronize as tpu_sync
+
+                tpu_sync(tensors, wait=True)
+            logger.info("[spec compile policy] FUSED DRAFT: compiled bs=%d", bs)
 
     def _fused_draft_steps(
         self,
