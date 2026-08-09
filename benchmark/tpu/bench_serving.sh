@@ -32,6 +32,8 @@
 #
 # Overridable env vars (defaults shown):
 #   MODEL=                          # REQUIRED — must match the served model
+#   TOKENIZER=                      # optional tokenizer ID/path (defaults to
+#                                   # benchmark client's model discovery)
 #   BASE_URL=http://127.0.0.1:30000
 #   BACKEND=sglang
 #   DATASET_NAME=random
@@ -84,6 +86,7 @@ BASE_URL=${BASE_URL:-http://127.0.0.1:30000}
 BACKEND=${BACKEND:-sglang}
 DATASET_NAME=${DATASET_NAME:-random}
 TOKENIZE_PROMPT=${TOKENIZE_PROMPT:-0}
+TOKENIZER=${TOKENIZER:-}
 ISL=${ISL:-8192}
 OSL=${OSL:-1024}
 BATCH_SIZE=${BATCH_SIZE:-64}
@@ -170,6 +173,7 @@ run_one() {
         --seed "$SEED"
         --output-file "$output_file"
     )
+    [[ -n "$TOKENIZER" ]] && args+=(--tokenizer "$TOKENIZER")
     [[ "$TOKENIZE_PROMPT" == "1" ]] && args+=(--tokenize-prompt)
 
     if [[ "$PROFILE" == "1" ]]; then

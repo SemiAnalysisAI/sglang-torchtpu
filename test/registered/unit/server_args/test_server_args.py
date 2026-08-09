@@ -73,6 +73,39 @@ class TestPrepareServerArgs(CustomTestCase):
             os.unlink(config_file)
 
 
+class TestRemoteModelSourcePaths(unittest.TestCase):
+    def test_downloads_distinct_speculative_draft_metadata(self):
+        args = object.__new__(ServerArgs)
+        args.model_path = "gs://bucket/target"
+        args.tokenizer_path = "gs://bucket/tokenizer"
+        args.speculative_draft_model_path = "gs://bucket/draft"
+
+        with patch.object(
+            server_args_module.ObjectStorageModel,
+            "download_and_get_path",
+        ) as download:
+            args._handle_model_source_paths()
+
+        self.assertEqual(
+            [call.args[0] for call in download.call_args_list],
+            [args.model_path, args.tokenizer_path, args.speculative_draft_model_path],
+        )
+
+    def test_does_not_redownload_shared_speculative_draft_metadata(self):
+        args = object.__new__(ServerArgs)
+        args.model_path = "gs://bucket/model"
+        args.tokenizer_path = args.model_path
+        args.speculative_draft_model_path = args.model_path
+
+        with patch.object(
+            server_args_module.ObjectStorageModel,
+            "download_and_get_path",
+        ) as download:
+            args._handle_model_source_paths()
+
+        download.assert_called_once_with(args.model_path)
+
+
 class TestMambaCacheStochasticRounding(unittest.TestCase):
     def test_rejects_fp32_ssm_cache(self):
         server_args = ServerArgs(

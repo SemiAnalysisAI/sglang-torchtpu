@@ -2968,7 +2968,7 @@ class ServerArgs:
             )
 
     def _handle_model_source_paths(self):
-        """Resolve model/tokenizer paths backed by remote object stores."""
+        """Resolve model, tokenizer, and draft paths backed by object stores."""
         if is_runai_obj_uri(self.model_path):
             ObjectStorageModel.download_and_get_path(self.model_path)
 
@@ -2978,6 +2978,18 @@ class ServerArgs:
             and self.tokenizer_path != self.model_path
         ):
             ObjectStorageModel.download_and_get_path(self.tokenizer_path)
+
+        if (
+            self.speculative_draft_model_path is not None
+            and is_runai_obj_uri(self.speculative_draft_model_path)
+            and self.speculative_draft_model_path
+            not in (self.model_path, self.tokenizer_path)
+        ):
+            # Speculative argument validation reads the draft config before
+            # workers launch, so its metadata must exist just like the target's.
+            ObjectStorageModel.download_and_get_path(
+                self.speculative_draft_model_path
+            )
 
     def _handle_pd_disaggregation(self):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
