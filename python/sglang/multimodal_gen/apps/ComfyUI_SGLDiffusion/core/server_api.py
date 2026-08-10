@@ -47,7 +47,7 @@ class SGLDiffusionServerAPI:
             - model_path: Path to the model
             - task_type: Type of task (e.g., "T2V", "I2I")
             - pipeline_name: Name of the pipeline
-            - num_gpus: Number of GPUs
+            - num_devices: Number of GPUs
             - dit_precision: DiT model precision
             - vae_precision: VAE model precision
         """

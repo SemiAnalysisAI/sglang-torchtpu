@@ -21,7 +21,7 @@ def test_comfyui_flux_pipeline_direct() -> None:
     generator = DiffGenerator.from_pretrained(
         model_path=model_path,
         pipeline_class_name="ComfyUIFluxPipeline",
-        num_gpus=2,
+        num_devices=2,
         comfyui_mode=True,
     )
 

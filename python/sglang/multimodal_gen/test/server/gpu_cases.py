@@ -307,7 +307,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         "wan2_1_t2v_1_3b_lora_1gpu",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
-            num_gpus=1,
+            num_devices=1,
             dynamic_lora_path="Cseti/Wan-LoRA-Arcane-Jinx-v1",
         ),
         DiffusionSamplingParams(
@@ -422,7 +422,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="robbyant/lingbot-world-fast-diffusers",
             modality="video",
-            num_gpus=1,
+            num_devices=1,
             extras=[
                 "--pipeline-class-name LingBotWorldCausalDMDPipeline --warmup false"
             ],

@@ -215,7 +215,7 @@ class GenerateSubcommand(CLISubcommand):
 
     def _get_init_arg_names(self) -> list[str]:
         """Get names of arguments for DiffGenerator initialization"""
-        return ["num_gpus", "tp_size", "sp_size", "model_path"]
+        return ["num_devices", "tp_size", "sp_size", "model_path"]
 
     def _get_generation_arg_names(self) -> list[str]:
         """Get names of arguments for generate_video method"""
@@ -228,7 +228,7 @@ class GenerateSubcommand(CLISubcommand):
 
     def validate(self, args: argparse.Namespace) -> None:
         """Validate the arguments for this command"""
-        if args.num_gpus is not None and args.num_gpus <= 0:
+        if args.num_devices is not None and args.num_devices <= 0:
             raise ValueError("Number of gpus must be positive")
 
         if args.config and not os.path.exists(args.config):

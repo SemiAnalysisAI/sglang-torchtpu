@@ -88,9 +88,9 @@ class XpuPlatform(Platform):
         if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
             return 0.0
 
-        num_gpus = torch.xpu.device_count()
-        if device_id < 0 or device_id >= num_gpus:
-            raise ValueError(f"Invalid XPU device_id={device_id}. num_gpus={num_gpus}")
+        num_devices = torch.xpu.device_count()
+        if device_id < 0 or device_id >= num_devices:
+            raise ValueError(f"Invalid XPU device_id={device_id}. num_devices={num_devices}")
 
         current = torch.xpu.current_device()
         if current != device_id:

@@ -76,7 +76,7 @@ class DisaggServerArgsMixin:
 
     def resolved_role_device(self) -> Literal["cpu", "cuda"]:
         if self.disagg_role_device == "auto":
-            return "cpu" if self.num_gpus <= 0 else "cuda"
+            return "cpu" if self.num_devices <= 0 else "cuda"
         return self.disagg_role_device
 
     @classmethod

@@ -32,7 +32,7 @@ class SGLDOptions:
                     "BOOLEAN",
                     {"default": False},
                 ),
-                "num_gpus": ("INT", {"default": 1, "min": 1, "step": 1}),
+                "num_devices": ("INT", {"default": 1, "min": 1, "step": 1}),
                 "tp_size": ("INT", {"default": -1, "min": -1, "step": 1}),
                 "sp_degree": ("INT", {"default": -1, "min": -1, "step": 1}),
                 "ulysses_degree": (
@@ -73,7 +73,7 @@ class SGLDOptions:
         self,
         model_type: str = "auto-detect",
         enable_torch_compile: bool = False,
-        num_gpus: int = 1,
+        num_devices: int = 1,
         tp_size: int = -1,
         sp_degree: int = -1,
         ulysses_degree: int = -1,
@@ -94,7 +94,7 @@ class SGLDOptions:
         options = {
             "model_type": model_type,
             "enable_torch_compile": enable_torch_compile,
-            "num_gpus": num_gpus,
+            "num_devices": num_devices,
             "tp_size": tp_size,
             "sp_degree": sp_degree,
             "ulysses_degree": ulysses_degree,

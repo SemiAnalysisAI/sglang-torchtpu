@@ -26,14 +26,14 @@ from sglang.multimodal_gen.runtime.models.encoders.base import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
-def _run(encoders, tp, sp, cfg, dp=1, disagg=False, num_gpus=None, image=()):
+def _run(encoders, tp, sp, cfg, dp=1, disagg=False, num_devices=None, image=()):
     self = SimpleNamespace(
         tp_size=tp,
         sp_degree=sp,
         cfg_parallel_degree=cfg,
         dp_size=dp,
         disagg_mode=disagg,
-        num_gpus=num_gpus if num_gpus is not None else tp * sp * cfg * dp,
+        num_devices=num_devices if num_devices is not None else tp * sp * cfg * dp,
         pipeline_config=SimpleNamespace(
             text_encoder_configs=tuple(encoders),
             image_encoder_configs=tuple(image),
@@ -42,10 +42,10 @@ def _run(encoders, tp, sp, cfg, dp=1, disagg=False, num_gpus=None, image=()):
     ServerArgs.adjust_pipeline_config(self)
 
 
-def _proposed_mode(tp, sp, cfg, dp=1, disagg=False, num_gpus=None):
+def _proposed_mode(tp, sp, cfg, dp=1, disagg=False, num_devices=None):
     enc = T5Config()
     enc.parallel_folding_mode = None
-    _run([enc], tp, sp, cfg, dp=dp, disagg=disagg, num_gpus=num_gpus)
+    _run([enc], tp, sp, cfg, dp=dp, disagg=disagg, num_devices=num_devices)
     return enc.parallel_folding_mode
 
 
@@ -89,7 +89,7 @@ def test_disagg_keeps_sp():
 
 
 def test_num_gpus_is_authoritative_for_replica():
-    assert _proposed_mode(tp=2, sp=1, cfg=1, num_gpus=8) == "world"
+    assert _proposed_mode(tp=2, sp=1, cfg=1, num_devices=8) == "world"
 
 
 def test_all_encoders_get_the_same_proposed_mode():

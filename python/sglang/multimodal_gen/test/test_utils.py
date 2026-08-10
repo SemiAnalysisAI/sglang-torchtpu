@@ -1024,11 +1024,11 @@ def get_consistency_gt_case_id(case_id: str) -> str:
 
 
 def _consistency_gt_filenames(
-    case_id: str, num_gpus: int, is_video: bool, output_format: str | None = None
+    case_id: str, num_devices: int, is_video: bool, output_format: str | None = None
 ) -> list[str]:
     """Return the list of GT image filenames for a case. Reused by GT generation and consistency check."""
     case_id = get_consistency_gt_case_id(case_id)
-    n = num_gpus
+    n = num_devices
     if is_video:
         return [
             f"{case_id}_{n}gpu_frame_0.png",
@@ -1040,10 +1040,10 @@ def _consistency_gt_filenames(
 
 
 def _base_consistency_gt_candidates(
-    case_id: str, num_gpus: int, is_video: bool, output_format: str | None = None
+    case_id: str, num_devices: int, is_video: bool, output_format: str | None = None
 ) -> list[str]:
     case_id = get_consistency_gt_case_id(case_id)
-    n = num_gpus
+    n = num_devices
     if is_video:
         return [
             f"{case_id}_{n}gpu_frame_0.png",
@@ -1057,10 +1057,10 @@ def _base_consistency_gt_candidates(
 
 
 def get_consistency_gt_candidate_sets(
-    case_id: str, num_gpus: int, is_video: bool, output_format: str | None = None
+    case_id: str, num_devices: int, is_video: bool, output_format: str | None = None
 ) -> list[list[str]]:
     candidates = _base_consistency_gt_candidates(
-        case_id, num_gpus, is_video, output_format
+        case_id, num_devices, is_video, output_format
     )
     if _is_ascend_consistency_case(case_id) or current_platform.is_npu():
         return [candidates]
@@ -1069,42 +1069,42 @@ def get_consistency_gt_candidate_sets(
 
 
 def get_consistency_gt_candidates(
-    case_id: str, num_gpus: int, is_video: bool, output_format: str | None = None
+    case_id: str, num_devices: int, is_video: bool, output_format: str | None = None
 ) -> list[str]:
     """Return candidate GT filenames for local consistency data."""
     return [
         candidate
         for candidate_set in get_consistency_gt_candidate_sets(
-            case_id, num_gpus, is_video, output_format
+            case_id, num_devices, is_video, output_format
         )
         for candidate in candidate_set
     ]
 
 
 def get_consistency_gt_remote_files(
-    case_id: str, num_gpus: int, is_video: bool, output_format: str | None = None
+    case_id: str, num_devices: int, is_video: bool, output_format: str | None = None
 ) -> list[tuple[str, str]]:
     """Return GT filenames with their remote raw URLs."""
     files = _find_remote_consistency_gt_files(
-        case_id, num_gpus, is_video, output_format
+        case_id, num_devices, is_video, output_format
     )
     if files:
         return files
 
     return _remote_consistency_gt_candidates(
-        SGL_TEST_FILES_CONSISTENCY_GT_BASE, case_id, num_gpus, is_video, output_format
+        SGL_TEST_FILES_CONSISTENCY_GT_BASE, case_id, num_devices, is_video, output_format
     )
 
 
 def _remote_consistency_gt_candidates(
     base_url: str,
     case_id: str,
-    num_gpus: int,
+    num_devices: int,
     is_video: bool,
     output_format: str | None = None,
 ) -> list[tuple[str, str]]:
     filenames = get_consistency_gt_candidates(
-        case_id, num_gpus, is_video, output_format
+        case_id, num_devices, is_video, output_format
     )
     return [(filename, f"{base_url}/{filename}") for filename in filenames]
 
@@ -1263,12 +1263,12 @@ def _load_remote_gt_image(url: str) -> np.ndarray:
 
 def _find_remote_consistency_gt_files(
     case_id: str,
-    num_gpus: int,
+    num_devices: int,
     is_video: bool,
     output_format: str | None = None,
 ) -> list[tuple[str, str]]:
     for filenames in get_consistency_gt_candidate_sets(
-        case_id, num_gpus, is_video, output_format
+        case_id, num_devices, is_video, output_format
     ):
         for base_url in _remote_consistency_gt_base_urls(case_id):
             candidates = [
@@ -1309,25 +1309,25 @@ def _get_consistency_gt_dir() -> Path | None:
 
 def _get_consistency_gt_cache_key(
     case_id: str,
-    num_gpus: int,
+    num_devices: int,
     is_video: bool,
     output_format: str | None,
 ) -> str:
     gt_dir = _get_consistency_gt_dir()
     source = str(gt_dir) if gt_dir is not None else "remote"
     platform = get_consistency_platform()
-    return f"{platform}:{case_id}:{num_gpus}:{is_video}:{output_format or ''}:{source}"
+    return f"{platform}:{case_id}:{num_devices}:{is_video}:{output_format or ''}:{source}"
 
 
 def load_consistency_gt(
     case_id: str,
-    num_gpus: int,
+    num_devices: int,
     is_video: bool = False,
     output_format: str | None = None,
 ) -> LoadedConsistencyGT:
     """Load GT images and CLIP embeddings for consistency checks."""
     cache_key = _get_consistency_gt_cache_key(
-        case_id, num_gpus, is_video, output_format
+        case_id, num_devices, is_video, output_format
     )
     cached = _consistency_gt_cache.get(cache_key)
     if cached is not None:
@@ -1338,7 +1338,7 @@ def load_consistency_gt(
     gt_dir = _get_consistency_gt_dir()
     if gt_dir is not None:
         candidate_sets = get_consistency_gt_candidate_sets(
-            case_id, num_gpus, is_video, output_format
+            case_id, num_devices, is_video, output_format
         )
         if is_video:
             selected = None
@@ -1360,7 +1360,7 @@ def load_consistency_gt(
         else:
             path = None
             for fn in get_consistency_gt_candidates(
-                case_id, num_gpus, is_video, output_format
+                case_id, num_devices, is_video, output_format
             ):
                 candidate = gt_dir / fn
                 if candidate.exists():
@@ -1368,7 +1368,7 @@ def load_consistency_gt(
                     break
             if path is None:
                 candidates = get_consistency_gt_candidates(
-                    case_id, num_gpus, is_video, output_format
+                    case_id, num_devices, is_video, output_format
                 )
                 raise FileNotFoundError(
                     f"GT image not found in {gt_dir}. Tried: {', '.join(candidates)}"
@@ -1377,11 +1377,11 @@ def load_consistency_gt(
         logger.info(f"Loaded {len(images)} GT images for {case_id} from {gt_dir}")
     else:
         remote_files = _find_remote_consistency_gt_files(
-            case_id, num_gpus, is_video, output_format
+            case_id, num_devices, is_video, output_format
         )
         if not remote_files:
             candidates = get_consistency_gt_candidates(
-                case_id, num_gpus, is_video, output_format
+                case_id, num_devices, is_video, output_format
             )
             raise FileNotFoundError(
                 f"GT image not found for {case_id}. Tried: {', '.join(candidates)}"
@@ -1399,14 +1399,14 @@ def load_consistency_gt(
 
 def load_gt_embeddings(
     case_id: str,
-    num_gpus: int,
+    num_devices: int,
     is_video: bool = False,
     output_format: str | None = None,
 ) -> list[np.ndarray]:
     """Load GT images and convert them into CLIP embeddings."""
     return load_consistency_gt(
         case_id=case_id,
-        num_gpus=num_gpus,
+        num_devices=num_devices,
         is_video=is_video,
         output_format=output_format,
     ).embeddings
@@ -1414,7 +1414,7 @@ def load_gt_embeddings(
 
 def gt_exists(
     case_id: str,
-    num_gpus: int,
+    num_devices: int,
     is_video: bool = False,
     output_format: str | None = None,
 ) -> bool:
@@ -1422,7 +1422,7 @@ def gt_exists(
     gt_dir = _get_consistency_gt_dir()
     if gt_dir is not None:
         candidate_sets = get_consistency_gt_candidate_sets(
-            case_id, num_gpus, is_video, output_format
+            case_id, num_devices, is_video, output_format
         )
         if is_video:
             return any(
@@ -1436,12 +1436,12 @@ def gt_exists(
         )
 
     cache_key = _get_consistency_gt_cache_key(
-        case_id, num_gpus, is_video, output_format
+        case_id, num_devices, is_video, output_format
     )
     if cache_key in _gt_exists_remote_cache:
         return True
     found = bool(
-        _find_remote_consistency_gt_files(case_id, num_gpus, is_video, output_format)
+        _find_remote_consistency_gt_files(case_id, num_devices, is_video, output_format)
     )
     if found:
         _gt_exists_remote_cache.add(cache_key)
@@ -1676,7 +1676,7 @@ def _draw_metric_items(
 
 def _make_consistency_failure_image(
     case_id: str,
-    num_gpus: int,
+    num_devices: int,
     output_frames: list[np.ndarray],
     gt_data: LoadedConsistencyGT,
     result: ConsistencyResult,
@@ -1704,7 +1704,7 @@ def _make_consistency_failure_image(
 
     header_lines = [
         f"Consistency failure: {case_id}",
-        f"modality={'video' if is_video else 'image'} | gpus={num_gpus} | frames={len(output_frames)}",
+        f"modality={'video' if is_video else 'image'} | gpus={num_devices} | frames={len(output_frames)}",
         (
             "thresholds: "
             f"clip>={result.thresholds.clip_threshold} "
@@ -1770,7 +1770,7 @@ def _make_consistency_failure_image(
 
 def _consistency_failure_record(
     case_id: str,
-    num_gpus: int,
+    num_devices: int,
     result: ConsistencyResult,
     is_video: bool,
     output_format: str | None,
@@ -1780,7 +1780,7 @@ def _consistency_failure_record(
 ) -> dict[str, Any]:
     return {
         "case_id": case_id,
-        "num_gpus": num_gpus,
+        "num_devices": num_devices,
         "is_video": is_video,
         "output_format": output_format,
         "comparison_png": image_name,
@@ -1821,7 +1821,7 @@ def _consistency_failure_record(
 def _save_generated_artifact_images(
     out_dir: Path,
     case_id: str,
-    num_gpus: int,
+    num_devices: int,
     output_frames: list[np.ndarray],
     is_video: bool,
     output_format: str | None,
@@ -1833,12 +1833,12 @@ def _save_generated_artifact_images(
     if is_video:
         suffixes = ("frame_0", "frame_mid", "frame_last")
         filenames = [
-            f"{safe_case_id}_{num_gpus}gpu_{suffix}.png"
+            f"{safe_case_id}_{num_devices}gpu_{suffix}.png"
             for suffix in suffixes[: len(output_frames)]
         ]
     else:
         ext = output_format_to_ext(output_format)
-        filenames = [f"{safe_case_id}_{num_gpus}gpu.{ext}"]
+        filenames = [f"{safe_case_id}_{num_devices}gpu.{ext}"]
 
     generated_files = []
     for frame, filename in zip(output_frames, filenames):
@@ -1853,7 +1853,7 @@ def _write_consistency_failure_index(
     records: list[dict[str, Any]],
 ) -> None:
     sections = []
-    for record in sorted(records, key=lambda r: (r["case_id"], r["num_gpus"])):
+    for record in sorted(records, key=lambda r: (r["case_id"], r["num_devices"])):
         case_id = html.escape(record["case_id"])
         png = html.escape(record["comparison_png"])
         metrics = record["metrics"]
@@ -1868,7 +1868,7 @@ def _write_consistency_failure_index(
         )
         sections.append(
             "<section>"
-            f"<h2>{case_id} ({record['num_gpus']} GPU)</h2>"
+            f"<h2>{case_id} ({record['num_devices']} GPU)</h2>"
             "<p>"
             f"clip={metrics['min_clip_similarity']} | "
             f"ssim={metrics['min_ssim']} | "
@@ -1899,7 +1899,7 @@ def _write_consistency_failure_index(
 def save_consistency_failure_artifact(
     artifact_dir: str | Path | None,
     case_id: str,
-    num_gpus: int,
+    num_devices: int,
     output_frames: list[np.ndarray],
     gt_data: LoadedConsistencyGT,
     result: ConsistencyResult,
@@ -1918,7 +1918,7 @@ def save_consistency_failure_artifact(
     image_path = out_dir / image_name
     comparison = _make_consistency_failure_image(
         case_id=case_id,
-        num_gpus=num_gpus,
+        num_devices=num_devices,
         output_frames=output_frames,
         gt_data=gt_data,
         result=result,
@@ -1929,7 +1929,7 @@ def save_consistency_failure_artifact(
     generated_files = _save_generated_artifact_images(
         out_dir=out_dir,
         case_id=case_id,
-        num_gpus=num_gpus,
+        num_devices=num_devices,
         output_frames=output_frames,
         is_video=is_video,
         output_format=output_format,
@@ -1937,7 +1937,7 @@ def save_consistency_failure_artifact(
 
     record = _consistency_failure_record(
         case_id=case_id,
-        num_gpus=num_gpus,
+        num_devices=num_devices,
         result=result,
         is_video=is_video,
         output_format=output_format,
@@ -1955,7 +1955,7 @@ def save_consistency_failure_artifact(
     records = [
         item
         for item in records
-        if not (item.get("case_id") == case_id and item.get("num_gpus") == num_gpus)
+        if not (item.get("case_id") == case_id and item.get("num_devices") == num_devices)
     ]
     records.append(record)
     summary_path.write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")

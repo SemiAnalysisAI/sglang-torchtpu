@@ -162,7 +162,7 @@ async def get_models(request: Request):
 
     response = {
         "model_path": server_args.model_path,
-        "num_gpus": server_args.num_gpus,
+        "num_devices": server_args.num_devices,
         "task_type": server_args.pipeline_config.task_type.name,
         "dit_precision": server_args.pipeline_config.dit_precision,
         "vae_precision": server_args.pipeline_config.vae_precision,

@@ -568,7 +568,7 @@ def test_save_consistency_failure_artifact(tmp_path, monkeypatch):
     artifact_path = save_consistency_failure_artifact(
         artifact_dir=tmp_path,
         case_id="unit_image_fail",
-        num_gpus=1,
+        num_devices=1,
         output_frames=[bad_image],
         gt_data=LoadedConsistencyGT(
             images=[gt_image],

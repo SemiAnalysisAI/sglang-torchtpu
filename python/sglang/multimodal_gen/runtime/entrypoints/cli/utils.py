@@ -20,13 +20,13 @@ class RaiseNotImplementedAction(argparse.Action):
 
 
 def launch_distributed(
-    num_gpus: int, args: list[str], master_port: int | None = None
+    num_devices: int, args: list[str], master_port: int | None = None
 ) -> int:
     """
     Launch a distributed job with the given arguments
 
     Args:
-        num_gpus: Number of GPUs to use
+        num_devices: Number of GPUs to use
         args: Arguments to pass to v1_sgl_diffusion_inference.py (defaults to sys.argv[1:])
         master_port: Port for the master process (default: random)
     """
@@ -44,7 +44,7 @@ def launch_distributed(
         python_executable,
         "-m",
         "torch.distributed.run",
-        f"--nproc_per_node={num_gpus}",
+        f"--nproc_per_node={num_devices}",
     ]
 
     if master_port is not None:
@@ -53,7 +53,7 @@ def launch_distributed(
     cmd.append(main_script)
     cmd.extend(args)
 
-    logger.info("Running inference with %d GPU(s)", num_gpus)
+    logger.info("Running inference with %d GPU(s)", num_devices)
     logger.info("Launching command: %s", shlex.join(cmd))
 
     current_env["PYTHONIOENCODING"] = "utf-8"

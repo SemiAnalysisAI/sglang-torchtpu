@@ -338,7 +338,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         )
 
         with tempfile.NamedTemporaryFile("w", suffix=".json") as config_file:
-            json.dump({"model_path": "/from/config", "num_gpus": 2}, config_file)
+            json.dump({"model_path": "/from/config", "num_devices": 2}, config_file)
             config_file.flush()
             parser = FlexibleArgumentParser()
             add_multimodal_gen_serve_args(parser)
@@ -377,7 +377,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                     server_args = ServerArgs.from_cli_args(args, unknown_args)
 
         self.assertEqual("/from/cli", server_args.model_path)
-        self.assertEqual(2, server_args.num_gpus)
+        self.assertEqual(2, server_args.num_devices)
         self.assertEqual("/custom/vae", server_args.component_paths["vae"])
         self.assertEqual(
             {"transformer": "fa"},
@@ -908,7 +908,7 @@ class TestOffloadDefaults(unittest.TestCase):
             SanaWMPipelineConfig(),
             kwargs={
                 "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
-                "num_gpus": 2,
+                "num_devices": 2,
                 "performance_mode": "auto",
             },
         )
@@ -923,7 +923,7 @@ class TestOffloadDefaults(unittest.TestCase):
                     SanaWMPipelineConfig(),
                     kwargs={
                         "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
-                        "num_gpus": 2,
+                        "num_devices": 2,
                         "use_fsdp_inference": True,
                     },
                 )
@@ -934,7 +934,7 @@ class TestOffloadDefaults(unittest.TestCase):
                 SanaWMPipelineConfig(),
                 kwargs={
                     "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
-                    "num_gpus": 2,
+                    "num_devices": 2,
                     "performance_mode": "auto",
                 },
             )
@@ -947,7 +947,7 @@ class TestOffloadDefaults(unittest.TestCase):
             SanaWMRealtimeConfig(),
             kwargs={
                 "model_path": "Efficient-Large-Model/SANA-WM_streaming",
-                "num_gpus": 2,
+                "num_devices": 2,
                 "performance_mode": "auto",
             },
         )
@@ -956,21 +956,21 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.enable_cfg_parallel)
 
     def test_auto_ltx23_large_gpu_counts_prefer_sp_over_cfg_parallel(self):
-        for num_gpus in (4, 8):
-            with self.subTest(num_gpus=num_gpus):
+        for num_devices in (4, 8):
+            with self.subTest(num_devices=num_devices):
                 args = self._from_dict_with_pipeline_config(
                     LTX2PipelineConfig(),
                     kwargs={
                         "model_path": "Lightricks/LTX-2.3",
-                        "num_gpus": num_gpus,
+                        "num_devices": num_devices,
                         "performance_mode": "auto",
                     },
                 )
 
                 self.assertFalse(args.enable_cfg_parallel)
                 self.assertEqual(args.cfg_parallel_degree, 1)
-                self.assertEqual(args.sp_degree, num_gpus)
-                self.assertEqual(args.ulysses_degree, num_gpus)
+                self.assertEqual(args.sp_degree, num_devices)
+                self.assertEqual(args.ulysses_degree, num_devices)
                 self.assertEqual(args.ring_degree, 1)
 
     def test_manual_mode_preserves_unset_performance_args(self):
@@ -978,7 +978,7 @@ class TestOffloadDefaults(unittest.TestCase):
             QwenImagePipelineConfig(),
             kwargs={
                 "model_path": "Qwen/Qwen-Image",
-                "num_gpus": 2,
+                "num_devices": 2,
                 "performance_mode": "manual",
             },
         )
@@ -1135,7 +1135,7 @@ class TestOffloadDefaults(unittest.TestCase):
             WanT2V480PConfig(),
             kwargs={
                 "model_path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-                "num_gpus": 2,
+                "num_devices": 2,
                 "performance_mode": "auto",
                 "use_fsdp_inference": True,
             },
@@ -1228,7 +1228,7 @@ class TestOffloadDefaults(unittest.TestCase):
                 WanT2V480PConfig(),
                 kwargs={
                     "model_path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-                    "num_gpus": 2,
+                    "num_devices": 2,
                     "performance_mode": "auto",
                 },
             )
@@ -1249,7 +1249,7 @@ class TestOffloadDefaults(unittest.TestCase):
             MOVAPipelineConfig(),
             kwargs={
                 "model_path": "OpenMOSS-Team/MOVA-360p",
-                "num_gpus": 2,
+                "num_devices": 2,
                 "dit_layerwise_offload": True,
             },
         )
@@ -1267,7 +1267,7 @@ class TestOffloadDefaults(unittest.TestCase):
             available_memory_gb=76,
             kwargs={
                 "model_path": "Lightricks/LTX-2",
-                "num_gpus": 2,
+                "num_devices": 2,
                 "pipeline_class_name": "LTX2TwoStagePipeline",
             },
         )
@@ -1289,7 +1289,7 @@ class TestOffloadDefaults(unittest.TestCase):
             available_memory_gb=134,
             kwargs={
                 "model_path": "Lightricks/LTX-2.3",
-                "num_gpus": 2,
+                "num_devices": 2,
                 "pipeline_class_name": "LTX2TwoStagePipeline",
             },
         )
@@ -1309,7 +1309,7 @@ class TestOffloadDefaults(unittest.TestCase):
             available_memory_gb=134,
             kwargs={
                 "model_path": "Lightricks/LTX-2.3",
-                "num_gpus": 2,
+                "num_devices": 2,
                 "pipeline_class_name": "LTX2TwoStagePipeline",
                 "ltx2_two_stage_device_mode": "original",
             },
@@ -1327,7 +1327,7 @@ class TestOffloadDefaults(unittest.TestCase):
             available_memory_gb=134,
             kwargs={
                 "model_path": "Lightricks/LTX-2.3",
-                "num_gpus": 2,
+                "num_devices": 2,
                 "pipeline_class_name": "LTX2TwoStagePipeline",
                 "ltx2_two_stage_device_mode": "snapshot",
             },
@@ -1346,7 +1346,7 @@ class TestOffloadDefaults(unittest.TestCase):
             available_memory_gb=134,
             kwargs={
                 "model_path": "Lightricks/LTX-2.3",
-                "num_gpus": 2,
+                "num_devices": 2,
                 "pipeline_class_name": "LTX2TwoStagePipeline",
                 "layerwise_offload_components": ["text_encoder"],
             },
@@ -1360,7 +1360,7 @@ class TestOffloadDefaults(unittest.TestCase):
             QwenImagePipelineConfig(),
             kwargs={
                 "model_path": "Qwen/Qwen-Image",
-                "num_gpus": 2,
+                "num_devices": 2,
                 "performance_mode": "auto",
             },
         )
@@ -1381,7 +1381,7 @@ class TestOffloadDefaults(unittest.TestCase):
             ZImagePipelineConfig(),
             kwargs={
                 "model_path": "Tongyi-MAI/Z-Image",
-                "num_gpus": 2,
+                "num_devices": 2,
                 "performance_mode": "auto",
             },
         )
@@ -1394,7 +1394,7 @@ class TestOffloadDefaults(unittest.TestCase):
             ZImagePipelineConfig(),
             kwargs={
                 "model_path": "Tongyi-MAI/Z-Image-Turbo",
-                "num_gpus": 2,
+                "num_devices": 2,
                 "performance_mode": "auto",
             },
         )
@@ -1407,7 +1407,7 @@ class TestOffloadDefaults(unittest.TestCase):
             QwenImagePipelineConfig(),
             kwargs={
                 "model_path": "Qwen/Qwen-Image",
-                "num_gpus": 2,
+                "num_devices": 2,
                 "performance_mode": "auto",
                 "use_fsdp_inference": False,
             },
@@ -1430,7 +1430,7 @@ class TestOffloadDefaults(unittest.TestCase):
             memory_gb=50,
             kwargs={
                 "model_path": "Qwen/Qwen-Image",
-                "num_gpus": 2,
+                "num_devices": 2,
                 "performance_mode": "auto",
             },
         )
@@ -1453,7 +1453,7 @@ class TestOffloadDefaults(unittest.TestCase):
             kwargs={
                 "model_path": "Qwen/Qwen-Image",
                 "base_gpu_id": 1,
-                "num_gpus": 2,
+                "num_devices": 2,
                 "performance_mode": "auto",
             },
         )
@@ -1468,7 +1468,7 @@ class TestOffloadDefaults(unittest.TestCase):
             kwargs={
                 "model_path": "Qwen/Qwen-Image",
                 "base_gpu_id": 1,
-                "num_gpus": 2,
+                "num_devices": 2,
                 "performance_mode": "auto",
             },
         )
@@ -1573,7 +1573,7 @@ class TestOffloadDefaults(unittest.TestCase):
             WanT2V480PConfig(),
             kwargs={
                 "model_path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-                "num_gpus": 2,
+                "num_devices": 2,
                 "performance_mode": "memory",
                 "use_fsdp_inference": True,
             },
@@ -2051,6 +2051,41 @@ class TestDisaggTransferBackendArgs(unittest.TestCase):
 
         args, _unknown = parser.parse_known_args(argv)
         self.assertEqual(args.disagg_transfer_backend, "mock")
+
+
+class TestNumDevices(unittest.TestCase):
+    """--num-devices is canonical; --num-gpus / num_gpus stay working."""
+
+    def _parse(self, argv):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args, _unknown = parser.parse_known_args(argv)
+        return args
+
+    def test_both_cli_spellings_set_num_devices(self):
+        for flag in ("--num-devices", "--num-gpus"):
+            with self.subTest(flag=flag):
+                args = self._parse(["--model-path", "/fake", flag, "4"])
+                self.assertEqual(args.num_devices, 4)
+
+    @staticmethod
+    def _from_dict(kwargs):
+        # A device count > 1 sends _adjust_parallelism through
+        # _model_default_uses_cfg, which resolves the model remotely.
+        with patch.object(ServerArgs, "_model_default_uses_cfg", return_value=False):
+            return _from_dict_without_model_resolution(kwargs)
+
+    def test_deprecated_kwarg_sets_num_devices(self):
+        args = self._from_dict({"model_path": "/fake", "num_gpus": 8})
+        self.assertEqual(args.num_devices, 8)
+
+    def test_deprecated_attribute_still_readable(self):
+        args = self._from_dict({"model_path": "/fake", "num_devices": 8})
+        self.assertEqual(args.num_gpus, 8)
+
+    def test_conflicting_spellings_raise(self):
+        with self.assertRaises(ValueError):
+            self._from_dict({"model_path": "/fake", "num_devices": 2, "num_gpus": 8})
 
 
 if __name__ == "__main__":

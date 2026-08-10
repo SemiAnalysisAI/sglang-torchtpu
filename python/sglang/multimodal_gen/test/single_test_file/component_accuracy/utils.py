@@ -337,14 +337,14 @@ def build_accuracy_server_args(
     base_model_root: str,
     case: Any,
     component: ComponentType,
-    num_gpus: int,
+    num_devices: int,
     component_paths: Dict[str, str],
 ) -> ServerArgs:
     cfg_parallel = bool(case.server_args.cfg_parallel)
     kwargs = {
         "model_path": base_model_root,
         "model_id": base_model_id,
-        "num_gpus": num_gpus,
+        "num_devices": num_devices,
         "trust_remote_code": True,
         "component_paths": component_paths,
         "enable_cfg_parallel": cfg_parallel,
@@ -707,7 +707,7 @@ def _run_staged_native_component_accuracy_case(
     case: Any,
     component: ComponentType,
     library: str,
-    num_gpus: int,
+    num_devices: int,
 ) -> None:
     from sglang.multimodal_gen.test.single_test_file.component_accuracy.hooks import (
         resolve_component_native_profile,
@@ -720,7 +720,7 @@ def _run_staged_native_component_accuracy_case(
             case,
             component,
             library,
-            num_gpus,
+            num_devices,
             materialize_sgl_on_device=(component != ComponentType.TRANSFORMER),
             materialize_ref_on_device=False,
         )
@@ -752,7 +752,7 @@ def _run_staged_native_component_accuracy_case(
 
         del sgl_call
         del sgl_raw
-        if component == ComponentType.TRANSFORMER and num_gpus == 1:
+        if component == ComponentType.TRANSFORMER and num_devices == 1:
             engine_cls.prepare_component_for_release(sgl)
         del sgl
         sgl = None
@@ -792,7 +792,7 @@ def _run_staged_native_component_accuracy_case(
         )
     finally:
         if sgl is not None:
-            if component == ComponentType.TRANSFORMER and num_gpus == 1:
+            if component == ComponentType.TRANSFORMER and num_devices == 1:
                 engine_cls.prepare_component_for_release(sgl)
             del sgl
         if ref is not None:
@@ -802,7 +802,7 @@ def _run_staged_native_component_accuracy_case(
 
 
 def _run_staged_text_encoder_accuracy_case(
-    engine_cls: Any, case: Any, num_gpus: int
+    engine_cls: Any, case: Any, num_devices: int
 ) -> None:
     sgl = None
     ref = None
@@ -811,7 +811,7 @@ def _run_staged_text_encoder_accuracy_case(
             case,
             ComponentType.TEXT_ENCODER,
             "transformers",
-            num_gpus,
+            num_devices,
             materialize_sgl_on_device=False,
             materialize_ref_on_device=False,
         )
@@ -857,15 +857,15 @@ def run_native_component_accuracy_case(
     case: Any,
     component: ComponentType,
     library: str,
-    num_gpus: int,
+    num_devices: int,
 ) -> None:
     _run_staged_native_component_accuracy_case(
-        engine_cls, case, component, library, num_gpus
+        engine_cls, case, component, library, num_devices
     )
 
 
-def run_text_encoder_accuracy_case(engine_cls: Any, case: Any, num_gpus: int) -> None:
-    _run_staged_text_encoder_accuracy_case(engine_cls, case, num_gpus)
+def run_text_encoder_accuracy_case(engine_cls: Any, case: Any, num_devices: int) -> None:
+    _run_staged_text_encoder_accuracy_case(engine_cls, case, num_devices)
 
 
 def _find_split_shard_parts(lookup, cand):

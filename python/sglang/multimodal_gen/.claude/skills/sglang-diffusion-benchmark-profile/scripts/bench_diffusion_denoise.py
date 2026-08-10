@@ -607,8 +607,8 @@ def _expected_nightly_cli_args(case: dict) -> dict[str, str]:
         if key in case:
             expected[flag] = str(case[key])
 
-    if case.get("num_gpus", 1) > 1:
-        expected["num-gpus"] = str(case["num_gpus"])
+    if case.get("num_devices", 1) > 1:
+        expected["num-gpus"] = str(case["num_devices"])
 
     serve_args = shlex.split(case["frameworks"]["sglang"].get("serve_args", ""))
     parsed_serve_args = _parse_cli_args(serve_args)

@@ -113,7 +113,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
         "flux_2_image_t2i_2npu",
         DiffusionServerArgs(
             model_path=FLUX_2_DEV_WEIGHTS_PATH,
-            num_gpus=2,
+            num_devices=2,
             tp_size=2,
             extras=EXTRAS_DISABLE_WARMUP,
         ),
@@ -123,7 +123,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
         "qwen_image_t2i_2npu",
         DiffusionServerArgs(
             model_path=QWEN_IMAGE_WEIGHTS_PATH,
-            num_gpus=2,
+            num_devices=2,
             # test ring attn
             ulysses_degree=1,
             ring_degree=2,
@@ -136,7 +136,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
         "wan2_2_t2v_14b_w8a8_2npu",
         DiffusionServerArgs(
             model_path=WAN2_2_T2V_A14B_DIFFUSERS_W8A8_WEIGHTS_PATH,
-            num_gpus=2,
+            num_devices=2,
             tp_size=1,
             ulysses_degree=2,
             extras=EXTRAS_DISABLE_WARMUP,
@@ -150,7 +150,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
         "ltx_2_ti2va_2npu",
         DiffusionServerArgs(
             model_path=LTX_2_WEIGHTS_PATH,
-            num_gpus=2,
+            num_devices=2,
             ulysses_degree=2,
             extras=EXTRAS_DISABLE_WARMUP,
         ),
@@ -161,7 +161,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
         "mova_360p_ti2va_2npu",
         DiffusionServerArgs(
             model_path=MOVA_360_WEIGHTS_PATH,
-            num_gpus=2,
+            num_devices=2,
             tp_size=2,
             dit_layerwise_offload=True,
             extras=EXTRAS_DISABLE_WARMUP,

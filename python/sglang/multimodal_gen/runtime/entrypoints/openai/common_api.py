@@ -37,7 +37,7 @@ class ModelCard(BaseModel):
 class DiffusionModelCard(ModelCard):
     """Extended ModelCard with diffusion-specific fields."""
 
-    num_gpus: Optional[int] = None
+    num_devices: Optional[int] = None
     task_type: Optional[str] = None
     dit_precision: Optional[str] = None
     vae_precision: Optional[str] = None
@@ -193,7 +193,7 @@ async def available_models():
         "id": server_args.model_path,
         "root": server_args.model_path,
         # Extended diffusion-specific fields
-        "num_gpus": server_args.num_gpus,
+        "num_devices": server_args.num_devices,
         "task_type": server_args.pipeline_config.task_type.name,
         "dit_precision": server_args.pipeline_config.dit_precision,
         "vae_precision": server_args.pipeline_config.vae_precision,
@@ -238,7 +238,7 @@ async def retrieve_model(model: str):
     card_kwargs = {
         "id": model,
         "root": model,
-        "num_gpus": server_args.num_gpus,
+        "num_devices": server_args.num_devices,
         "task_type": server_args.pipeline_config.task_type.name,
         "dit_precision": server_args.pipeline_config.dit_precision,
         "vae_precision": server_args.pipeline_config.vae_precision,

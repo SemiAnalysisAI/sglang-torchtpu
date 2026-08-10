@@ -355,13 +355,13 @@ def run_component_accuracy_files(files, filter_expr=None, continue_on_error=Fals
     exit_code = 0
     for file_path in files:
         file_name = Path(file_path).name
-        num_gpus = COMPONENT_ACCURACY_FILE_NUM_GPUS.get(file_name, 1)
-        if num_gpus > 1:
+        num_devices = COMPONENT_ACCURACY_FILE_NUM_GPUS.get(file_name, 1)
+        if num_devices > 1:
             cmd = [
                 sys.executable,
                 "-m",
                 "torch.distributed.run",
-                f"--nproc_per_node={num_gpus}",
+                f"--nproc_per_node={num_devices}",
                 "-m",
                 "pytest",
                 "-s",

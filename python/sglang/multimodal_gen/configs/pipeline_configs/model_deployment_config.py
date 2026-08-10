@@ -26,8 +26,8 @@ class ModelDeploymentConfig:
     # degree 1 keeps CFG parallel disabled and leaves GPUs available for SP
     auto_cfg_parallel_degree_by_num_gpus: tuple[tuple[int, int], ...] = ()
 
-    def get_auto_cfg_parallel_degree(self, num_gpus: int) -> int:
+    def get_auto_cfg_parallel_degree(self, num_devices: int) -> int:
         for candidate_num_gpus, cfg_degree in self.auto_cfg_parallel_degree_by_num_gpus:
-            if candidate_num_gpus == num_gpus:
+            if candidate_num_gpus == num_devices:
                 return cfg_degree
         return 2

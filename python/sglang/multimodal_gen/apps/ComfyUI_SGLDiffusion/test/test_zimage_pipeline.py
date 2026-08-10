@@ -21,7 +21,7 @@ def test_comfyui_zimage_pipeline_direct() -> None:
     generator = DiffGenerator.from_pretrained(
         model_path=model_path,
         pipeline_class_name="ComfyUIZImagePipeline",
-        num_gpus=1,
+        num_devices=1,
         sp_degree=1,
         comfyui_mode=True,
     )

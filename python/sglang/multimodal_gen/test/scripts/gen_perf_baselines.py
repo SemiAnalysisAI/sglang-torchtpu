@@ -52,7 +52,7 @@ def _openai_client(port: int) -> OpenAI:
 def _build_server_extra_args(case: DiffusionTestCase) -> str:
     server_args = case.server_args
     a = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
-    a += f" --num-gpus {server_args.num_gpus}"
+    a += f" --num-gpus {server_args.num_devices}"
     if server_args.tp_size is not None:
         a += f" --tp-size {server_args.tp_size}"
     if server_args.ulysses_degree is not None:

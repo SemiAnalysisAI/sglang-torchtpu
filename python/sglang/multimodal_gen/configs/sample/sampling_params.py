@@ -141,7 +141,7 @@ class SamplingParams:
     # Original dimensions (before VAE scaling)
     num_frames: int = 1  # Default for image models
     num_frames_round_down: bool = (
-        False  # Whether to round down num_frames if it's not divisible by num_gpus
+        False  # Whether to round down num_frames if it's not divisible by num_devices
     )
 
     # Subclasses can set these to provide model-specific default resolutions.
@@ -575,7 +575,7 @@ class SamplingParams:
             # mandatory frame adjusting logic, mod
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
             # If we apply it after, adjust_num_frames might modify the frame count
-            # and break the divisibility constraint (alignment) required by num_gpus.
+            # and break the divisibility constraint (alignment) required by num_devices.
             original_num_frames = self.num_frames
             self.num_frames = server_args.pipeline_config.adjust_num_frames(
                 original_num_frames
@@ -592,7 +592,7 @@ class SamplingParams:
                     pipeline_config.vae_config.use_temporal_scaling_frames
                 )
                 num_frames = self.num_frames
-                num_gpus = server_args.num_gpus
+                num_devices = server_args.num_devices
                 temporal_scale_factor = (
                     pipeline_config.vae_config.arch_config.temporal_compression_ratio
                 )
@@ -604,16 +604,16 @@ class SamplingParams:
                 else:
                     orig_latent_num_frames = num_frames
 
-                if orig_latent_num_frames % server_args.num_gpus != 0:
+                if orig_latent_num_frames % server_args.num_devices != 0:
                     # Adjust latent frames to be divisible by number of GPUs
                     if self.num_frames_round_down:
                         # Ensure we have at least 1 batch per GPU
                         new_latent_num_frames = (
-                            max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
+                            max(1, (orig_latent_num_frames // num_devices)) * num_devices
                         )
                     else:
                         new_latent_num_frames = (
-                            math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
+                            math.ceil(orig_latent_num_frames / num_devices) * num_devices
                         )
 
                     if use_temporal_scaling_frames:
@@ -628,7 +628,7 @@ class SamplingParams:
                         "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
                         self.num_frames,
                         new_num_frames,
-                        server_args.num_gpus,
+                        server_args.num_devices,
                     )
                     self.num_frames = new_num_frames
 

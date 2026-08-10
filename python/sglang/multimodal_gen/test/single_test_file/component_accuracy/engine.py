@@ -571,7 +571,7 @@ class AccuracyEngine:
         case: DiffusionTestCase,
         component: ComponentType,
         library: str,
-        num_gpus: int,
+        num_devices: int,
         materialize_sgl_on_device: bool = True,
         materialize_ref_on_device: bool = True,
     ) -> Tuple[nn.Module, nn.Module, str]:
@@ -596,7 +596,7 @@ class AccuracyEngine:
             component_selection.base_model_root,
             case,
             component,
-            num_gpus,
+            num_devices,
             component_selection.component_paths,
         )
         if component == ComponentType.TRANSFORMER and not materialize_sgl_on_device:
@@ -659,7 +659,7 @@ class AccuracyEngine:
     @staticmethod
     def run_vae_channels_last_3d_parity(
         case: DiffusionTestCase,
-        num_gpus: int,
+        num_devices: int,
     ) -> None:
         component = ComponentType.VAE
         spec = COMPONENT_SPECS[component]
@@ -675,7 +675,7 @@ class AccuracyEngine:
             component_selection.base_model_root,
             case,
             component,
-            num_gpus,
+            num_devices,
             component_selection.component_paths,
         )
 

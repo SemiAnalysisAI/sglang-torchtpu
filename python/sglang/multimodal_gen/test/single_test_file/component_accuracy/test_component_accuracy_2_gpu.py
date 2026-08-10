@@ -42,7 +42,7 @@ class TestComponentAccuracy2GPU:
             case,
             ComponentType.VAE,
             "diffusers",
-            case.server_args.num_gpus,
+            case.server_args.num_devices,
         )
 
     def test_transformer_accuracy(self, case):
@@ -58,7 +58,7 @@ class TestComponentAccuracy2GPU:
             case,
             ComponentType.TRANSFORMER,
             "diffusers",
-            case.server_args.num_gpus,
+            case.server_args.num_devices,
         )
 
     def test_encoder_accuracy(self, case):
@@ -72,7 +72,7 @@ class TestComponentAccuracy2GPU:
         run_text_encoder_accuracy_case(
             AccuracyEngine,
             case,
-            case.server_args.num_gpus,
+            case.server_args.num_devices,
         )
 
 
@@ -85,5 +85,5 @@ class TestVAEChannelsLast3DParity2GPU:
     def test_vae_channels_last_3d_parity(self, case):
         AccuracyEngine.run_vae_channels_last_3d_parity(
             case,
-            case.server_args.num_gpus,
+            case.server_args.num_devices,
         )

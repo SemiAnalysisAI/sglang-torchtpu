@@ -200,7 +200,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         os.environ["MASTER_PORT"] = str(self.master_port)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(self.rank)
-        os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
+        os.environ["WORLD_SIZE"] = str(self.server_args.num_devices)
         self._configure_persistent_torch_compile_cache()
         # initialize the distributed environment
         maybe_init_distributed_environment_and_model_parallel(

@@ -30,7 +30,7 @@ def _component_accuracy_key(case: DiffusionTestCase, component: ComponentType) -
         component.value,
         server_args.model_path,
         override_path,
-        server_args.num_gpus,
+        server_args.num_devices,
         server_args.tp_size,
         server_args.ulysses_degree,
         server_args.ring_degree,

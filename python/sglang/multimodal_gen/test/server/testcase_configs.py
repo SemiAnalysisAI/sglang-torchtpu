@@ -171,7 +171,7 @@ class DiffusionServerArgs:
 
     custom_validator: str | None = None  # auto-derived unless explicitly overridden
     # resources
-    num_gpus: int = 1
+    num_devices: int = 1
     tp_size: int | None = None
     ulysses_degree: int | None = None
     ring_degree: int | None = None
@@ -752,10 +752,10 @@ def _make_modelopt_ci_case(
 
 
 def _with_default_num_gpus(
-    cases: list[DiffusionTestCase], num_gpus: int
+    cases: list[DiffusionTestCase], num_devices: int
 ) -> list[DiffusionTestCase]:
     return [
-        replace(case, server_args=replace(case.server_args, num_gpus=num_gpus))
+        replace(case, server_args=replace(case.server_args, num_devices=num_devices))
         for case in cases
     ]
 

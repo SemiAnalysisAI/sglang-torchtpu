@@ -84,7 +84,7 @@ class ServerArgsAutoTuner:
                     "performance_mode=speed enables torch.compile "
                     "(pass --enable-torch-compile false to opt out)"
                 )
-            if args.num_gpus >= 2 and self._can_apply_fsdp_policy(
+            if args.num_devices >= 2 and self._can_apply_fsdp_policy(
                 require_memory_headroom=False
             ):
                 self._set_gpu_resident_defaults(use_fsdp=True)
@@ -220,7 +220,7 @@ class ServerArgsAutoTuner:
         args = self.server_args
         if (
             args.performance_mode == "auto"
-            and args.num_gpus >= 2
+            and args.num_devices >= 2
             and not self._explicit_memory_policy
             and self._auto_uses_dit_offload()
             and self._can_apply_fsdp_policy(require_memory_headroom=True)
@@ -523,7 +523,7 @@ class ServerArgsAutoTuner:
                 empty_cache=False,
             )
             for device_id in range(
-                args.base_gpu_id, args.base_gpu_id + max(1, args.num_gpus)
+                args.base_gpu_id, args.base_gpu_id + max(1, args.num_devices)
             )
         )
 

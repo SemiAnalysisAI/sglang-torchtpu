@@ -126,7 +126,7 @@ TWO_GPU_MUSA_CASES: list[DiffusionTestCase] = [
             model_path=hf_cached_model("Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"),
             modality="video",
             custom_validator="video",
-            num_gpus=2,
+            num_devices=2,
         ),
         TI2V_sampling_params,
         run_consistency_check=False,

@@ -178,13 +178,13 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     # Start a new server with multiple worker processes
     logger.info("Starting server...")
 
-    num_gpus = server_args.num_gpus
+    num_devices = server_args.num_devices
     processes = []
 
     # Pipes for master to talk to slaves
     task_pipes_to_slaves_w = []
     task_pipes_to_slaves_r = []
-    for _ in range(num_gpus - 1):
+    for _ in range(num_devices - 1):
         r, w = mp.Pipe(duplex=False)
         task_pipes_to_slaves_r.append(r)
         task_pipes_to_slaves_w.append(w)
@@ -192,7 +192,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     # Pipes for slaves to talk to master
     result_pipes_from_slaves_w = []
     result_pipes_from_slaves_r = []
-    for _ in range(num_gpus - 1):
+    for _ in range(num_devices - 1):
         r, w = mp.Pipe(duplex=False)
         result_pipes_from_slaves_r.append(r)
         result_pipes_from_slaves_w.append(w)
@@ -202,7 +202,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     scheduler_pipe_readers = []
     scheduler_pipe_writers = []
 
-    for i in range(num_gpus):
+    for i in range(num_devices):
         reader, writer = mp.Pipe(duplex=False)
         scheduler_pipe_writers.append(writer)
         if i == 0:  # Master worker
@@ -404,12 +404,12 @@ def launch_pool_disagg_server(
                 "disagg_mode": True,
                 "pool_work_endpoint": work_eps[inst_idx],
                 "pool_result_endpoint": result_ep,
-                "num_gpus": num_role_gpus,
+                "num_devices": num_role_gpus,
                 "warmup": role_type == RoleType.ENCODER,
                 "server_warmup": False,
                 "scheduler_port": find_port(port_cursor),
                 "master_port": find_port(port_cursor + 100),
-                # Per-role parallelism (None = auto-derive from num_gpus)
+                # Per-role parallelism (None = auto-derive from num_devices)
                 "tp_size": role_par["tp_size"],
                 "sp_degree": role_par["sp_degree"],
                 "ulysses_degree": role_par["ulysses_degree"],
@@ -660,9 +660,9 @@ def launch_disagg_role(server_args: ServerArgs):
     result_endpoint = server_args.derive_pool_result_endpoint()
 
     logger.info(
-        "Starting disagg role: %s, num_gpus=%d",
+        "Starting disagg role: %s, num_devices=%d",
         role_type.value,
-        server_args.num_gpus,
+        server_args.num_devices,
     )
     logger.info("  Work endpoint (bind): %s", work_endpoint)
     logger.info("  Result endpoint (connect): %s", result_endpoint)
@@ -689,7 +689,7 @@ def launch_disagg_role(server_args: ServerArgs):
         "warmup": role_type == RoleType.ENCODER,
         "server_warmup": False,
         "scheduler_port": internal_scheduler_port,
-        # Per-role parallelism (None = auto-derive from num_gpus)
+        # Per-role parallelism (None = auto-derive from num_devices)
         "tp_size": role_par["tp_size"],
         "sp_degree": role_par["sp_degree"],
         "ulysses_degree": role_par["ulysses_degree"],
@@ -706,13 +706,13 @@ def launch_disagg_role(server_args: ServerArgs):
     # Spawn GPU worker processes
     # NOTE: All ranks must be spawned before waiting for ready signals,
     # because NCCL init_process_group blocks until all ranks connect.
-    num_gpus = server_args.num_gpus
+    num_devices = server_args.num_devices
     base_gpu_id = server_args.base_gpu_id
     pool_ctx = mp.get_context("spawn")
     processes = []
     readers = []
 
-    for rank_idx in range(num_gpus):
+    for rank_idx in range(num_devices):
         reader, writer = pool_ctx.Pipe(duplex=False)
         gpu_id = base_gpu_id + rank_idx
 
@@ -746,7 +746,7 @@ def launch_disagg_role(server_args: ServerArgs):
     logger.info(
         "Role %s ready (%d GPU(s), work=%s)",
         role_type.value.upper(),
-        num_gpus,
+        num_devices,
         work_endpoint,
     )
 

@@ -117,7 +117,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
     extra_args = f"--model-type diffusion {extra_args}".strip()
 
-    extra_args += f" --num-gpus {server_args.num_gpus}"
+    extra_args += f" --num-gpus {server_args.num_devices}"
 
     if server_args.tp_size is not None:
         extra_args += f" --tp-size {server_args.tp_size}"
@@ -189,7 +189,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         port,
         wait_deadline,
         extra_args,
-        server_args.num_gpus,
+        server_args.num_devices,
     )
 
     manager = ServerManager(
@@ -593,30 +593,30 @@ class DiffusionServerBase:
             )
             return
 
-        num_gpus = case.server_args.num_gpus
+        num_devices = case.server_args.num_devices
         is_video = case.server_args.modality == "video"
         output_format = case.sampling_params.output_format
 
         if not gt_exists(
-            case.id, num_gpus, is_video=is_video, output_format=output_format
+            case.id, num_devices, is_video=is_video, output_format=output_format
         ):
             if _get_consistency_gt_dir() is not None:
                 names = ", ".join(
                     get_consistency_gt_candidates(
-                        case.id, num_gpus, is_video, output_format
+                        case.id, num_devices, is_video, output_format
                     )
                 )
             else:
                 names = ", ".join(
                     _consistency_gt_filenames(
-                        case.id, num_gpus, is_video, output_format
+                        case.id, num_devices, is_video, output_format
                     )
                 )
             logger.error(f"""
 --- MISSING GROUND TRUTH DETECTED ---
 GT image(s) not found for '{case.id}'.
 
-Add the expected file(s) to sgl-project/ci-data in diffusion-ci/consistency_gt/sglang_generated/ with naming (n=num_gpus).
+Add the expected file(s) to sgl-project/ci-data in diffusion-ci/consistency_gt/sglang_generated/ with naming (n=num_devices).
   Image: {case.id}_{{n}}gpu.<ext> (ext from output_format: png, jpg, webp)
   Video: {case.id}_{{n}}gpu_frame_0.png, {case.id}_{{n}}gpu_frame_mid.png, {case.id}_{{n}}gpu_frame_last.png
 
@@ -640,7 +640,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             )
 
         gt_data = load_consistency_gt(
-            case.id, num_gpus, is_video=is_video, output_format=output_format
+            case.id, num_devices, is_video=is_video, output_format=output_format
         )
         thresholds = get_consistency_thresholds(case.id, is_video=is_video)
 
@@ -662,14 +662,14 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             failed_frames = []
             gt_remote_files = get_consistency_gt_remote_files(
                 case.id,
-                num_gpus,
+                num_devices,
                 is_video=is_video,
                 output_format=output_format,
             )
             artifact_path = save_consistency_failure_artifact(
                 artifact_dir=os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR"),
                 case_id=case.id,
-                num_gpus=num_gpus,
+                num_devices=num_devices,
                 output_frames=output_frames,
                 gt_data=gt_data,
                 result=result,
@@ -746,7 +746,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         out_dir = Path(gt_output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        num_gpus = case.server_args.num_gpus
+        num_devices = case.server_args.num_devices
         is_video = case.server_args.modality == "video"
 
         if is_video:
@@ -764,7 +764,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 return
 
             # Save frames (reuse naming from _consistency_gt_filenames)
-            filenames = _consistency_gt_filenames(case.id, num_gpus, is_video=True)
+            filenames = _consistency_gt_filenames(case.id, num_devices, is_video=True)
             from PIL import Image
 
             for frame, fn in zip(frames, filenames):
@@ -777,7 +777,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
             detected_format = detect_image_format(content)
             filenames = _consistency_gt_filenames(
-                case.id, num_gpus, is_video=False, output_format=detected_format
+                case.id, num_devices, is_video=False, output_format=detected_format
             )
             output_path = out_dir / filenames[0]
             output_path.write_bytes(content)
@@ -1104,13 +1104,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         ), f"Model ID mismatch: expected {case.server_args.model_path}, got {model['id']}"
 
         # Verify extended diffusion-specific fields
-        assert "num_gpus" in model, "Model missing 'num_gpus' field"
+        assert "num_devices" in model, "Model missing 'num_devices' field"
         assert "task_type" in model, "Model missing 'task_type' field"
         assert "dit_precision" in model, "Model missing 'dit_precision' field"
         assert "vae_precision" in model, "Model missing 'vae_precision' field"
         assert (
-            model["num_gpus"] == case.server_args.num_gpus
-        ), f"num_gpus mismatch: expected {case.server_args.num_gpus}, got {model['num_gpus']}"
+            model["num_devices"] == case.server_args.num_devices
+        ), f"num_devices mismatch: expected {case.server_args.num_devices}, got {model['num_devices']}"
         expected_task_type = get_model_task_type_for_server_args(case.server_args).name
         assert model["task_type"] == expected_task_type, (
             f"task_type mismatch: expected {expected_task_type}, "
@@ -1133,7 +1133,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert single_model["object"] == "model", "Single model object type mismatch"
 
         # Verify extended fields on single model endpoint too
-        assert "num_gpus" in single_model, "Single model missing 'num_gpus' field"
+        assert "num_devices" in single_model, "Single model missing 'num_devices' field"
         assert "task_type" in single_model, "Single model missing 'task_type' field"
         assert single_model["task_type"] == expected_task_type, (
             f"Single model task_type mismatch: expected {expected_task_type}, "

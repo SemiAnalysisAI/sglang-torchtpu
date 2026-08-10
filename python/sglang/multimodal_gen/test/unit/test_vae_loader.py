@@ -21,9 +21,9 @@ from sglang.multimodal_gen.runtime.models.vaes import wanvae
 
 
 class _FakeServerArgs:
-    def __init__(self, pipeline_config, num_gpus=1):
+    def __init__(self, pipeline_config, num_devices=1):
         self.pipeline_config = pipeline_config
-        self.num_gpus = num_gpus
+        self.num_devices = num_devices
 
 
 class TestVAELoader(unittest.TestCase):
@@ -77,7 +77,7 @@ class TestVAELoader(unittest.TestCase):
             patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
             patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
         ):
-            server_args = _FakeServerArgs(WanT2V480PConfig(), num_gpus=1)
+            server_args = _FakeServerArgs(WanT2V480PConfig(), num_devices=1)
             self.assertTrue(_should_use_channels_last_3d(server_args, "video_vae"))
 
     def test_channels_last_3d_defaults_true_for_single_gpu_fast_wan_on_cuda(self):
@@ -86,7 +86,7 @@ class TestVAELoader(unittest.TestCase):
             patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
             patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
         ):
-            server_args = _FakeServerArgs(FastWan2_2_TI2V_5B_Config(), num_gpus=1)
+            server_args = _FakeServerArgs(FastWan2_2_TI2V_5B_Config(), num_devices=1)
             self.assertTrue(_should_use_channels_last_3d(server_args, "video_vae"))
 
     def test_channels_last_3d_defaults_false_for_multi_gpu_wan_on_cuda(self):
@@ -95,7 +95,7 @@ class TestVAELoader(unittest.TestCase):
             patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
             patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
         ):
-            server_args = _FakeServerArgs(Wan2_2_I2V_A14B_Config(), num_gpus=2)
+            server_args = _FakeServerArgs(Wan2_2_I2V_A14B_Config(), num_devices=2)
             self.assertFalse(_should_use_channels_last_3d(server_args, "video_vae"))
 
     def test_channels_last_3d_defaults_true_for_single_gpu_ltx_on_cuda(self):
@@ -104,7 +104,7 @@ class TestVAELoader(unittest.TestCase):
             patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
             patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
         ):
-            server_args = _FakeServerArgs(LTX2PipelineConfig(), num_gpus=1)
+            server_args = _FakeServerArgs(LTX2PipelineConfig(), num_devices=1)
             self.assertTrue(_should_use_channels_last_3d(server_args, "video_vae"))
 
     def test_channels_last_3d_defaults_false_for_multi_gpu_ltx_on_cuda(self):
@@ -113,7 +113,7 @@ class TestVAELoader(unittest.TestCase):
             patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
             patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
         ):
-            server_args = _FakeServerArgs(LTX2PipelineConfig(), num_gpus=2)
+            server_args = _FakeServerArgs(LTX2PipelineConfig(), num_devices=2)
             self.assertFalse(_should_use_channels_last_3d(server_args, "video_vae"))
 
     def test_channels_last_3d_can_be_disabled_by_env(self):
@@ -133,7 +133,7 @@ class TestVAELoader(unittest.TestCase):
             patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
             patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
         ):
-            server_args = _FakeServerArgs(LTX2PipelineConfig(), num_gpus=2)
+            server_args = _FakeServerArgs(LTX2PipelineConfig(), num_devices=2)
             self.assertTrue(_should_use_channels_last_3d(server_args, "video_vae"))
 
     def test_channels_last_3d_auto_uses_model_policy(self):
@@ -142,8 +142,8 @@ class TestVAELoader(unittest.TestCase):
             patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
             patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
         ):
-            wan_args = _FakeServerArgs(WanT2V480PConfig(), num_gpus=1)
-            ltx_args = _FakeServerArgs(LTX2PipelineConfig(), num_gpus=2)
+            wan_args = _FakeServerArgs(WanT2V480PConfig(), num_devices=1)
+            ltx_args = _FakeServerArgs(LTX2PipelineConfig(), num_devices=2)
 
             self.assertTrue(_should_use_channels_last_3d(wan_args, "video_vae"))
             self.assertFalse(_should_use_channels_last_3d(ltx_args, "video_vae"))

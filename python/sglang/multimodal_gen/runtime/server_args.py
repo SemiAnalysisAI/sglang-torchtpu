@@ -200,7 +200,13 @@ class ServerArgs(DisaggServerArgsMixin):
     revision: str | None = None
 
     # Parallelism
-    num_gpus: int = 1
+    # Device count of whatever kind the platform provides: GPUs on CUDA/ROCm,
+    # TPU chips on TPU, NUMA nodes on CPU.
+    num_devices: int = 1
+    # deprecated: num_gpus. Kept as a field so ServerArgs(num_gpus=...), config
+    # files and dict round-trips keep working; __post_init__ resolves it into
+    # num_devices and then mirrors it back so existing reads still see a value.
+    num_gpus: int | None = None
     performance_mode: str = "auto"
     base_gpu_id: int = 0
     gpu_ids: list[int] | None = None
@@ -214,7 +220,7 @@ class ServerArgs(DisaggServerArgsMixin):
     dp_size: int = 1
     # number of gpu in a dp group
     dp_degree: int = 1
-    # cfg parallel (None = auto-decide based on num_gpus)
+    # cfg parallel (None = auto-decide based on num_devices)
     enable_cfg_parallel: Optional[bool] = None
     # number of GPUs in each CFG parallel group (None = auto, 1 = disabled, N > 1 = enabled)
     cfg_parallel_degree: Optional[int] = None
@@ -571,7 +577,7 @@ class ServerArgs(DisaggServerArgsMixin):
         dp_size = self.dp_size or 1
         sp_degree = self.sp_degree or 1
         # one replica = all its GPUs
-        replica_size = (self.num_gpus or tp_size) // dp_size
+        replica_size = (self.num_devices or tp_size) // dp_size
         fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
 
         if fold_world:
@@ -758,7 +764,7 @@ class ServerArgs(DisaggServerArgsMixin):
             if (
                 current_platform.is_cuda()
                 and self.pipeline_class_name is None
-                and self.num_gpus == 1
+                and self.num_devices == 1
                 and self.tp_size == 1
                 and self.sp_degree == 1
                 and self.ulysses_degree == 1
@@ -974,11 +980,11 @@ class ServerArgs(DisaggServerArgsMixin):
             self.tp_size = 1
 
         if current_platform.is_cpu() and self.tp_size > 1:
-            # CPU platform reuse num_gpus to represent num cpu numa nodes as devices
-            self.num_gpus = self.tp_size
+            # CPU platform reuse num_devices to represent num cpu numa nodes as devices
+            self.num_devices = self.tp_size
 
         if self.hsdp_shard_dim is None:
-            self.hsdp_shard_dim = self.num_gpus
+            self.hsdp_shard_dim = self.num_devices
 
         # --cfg-parallel-size takes precedence over --enable-cfg-parallel bool.
         if self.cfg_parallel_degree is not None:
@@ -995,7 +1001,7 @@ class ServerArgs(DisaggServerArgsMixin):
         if cfg_unspecified:
             deployment_config = self.pipeline_config.get_model_deployment_config()
             auto_cfg_parallel_degree = deployment_config.get_auto_cfg_parallel_degree(
-                self.num_gpus
+                self.num_devices
             )
             if auto_cfg_parallel_degree < 1:
                 self.enable_cfg_parallel = False
@@ -1004,8 +1010,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 if (
                     self.performance_mode != "manual"
                     and deployment_config.auto_enable_cfg_parallel
-                    and self.num_gpus >= 2
-                    and self.num_gpus % cfg_group_size == 0
+                    and self.num_devices >= 2
+                    and self.num_devices % cfg_group_size == 0
                     and sp_unspecified
                     and ulysses_unspecified
                     and ring_unspecified
@@ -1019,12 +1025,12 @@ class ServerArgs(DisaggServerArgsMixin):
                             "Use --sp-degree / --ulysses-degree to use sequence "
                             "parallelism instead.",
                             self.cfg_parallel_degree,
-                            self.num_gpus,
+                            self.num_devices,
                         )
                     else:
                         logger.info(
                             "Automatically disabled CFG parallel for %d GPUs based on model deployment config.",
-                            self.num_gpus,
+                            self.num_devices,
                         )
                 else:
                     self.enable_cfg_parallel = False
@@ -1038,8 +1044,8 @@ class ServerArgs(DisaggServerArgsMixin):
             num_gpus_per_group = self.dp_size * self.tp_size
             if self.enable_cfg_parallel:
                 num_gpus_per_group *= self.cfg_parallel_degree
-            if self.num_gpus % num_gpus_per_group == 0:
-                self.sp_degree = self.num_gpus // num_gpus_per_group
+            if self.num_devices % num_gpus_per_group == 0:
+                self.sp_degree = self.num_devices // num_gpus_per_group
             else:
                 # Will be validated later
                 self.sp_degree = 1
@@ -1239,6 +1245,8 @@ class ServerArgs(DisaggServerArgsMixin):
         # configure logger before use
         configure_logger(server_args=self)
 
+        self._resolve_deprecated_num_gpus()
+
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
             self.disagg_role = RoleType.from_string(self.disagg_role)
@@ -1353,10 +1361,14 @@ class ServerArgs(DisaggServerArgsMixin):
 
         # Parallelism
         parser.add_argument(
+            "--num-devices",
             "--num-gpus",
+            dest="num_devices",
             type=int,
-            default=ServerArgs.num_gpus,
-            help="The number of GPUs to use.",
+            default=ServerArgs.num_devices,
+            help="The number of devices to use. Counts GPUs on CUDA/ROCm, TPU "
+            "chips on TPU, and NUMA nodes on CPU. '--num-gpus' is a deprecated "
+            "alias.",
         )
         parser.add_argument(
             "--base-gpu-id",
@@ -1403,7 +1415,7 @@ class ServerArgs(DisaggServerArgsMixin):
             "--enable-cfg-parallel",
             action=StoreBoolean,
             default=None,
-            help="Enable cfg parallel at degree 2. Auto-enabled when num_gpus >= 2 and no SP flags are set. Use false to disable it explicitly.",
+            help="Enable cfg parallel at degree 2. Auto-enabled when num_devices >= 2 and no SP flags are set. Use false to disable it explicitly.",
         )
         parser.add_argument(
             "--cfg-parallel-size",
@@ -1436,7 +1448,7 @@ class ServerArgs(DisaggServerArgsMixin):
             "--hsdp-shard-dim",
             type=int,
             default=None,
-            help="The data parallelism shards. Defaults to num_gpus if not specified.",
+            help="The data parallelism shards. Defaults to num_devices if not specified.",
         )
         parser.add_argument(
             "--dist-timeout",
@@ -2157,7 +2169,13 @@ class ServerArgs(DisaggServerArgsMixin):
             "dp": "dp_size",
             "layerwise_offload_modules": "layerwise_offload_components",
             "mode": "performance_mode",
+            "num_gpus": "num_devices",
         }
+        if "num_gpus" in provided_arg_names:
+            logger.warning(
+                "--num-gpus is deprecated; use --num-devices. It counts devices "
+                "of whatever kind the platform provides, not only GPUs."
+            )
         for alias_name, dest_name in cli_aliases.items():
             if alias_name in provided_arg_names:
                 provided_arg_names.add(dest_name)
@@ -2168,6 +2186,27 @@ class ServerArgs(DisaggServerArgsMixin):
                 provided_args[k] = v
 
         return provided_args
+
+    def _resolve_deprecated_num_gpus(self):
+        """Accept the legacy ``num_gpus`` spelling, then keep both in sync.
+
+        Programmatic callers pass ``ServerArgs(num_gpus=N)`` and read
+        ``server_args.num_gpus``; both keep working, and the canonical field is
+        ``num_devices``.
+        """
+        if self.num_gpus is not None and self.num_gpus != self.num_devices:
+            if self.num_devices != type(self).num_devices:
+                raise ValueError(
+                    f"Conflicting device counts: num_devices={self.num_devices} "
+                    f"and deprecated num_gpus={self.num_gpus}. Set only "
+                    "num_devices."
+                )
+            logger.warning(
+                "num_gpus is deprecated; use num_devices. It counts devices of "
+                "whatever kind the platform provides, not only GPUs."
+            )
+            self.num_devices = self.num_gpus
+        self.num_gpus = self.num_devices
 
     def _validate_pipeline(self):
         if self.pipeline_config is None:
@@ -2241,30 +2280,30 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
 
     def _validate_parallelism(self):
-        if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:
+        if self.sp_degree > self.num_devices or self.num_devices % self.sp_degree != 0:
             raise ValueError(
-                f"num_gpus ({self.num_gpus}) must be >= and divisible by sp_degree ({self.sp_degree})"
+                f"num_devices ({self.num_devices}) must be >= and divisible by sp_degree ({self.sp_degree})"
             )
 
         if (
-            self.hsdp_replicate_dim > self.num_gpus
-            or self.num_gpus % self.hsdp_replicate_dim != 0
+            self.hsdp_replicate_dim > self.num_devices
+            or self.num_devices % self.hsdp_replicate_dim != 0
         ):
             raise ValueError(
-                f"num_gpus ({self.num_gpus}) must be >= and divisible by hsdp_replicate_dim ({self.hsdp_replicate_dim})"
+                f"num_devices ({self.num_devices}) must be >= and divisible by hsdp_replicate_dim ({self.hsdp_replicate_dim})"
             )
 
         if (
-            self.hsdp_shard_dim > self.num_gpus
-            or self.num_gpus % self.hsdp_shard_dim != 0
+            self.hsdp_shard_dim > self.num_devices
+            or self.num_devices % self.hsdp_shard_dim != 0
         ):
             raise ValueError(
-                f"num_gpus ({self.num_gpus}) must be >= and divisible by hsdp_shard_dim ({self.hsdp_shard_dim})"
+                f"num_devices ({self.num_devices}) must be >= and divisible by hsdp_shard_dim ({self.hsdp_shard_dim})"
             )
 
-        if self.num_gpus % self.dp_size != 0:
+        if self.num_devices % self.dp_size != 0:
             raise ValueError(
-                f"num_gpus ({self.num_gpus}) must be divisible by dp_size ({self.dp_size})"
+                f"num_devices ({self.num_devices}) must be divisible by dp_size ({self.dp_size})"
             )
 
         if self.dp_size < 1:
@@ -2277,9 +2316,9 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.enable_cfg_parallel:
             num_gpus_per_group *= self.cfg_parallel_degree
 
-        if self.num_gpus % num_gpus_per_group != 0:
+        if self.num_devices % num_gpus_per_group != 0:
             raise ValueError(
-                f"num_gpus ({self.num_gpus}) must be divisible by (dp_size * tp_size"
+                f"num_devices ({self.num_devices}) must be divisible by (dp_size * tp_size"
                 f"{f' * {self.cfg_parallel_degree}' if self.enable_cfg_parallel else ''}"
                 f") = {num_gpus_per_group}"
             )
@@ -2300,9 +2339,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
 
     def _validate_cfg_parallel(self):
-        if self.enable_cfg_parallel and self.num_gpus == 1:
+        if self.enable_cfg_parallel and self.num_devices == 1:
             raise ValueError(
-                "CFG Parallelism is enabled via `--enable-cfg-parallel`, but num_gpus == 1"
+                "CFG Parallelism is enabled via `--enable-cfg-parallel`, but num_devices == 1"
             )
 
     def _validate_batching(self):

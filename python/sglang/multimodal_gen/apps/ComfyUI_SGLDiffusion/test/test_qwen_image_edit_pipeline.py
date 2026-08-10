@@ -21,7 +21,7 @@ def test_comfyui_qwen_image_edit_pipeline_direct() -> None:
     generator = DiffGenerator.from_pretrained(
         model_path=model_path,
         pipeline_class_name="ComfyUIQwenImageEditPipeline",
-        num_gpus=1,
+        num_devices=1,
         comfyui_mode=True,
         dit_layerwise_offload=False,
     )
