@@ -50,6 +50,7 @@ mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS.
 # strings and validation would reject them.
 
 import logging
+import math
 from typing import Optional
 
 import torch
@@ -186,9 +187,13 @@ def _fused_moe_jax(
     # to expert 0 with zero weight, so they contribute nothing to any real
     # token and are sliced off at the very end.
     m_orig = m
-    TOKEN_ALIGN = (
-        16  # token bucket; m_pad % 16 == 0 => (m_pad*topk) % 16 == 0 for any topk
-    )
+    # The kernel's real constraint is (m_pad * topk) % 16 == 0, so the minimal
+    # safe token alignment is 16 // gcd(16, topk) -- not a flat 16. Qwen3.5 has
+    # topk=10, giving gcd 2 and an alignment of 8: a decode batch of 8 then pads
+    # to 8 instead of 16, halving the routed rows the grouped matmul and the
+    # permute both see (160 -> 80). A flat 16 is still what topk=1 or any odd
+    # topk resolves to, so this only ever loosens padding, never tightens it.
+    TOKEN_ALIGN = 16 // math.gcd(16, topk)
     m_pad = ((m + TOKEN_ALIGN - 1) // TOKEN_ALIGN) * TOKEN_ALIGN
     if m_pad != m:
         hidden_states = jnp.pad(hidden_states, ((0, m_pad - m), (0, 0)))
