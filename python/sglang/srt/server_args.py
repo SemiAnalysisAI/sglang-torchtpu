@@ -4854,6 +4854,10 @@ class ServerArgs:
                 self.torch_compile_max_bs,
                 self.tpu_compile_bs,
                 self.max_running_requests,
+                ensure_single_request_bucket=(
+                    self.attention_backend == "pallas_tpu_rpa_batched"
+                    and envs.SGLANG_USE_TPU_STACKED_RPA.get()
+                ),
             )
             logger.info(
                 "TPU batch limits after reconciliation: "

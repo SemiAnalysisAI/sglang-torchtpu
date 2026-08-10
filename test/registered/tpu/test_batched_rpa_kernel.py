@@ -83,6 +83,23 @@ class TestBatchedRpaAdaptiveSplitKernel(unittest.TestCase):
             split_k_run=False,
         )
 
+    def test_rejected_split_uses_regular_schedule_and_matches_reference(self):
+        import jax
+        import jax.numpy as jnp
+
+        # The split-capable kernel remains selected for a multi-request decode
+        # bucket, but these uniform short requests fail the planner's length
+        # threshold and must execute the ordinary request-parallel schedule.
+        self._run_decode_case(
+            jax,
+            jnp,
+            jnp.bfloat16,
+            kv_lens_host=np.asarray([257, 257, 257, 257], dtype=np.int32),
+            kernel_batch_size=4,
+            stacked=False,
+            split_k_run=True,
+        )
+
     def _run_decode_case(
         self,
         jax,

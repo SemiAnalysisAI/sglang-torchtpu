@@ -564,6 +564,8 @@ def reconcile_tpu_batch_limits(
     torch_compile_max_bs: int | None,
     tpu_compile_bs: Optional[List[int]],
     max_running_requests: int | None,
+    *,
+    ensure_single_request_bucket: bool = False,
 ) -> tuple[int, Optional[List[int]], int]:
     """Make the TPU compile grid cover scheduler concurrency without dead shapes."""
     explicit_compile_limits = [
@@ -587,6 +589,12 @@ def reconcile_tpu_batch_limits(
 
     if tpu_compile_bs and max(tpu_compile_bs) < max_running_requests:
         tpu_compile_bs = sorted(set(tpu_compile_bs) | {max_running_requests})
+
+    if ensure_single_request_bucket and tpu_compile_bs:
+        # A custom bucket list may otherwise pad a real BS1 decode to a larger
+        # static shape. Stacked RPA selects its dedicated single-request kernel
+        # from that shape, so preserve BS1 while the expert gate is enabled.
+        tpu_compile_bs = sorted(set(tpu_compile_bs) | {1})
 
     return tcmb, tpu_compile_bs, max_running_requests
 

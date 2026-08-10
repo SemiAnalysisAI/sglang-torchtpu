@@ -661,10 +661,17 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
     explicit limits when no larger serving batch is reachable (Task #40)."""
 
     def _r(
-        self, torch_compile_max_bs=None, tpu_compile_bs=None, max_running_requests=None
+        self,
+        torch_compile_max_bs=None,
+        tpu_compile_bs=None,
+        max_running_requests=None,
+        ensure_single_request_bucket=False,
     ):
         return reconcile_tpu_batch_limits(
-            torch_compile_max_bs, tpu_compile_bs, max_running_requests
+            torch_compile_max_bs,
+            tpu_compile_bs,
+            max_running_requests,
+            ensure_single_request_bucket=ensure_single_request_bucket,
         )
 
     def test_default_neither_set(self):
@@ -711,6 +718,24 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
             max_running_requests=32,
         )
         self.assertEqual((tcmb, bs, mrr), (128, [1, 8, 32], 32))
+
+    def test_stacked_rpa_preserves_single_request_bucket(self):
+        self.assertEqual(
+            self._r(
+                tpu_compile_bs=[8, 16],
+                ensure_single_request_bucket=True,
+            ),
+            (16, [1, 8, 16], 16),
+        )
+
+    def test_disabled_stacked_rpa_preserves_explicit_buckets(self):
+        self.assertEqual(
+            self._r(
+                tpu_compile_bs=[8, 16],
+                ensure_single_request_bucket=False,
+            ),
+            (16, [8, 16], 16),
+        )
 
     def test_invariant_grid_always_covers_concurrency(self):
         cases = [
