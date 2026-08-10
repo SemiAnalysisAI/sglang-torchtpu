@@ -8,7 +8,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     materialize_output_sample,
     save_outputs,
 )
-from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.managers.device_worker import DeviceWorker
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     build_raw_rgb_frame_batches,
@@ -59,7 +59,7 @@ def test_save_outputs_can_materialize_without_saving(tmp_path):
 
 
 def test_file_path_transport_clears_in_memory_outputs():
-    worker = GPUWorker.__new__(GPUWorker)
+    worker = DeviceWorker.__new__(DeviceWorker)
     worker.rank = 0
     output_batch = OutputBatch(
         output=[object()],

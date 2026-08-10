@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     )
 
 
-class GPUWorkerPostTrainingMixin:
+class DeviceWorkerPostTrainingMixin:
     def update_weights_from_disk(
         self,
         model_path: str,

@@ -11,14 +11,14 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 )
 from sglang.srt.utils import cpu_has_amx_support, get_cpu_ids_by_node
 
-from .gpu_worker import GPUWorker
+from .device_worker import DeviceWorker
 
 _is_cpu_amx_available = cpu_has_amx_support()
 
 logger = init_logger(__name__)
 
 
-class CPUWorker(GPUWorker):
+class CPUWorker(DeviceWorker):
     """
     A worker that executes the model on pure CPU platforms
     """

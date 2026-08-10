@@ -52,8 +52,8 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
-    GPUWorkerPostTrainingMixin,
+from sglang.multimodal_gen.runtime.post_training.device_worker_post_training_mixin import (
+    DeviceWorkerPostTrainingMixin,
 )
 from sglang.multimodal_gen.runtime.realtime.session import (
     RealtimeSessionCache,
@@ -104,7 +104,7 @@ class _ExpandedOutputParts:
     trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
 
 
-class GPUWorker(GPUWorkerPostTrainingMixin):
+class DeviceWorker(DeviceWorkerPostTrainingMixin):
     """
     A worker that executes the model on a single GPU.
     """
@@ -538,7 +538,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ):
                 torch.cuda.synchronize()
             output_batch.metrics.record_stage(
-                "GPUWorker.frame_materialize_for_return",
+                "DeviceWorker.frame_materialize_for_return",
                 time.perf_counter() - start_time,
             )
 
@@ -714,7 +714,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     @staticmethod
     def _to_output_batch(result: Req | OutputBatch) -> OutputBatch:
         if isinstance(result, Req):
-            return GPUWorker._req_to_output_batch(result)
+            return DeviceWorker._req_to_output_batch(result)
         return result
 
     @staticmethod
@@ -740,10 +740,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         parts = _ExpandedOutputParts()
 
         for output_batch in output_batches:
-            GPUWorker._merge_expanded_singletons(merged, output_batch)
-            GPUWorker._collect_expanded_parts(parts, output_batch)
+            DeviceWorker._merge_expanded_singletons(merged, output_batch)
+            DeviceWorker._collect_expanded_parts(parts, output_batch)
 
-        GPUWorker._finalize_expanded_parts(
+        DeviceWorker._finalize_expanded_parts(
             merged,
             parts,
             audio_sample_rate=output_batches[0].audio_sample_rate,
@@ -788,7 +788,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if isinstance(output_batch.noise_pred, torch.Tensor):
             parts.noise_preds.append(output_batch.noise_pred)
         if output_batch.trajectory_decoded:
-            GPUWorker._collect_trajectory_decoded(
+            DeviceWorker._collect_trajectory_decoded(
                 parts, output_batch.trajectory_decoded
             )
 
