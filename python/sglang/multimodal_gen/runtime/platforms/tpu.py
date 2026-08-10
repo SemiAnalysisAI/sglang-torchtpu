@@ -248,6 +248,15 @@ class TpuPlatform(Platform):
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
+        # TORCH_TPU_TOPOLOGY is required for distributed init, and resolving it
+        # needs torch_tpu hardware discovery, which the parent must not do (it
+        # would initialize PJRT and steal a worker's chip). srt splits the same
+        # helper the same way: parent sets the slicebuilder env, the worker
+        # resolves topology. Env-only; the first device touch is still below.
+        from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
+
+        _prepare_tpu_env(world_size, resolve_single_host_topology=True)
+
         # Chip selection comes from the slicebuilder env; local index is 0.
         torch.tpu.set_device(0)
 
