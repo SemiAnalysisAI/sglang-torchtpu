@@ -430,13 +430,16 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         if rank != 0:
             return  # one rank is enough; 8 interleaved ranks are unreadable
         pool = self.req_to_token_pool.mamba_pool
+        # One tensor per layer (TpuPerLayerState), so summing over layers is a
+        # loop over the list rather than a `[:, slot]` slice of a stacked pool.
         temporal = pool.mamba_cache.temporal
         slots = self._state_indices.detach().cpu().tolist()
         real = [s for s in slots if s >= 0]
         # Per-slot norm is the number that matters: the whole-pool norm mixes in
         # every other slot and hides whether THIS request's state advanced.
         per_slot = {
-            s: round(float(temporal[:, s].abs().sum().item()), 3) for s in real[:4]
+            s: round(sum(float(t[s].abs().sum().item()) for t in temporal), 3)
+            for s in real[:4]
         }
         # query_start_loc / seq_lens / distribution drive the kernel's tile
         # accounting: query_lens = diff(query_start_loc), masked to num_seqs from

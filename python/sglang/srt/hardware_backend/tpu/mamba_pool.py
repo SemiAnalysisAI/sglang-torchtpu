@@ -8,13 +8,41 @@ expected by the Triton GDN kernels. This subclass reallocates the two state
 buffers on the TPU device in the layout expected by the fused Pallas kernel
 :func:`sglang.srt.layers.attention.pallas.gdn.fused_conv1d_gdn`:
 
-* ``conv``:      ``[num_layers, size + 1, kernel_size - 1, conv_dim]``
-* ``recurrent``: ``[num_layers, size + 1, num_v_heads, d_k, d_v]``
+* ``conv``:      ``[size + 1, kernel_size - 1, conv_dim]``    (one per layer)
+* ``recurrent``: ``[size + 1, num_v_heads, d_k, d_v]``        (one per layer)
 
 versus the GPU layouts ``[..., conv_dim, kernel_size - 1]`` and
 ``[..., num_v_heads, d_v, d_k]``. Allocating kernel-native here means the TPU
 GDN backend passes the per-layer table straight to the op with no per-forward
 transpose.
+
+**One tensor per layer, not one stacked ``[num_layers, ...]`` tensor.** The GPU
+pool stacks the layer axis and hands each layer ``pool[layer]``, a view. That
+costs ~0.70 ms per decode step on Qwen3.5-397B, because torch_tpu's Pallas
+bridge does not alias at the torch level -- it always writes donated outputs
+back with ``tensor_args[i].copy_(results[j])``
+(``torch_tpu/_internal/pallas/pallas.py:545``). Against a tensor that owns its
+whole buffer XLA elides that copy; against a *view of a stacked pool* it cannot,
+and the step acquires, per GDN layer, a slice-in and a dynamic-update-slice
+back out -- plus a one-shot copy-on-write of the entire 181 MiB recurrent pool,
+because the pool is an entry parameter the program mutates.
+
+Measured on the 60-layer/45-GDN-layer decode step, all of it pure bookkeeping:
+whole-pool COW 0.136 ms, recurrent slice read 0.240, recurrent write-back 0.182,
+conv slice read 0.047, conv write-back 0.054, conv slice relayout 0.026, conv
+pool relayout 0.017 -- 0.702 ms/step against 0.497 ms of actual GDN kernel.
+
+The existence proof for the fix is in the sibling KV pool: the 15 full-attention
+layers go through the *same* bridge with the *same* ``donate_argnums`` /
+``input_output_aliases`` API (``attention_pallas_rpa_base.py``), and emit zero
+slices and zero dynamic-update-slices -- because ``TpuFusedMHATokenToKVPool``
+allocates one independent tensor per layer (``kv_pool.py``). Same bridge, same
+API, different pool layout, no overhead.
+
+The consequence is that the stacked-layout methods the GPU pool inherits
+(``copy_from``, ``get_cpu_copy``, ``load_cpu_copy``,
+``get_contiguous_buf_infos``) cannot work here, so they raise rather than
+silently mis-index. None is reachable on the TPU path today.
 
 Slot 0 is a reserved null block (padded / invalid tokens); real slots are
 ``1 .. size``. The kernel masks reads on fresh requests via
@@ -29,16 +57,45 @@ Selected by ``TpuSRTPlatform.get_mamba_pool_cls`` and instantiated from
 import logging
 from typing import List, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.mem_cache.memory_pool import MambaPool, get_tensor_size_bytes
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
 GB = 1024**3
+
+
+class TpuPerLayerState(msgspec.Struct, frozen=True):
+    """GDN state held as one independent tensor per layer.
+
+    ``conv[kind][layer]`` and ``temporal[layer]`` each own their whole buffer, so
+    :meth:`at_layer_idx` hands the Pallas bridge a real tensor rather than a view
+    into a stacked pool. That is the entire purpose of this container -- see the
+    module docstring for what the view costs.
+
+    Presents the same ``at_layer_idx`` / ``mem_usage_bytes`` surface as
+    :class:`MambaPool.State` and returns a plain ``MambaPool.State`` per layer, so
+    every consumer downstream of ``mamba2_layer_cache`` is unchanged.
+    """
+
+    conv: List[List[torch.Tensor]]  # [state_kind][layer]
+    temporal: List[torch.Tensor]  # [layer]
+
+    def at_layer_idx(self, layer: int) -> "MambaPool.State":
+        # A list index, not a tensor slice: the result owns its storage.
+        return MambaPool.State(
+            conv=[per_layer[layer] for per_layer in self.conv],
+            temporal=self.temporal[layer],
+        )
+
+    def mem_usage_bytes(self) -> int:
+        # get_tensor_size_bytes recurses through nested lists.
+        return get_tensor_size_bytes(self.conv) + get_tensor_size_bytes(self.temporal)
 
 
 class TpuMambaPool(MambaPool):
@@ -111,35 +168,48 @@ class TpuMambaPool(MambaPool):
         conv_dtype = torch.float32
         ssm_dtype = torch.float32
 
-        # conv: kernel-native [num_layers, size+1, K-1, conv_dim]
+        # One tensor per layer, never a stacked [num_layers, ...] buffer -- see
+        # the module docstring. Total bytes are identical; what changes is that
+        # each layer's state owns its storage, so the Pallas bridge's write-back
+        # aliases in place instead of lowering to slice + dynamic-update-slice.
+        #
+        # conv: kernel-native [size+1, K-1, conv_dim] per layer
         # (GPU stores [..., conv_dim, K-1]; we swap the trailing two axes).
         conv_state = [
-            torch.zeros(
-                (num_mamba_layers, size + 1, conv_dim_km1[1], conv_dim_km1[0]),
-                dtype=conv_dtype,
-                device=device,
-            )
+            [
+                torch.zeros(
+                    (size + 1, conv_dim_km1[1], conv_dim_km1[0]),
+                    dtype=conv_dtype,
+                    device=device,
+                )
+                for _ in range(num_mamba_layers)
+            ]
             for conv_dim_km1 in conv_state_shapes
         ]
 
-        # recurrent: kernel-native [num_layers, size+1, n_v, d_k, d_v]
+        # recurrent: kernel-native [size+1, n_v, d_k, d_v] per layer
         # (GPU stores [..., n_v, d_v, d_k]; we swap the trailing two axes).
-        temporal_state = torch.zeros(
-            (num_mamba_layers, size + 1, n_v, d_k, d_v),
-            dtype=ssm_dtype,
-            device=device,
-        )
+        temporal_state = [
+            torch.zeros(
+                (size + 1, n_v, d_k, d_v),
+                dtype=ssm_dtype,
+                device=device,
+            )
+            for _ in range(num_mamba_layers)
+        ]
 
-        self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
+        self.mamba_cache = TpuPerLayerState(
+            conv=conv_state, temporal=temporal_state
+        )
         self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
         logger.info(
             "TPU Mamba/GDN state cache allocated: max_size=%d, layers=%d, "
-            "conv=%s%s, recurrent=%s (mem=%.3fGB)",
+            "per-layer conv=%s%s, per-layer recurrent=%s (mem=%.3fGB)",
             size,
             num_mamba_layers,
-            list(conv_state[0].shape),
+            list(conv_state[0][0].shape),
             "" if len(conv_state) == 1 else f" x{len(conv_state)}",
-            list(temporal_state.shape),
+            list(temporal_state[0].shape),
             self.mem_usage,
         )
 
@@ -173,10 +243,15 @@ class TpuMambaPool(MambaPool):
             return
         if indices is None or indices.numel() == 0:
             return
-        idx = indices.to(device=self.mamba_cache.temporal.device, dtype=torch.long)
-        for conv in self.mamba_cache.conv:
-            conv[:, idx] = 0
-        self.mamba_cache.temporal[:, idx] = 0
+        # Slot is the leading axis of each per-layer tensor (the layer axis is
+        # the list index), so this indexes [idx] rather than the GPU pool's
+        # [:, idx].
+        idx = indices.to(device=self.mamba_cache.temporal[0].device, dtype=torch.long)
+        for per_layer in self.mamba_cache.conv:
+            for conv in per_layer:
+                conv[idx] = 0
+        for temporal in self.mamba_cache.temporal:
+            temporal[idx] = 0
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         raise NotImplementedError(
@@ -184,4 +259,42 @@ class TpuMambaPool(MambaPool):
             "supported on TPU yet. Radix cache is auto-disabled for hybrid "
             "GDN models on TPU (see kv_cache_builder.build_kv_cache); reaching "
             "here means prefix caching was force-enabled for this pool."
+        )
+
+    # The four below are inherited from MambaPool, which indexes the layer axis
+    # as `state[:, slots]` on a stacked tensor. This pool has no layer axis to
+    # index -- state is one tensor per layer -- so the inherited versions would
+    # silently address the *slot* axis instead. The two RDMA ones additionally
+    # walk `vars(self.mamba_cache)`, which a msgspec.Struct does not support.
+    # None is reachable on TPU today (host/hierarchical cache and RDMA
+    # disaggregation are both unsupported here), so they raise rather than
+    # pretend.
+
+    def get_cpu_copy(self, indices):
+        raise NotImplementedError(
+            "Host-offload of GDN state is not supported on TPU: TpuMambaPool "
+            "stores one tensor per layer, not a stacked [num_layers, ...] pool, "
+            "so MambaPool.get_cpu_copy's `[:, indices]` does not apply."
+        )
+
+    def load_cpu_copy(self, mamba_cache_cpu, indices):
+        raise NotImplementedError(
+            "Host-offload of GDN state is not supported on TPU: TpuMambaPool "
+            "stores one tensor per layer, not a stacked [num_layers, ...] pool, "
+            "so MambaPool.load_cpu_copy's `[:, indices]` does not apply."
+        )
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "RDMA registration of GDN state is not supported on TPU: "
+            "TpuMambaPool stores one tensor per layer, so the per-layer strides "
+            "MambaPool.get_contiguous_buf_infos derives from a stacked buffer "
+            "do not exist."
+        )
+
+    def get_state_dim_per_tensor(self):
+        raise NotImplementedError(
+            "RDMA registration of GDN state is not supported on TPU; see "
+            "TpuMambaPool.get_contiguous_buf_infos. The TP-sliceable axis this "
+            "reports as dim 2 of a stacked buffer is dim 1 of a per-layer one."
         )
