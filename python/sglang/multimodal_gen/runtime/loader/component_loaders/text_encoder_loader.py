@@ -468,10 +468,12 @@ class TextEncoderLoader(ComponentLoader):
             )
 
             if should_offload:
-                # Disable FSDP for MPS as it's not compatible
-                if current_platform.is_mps():
+                if not current_platform.supports_fsdp():
                     logger.info(
-                        "Disabling FSDP sharding for MPS platform as it's not compatible"
+                        "Platform %s does not support FSDP sharding; loading %s "
+                        "unsharded.",
+                        current_platform.device_type,
+                        type(model).__name__,
                     )
                     model = model.to(local_torch_device)
                 elif fsdp_cpu_offload:

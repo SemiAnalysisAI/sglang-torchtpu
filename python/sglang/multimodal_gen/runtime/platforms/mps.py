@@ -27,6 +27,10 @@ class MpsPlatform(Platform):
     device_control_env_var: str = "MPS_VISIBLE_DEVICES"
 
     @classmethod
+    def supports_fsdp(cls) -> bool:
+        return False  # FSDP is not compatible with MPS.
+
+    @classmethod
     @lru_cache(maxsize=1)
     def is_amp_supported(cls) -> bool:
         return False

@@ -288,6 +288,12 @@ class TpuPlatform(Platform):
         return False  # the op decorators target inductor, which cannot lower to TPU
 
     @classmethod
+    def supports_fsdp(cls) -> bool:
+        # FSDP's _move_states_to_device does `tensor.data = tensor.to(device)`,
+        # which torch_tpu rejects across tensor types (set_data mismatch).
+        return False
+
+    @classmethod
     def supports_vae_decode_torch_compile(cls) -> bool:
         # VAE frame loops feed caches with per-chunk shapes, which recompile
         # per shape on a static-shape backend; lazy decode is the validated

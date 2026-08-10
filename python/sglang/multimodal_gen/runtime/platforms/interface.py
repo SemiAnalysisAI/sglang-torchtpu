@@ -480,6 +480,12 @@ class Platform:
         return True
 
     @classmethod
+    def supports_fsdp(cls) -> bool:
+        """Whether FSDP sharding works on this platform. Platforms that return
+        False load the component unsharded instead."""
+        return True
+
+    @classmethod
     def vae_decode_context(cls, pipeline: Any) -> Any:
         """Context manager scoping the VAE decode (e.g. to free device memory
         for decode on memory-constrained platforms). Default: no-op."""
