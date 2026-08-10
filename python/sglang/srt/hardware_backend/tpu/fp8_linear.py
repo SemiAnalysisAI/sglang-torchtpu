@@ -21,9 +21,15 @@ def _quantize_activation_per_row(
     x_scale = torch.clamp(
         x.abs().amax(dim=1, keepdim=True).float() / dtype_max, min=1e-12
     )
-    x_q = torch.clamp(x.float() / x_scale, min=-dtype_max, max=dtype_max).to(
-        target_dtype
-    )
+    # No clamp on the quotient. x_scale is amax/dtype_max, so |x / x_scale| <=
+    # dtype_max by construction; the only case the clamp ever bound was an
+    # all-zero row hitting the 1e-12 floor, where the numerator is 0 anyway.
+    # Rounding in x_scale can overshoot by ~1 ulp of fp32, which is ~7 orders of
+    # magnitude below the fp8 spacing at dtype_max, so the cast lands on the same
+    # value. Verified bit-identical on device (max|diff| 0.0, no non-finites)
+    # over randn * 37. Worth removing: this clamp is one [M,K] elementwise kernel
+    # per dense linear, and there are ~120 of those per decode step.
+    x_q = (x.float() / x_scale).to(target_dtype)
     return x_q, x_scale
 
 
