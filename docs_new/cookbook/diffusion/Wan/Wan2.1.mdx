@@ -46,7 +46,7 @@ The Wan2.1 series offers models in multiple sizes and resolutions. SGLang suppor
 Current supported optimization options are listed in the [SGLang diffusion support matrix](../../../docs/sglang-diffusion/attention_backends#platform-support-matrix).
 
 - `--vae-path`: Path to a custom VAE model or HuggingFace model ID. If not specified, the VAE will be loaded from the main model path.
-- `--num-gpus {NUM_GPUS}`: Number of GPUs to use.
+- `--num-devices {NUM_DEVICES}`: Number of devices to use.
 - `--tp-size {TP_SIZE}`: Tensor parallelism size (for the encoder/DiT; keep \(\leq 1\) if relying heavily on CPU offload).
 - `--sp-degree {SP_SIZE}`: Sequence parallelism degree.
 - `--ulysses-degree {ULYSSES_DEGREE}`: Degree of DeepSpeed-Ulysses-style SP in USP.
@@ -85,7 +85,7 @@ SERVER_ARGS=(
   --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
   --text-encoder-cpu-offload
   --pin-cpu-memory
-  --num-gpus 4
+  --num-devices 4
   --ulysses-degree=2
   --enable-cfg-parallel
 )

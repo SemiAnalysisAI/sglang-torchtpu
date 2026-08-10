@@ -126,8 +126,8 @@ export const LTXDeployment = () => {
 
   const getParallelFlags = () => {
     const parallelFlagsMap = {
-      'h200-2gpu': ` \\\n  --num-gpus 2 \\\n  --enable-cfg-parallel`,
-      'h200-4gpu': ` \\\n  --num-gpus 4 \\\n  --tp-size 2 \\\n  --enable-cfg-parallel`,
+      'h200-2gpu': ` \\\n  --num-devices 2 \\\n  --enable-cfg-parallel`,
+      'h200-4gpu': ` \\\n  --num-devices 4 \\\n  --tp-size 2 \\\n  --enable-cfg-parallel`,
     };
     return parallelFlagsMap[values.hardware] || '';
   };

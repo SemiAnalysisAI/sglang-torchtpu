@@ -22,7 +22,7 @@ This page reports Ring-SP performance on Ascend NPU with `torch_npu==2.10.0`.
 
 ```bash
 sglang generate --model-path /nas/disk1/Wan2.1-T2V-1.3B-Diffusers \
-    --prompt "a cat is playing piano" --num-gpus 1 --ring-degree 1 \
+    --prompt "a cat is playing piano" --num-devices 1 --ring-degree 1 \
     --save-output
 ```
 
@@ -30,7 +30,7 @@ sglang generate --model-path /nas/disk1/Wan2.1-T2V-1.3B-Diffusers \
 
 ```bash
 sglang generate --model-path /nas/disk1/Wan2.1-T2V-1.3B-Diffusers \
-    --prompt "a cat is playing piano" --num-gpus 2 --ring-degree 2 \
+    --prompt "a cat is playing piano" --num-devices 2 --ring-degree 2 \
     --save-output
 ```
 

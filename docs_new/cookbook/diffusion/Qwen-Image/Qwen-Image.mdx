@@ -57,7 +57,7 @@ sglang generate \
 Currently supported optimizations are listed [here](/docs/sglang-diffusion/compatibility_matrix).
 
 - `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
-- `--num-gpus`: Number of GPUs to use
+- `--num-devices`: Number of devices to use
 - `--tp-size`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
 - `--sp-degree`: Sequence parallelism size (typically should match the number of GPUs)
 - `--ulysses-degree`: The degree of DeepSpeed-Ulysses-style SP in USP

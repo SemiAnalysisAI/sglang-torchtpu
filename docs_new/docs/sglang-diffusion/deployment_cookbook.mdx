@@ -97,7 +97,7 @@ Examples:
 ```bash
 sglang generate \
   --model-path Qwen/Qwen-Image \
-  --num-gpus 2 \
+  --num-devices 2 \
   --performance-mode auto
 ```
 
@@ -112,7 +112,7 @@ Explicit flags win over the mode:
 ```bash
 sglang generate \
   --model-path Qwen/Qwen-Image \
-  --num-gpus 2 \
+  --num-devices 2 \
   --performance-mode auto \
   --use-fsdp-inference false
 ```

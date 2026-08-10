@@ -41,7 +41,7 @@ Serve `Cosmos3-Nano` directly from the Hugging Face model ID:
 ```bash Command
 sglang serve \
   --model-path nvidia/Cosmos3-Nano \
-  --num-gpus 1
+  --num-devices 1
 ```
 
 For `Cosmos3-Super`, split the model across multiple GPUs:
@@ -49,7 +49,7 @@ For `Cosmos3-Super`, split the model across multiple GPUs:
 ```bash Command
 sglang serve \
   --model-path nvidia/Cosmos3-Super \
-  --num-gpus 4
+  --num-devices 4
 ```
 
 The server also accepts the specialized `nvidia/Cosmos3-Super-Text2Image` and `nvidia/Cosmos3-Super-Image2Video` checkpoint IDs.

@@ -20,7 +20,7 @@ Performance numbers are useful only when the intended backend actually ran.
 - Treat any log containing `Falling back to diffusers backend`, `Using diffusers backend`, or `Loaded diffusers pipeline` as invalid for native SGLang performance tuning.
 - Use `--backend diffusers` only for an explicit diffusers baseline. For native recipes, leave the default backend or pin `--backend sglang`.
 - If a fallback happened, fix pipeline registration/model-path/config issues first, then rerun. Do not compare perf dumps collected from a fallback run.
-- When the runtime auto-selects parallel settings because the user omitted them, keep the result as an auto-tuned baseline. For reproducible tuning, pin `--num-gpus`, `--ulysses-degree`, `--ring-degree`, and `--enable-cfg-parallel` explicitly.
+- When the runtime auto-selects parallel settings because the user omitted them, keep the result as an auto-tuned baseline. For reproducible tuning, pin `--num-devices`, `--ulysses-degree`, `--ring-degree`, and `--enable-cfg-parallel` explicitly.
 
 Reference: [SGLang-Diffusion Advanced Optimizations Blog](https://lmsys.org/blog/2026-02-16-sglang-diffusion-advanced-optimizations/)
 
@@ -35,7 +35,7 @@ These options are intended to preserve output quality. In practice, some paths (
 | **torch.compile** | `--enable-torch-compile` | Applies `torch.compile` to the DiT forward pass, fusing ops and reducing kernel launch overhead. | ~1.2–1.5x on denoising | First request is slow (compilation). May cause minor precision drifts due to [PyTorch issue #145213](https://github.com/pytorch/pytorch/issues/145213). Pair with `--warmup` for best results. |
 | **Warmup** | `--warmup` | Runs dummy forward passes to warm up CUDA caches, JIT, and `torch.compile`. Eliminates cold-start penalty. | Removes first-request latency spike | Adds startup time. Without `--warmup-resolutions`, warmup happens on first request. |
 | **Warmup Resolutions** | `--warmup-resolutions 256x256 720x720` | Pre-compiles and warms up specific resolutions at server startup (instead of lazily on first request). | Faster first request per resolution | Each resolution adds to startup time. Serving mode only; useful when you know your target resolutions in advance. |
-| **Multi-GPU (SP)** | `--num-gpus N --ulysses-degree N` | Sequence parallelism across GPUs. Shards sequence tokens (not frames) to minimize padding. | Near-linear scaling with N GPUs | Requires NCCL; inter-GPU bandwidth matters. `ulysses_degree * ring_degree = sp_degree`. For Wan2.2 video, start by benchmarking pure Ulysses before assuming a mixed Ulysses/Ring layout is fastest. |
+| **Multi-GPU (SP)** | `--num-devices N --ulysses-degree N` | Sequence parallelism across GPUs. Shards sequence tokens (not frames) to minimize padding. | Near-linear scaling with N GPUs | Requires NCCL; inter-GPU bandwidth matters. `ulysses_degree * ring_degree = sp_degree`. For Wan2.2 video, start by benchmarking pure Ulysses before assuming a mixed Ulysses/Ring layout is fastest. |
 | **CFG Parallel** | `--enable-cfg-parallel` | Runs conditional and unconditional CFG branches in parallel across GPUs. For CFG models on multi-GPU, benchmark this against pure Ulysses on your topology instead of assuming one always wins. | Often faster than pure SP for CFG models | Requires `num_gpus >= 2`. Halves the Ulysses group size (e.g. 8 GPU → two 4-GPU groups). Only for models that use CFG. Nightly coverage configs may intentionally use smaller Ulysses groups to keep ring behavior exercised; that does not automatically make them the lowest-latency choice. |
 | **Layerwise Offload** | `--dit-layerwise-offload` | Async layer-by-layer H2D prefetch with compute overlap. Only ~2 DiT layers reside on GPU at a time, dramatically reducing VRAM. For some video models the copy stream can be almost fully hidden behind compute. | Saves VRAM (40 GB → ~11 GB for Wan A14B); can be near-zero speed cost on the right workload | Enabled by default for Wan/MOVA video models. Incompatible with Cache-DiT. For **image models** or highly parallelized setups (many GPUs, small per-GPU compute), the copy stream may not be fully hidden and can cause slowdown. |
 | **Offload Prefetch Size** | `--dit-offload-prefetch-size F` | Fine-grained control over layerwise offload: how many layers to prefetch ahead. `0.0` = 1 layer (min VRAM), `0.1` = 10% of layers, `≥1` = absolute layer count. | Tune for cases where default offload has copy stream interference (e.g. image models). 0.05–0.1 is a good starting point. | Values ≥ 0.5 approach no-offload VRAM with worse performance. Use lower values when copy overlap is weak; disable offload when memory allows and latency dominates. |
@@ -68,7 +68,7 @@ These options **trade output quality** for speed or VRAM savings. Results will d
 
 ```bash
 sglang generate --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --num-gpus 8 --enable-cfg-parallel --ulysses-degree 4 \
+  --num-devices 8 --enable-cfg-parallel --ulysses-degree 4 \
   --enable-torch-compile --warmup \
   --text-encoder-cpu-offload true \
   --prompt "..." --save-output
@@ -90,7 +90,7 @@ sglang generate --model-path Lightricks/LTX-2 \
   --prompt "A cat and a dog baking a cake together in a kitchen." \
   --width 768 --height 512 \
   --num-frames 121 \
-  --seed 42 --num-gpus 2 --enable-cfg-parallel \
+  --seed 42 --num-devices 2 --enable-cfg-parallel \
   --enable-torch-compile --warmup --save-output
 ```
 
@@ -105,7 +105,7 @@ sglang generate --model-path Lightricks/LTX-2.3 \
   --image-path "${ASSET_DIR}/cat.png" \
   --width 768 --height 512 \
   --num-frames 121 \
-  --seed 42 --num-gpus 2 --cfg-parallel-size 2 \
+  --seed 42 --num-devices 2 --cfg-parallel-size 2 \
   --enable-torch-compile --warmup --save-output
 ```
 
@@ -120,7 +120,7 @@ sglang generate --model-path Lightricks/LTX-2.3 \
   --width 768 --height 512 \
   --num-frames 121 --fps 24 \
   --num-inference-steps 30 --guidance-scale 3.0 \
-  --seed 1234 --num-gpus 2 \
+  --seed 1234 --num-devices 2 \
   --enable-torch-compile --warmup --save-output
 ```
 
@@ -136,7 +136,7 @@ sglang generate --model-path Lightricks/LTX-2.3 \
   --width 1536 --height 1024 \
   --num-frames 121 --fps 24 \
   --num-inference-steps 30 --guidance-scale 3.0 \
-  --seed 1234 --num-gpus 2 \
+  --seed 1234 --num-devices 2 \
   --enable-torch-compile --warmup --save-output
 ```
 
@@ -163,7 +163,7 @@ sglang generate --backend=sglang \
   --image-path "${ASSET_DIR}/cat.png" \
   --width 1024 --height 1024 \
   --num-inference-steps 40 --guidance-scale 4.0 \
-  --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 \
+  --num-devices 2 --enable-cfg-parallel --ulysses-degree 1 \
   --dit-layerwise-offload false --dit-cpu-offload false \
   --enable-torch-compile --warmup --save-output
 ```
@@ -175,7 +175,7 @@ sglang generate --backend=sglang \
   --image-path "${ASSET_DIR}/cat.png" \
   --width 1024 --height 1024 \
   --num-inference-steps 40 --guidance-scale 4.0 \
-  --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 \
+  --num-devices 2 --enable-cfg-parallel --ulysses-degree 1 \
   --dit-layerwise-offload false --dit-cpu-offload false \
   --enable-torch-compile --warmup --save-output
 ```
@@ -255,7 +255,7 @@ Use these as first commands to benchmark, not as universal winners.
 | FLUX.2 Klein / Klein Base | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup --dit-layerwise-offload false` | Current registry has `black-forest-labs/FLUX.2-klein-4B`, `FLUX.2-klein-9B`, and base variants. Klein is step-distilled; Klein Base is not. |
 | Qwen-Image / Qwen-Image-Edit | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup`; optionally native `SGLANG_CACHE_DIT_ENABLED=true` | Cache-DiT is lossy. For edit tasks, keep reference image, seed, and output size fixed. |
 | Z-Image / Z-Image-Turbo | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup` | Keep base Z-Image separate from Turbo: base uses 50-step CFG defaults, Turbo uses 9-step zero-CFG defaults. Mainline has Z-Image tanh/gate norm fusions. |
-| Wan2.2 A14B T2V/I2V | 1280x720, 81 frames | Nightly: `--num-gpus 4 --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory` | For lowest latency, also benchmark pure Ulysses on the same GPUs. |
+| Wan2.2 A14B T2V/I2V | 1280x720, 81 frames | Nightly: `--num-devices 4 --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory` | For lowest latency, also benchmark pure Ulysses on the same GPUs. |
 | Wan2.2 TI2V 5B | 1280x720, 81 frames, 1 GPU | `--enable-torch-compile --warmup` | Keep the input image and motion prompt fixed when comparing sparse attention or Cache-DiT. |
 | Wan2.1 / FastWan / TurboWan variants | 480p or 720p video, family defaults | `--enable-torch-compile --warmup`; add `--ulysses-degree` / CFG parallel only after measuring | Current registry includes Wan2.1, FastWan2.1, FastWan2.2 TI2V, TurboWan2.1, TurboWan2.2 I2V, and Wan2.1-Fun InP. Use the compatibility matrix and benchmark presets before choosing topology. |
 | Cosmos3 Nano / Super | T2I: 1024x1024 with `--num-frames 1`; T2V/I2V: 480p/720p video | `SGLANG_DISABLE_COSMOS3_GUARDRAILS=1` for benchmark isolation; `--enable-torch-compile --warmup` | One checkpoint serves T2I/T2V/I2V. Mode is request-driven: `num_frames == 1` means T2I, `--image-path` means I2V. |
@@ -263,8 +263,8 @@ Use these as first commands to benchmark, not as universal winners.
 | ERNIE-Image / GLM-Image / SANA / SD3 | 1024-class image, family defaults | `--enable-torch-compile --warmup`; disable offload only after checking VRAM | Treat these as current native image families. Start with benchmark/profile presets for ERNIE, GLM, and SANA; use registry/config defaults for SD3 unless you add a new preset. |
 | LTX-2 / LTX-2.3 | 768x512 or HQ 1920x1088, 121 frames | `--pipeline-class-name LTX2TwoStagePipeline --enable-torch-compile --warmup`; HQ uses `LTX2TwoStageHQPipeline` | Use benchmark/profile presets for nightly alignment, one-stage, high-resolution stress, and HQ. Device mode choices are `original` and `resident`; `resident` is fastest but uses more VRAM. `snapshot` is a deprecated alias for `original`, so do not use it in new commands. |
 | HunyuanVideo | 848x480 or 720p class video | `--text-encoder-cpu-offload --pin-cpu-memory --enable-torch-compile --warmup` | Check VAE decode separately. GroupNorm+SiLU is default-eligible in mainline when wrapper guards pass; use `bench_group_norm_silu.py` when VAE residual blocks are hot. |
-| JoyAI-Image-Edit | 1024-class TI2I, 40 steps, guidance 4.0 | `--backend=sglang --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 --enable-torch-compile --warmup --dit-layerwise-offload false --dit-cpu-offload false` | Newly supported image-edit path. Keep the input image, prompt, seed, and output size fixed; 2-GPU CFG parallel is the validated H100 starting point. |
-| FireRed-Image-Edit 1.0 / 1.1 | 1024x1024 image edit, 40 steps, guidance 4.0 | `--backend=sglang --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 --enable-torch-compile --warmup --dit-layerwise-offload false --dit-cpu-offload false` | Uses the native `QwenImageEditPlusPipeline` path. 2-GPU CFG parallel is the validated H100 starting point; benchmark 1.0 and 1.1 separately because checkpoint differences can change denoise latency. |
+| JoyAI-Image-Edit | 1024-class TI2I, 40 steps, guidance 4.0 | `--backend=sglang --num-devices 2 --enable-cfg-parallel --ulysses-degree 1 --enable-torch-compile --warmup --dit-layerwise-offload false --dit-cpu-offload false` | Newly supported image-edit path. Keep the input image, prompt, seed, and output size fixed; 2-GPU CFG parallel is the validated H100 starting point. |
+| FireRed-Image-Edit 1.0 / 1.1 | 1024x1024 image edit, 40 steps, guidance 4.0 | `--backend=sglang --num-devices 2 --enable-cfg-parallel --ulysses-degree 1 --enable-torch-compile --warmup --dit-layerwise-offload false --dit-cpu-offload false` | Uses the native `QwenImageEditPlusPipeline` path. 2-GPU CFG parallel is the validated H100 starting point; benchmark 1.0 and 1.1 separately because checkpoint differences can change denoise latency. |
 | Hunyuan3D-2 shape | Shape generation, 50 steps, guidance 5.0 | `--backend=sglang --enable-torch-compile --warmup --dit-layerwise-offload false --dit-cpu-offload false` | Focus on `Hunyuan3DShapeDenoisingStage`; keep mesh export/paint timings separate from denoise. |
 | MOVA / Helios / LingBot World | Use the benchmark/profile presets or server test cases first | `--enable-torch-compile --warmup`; pin offload and topology flags explicitly | These video/realtime families have model-specific stages and condition handling. Keep prompt/image/action inputs fixed and prefer perf dumps over wall time alone. |
 

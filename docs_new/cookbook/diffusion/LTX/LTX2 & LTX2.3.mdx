@@ -83,9 +83,9 @@ For latency-oriented LTX serving, prefer CFG parallel over sequence parallelism.
 | --- | --- | --- |
 | LTX-2.3, 1 high-VRAM GPU | `--ltx2-two-stage-device-mode resident` | Fastest two-stage setup when both DiTs fit. |
 | LTX-2.3, 1 standard GPU | `--ltx2-two-stage-device-mode original` | Lower VRAM than `resident`; use this when H100-class memory is tight. |
-| LTX-2, 2 GPUs | `--num-gpus 2 --enable-cfg-parallel` | Fastest verified 2-GPU setup; keep `--dit-layerwise-offload` disabled unless memory is tight. |
-| LTX-2.3, 2 GPUs | `--num-gpus 2 --enable-cfg-parallel --ltx2-two-stage-device-mode resident` | Fastest common 2-GPU setup. |
-| LTX-2.3, 4 GPUs | `--num-gpus 4 --tp-size 2 --enable-cfg-parallel --ltx2-two-stage-device-mode resident` | Fastest common 4-GPU layout: TP2 inside each CFG branch. |
+| LTX-2, 2 GPUs | `--num-devices 2 --enable-cfg-parallel` | Fastest verified 2-GPU setup; keep `--dit-layerwise-offload` disabled unless memory is tight. |
+| LTX-2.3, 2 GPUs | `--num-devices 2 --enable-cfg-parallel --ltx2-two-stage-device-mode resident` | Fastest common 2-GPU setup. |
+| LTX-2.3, 4 GPUs | `--num-devices 4 --tp-size 2 --enable-cfg-parallel --ltx2-two-stage-device-mode resident` | Fastest common 4-GPU layout: TP2 inside each CFG branch. |
 | Official comparison | `--ltx2-two-stage-device-mode original` | Use this only when matching the original LTX-2.3 stage-switch semantics matters. |
 
 Use `--enable-cfg-parallel` for degree-2 CFG parallel. Use `--cfg-parallel-size` only when you explicitly need a different CFG branch count. If `resident` exceeds available VRAM, keep the same parallelism preset and switch only the device mode to `original`.
@@ -98,7 +98,7 @@ On high-VRAM GPUs, add `--text-encoder-cpu-offload false` if text encoding laten
 sglang serve \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2TwoStagePipeline \
-  --num-gpus 2 \
+  --num-devices 2 \
   --enable-cfg-parallel \
   --ltx2-two-stage-device-mode resident
 ```
@@ -109,7 +109,7 @@ sglang serve \
 sglang serve \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2TwoStagePipeline \
-  --num-gpus 4 \
+  --num-devices 4 \
   --tp-size 2 \
   --enable-cfg-parallel \
   --ltx2-two-stage-device-mode resident

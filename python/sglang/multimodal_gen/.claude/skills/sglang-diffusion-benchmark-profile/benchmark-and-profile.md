@@ -240,7 +240,7 @@ sglang generate \
   --prompt="A cat and a dog baking a cake together in a kitchen." \
   --width=768 --height=512 \
   --num-frames=121 \
-  --seed=42 --num-gpus=2 --enable-cfg-parallel \
+  --seed=42 --num-devices=2 --enable-cfg-parallel \
   --save-output --enable-torch-compile --warmup
 ```
 
@@ -257,7 +257,7 @@ sglang generate \
   --image-path="${ASSET_DIR}/cat.png" \
   --width=768 --height=512 \
   --num-frames=121 \
-  --seed=42 --num-gpus=2 --cfg-parallel-size=2 \
+  --seed=42 --num-devices=2 --cfg-parallel-size=2 \
   --save-output --enable-torch-compile --warmup
 ```
 
@@ -273,7 +273,7 @@ sglang generate \
   --width=768 --height=512 \
   --num-frames=121 --fps=24 \
   --num-inference-steps=30 --guidance-scale=3.0 \
-  --seed=1234 --num-gpus=2 \
+  --seed=1234 --num-devices=2 \
   --save-output --enable-torch-compile --warmup
 ```
 
@@ -291,7 +291,7 @@ sglang generate \
   --width=1536 --height=1024 \
   --num-frames=121 --fps=24 \
   --num-inference-steps=30 --guidance-scale=3.0 \
-  --seed=1234 --num-gpus=2 \
+  --seed=1234 --num-devices=2 \
   --save-output --enable-torch-compile --warmup
 ```
 
@@ -308,7 +308,7 @@ sglang generate \
   --image-path="${ASSET_DIR}/cat.png" \
   --width=1024 --height=1024 \
   --num-inference-steps=40 --guidance-scale=4.0 \
-  --num-gpus=2 --enable-cfg-parallel --ulysses-degree=1 \
+  --num-devices=2 --enable-cfg-parallel --ulysses-degree=1 \
   --dit-layerwise-offload false --dit-cpu-offload false \
   --save-output --enable-torch-compile --warmup
 ```
@@ -323,7 +323,7 @@ sglang generate \
   --image-path="${ASSET_DIR}/cat.png" \
   --width=1024 --height=1024 \
   --num-inference-steps=40 --guidance-scale=4.0 \
-  --num-gpus=2 --enable-cfg-parallel --ulysses-degree=1 \
+  --num-devices=2 --enable-cfg-parallel --ulysses-degree=1 \
   --dit-layerwise-offload false --dit-cpu-offload false \
   --save-output --enable-torch-compile --warmup
 ```
@@ -368,7 +368,7 @@ sglang generate \
   --image-path="${ASSET_DIR}/cat.png" \
   --width=1280 --height=720 --num-frames=81 \
   --seed=42 --save-output \
-  --num-gpus=4 --enable-cfg-parallel --ulysses-degree=2 \
+  --num-devices=4 --enable-cfg-parallel --ulysses-degree=2 \
   --text-encoder-cpu-offload --pin-cpu-memory \
   --warmup --enable-torch-compile
 ```

@@ -180,14 +180,14 @@ Common launch variants:
 sglang serve \
   --model-path Efficient-Large-Model/SANA-WM_streaming \
   --pipeline-class-name SanaWMRealtimePipeline \
-  --num-gpus 8 --sp-degree 8 \
+  --num-devices 8 --sp-degree 8 \
   --host 127.0.0.1 --port 30000
 
 # single GPU
 sglang serve \
   --model-path Efficient-Large-Model/SANA-WM_streaming \
   --pipeline-class-name SanaWMRealtimePipeline \
-  --num-gpus 1 --host 127.0.0.1 --port 30000
+  --num-devices 1 --host 127.0.0.1 --port 30000
 
 # offload DiT + text encoder to CPU (tight VRAM)
 sglang serve \

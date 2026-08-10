@@ -11,7 +11,7 @@ SGLang's diffusion/multimodal generation subsystem. Separate from the LLM runtim
 sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers --prompt "A curious raccoon" --save-output
 
 # Start server
-sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers --num-gpus 4
+sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers --num-devices 4
 
 # Python API
 from sglang import DiffGenerator
@@ -80,10 +80,10 @@ configs/
 
 ```bash
 # Sequence parallelism (video frames across GPUs)
-sglang serve --model-path ... --num-gpus 4 --ulysses-degree 2 --ring-degree 2
+sglang serve --model-path ... --num-devices 4 --ulysses-degree 2 --ring-degree 2
 
 # Tensor parallelism (model layers across GPUs)
-sglang serve --model-path ... --num-gpus 2 --tp-size 2
+sglang serve --model-path ... --num-devices 2 --tp-size 2
 ```
 
 ## Testing

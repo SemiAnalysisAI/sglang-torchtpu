@@ -25,7 +25,7 @@ export SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW=true
 sglang serve \
   --model-path robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
   --pipeline-class-name LingBotWorldCausalDMDPipeline \
-  --num-gpus 8 \
+  --num-devices 8 \
   --ulysses-degree 8 \
   --dit-cpu-offload false \
   --text-encoder-cpu-offload false \

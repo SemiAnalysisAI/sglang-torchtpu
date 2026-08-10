@@ -30,7 +30,7 @@ NF4:
 ```bash Command
 HF_TOKEN=$HF_TOKEN sglang serve \
   --model-path ideogram-ai/ideogram-4-nf4 \
-  --num-gpus 1 \
+  --num-devices 1 \
   --performance-mode auto \
   --port 30010
 ```
@@ -40,7 +40,7 @@ FP8:
 ```bash Command
 HF_TOKEN=$HF_TOKEN sglang serve \
   --model-path ideogram-ai/ideogram-4-fp8 \
-  --num-gpus 1 \
+  --num-devices 1 \
   --performance-mode auto \
   --port 30010
 ```
@@ -50,7 +50,7 @@ Comfy-Org NVFP4:
 ```bash Command
 HF_TOKEN=$HF_TOKEN sglang serve \
   --model-path Comfy-Org/Ideogram-4 \
-  --num-gpus 1 \
+  --num-devices 1 \
   --performance-mode auto \
   --port 30010
 ```

@@ -38,7 +38,7 @@ Krea-2-Turbo generates high-quality images in only 8 inference steps. Launch the
 ```bash Command
 sglang serve \
   --model-path krea/Krea-2-Turbo \
-  --num-gpus 1 \
+  --num-devices 1 \
   --port 30000
 ```
 
@@ -48,12 +48,12 @@ The step count and guidance scale are **request-time** settings (see [API Usage]
 
 Currently supported optimizations are listed [here](/docs/sglang-diffusion/compatibility_matrix).
 
-- `--num-gpus`: Number of GPUs to use.
+- `--num-devices`: Number of devices to use.
 - Multi-GPU (tensor and/or sequence parallelism): see [Section 3.3](#3-3-multi-gpu-tensor-and-sequence-parallelism).
 
 ### 3.3 Multi-GPU: tensor and sequence parallelism
 
-Krea-2 supports two multi-GPU axes that can be combined; `--num-gpus` must equal
+Krea-2 supports two multi-GPU axes that can be combined; `--num-devices` must equal
 `tp_size × ulysses_degree`.
 
 - **Tensor parallelism (`--tp-size N`)** shards the DiT weights across GPUs, lowering
@@ -67,13 +67,13 @@ Krea-2 supports two multi-GPU axes that can be combined; `--num-gpus` must equal
 
 ```bash Command
 # Tensor parallel (2 GPUs) — lowest per-GPU VRAM (DiT weights sharded)
-sglang serve --model-path krea/Krea-2-Turbo --num-gpus 2 --tp-size 2 --port 30000
+sglang serve --model-path krea/Krea-2-Turbo --num-devices 2 --tp-size 2 --port 30000
 
 # Sequence parallel / Ulysses (2 GPUs) — output bitwise-identical to single-GPU
-sglang serve --model-path krea/Krea-2-Turbo --num-gpus 2 --ulysses-degree 2 --port 30000
+sglang serve --model-path krea/Krea-2-Turbo --num-devices 2 --ulysses-degree 2 --port 30000
 
 # Hybrid TP × SP (4 GPUs) — composes both axes
-sglang serve --model-path krea/Krea-2-Turbo --num-gpus 4 --tp-size 2 --ulysses-degree 2 --port 30000
+sglang serve --model-path krea/Krea-2-Turbo --num-devices 4 --tp-size 2 --ulysses-degree 2 --port 30000
 ```
 
 Measured on 2× H200 (Krea-2-Turbo, 8 steps, 1024×1024): `--tp-size 2` and
@@ -131,7 +131,7 @@ Cache-DiT works for **both** Krea-2 variants with no extra configuration: SGLang
 ```bash Command
 SGLANG_CACHE_DIT_ENABLED=true sglang serve \
   --model-path krea/Krea-2-Turbo \
-  --num-gpus 1 \
+  --num-devices 1 \
   --port 30000
 ```
 

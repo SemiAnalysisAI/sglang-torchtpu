@@ -68,7 +68,7 @@ sglang serve \\
   --host 0.0.0.0 \\
   --port 30002 \\
   --adjust-frames false \\
-  --num-gpus 8 \\
+  --num-devices 8 \\
   --ring-degree 2 \\
   --ulysses-degree 4 \\
   --tp 1 \\

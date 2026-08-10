@@ -110,12 +110,12 @@ parallelism_config:
 
 Then, apply the distributed inference acceleration config from yaml. `ulysses_size: auto` means that cache-dit will auto detect the `world_size` as the ulysses_size. Otherwise, you should manually set it as specific int number, e.g, 4.
 
-Then apply the distributed config with: (Note: please add `--num-gpus N` to specify the number of gpus for distributed inference)
+Then apply the distributed config with: (Note: please add `--num-devices N` to specify the number of gpus for distributed inference)
 
 ```bash
 sglang generate \
   --backend diffusers \
-  --num-gpus 4 \
+  --num-devices 4 \
   --model-path Qwen/Qwen-Image \
   --cache-dit-config parallel.yaml \
   --prompt "A futuristic cityscape at sunset"
@@ -218,7 +218,7 @@ Then, apply the hybrid cache and parallel acceleration config from yaml.
 ```bash
 sglang generate \
   --backend diffusers \
-  --num-gpus 4 \
+  --num-devices 4 \
   --model-path Qwen/Qwen-Image \
   --cache-dit-config hybrid.yaml \
   --prompt "A beautiful sunset over the mountains"

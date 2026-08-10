@@ -165,7 +165,7 @@ export const Wan21Deployment = () => {
     let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --dit-layerwise-offload true`;
 
     if (bestPractice === 'on') {
-      command += ` \\\n  --num-gpus 4 \\\n  --ulysses-degree 2 \\\n  --enable-cfg-parallel`;
+      command += ` \\\n  --num-devices 4 \\\n  --ulysses-degree 2 \\\n  --enable-cfg-parallel`;
     }
 
     if (selectedLoraPath) {

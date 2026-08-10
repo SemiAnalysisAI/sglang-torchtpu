@@ -59,21 +59,21 @@ sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --disagg-role encoder \
     --disagg-server-addr tcp://127.0.0.1:19655 \
     --scheduler-port 19000 \
-    --num-gpus 1 --base-gpu-id 0
+    --num-devices 1 --base-gpu-id 0
 
 # Terminal 2: Denoiser (GPU 1)
 sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --disagg-role denoiser \
     --disagg-server-addr tcp://127.0.0.1:19655 \
     --scheduler-port 19001 \
-    --num-gpus 1 --base-gpu-id 1
+    --num-devices 1 --base-gpu-id 1
 
 # Terminal 3: Decoder (GPU 2)
 sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --disagg-role decoder \
     --disagg-server-addr tcp://127.0.0.1:19655 \
     --scheduler-port 19002 \
-    --num-gpus 1 --base-gpu-id 2
+    --num-devices 1 --base-gpu-id 2
 
 # Terminal 4: DiffusionServer head (no GPU, receives HTTP requests)
 sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
@@ -109,7 +109,7 @@ sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers \
     --disagg-role encoder \
     --disagg-server-addr tcp://10.0.0.4:19655 \
     --scheduler-port 19000 \
-    --num-gpus 1 \
+    --num-devices 1 \
     --disagg-p2p-hostname 10.0.0.1 --disagg-ib-device mlx5_0
 
 # Machine B (10.0.0.2): Denoiser (4 GPUs with SP)
@@ -117,7 +117,7 @@ sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers \
     --disagg-role denoiser \
     --disagg-server-addr tcp://10.0.0.4:19655 \
     --scheduler-port 19001 \
-    --num-gpus 4 --denoiser-sp 4 --denoiser-ulysses 2 --denoiser-ring 2 \
+    --num-devices 4 --denoiser-sp 4 --denoiser-ulysses 2 --denoiser-ring 2 \
     --disagg-p2p-hostname 10.0.0.2 --disagg-ib-device mlx5_0
 
 # Machine C (10.0.0.3): Decoder
@@ -125,7 +125,7 @@ sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers \
     --disagg-role decoder \
     --disagg-server-addr tcp://10.0.0.4:19655 \
     --scheduler-port 19002 \
-    --num-gpus 1 \
+    --num-devices 1 \
     --disagg-p2p-hostname 10.0.0.3 --disagg-ib-device mlx5_0
 
 # Machine D (10.0.0.4): DiffusionServer head
@@ -280,7 +280,7 @@ Set `--disagg-p2p-hostname` to the actual IP on each machine. For multi-machine,
   </tbody>
 </table>
 
-If not specified, parallelism is auto-derived from `--num-gpus`.
+If not specified, parallelism is auto-derived from `--num-devices`.
 
 ## Other Options
 

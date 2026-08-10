@@ -120,9 +120,9 @@
         let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --dit-layerwise-offload true`;
         if (bestPractice === 'on') {
           if (hardware === 'b300') {
-            command += ` \\\n  --tp-size 2 \\\n  --num-gpus 8 \\\n  --sp-degree 2 \\\n  --ulysses-degree 2 \\\n  --enable-cfg-parallel`;
+            command += ` \\\n  --tp-size 2 \\\n  --num-devices 8 \\\n  --sp-degree 2 \\\n  --ulysses-degree 2 \\\n  --enable-cfg-parallel`;
           } else {
-            command += ` \\\n  --num-gpus 4 \\\n  --ulysses-degree 2 \\\n  --enable-cfg-parallel`;
+            command += ` \\\n  --num-devices 4 \\\n  --ulysses-degree 2 \\\n  --enable-cfg-parallel`;
           }
         }
         if (selectedLoraPath && selectedLoraPath !== 'none') {

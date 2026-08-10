@@ -43,7 +43,7 @@ import { MOVADeployment } from '/src/snippets/diffusion/mova-deployment.jsx'
 
 Currently supported optimizations are listed [here](/docs/sglang-diffusion/compatibility_matrix).
 
-- `--num-gpus`: Number of GPUs to use
+- `--num-devices`: Number of devices to use
 - `--tp`: Tensor parallelism size (should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
 - `--ring-degree`: The degree of ring attention-style SP in USP
 - `--ulysses-degree`: The degree of DeepSpeed-Ulysses-style SP in USP
@@ -65,7 +65,7 @@ sglang generate \
   At one point, he says, \"I would also believe that this advance in AI recently wasn't unexpected.\"" \
   --image-path "<YOUR-IMAGE-PATH>" \
   --adjust-frames false \
-  --num-gpus 8 \
+  --num-devices 8 \
   --ring-degree 2 \
   --ulysses-degree 4 \
   --num-frames 193 \
@@ -214,7 +214,7 @@ Test Environment:
 
 ```bash Command
 sglang serve --model-path OpenMOSS-Team/MOVA-720p --port 30002 \
-  --adjust-frames false --num-gpus 8 --ring-degree 2 --ulysses-degree 4 \
+  --adjust-frames false --num-devices 8 --ring-degree 2 --ulysses-degree 4 \
   --tp 1 --enable-torch-compile
 ```
 
@@ -255,7 +255,7 @@ Peak Memory Median (MB):                 74996.00
 
 ```bash Command
 sglang serve --model-path OpenMOSS-Team/MOVA-720p --port 30002 \
-  --adjust-frames false --num-gpus 8 --ring-degree 2 --ulysses-degree 4 \
+  --adjust-frames false --num-devices 8 --ring-degree 2 --ulysses-degree 4 \
   --tp 1 --enable-torch-compile
 ```
 

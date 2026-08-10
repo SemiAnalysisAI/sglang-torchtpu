@@ -28,7 +28,7 @@ This example uses two GPUs with `sp=2`, `ulysses=1`, and `ring=2`.
 ```bash
 sglang serve \
   --model-path Wan-AI/Wan2.2-TI2V-5B-Diffusers \
-  --num-gpus 2 \
+  --num-devices 2 \
   --sp-degree 2 \
   --ulysses-degree 1 \
   --ring-degree 2 \
@@ -42,7 +42,7 @@ Use an explicit single-GPU baseline before attributing a gain to sequence parall
 ```bash
 sglang serve \
   --model-path Wan-AI/Wan2.2-TI2V-5B-Diffusers \
-  --num-gpus 1 \
+  --num-devices 1 \
   --sp-degree 1 \
   --ulysses-degree 1 \
   --ring-degree 1 \
