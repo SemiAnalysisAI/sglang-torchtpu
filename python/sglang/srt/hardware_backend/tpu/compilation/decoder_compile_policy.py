@@ -856,13 +856,20 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
     def _trim_q(t: torch.Tensor, real_q: int) -> torch.Tensor:
         """Trim the token axis, but skip the slice when it would be a no-op.
 
-        ``super().finalize_forward_batch`` above has often already trimmed to
-        ``real_q``, so ``t[:real_q]`` here is frequently a no-op *slice* -- and a
-        no-op slice is still a strided view, which torch_tpu materializes as a
-        **same-shape identity copy** in a separate ``tt_jit_as_strided`` program
-        between decode steps. Those copies are the inter-step bubble: attaching
-        this policy moved the gap from 0.42 ms to 3.95 ms/step (-27% throughput).
-        See ab/INVESTIGATION.md.
+        ``prepare_forward_batch`` pads to the *next* bucket, so a batch whose
+        size already lands on a bucket boundary is not padded at all. In
+        steady-state decode ``real_q`` is just the running-request count, and
+        serving concurrencies sit on the bucket values -- so ``t[:real_q]`` is
+        a no-op *slice* on most steps, not on rare ones.
+
+        A no-op slice is still a strided view, and torch_tpu tensors are opaque
+        dense buffers with no stride metadata, so the backend materializes every
+        view -- here as a **same-shape identity copy** in its own
+        ``tt_jit_as_strided`` program. This runs eagerly between decode steps
+        (``finalize_forward_batch`` is called on the compiled forward's output,
+        outside the graph), where its per-program host cost is serial and
+        unhidden. Those copies are the inter-step bubble: attaching this policy
+        moved the gap from 0.42 ms to 3.95 ms/step (-27% throughput).
         """
         return t if t.shape[0] == real_q else t[:real_q]
 
@@ -883,8 +890,9 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             if isinstance(hidden_states, torch.Tensor):
                 hidden_states = self._trim_q(hidden_states, real_q)
             if isinstance(aux_hidden_states, (list, tuple)):
-                # One slice per element: with a per-layer collection this is
-                # where the bulk of the identity copies come from.
+                # One slice per captured layer. Empty unless EAGLE3 / DFLASH
+                # populated ``layers_to_capture``, so this branch multiplies the
+                # identity copies only under speculative decoding.
                 aux_hidden_states = type(aux_hidden_states)(
                     self._trim_q(value, real_q)
                     if isinstance(value, torch.Tensor)
