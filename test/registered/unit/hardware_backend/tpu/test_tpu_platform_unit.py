@@ -257,36 +257,34 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         self._apply(args)
         self.assertTrue(args.enable_torch_compile)
 
-    def test_dp_attention_requires_dp_lm_head_when_attn_tp_gt_1(self):
-        args = self._args(
-            enable_dp_attention=True,
-            tp_size=8,
-            dp_size=2,
-            enable_dp_lm_head=False,
-        )
-        with self.assertRaisesRegex(
-            ValueError, "When attention TP > 1 under DP attention on TPU"
-        ):
-            self._apply(args)
+    def test_dp_attention_requires_dp_lm_head_at_every_attn_tp_size(self):
+        # attn_tp_size > 1: the alternative logits path sizes its gather buffer
+        # from the shim's padded token counts and fails on the row mismatch.
+        # attn_tp_size == 1: nothing gathers the vocab shards back, so the
+        # sampler silently argmaxes 1/tp of the row. Both must be rejected.
+        for dp_size in (2, 8):
+            with self.subTest(dp_size=dp_size):
+                args = self._args(
+                    enable_dp_attention=True,
+                    tp_size=8,
+                    dp_size=dp_size,
+                    enable_dp_lm_head=False,
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "DP attention on TPU requires --enable-dp-lm-head"
+                ):
+                    self._apply(args)
 
-    def test_dp_attention_allows_valid_dp_lm_head_combos(self):
-        # attn_tp_size > 1 with enable_dp_lm_head=True
-        args = self._args(
-            enable_dp_attention=True,
-            tp_size=8,
-            dp_size=2,
-            enable_dp_lm_head=True,
-        )
-        self._apply(args)
-
-        # attn_tp_size == 1 with enable_dp_lm_head=False
-        args = self._args(
-            enable_dp_attention=True,
-            tp_size=8,
-            dp_size=8,
-            enable_dp_lm_head=False,
-        )
-        self._apply(args)
+    def test_dp_attention_allows_dp_lm_head(self):
+        for dp_size in (2, 8):
+            with self.subTest(dp_size=dp_size):
+                args = self._args(
+                    enable_dp_attention=True,
+                    tp_size=8,
+                    dp_size=dp_size,
+                    enable_dp_lm_head=True,
+                )
+                self._apply(args)
 
     def test_configures_export_mesh_from_tp_size(self):
         args = self._args(tp_size=16)

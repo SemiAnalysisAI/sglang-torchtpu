@@ -163,14 +163,23 @@ class TpuSRTPlatform(SRTPlatform):
                     "yet (only EAGLE3)."
                 )
 
-        if server_args.enable_dp_attention:
+        if server_args.enable_dp_attention and not server_args.enable_dp_lm_head:
+            # Required at EVERY attn_tp_size, not just > 1. The alternative
+            # (the LogitsProcessor's dp_gather_replicate path) cannot work on
+            # TPU: the compiled-forward shim rewrites
+            # global_num_tokens_for_logprob to the padded batch bucket for the
+            # inner decoder, the eager logits step then sizes its gather buffer
+            # from those padded counts while contributing only the real rows,
+            # and the collective fails on the row mismatch. At attn_tp_size == 1
+            # this used to pass validation and then produce silent garbage
+            # instead -- the head shards over the full TP group while nothing
+            # gathers the shards back.
             attn_tp_size = server_args.tp_size // server_args.dp_size
-            if attn_tp_size > 1 and not server_args.enable_dp_lm_head:
-                raise ValueError(
-                    f"When attention TP > 1 under DP attention on TPU (attn_tp_size={attn_tp_size} "
-                    f"from tp_size={server_args.tp_size} and dp_size={server_args.dp_size}), "
-                    "--enable-dp-lm-head must be enabled."
-                )
+            raise ValueError(
+                "DP attention on TPU requires --enable-dp-lm-head "
+                f"(attn_tp_size={attn_tp_size} from tp_size={server_args.tp_size} "
+                f"and dp_size={server_args.dp_size})."
+            )
 
         if server_args.page_size is None:
             server_args.override("tpu.apply_server_args_defaults", page_size=64)

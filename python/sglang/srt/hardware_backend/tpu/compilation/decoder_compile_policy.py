@@ -804,7 +804,13 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
     """Qwen3-VL decoder policy that warms multimodal prefill call shapes."""
 
     def install(self) -> bool:
-        if is_dp_attention_enabled():
+        # --language-only never runs the ViT, so the multimodal owner behaves as
+        # a text model here; the restriction below is about the VL path.
+        serves_multimodal = (
+            self._owner_is_multimodal
+            and not self.model_runner.server_args.language_only
+        )
+        if serves_multimodal and is_dp_attention_enabled():
             raise NotImplementedError(
                 "Qwen3-VL TPU decoder compilation does not support DP attention; "
                 "disable --enable-torch-compile for this configuration."
@@ -820,11 +826,24 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
     def _model_is_mrope(self) -> bool:
         return bool(getattr(self.model_runner, "model_is_mrope", False))
 
+    @property
+    def _owner_is_multimodal(self) -> bool:
+        """Whether the runner's model is the VL wrapper, not a text-only entry.
+
+        This policy is attached to the SHARED backbone (``Qwen3_5ForCausalLM``),
+        so the text-only entry (``Qwen3_5TextForCausalLM``) inherits it too. Every
+        restriction that belongs to the VL input_embeds path must therefore be
+        gated on the owner actually being multimodal, or text-only serving pays
+        for machinery it never runs.
+        """
+        outer = getattr(self.model_runner, "model", None)
+        return hasattr(outer, "get_image_feature")
+
     def _uses_input_embeds(self, target: Any) -> bool:
         """Whether to warm ``target`` via the Qwen3-VL input_embeds path."""
-        outer = getattr(self.model_runner, "model", None)
-        is_multimodal = hasattr(outer, "get_image_feature")
-        return is_multimodal and callable(getattr(target, "get_input_embeddings", None))
+        return self._owner_is_multimodal and callable(
+            getattr(target, "get_input_embeddings", None)
+        )
 
     def _decode_uses_input_ids(self) -> bool:
         """Whether the wrapper hands decode raw ``input_ids``, skipping embed.

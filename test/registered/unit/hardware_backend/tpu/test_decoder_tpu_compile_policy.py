@@ -269,8 +269,12 @@ class TestQwen3VLDecoderUnpadding(CustomTestCase):
 
         self.assertEqual(result.shape, (3, 4))
 
-    def test_rejects_dp_attention_at_install(self):
+    def test_rejects_dp_attention_at_install_for_multimodal_owner(self):
         policy = Qwen3VLDecoderTpuCompilePolicy()
+        policy.model_runner = SimpleNamespace(
+            model=SimpleNamespace(get_image_feature=MagicMock()),
+            server_args=SimpleNamespace(language_only=False),
+        )
 
         with patch(
             "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
@@ -278,6 +282,45 @@ class TestQwen3VLDecoderUnpadding(CustomTestCase):
             return_value=True,
         ), self.assertRaisesRegex(NotImplementedError, "does not support DP attention"):
             policy.install()
+
+    def test_allows_dp_attention_for_text_only_owner(self):
+        # The policy is attached to the shared Qwen3.5 backbone, so the text-only
+        # entry inherits it. The DP restriction belongs to the VL input_embeds
+        # path, which a text-only owner never takes.
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        policy.model_runner = SimpleNamespace(
+            model=SimpleNamespace(),
+            server_args=SimpleNamespace(language_only=False),
+        )
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "is_dp_attention_enabled",
+            return_value=True,
+        ), patch.object(
+            DecoderTpuCompilePolicy, "install", return_value=True
+        ) as base_install:
+            self.assertTrue(policy.install())
+        base_install.assert_called_once()
+
+    def test_allows_dp_attention_for_language_only_serving(self):
+        # --language-only serves the VL checkpoint's text tower; the ViT never
+        # runs, so the DP restriction on the VL path does not apply.
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        policy.model_runner = SimpleNamespace(
+            model=SimpleNamespace(get_image_feature=MagicMock()),
+            server_args=SimpleNamespace(language_only=True),
+        )
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "is_dp_attention_enabled",
+            return_value=True,
+        ), patch.object(
+            DecoderTpuCompilePolicy, "install", return_value=True
+        ) as base_install:
+            self.assertTrue(policy.install())
+        base_install.assert_called_once()
 
     def test_restores_extend_metadata_before_logits_processing(self):
         policy = Qwen3VLDecoderTpuCompilePolicy()
