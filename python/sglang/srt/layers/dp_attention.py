@@ -112,7 +112,11 @@ class _DpGatheredBufferWrapper:
     _device: torch.device
     _global_dp_buffer_len: int
     _local_dp_buffer_len: int
-    _dp_max_padding: bool
+    # Read outside any forward (e.g. warmup calling embed_tokens), before the
+    # first set_dp_buffer_len, so it needs a value; a bare annotation makes
+    # is_dp_max_padding() raise AttributeError there. False is the conservative
+    # default: it only disables the symmetric-memory allocation path.
+    _dp_max_padding: bool = False
     _global_num_tokens: Optional[List[int]]
     _is_extend_in_batch: bool
 

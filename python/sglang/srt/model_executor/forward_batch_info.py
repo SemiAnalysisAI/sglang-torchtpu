@@ -1241,11 +1241,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
-                if hybrid_ssm:
+                # The fabricated single row below covers the IDLE rank only: it
+                # overwrites seq_lens with one sequence spanning the whole padded
+                # block, which is meaningless for a rank that has live requests.
+                # A rank holding real decode work while another rank prefills --
+                # the normal case once chunked prefill spreads one prompt over
+                # many steps -- takes the generic per-request conversion instead
+                # (1 query token per sequence, prefix seq_len-1), which is what
+                # every non-hybrid model already does here.
+                if hybrid_ssm and self._original_forward_mode.is_idle():
                     dev = self.seq_lens.device
-                    assert (
-                        self.seq_lens.shape[0] == 0
-                    ), "extend-idle conversion expects an empty rank"
                     self.extend_num_tokens = num_tokens
                     self.extend_seq_lens = torch.tensor(
                         [num_tokens], dtype=torch.int32, device=dev
