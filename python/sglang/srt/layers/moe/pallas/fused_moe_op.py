@@ -405,7 +405,20 @@ def _fused_moe_jax(
         )
         return combined[:m_orig].astype(out_dtype)
 
-    # TODO (Qinghan): check performance against scatter
+    # Keep the argsort. The scatter alternative was measured and is SLOWER on TPU.
+    #
+    #   unsort_idx = jnp.zeros(n).at[argsort_idx].set(jnp.arange(n))
+    #
+    # is the textbook O(n) inverse permutation and is bit-identical to the argsort
+    # (verified across 8 shapes incl. the all-duplicate-key case and the production
+    # m=4096/topk=10). Measured on Qwen3.5-397B-A17B-FP8, TP8/EP8, ISL 8192 CONC=4:
+    # **median TTFT 368.3 vs 356.0 ms, i.e. +12.3 ms (+3.5%, ~6 sigma against a
+    # cross-launch sd of 2.05 ms)**. Decode ITL was unchanged (7.659), as expected —
+    # decode takes the `use_dense_unpermute` path above and never reaches here.
+    #
+    # The "O(n) scatter beats O(n log n) sort" intuition is a CPU/GPU one. At
+    # n = m*topk = 40960 the TPU has hardware-assisted sort, while a scatter to
+    # arbitrary indices is a random-access write that XLA lowers far less well.
     unsort_idx = jnp.argsort(argsort_idx)
     if use_sc_gather:
         if not no_combine:
