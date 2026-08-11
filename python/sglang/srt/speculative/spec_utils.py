@@ -50,8 +50,6 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
-from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -1380,6 +1378,11 @@ class GrammarTree:
         retrieve_next_sibling: torch.Tensor,
         draft_token: torch.Tensor,
     ) -> GrammarTree:
+        # Function-local: managers.utils imports schedule_batch at module
+        # level, and schedule_batch -> overlap_utils -> spec_utils would close
+        # an import cycle on this fork.
+        from sglang.srt.managers.utils import _async_d2h
+
         tensors = (retrieve_next_token, retrieve_next_sibling, draft_token)
         host = tuple(_async_d2h(t) for t in tensors)
         # Sources may be mixed -- an algorithm can synthesize part of the tree on
@@ -1563,6 +1566,11 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     Lazy: gather the positions planned by mamba_lazy_spec_prepare. Runs
     inside forward isolation, so it must not mutate req/pool state.
     """
+    # Function-local: schedule_batch -> overlap_utils -> spec_utils is a
+    # module-level import cycle on this fork (overlap_utils pulls the
+    # gather_spec_extras_func dispatcher from here).
+    from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+
     if not mamba_extra_buffer_enabled():
         return
     track_positions = None
