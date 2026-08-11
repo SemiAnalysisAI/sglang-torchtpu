@@ -189,6 +189,8 @@ def _bare_manager(mode, pool, aux_tensors):
     m._socket_cache = {}
     m._monitor_cache = {}
     m._socket_lock = threading.Lock()
+    # Upstream _send_multipart_locked serializes per-endpoint sends.
+    m._socket_send_locks = {}
 
     sock = ctx.socket(zmq.PULL)
     sock.setsockopt(zmq.RCVTIMEO, 5000)
