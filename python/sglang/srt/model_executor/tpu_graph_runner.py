@@ -75,6 +75,39 @@ def _augment_spec_policy(policy_cls: type, model_runner: ModelRunner) -> type:
 logger = get_logger("tpu_graph_runner")
 
 
+def _resolve_fused_op_dispatch(model: Any) -> None:
+    """Eagerly resolve ``BaseFusedOp._forward_method`` on every op the model
+    can reach: its submodules plus the module-level singletons recorded in the
+    kernel registry (``target`` is ``"module:INSTANCE.method"``)."""
+    import importlib
+
+    from sglang.kernels.fused_op import BaseFusedOp
+    from sglang.kernels.registry import registry
+
+    def _resolve(op: BaseFusedOp) -> None:
+        if getattr(op, "_forward_method", object()) is None:
+            op._forward_method = op._resolve_forward_method()
+
+    modules = model.modules() if callable(getattr(model, "modules", None)) else (model,)
+    for module in modules:
+        if isinstance(module, BaseFusedOp):
+            _resolve(module)
+
+    seen = set()
+    for spec in registry.all_specs():
+        mod_name, _, attr = spec.target.partition(":")
+        inst_name = attr.split(".")[0]
+        if not inst_name or (mod_name, inst_name) in seen:
+            continue
+        seen.add((mod_name, inst_name))
+        try:
+            obj = getattr(importlib.import_module(mod_name), inst_name, None)
+        except Exception:
+            continue  # spec modules are import-metadata; skip unloadable ones
+        if isinstance(obj, BaseFusedOp):
+            _resolve(obj)
+
+
 class TpuGraphRunner:
     """Orchestrate ``torch.compile(backend='tpu')`` annotation policies."""
 
@@ -148,6 +181,15 @@ class TpuGraphRunner:
         from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 
         get_cp_decode_attn_tp_ctx()
+
+        # BaseFusedOp.forward resolves ``_forward_method`` lazily on first
+        # call; when that first call happens inside a traced precompile,
+        # dynamo bakes an ``_forward_method is None`` guard into that variant,
+        # which can never re-match once the method is cached — tripping
+        # fail_on_recompile mid-serving. The fork's old MultiPlatformOp
+        # resolved dispatch in __init__; restore that timing by resolving
+        # every reachable op before any tracing.
+        _resolve_fused_op_dispatch(self.model)
 
         # TODO: Move policy discovery and installation into a reusable compile
         # runner when a second platform adopts support_torch_compile metadata.
