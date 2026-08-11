@@ -106,10 +106,12 @@ class TpuGraphRunner:
             # Reflect the skip to downstream code that branches on this
             # flag (kernel_warmup pre-compile loops on the CUDA side;
             # any future TPU equivalent should follow the same
-            # convention).
-            model_runner.server_args.override(
-                "tpu_graph_runner", enable_torch_compile=False
-            )
+            # convention). CaptureFlags is the designated post-publish
+            # writer surface for this flag (see base_runner's identical
+            # _can_torch_compile clear).
+            from sglang.srt.runtime_context import get_flags
+
+            get_flags().capture.enable_torch_compile = False
             return
 
         # Raise dynamo's recompile ceiling. torch.compile builds a fresh graph

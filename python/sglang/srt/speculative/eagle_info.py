@@ -7,11 +7,8 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.distributed import get_tp_group
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
-    is_dp_attention_enabled,
-)
+from sglang.srt.distributed import get_attn_tp_group, get_tp_group
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -414,9 +411,7 @@ class EagleVerifyInput(SpecInput):
             # non-determinism in softmax/top_k/top_p, causing different
             # sampled tokens. Broadcast from rank 0 to ensure consistency.
             tp_group = (
-                get_attention_tp_group()
-                if is_dp_attention_enabled()
-                else get_tp_group()
+                get_attn_tp_group() if is_dp_attention_enabled() else get_tp_group()
             )
             if tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)

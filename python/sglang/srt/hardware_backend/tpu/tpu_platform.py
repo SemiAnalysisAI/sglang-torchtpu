@@ -73,6 +73,10 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     def apply_server_args_defaults(self, server_args: ServerArgs) -> None:
+        # Pre-publish resolution writes go through declare_late_resolution
+        # (ServerArgs.override was removed upstream; post-publish changes go
+        # to the bags via get_context().override).
+        from sglang.srt.arg_groups.overrides import declare_late_resolution
         from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
 
         # Under Ray the slicebuilder/topology env is built per-rank after the
@@ -88,15 +92,19 @@ class TpuSRTPlatform(SRTPlatform):
         )
 
         if server_args.dtype is None or server_args.dtype == "auto":
-            server_args.override("tpu.apply_server_args_defaults", dtype="bfloat16")
+            declare_late_resolution(
+                server_args, "tpu.apply_server_args_defaults", dtype="bfloat16"
+            )
 
         if server_args.attention_backend is None:
-            server_args.override(
+            declare_late_resolution(
+                server_args,
                 "tpu.apply_server_args_defaults",
                 attention_backend=self.get_default_attention_backend(),
             )
 
-        server_args.override(
+        declare_late_resolution(
+            server_args,
             "tpu.apply_server_args_defaults",
             disable_cuda_graph=True,
             disable_piecewise_cuda_graph=True,
@@ -113,8 +121,8 @@ class TpuSRTPlatform(SRTPlatform):
         # ``--disable-overlap-schedule``.
 
         if server_args.mem_fraction_static is None:
-            server_args.override(
-                "tpu.apply_server_args_defaults", mem_fraction_static=0.40
+            declare_late_resolution(
+                server_args, "tpu.apply_server_args_defaults", mem_fraction_static=0.40
             )
 
         # raiden's load-back keeps the reloaded prefix's slot indices on CPU
@@ -173,7 +181,9 @@ class TpuSRTPlatform(SRTPlatform):
                 )
 
         if server_args.page_size is None:
-            server_args.override("tpu.apply_server_args_defaults", page_size=64)
+            declare_late_resolution(
+                server_args, "tpu.apply_server_args_defaults", page_size=64
+            )
 
     # ------------------------------------------------------------------
     # Subsystem factory methods
