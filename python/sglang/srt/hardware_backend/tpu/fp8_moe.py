@@ -356,11 +356,6 @@ def apply_tpu_fp8_moe(
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)
-    # Padded tokens might have expert index of -1, override the expert
-    # selection to expert 0.
-    valid = topk_ids >= 0
-    topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
-    topk_weights = topk_weights * valid.to(topk_weights.dtype)
     if layer.num_fused_shared_experts:
         raise NotImplementedError(
             "Fused shared experts are not supported on the TPU MoE path."
@@ -376,6 +371,51 @@ def apply_tpu_fp8_moe(
     if ep_size > 1:
         global_num_experts = layer.num_local_experts * ep_size
         expert_group_offset = ep_rank * layer.num_local_experts
+
+    # Retire rows that must not do any expert work:
+    #   (a) topk_ids == -1 -- the router's own "no expert" marker;
+    #   (b) rows past this forward's real token count -- the compiled-graph token
+    #       bucket pads e.g. a 3328-token prefill chunk up to 4096, and those 768
+    #       rows carry the embedding of token id 0 through a full router pass, so
+    #       they reach the MoE looking like ordinary tokens.
+    #
+    # Both go to a SENTINEL expert id equal to `route_num_experts`, NOT to expert 0
+    # as before. Expert 0 is a real expert: routing dead rows there inflates
+    # group_sizes[0], so the grouped matmul streams w1/w2 for them and does the
+    # FLOPs anyway. The sentinel is out of range for
+    # `one_hot(topk_ids_flat, route_num_experts)` in `_fused_moe_jax`, so it joins
+    # no group, sorts to the end of the permutation, and gmm_v2 never visits it.
+    # Zeroing the weights alone does NOT save the work -- it only stops the dead
+    # rows corrupting the output.
+    #
+    # `route_num_experts` must match `_fused_moe_jax` exactly: it uses
+    # `global_num_experts if global_num_experts > w1.shape[0] else w1.shape[0]`,
+    # and `w1.shape[0]` is this rank's local expert count.
+    #
+    # Measured padding, Qwen3.5-397B ISL 8192 CONC=4 TP8/EP8: 7.0% of executed MoE
+    # rows overall -- ~0% on a full 4096-token chunk, ~20% on the tail chunk.
+    # Imported here rather than at module scope: this module is imported during
+    # quant-method registration, well before the compilation package is set up.
+    from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+        get_real_token_count,
+    )
+
+    route_num_experts = max(global_num_experts, layer.num_local_experts)
+    valid = topk_ids >= 0
+    real_tokens = get_real_token_count(topk_ids.device)
+    if real_tokens is not None:
+        # `_pad_forward_batch_inputs` appends padding, so real tokens occupy
+        # [0, real_q) and a positional compare is exact. Kept as a TENSOR compare
+        # (never a Python int) so the per-request chunk length cannot become a
+        # Dynamo guard and force a serving-time recompile.
+        row_ok = torch.arange(
+            topk_ids.shape[0], device=topk_ids.device, dtype=torch.int32
+        ) < real_tokens.to(torch.int32)
+        valid = valid & row_ok.unsqueeze(-1)
+    topk_ids = torch.where(
+        valid, topk_ids, torch.full_like(topk_ids, route_num_experts)
+    )
+    topk_weights = topk_weights * valid.to(topk_weights.dtype)
 
     # TODO(torch_tpu): try native torch._scaled_grouped_mm for channelwise
     # scales and torch._scaled_grouped_mm_v2 for block scales once torch_tpu

@@ -23,6 +23,7 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _pad_forward_batch_inputs,
     _restore_forward_batch_inputs,
     build_bucketers,
+    set_real_token_count,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -446,6 +447,18 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         setattr(forward_batch, _REAL_Q_KEY, real_q)
         setattr(forward_batch, _REAL_B_KEY, real_b)
+        # Publish the real token count as a device tensor for the MoE's padded-row
+        # skip. Done here because this runs *before* the compiled decoder, so the
+        # in-place update is not traced and the value is free to vary per step.
+        #
+        # Extend only: decode fills its bs bucket almost exactly (#running-req 4
+        # into a bucket of 4 in 268/289 batches), so there is no padding to skip
+        # there and the masking ops are pure overhead on an op-count-bound step.
+        set_real_token_count(
+            forward_batch.input_ids.device,
+            real_q,
+            enabled=forward_batch.forward_mode.is_extend(),
+        )
         spec_info = forward_batch.spec_info
         if spec_info is not None:
             spec_info.record_padding(

@@ -57,6 +57,59 @@ _REAL_Q_KEY = "_tpu_real_q"
 _REAL_B_KEY = "_tpu_real_b"
 _DEFAULT_KWARG_TYPES = (type(None), bool, int, float, str)
 
+# This forward's real (unpadded) token count, as a DEVICE TENSOR.
+#
+# The MoE needs it to skip bucket-padded rows (see fp8_moe.apply_tpu_fp8_moe), and
+# it must cross the torch.compile boundary as a tensor:
+#   * a Python int would be baked in as a Dynamo guard, and prefill chunk lengths
+#     vary per request (3328, 3072, 2816, ...), so every new length would recompile
+#     -- which this repo turns into a hard error after warmup (#240).
+#   * a *fresh* tensor each step would change object identity and also recompile.
+# So: allocate ONE tensor per device and update it in place, keeping identity stable
+# while the value flows at runtime.
+_REAL_Q_DEV: dict[str, torch.Tensor] = {}
+
+
+_MASK_PADDED_MOE_ROWS = False
+
+
+def set_real_token_count(device: torch.device, real_q: int, enabled: bool) -> None:
+    """Publish this forward's real token count. Call OUTSIDE the compiled region.
+
+    `enabled` gates whether consumers emit the masking ops at all, and must be
+    constant for a given compiled graph. It is driven by forward mode, and extend
+    and decode are compiled separately here, so the guard is stable.
+
+    Measured why this gate exists: applying the mask on decode too cost median ITL
+    7.657 -> 8.048 ms (+5.1%, 26 sigma) for no benefit -- decode runs at
+    `#running-req: 4` into a bs bucket of 4 in 268/289 batches, so there is ~0%
+    padding to skip, and the per-layer arange/compare/where is pure added op count
+    on a step that is op-count-bound.
+    """
+    global _MASK_PADDED_MOE_ROWS
+    _MASK_PADDED_MOE_ROWS = enabled
+    if not enabled:
+        return
+    key = str(device)
+    buf = _REAL_Q_DEV.get(key)
+    if buf is None:
+        _REAL_Q_DEV[key] = torch.tensor([real_q], dtype=torch.int32, device=device)
+        return
+    buf.fill_(real_q)
+
+
+def get_real_token_count(device: torch.device) -> Optional[torch.Tensor]:
+    """The tensor published by `set_real_token_count`, or None if never set.
+
+    None means "no padding information available" and callers must treat every row
+    as real -- never as "no rows are real", which would silently drop the batch.
+    Returns None whenever masking is disabled for this forward, so the caller
+    traces no masking ops at all rather than tracing a no-op mask.
+    """
+    if not _MASK_PADDED_MOE_ROWS:
+        return None
+    return _REAL_Q_DEV.get(str(device))
+
 
 def _extend_batch_cap(
     t_bucketer: Bucketer,
