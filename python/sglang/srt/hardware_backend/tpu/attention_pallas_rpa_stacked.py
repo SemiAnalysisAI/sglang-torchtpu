@@ -32,6 +32,45 @@ def _import_stacked_kernel():
     return ragged_paged_attention
 
 
+def _import_stacked_schedule_builder():
+    from sglang.srt.layers.attention.pallas.stacked_rpa.wrapper import (
+        build_schedules,
+        flatten_schedules,
+        schedule_leaf_shapes,
+    )
+
+    return build_schedules, flatten_schedules, schedule_leaf_shapes
+
+
+def _split_schedule(
+    schedule_flat, queries, keys, kv_cache, kv_lens, page_indices, **static
+):
+    """Rebuild the schedule leaves from the concatenated tensor.
+
+    The kernel bridge passes only tensors, so the step's schedule arrives as
+    one 1-D int32 array; the leaf shapes are a pure function of the static
+    config, so the split needs nothing that is not already known here.
+    """
+    if schedule_flat is None:
+        return None
+
+    from sglang.srt.layers.attention.pallas.stacked_rpa.wrapper import (
+        schedule_leaf_shapes,
+    )
+
+    shapes = schedule_leaf_shapes(
+        queries, keys, kv_cache, kv_lens, page_indices, **static
+    )
+    leaves, offset = [], 0
+    for shape in shapes:
+        size = 1
+        for dim in shape:
+            size *= dim
+        leaves.append(schedule_flat[offset : offset + size].reshape(shape))
+        offset += size
+    return tuple(leaves)
+
+
 def _invoke_stacked_kernel(
     jax_rpa,
     *,
@@ -51,6 +90,7 @@ def _invoke_stacked_kernel(
     k_scale,
     v_scale,
     dispatch_hint,
+    schedule_flat,
 ):
     # cu_kv_lens is not consumed by the stacked kernel: its page table is
     # rectangular, so the page offset is derived from pages_per_seq.
@@ -73,6 +113,20 @@ def _invoke_stacked_kernel(
         use_causal_mask=True,
         update_kv_cache=True,
         dispatch_hint=dispatch_hint,
+        precomputed_schedule_leaves=_split_schedule(
+            schedule_flat,
+            queries,
+            keys,
+            kv_cache_fused,
+            kv_lens,
+            page_indices,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            dispatch_hint=dispatch_hint,
+        ),
     )
 
 
@@ -90,6 +144,7 @@ RPA_STACKED_SPEC = RpaKernelSpec(
     # entries in the vendored tuned_block_sizes.py.
     min_page_size=256,
     supports_dispatch_hint=True,
+    import_schedule_builder=_import_stacked_schedule_builder,
 )
 
 

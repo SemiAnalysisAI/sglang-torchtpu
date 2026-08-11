@@ -38,7 +38,7 @@ def broadcast_minor(src, shape):
     target_minor = align_to(shape[-1], src.shape[-1])
     # no-op concatenation.
     broadcasted = jnp.concat([src] * (target_minor // src.shape[-1]), axis=-1)
-    return broadcasted[..., :shape[-1]]
+    return broadcasted[..., : shape[-1]]
 
 
 def get_dtype_packing(dtype):
@@ -83,7 +83,7 @@ def strided_store(ref, start, sz, step, val):
     step *= folds
     assert sz % step == 0
     for i in range(folds):
-        val_slice = val[:, i * num_lanes:(i + 1) * num_lanes]
+        val_slice = val[:, i * num_lanes : (i + 1) * num_lanes]
         ref[pl.ds(start + i, sz // step, step)] = val_slice
 
 
@@ -120,12 +120,12 @@ def convert_to_target_bitwidth(val, target_bitwidth: int, kv_dtype: jnp.dtype):
         v = pltpu.bitcast(right, kv_dtype)
         return [(k, v)]
     else:
-        left_out = convert_to_target_bitwidth(left,
-                                              target_bitwidth=target_bitwidth,
-                                              kv_dtype=kv_dtype)
-        right_out = convert_to_target_bitwidth(right,
-                                               target_bitwidth=target_bitwidth,
-                                               kv_dtype=kv_dtype)
+        left_out = convert_to_target_bitwidth(
+            left, target_bitwidth=target_bitwidth, kv_dtype=kv_dtype
+        )
+        right_out = convert_to_target_bitwidth(
+            right, target_bitwidth=target_bitwidth, kv_dtype=kv_dtype
+        )
         return left_out + right_out
 
 

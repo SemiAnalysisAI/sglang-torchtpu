@@ -27,8 +27,9 @@ class _BypassRef(pltpu.BufferedRef):
 class KVBufferedRefSeqAlongLane(_BypassRef):
     """Handles fetching and updating KV cache using SEQ_ALONG_LANE memory layout."""
 
-    cfgs: configs.RpaConfigs = dataclasses.field(default=None,
-                                                 metadata=dict(static=True))
+    cfgs: configs.RpaConfigs = dataclasses.field(
+        default=None, metadata=dict(static=True)
+    )
 
     @classmethod
     def create(
@@ -94,30 +95,29 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
             for b in range(self.cfgs.batch_size):
                 total_valid = 0
                 for i in range(bkv_p_cache):
-                    _, _, cache_sz = schedule_ref.get_dma_kv_cache(
-                        block_idx, b, i)
+                    _, _, cache_sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
                     total_valid += jnp.where(cache_sz > 0, 1, 0)
                 first_p_idx, first_dst_off, _ = schedule_ref.get_dma_kv_cache(
-                    block_idx, b, 0)
+                    block_idx, b, 0
+                )
                 first_dst_page = first_dst_off // page_size
                 pltpu.make_async_copy(
                     kv_cache_hbm.at[pl.ds(first_p_idx, total_valid), :, :, :],
-                    vmem_dst_5d.at[
-                        b, pl.ds(first_dst_page, total_valid), :, :, :],
+                    vmem_dst_5d.at[b, pl.ds(first_dst_page, total_valid), :, :, :],
                     sem,
                 ).start()
 
                 for i in range(self.cfgs.bkv_p_new):
                     src_new_off, dst_vmem_off, dma_valid = (
-                        schedule_ref.get_dma_fetch_kv_new(block_idx, b, i))
+                        schedule_ref.get_dma_fetch_kv_new(block_idx, b, i)
+                    )
                     sz = dma_valid * page_size
                     src_new_off = pl.multiple_of(src_new_off, 128)
                     dst_page = dst_vmem_off // page_size
                     sz = pl.multiple_of(sz, 128)
                     pltpu.make_async_copy(
                         new_kv_hbm.at[:, :, pl.ds(src_new_off, sz)],
-                        vmem_dst_5d.at[b, dst_page, :, :,
-                                       pl.ds(0, sz)],
+                        vmem_dst_5d.at[b, dst_page, :, :, pl.ds(0, sz)],
                         sem,
                     ).start()
         else:
@@ -128,7 +128,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
             for b in range(self.cfgs.batch_size):
                 for i in range(bkv_p_cache):
                     p_idx, dst_off, cache_sz = schedule_ref.get_dma_kv_cache(
-                        block_idx, b, i)
+                        block_idx, b, i
+                    )
                     # Real size, so a partial last page isn't read in full.
                     sz = cache_sz
                     dst_off = pl.multiple_of(dst_off, 128)
@@ -143,15 +144,15 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 n_new = 0 if self.cfgs.new_kv_resident else self.cfgs.bkv_p_new
                 for i in range(n_new):
                     src_new_off, dst_vmem_off, dma_valid = (
-                        schedule_ref.get_dma_fetch_kv_new(block_idx, b, i))
+                        schedule_ref.get_dma_fetch_kv_new(block_idx, b, i)
+                    )
                     sz = dma_valid * _new_fetch_sz(src_new_off)
                     src_new_off = pl.multiple_of(src_new_off, 128)
                     dst_vmem_off = pl.multiple_of(dst_vmem_off, 128)
                     sz = pl.multiple_of(sz, 128)
                     pltpu.make_async_copy(
                         new_kv_hbm.at[:, :, pl.ds(src_new_off, sz)],
-                        vmem_dst_lane.at[b, :, :,
-                                         pl.ds(dst_vmem_off, sz)],
+                        vmem_dst_lane.at[b, :, :, pl.ds(dst_vmem_off, sz)],
                         sem,
                     ).start()
 
@@ -171,18 +172,16 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
             for b in range(self.cfgs.batch_size):
                 do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
                 for i in range(self.cfgs.bkv_p_new):
-                    (dst_hbm_p, src_vmem_off, dma_valid, wb_lane,
-                     wb_sz) = schedule_ref.get_dma_update_kv_new(
-                         block_idx, b, i)
+                    dst_hbm_p, src_vmem_off, dma_valid, wb_lane, wb_sz = (
+                        schedule_ref.get_dma_update_kv_new(block_idx, b, i)
+                    )
                     sz = jnp.where(do_writeback, dma_valid * wb_sz, 0)
                     src_page = src_vmem_off // page_size
                     sz = pl.multiple_of(sz, 128)
                     wb_lane = pl.multiple_of(wb_lane, 128)
                     pltpu.make_async_copy(
-                        vmem_src_5d.at[b, src_page, :, :,
-                                       pl.ds(wb_lane, sz)],
-                        kv_out_ref.at[dst_hbm_p, :, :,
-                                      pl.ds(wb_lane, sz)],
+                        vmem_src_5d.at[b, src_page, :, :, pl.ds(wb_lane, sz)],
+                        kv_out_ref.at[dst_hbm_p, :, :, pl.ds(wb_lane, sz)],
                         sem,
                     ).start()
         else:
@@ -190,18 +189,16 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
             for b in range(self.cfgs.batch_size):
                 do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
                 for i in range(self.cfgs.bkv_p_new):
-                    (dst_hbm_p, src_vmem_off, dma_valid, wb_lane,
-                     wb_sz) = schedule_ref.get_dma_update_kv_new(
-                         block_idx, b, i)
+                    dst_hbm_p, src_vmem_off, dma_valid, wb_lane, wb_sz = (
+                        schedule_ref.get_dma_update_kv_new(block_idx, b, i)
+                    )
                     sz = jnp.where(do_writeback, dma_valid * wb_sz, 0)
                     src_vmem_off = pl.multiple_of(src_vmem_off + wb_lane, 128)
                     sz = pl.multiple_of(sz, 128)
                     wb_lane = pl.multiple_of(wb_lane, 128)
                     pltpu.make_async_copy(
-                        vmem_src_lane.at[b, :, :,
-                                         pl.ds(src_vmem_off, sz)],
-                        kv_out_ref.at[dst_hbm_p, :, :,
-                                      pl.ds(wb_lane, sz)],
+                        vmem_src_lane.at[b, :, :, pl.ds(src_vmem_off, sz)],
+                        kv_out_ref.at[dst_hbm_p, :, :, pl.ds(wb_lane, sz)],
                         sem,
                     ).start()
 
@@ -221,12 +218,10 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
             for b in range(self.cfgs.batch_size):
                 total_pages_b = 0
                 for i in range(self.cfgs.bkv_p_cache):
-                    _, _, cache_sz = schedule_ref.get_dma_kv_cache(
-                        block_idx, b, i)
+                    _, _, cache_sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
                     total_pages_b += jnp.where(cache_sz > 0, 1, 0)
                 for i in range(self.cfgs.bkv_p_new):
-                    _, _, dma_valid = schedule_ref.get_dma_fetch_kv_new(
-                        block_idx, b, i)
+                    _, _, dma_valid = schedule_ref.get_dma_fetch_kv_new(block_idx, b, i)
                     total_pages_b += jnp.where(dma_valid > 0, 1, 0)
                 pltpu.make_async_copy(
                     vmem_dst_5d.at[b, pl.ds(0, total_pages_b), :, :, :],
@@ -236,22 +231,20 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         else:
             vmem_dst = self.window_ref.at[slot]
             # Must match copy_in's byte count exactly or the wait hangs.
-            new_fetch_lanes = min(self.cfgs.serve.page_size,
-                                  new_kv_hbm.shape[-1])
+            new_fetch_lanes = min(self.cfgs.serve.page_size, new_kv_hbm.shape[-1])
             for b in range(self.cfgs.batch_size):
                 cache_lanes_b = 0
                 new_lanes_b = 0
                 for i in range(self.cfgs.bkv_p_cache):
-                    _, _, cache_sz = schedule_ref.get_dma_kv_cache(
-                        block_idx, b, i)
+                    _, _, cache_sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
                     cache_lanes_b += cache_sz
                 n_new = 0 if self.cfgs.new_kv_resident else self.cfgs.bkv_p_new
                 for i in range(n_new):
-                    src_new_off, _, dma_valid = (
-                        schedule_ref.get_dma_fetch_kv_new(block_idx, b, i))
+                    src_new_off, _, dma_valid = schedule_ref.get_dma_fetch_kv_new(
+                        block_idx, b, i
+                    )
                     remaining = new_kv_hbm.shape[-1] - src_new_off
-                    fetch_sz = jnp.minimum(new_fetch_lanes,
-                                           jnp.maximum(remaining, 0))
+                    fetch_sz = jnp.minimum(new_fetch_lanes, jnp.maximum(remaining, 0))
                     new_lanes_b += jnp.where(dma_valid > 0, fetch_sz, 0)
                 sz = cache_lanes_b + new_lanes_b
                 sz = pl.multiple_of(sz, 128)
@@ -278,13 +271,13 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
             # disagrees with the send hangs the pipeline.
             sz = 0
             for i in range(self.cfgs.bkv_p_new):
-                _, _, dma_valid, _, wb_sz = (
-                    schedule_ref.get_dma_update_kv_new(block_idx, b, i))
+                _, _, dma_valid, _, wb_sz = schedule_ref.get_dma_update_kv_new(
+                    block_idx, b, i
+                )
                 sz += jnp.where(do_writeback, dma_valid * wb_sz, 0)
 
             sz = pl.multiple_of(sz, 128)
-            dst_hbm_p, _, _, _, _ = schedule_ref.get_dma_update_kv_new(
-                block_idx, b, 0)
+            dst_hbm_p, _, _, _, _ = schedule_ref.get_dma_update_kv_new(block_idx, b, 0)
             hbm_p_idx = dst_hbm_p  # physical page (folded in at build)
             pltpu.make_async_copy(
                 kv_out_ref.at[hbm_p_idx, :, :, pl.ds(0, sz)],
@@ -298,8 +291,9 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
 class BatchingORef(pltpu.BufferedRef):
     """Handles normalizing and storing the final attention output."""
 
-    cfgs: configs.RpaConfigs = dataclasses.field(default=None,
-                                                 metadata=dict(static=True))
+    cfgs: configs.RpaConfigs = dataclasses.field(
+        default=None, metadata=dict(static=True)
+    )
 
     @classmethod
     def create(
@@ -403,8 +397,9 @@ class BatchingORef(pltpu.BufferedRef):
 class BatchingVisibilityRef(pltpu.BufferedRef):
     """Handles fetching visibility blocks using precomputed Q metadata."""
 
-    cfgs: configs.RpaConfigs = dataclasses.field(default=None,
-                                                 metadata=dict(static=True))
+    cfgs: configs.RpaConfigs = dataclasses.field(
+        default=None, metadata=dict(static=True)
+    )
 
     @classmethod
     def create(
@@ -488,8 +483,9 @@ class BatchingVisibilityRef(pltpu.BufferedRef):
 class BatchingQRef(pltpu.BufferedRef):
     """Handles fetching Q blocks using precomputed metadata."""
 
-    cfgs: configs.RpaConfigs = dataclasses.field(default=None,
-                                                 metadata=dict(static=True))
+    cfgs: configs.RpaConfigs = dataclasses.field(
+        default=None, metadata=dict(static=True)
+    )
 
     @classmethod
     def create(

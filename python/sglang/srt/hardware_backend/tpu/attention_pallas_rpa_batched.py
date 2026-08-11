@@ -45,9 +45,11 @@ def _invoke_batched_kernel(
     k_scale,
     v_scale,
     dispatch_hint,
+    schedule_flat,
 ):
-    # cu_kv_lens and attention_sink are not consumed by the batched kernel.
-    del cu_kv_lens, attention_sink
+    # cu_kv_lens and attention_sink are not consumed by the batched kernel,
+    # which builds its schedule inline.
+    del cu_kv_lens, attention_sink, schedule_flat
     return jax_rpa(
         queries,
         keys,

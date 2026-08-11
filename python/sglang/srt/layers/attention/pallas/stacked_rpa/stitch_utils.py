@@ -29,8 +29,7 @@ def _stitch_decode_lane(
     on the lane.
     """
     num_lanes = pltpu.get_tpu_info().num_lanes
-    vmem_u32 = vmem_ref.at[b_idx].bitcast(
-        jnp.uint32)  # [2*kv, hd_words, v_len]
+    vmem_u32 = vmem_ref.at[b_idx].bitcast(jnp.uint32)  # [2*kv, hd_words, v_len]
     dst_off = (bkv_sz_cache // num_lanes) * num_lanes
     dst_rel = bkv_sz_cache % num_lanes
     src_lane = new_tok_offset % num_lanes
@@ -46,8 +45,7 @@ def _stitch_decode_lane(
         src_off = (new_tok_offset // num_lanes) * num_lanes
         src = src_u32[:, :, pl.ds(src_off, num_lanes)]
     else:
-        src_off = cache_pages * page_size + (new_tok_offset //
-                                             num_lanes) * num_lanes
+        src_off = cache_pages * page_size + (new_tok_offset // num_lanes) * num_lanes
         src = vmem_u32[:, :, pl.ds(src_off, num_lanes)]
     rolled = pltpu.roll(src, dst_rel - src_lane, axis=2)
     lane_idx = jax.lax.broadcasted_iota(jnp.int32, dst.shape, 2)
@@ -72,16 +70,17 @@ def _stitch_prefill_lane(
     ``reshape(words_per_sublane, num_sublanes, v_len)`` forced a relayout).
     """
     roll_shift = (
-        bkv_sz_cache -
-        (cache_pages * cfgs.serve.page_size + new_tok_offset)) % v_len
+        bkv_sz_cache - (cache_pages * cfgs.serve.page_size + new_tok_offset)
+    ) % v_len
     rolled_u32 = pltpu.roll(vmem_u32_ref[...], roll_shift, axis=2)
 
-    lane_idx = jax.lax.broadcasted_iota(jnp.int32,
-                                        rolled_u32[..., :cfgs.bkv_sz].shape, 2)
+    lane_idx = jax.lax.broadcasted_iota(
+        jnp.int32, rolled_u32[..., : cfgs.bkv_sz].shape, 2
+    )
     merged_cache_u32 = jax.lax.select(
         lane_idx >= bkv_sz_cache,
-        rolled_u32[..., :cfgs.bkv_sz],
-        vmem_u32_ref[..., :cfgs.bkv_sz],
+        rolled_u32[..., : cfgs.bkv_sz],
+        vmem_u32_ref[..., : cfgs.bkv_sz],
     )
 
     return merged_cache_u32
@@ -111,7 +110,7 @@ def store_new_kv_lane(
         merged_cache_u32 = stitch_result
         # 4D [2*kv, head_dim, v_len] u32 view: store the stitched sequence back
         # in the native layout (no reshape/relayout), mirroring the load path.
-        vmem_u32_ref[:, :, :cfgs.bkv_sz] = merged_cache_u32
+        vmem_u32_ref[:, :, : cfgs.bkv_sz] = merged_cache_u32
 
 
 def stitch_new_kv_lane(

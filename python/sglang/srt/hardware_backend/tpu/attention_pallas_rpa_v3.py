@@ -55,9 +55,10 @@ def _invoke_v3_kernel(
     k_scale,
     v_scale,
     dispatch_hint,
+    schedule_flat,
 ):
-    # v3 has no per-mode dispatch to skip.
-    del dispatch_hint
+    # v3 has no per-mode dispatch to skip and builds its schedule inline.
+    del dispatch_hint, schedule_flat
     return jax_rpa(
         queries,
         keys,

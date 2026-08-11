@@ -2,6 +2,7 @@
 # tpu_inference/kernels/experimental/stacked_rpa/flash_attention_chunked.py
 # Commit 37ce4872252c5259d65fe6d818181a07a4646dac (2026-08-10)
 """Chunked-KV flash attention (SEQ_ALONG_LANE, 5-D VMEM)."""
+
 from __future__ import annotations
 
 import jax
@@ -58,8 +59,12 @@ def flash_attention_chunked(
             kv_base = processed_kv_len + page_idx * page_size
         else:
             halo_j = page_idx - num_cache_pages
-            kv_base = (processed_kv_len + bkv_sz_frm_cache +
-                       halo_j * page_size - new_tok_offset)
+            kv_base = (
+                processed_kv_len
+                + bkv_sz_frm_cache
+                + halo_j * page_size
+                - new_tok_offset
+            )
 
         ks_p = []
         vs_p = []
@@ -74,9 +79,9 @@ def flash_attention_chunked(
         if cfgs.serve.scale_q is not None:
             if jnp.issubdtype(k_p.dtype, jnp.floating):
                 dtype_info = jnp.finfo(k_p.dtype)
-                q_use = jnp.clip(q,
-                                 min=float(dtype_info.min),
-                                 max=float(dtype_info.max)).astype(k_p.dtype)
+                q_use = jnp.clip(
+                    q, min=float(dtype_info.min), max=float(dtype_info.max)
+                ).astype(k_p.dtype)
             else:
                 q_use = q.astype(k_p.dtype)
         else:
@@ -95,25 +100,25 @@ def flash_attention_chunked(
             qk_p = cfgs.model.soft_cap * jnp.tanh(qk_p / cfgs.model.soft_cap)
 
         s_p = page_size
-        kv_idx_b = (lax.broadcasted_iota(int_ty,
-                                         (k_heads, tq, s_p), 2) + kv_base)
-        q_offset_b = (lax.broadcasted_iota(jnp.int32, (k_heads, tq, s_p), 1) //
-                      cfgs.aligned_num_q_heads_per_kv_head + bq_start)
+        kv_idx_b = lax.broadcasted_iota(int_ty, (k_heads, tq, s_p), 2) + kv_base
+        q_offset_b = (
+            lax.broadcasted_iota(jnp.int32, (k_heads, tq, s_p), 1)
+            // cfgs.aligned_num_q_heads_per_kv_head
+            + bq_start
+        )
 
         def compute_mask(_):
             if visibility is not None:
                 num_query_tokens = tq // cfgs.aligned_num_q_heads_per_kv_head
-                vis = visibility[bq_start:bq_start + num_query_tokens, :2]
+                vis = visibility[bq_start : bq_start + num_query_tokens, :2]
                 bq_shape = (num_query_tokens, s_p)
-                k_span_bq = (lax.broadcasted_iota(jnp.int32, bq_shape, 1) +
-                             kv_base)
-                vis_start = lax.broadcast_in_dim(vis[:, 0], bq_shape, (0, ))
-                vis_end = lax.broadcast_in_dim(vis[:, 1], bq_shape, (0, ))
-                mask_bq = jnp.logical_and(k_span_bq >= vis_start, k_span_bq
-                                          <= vis_end)
-                mask_tq = jnp.repeat(mask_bq,
-                                     cfgs.aligned_num_q_heads_per_kv_head,
-                                     axis=0)
+                k_span_bq = lax.broadcasted_iota(jnp.int32, bq_shape, 1) + kv_base
+                vis_start = lax.broadcast_in_dim(vis[:, 0], bq_shape, (0,))
+                vis_end = lax.broadcast_in_dim(vis[:, 1], bq_shape, (0,))
+                mask_bq = jnp.logical_and(k_span_bq >= vis_start, k_span_bq <= vis_end)
+                mask_tq = jnp.repeat(
+                    mask_bq, cfgs.aligned_num_q_heads_per_kv_head, axis=0
+                )
                 return jnp.stack([mask_tq for _ in range(k_heads)], axis=0)
             q_idx_b = q_offset_b.astype(int_ty) + processed_q_len
             m0 = q_idx_b < effective_kv_len
@@ -122,10 +127,11 @@ def flash_attention_chunked(
                 m0 = jnp.logical_and(
                     m0,
                     q_idx_b.astype(jnp.int32)
-                    < kv_idx_b.astype(jnp.int32) + int(sliding_window))
+                    < kv_idx_b.astype(jnp.int32) + int(sliding_window),
+                )
             return m0
 
-        _branchless_ok = (skip_mask is not None and tq * s_p <= 64 * 1024)
+        _branchless_ok = skip_mask is not None and tq * s_p <= 64 * 1024
         if skip_mask is not None and _branchless_ok:
             mask_pred = compute_mask(None)
             masked = jnp.where(mask_pred, qk_p[0], mask_value)

@@ -38,6 +38,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, Protocol
 
+import numpy as np
 import torch
 
 from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
@@ -86,6 +87,10 @@ class PallasForwardMetadata:
     # from the traced graph. Static because it is a JIT cache key and
     # ``direct_compile`` registers this dataclass as a pytree.
     dispatch_hint: str = field(default="auto", metadata=dict(static=True))
+    # This step's ``(decode, mixed)`` schedule pair, concatenated into one 1-D
+    # int32 tensor by the first attention layer to run and reused by the rest.
+    # Data, not static: it is a graph value under ``direct_compile``.
+    schedule_leaves: object = None
 
 
 class InvokeKernelFn(Protocol):
@@ -116,6 +121,7 @@ class InvokeKernelFn(Protocol):
         k_scale,
         v_scale,
         dispatch_hint,
+        schedule_flat,
     ) -> tuple: ...
 
 
@@ -154,6 +160,13 @@ class RpaKernelSpec:
     # pins ``dispatch_hint="auto"``, leaving the kernel's distribution-driven
     # ranges in charge and the export cache key constant.
     supports_dispatch_hint: bool = False
+    # Returns ``(build_schedules, flatten_schedules, schedule_leaf_shapes)``
+    # when it can build its schedule separately from the attention call. The
+    # schedule only depends on per-step metadata, so hoisting it out of the
+    # per-layer path saves one pallas launch per layer.
+    import_schedule_builder: (
+        Callable[[], tuple[Callable, Callable, Callable]] | None
+    ) = None
 
 
 # torch custom ops are process-global; cache one per op_name so repeated backend
@@ -177,6 +190,166 @@ def _quantize_kv_to_fp8(
     scaled = t.to(torch.float32) / scale
     scaled = torch.clamp(scaled, finfo.min, finfo.max)
     return scaled.to(fp8_dtype)
+
+
+_SCHEDULE_OP_CACHE: dict = {}
+
+
+def _as_shape_dtype(t: torch.Tensor):
+    """A jax ShapeDtypeStruct mirroring a torch tensor's shape and dtype.
+
+    Used where the kernel only inspects shapes and dtypes, so a fake tensor
+    never has to become a real array.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    name = str(t.dtype).rsplit(".", 1)[-1]
+    return jax.ShapeDtypeStruct(tuple(t.shape), jnp.dtype(getattr(jnp, name)))
+
+
+def _build_pallas_schedule_op(spec: RpaKernelSpec):
+    """Register the kernel's schedule builder as its own torch custom op.
+
+    The schedule is a function of this step's metadata alone, so building it
+    once and threading the tensors through every layer replaces one pallas
+    launch per layer with one per step. Its leaves are 1-D int32 arrays, which
+    is what makes them expressible as custom-op outputs.
+    """
+    cached = _SCHEDULE_OP_CACHE.get(spec.op_name)
+    if cached is not None:
+        return cached
+
+    import jax
+    from torch_tpu._internal import pallas as _torch_pallas
+
+    build_schedules, flatten_schedules, leaf_shapes = spec.import_schedule_builder()
+    op_name = f"{spec.op_name}_schedules"
+
+    def _wrapped(
+        queries: jax.Array,
+        keys: jax.Array,
+        values: jax.Array,
+        kv_cache_fused: jax.Array,
+        kv_lens: jax.Array,
+        page_indices: jax.Array,
+        cu_q_lens: jax.Array,
+        distribution: jax.Array,
+        sm_scale: float = 1.0,
+        sliding_window: int | None = None,
+        soft_cap: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+        dispatch_hint: str = "auto",
+    ):
+        import jax.numpy as jnp
+
+        leaves = flatten_schedules(
+            build_schedules(
+                queries,
+                keys,
+                values,
+                kv_cache_fused,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                sm_scale=sm_scale,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                dispatch_hint=dispatch_hint,
+            )
+        )
+        return jnp.concatenate([leaf.reshape(-1) for leaf in leaves])
+
+    jax_kernel = _torch_pallas.custom_jax_kernel(
+        _wrapped,
+        name=f"jax_{op_name}",
+        # Static by _wrapped position: 8=sm_scale, 9=sliding_window,
+        # 10=soft_cap, 11=k_scale, 12=v_scale, 13=dispatch_hint. Nothing is
+        # donated: q/k/v are still needed by the attention call that follows.
+        static_argnums=(8, 9, 10, 11, 12, 13),
+        warn_deprecated=False,
+    )
+
+    @torch.library.custom_op(op_name, mutates_args=(), device_types=["tpu"])
+    def custom_op(
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        kv_cache_fused: torch.Tensor,
+        kv_lens: torch.Tensor,
+        page_indices: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        sm_scale: float = 1.0,
+        sliding_window: int | None = None,
+        soft_cap: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+        dispatch_hint: str = "auto",
+    ) -> torch.Tensor:
+        with tpu_info_for_cpu_export():
+            flat = jax_kernel(
+                queries,
+                keys,
+                values,
+                kv_cache_fused,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                sm_scale,
+                sliding_window,
+                soft_cap,
+                k_scale,
+                v_scale,
+                dispatch_hint,
+            )
+        return flat
+
+    def _fake_impl(
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        kv_cache_fused: torch.Tensor,
+        kv_lens: torch.Tensor,
+        page_indices: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        sm_scale: float = 1.0,
+        sliding_window: int | None = None,
+        soft_cap: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+        dispatch_hint: str = "auto",
+    ) -> torch.Tensor:
+        # Ask the kernel for the leaf shapes rather than building anything;
+        # only shapes and dtypes of the array arguments are read, so
+        # ShapeDtypeStruct stand-ins are enough.
+        with tpu_info_for_cpu_export():
+            shapes = leaf_shapes(
+                _as_shape_dtype(queries),
+                _as_shape_dtype(keys),
+                _as_shape_dtype(kv_cache_fused),
+                _as_shape_dtype(kv_lens),
+                _as_shape_dtype(page_indices),
+                sm_scale=sm_scale,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                dispatch_hint=dispatch_hint,
+            )
+        total = sum(int(np.prod(shape)) for shape in shapes)
+        return torch.empty(total, dtype=torch.int32, device=queries.device)
+
+    custom_op.register_fake(_fake_impl)
+
+    _SCHEDULE_OP_CACHE[op_name] = custom_op
+    return custom_op
 
 
 def _build_pallas_kernel_op(spec: RpaKernelSpec):
@@ -216,6 +389,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         k_scale: float | None = None,
         v_scale: float | None = None,
         dispatch_hint: str = "auto",
+        schedule_flat: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         if not spec.supports_attention_sink and attention_sink is not None:
             raise NotImplementedError(f"{op_name} does not support attention sinks")
@@ -241,6 +415,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
             k_scale=k_scale,
             v_scale=v_scale,
             dispatch_hint=dispatch_hint,
+            schedule_flat=schedule_flat,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
@@ -248,7 +423,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         name=f"jax_{op_name}",
         # Static (non-traced) args by _wrapped position: 10=sm_scale,
         # 11=sliding_window, 12=soft_cap, 13=k_scale, 14=v_scale,
-        # 15=dispatch_hint.
+        # 15=dispatch_hint. 16=schedule_flat is a traced tensor.
         static_argnums=(10, 11, 12, 13, 14, 15),
         donate_argnums=(3,),
         input_output_aliases={3: 1},
@@ -277,6 +452,10 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         k_scale: float | None = None,
         v_scale: float | None = None,
         dispatch_hint: str = "auto",
+        # This step's schedule, flattened to one 1-D int32 tensor: the kernel
+        # bridge takes only tensors and None, so the pair travels concatenated
+        # and is split back inside using the kernel's own leaf shapes.
+        schedule_flat: torch.Tensor | None = None,
     ) -> torch.Tensor:
         with tpu_info_for_cpu_export():
             output, _updated_kv = jax_kernel(
@@ -296,6 +475,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
                 k_scale,
                 v_scale,
                 dispatch_hint,
+                schedule_flat,
             )
         return output
 
@@ -386,6 +566,16 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # traced region — dynamo can't handle ``inspect.signature`` on the
         # wrapped JAX function. The forward path then just looks the op up.
         self._op = self._build_kernel_op()
+        # Same eager-registration reason as above: dynamo cannot trace the
+        # jax_op registration path.
+        self._sched_op = (
+            _build_pallas_schedule_op(self.kernel_spec)
+            if self.kernel_spec.import_schedule_builder is not None
+            else None
+        )
+
+    def _schedule_op(self):
+        return self._sched_op
 
     def _build_kernel_op(self):
         """Build the Pallas custom op stored as ``self._op``.
@@ -877,6 +1067,37 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             k_scale = None
             v_scale = None
 
+        dispatch_hint = (
+            self.forward_metadata.dispatch_hint
+            if self.kernel_spec.supports_dispatch_hint
+            else "auto"
+        )
+
+        # The schedule is the same for every layer in a step, so the first one
+        # to run builds it and the rest read the tensors back. Under a traced
+        # graph this resolves once at trace time: layer 0 gets the builder,
+        # everyone else gets its outputs.
+        if (
+            self.kernel_spec.import_schedule_builder is not None
+            and self.forward_metadata.schedule_leaves is None
+        ):
+            self.forward_metadata.schedule_leaves = self._schedule_op()(
+                q,
+                k,
+                v,
+                kv_cache,
+                self.forward_metadata.kv_lens,
+                page_indices,
+                self.forward_metadata.cu_q_lens,
+                self.forward_metadata.distribution,
+                float(layer.scaling),
+                sliding_window,
+                soft_cap,
+                k_scale,
+                v_scale,
+                dispatch_hint,
+            )
+
         out = op(
             q,
             k,
@@ -893,11 +1114,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             soft_cap,
             k_scale,
             v_scale,
-            (
-                self.forward_metadata.dispatch_hint
-                if self.kernel_spec.supports_dispatch_hint
-                else "auto"
-            ),
+            dispatch_hint,
+            self.forward_metadata.schedule_leaves,
         )
 
         # The kernel emits output at the (padded) qk head_dim. For asymmetric

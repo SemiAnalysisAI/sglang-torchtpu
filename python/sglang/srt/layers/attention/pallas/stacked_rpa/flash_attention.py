@@ -59,26 +59,30 @@ def flash_attention_qk_softmax(
     int_ty = cfgs.serve.int_ty
 
     for b_idx in range(b):
-        kv_idx_b = (lax.broadcasted_iota(int_ty, (k_heads, tq, s), 2) +
-                    processed_kv_len[b_idx])
-        q_offset_b = (lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1) //
-                      cfgs.aligned_num_q_heads_per_kv_head + bq_start)
+        kv_idx_b = (
+            lax.broadcasted_iota(int_ty, (k_heads, tq, s), 2) + processed_kv_len[b_idx]
+        )
+        q_offset_b = (
+            lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
+            // cfgs.aligned_num_q_heads_per_kv_head
+            + bq_start
+        )
 
         def compute_mask(_):
             if visibility is not None:
                 num_query_tokens = tq // cfgs.aligned_num_q_heads_per_kv_head
-                vis = visibility[b_idx][bq_start:bq_start +
-                                        num_query_tokens, :2]
+                vis = visibility[b_idx][bq_start : bq_start + num_query_tokens, :2]
                 bq_shape = (num_query_tokens, s)
-                k_span_bq = (lax.broadcasted_iota(jnp.int32, bq_shape, 1) +
-                             processed_kv_len[b_idx])
-                vis_start = lax.broadcast_in_dim(vis[:, 0], bq_shape, (0, ))
-                vis_end = lax.broadcast_in_dim(vis[:, 1], bq_shape, (0, ))
-                mask_bq = jnp.logical_and(k_span_bq >= vis_start, k_span_bq
-                                          <= vis_end)
-                mask_tq = jnp.repeat(mask_bq,
-                                     cfgs.aligned_num_q_heads_per_kv_head,
-                                     axis=0)
+                k_span_bq = (
+                    lax.broadcasted_iota(jnp.int32, bq_shape, 1)
+                    + processed_kv_len[b_idx]
+                )
+                vis_start = lax.broadcast_in_dim(vis[:, 0], bq_shape, (0,))
+                vis_end = lax.broadcast_in_dim(vis[:, 1], bq_shape, (0,))
+                mask_bq = jnp.logical_and(k_span_bq >= vis_start, k_span_bq <= vis_end)
+                mask_tq = jnp.repeat(
+                    mask_bq, cfgs.aligned_num_q_heads_per_kv_head, axis=0
+                )
                 return jnp.stack([mask_tq for _ in range(k_heads)], axis=0)
 
             q_idx_b = q_offset_b.astype(int_ty) + processed_q_len[b_idx]
@@ -97,7 +101,8 @@ def flash_attention_qk_softmax(
                 mask = jnp.logical_and(
                     mask,
                     q_idx_b.astype(jnp.int32)
-                    < kv_idx_b.astype(jnp.int32) + int(sliding_window))
+                    < kv_idx_b.astype(jnp.int32) + int(sliding_window),
+                )
             return mask
 
         # Small qk tiles (decode, tq == 1) fit the branchless path without VREG
@@ -108,13 +113,13 @@ def flash_attention_qk_softmax(
         # catastrophically (>44 MB scratch on bq_sz=512 prefill measured on
         # v7x-8), so keep the original ``lax.cond`` there. Threshold picked as
         # tq == 1 -- exactly the single-token decode fast path.
-        _branchless_ok = (skip_mask is not None
-                          and qk.shape[2] * qk.shape[3] <= 64 * 1024)
+        _branchless_ok = (
+            skip_mask is not None and qk.shape[2] * qk.shape[3] <= 64 * 1024
+        )
         if skip_mask is not None and _branchless_ok:
             mask_pred = compute_mask(None)
             masked_qk = jnp.where(mask_pred, qk[b_idx], mask_value)
-            qk_masked_b = jnp.where(skip_mask[b_idx] != 0, qk[b_idx],
-                                    masked_qk)
+            qk_masked_b = jnp.where(skip_mask[b_idx] != 0, qk[b_idx], masked_qk)
         elif skip_mask is not None:
             qk_masked_b = lax.cond(
                 skip_mask[b_idx] != 0,
@@ -131,10 +136,9 @@ def flash_attention_qk_softmax(
     m_curr = jnp.max(qk, axis=-1, keepdims=True)
     m_next = jnp.maximum(m_prev, m_curr)
     p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
-    p_rowsum = jnp.sum(p,
-                       axis=-1,
-                       keepdims=True,
-                       dtype=configs.accum_dtype(cfgs.serve.dtype_out))
+    p_rowsum = jnp.sum(
+        p, axis=-1, keepdims=True, dtype=configs.accum_dtype(cfgs.serve.dtype_out)
+    )
 
     alpha = jnp.exp(m_prev - m_next)
     l_next = alpha * l_prev + p_rowsum

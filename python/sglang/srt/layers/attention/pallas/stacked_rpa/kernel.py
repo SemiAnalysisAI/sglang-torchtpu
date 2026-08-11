@@ -12,33 +12,42 @@ from jax import lax
 
 # isort: off
 from sglang.srt.layers.attention.pallas.stacked_rpa import (
-    bref_override, configs, flash_attention, flash_attention_chunked, schedule,
-    stitch_utils, utils)
+    bref_override,
+    configs,
+    flash_attention,
+    flash_attention_chunked,
+    schedule,
+    stitch_utils,
+    utils,
+)
+
 # isort: on
 
 # pl.with_scoped is required at import time; enforced by JAX >= 0.9.2.
 
 
-def _run_chunked_flash_path(*,
-                            q,
-                            kv_in_vref,
-                            m_scratch_ref,
-                            l_scratch_ref,
-                            acc_scratch_ref,
-                            processed_q_len,
-                            processed_kv_len,
-                            effective_kv_len,
-                            bkv_sz_frm_cache_list,
-                            new_kv_len_start_list,
-                            visibility_list,
-                            skip_mask_list,
-                            step,
-                            schedule_ref,
-                            cfgs,
-                            m_val,
-                            l_val,
-                            acc_val,
-                            new_kv_vref=None):
+def _run_chunked_flash_path(
+    *,
+    q,
+    kv_in_vref,
+    m_scratch_ref,
+    l_scratch_ref,
+    acc_scratch_ref,
+    processed_q_len,
+    processed_kv_len,
+    effective_kv_len,
+    bkv_sz_frm_cache_list,
+    new_kv_len_start_list,
+    visibility_list,
+    skip_mask_list,
+    step,
+    schedule_ref,
+    cfgs,
+    m_val,
+    l_val,
+    acc_val,
+    new_kv_vref=None,
+):
     del new_kv_vref  # chunked path stages new KV in its own 5-D buffer
     # Decode-only path (bq_sz=1) with the 5-D VMEM layout and per-page
     # flash. m_val / l_val / acc_val are the accumulator snapshot the caller
@@ -49,54 +58,57 @@ def _run_chunked_flash_path(*,
         q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
         q_slice = slice(q_start, q_end)
         for b_idx in range(cfgs.batch_size):
-            new_tok_off_b = (new_kv_len_start_list[b_idx].astype(jnp.int32) %
-                             cfgs.serve.page_size)
+            new_tok_off_b = (
+                new_kv_len_start_list[b_idx].astype(jnp.int32) % cfgs.serve.page_size
+            )
             m_next, l_next, o_next = flash_attention_chunked.flash_attention_chunked(
-                q[b_idx:b_idx + 1, :, q_slice, :],
+                q[b_idx : b_idx + 1, :, q_slice, :],
                 kv_in_vref,
-                m_prev=m_val[b_idx:b_idx + 1, :, q_slice, :],
-                l_prev=l_val[b_idx:b_idx + 1, :, q_slice, :],
-                o_prev=acc_val[b_idx:b_idx + 1, :, q_slice, :],
+                m_prev=m_val[b_idx : b_idx + 1, :, q_slice, :],
+                l_prev=l_val[b_idx : b_idx + 1, :, q_slice, :],
+                o_prev=acc_val[b_idx : b_idx + 1, :, q_slice, :],
                 b_batch_idx=b_idx,
                 processed_q_len=processed_q_len[b_idx],
                 processed_kv_len=processed_kv_len[b_idx],
                 effective_kv_len=effective_kv_len[b_idx],
                 bkv_sz_frm_cache=bkv_sz_frm_cache_list[b_idx],
                 new_tok_offset=new_tok_off_b,
-                visibility=(visibility_list[b_idx]
-                            if cfgs.has_visibility else None),
-                skip_mask=(skip_mask_list[b_idx]
-                           if skip_mask_list is not None else None),
+                visibility=(visibility_list[b_idx] if cfgs.has_visibility else None),
+                skip_mask=(
+                    skip_mask_list[b_idx] if skip_mask_list is not None else None
+                ),
                 cfgs=cfgs,
                 bq_start=bq_start,
                 num_cache_pages=cfgs.bkv_p_cache,
                 num_new_pages=cfgs.bkv_p_new,
             )
-            m_scratch_ref[b_idx:b_idx + 1, :, q_slice, :] = m_next
-            l_scratch_ref[b_idx:b_idx + 1, :, q_slice, :] = l_next
-            acc_scratch_ref[b_idx:b_idx + 1, :, q_slice, :] = o_next
+            m_scratch_ref[b_idx : b_idx + 1, :, q_slice, :] = m_next
+            l_scratch_ref[b_idx : b_idx + 1, :, q_slice, :] = l_next
+            acc_scratch_ref[b_idx : b_idx + 1, :, q_slice, :] = o_next
 
 
-def _run_shipped_flash_path(*,
-                            q,
-                            kv_in_vref,
-                            m_scratch_ref,
-                            l_scratch_ref,
-                            acc_scratch_ref,
-                            processed_q_len,
-                            processed_kv_len,
-                            effective_kv_len,
-                            bkv_sz_frm_cache_list,
-                            new_kv_len_start_list,
-                            visibility_list,
-                            skip_mask_list,
-                            step,
-                            schedule_ref,
-                            cfgs,
-                            m_val,
-                            l_val,
-                            acc_val,
-                            new_kv_vref=None):
+def _run_shipped_flash_path(
+    *,
+    q,
+    kv_in_vref,
+    m_scratch_ref,
+    l_scratch_ref,
+    acc_scratch_ref,
+    processed_q_len,
+    processed_kv_len,
+    effective_kv_len,
+    bkv_sz_frm_cache_list,
+    new_kv_len_start_list,
+    visibility_list,
+    skip_mask_list,
+    step,
+    schedule_ref,
+    cfgs,
+    m_val,
+    l_val,
+    acc_val,
+    new_kv_vref=None,
+):
     # MIXED / PREFILL path (and DECODE when the chunked path is not enabled).
     # Uses the 4-D VMEM layout, a single-shot flash, and a stitch pass.
     # Snapshot arguments follow the same convention as
@@ -104,28 +116,29 @@ def _run_shipped_flash_path(*,
     _defer_v = cfgs.bq_sz == 1
     stitch_results = []
     for b_idx in range(cfgs.batch_size):
-        res = stitch_utils.stitch_new_kv_lane(kv_in_vref,
-                                              b_idx,
-                                              bkv_sz_frm_cache_list[b_idx],
-                                              new_kv_len_start_list[b_idx],
-                                              cfgs=cfgs,
-                                              new_kv_vref=new_kv_vref)
+        res = stitch_utils.stitch_new_kv_lane(
+            kv_in_vref,
+            b_idx,
+            bkv_sz_frm_cache_list[b_idx],
+            new_kv_len_start_list[b_idx],
+            cfgs=cfgs,
+            new_kv_vref=new_kv_vref,
+        )
         stitch_results.append(res)
     for b_idx in range(cfgs.batch_size):
-        stitch_utils.store_new_kv_lane(kv_in_vref,
-                                       b_idx,
-                                       stitch_results[b_idx],
-                                       cfgs=cfgs)
+        stitch_utils.store_new_kv_lane(
+            kv_in_vref, b_idx, stitch_results[b_idx], cfgs=cfgs
+        )
     k_b = []
     v_b = []
     for b_idx in range(cfgs.batch_size):
         ks = []
         vs = []
         for kv_head in range(cfgs.model.num_kv_heads):
-            k_head = kv_in_vref[b_idx, kv_head * 2, :, 0:cfgs.bkv_sz]
+            k_head = kv_in_vref[b_idx, kv_head * 2, :, 0 : cfgs.bkv_sz]
             ks.append(k_head)
             if not _defer_v:
-                v_head = kv_in_vref[b_idx, kv_head * 2 + 1, :, 0:cfgs.bkv_sz]
+                v_head = kv_in_vref[b_idx, kv_head * 2 + 1, :, 0 : cfgs.bkv_sz]
                 vs.append(v_head)
         k_b.append(jnp.stack(ks, axis=0))
         if not _defer_v:
@@ -134,17 +147,20 @@ def _run_shipped_flash_path(*,
     v = jnp.stack(v_b, axis=0) if not _defer_v else None
 
     def _mask_v(vv):
-        kv_valid = jnp.stack([
-            jnp.clip(
-                effective_kv_len[b].astype(jnp.int32) -
-                processed_kv_len[b].astype(jnp.int32),
-                0,
-                cfgs.bkv_sz,
-            ) for b in range(cfgs.batch_size)
-        ])
+        kv_valid = jnp.stack(
+            [
+                jnp.clip(
+                    effective_kv_len[b].astype(jnp.int32)
+                    - processed_kv_len[b].astype(jnp.int32),
+                    0,
+                    cfgs.bkv_sz,
+                )
+                for b in range(cfgs.batch_size)
+            ]
+        )
         keep = lax.broadcasted_iota(
-            jnp.int32, vv.shape, vv.ndim -
-            1) < kv_valid.reshape((cfgs.batch_size, ) + (1, ) * (vv.ndim - 1))
+            jnp.int32, vv.shape, vv.ndim - 1
+        ) < kv_valid.reshape((cfgs.batch_size,) + (1,) * (vv.ndim - 1))
         return jnp.where(keep, vv, 0)
 
     if not _defer_v:
@@ -169,16 +185,14 @@ def _run_shipped_flash_path(*,
             visibility=visibility_list if cfgs.has_visibility else None,
             skip_mask=skip_mask_list,
             cfgs=cfgs,
-            bq_start=bq_start)
+            bq_start=bq_start,
+        )
         m_scratch_ref[:, :, q_slice] = m_next
         l_scratch_ref[:, :, q_slice] = l_next
         if prev_p is not None:
-            o_next = flash_attention.flash_attention_pv(prev_p,
-                                                        v,
-                                                        prev_alpha,
-                                                        acc_val[:, :,
-                                                                prev_q_slice],
-                                                        cfgs=cfgs)
+            o_next = flash_attention.flash_attention_pv(
+                prev_p, v, prev_alpha, acc_val[:, :, prev_q_slice], cfgs=cfgs
+            )
             acc_scratch_ref[:, :, prev_q_slice] = o_next
         prev_p = p
         prev_alpha = alpha
@@ -189,16 +203,14 @@ def _run_shipped_flash_path(*,
         for b_idx in range(cfgs.batch_size):
             vs = []
             for kv_head in range(cfgs.model.num_kv_heads):
-                v_head = kv_in_vref[b_idx, kv_head * 2 + 1, :, 0:cfgs.bkv_sz]
+                v_head = kv_in_vref[b_idx, kv_head * 2 + 1, :, 0 : cfgs.bkv_sz]
                 vs.append(v_head)
             v_b_deferred.append(jnp.stack(vs, axis=0))
         v = jnp.stack(v_b_deferred, axis=0)
         v = _mask_v(v)
-    o_next = flash_attention.flash_attention_pv(prev_p,
-                                                v,
-                                                prev_alpha,
-                                                acc_val[:, :, prev_q_slice],
-                                                cfgs=cfgs)
+    o_next = flash_attention.flash_attention_pv(
+        prev_p, v, prev_alpha, acc_val[:, :, prev_q_slice], cfgs=cfgs
+    )
     acc_scratch_ref[:, :, prev_q_slice] = o_next
 
 
@@ -220,12 +232,15 @@ def calculate_and_store_out(
         batch_l = l_scratch_ref[b_idx]
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
 
-        if (cfgs.serve.dtype_out == jnp.float32
-                or cfgs.serve.dtype_out == batch_l.dtype == jnp.bfloat16):
+        if (
+            cfgs.serve.dtype_out == jnp.float32
+            or cfgs.serve.dtype_out == batch_l.dtype == jnp.bfloat16
+        ):
             result = lax.div(batch_acc, batch_l)
         else:
             result = batch_acc.astype(jnp.float32) * pl.reciprocal(
-                batch_l.astype(jnp.float32), approx=True)
+                batch_l.astype(jnp.float32), approx=True
+            )
         out = result.astype(cfgs.serve.dtype_out)
 
         o_u32_vref = o_vref.at[b_idx].bitcast(jnp.uint32)
@@ -302,17 +317,21 @@ def _stacked_combine_and_store(
                     m_m = jnp.where(included(m), m_scratch_ref[m], -jnp.inf)
                 alpha = jnp.exp(m_m - m_comb)  # 0 for excluded/identity
                 l_comb = l_comb + alpha * l_scratch_ref[m]
-                acc_comb = acc_comb + (utils.broadcast_minor(
-                    alpha, acc_comb.shape) * acc_scratch_ref[m])
+                acc_comb = acc_comb + (
+                    utils.broadcast_minor(alpha, acc_comb.shape) * acc_scratch_ref[m]
+                )
 
             # 3) normalize
             batch_l = utils.broadcast_minor(l_comb, acc_comb.shape)
-            if (cfgs.serve.dtype_out == jnp.float32
-                    or cfgs.serve.dtype_out == batch_l.dtype == jnp.bfloat16):
+            if (
+                cfgs.serve.dtype_out == jnp.float32
+                or cfgs.serve.dtype_out == batch_l.dtype == jnp.bfloat16
+            ):
                 result = lax.div(acc_comb, batch_l)
             else:
                 result = acc_comb.astype(jnp.float32) * pl.reciprocal(
-                    batch_l.astype(jnp.float32), approx=True)
+                    batch_l.astype(jnp.float32), approx=True
+                )
             out = result.astype(cfgs.serve.dtype_out)
             if cfgs.aligned_q_head_dim != cfgs.aligned_kv_head_dim:
                 out = jnp.pad(
@@ -320,8 +339,7 @@ def _stacked_combine_and_store(
                     (
                         (0, 0),
                         (0, 0),
-                        (0,
-                         cfgs.aligned_q_head_dim - cfgs.aligned_kv_head_dim),
+                        (0, cfgs.aligned_q_head_dim - cfgs.aligned_kv_head_dim),
                     ),
                     constant_values=0,
                 )
@@ -381,16 +399,21 @@ def _dense_combine_and_store(
             m_g = m_scratch_ref[root]
             for m in range(root + 1, n):
                 m_g = jnp.maximum(
-                    m_g, jnp.where(included(m), m_scratch_ref[m], -jnp.inf))
+                    m_g, jnp.where(included(m), m_scratch_ref[m], -jnp.inf)
+                )
             l_g = jnp.zeros_like(l_scratch_ref[root])
             acc_g = jnp.zeros_like(acc_scratch_ref[root])
             for m in range(root, n):
-                m_m = (m_scratch_ref[root] if m == root else jnp.where(
-                    included(m), m_scratch_ref[m], -jnp.inf))
+                m_m = (
+                    m_scratch_ref[root]
+                    if m == root
+                    else jnp.where(included(m), m_scratch_ref[m], -jnp.inf)
+                )
                 a = jnp.exp(m_m - m_g)
                 l_g = l_g + a * l_scratch_ref[m]
-                acc_g = acc_g + (utils.broadcast_minor(a, acc_g.shape) *
-                                 acc_scratch_ref[m])
+                acc_g = acc_g + (
+                    utils.broadcast_minor(a, acc_g.shape) * acc_scratch_ref[m]
+                )
             m_scratch_ref[root] = m_g
             l_scratch_ref[root] = l_g
             acc_scratch_ref[root] = acc_g
@@ -407,10 +430,9 @@ def _dense_combine_and_store(
         m_scratch_ref[0] = mx
         l_scratch_ref[0] = ac * l_carry_ref[0] + ag * l_scratch_ref[0]
         acc_scratch_ref[0] = (
-            utils.broadcast_minor(ac, acc_scratch_ref[0].shape) *
-            acc_carry_ref[0] +
-            utils.broadcast_minor(ag, acc_scratch_ref[0].shape) *
-            acc_scratch_ref[0])
+            utils.broadcast_minor(ac, acc_scratch_ref[0].shape) * acc_carry_ref[0]
+            + utils.broadcast_minor(ag, acc_scratch_ref[0].shape) * acc_scratch_ref[0]
+        )
         carry_valid_ref[0] = 0
 
     # --- Phase 3: the single non-final (straddling) group becomes the carry. ---
@@ -442,8 +464,9 @@ def _dense_combine_and_store(
     # output cells when it is low, to get the best of both with no regression.
     has_output = schedule_ref.is_final[step_idx, 0] == 1
     for root in range(1, n):
-        has_output = jnp.logical_or(has_output,
-                                    schedule_ref.is_final[step_idx, root] == 1)
+        has_output = jnp.logical_or(
+            has_output, schedule_ref.is_final[step_idx, root] == 1
+        )
 
     @pl.when(has_output)
     def _emit_all():
@@ -453,12 +476,15 @@ def _dense_combine_and_store(
         acc_all = acc_scratch_ref[...]
         denom = jnp.where(l_all == 0.0, 1.0, l_all)  # avoid 0/0 in idle cells
         batch_l = utils.broadcast_minor(denom, acc_all.shape)
-        if (cfgs.serve.dtype_out == jnp.float32
-                or cfgs.serve.dtype_out == batch_l.dtype == jnp.bfloat16):
+        if (
+            cfgs.serve.dtype_out == jnp.float32
+            or cfgs.serve.dtype_out == batch_l.dtype == jnp.bfloat16
+        ):
             result = lax.div(acc_all, batch_l)
         else:
             result = acc_all.astype(jnp.float32) * pl.reciprocal(
-                batch_l.astype(jnp.float32), approx=True)
+                batch_l.astype(jnp.float32), approx=True
+            )
         out = result.astype(cfgs.serve.dtype_out)
         if cfgs.aligned_q_head_dim != cfgs.aligned_kv_head_dim:
             out = jnp.pad(
@@ -541,9 +567,9 @@ def rpa_body(
         if cfgs.use_window_anchor:
             # Match schedule.py's anchored block base (page-aligned window
             # start); k_idx is the local block index (0) in the anchored range.
-            anchor_tok = utils.window_anchor_tok(kv_len, q_len,
-                                                 cfgs.model.sliding_window,
-                                                 cfgs.serve.page_size_log2)
+            anchor_tok = utils.window_anchor_tok(
+                kv_len, q_len, cfgs.model.sliding_window, cfgs.serve.page_size_log2
+            )
             k_id = jnp.where(is_valid, anchor_tok + k_idx * cfgs.bkv_sz, 0)
         else:
             k_id = jnp.where(is_valid, k_idx * cfgs.bkv_sz, 0)
@@ -572,18 +598,14 @@ def rpa_body(
         if not cfgs.is_stacked:
             start_k_idx = 0
             if (sliding_window := cfgs.model.sliding_window) is not None:
-                sw_start_idx = (kv_len - q_len + q_idx * cfgs.bq_sz -
-                                sliding_window + 1)
+                sw_start_idx = kv_len - q_len + q_idx * cfgs.bq_sz - sliding_window + 1
                 start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
 
             is_first_k_block = k_idx == start_k_idx
             reset_cond = jnp.logical_and(is_valid, is_first_k_block)
-            m_scratch_ref[b_idx] = jnp.where(reset_cond, -jnp.inf,
-                                             m_scratch_ref[b_idx])
-            l_scratch_ref[b_idx] = jnp.where(reset_cond, 0.0,
-                                             l_scratch_ref[b_idx])
-            acc_scratch_ref[b_idx] = jnp.where(reset_cond, 0.0,
-                                               acc_scratch_ref[b_idx])
+            m_scratch_ref[b_idx] = jnp.where(reset_cond, -jnp.inf, m_scratch_ref[b_idx])
+            l_scratch_ref[b_idx] = jnp.where(reset_cond, 0.0, l_scratch_ref[b_idx])
+            acc_scratch_ref[b_idx] = jnp.where(reset_cond, 0.0, acc_scratch_ref[b_idx])
 
     # Step 2: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
@@ -602,7 +624,7 @@ def rpa_body(
         cfgs.aligned_q_head_dim,
     )
     if cfgs.aligned_q_head_dim != cfgs.aligned_kv_head_dim:
-        q = q[..., :cfgs.aligned_kv_head_dim]
+        q = q[..., : cfgs.aligned_kv_head_dim]
 
     # dense_pack reset happens BEFORE the flash so both paths see fresh
     # identity in scratches; snapshot captures those identity values so the
@@ -653,13 +675,15 @@ def rpa_body(
         # combine correct.
         for b_idx in range(cfgs.batch_size):
             is_valid_b = schedule_ref.s_idx[step, b_idx] != -1
-            m_scratch_ref[b_idx] = jnp.where(is_valid_b, m_scratch_ref[b_idx],
-                                             m_val[b_idx])
-            l_scratch_ref[b_idx] = jnp.where(is_valid_b, l_scratch_ref[b_idx],
-                                             l_val[b_idx])
-            acc_scratch_ref[b_idx] = jnp.where(is_valid_b,
-                                               acc_scratch_ref[b_idx],
-                                               acc_val[b_idx])
+            m_scratch_ref[b_idx] = jnp.where(
+                is_valid_b, m_scratch_ref[b_idx], m_val[b_idx]
+            )
+            l_scratch_ref[b_idx] = jnp.where(
+                is_valid_b, l_scratch_ref[b_idx], l_val[b_idx]
+            )
+            acc_scratch_ref[b_idx] = jnp.where(
+                is_valid_b, acc_scratch_ref[b_idx], acc_val[b_idx]
+            )
 
     # Step 4: Write back outputs.
     if cfgs.is_stacked and cfgs.dense_pack:
@@ -709,21 +733,19 @@ def create_allocs(
     kv_cache_spec = pl.BlockSpec(
         block_shape=cfgs.kv_vmem_shape,
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, ),
-        pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer,
-                                  use_lookahead=True),
+        index_map=lambda i: (i,),
+        pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer, use_lookahead=True),
     )
     q_spec = pl.BlockSpec(
         block_shape=cfgs.q_vmem_shape,
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, ),
-        pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer,
-                                  use_lookahead=True),
+        index_map=lambda i: (i,),
+        pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer, use_lookahead=True),
     )
     o_spec = pl.BlockSpec(
         block_shape=cfgs.q_vmem_shape,
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, ),
+        index_map=lambda i: (i,),
         # Output BufferedRef is limited to buffer_count<=2 by Pallas runtime
         # (see NotImplementedError in pltpu output-ref handling). Flipping
         # use_lookahead=True with count=2 still lets the last-step write-back
@@ -733,9 +755,8 @@ def create_allocs(
     visibility_spec = pl.BlockSpec(
         block_shape=(cfgs.batch_size, cfgs.bq_sz, 128),
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, ),
-        pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer,
-                                  use_lookahead=True),
+        index_map=lambda i: (i,),
+        pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer, use_lookahead=True),
     )
 
     kv_cache_alloc_cls = bref_override.KVBufferedRefSeqAlongLane
@@ -781,7 +802,8 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
 
 
 def get_kernel_metadata(
-    cfgs: configs.RpaConfigs, ) -> dict[str, str | int | float]:
+    cfgs: configs.RpaConfigs,
+) -> dict[str, str | int | float]:
     cfgs_dict = dataclasses.asdict(cfgs)
     ret = {}
     for path, val in jax.tree_util.tree_leaves_with_path(cfgs_dict):
@@ -849,7 +871,8 @@ def rpa_kernel(
         del o_kv_cache_hbm_ref
 
         q_alloc, kv_cache_alloc, visibility_alloc, o_alloc = create_allocs(
-            kv_cache_hbm_ref, q_hbm_ref, visibility_hbm_ref, cfgs)
+            kv_cache_hbm_ref, q_hbm_ref, visibility_hbm_ref, cfgs
+        )
 
         @pl.with_scoped(
             final_allocs=(q_alloc, kv_cache_alloc, visibility_alloc, o_alloc),
@@ -857,12 +880,13 @@ def rpa_kernel(
             # (double-buffered: prefetch window w+1 while computing window w).
             schedule_ref=tuple(
                 schedule.RpaSchedule.create_shape_dtype(
-                    cfgs, steps=cfgs.sched_window).scratch_shapes()
-                for _ in range(1 if cfgs.fits_one_window else 2)),
+                    cfgs, steps=cfgs.sched_window
+                ).scratch_shapes()
+                for _ in range(1 if cfgs.fits_one_window else 2)
+            ),
             # +1 slot: the last index is reserved for the resident new-KV
             # copy so it never shares a semaphore with the schedule stream.
-            dma_sem=pltpu.SemaphoreType.DMA((
-                2, ) if cfgs.fits_one_window else (3, )),
+            dma_sem=pltpu.SemaphoreType.DMA((2,) if cfgs.fits_one_window else (3,)),
             scratches=(
                 pltpu.VMEM(
                     cfgs.lm_scratch_shape,
@@ -877,20 +901,21 @@ def rpa_kernel(
                     dtype=configs.accum_dtype(cfgs.serve.dtype_out),
                 ),  # acc
                 pltpu.VMEM(
-                    (1, ) + tuple(cfgs.lm_scratch_shape[1:]),
+                    (1,) + tuple(cfgs.lm_scratch_shape[1:]),
                     dtype=configs.accum_dtype(cfgs.serve.dtype_out),
                 ),  # m_carry
                 pltpu.VMEM(
-                    (1, ) + tuple(cfgs.lm_scratch_shape[1:]),
+                    (1,) + tuple(cfgs.lm_scratch_shape[1:]),
                     dtype=configs.accum_dtype(cfgs.serve.dtype_out),
                 ),  # l_carry
                 pltpu.VMEM(
-                    (1, ) + tuple(cfgs.acc_scratch_shape[1:]),
+                    (1,) + tuple(cfgs.acc_scratch_shape[1:]),
                     dtype=configs.accum_dtype(cfgs.serve.dtype_out),
                 ),  # acc_carry
-                pltpu.SMEM((1, ), jnp.int32),  # carry_valid
-                pltpu.VMEM(cfgs.new_kv_vmem_shape,
-                           dtype=cfgs.serve.dtype_kv),  # resident new KV
+                pltpu.SMEM((1,), jnp.int32),  # carry_valid
+                pltpu.VMEM(
+                    cfgs.new_kv_vmem_shape, dtype=cfgs.serve.dtype_kv
+                ),  # resident new KV
             ),
         )
         def _run(final_allocs, schedule_ref, dma_sem, scratches):
@@ -965,17 +990,17 @@ def rpa_kernel(
                         raw_stride = s_len // w_size  # int32s per step
                         copy_len = jnp.minimum(
                             pl.multiple_of(
-                                pl.cdiv(n_steps * raw_stride, 1024) * 1024,
-                                1024),
+                                pl.cdiv(n_steps * raw_stride, 1024) * 1024, 1024
+                            ),
                             s_len,
                         )
                         descs.append(
                             pltpu.make_async_copy(
-                                h.at[pl.ds(pl.multiple_of(w * s_len, s_len),
-                                           copy_len)],
+                                h.at[pl.ds(pl.multiple_of(w * s_len, s_len), copy_len)],
                                 s.at[pl.ds(0, copy_len)],
                                 dma_sem.at[sem_idx],
-                            ))
+                            )
+                        )
                 return descs
 
             def _run_pipeline(n_steps, buf):
@@ -986,20 +1011,20 @@ def rpa_kernel(
                         cu_q_lens_ref=cu_q_lens_ref,
                         kv_lens_ref=kv_lens_ref,
                     ),
-                    grid=(n_steps, ),
+                    grid=(n_steps,),
                     in_specs=(
                         q_alloc.spec,
                         kv_cache_alloc.spec,
                         visibility_alloc.spec,
                     ),
-                    out_specs=(o_alloc.spec, ),
+                    out_specs=(o_alloc.spec,),
                 )
                 pipeline_func(
                     (q_hbm_ref, buf),
                     (kv_cache_hbm_ref, new_kv_hbm_ref, buf),
                     (visibility_hbm_ref, buf),
                     (o_hbm_ref, buf),
-                    scratches=(buf, ) + scratches,
+                    scratches=(buf,) + scratches,
                     allocations=final_allocs,
                 )
 
@@ -1025,8 +1050,9 @@ def rpa_kernel(
                 # compute. The m/l/acc scratches persist across windows so a
                 # sequence spanning windows accumulates correctly.
                 buf0, buf1 = schedule_ref
-                num_windows_actual = jnp.minimum(pl.cdiv(actual_steps, w_size),
-                                                 num_windows)
+                num_windows_actual = jnp.minimum(
+                    pl.cdiv(actual_steps, w_size), num_windows
+                )
 
                 # Prologue: start window 0's copy into buf0 (sem 0), overlapped
                 # with kv_cache_init. Its wait happens in iteration 0.
@@ -1041,8 +1067,7 @@ def rpa_kernel(
                 def _window(w, _):
                     win_steps = jnp.clip(actual_steps - w * w_size, 0, w_size)
                     nxt = w + 1
-                    nxt_steps = jnp.clip(actual_steps - nxt * w_size, 0,
-                                         w_size)
+                    nxt_steps = jnp.clip(actual_steps - nxt * w_size, 0, w_size)
                     even = (w % 2) == 0
 
                     # Prefetch window w+1 into the OTHER buffer (async, no wait) so
@@ -1053,8 +1078,8 @@ def rpa_kernel(
                             c.start()
 
                     @pl.when(
-                        jnp.logical_and(nxt < num_windows_actual,
-                                        jnp.logical_not(even)))
+                        jnp.logical_and(nxt < num_windows_actual, jnp.logical_not(even))
+                    )
                     def _prefetch_to_buf0():
                         for c in _sched_copies(nxt, nxt_steps, buf0, 0):
                             c.start()
@@ -1104,8 +1129,7 @@ def rpa_kernel(
             ],
             out_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_o_hbm_ref
-                pl.BlockSpec(
-                    memory_space=pltpu.HBM),  # aliased_kv_cache_hbm_ref
+                pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_kv_cache_hbm_ref
             ],
         ),
         compiler_params=pltpu.CompilerParams(
@@ -1117,10 +1141,7 @@ def rpa_kernel(
             # disable_bounds_checks); semaphore usage is covered by the tests.
             disable_semaphore_checks=True,
         ),
-        input_output_aliases={
-            _q_in_idx: 0,
-            _kv_in_idx: 1
-        },
+        input_output_aliases={_q_in_idx: 0, _kv_in_idx: 1},
         name=get_kernel_name(cfgs),
         metadata=get_kernel_metadata(cfgs),
     )
@@ -1134,7 +1155,8 @@ def rpa_kernel(
         return pltpu.with_memory_space_constraint(x, pltpu.HBM)
 
     constrained_schedule_hbm_ref = jax.tree_util.tree_map_with_path(
-        _constrain_hbm, schedule_hbm)
+        _constrain_hbm, schedule_hbm
+    )
     return _kernel(
         cu_q_lens,
         kv_lens,

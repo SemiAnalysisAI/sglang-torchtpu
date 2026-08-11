@@ -11,10 +11,13 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang.srt.layers.attention.pallas.stacked_rpa import (configs, kernel,
-                                                            schedule,
-                                                            tuned_block_sizes,
-                                                            utils)
+from sglang.srt.layers.attention.pallas.stacked_rpa import (
+    configs,
+    kernel,
+    schedule,
+    tuned_block_sizes,
+    utils,
+)
 
 
 def _require_seq_along_lane(kv_layout: configs.KVLayout) -> None:
@@ -22,7 +25,8 @@ def _require_seq_along_lane(kv_layout: configs.KVLayout) -> None:
     if kv_layout != configs.KVLayout.SEQ_ALONG_LANE:
         raise ValueError(
             "stacked_rpa only supports the 4D SEQ_ALONG_LANE kv-cache layout, "
-            f"but got kv_layout={kv_layout!r}.")
+            f"but got kv_layout={kv_layout!r}."
+        )
 
 
 def prepare_queries(
@@ -33,33 +37,36 @@ def prepare_queries(
     total_q_tokens, actual_num_q_heads, actual_head_dim = q.shape
     num_q_heads_per_kv_head = actual_num_q_heads // num_kv_heads
     q_packing = utils.get_dtype_packing(q_dtype)
-    aligned_num_q_heads_per_kv_head = utils.align_to(num_q_heads_per_kv_head,
-                                                     q_packing)
+    aligned_num_q_heads_per_kv_head = utils.align_to(num_q_heads_per_kv_head, q_packing)
     num_lanes = pltpu.get_tpu_info().num_lanes
     aligned_q_head_dim = utils.align_to(actual_head_dim, num_lanes)
 
     # queries: (T, H, D) -> (T, H_kv, G, D)
-    return (jnp.pad(
-        q.reshape(
+    return (
+        jnp.pad(
+            q.reshape(
+                total_q_tokens,
+                num_kv_heads,
+                num_q_heads_per_kv_head,
+                actual_head_dim,
+            ),
+            (
+                (0, 0),
+                (0, 0),
+                (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head),
+                (0, aligned_q_head_dim - actual_head_dim),
+            ),
+            constant_values=0,
+        )
+        .reshape(
             total_q_tokens,
             num_kv_heads,
-            num_q_heads_per_kv_head,
-            actual_head_dim,
-        ),
-        (
-            (0, 0),
-            (0, 0),
-            (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head),
-            (0, aligned_q_head_dim - actual_head_dim),
-        ),
-        constant_values=0,
-    ).reshape(
-        total_q_tokens,
-        num_kv_heads,
-        aligned_num_q_heads_per_kv_head // q_packing,
-        q_packing,
-        aligned_q_head_dim,
-    ).swapaxes(0, 1))
+            aligned_num_q_heads_per_kv_head // q_packing,
+            q_packing,
+            aligned_q_head_dim,
+        )
+        .swapaxes(0, 1)
+    )
 
 
 def prepare_inputs(
@@ -79,8 +86,7 @@ def prepare_inputs(
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     num_sublanes = pltpu.get_tpu_info().num_sublanes
-    aligned_kv_head_dim = utils.align_to(actual_head_dim,
-                                         num_sublanes * kv_packing)
+    aligned_kv_head_dim = utils.align_to(actual_head_dim, num_sublanes * kv_packing)
 
     o_hbm_alias_q_hbm = prepare_queries(q, actual_num_kv_heads, q_dtype)
 
@@ -96,7 +102,8 @@ def prepare_inputs(
         if new_kv_hbm.shape != expected_shape:
             raise ValueError(
                 f"prepacked_new_kv_hbm has shape {new_kv_hbm.shape}, "
-                f"expected {expected_shape}")
+                f"expected {expected_shape}"
+            )
     else:
         new_kv_hbm = prepare_seq_along_lane_new_kv_hbm(k, v, kv_dtype=kv_dtype)
     return o_hbm_alias_q_hbm, new_kv_hbm
@@ -123,25 +130,28 @@ def prepare_seq_along_lane_new_kv_hbm(
     kv_packing = utils.get_dtype_packing(kv_dtype)
     num_lanes = pltpu.get_tpu_info().num_lanes
     num_sublanes = pltpu.get_tpu_info().num_sublanes
-    aligned_kv_head_dim = utils.align_to(actual_head_dim,
-                                         num_sublanes * kv_packing)
+    aligned_kv_head_dim = utils.align_to(actual_head_dim, num_sublanes * kv_packing)
     padded_total_tokens = utils.align_to(total_q_tokens, num_lanes)
     actual_num_kv_heads_x2 = actual_num_kv_heads * 2
-    return (jnp.pad(
-        jnp.concatenate([k, v], axis=-1).reshape(total_q_tokens,
-                                                 actual_num_kv_heads_x2,
-                                                 actual_head_dim),
-        (
-            (0, padded_total_tokens - total_q_tokens),
-            (0, 0),
-            (0, aligned_kv_head_dim - actual_head_dim),
-        ),
-        constant_values=0,
-    ).reshape(
-        padded_total_tokens,
-        actual_num_kv_heads_x2,
-        aligned_kv_head_dim,
-    ).transpose(1, 2, 0))
+    return (
+        jnp.pad(
+            jnp.concatenate([k, v], axis=-1).reshape(
+                total_q_tokens, actual_num_kv_heads_x2, actual_head_dim
+            ),
+            (
+                (0, padded_total_tokens - total_q_tokens),
+                (0, 0),
+                (0, aligned_kv_head_dim - actual_head_dim),
+            ),
+            constant_values=0,
+        )
+        .reshape(
+            padded_total_tokens,
+            actual_num_kv_heads_x2,
+            aligned_kv_head_dim,
+        )
+        .transpose(1, 2, 0)
+    )
 
 
 def prepare_outputs(out: jax.Array) -> jax.Array:
@@ -200,7 +210,8 @@ def _calculate_vmem_usage(
 
     aligned_head_dim = utils.align_to(model_cfgs.head_dim, num_lanes)
     aligned_num_q_heads_per_kv_head = utils.align_to(
-        model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q)
+        model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q
+    )
     aligned_num_q_heads = aligned_num_q_heads_per_kv_head * model_cfgs.num_kv_heads
 
     # kv_vmem_shape puts num_kv_heads*2 on a regular axis (index 1), not on
@@ -215,13 +226,16 @@ def _calculate_vmem_usage(
     # Buffer memory (double/triple buffered). SEQ_ALONG_LANE staging carries a
     # +2*page_size halo for the boundary stitch.
     bq_array_size = bq_sz * aligned_num_q_heads * aligned_head_dim
-    bkv_array_size = ((bkv_sz + 2 * serve_cfgs.page_size) * num_kv_heads_x2 *
-                      aligned_head_dim)
+    bkv_array_size = (
+        (bkv_sz + 2 * serve_cfgs.page_size) * num_kv_heads_x2 * aligned_head_dim
+    )
     bo_array_size = bq_array_size
 
-    buffer_bytes = (bq_array_size * q_bytes * n_buffer +
-                    bkv_array_size * kv_bytes * n_buffer +
-                    bo_array_size * out_bytes * 2)
+    buffer_bytes = (
+        bq_array_size * q_bytes * n_buffer
+        + bkv_array_size * kv_bytes * n_buffer
+        + bo_array_size * out_bytes * 2
+    )
 
     # Worst-case compute memory.
     loaded_bq_bytes = bq_sz * model_cfgs.num_q_heads * aligned_head_dim * q_bytes
@@ -243,14 +257,17 @@ def calculate_block_sizes(
     tpu_info = pltpu.get_tpu_info()
     mxu_column_size = tpu_info.mxu_column_size
 
-    def calculate_vmem_usage(batch_size: int, n_buffer: int, bq_sz: int,
-                             bkv_sz: int) -> int:
+    def calculate_vmem_usage(
+        batch_size: int, n_buffer: int, bq_sz: int, bkv_sz: int
+    ) -> int:
         """Given tile size, calculate VMEM usage of the kernel."""
-        return _calculate_vmem_usage(model_cfgs, serve_cfgs, batch_size,
-                                     n_buffer, bq_sz, bkv_sz)
+        return _calculate_vmem_usage(
+            model_cfgs, serve_cfgs, batch_size, n_buffer, bq_sz, bkv_sz
+        )
 
-    def calculate_compute_buffer_time(batch_size: int, bq_c_sz: int,
-                                      bkv_sz: int) -> int:
+    def calculate_compute_buffer_time(
+        batch_size: int, bq_c_sz: int, bkv_sz: int
+    ) -> int:
         """Calculate computational complexity of a single compute block."""
 
         num_k_rows = pl.cdiv(bkv_sz, mxu_column_size)
@@ -261,9 +278,8 @@ def calculate_block_sizes(
         return batch_size * num_muls
 
     def find_best_block_sizes(
-            max_batch_size: int,
-            max_n_buffer: int,
-            fixed_bq_sz: int | None = None) -> configs.BlockSizes:
+        max_batch_size: int, max_n_buffer: int, fixed_bq_sz: int | None = None
+    ) -> configs.BlockSizes:
         """Loop through different block sizes to find the most optimal one."""
 
         # Use 80% of VMEM to leave room for compiler-emitted scratch that this
@@ -285,26 +301,31 @@ def calculate_block_sizes(
 
         # If current batch size triggers OOM, decrease batch size until the kernel
         # fits within VMEM limit.
-        while (batch_size > 1
-               and calculate_vmem_usage(batch_size, n_buffer, bq_sz,
-                                        bkv_sz) > capped_vmem_limit_bytes):
+        while (
+            batch_size > 1
+            and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+            > capped_vmem_limit_bytes
+        ):
             batch_size -= 1
 
         # As a last resort, attempt to decrease number of buffers to avoid OOM.
-        while (calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-               > capped_vmem_limit_bytes):
+        while (
+            calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+            > capped_vmem_limit_bytes
+        ):
             n_buffer -= 1
 
         # Indicates OOM was triggered even when batch_size=1 or n_buffer=1.
         # NOTE: If the function does not exit at this point even when either values
         # are zero, it will trigger infinite loop at the next while loop.
         if batch_size == 0 or n_buffer == 0:
-            raise ValueError(
-                "Cannot find batch size that fits within VMEM limit.")
+            raise ValueError("Cannot find batch size that fits within VMEM limit.")
 
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
-        while (calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-               < capped_vmem_limit_bytes):
+        while (
+            calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+            < capped_vmem_limit_bytes
+        ):
             # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
             # size. When using causal masking, if bq size is larger than bkv size,
             # entire kv tile can be masked out for some query tokens. Similarly, if
@@ -319,8 +340,7 @@ def calculate_block_sizes(
 
         # Indicates OOM was triggered from the starting bkv size.
         if bkv_sz == 0:
-            raise ValueError(
-                "Cannot find block sizes that fit within VMEM limit.")
+            raise ValueError("Cannot find block sizes that fit within VMEM limit.")
 
         # Step 3: Given current tile size, calculate compute tile size.
 
@@ -330,8 +350,10 @@ def calculate_block_sizes(
         last_valid_bq_c_sz = bq_c_sz = bq_sz
         bq_c_rem = 0
 
-        while (calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz)
-               > threshold or bq_c_rem != 0) and num_bq_c < bq_sz:
+        while (
+            calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) > threshold
+            or bq_c_rem != 0
+        ) and num_bq_c < bq_sz:
             if bq_c_rem == 0:
                 last_valid_bq_c_sz = bq_c_sz
             num_bq_c += 1
@@ -376,12 +398,12 @@ def calculate_block_sizes(
     LONG_CTX_THRESHOLD = 128 * 1024
 
     if max_model_len_from_cfg < LONG_CTX_THRESHOLD:
-        decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer,
-                                                   decode_fixed_bq_sz)
+        decode_block_sizes = find_best_block_sizes(
+            decode_batch_size, n_buffer, decode_fixed_bq_sz
+        )
         if decode_block_sizes.bkv_sz > max_model_len_from_cfg:
             capped = max(max_model_len_from_cfg, serve_cfgs.page_size)
-            decode_block_sizes = dataclasses.replace(decode_block_sizes,
-                                                     bkv_sz=capped)
+            decode_block_sizes = dataclasses.replace(decode_block_sizes, bkv_sz=capped)
     else:
         # (batch, nbuf) candidates for the long-context search. Ties break
         # towards the last-listed entry (>= in the loop below), which puts
@@ -411,8 +433,7 @@ def calculate_block_sizes(
                 best_score = score
                 decode_block_sizes = cand
         if decode_block_sizes is None:
-            decode_block_sizes = find_best_block_sizes(1, 2,
-                                                       decode_fixed_bq_sz)
+            decode_block_sizes = find_best_block_sizes(1, 2, decode_fixed_bq_sz)
     # The batched-RPA long_ctx_decode override (force bkv=16384, batch=4 when
     # max_model_len>=32768) was intentionally not carried over. It keyed on
     # the static max_model_len rather than the live kv_len, so short and
@@ -427,16 +448,17 @@ def calculate_block_sizes(
     # noticeably slower at spec-decode sizes. Prefill/MIXED keep their
     # threshold-derived bq_c_sz -- their bq is too large to fit as a single
     # compute buffer.
-    decode_block_sizes = decode_block_sizes.floor_bq_to_decode_q_len(
-        decode_q_len)
-    decode_block_sizes = dataclasses.replace(decode_block_sizes,
-                                             bq_c_sz=decode_block_sizes.bq_sz)
+    decode_block_sizes = decode_block_sizes.floor_bq_to_decode_q_len(decode_q_len)
+    decode_block_sizes = dataclasses.replace(
+        decode_block_sizes, bq_c_sz=decode_block_sizes.bq_sz
+    )
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
     # MIXED mode uses the prefill block sizes. Cap bq_sz at the actual query
     # count so small-query MIXED workloads do not run a prefill-sized tile.
     # This is a no-op for prefill (total_q >= bq) and DECODE (bq=1).
     prefill_block_sizes = prefill_block_sizes.cap_bq_to_total_q(
-        serve_cfgs.total_q_tokens)
+        serve_cfgs.total_q_tokens
+    )
 
     return decode_block_sizes, prefill_block_sizes
 
@@ -513,10 +535,12 @@ def _resolve_attn_static(
     )
 
     default_decode, default_prefill = calculate_block_sizes(
-        model_cfgs, serve_cfgs, vmem_limit_bytes, decode_q_len)
+        model_cfgs, serve_cfgs, vmem_limit_bytes, decode_q_len
+    )
     max_model_len = serve_cfgs.pages_per_seq * page_size
     tuned_mixed = tuned_block_sizes.get_tuned_block_sizes(
-        model_cfgs, serve_cfgs, max_model_len, configs.RpaCase.MIXED)
+        model_cfgs, serve_cfgs, max_model_len, configs.RpaCase.MIXED
+    )
     # Decode block size. Priority: explicit decode_block_sizes arg > env bkv
     # override (STACKED_RPA_BKV) > max_model_len-keyed tuned table > VMEM
     # heuristic. The env override lets the user drive bkv_sz directly and SKIP the
@@ -524,8 +548,7 @@ def _resolve_attn_static(
     # via STACKED_RPA_PAGE_SIZE). Non-page-multiple values are fixed by
     # _clamp_bkv_to_page below. When no override is set, the tuned table (keyed on
     # sliding_window + a bucket of the 128-padded total_q_tokens) still applies.
-    from sglang.srt.layers.attention.pallas.stacked_rpa.envvars import \
-        stacked_rpa_bkv
+    from sglang.srt.layers.attention.pallas.stacked_rpa.envvars import stacked_rpa_bkv
 
     user_bkv = stacked_rpa_bkv()
     if decode_block_sizes is not None:
@@ -534,7 +557,8 @@ def _resolve_attn_static(
         effective_decode = dataclasses.replace(default_decode, bkv_sz=user_bkv)
     else:
         tuned_decode = tuned_block_sizes.get_tuned_block_sizes(
-            model_cfgs, serve_cfgs, max_model_len, configs.RpaCase.DECODE)
+            model_cfgs, serve_cfgs, max_model_len, configs.RpaCase.DECODE
+        )
         effective_decode = tuned_decode or default_decode
     effective_prefill = prefill_block_sizes or tuned_mixed or default_prefill
 
@@ -547,16 +571,16 @@ def _resolve_attn_static(
     # heuristic / user bkv for the anchored path because the anchor's correctness
     # requires the single block to cover the whole window. Explicit
     # decode_block_sizes still wins (caller override). No effect without a window.
-    from sglang.srt.layers.attention.pallas.stacked_rpa.envvars import \
-        stacked_rpa_sw_bound
+    from sglang.srt.layers.attention.pallas.stacked_rpa.envvars import (
+        stacked_rpa_sw_bound,
+    )
 
     sw_bound = stacked_rpa_sw_bound()
     if sliding_window is not None and sw_bound and decode_block_sizes is None:
         page = serve_cfgs.page_size
         win_pages = -(-(sliding_window + decode_q_len + page - 1) // page)
         win_bkv = win_pages * page
-        effective_decode = dataclasses.replace(effective_decode,
-                                               bkv_sz=win_bkv)
+        effective_decode = dataclasses.replace(effective_decode, bkv_sz=win_bkv)
 
     # Spec decode (decode_q_len>1) runs through the DECODE region, which needs
     # bq_sz >= decode_q_len. Tuned/user/default decode entries pin bq_sz for
@@ -568,14 +592,17 @@ def _resolve_attn_static(
         # OOM. default_decode is already VMEM-checked with fixed_bq_sz=
         # align(decode_q_len), so fall back to it when the floored tile would
         # exceed the 80% budget (never silently OOM).
-        fits = (_calculate_vmem_usage(
-            model_cfgs,
-            serve_cfgs,
-            floored.batch_size,
-            floored.n_buffer,
-            floored.bq_sz,
-            floored.bkv_sz,
-        ) <= vmem_limit_bytes * 0.8)
+        fits = (
+            _calculate_vmem_usage(
+                model_cfgs,
+                serve_cfgs,
+                floored.batch_size,
+                floored.n_buffer,
+                floored.bq_sz,
+                floored.bkv_sz,
+            )
+            <= vmem_limit_bytes * 0.8
+        )
         effective_decode = floored if fits else default_decode
 
     # SEQ_ALONG_LANE is page-granular: every k-block must cover >= 1 page, so
@@ -618,8 +645,9 @@ def _make_cfgs(
     update_kv_cache: bool = True,
     decode_q_len: int = 1,
 ):
-    effective_blocks = (effective_decode if mode == configs.RpaCase.DECODE else
-                        effective_prefill)
+    effective_blocks = (
+        effective_decode if mode == configs.RpaCase.DECODE else effective_prefill
+    )
     # The DECODE region always uses the transposed stacked schedule (keyed on
     # mode via RpaConfigs.is_stacked). Dense cross-step packing is controlled by:
     #   - DECODE via STACKED_RPA_DENSE_PACK (default on)
@@ -639,12 +667,16 @@ def _make_cfgs(
     # path (adaptive dispatch). Until then, only enable for imbalanced/long
     # mixed batches.
 
-    dense_pack = (os.environ.get("STACKED_RPA_DENSE_PACK", "1") == "1"
-                  and mode == configs.RpaCase.DECODE) or (
-                      mode == configs.RpaCase.MIXED
-                      and os.environ.get("STACKED_RPA_MIXED", "0") == "1")
-    from sglang.srt.layers.attention.pallas.stacked_rpa.envvars import \
-        stacked_rpa_sw_bound
+    dense_pack = (
+        os.environ.get("STACKED_RPA_DENSE_PACK", "1") == "1"
+        and mode == configs.RpaCase.DECODE
+    ) or (
+        mode == configs.RpaCase.MIXED
+        and os.environ.get("STACKED_RPA_MIXED", "0") == "1"
+    )
+    from sglang.srt.layers.attention.pallas.stacked_rpa.envvars import (
+        stacked_rpa_sw_bound,
+    )
 
     return configs.RpaConfigs(
         block=effective_blocks,
@@ -673,8 +705,7 @@ def _make_visibility_hbm(
         # No visibility -> the kernel gates every visibility_hbm access on
         # cfgs.has_visibility, so contents are unread. Use jnp.empty to skip
         # the device-side memset (jnp.zeros pays that cost per call).
-        return jnp.empty((queries.shape[0] + visibility_pad, 128),
-                         dtype=jnp.int32)
+        return jnp.empty((queries.shape[0] + visibility_pad, 128), dtype=jnp.int32)
     return jnp.pad(visibility, ((0, visibility_pad), (0, 126)))
 
 
@@ -698,17 +729,18 @@ def _validate_prepacked_inputs(
     expected_kv_shape = (
         cfgs.model.num_kv_heads * 2,
         cfgs.aligned_kv_head_dim,
-        utils.align_to(q.shape[0],
-                       pltpu.get_tpu_info().num_lanes),
+        utils.align_to(q.shape[0], pltpu.get_tpu_info().num_lanes),
     )
     if prepacked_new_kv_hbm.shape != expected_kv_shape:
         raise ValueError(
             f"Expected {prepacked_new_kv_hbm.shape=} to be equal to"
-            f" {expected_kv_shape=}")
+            f" {expected_kv_shape=}"
+        )
     if prepacked_new_kv_hbm.dtype != kv_cache.dtype:
         raise ValueError(
             "Expected prepacked KV dtype and KV cache dtype to match, but got"
-            f" {prepacked_new_kv_hbm.dtype=} and {kv_cache.dtype=}")
+            f" {prepacked_new_kv_hbm.dtype=} and {kv_cache.dtype=}"
+        )
 
     expected_kv_cache_shape = (
         kv_cache.shape[0],
@@ -723,36 +755,39 @@ def _validate_prepacked_inputs(
     if not jnp.issubdtype(kv_cache.dtype, jnp.floating):
         raise ValueError(f"Expected {kv_cache.dtype=} to be a floating point.")
 
-    if not (jnp.int32 == kv_lens.dtype == page_indices.dtype == cu_q_lens.dtype
-            == distribution.dtype):
+    if not (
+        jnp.int32
+        == kv_lens.dtype
+        == page_indices.dtype
+        == cu_q_lens.dtype
+        == distribution.dtype
+    ):
         raise ValueError(
             f"Expected int32 dtype for {kv_lens.dtype=}, {page_indices.dtype=},"
-            f" {cu_q_lens.dtype=}, {distribution.dtype=}")
+            f" {cu_q_lens.dtype=}, {distribution.dtype=}"
+        )
     if not (kv_lens.ndim == page_indices.ndim == cu_q_lens.ndim == 1):
         raise ValueError(
             f"Expected 1D array for {kv_lens.shape=}, {page_indices.shape=},"
-            f" {cu_q_lens.shape=}")
+            f" {cu_q_lens.shape=}"
+        )
     max_num_seqs = kv_lens.shape[0]
     num_page_indices = page_indices.shape[0]
     if num_page_indices % max_num_seqs != 0:
         raise ValueError(
             f"Expected {num_page_indices=} to be divisible by {max_num_seqs=}."
         )
-    if cu_q_lens.shape != (max_num_seqs + 1, ):
-        raise ValueError(
-            f"Expected {cu_q_lens.shape=} to be ({max_num_seqs + 1},).")
-    if distribution.shape != (3, ):
+    if cu_q_lens.shape != (max_num_seqs + 1,):
+        raise ValueError(f"Expected {cu_q_lens.shape=} to be ({max_num_seqs + 1},).")
+    if distribution.shape != (3,):
         raise ValueError(f"Expected {distribution.shape=} to be (3,).")
     if visibility is not None:
         if visibility.shape != (q.shape[0], 2):
-            raise ValueError(
-                f"Expected {visibility.shape=} to be ({q.shape[0]}, 2).")
+            raise ValueError(f"Expected {visibility.shape=} to be ({q.shape[0]}, 2).")
         if visibility.dtype != jnp.int32:
-            raise ValueError(
-                f"Expected {visibility.dtype=} to be {jnp.int32=}.")
+            raise ValueError(f"Expected {visibility.dtype=} to be {jnp.int32=}.")
         if cfgs.model.sliding_window is not None:
-            raise ValueError(
-                "visibility and sliding_window are mutually exclusive.")
+            raise ValueError("visibility and sliding_window are mutually exclusive.")
 
 
 def build_schedules(
@@ -793,8 +828,7 @@ def build_schedules(
     """
     del values
     if visibility is not None and sliding_window is not None:
-        raise ValueError(
-            "visibility and sliding_window are mutually exclusive.")
+        raise ValueError("visibility and sliding_window are mutually exclusive.")
     if decode_q_len < 1:
         raise ValueError(f"decode_q_len must be >= 1, got {decode_q_len}")
     (
@@ -846,8 +880,9 @@ def build_schedules(
         has_visibility=visibility is not None,
         update_kv_cache=update_kv_cache,
     )
-    visibility_hbm = _make_visibility_hbm(queries, effective_decode,
-                                          effective_prefill, visibility)
+    visibility_hbm = _make_visibility_hbm(
+        queries, effective_decode, effective_prefill, visibility
+    )
     # M1 (hardcore): skip the metadata pallas for the mode the caller knows
     # won't fire. Each generate_rpa_metadata is a full pallas_call (~140us of
     # scalar-core work at short ctx). dispatch_hint="decode_only" (the common
@@ -857,23 +892,182 @@ def build_schedules(
     # empty, so the None mixed_schedule is never dereferenced.
     build_decode = dispatch_hint in ("auto", "decode_only")
     build_mixed = dispatch_hint in ("auto", "mixed_only")
-    decode_schedule = (schedule.generate_rpa_metadata(
-        cu_q_lens,
-        kv_lens,
-        distribution,
-        page_indices,
-        cfgs=decode_cfgs,
-        visibility=visibility_hbm if visibility is not None else None,
-    ) if build_decode else None)
-    mixed_schedule = (schedule.generate_rpa_metadata(
-        cu_q_lens,
-        kv_lens,
-        distribution,
-        page_indices,
-        cfgs=mixed_cfgs,
-        visibility=visibility_hbm if visibility is not None else None,
-    ) if build_mixed else None)
+    decode_schedule = (
+        schedule.generate_rpa_metadata(
+            cu_q_lens,
+            kv_lens,
+            distribution,
+            page_indices,
+            cfgs=decode_cfgs,
+            visibility=visibility_hbm if visibility is not None else None,
+        )
+        if build_decode
+        else None
+    )
+    mixed_schedule = (
+        schedule.generate_rpa_metadata(
+            cu_q_lens,
+            kv_lens,
+            distribution,
+            page_indices,
+            cfgs=mixed_cfgs,
+            visibility=visibility_hbm if visibility is not None else None,
+        )
+        if build_mixed
+        else None
+    )
     return decode_schedule, mixed_schedule
+
+
+# --- sglang addition -------------------------------------------------------
+# The schedule depends only on per-step metadata, so a server builds it once and
+# reuses it for every layer. Crossing SGLang's torch custom-op boundary means
+# handing over plain tensors, and every schedule leaf is already a 1-D int32
+# array, so the pair flattens to a tuple of tensors and rebuilds from the
+# treedef, which is fixed by the (static) configs.
+
+
+def flatten_schedules(schedules) -> tuple:
+    """Flatten ``(decode_schedule, mixed_schedule)`` to its int32 leaves."""
+    return tuple(jax.tree_util.tree_leaves(schedules))
+
+
+def schedule_leaf_shapes(
+    queries,
+    keys,
+    kv_cache,
+    kv_lens,
+    page_indices,
+    *,
+    sm_scale: float = 1.0,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    mask_value: float | None = None,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    decode_q_len: int = 1,
+    vmem_limit_bytes: int | None = None,
+    out_dtype=None,
+    kv_layout: configs.KVLayout = configs.KVLayout.SEQ_ALONG_LANE,
+    decode_block_sizes: configs.BlockSizes | None = None,
+    prefill_block_sizes: configs.BlockSizes | None = None,
+    update_kv_cache: bool = True,
+    has_visibility: bool = False,
+    dispatch_hint: str = "auto",
+) -> list[tuple[int, ...]]:
+    """Shapes of what ``flatten_schedules(build_schedules(...))`` returns.
+
+    Lets a caller size the outputs without building them, which is what a
+    torch ``register_fake`` needs. Only shapes and dtypes of the array
+    arguments are read, so ``jax.ShapeDtypeStruct`` stand-ins are enough.
+    """
+    (
+        model_cfgs,
+        serve_cfgs,
+        effective_decode,
+        effective_prefill,
+        vmem_limit_bytes,
+        _out_dtype,
+        _mask_value,
+    ) = _resolve_attn_static(
+        queries,
+        keys,
+        kv_cache,
+        kv_lens,
+        page_indices,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        mask_value=mask_value,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        vmem_limit_bytes=vmem_limit_bytes,
+        out_dtype=out_dtype,
+        kv_layout=kv_layout,
+        decode_block_sizes=decode_block_sizes,
+        prefill_block_sizes=prefill_block_sizes,
+        decode_q_len=decode_q_len,
+    )
+    protos = []
+    if dispatch_hint in ("auto", "decode_only"):
+        protos.append(
+            schedule.RpaSchedule.create_hbm_shape_dtype(
+                _make_cfgs(
+                    configs.RpaCase.DECODE,
+                    model_cfgs,
+                    serve_cfgs,
+                    effective_decode,
+                    effective_prefill,
+                    vmem_limit_bytes,
+                    has_visibility=has_visibility,
+                    update_kv_cache=update_kv_cache,
+                    decode_q_len=decode_q_len,
+                )
+            )
+        )
+    if dispatch_hint in ("auto", "mixed_only"):
+        protos.append(
+            schedule.RpaSchedule.create_hbm_shape_dtype(
+                _make_cfgs(
+                    configs.RpaCase.MIXED,
+                    model_cfgs,
+                    serve_cfgs,
+                    effective_decode,
+                    effective_prefill,
+                    vmem_limit_bytes,
+                    has_visibility=has_visibility,
+                    update_kv_cache=update_kv_cache,
+                )
+            )
+        )
+    return [tuple(leaf.shape) for leaf in jax.tree_util.tree_leaves(protos)]
+
+
+def _schedule_treedef(
+    model_cfgs,
+    serve_cfgs,
+    effective_decode,
+    effective_prefill,
+    vmem_limit_bytes,
+    *,
+    has_visibility: bool,
+    update_kv_cache: bool,
+    decode_q_len: int,
+    dispatch_hint: str,
+):
+    """Treedef of the ``(decode, mixed)`` pair ``build_schedules`` returns.
+
+    Mirrors its ``dispatch_hint`` gating: a mode that is not built contributes
+    no leaves, so the flat tuple and this structure stay in step.
+    """
+
+    def proto(mode, **kw):
+        cfgs = _make_cfgs(
+            mode,
+            model_cfgs,
+            serve_cfgs,
+            effective_decode,
+            effective_prefill,
+            vmem_limit_bytes,
+            has_visibility=has_visibility,
+            update_kv_cache=update_kv_cache,
+            **kw,
+        )
+        return schedule.RpaSchedule.create_hbm_shape_dtype(cfgs)
+
+    decode = (
+        proto(configs.RpaCase.DECODE, decode_q_len=decode_q_len)
+        if dispatch_hint in ("auto", "decode_only")
+        else None
+    )
+    mixed = (
+        proto(configs.RpaCase.MIXED)
+        if dispatch_hint in ("auto", "mixed_only")
+        else None
+    )
+    return jax.tree_util.tree_structure((decode, mixed))
 
 
 def build_schedules_prepacked_kv(
@@ -903,8 +1097,7 @@ def build_schedules_prepacked_kv(
 ):
     """Precompute schedules for the prepacked-KV SEQ_ALONG_LANE entry point."""
     if visibility is not None and sliding_window is not None:
-        raise ValueError(
-            "visibility and sliding_window are mutually exclusive.")
+        raise ValueError("visibility and sliding_window are mutually exclusive.")
     if decode_q_len < 1:
         raise ValueError(f"decode_q_len must be >= 1, got {decode_q_len}")
     (
@@ -968,8 +1161,9 @@ def build_schedules_prepacked_kv(
         distribution,
         visibility=visibility,
     )
-    visibility_hbm = _make_visibility_hbm(queries, effective_decode,
-                                          effective_prefill, visibility)
+    visibility_hbm = _make_visibility_hbm(
+        queries, effective_decode, effective_prefill, visibility
+    )
     # Stacked RPA is SEQ_ALONG_LANE-only and runs native multi-token (spec)
     # decode on the stacked DECODE kernel, so spec-decode sequences stay in the
     # caller's decode bucket (no force-to-MIXED for decode_q_len > 1, unlike the
@@ -1052,8 +1246,7 @@ def ragged_paged_attention_prepacked_kv(
     if attention_sink is not None:
         raise ValueError("attention_sink is not supported by batched RPA.")
     if visibility is not None and sliding_window is not None:
-        raise ValueError(
-            "visibility and sliding_window are mutually exclusive.")
+        raise ValueError("visibility and sliding_window are mutually exclusive.")
     if debug_mode:
         raise ValueError("Debug mode is not supported.")
     if decode_q_len < 1:
@@ -1092,8 +1285,9 @@ def ragged_paged_attention_prepacked_kv(
     head_dim = queries.shape[2]
 
     q_hbm = prepare_queries(queries, num_kv_heads, queries.dtype)
-    visibility_hbm = _make_visibility_hbm(queries, effective_decode,
-                                          effective_prefill, visibility)
+    visibility_hbm = _make_visibility_hbm(
+        queries, effective_decode, effective_prefill, visibility
+    )
 
     # Stacked RPA is SEQ_ALONG_LANE-only: keep spec decode on the stacked DECODE
     # kernel (no force-to-MIXED for decode_q_len > 1).
@@ -1126,9 +1320,11 @@ def ragged_paged_attention_prepacked_kv(
         )
 
         if precomputed_schedules is not None:
-            schedule_hbm = (precomputed_schedules[0]
-                            if mode == configs.RpaCase.DECODE else
-                            precomputed_schedules[1])
+            schedule_hbm = (
+                precomputed_schedules[0]
+                if mode == configs.RpaCase.DECODE
+                else precomputed_schedules[1]
+            )
         else:
             schedule_hbm = schedule.generate_rpa_metadata(
                 cu_q_lens,
@@ -1169,11 +1365,12 @@ def ragged_paged_attention_prepacked_kv(
             (o_hbm_alias_q_hbm, kv_cache),
         )
 
-    o_hbm_alias_q_hbm, kv_cache = maybe_run_rpa_kernel(configs.RpaCase.DECODE,
-                                                       q_hbm, kv_cache)
-    o_hbm_alias_q_hbm, kv_cache = maybe_run_rpa_kernel(configs.RpaCase.MIXED,
-                                                       o_hbm_alias_q_hbm,
-                                                       kv_cache)
+    o_hbm_alias_q_hbm, kv_cache = maybe_run_rpa_kernel(
+        configs.RpaCase.DECODE, q_hbm, kv_cache
+    )
+    o_hbm_alias_q_hbm, kv_cache = maybe_run_rpa_kernel(
+        configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache
+    )
 
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
@@ -1236,6 +1433,7 @@ def ragged_paged_attention(
     update_kv_cache: bool = True,
     kv_layout: configs.KVLayout = configs.KVLayout.SEQ_ALONG_LANE,
     precomputed_schedules: tuple | None = None,
+    precomputed_schedule_leaves: tuple | None = None,
     prepacked_new_kv_hbm: jax.Array | None = None,
     dispatch_hint: str = "auto",
 ) -> tuple[jax.Array, jax.Array]:
@@ -1303,8 +1501,7 @@ def ragged_paged_attention(
     if attention_sink is not None:
         raise ValueError("attention_sink is not supported by batched RPA.")
     if visibility is not None and sliding_window is not None:
-        raise ValueError(
-            "visibility and sliding_window are mutually exclusive.")
+        raise ValueError("visibility and sliding_window are mutually exclusive.")
     if chunk_prefill_size is not None:
         raise ValueError("Specifying chunk prefill size is not supported.")
     if debug_mode:
@@ -1353,8 +1550,32 @@ def ragged_paged_attention(
         kv_layout=kv_layout,
         prepacked_new_kv_hbm=prepacked_new_kv_hbm,
     )
-    visibility_hbm = _make_visibility_hbm(queries, effective_decode,
-                                          effective_prefill, visibility)
+    visibility_hbm = _make_visibility_hbm(
+        queries, effective_decode, effective_prefill, visibility
+    )
+
+    # sglang addition: schedules handed over as flat tensors (see
+    # flatten_schedules) rebuild here, where the configs that fix the treedef
+    # are known.
+    if precomputed_schedule_leaves is not None:
+        if precomputed_schedules is not None:
+            raise ValueError(
+                "pass precomputed_schedules or precomputed_schedule_leaves, " "not both"
+            )
+        precomputed_schedules = jax.tree_util.tree_unflatten(
+            _schedule_treedef(
+                model_cfgs,
+                serve_cfgs,
+                effective_decode,
+                effective_prefill,
+                vmem_limit_bytes,
+                has_visibility=visibility is not None,
+                update_kv_cache=update_kv_cache,
+                decode_q_len=decode_q_len,
+                dispatch_hint=dispatch_hint,
+            ),
+            list(precomputed_schedule_leaves),
+        )
 
     def run_rpa_kernel(
         mode: configs.RpaCase,
@@ -1385,9 +1606,11 @@ def ragged_paged_attention(
         )
 
         if precomputed_schedules is not None:
-            schedule_hbm = (precomputed_schedules[0]
-                            if mode == configs.RpaCase.DECODE else
-                            precomputed_schedules[1])
+            schedule_hbm = (
+                precomputed_schedules[0]
+                if mode == configs.RpaCase.DECODE
+                else precomputed_schedules[1]
+            )
         else:
             schedule_hbm = schedule.generate_rpa_metadata(
                 cu_q_lens,
@@ -1428,11 +1651,12 @@ def ragged_paged_attention(
             (o_hbm_alias_q_hbm, kv_cache),
         )
 
-    o_hbm_alias_q_hbm, kv_cache = maybe_run_rpa_kernel(configs.RpaCase.DECODE,
-                                                       q_hbm, kv_cache)
-    o_hbm_alias_q_hbm, kv_cache = maybe_run_rpa_kernel(configs.RpaCase.MIXED,
-                                                       o_hbm_alias_q_hbm,
-                                                       kv_cache)
+    o_hbm_alias_q_hbm, kv_cache = maybe_run_rpa_kernel(
+        configs.RpaCase.DECODE, q_hbm, kv_cache
+    )
+    o_hbm_alias_q_hbm, kv_cache = maybe_run_rpa_kernel(
+        configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache
+    )
 
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)

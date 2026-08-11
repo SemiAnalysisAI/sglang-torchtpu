@@ -30,8 +30,7 @@ class SmemWrapper:
         # padding tail is never addressed.
         n = int(np.prod(shape))
         n_pad = -(-n // 1024) * 1024
-        return cls(data=jax.ShapeDtypeStruct((n_pad, ), jnp.int32),
-                   shape=shape)
+        return cls(data=jax.ShapeDtypeStruct((n_pad,), jnp.int32), shape=shape)
 
     def _get_pos(self, indices):
         strides = pl.strides_from_shape(self.shape)
@@ -70,9 +69,7 @@ class RpaSchedule:
     cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
-    def create_shape_dtype(cls,
-                           cfgs: configs.RpaConfigs,
-                           steps: int | None = None):
+    def create_shape_dtype(cls, cfgs: configs.RpaConfigs, steps: int | None = None):
         # `steps` sizes the leading (step) dimension. The HBM-resident schedule
         # is sized to cfgs.total_steps_ub (the full streamed schedule); the SMEM
         # scratch / consume window is sized to cfgs.max_steps_ub (one window).
@@ -92,14 +89,17 @@ class RpaSchedule:
             is_final=idx_wrapper,
             dma_q=SmemWrapper.create_shape_dtype((steps, cfgs.batch_size, 2)),
             dma_kv_cache=SmemWrapper.create_shape_dtype(
-                (steps, cfgs.batch_size, cfgs.bkv_p_cache, 3)),
-            dma_kv_new=SmemWrapper.create_shape_dtype((
-                steps,
-                cfgs.batch_size,
-                cfgs.bkv_p_new,
-                cfgs.dma_kv_new_size,
-            ), ),
-            actual_steps=jax.ShapeDtypeStruct((1, ), jnp.int32),
+                (steps, cfgs.batch_size, cfgs.bkv_p_cache, 3)
+            ),
+            dma_kv_new=SmemWrapper.create_shape_dtype(
+                (
+                    steps,
+                    cfgs.batch_size,
+                    cfgs.bkv_p_new,
+                    cfgs.dma_kv_new_size,
+                ),
+            ),
+            actual_steps=jax.ShapeDtypeStruct((1,), jnp.int32),
             cfgs=cfgs,
         )
 
@@ -120,7 +120,8 @@ class RpaSchedule:
             if isinstance(x, SmemWrapper):
                 return SmemWrapper(
                     data=jax.ShapeDtypeStruct(
-                        (x.data.shape[0] * num_windows, ), x.data.dtype),
+                        (x.data.shape[0] * num_windows,), x.data.dtype
+                    ),
                     shape=x.shape,
                 )
             return x
@@ -185,8 +186,8 @@ class RpaSchedule:
         return dst_hbm, src_vmem, sz, wb_lane, wb_sz
 
     def get_dma_q(
-            self, step: jax.typing.ArrayLike,
-            batch_idx: jax.typing.ArrayLike) -> tuple[jax.Array, jax.Array]:
+        self, step: jax.typing.ArrayLike, batch_idx: jax.typing.ArrayLike
+    ) -> tuple[jax.Array, jax.Array]:
         # 0: src_hbm, 1: size
         src_hbm = self.dma_q[step, batch_idx, 0]
         sz = self.dma_q[step, batch_idx, 1]
@@ -264,8 +265,7 @@ def compute_metadata(
         q_len,
         end_k_idx,
     ):
-        in_window = jnp.logical_and(step >= window_lo, step
-                                    < window_lo + w_size)
+        in_window = jnp.logical_and(step >= window_lo, step < window_lo + w_size)
         local = jnp.clip(step - window_lo, 0, w_size - 1)
 
         kv_len_start = k_idx * cfgs.bkv_sz
@@ -274,12 +274,11 @@ def compute_metadata(
             # Anchor the (single) decode block at the page-aligned window start
             # instead of the global k_idx*bkv_sz grid, so it reads exactly one
             # window. The consume mask (kernel.py) recomputes the same anchor.
-            anchor_tok = utils.window_anchor_tok(k_len, q_len,
-                                                 cfgs.model.sliding_window,
-                                                 cfgs.serve.page_size_log2)
+            anchor_tok = utils.window_anchor_tok(
+                k_len, q_len, cfgs.model.sliding_window, cfgs.serve.page_size_log2
+            )
             kv_len_start = anchor_tok + k_idx * cfgs.bkv_sz
-            kv_p_start = (
-                anchor_tok >> cfgs.serve.page_size_log2) + k_idx * cfgs.bkv_p
+            kv_p_start = (anchor_tok >> cfgs.serve.page_size_log2) + k_idx * cfgs.bkv_p
         kv_left = k_len - kv_len_start
         if cfgs.update_kv_cache:
             kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
@@ -294,7 +293,8 @@ def compute_metadata(
         # that attends to it.
         q_wb = jnp.maximum(0, (kv_len_start - (k_len - q_len))) // cfgs.bq_sz
         do_writeback = jnp.where(
-            cfgs.update_kv_cache & (new_sz > 0) & (q_idx == q_wb), 1, 0)
+            cfgs.update_kv_cache & (new_sz > 0) & (q_idx == q_wb), 1, 0
+        )
 
         min_q_pos = k_len - q_len + q_idx * cfgs.bq_sz
         skip_mask = jnp.where(
@@ -317,8 +317,9 @@ def compute_metadata(
             )
 
             fetch_dma_valid = jnp.where(i < num_pages_to_fetch, 1, 0)
-            new_page_start = (hbm_token_idx_base -
-                              new_tok_offset) + i * cfgs.serve.page_size
+            new_page_start = (
+                hbm_token_idx_base - new_tok_offset
+            ) + i * cfgs.serve.page_size
             # Halo VMEM slot. Chunked flash reads at a static offset
             # ``bkv_p_cache + i``; the single-shot flash reads at
             # ``cache_pages + i``, just after the cache tokens.
@@ -348,10 +349,12 @@ def compute_metadata(
             wb_sz = jnp.where(dma_sz > 0, wb_end - wb_lane, 0)
 
             w, _ = cfgs.wb_lane_bits
-            packed_dma_valid = (fetch_dma_valid
-                                | (jnp.where(dma_sz > 0, 1, 0) << 1)
-                                | ((wb_lane // num_lanes) << 2)
-                                | ((wb_sz // num_lanes) << (2 + w)))
+            packed_dma_valid = (
+                fetch_dma_valid
+                | (jnp.where(dma_sz > 0, 1, 0) << 1)
+                | ((wb_lane // num_lanes) << 2)
+                | ((wb_sz // num_lanes) << (2 + w))
+            )
 
             schedule.dma_kv_new[local, target_lane, i, 0] = new_page_start
             schedule.dma_kv_new[local, target_lane, i, 1] = fetch_vmem
@@ -394,8 +397,9 @@ def compute_metadata(
                 dma_sz = jnp.clip(dma_sz, 0, cfgs.serve.page_size)
                 # Physical KV-cache page via the per-seq page table (folded in at
                 # build time). within-seq logical page = kv_p_start + i.
-                src_hbm = seq_page_table_ref[jnp.minimum(
-                    kv_p_start + i, cfgs.serve.pages_per_seq - 1)]
+                src_hbm = seq_page_table_ref[
+                    jnp.minimum(kv_p_start + i, cfgs.serve.pages_per_seq - 1)
+                ]
                 # Keep the real size rather than a 0/1 valid bit: the
                 # consume side used to rebuild it as valid * page_size, so a
                 # sequence's partial last page was always read in full (2x
@@ -428,8 +432,9 @@ def compute_metadata(
             elif cfgs.bkv_p_new < cfgs.bkv_p:
                 # Decode path (single token)
                 assert cfgs.bkv_p_new == 1
-                slot_start = (bkv_sz_cache //
-                              cfgs.serve.page_size) * cfgs.serve.page_size
+                slot_start = (
+                    bkv_sz_cache // cfgs.serve.page_size
+                ) * cfgs.serve.page_size
                 fill_dma_kv_new(0, bkv_sz_cache, new_sz, slot_start)
             else:
                 iters = max(cfgs.bkv_p, cfgs.bkv_p_new)
@@ -476,12 +481,14 @@ def compute_metadata(
         elif (sliding_window := cfgs.model.sliding_window) is not None:
             sw_start_idx = k_len - q_len + q_idx * cfgs.bq_sz - sliding_window + 1
             start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
-            end_k_idx_causal = (k_len - q_len + q_idx * cfgs.bq_sz +
-                                q_sz_task - 1) // cfgs.bkv_sz + 1
+            end_k_idx_causal = (
+                k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task - 1
+            ) // cfgs.bkv_sz + 1
             end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
         else:
-            end_k_idx_causal = (k_len - q_len + q_idx * cfgs.bq_sz +
-                                q_sz_task - 1) // cfgs.bkv_sz + 1
+            end_k_idx_causal = (
+                k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task - 1
+            ) // cfgs.bkv_sz + 1
             end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
 
         k_loop_fn = functools.partial(
@@ -497,7 +504,8 @@ def compute_metadata(
             end_k_idx=end_k_idx,
         )
         lane_lengths_ref[target_lane] = jax.lax.fori_loop(
-            start_k_idx, end_k_idx, k_loop_fn, curr_ptr)
+            start_k_idx, end_k_idx, k_loop_fn, curr_ptr
+        )
 
     def seq_loop(s_idx, _):
         q_start = cu_q_lens_ref[s_idx]
@@ -606,34 +614,35 @@ def compute_metadata(
                 if cfgs.has_visibility:
                     min_vis_start = visibility_bounds_ref[s_idx, q_idx, 0]
                     max_vis_end = visibility_bounds_ref[s_idx, q_idx, 1]
-                    start_k_idx = jnp.clip(min_vis_start, 0,
-                                           k_len) // cfgs.bkv_sz
+                    start_k_idx = jnp.clip(min_vis_start, 0, k_len) // cfgs.bkv_sz
                     end_k_idx = jnp.minimum(
-                        num_k,
-                        jnp.maximum(0, max_vis_end) // cfgs.bkv_sz + 1)
+                        num_k, jnp.maximum(0, max_vis_end) // cfgs.bkv_sz + 1
+                    )
                 elif (sliding_window := cfgs.model.sliding_window) is not None:
                     if cfgs.use_window_anchor:
                         # Single block anchored at the page-aligned window start.
                         anchor_tok = utils.window_anchor_tok(
-                            k_len, q_len, sliding_window,
-                            cfgs.serve.page_size_log2)
+                            k_len, q_len, sliding_window, cfgs.serve.page_size_log2
+                        )
                         start_k_idx = 0
                         end_k_idx = pl.cdiv(k_len - anchor_tok, cfgs.bkv_sz)
                     else:
-                        sw_start_idx = (k_len - q_len + q_idx * cfgs.bq_sz -
-                                        sliding_window + 1)
-                        start_k_idx = jnp.maximum(0,
-                                                  sw_start_idx) // cfgs.bkv_sz
+                        sw_start_idx = (
+                            k_len - q_len + q_idx * cfgs.bq_sz - sliding_window + 1
+                        )
+                        start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
                         end_k_idx = jnp.minimum(
                             num_k,
-                            (k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task -
-                             1) // cfgs.bkv_sz + 1,
+                            (k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task - 1)
+                            // cfgs.bkv_sz
+                            + 1,
                         )
                 else:
                     end_k_idx = jnp.minimum(
                         num_k,
-                        (k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task - 1) //
-                        cfgs.bkv_sz + 1,
+                        (k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task - 1)
+                        // cfgs.bkv_sz
+                        + 1,
                     )
 
                 num_k_seq = jnp.maximum(end_k_idx - start_k_idx, 0)
@@ -682,8 +691,9 @@ def compute_metadata(
             return jax.lax.fori_loop(0, num_q, dense_q_loop, g)
 
         start_seq_idx, end_seq_idx = cfgs.mode.get_range(distribution_ref)
-        final_g = jax.lax.fori_loop(start_seq_idx, end_seq_idx, dense_seq_loop,
-                                    jnp.int32(0))
+        final_g = jax.lax.fori_loop(
+            start_seq_idx, end_seq_idx, dense_seq_loop, jnp.int32(0)
+        )
         lane_lengths_ref[0] = pl.cdiv(final_g, n)
         return
 
@@ -706,8 +716,7 @@ def compute_metadata(
         pps_pad = cfgs.seq_page_table_size
 
         def write_combine_span(cstep, root, span, active):
-            cin = jnp.logical_and(cstep >= window_lo, cstep
-                                  < window_lo + w_size)
+            cin = jnp.logical_and(cstep >= window_lo, cstep < window_lo + w_size)
             clocal = jnp.clip(cstep - window_lo, 0, w_size - 1)
 
             @pl.when(jnp.logical_and(cin, active))
@@ -744,30 +753,32 @@ def compute_metadata(
                 max_vis_end = visibility_bounds_ref[s_idx, q_idx, 1]
                 start_k_idx = jnp.clip(min_vis_start, 0, k_len) // cfgs.bkv_sz
                 end_k_idx = jnp.minimum(
-                    num_k,
-                    jnp.maximum(0, max_vis_end) // cfgs.bkv_sz + 1)
+                    num_k, jnp.maximum(0, max_vis_end) // cfgs.bkv_sz + 1
+                )
             elif (sliding_window := cfgs.model.sliding_window) is not None:
                 if cfgs.use_window_anchor:
                     # Single block anchored at the page-aligned window start.
                     anchor_tok = utils.window_anchor_tok(
-                        k_len, q_len, sliding_window,
-                        cfgs.serve.page_size_log2)
+                        k_len, q_len, sliding_window, cfgs.serve.page_size_log2
+                    )
                     start_k_idx = 0
                     end_k_idx = pl.cdiv(k_len - anchor_tok, cfgs.bkv_sz)
                 else:
-                    sw_start_idx = (k_len - q_len + q_idx * cfgs.bq_sz -
-                                    sliding_window + 1)
+                    sw_start_idx = (
+                        k_len - q_len + q_idx * cfgs.bq_sz - sliding_window + 1
+                    )
                     start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
                     end_k_idx = jnp.minimum(
                         num_k,
-                        (k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task - 1) //
-                        cfgs.bkv_sz + 1,
+                        (k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task - 1)
+                        // cfgs.bkv_sz
+                        + 1,
                     )
             else:
                 end_k_idx = jnp.minimum(
                     num_k,
-                    (k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task - 1) //
-                    cfgs.bkv_sz + 1,
+                    (k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task - 1) // cfgs.bkv_sz
+                    + 1,
                 )
 
             num_k_seq = jnp.maximum(end_k_idx - start_k_idx, 0)
@@ -776,10 +787,8 @@ def compute_metadata(
             # Bump to a fresh step if a short request overflows the current step,
             # or a long request needs step alignment.
             base_raw = step_base * n + cell_cursor
-            need_new = jnp.where(is_long, cell_cursor > 0,
-                                 cell_cursor + num_k_seq > n)
-            base_global = jnp.where(need_new,
-                                    pl.cdiv(base_raw, n) * n, base_raw)
+            need_new = jnp.where(is_long, cell_cursor > 0, cell_cursor + num_k_seq > n)
+            base_global = jnp.where(need_new, pl.cdiv(base_raw, n) * n, base_raw)
 
             def sk_k_loop(k_idx, _):
                 p = k_idx - start_k_idx
@@ -923,8 +932,11 @@ def rpa_metadata_schedule_kernel(
     # q-block per sequence). MIXED/PREFILL derive their q-block count from
     # the aggregate token count, which can under-count the true per-sequence
     # sum by up to num_seqs - 1, so the bound is unsafe there.
-    mask_upper = (min(cfgs._worst_steps, w_size)
-                  if cfgs.mode == configs.RpaCase.DECODE else w_size)
+    mask_upper = (
+        min(cfgs._worst_steps, w_size)
+        if cfgs.mode == configs.RpaCase.DECODE
+        else w_size
+    )
 
     def build_window(w):
         window_lo = w * w_size
@@ -954,8 +966,7 @@ def rpa_metadata_schedule_kernel(
         dma_list = []
         for h, s in zip(flat_hbm, flat_smem):
             if h.shape[0] > 1:
-                s_len = s.shape[
-                    0]  # full SMEM leaf == one window (w_size * stride)
+                s_len = s.shape[0]  # full SMEM leaf == one window (w_size * stride)
                 raw_stride = s_len // w_size  # int32s per step
                 copy_len = min(
                     ((mask_upper * raw_stride + 1023) // 1024) * 1024,
@@ -981,8 +992,9 @@ def rpa_metadata_schedule_kernel(
     schedule_ref.actual_steps[0] = max_steps
     for h, s in zip(flat_hbm, flat_smem):
         if h.shape[0] == 1:  # actual_steps scalar: write once.
-            copy = pltpu.make_async_copy(s.at[pl.ds(0, 1)], h.at[pl.ds(0, 1)],
-                                         dma_sem.at[0])
+            copy = pltpu.make_async_copy(
+                s.at[pl.ds(0, 1)], h.at[pl.ds(0, 1)], dma_sem.at[0]
+            )
             copy.start()
             copy.wait()
 
@@ -990,8 +1002,9 @@ def rpa_metadata_schedule_kernel(
     # steps (ceil(actual_steps / w_size)), capped by the static worst-case count.
     # Using fori_loop (instead of a Python range unroll) keeps the compiled
     # program a single window body, so compile cost is independent of num_windows.
-    num_windows_actual = jnp.minimum(pl.cdiv(max_steps, w_size),
-                                     cfgs.total_steps_ub // w_size)
+    num_windows_actual = jnp.minimum(
+        pl.cdiv(max_steps, w_size), cfgs.total_steps_ub // w_size
+    )
 
     def _rest(w, _):
         build_window(w)
@@ -1060,13 +1073,12 @@ def generate_rpa_metadata(
     smem_shaped = RpaSchedule.create_shape_dtype(cfgs, steps=cfgs.sched_window)
     if cfgs.has_visibility:
         if visibility is None:
-            raise ValueError(
-                "visibility is required when cfgs.has_visibility=True.")
-        max_q_blocks_per_seq = max(
-            pl.cdiv(cfgs.serve.total_q_tokens, cfgs.bq_sz), 1)
+            raise ValueError("visibility is required when cfgs.has_visibility=True.")
+        max_q_blocks_per_seq = max(pl.cdiv(cfgs.serve.total_q_tokens, cfgs.bq_sz), 1)
         q_offsets = (
-            jnp.arange(max_q_blocks_per_seq, dtype=jnp.int32)[:, None] *
-            cfgs.bq_sz + jnp.arange(cfgs.bq_sz, dtype=jnp.int32)[None, :])
+            jnp.arange(max_q_blocks_per_seq, dtype=jnp.int32)[:, None] * cfgs.bq_sz
+            + jnp.arange(cfgs.bq_sz, dtype=jnp.int32)[None, :]
+        )
 
         def seq_visibility_bounds(s_idx):
             q_start = cu_q_lens[s_idx]
@@ -1081,8 +1093,9 @@ def generate_rpa_metadata(
             max_end = jnp.max(jnp.where(active, vis_end, -1), axis=1)
             return jnp.stack([min_start, max_end], axis=1).astype(jnp.int32)
 
-        visibility_bounds = jax.vmap(seq_visibility_bounds)(jnp.arange(
-            cfgs.serve.num_seqs, dtype=jnp.int32))
+        visibility_bounds = jax.vmap(seq_visibility_bounds)(
+            jnp.arange(cfgs.serve.num_seqs, dtype=jnp.int32)
+        )
     else:
         visibility_bounds = jnp.zeros((1, 1, 2), dtype=jnp.int32)
 
@@ -1126,10 +1139,10 @@ def generate_rpa_metadata(
                 out_specs=hbm_shaped.out_specs(),
                 scratch_shapes=[
                     smem_shaped.scratch_shapes(),
-                    pltpu.SMEM((cfgs.batch_size, ), jnp.int32),
-                    pltpu.SemaphoreType.DMA((1, )),
-                    pltpu.SMEM((cfgs.seq_page_table_size, ), jnp.int32),
-                    pltpu.SemaphoreType.DMA((1, )),
+                    pltpu.SMEM((cfgs.batch_size,), jnp.int32),
+                    pltpu.SemaphoreType.DMA((1,)),
+                    pltpu.SMEM((cfgs.seq_page_table_size,), jnp.int32),
+                    pltpu.SemaphoreType.DMA((1,)),
                 ],
             ),
             interpret=interpret,
@@ -1155,10 +1168,10 @@ def generate_rpa_metadata(
             out_specs=hbm_shaped.out_specs(),
             scratch_shapes=[
                 smem_shaped.scratch_shapes(),
-                pltpu.SMEM((cfgs.batch_size, ), jnp.int32),
-                pltpu.SemaphoreType.DMA((1, )),
-                pltpu.SMEM((cfgs.seq_page_table_size, ), jnp.int32),
-                pltpu.SemaphoreType.DMA((1, )),
+                pltpu.SMEM((cfgs.batch_size,), jnp.int32),
+                pltpu.SemaphoreType.DMA((1,)),
+                pltpu.SMEM((cfgs.seq_page_table_size,), jnp.int32),
+                pltpu.SemaphoreType.DMA((1,)),
             ],
         ),
         interpret=interpret,
