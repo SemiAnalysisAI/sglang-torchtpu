@@ -304,7 +304,7 @@ class TpuSRTPlatform(SRTPlatform):
     def supports_fp8(self) -> bool:
         return False
 
-    def is_pin_memory_available(self) -> bool:
+    def is_pin_memory_available(self, device=None) -> bool:
         return False
 
     def support_cuda_graph(self) -> bool:
@@ -403,8 +403,8 @@ class TpuSRTPlatform(SRTPlatform):
         free, total = torch.accelerator.get_memory_info(device)
         return float(total - free)
 
-    def get_device(self, local_rank: int) -> torch.device:
-        return torch.device("tpu", local_rank)
+    def get_device(self, device_id: int = 0) -> torch.device:
+        return torch.device("tpu", device_id)
 
     def set_device(self, device: torch.device) -> None:
         torch.tpu.set_device(device)

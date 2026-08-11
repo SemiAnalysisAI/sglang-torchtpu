@@ -179,7 +179,14 @@ class TpuRaidenHostKVCache(HostKVCache):
         return self.transfer.load(host_pages, device_pages)
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ) -> None:
         # The raiden controller issues a single all-layer ``load_all_layer``;
         # the per-layer path must never be reached on this pool.

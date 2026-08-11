@@ -728,9 +728,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
 
         # Match TpuGraphRunner's no_grad wrapper for Dynamo cache reuse.
-        with forward_context(
-            ForwardContext(attn_backend=forward_attn_backend)
-        ), torch.no_grad():
+        with (
+            forward_context(ForwardContext(attn_backend=forward_attn_backend)),
+            torch.no_grad(),
+        ):
             out = self.owner.forward(*args, **kwargs)
             # Materialize lazy outputs and backend-marked side effects.
             _materialize_out(
@@ -924,10 +925,10 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             input_deepstack_embeds is not None,
         )
 
-    def finalize_forward_batch(self, out: Any, forward_batch: Any) -> Any:
+    def finalize_forward_batch(self, outputs: Any, forward_batch: Any) -> Any:
         """Slice the inner VL decoder output before outer logits processing."""
         real_q = getattr(forward_batch, _REAL_Q_KEY, None)
-        out = super().finalize_forward_batch(out, forward_batch)
+        out = super().finalize_forward_batch(outputs, forward_batch)
         if real_q is None:
             return out
         if isinstance(out, torch.Tensor):
