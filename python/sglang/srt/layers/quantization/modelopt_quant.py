@@ -833,6 +833,18 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         return None
 
 
+class TpuModelOptMixedPrecisionConfig(ModelOptMixedPrecisionConfig):
+    """Fail-closed boundary for unsupported TPU ModelOpt mixed checkpoints."""
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> TpuModelOptMixedPrecisionConfig:
+        raise NotImplementedError(
+            "ModelOpt MIXED_PRECISION checkpoints are not supported on TPU. "
+            "TPU packed-FP4 support requires the MoE-only block-512 "
+            "modelopt_fp4 checkpoint schema."
+        )
+
+
 class ModelOptFp8MoEMethod(FusedMoEMethodBase):
     """MoE method for ModelOpt FP8.
     Supports loading FP8 checkpoints with static weight scale and activation scale.
@@ -1182,7 +1194,15 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 
 
 class ModelOptFp4Config(ModelOptQuantConfig):
-    """Config class for FP4."""
+    """Config class for ModelOpt-compatible packed FP4 checkpoints.
+
+    ``global_scale`` and ``scale_dtype`` describe the TPU block-512 extension,
+    not standard NVIDIA NVFP4.  Standard NVFP4 methods require per-tensor
+    global scales (``global_scale=True``) and FP8 block scales (represented by
+    an absent ``scale_dtype``).  Keeping the extension metadata on the shared
+    config ensures that every backend can either interpret it or reject it
+    explicitly instead of silently ignoring checkpoint fields.
+    """
 
     def __init__(
         self,
@@ -1192,6 +1212,8 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         exclude_modules: List[str] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_per_token_activation: Optional[bool] = None,
+        global_scale: bool = True,
+        scale_dtype: Optional[str] = None,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
@@ -1206,6 +1228,8 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if use_per_token_activation is None
             else use_per_token_activation
         )
+        self.global_scale = global_scale
+        self.scale_dtype = scale_dtype
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -1269,6 +1293,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         kv_cache_quant_algo = None
         group_size = None
         exclude_modules = []
+        checkpoint_format = config
 
         # Try flat format first (config.json quantization_config - preferred format)
         quant_method = config.get("quant_algo")
@@ -1309,17 +1334,18 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         else:
             # Fall back to nested format (hf_quant_config.json - legacy format)
             try:
-                quant_config = cls.get_from_keys(config, ["quantization"])
-                quant_method = quant_config["quant_algo"]
-                kv_cache_quant_algo = quant_config.get("kv_cache_quant_algo")
+                checkpoint_format = cls.get_from_keys(config, ["quantization"])
+                quant_method = checkpoint_format["quant_algo"]
+                kv_cache_quant_algo = checkpoint_format.get("kv_cache_quant_algo")
                 if not kv_cache_quant_algo:
                     kv_cache_quant_algo = "auto"
-                group_size = ModelOptFp4Config.common_group_size(config)
-                exclude_modules = quant_config.get("exclude_modules", [])
+                group_size = cls.common_group_size(config)
+                exclude_modules = checkpoint_format.get("exclude_modules", [])
             except (ValueError, KeyError):
                 raise ValueError(
                     "Cannot find 'quant_algo' in the model's quantization config. "
-                    "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
+                    "Expected either flat format (config.json) or nested format "
+                    "(hf_quant_config.json)."
                 )
 
         if quant_method not in ["FP8", "NVFP4"]:
@@ -1341,11 +1367,13 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 "specified in the quantization config"
             )
         return cls(
-            is_checkpoint_nvfp4_serialized,
-            kv_cache_quant_algo,
-            group_size,
-            exclude_modules,
-            config.get("packed_modules_mapping"),
+            is_checkpoint_nvfp4_serialized=is_checkpoint_nvfp4_serialized,
+            kv_cache_quant_algo=kv_cache_quant_algo,
+            group_size=group_size,
+            exclude_modules=exclude_modules,
+            packed_modules_mapping=config.get("packed_modules_mapping"),
+            global_scale=checkpoint_format.get("global_scale", True),
+            scale_dtype=checkpoint_format.get("scale_dtype"),
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
@@ -1354,6 +1382,64 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             prefix,
             Linear=ModelOptFp4LinearMethod,
             Moe=ModelOptNvFp4FusedMoEMethod,
+        )
+
+
+class TpuModelOptCompatibleFp4Config(ModelOptFp4Config):
+    """TPU block-512 packed-FP4 checkpoint schema.
+
+    Reuses ModelOpt tensor names and packed E2M1 weights, but is not standard
+    NVIDIA NVFP4: block scales may use fp32/bf16/fp8, the per-tensor global
+    scale may be absent, only MoE experts are quantized, and execution is W4A8
+    through Pallas rather than native Blackwell FP4.
+    """
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        if isinstance(layer, (LinearBase, ParallelLMHead)):
+            if is_layer_skipped(
+                prefix, self.exclude_modules, self.packed_modules_mapping or {}
+            ) or self.is_layer_excluded(prefix):
+                return UnquantizedLinearMethod()
+            raise NotImplementedError(
+                "TPU ModelOpt-compatible FP4 supports only MoE experts; "
+                f"dense layer {prefix!r} must be excluded from quantization."
+            )
+        if self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
+            return ModelOptFp8KVCacheMethod(self)
+        if isinstance(layer, FusedMoE):
+            if self.is_layer_excluded(prefix):
+                return None
+            return TpuModelOptNvFp4FusedMoEMethod(self)
+        return None
+
+
+def _validate_standard_modelopt_fp4_config(quant_config: ModelOptQuantConfig) -> None:
+    """Reject TPU block-512 extension metadata in standard NVFP4 methods."""
+    group_size = getattr(quant_config, "group_size", None)
+    global_scale = getattr(quant_config, "global_scale", True)
+    scale_dtype = getattr(quant_config, "scale_dtype", None)
+    unsupported = []
+    # ``None`` is retained for direct config construction and online NVFP4;
+    # parsed serialized checkpoints always supply a concrete group size.
+    if group_size not in (None, 16):
+        unsupported.append(f"group_size={group_size!r}")
+    if global_scale is not True:
+        unsupported.append(f"global_scale={global_scale!r}")
+    if scale_dtype is not None:
+        unsupported.append(f"scale_dtype={scale_dtype!r}")
+    if unsupported:
+        raise ValueError(
+            "Standard NVIDIA NVFP4 methods support only block-16 checkpoints "
+            "with global_scale=True and no scale_dtype. The ModelOpt-compatible "
+            "block-512 extension is supported only by the TPU MoE method; got "
+            + ", ".join(unsupported)
+            + "."
         )
 
 
@@ -1380,7 +1466,7 @@ class HybridFp8NvFp4Config(Fp8Config):
 
         if isinstance(layer, FusedMoE):
             if not self.nvfp4_config.is_layer_excluded(prefix):
-                return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
+                return self.nvfp4_config.get_quant_method(layer, prefix)
             # Fall back to MXFP4 for MTP MoE layers
             if self.is_fp4_experts:
                 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
@@ -1412,6 +1498,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     """
 
     def __init__(self, quant_config: ModelOptFp4Config):
+        _validate_standard_modelopt_fp4_config(quant_config)
         self.quant_config = quant_config
 
     def create_weights(
@@ -1743,6 +1830,7 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
     """
 
     def __init__(self, quant_config: ModelOptFp4Config):
+        _validate_standard_modelopt_fp4_config(quant_config)
         self.quant_config = quant_config
 
     def create_weights(
@@ -1893,6 +1981,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
 
     def __init__(self, quant_config: ModelOptFp4Config):
+        _validate_standard_modelopt_fp4_config(quant_config)
         self.quant_config = quant_config
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto() and is_cuda():
@@ -1911,6 +2000,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
         self._cache_permute_indices = {}
+
+    def _weight_scale_dtype(self) -> torch.dtype:
+        return torch.float8_e4m3fn
+
+    def _uses_swizzled_blockscales(self) -> bool:
+        return True
+
+    def _uses_global_scale_parameters(self) -> bool:
+        return True
 
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
@@ -1982,7 +2080,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.quant_config = self.quant_config
 
         weight_dtype = torch.uint8
-        weight_scale_dtype = torch.float8_e4m3fn
+        weight_scale_dtype = self._weight_scale_dtype()
         weight_loader = extra_weight_attrs.get("weight_loader")
         if is_nvfp4_online:
             weight_loader = self.get_online_weight_loader(layer, weight_loader)
@@ -2036,7 +2134,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # swizzle+allocate here to avoid GPU memory fragmentation
         if self.enable_flashinfer_trtllm_moe:
             layer.w13_blockscale_swizzled = None
-        else:
+        elif self._uses_swizzled_blockscales():
             layer.w13_blockscale_swizzled = Parameter(
                 swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
             )
@@ -2056,7 +2154,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if self.enable_flashinfer_trtllm_moe:
             layer.w2_blockscale_swizzled = None
-        else:
+        elif self._uses_swizzled_blockscales():
             layer.w2_blockscale_swizzled = Parameter(
                 swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
             )
@@ -2066,6 +2164,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
         )
+
+        if not self._uses_global_scale_parameters():
+            return
 
         w13_weight_scale_shape = (
             (layer.num_local_experts, 2)
@@ -2644,3 +2745,163 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         ).to(x.dtype)
         # Scale by routed_scaling_factor is fused into select_experts.
         return StandardCombineInput(hidden_states=output)
+
+
+class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
+    """TPU adapter for ModelOpt NVFP4 MoE checkpoints."""
+
+    def __init__(self, quant_config: TpuModelOptCompatibleFp4Config):
+        # Do not run the GPU backend/capability validation in the parent
+        # constructor. TPU validates its checkpoint and runner contracts below.
+        if quant_config.group_size != 512:
+            raise NotImplementedError(
+                "TPU NVFP4 MoE requires a block-512 checkpoint, "
+                f"got group_size={quant_config.group_size}."
+            )
+        if not isinstance(quant_config.global_scale, bool):
+            raise ValueError(
+                "TPU ModelOpt-compatible FP4 requires global_scale to be a bool, "
+                f"got {quant_config.global_scale!r}."
+            )
+        scale_dtypes = {
+            "float32": torch.float32,
+            "fp32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+            "float8_e4m3fn": torch.float8_e4m3fn,
+            "fp8": torch.float8_e4m3fn,
+        }
+        scale_dtype_name = quant_config.scale_dtype
+        if scale_dtype_name is not None:
+            if not isinstance(scale_dtype_name, str):
+                raise ValueError(
+                    "TPU ModelOpt-compatible FP4 requires scale_dtype to be a "
+                    f"string, got {scale_dtype_name!r}."
+                )
+            scale_dtype_name = scale_dtype_name.strip().lower()
+            if scale_dtype_name not in scale_dtypes:
+                raise ValueError(
+                    "Unsupported TPU ModelOpt-compatible FP4 checkpoint "
+                    f"scale_dtype={quant_config.scale_dtype!r}."
+                )
+        self._checkpoint_scale_dtype = (
+            scale_dtypes[scale_dtype_name]
+            if scale_dtype_name is not None
+            else (torch.float8_e4m3fn if quant_config.global_scale else torch.float32)
+        )
+        self._prepared_scale_dtype = (
+            scale_dtypes[scale_dtype_name]
+            if scale_dtype_name is not None
+            else (torch.bfloat16 if quant_config.global_scale else torch.float32)
+        )
+        self.quant_config = quant_config
+        self.enable_flashinfer_trtllm_moe = False
+
+    def _weight_scale_dtype(self) -> torch.dtype:
+        return self._checkpoint_scale_dtype
+
+    def _uses_swizzled_blockscales(self) -> bool:
+        return False
+
+    def _uses_global_scale_parameters(self) -> bool:
+        return self.quant_config.global_scale
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        return super().create_weights(
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def _resolve_fused_rs(self, layer: torch.nn.Module) -> None:
+        """Resolve the TPU MoE backend after the model publishes its contract."""
+        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+            has_tpu_fused_rs_post_expert_norm,
+            unmet_tpu_nvfp4_fused_rs_requirements,
+        )
+
+        has_post_expert_norm = has_tpu_fused_rs_post_expert_norm(layer)
+        if has_post_expert_norm:
+            layer.allow_backend_reduction = True
+
+        moe_runner_backend = get_moe_runner_backend()
+        if not (
+            moe_runner_backend.is_auto() or moe_runner_backend.is_pallas_tpu_fused_rs()
+        ):
+            raise ValueError(
+                "TPU NVFP4 MoE supports only --moe-runner-backend auto or "
+                "pallas_tpu_fused_rs"
+            )
+
+        unmet_requirements = unmet_tpu_nvfp4_fused_rs_requirements(
+            layer,
+            group_size=self.quant_config.group_size,
+            no_combine=self.moe_runner_config.no_combine,
+        )
+        self.handles_moe_reduction = not unmet_requirements
+        if self.handles_moe_reduction:
+            logger.info("Using TPU Pallas NVFP4 fused-RS MoE backend")
+        elif moe_runner_backend.is_pallas_tpu_fused_rs():
+            raise ValueError(
+                "--moe-runner-backend pallas_tpu_fused_rs cannot honor this "
+                "TPU NVFP4 layer. Unmet requirements: " + ", ".join(unmet_requirements)
+            )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+            prepare_tpu_nvfp4_moe_weights,
+        )
+
+        # Resolve the path before formatting because fused-RS uses a different
+        # packed-weight layout from the stock Pallas fallback.
+        self._resolve_fused_rs(layer)
+
+        prepare_tpu_nvfp4_moe_weights(
+            layer,
+            group_size=self.quant_config.group_size,
+            scale_dtype=self._prepared_scale_dtype,
+            use_fused_rs=self.handles_moe_reduction,
+        )
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        moe_runner_backend = get_moe_runner_backend()
+        if not (
+            moe_runner_backend.is_auto() or moe_runner_backend.is_pallas_tpu_fused_rs()
+        ):
+            raise ValueError(
+                "TPU NVFP4 MoE supports only --moe-runner-backend auto or "
+                "pallas_tpu_fused_rs"
+            )
+        # Compatibility is resolved after model setup in _resolve_fused_rs.
+
+    def apply(
+        self,
+        layer: FusedMoE,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.hardware_backend.tpu.fp4_moe import apply_tpu_nvfp4_moe
+
+        return apply_tpu_nvfp4_moe(
+            layer=layer,
+            dispatch_output=dispatch_output,
+            activation=self.moe_runner_config.activation,
+            apply_router_weight_on_input=(
+                self.moe_runner_config.apply_router_weight_on_input
+            ),
+            no_combine=self.moe_runner_config.no_combine,
+            use_fused_rs=self.handles_moe_reduction,
+        )
