@@ -101,8 +101,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
     patch-count buckets on TPU. Model-specific behavior (bucket ladders, warmup
     inputs, padding, output unpadding, the serve-entry adapter, and probing the
     encoder for device/dtype/embed_dim/merge alignment) is expressed through
-    hooks that subclasses override; see ``Qwen3VLVisionTpuCompilePolicy`` for
-    the Qwen3-VL implementation.
+    hooks that subclasses override.
     """
 
     platform = "tpu"
