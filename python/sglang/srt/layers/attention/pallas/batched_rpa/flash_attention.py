@@ -5,7 +5,6 @@
 import jax
 import jax.numpy as jnp
 from jax import lax
-from jax.experimental.pallas import tpu as pltpu
 
 from sglang.srt.layers.attention.pallas.batched_rpa import configs, utils
 
@@ -23,7 +22,7 @@ def flash_attention_qk_softmax(
     bq_start: int,
 ):
     """Flash attention kernel."""
-    b, k_heads, tq, _ = q.shape
+    b, k_heads, tq, h_size = q.shape
     s = k.shape[2]
 
     if cfgs.serve.scale_q is not None:
@@ -35,13 +34,16 @@ def flash_attention_qk_softmax(
             q = jnp.clip(q, min=minval, max=maxval)
         q = q.astype(k.dtype)
 
+    # einshape is a hijax op, so pjit cannot cache the compiled executable and
+    # re-traces every call. These only merge or split adjacent leading axes,
+    # which a plain reshape does at the same layout and no runtime cost.
     qk = lax.dot_general(
-        pltpu.einshape("bkth->(bk)th", q, True),
-        pltpu.einshape("bksh->(bk)sh", k, True),
+        q.reshape(b * k_heads, tq, h_size),
+        k.reshape(b * k_heads, s, h_size),
         dimension_numbers=(([2], [2]), ([0], [0])),
         preferred_element_type=jnp.float32,
     ).astype(cfgs.serve.dtype_out)
-    qk = pltpu.einshape("(bk)ts->bkts", qk, True, b=b)
+    qk = qk.reshape(b, k_heads, tq, s)
 
     qk *= cfgs.model.sm_scale
     if cfgs.serve.scale_k is not None:
@@ -54,7 +56,7 @@ def flash_attention_qk_softmax(
 
     qk_masked = []
 
-    int_ty = cfgs.serve.int_ty
+    int_ty = cfgs.int_ty
 
     for b_idx in range(cfgs.block.batch_size):
         kv_idx_b = (
@@ -71,7 +73,14 @@ def flash_attention_qk_softmax(
         mask_b = jnp.logical_and(mask_b, q_idx_b >= kv_idx_b)
 
         if (sliding_window := cfgs.model.sliding_window) is not None:
-            mask_b = jnp.logical_and(mask_b, q_idx_b < kv_idx_b + sliding_window)
+            # kv_idx_b already sits near max_model_len at the tail, so adding
+            # the window can pass INT16_MAX even when the context itself fits.
+            # Wrapping there flips the predicate and drops valid keys. The
+            # compare yields a bool, so widening it costs nothing downstream.
+            mask_b = jnp.logical_and(
+                mask_b,
+                q_idx_b.astype(jnp.int32) < kv_idx_b.astype(jnp.int32) + sliding_window,
+            )
 
         qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
     qk = jnp.stack(qk_masked, axis=0)
@@ -95,14 +104,15 @@ def flash_attention_pv(
     cfgs: configs.RpaConfigs,
 ):
     """Flash attention kernel."""
-    b = p.shape[0]
+    b, k_heads, tq, s = p.shape
+    h_size = v.shape[3]
     pv = lax.dot_general(
-        pltpu.einshape("bkts->(bk)ts", p, True),
-        pltpu.einshape("bksh->(bk)sh", v, True),
+        p.reshape(b * k_heads, tq, s),
+        v.reshape(b * k_heads, s, h_size),
         dimension_numbers=(([2], [1]), ([0], [0])),
         preferred_element_type=jnp.float32,
     ).astype(cfgs.serve.dtype_out)
-    pv = pltpu.einshape("(bk)th->bkth", pv, True, b=b)
+    pv = pv.reshape(b, k_heads, tq, h_size)
 
     if cfgs.serve.scale_v is not None:
         pv *= cfgs.serve.scale_v

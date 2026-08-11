@@ -77,13 +77,18 @@ def _build_req_to_token(
 
 
 def _build_meta(backend, fb) -> PallasForwardMetadata:
-    """Mirror ``init_forward_metadata`` without the KV-pool commit hook."""
-    distribution = backend._get_cached_rpa_distribution(
-        fb.forward_mode.is_decode(),
-        backend._non_empty_batch_size(fb),
-        fb.seq_lens.device,
+    """Run the real ``init_forward_metadata`` minus the KV-pool commit hook.
+
+    Going through the production method (rather than re-deriving its arguments
+    here) is what makes the dispatch_hint / distribution agreement tests mean
+    something: the hint must come from the same ``is_decode`` the distribution
+    did.
+    """
+    backend.token_to_kv_pool = types.SimpleNamespace(
+        tpu_commit_pending_loads=lambda: None
     )
-    return backend._build_metadata(fb, distribution)
+    backend.init_forward_metadata(fb)
+    return backend.forward_metadata
 
 
 class TestBatchedRpaMetadataDecode(CustomTestCase):
@@ -156,6 +161,14 @@ class TestBatchedRpaMetadataDecode(CustomTestCase):
     def test_no_swa_page_indices(self):
         self.assertIsNone(self._build().swa_page_indices)
 
+    def test_dispatch_hint_agrees_with_distribution(self):
+        # The hint drops the other mode's kernel from the traced graph, so it
+        # must never contradict the ranges ``distribution`` encodes.
+        meta = self._build()
+        self.assertEqual(meta.dispatch_hint, "decode_only")
+        decode_end = int(meta.distribution[0])
+        self.assertGreater(decode_end, 0, "decode_only hint with an empty range")
+
 
 class TestBatchedRpaMetadataExtend(CustomTestCase):
     """Extend-mode metadata: cu_q_lens from extend_seq_lens, distribution [0,0,n]."""
@@ -202,6 +215,12 @@ class TestBatchedRpaMetadataExtend(CustomTestCase):
     def test_kv_lens_is_full_seq_lens(self):
         meta = self._build()
         self.assertTrue(torch.equal(meta.kv_lens, self.seq_lens.to(torch.int32)))
+
+    def test_dispatch_hint_agrees_with_distribution(self):
+        meta = self._build()
+        self.assertEqual(meta.dispatch_hint, "mixed_only")
+        self.assertEqual(int(meta.distribution[0]), 0, "decode range must be empty")
+        self.assertGreater(int(meta.distribution[2]), int(meta.distribution[1]))
 
 
 class TestBatchedRpaDistributionEncoding(CustomTestCase):

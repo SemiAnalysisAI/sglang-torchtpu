@@ -30,8 +30,18 @@ from sglang.srt.layers.attention.pallas.batched_rpa import (
     configs,
     kernel,
     schedule,
+    tuned_block_sizes,
     utils,
 )
+
+# Fraction of the VMEM budget a block-size pick may use. The estimator does
+# not model compiler-emitted scratch, so the rest is left as headroom.
+_VMEM_FRACTION = 0.8
+# Decode may spend a little more, but only to cut the number of k-blocks per
+# sequence (see _pick_decode_block_sizes).
+_DECODE_RELAXED_VMEM_FRACTION = 0.9
+# Lane cap for decode. Fixed value based on experimental results.
+_DECODE_MAX_BATCH = 8
 
 
 def prepare_inputs(
@@ -218,7 +228,7 @@ def calculate_block_sizes(
 
         # Even if we loose some potential performance, we want to avoid OOM at all
         # costs. Therefore, we conservatively only use 80% of the VMEM budget.
-        capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
+        capped_vmem_limit_bytes = vmem_limit_bytes * _VMEM_FRACTION
 
         bkv_sz = bkv_stride = mxu_column_size
         if fixed_bq_sz is None:
@@ -303,14 +313,138 @@ def calculate_block_sizes(
 
     # Default to triple buffer as its almost always beneficial.
     n_buffer = 3
+    decode_batch_size = _DECODE_MAX_BATCH
     # Fixed value based on experimental results.
-    decode_batch_size = 8
     prefill_batch_size = 2
 
-    decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
+    decode_block_sizes = _pick_decode_block_sizes(
+        estimate_vmem_usage,
+        fallback=lambda: find_best_block_sizes(decode_batch_size, n_buffer, 1),
+        vmem_limit_bytes=vmem_limit_bytes,
+        serve_cfgs=serve_cfgs,
+        max_batch_size=decode_batch_size,
+        max_n_buffer=n_buffer,
+    )
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
 
     return decode_block_sizes, prefill_block_sizes
+
+
+def _decode_kv_tiles(max_model_len: int, page_size: int):
+    """KV tiles that split the context into 1, 2, 3, ... whole blocks.
+
+    Yields ``(num_blocks, bkv_sz)`` widest-first. Only these widths are worth
+    considering: a tile between two ladder rungs needs the same number of
+    blocks as the narrower rung while paying a wider matmul on the tail of the
+    last one.
+    """
+    seen = set()
+    for num_blocks in range(1, max_model_len // page_size + 2):
+        bkv_sz = min(
+            utils.align_to(pl.cdiv(max_model_len, num_blocks), page_size), max_model_len
+        )
+        if bkv_sz < page_size:
+            return
+        if bkv_sz not in seen:
+            seen.add(bkv_sz)
+            yield num_blocks, bkv_sz
+
+
+def _pick_decode_block_sizes(
+    estimate_vmem_usage,
+    *,
+    fallback,
+    vmem_limit_bytes: int,
+    serve_cfgs: configs.ServingConfigs,
+    max_batch_size: int,
+    max_n_buffer: int,
+) -> configs.BlockSizes:
+    """Choose decode block sizes for the deployment's context length.
+
+    The legacy pick maximised ``bkv_sz`` at a fixed ``(batch_size=8,
+    n_buffer=3)``, ignoring the context length entirely. That leaves a lot on
+    the table: the tile it lands on rarely divides the context, so each
+    sequence needs several k-blocks, and the flash body does not clip its MXU
+    work to ``kv_len``, so every partial block pays a full-width matmul.
+
+    Measured on v7 (Qwen3-Coder-480B TP=8 shapes, bf16 and fp8 KV, decode at
+    concurrency 8 and 64), the ordering that tracks the sweep winners is:
+    fewest k-blocks per sequence first, then the largest lane count that fits,
+    then the deepest buffering that fits. Within 0-3.6% of the per-shape
+    optimum from 1k to 32k context.
+
+    The tile is sized from ``max_model_len``, not from the live ``kv_len``,
+    which is only known at run time. Sequences much shorter than the window
+    therefore pay a wider matmul than they need: measured at 1/4 of the
+    window the pick is up to 19% slower than the legacy one, against 46-134%
+    faster when sequences do fill it. The downside is bounded and the upside
+    is not, so this errs wide.
+    """
+    max_model_len = serve_cfgs.max_model_len
+    page_size = serve_cfgs.page_size
+
+    def fits_step_budget(bkv_sz: int, batch_size: int) -> bool:
+        """Whether the schedule for a full batch stays inside SMEM.
+
+        ``compute_metadata`` does not clamp its step counter, so a pick whose
+        worst-case schedule is longer than the scratch writes past the end of
+        it. Lowering the lane count multiplies the step count, so the picker
+        has to check.
+        """
+        steps = pl.cdiv(
+            serve_cfgs.num_seqs * pl.cdiv(max_model_len, bkv_sz), batch_size
+        )
+        return steps <= configs.max_steps_ub_for(
+            serve_cfgs,
+            batch_size=batch_size,
+            bkv_p_cache=bkv_sz // page_size,
+            bkv_p_new=1,
+        )
+
+    def search(vmem_fraction: float, max_blocks: int, check_steps: bool):
+        limit = vmem_limit_bytes * vmem_fraction
+        for num_blocks, bkv_sz in _decode_kv_tiles(max_model_len, page_size):
+            if num_blocks > max_blocks:
+                return None
+            for batch_size in range(max_batch_size, 0, -1):
+                if check_steps and not fits_step_budget(bkv_sz, batch_size):
+                    continue
+                for n_buffer in range(max_n_buffer, 1, -1):
+                    if estimate_vmem_usage(batch_size, n_buffer, 1, bkv_sz) <= limit:
+                        return num_blocks, configs.BlockSizes(
+                            bq_sz=1,
+                            bq_c_sz=1,
+                            bkv_sz=bkv_sz,
+                            batch_size=batch_size,
+                            n_buffer=n_buffer,
+                        )
+        return None
+
+    # Prefer a pick whose schedule fits SMEM; if none does (the schedule
+    # scratch is simply too small for this many sequences at this context, a
+    # limit the legacy pick hits too) fall back to the perf ordering alone.
+    for check_steps in (True, False):
+        found = search(_VMEM_FRACTION, max_model_len, check_steps)
+        if found is not None:
+            break
+    if found is None:
+        # Nothing on the tile ladder fits even at one page; let the legacy
+        # search report the failure (or find something the ladder missed).
+        return fallback()
+
+    num_blocks, blocks = found
+    if num_blocks > 1:
+        # Splitting the context costs a whole extra pipeline turn per sequence
+        # plus a partial last block, which is worth more than the margin. The
+        # margin covers what the estimator does not model -- chiefly that K and
+        # V are both live across QK and PV while ``loaded_bkv_size`` counts one
+        # of them -- and decode's own tail (the qk/p intermediates) is small
+        # because bq_sz is 1. Widening may also drop a buffer to pay for the
+        # tile; that is the intended trade, and it never adds one.
+        wider = search(_DECODE_RELAXED_VMEM_FRACTION, num_blocks - 1, check_steps)
+        if wider is not None:
+            blocks = wider[1]
+    return blocks
 
 
 @jax.jit(
@@ -331,6 +465,7 @@ def calculate_block_sizes(
         "use_causal_mask",
         "update_kv_cache",
         "stacked",
+        "dispatch_hint",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -360,6 +495,7 @@ def ragged_paged_attention(
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,
     stacked: bool = False,
+    dispatch_hint: str = "auto",
 ) -> tuple[jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -396,6 +532,13 @@ def ragged_paged_attention(
         debug_mode: Not used.
         out_dtype: Dtype of output. Defaults to dtype of queries.
         use_causal_mask: Not used.
+        dispatch_hint: ``"auto"`` (default) traces both the DECODE and the
+            MIXED kernel. ``"decode_only"`` / ``"mixed_only"`` drop the other
+            mode -- its attention kernel *and* its schedule pallas -- from the
+            traced graph. A serving step is always one or the other, so the
+            skipped mode's range would be empty anyway; the hint just lets the
+            caller say so statically. Passing a hint that contradicts the
+            traced ``distribution`` silently drops that mode's sequences.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -404,6 +547,8 @@ def ragged_paged_attention(
             concatenated along num kv heads dim.
     """
 
+    if dispatch_hint not in ("auto", "decode_only", "mixed_only"):
+        raise ValueError(f"Unknown {dispatch_hint=}")
     if not use_causal_mask:
         raise ValueError("Only causal attention is supported.")
     if chunk_prefill_size is not None:
@@ -461,11 +606,24 @@ def ragged_paged_attention(
         o_hbm_alias_q_hbm: jax.Array,
         kv_cache: jax.Array,
     ):
+        if dispatch_hint == "decode_only" and mode != configs.RpaCase.DECODE:
+            return o_hbm_alias_q_hbm, kv_cache
+        if dispatch_hint == "mixed_only" and mode != configs.RpaCase.MIXED:
+            return o_hbm_alias_q_hbm, kv_cache
+
+        tuned = tuned_block_sizes.get_tuned_block_sizes(
+            model_cfgs, serve_cfgs, mode, vmem_limit_bytes
+        )
         if mode == configs.RpaCase.DECODE:
-            effective_blocks = decode_block_sizes or default_decode
+            effective_blocks = decode_block_sizes or tuned or default_decode
             if stacked:
                 stacked_bkv_sz = max(page_size, utils.align_to(1024, page_size))
-                stacked_batch_size = effective_blocks.batch_size
+                # Start the refit from the lane cap, not from the decode pick:
+                # stacked stripes one request's k-blocks across the lanes, so
+                # it wants as many as fit at its own (small) tile, whereas the
+                # decode pick trades lanes away for a tile that can be tens of
+                # thousands of tokens wide.
+                stacked_batch_size = _DECODE_MAX_BATCH
                 while (
                     stacked_batch_size > 1
                     and _calculate_vmem_usage(
@@ -489,7 +647,7 @@ def ragged_paged_attention(
                     batch_size=stacked_batch_size,
                 )
         else:
-            effective_blocks = prefill_block_sizes or default_prefill
+            effective_blocks = prefill_block_sizes or tuned or default_prefill
 
         cfgs = configs.RpaConfigs(
             block=effective_blocks,

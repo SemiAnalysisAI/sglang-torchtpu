@@ -44,6 +44,7 @@ def _invoke_batched_kernel(
     soft_cap,
     k_scale,
     v_scale,
+    dispatch_hint,
 ):
     # cu_kv_lens and attention_sink are not consumed by the batched kernel.
     del cu_kv_lens, attention_sink
@@ -63,17 +64,22 @@ def _invoke_batched_kernel(
         v_scale=v_scale,
         use_causal_mask=True,
         update_kv_cache=True,
+        dispatch_hint=dispatch_hint,
     )
 
 
 RPA_BATCHED_SPEC = RpaKernelSpec(
-    op_name="sglang_tpu_pallas::ragged_paged_attention_batched",
+    # v2: vendored kernel source changed (flash reshapes, int_ty promotion,
+    # decode block-size picker) and the op gained ``dispatch_hint``, so the
+    # compile cache must not reuse graphs keyed on the old name.
+    op_name="sglang_tpu_pallas::ragged_paged_attention_batched_v2",
     import_kernel=_import_batched_kernel,
     invoke_kernel=_invoke_batched_kernel,
     supports_attention_sink=False,
     extend_distribution_mask=(0, 0, 1),  # [0, 0, n] (MIXED-only)
     uses_draft_extend_v2=False,
     min_page_size=256,
+    supports_dispatch_hint=True,
 )
 
 

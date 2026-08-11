@@ -35,7 +35,7 @@ Design notes
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import torch
@@ -80,6 +80,12 @@ class PallasForwardMetadata:
     distribution: torch.Tensor
     # i32[max_num_seqs * pages_per_seq]  page indices
     swa_page_indices: torch.Tensor | None = None
+    # Which of the kernel's two modes this step can populate, from the same
+    # is_decode that built ``distribution`` so the two cannot disagree. Kernels
+    # that understand it drop the other mode's attention and schedule pallas
+    # from the traced graph. Static because it is a JIT cache key and
+    # ``direct_compile`` registers this dataclass as a pytree.
+    dispatch_hint: str = field(default="auto", metadata=dict(static=True))
 
 
 class InvokeKernelFn(Protocol):
@@ -109,6 +115,7 @@ class InvokeKernelFn(Protocol):
         soft_cap,
         k_scale,
         v_scale,
+        dispatch_hint,
     ) -> tuple: ...
 
 
@@ -143,6 +150,10 @@ class RpaKernelSpec:
     # Minimum KV page/block size the kernel needs (None = no floor). Consumed by
     # the TPU platform's page-size defaulting, not by this module.
     min_page_size: int | None = None
+    # Whether the kernel can drop the mode this step cannot populate. False
+    # pins ``dispatch_hint="auto"``, leaving the kernel's distribution-driven
+    # ranges in charge and the export cache key constant.
+    supports_dispatch_hint: bool = False
 
 
 # torch custom ops are process-global; cache one per op_name so repeated backend
@@ -204,6 +215,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         soft_cap: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
+        dispatch_hint: str = "auto",
     ) -> tuple[jax.Array, jax.Array]:
         if not spec.supports_attention_sink and attention_sink is not None:
             raise NotImplementedError(f"{op_name} does not support attention sinks")
@@ -228,14 +240,16 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
             soft_cap=soft_cap,
             k_scale=k_scale,
             v_scale=v_scale,
+            dispatch_hint=dispatch_hint,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
         # Static (non-traced) args by _wrapped position: 10=sm_scale,
-        # 11=sliding_window, 12=soft_cap, 13=k_scale, 14=v_scale.
-        static_argnums=(10, 11, 12, 13, 14),
+        # 11=sliding_window, 12=soft_cap, 13=k_scale, 14=v_scale,
+        # 15=dispatch_hint.
+        static_argnums=(10, 11, 12, 13, 14, 15),
         donate_argnums=(3,),
         input_output_aliases={3: 1},
         warn_deprecated=False,
@@ -262,6 +276,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         soft_cap: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
+        dispatch_hint: str = "auto",
     ) -> torch.Tensor:
         with tpu_info_for_cpu_export():
             output, _updated_kv = jax_kernel(
@@ -280,6 +295,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
                 soft_cap,
                 k_scale,
                 v_scale,
+                dispatch_hint,
             )
         return output
 
@@ -413,7 +429,23 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         distribution = self._get_cached_rpa_distribution(
             is_decode, non_empty_bs, device
         )
-        self.forward_metadata = self._build_metadata(forward_batch, distribution)
+        self.forward_metadata = self._build_metadata(
+            forward_batch,
+            distribution,
+            dispatch_hint=self._dispatch_hint_for(is_decode),
+        )
+
+    def _dispatch_hint_for(self, is_decode: bool) -> str:
+        """Name the single mode ``distribution`` can put sequences in.
+
+        A variant whose extend encoding spans more than one mode gets "auto"
+        rather than a label that is only mostly true.
+        """
+        if is_decode:
+            return "decode_only"
+        if self.kernel_spec.extend_distribution_mask == (0, 0, 1):
+            return "mixed_only"
+        return "auto"
 
     @staticmethod
     def _pre_bucket_padded_batch_size(forward_batch: ForwardBatch) -> int:
@@ -478,7 +510,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         )
 
     def _build_metadata(
-        self, forward_batch: ForwardBatch, distribution: torch.Tensor
+        self,
+        forward_batch: ForwardBatch,
+        distribution: torch.Tensor,
+        *,
+        dispatch_hint: str = "auto",
     ) -> PallasForwardMetadata:
         """Build per-forward-pass metadata for the Pallas kernel.
 
@@ -514,6 +550,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 req_to_token,
                 pages_per_seq,
                 distribution,
+                dispatch_hint,
             )
 
         # -------------------------------------------------------------- #
@@ -618,6 +655,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             page_indices=page_indices,
             distribution=distribution,
             swa_page_indices=swa_page_indices,
+            dispatch_hint=dispatch_hint,
         )
 
     def _build_metadata_host(
@@ -629,6 +667,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         req_to_token,
         pages_per_seq,
         distribution: torch.Tensor,
+        dispatch_hint: str = "auto",
     ) -> PallasForwardMetadata:
         """Host-resident metadata build (gated in ``_build_metadata``).
 
@@ -737,6 +776,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             page_indices=page_indices.to(device, non_blocking=True),
             distribution=distribution,
             swa_page_indices=swa_page_indices,
+            dispatch_hint=dispatch_hint,
         )
 
     # ------------------------------------------------------------------ #
@@ -853,6 +893,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             soft_cap,
             k_scale,
             v_scale,
+            (
+                self.forward_metadata.dispatch_hint
+                if self.kernel_spec.supports_dispatch_hint
+                else "auto"
+            ),
         )
 
         # The kernel emits output at the (padded) qk head_dim. For asymmetric

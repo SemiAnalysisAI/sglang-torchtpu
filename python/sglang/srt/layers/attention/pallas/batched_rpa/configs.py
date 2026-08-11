@@ -12,6 +12,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang.srt.layers.attention.pallas.batched_rpa import utils
 
+INT16_MAX = 2**15 - 1
+
 
 @dataclasses.dataclass(frozen=True)
 class BlockSizes:
@@ -69,8 +71,25 @@ class ServingConfigs:
         return self.page_size - 1
 
     @property
+    def max_model_len(self) -> int:
+        """Largest token position the page table can address."""
+        return self.pages_per_seq * self.page_size
+
+    @property
     def int_ty(self) -> jnp.dtype:
+        """Block-size-agnostic integer type for the mask iotas.
+
+        Use ``RpaConfigs.int_ty`` in the kernel: the iotas span the whole last
+        KV block, so the real bound depends on ``bkv_sz`` too. This one only
+        knows the context can never be addressed past ``max_model_len``.
+        """
         if utils.get_dtype_packing(self.dtype_q) == 1:
+            return jnp.int32
+
+        # The mask iotas carry absolute token positions, so int16 silently
+        # wraps once the addressable context passes INT16_MAX and the causal
+        # predicate flips. Fall back to int32 there.
+        if self.max_model_len > INT16_MAX:
             return jnp.int32
 
         match pltpu.get_tpu_info().generation:
@@ -121,6 +140,49 @@ class RpaCase(enum.StrEnum):
                 return distribution[1], distribution[2]
 
 
+def max_steps_ub_for(
+    serve_cfgs: ServingConfigs,
+    *,
+    batch_size: int,
+    bkv_p_cache: int,
+    bkv_p_new: int,
+) -> int:
+    """Maximum kernel steps the SMEM schedule scratch can hold.
+
+    Split out of ``RpaConfigs.max_steps_ub`` so the block-size picker can ask
+    the question before it has an ``RpaConfigs`` to ask it of: a pick whose
+    schedule needs more steps than this writes past the scratch.
+    """
+    fixed_bytes = 0
+    fixed_bytes += serve_cfgs.num_seqs  # kv_lens
+    fixed_bytes += serve_cfgs.num_seqs + 1  # cu_q_lens
+    fixed_bytes += serve_cfgs.num_seqs * serve_cfgs.pages_per_seq  # page_indices
+    fixed_bytes += 3  # distribution
+    fixed_bytes += batch_size  # lane_lengths
+    fixed_bytes += 1  # actual_steps
+
+    word_size_bytes = 4
+    fixed_bytes *= word_size_bytes
+
+    # Leave room for compiler padding, semaphores, and spill slots that are
+    # not represented in the logical schedule payload below.
+    smem_limit_bytes = pltpu.get_tpu_info().smem_capacity_bytes - 64 * 1024
+    available_bytes = smem_limit_bytes - fixed_bytes
+
+    # Per step per batch item:
+    # Seven scalar fields: 7 * 4 = 28
+    # dma_q and dma_o: 4 * 4 = 16
+    # dma_kv_cache: bkv_p_cache * 3 * 4 = 12 * bkv_p_cache
+    # dma_kv_new: bkv_p_new * 4 * 4 = 16 * bkv_p_new
+    bytes_per_step = 44 + 12 * bkv_p_cache + 16 * bkv_p_new
+    bytes_per_step *= batch_size
+
+    max_steps_ub = available_bytes // bytes_per_step
+
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    return max(1, max_steps_ub // num_lanes) * num_lanes
+
+
 @dataclasses.dataclass(frozen=True, eq=True)
 class RpaConfigs:
     block: BlockSizes
@@ -157,36 +219,30 @@ class RpaConfigs:
     @property
     def max_steps_ub(self) -> int:
         """Get maximum upper bound of kernel steps based on SMEM limit."""
+        return max_steps_ub_for(
+            self.serve,
+            batch_size=self.block.batch_size,
+            bkv_p_cache=self.bkv_p_cache,
+            bkv_p_new=self.bkv_p_new,
+        )
 
-        fixed_bytes = 0
-        fixed_bytes += self.serve.num_seqs  # kv_lens
-        fixed_bytes += self.serve.num_seqs + 1  # cu_q_lens
-        fixed_bytes += self.serve.num_seqs * self.serve.pages_per_seq  # page_indices
-        fixed_bytes += 3  # distribution
-        fixed_bytes += self.block.batch_size  # lane_lengths
-        fixed_bytes += 1  # actual_steps
+    @property
+    def int_ty(self) -> jnp.dtype:
+        """Integer type the kernel materialises absolute token positions in.
 
-        word_size_bytes = 4
-        fixed_bytes *= word_size_bytes
-
-        # Leave room for compiler padding, semaphores, and spill slots that are
-        # not represented in the logical schedule payload below.
-        smem_limit_bytes = pltpu.get_tpu_info().smem_capacity_bytes - 64 * 1024
-        available_bytes = smem_limit_bytes - fixed_bytes
-
-        # Per step per batch item:
-        # Seven scalar fields: 7 * 4 = 28
-        # dma_q and dma_o: 4 * 4 = 16
-        # dma_kv_cache: bkv_p_cache * 3 * 4 = 12 * bkv_p_cache
-        # dma_kv_new: bkv_p_new * 4 * 4 = 16 * bkv_p_new
-        bytes_per_step = 44 + 12 * self.bkv_p_cache + 16 * self.bkv_p_new
-        bytes_per_step *= self.block.batch_size
-
-        max_steps_ub = available_bytes // bytes_per_step
-
-        num_lanes = pltpu.get_tpu_info().num_lanes
-        max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
-        return max_steps_ub
+        The mask iota spans the *whole* last KV block, not just the live part
+        of it, so the largest position it produces is
+        ``align_to(max_model_len, bkv_sz) - 1`` -- up to ``bkv_sz - 1`` past
+        the addressable context. Deciding on ``max_model_len`` alone would
+        leave int16 selected for a window whose last block still wraps, which
+        flips the causal predicate and folds stale KV into the softmax.
+        """
+        base = self.serve.int_ty
+        if base == jnp.int32:
+            return base
+        if utils.align_to(self.serve.max_model_len, self.bkv_sz) - 1 > INT16_MAX:
+            return jnp.int32
+        return base
 
     @property
     def bkv_p(self) -> int:

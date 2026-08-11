@@ -103,12 +103,8 @@ def calculate_and_store_out(
 
     if cfgs.stacked:
         is_complete = schedule_ref.is_last_k[step_idx, 0] == 1
-        jax.lax.cond(
-            is_complete,
-            jax.named_call(_accum, name="stacked_accum"),
-            lambda _: None,
-            0,
-        )
+        # No jax.named_call: it is a call primitive, not a free annotation.
+        jax.lax.cond(is_complete, _accum, lambda _: None, 0)
         return
 
     for b in range(cfgs.batch_size):
@@ -119,9 +115,7 @@ def calculate_and_store_out(
         # tune `fuse_accum` for your use case.
         if not cfgs.fuse_accum:
             is_last_k = schedule_ref.is_last_k[step_idx, b] == 1
-            jax.lax.cond(
-                is_last_k, jax.named_call(_accum, name="accum"), lambda _: None, b
-            )
+            jax.lax.cond(is_last_k, _accum, lambda _: None, b)
         else:
             _accum(b)
 
@@ -150,7 +144,7 @@ def _rpa_compute_body(
     processed_q_len = []
     processed_kv_len = []
     effective_kv_len = []
-    int_ty = cfgs.serve.int_ty
+    int_ty = cfgs.int_ty
     for b_idx in range(cfgs.batch_size):
         s_idx = schedule_ref.s_idx[step, b_idx]
         is_valid = s_idx != -1
@@ -406,6 +400,8 @@ def create_allocs(
         block_shape=cfgs.q_vmem_shape,
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i,),
+        # No lookahead: the scheduler only consults it for input refs, and
+        # _make_pipeline_allocations rejects it on an output spec outright.
         pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=False),
     )
 
