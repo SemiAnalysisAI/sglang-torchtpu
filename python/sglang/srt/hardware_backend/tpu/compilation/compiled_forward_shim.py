@@ -153,11 +153,8 @@ def _dp_attn_apply_bucket_metadata(forward_batch, pad_t: int, pad_b: int) -> Non
     forward_batch.dp_local_num_tokens = None
     forward_batch.global_dp_buffer_len = pad_t * dp_size
     set_dp_buffer_len(pad_t * dp_size, pad_t, True, [pad_t] * dp_size)
-    # Publish the per-batch extend flag into the get_forward() flags tier.
-    # Traced code reads it (dynamo guards on its value), and the precompile
-    # dummies never pass through forward_batch_info's DP sync (which is where
-    # serving publishes it) — without this, extend variants trace with a stale
-    # False and can never re-match a real extend after the recompile freeze.
+    # Traced code guards on this flags-tier value; precompile dummies bypass
+    # the DP sync that normally publishes it, so publish here for both paths.
     set_is_extend_in_batch(
         getattr(
             forward_batch,

@@ -610,9 +610,8 @@ def should_skip_post_experts_all_reduce(
     """
     if should_skip_mlp_all_reduce():
         return True
-    # Before the dwdp read: experts_reduced is a pure-arg skip reason (the TPU
-    # fused-RS kernel already did the EP reduction) and must stay decidable
-    # without a published parallel context (unit tests exercise it bare).
+    # Pure-arg check first: must stay decidable without a published
+    # parallel context (TPU fused-RS already did the EP reduction).
     if experts_reduced and not is_tp_path:
         return True
     if get_parallel().dwdp_size > 1:

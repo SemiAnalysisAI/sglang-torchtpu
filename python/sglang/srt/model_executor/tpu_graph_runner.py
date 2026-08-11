@@ -76,9 +76,8 @@ logger = get_logger("tpu_graph_runner")
 
 
 def _resolve_fused_op_dispatch(model: Any) -> None:
-    """Eagerly resolve ``BaseFusedOp._forward_method`` on every op the model
-    can reach: its submodules plus the module-level singletons recorded in the
-    kernel registry (``target`` is ``"module:INSTANCE.method"``)."""
+    """Eagerly resolve ``BaseFusedOp._forward_method`` on model submodules and
+    kernel-registry singletons."""
     import importlib
 
     from sglang.kernels.fused_op import BaseFusedOp, get_fused_op_backend
@@ -140,12 +139,8 @@ class TpuGraphRunner:
                 "torch.compile install on TPU.",
                 type(self.model).__name__,
             )
-            # Reflect the skip to downstream code that branches on this
-            # flag (kernel_warmup pre-compile loops on the CUDA side;
-            # any future TPU equivalent should follow the same
-            # convention). CaptureFlags is the designated post-publish
-            # writer surface for this flag (see base_runner's identical
-            # _can_torch_compile clear).
+            # Reflect the skip to downstream readers; CaptureFlags is the
+            # designated post-publish writer for this flag (as base_runner).
             from sglang.srt.runtime_context import get_flags
 
             get_flags().capture.enable_torch_compile = False
@@ -182,13 +177,8 @@ class TpuGraphRunner:
 
         get_cp_decode_attn_tp_ctx()
 
-        # BaseFusedOp.forward resolves ``_forward_method`` lazily on first
-        # call; when that first call happens inside a traced precompile,
-        # dynamo bakes an ``_forward_method is None`` guard into that variant,
-        # which can never re-match once the method is cached — tripping
-        # fail_on_recompile mid-serving. The fork's old MultiPlatformOp
-        # resolved dispatch in __init__; restore that timing by resolving
-        # every reachable op before any tracing.
+        # TODO: drop if upstream resolves BaseFusedOp dispatch at construction
+        # instead of on first forward (keeps it out of the dynamo trace).
         _resolve_fused_op_dispatch(self.model)
 
         # TODO: Move policy discovery and installation into a reusable compile

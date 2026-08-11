@@ -74,9 +74,7 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     def apply_server_args_defaults(self, server_args: ServerArgs) -> None:
-        # Pre-publish resolution writes go through declare_late_resolution
-        # (ServerArgs.override was removed upstream; post-publish changes go
-        # to the bags via get_context().override).
+        # Pre-publish resolution writes go through declare_late_resolution.
         from sglang.srt.arg_groups.overrides import declare_late_resolution
         from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
 

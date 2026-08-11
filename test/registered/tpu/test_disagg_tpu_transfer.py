@@ -189,7 +189,7 @@ def _bare_manager(mode, pool, aux_tensors):
     m._socket_cache = {}
     m._monitor_cache = {}
     m._socket_lock = threading.Lock()
-    # Upstream _send_multipart_locked serializes per-endpoint sends.
+    # Read by _send_multipart_locked.
     m._socket_send_locks = {}
 
     sock = ctx.socket(zmq.PULL)
@@ -761,8 +761,7 @@ class TestPrepareForPrebuiltTpuPadding(CustomTestCase):
                 req.is_retracted = False
                 req.multimodal_inputs = None
                 req.sampling_params = SamplingParams()
-                # Upstream SamplingBatchInfo.from_schedule_batch reads this
-                # per-req flag (Req default: False).
+                # Read by SamplingBatchInfo.from_schedule_batch (Req default).
                 req.return_sampling_mask = False
 
                 self.reqs = [req]

@@ -561,14 +561,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             if (
                 forward_batch.forward_mode.is_idle()
                 and is_dp_attention_enabled()
-                # Relabel any DP-synced idle (global token list present),
-                # INCLUDING the all-idle group. Upstream's dp_attn now emits
-                # idle batches in more situations (inactive slots, all-idle
-                # sync steps); an IDLE mode reaching the compiled forward can
-                # never match a variant's forward_mode guard and trips
-                # fail_on_recompile. All-idle pads to the smallest decode
-                # bucket like any per-rank idle. Non-sync idles (no global
-                # list) keep IDLE and stay out of the padded decode path.
+                # Any DP-synced idle (incl. all-idle): an IDLE mode reaching
+                # the compiled forward can't match any variant's mode guard.
                 and forward_batch.global_num_tokens_cpu
             ):
                 forward_batch.forward_mode = ForwardMode.DECODE
