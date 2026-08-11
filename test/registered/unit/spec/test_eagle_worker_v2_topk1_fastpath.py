@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
@@ -222,7 +223,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         existing_backend = object()
         decode_backend = object()
         worker.server_args = _fake_server_args()
-        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
+        worker.draft_runner = SimpleNamespace(
+            attn_backend=existing_backend, compile_policy=NoopCompilePolicy()
+        )
         worker.topk = 1
         worker.speculative_num_steps = 2
         worker.seed_dsa_topk_from_draft_extend = False
@@ -244,7 +247,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         decode_backend = object()
         draft_extend_backend = object()
         worker.server_args = _fake_server_args()
-        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
+        worker.draft_runner = SimpleNamespace(
+            attn_backend=existing_backend, compile_policy=NoopCompilePolicy()
+        )
         worker.topk = 1
         worker.speculative_num_steps = 2
         worker.seed_dsa_topk_from_draft_extend = True

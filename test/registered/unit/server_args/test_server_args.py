@@ -1515,6 +1515,28 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
                     self._validate_prefill_only_args(kv_cache_dtype=kv_cache_dtype)
 
 
+class TestTpuCompileTracer(unittest.TestCase):
+    def test_default_is_dynamo(self):
+        args = ServerArgs(model_path="dummy")
+        self.assertEqual(args.tpu_compile_tracer, "dynamo")
+
+    def test_direct_rejects_unsupported_configurations(self):
+        cases = (
+            ({"device": "cuda"}, "supported only on TPU"),
+            ({"speculative_algorithm": "EAGLE3"}, "speculative decoding"),
+            ({"unsafe_save_torch_compile_bundle": "/tmp/bundle"}, "bundles"),
+        )
+        for overrides, error in cases:
+            with (
+                self.subTest(overrides=overrides),
+                self.assertRaisesRegex(ValueError, error),
+            ):
+                config = {"device": "tpu", "tpu_compile_tracer": "direct"}
+                config.update(overrides)
+                args = ServerArgs(model_path="dummy", **config)
+                args._handle_tpu_compile_tracer()
+
+
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
     @patch(
         "sglang.srt.model_executor.runner_backend."

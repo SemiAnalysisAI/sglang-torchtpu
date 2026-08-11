@@ -223,6 +223,9 @@ def build_tree_kernel_efficient(
             dtype=packed_dtypes[packed_dtype_idx],
             device=device,
         )
+    elif tree_mask_mode == TreeMaskMode.FULL_MASK and _use_torch_native:
+        # TPU causal attention does not use the dense mask.
+        tree_mask = torch.empty((0,), dtype=torch.bool, device=device)
     elif tree_mask_mode == TreeMaskMode.FULL_MASK:
         mask_shape = (
             seq_lens_sum * num_verify_tokens
