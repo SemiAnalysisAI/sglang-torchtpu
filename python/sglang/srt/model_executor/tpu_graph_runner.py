@@ -177,12 +177,8 @@ class TpuGraphRunner:
 
         _register_tpu_compile_backend()
 
-        # Warm dynamo-hostile lazy singletons so their one-time init runs
-        # eagerly instead of inside the compiled forward. DeepSeek's
-        # maybe_use_decode_attn_tp calls get_cp_decode_attn_tp_ctx() from the
-        # model forward; the first call constructs the context and calls
-        # logger.info, which dynamo rejects under fullgraph
-        # (torch._dynamo.exc.Unsupported: logging.Logger method).
+        # TODO: remove — TPU does not support CP decode-attn-TP; this only
+        # keeps the singleton's first-call init out of the dynamo trace.
         from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 
         get_cp_decode_attn_tp_ctx()
