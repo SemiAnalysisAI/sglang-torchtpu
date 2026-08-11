@@ -47,6 +47,20 @@ def _compute_patch_counts(
     return counts
 
 
+def _env_patch_buckets(env_var: str) -> list[int] | None:
+    """Parse a comma-separated patch-bucket override out of ``env_var``.
+
+    Returns ``None`` when unset (use the computed ladder) and ``[]`` when set but
+    empty (precompile disabled).
+    """
+    env_val = os.environ.get(env_var, None)
+    if env_val is None:
+        return None
+    if env_val.strip() == "":
+        return []
+    return sorted({int(x.strip()) for x in env_val.split(",") if x.strip()})
+
+
 def _validate_patch_buckets(buckets: list[int], merge_size: int) -> list[int]:
     merge_sq = merge_size**2
     for bucket in buckets:
@@ -98,10 +112,9 @@ class VisionTpuCompilePolicy(CompilePolicy):
 
     Owns the full compile lifecycle -- install, precompile warmup, and the
     padded ``run`` orchestration -- for any ViT encoder that precompiles fixed
-    patch-count buckets on TPU. Model-specific behavior (bucket ladders, warmup
-    inputs, padding, output unpadding, the serve-entry adapter, and probing the
-    encoder for device/dtype/embed_dim/merge alignment) is expressed through
-    hooks that subclasses override.
+    patch-count buckets on TPU. Model-specific behavior (the bucket ladder,
+    warmup inputs, and the padded call/uncall seam) is expressed through hooks
+    that subclasses override; the base never reads encoder attributes itself.
     """
 
     platform = "tpu"
@@ -182,21 +195,9 @@ class VisionTpuCompilePolicy(CompilePolicy):
         return True
 
     def resolve_patch_buckets(self) -> list[int]:
-        if self._patch_buckets is not None:
-            return self._patch_buckets
-
-        env_val = os.environ.get(self._bucket_env_var(), None)
-        if env_val is not None:
-            if env_val.strip() == "":
-                self._patch_buckets = []
-                return self._patch_buckets
-            buckets = sorted({int(x.strip()) for x in env_val.split(",") if x.strip()})
-            buckets = self._validate_buckets(buckets)
-        else:
-            buckets = self.compute_default_buckets()
-
-        self._patch_buckets = buckets
-        return buckets
+        if self._patch_buckets is None:
+            self._patch_buckets = self.compute_patch_buckets()
+        return self._patch_buckets
 
     def _bucket_for(self, seq_len: int) -> int | None:
         for bucket in self.resolve_patch_buckets():
@@ -234,15 +235,10 @@ class VisionTpuCompilePolicy(CompilePolicy):
             )
             return
 
-        device, dtype = self._probe_device_dtype()
-        embed_dim = self._probe_embed_dim()
-
         logger.info(
-            "VisionTpuCompilePolicy.precompile: warming %d patch counts %s "
-            "(embed_dim=%d).",
+            "VisionTpuCompilePolicy.precompile: warming %d patch counts %s.",
             len(patch_counts),
             patch_counts,
-            embed_dim,
         )
 
         init_dtype = torch.get_default_dtype()
@@ -257,9 +253,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
                         len(patch_counts),
                         patch_count,
                     )
-                    inputs = self.make_warmup_inputs(
-                        patch_count, device, dtype, embed_dim
-                    )
+                    inputs = self.make_warmup_inputs(patch_count)
                     result = self.compiled_fn(*inputs)
                     tpu_sync([result], wait=True)
         finally:
@@ -284,78 +278,45 @@ class VisionTpuCompilePolicy(CompilePolicy):
                 ),
             )
 
-        result = self._invoke_compiled(args, ctx)
-        result = self.unpad_outputs(result, ctx)
-        return self.postprocess(result, ctx)
+        return self.unpad_outputs(self.compiled_fn(*args), ctx)
 
     # --- Model-specific hooks -------------------------------------------------
     # Subclasses override these to describe one vision encoder. The generic
     # lifecycle above calls them; it never reads encoder attributes directly.
 
     @abstractmethod
-    def compute_default_buckets(self) -> list[int]:
-        """Non-env default patch-count bucket ladder for this encoder."""
+    def compute_patch_buckets(self) -> list[int]:
+        """Patch-count bucket ladder for this encoder (cached by the caller).
+
+        Owns any env override the encoder honors; ``_env_patch_buckets`` parses
+        the usual comma-list form. Return ``[]`` to disable precompile.
+        """
 
     @abstractmethod
-    def make_warmup_inputs(
-        self,
-        patch_count: int,
-        device: torch.device,
-        dtype: torch.dtype,
-        embed_dim: int,
-    ) -> tuple[Any, ...]:
-        """Build the compiled-fn argument tuple for a warmup patch count."""
+    def make_warmup_inputs(self, patch_count: int) -> tuple[Any, ...]:
+        """Build the compiled-fn argument tuple for a warmup patch count.
+
+        Reads whatever encoder state it needs (device, dtype, embedding dim)
+        directly; the base holds no opinion about the encoder's module tree.
+        """
 
     @abstractmethod
     def prepare_call(self, *raw: Any) -> tuple[tuple[Any, ...], Any]:
         """Adapt caller inputs into the compiled-fn arg tuple + a run context.
 
         Returns ``(args, ctx)``: ``args`` is splatted into ``self.compiled_fn``;
-        ``ctx`` is threaded through ``unpad_outputs`` and ``postprocess``. This is
-        the single model-specific seam for the compiled call -- padding, segment
-        IDs, and any eager pre-embedding all happen here.
+        ``ctx`` is threaded through to ``unpad_outputs``. This is the single
+        model-specific seam for the compiled call -- padding, segment IDs, and
+        any eager pre-embedding all happen here.
         """
-
-    # ``unpad_outputs`` stays abstract (declared on ``CompilePolicy``): it slices
-    # the padded compiled output back to the real token count for this encoder.
 
     @abstractmethod
-    def _probe_embed_dim(self) -> int:
-        """Read the encoder embedding dim used to size warmup inputs."""
+    def unpad_outputs(self, result: Any, ctx: Any) -> Any:
+        """Turn the padded compiled output into what the caller expects.
 
-    @abstractmethod
-    def _probe_device_dtype(self) -> tuple[torch.device, torch.dtype]:
-        """Read the encoder parameter device and dtype for warmup inputs."""
-
-    def postprocess(self, result: Any, ctx: Any) -> Any:
-        """Adapt the unpadded output before returning (default: identity)."""
-        return result
-
-    def _invoke_compiled(self, args: tuple[Any, ...], ctx: Any) -> Any:
-        """Call the compiled boundary on ``args`` (default: a plain call).
-
-        A seam for debug paths that must also run the eager boundary for a
-        parity comparison before returning the compiled result.
+        Slices the real token count back out of the bucket, plus any
+        encoder-specific output adaptation.
         """
-        return self.compiled_fn(*args)
-
-    def _bucket_env_var(self) -> str:
-        """Env var whose comma-list overrides the default bucket ladder."""
-        return "SGLANG_TPU_VIT_PRECOMPILE_SIZES"
-
-    def _validate_buckets(self, buckets: list[int]) -> list[int]:
-        """Validate an env-provided bucket ladder (default: perfect squares)."""
-        return _validate_patch_buckets(buckets, self._merge_align())
-
-    def _merge_align(self) -> int:
-        """Spatial-merge alignment for the default perfect-square validation.
-
-        Only reached by subclasses that keep the default ``_validate_buckets``.
-        """
-        raise NotImplementedError(
-            "subclasses using the default _validate_buckets must implement "
-            "_merge_align()"
-        )
 
     def _runner_ready_for_compile(self, runner: Any) -> bool:
         """Whether ``runner``'s attention path supports the compiled boundary."""
@@ -430,8 +391,11 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
 
         runner.run = _run
 
-    def compute_default_buckets(self) -> list[int]:
+    def compute_patch_buckets(self) -> list[int]:
         merge_size = self._merge_align()
+        buckets = _env_patch_buckets("SGLANG_TPU_VIT_PRECOMPILE_SIZES")
+        if buckets is not None:
+            return _validate_patch_buckets(buckets, merge_size)
         max_patches = int(
             os.environ.get(
                 "SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES",
@@ -441,13 +405,12 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
         return _compute_patch_counts(merge_size, max_patches=max_patches)
 
     def make_warmup_inputs(
-        self,
-        patch_count: int,
-        device: torch.device,
-        dtype: torch.dtype,
-        embed_dim: int,
+        self, patch_count: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         vit = self.vit
+        weight = vit.patch_embed.proj.weight
+        device, dtype = weight.device, weight.dtype
+        embed_dim = vit.blocks[0].norm1.normalized_shape[0]
         x = torch.zeros(patch_count, 1, embed_dim, device=device, dtype=dtype)
         grid = int(math.isqrt(patch_count))
         cos, sin = vit.rot_pos_emb([[1, grid, grid]])
@@ -542,21 +505,10 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
         padding = ctx.padding
         if padding.padded:
             result = result[: padding.real_seq_len // padding.merge_sq]
-        return result
-
-    def postprocess(
-        self, result: torch.Tensor, ctx: _Qwen3VLRunContext
-    ) -> torch.Tensor:
+        # Qwen3-VL's caller asks for a subset of the merged output rows.
         if ctx.output_indices is not None:
             result = result.index_select(0, ctx.output_indices)
         return result
-
-    def _probe_embed_dim(self) -> int:
-        return self.vit.blocks[0].norm1.normalized_shape[0]
-
-    def _probe_device_dtype(self) -> tuple[torch.device, torch.dtype]:
-        weight = self.vit.patch_embed.proj.weight
-        return weight.device, weight.dtype
 
     def _merge_align(self) -> int:
         return getattr(self.vit, "spatial_merge_size", 2)

@@ -75,10 +75,16 @@ class TestViTTpuCompileRunner(unittest.TestCase):
     def test_policy_declares_tpu_platform(self):
         self.assertEqual(VisionTpuCompilePolicy.platform, "tpu")
 
-    def test_qwen3_vl_policy_extends_base_and_declares_tpu_platform(self):
+    def test_qwen3_vl_policy_extends_base_and_implements_every_hook(self):
+        # A base hook left unimplemented here would not surface until the policy
+        # is instantiated at install time, i.e. in a serving run.
         self.assertEqual(Qwen3VLVisionTpuCompilePolicy.platform, "tpu")
         self.assertTrue(
             issubclass(Qwen3VLVisionTpuCompilePolicy, VisionTpuCompilePolicy)
+        )
+        self.assertEqual(
+            getattr(Qwen3VLVisionTpuCompilePolicy, "__abstractmethods__", frozenset()),
+            frozenset(),
         )
 
     def test_segment_ids_are_built_from_host_cumulative_lengths(self):
