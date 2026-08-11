@@ -84,6 +84,14 @@ def _cu_seqlens_to_segment_ids(
     return segment_ids.to(device=device, non_blocking=True)
 
 
+@dataclass(frozen=True)
+class VisionPaddingContext:
+    real_seq_len: int
+    bucket_len: int | None
+    padded: bool
+    merge_sq: int
+
+
 class VisionTpuCompilePolicy(CompilePolicy):
     """Model-agnostic compile policy for TPU vision encoders.
 
@@ -315,9 +323,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
 class _Qwen3VLRunContext:
     """Run context threaded from ``prepare_call`` to ``unpad_outputs``."""
 
-    real_seq_len: int
-    padded: bool
-    merge_sq: int
+    padding: VisionPaddingContext
     output_indices: torch.Tensor | None
 
 
@@ -433,9 +439,12 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
             [0, x_3d.shape[0]], device=x_3d.device, dtype=torch.int32
         )
         ctx = _Qwen3VLRunContext(
-            real_seq_len=seq_len,
-            padded=padded,
-            merge_sq=merge_sq,
+            padding=VisionPaddingContext(
+                real_seq_len=seq_len,
+                bucket_len=bucket_len,
+                padded=padded,
+                merge_sq=merge_sq,
+            ),
             output_indices=output_indices,
         )
         return (x_3d, graph_cu_seqlens, cos, sin, segment_ids), ctx
@@ -443,8 +452,9 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
     def unpad_outputs(
         self, result: torch.Tensor, ctx: _Qwen3VLRunContext
     ) -> torch.Tensor:
-        if ctx.padded:
-            result = result[: ctx.real_seq_len // ctx.merge_sq]
+        padding = ctx.padding
+        if padding.padded:
+            result = result[: padding.real_seq_len // padding.merge_sq]
         # Qwen3-VL's caller asks for a subset of the merged output rows.
         if ctx.output_indices is not None:
             result = result.index_select(0, ctx.output_indices)
