@@ -137,6 +137,59 @@ def _dividing_tile_k(base_tile_info):
     return wrapped
 
 
+def _capped_tile_m(base_tile_info, max_tile_m: int):
+    """Wrap a gmm_v2 ``tile_info`` so the resolved ``tile_m`` is at most ``max_tile_m``.
+
+    Why this knob exists. gmm_v2's grid is built per expert group, and a group
+    contributes ``cdiv(group_size + local_offset, tile_m)`` m-iterations with a floor
+    of one whenever it is non-empty -- so the cost is roughly
+    ``(m_tiles + num_groups) * tile_m`` rows of work (see prefill64k/RESULTS.md section
+    3, which measured ~2 us per active expert). ``calculate_tiling`` picks
+    ``tile_m = 128`` for MXU efficiency and only clamps it to ``size_m``, which is the
+    right call when rows dominate. In the *decode* regime it is not: at CONC=128,
+    ``size_m = batch * topk = 1280`` over 64 local experts gives
+    ``(10 + 64) * 128 = 9472`` row-equivalents for 1280 real rows, i.e. 86% of
+    tile-visits are pure group overhead. The waste term is ``num_groups * tile_m``, so
+    it falls linearly with ``tile_m``.
+
+    The trade is that a smaller ``tile_m`` means more m-iterations per group and hence
+    more RHS streaming, and gmm_v2 only triple-buffers the RHS -- so this is a genuine
+    A/B, not a free win. Default off.
+
+    MEASURED AND IT LOSES -- do not re-run the obvious experiment. Qwen3.5-397B-A17B-FP8,
+    TP8/EP8, ISL 8192 / OSL 1024, CONC=128, ``tile_m=16`` vs the kernel's 128:
+
+        median ITL   33.42 -> 34.51  (+3.3%)
+        median TPOT  77.78 -> 97.07  (+25%)
+        median TTFT  428.4 -> 607.2  (+42%)
+        p99 TTFT     33004 -> 47602  (+44%)
+
+    ITL regressed too, not just the prefill-side metrics, so the RHS-streaming cost
+    dominates the avoided group padding: the ``(m_tiles + num_groups) * tile_m`` law
+    counts tile-visits correctly but cost-per-visit is far from constant. The group
+    overhead is real and is NOT attackable by shrinking ``tile_m``. Kept as a tuning
+    surface for other expert-count / topk shapes, not because 128 needs changing here.
+    """
+    import dataclasses
+
+    from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes
+
+    def wrapped(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act=None):
+        if isinstance(base_tile_info, TileSizes):
+            tiles = base_tile_info
+        else:
+            tiles = base_tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+        capped = min(tiles.tile_m, max_tile_m)
+        # Keep it a positive multiple of the 8-row sublane so the kernel's
+        # sublane-alignment reasoning still holds.
+        capped = max(8, (capped // 8) * 8)
+        if capped != tiles.tile_m:
+            tiles = dataclasses.replace(tiles, tile_m=capped)
+        return tiles
+
+    return wrapped
+
+
 def _fuse_act_name(activation_name):
     """Map SGLang's activation name to gmm_v2's ``fuse_act`` string.
 
@@ -177,6 +230,7 @@ def _fused_moe_jax(
     expert_group_offset=0,
     use_sc_gather=0,
     permute_dense_threshold=0,
+    moe_tile_m=0,
 ):
     """Production fused-MoE kernel body. Exported by ``_build_fused_moe_op``.
 
@@ -307,6 +361,8 @@ def _fused_moe_jax(
     # Weights arrive lane-aligned from the loader (bf16: pad activations to
     # match; quantized: unpadded-at-load dims are unsupported)
     gmm1_tiling = _dividing_tile_k(gmm1_tile_info or calculate_tiling)
+    if moe_tile_m > 0:
+        gmm1_tiling = _capped_tile_m(gmm1_tiling, moe_tile_m)
     if w1_scale is None:
         assert w1.shape[1] % 128 == 0, (
             f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight K "
@@ -373,6 +429,8 @@ def _fused_moe_jax(
         )
     # Tile sizes are derived by the kernel's own ``calculate_tiling``.
     gmm2_tiling = _dividing_tile_k(calculate_tiling)
+    if moe_tile_m > 0:
+        gmm2_tiling = _capped_tile_m(gmm2_tiling, moe_tile_m)
     gmm2_out = gmm_v2(
         lhs=gmm1_out,
         rhs=w2,
@@ -520,6 +578,7 @@ def _build_fused_moe_op():
         expert_group_offset: int = 0,
         use_sc_gather: int = 0,
         permute_dense_threshold: int = 0,
+        moe_tile_m: int = 0,
     ) -> jax.Array:
         return _fused_moe_jax(
             hidden_states,
@@ -538,6 +597,7 @@ def _build_fused_moe_op():
             expert_group_offset,
             use_sc_gather,
             permute_dense_threshold,
+            moe_tile_m,
         )
 
     custom_op = cpu_export_jax_op(op_name, _wrapped)
@@ -559,6 +619,7 @@ def _build_fused_moe_op():
         expert_group_offset: int = 0,
         use_sc_gather: int = 0,
         permute_dense_threshold: int = 0,
+        moe_tile_m: int = 0,
     ):
         if no_combine:
             return hidden_states.new_empty(
@@ -623,4 +684,5 @@ def fused_moe_call(
         expert_group_offset,
         int(envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()),
         int(envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD.get()),
+        int(envs.SGLANG_TPU_FUSED_MOE_TILE_M.get()),
     )

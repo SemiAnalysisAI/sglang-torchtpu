@@ -1027,6 +1027,16 @@ class Envs:
     # which the dense matmul path is taken. Suggset to start with 1024 or 2048
     # and tune from there.
     SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
+    # MoE: cap gmm_v2's tile_m. 0 keeps the kernel's own choice (128, clamped to
+    # the routed-row count). gmm_v2 spends roughly (m_tiles + num_groups) * tile_m
+    # rows of work because every non-empty expert group costs at least one
+    # m-iteration, so the waste term scales linearly with tile_m. That is a good
+    # trade when rows dominate and a bad one at decode: batch 128 x topk 10 = 1280
+    # routed rows over 64 local experts is (10 + 64) * 128 = 9472 row-equivalents,
+    # 86% of it group overhead. Lowering tile_m cuts the overhead but adds
+    # m-iterations per group and hence RHS streaming, which gmm_v2 only
+    # triple-buffers -- so this is a tuning knob, not a free win.
+    SGLANG_TPU_FUSED_MOE_TILE_M = EnvInt(0)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)
