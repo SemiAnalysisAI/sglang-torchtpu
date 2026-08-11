@@ -83,8 +83,7 @@ dependencies = [
   "tpu-raiden-torch==0.0.1.dev20260806130316",
   # >=0.0.44 is torch-tpu's floor for the native scan emitter
   # (MIN_LIBTPU_VERSION_WITH_NATIVE_SCAN); below it every cumulative op lowers to
-  # a serial while-loop instead of chlo.ScanOp -- a cumsum over an 8.4M-element
-  # mask takes 28.2s that way vs 0.002s with the emitter on.
+  # a serial while-loop instead of chlo.ScanOp -- a severe perf regression.
   "libtpu==0.0.44.1",
   "torch==2.11.0",
   "torchvision==0.26.0",
