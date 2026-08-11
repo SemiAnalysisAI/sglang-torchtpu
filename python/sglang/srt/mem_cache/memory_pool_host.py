@@ -113,6 +113,10 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
     ):
         assert layout == "page_first_fused", layout
         assert not pin_memory
+        # Upstream HostKVCache packs MTP-draft KV layers behind the target's
+        # (layer_num = target + draft); TPU has no packed draft pools, so the
+        # target layer count is the whole pool.
+        self.target_layer_num = device_pool.layer_num
         super().__init__(
             device_pool,
             host_to_device_ratio,
