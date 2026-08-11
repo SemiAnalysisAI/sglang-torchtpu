@@ -725,7 +725,9 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
         self.assertEqual(config.nvfp4_config.scale_dtype, "float32")
         self.assertEqual(
             config.nvfp4_config.exclude_modules,
-            ["vision", "model.decoder.*"],
+            # "stages.*" joined the hybrid loader's exclude list in the
+            # upstream sync (staged-decoder archs are never FP4-quantized).
+            ["vision", "model.decoder.*", "stages.*"],
         )
         get_quantization_config.assert_called_once_with("modelopt_fp4")
 
