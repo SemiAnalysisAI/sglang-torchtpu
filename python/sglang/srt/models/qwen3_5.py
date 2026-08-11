@@ -97,7 +97,9 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 
+from sglang.srt.compilation.support_torch_compile import support_torch_compile
 from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import get_global_server_args
 
 # Utils
@@ -1701,6 +1703,28 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             loaded_params.add(name)
 
         return loaded_params
+
+
+if current_platform.supports_torch_compile() and envs.SGLANG_TPU_QWEN35_COMPILE.get():
+    from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+        Qwen3VLDecoderTpuCompilePolicy,
+    )
+
+    # Annotate the decoder boundary so TpuGraphRunner installs torch.compile on
+    # it. Both serving paths hold this same module -- Qwen3_5TextForCausalLM as
+    # `self.model`, the multimodal wrapper as `language_model_cls` -- so
+    # annotating here rather than at either wrapper is what makes both compile
+    # (Qwen3_5MoeForCausalLM inherits the attribute). Without it the published
+    # ConditionalGeneration checkpoint runs fully eager even with
+    # --enable-torch-compile.
+    #
+    # Qwen3VLDecoderTpuCompilePolicy subclasses the plain decoder policy and
+    # only diverges when the owner exposes the VL input_embeds path
+    # (`_uses_input_embeds`), so it is correct for both.
+    support_torch_compile(
+        Qwen3_5ForCausalLM,
+        policy=Qwen3VLDecoderTpuCompilePolicy,
+    )
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
