@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+    Qwen3VLVisionTpuCompilePolicy,
     VisionTpuCompilePolicy,
     ViTTpuCompileRunner,
     _cu_seqlens_to_segment_ids,
@@ -73,6 +74,12 @@ def _make_vit(block):
 class TestViTTpuCompileRunner(unittest.TestCase):
     def test_policy_declares_tpu_platform(self):
         self.assertEqual(VisionTpuCompilePolicy.platform, "tpu")
+
+    def test_qwen3_vl_policy_extends_base_and_declares_tpu_platform(self):
+        self.assertEqual(Qwen3VLVisionTpuCompilePolicy.platform, "tpu")
+        self.assertTrue(
+            issubclass(Qwen3VLVisionTpuCompilePolicy, VisionTpuCompilePolicy)
+        )
 
     def test_segment_ids_are_built_from_host_cumulative_lengths(self):
         cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)

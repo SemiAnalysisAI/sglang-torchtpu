@@ -37,7 +37,7 @@ class FakeViTTpuCompileRunner:
     pass
 
 
-class FakeVisionTpuCompilePolicy(CompilePolicy):
+class FakeQwen3VLVisionTpuCompilePolicy(CompilePolicy):
     platform = "tpu"
     backend = "tpu"
 
@@ -56,7 +56,8 @@ def _stub_tpu_modules():
         "sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner"
     )
     vit_module.ViTTpuCompileRunner = FakeViTTpuCompileRunner
-    vit_module.VisionTpuCompilePolicy = FakeVisionTpuCompilePolicy
+    vit_module.VisionTpuCompilePolicy = FakeQwen3VLVisionTpuCompilePolicy
+    vit_module.Qwen3VLVisionTpuCompilePolicy = FakeQwen3VLVisionTpuCompilePolicy
 
     decoder_policy_module = types.ModuleType(
         "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
@@ -96,7 +97,7 @@ class TestQwen3VLTpuCompileAnnotation(CustomTestCase):
                 self.assertEqual(policy.platform, "tpu")
 
                 vision_policy = get_torch_compile_policy(qwen3_vl.Qwen3VLMoeVisionModel)
-                self.assertIs(vision_policy, FakeVisionTpuCompilePolicy)
+                self.assertIs(vision_policy, FakeQwen3VLVisionTpuCompilePolicy)
                 self.assertEqual(vision_policy.platform, "tpu")
                 self.assertIs(
                     qwen3_vl.graph_runners_dict["tpu"], FakeViTTpuCompileRunner

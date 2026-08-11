@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import math
 import os
+from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
@@ -92,7 +94,16 @@ class VisionPaddingContext:
 
 
 class VisionTpuCompilePolicy(CompilePolicy):
-    """Complete compile policy for compiled Qwen3-VL ViT blocks."""
+    """Model-agnostic compile policy for TPU vision encoders.
+
+    Owns the full compile lifecycle -- install, precompile warmup, and the
+    padded ``run`` orchestration -- for any ViT encoder that precompiles fixed
+    patch-count buckets on TPU. Model-specific behavior (bucket ladders, warmup
+    inputs, padding, output unpadding, the serve-entry adapter, and probing the
+    encoder for device/dtype/embed_dim/merge alignment) is expressed through
+    hooks that subclasses override; see ``Qwen3VLVisionTpuCompilePolicy`` for
+    the Qwen3-VL implementation.
+    """
 
     platform = "tpu"
     backend = "tpu"
@@ -107,7 +118,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
         owner: Any | None = None,
         method_name: str = "forward",
         method: Any | None = None,
-        name: str = "qwen3_vl_vit_encoder",
+        name: str | None = None,
         label: str | None = None,
     ) -> None:
         super().__init__(
@@ -135,10 +146,10 @@ class VisionTpuCompilePolicy(CompilePolicy):
         if runner is None:
             logger.warning("VisionTpuCompilePolicy: missing owner; cannot install.")
             return False
-        if not getattr(runner, "_supports_segment_ids", False):
+        if not self._runner_ready_for_compile(runner):
             logger.info(
-                "VisionTpuCompilePolicy: skipped because segment_ids are not "
-                "supported."
+                "VisionTpuCompilePolicy: skipped because the runner does not "
+                "support the compiled boundary."
             )
             return False
 
@@ -162,6 +173,245 @@ class VisionTpuCompilePolicy(CompilePolicy):
         )
         setattr(runner, self.method_name, self.compiled_fn)
 
+        self._install_run_adapter(runner)
+        logger.info(
+            "VisionTpuCompilePolicy: installed %s on %s.%s.",
+            self.name,
+            type(runner).__name__,
+            self.method_name,
+        )
+        return True
+
+    def resolve_patch_buckets(self) -> list[int]:
+        if self._patch_buckets is not None:
+            return self._patch_buckets
+
+        env_val = os.environ.get(self._bucket_env_var(), None)
+        if env_val is not None:
+            if env_val.strip() == "":
+                self._patch_buckets = []
+                return self._patch_buckets
+            buckets = sorted({int(x.strip()) for x in env_val.split(",") if x.strip()})
+            buckets = self._validate_buckets(buckets)
+        else:
+            buckets = self.compute_default_buckets()
+
+        self._patch_buckets = buckets
+        return buckets
+
+    def _bucket_for(self, seq_len: int) -> int | None:
+        for bucket in self.resolve_patch_buckets():
+            if bucket >= seq_len:
+                return bucket
+        return None
+
+    def precompile(self, patch_counts: list[int] | None = None) -> None:
+        """Warm the torch.compile cache for common patch counts."""
+        owner = self.owner
+        runner = self._resolve_runner()
+        if owner is None or runner is None:
+            logger.warning("VisionTpuCompilePolicy.precompile: missing owner.")
+            return
+        if not self._runner_ready_for_compile(runner):
+            logger.info(
+                "VisionTpuCompilePolicy.precompile: skipped because the runner "
+                "does not support the compiled boundary."
+            )
+            return
+
+        if patch_counts is None:
+            patch_counts = self.resolve_patch_buckets()
+        if not patch_counts:
+            logger.info(
+                "VisionTpuCompilePolicy.precompile: no patch counts to warm "
+                "(disabled via SGLANG_TPU_VIT_PRECOMPILE_SIZES='')."
+            )
+            return
+
+        if self.compiled_fn is None:
+            logger.info(
+                "VisionTpuCompilePolicy.precompile: skipped because policy is "
+                "not installed."
+            )
+            return
+
+        device, dtype = self._probe_device_dtype()
+        embed_dim = self._probe_embed_dim()
+
+        logger.info(
+            "VisionTpuCompilePolicy.precompile: warming %d patch counts %s "
+            "(embed_dim=%d).",
+            len(patch_counts),
+            patch_counts,
+            embed_dim,
+        )
+
+        init_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float32)
+        try:
+            with self._precompile_context(), torch.no_grad():
+                for index, patch_count in enumerate(patch_counts):
+                    logger.info(
+                        "VisionTpuCompilePolicy.precompile: [%d/%d] "
+                        "patch_count=%d ...",
+                        index + 1,
+                        len(patch_counts),
+                        patch_count,
+                    )
+                    inputs = self.make_warmup_inputs(
+                        patch_count, device, dtype, embed_dim
+                    )
+                    result = self.compiled_fn(*inputs)
+                    tpu_sync([result], wait=True)
+        finally:
+            torch.set_default_dtype(init_dtype)
+
+        logger.info("VisionTpuCompilePolicy.precompile: done.")
+
+    def run(self, *raw: Any) -> torch.Tensor:
+        runner = self._resolve_runner()
+        if runner is None or self.compiled_fn is None:
+            raise RuntimeError("VisionTpuCompilePolicy.run called before install().")
+
+        args, ctx = self.prepare_call(*raw)
+
+        if not getattr(runner, "_logged_shapes", False):
+            runner._logged_shapes = True
+            logger.info(
+                "VisionTpuCompilePolicy.run: compiled-fn arg shapes=%s",
+                tuple(
+                    tuple(a.shape) if isinstance(a, torch.Tensor) else None
+                    for a in args
+                ),
+            )
+
+        result = self._invoke_compiled(args, ctx)
+        result = self.unpad_outputs(result, ctx)
+        return self.postprocess(result, ctx)
+
+    # --- Model-specific hooks -------------------------------------------------
+    # Subclasses override these to describe one vision encoder. The generic
+    # lifecycle above calls them; it never reads encoder attributes directly.
+
+    @abstractmethod
+    def compute_default_buckets(self) -> list[int]:
+        """Non-env default patch-count bucket ladder for this encoder."""
+
+    @abstractmethod
+    def make_warmup_inputs(
+        self,
+        patch_count: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        embed_dim: int,
+    ) -> tuple[Any, ...]:
+        """Build the compiled-fn argument tuple for a warmup patch count."""
+
+    @abstractmethod
+    def prepare_call(self, *raw: Any) -> tuple[tuple[Any, ...], Any]:
+        """Adapt caller inputs into the compiled-fn arg tuple + a run context.
+
+        Returns ``(args, ctx)``: ``args`` is splatted into ``self.compiled_fn``;
+        ``ctx`` is threaded through ``unpad_outputs`` and ``postprocess``. This is
+        the single model-specific seam for the compiled call -- padding, segment
+        IDs, and any eager pre-embedding all happen here.
+        """
+
+    # ``unpad_outputs`` stays abstract (declared on ``CompilePolicy``): it slices
+    # the padded compiled output back to the real token count for this encoder.
+
+    @abstractmethod
+    def _probe_embed_dim(self) -> int:
+        """Read the encoder embedding dim used to size warmup inputs."""
+
+    @abstractmethod
+    def _probe_device_dtype(self) -> tuple[torch.device, torch.dtype]:
+        """Read the encoder parameter device and dtype for warmup inputs."""
+
+    def postprocess(self, result: Any, ctx: Any) -> Any:
+        """Adapt the unpadded output before returning (default: identity)."""
+        return result
+
+    def _invoke_compiled(self, args: tuple[Any, ...], ctx: Any) -> Any:
+        """Call the compiled boundary on ``args`` (default: a plain call).
+
+        A seam for debug paths that must also run the eager boundary for a
+        parity comparison before returning the compiled result.
+        """
+        return self.compiled_fn(*args)
+
+    def _bucket_env_var(self) -> str:
+        """Env var whose comma-list overrides the default bucket ladder."""
+        return "SGLANG_TPU_VIT_PRECOMPILE_SIZES"
+
+    def _validate_buckets(self, buckets: list[int]) -> list[int]:
+        """Validate an env-provided bucket ladder (default: perfect squares)."""
+        return _validate_patch_buckets(buckets, self._merge_align())
+
+    def _merge_align(self) -> int:
+        """Spatial-merge alignment for the default perfect-square validation.
+
+        Only reached by subclasses that keep the default ``_validate_buckets``.
+        """
+        raise NotImplementedError(
+            "subclasses using the default _validate_buckets must implement "
+            "_merge_align()"
+        )
+
+    def _runner_ready_for_compile(self, runner: Any) -> bool:
+        """Whether ``runner``'s attention path supports the compiled boundary."""
+        return getattr(runner, "_supports_segment_ids", False)
+
+    def _precompile_context(self):
+        """Context manager wrapping the warmup loop (default: no-op).
+
+        Subclasses whose compiled boundary must be traced under a specific
+        runtime state (e.g. a ForwardContext) override this so warmup matches
+        serving and does not recompile on the first real request.
+        """
+        return contextlib.nullcontext()
+
+    def _install_run_adapter(self, runner: Any) -> None:
+        """Wire the serve entry point onto ``runner`` (default: no-op).
+
+        Subclasses that must adapt the caller's ``run`` signature to
+        ``self.run`` replace ``runner.run`` here.
+        """
+
+
+@dataclass(frozen=True)
+class _Qwen3VLRunContext:
+    """Run context threaded through a Qwen3-VL compiled ViT call."""
+
+    padding: VisionPaddingContext
+    output_indices: torch.Tensor | None
+
+
+class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
+    """Compile policy for compiled Qwen3-VL ViT blocks."""
+
+    def __init__(
+        self,
+        vit: Any | None = None,
+        *,
+        model_runner: Any | None = None,
+        owner: Any | None = None,
+        method_name: str = "forward",
+        method: Any | None = None,
+        name: str = "qwen3_vl_vit_encoder",
+        label: str | None = None,
+    ) -> None:
+        super().__init__(
+            vit,
+            model_runner=model_runner,
+            owner=owner,
+            method_name=method_name,
+            method=method,
+            name=name,
+            label=label,
+        )
+
+    def _install_run_adapter(self, runner: Any) -> None:
         def _run(
             x: torch.Tensor,
             cu_seqlens: torch.Tensor,
@@ -176,17 +426,20 @@ class VisionTpuCompilePolicy(CompilePolicy):
                 cu_seqlens,
                 rotary_pos_emb_cos,
                 rotary_pos_emb_sin,
-                output_indices=output_indices,
+                output_indices,
             )
 
         runner.run = _run
-        logger.info(
-            "VisionTpuCompilePolicy: installed %s on %s.%s.",
-            self.name,
-            type(runner).__name__,
-            self.method_name,
+
+    def compute_default_buckets(self) -> list[int]:
+        merge_size = self._merge_align()
+        max_patches = int(
+            os.environ.get(
+                "SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES",
+                str(_DEFAULT_MAX_PATCHES),
+            )
         )
-        return True
+        return _compute_patch_counts(merge_size, max_patches=max_patches)
 
     def make_warmup_inputs(
         self,
@@ -209,7 +462,26 @@ class VisionTpuCompilePolicy(CompilePolicy):
 
         return x, cu_seqlens, cos, sin, segment_ids
 
-    def pad_inputs(
+    def prepare_call(
+        self,
+        x_3d: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        output_indices: torch.Tensor | None = None,
+    ) -> tuple[tuple[torch.Tensor, ...], _Qwen3VLRunContext]:
+        (
+            x_3d,
+            graph_cu_seqlens,
+            cos,
+            sin,
+            segment_ids,
+            padding,
+        ) = self._pad_inputs(x_3d, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin)
+        ctx = _Qwen3VLRunContext(padding=padding, output_indices=output_indices)
+        return (x_3d, graph_cu_seqlens, cos, sin, segment_ids), ctx
+
+    def _pad_inputs(
         self,
         x_3d: torch.Tensor,
         cu_seqlens: torch.Tensor,
@@ -266,151 +538,29 @@ class VisionTpuCompilePolicy(CompilePolicy):
         return x_3d, graph_cu_seqlens, cos, sin, segment_ids, context
 
     def unpad_outputs(
-        self, result: torch.Tensor, context: VisionPaddingContext
+        self, result: torch.Tensor, ctx: _Qwen3VLRunContext
     ) -> torch.Tensor:
-        if context.padded:
-            result = result[: context.real_seq_len // context.merge_sq]
+        padding = ctx.padding
+        if padding.padded:
+            result = result[: padding.real_seq_len // padding.merge_sq]
         return result
 
-    def resolve_patch_buckets(self) -> list[int]:
-        if self._patch_buckets is not None:
-            return self._patch_buckets
-
-        env_val = os.environ.get("SGLANG_TPU_VIT_PRECOMPILE_SIZES", None)
-        if env_val is not None:
-            if env_val.strip() == "":
-                self._patch_buckets = []
-                return self._patch_buckets
-            buckets = sorted({int(x.strip()) for x in env_val.split(",") if x.strip()})
-            buckets = _validate_patch_buckets(
-                buckets, getattr(self.vit, "spatial_merge_size", 2)
-            )
-        else:
-            merge_size = getattr(self.vit, "spatial_merge_size", 2)
-            max_patches = int(
-                os.environ.get(
-                    "SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES",
-                    str(_DEFAULT_MAX_PATCHES),
-                )
-            )
-            buckets = _compute_patch_counts(merge_size, max_patches=max_patches)
-
-        self._patch_buckets = buckets
-        return buckets
-
-    def _bucket_for(self, seq_len: int) -> int | None:
-        for bucket in self.resolve_patch_buckets():
-            if bucket >= seq_len:
-                return bucket
-        return None
-
-    def precompile(self, patch_counts: list[int] | None = None) -> None:
-        """Warm the torch.compile cache for common patch counts."""
-        owner = self.owner
-        runner = self._resolve_runner()
-        if owner is None or runner is None:
-            logger.warning("VisionTpuCompilePolicy.precompile: missing owner.")
-            return
-        if not getattr(runner, "_supports_segment_ids", False):
-            logger.info(
-                "VisionTpuCompilePolicy.precompile: skipped because segment_ids "
-                "are not supported."
-            )
-            return
-
-        if patch_counts is None:
-            patch_counts = self.resolve_patch_buckets()
-        if not patch_counts:
-            logger.info(
-                "VisionTpuCompilePolicy.precompile: no patch counts to warm "
-                "(disabled via SGLANG_TPU_VIT_PRECOMPILE_SIZES='')."
-            )
-            return
-
-        if self.compiled_fn is None:
-            logger.info(
-                "VisionTpuCompilePolicy.precompile: skipped because policy is "
-                "not installed."
-            )
-            return
-
-        vit = self.vit
-        device = vit.patch_embed.proj.weight.device
-        dtype = vit.patch_embed.proj.weight.dtype
-        embed_dim = vit.blocks[0].norm1.normalized_shape[0]
-
-        logger.info(
-            "VisionTpuCompilePolicy.precompile: warming %d patch counts %s "
-            "(embed_dim=%d).",
-            len(patch_counts),
-            patch_counts,
-            embed_dim,
-        )
-
-        init_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(torch.float32)
-        try:
-            with torch.no_grad():
-                for index, patch_count in enumerate(patch_counts):
-                    logger.info(
-                        "VisionTpuCompilePolicy.precompile: [%d/%d] "
-                        "patch_count=%d ...",
-                        index + 1,
-                        len(patch_counts),
-                        patch_count,
-                    )
-                    inputs = self.make_warmup_inputs(
-                        patch_count, device, dtype, embed_dim
-                    )
-                    result = self.compiled_fn(*inputs)
-                    tpu_sync([result], wait=True)
-        finally:
-            torch.set_default_dtype(init_dtype)
-
-        logger.info("VisionTpuCompilePolicy.precompile: done.")
-
-    def run(
-        self,
-        x_3d: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary_pos_emb_cos: torch.Tensor,
-        rotary_pos_emb_sin: torch.Tensor,
-        output_indices: torch.Tensor | None = None,
+    def postprocess(
+        self, result: torch.Tensor, ctx: _Qwen3VLRunContext
     ) -> torch.Tensor:
-        runner = self._resolve_runner()
-        if runner is None or self.compiled_fn is None:
-            raise RuntimeError("VisionTpuCompilePolicy.run called before install().")
-        (
-            x_3d,
-            graph_cu_seqlens,
-            cos,
-            sin,
-            segment_ids,
-            context,
-        ) = self.pad_inputs(x_3d, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin)
-
-        if not getattr(runner, "_logged_shapes", False):
-            runner._logged_shapes = True
-            logger.info(
-                "ViTTpuCompileRunner.run: seq_len=%d bucket=%s padded=%s "
-                "x=%s cos=%s sin=%s seg=%s cu=%s",
-                context.real_seq_len,
-                context.bucket_len,
-                context.padded,
-                tuple(x_3d.shape),
-                tuple(cos.shape),
-                tuple(sin.shape),
-                tuple(segment_ids.shape),
-                tuple(graph_cu_seqlens.shape),
-            )
-
-        result = self.compiled_fn(x_3d, graph_cu_seqlens, cos, sin, segment_ids)
-        result = self.unpad_outputs(result, context)
-
-        if output_indices is not None:
-            result = result.index_select(0, output_indices)
-
+        if ctx.output_indices is not None:
+            result = result.index_select(0, ctx.output_indices)
         return result
+
+    def _probe_embed_dim(self) -> int:
+        return self.vit.blocks[0].norm1.normalized_shape[0]
+
+    def _probe_device_dtype(self) -> tuple[torch.device, torch.dtype]:
+        weight = self.vit.patch_embed.proj.weight
+        return weight.device, weight.dtype
+
+    def _merge_align(self) -> int:
+        return getattr(self.vit, "spatial_merge_size", 2)
 
 
 class ViTTpuCompileRunner:
