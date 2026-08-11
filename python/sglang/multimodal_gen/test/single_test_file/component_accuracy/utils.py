@@ -864,7 +864,9 @@ def run_native_component_accuracy_case(
     )
 
 
-def run_text_encoder_accuracy_case(engine_cls: Any, case: Any, num_devices: int) -> None:
+def run_text_encoder_accuracy_case(
+    engine_cls: Any, case: Any, num_devices: int
+) -> None:
     _run_staged_text_encoder_accuracy_case(engine_cls, case, num_devices)
 
 

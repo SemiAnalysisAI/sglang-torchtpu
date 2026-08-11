@@ -609,11 +609,13 @@ class SamplingParams:
                     if self.num_frames_round_down:
                         # Ensure we have at least 1 batch per GPU
                         new_latent_num_frames = (
-                            max(1, (orig_latent_num_frames // num_devices)) * num_devices
+                            max(1, (orig_latent_num_frames // num_devices))
+                            * num_devices
                         )
                     else:
                         new_latent_num_frames = (
-                            math.ceil(orig_latent_num_frames / num_devices) * num_devices
+                            math.ceil(orig_latent_num_frames / num_devices)
+                            * num_devices
                         )
 
                     if use_temporal_scaling_frames:

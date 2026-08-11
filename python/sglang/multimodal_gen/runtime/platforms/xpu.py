@@ -90,7 +90,9 @@ class XpuPlatform(Platform):
 
         num_devices = torch.xpu.device_count()
         if device_id < 0 or device_id >= num_devices:
-            raise ValueError(f"Invalid XPU device_id={device_id}. num_devices={num_devices}")
+            raise ValueError(
+                f"Invalid XPU device_id={device_id}. num_devices={num_devices}"
+            )
 
         current = torch.xpu.current_device()
         if current != device_id:

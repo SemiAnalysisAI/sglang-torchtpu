@@ -38,10 +38,10 @@ from sglang.multimodal_gen.runtime.ipc_array import (
     spill_large_arrays_to_file_refs,
 )
 from sglang.multimodal_gen.runtime.managers.cpu_worker import CPUWorker
+from sglang.multimodal_gen.runtime.managers.device_worker import DeviceWorker
 from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
     BatchAdmissionController,
 )
-from sglang.multimodal_gen.runtime.managers.device_worker import DeviceWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     BatchMetricsWindow,

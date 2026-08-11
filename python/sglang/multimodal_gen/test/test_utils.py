@@ -1092,7 +1092,11 @@ def get_consistency_gt_remote_files(
         return files
 
     return _remote_consistency_gt_candidates(
-        SGL_TEST_FILES_CONSISTENCY_GT_BASE, case_id, num_devices, is_video, output_format
+        SGL_TEST_FILES_CONSISTENCY_GT_BASE,
+        case_id,
+        num_devices,
+        is_video,
+        output_format,
     )
 
 
@@ -1316,7 +1320,9 @@ def _get_consistency_gt_cache_key(
     gt_dir = _get_consistency_gt_dir()
     source = str(gt_dir) if gt_dir is not None else "remote"
     platform = get_consistency_platform()
-    return f"{platform}:{case_id}:{num_devices}:{is_video}:{output_format or ''}:{source}"
+    return (
+        f"{platform}:{case_id}:{num_devices}:{is_video}:{output_format or ''}:{source}"
+    )
 
 
 def load_consistency_gt(
@@ -1955,7 +1961,9 @@ def save_consistency_failure_artifact(
     records = [
         item
         for item in records
-        if not (item.get("case_id") == case_id and item.get("num_devices") == num_devices)
+        if not (
+            item.get("case_id") == case_id and item.get("num_devices") == num_devices
+        )
     ]
     records.append(record)
     summary_path.write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
