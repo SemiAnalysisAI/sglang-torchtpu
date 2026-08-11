@@ -81,7 +81,13 @@ dependencies = [
   # connector (sglang/srt/disaggregation/raiden/) and the raiden HiCache
   # transfer backend (sglang/srt/hardware_backend/tpu/raiden_transfer.py).
   "tpu-raiden-torch==0.0.1.dev20260806130316",
-  "libtpu==0.0.42.1",
+  # >=0.0.44 is torch-tpu's floor for the native scan emitter
+  # (MIN_LIBTPU_VERSION_WITH_NATIVE_SCAN); below it every cumulative op lowers to
+  # a serial while-loop instead of chlo.ScanOp. Deliberately ahead of the libtpu
+  # that jax 0.10.2's `tpu` extra pins (0.0.42.*): jax only enforces a lower bound
+  # on libtpu (pallas/mosaic rejects libtpu older than its own release window), so
+  # running libtpu ahead of jax is the supported direction.
+  "libtpu==0.0.44.1",
   "torch==2.11.0",
   "torchvision==0.26.0",
   "jax==0.10.2",
