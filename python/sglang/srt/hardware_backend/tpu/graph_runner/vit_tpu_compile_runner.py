@@ -47,20 +47,6 @@ def _compute_patch_counts(
     return counts
 
 
-def _env_patch_buckets(env_var: str) -> list[int] | None:
-    """Parse a comma-separated patch-bucket override out of ``env_var``.
-
-    Returns ``None`` when unset (use the computed ladder) and ``[]`` when set but
-    empty (precompile disabled).
-    """
-    env_val = os.environ.get(env_var, None)
-    if env_val is None:
-        return None
-    if env_val.strip() == "":
-        return []
-    return sorted({int(x.strip()) for x in env_val.split(",") if x.strip()})
-
-
 def _validate_patch_buckets(buckets: list[int], merge_size: int) -> list[int]:
     merge_sq = merge_size**2
     for bucket in buckets:
@@ -288,8 +274,8 @@ class VisionTpuCompilePolicy(CompilePolicy):
     def compute_patch_buckets(self) -> list[int]:
         """Patch-count bucket ladder for this encoder (cached by the caller).
 
-        Owns any env override the encoder honors; ``_env_patch_buckets`` parses
-        the usual comma-list form. Return ``[]`` to disable precompile.
+        Owns any env override the encoder honors. Return ``[]`` to disable
+        precompile.
         """
 
     @abstractmethod
@@ -402,8 +388,11 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
 
     def compute_patch_buckets(self) -> list[int]:
         merge_size = self._merge_align()
-        buckets = _env_patch_buckets("SGLANG_TPU_VIT_PRECOMPILE_SIZES")
-        if buckets is not None:
+        # Set but empty disables precompile: the comprehension yields [], which
+        # validates trivially and warms nothing.
+        env_val = os.environ.get("SGLANG_TPU_VIT_PRECOMPILE_SIZES", None)
+        if env_val is not None:
+            buckets = sorted({int(x.strip()) for x in env_val.split(",") if x.strip()})
             return _validate_patch_buckets(buckets, merge_size)
         max_patches = int(
             os.environ.get(
