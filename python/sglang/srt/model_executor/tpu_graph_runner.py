@@ -84,9 +84,8 @@ def _resolve_fused_op_dispatch(model: Any) -> None:
     from sglang.kernels.fused_op import BaseFusedOp, get_fused_op_backend
     from sglang.kernels.registry import registry
 
-    # The module-level forced-backend sentinel is likewise resolved on first
-    # forward (``if forced is _UNRESOLVED`` guards the traced code); resolve
-    # it eagerly so no variant bakes the unresolved state.
+    # TODO: drop if upstream resolves the forced-backend sentinel at import
+    # or construction time instead of on first forward.
     get_fused_op_backend()
 
     def _resolve(op: BaseFusedOp) -> None:
