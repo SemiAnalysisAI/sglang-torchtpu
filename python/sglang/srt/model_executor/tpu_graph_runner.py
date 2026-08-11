@@ -81,8 +81,13 @@ def _resolve_fused_op_dispatch(model: Any) -> None:
     kernel registry (``target`` is ``"module:INSTANCE.method"``)."""
     import importlib
 
-    from sglang.kernels.fused_op import BaseFusedOp
+    from sglang.kernels.fused_op import BaseFusedOp, get_fused_op_backend
     from sglang.kernels.registry import registry
+
+    # The module-level forced-backend sentinel is likewise resolved on first
+    # forward (``if forced is _UNRESOLVED`` guards the traced code); resolve
+    # it eagerly so no variant bakes the unresolved state.
+    get_fused_op_backend()
 
     def _resolve(op: BaseFusedOp) -> None:
         if getattr(op, "_forward_method", object()) is None:
