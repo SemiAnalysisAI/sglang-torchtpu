@@ -36,7 +36,6 @@ The ``batched_tokens_bucket`` is derived from the *static, 128-padded*
 the same padded quantity so emitted keys match the reader.
 """
 
-import jax
 import jax.numpy as jnp
 
 from sglang.srt.layers.attention.pallas.stacked_rpa import configs
