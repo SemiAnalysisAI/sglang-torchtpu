@@ -759,6 +759,9 @@ class TestPrepareForPrebuiltTpuPadding(CustomTestCase):
                 req.is_retracted = False
                 req.multimodal_inputs = None
                 req.sampling_params = SamplingParams()
+                # Upstream SamplingBatchInfo.from_schedule_batch reads this
+                # per-req flag (Req default: False).
+                req.return_sampling_mask = False
 
                 self.reqs = [req]
                 self.req_to_token_pool = SimpleNamespace(
