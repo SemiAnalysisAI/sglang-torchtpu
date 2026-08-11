@@ -60,13 +60,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
     _is_musa,
-<<<<<<< HEAD
     _is_tpu,
-    _use_aiter,
-    _use_aiter_bpreshuffle_gfx95,
-    _use_aiter_gfx95,
-=======
->>>>>>> upstream/main
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (

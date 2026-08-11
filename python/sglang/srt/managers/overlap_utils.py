@@ -6,16 +6,11 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
-<<<<<<< HEAD
 from sglang.srt.speculative.spec_utils import gather_spec_extras_func
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
 
 _is_tpu = is_tpu()
-=======
-from sglang.srt.utils import is_cuda, is_hip, is_npu
->>>>>>> upstream/main
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -122,7 +117,6 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
         future_map._resolve_spec_extras(batch)
 
 
-<<<<<<< HEAD
 # Device types whose backend bakes a Python-int index as a compile-time constant
 # (e.g. torch_tpu / XLA), so indexing a buffer with a slice or int recompiles the
 # graph per distinct value. On these the FutureMap keeps its circular-buffer write
@@ -140,7 +134,8 @@ def _device_use_dynamic_index(device: torch.device) -> bool:
     """
     dev_type = device.type if hasattr(device, "type") else str(device).split(":")[0]
     return any(dev_type == known for known in _DYNAMIC_INDEX_DEVICE_TYPES)
-=======
+
+
 CONFIDENCE_RELAY_RING_LAG: int = 2
 CONFIDENCE_RELAY_RING_DEPTH: int = CONFIDENCE_RELAY_RING_LAG + 1
 
@@ -149,7 +144,6 @@ class ResolvedConfidence(msgspec.Struct):
 
     confidence: torch.Tensor
     generation: torch.Tensor
->>>>>>> upstream/main
 
 
 @dataclass
@@ -534,16 +528,12 @@ class FutureMap:
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
-<<<<<<< HEAD
         self._store(
             self.new_seq_lens_buf, indices, new_seq_lens.to(self.new_seq_lens_buf.dtype)
         )
-=======
-        self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
             self.confidence_relay.scatter(indices, confidence)
->>>>>>> upstream/main
         # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
         if self.spec_algo.is_some():
             device_module = torch.get_device_module(self.device)
@@ -572,16 +562,11 @@ class FutureMap:
             return
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(payload)
-<<<<<<< HEAD
+        self._maybe_init_dsa_topk_indices_buf(payload)
         self._store(
             self.output_tokens_buf,
             indices,
             payload.bonus_tokens.to(self.output_tokens_buf.dtype),
-=======
-        self._maybe_init_dsa_topk_indices_buf(payload)
-        self.output_tokens_buf[indices] = payload.bonus_tokens.to(
-            self.output_tokens_buf.dtype
->>>>>>> upstream/main
         )
 
         if self.need_topk:

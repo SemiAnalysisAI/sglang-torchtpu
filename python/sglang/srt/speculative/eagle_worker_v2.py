@@ -45,9 +45,6 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
-<<<<<<< HEAD
-from sglang.srt.platforms import current_platform
-=======
 from sglang.srt.runtime_context import (
     get_context,
     get_exec,
@@ -55,7 +52,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
->>>>>>> upstream/main
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -91,12 +87,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_sample,
-<<<<<<< HEAD
-    fill_bonus_tokens_func,
-    generate_token_bitmask,
-=======
     get_plan_stream,
->>>>>>> upstream/main
     load_token_map,
     renorm_draft_probs,
     sample_draft_proposal,
@@ -134,22 +125,6 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 
-<<<<<<< HEAD
-def _get_plan_stream(
-    device: str,
-) -> Tuple[any, contextlib.AbstractContextManager]:
-    if not current_platform.supports_overlap_streams():
-        return None, contextlib.nullcontext()
-    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
-        plan_stream = torch.get_device_module(device).Stream()
-        plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
-        return plan_stream, plan_stream_ctx
-    else:
-        return None, contextlib.nullcontext()
-
-
-=======
->>>>>>> upstream/main
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -373,16 +348,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-<<<<<<< HEAD
         # TPU sets disable_cuda_graph after cuda_graph_config is parsed, so the
         # decode backend can remain Backend.FULL even though capture is disabled.
         if self.server_args.disable_cuda_graph:
             return
 
-        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
-=======
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
->>>>>>> upstream/main
             return
 
         if get_model().model_impl == "mindspore":
@@ -1550,114 +1521,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             grammar_barrier=grammar_barrier,
         )
 
-<<<<<<< HEAD
-        if not batch.forward_mode.is_idle():
-            accept_tokens = predict[accept_index]
-            bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
-            # stride = accept_tokens per-req width = accept_index.shape[1]
-            # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
-            fill_bonus_tokens_func(
-                accept_tokens,
-                accept_lens,
-                bonus_tokens,
-                accept_index.shape[1],
-            )
-        else:
-            bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
-
-        if batch.return_logprob and not batch.forward_mode.is_idle():
-            compute_spec_v2_logprobs(
-                batch, logits_output, predict, accept_index, self.speculative_num_steps
-            )
-
-        if not batch.forward_mode.is_idle() and self.topk > 1:
-            # topk == 1 needs nothing here: the accepted path is already the front
-            # chain, so the whole compaction is an identity transform.
-            predict = self._finalize_accept_tree_path(
-                batch, accept_index, accept_lens, predict, logits_output, bs
-            )
-
-        next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
-
-        # verify_forward_batch transitively holds verify-time GPU tensors
-        # (draft_token / out_cache_loc / ...) that must outlive the imminent
-        # batch.input_ids rebind in prepare_for_draft_extend.
-        # Scheduler pins it in batch_record_buf for the 2-iter window.
-        return GenerationBatchResult(
-            logits_output=logits_output,
-            next_token_ids=predict,
-            can_run_cuda_graph=can_run_cuda_graph,
-            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
-            next_draft_input=next_draft_input,
-            accept_lens=accept_lens,
-            new_seq_lens=new_seq_lens,
-            routed_experts_output=forward_batch_output.routed_experts_output,
-            indexer_topk_output=forward_batch_output.indexer_topk_output,
-            extra_keep_alive_refs=[verify_forward_batch],
-        )
-
-    def _finalize_accept_tree_path(
-        self,
-        batch: ScheduleBatch,
-        accept_index: torch.Tensor,
-        accept_lens: torch.Tensor,
-        predict: torch.Tensor,
-        logits_output,
-        bs: int,
-    ) -> torch.Tensor:
-        """Tree drafting (topk > 1): move the accepted path -- KV slots, predict,
-        hidden_states -- to the contiguous front of each per-req block, which the
-        downstream chain-layout code (draft-extend select_index, committed-KV reads)
-        assumes. Returns compacted predict; mutates logits_output.hidden_states
-        (moved only when present)."""
-        move_accept_tokens_to_target_kvcache(
-            batch, accept_index, accept_lens - 1, self.token_to_kv_pool_allocator
-        )
-        predict = self._compact_accept_to_front(predict, accept_index, bs)
-        if logits_output.hidden_states is not None:
-            logits_output.hidden_states = self._compact_accept_to_front(
-                logits_output.hidden_states, accept_index, bs
-            )
-        return predict
-
-    def _compact_accept_to_front(
-        self, x: torch.Tensor, accept_index: torch.Tensor, bs: int
-    ) -> torch.Tensor:
-        """Gather the accepted tree path to the front of each per-req block.
-
-        ``x`` is node-indexed over the whole tree (``[bs * num_draft_tokens, ...]``),
-        ``accept_index`` is ``[bs, spec_steps + 1]`` global node indices (-1 padded).
-        Padded entries clamp to node 0 but land past accept_lens (never read);
-        trailing unaccepted slots stay and are freed as overshoot.
-        """
-        nd = self.speculative_num_draft_tokens
-        s1 = accept_index.shape[1]  # spec_steps + 1
-        safe = accept_index.to(torch.int64).clamp(min=0).reshape(-1)
-        gathered = x[safe]
-        out = x.clone()
-        out.view(bs, nd, *x.shape[1:])[:, :s1] = gathered.view(bs, s1, *x.shape[1:])
-        return out
-
-    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        success, message = self._draft_worker.draft_runner.update_weights_from_disk(
-            recv_req.model_path,
-            recv_req.load_format,
-            recapture_cuda_graph=recv_req.recapture_cuda_graph,
-        )
-        if not success:
-            return success, message
-        return True, "Succeeded to update model weights."
-
-    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        success, message = self._draft_worker.draft_runner.update_weights_from_ipc(
-            recv_req
-        )
-        if not success:
-            return success, message
-        return True, "Succeeded to update model weights."
-
-=======
->>>>>>> upstream/main
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()
         named_tensors = MultiprocessingSerializer.deserialize(

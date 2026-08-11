@@ -270,13 +270,10 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "aiter",
     "marlin",
-<<<<<<< HEAD
-    "pallas_tpu_fused_rs",
-=======
     "humming",
     "experimental_sgl_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
->>>>>>> upstream/main
+    "pallas_tpu_fused_rs",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -2051,14 +2048,11 @@ class ServerArgs:
     enable_torch_compile_debug_mode: A[
         bool, "Enable debug mode for torch compile", NS("exec.graph")
     ] = False
-<<<<<<< HEAD
-    enable_torch_compile_debug_mode: A[bool, "Enable debug mode for torch compile"] = (
-        False
-    )
     unsafe_save_torch_compile_bundle: A[
         Optional[str],
         "Directory in which to save per-rank torch.compile bundles after warmup. "
         "Leave both bundle flags unset to use torch.compile normally.",
+        NS("exec.graph"),
     ] = None
     unsafe_load_torch_compile_bundle: A[
         Optional[str],
@@ -2067,16 +2061,13 @@ class ServerArgs:
         "by an SGLang server with the same setup as the one in which it was saved. "
         "Only load bundles from trusted sources because compiler artifacts may "
         "execute arbitrary code.",
+        NS("exec.graph"),
     ] = None
     torch_compile_max_bs: A[
         Optional[int],
         "Set the maximum batch size when using torch compile.",
+        NS("exec.graph"),
     ] = None
-=======
-    torch_compile_max_bs: A[
-        int, "Set the maximum batch size when using torch compile.", NS("exec.graph")
-    ] = 32
->>>>>>> upstream/main
     torchao_config: A[
         str,
         "Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
@@ -5460,33 +5451,6 @@ class ServerArgs:
         elif model_arch in ["GptOssForCausalLM"]:
             # Attention backend selection + XPU dtype validation moved to the
             # override registry (arg_groups/overrides.py: _gpt_oss_overrides).
-<<<<<<< HEAD
-
-            supported_backends = [
-                "triton",
-                "trtllm_mha",
-                "fa3",
-                "fa4",
-                "ascend",
-                "intel_amx",
-                "intel_xpu",
-                "aiter",
-                # TPU
-                "pallas_tpu_rpa_v3",
-                "pallas_tpu_rpa_batched",
-            ]
-            prefill_attn_backend, decode_attn_backend = (
-                self._resolved_attention_backends()
-            )
-            assert (
-                prefill_attn_backend in supported_backends
-                and decode_attn_backend in supported_backends
-            ), (
-                f"GptOssForCausalLM requires one of {supported_backends} attention backend, but got the following backends\n"
-                f"- Prefill: {prefill_attn_backend}\n"
-                f"- Decode: {decode_attn_backend}\n"
-            )
-=======
             # Exempt MLX only: none of these backends exist on MPS, and MLX runs
             # attention inside its own runner, so attention_backend is still
             # unset here.  Plain macOS stays on the list -- torch_native has
@@ -5501,6 +5465,9 @@ class ServerArgs:
                     "intel_amx",
                     "intel_xpu",
                     "aiter",
+                    # TPU
+                    "pallas_tpu_rpa_v3",
+                    "pallas_tpu_rpa_batched",
                 ]
                 prefill_attn_backend, decode_attn_backend = (
                     self._resolved_attention_backends()
@@ -5513,7 +5480,6 @@ class ServerArgs:
                     f"- Prefill: {prefill_attn_backend}\n"
                     f"- Decode: {decode_attn_backend}\n"
                 )
->>>>>>> upstream/main
 
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"
@@ -9005,23 +8971,16 @@ class ServerArgs:
             )
 
     def check_server_args(self):
-<<<<<<< HEAD
         # Check parallel size constraints. nnodes=0 is the Ray auto-detect
         # sentinel (TPU only): the real count is resolved from the live cluster
         # at scheduler launch, so defer the divisibility check until then.
         assert self.nnodes >= 1 or (
             self.use_ray and self.device == "tpu"
         ), "nnodes=0 (auto-detect) is only valid with --use-ray on TPU"
-        assert (
-            self.nnodes == 0 or (self.tp_size * self.pp_size) % self.nnodes == 0
-        ), "tp_size must be divisible by number of nodes"
-=======
-        # Check parallel size constraints
         if self.ep_join_mode != "scale":
             assert (
-                self.tp_size * self.pp_size
-            ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
->>>>>>> upstream/main
+                self.nnodes == 0 or (self.tp_size * self.pp_size) % self.nnodes == 0
+            ), "tp_size must be divisible by number of nodes"
 
         assert (
             self.pp_max_micro_batch_size is None or self.pp_max_micro_batch_size >= 1

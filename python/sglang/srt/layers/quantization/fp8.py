@@ -12,17 +12,13 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-<<<<<<< HEAD
-from sglang.srt.distributed import get_tensor_model_parallel_rank, get_tp_group
-=======
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
-from sglang.srt.distributed import get_tp_group
->>>>>>> upstream/main
+from sglang.srt.distributed import get_tensor_model_parallel_rank, get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -618,7 +614,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 output_size,
                 output_size_per_partition,
                 output_partition_sizes,
-                skip_block_quant_check or (_is_tpu and not self.use_mxfp8),
+                skip_block_quant_check or (_is_tpu and not use_mxfp8),
             )
         else:
             block_n, block_k = None, None
@@ -646,7 +642,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
                 scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
                 scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
-                if _is_tpu and not self.use_mxfp8:
+                if _is_tpu and not use_mxfp8:
                     tp_rank = get_tensor_model_parallel_rank()
                     output_tp_rank = (
                         tp_rank if output_size != output_size_per_partition else 0
@@ -1165,7 +1161,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-<<<<<<< HEAD
         if _is_tpu and not self.block_quant and not self.use_mxfp8:
             from sglang.srt.hardware_backend.tpu.fp8_linear import apply_tpu_fp8_linear
 
@@ -1174,7 +1169,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
                 bias=bias,
-=======
+            )
+
         if isinstance(x, tuple):
             # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
             # x = (fp8_input, per_tensor_input_scale[, orig_dtype]).
@@ -1191,7 +1187,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 cutlass_fp8_supported=self.cutlass_fp8_supported,
                 use_per_token_if_dynamic=self.use_per_token_if_dynamic,
                 pre_quant_output_dtype=out_dtype,
->>>>>>> upstream/main
             )
 
         return apply_fp8_linear(
@@ -2302,7 +2297,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
-<<<<<<< HEAD
         if _is_tpu:
             from sglang.srt.hardware_backend.tpu.fp8_moe import (
                 prepare_tpu_fp8_moe_weights,
@@ -2340,7 +2334,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         "--moe-runner-backend pallas_tpu_fused_rs is not supported by "
                         f"this model or parallel layout: {reason}"
                     )
-=======
+
         if (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -2349,7 +2343,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if get_moe_runner_backend().is_hpc_ops():
             self._prepare_hpc_ops_weights(layer)
->>>>>>> upstream/main
 
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})

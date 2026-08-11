@@ -26,13 +26,9 @@ from xgrammar import (
     StructuralTag,
     StructuralTagItem,
     TokenizerInfo,
-<<<<<<< HEAD
-    allocate_token_bitmask,
     apply_token_bitmask_inplace,
-=======
     bitmask_dtype,
     get_bitmask_shape,
->>>>>>> upstream/main
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
@@ -138,17 +134,12 @@ class XGrammarGrammar(BaseGrammarObject):
             import sgl_kernel_npu  # noqa: F401
 
             torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
-<<<<<<< HEAD
         elif logits.device.type == "tpu":
             apply_token_bitmask_inplace(logits, vocab_mask, backend="torch_compile")
-=======
         elif logits.device.type == "cpu":
             # Used by the MLX backend, which builds its additive mask rows
             # on the CPU before inserting them into the lazy graph.
-            from xgrammar import apply_token_bitmask_inplace
-
             apply_token_bitmask_inplace(logits, vocab_mask, backend="cpu")
->>>>>>> upstream/main
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 

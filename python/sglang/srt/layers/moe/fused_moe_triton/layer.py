@@ -81,11 +81,8 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
-<<<<<<< HEAD
-    is_tpu,
-=======
     is_npu,
->>>>>>> upstream/main
+    is_tpu,
     print_info_once,
     round_up,
 )
@@ -94,11 +91,8 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-<<<<<<< HEAD
-_is_tpu = is_tpu()
-=======
 _is_npu = is_npu()
->>>>>>> upstream/main
+_is_tpu = is_tpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 # Log the deferred-finalize config at most once per process (rank). Different MoE
@@ -1462,7 +1456,6 @@ class FusedMoE(torch.nn.Module):
                 hidden_states, topk_output, pre_quant_input=pre_quant_input
             )
 
-<<<<<<< HEAD
     @property
     def handles_moe_reduction(self) -> bool:
         return bool(
@@ -1470,15 +1463,12 @@ class FusedMoE(torch.nn.Module):
             and getattr(self.quant_method, "handles_moe_reduction", False)
         )
 
-    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-=======
     def forward_impl(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
->>>>>>> upstream/main
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 

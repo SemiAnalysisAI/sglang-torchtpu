@@ -74,13 +74,8 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_sharded_mrope_vision_model,
 )
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
-<<<<<<< HEAD
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.server_args import get_global_server_args
-=======
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
->>>>>>> upstream/main
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -101,7 +96,6 @@ if _is_npu:
 
     graph_runners_dict["npu"] = ViTNpuGraphRunner
 
-<<<<<<< HEAD
 if _is_tpu:
     from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
         VisionTpuCompilePolicy,
@@ -111,8 +105,6 @@ if _is_tpu:
     graph_runners_dict["tpu"] = ViTTpuCompileRunner
 
 
-=======
->>>>>>> upstream/main
 logger = logging.getLogger(__name__)
 
 _is_cpu_amx_available = cpu_has_amx_support()

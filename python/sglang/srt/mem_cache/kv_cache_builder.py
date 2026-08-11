@@ -97,13 +97,8 @@ def _register_legacy_hicache_draft(
         MHATokenToKVPool,
         MLATokenToKVPool,
     )
-<<<<<<< HEAD
-    from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
-    from sglang.srt.platforms import current_platform
-=======
-    from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
->>>>>>> upstream/main
+    from sglang.srt.platforms import current_platform
 
     pool = draft_pool
     if pool.layer_num == 0:
@@ -121,12 +116,8 @@ def _register_legacy_hicache_draft(
         pool_label="draft",
     )
     if isinstance(pool, MHATokenToKVPool):
-<<<<<<< HEAD
         host_cls = current_platform.get_mha_kv_pool_host_cls(pool)
-        draft_host_pool = host_cls(pool, **kw)
-=======
-        draft_host_pool = get_mha_host_pool_cls(pool)(pool, **host_pool_kwargs)
->>>>>>> upstream/main
+        draft_host_pool = host_cls(pool, **host_pool_kwargs)
     elif isinstance(pool, MLATokenToKVPool):
         draft_host_pool = MLATokenToKVPoolHost(pool, **host_pool_kwargs)
     else:

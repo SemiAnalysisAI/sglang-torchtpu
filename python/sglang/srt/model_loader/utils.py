@@ -291,17 +291,15 @@ def should_async_load(weight: torch.Tensor) -> bool:
     and improve throughput. For device tensors, threading often adds overhead
     (e.g., GIL contention) without benefit, so we do it synchronously.
 
-<<<<<<< HEAD
     TPU loads must be synchronous: threaded copies race torch_tpu's enqueue path.
-    """
-    from sglang.srt.utils.common import is_tpu
-=======
+
     RunAI-streamed tensors are zero-copy views into a reused CPU buffer. They
     must be consumed synchronously before the streamer fills its next batch.
     """
+    from sglang.srt.utils.common import is_tpu
+
     if getattr(weight, "_sglang_runai_streamer_tensor", False):
         return False
->>>>>>> upstream/main
 
     device = getattr(weight, "device", None)
     if device is None:

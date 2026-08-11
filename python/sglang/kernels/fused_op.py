@@ -150,6 +150,7 @@ _PLATFORM_METHODS: Dict[str, Tuple[str, ...]] = {
     "musa": ("forward_musa",),
     "npu": ("forward_npu",),
     "xpu": ("forward_xpu",),
+    "tpu": ("forward_tpu",),
     "cpu": ("forward_cpu",),
 }
 
@@ -174,6 +175,7 @@ def _platform_key() -> str:
         is_hip,
         is_musa,
         is_npu,
+        is_tpu,
         is_xpu,
     )
 
@@ -181,6 +183,8 @@ def _platform_key() -> str:
         return "cuda"
     if is_hip():
         return "hip"
+    if is_tpu():
+        return "tpu"
     if is_cpu() and cpu_has_amx_support():
         return "cpu"
     if is_npu():

@@ -44,12 +44,8 @@ from sglang.srt.models.mimo_v2 import (
     MiMoV2MLP,
     load_mimo_v2_qkv_proj_weight,
 )
-<<<<<<< HEAD
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel, get_server_args
-=======
 from sglang.srt.runtime_context import get_parallel
->>>>>>> upstream/main
 from sglang.srt.utils import add_prefix
 
 MiMoV2Config = None

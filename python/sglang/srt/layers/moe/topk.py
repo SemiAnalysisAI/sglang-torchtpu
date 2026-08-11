@@ -124,13 +124,9 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
-<<<<<<< HEAD
 # torch_tpu's compile backend cannot lower the top-k routing graphs (Inductor
 # LoweringException in scheduling); the eager math runs fine on TPU.
 _is_tpu = is_tpu()
-_is_xpu = is_xpu()
-=======
->>>>>>> upstream/main
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
@@ -1074,9 +1070,6 @@ def grouped_topk_cpu(
     )
 
 
-<<<<<<< HEAD
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu or _is_tpu)
-=======
 def grouped_topk_xpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1130,8 +1123,7 @@ def grouped_topk_xpu(
     )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
->>>>>>> upstream/main
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu or _is_tpu)
 def kimi_k2_biased_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,

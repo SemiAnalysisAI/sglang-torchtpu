@@ -1467,16 +1467,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self._original_num_tokens = self.positions.shape[0]
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
-<<<<<<< HEAD
         if self.req_pool_indices_cpu is not None:
             self.req_pool_indices_cpu = self._pad_tensor_to_size(
                 self.req_pool_indices_cpu, bs
             )
-        self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
-=======
         if self.lora_ids is not None:
             self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
->>>>>>> upstream/main
 
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()

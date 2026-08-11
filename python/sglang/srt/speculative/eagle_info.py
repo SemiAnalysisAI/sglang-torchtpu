@@ -6,11 +6,8 @@ from typing import List, Optional
 import torch
 import torch.nn.functional as F
 
-<<<<<<< HEAD
-from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     is_dp_attention_enabled,
@@ -18,13 +15,14 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.common import (
+from sglang.srt.mem_cache.allocation import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
     get_last_loc,
 )
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_utils import (
     top_k_renorm_prob_func,
@@ -32,11 +30,6 @@ from sglang.srt.speculative.eagle_utils import (
     tree_speculative_sampling_target_only_func,
     verify_tree_greedy_func,
 )
-=======
-from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import get_spec
->>>>>>> upstream/main
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -112,11 +105,7 @@ class EagleVerifyInput(SpecInput):
 
     @classmethod
     def create_idle_input(
-<<<<<<< HEAD
-        cls, topk: int, spec_steps: int, num_verify_tokens: int, device="cuda"
-=======
         cls, topk: int, spec_steps: int, num_verify_tokens: int, device: str
->>>>>>> upstream/main
     ):
         return cls(
             draft_token=torch.empty((0,), dtype=torch.long, device=device),
@@ -731,10 +720,6 @@ class EagleDraftInput(SpecInput):
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
 
-<<<<<<< HEAD
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
-
     def prepare_for_extend(self, batch: ScheduleBatch):
 
         if batch.forward_mode.is_idle():
@@ -767,8 +752,6 @@ class EagleDraftInput(SpecInput):
             return None
         return _draft_runner_of(worker).model_config.dtype
 
-=======
->>>>>>> upstream/main
     @classmethod
     def create_idle_input(
         cls,

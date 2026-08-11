@@ -267,11 +267,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.Renormalize,
         )
-<<<<<<< HEAD
         # This block owns reduction outside FusedMoE and consults the selected
         # backend's handles_moe_reduction contract below.
         self.experts.allow_backend_reduction = True
-=======
 
         # Router gate: description-driven quant, mirroring vllm-ascend. Only the
         # offline ModelSlim path (which carries a per-layer quant_model_description)
@@ -283,7 +281,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             if (quant_config is not None and quant_config.get_name() == "modelslim")
             else None
         )
->>>>>>> upstream/main
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
@@ -338,14 +335,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
-<<<<<<< HEAD
             is_tp_path=False,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
             experts_reduced=getattr(self.experts, "handles_moe_reduction", False),
-=======
-            is_tp_path=False
->>>>>>> upstream/main
         ):
             final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
 
@@ -534,14 +525,9 @@ class Qwen3MoeAttention(nn.Module):
             self.rotary_emb, MRotaryEmbedding
         ) and self.head_dim in (64, 128, 256)
         _yarn_factor, _, _, _ = compute_yarn_parameters(config)
-        server_args = get_server_args()
-        enable_fused_qk_norm_rope = server_args.enable_fused_qk_norm_rope
+        enable_fused_qk_norm_rope = get_exec().kernel.enable_fused_qk_norm_rope
         self.use_fused_qk_norm_rope = (
-<<<<<<< HEAD
             enable_fused_qk_norm_rope
-=======
-            get_exec().kernel.enable_fused_qk_norm_rope
->>>>>>> upstream/main
             and self.compatible_with_fused_qk_norm_rope
             and _is_cuda
             and can_use_fused_qk_norm_rope(

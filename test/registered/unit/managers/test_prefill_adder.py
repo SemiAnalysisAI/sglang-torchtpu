@@ -548,15 +548,6 @@ class TestPrefillAdder(CustomTestCase):
         # window -- a cached prefix funds the rest -- rather than a constant
         # window, which over-charged short requests into an admission livelock.
         cases = [
-<<<<<<< HEAD
-            # (extend, rem_chunk, window, page, expected, label)
-            (64, None, 128, 16, 128 + 16, "no_cap_floor_active"),
-            (200, None, 256, 32, 256 + 32, "no_cap_floor_active_other_dims"),
-            (300, None, 128, 16, 300 + 16, "no_cap_floor_inactive"),
-            (200, 50, 64, 8, 50 + 64 + 8, "chunk_and_window_reserved"),
-            (300, 500, 64, 64, 300 + 64 + 64, "chunk_below_cap"),
-            (0, None, 128, 16, 128 + 16, "extend_zero_floor_only"),
-=======
             # (extend, max_new, rem_chunk, window, page, expected, label)
             (64, 512, None, 128, 16, 128 + 16, "long_decode_hits_window_floor"),
             (64, 32, None, 128, 16, 96 + 16, "short_req_reserves_below_window"),
@@ -569,7 +560,6 @@ class TestPrefillAdder(CustomTestCase):
             (2000, 256, 1024, 512, 16, 1024 + 16, "multichunk_alloc_over_window"),
             (0, 512, None, 128, 16, 128 + 16, "extend_zero_long_decode"),
             (0, 40, None, 128, 16, 40 + 16, "extend_zero_short_decode"),
->>>>>>> upstream/main
         ]
         for extend, max_new, rem_chunk, window, page, expected, label in cases:
             with self.subTest(label=label):

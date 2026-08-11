@@ -39,9 +39,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-<<<<<<< HEAD
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
@@ -50,10 +48,6 @@ from sglang.srt.utils import (
     is_tpu,
     set_weight_attrs,
 )
-=======
-from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
->>>>>>> upstream/main
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (

@@ -32,6 +32,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_tpu,
     next_power_of_2,
     support_triton,
 )
@@ -41,6 +42,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
+_is_tpu = is_tpu()
 
 if _is_cpu:
     from sgl_kernel import assign_req_to_token_pool_cpu
@@ -50,6 +52,70 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import DSV4StateLens
 
 logger = logging.getLogger(__name__)
+
+
+def _write_req_to_token_vectorized(
+    req_to_token: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    extend_lens: torch.Tensor,
+    prefix_tensors: list[torch.Tensor],
+) -> None:
+    """Vectorized, device-resident ``req_to_token`` write — the tensor-indexed
+    equivalent of the per-request Python-int loop in ``write_cache_indices``.
+
+    For each request ``i`` at row ``req_pool_indices[i]`` it writes:
+      * ``out_cache_loc`` (concatenated over requests) into the extend columns
+        ``[prefix_lens[i], prefix_lens[i] + extend_lens[i])``, and
+      * ``prefix_tensors[i]`` into the prefix columns ``[0, prefix_lens[i])``.
+
+    Each part is a single ``index_put_`` so the destination offsets stay DATA (a
+    dynamic scatter); on TPU this avoids torch_tpu baking per-request offsets as
+    HLO constants. Device-agnostic — also correct on CPU (relied on by the test).
+    """
+    index_dtype = torch.int64
+    max_context_len = req_to_token.shape[1]  # row stride of the flattened table
+    flat_table = req_to_token.view(-1)
+    device = req_to_token.device
+
+    def _scatter_segments(values, seg_rows, seg_lens, seg_col_starts):
+        """Write ``values`` into ``req_to_token`` one contiguous segment per
+        request: segment ``i`` goes to row ``seg_rows[i]``, columns
+        ``[seg_col_starts[i], seg_col_starts[i] + seg_lens[i])`` (column 0 when
+        ``seg_col_starts`` is None)."""
+        num_tokens = values.shape[0]
+        if num_tokens == 0:
+            return
+        row_per_token = torch.repeat_interleave(
+            seg_rows, seg_lens, output_size=num_tokens
+        )
+        # First flat-token offset of each segment, broadcast per token, so the
+        # within-segment column is just (global token idx - segment start).
+        seg_token_starts = torch.cumsum(seg_lens, 0) - seg_lens
+        col_within_seg = torch.arange(
+            num_tokens, device=device
+        ) - torch.repeat_interleave(seg_token_starts, seg_lens, output_size=num_tokens)
+        if seg_col_starts is not None:
+            col_per_token = (
+                torch.repeat_interleave(
+                    seg_col_starts, seg_lens, output_size=num_tokens
+                )
+                + col_within_seg
+            )
+        else:
+            col_per_token = col_within_seg
+        flat_indices = row_per_token.to(
+            index_dtype
+        ) * max_context_len + col_per_token.to(index_dtype)
+        flat_table.index_put_((flat_indices,), values.to(flat_table.dtype))
+
+    # extend: out_cache_loc -> req_to_token[req_idx, prefix_len:seq_len]
+    _scatter_segments(out_cache_loc, req_pool_indices, extend_lens, prefix_lens)
+    # prefix: prefix_tensors[i] -> req_to_token[req_idx, 0:prefix_len] (often empty)
+    if prefix_tensors and any(p.numel() for p in prefix_tensors):
+        prefix_vals = torch.cat([p.reshape(-1) for p in prefix_tensors])
+        _scatter_segments(prefix_vals, req_pool_indices, prefix_lens, None)
 
 
 def write_cache_indices(
@@ -82,7 +148,41 @@ def write_cache_indices(
             out_cache_loc,
             req_to_token_pool.req_to_token.shape[1],
         )
+    elif req_to_token_pool.req_to_token.device.type == "tpu":
+        # TEMPORARY TPU FIX. TPU has no Triton driver, so the per-request Python-int
+        # loop below would run — but `req_to_token[req_idx, prefix_len:seq_len] = ...`
+        # with Python-int bounds makes torch_tpu bake the (slot, prefix_len, seq_len)
+        # offsets as COMPILE-TIME CONSTANTS, so every distinct (slot, len) is a new
+        # graph with a new compilation-cache key -> constant recompilation
+        # (tt_jit_to_copy_.._as_strided), inflating TTFT.
+        # `_write_req_to_token_vectorized` does one tensor-indexed `index_put_`
+        # instead: the destination offsets stay DATA, so the graph depends only on
+        # the (bucketed) token count, not the index values, and compiles once.
+        # Mirrors the Triton kernel / vLLM's `.at[idx].set`.
+        #
+        # TODO(perf): this keeps `req_to_token` device-resident and writes it with an
+        # on-device scatter. The alternative is to make `req_to_token_pool`
+        # host-resident — the write becomes a trivial CPU scatter with no recompile,
+        # at the cost of a per-forward `page_indices` H2D copy in the attention
+        # backend. Static analysis predicts host-resident is a regression (the slot
+        # indices are device-produced and device-consumed; see
+        # docs/tpu-prs/PR_BODY-write-cache-vectorize.md), but the two approaches
+        # should be measured (TTFT / throughput) to confirm.
+        _write_req_to_token_vectorized(
+            req_to_token_pool.req_to_token,
+            out_cache_loc,
+            req_pool_indices_tensor,
+            prefix_lens_tensor,
+            extend_lens_tensor,
+            prefix_tensors,
+        )
     else:
+        # Host-resident pool: the CPU scatter below needs host-side values.
+        if (
+            req_to_token_pool.req_to_token.device.type == "cpu"
+            and out_cache_loc.device.type != "cpu"
+        ):
+            out_cache_loc = out_cache_loc.cpu()
         pt = 0
         for i in range(req_pool_indices_cpu.shape[0]):
             req_idx = req_pool_indices_cpu[i].item()
@@ -107,7 +207,12 @@ def get_last_loc(
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
     attn_backend = get_exec().kernel.attention_backend
-    uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
+    uses_triton_dispatch = attn_backend not in (
+        "ascend",
+        "torch_native",
+        "pallas_tpu_rpa_v3",
+        "pallas_tpu_rpa_batched",
+    )
 
     if _is_hip and uses_triton_dispatch:
         # HIP-only: the legacy get_last_loc_triton kernel emits a
@@ -136,6 +241,11 @@ def get_last_loc_torch(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
+    # Host-resident pool: index with host tensors (torch.where evaluates the
+    # gather branch even when prefix_lens==0, so a device index would error).
+    if req_to_token.device.type == "cpu":
+        req_pool_indices_tensor = req_pool_indices_tensor.cpu()
+        prefix_lens_tensor = prefix_lens_tensor.cpu()
     return torch.where(
         prefix_lens_tensor > 0,
         req_to_token[req_pool_indices_tensor, prefix_lens_tensor - 1],
@@ -201,6 +311,7 @@ def alloc_paged_token_slots_extend(
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional[DSV4StateLens] = None,
     batch=None,
+    out_cache_loc_host: Optional[torch.Tensor] = None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -216,6 +327,8 @@ def alloc_paged_token_slots_extend(
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
         if dsv4_state_lens is not None:
             extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
+    if out_cache_loc_host is not None:
+        extra_alloc_kwargs["out_indices_cpu"] = out_cache_loc_host
 
     out = allocator.alloc_extend(
         prefix_lens,
@@ -350,9 +463,11 @@ def alloc_for_extend(
     elif alloc_page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
-        # Paged allocation - build last_loc
+        # Paged allocation - build last_loc. The empty-prefix sentinel must
+        # match the prefix slices' device so torch.cat stays single-device.
+        _last_loc_dev = batch.req_to_token_pool.req_to_token.device
         last_loc = [
-            (t[-1:] if len(t) > 0 else torch.full((1,), -1, device=batch.device))
+            (t[-1:] if len(t) > 0 else torch.full((1,), -1, device=_last_loc_dev))
             for t in prefix_tensors
         ]
         out_cache_loc = alloc_paged_token_slots_extend(
@@ -546,18 +661,22 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     batch.maybe_evict_swa()
 
-    seq_lens_gpu = batch.seq_lens
-    bs = seq_lens_gpu.shape[0]
+    seq_lens = batch.seq_lens_cpu if _is_tpu else batch.seq_lens
+    bs = seq_lens.shape[0]
 
     if _alloc_page_size(batch) == 1:
         # Non-paged allocation
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
         # Paged allocation
-        last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, seq_lens_gpu - 1
-        ]
-        seq_lens_next = seq_lens_gpu + token_per_req
+        _r2t = batch.req_to_token_pool.req_to_token
+        if _r2t.device.type == "cpu":
+            # Host-resident pool: gather last_loc on host (alloc_decode runs
+            # its formula on host).
+            last_loc = _r2t[batch.req_pool_indices.cpu(), seq_lens - 1]
+        else:
+            last_loc = _r2t[batch.req_pool_indices, seq_lens - 1]
+        seq_lens_next = seq_lens + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
             seq_lens=seq_lens_next,
@@ -571,13 +690,18 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     # Write to req_to_token_pool
     if batch.model_config.is_encoder_decoder:
-        locs = batch.encoder_lens + seq_lens_gpu
+        locs = batch.encoder_lens.to(seq_lens.device) + seq_lens
     else:
-        locs = seq_lens_gpu.clone()
+        locs = seq_lens.clone()
 
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
-    )
+    if _is_tpu:
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices_cpu, locs), out_cache_loc.to(torch.int32)
+        )
+    else:
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+        )
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:

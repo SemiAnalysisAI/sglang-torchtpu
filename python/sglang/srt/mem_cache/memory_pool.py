@@ -36,7 +36,6 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 import numpy as np
 import torch
 
-<<<<<<< HEAD
 try:
     import triton
     import triton.language as tl
@@ -44,19 +43,7 @@ except ImportError:
     triton = None
     tl = None
 
-try:
-    from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
-except ImportError:
-    can_use_store_cache = None
-    store_cache = None
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
-from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa import index_buf_accessor
-from sglang.srt.layers.attention.dsa.quant_k_cache import (
-=======
 from sglang.kernels.ops.attention.dsa.quant_k_cache import (
->>>>>>> upstream/main
     quantize_k_cache,
     quantize_k_cache_separate,
 )
@@ -65,7 +52,14 @@ from sglang.kernels.ops.kvcache.cache_move import (
     set_kv_buffer_prefix_valid_tiled,
     store_cache_4d,
 )
-from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
+
+try:
+    from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
+except ImportError:
+    # JIT kvcache module is CUDA/HIP-only; degrade to None on backends (e.g. TPU)
+    # where it can't be imported. Both names are only used under _is_cuda/_is_hip.
+    can_use_store_cache = None
+    store_cache = None
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE

@@ -6,7 +6,6 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 on:
   schedule:
     - cron: '0 */12 * * *' # Run every 12 hours (UTC)
-<<<<<<< HEAD
   # Disabled in sglang-torchtpu: TPU PRs should not spawn AMD checks.
   # AMD CI remains available via schedule, workflow_dispatch, and workflow_call.
   # pull_request:
@@ -14,19 +13,9 @@ on:
   #     - "python/**"
   #     - "scripts/ci/**"
   #     - "test/**"
-  #     - "sgl-kernel/**"
+  #     - "python/sglang/kernels/aot/**"
   #     - ".github/workflows/pr-test-amd.yml"
   #     - "docker/rocm.Dockerfile"
-=======
-  pull_request:
-    paths:
-      - "python/**"
-      - "scripts/ci/**"
-      - "test/**"
-      - "python/sglang/kernels/aot/**"
-      - ".github/workflows/pr-test-amd.yml"
-      - "docker/rocm.Dockerfile"
->>>>>>> upstream/main
   workflow_dispatch:
     inputs:
       target_stage_select:

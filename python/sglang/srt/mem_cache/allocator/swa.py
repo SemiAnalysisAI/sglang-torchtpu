@@ -381,7 +381,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
-<<<<<<< HEAD
+        if not self.is_not_in_free_group:
+            self.swa_free_group.append(self._copy_for_free_group(free_index))
+            return
+
         if _is_tpu:
             # TPU: mapping is host-resident and the free_index bookkeeping is
             # host-side (#29/#107). Gather/scatter on the mapping's device using
@@ -395,10 +398,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_indices = swa_indices[swa_indices > 0]
             self.swa_attn_allocator.free(swa_indices)
             mapping[idx] = 0
-=======
-        if not self.is_not_in_free_group:
-            self.swa_free_group.append(self._copy_for_free_group(free_index))
->>>>>>> upstream/main
             return
 
         if self.page_size == 1:

@@ -61,11 +61,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_mps,
     is_npu,
-<<<<<<< HEAD
     is_tpu,
-    mxfp_supported,
-=======
->>>>>>> upstream/main
 )
 
 _is_gfx95_supported = is_gfx95_supported()
@@ -106,11 +102,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 }
 
 
-<<<<<<< HEAD
-if is_cpu() or is_cuda() or (_is_mxfp_supported and is_hip()) or is_tpu():
-=======
-if is_cpu() or is_cuda() or _is_gfx95_supported:
->>>>>>> upstream/main
+if is_cpu() or is_cuda() or _is_gfx95_supported or is_tpu():
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,

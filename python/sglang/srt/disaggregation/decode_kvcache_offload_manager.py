@@ -18,14 +18,9 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-<<<<<<< HEAD
-from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
-from sglang.srt.platforms import current_platform
-=======
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
-from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
->>>>>>> upstream/main
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import ceil_align
 

@@ -129,8 +129,6 @@ def _find_engine_bundle(
 class RayEngine(Engine):
     """Engine using Ray actors for scheduler processes."""
 
-<<<<<<< HEAD
-=======
     def __init__(self, **kwargs):
         # Set before super().__init__(): it launches the subprocesses, which need
         # the group to schedule the scheduler actors onto.
@@ -139,7 +137,6 @@ class RayEngine(Engine):
             kwargs["log_level"] = "error"
         super().__init__(server_args=ServerArgs(**kwargs))
 
->>>>>>> upstream/main
     def shutdown(self):
         """Shutdown the engine — kill Ray scheduler actors then local processes."""
         for actor in self._scheduler_init_result.scheduler_actors:
@@ -164,7 +161,6 @@ class RayEngine(Engine):
             Tuple of (RaySchedulerInitResult, None).
             scheduler_procs is None since Ray uses actors instead of mp.Process.
         """
-<<<<<<< HEAD
         # TPU + Ray: honor server_args.nnodes, discovering the pre-ordered host
         # list from the live cluster. nnodes=0 opts into auto-detecting the count.
         # The computed TPU env is stashed on server_args (tpu_worker_hostnames /
@@ -181,12 +177,6 @@ class RayEngine(Engine):
                 detect_tpu_nnodes,
                 discover_tpu_worker_hostnames,
                 redact_env_for_log,
-=======
-        pg = placement_group or ray.util.get_current_placement_group()
-        if pg is None:
-            from ray.util.placement_group import (
-                placement_group as create_placement_group,
->>>>>>> upstream/main
             )
 
             if not ray.is_initialized():
@@ -271,7 +261,7 @@ class RayEngine(Engine):
                         server_args, tpu_worker_hostnames=tpu_worker_hostnames
                     )
 
-        pg = ray.util.get_current_placement_group()
+        pg = placement_group or ray.util.get_current_placement_group()
         if pg is None:
             if server_args.enable_dp_attention:
                 total_gpus = server_args.tp_size * server_args.pp_size
@@ -297,10 +287,7 @@ class RayEngine(Engine):
             )
             ray.get(pg.ready())
 
-<<<<<<< HEAD
-=======
         is_custom_pg = placement_group is not None
->>>>>>> upstream/main
         nnodes = server_args.nnodes
 
         if server_args.use_ray and server_args.device == "tpu" and nnodes > 1:
@@ -461,7 +448,6 @@ class RayEngine(Engine):
             server_args,
             dist_init_addr=f"{rank0_node_ip}:{port_args.nccl_port}",
         )
-<<<<<<< HEAD
 
         # Create the DP controller in-process. This blocks until all actors
         # are initialized and their event loops have started.
@@ -471,12 +457,7 @@ class RayEngine(Engine):
             pg,
             bundle_for_node,
             rank0_node_ip,
-=======
-        # Create the DP controller in-process. This blocks until all actors
-        # are initialized and their event loops have started.
-        controller = RayDataParallelController(
-            dp_server_args, port_args, pg, bundle_for_node, rank0_node_ip, is_custom_pg
->>>>>>> upstream/main
+            is_custom_pg,
         )
 
         # Start the DP controller's event loop in a daemon thread.

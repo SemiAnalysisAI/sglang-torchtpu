@@ -507,6 +507,10 @@ class BaseMultimodalProcessor(ABC):
             return "cpu"
         if _is_xpu:
             return "xpu"
+        if _is_tpu:
+            # transformers image processors don't support TPU as a device.
+            # Preprocess on CPU; the model runner will move tensors to TPU.
+            return "cpu"
         if not _is_npu:
             return f"cuda:{server_args.base_gpu_id}"
         if processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
@@ -579,31 +583,9 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessor)
             and not self.disable_fast_image_processor
         ):
-<<<<<<< HEAD
-            if _is_cpu or get_global_server_args().rl_on_policy_target is not None:
-                kwargs["device"] = "cpu"
-            elif _is_xpu:
-                kwargs["device"] = "xpu"
-            elif _is_tpu:
-                # transformers image processors don't support TPU as a device.
-                # Preprocess on CPU; the model runner will move tensors to TPU.
-                kwargs["device"] = "cpu"
-            elif not _is_npu:
-                base_gpu_id = get_global_server_args().base_gpu_id
-                kwargs["device"] = f"cuda:{base_gpu_id}"
-            elif processor.__class__.__name__ not in {
-                "Glm4vProcessor",
-                "Glm46VProcessor",
-            }:
-                # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
-                from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
-                    npu_apply_qwen_image_preprocess_patch,
-                )
-=======
             device = self._fast_image_processor_device(processor)
             if device is not None:
                 kwargs["device"] = device
->>>>>>> upstream/main
 
         # Avoid double BOS when the chat template already wrote one.
         if self._tokenizer_auto_adds_specials and isinstance(input_text, str):

@@ -25,10 +25,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-<<<<<<< HEAD
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
-=======
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.runtime_context import (
@@ -45,7 +42,6 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
->>>>>>> upstream/main
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -57,11 +53,6 @@ import torch
 import torch.distributed
 from torch.distributed import barrier
 
-<<<<<<< HEAD
-from sglang.jit_kernel.ngram_embedding import update_token_table
-from sglang.srt.compilation import torch_compile_bundle
-from sglang.srt.configs.model_config import ModelConfig, ModelImpl
-=======
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
 
@@ -71,13 +62,13 @@ try:
     )
 except ImportError:
     initialize_mamba_selective_state_update_backend = None
+from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
     is_deepseek_v4,
     is_minimax_sparse,
 )
->>>>>>> upstream/main
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
@@ -1691,7 +1682,11 @@ class Scheduler(
         Sets up the schedule stream and dispatches to the appropriate event loop.
         The event loop blocks until shutdown.
         """
-<<<<<<< HEAD
+        # Engine init (graph capture, warmups) is done; from here on any
+        # Triton kernel device-load is a lazy first-use at serving time.
+        triton_load_watch.install()
+        triton_load_watch.mark_serving_started()
+
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool. Set it
         # unconditionally (before the single-stream early return) so
@@ -1702,14 +1697,6 @@ class Scheduler(
         )
 
         if use_mlx() or not self.use_overlap_streams:
-=======
-        # Engine init (graph capture, warmups) is done; from here on any
-        # Triton kernel device-load is a lazy first-use at serving time.
-        triton_load_watch.install()
-        triton_load_watch.mark_serving_started()
-
-        if use_mlx():
->>>>>>> upstream/main
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
             # not PyTorch MPS streams.
             # Also, this avoids having another stream for
@@ -1720,12 +1707,6 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-<<<<<<< HEAD
-        # NOTE: keep device_module.stream() (not StreamContext) so torch_tpu,
-        # which exposes .stream() but not necessarily .StreamContext, still
-        # enters its schedule stream; equivalent to StreamContext on CUDA.
-        with self.device_module.stream(self.schedule_stream):
-=======
         elif is_cuda() or _is_hip:
             # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
             # stream aliases forward_stream, which would eliminate scheduler
@@ -1738,11 +1719,10 @@ class Scheduler(
             ):
                 self.schedule_stream = self.device_module.Stream(priority=0)
                 _redraws += 1
-        # The global WAR barrier fences the scheduler's next shared-buffer write
-        # on the previous forward's read of the unified memory pool.
-        self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
-        with self.device_module.StreamContext(self.schedule_stream):
->>>>>>> upstream/main
+        # NOTE: keep device_module.stream() (not StreamContext) so torch_tpu,
+        # which exposes .stream() but not necessarily .StreamContext, still
+        # enters its schedule stream; equivalent to StreamContext on CUDA.
+        with self.device_module.stream(self.schedule_stream):
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
@@ -4116,15 +4096,11 @@ class Scheduler(
         if not self.is_fully_idle():
             return
 
-<<<<<<< HEAD
         if self.forward_ct > 0 and not self.recompile_stance_set:
             self.recompile_stance_set = True
             self._maybe_arm_fail_on_recompile()
 
-        if self.server_args.enable_unified_memory:
-=======
         if self.enable_unified_memory:
->>>>>>> upstream/main
             try:
                 self.token_to_kv_pool_allocator.flush_opportunistic()
             except Exception:

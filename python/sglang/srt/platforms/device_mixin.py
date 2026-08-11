@@ -178,7 +178,6 @@ class DeviceMixin:
         """[Active] Get current peak memory usage in bytes."""
         raise NotImplementedError
 
-<<<<<<< HEAD
     @contextmanager
     def weight_loading_context(self, weights):
         """[Active] Wrap the weight iterator consumed by ``model.load_weights``.
@@ -188,11 +187,10 @@ class DeviceMixin:
         graph to bound its materialization peak).
         """
         yield weights
-=======
+
     def is_pin_memory_available(self, device=None) -> bool:
         """[Active] Whether pinned host memory is available for a target device."""
         return False
->>>>>>> upstream/main
 
     # ------------------------------------------------------------------
     # Planned methods — reserved interface.  Core still uses hardcoded

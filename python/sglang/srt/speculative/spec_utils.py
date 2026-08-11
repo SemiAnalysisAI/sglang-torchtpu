@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-<<<<<<< HEAD
-import functools
-=======
 import contextlib
->>>>>>> upstream/main
+import functools
 import logging
 import os
 import time
-from collections.abc import Callable
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 
@@ -17,8 +13,12 @@ import triton
 import triton.language as tl
 from huggingface_hub import snapshot_download
 
+# V2 (triton) path: re-export upstream's maintained kernels from cache_locs.
 from sglang.kernels.ops.speculative.cache_locs import (
     align_evict_mask_to_page_size as align_evict_mask_to_page_size,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_draft_cache_locs_contiguous as assign_draft_cache_locs_contiguous,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs as assign_extend_cache_locs,
@@ -30,14 +30,19 @@ from sglang.kernels.ops.speculative.cache_locs import (
     generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
-    get_src_tgt_cache_loc as get_src_tgt_cache_loc,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
     get_target_cache_loc as get_target_cache_loc,
 )
+
+# Non-TPU backends (triton / CPU) dispatch through the kernel-side ``*_func``
+# wrappers; the ``*_func`` defined below add the TPU torch-native path on top.
 from sglang.kernels.ops.speculative.eagle import (
-    fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
+    fill_accept_out_cache_loc_func as _fill_accept_out_cache_loc_func,
 )
+from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens as fill_bonus_tokens
+from sglang.kernels.ops.speculative.eagle import (
+    fill_bonus_tokens_func as _fill_bonus_tokens_func,
+)
+from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
@@ -45,67 +50,31 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-<<<<<<< HEAD
-from sglang.srt.mem_cache.common import (
-    alloc_paged_token_slots_extend,
-    alloc_token_slots,
-    get_last_loc,
-)
-from sglang.srt.server_args import get_global_server_args
-
-# V2 (triton) path: re-export upstream's maintained kernels from cache_locs.
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_draft_cache_locs_contiguous as assign_draft_cache_locs_contiguous,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_extend_cache_locs as assign_extend_cache_locs,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_req_to_token_pool as assign_req_to_token_pool,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
-=======
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+)
+from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool as assign_req_to_token_pool,
 )
 from sglang.srt.mem_cache.allocation import (
-    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
+    assign_req_to_token_pool_func as _assign_req_to_token_pool_func,
 )
+from sglang.srt.mem_cache.allocation import (
+    get_last_loc,
+)
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_spec,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
     max_speculative_num_draft_tokens,
->>>>>>> upstream/main
 )
 from sglang.srt.utils import (
     is_cpu,
-    is_cuda,
-    is_hip,
-    is_musa,
-    is_npu,
-    is_xpu,
-    next_power_of_2,
-)
-<<<<<<< HEAD
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    get_target_cache_loc as get_target_cache_loc,
-)
-from sglang.srt.speculative.triton_ops.eagle import (
-    fill_accept_out_cache_loc as fill_accept_out_cache_loc,
-)
-from sglang.srt.speculative.triton_ops.eagle import (
-    fill_bonus_tokens as fill_bonus_tokens,
-)
-from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
-from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_musa,
@@ -114,8 +83,6 @@ from sglang.srt.utils import (
     is_xpu,
     next_power_of_2,
 )
-=======
->>>>>>> upstream/main
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.nvtx_utils import profile_range
 
@@ -125,12 +92,9 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 _is_tpu = is_tpu()
 _is_xpu = is_xpu()
-<<<<<<< HEAD
+_is_cpu = is_cpu()
 # TPU/XLA cannot run the triton kernels; V1 dispatches to torch-native impls.
 _use_torch_native = _is_tpu
-=======
-_is_cpu = is_cpu()
->>>>>>> upstream/main
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -271,14 +235,13 @@ def assign_req_to_token_pool_func(
             batch_size,
         )
         return
-    assign_req_to_token_pool[(batch_size,)](
+    _assign_req_to_token_pool_func(
         req_pool_indices,
         req_to_token,
         start_offset,
         end_offset,
         out_cache_loc,
-        req_to_token.shape[1],
-        next_power_of_2(batch_size),
+        batch_size,
     )
 
 
@@ -448,6 +411,16 @@ def assign_extend_cache_locs_kernel_func(
         valid = torch.arange(cap, device=out_device) < inclusive_ends[-1].to(out_device)
         out_cache_loc.copy_(torch.where(valid, gathered, out_cache_loc))
         return
+    if _is_cpu:
+        assign_extend_cache_locs_cpu(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            req_to_token.shape[1],
+        )
+        return
     assign_extend_cache_locs[(bs,)](
         req_pool_indices,
         req_to_token,
@@ -511,7 +484,9 @@ def fill_bonus_tokens_func(
         )
         bonus_tokens.copy_(accept_tokens.reshape(-1)[indices].to(bonus_tokens.dtype))
         return
-    fill_bonus_tokens[(bs,)](accept_tokens, accept_lens, bonus_tokens, num_draft_tokens)
+    _fill_bonus_tokens_func(
+        accept_tokens, accept_lens, bonus_tokens, num_draft_tokens, bs
+    )
 
 
 def fill_accept_out_cache_loc_func(
@@ -540,11 +515,11 @@ def fill_accept_out_cache_loc_func(
         buffer.scatter_(0, torch.where(mask, destinations, discard), values)
         accept_out_cache_loc.copy_(buffer[:size])
         return
-    fill_accept_out_cache_loc[(size,)](
+    _fill_accept_out_cache_loc_func(
         accept_index,
         out_cache_loc,
         accept_out_cache_loc,
-        next_power_of_2(size),
+        size,
     )
 
 
@@ -1088,7 +1063,9 @@ def get_src_tgt_cache_loc(
     page_size: int,
 ):
     src_cache_loc = out_cache_loc[accept_index]
-    tgt_cache_loc = torch.empty_like(src_cache_loc)
+    # zeros_like, not empty_like: any uncovered tail stays at slot 0 (padding)
+    # instead of caching-allocator garbage.
+    tgt_cache_loc = torch.zeros_like(src_cache_loc)
     extended_len = seq_lens + draft_token_num
     keep_len = torch.minimum(
         (seq_lens + num_correct_drafts + 1 + page_size - 1) // page_size * page_size,
@@ -1243,14 +1220,7 @@ def generate_simulated_accept_index(
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
-<<<<<<< HEAD
-        (bs, spec_steps + 1),
-        -1,
-        dtype=torch.int32,
-        device=accept_index.device,
-=======
         (bs, spec_steps + 1), -1, dtype=torch.int32, device=accept_index.device
->>>>>>> upstream/main
     )
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device
@@ -1562,7 +1532,8 @@ def move_accept_tokens_to_target_kvcache(
         device=device,
     )
     accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
-<<<<<<< HEAD
+    # The CPU / triton dispatch (and the TPU torch-native path) lives in the
+    # kernel wrapper; ``size`` there is accept_index.numel() == this ``size``.
     assign_extend_cache_locs_kernel_func(
         batch.req_pool_indices,
         batch.req_to_token_pool.req_to_token,
@@ -1570,35 +1541,10 @@ def move_accept_tokens_to_target_kvcache(
         batch.seq_lens + num_correct_drafts + 1,
         tgt_cache_loc,
     )
-=======
-    if _is_cpu:
-        assign_extend_cache_locs_cpu(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + num_correct_drafts + 1,
-            tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-        )
-    else:
-        assign_extend_cache_locs[(bs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + num_correct_drafts + 1,
-            tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
->>>>>>> upstream/main
     fill_accept_out_cache_loc_func(
         accept_index,
         batch.out_cache_loc,
         accept_out_cache_loc,
-<<<<<<< HEAD
-=======
-        size,
->>>>>>> upstream/main
     )
     token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
         tgt_cache_loc, accept_out_cache_loc
@@ -1619,11 +1565,6 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """
     if not mamba_extra_buffer_enabled():
         return
-<<<<<<< HEAD
-    from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
-
-    set_mamba_track_indices_from_reqs(batch)
-=======
     track_positions = None
     if mamba_extra_buffer_lazy_enabled():
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
@@ -1634,7 +1575,6 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
             "must run in prepare_for_decode for every spec decode iteration"
         )
     set_mamba_track_indices_from_reqs(batch, track_positions)
->>>>>>> upstream/main
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
 
@@ -1902,7 +1842,6 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
         eagle_prepare_for_decode(batch)
 
 
-<<<<<<< HEAD
 # Disable torch.compile for this function because it will be
 # even slower.
 # @torch.compile(dynamic=True)
@@ -1937,14 +1876,18 @@ def get_last_loc_large_page_size_large_top_k(
         extend_lens,
         last_page_lens,
     )
-=======
+
+
 def get_plan_stream(
     device: str,
 ) -> Tuple[Any, contextlib.AbstractContextManager]:
+    # Platforms without real multi-stream execution (e.g. TPU) get no plan
+    # stream: a non-default stream there only relabels fences.
+    if not current_platform.supports_overlap_streams():
+        return None, contextlib.nullcontext()
     if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
         plan_stream = torch.get_device_module(device).Stream()
         plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
         return plan_stream, plan_stream_ctx
     else:
         return None, contextlib.nullcontext()
->>>>>>> upstream/main

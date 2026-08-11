@@ -25,32 +25,8 @@ from typing import Optional, Union
 import torch
 import torch.distributed as dist
 
-<<<<<<< HEAD
 from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
-from sglang.srt.configs import (
-    BailingHybridConfig,
-    FalconH1Config,
-    GraniteMoeHybridConfig,
-    InternS2PreviewConfig,
-    JetNemotronConfig,
-    JetVLMConfig,
-    KimiLinearConfig,
-    Lfm2Config,
-    Lfm2MoeConfig,
-    Lfm2VlConfig,
-    NemotronH_Nano_VL_V2_Config,
-    NemotronHConfig,
-    Qwen3_5Config,
-    Qwen3_5MoeConfig,
-    Qwen3NextConfig,
-    ZayaConfig,
-)
-from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
-from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-=======
 from sglang.srt.configs.load_config import LoadConfig
->>>>>>> upstream/main
 from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
@@ -265,42 +241,6 @@ if _is_npu:
 elif current_platform.is_out_of_tree():
     current_platform.init_backend()
 
-<<<<<<< HEAD
-MLA_ATTENTION_BACKENDS = [
-    "aiter",
-    "flashinfer",
-    "fa3",
-    "fa4",
-    "triton",
-    "flashmla",
-    "cutedsl_mla",
-    "cutlass_mla",
-    "trtllm_mla",
-    "tokenspeed_mla",
-    "ascend",
-    "dsa",
-    "nsa",  # Deprecated alias for "dsa"
-    "intel_xpu",
-    "pallas_tpu_mla",
-]
-
-
-TORCH_DTYPE_TO_KV_CACHE_STR = {
-    torch.float8_e4m3fn: "fp8_e4m3",
-    torch.float8_e4m3fnuz: "fp8_e4m3",
-    torch.float8_e5m2: "fp8_e5m2",
-    torch.bfloat16: "bf16",
-}
-
-
-def add_mla_attention_backend(backend_name):
-    if backend_name not in MLA_ATTENTION_BACKENDS:
-        MLA_ATTENTION_BACKENDS.append(backend_name)
-        logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
-
-
-=======
->>>>>>> upstream/main
 # Detect stragger ranks in model loading
 
 
@@ -426,29 +366,6 @@ class ModelRunner:
         if server_args.show_time_cost:
             enable_show_time_cost()
 
-<<<<<<< HEAD
-        # Chunked prefix caching requires an MLA model on a backend whose
-        # kernels read that layout. This is a load-time gate, not a
-        # resolution-time one: TPU registers its supported backends during
-        # worker bootstrap, while other out-of-tree platforms may do so when
-        # this module is imported. Both occur after ServerArgs.__post_init__.
-        # Target runner only: a draft
-        # model's (often non-MLA) config must not flip the shared setting.
-        if not self.is_draft_worker and (
-            not self.use_mla_backend
-            or server_args.attention_backend
-            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
-        ):
-            if not server_args.disable_chunked_prefix_cache:
-                server_args.override(
-                    "model_runner.chunked_prefix_cache_gate",
-                    disable_chunked_prefix_cache=True,
-                )
-        if not self.is_draft_worker and not server_args.disable_chunked_prefix_cache:
-            logger.info("Chunked prefix cache is turned on.")
-
-=======
->>>>>>> upstream/main
         # Set the global server_args in the scheduler process (target worker
         # only, so a draft init cannot clobber target-derived global state).
         if not self.is_draft_worker:
@@ -707,66 +624,11 @@ class ModelRunner:
             )
 
     def initialize(self):
-<<<<<<< HEAD
-        server_args = self.server_args
-
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=self.server_args.enable_memory_saver
-        )
-
-        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
-            self.remote_instance_init_transfer_engine()
-
-        if not self.is_draft_worker:
-            # Skip expert-location metadata when nothing consumes it. On TPU,
-            # _compute_logical_to_all_physical_map issues many D2H copies and costs
-            # ~22s at startup; for configs without EP dispatch / EPLB / distribution
-            # recording, the metadata is never read (see expert_location_dispatch.py
-            # and fused_moe_triton/layer.py which handle None).
-            needs_expert_location_metadata = (
-                server_args.enable_eplb
-                or server_args.ep_dispatch_algorithm is not None
-                or server_args.expert_distribution_recorder_mode is not None
-                or server_args.init_expert_location != "trivial"
-            )
-            set_global_expert_location_metadata(
-                compute_initial_expert_location_metadata(
-                    server_args=server_args,
-                    model_config=self.model_config,
-                    moe_ep_rank=self.moe_ep_rank,
-                )
-                if needs_expert_location_metadata
-                else None
-            )
-            if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
-                logger.info(
-                    f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
-                )
-
-            set_global_expert_distribution_recorder(
-                ExpertDistributionRecorder.init_new(
-                    server_args,
-                    get_global_expert_location_metadata(),
-                    rank=self.tp_rank,
-                )
-            )
-
-        if self.server_args.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
-            self._init_lplb_solvers()
-
-        # Expert parallelism
-        self.eplb_manager = (
-            EPLBManager(self)
-            if self.server_args.enable_eplb and (not self.is_draft_worker)
-            else None
-        )
-=======
         self.init_memory_saver_adapter()
         self.maybe_init_remote_instance_transfer_engine()
         self.maybe_init_expert_location_metadata()
         self.maybe_init_lplb_solvers()
         self.maybe_init_eplb_manager()
->>>>>>> upstream/main
         self.expert_location_updater = ExpertLocationUpdater()
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
@@ -822,12 +684,25 @@ class ModelRunner:
         expert_rank = self.ps.moe_ep_rank + (
             get_parallel().ep_join_rank_offset if is_ep_scale_joiner() else 0
         )
+        # Skip expert-location metadata when nothing consumes it. On TPU,
+        # _compute_logical_to_all_physical_map issues many D2H copies and costs
+        # ~22s at startup; for configs without EP dispatch / EPLB / distribution
+        # recording, the metadata is never read (see expert_location_dispatch.py
+        # and fused_moe_triton/layer.py which handle None).
+        needs_expert_location_metadata = (
+            self.server_args.enable_eplb
+            or self.server_args.ep_dispatch_algorithm is not None
+            or self.server_args.expert_distribution_recorder_mode is not None
+            or self.server_args.init_expert_location != "trivial"
+        )
         set_global_expert_location_metadata(
             compute_initial_expert_location_metadata(
                 server_args=self.server_args,
                 model_config=self.model_config,
                 moe_ep_rank=expert_rank,
             )
+            if needs_expert_location_metadata
+            else None
         )
         if self.ps.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
             logger.info(
@@ -1077,21 +952,8 @@ class ModelRunner:
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
 
-<<<<<<< HEAD
-        if self.device == "cuda" or self.device == "musa":
-            self.init_cublas()
-            self.init_attention_backend()
-        elif self.device in ["cpu", "tpu", "xpu"]:
-            self.init_attention_backend()
-        elif self.device == "npu":
-            self.init_attention_backend()
-            # lazy init for zbal with mix mode (before graph capture when enable_cuda_graph)
-            if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 and not self.is_draft_worker:
-                from sglang.srt.hardware_backend.npu.utils import lazy_init_zbal_gva_mem
-=======
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
->>>>>>> upstream/main
 
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
@@ -1134,83 +996,6 @@ class ModelRunner:
         )
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
-<<<<<<< HEAD
-        """Capture cuda graphs. Requires init_attention_backends() to have run.
-
-        Spec draft runners pass capture_decode_cuda_graph=False
-        because they capture their own decode-style graphs separately.
-        """
-
-        self.graph_shared_output = GraphSharedOutput.create_for_model_runner(self)
-
-        # The eager (no-cuda-graph) phase runner, built AFTER the attention
-        # backend so its __init__ can warm up kernels (run-once) and allocate the
-        # fixed-max static buffer — both before the cuda-graph runners, so that
-        # buffer is canonical in the shared pool and the cg runners coalesce onto
-        # it. Always built: it serves both the fully-disabled case (decode/prefill
-        # runners point at it) and the eager fallback when a cg runner can't run a
-        # batch.
-        self.eager_runner = EagerRunner(self)
-
-        # cuda-graph capture: prefill before decode, so both coalesce onto the
-        # eager buffer allocated above. (init_prefill_cuda_graph routes prefill
-        # to the eager runner when the prefill graph is disabled.)
-        self.init_prefill_cuda_graph()
-
-        self.decode_cuda_graph_runner = None
-        self.graph_mem_usage = 0
-
-        if capture_decode_cuda_graph:
-            if self.device in ("cuda", "musa", "cpu", "npu", "xpu", "tpu"):
-                self.init_decode_cuda_graph()
-            elif (
-                current_platform.is_out_of_tree()
-                and current_platform.support_cuda_graph()
-            ):
-                self.init_decode_cuda_graph()
-        else:
-            # EAGLE draft workers own their decode-style graph capture, but TPU
-            # still uses this hook to install its torch.compile policy. The TPU
-            # graph runner does not capture or replay a device graph.
-            if self.device == "tpu" and get_flags().capture.enable_torch_compile:
-                self.init_decode_cuda_graph()
-            else:
-                self.decode_cuda_graph_runner = self.eager_runner
-
-        # Register forward hooks AFTER cuda-graph capture so their tensor ops are
-        # not traced into any captured graph — capture stays hook-free and hooks
-        # fire only on the eager forward path (capture replay never runs Python
-        # hooks anyway).
-        if self.server_args.forward_hooks:
-            register_forward_hooks(self.model, self.server_args.forward_hooks)
-
-        self.prealloc_symmetric_memory_pool()
-
-        if self.canary_manager is not None and not self.is_draft_worker:
-            self.canary_manager.mark_init_finished()
-
-    def adjust_hybrid_swa_layers_for_pp(self):
-        if not self.is_hybrid_swa:
-            return
-
-        if self.model_config.is_deepseek_v4_arch:
-            return
-
-        full_attention_layer_ids = [
-            layer_idx
-            for layer_idx in range(self.start_layer, self.end_layer + 1)
-            if hasattr(self.model_config, "full_attention_layer_ids")
-            and layer_idx in self.model_config.full_attention_layer_ids
-        ]
-        swa_attention_layer_ids = [
-            layer_idx
-            for layer_idx in range(self.start_layer, self.end_layer + 1)
-            if hasattr(self.model_config, "swa_attention_layer_ids")
-            and layer_idx in self.model_config.swa_attention_layer_ids
-        ]
-        self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
-        self.model_config.full_attention_layer_ids = full_attention_layer_ids
-=======
         capture = capture_cuda_graphs(
             model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
         )
@@ -1219,7 +1004,6 @@ class ModelRunner:
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
->>>>>>> upstream/main
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
@@ -1257,136 +1041,6 @@ class ModelRunner:
         )
 
     def init_torch_distributed(self):
-<<<<<<< HEAD
-        tic = time.perf_counter()
-        logger.info("Init torch distributed begin.")
-
-        try:
-            torch.get_device_module(self.device).set_device(self.gpu_id)
-        except Exception:
-            logger.warning(
-                f"Context: {self.device=} {self.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {self.tp_rank=} {self.tp_size=}"
-            )
-            raise
-
-        backend = get_default_distributed_backend(self.device)
-        # tpu_dist bootstrap requires exactly one TPU device per process.
-        # On multi-chip hosts with world_size==1, PJRT sees multiple chips
-        # and raises. Match torchtpu-vllm: use gloo for single-rank TPU.
-        if self.device == "tpu" and self.tp_size == 1:
-            backend = "gloo"
-        if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
-            backend = "mooncake"
-            if self.server_args.mooncake_ib_device:
-                from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-                    get_ib_devices_for_gpu,
-                )
-
-                ib_device_for_gpu = get_ib_devices_for_gpu(
-                    self.server_args.mooncake_ib_device, self.gpu_id
-                )
-                mooncake_ib_device = (
-                    ib_device_for_gpu.split(",") if ib_device_for_gpu else []
-                )
-                try:
-                    from mooncake import ep as mooncake_ep
-
-                    mooncake_ep.set_device_filter(mooncake_ib_device)
-                except:
-                    pass  # A warning will be raised in `init_distributed_environment`
-
-        before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        if not self.server_args.enable_p2p_check:
-            monkey_patch_p2p_access_check()
-
-        # Allow external orchestrators (e.g. trainpi) to override the distributed
-        # init method.  When set to "env://", torch uses MASTER_ADDR/MASTER_PORT
-        # env-vars and an externally-created TCPStore, completely avoiding port
-        # conflicts with intra-host collocation.
-        dist_init_method_override = envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
-        if dist_init_method_override:
-            dist_init_method = dist_init_method_override
-        elif self.server_args.dist_init_addr:
-            na = NetworkAddress.parse(self.server_args.dist_init_addr)
-            dist_init_method = na.to_tcp()
-        else:
-            dist_init_method = NetworkAddress(
-                self.server_args.host or "127.0.0.1", self.dist_port
-            ).to_tcp()
-        set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
-        set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
-        set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
-
-        if not self.is_draft_worker:
-            if self.device == "cpu":
-                if _is_cpu_amx_available or _is_cpu_arm64:
-                    # Bind OpenMP threads to CPU cores
-                    torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
-
-                    # Set local size to hint SGLang to use shared memory based AllReduce
-                    os.environ["LOCAL_SIZE"] = str(self.tp_size)
-                    torch.ops.sgl_kernel.initialize(self.tp_size, self.tp_rank)
-
-                else:
-                    logger.warning(
-                        "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
-                    )
-
-            # Only initialize the distributed environment on the target model worker.
-            init_distributed_environment(
-                backend=backend,
-                world_size=self.tp_size * self.pp_size,
-                rank=self.tp_size * self.pp_rank + self.tp_rank,
-                local_rank=self.gpu_id,
-                distributed_init_method=dist_init_method,
-                timeout=self.server_args.dist_timeout,
-                moe_a2a_backend=self.server_args.moe_a2a_backend,
-                recovered_rank=self.server_args.elastic_ep_rejoin,
-            )
-            initialize_model_parallel(
-                tensor_model_parallel_size=self.tp_size,
-                attention_data_parallel_size=self.dp_size,
-                pipeline_model_parallel_size=self.pp_size,
-                expert_model_parallel_size=self.moe_ep_size,
-                attention_context_model_parallel_size=self.attn_cp_size,
-                moe_data_model_parallel_size=self.moe_dp_size,
-                decode_context_parallel_size=self.dcp_size,
-                duplicate_tp_group=self.server_args.enable_pdmux,
-                enable_symm_mem=self.server_args.enable_symm_mem,
-                recovered_rank=self.server_args.elastic_ep_rejoin,
-            )
-            initialize_dp_attention(
-                server_args=self.server_args,
-                model_config=self.model_config,
-            )
-            if is_npu():
-                register_sgl_tp_rank(self.gpu_id)
-
-            # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
-            # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
-            if self.server_args.pre_warm_nccl and (
-                self.tp_size > 1 or self.pp_size > 1 or self.moe_ep_size > 1
-            ):
-                warmup_start = time.perf_counter()
-                tp_group_handle = get_tp_group().device_group
-
-                # Single warmup all_reduce to initialize NCCL/RCCL/HCCL communicator
-                warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
-                dist.all_reduce(warmup_tensor, group=tp_group_handle)
-                current_platform.synchronize()
-
-                warmup_elapsed = time.perf_counter() - warmup_start
-                logger.info(
-                    f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
-                    f"(tp_size={self.tp_size}, pp_size={self.pp_size}, ep_size={self.moe_ep_size})"
-                )
-
-        pre_model_load_memory = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
-=======
         result = bootstrap.init_torch_distributed(
             server_args=self.server_args,
             model_config=self.model_config,
@@ -1395,7 +1049,6 @@ class ModelRunner:
             dist_port=self.dist_port,
             is_draft_worker=self.is_draft_worker,
             local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,
->>>>>>> upstream/main
         )
         self.tp_group = result.tp_group
         self.pp_group = result.pp_group
@@ -1689,92 +1342,6 @@ class ModelRunner:
 
     def init_decode_cuda_graph(self):
         self.decode_cuda_graph_runner = None
-<<<<<<< HEAD
-        self.graph_mem_usage = 0
-
-        if not self.is_generation:
-            # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
-            return
-
-        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
-            return
-
-        # TPU uses this hook only to install torch.compile via
-        # TpuGraphRunner (PJRT handles compilation caching, so there is
-        # no CUDA-style capture/replay). The upstream DISABLED-backend
-        # gate below would always return early on TPU (its decode backend
-        # resolves to disabled by default), so handle TPU in a dedicated
-        # branch and leave the original gates untouched for other devices.
-        if self.device == "tpu":
-            if not get_flags().capture.enable_torch_compile:
-                return
-        else:
-            if self.device != "cpu" and check_cuda_graph_backend(
-                Phase.DECODE, Backend.DISABLED
-            ):
-                return
-
-            if self.device == "cpu" and not get_flags().capture.enable_torch_compile:
-                return
-
-        tic = time.perf_counter()
-        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        graph_backend = defaultdict(
-            lambda: f"{current_platform.device_name} graph",
-            {
-                "cuda": "CUDA graph",
-                "musa": "CUDA graph",
-                "cpu": "CPU graph",
-                "npu": "NPU graph",
-                "xpu": "XPU graph",
-                "tpu": "TPU graph",
-            },
-        )
-        role = "draft" if self.is_draft_worker else "target"
-        if self.spec_algorithm.is_speculative():
-            capture_name = f"{role} verify"
-            num_tokens_per_bs = (
-                self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                    self.server_args.speculative_num_draft_tokens,
-                    self.is_draft_worker,
-                )
-            )
-        else:
-            capture_name = f"{role} decode"
-            num_tokens_per_bs = 1
-        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
-        decode_backend = self.server_args.cuda_graph_config.decode.backend
-        logger.info(
-            f"Capture {capture_name} {graph_backend[self.device]} begin. "
-            f"backend={decode_backend}, num_tokens_per_bs={num_tokens_per_bs}, "
-            f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
-        )
-
-        if current_platform.is_out_of_tree() or _is_tpu:
-            GraphRunnerCls = current_platform.get_graph_runner_cls()
-            self.decode_cuda_graph_runner = GraphRunnerCls(self)
-        else:
-            from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
-                DecodeCudaGraphRunner,
-            )
-
-            graph_runners = defaultdict(
-                lambda: DecodeCudaGraphRunner,
-                {
-                    "cpu": CPUGraphRunner,
-                    "npu": NPUGraphRunner,
-                    "xpu": XPUGraphRunner,
-                },
-            )
-            self.decode_cuda_graph_runner = graph_runners[self.device](self)
-
-        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        self.graph_mem_usage = before_mem - after_mem
-        logger.info(
-            f"Capture {capture_name} {graph_backend[self.device]} end. "
-            f"elapsed={time.perf_counter() - tic:.2f} s, "
-            f"mem usage={self.graph_mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
-=======
         capture = capture_decode_graph(model_runner=self)
         self.decode_cuda_graph_runner = capture.runner
         self.graph_memory_usage = replace_graph_memory_usage(
@@ -1786,7 +1353,6 @@ class ModelRunner:
             self.graph_time_usage,
             capture.time_usage,
             phases=("decode", "target_verify", "draft_decode"),
->>>>>>> upstream/main
         )
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):

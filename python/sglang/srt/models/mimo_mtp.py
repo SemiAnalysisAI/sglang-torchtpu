@@ -199,12 +199,9 @@ class MiMoMTP(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-<<<<<<< HEAD
         # Settle device memory after weight tying via the platform abstraction
         # (empty_cache + synchronize) so it works on any backend -- the raw
         # torch.cuda.* calls raise on non-CUDA backends (e.g. TPU).
-=======
->>>>>>> upstream/main
         current_platform.empty_cache()
         current_platform.synchronize()
 

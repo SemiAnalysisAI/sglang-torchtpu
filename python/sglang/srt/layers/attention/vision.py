@@ -1445,11 +1445,8 @@ class VisionAttention(nn.Module):
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-<<<<<<< HEAD
         segment_ids: Optional[torch.Tensor] = None,
-=======
         forward_metadata: Optional[VisionAttentionMetadata] = None,
->>>>>>> upstream/main
         full_attn: bool = True,
         **kwargs,
     ) -> torch.Tensor:
@@ -1609,11 +1606,8 @@ class VisionAttention(nn.Module):
             seq_len=s,
             cu_seqlens=cu_seqlens,
             attention_mask=attention_mask,
-<<<<<<< HEAD
             segment_ids=segment_ids,
-=======
             forward_metadata=forward_metadata,
->>>>>>> upstream/main
             sequence_lengths=sequence_lengths,
             max_seqlen=max_seqlen,
             output_ws=attn_output_ws,

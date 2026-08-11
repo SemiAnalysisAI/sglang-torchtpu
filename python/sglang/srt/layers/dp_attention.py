@@ -27,17 +27,12 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-<<<<<<< HEAD
-from sglang.srt.runtime_context import get_flags
-from sglang.srt.utils import get_bool_env_var, is_hip, is_tpu
-=======
 from sglang.srt.runtime_context import (
     configured_attn_cp_size,
     configured_moe_dp_size,
     get_flags,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip
->>>>>>> upstream/main
+from sglang.srt.utils import get_bool_env_var, is_hip, is_tpu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -835,14 +830,10 @@ def _dp_gather(
                 global_tokens, local_tokens, forward_batch, is_partial, _gatherv_sizes
             )
             return
-<<<<<<< HEAD
-    if forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN:
-=======
     if (
         forward_batch.dp_padding_mode is not None
-        and forward_batch.dp_padding_mode.is_max_len()
+        and forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN
     ):
->>>>>>> upstream/main
         _dp_gather_via_all_gather(
             global_tokens, local_tokens, forward_batch, is_partial
         )
@@ -1072,8 +1063,7 @@ def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
-<<<<<<< HEAD
-    return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
+    return get_attn_tp_group().all_gather(input, output_tensor_list=output_list)
 
 
 # 0-D int64 rank-id tensors, keyed by (axis, device); axis is "attn_tp" or
@@ -1096,7 +1086,7 @@ def _init_rank_tensors(device: torch.device) -> None:
             .device attribute also hit.
     """
     for axis, rank in (
-        ("attn_tp", get_attention_tp_rank()),
+        ("attn_tp", get_attn_tensor_model_parallel_rank()),
         ("attn_dp", get_attention_dp_rank()),
     ):
         t = torch.tensor(rank, device=device, dtype=torch.int64)
@@ -1169,6 +1159,3 @@ def attn_rank0_scale(ref: torch.Tensor) -> torch.Tensor:
         the zero ranks.
     """
     return (_rank_tensor("attn_tp", ref.device) == 0).to(ref.dtype)
-=======
-    return get_attn_tp_group().all_gather(input, output_tensor_list=output_list)
->>>>>>> upstream/main

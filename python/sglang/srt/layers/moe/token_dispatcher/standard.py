@@ -112,14 +112,11 @@ class StandardDispatcher(BaseDispatcher):
         # Skip local expert mapping when the backend handles EP with global expert IDs:
         # - cutlass / cutedsl / trtllm_routed handle EP internally
         # - mxfp4 dispatcher mapping is already global
-<<<<<<< HEAD
+        # - hpc_ops consumes global ids together with rank_ep / num_expert_total
         # - the TPU runner takes global IDs and translates/masks them itself
         #   (mask_tpu_moe_non_local_experts); keeping the mapping out of the
         #   dispatcher also keeps lazily-created module state out of the
         #   compiled graph, whose guards precompiled TPU programs depend on
-=======
-        # - hpc_ops consumes global ids together with rank_ep / num_expert_total
->>>>>>> upstream/main
         self.skip_local_expert_mapping = (
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()

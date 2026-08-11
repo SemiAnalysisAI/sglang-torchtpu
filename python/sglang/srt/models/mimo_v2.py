@@ -78,13 +78,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
-<<<<<<< HEAD
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.server_args import get_global_server_args
-=======
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
->>>>>>> upstream/main
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,

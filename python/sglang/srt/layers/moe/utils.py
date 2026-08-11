@@ -9,17 +9,11 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.environ import envs
-<<<<<<< HEAD
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-from sglang.srt.runtime_context import get_flags, get_parallel
-from sglang.srt.utils import is_cuda, is_npu, is_tpu
-=======
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.runtime_context import get_exec, get_flags, get_forward, get_parallel
-from sglang.srt.utils import is_cuda, is_npu
->>>>>>> upstream/main
+from sglang.srt.utils import is_cuda, is_npu, is_tpu
 
 _is_npu = is_npu()
 _is_tpu = is_tpu()
@@ -117,22 +111,17 @@ class MoeRunnerBackend(Enum):
     HUMMING = "humming"
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     AITER = "aiter"
-<<<<<<< HEAD
-    PALLAS_TPU_FUSED_RS = "pallas_tpu_fused_rs"
-=======
     HPC_OPS = "hpc_ops"
->>>>>>> upstream/main
+    PALLAS_TPU_FUSED_RS = "pallas_tpu_fused_rs"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
 
-<<<<<<< HEAD
-    def is_pallas_tpu_fused_rs(self):
-        return self == MoeRunnerBackend.PALLAS_TPU_FUSED_RS
-=======
     def is_hpc_ops(self):
         return self == MoeRunnerBackend.HPC_OPS
->>>>>>> upstream/main
+
+    def is_pallas_tpu_fused_rs(self):
+        return self == MoeRunnerBackend.PALLAS_TPU_FUSED_RS
 
     def is_deep_gemm(self):
         return self == MoeRunnerBackend.DEEP_GEMM
@@ -576,15 +565,6 @@ def should_use_dp_reduce_scatterv():
     )
 
 
-<<<<<<< HEAD
-def should_skip_post_experts_all_reduce(
-    *,
-    is_tp_path: bool,
-    use_reduce_scatter: bool = False,
-    should_allreduce_fusion: bool = False,
-    experts_reduced: bool = False,
-) -> bool:
-=======
 def should_skip_mlp_all_reduce() -> bool:
     """Whether dense MLP / row-parallel projections should skip their all-reduce.
 
@@ -596,8 +576,11 @@ def should_skip_mlp_all_reduce() -> bool:
     return f.fuse_mlp_allreduce or f.mlp_reduce_scatter
 
 
-def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
->>>>>>> upstream/main
+def should_skip_post_experts_all_reduce(
+    *,
+    is_tp_path: bool,
+    experts_reduced: bool = False,
+) -> bool:
     """Whether to skip the post-experts all-reduce (EP or TP) because a
     downstream component will fuse, replace, or absorb it.
 

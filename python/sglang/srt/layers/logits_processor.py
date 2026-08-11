@@ -25,6 +25,7 @@ from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
     pack_aux_hidden_states,
@@ -479,42 +480,22 @@ class LogitsProcessor(nn.Module):
             and not logits_metadata.extend_return_logprob
         ):
             # Prefill without input logprobs.
-<<<<<<< HEAD
-            if logits_metadata.padded_static_len < 0:
-                if _is_tpu:
-                    # Set dtype to int32 rather than cumsum's default int64.
-                    # 32-bit integers are TPU native while s64 requires
-                    # emulation, and its buggy lowering can run into
-                    # "Unsupported conversion from vmreg/vreg to U64". int32
-                    # is plenty for per-batch token counts.
-                    last_index = (
-                        torch.cumsum(
-                            logits_metadata.extend_seq_lens,
-                            dim=0,
-                            dtype=torch.int32,
-                        )
-                        - 1
-                    )
-                else:
-                    last_index = (
-                        torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
-                    )
-            else:
-                # If padding_static length is 5 and extended_seq_lens is [2, 3],
-                # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
-                # and this retrieves t01 and t12, which are the valid last tokens
-                idx = torch.arange(
-                    len(logits_metadata.extend_seq_lens),
-                    device=logits_metadata.extend_seq_lens.device,
-                )
+            if _is_tpu:
+                # Set dtype to int32 rather than cumsum's default int64.
+                # 32-bit integers are TPU native while s64 requires
+                # emulation, and its buggy lowering can run into
+                # "Unsupported conversion from vmreg/vreg to U64". int32
+                # is plenty for per-batch token counts.
                 last_index = (
-                    idx * logits_metadata.padded_static_len
-                    + logits_metadata.extend_seq_lens
+                    torch.cumsum(
+                        logits_metadata.extend_seq_lens,
+                        dim=0,
+                        dtype=torch.int32,
+                    )
                     - 1
                 )
-=======
-            last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
->>>>>>> upstream/main
+            else:
+                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
             pruned_states = hidden_states[last_index]
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = hidden_states_before_norm[last_index]
@@ -756,11 +737,7 @@ class LogitsProcessor(nn.Module):
         )
 
         if self.final_logit_softcapping:
-<<<<<<< HEAD
-            if not (_is_npu or _is_tpu):
-=======
-            if not (_is_npu or _is_cpu):
->>>>>>> upstream/main
+            if not (_is_npu or _is_cpu or _is_tpu):
                 fused_softcap(logits, self.final_logit_softcapping)
             else:
                 logits = self.final_logit_softcapping * torch.tanh(

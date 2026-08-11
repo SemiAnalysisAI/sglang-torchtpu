@@ -43,11 +43,8 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
-<<<<<<< HEAD
 _use_torch_native = is_tpu()
-=======
 _is_cpu = is_cpu()
->>>>>>> upstream/main
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +137,12 @@ class TreeMaskMode(IntEnum):
     QLEN_ONLY_BITPACKING = 2
 
 
-<<<<<<< HEAD
+def default_tree_mask_mode() -> TreeMaskMode:
+    # The CPU verify attention kernel (intel_amx) consumes the qlen x qlen
+    # QLEN_ONLY tree mask directly; FULL_MASK is for the GPU kernels.
+    return TreeMaskMode.QLEN_ONLY if _is_cpu else TreeMaskMode.FULL_MASK
+
+
 def _build_tree_kernel_efficient_torch(
     topk: int,
     tree_mask_mode: TreeMaskMode,
@@ -168,12 +170,6 @@ def _build_tree_kernel_efficient_torch(
         retrieve_next_token[:, :-1] = torch.arange(
             1, num_verify_tokens, device=device, dtype=torch.long
         )
-=======
-def default_tree_mask_mode() -> TreeMaskMode:
-    # The CPU verify attention kernel (intel_amx) consumes the qlen x qlen
-    # QLEN_ONLY tree mask directly; FULL_MASK is for the GPU kernels.
-    return TreeMaskMode.QLEN_ONLY if _is_cpu else TreeMaskMode.FULL_MASK
->>>>>>> upstream/main
 
 
 def build_tree_kernel_efficient(
@@ -615,14 +611,10 @@ def eagle_prepare_for_verify(
         ForwardBatch,
         ForwardMode,
     )
-<<<<<<< HEAD
     from sglang.srt.speculative.spec_utils import (
         assign_extend_cache_locs_func,
         prepare_mamba_track_for_verify,
     )
-=======
-    from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
->>>>>>> upstream/main
 
     if not batch.forward_mode.is_idle():
         # Assign cache locations
@@ -635,19 +627,31 @@ def eagle_prepare_for_verify(
             "v2 prepare_for_verify input_ids",
         )
         device = batch.device
-        # Uniform variant: end offsets (= start + draft_token_num) are computed
-        # inside the kernel, keeping the eager `seq_lens + N` add off the host
-        # critical path (bs=1 MTP inter-phase seam).
-        batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=req_to_token_pool.req_to_token,
-            start_offset=batch.seq_lens,
-            batch_size=bs,
-            draft_token_num=verify_input.draft_token_num,
-            device=device,
-            host_req_pool_indices=batch.req_pool_indices_cpu,
-            host_seq_lens=batch.seq_lens_cpu,
-        )
+        if _use_torch_native:
+            # TPU: torch-native gather routed through the host mirrors.
+            batch.out_cache_loc = assign_extend_cache_locs_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                end_offset=batch.seq_lens + verify_input.draft_token_num,
+                batch_size=bs,
+                draft_token_num=verify_input.draft_token_num,
+                device=device,
+                host_req_pool_indices=batch.req_pool_indices_cpu,
+                host_seq_lens=batch.seq_lens_cpu,
+            )
+        else:
+            # Uniform variant: end offsets (= start + draft_token_num) are computed
+            # inside the kernel, keeping the eager `seq_lens + N` add off the host
+            # critical path (bs=1 MTP inter-phase seam).
+            batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                batch_size=bs,
+                draft_token_num=verify_input.draft_token_num,
+                device=device,
+            )
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
@@ -871,15 +875,9 @@ def eagle_sample(
                 tree_speculative_sampling_target_only,
             )
 
-<<<<<<< HEAD
-            from sglang.srt.speculative.reject_sampling import (
+            from sglang.kernels.ops.speculative.reject_sampling import (
                 chain_speculative_sampling_triton,
             )
-=======
-        from sglang.kernels.ops.speculative.reject_sampling import (
-            chain_speculative_sampling_triton,
-        )
->>>>>>> upstream/main
 
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
 
@@ -1018,14 +1016,8 @@ def eagle_sample(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
-<<<<<<< HEAD
-    from sglang.srt.speculative.spec_utils import (
-        allocate_and_assign_decode_cache,
-        assign_req_to_token_pool_func,
-    )
+    from sglang.srt.speculative.spec_utils import allocate_and_assign_decode_cache
 
-=======
->>>>>>> upstream/main
     bs = batch.batch_size()
 
     # Accumulate penalty
@@ -1075,9 +1067,10 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
         )
 
-<<<<<<< HEAD
     if _use_torch_native and batch.req_to_token_pool.host_resident:
-        out_cache_loc = allocate_and_assign_decode_cache(
+        # TPU: req_to_token lives on the host, so allocate and write the page
+        # table through the host mirrors instead of the device alloc path.
+        allocate_and_assign_decode_cache(
             tree_cache=batch.tree_cache,
             req_to_token_pool=batch.req_to_token_pool,
             req_pool_indices=batch.req_pool_indices,
@@ -1088,40 +1081,27 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             device=batch.device,
             host_req_pool_indices=batch.req_pool_indices_cpu,
         )
+        # Bookkeeping that alloc_for_spec_decode does for the device path.
+        for i, req in enumerate(batch.reqs):
+            req.kv.kv_allocated_len = max(
+                req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i])
+            )
     else:
         # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
         # barrier has chained to the prev forward -> host stalls a full forward.
         cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
         nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-        if page_size == 1:
-            out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
-        else:
-            last_loc = get_last_loc(
-                batch.req_to_token_pool.req_to_token,
-                batch.req_pool_indices,
-                cur_kv_lens_device,
-            )
-            device_type = getattr(
-                batch.device, "type", str(batch.device).split(":", 1)[0]
-            )
-            out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
-                batch.tree_cache,
-                cur_kv_lens_device,
-                cur_kv_lens_cpu,
-                nxt_kv_lens_device,
-                nxt_kv_lens_cpu,
-                last_loc,
-                num_needed_tokens,
-                req_pool_indices=batch.req_pool_indices,
-                batch=batch,
-            )
-        assign_req_to_token_pool_func(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            cur_kv_lens_device,
-            nxt_kv_lens_device,
-            out_cache_loc,
-            bs,
+        alloc_for_spec_decode(
+            batch.tree_cache,
+            batch.req_to_token_pool,
+            reqs=batch.reqs,
+            req_pool_indices=batch.req_pool_indices,
+            cur_kv_lens=cur_kv_lens_device,
+            cur_kv_lens_cpu=cur_kv_lens_cpu,
+            nxt_kv_lens=nxt_kv_lens_device,
+            nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+            num_needed_tokens=num_needed_tokens,
+            batch=batch,
         )
 
 
@@ -1313,27 +1293,4 @@ def tree_speculative_sampling_target_only_func(
         threshold_single=threshold_single,
         threshold_acc=threshold_acc,
         deterministic=deterministic,
-=======
-    # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
-    # barrier has chained to the prev forward -> host stalls a full forward.
-    cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-    nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-    tree_cache = batch.tree_cache
-    req_to_token_pool = batch.req_to_token_pool
-    req_pool_indices = batch.req_pool_indices
-    reqs = batch.reqs
-    cur_kv_lens = cur_kv_lens_device
-    nxt_kv_lens = nxt_kv_lens_device
-    alloc_for_spec_decode(
-        tree_cache,
-        req_to_token_pool,
-        reqs=reqs,
-        req_pool_indices=req_pool_indices,
-        cur_kv_lens=cur_kv_lens,
-        cur_kv_lens_cpu=cur_kv_lens_cpu,
-        nxt_kv_lens=nxt_kv_lens,
-        nxt_kv_lens_cpu=nxt_kv_lens_cpu,
-        num_needed_tokens=num_needed_tokens,
-        batch=batch,
->>>>>>> upstream/main
     )

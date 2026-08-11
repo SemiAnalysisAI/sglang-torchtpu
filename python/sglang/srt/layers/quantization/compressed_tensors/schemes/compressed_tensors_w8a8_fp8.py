@@ -275,9 +275,6 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-<<<<<<< HEAD
-        if layer.weight_block_size is not None:
-=======
         if isinstance(x, tuple):
             # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
             # x = (fp8_input, per_tensor_input_scale[, orig_dtype]).
@@ -295,8 +292,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 compressed_tensor_quant=True,
                 pre_quant_output_dtype=out_dtype,
             )
-        if self.weight_block_size is not None:
->>>>>>> upstream/main
+        if layer.weight_block_size is not None:
             return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,

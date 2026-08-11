@@ -175,12 +175,17 @@ def capture_cuda_graphs(
         capture_time=0,
     )
     if capture_decode_cuda_graph:
-        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
+        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu", "tpu"):
             decode = capture_decode_graph(model_runner=model_runner)
         elif (
             current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
         ):
             decode = capture_decode_graph(model_runner=model_runner)
+    elif model_runner.device == "tpu" and get_flags().capture.enable_torch_compile:
+        # EAGLE draft workers own their decode-style graph capture, but TPU
+        # still uses this hook to install its torch.compile policy. The TPU
+        # graph runner does not capture or replay a device graph.
+        decode = capture_decode_graph(model_runner=model_runner)
     else:
         decode = GraphCapture(
             runner=eager_runner,
@@ -427,12 +432,24 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         return no_capture
     if model_runner.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
         return no_capture
-    if model_runner.device != "cpu" and check_cuda_graph_backend(
-        Phase.DECODE, Backend.DISABLED
-    ):
-        return no_capture
-    if model_runner.device == "cpu" and not get_flags().capture.enable_torch_compile:
-        return no_capture
+    # TPU uses this hook only to install torch.compile via TpuGraphRunner (PJRT
+    # handles compilation caching, so there is no CUDA-style capture/replay).
+    # The upstream DISABLED-backend gate below would always return early on TPU
+    # (its decode backend resolves to disabled by default), so handle TPU in a
+    # dedicated branch and leave the original gates untouched for other devices.
+    if model_runner.device == "tpu":
+        if not get_flags().capture.enable_torch_compile:
+            return no_capture
+    else:
+        if model_runner.device != "cpu" and check_cuda_graph_backend(
+            Phase.DECODE, Backend.DISABLED
+        ):
+            return no_capture
+        if (
+            model_runner.device == "cpu"
+            and not get_flags().capture.enable_torch_compile
+        ):
+            return no_capture
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
@@ -444,6 +461,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
             "cpu": "CPU graph",
             "npu": "NPU graph",
             "xpu": "XPU graph",
+            "tpu": "TPU graph",
         },
     )
     role = "draft" if model_runner.is_draft_worker else "target"
@@ -461,7 +479,9 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
     )
 
-    if current_platform.is_out_of_tree():
+    # TPU is an in-tree PlatformEnum, so is_out_of_tree() is False for it; it
+    # still resolves its graph runner (TpuGraphRunner) through the platform.
+    if current_platform.is_out_of_tree() or current_platform.is_tpu():
         GraphRunnerCls = current_platform.get_graph_runner_cls()
         runner = GraphRunnerCls(model_runner)
     else:

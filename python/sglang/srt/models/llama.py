@@ -52,14 +52,9 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
-<<<<<<< HEAD
-from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_tpu, is_xpu, make_layers
-=======
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_xpu, make_layers
->>>>>>> upstream/main
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_tpu, is_xpu, make_layers
 from sglang.utils import get_exception_traceback
 
 _is_cuda = is_cuda()

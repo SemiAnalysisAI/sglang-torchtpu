@@ -708,12 +708,6 @@ class PrefillAdder:
     ) -> int:
         """SWA pool budget per request. Only valid when is_hybrid_swa is True.
 
-<<<<<<< HEAD
-        With chunked prefill + overlap scheduling, reserve both the next chunk
-        and the request's retained sliding window. The allocator's evictable
-        count can still include that window until the overlap result commits,
-        so using only the larger value can over-admit and force retraction.
-=======
         With chunked prefill + overlap scheduler, the peak SWA occupancy is:
           chunk N (running, not yet in tree) + sliding window (locked in tree)
           + chunk N+1 (new allocation)
@@ -725,19 +719,22 @@ class PrefillAdder:
 
         where alloc = min(extend, rem_chunk); the min() cap keeps the two terms
         from double-counting extend, so budget <= extend + max_new_tokens + page.
->>>>>>> upstream/main
+
+        When chunking is active, the allocator's evictable count can still
+        include this request's retained sliding window until the overlap result
+        commits, so the chunk and the window reservation are charged additively
+        (alloc + reserved) rather than offset against each other; offsetting can
+        over-admit and force retraction.
         """
         if self.rem_chunk_tokens is not None:
             alloc = min(extend_input_len, self.rem_chunk_tokens)
         else:
             alloc = extend_input_len
-<<<<<<< HEAD
-        if self.rem_chunk_tokens is not None:
-            budget = alloc + self.tree_cache.sliding_window_size + self.page_size
-        else:
-            budget = max(alloc, self.tree_cache.sliding_window_size) + self.page_size
-=======
         window = self.tree_cache.sliding_window_size
+        if self.rem_chunk_tokens is not None:
+            return alloc + self._swa_reserved_tokens(
+                extend_input_len, max_new_tokens, swa_host_hit_length
+            )
         return max(alloc - window, 0) + self._swa_reserved_tokens(
             extend_input_len, max_new_tokens, swa_host_hit_length
         )
@@ -757,7 +754,6 @@ class PrefillAdder:
         window = self.tree_cache.sliding_window_size
         headroom = min(extend_input_len + max_new_tokens, window)
         reserved = headroom + self.page_size
->>>>>>> upstream/main
         if swa_host_hit_length > 0:
             reserved += self.ceil_paged_tokens(swa_host_hit_length)
         return reserved

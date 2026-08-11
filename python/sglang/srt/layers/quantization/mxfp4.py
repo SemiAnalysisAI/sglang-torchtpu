@@ -626,17 +626,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self._fi_kernel == "cutlass_sm90":
             self._process_weights_for_sm90_cutlass(layer)
             return
-<<<<<<< HEAD
+        if self._fi_kernel == "cutlass_sm120":
+            self._process_weights_for_sm120_cutlass(layer)
+            return
         if is_tpu():
             from sglang.srt.layers.quantization.mxfp4_tpu_util import (
                 prepare_tpu_mxfp4_moe_weights,
             )
 
             prepare_tpu_mxfp4_moe_weights(layer)
-=======
-        if self._fi_kernel == "cutlass_sm120":
-            self._process_weights_for_sm120_cutlass(layer)
->>>>>>> upstream/main
             return
         if self.use_flashinfer:
             # Per-expert buffers are local (create_weights uses num_local_experts);
@@ -1379,7 +1377,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-<<<<<<< HEAD
         # TODO(qinghan): once the packed-FP4 fast path lands, gate this on a
         # config flag instead of unconditionally taking the BF16 triage path.
         if is_tpu():
@@ -1389,7 +1386,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
             return UnquantizedFusedMoEMethod.forward_tpu(self, layer, dispatch_output)
-=======
+
         if self.use_deep_gemm:
             # Handles standard AND deepep_ll/deepep_normal dispatch formats via
             # the runner's registered pre/post-permute functions. Must run
@@ -1407,7 +1404,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 is_fp4_experts=True,
             )
             return self.runner.run(dispatch_output, quant_info)
->>>>>>> upstream/main
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output

@@ -28,18 +28,9 @@ from sglang.srt.entrypoints.engine import (
 )
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.data_parallel_controller import DataParallelController
-<<<<<<< HEAD
+from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
 from sglang.srt.ray.engine import _actor_options
 from sglang.srt.ray.scheduler_actor import SchedulerActor
-=======
-from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
-from sglang.srt.ray.engine import (
-    _compute_world_size,
-    _create_scheduler_actor,
-    _get_bundle_node_ip,
-    _resolve_bundle_indices,
-)
->>>>>>> upstream/main
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils.network import bind_port, get_zmq_socket, get_zmq_socket_on_host
 
@@ -148,24 +139,11 @@ class RayDataParallelController(DataParallelController):
         nnodes = server_args.nnodes
         batch_start_idx = len(self.scheduler_actors)
 
-<<<<<<< HEAD
         for node_idx in range(nnodes):
             bundle_idx = self.bundle_for_node[node_idx]
             pp_range, tp_range, pp_per_node, tp_per_node = _calculate_rank_ranges(
                 nnodes, server_args.pp_size, server_args.tp_size, node_rank=node_idx
             )
-=======
-        if not self.is_custom_pg:
-            for node_idx in range(nnodes):
-                bundle_idx = self.bundle_for_node[node_idx]
-                pp_range, tp_range, pp_per_node, tp_per_node = _calculate_rank_ranges(
-                    nnodes, server_args.pp_size, server_args.tp_size, node_rank=node_idx
-                )
-                for pp_rank in pp_range:
-                    for tp_rank in tp_range:
-                        rank_port_args = port_args
-                        actual_dp_rank = dp_rank
->>>>>>> upstream/main
 
             for pp_rank in pp_range:
                 for tp_rank in tp_range:

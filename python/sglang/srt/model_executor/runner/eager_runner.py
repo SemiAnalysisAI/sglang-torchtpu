@@ -49,18 +49,13 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
 )
-<<<<<<< HEAD
 from sglang.srt.utils import is_hip, is_tpu
-from sglang.srt.utils.common import ceil_align, require_mlp_sync
-=======
-from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import (
     ceil_align,
     get_eager_max_batch_size,
     require_mlp_sync,
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
->>>>>>> upstream/main
 
 logger = logging.getLogger(__name__)
 

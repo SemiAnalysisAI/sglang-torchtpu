@@ -23,9 +23,10 @@ def maybe_disable_chunked_prefix_cache(
 ) -> None:
     # Chunked prefix caching requires an MLA model on a backend whose
     # kernels read that layout. This is a load-time gate, not a
-    # resolution-time one: out-of-tree platforms register their supported
-    # backends in init_backend(), which runs when this module is imported
-    # — after ServerArgs.__post_init__. Target runner only: a draft
+    # resolution-time one: TPU registers its supported backends during
+    # worker bootstrap, while other out-of-tree platforms may do so when
+    # this module is imported. Both occur after ServerArgs.__post_init__.
+    # Target runner only: a draft
     # model's (often non-MLA) config must not flip the shared setting.
     if is_draft_worker:
         return

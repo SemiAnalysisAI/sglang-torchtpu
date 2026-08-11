@@ -7,7 +7,7 @@ import torch.distributed as dist
 from torch import nn
 
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed import get_attn_tp_group, get_tp_group
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -228,12 +228,8 @@ class Sampler(nn.Module):
                     )
                 del probs
 
-<<<<<<< HEAD
         batch_next_token_ids = batch_next_token_ids.to(torch.int64)
 
-        # Attach logprobs to logits_output (in-place modification)
-=======
->>>>>>> upstream/main
         if return_logprob:
             if SGLANG_RETURN_ORIGINAL_LOGPROB:
                 logprobs = original_logprobs
@@ -510,9 +506,7 @@ class Sampler(nn.Module):
             # Use broadcast because TPU MIN all-reduce is unsupported.
             if batch_next_token_ids.device.type == "tpu":
                 tp_group = (
-                    get_attention_tp_group()
-                    if is_dp_attention_enabled()
-                    else get_tp_group()
+                    get_attn_tp_group() if is_dp_attention_enabled() else get_tp_group()
                 )
                 tp_group.broadcast(batch_next_token_ids, src=0)
                 return

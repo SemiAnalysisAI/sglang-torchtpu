@@ -45,11 +45,6 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
-<<<<<<< HEAD
-    get_attention_tp_group,
-    get_attention_tp_size,
-=======
->>>>>>> upstream/main
     get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
@@ -464,7 +459,7 @@ def _tpu_hybrid_reduce_scatter_unsupported() -> bool:
     through all-reduce + dp_scatter instead. should_use_reduce_scatter and
     _scatter_hidden_states must agree on this.
     """
-    return _is_tpu and is_dp_attention_enabled() and get_attention_tp_size() > 1
+    return _is_tpu and is_dp_attention_enabled() and get_parallel().attn_tp_size > 1
 
 
 class LayerCommunicator:

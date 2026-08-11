@@ -883,34 +883,24 @@ class DefaultModelLoader(BaseModelLoader):
                 for name, loaded_weight in weights
             )
 
-<<<<<<< HEAD
         # Give the active platform a hook around weight loading
         # (e.g. flush deferred device copies for torch_tpu). Default is no-op.
         with current_platform.weight_loading_context(weights) as weights:
-            if is_nvfp4_online:
+            if is_nvfp4_online or is_modelopt_fp4_online:
                 # Scope exact FP4 quantization math to load-time conversion only;
                 # restore the original environment before serving starts.
                 with temp_set_env(
-                    TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
                     FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
+                    FLASHINFER_NVFP4_4OVER6="1",
+                    FLASHINFER_NVFP4_4OVER6_E4M3_USE_256="0",
+                    FLASHINFER_NVFP4_4OVER6_ERR_MODE="MSE",
+                    FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH="1",
                 ):
                     model.load_weights(weights)
                 if target_device.type == "cuda":
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
             else:
-=======
-        if is_nvfp4_online or is_modelopt_fp4_online:
-            # Scope exact FP4 quantization math to load-time conversion only;
-            # restore the original environment before serving starts.
-            with temp_set_env(
-                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
-                FLASHINFER_NVFP4_4OVER6="1",
-                FLASHINFER_NVFP4_4OVER6_E4M3_USE_256="0",
-                FLASHINFER_NVFP4_4OVER6_ERR_MODE="MSE",
-                FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH="1",
-            ):
->>>>>>> upstream/main
                 model.load_weights(weights)
 
         # Used in tests to verify memory savings when using online quantization.

@@ -57,13 +57,13 @@ def _get_device_module():
 @cache
 def _timing_events_supported() -> bool:
     try:
-        device_module.Event(enable_timing=True)
+        _get_device_module().Event(enable_timing=True)
         return True
     except (TypeError, NotImplementedError):
         logger.warning(
             "%s.Event does not support enable_timing=True; load-back "
             "duration metric will be skipped on this backend.",
-            device_module.__name__,
+            _get_device_module().__name__,
         )
         return False
 
@@ -71,7 +71,11 @@ def _timing_events_supported() -> bool:
 def make_timing_event_pair():
     timing_enabled = _timing_events_supported()
     kwargs = {"enable_timing": True} if timing_enabled else {}
-    return device_module.Event(**kwargs), device_module.Event(**kwargs), timing_enabled
+    return (
+        _get_device_module().Event(**kwargs),
+        _get_device_module().Event(**kwargs),
+        timing_enabled,
+    )
 
 
 class LayerLoadingEvent:
@@ -816,13 +820,8 @@ class HiCacheController:
             )
         self.write_queue.clear()
 
-<<<<<<< HEAD
         start_event = _get_device_module().Event()
-        finish_event = _get_device_module().Event()
-=======
-        start_event = device_module.Event()
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
->>>>>>> upstream/main
 
         start_event.record()
         with _get_device_module().stream(self.write_stream):
@@ -923,13 +922,9 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
-<<<<<<< HEAD
-        with _get_device_module().stream(self.load_stream):
-=======
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
 
-        with device_module.stream(self.load_stream):
->>>>>>> upstream/main
+        with _get_device_module().stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             ack_start_event.record()
             for i in range(self.layer_num):

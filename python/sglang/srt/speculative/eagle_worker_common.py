@@ -4,10 +4,6 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import (
-    assign_draft_cache_locs_contiguous,
-)
-from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
 from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -24,8 +20,10 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
+    assign_draft_cache_locs_contiguous_func,
     build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
+    fill_bonus_tokens_func,
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
     record_stream_for_v2_verify,
@@ -191,6 +189,7 @@ def prepare_for_draft_extend(
         # Supply CPU mirror (extend_seq_lens are all num_window_tokens) so
         # backend max() reads from list without a per-iter D2H sync.
         forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
+    draft_model_runner.compile_policy.prepare_spec_forward_batch(forward_batch)
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
@@ -242,14 +241,15 @@ def prepare_for_draft(
                 )
             else:
                 # FIXME(lsyin): align with the default code path
-                assign_draft_cache_locs_contiguous[(bs,)](
+                assign_draft_cache_locs_contiguous_func(
                     batch.req_pool_indices,
                     req_to_token_pool.req_to_token,
                     batch.seq_lens,
                     batch.out_cache_loc,
-                    req_to_token_pool.req_to_token.shape[1],
                     topk,
                     num_steps,
+                    host_req_pool_indices=batch.req_pool_indices_cpu,
+                    host_seq_lens=batch.seq_lens_cpu,
                 )
         else:
             # page_size > 1 + topk > 1: per-branch page-aligned draft pages.
@@ -619,7 +619,6 @@ def run_eagle_verify(
             accept_lens,
             bonus_tokens,
             accept_index.shape[1],
-            bs,
         )
     else:
         bonus_tokens = torch.empty((0,), device=device, dtype=torch.int32)

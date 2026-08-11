@@ -435,13 +435,8 @@ class HybridCacheController(BaseHiCacheController):
                 self.move_hybrid_indices(op)
             )
         self.write_queue.clear()
-<<<<<<< HEAD
         start_event = _get_device_module().Event()
-        finish_event = _get_device_module().Event()
-=======
-        start_event = device_module.Event()
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
->>>>>>> upstream/main
         start_event.record()
         with _get_device_module().stream(self.write_stream):
             start_event.wait(self.write_stream)
@@ -569,14 +564,10 @@ class HybridCacheController(BaseHiCacheController):
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
-<<<<<<< HEAD
-        with _get_device_module().stream(self.load_stream):
-=======
 
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
 
-        with device_module.stream(self.load_stream):
->>>>>>> upstream/main
+        with _get_device_module().stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             ack_start_event.record()
             target_device_pool = self.mem_pool_host.anchor_entry.device_pool

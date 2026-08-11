@@ -7,17 +7,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-<<<<<<< HEAD
-from sglang.srt.speculative.spec_utils import (
-    assign_draft_cache_locs_contiguous_func,
-)
-=======
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
 )
 from sglang.srt.runtime_context import get_exec, get_schedule
->>>>>>> upstream/main
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import (
@@ -139,137 +133,6 @@ class EagleDraftWorkerBase(ABC):
             get_schedule().max_running_requests or 0,
             1,
         )
-<<<<<<< HEAD
-        batch.forward_mode = (
-            ForwardMode.IDLE
-            if batch.forward_mode.is_idle()
-            else ForwardMode.DRAFT_EXTEND_V2
-        )
-        batch.capture_hidden_mode = capture_mode
-        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
-        # Forward sees post-write length (draft extend writes num_draft_tokens
-        # slots); mutation stays on forward_batch to preserve SB.seq_lens.
-        forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
-        if not gpu_only:
-            forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
-            forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
-        else:
-            # Supply CPU mirror (extend_seq_lens are all num_draft_tokens) so
-            # backend max() reads from list without a per-iter D2H sync.
-            forward_batch.extend_seq_lens_cpu = [num_draft_tokens] * bs
-        draft_model_runner.compile_policy.prepare_spec_forward_batch(forward_batch)
-        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
-            forward_batch
-        )
-        if not batch.forward_mode.is_idle() and not can_cuda_graph:
-            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
-            # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
-            # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
-            # (the `_batch_size == batch_size` assertion, see #27091); the
-            # marked pre-pad metadata is used as-is, matching the proven
-            # skip_attn_backend_init=True behavior.
-            # On NPU with --disable-cuda-graph, block_table shape won't match
-            # after prepare_mlp_sync_batch padding; defer re-init to
-            # forward_extend (post-pad) instead.
-            if not is_npu() or can_cuda_graph:
-                forward_batch.mark_forward_metadata_ready()
-        return forward_batch
-
-    def prepare_for_draft(
-        self,
-        draft_input: EagleDraftInput,
-        req_to_token_pool: ReqToTokenPool,
-        batch: ScheduleBatch,
-        cuda_graph_runner: EAGLEDraftCudaGraphRunner,
-        draft_model_runner: ModelRunner,
-        topk: int,
-        num_steps: int,
-    ):
-        from sglang.srt.model_executor.forward_batch_info import (
-            CaptureHiddenMode,
-            ForwardBatch,
-        )
-
-        if not batch.forward_mode.is_idle():
-            bs = len(batch.seq_lens)
-
-            # Assign cache locations (draft-write targets).
-            page_size = batch.token_to_kv_pool_allocator.page_size
-            if page_size == 1 or topk == 1:
-                batch.out_cache_loc = torch.empty(
-                    (bs * topk * num_steps,),
-                    dtype=torch.int64,
-                    device=batch.device,
-                )
-                # FIXME(lsyin): align with the default code path
-                assign_draft_cache_locs_contiguous_func(
-                    batch.req_pool_indices,
-                    req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    topk,
-                    num_steps,
-                    host_req_pool_indices=batch.req_pool_indices_cpu,
-                    host_seq_lens=batch.seq_lens_cpu,
-                )
-            else:
-                # page_size > 1 + topk > 1: per-branch page-aligned draft pages.
-                # Reduce out_cache_loc from the page-aligned tree region down to the
-                # dense draft slots (skip each branch's duplicated prefix-tail slots
-                # and trailing padding), matching generate_draft_decode_kv_indices'
-                # paged read formula: prefix_base + t*num_new_pages*page + last_page + s.
-                # base is batch.seq_lens (== KV-ready committed prefix at draft time;
-                # the bonus is the tree root written by verify, not part of [0:seq_lens]).
-                rows = req_to_token_pool.req_to_token[batch.req_pool_indices.long()]
-                seq_lens = batch.seq_lens.to(torch.int64)
-                last_page = seq_lens % page_size
-                prefix_base = seq_lens - last_page
-                num_new_pages = (last_page + num_steps + page_size - 1) // page_size
-                topk_ids = torch.arange(
-                    topk, device=rows.device, dtype=torch.int64
-                ).view(1, topk)
-                starts = (
-                    prefix_base.view(bs, 1)
-                    + topk_ids * (num_new_pages.view(bs, 1) * page_size)
-                    + last_page.view(bs, 1)
-                )
-                steps = torch.arange(
-                    num_steps, device=rows.device, dtype=torch.int64
-                ).view(1, 1, num_steps)
-                pos = (starts.view(bs, topk, 1) + steps).reshape(bs, topk * num_steps)
-                batch.out_cache_loc = (
-                    torch.gather(rows, 1, pos).reshape(-1).contiguous()
-                )
-
-                # Each branch's page-aligned region starts with `last_page` hole slots
-                # overlapping the prefix tail page; duplicate the real prefix-tail KV
-                # into them so whole-page reads stay coherent (see helper docstring).
-                duplicate_prefix_tail_to_draft_branches(
-                    draft_model_runner.token_to_kv_pool,
-                    rows,
-                    prefix_base,
-                    last_page,
-                    num_new_pages,
-                    topk,
-                    page_size,
-                )
-
-        # Get a forward batch
-        draft_input.num_tokens_per_req = topk
-        draft_input.num_tokens_for_logprob_per_req = topk
-        capture_mode = (
-            CaptureHiddenMode.NULL
-            if draft_model_runner.spec_algorithm.is_standalone()
-            else CaptureHiddenMode.LAST
-        )
-        draft_input.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
-        batch.capture_hidden_mode = capture_mode
-        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
-        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
-            forward_batch
-        )
-        return forward_batch, can_cuda_graph
-=======
         # A single-step chain has no parent entries (slow path drops the last
         # step). repeat (not expand): the kernel reads these as contiguous.
         parent_width = num_steps if num_steps > 1 else 0
@@ -279,7 +142,6 @@ class EagleDraftWorkerBase(ABC):
         self._topk1_score_indices_prealloc = torch.arange(
             num_steps, dtype=torch.long, device=self.device
         ).repeat(max_bs, 1)
->>>>>>> upstream/main
 
 
 class BaseSpecWorker(ABC):

@@ -168,7 +168,6 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
-<<<<<<< HEAD
     def get_fused_kv_buffer(self, layer_id: int):
         """TPU-only proxy: route to the sub-pool's fused 5D buffer.
 
@@ -186,7 +185,7 @@ class SWAKVPool(BaseSWAKVPool):
 
     def set_swa_loc(self, loc: torch.Tensor):
         self.swa_loc = loc
-=======
+
     def get_kv_scale_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
@@ -194,7 +193,6 @@ class SWAKVPool(BaseSWAKVPool):
             return self.swa_kv_pool.get_kv_scale_buffer(layer_id_pool)
         else:
             return self.full_kv_pool.get_kv_scale_buffer(layer_id_pool)
->>>>>>> upstream/main
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
         assert self.full_to_swa_index_mapping is not None

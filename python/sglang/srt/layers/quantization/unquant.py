@@ -10,11 +10,8 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-<<<<<<< HEAD
-from sglang.srt.distributed import get_moe_expert_parallel_rank
-=======
 from sglang.kernels.fused_op import BaseFusedOp
->>>>>>> upstream/main
+from sglang.srt.distributed import get_moe_expert_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
@@ -642,8 +639,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     # fused_moe_forward_native is installed instead via this hook.
     def _torch_compile_forward(self, num_tokens: int) -> Optional[Callable]:
         # torch.compile on this layer only pays off at bs=1; keep the
-        # optimized dispatch otherwise.
-        if num_tokens == 1:
+        # optimized dispatch otherwise. Never on TPU: forward_tpu must stay.
+        if num_tokens == 1 and not _is_tpu:
             from sglang.srt.layers.moe.fused_moe_native import (
                 fused_moe_forward_native,
             )

@@ -24,29 +24,22 @@ from typing import TYPE_CHECKING
 
 import torch
 
-<<<<<<< HEAD
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 
 try:
-    from sglang.srt.mem_cache.triton_ops.allocator import (
+    from sglang.kernels.ops.memory.allocator import (
         alloc_decode_kernel,
         alloc_extend_kernel,
     )
 except ImportError:
-    # ``triton_ops.allocator`` imports ``triton`` at module top; on backends
-    # without triton (e.g. TPU) that raises ImportError. The paged allocator's
-    # kernel path is unused there — ``TpuPagedTokenToKVPoolAllocator`` overrides
-    # ``alloc_extend`` / ``alloc_decode`` with host-side index math — so degrade
-    # to ``None`` instead of failing the whole ``mem_cache.allocator`` import.
+    # ``kernels.ops.memory.allocator`` imports ``triton`` at module top; on
+    # backends without triton (e.g. TPU) that raises ImportError. The paged
+    # allocator's kernel path is unused there — ``TpuPagedTokenToKVPoolAllocator``
+    # overrides ``alloc_extend`` / ``alloc_decode`` with host-side index math —
+    # so degrade to ``None`` instead of failing the whole
+    # ``mem_cache.allocator`` import.
     alloc_decode_kernel = None
     alloc_extend_kernel = None
-=======
-from sglang.kernels.ops.memory.allocator import (
-    alloc_decode_kernel,
-    alloc_extend_kernel,
-)
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
->>>>>>> upstream/main
 from sglang.srt.utils import (
     get_bool_env_var,
     get_num_new_pages,

@@ -306,6 +306,26 @@ class KVCacheConfigurator:
         if swa_max_total_num_tokens is not None:
             swa_max_total_num_tokens *= loc_scale
 
+        # On TPU the hybrid-SWA two-pool KV cache miscompiles under
+        # torch.compile unless the SWA sub-pool's allocatable page count is a
+        # multiple of the sublane tiling factor (8). The pool size is derived
+        # from leftover HBM, which lands on arbitrary page counts (e.g.
+        # gpt-oss-20b tp=8 -> 819 pages); at a non-8-aligned count the compiled
+        # decode read of the SWA pool returns wrong K/V. Round the SWA pool
+        # down to an 8-page-aligned size (costs at most 7 pages and keeps the
+        # window-ring HBM savings).
+        if self.device == "tpu" and swa_max_total_num_tokens is not None:
+            align_tokens = self.pool_page_size * 8
+            aligned = (swa_max_total_num_tokens // align_tokens) * align_tokens
+            if aligned != swa_max_total_num_tokens and aligned > 0:
+                logger.info(
+                    "[hybrid-SWA] aligning swa_max_total_num_tokens "
+                    f"{swa_max_total_num_tokens} -> {aligned} "
+                    "(SWA page count must be a multiple of 8 for correct "
+                    "torch.compile decode on TPU)"
+                )
+                swa_max_total_num_tokens = aligned
+
         # DSV4 compressed-attention pool sizes. Draft worker reuses target's
         # full/swa sizes but does NOT own c4/c128/state pools (those live on
         # the target rank only); zero them out regardless of what config holds.
@@ -917,6 +937,26 @@ class KVCacheConfigurator:
                 token_to_kv_pool = self._build_ascend_mha_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
+        elif (
+            current_platform.is_tpu()
+            and not self.use_mla_backend
+            and not self.mambaish_config
+        ):
+            # TPU MHA pools (mirrors the ascend branch above). TPU is in-tree
+            # (PlatformEnum.TPU), so the is_out_of_tree() branch never fires;
+            # build via the same platform hooks the OOT path uses.
+            # get_mha_kv_pool_cls() returns the fused (RPA v3) or flat
+            # (torch_native / pallas_tpu_flash) pool per the resolved backend.
+            # TPU MLA models fall through to the shared MLA branch below.
+            if self.is_hybrid_swa:
+                token_to_kv_pool = self._build_tpu_swa_kv_pool(
+                    full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                    swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                )
+            else:
+                token_to_kv_pool = self._build_oot_mha_kv_pool(
+                    max_total_num_tokens=sizes.max_total_num_tokens,
+                )
         elif self.use_mla_backend and is_dsa_model:
             token_to_kv_pool = self._build_dsa_kv_pool(
                 max_total_num_tokens=sizes.max_total_num_tokens,
@@ -1196,6 +1236,47 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def _build_tpu_swa_kv_pool(
+        self,
+        *,
+        full_max_total_num_tokens: Optional[int],
+        swa_max_total_num_tokens: Optional[int],
+    ) -> KVCache:
+        PoolCls = current_platform.get_mha_kv_pool_cls()
+        # ``head_num`` sizes the FULL-attention sub-pool. When the SWA layers
+        # have a different KV-head count (e.g. MiMo: num_key_value_heads=4 full
+        # vs swa_num_key_value_heads=8), the SWA sub-pool must be sized to the
+        # SWA count -- otherwise the Pallas kernel DMAs the SWA layer's K/V
+        # (swa heads) into a full-head-sized buffer and fails verification.
+        # Pass swa_head_num so the SWA sub-pool uses the SWA count. (Do NOT
+        # pass v_head_dim here: the fused KV buffer stores V padded to head_dim
+        # and the kernel DMAs at that width.) When the counts match (e.g.
+        # GPT-OSS) this is a no-op.
+        swa_head_num = max(
+            1,
+            getattr(
+                self.model_config.hf_text_config,
+                "swa_num_key_value_heads",
+                self.model_config.hf_text_config.num_key_value_heads,
+            )
+            // get_parallel().attn_tp_size,
+        )
+        return SWAKVPool(
+            size=full_max_total_num_tokens,
+            size_swa=swa_max_total_num_tokens,
+            page_size=self.pool_page_size,
+            dtype=self.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            ),
+            head_dim=self.model_config.head_dim,
+            swa_head_num=swa_head_num,
+            swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
+            full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+            device=self.device,
+            token_to_kv_pool_class=PoolCls,
+        )
+
     def _build_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
@@ -1259,7 +1340,14 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_mla_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        token_to_kv_pool = MLATokenToKVPool(
+        # On TPU, pallas_tpu_mla uses the paged fused-latent pool the MLA v2
+        # kernel addresses; other TPU backends resolve to the generic pool.
+        MlaPoolCls = (
+            current_platform.get_mla_kv_pool_cls()
+            if current_platform.is_tpu()
+            else MLATokenToKVPool
+        )
+        token_to_kv_pool = MlaPoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
@@ -1501,6 +1589,20 @@ class KVCacheConfigurator:
         need_sort = get_disagg().disaggregation_mode in ("decode", "prefill")
         if token_to_kv_pool_allocator is None:
             if current_platform.is_out_of_tree():
+                AllocatorCls = current_platform.get_paged_allocator_cls()
+                token_to_kv_pool_allocator = AllocatorCls(
+                    sizes.max_total_num_tokens,
+                    page_size=get_schedule().page_size,
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                    kvcache=token_to_kv_pool,
+                    need_sort=need_sort,
+                )
+            elif current_platform.is_tpu() and not self.is_hybrid_swa:
+                # Hybrid SWA on TPU falls through to the generic SWA allocator
+                # arms below -- the sub-pools are TPU-fused but the allocator
+                # just bookkeeps token slots and the full<->swa mapping
+                # (queried by pallas_backend in _build_metadata).
                 AllocatorCls = current_platform.get_paged_allocator_cls()
                 token_to_kv_pool_allocator = AllocatorCls(
                     sizes.max_total_num_tokens,

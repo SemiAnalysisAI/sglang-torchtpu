@@ -66,11 +66,6 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
-<<<<<<< HEAD
-if _is_cuda:
-    # CUDA-only (CuteDSL); `not _is_hip` also matched TPU/NPU/CPU.
-    from sglang.jit_kernel.dsa import pick_dsl_expand
-=======
 _is_xpu = is_xpu()
 
 if not _is_npu:
@@ -87,8 +82,8 @@ else:
     deepgemm_paged_mqa_logits_split = None
 
 if _is_cuda:
+    # CUDA-only (CuteDSL); `not _is_hip` also matched TPU/NPU/CPU.
     from sglang.kernels.ops.attention.dsa import pick_dsl_expand
->>>>>>> upstream/main
 else:
     pick_dsl_expand = None
 

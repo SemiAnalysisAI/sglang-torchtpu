@@ -282,13 +282,8 @@ jobs:
 
   # Runs on 5090 (32GB, SM120)
   base-a-test-1-gpu-small:
-<<<<<<< HEAD
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
-=======
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
->>>>>>> upstream/main
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-a-test-1-gpu-small
@@ -319,13 +314,8 @@ jobs:
 
   # Runs on 5090 (32GB, SM120)
   base-b-test-1-gpu-small:
-<<<<<<< HEAD
-    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
-=======
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
->>>>>>> upstream/main
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-b-test-1-gpu-small
@@ -339,13 +329,8 @@ jobs:
 
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   base-b-test-1-gpu-large:
-<<<<<<< HEAD
-    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
-=======
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
->>>>>>> upstream/main
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-b-test-1-gpu-large
@@ -359,13 +344,8 @@ jobs:
     secrets: inherit
 
   base-b-test-2-gpu-large:
-<<<<<<< HEAD
-    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
-=======
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
->>>>>>> upstream/main
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-b-test-2-gpu-large
@@ -378,13 +358,8 @@ jobs:
     secrets: inherit
 
   base-b-test-4-gpu-b200:
-<<<<<<< HEAD
-    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
-=======
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
->>>>>>> upstream/main
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-b-test-4-gpu-b200
@@ -419,13 +394,8 @@ jobs:
     secrets: inherit
 
   base-c-test-4-gpu-h100:
-<<<<<<< HEAD
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
-=======
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
->>>>>>> upstream/main
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-4-gpu-h100
@@ -440,13 +410,8 @@ jobs:
     secrets: inherit
 
   base-c-test-8-gpu-h200:
-<<<<<<< HEAD
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
-=======
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
->>>>>>> upstream/main
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-8-gpu-h200
@@ -467,13 +432,8 @@ jobs:
     secrets: inherit
 
   base-c-test-8-gpu-h20:
-<<<<<<< HEAD
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
-=======
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
->>>>>>> upstream/main
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-8-gpu-h20
@@ -482,63 +442,12 @@ jobs:
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
-<<<<<<< HEAD
-    secrets: inherit
-
-  base-c-test-deepep-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: base-c-test-deepep-4-gpu-h100
-      runner_config: deepep-4-gpu-h100
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '30'
-      warmup_deep_gemm_models: 'lmsys/sglang-ci-dsv3-test:4'
-      warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4'
-    secrets: inherit
-
-  base-c-test-deepep-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: base-c-test-deepep-4-gpu-b200
-      runner_config: deepep-4-gpu-b200
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '30'
-      timeout_per_file: '1800'
-    secrets: inherit
-
-  base-c-test-deepep-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: base-c-test-deepep-8-gpu-h200
-      runner_config: deepep-8-gpu-h200
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '30'
-      timeout_per_file: '1800'
-    secrets: inherit
-
-  base-c-test-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
-=======
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   base-c-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
->>>>>>> upstream/main
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-4-gpu-b200
@@ -552,13 +461,8 @@ jobs:
     secrets: inherit
 
   base-c-test-4-gpu-gb300:
-<<<<<<< HEAD
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
-=======
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
->>>>>>> upstream/main
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-4-gpu-gb300
@@ -575,7 +479,7 @@ jobs:
 
   base-c-test-8-gpu-b300:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-8-gpu-b300
