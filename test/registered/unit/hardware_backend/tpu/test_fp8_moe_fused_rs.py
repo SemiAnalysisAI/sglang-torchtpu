@@ -173,15 +173,28 @@ class TestFp8MoeFusedRs(CustomTestCase):
         self.assertFalse(should_use_fp8_fused_rs(padded_tokens * 3))
 
     def test_skips_only_ep_reduction_for_reduced_expert_output(self):
-        self.assertTrue(
-            should_skip_post_experts_all_reduce(is_tp_path=False, experts_reduced=True)
-        )
-        self.assertFalse(
-            should_skip_post_experts_all_reduce(is_tp_path=True, experts_reduced=True)
-        )
-        self.assertFalse(
-            should_skip_post_experts_all_reduce(is_tp_path=False, experts_reduced=False)
-        )
+        # Upstream's dwdp gate reads the published parallel context, which
+        # unit tests don't have; pin dwdp_size=1 (the no-dwdp default). The
+        # other checks on this path are context-free on TPU.
+        with patch(
+            "sglang.srt.layers.moe.utils.get_parallel",
+            return_value=SimpleNamespace(dwdp_size=1),
+        ):
+            self.assertTrue(
+                should_skip_post_experts_all_reduce(
+                    is_tp_path=False, experts_reduced=True
+                )
+            )
+            self.assertFalse(
+                should_skip_post_experts_all_reduce(
+                    is_tp_path=True, experts_reduced=True
+                )
+            )
+            self.assertFalse(
+                should_skip_post_experts_all_reduce(
+                    is_tp_path=False, experts_reduced=False
+                )
+            )
 
     def test_fused_moe_exposes_quant_method_reduction_contract(self):
         layer = object.__new__(FusedMoE)
