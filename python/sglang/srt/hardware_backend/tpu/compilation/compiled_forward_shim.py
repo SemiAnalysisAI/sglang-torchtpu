@@ -131,7 +131,10 @@ def _dp_attn_select_bucket_shape(
 
 def _dp_attn_apply_bucket_metadata(forward_batch, pad_t: int, pad_b: int) -> None:
     """Update the DP-attention state on forward_batch for the chosen bucket."""
-    from sglang.srt.layers.dp_attention import set_dp_buffer_len
+    from sglang.srt.layers.dp_attention import (
+        set_dp_buffer_len,
+        set_is_extend_in_batch,
+    )
 
     dp_size = len(forward_batch.global_num_tokens_cpu)
     device = forward_batch.input_ids.device
@@ -150,6 +153,18 @@ def _dp_attn_apply_bucket_metadata(forward_batch, pad_t: int, pad_b: int) -> Non
     forward_batch.dp_local_num_tokens = None
     forward_batch.global_dp_buffer_len = pad_t * dp_size
     set_dp_buffer_len(pad_t * dp_size, pad_t, True, [pad_t] * dp_size)
+    # Publish the per-batch extend flag into the get_forward() flags tier.
+    # Traced code reads it (dynamo guards on its value), and the precompile
+    # dummies never pass through forward_batch_info's DP sync (which is where
+    # serving publishes it) — without this, extend variants trace with a stale
+    # False and can never re-match a real extend after the recompile freeze.
+    set_is_extend_in_batch(
+        getattr(
+            forward_batch,
+            "is_extend_in_batch",
+            forward_batch.forward_mode.is_extend(),
+        )
+    )
 
 
 def _dp_attn_compute_padding(
@@ -294,10 +309,9 @@ def _pad_forward_batch_inputs(
     elif is_draft_extend_v2 and forward_batch.spec_info is not None:
         pad_b = b_bucketer.next_bucket(real_b)
         num_tokens_per_req = forward_batch.spec_info.num_tokens_per_req
-        assert num_tokens_per_req > 0, (
-            "DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, "
-            f"got {num_tokens_per_req}"
-        )
+        assert (
+            num_tokens_per_req > 0
+        ), f"DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, got {num_tokens_per_req}"
         pad_t = pad_b * num_tokens_per_req
         real_q_out, real_b_out = real_q, real_b
     else:
