@@ -84,14 +84,6 @@ def _cu_seqlens_to_segment_ids(
     return segment_ids.to(device=device, non_blocking=True)
 
 
-@dataclass(frozen=True)
-class VisionPaddingContext:
-    real_seq_len: int
-    bucket_len: int | None
-    padded: bool
-    merge_sq: int
-
-
 class VisionTpuCompilePolicy(CompilePolicy):
     """Model-agnostic compile policy for TPU vision encoders.
 
@@ -132,6 +124,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
         self.compiled_fn = None
         self._patch_buckets: list[int] | None = None
         self._warned_oversize: set[int] = set()
+        self._logged_shapes = False
 
     def _resolve_runner(self) -> Any | None:
         if self.owner is None:
@@ -247,14 +240,13 @@ class VisionTpuCompilePolicy(CompilePolicy):
         logger.info("VisionTpuCompilePolicy.precompile: done.")
 
     def run(self, *raw: Any) -> torch.Tensor:
-        runner = self._resolve_runner()
-        if runner is None or self.compiled_fn is None:
+        if self.compiled_fn is None:
             raise RuntimeError("VisionTpuCompilePolicy.run called before install().")
 
         args, ctx = self.prepare_call(*raw)
 
-        if not getattr(runner, "_logged_shapes", False):
-            runner._logged_shapes = True
+        if not self._logged_shapes:
+            self._logged_shapes = True
             logger.info(
                 "VisionTpuCompilePolicy.run: compiled-fn arg shapes=%s",
                 tuple(
@@ -321,9 +313,11 @@ class VisionTpuCompilePolicy(CompilePolicy):
 
 @dataclass(frozen=True)
 class _Qwen3VLRunContext:
-    """Run context threaded through a Qwen3-VL compiled ViT call."""
+    """Run context threaded from ``prepare_call`` to ``unpad_outputs``."""
 
-    padding: VisionPaddingContext
+    real_seq_len: int
+    padded: bool
+    merge_sq: int
     output_indices: torch.Tensor | None
 
 
@@ -404,31 +398,6 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
         rotary_pos_emb_sin: torch.Tensor,
         output_indices: torch.Tensor | None = None,
     ) -> tuple[tuple[torch.Tensor, ...], _Qwen3VLRunContext]:
-        (
-            x_3d,
-            graph_cu_seqlens,
-            cos,
-            sin,
-            segment_ids,
-            padding,
-        ) = self._pad_inputs(x_3d, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin)
-        ctx = _Qwen3VLRunContext(padding=padding, output_indices=output_indices)
-        return (x_3d, graph_cu_seqlens, cos, sin, segment_ids), ctx
-
-    def _pad_inputs(
-        self,
-        x_3d: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary_pos_emb_cos: torch.Tensor,
-        rotary_pos_emb_sin: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        VisionPaddingContext,
-    ]:
         seq_len = x_3d.shape[0]
         merge_sq = getattr(self.vit, "spatial_merge_size", 2) ** 2
         bucket_len = self._bucket_for(seq_len)
@@ -463,20 +432,19 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
         graph_cu_seqlens = torch.tensor(
             [0, x_3d.shape[0]], device=x_3d.device, dtype=torch.int32
         )
-        context = VisionPaddingContext(
+        ctx = _Qwen3VLRunContext(
             real_seq_len=seq_len,
-            bucket_len=bucket_len,
             padded=padded,
             merge_sq=merge_sq,
+            output_indices=output_indices,
         )
-        return x_3d, graph_cu_seqlens, cos, sin, segment_ids, context
+        return (x_3d, graph_cu_seqlens, cos, sin, segment_ids), ctx
 
     def unpad_outputs(
         self, result: torch.Tensor, ctx: _Qwen3VLRunContext
     ) -> torch.Tensor:
-        padding = ctx.padding
-        if padding.padded:
-            result = result[: padding.real_seq_len // padding.merge_sq]
+        if ctx.padded:
+            result = result[: ctx.real_seq_len // ctx.merge_sq]
         # Qwen3-VL's caller asks for a subset of the merged output rows.
         if ctx.output_indices is not None:
             result = result.index_select(0, ctx.output_indices)
