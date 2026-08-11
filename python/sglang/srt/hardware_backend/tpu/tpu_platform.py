@@ -212,7 +212,17 @@ class TpuSRTPlatform(SRTPlatform):
         # time (set in ModelRunner.__init__, before _init_pools).
         from sglang.srt.server_args import get_global_server_args
 
-        if get_global_server_args().attention_backend in (
+        backend = get_global_server_args().attention_backend
+        if backend == "pallas_tpu_rpa_stacked":
+            # The stacked kernel reads a SEQ_ALONG_LANE cache, not the fused 5D
+            # one; the token index is on the lane axis.
+            from sglang.srt.hardware_backend.tpu.kv_pool import (
+                TpuSeqAlongLaneKVPool,
+            )
+
+            return TpuSeqAlongLaneKVPool
+
+        if backend in (
             "pallas_tpu_rpa_v3",
             "pallas_tpu_rpa_batched",
         ):
