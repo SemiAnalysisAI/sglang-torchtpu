@@ -90,8 +90,12 @@ from sglang.srt.models.qwen2_moe import (
 )
 
 # Models
-from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.qwen3_vl import (
+    Qwen3VLForConditionalGeneration,
+    mrope_positions_or_text_fallback,
+)
 from sglang.srt.models.utils import (
+    WeightsMapper,
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
 )
@@ -1741,7 +1745,7 @@ def _decode_forward_embedding_in_language_model(
     actually get spliced.
     """
     if model.is_mrope_enabled:
-        positions = forward_batch.mrope_positions
+        positions = mrope_positions_or_text_fallback(forward_batch, positions)
 
     hidden_states = model.model(input_ids, positions, forward_batch)
 
@@ -2381,6 +2385,26 @@ class Qwen3_5TextForCausalLM(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
+    # The published checkpoints are the VL model, so every name in the
+    # quantization config's `modules_to_not_convert` is prefixed
+    # `model.language_model.` (or `model.visual.` / `mtp.`), while this entry's
+    # modules are plain `model.*` -- see load_weights below, which strips the
+    # same prefix off the weight names. Without this mapper `is_layer_skipped`
+    # matches nothing, so the router `mlp.gate`, `shared_expert_gate`, the GDN
+    # `conv1d` / `in_proj_a` / `in_proj_b` and `embed_tokens` all get quantized
+    # to fp8 despite shipping as bf16 in the checkpoint, and the model answers
+    # every prompt with the vocab's last (padding) token, i.e. empty text.
+    # The loader passes this to quant_config.apply_weight_name_mapper()
+    # (model_loader/loader.py:315); it does NOT touch the weight stream.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+            "model.visual.": None,
+            "visual.": None,
+            "mtp.": None,
+        },
+    )
+
     def __init__(
         self,
         config,
@@ -2399,11 +2423,21 @@ class Qwen3_5TextForCausalLM(nn.Module):
         self.model = backbone_cls(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
+        # use_attn_tp_group must mirror the LogitsProcessor's own choice: with
+        # --enable-dp-lm-head it gathers the vocab shards over the ATTENTION-TP
+        # group, so the head has to be sharded over that same group. Left at the
+        # default the head shards over the full TP group while the gather covers
+        # only attn_tp ranks, and every rank keeps 1/tp of the vocab as if it
+        # were the whole row -- the sampler then argmaxes a fragment. At
+        # tp8/dp8 (attn_tp == 1) the gather disappears entirely and the output is
+        # pure garbage rather than merely wrong. Matches the VL wrapper
+        # (qwen3_vl.py) and every other DP-attention model.
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
             quant_config=quant_config,
             org_num_embeddings=config.vocab_size,
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
             prefix=add_prefix("lm_head", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
@@ -2439,6 +2473,12 @@ class Qwen3_5TextForCausalLM(nn.Module):
         # namespace and delegate (the backbone loader fuses q/k/v and the GDN
         # in-projections via its stacked_params_mapping).
         lm_prefix = "model.language_model."
+        embed_name = f"{lm_prefix}embed_tokens.weight"
+
+        def _load_head(w: torch.Tensor) -> None:
+            param = self.lm_head.weight
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, w)
 
         # Remap lazily. Buffering into a list would drain the incoming stream
         # before a single parameter is copied, which defeats the platform's
@@ -2455,12 +2495,20 @@ class Qwen3_5TextForCausalLM(nn.Module):
                 ):
                     continue
                 if name.startswith("lm_head."):
-                    param = self.lm_head.weight
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, w)
-                elif name.startswith(lm_prefix):
+                    _load_head(w)
+                    continue
+                if name == embed_name and self.config.tie_word_embeddings:
+                    # Tied embeddings: the checkpoint carries no lm_head weight,
+                    # so feed the head the SAME checkpoint tensor rather than
+                    # copying the loaded embedding across. The two layers need
+                    # not share a vocab-parallel layout -- the backbone
+                    # replicates embed_tokens under DP attention while the head
+                    # shards over the attention-TP group -- so a tensor copy
+                    # would be a shape error (and, where the shapes happened to
+                    # match by accident, the wrong rows). The head's own
+                    # weight_loader slices whatever shard it owns.
+                    _load_head(w)
+                if name.startswith(lm_prefix):
                     yield name[len(lm_prefix) :], w
                 elif name.startswith("model."):
                     yield name[len("model.") :], w
@@ -2468,9 +2516,33 @@ class Qwen3_5TextForCausalLM(nn.Module):
                     yield name, w
 
         self.model.load_weights(_remapped())
-        # Tied embeddings: no lm_head weight in the checkpoint.
-        if self.config.tie_word_embeddings:
-            self.lm_head.weight.data.copy_(self.model.embed_tokens.weight.data)
+        if envs.SGLANG_TPU_DEBUG_SCAN_LOADED_WEIGHTS.get():
+            _report_unfinite_params(self)
+
+
+def _report_unfinite_params(model: nn.Module, limit: int = 40) -> None:
+    """Log parameters that are non-finite after loading.
+
+    A weight_loader that never fires leaves its parameter at whatever
+    ``torch.empty`` returned, and nothing downstream checks: the model serves
+    NaN logits and the sampler answers with the vocab's last row. Names are the
+    fastest way to identify which loader branch missed.
+    """
+    bad = []
+    for name, param in model.named_parameters(remove_duplicate=False):
+        if not torch.isfinite(param.float()).all().item():
+            bad.append(f"{name} {tuple(param.shape)} {param.dtype}")
+            if len(bad) >= limit:
+                break
+    if bad:
+        logger.error(
+            "[qwen3.5] %d non-finite parameters after load (first %d): %s",
+            len(bad),
+            limit,
+            "\n  ".join(bad),
+        )
+    else:
+        logger.info("[qwen3.5] all parameters finite after load")
 
 
 EntryClass = [

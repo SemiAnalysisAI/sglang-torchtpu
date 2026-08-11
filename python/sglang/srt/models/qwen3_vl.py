@@ -1245,6 +1245,24 @@ if current_platform.supports_torch_compile():
     )
 
 
+def mrope_positions_or_text_fallback(
+    forward_batch: ForwardBatch, positions: torch.Tensor
+) -> torch.Tensor:
+    """This batch's MRoPE positions, synthesized when the batch carries none.
+
+    A DP-attention rank with no requests has no ``mrope_positions`` (nor does the
+    fabricated batch that stands in for it under the TPU's MAX_LEN padding), so
+    an unconditional swap hands the rotary embedding ``None`` and it fails on
+    ``positions.ndim``. Every rank has to trace the same ``(3, N)`` call shape, so
+    synthesize rather than fall back to 1-D: with no image, MRoPE's three
+    sections all carry the plain token index, so repeating ``positions`` is the
+    correct text encoding and not just a shape filler.
+    """
+    if forward_batch.mrope_positions is not None:
+        return forward_batch.mrope_positions
+    return positions.view(1, -1).repeat(3, 1)
+
+
 class Qwen3VLForConditionalGeneration(nn.Module):
     # Whether decode hands the language model raw ``input_ids`` rather than the
     # ``input_embeds`` that ``general_mm_embed_routine`` precomputes. Subclasses
@@ -1442,7 +1460,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 (Use input_metadata.mrope_positions to replace it)
         """
         if self.is_mrope_enabled:
-            positions = forward_batch.mrope_positions
+            positions = mrope_positions_or_text_fallback(forward_batch, positions)
 
         if not (
             forward_batch.forward_mode.is_decode()

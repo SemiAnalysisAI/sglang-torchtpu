@@ -994,6 +994,12 @@ class Envs:
     # is only a diagnostic for suspected recurrent-state contamination. See
     # TpuMambaPool.clear_slots.
     SGLANG_TPU_CLEAR_MAMBA_SLOTS = EnvBool(False)
+    # Scan every parameter for NaN/Inf after Qwen3.5 weight loading and log the
+    # offenders. Nothing else checks: a weight_loader branch that never fires
+    # leaves its parameter at whatever torch.empty returned, and the only
+    # symptom is that every prompt decodes to the vocab's last row (empty text).
+    # Costs one device program per parameter, so keep it to diagnosis.
+    SGLANG_TPU_DEBUG_SCAN_LOADED_WEIGHTS = EnvBool(False)
     # Attach the TPU decoder compile policy to Qwen3.5. Set 0 to serve the same
     # model eagerly, which is the only way to A/B compiled-vs-eager on this
     # architecture: omitting --enable-torch-compile instead routes into a
