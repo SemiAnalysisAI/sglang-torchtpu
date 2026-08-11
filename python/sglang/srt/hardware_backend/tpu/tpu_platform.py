@@ -139,14 +139,18 @@ class TpuSRTPlatform(SRTPlatform):
         # Only EAGLE3 spec decoding is supported on TPU, and only with topk == 1
         spec_algo = server_args.speculative_algorithm
         if spec_algo is not None:
-            if server_args.attention_backend == "pallas_tpu_rpa_batched":
-                # Batched RPA has no draft-backend wiring in
-                # speculative.draft_utils, so reject here with a clear message
-                # rather than failing later during draft-backend creation.
+            if server_args.attention_backend in (
+                "pallas_tpu_rpa_batched",
+                "pallas_tpu_rpa_stacked",
+            ):
+                # Neither has draft-backend wiring in speculative.draft_utils,
+                # so reject here with a clear message rather than failing later
+                # during draft-backend creation.
                 raise NotImplementedError(
                     "Speculative decoding is not supported with "
-                    "--attention-backend pallas_tpu_rpa_batched yet. Use "
-                    "--attention-backend pallas_tpu_rpa_v3 for speculative decoding."
+                    f"--attention-backend {server_args.attention_backend} yet. "
+                    "Use --attention-backend pallas_tpu_rpa_v3 for speculative "
+                    "decoding."
                 )
             if spec_algo == "EAGLE3":
                 if server_args.speculative_use_rejection_sampling:

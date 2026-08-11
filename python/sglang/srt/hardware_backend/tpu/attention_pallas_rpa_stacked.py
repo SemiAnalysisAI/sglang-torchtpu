@@ -83,10 +83,12 @@ RPA_STACKED_SPEC = RpaKernelSpec(
     supports_attention_sink=True,
     extend_distribution_mask=(0, 0, 1),  # [0, 0, n] (MIXED-only)
     uses_draft_extend_v2=False,
-    # The tuned block sizes and the kernel's own page-size guidance both target
-    # 2048: it halves the KV DMA descriptor count and is what the long-context
-    # entries were measured at.
-    min_page_size=2048,
+    # Upstream's guidance and tuned entries target page_size 2048, but that was
+    # measured on a different VMEM budget: here 2048 makes the widest useful
+    # tiles overflow VMEM (batch_size=8 at bkv=8192 fails to allocate), and 256
+    # is 12x faster at every shape swept on v7. See the sglang-side tuned
+    # entries in the vendored tuned_block_sizes.py.
+    min_page_size=256,
     supports_dispatch_hint=True,
 )
 

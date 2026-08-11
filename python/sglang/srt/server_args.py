@@ -4364,6 +4364,7 @@ class ServerArgs:
                 # TPU
                 "pallas_tpu_rpa_v3",
                 "pallas_tpu_rpa_batched",
+                "pallas_tpu_rpa_stacked",
             ]
             prefill_attn_backend, decode_attn_backend = (
                 self._resolved_attention_backends()
