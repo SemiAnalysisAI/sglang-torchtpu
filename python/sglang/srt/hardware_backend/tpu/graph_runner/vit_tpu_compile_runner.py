@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import inspect
 import logging
 import math
@@ -230,7 +229,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
         init_dtype = torch.get_default_dtype()
         torch.set_default_dtype(torch.float32)
         try:
-            with self._precompile_context(), torch.no_grad():
+            with torch.no_grad():
                 for index, patch_count in enumerate(patch_counts):
                     logger.info(
                         "VisionTpuCompilePolicy.precompile: [%d/%d] "
@@ -312,15 +311,6 @@ class VisionTpuCompilePolicy(CompilePolicy):
         """
         return True
 
-    def _precompile_context(self):
-        """Context manager wrapping the warmup loop (default: no-op).
-
-        Subclasses whose compiled boundary must be traced under a specific
-        runtime state (e.g. a ForwardContext) override this so warmup matches
-        serving and does not recompile on the first real request.
-        """
-        return contextlib.nullcontext()
-
     def _install_run_adapter(self, runner: Any) -> None:
         """Wire the serve entry point onto ``runner`` (default: no-op).
 
@@ -341,25 +331,9 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
     """Compile policy for compiled Qwen3-VL ViT blocks."""
 
     def __init__(
-        self,
-        vit: Any | None = None,
-        *,
-        model_runner: Any | None = None,
-        owner: Any | None = None,
-        method_name: str = "forward",
-        method: Any | None = None,
-        name: str = "qwen3_vl_vit_encoder",
-        label: str | None = None,
+        self, vit: Any | None = None, *, name: str = "qwen3_vl_vit_encoder", **kwargs
     ) -> None:
-        super().__init__(
-            vit,
-            model_runner=model_runner,
-            owner=owner,
-            method_name=method_name,
-            method=method,
-            name=name,
-            label=label,
-        )
+        super().__init__(vit, name=name, **kwargs)
 
     def _runner_ready_for_compile(self, runner: Any) -> bool:
         # ``_supports_segment_ids`` is set by ``ViTTpuCompileRunner``; without it
@@ -387,7 +361,7 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
         runner.run = _run
 
     def compute_patch_buckets(self) -> list[int]:
-        merge_size = self._merge_align()
+        merge_size = getattr(self.vit, "spatial_merge_size", 2)
         # Set but empty disables precompile: the comprehension yields [], which
         # validates trivially and warms nothing.
         env_val = os.environ.get("SGLANG_TPU_VIT_PRECOMPILE_SIZES", None)
@@ -507,9 +481,6 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
         if ctx.output_indices is not None:
             result = result.index_select(0, ctx.output_indices)
         return result
-
-    def _merge_align(self) -> int:
-        return getattr(self.vit, "spatial_merge_size", 2)
 
 
 class ViTTpuCompileRunner:
