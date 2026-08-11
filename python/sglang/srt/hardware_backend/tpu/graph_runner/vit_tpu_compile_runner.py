@@ -319,8 +319,12 @@ class VisionTpuCompilePolicy(CompilePolicy):
         """
 
     def _runner_ready_for_compile(self, runner: Any) -> bool:
-        """Whether ``runner``'s attention path supports the compiled boundary."""
-        return getattr(runner, "_supports_segment_ids", False)
+        """Whether ``runner`` can execute the compiled boundary.
+
+        Defaults to yes. Override to gate install/precompile on an encoder
+        capability, returning False to fall back to eager vision.
+        """
+        return True
 
     def _precompile_context(self):
         """Context manager wrapping the warmup loop (default: no-op).
@@ -370,6 +374,11 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
             name=name,
             label=label,
         )
+
+    def _runner_ready_for_compile(self, runner: Any) -> bool:
+        # ``_supports_segment_ids`` is set by ``ViTTpuCompileRunner``; without it
+        # the blocks cannot take the segment_ids the compiled boundary passes.
+        return getattr(runner, "_supports_segment_ids", False)
 
     def _install_run_adapter(self, runner: Any) -> None:
         def _run(
