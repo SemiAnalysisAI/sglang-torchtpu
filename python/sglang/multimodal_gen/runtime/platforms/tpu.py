@@ -125,9 +125,20 @@ class TpuPlatform(Platform):
         if torch.tpu.is_initialized():
             _free, total = torch.accelerator.get_memory_info()
             return total
-        # ponytail: pre-init static floor (tpu7x ~95 GiB); topology lookup
-        # if smaller-HBM TPUs become targets.
-        return 90 * (1 << 30)
+        # Pre-init: PCI-scan lookup, documented PJRT-safe ("does not
+        # initialize any TPU runtime"). Generation- and megacore-aware
+        # (e.g. v7 exposes two devices/chip at half the chip HBM each).
+        # TODO: move off _internal when torch_tpu ships a public surface
+        # (same ask as the pallas jax_op import).
+        try:
+            from torch_tpu._internal.utils import hardware
+
+            per_device = hardware.get_hbm_bytes_per_device()
+            if per_device:
+                return per_device
+        except ImportError:
+            pass
+        return 90 * (1 << 30)  # last-resort floor (~tpu7x per-device)
 
     @classmethod
     def get_available_gpu_memory(

@@ -158,6 +158,20 @@ class TestNoDeviceInitFromQueries(unittest.TestCase):
         TpuPlatform.reset_peak_memory_stats()
         self.assertFalse(torch.tpu.is_initialized())
 
+    def test_total_memory_uses_hardware_lookup_pre_init(self):
+        # The pre-init path must answer from the PCI-scan lookup (megacore/
+        # per-device aware), not the static floor, when torch_tpu knows the
+        # generation.
+        if torch.tpu.is_initialized():
+            self.skipTest("TPU runtime already initialized in this process")
+        from torch_tpu._internal.utils import hardware
+
+        expected = hardware.get_hbm_bytes_per_device()
+        if expected is None:
+            self.skipTest("no recognized TPU attached")
+        self.assertEqual(TpuPlatform.get_device_total_memory(), expected)
+        self.assertFalse(torch.tpu.is_initialized())
+
 
 if __name__ == "__main__":
     unittest.main()
