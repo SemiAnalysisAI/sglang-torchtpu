@@ -5,7 +5,6 @@ from __future__ import annotations
 import inspect
 import logging
 import math
-import os
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -17,6 +16,7 @@ from torch_tpu._internal.sync.sync import synchronize as tpu_sync
 
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.patches import _register_tpu_compile_backend
 
 logger = logging.getLogger(__name__)
@@ -362,19 +362,17 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
 
     def compute_patch_buckets(self) -> list[int]:
         merge_size = getattr(self.vit, "spatial_merge_size", 2)
-        # Set but empty disables precompile: the comprehension yields [], which
-        # validates trivially and warms nothing.
-        env_val = os.environ.get("SGLANG_TPU_VIT_PRECOMPILE_SIZES", None)
-        if env_val is not None:
-            buckets = sorted({int(x.strip()) for x in env_val.split(",") if x.strip()})
-            return _validate_patch_buckets(buckets, merge_size)
-        max_patches = int(
-            os.environ.get(
-                "SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES",
-                str(_DEFAULT_MAX_PATCHES),
+        # Set but empty disables precompile: EnvTuple drops empty entries, so the
+        # override is (), which validates trivially and warms nothing.
+        if envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.is_set():
+            buckets = sorted(
+                {int(x) for x in envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.get()}
             )
+            return _validate_patch_buckets(buckets, merge_size)
+        return _compute_patch_counts(
+            merge_size,
+            max_patches=envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.get(),
         )
-        return _compute_patch_counts(merge_size, max_patches=max_patches)
 
     def make_warmup_inputs(
         self, patch_count: int

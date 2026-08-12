@@ -1,4 +1,4 @@
-import os
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -18,9 +18,22 @@ from sglang.srt.layers.attention.vision import (
     VisionTpuAttention,
     _build_tpu_segment_ids,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
+
+
+@contextlib.contextmanager
+def _unset(field):
+    """Run with ``field`` unset, restoring whatever was there before.
+
+    ``override`` snapshots and restores on exit, so clearing inside it is safe;
+    the Envs API has no override-to-unset of its own.
+    """
+    with field.override(""):
+        field.clear()
+        yield
 
 
 class _SegmentBlock(nn.Module):
@@ -126,34 +139,27 @@ class TestViTTpuCompileRunner(unittest.TestCase):
 
     def test_qwen3_vl_patch_buckets_honor_the_env_override(self):
         policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
+        sizes = envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES
 
-        # Unset only the two knobs under test. Do NOT clear os.environ wholesale:
-        # this suite shares a process with the TPU runtime, whose lazy init reads
-        # TPU_* / PJRT / LD_LIBRARY_PATH.
-        with patch.dict(os.environ):
-            os.environ.pop("SGLANG_TPU_VIT_PRECOMPILE_SIZES", None)
-            os.environ.pop("SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES", None)
+        with _unset(sizes), _unset(envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES):
             ladder = policy.compute_patch_buckets()
         self.assertEqual((ladder[0], ladder[-1]), (196, 4900))
 
         # Sorted and de-duplicated, and validated against the merge window.
-        with patch.dict(
-            os.environ, {"SGLANG_TPU_VIT_PRECOMPILE_SIZES": "324, 196 ,196"}
-        ):
+        with sizes.override("324, 196 ,196"):
             self.assertEqual(policy.compute_patch_buckets(), [196, 324])
         # Set but empty disables precompile.
-        with patch.dict(os.environ, {"SGLANG_TPU_VIT_PRECOMPILE_SIZES": ""}):
+        with sizes.override(""):
             self.assertEqual(policy.compute_patch_buckets(), [])
-        with (
-            patch.dict(os.environ, {"SGLANG_TPU_VIT_PRECOMPILE_SIZES": "200"}),
-            self.assertRaisesRegex(ValueError, "perfect squares"),
+        with sizes.override("200"), self.assertRaisesRegex(
+            ValueError, "perfect squares"
         ):
             policy.compute_patch_buckets()
 
         # resolve_patch_buckets caches, so a later env change is not picked up.
-        with patch.dict(os.environ, {"SGLANG_TPU_VIT_PRECOMPILE_SIZES": "196"}):
+        with sizes.override("196"):
             self.assertEqual(policy.resolve_patch_buckets(), [196])
-        with patch.dict(os.environ, {"SGLANG_TPU_VIT_PRECOMPILE_SIZES": "324"}):
+        with sizes.override("324"):
             self.assertEqual(policy.resolve_patch_buckets(), [196])
 
     def test_qwen3_vl_unpad_trims_bucket_padding_and_selects_rows(self):
