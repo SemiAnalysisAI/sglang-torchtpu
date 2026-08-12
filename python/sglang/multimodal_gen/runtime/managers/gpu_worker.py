@@ -228,10 +228,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         intra_op_threads = _worker_cpu_intra_op_threads(local_num_gpus)
         if intra_op_threads is not None:
             torch.set_num_threads(intra_op_threads)
-        # Distributed rendezvous env. Single node stays on loopback;
-        # cross-node rendezvous must use an address every node can reach,
-        # so --dist-init-addr takes over. Routed through the platform so
-        # runtimes that latch env or bind devices at import can intervene.
+        # Set environment variables for distributed initialization. Single
+        # node rendezvous stays on loopback; cross-node rendezvous must use
+        # an address every node can reach, so --dist-init-addr takes over.
         if self.server_args.nnodes > 1:
             rendezvous_addr = NetworkAddress.parse(self.server_args.dist_init_addr)
         else:
