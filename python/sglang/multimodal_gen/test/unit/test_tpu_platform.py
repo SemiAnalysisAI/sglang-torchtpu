@@ -5,6 +5,7 @@ torch_tpu imports to call time.
 """
 
 import importlib.util
+import os
 import unittest
 from unittest.mock import patch
 
@@ -118,14 +119,23 @@ class TestDitEvictionContext(unittest.TestCase):
 
 @unittest.skipUnless(hasattr(torch, "tpu"), "requires torch_tpu")
 class TestDenoiseLoopEagerMode(unittest.TestCase):
-    def test_default_mode_is_defer_and_fuse(self):
+    def test_default_mode_follows_world_size(self):
         from torch_tpu._internal import execution_mode
 
-        with TpuPlatform.denoise_loop_context():
-            # pybind11 enum members are not identity-stable; compare equality.
-            self.assertEqual(
-                execution_mode.eager_mode, execution_mode.EagerMode.DEFER_AND_FUSE
-            )
+        # Fusion is measured workload-dependent; unset env picks by world size.
+        with patch.dict(os.environ, {"WORLD_SIZE": "8"}, clear=False):
+            os.environ.pop("SGLANG_DIFFUSION_TPU_EAGER_MODE", None)
+            with TpuPlatform.denoise_loop_context():
+                # pybind11 enum members are not identity-stable; compare equality.
+                self.assertEqual(
+                    execution_mode.eager_mode, execution_mode.EagerMode.DEFER_AND_FUSE
+                )
+        with patch.dict(os.environ, {"WORLD_SIZE": "1"}, clear=False):
+            os.environ.pop("SGLANG_DIFFUSION_TPU_EAGER_MODE", None)
+            with TpuPlatform.denoise_loop_context():
+                self.assertEqual(
+                    execution_mode.eager_mode, execution_mode.EagerMode.DEFER_NEVER
+                )
 
     def test_env_selects_mode_and_rejects_invalid(self):
         import os

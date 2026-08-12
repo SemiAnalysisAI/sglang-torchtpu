@@ -211,8 +211,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
         "SGLANG_DIFFUSION_PLATFORM_OVERRIDE", ""
     ),
-    # torch_tpu EagerMode name for the denoising loop (e.g. DEFER_NEVER);
-    # the fused default is the validated fast configuration.
+    # torch_tpu EagerMode name for the denoising loop (e.g. DEFER_NEVER).
+    # Unset, the platform picks by world size: DEFER_AND_FUSE multi-device
+    # (measured 1.29x win on 8-chip A14B), DEFER_NEVER single-device
+    # (fusion measured ~3.4x slower there). Setting the env pins the mode.
     "SGLANG_DIFFUSION_TPU_EAGER_MODE": _lazy_str(
         "SGLANG_DIFFUSION_TPU_EAGER_MODE", "DEFER_AND_FUSE"
     ),

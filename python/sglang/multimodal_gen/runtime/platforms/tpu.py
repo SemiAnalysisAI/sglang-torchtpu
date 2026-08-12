@@ -419,13 +419,21 @@ class TpuPlatform(Platform):
 
     @classmethod
     def denoise_loop_context(cls) -> Any:
-        # DEFER_AND_FUSE fuses each step's ops; scoped to the loop because
-        # VAE decode regresses under it.
+        # DEFER_AND_FUSE fuses each step's ops; scoped to the denoising stage
+        # because VAE decode regresses under it. The default is measured
+        # workload-dependent: fusion wins multi-device (A14B 8-chip, 1.29x)
+        # and loses badly single-device (~3.4x) — so unless the env is set
+        # explicitly, pick by world size.
         from torch_tpu._internal.execution_mode import EagerMode, set_eager_mode
 
         from sglang.multimodal_gen import envs
 
-        mode_name = envs.SGLANG_DIFFUSION_TPU_EAGER_MODE
+        if "SGLANG_DIFFUSION_TPU_EAGER_MODE" in os.environ:
+            mode_name = envs.SGLANG_DIFFUSION_TPU_EAGER_MODE
+        elif int(os.environ.get("WORLD_SIZE", "1")) > 1:
+            mode_name = "DEFER_AND_FUSE"
+        else:
+            mode_name = "DEFER_NEVER"
         # EagerMode is a pybind11 enum: look up via __members__.
         mode = EagerMode.__members__.get(mode_name)
         if mode is None:
