@@ -127,7 +127,12 @@ class TestViTTpuCompileRunner(unittest.TestCase):
     def test_qwen3_vl_patch_buckets_honor_the_env_override(self):
         policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
 
-        with patch.dict(os.environ, {}, clear=True):
+        # Unset only the two knobs under test. Do NOT clear os.environ wholesale:
+        # this suite shares a process with the TPU runtime, whose lazy init reads
+        # TPU_* / PJRT / LD_LIBRARY_PATH.
+        with patch.dict(os.environ):
+            os.environ.pop("SGLANG_TPU_VIT_PRECOMPILE_SIZES", None)
+            os.environ.pop("SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES", None)
             ladder = policy.compute_patch_buckets()
         self.assertEqual((ladder[0], ladder[-1]), (196, 4900))
 
