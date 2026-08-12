@@ -27,13 +27,7 @@ _ASSOCIATIVE_SCAN_OVERRIDES = (
     # TODO: drop once google-pytorch/torch_tpu#2898 is fixed.
     # libtpu >= 0.0.44 miscompiles `scan(..., is_associative=true)`, so every
     # cumulative op (cumsum/cumprod/cummax/cummin/logcumsumexp) silently returns
-    # wrong values when the scanned length is not a multiple of 1024. Measured on
-    # tpu7x with libtpu 0.0.44.1: cumsum over 8,388,615 int32 gives 8,385,543 wrong
-    # elements, while every multiple of 1024 is exact -- which is why it hides well.
-    # Nothing raises; the `masked_scatter_` fallback below builds its scatter indices
-    # with cumsum, so a wrong scan silently misplaces multimodal embeddings.
-    # Disabling the associative emitter expands the scan to a reduce-window prefix
-    # sum instead: correct, and still 0.002s (vs 28s for the while-loop lowering).
+    # wrong values when the scanned length is not a multiple of 1024.
     "--xla_tpu_use_associative_scan_emitter=false",
 )
 
