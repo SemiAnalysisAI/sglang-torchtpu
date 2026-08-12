@@ -106,9 +106,11 @@ class TestQwen3VLTpuCompileAnnotation(CustomTestCase):
                 vision = sys.modules["sglang.srt.layers.attention.vision"]
                 attention = object.__new__(vision.VisionAttention)
                 with (
+                    # #30493 retired get_global_server_args; vision.py now reads
+                    # the backend override through runtime_context.get_mm().
                     patch.object(
                         vision,
-                        "get_global_server_args",
+                        "get_mm",
                         return_value=types.SimpleNamespace(mm_attention_backend=None),
                     ),
                     patch.object(vision, "is_cuda", return_value=False),
