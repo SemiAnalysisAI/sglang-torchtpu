@@ -14,6 +14,7 @@
 substitutions:
   _IMAGE: "us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu"
   _TAG: "latest"
+  _EXTRA_TAG: ""
 
 serviceAccount: "projects/sglang-torchtpu/serviceAccounts/tpu-ci@sglang-torchtpu.iam.gserviceaccount.com"
 
@@ -35,10 +36,14 @@ steps:
           http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token \
           | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')"
         printf '%s' "$$TOKEN" > /workspace/gcp_token
+        tag_args=("-t" "${_IMAGE}:${_TAG}")
+        if [ -n "${_EXTRA_TAG}" ]; then
+          tag_args+=("-t" "${_IMAGE}:${_EXTRA_TAG}")
+        fi
         DOCKER_BUILDKIT=1 docker build \
           -f docker/tpu.Dockerfile \
           --secret id=gcp_token,src=/workspace/gcp_token \
-          -t "${_IMAGE}:${_TAG}" .
+          "$${tag_args[@]}" .
         rm -f /workspace/gcp_token
 
 images:

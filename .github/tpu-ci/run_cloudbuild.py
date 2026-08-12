@@ -50,6 +50,7 @@ def main() -> None:
     ap.add_argument("--bucket", required=True, help="GCS bucket of the staged source")
     ap.add_argument("--object", required=True, help="GCS object of the staged source")
     ap.add_argument("--tag", required=True, help="value for the _TAG substitution")
+    ap.add_argument("--extra-tag", help="optional extra tag to push (e.g. latest)")
     ap.add_argument("--token-file", required=True, help="file holding a bearer token")
     ap.add_argument("--timeout", default="3600s", help="build timeout")
     args = ap.parse_args()
@@ -78,12 +79,20 @@ def main() -> None:
                 return e.code, {"error": e.read().decode()[:500]}
 
     cfg = _load_config(args.config)
+    images = list(cfg.get("images", []))
+    substitutions = {**cfg.get("substitutions", {}), "_TAG": args.tag}
+    if args.extra_tag:
+        substitutions["_EXTRA_TAG"] = args.extra_tag
+        extra_image = "${_IMAGE}:${_EXTRA_TAG}"
+        if extra_image not in images:
+            images.append(extra_image)
+
     build = {
         "source": {"storageSource": {"bucket": args.bucket, "object": args.object}},
         "steps": cfg["steps"],
-        "images": cfg.get("images", []),
+        "images": images,
         "options": cfg.get("options", {}),
-        "substitutions": {**cfg.get("substitutions", {}), "_TAG": args.tag},
+        "substitutions": substitutions,
         "timeout": args.timeout,
     }
     if "serviceAccount" in cfg:  # run the build as the configured SA (tpu-ci)

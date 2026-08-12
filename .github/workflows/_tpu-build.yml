@@ -8,6 +8,11 @@ on:
       ref:
         required: true
         type: string
+      tag_latest:
+        description: "Whether to also tag and push as :latest (defaults to true if ref is main)"
+        required: false
+        type: boolean
+        default: false
     outputs:
       digest:
         description: "Digest-pinned image reference (repo@sha256:...)"
@@ -66,8 +71,13 @@ jobs:
           tar --exclude=./.git -czf "$src" -C "$GITHUB_WORKSPACE" .
           gcloud storage cp "$src" "gs://${bucket}/${object}" --project "$GCP_PROJECT" \
             --access-token-file="$tokfile"
+          extra_args=()
+          if [[ "${{ inputs.tag_latest }}" == "true" || "$INPUT_REF" == "main" ]]; then
+            extra_args+=(--extra-tag "latest")
+          fi
           digest="$(python3 .github/tpu-ci/run_cloudbuild.py \
             --project "$GCP_PROJECT" --config docker/cloudbuild.tpu.yaml \
-            --bucket "$bucket" --object "$object" --tag "$tag" --token-file "$tokfile")"
+            --bucket "$bucket" --object "$object" --tag "$tag" --token-file "$tokfile" \
+            "${extra_args[@]}")"
           echo "digest=${AR_IMAGE}@${digest}" >> "$GITHUB_OUTPUT"
           echo "built ${AR_IMAGE}@${digest}"
