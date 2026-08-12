@@ -74,27 +74,46 @@ class TestPlatformMemoryHooks(unittest.TestCase):
 
 
 class TestInitWorkerDeviceEnv(unittest.TestCase):
-    def test_sets_device_and_rendezvous_env(self):
-        module = _device_module_mock(available=True)
+    def _run(self, **kwargs):
+        import sglang.multimodal_gen.runtime.platforms as platforms
+
         env_keys = ("MASTER_ADDR", "MASTER_PORT", "LOCAL_RANK", "RANK", "WORLD_SIZE")
         saved = {key: os.environ.get(key) for key in env_keys}
+        sentinel_device = object()
         try:
-            with patch("torch.get_device_module", return_value=module):
+            with (
+                patch.object(
+                    platforms.current_platform,
+                    "get_device",
+                    return_value=sentinel_device,
+                ),
+                patch.object(Platform, "set_device") as set_device,
+            ):
                 Platform.init_worker_device_env(
-                    local_rank=2, rank=3, world_size=8, master_port=12355
+                    local_rank=2, rank=3, world_size=8, master_port=12355, **kwargs
                 )
-            module.set_device.assert_called_once_with(2)
-            self.assertEqual(os.environ["MASTER_ADDR"], "localhost")
-            self.assertEqual(os.environ["MASTER_PORT"], "12355")
-            self.assertEqual(os.environ["LOCAL_RANK"], "2")
-            self.assertEqual(os.environ["RANK"], "3")
-            self.assertEqual(os.environ["WORLD_SIZE"], "8")
+            set_device.assert_called_once_with(sentinel_device)
+            return {key: os.environ.get(key) for key in env_keys}
         finally:
             for key, value in saved.items():
                 if value is None:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+    def test_sets_device_and_rendezvous_env(self):
+        env = self._run()
+        # Loopback default mirrors gpu_worker's single-node rendezvous.
+        self.assertEqual(env["MASTER_ADDR"], "127.0.0.1")
+        self.assertEqual(env["MASTER_PORT"], "12355")
+        self.assertEqual(env["LOCAL_RANK"], "2")
+        self.assertEqual(env["RANK"], "3")
+        self.assertEqual(env["WORLD_SIZE"], "8")
+
+    def test_master_addr_passes_through(self):
+        # nnodes > 1: gpu_worker resolves --dist-init-addr and passes it here.
+        env = self._run(master_addr="10.0.0.7")
+        self.assertEqual(env["MASTER_ADDR"], "10.0.0.7")
 
 
 if __name__ == "__main__":
