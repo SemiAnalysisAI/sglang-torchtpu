@@ -560,6 +560,8 @@ class CudaPlatformBase(Platform):
         selected_backend: AttentionBackendEnum | None,
         head_size: int,
         dtype: torch.dtype,
+        causal: bool = False,
+        num_kv_heads: int | None = None,
     ) -> str:
         if selected_backend is None:
             target_backend = cls._resolve_default_attn_backend()

@@ -248,8 +248,15 @@ class Platform:
         selected_backend: AttentionBackendEnum | None,
         head_size: int,
         dtype: torch.dtype,
+        causal: bool = False,
+        num_kv_heads: int | None = None,
     ) -> str:
-        """Get the attention backend class of a device."""
+        """Get the attention backend class of a device.
+
+        ``causal`` and ``num_kv_heads`` describe the requesting layer so
+        platforms with capability-limited kernels can route at selection
+        time. ``num_kv_heads`` is the KV-head count only when it differs
+        from the query-head count (GQA/MQA); None otherwise."""
         return ""
 
     @classmethod

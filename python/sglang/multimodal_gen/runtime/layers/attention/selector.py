@@ -153,6 +153,8 @@ def get_attn_backend(
     supported_attention_backends: set[AttentionBackendEnum] | None = None,
     selected_attention_backend: AttentionBackendEnum | None = None,
     attention_requirements: AttentionRequirements | None = None,
+    causal: bool = False,
+    num_kv_heads: int | None = None,
 ) -> type[AttentionBackend]:
     if supported_attention_backends is None:
         be_tuple = tuple()
@@ -187,6 +189,8 @@ def get_attn_backend(
         dtype,
         be_tuple,
         selected_backend,
+        causal,
+        num_kv_heads,
     )
 
     backend_name = attention_backend_cls.get_enum().name.lower()
@@ -210,6 +214,8 @@ def _cached_get_attn_backend(
     dtype: torch.dtype,
     supported_attention_backends: tuple[AttentionBackendEnum],
     selected_backend: AttentionBackendEnum | None,
+    causal: bool = False,
+    num_kv_heads: int | None = None,
 ) -> type[AttentionBackend]:
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -234,7 +240,7 @@ def _cached_get_attn_backend(
         )
 
     attention_cls = current_platform.get_attn_backend_cls_str(
-        selected_backend, head_size, dtype
+        selected_backend, head_size, dtype, causal=causal, num_kv_heads=num_kv_heads
     )
     if not attention_cls:
         raise ValueError(

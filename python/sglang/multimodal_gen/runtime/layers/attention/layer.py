@@ -301,7 +301,12 @@ class UlyssesAttention(nn.Module):
 
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            causal=causal,
+            # GQA/MQA signal: only when KV heads differ from query heads.
+            num_kv_heads=num_kv_heads if num_kv_heads != num_heads else None,
         )
         impl_cls = attn_backend.get_impl_cls()
 
@@ -555,7 +560,12 @@ class LocalAttention(nn.Module):
 
         dtype = compute_dtype or get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            causal=causal,
+            # GQA/MQA signal: only when KV heads differ from query heads.
+            num_kv_heads=num_kv_heads if num_kv_heads != num_heads else None,
         )
         impl_cls = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
@@ -690,7 +700,12 @@ class USPAttention(nn.Module):
 
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            causal=causal,
+            # GQA/MQA signal: only when KV heads differ from query heads.
+            num_kv_heads=num_kv_heads if num_kv_heads != num_heads else None,
         )
         if get_ring_parallel_world_size() > 1:
             if not attn_backend.supports_ring_rotation():

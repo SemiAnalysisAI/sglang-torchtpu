@@ -121,6 +121,8 @@ class CpuPlatform(Platform):
         selected_backend: AttentionBackendEnum | None,
         head_size: int,
         dtype: torch.dtype,
+        causal: bool = False,
+        num_kv_heads: int | None = None,
     ) -> str:
         if selected_backend not in (None, AttentionBackendEnum.TORCH_SDPA):
             logger.warning(

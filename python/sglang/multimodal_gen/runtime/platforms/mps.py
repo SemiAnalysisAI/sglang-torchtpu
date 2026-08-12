@@ -113,6 +113,8 @@ class MpsPlatform(Platform):
         selected_backend: AttentionBackendEnum | None,
         head_size: int,
         dtype: torch.dtype,
+        causal: bool = False,
+        num_kv_heads: int | None = None,
     ) -> str:
         # MPS supports SDPA (Scaled Dot-Product Attention) which is the most compatible
         logger.info("Using Torch SDPA backend for MPS.")

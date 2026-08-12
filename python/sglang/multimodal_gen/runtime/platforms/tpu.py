@@ -289,8 +289,25 @@ class TpuPlatform(Platform):
         selected_backend: AttentionBackendEnum | None,
         head_size: int,
         dtype: torch.dtype,
+        causal: bool = False,
+        num_kv_heads: int | None = None,
     ) -> str:
         if selected_backend in (None, AttentionBackendEnum.TPU_PALLAS_FLASH):
+            # The pallas kernel is non-causal, equal-head-count only. Route
+            # unsupported layers to SDPA at selection time: a construction
+            # raise gets swallowed by component loaders into the silent
+            # native-transformers fallback (losing custom encoder APIs).
+            if causal or num_kv_heads is not None:
+                reason = "causal" if causal else "GQA"
+                logger.info_once(
+                    f"TPU: routing {reason} attention to Torch SDPA (the "
+                    "pallas flash kernel is non-causal, equal head counts "
+                    "only)."
+                )
+                return (
+                    "sglang.multimodal_gen.runtime.layers.attention.backends."
+                    "sdpa.SDPABackend"
+                )
             logger.info("Using TPU pallas flash attention backend.")
             return (
                 "sglang.multimodal_gen.runtime.layers.attention.backends."

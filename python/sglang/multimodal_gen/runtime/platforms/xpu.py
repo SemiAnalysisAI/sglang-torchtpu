@@ -126,6 +126,8 @@ class XpuPlatform(Platform):
         selected_backend: AttentionBackendEnum | None,
         head_size: int,
         dtype: torch.dtype,
+        causal: bool = False,
+        num_kv_heads: int | None = None,
     ) -> str:
         """Get the attention backend class string for Intel XPU.
 
