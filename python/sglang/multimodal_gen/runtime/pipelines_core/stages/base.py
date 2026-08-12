@@ -10,7 +10,8 @@ composed to create complete diffusion pipelines.
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+import weakref
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from enum import Enum, auto
 
@@ -272,6 +273,21 @@ class PipelineStage(StageDedupMixin, ABC):
     def role_affinity(self) -> RoleType:
         return RoleType.ENCODER
 
+    def _platform_stage_context(self):
+        """Platform lifecycle context for this stage's ``forward``, keyed by
+        ``role_affinity`` so stages that override ``forward`` inherit it
+        without calling platform hooks themselves. No-op contexts on every
+        platform without deferred execution."""
+        role = self.role_affinity
+        if role == RoleType.DENOISER:
+            return current_platform.denoise_loop_context()
+        if role == RoleType.DECODER:
+            pipeline = getattr(self, "pipeline", None)
+            if isinstance(pipeline, weakref.ReferenceType):
+                pipeline = pipeline()
+            return current_platform.vae_decode_context(pipeline)
+        return nullcontext()
+
     # execute on all ranks by default
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -372,13 +388,16 @@ class PipelineStage(StageDedupMixin, ABC):
         previous_batch_is_warmup = self._current_batch_is_warmup
         self._current_batch_is_warmup = batch.is_warmup
         try:
-            with StageProfiler(
-                stage_name,
-                logger=logger,
-                metrics=batch.metrics,
-                log_stage_start_end=not batch.is_warmup
-                and not (self.server_args and self.server_args.comfyui_mode),
-                perf_dump_path_provided=batch.perf_dump_path is not None,
+            with (
+                StageProfiler(
+                    stage_name,
+                    logger=logger,
+                    metrics=batch.metrics,
+                    log_stage_start_end=not batch.is_warmup
+                    and not (self.server_args and self.server_args.comfyui_mode),
+                    perf_dump_path_provided=batch.perf_dump_path is not None,
+                ),
+                self._platform_stage_context(),
             ):
                 result = self.forward(batch, server_args)
         finally:

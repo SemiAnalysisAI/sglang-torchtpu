@@ -1711,7 +1711,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 enabled=ctx.autocast_enabled,
             ),
             maybe_nvtx_range("denoising_loop", use_nvtx),
-            current_platform.denoise_loop_context(),
         ):
             with self.progress_bar(
                 total=ctx.num_inference_steps, batch=batch
@@ -1752,7 +1751,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                                 step_index=step_index,
                             )
                         self._run_denoising_step(ctx, step, batch, server_args)
-                        current_platform.on_denoise_step_end()
                         self._record_trajectory(ctx, step, batch, server_args)
 
                         if step_index == num_timesteps - 1 or (

@@ -243,10 +243,7 @@ class DecodingStage(PipelineStage):
             torch.mps.empty_cache()
 
         # Decode latents
-        with (
-            current_platform.vae_decode_context(pipeline),
-            autocast_context(vae_dtype, server_args.disable_autocast),
-        ):
+        with autocast_context(vae_dtype, server_args.disable_autocast):
             try:
                 # TODO: make it more specific
                 if server_args.pipeline_config.vae_tiling:

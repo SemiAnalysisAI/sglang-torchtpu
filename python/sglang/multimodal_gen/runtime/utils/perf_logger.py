@@ -231,6 +231,14 @@ class StageProfiler:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None and self._should_record_as_step():
+            # Per-step platform hook (bounds the lazy queue on deferred-
+            # execution backends). Every denoising-style loop marks its step
+            # profilers record_as_step, so stages that override forward get
+            # the hook through this shared boundary. Runs before the elapsed
+            # computation so step timings include the sync, matching the
+            # previous in-loop call site.
+            current_platform.on_denoise_step_end()
         if not ((self.log_timing and self.metrics) or self.log_stage_start_end):
             return False
 
