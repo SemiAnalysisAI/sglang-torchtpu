@@ -30,8 +30,7 @@ class TestTpuTextEncoderBackendDefault:
                 component_attention_backends={"text_encoder": "tpu_pallas_flash"}
             )
         assert (
-            args.component_attention_backends.get("text_encoder")
-            == "tpu_pallas_flash"
+            args.component_attention_backends.get("text_encoder") == "tpu_pallas_flash"
         )
 
     def test_non_tpu_platforms_unchanged(self):

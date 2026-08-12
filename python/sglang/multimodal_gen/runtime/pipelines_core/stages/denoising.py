@@ -461,9 +461,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         platform_forward = current_platform.compile_module_override(module)
         if platform_forward is not None:
-            self._torch_compile_registry.install_forward_once(
-                module, platform_forward
-            )
+            self._torch_compile_registry.install_forward_once(module, platform_forward)
             logger.info(
                 "Compiling %s via the platform direct tracer",
                 type(module).__name__,

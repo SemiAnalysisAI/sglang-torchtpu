@@ -16,9 +16,7 @@ SDPA = "sdpa.SDPABackend"
 
 class TestTpuAttentionSelection:
     def _select(self, **kwargs):
-        return TpuPlatform.get_attn_backend_cls_str(
-            None, 128, torch.bfloat16, **kwargs
-        )
+        return TpuPlatform.get_attn_backend_cls_str(None, 128, torch.bfloat16, **kwargs)
 
     def test_default_is_pallas(self):
         assert self._select().endswith(PALLAS)

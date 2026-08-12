@@ -7,7 +7,6 @@ from typing import Any
 import torch
 
 
-
 def set_weight_attrs(
     weight: torch.Tensor,
     weight_attrs: dict[str, Any] | None,

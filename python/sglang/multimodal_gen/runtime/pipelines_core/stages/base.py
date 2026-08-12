@@ -8,9 +8,9 @@ This module defines the abstract base classes for pipeline stages that can be
 composed to create complete diffusion pipelines.
 """
 
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
-import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from enum import Enum, auto
