@@ -44,7 +44,11 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.scheduler import (
+    run_scheduler_process,
+    run_scheduler_process_from_bootstrap_rank,
+    run_scheduler_process_with_legacy_hook,
+)
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
@@ -627,8 +631,6 @@ class DataParallelController:
                 tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
             )
 
-        attn_cp_rank = 0
-        moe_dp_rank = 0
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
                 rank_port_args = port_args
@@ -668,54 +670,36 @@ class DataParallelController:
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
-                attn_dp_size = (
-                    server_args.dp_size if server_args.enable_dp_attention else 1
-                )
-
-                # Parallelism hierarchy (outermost to innermost):
-                # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
-                # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
-                attn_tp_size = (
-                    server_args.tp_size // attn_dp_size // server_args.attn_cp_size
-                )
-                attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
-                moe_dp_rank = tp_rank // (
-                    server_args.tp_size // server_args.moe_dp_size
-                )
-                moe_ep_rank = (
-                    tp_rank
-                    % (server_args.tp_size // server_args.moe_dp_size)
-                    // (
-                        server_args.tp_size
-                        // server_args.moe_dp_size
-                        // server_args.ep_size
-                    )
-                )
-
-                # Scheduler internals use local ranks; logs use global ranks.
-                offset = server_args.ep_join_rank_offset
-                display_tp_rank = tp_rank + offset
-                display_moe_ep_rank = moe_ep_rank + offset
-                display_dp_rank = dp_rank + offset if dp_rank is not None else None
-
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
-                    proc = mp.Process(
-                        target=self.run_scheduler_process_func,
-                        args=(
+                    if self.run_scheduler_process_func is run_scheduler_process:
+                        scheduler_target = run_scheduler_process_from_bootstrap_rank
+                        scheduler_args = (
                             server_args,
                             rank_port_args,
                             gpu_id,
                             tp_rank,
-                            attn_cp_rank,
-                            moe_dp_rank,
-                            moe_ep_rank,
                             pp_rank,
                             dp_rank,
                             writer,
-                            display_tp_rank,
-                            display_dp_rank,
-                            display_moe_ep_rank,
-                        ),
+                            worker_ports,
+                        )
+                    else:
+                        scheduler_target = run_scheduler_process_with_legacy_hook
+                        scheduler_args = (
+                            self.run_scheduler_process_func,
+                            server_args,
+                            rank_port_args,
+                            gpu_id,
+                            tp_rank,
+                            pp_rank,
+                            dp_rank,
+                            writer,
+                            worker_ports,
+                        )
+
+                    proc = mp.Process(
+                        target=scheduler_target,
+                        args=scheduler_args,
                     )
                     with (
                         memory_saver_adapter.configure_subprocess(),

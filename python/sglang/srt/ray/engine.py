@@ -31,7 +31,6 @@ from sglang.srt.entrypoints.engine import (
     Engine,
     SchedulerInitResult,
     _calculate_rank_ranges,
-    _compute_parallelism_ranks,
 )
 from sglang.srt.ray.scheduler_actor import SchedulerActor
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -175,7 +174,6 @@ class RayEngine(Engine):
             from sglang.srt.hardware_backend.tpu.ray_utils import (
                 _forwarded_driver_env,
                 detect_tpu_nnodes,
-                discover_tpu_worker_hostnames,
                 redact_env_for_log,
             )
 
@@ -251,38 +249,42 @@ class RayEngine(Engine):
                     ],
                     torch_tpu_topology=single_host_env.get("TORCH_TPU_TOPOLOGY"),
                 )
-            else:
-                tpu_worker_hostnames = discover_tpu_worker_hostnames(server_args.nnodes)
-                if tpu_worker_hostnames:
-                    # Multihost: stash the physically-ordered (TPU_WORKER_ID) host
-                    # list. Actors rebuild the slicebuilder deterministically from it
-                    # (see _prepare_tpu_env), so the port list is identical everywhere.
-                    server_args = dataclasses.replace(
-                        server_args, tpu_worker_hostnames=tpu_worker_hostnames
-                    )
-
         pg = placement_group or ray.util.get_current_placement_group()
-        if pg is None:
-            if server_args.enable_dp_attention:
-                total_gpus = server_args.tp_size * server_args.pp_size
-            else:
-                total_gpus = (
-                    server_args.dp_size * server_args.tp_size * server_args.pp_size
-                )
+        if server_args.enable_dp_attention:
+            total_accelerators = server_args.tp_size * server_args.pp_size
+        else:
+            total_accelerators = (
+                server_args.dp_size * server_args.tp_size * server_args.pp_size
+            )
+        accelerators_per_node = total_accelerators // server_args.nnodes
 
+        if (
+            server_args.use_ray
+            and server_args.device == "tpu"
+            and server_args.nnodes > 1
+        ):
+            from sglang.srt.hardware_backend.tpu.ray_utils import (
+                validate_full_host_tpu_allocation,
+            )
+
+            # Validate before creating/waiting for a placement group. An
+            # oversized request could otherwise wait forever; a partial request
+            # could reserve a PG that we immediately reject and leak it.
+            validate_full_host_tpu_allocation(server_args.nnodes, accelerators_per_node)
+
+        if pg is None:
             nnodes = server_args.nnodes
-            gpus_per_node = total_gpus // nnodes
             strategy = "STRICT_PACK" if nnodes == 1 else "SPREAD"
             accel = _accelerator_resource_name(server_args)
 
             logger.info(
                 "No placement group detected. Auto-creating one with "
-                f"{nnodes} bundle(s), {gpus_per_node} {accel}(s)/bundle, "
+                f"{nnodes} bundle(s), {accelerators_per_node} {accel}(s)/bundle, "
                 "placement group explicitly and schedule the Engine onto it."
             )
 
             pg = create_placement_group(
-                [{"CPU": 1, accel: gpus_per_node}] * nnodes,
+                [{"CPU": 1, accel: accelerators_per_node}] * nnodes,
                 strategy=strategy,
             )
             ray.get(pg.ready())
@@ -292,18 +294,23 @@ class RayEngine(Engine):
 
         if server_args.use_ray and server_args.device == "tpu" and nnodes > 1:
             # TPU multihost: the slicebuilder endpoint list and MASTER_ADDR are
-            # ordered by physical TPU_WORKER_ID, so rank r must land on the host
-            # whose TPU_WORKER_ID == r // devices_per_host. Ray bundle indices are
-            # NOT guaranteed to follow TPU_WORKER_ID order (they only coincide for
-            # nnodes==2 with the head on worker 0), so probe each bundle's physical
-            # worker id and order bundle_for_node by it. Also verifies rank0
-            # (worker 0) is co-located with the Engine; anything inconsistent
-            # raises here instead of hanging later at PJRT bind / rendezvous.
+            # ordered by physical TPU coordinates. Probe one disposable PJRT
+            # client per bundle before launching actors, then use that same order
+            # for rank placement, slicebuilder endpoints, and MASTER_ADDR.
             from sglang.srt.hardware_backend.tpu.ray_utils import (
-                order_tpu_bundles_by_worker_id,
+                order_tpu_bundles_by_topology,
             )
 
-            bundle_for_node, rank0_node_ip = order_tpu_bundles_by_worker_id(pg, nnodes)
+            (
+                bundle_for_node,
+                rank0_node_ip,
+                tpu_worker_hostnames,
+            ) = order_tpu_bundles_by_topology(
+                pg, nnodes, tpus_per_node=accelerators_per_node
+            )
+            server_args = dataclasses.replace(
+                server_args, tpu_worker_hostnames=tpu_worker_hostnames
+            )
         else:
             # GPU (or single host): rank placement is independent of any physical
             # slice order, so co-locate rank0 with the Engine and keep numeric
@@ -344,10 +351,6 @@ class RayEngine(Engine):
                             tp_rank % tp_per_node
                         )
 
-                        attn_cp_rank, moe_dp_rank, moe_ep_rank = (
-                            _compute_parallelism_ranks(server_args, tp_rank)
-                        )
-
                         actor = SchedulerActor.options(
                             **_actor_options(server_args),
                             name=f"sglang_scheduler_node{rank0_node_ip}_pp{pp_rank}_tp{tp_rank}_pg{pg.id.hex()[:8]}_bundle{bundle_idx}",
@@ -360,9 +363,6 @@ class RayEngine(Engine):
                             port_args=port_args,
                             gpu_id=local_gpu_idx,
                             tp_rank=tp_rank,
-                            attn_cp_rank=attn_cp_rank,
-                            moe_dp_rank=moe_dp_rank,
-                            moe_ep_rank=moe_ep_rank,
                             pp_rank=pp_rank,
                             dp_rank=0,
                             dist_init_addr=dist_init_addr,

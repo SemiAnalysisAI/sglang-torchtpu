@@ -10,8 +10,8 @@
 #   * CHUNKED_PREFILL_SIZE / MAX_PREFILL_TOKENS raised 4096 -> 8192, and 8192 added
 #     to TPU_COMPILE_TOKENS: a prefill shape outside the precompiled buckets takes
 #     the recompile path that crashes torch_tpu (InductorError KeyError 'tpu').
-#   * no NODE_RANK/RANK0_HOST plumbing: on GKE the rank and peer list auto-derive
-#     from TPU_WORKER_ID / TPU_WORKER_HOSTNAMES, and HOST/PORT come from the JobSet.
+#   * NODE_RANK is derived from physical TPU coordinates; set RANK0_HOST (or
+#     DIST_INIT_ADDR) to the topological rank-0 pod on every host.
 # MEM_FRACTION_STATIC=0.7 is load-bearing: the 1T fp8 weights are a large fixed cost
 # per device, and lower values yield a NEGATIVE KV budget ("Not enough memory").
 set -uo pipefail

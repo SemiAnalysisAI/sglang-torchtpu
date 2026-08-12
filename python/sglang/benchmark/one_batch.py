@@ -298,7 +298,10 @@ class BenchArgs:
 
 
 def load_model(server_args, port_args, gpu_id, tp_rank):
-    initialize_torch_tpu_worker(server_args, tp_rank)
+    if server_args.pp_size != 1:
+        raise ValueError("one_batch does not support pipeline parallelism")
+    tp_rank, pp_rank = initialize_torch_tpu_worker(server_args, tp_rank)
+    assert pp_rank == 0
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)

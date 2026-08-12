@@ -87,7 +87,8 @@ class TpuSRTPlatform(SRTPlatform):
         # the libtpu/env overrides now so actors inherit them before importing
         # torch_tpu.
         _prepare_tpu_env(
-            server_args.tp_size, setup_slicebuilder=not server_args.use_ray
+            server_args.tp_size * server_args.pp_size,
+            setup_slicebuilder=not server_args.use_ray,
         )
 
         if server_args.dtype is None or server_args.dtype == "auto":

@@ -33,7 +33,10 @@ from sglang.srt.utils import (
     monkey_patch_p2p_access_check,
 )
 from sglang.srt.utils.network import NetworkAddress
-from sglang.srt.utils.patch_torch import register_sgl_tp_rank
+from sglang.srt.utils.patch_torch import (
+    _validate_torch_tpu_rank_device,
+    register_sgl_tp_rank,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +100,13 @@ def init_torch_distributed(
             moe_dp_size=ps.moe_dp_size,
             dcp_size=ps.attn_dcp_size,
         )
+
+        # The scheduler relabels its provisional TP rank from PJRT device
+        # discovery before this process group is created. Verify the invariant
+        # again before model loading so rank-specific AOT artifacts cannot be
+        # used under a mismatched physical device ID.
+        if device == "tpu":
+            _validate_torch_tpu_rank_device(ps.tp_rank, ps.pp_rank, ps.tp_size)
 
         # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
         # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)

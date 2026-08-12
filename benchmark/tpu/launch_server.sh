@@ -24,16 +24,19 @@
 # Example — multihost MoE across a 2x2x2 v7x slice (2 hosts → tp=16, ep=8).
 # Preferred: Ray mode. Bring up a Ray cluster (head + workers), then run this
 # ONLY on the head. The head Engine discovers the peer hostnames + slice
-# topology from the live Ray cluster, so you supply only NNODES — no
+# topology from the live Ray cluster. Multihost Ray currently requires the
+# model to consume every TPU on every node so its coordinate probes retain full
+# topology visibility. Supply only NNODES — no
 # TPU_WORKER_HOSTNAMES, node rank, or dist addr. TP_SIZE auto-derives to
 # NNODES*CHIPS_PER_HOST:
 #   SGLANG_USE_RAY=1 NNODES=2 MODEL=Qwen/Qwen3-30B-A3B EP_SIZE=8 \
 #   MEM_FRACTION_STATIC=0.30 ./launch_server.sh
 #
 # Alternative — no Ray: launch this SAME command on every host (one pod per
-# host); node rank and the peer list are auto-detected from the GKE TPU env
-# (TPU_WORKER_ID / TPU_WORKER_HOSTNAMES):
-#   MODEL=Qwen/Qwen3-30B-A3B EP_SIZE=8 MEM_FRACTION_STATIC=0.30 ./launch_server.sh
+# host); node rank is derived from physical TPU coordinates. Set RANK0_HOST (or
+# DIST_INIT_ADDR) to the topological rank-0 host on every pod:
+#   RANK0_HOST=<rank0-host> MODEL=Qwen/Qwen3-30B-A3B EP_SIZE=8 \
+#     MEM_FRACTION_STATIC=0.30 ./launch_server.sh
 # See the "multihost (multi-node) coordination" section below for manual control.
 #
 # Chiplet visibility is derived from TP_SIZE: tp=1 pins to chiplet 0 (torch_tpu
@@ -104,12 +107,12 @@
 #   NNODES=                        # # hosts. Ray mode: user-supplied (may be
 #                                  #   overridden by the discovered cluster).
 #                                  #   Non-Ray: auto from TPU_WORKER_HOSTNAMES.
-#   NODE_RANK=                     # non-Ray this host's rank; auto from TPU_WORKER_ID
+#   NODE_RANK=                     # non-Ray rank; auto from physical coordinates
 #   DIST_INIT_ADDR=                # non-Ray torch.distributed rendezvous addr;
 #                                  #   auto-built (Ray computes it at runtime)
 #   DIST_PORT=10011                # rendezvous port (NOT the HTTP PORT)
 #   CHIPS_PER_HOST=8               # tp-devices per host (v7x: 4 chips x 2 cores)
-#   RANK0_HOST=                    # rank-0 hostname; needed for node_rank>0 manual mode
+#   RANK0_HOST=                    # topological rank-0 hostname (non-Ray multihost)
 set -euo pipefail
 # Shared static TPU env (PYTHON, SGLANG_PLATFORM, HF cache, LIBTPU_INIT_ARGS,
 # TORCH_LOGS, ...) lives in common_env.sh next to this script — source it so
@@ -137,19 +140,33 @@ MODEL_SLUG=$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' 
 USE_RAY=${SGLANG_USE_RAY:-0}
 if [[ "$USE_RAY" == "1" ]]; then
     # Ray mode: only the HEAD runs this script. The head Engine discovers the
-    # peer hostnames + slice topology straight from the live Ray cluster
-    # (ray.nodes() + a SPREAD placement group that probes every node's
-    # TPU_WORKER_ID / IP, then sorts by TPU_WORKER_ID for physical order).
+    # peer hostnames + slice topology straight from the live Ray cluster using
+    # one short-lived coordinate probe per placement-group bundle.
     # So TPU_WORKER_HOSTNAMES / NODE_RANK / RANK0_HOST / DIST_INIT_ADDR are all
     # discovered at runtime and NOT needed here — the user supplies only NNODES.
     NNODES=${NNODES:-1}
     NODE_RANK=0
     [[ "$NNODES" -gt 1 ]] && ENABLE_MULTIHOST=1 || ENABLE_MULTIHOST=0
-elif [[ -n "${TPU_WORKER_ID:-}" && -n "${TPU_WORKER_HOSTNAMES:-}" ]]; then
+elif [[ -n "${TPU_WORKER_HOSTNAMES:-}" ]]; then
     ENABLE_MULTIHOST=1
-    NODE_RANK=${NODE_RANK:-$TPU_WORKER_ID}
     NNODES=${NNODES:-$(awk -F, '{print NF}' <<< "$TPU_WORKER_HOSTNAMES")}
-    RANK0_HOST=${RANK0_HOST:-$(cut -d, -f1 <<< "$TPU_WORKER_HOSTNAMES")}
+    if [[ -z "${NODE_RANK:-}" ]]; then
+        # TorchTPU PR #2948 exposes local_device_coords() and the topological
+        # rank calculation. Run it in a disposable client so PJRT is released
+        # before SGLang spawns scheduler workers.
+        _topology_probe_output=$(
+            "$PYTHON" -m sglang.srt.hardware_backend.tpu.topology
+        ) || {
+            echo "ERROR: failed to derive NODE_RANK from TPU coordinates; install a TorchTPU build containing PR #2948 or set NODE_RANK explicitly." >&2
+            exit 2
+        }
+        NODE_RANK=$(sed -n 's/^SGLANG_TPU_NODE_RANK=//p' <<< "$_topology_probe_output" | tail -n 1)
+        if [[ ! "$NODE_RANK" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: the TPU coordinate probe returned an invalid topological node rank: $NODE_RANK" >&2
+            exit 2
+        fi
+    fi
+    RANK0_HOST=${RANK0_HOST:-}
 elif [[ "${NNODES:-1}" -gt 1 ]]; then
     ENABLE_MULTIHOST=1             # manual: caller sets NNODES / NODE_RANK / RANK0_HOST
     NODE_RANK=${NODE_RANK:-0}
@@ -165,13 +182,13 @@ if [[ "$ENABLE_MULTIHOST" == "1" ]]; then
         # Non-Ray multihost: build the torch.distributed rendezvous addr here
         # (Ray computes it from the discovered rank-0 node IP instead).
         if [[ -z "${DIST_INIT_ADDR:-}" ]]; then
-            if [[ "$NODE_RANK" == "0" ]]; then
-                DIST_INIT_ADDR="0.0.0.0"
-            else
-                DIST_INIT_ADDR="${RANK0_HOST:?set RANK0_HOST or DIST_INIT_ADDR for node_rank>0}"
-            fi
+            DIST_INIT_ADDR="${RANK0_HOST:?set the topological rank-0 RANK0_HOST or DIST_INIT_ADDR on every host}"
         fi
         [[ "$DIST_INIT_ADDR" == *:* ]] || DIST_INIT_ADDR="$DIST_INIT_ADDR:$DIST_PORT"
+        # PJRT reads MASTER_ADDR separately from SGLang's c10d init URL. Keep
+        # both pointed at the same topology-correct host rather than falling
+        # back to TPU_WORKER_HOSTNAMES ordering.
+        export MASTER_ADDR="${RANK0_HOST:-${DIST_INIT_ADDR%:*}}"
     fi
 else
     DEFAULT_TP=8

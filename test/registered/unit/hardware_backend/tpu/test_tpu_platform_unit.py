@@ -212,6 +212,9 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             disable_overlap_schedule=False,
             mem_fraction_static=None,
             tp_size=1,
+            pp_size=1,
+            nnodes=1,
+            node_rank=0,
             dp_size=1,
             enable_dp_attention=False,
             enable_dp_lm_head=False,
@@ -298,6 +301,29 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             platform.apply_server_args_defaults(args)
 
         prepare_tpu_env.assert_called_once_with(16, setup_slicebuilder=True)
+
+    def test_configures_slicebuilder_from_composite_world_size(self):
+        args = self._args(tp_size=4, pp_size=2)
+        platform = TpuSRTPlatform()
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
+        ) as prepare_tpu_env:
+            platform.apply_server_args_defaults(args)
+
+        prepare_tpu_env.assert_called_once_with(8, setup_slicebuilder=True)
+
+    def test_multihost_keeps_launcher_assigned_node_rank(self):
+        args = self._args(nnodes=2, node_rank=0, use_ray=False)
+        with patch.dict(os.environ, {"TPU_WORKER_ID": "1"}, clear=False):
+            self._apply(args)
+        self.assertEqual(args.node_rank, 0)
+
+    def test_ray_keeps_actor_assigned_node_rank(self):
+        args = self._args(nnodes=2, node_rank=0, use_ray=True)
+        with patch.dict(os.environ, {"TPU_WORKER_ID": "1"}, clear=False):
+            self._apply(args)
+        self.assertEqual(args.node_rank, 0)
 
     def test_parent_defaults_do_not_import_torch_tpu(self):
         args = self._args(tp_size=8)

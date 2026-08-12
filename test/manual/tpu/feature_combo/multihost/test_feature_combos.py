@@ -8,7 +8,7 @@ churn -> host-reload -> concurrent wave -> flush/repopulate); greedy outputs
 must stay bit-equal to the populate baseline throughout — for pd that
 certifies the cross-host KV transfer. See ``run_probe`` for the exact oracle.
 
-Topology & roles (auto-detected from the GKE TPU env, override via NODE_RANK):
+Topology & roles (derived from TPU coordinates, override via NODE_RANK):
   pd:    host 0 = prefill engine (tp=8) + mini-LB + probe/asserts
          host 1 = decode engine (tp=8); KV crosses hosts over DCN
   spec:  ONE server spans both hosts (tp = NNODES * CHIPS_PER_HOST = 16);
@@ -94,7 +94,23 @@ MIN_ACCEPT_LENGTH = float(E("MIN_ACCEPT_LENGTH", "1.0"))
 ACCEPT_LENGTH_REF = E("ACCEPT_LENGTH_REF", "2.810")
 KEEP_UP = E("KEEP_UP", "0") == "1"
 
-RANK = int(E("NODE_RANK", E("TPU_WORKER_ID", "0")))
+if E("NODE_RANK") is None:
+    rank_output = subprocess.check_output(
+        [PYTHON, "-m", "sglang.srt.hardware_backend.tpu.topology"],
+        cwd=REPO,
+        text=True,
+    )
+    rank_lines = [
+        line.removeprefix("SGLANG_TPU_NODE_RANK=")
+        for line in rank_output.splitlines()
+        if line.startswith("SGLANG_TPU_NODE_RANK=")
+    ]
+    if not rank_lines:
+        raise RuntimeError("TPU coordinate probe returned no topological node rank")
+    RANK = int(rank_lines[-1])
+    os.environ["NODE_RANK"] = str(RANK)
+else:
+    RANK = int(E("NODE_RANK"))
 HOSTNAMES = [h for h in E("TPU_WORKER_HOSTNAMES", "").split(",") if h]
 SELF_HOST = E("SELF_HOST", HOSTNAMES[0] if HOSTNAMES else "127.0.0.1")
 PEER_DECODE_HOST = E("PEER_DECODE_HOST", HOSTNAMES[1] if len(HOSTNAMES) > 1 else "")

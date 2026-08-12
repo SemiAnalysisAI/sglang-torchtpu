@@ -4,11 +4,8 @@ Runs anywhere (no TPU / no live Ray cluster required) -- exercises the pure,
 CPU-side logic that the Ray engine relies on for correct TPU launch:
 
 * ``_resolve_bundle_order_from_probes`` -- maps Ray placement-group bundles to
-  physical ``TPU_WORKER_ID`` order. Regression coverage for the bug where
-  ``bundle_for_node`` used engine-first + numeric bundle order while the
-  slicebuilder endpoints / ``MASTER_ADDR`` assume physical ``TPU_WORKER_ID``
-  order -- silently misplacing ranks for nnodes >= 3 or when the Engine is not
-  on TPU worker 0.
+  coordinate-derived node order, shared by scheduler placement, slicebuilder
+  endpoints, and ``MASTER_ADDR``.
 * ``tpu_actor_runtime_env`` / ``compute_single_host_tpu_env`` -- the launcher
   stashes the TPU env on ``server_args`` and injects it into each actor via
   ``runtime_env``, because Ray does NOT propagate the driver's ``os.environ``
@@ -64,108 +61,55 @@ def _server_args(**overrides):
 
 
 class TestResolveBundleOrderFromProbes(CustomTestCase):
-    def test_nnodes2_bundles_already_in_worker_order(self):
-        # bundle 0 -> worker 0 (engine), bundle 1 -> worker 1
-        probes = [("0", "10.0.0.0"), ("1", "10.0.0.1")]
-        bundle_for_node, rank0_ip = _resolve_bundle_order_from_probes(
-            probes, engine_ip="10.0.0.0"
+    def test_nnodes2_bundles_already_in_topology_order(self):
+        result = _resolve_bundle_order_from_probes(
+            [(0, "10.0.0.0"), (1, "10.0.0.1")], engine_ip="10.0.0.0"
         )
-        self.assertEqual(bundle_for_node, [0, 1])
-        self.assertEqual(rank0_ip, "10.0.0.0")
+        self.assertEqual(result, ([0, 1], "10.0.0.0", "10.0.0.0,10.0.0.1"))
 
-    def test_nnodes2_bundles_reversed_vs_worker_order(self):
-        # Ray happened to assign bundle 0 -> worker 1, bundle 1 -> worker 0.
-        # Node k must still map to the bundle on physical worker k.
-        probes = [("1", "10.0.0.1"), ("0", "10.0.0.0")]
-        bundle_for_node, rank0_ip = _resolve_bundle_order_from_probes(
-            probes, engine_ip="10.0.0.0"
+    def test_nnodes2_bundles_reversed_vs_topology_order(self):
+        result = _resolve_bundle_order_from_probes(
+            [(1, "10.0.0.1"), (0, "10.0.0.0")], engine_ip="10.0.0.0"
         )
-        # node 0 -> worker 0 -> bundle 1 ; node 1 -> worker 1 -> bundle 0
-        self.assertEqual(bundle_for_node, [1, 0])
-        self.assertEqual(rank0_ip, "10.0.0.0")
+        self.assertEqual(result, ([1, 0], "10.0.0.0", "10.0.0.0,10.0.0.1"))
 
-    def test_nnodes3_bundle_numeric_order_differs_from_worker_order(self):
-        # The core nnodes>=3 regression: bundle index order != TPU_WORKER_ID order.
-        # bundle 0 -> worker 2, bundle 1 -> worker 0 (engine), bundle 2 -> worker 1
-        probes = [
-            ("2", "10.0.0.2"),
-            ("0", "10.0.0.0"),
-            ("1", "10.0.0.1"),
-        ]
-        bundle_for_node, rank0_ip = _resolve_bundle_order_from_probes(
-            probes, engine_ip="10.0.0.0"
+    def test_nnodes3_bundle_order_differs_from_topology(self):
+        result = _resolve_bundle_order_from_probes(
+            [(2, "ip2"), (0, "ip0"), (1, "ip1")], engine_ip="ip0"
         )
-        # node 0 -> worker 0 -> bundle 1
-        # node 1 -> worker 1 -> bundle 2
-        # node 2 -> worker 2 -> bundle 0
-        self.assertEqual(bundle_for_node, [1, 2, 0])
-        self.assertEqual(rank0_ip, "10.0.0.0")
+        self.assertEqual(result, ([1, 2, 0], "ip0", "ip0,ip1,ip2"))
 
     def test_nnodes4_arbitrary_permutation(self):
-        # 4-node slice with a fully scrambled bundle->worker mapping.
-        # bundle idx:   0      1      2      3
-        # worker id:    3      0      2      1
-        probes = [
-            ("3", "ip3"),
-            ("0", "ip0"),
-            ("2", "ip2"),
-            ("1", "ip1"),
-        ]
-        bundle_for_node, rank0_ip = _resolve_bundle_order_from_probes(
+        result = _resolve_bundle_order_from_probes(
+            [(3, "ip3"), (0, "ip0"), (2, "ip2"), (1, "ip1")],
+            engine_ip="ip0",
+        )
+        self.assertEqual(result, ([1, 3, 2, 0], "ip0", "ip0,ip1,ip2,ip3"))
+
+    def test_topological_ranks_ordered_numerically(self):
+        probes = [(i, f"ip{i}") for i in range(10)][::-1]
+        bundles, rank0_ip, hostnames = _resolve_bundle_order_from_probes(
             probes, engine_ip="ip0"
         )
-        # node k -> bundle whose worker id == k
-        # w0->bundle1, w1->bundle3, w2->bundle2, w3->bundle0
-        self.assertEqual(bundle_for_node, [1, 3, 2, 0])
+        self.assertEqual(bundles, [9, 8, 7, 6, 5, 4, 3, 2, 1, 0])
         self.assertEqual(rank0_ip, "ip0")
+        self.assertEqual(hostnames, ",".join(f"ip{i}" for i in range(10)))
 
-    def test_worker_ids_ordered_numerically_not_lexically(self):
-        # A 10-node slice: worker id "10" must be treated as int 10 (after "9"),
-        # not sorted lexically before "2".
-        probes = [(str(i), f"ip{i}") for i in range(10)]
-        # scramble bundle order so the mapping is non-trivial
-        probes = probes[::-1]  # bundle 0 -> worker 9, ..., bundle 9 -> worker 0
-        bundle_for_node, rank0_ip = _resolve_bundle_order_from_probes(
-            probes, engine_ip="ip0"
-        )
-        # node k -> bundle (9 - k)
-        self.assertEqual(bundle_for_node, [9, 8, 7, 6, 5, 4, 3, 2, 1, 0])
-        self.assertEqual(rank0_ip, "ip0")
+    def test_raises_when_engine_not_on_topological_rank0(self):
+        with self.assertRaisesRegex(RuntimeError, "topological TPU node 0"):
+            _resolve_bundle_order_from_probes([(0, "ip0"), (1, "ip1")], engine_ip="ip1")
 
-    def test_raises_when_engine_not_on_worker0(self):
-        # Engine (rank0 scheduler) lives on worker 1, but MASTER_ADDR would point
-        # at worker 0 -> must fail loudly instead of hanging at rendezvous.
-        probes = [("0", "10.0.0.0"), ("1", "10.0.0.1")]
-        with self.assertRaises(RuntimeError) as ctx:
-            _resolve_bundle_order_from_probes(probes, engine_ip="10.0.0.1")
-        self.assertIn("worker 0", str(ctx.exception))
+    def test_raises_on_duplicate_topological_rank(self):
+        with self.assertRaisesRegex(RuntimeError, "duplicate"):
+            _resolve_bundle_order_from_probes([(0, "ip0"), (0, "ip9")], engine_ip="ip0")
 
-    def test_raises_when_worker_id_missing(self):
-        probes = [("0", "10.0.0.0"), (None, "10.0.0.1")]
-        with self.assertRaises(RuntimeError) as ctx:
-            _resolve_bundle_order_from_probes(probes, engine_ip="10.0.0.0")
-        self.assertIn("TPU_WORKER_ID missing", str(ctx.exception))
-
-    def test_raises_on_duplicate_worker_id(self):
-        probes = [("0", "10.0.0.0"), ("0", "10.0.0.9")]
-        with self.assertRaises(RuntimeError) as ctx:
-            _resolve_bundle_order_from_probes(probes, engine_ip="10.0.0.0")
-        self.assertIn("duplicate", str(ctx.exception))
-
-    def test_raises_on_noncontiguous_worker_ids(self):
-        # worker ids {0, 2} for a 2-node slice -- something is wrong with discovery.
-        probes = [("0", "10.0.0.0"), ("2", "10.0.0.2")]
-        with self.assertRaises(RuntimeError) as ctx:
-            _resolve_bundle_order_from_probes(probes, engine_ip="10.0.0.0")
-        self.assertIn("contiguous", str(ctx.exception))
+    def test_raises_on_noncontiguous_topological_ranks(self):
+        with self.assertRaisesRegex(RuntimeError, "contiguous"):
+            _resolve_bundle_order_from_probes([(0, "ip0"), (2, "ip2")], engine_ip="ip0")
 
     def test_single_node(self):
-        probes = [("0", "10.0.0.0")]
-        bundle_for_node, rank0_ip = _resolve_bundle_order_from_probes(
-            probes, engine_ip="10.0.0.0"
-        )
-        self.assertEqual(bundle_for_node, [0])
-        self.assertEqual(rank0_ip, "10.0.0.0")
+        result = _resolve_bundle_order_from_probes([(0, "ip0")], engine_ip="ip0")
+        self.assertEqual(result, ([0], "ip0", "ip0"))
 
 
 class TestTpuActorRuntimeEnv(CustomTestCase):
@@ -424,6 +368,58 @@ class TestDetectTpuNnodes(CustomTestCase):
             ray_utils.ray, "nodes", side_effect=RuntimeError("boom")
         ):
             self.assertEqual(ray_utils.detect_tpu_nnodes(), 0)
+
+
+class TestValidateFullHostTpuAllocation(CustomTestCase):
+    def test_accepts_uniform_full_slice(self):
+        from sglang.srt.hardware_backend.tpu import ray_utils
+
+        nodes = [
+            {"Alive": True, "Resources": {"TPU": 8}},
+            {"Alive": True, "Resources": {"TPU": 8}},
+        ]
+        with mock.patch.object(ray_utils.ray, "nodes", return_value=nodes):
+            ray_utils.validate_full_host_tpu_allocation(2, 8)
+
+    def test_rejects_partial_host_allocation(self):
+        from sglang.srt.hardware_backend.tpu import ray_utils
+
+        nodes = [
+            {"Alive": True, "Resources": {"TPU": 8}},
+            {"Alive": True, "Resources": {"TPU": 8}},
+        ]
+        with (
+            mock.patch.object(ray_utils.ray, "nodes", return_value=nodes),
+            self.assertRaisesRegex(RuntimeError, "full-slice placement"),
+        ):
+            ray_utils.validate_full_host_tpu_allocation(2, 4)
+
+    def test_rejects_oversized_host_allocation(self):
+        from sglang.srt.hardware_backend.tpu import ray_utils
+
+        nodes = [
+            {"Alive": True, "Resources": {"TPU": 4}},
+            {"Alive": True, "Resources": {"TPU": 4}},
+        ]
+        with (
+            mock.patch.object(ray_utils.ray, "nodes", return_value=nodes),
+            self.assertRaisesRegex(RuntimeError, "full-slice placement"),
+        ):
+            ray_utils.validate_full_host_tpu_allocation(2, 8)
+
+    def test_rejects_partial_slice(self):
+        from sglang.srt.hardware_backend.tpu import ray_utils
+
+        nodes = [
+            {"Alive": True, "Resources": {"TPU": 8}},
+            {"Alive": True, "Resources": {"TPU": 8}},
+            {"Alive": True, "Resources": {"TPU": 8}},
+        ]
+        with (
+            mock.patch.object(ray_utils.ray, "nodes", return_value=nodes),
+            self.assertRaisesRegex(RuntimeError, "full-slice placement"),
+        ):
+            ray_utils.validate_full_host_tpu_allocation(2, 8)
 
 
 class TestRedactEnvForLog(CustomTestCase):

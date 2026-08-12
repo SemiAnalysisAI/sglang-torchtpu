@@ -21,7 +21,7 @@ Start **rank 0 first**; wait until it logs `Initializing TPU distributed runtime
 then start rank 1. Open `DIST_PORT` (10011) between the hosts.
 ```bash
 # host 0 (serves HTTP :30000):
-./launch_mimo_25_pro_multihost.sh 0
+RANK0_HOST=<host0-internal-ip> ./launch_mimo_25_pro_multihost.sh 0
 # host 1:
 RANK0_HOST=<host0-internal-ip> ./launch_mimo_25_pro_multihost.sh 1
 ```

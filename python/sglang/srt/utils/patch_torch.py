@@ -29,9 +29,9 @@ if _is_npu:
         return npu_reductions._rebuild_npu_tensor_original(*args)
 
     def npu_verl_to_sglang(device: int):
-        assert (
-            SGLANG_TP_RANK is not None
-        ), "SGLANG_TP_RANK is not registered. Please call register_sgl_tp_rank() first."
+        assert SGLANG_TP_RANK is not None, (
+            "SGLANG_TP_RANK is not registered. Please call register_sgl_tp_rank() first."
+        )
         return SGLANG_TP_RANK
 
 
@@ -103,7 +103,7 @@ def _modify_tuple(t, index: int, modifier: Callable):
     return *t[:index], modifier(t[index]), *t[index + 1 :]
 
 
-def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
+def monkey_patch_torch_tpu_env(server_args, tp_rank: int, pp_rank: int = 0):
     """Set TorchTPU's per-worker distributed environment.
 
     Sets torchrun-style env vars for torch_tpu's PJRT slicebuilder
@@ -118,38 +118,99 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
 
     import os
 
-    world_size = server_args.tp_size
+    world_size = server_args.tp_size * server_args.pp_size
     local_world_size = max(world_size // server_args.nnodes, 1)
-    os.environ["RANK"] = str(tp_rank)
-    os.environ["LOCAL_RANK"] = str(tp_rank % local_world_size)
+    global_rank = server_args.tp_size * pp_rank + tp_rank
+    os.environ["RANK"] = str(global_rank)
+    os.environ["LOCAL_RANK"] = str(global_rank % local_world_size)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
 
-    # Multihost: every rank must rendezvous at rank-0's node. TPU_WORKER_HOSTNAMES
-    # is ordered by TPU_WORKER_ID (physical slice order), so hosts[0] is where
-    # RANK 0 lives. Under Ray, force it: the inherited MASTER_ADDR is the driver's
-    # loopback, which would leave each host rendezvousing with itself. Off the Ray
-    # path a launcher (e.g. torchrun) may have set MASTER_ADDR correctly, so only
-    # fill it in when unset (defaulting to hosts[0] for multihost, else loopback).
+    # Multihost: every rank must rendezvous at rank-0's node. Ray injects a host
+    # list ordered by coordinate-derived node rank, so hosts[0] is safe there.
+    # The non-Ray launcher sets MASTER_ADDR explicitly because the raw GKE host
+    # list is not guaranteed to be in physical topology order.
     hosts = [h for h in os.environ.get("TPU_WORKER_HOSTNAMES", "").split(",") if h]
     if server_args.use_ray and len(hosts) > 1:
         os.environ["MASTER_ADDR"] = hosts[0]
-    else:
-        os.environ.setdefault(
-            "MASTER_ADDR", hosts[0] if len(hosts) > 1 else "127.0.0.1"
+    elif server_args.nnodes > 1 and "MASTER_ADDR" not in os.environ:
+        raise RuntimeError(
+            "Multi-host TPU launch requires MASTER_ADDR for the topological "
+            "rank-0 host; TPU_WORKER_HOSTNAMES is not guaranteed to be in "
+            "physical topology order."
         )
+    else:
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29500")
 
 
-def initialize_torch_tpu_worker(server_args, tp_rank: int):
-    """Configure and initialize TorchTPU in a scheduler worker."""
-    monkey_patch_torch_tpu_env(server_args, tp_rank)
+def _compute_torch_tpu_numeric_rank(
+    global_device_id: int,
+    all_global_device_ids: list[int],
+    world_size: int,
+) -> int:
+    """Return the c10d rank that numerically matches a PJRT global device ID."""
+    ordered_device_ids = sorted(int(value) for value in all_global_device_ids)
+    expected_device_ids = list(range(world_size))
+    if ordered_device_ids != expected_device_ids:
+        raise RuntimeError(
+            "TorchTPU numerical rank alignment requires exactly one contiguous "
+            "PJRT global device ID per rank: expected "
+            f"{expected_device_ids}, got {ordered_device_ids}."
+        )
+    if global_device_id not in ordered_device_ids:
+        raise RuntimeError(
+            f"PJRT global device {global_device_id} is absent from the slice's "
+            f"device IDs {ordered_device_ids}."
+        )
+    return global_device_id
+
+
+def _align_torch_tpu_rank_with_device(world_size: int) -> int:
+    """Initialize PJRT discovery, then relabel this worker before c10d init."""
+    import os
+
+    from torch_tpu._internal.distributed import tpu_distributed
+
+    global_device_id = int(tpu_distributed.global_device_id())
+    all_global_device_ids = list(tpu_distributed.all_global_device_ids())
+    aligned_rank = _compute_torch_tpu_numeric_rank(
+        global_device_id, all_global_device_ids, world_size
+    )
+    os.environ["RANK"] = str(aligned_rank)
+    return aligned_rank
+
+
+def _validate_torch_tpu_rank_device(tp_rank: int, pp_rank: int, tp_size: int) -> int:
+    """Require every composite SGLang rank to equal its PJRT device ID."""
+    attributes = torch.tpu.get_local_device_attributes()
+    global_device_id = int(attributes["id"])
+    global_rank = tp_size * pp_rank + tp_rank
+    if global_rank != global_device_id:
+        raise RuntimeError(
+            "TorchTPU numerical rank alignment failed: SGLang global rank "
+            f"{global_rank} (PP{pp_rank}, TP{tp_rank}) owns PJRT global device "
+            f"{global_device_id}."
+        )
+    return global_device_id
+
+
+def initialize_torch_tpu_worker(
+    server_args, tp_rank: int, pp_rank: int = 0
+) -> tuple[int, int]:
+    """Return canonical ``(tp_rank, pp_rank)`` coordinates from PJRT."""
+    monkey_patch_torch_tpu_env(server_args, tp_rank, pp_rank)
     if server_args.device != "tpu":
-        return
+        return tp_rank, pp_rank
 
     from sglang.srt.platforms import current_platform
 
     current_platform.init_backend()
+    global_rank = _align_torch_tpu_rank_with_device(
+        server_args.tp_size * server_args.pp_size
+    )
+    canonical_pp_rank, canonical_tp_rank = divmod(global_rank, server_args.tp_size)
+    return canonical_tp_rank, canonical_pp_rank
 
 
 def monkey_patch_torch_compile():

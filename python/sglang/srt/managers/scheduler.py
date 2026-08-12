@@ -218,6 +218,10 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
     create_scheduler_watchdog,
 )
 from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
+from sglang.srt.managers.scheduler_process import (
+    compute_scheduler_parallel_ranks,
+    initialize_scheduler_process_config,
+)
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
@@ -320,7 +324,6 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
-from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -5060,22 +5063,29 @@ def configure_scheduler_process(
     return dp_rank
 
 
-def run_scheduler_process(
+def run_scheduler_process_from_bootstrap_rank(
     server_args: ServerArgs,
     port_args: PortArgs,
     gpu_id: int,
     tp_rank: int,
-    attn_cp_rank: int,
-    moe_dp_rank: int,
-    moe_ep_rank: int,
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
-    display_tp_rank: Optional[int] = None,
-    display_dp_rank: Optional[int] = None,
-    display_moe_ep_rank: Optional[int] = None,
+    worker_ports: Optional[List[int]] = None,
 ):
-    initialize_torch_tpu_worker(server_args, tp_rank)
+    # Launcher coordinates exist only to let PJRT identify this process's
+    # physical device. Derive all semantic scheduler state from the canonical
+    # composite rank exactly once.
+    process_config = initialize_scheduler_process_config(
+        server_args, port_args, tp_rank, pp_rank, dp_rank, worker_ports
+    )
+    port_args = process_config.port_args
+    tp_rank = process_config.tp_rank
+    pp_rank = process_config.pp_rank
+    attn_cp_rank = process_config.attn_cp_rank
+    moe_dp_rank = process_config.moe_dp_rank
+    moe_ep_rank = process_config.moe_ep_rank
+    dp_rank = process_config.dp_rank
 
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
@@ -5089,9 +5099,9 @@ def run_scheduler_process(
         moe_ep_rank,
         pp_rank,
         dp_rank,
-        display_tp_rank=display_tp_rank,
-        display_dp_rank=display_dp_rank,
-        display_moe_ep_rank=display_moe_ep_rank,
+        display_tp_rank=process_config.display_tp_rank,
+        display_dp_rank=process_config.display_dp_rank,
+        display_moe_ep_rank=process_config.display_moe_ep_rank,
     )
     # Scheduler.__init__ reads the config namespaces before the model
     # worker's own publish.
@@ -5153,3 +5163,81 @@ def run_scheduler_process(
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
                 scheduler.release_host_resources()
+
+
+_legacy_scheduler_worker_ports: Optional[List[int]] = None
+
+
+def run_scheduler_process_with_legacy_hook(
+    hook,
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    gpu_id: int,
+    tp_rank: int,
+    pp_rank: int,
+    dp_rank: Optional[int],
+    pipe_writer,
+    worker_ports: Optional[List[int]] = None,
+):
+    """Invoke an old-shape private hook while retaining new launch context."""
+    attn_cp_rank, moe_dp_rank, moe_ep_rank, _ = compute_scheduler_parallel_ranks(
+        server_args, tp_rank, dp_rank
+    )
+    offset = server_args.ep_join_rank_offset
+
+    global _legacy_scheduler_worker_ports
+    _legacy_scheduler_worker_ports = worker_ports
+    try:
+        return hook(
+            server_args,
+            port_args,
+            gpu_id,
+            tp_rank,
+            attn_cp_rank,
+            moe_dp_rank,
+            moe_ep_rank,
+            pp_rank,
+            dp_rank,
+            pipe_writer,
+            tp_rank + offset,
+            dp_rank + offset if dp_rank is not None else None,
+            moe_ep_rank + offset,
+        )
+    finally:
+        _legacy_scheduler_worker_ports = None
+
+
+def run_scheduler_process(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    gpu_id: int,
+    tp_rank: int,
+    attn_cp_rank: int,
+    moe_dp_rank: int,
+    moe_ep_rank: int,
+    pp_rank: int,
+    dp_rank: Optional[int],
+    pipe_writer,
+    display_tp_rank: Optional[int] = None,
+    display_dp_rank: Optional[int] = None,
+    display_moe_ep_rank: Optional[int] = None,
+):
+    """Backward-compatible adapter for private scheduler launch overrides."""
+    del (
+        attn_cp_rank,
+        moe_dp_rank,
+        moe_ep_rank,
+        display_tp_rank,
+        display_dp_rank,
+        display_moe_ep_rank,
+    )
+    return run_scheduler_process_from_bootstrap_rank(
+        server_args,
+        port_args,
+        gpu_id,
+        tp_rank,
+        pp_rank,
+        dp_rank,
+        pipe_writer,
+        _legacy_scheduler_worker_ports,
+    )

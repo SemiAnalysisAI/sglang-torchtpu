@@ -17,11 +17,13 @@ warmup_buckets.py    # request-sender used by warmup.sh
 Multihost feature-combination tests (July-30 milestone) live in
 `test/manual/tpu/feature_combo/multihost/test_feature_combos.py` (single file, both rows;
 launches engines through the launchers here). Run the same command on every
-pod of the 2-host dev box — roles auto-detect from TPU_WORKER_ID:
+pod of the 2-host dev box. A TorchTPU build containing PR #2948 derives each
+node rank from physical coordinates; set `RANK0_HOST` (or `DIST_INIT_ADDR`) to
+the topological rank-0 pod on every host:
 
 ```
-python test/manual/tpu/feature_combo/multihost/test_feature_combos.py pd    # prefix+KVoffload+P/D
-python test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec  # prefix+EAGLE3+KVoffload
+RANK0_HOST=<rank0-host> python test/manual/tpu/feature_combo/multihost/test_feature_combos.py pd
+RANK0_HOST=<rank0-host> python test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec
 ```
 
 ## Usage

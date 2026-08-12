@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import ray
 
@@ -40,21 +40,21 @@ class SchedulerActor:
         port_args: PortArgs,
         gpu_id: int,
         tp_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
-        moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
         dist_init_addr: Optional[str] = None,
+        worker_ports: Optional[List[int]] = None,
     ):
         import dataclasses
 
         from sglang.srt.environ import envs
+        from sglang.srt.managers.scheduler_process import (
+            initialize_scheduler_process_config,
+        )
         from sglang.srt.utils.numa_utils import (
             get_numa_node_if_available,
             numa_bind_to_node,
         )
-        from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
 
         # Override dist_init_addr if provided (for multi-node)
         if dist_init_addr:
@@ -71,7 +71,16 @@ class SchedulerActor:
         # WORLD_SIZE/MASTER_* for torch_tpu's PJRT slicebuilder), then initialize
         # the backend before importing Scheduler. Ray actors skip the mp entry
         # point that normally performs this work. No-op for non-TPU.
-        initialize_torch_tpu_worker(server_args, tp_rank)
+        process_config = initialize_scheduler_process_config(
+            server_args, port_args, tp_rank, pp_rank, dp_rank, worker_ports
+        )
+        port_args = process_config.port_args
+        tp_rank = process_config.tp_rank
+        pp_rank = process_config.pp_rank
+        attn_cp_rank = process_config.attn_cp_rank
+        moe_dp_rank = process_config.moe_dp_rank
+        moe_ep_rank = process_config.moe_ep_rank
+        dp_rank = process_config.dp_rank
 
         from sglang.srt.managers.scheduler import (
             Scheduler,
@@ -101,6 +110,9 @@ class SchedulerActor:
             moe_ep_rank,
             pp_rank,
             dp_rank,
+            display_tp_rank=process_config.display_tp_rank,
+            display_dp_rank=process_config.display_dp_rank,
+            display_moe_ep_rank=process_config.display_moe_ep_rank,
         )
 
         # Ray actors can't use the numactl subprocess-wrapping approach

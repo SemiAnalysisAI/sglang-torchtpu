@@ -21,13 +21,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
 
 import ray
-from ray.util.placement_group import placement_group as create_placement_group
-from ray.util.placement_group import (
-    remove_placement_group,
-)
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 logger = logging.getLogger(__name__)
@@ -51,144 +46,110 @@ def detect_tpu_nnodes() -> int:
         return 0
 
 
-@ray.remote(num_cpus=0, num_gpus=0)
-def _get_worker_id_and_address():
-    """Ray task: return this node's ``(TPU_WORKER_ID, ip)`` for slice ordering."""
-    return os.environ.get("TPU_WORKER_ID"), ray.util.get_node_ip_address()
+def validate_full_host_tpu_allocation(nnodes: int, tpus_per_node: int) -> None:
+    """Require topology probes to reserve every physical TPU on each host.
 
-
-def discover_tpu_worker_hostnames(nnodes: int) -> Optional[str]:
-    """Discover the physically-ordered TPU host list from the live Ray cluster.
-
-    The torch_tpu slicebuilder (``_prepare_tpu_env``) needs hosts ordered by
-    physical slice position (``TPU_WORKER_ID``). We always discover this from Ray
-    (ignoring any pre-set ``TPU_WORKER_HOSTNAMES`` in the environment) by probing
-    every node for its ``TPU_WORKER_ID`` and IP, then sorting by ``TPU_WORKER_ID``
-    -- never by the arbitrary ``ray.nodes()`` order. Returns None if it can't be
-    discovered, in which case each actor falls back to its own pod env.
+    Ray rewrites TPU visibility and host bounds whenever a task requests only a
+    subset of a host's TPU resources. That makes physical coordinate discovery
+    impossible, so multihost Ray currently supports only full-slice placement.
     """
-    if nnodes <= 1:
-        return None
-
-    # One probe per node via a SPREAD placement group so each lands on a distinct
-    # host; sort by TPU_WORKER_ID afterwards to recover physical order.
-    pg = None
-    try:
-        pg = create_placement_group([{"CPU": 1}] * nnodes, strategy="SPREAD")
-        ray.get(pg.ready())
-        probes = ray.get(
-            [
-                _get_worker_id_and_address.options(
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg, placement_group_bundle_index=i
-                    )
-                ).remote()
-                for i in range(nnodes)
-            ]
+    physical_counts = [
+        int(node.get("Resources", {}).get("TPU", 0))
+        for node in ray.nodes()
+        if node.get("Alive") and float(node.get("Resources", {}).get("TPU", 0)) > 0
+    ]
+    if len(physical_counts) != nnodes or any(
+        count != tpus_per_node for count in physical_counts
+    ):
+        raise RuntimeError(
+            "Ray TPU topology discovery requires full-slice placement: expected "
+            f"exactly {nnodes} TPU node(s) with {tpus_per_node} TPU(s) requested "
+            f"per node, but the live physical TPU counts are {physical_counts}. "
+            "Partial-host and partial-slice Ray placement would hide physical "
+            "device coordinates."
         )
-    except Exception as e:  # pragma: no cover - defensive
-        logger.warning("Ray discovery: failed to probe TPU worker hostnames: %s", e)
-        return None
-    finally:
-        if pg is not None:
-            remove_placement_group(pg)
 
-    if any(worker_id is None for worker_id, _ in probes):
-        logger.warning(
-            "Ray discovery: TPU_WORKER_ID missing on some nodes; cannot order "
-            "hosts. Actors will fall back to their own pod env."
-        )
-        return None
 
-    ordered = sorted(probes, key=lambda p: int(p[0]))
-    hostnames = ",".join(ip for _, ip in ordered)
-    logger.info(
-        "Ray discovery: TPU_WORKER_HOSTNAMES=%s (ordered by TPU_WORKER_ID)",
-        hostnames,
+@ray.remote(num_cpus=0, num_gpus=0)
+def _get_topological_rank_and_address():
+    """Return this node's coordinate-derived rank and IP without retaining PJRT."""
+    from sglang.srt.hardware_backend.tpu.topology import (
+        probe_topological_node_rank,
     )
-    return hostnames
+
+    result = probe_topological_node_rank()
+    return int(result["node_rank"]), ray.util.get_node_ip_address()
 
 
 def _resolve_bundle_order_from_probes(
-    probes: list[tuple[Optional[str], str]], engine_ip: str
-) -> tuple[list[int], str]:
-    """Turn per-bundle ``(TPU_WORKER_ID, ip)`` probes into a physically-ordered
-    ``bundle_for_node`` plus the rank-0 host IP.
+    probes: list[tuple[int, str]], engine_ip: str
+) -> tuple[list[int], str, str]:
+    """Resolve Ray bundles and hosts from coordinate-derived node ranks.
 
-    ``probes[bundle_idx]`` is the ``(TPU_WORKER_ID, ip)`` observed on Ray
-    placement-group bundle ``bundle_idx``. The returned ``bundle_for_node[k]``
-    is the bundle index whose physical ``TPU_WORKER_ID == k``, so scheduler node
-    ``k`` lands on physical worker ``k`` -- matching the slicebuilder endpoint
-    list and ``MASTER_ADDR`` (both ordered by ``TPU_WORKER_ID``; see
-    ``discover_tpu_worker_hostnames`` / ``initialize_torch_tpu_worker``). Ray does
-    not guarantee bundle indices follow ``TPU_WORKER_ID`` order, so relying on
-    numeric bundle order silently misplaces ranks for nnodes >= 3.
+    ``probes[bundle_idx]`` is ``(topological_node_rank, ip)``. The returned host
+    list and bundle list are both ordered by physical topology, so scheduler
+    rank ranges, slicebuilder endpoints, and ``MASTER_ADDR`` agree.
 
-    Also verifies rank-0 (``TPU_WORKER_ID == 0``) is co-located with the Engine,
-    since ``MASTER_ADDR`` points at worker 0 and the rank-0 scheduler must share
-    the Engine's node. Raises ``RuntimeError`` on any inconsistency (missing /
-    duplicate / non-contiguous worker ids, or engine not on worker 0) instead of
-    letting the run hang later at PJRT bind / rendezvous.
+    The Engine must be on topological node 0 because SGLang co-locates its rank-0
+    scheduler and tokenizer there.
 
     Pure function (no Ray calls) so the ordering + validation can be unit-tested.
     """
     nnodes = len(probes)
 
-    if any(worker_id is None for worker_id, _ in probes):
-        raise RuntimeError(
-            "Ray TPU multihost: TPU_WORKER_ID missing on some bundles "
-            f"({probes}); cannot order ranks by physical slice position."
-        )
-
-    worker_id_to_bundle: dict[int, int] = {}
-    worker_id_to_ip: dict[int, str] = {}
-    for bundle_idx, (worker_id, ip) in enumerate(probes):
-        wid = int(worker_id)
-        if wid in worker_id_to_bundle:
+    rank_to_bundle: dict[int, int] = {}
+    rank_to_ip: dict[int, str] = {}
+    for bundle_idx, (node_rank, ip) in enumerate(probes):
+        node_rank = int(node_rank)
+        if node_rank in rank_to_bundle:
             raise RuntimeError(
-                f"Ray TPU multihost: duplicate TPU_WORKER_ID={wid} across "
-                f"bundles {worker_id_to_bundle[wid]} and {bundle_idx} ({probes})."
+                f"Ray TPU multihost: duplicate topological node rank {node_rank} "
+                f"across bundles {rank_to_bundle[node_rank]} and {bundle_idx} "
+                f"({probes})."
             )
-        worker_id_to_bundle[wid] = bundle_idx
-        worker_id_to_ip[wid] = ip
+        rank_to_bundle[node_rank] = bundle_idx
+        rank_to_ip[node_rank] = ip
 
-    if sorted(worker_id_to_bundle) != list(range(nnodes)):
+    if sorted(rank_to_bundle) != list(range(nnodes)):
         raise RuntimeError(
-            "Ray TPU multihost: TPU_WORKER_IDs are not contiguous 0.."
-            f"{nnodes - 1}; got {sorted(worker_id_to_bundle)} ({probes})."
+            "Ray TPU multihost: topological node ranks are not contiguous 0.."
+            f"{nnodes - 1}; got {sorted(rank_to_bundle)} ({probes})."
         )
 
-    bundle_for_node = [worker_id_to_bundle[k] for k in range(nnodes)]
-    rank0_node_ip = worker_id_to_ip[0]
+    bundle_for_node = [rank_to_bundle[k] for k in range(nnodes)]
+    ordered_ips = [rank_to_ip[k] for k in range(nnodes)]
+    rank0_node_ip = ordered_ips[0]
 
     if engine_ip != rank0_node_ip:
         raise RuntimeError(
-            f"Ray TPU multihost: Engine runs on {engine_ip} but TPU worker 0 is "
-            f"on {rank0_node_ip}. The rank-0 scheduler must be co-located with "
-            "the Engine (MASTER_ADDR points at worker 0). Start the Ray head / "
-            "Engine on the host whose TPU_WORKER_ID is 0."
+            f"Ray TPU multihost: Engine runs on {engine_ip} but topological TPU "
+            f"node 0 is on {rank0_node_ip}. Start the Ray head / Engine on "
+            "topological node 0 so its tokenizer and rank-0 scheduler are "
+            "co-located."
         )
 
-    return bundle_for_node, rank0_node_ip
+    return bundle_for_node, rank0_node_ip, ",".join(ordered_ips)
 
 
-def order_tpu_bundles_by_worker_id(
-    placement_group, nnodes: int
-) -> tuple[list[int], str]:
-    """Probe the live placement group and order bundles by physical TPU_WORKER_ID.
+def order_tpu_bundles_by_topology(
+    placement_group, nnodes: int, tpus_per_node: int
+) -> tuple[list[int], str, str]:
+    """Probe the live placement group and order bundles by TPU coordinates.
 
-    Returns ``(bundle_for_node, rank0_node_ip)`` where ``bundle_for_node[k]`` is
-    the bundle on the host with ``TPU_WORKER_ID == k`` and ``rank0_node_ip`` is
-    that of worker 0. See ``_resolve_bundle_order_from_probes`` for the ordering
-    contract and validation. Raises ``RuntimeError`` on any inconsistency.
+    Each task reserves the bundle's full TPU allocation. Reserving only one TPU
+    makes Ray narrow ``TPU_VISIBLE_CHIPS`` and the TPU host bounds, which hides
+    the physical multihost coordinates that this probe needs. Coordinate
+    discovery then runs in a short-lived child so PJRT is released before the
+    scheduler actors start.
     """
     engine_ip = ray.util.get_node_ip_address()
     probes = ray.get(
         [
-            _get_worker_id_and_address.options(
+            _get_topological_rank_and_address.options(
+                resources={"TPU": tpus_per_node},
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=placement_group, placement_group_bundle_index=i
-                )
+                ),
             ).remote()
             for i in range(nnodes)
         ]

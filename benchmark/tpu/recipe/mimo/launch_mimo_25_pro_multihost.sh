@@ -9,9 +9,11 @@
 #
 # RUN THE SAME COMMAND ON BOTH HOSTS, only NODE_RANK differs. Start rank 0 FIRST
 # and let it reach "Initializing TPU distributed runtime" before starting rank 1:
-#   Host 0 (rank 0, serves HTTP :30000):  ./launch_mimo_25_pro_multihost.sh 0
+#   Host 0 (rank 0, serves HTTP :30000):
+#     RANK0_HOST=<host0-internal-ip> ./launch_mimo_25_pro_multihost.sh 0
 #   Host 1 (rank 1):   RANK0_HOST=<host0-internal-ip> ./launch_mimo_25_pro_multihost.sh 1
-# GKE tpu7x-16 slice: run with NO arg on every worker (rank auto from TPU_WORKER_*).
+# GKE tpu7x-16 slice: omit the rank argument to derive it from TPU coordinates,
+# but set RANK0_HOST on every worker.
 #
 # Defaults: 8k context, max_running=8. Override via env, e.g. the original 128k run:
 #   CONTEXT_LEN=131072 MAX_RUNNING=2 ./launch_mimo_25_pro_multihost.sh 0

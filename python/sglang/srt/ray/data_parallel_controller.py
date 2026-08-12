@@ -24,7 +24,6 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from sglang.srt.entrypoints.engine import (
     _calculate_rank_ranges,
-    _compute_parallelism_ranks,
 )
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.data_parallel_controller import DataParallelController
@@ -177,10 +176,6 @@ class RayDataParallelController(DataParallelController):
                         tp_rank % tp_per_node
                     )
 
-                    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
-                        server_args, tp_rank
-                    )
-
                     # Each DP group needs a unique dist_init_addr for its own
                     # torch.distributed process group. Use nccl_port which is
                     # unique per DP group (regular DP) or shared (DP attention).
@@ -202,12 +197,10 @@ class RayDataParallelController(DataParallelController):
                         port_args=rank_port_args,
                         gpu_id=local_gpu_idx,
                         tp_rank=tp_rank,
-                        attn_cp_rank=attn_cp_rank,
-                        moe_dp_rank=moe_dp_rank,
-                        moe_ep_rank=moe_ep_rank,
                         pp_rank=pp_rank,
                         dp_rank=actual_dp_rank,
                         dist_init_addr=dist_init_addr,
+                        worker_ports=worker_ports,
                     )
                     self.scheduler_actors.append(actor)
 

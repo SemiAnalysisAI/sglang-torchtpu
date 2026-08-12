@@ -92,7 +92,11 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     run_multi_detokenizer_router_process,
 )
-from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.scheduler import (
+    run_scheduler_process,
+    run_scheduler_process_from_bootstrap_rank,
+    run_scheduler_process_with_legacy_hook,
+)
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
@@ -873,25 +877,37 @@ class Engine(EngineScoreMixin, EngineBase):
                         + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                         + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                     )
-                    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
-                        server_args, tp_rank
-                    )
-
                     with maybe_reindex_device_id(gpu_id) as gpu_id:
-                        proc = mp.Process(
-                            target=run_scheduler_process_func,
-                            args=(
+                        if run_scheduler_process_func is run_scheduler_process:
+                            scheduler_target = (
+                                run_scheduler_process_from_bootstrap_rank
+                            )
+                            scheduler_args = (
                                 server_args,
                                 port_args,
                                 gpu_id,
                                 tp_rank,
-                                attn_cp_rank,
-                                moe_dp_rank,
-                                moe_ep_rank,
                                 pp_rank,
                                 None,
                                 writer,
-                            ),
+                            )
+                        else:
+                            scheduler_target = run_scheduler_process_with_legacy_hook
+                            scheduler_args = (
+                                run_scheduler_process_func,
+                                server_args,
+                                port_args,
+                                gpu_id,
+                                tp_rank,
+                                pp_rank,
+                                None,
+                                writer,
+                                None,
+                            )
+
+                        proc = mp.Process(
+                            target=scheduler_target,
+                            args=scheduler_args,
                         )
                         with (
                             memory_saver_adapter.configure_subprocess(),
@@ -1805,23 +1821,3 @@ def _calculate_rank_ranges(
     )
 
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
-
-
-def _compute_parallelism_ranks(
-    server_args: ServerArgs, tp_rank: int
-) -> Tuple[int, int, int]:
-    """Compute attention-CP, MoE-DP, and MoE-EP ranks for a TP rank."""
-    attn_dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
-
-    # Parallelism hierarchy (outermost to innermost):
-    # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
-    # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
-    attn_tp_size = server_args.tp_size // attn_dp_size // server_args.attn_cp_size
-    attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
-    moe_dp_rank = tp_rank // (server_args.tp_size // server_args.moe_dp_size)
-    moe_ep_rank = (
-        tp_rank
-        % (server_args.tp_size // server_args.moe_dp_size)
-        // (server_args.tp_size // server_args.moe_dp_size // server_args.ep_size)
-    )
-    return attn_cp_rank, moe_dp_rank, moe_ep_rank
