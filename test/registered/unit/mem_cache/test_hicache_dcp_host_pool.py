@@ -43,17 +43,24 @@ def _fake_mla_device_pool(size: int = 1024) -> SimpleNamespace:
 
 
 def _make_host_pool(dcp_rank: int, device_size: int = 1024) -> MLATokenToKVPoolHost:
-    return MLATokenToKVPoolHost(
-        _fake_mla_device_pool(device_size),
-        host_to_device_ratio=2.0,
-        host_size=0,
-        page_size=WIDENED_PAGE,
-        layout="layer_first",
-        pin_memory=False,
-        device="cpu",
-        dcp_size=DCP_SIZE,
-        dcp_rank=dcp_rank,
-    )
+    # The host pool subtracts a fixed 10 GiB reserve from psutil's available
+    # memory, so on a CI runner with less than that free the check rejects even
+    # a zero-byte pool. These tests are about index math, not host capacity.
+    with mock.patch(
+        "sglang.srt.mem_cache.pool_host.base.psutil.virtual_memory",
+        return_value=SimpleNamespace(available=64 * 1024**3),
+    ):
+        return MLATokenToKVPoolHost(
+            _fake_mla_device_pool(device_size),
+            host_to_device_ratio=2.0,
+            host_size=0,
+            page_size=WIDENED_PAGE,
+            layout="layer_first",
+            pin_memory=False,
+            device="cpu",
+            dcp_size=DCP_SIZE,
+            dcp_rank=dcp_rank,
+        )
 
 
 class TestDcpKernelIndices(CustomTestCase):
@@ -156,15 +163,20 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
             pool.alloc(PHYSICAL_PAGE)  # not a multiple of the widened page
 
     def test_non_dcp_pool_unchanged(self):
-        pool = MLATokenToKVPoolHost(
-            _fake_mla_device_pool(),
-            host_to_device_ratio=2.0,
-            host_size=0,
-            page_size=PHYSICAL_PAGE,
-            layout="layer_first",
-            pin_memory=False,
-            device="cpu",
-        )
+        # Pin the memory probe like _make_host_pool (10 GiB reserve vs loaded runner).
+        with mock.patch(
+            "sglang.srt.mem_cache.pool_host.base.psutil.virtual_memory",
+            return_value=SimpleNamespace(available=64 * 1024**3),
+        ):
+            pool = MLATokenToKVPoolHost(
+                _fake_mla_device_pool(),
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=PHYSICAL_PAGE,
+                layout="layer_first",
+                pin_memory=False,
+                device="cpu",
+            )
         self.assertEqual(pool.page_size, PHYSICAL_PAGE)
         self.assertEqual(pool.logical_size, pool.size)
         self.assertEqual(pool.logical_page_size, PHYSICAL_PAGE)
