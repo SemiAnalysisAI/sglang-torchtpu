@@ -32,6 +32,16 @@ class TestMaskedScatterTpu(CustomTestCase):
             import torch_tpu  # noqa: F401
 
             from sglang.srt.hardware_backend.tpu import patches
+            from sglang.srt.hardware_backend.tpu.env_override import (
+                apply_tpu_env_overrides,
+            )
+
+            # Serving applies these via _prepare_tpu_env() before it touches a
+            # device; this test reaches torch_tpu directly, so it must opt in
+            # itself or it would exercise an unconfigured libtpu. Must precede the
+            # probe below: libtpu reads LIBTPU_INIT_ARGS when PJRT starts, which is
+            # deferred to the first device op rather than to `import torch_tpu`.
+            apply_tpu_env_overrides()
 
             cls.dev = "tpu"
             torch.zeros(1, device=cls.dev)  # probe: a real TPU is present
