@@ -98,7 +98,7 @@ if _is_npu:
 
 if _is_tpu:
     from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
-        VisionTpuCompilePolicy,
+        Qwen3VLVisionTpuCompilePolicy,
         ViTTpuCompileRunner,
     )
 
@@ -1124,7 +1124,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 if _is_tpu:
     support_torch_compile(
         Qwen3VLMoeVisionModel,
-        policy=VisionTpuCompilePolicy,
+        policy=Qwen3VLVisionTpuCompilePolicy,
     )
 
 

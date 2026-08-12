@@ -1371,6 +1371,11 @@ class Envs:
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
     SGLANG_TPU_REQ_TO_TOKEN_ON_HOST = EnvBool(True)
     SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
+
+    # Vision-encoder precompile ladder. Unset uses the computed square-grid
+    # ladder; set-but-empty disables precompile entirely.
+    SGLANG_TPU_VIT_PRECOMPILE_SIZES = EnvTuple(tuple())
+    SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES = EnvInt(4900)
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
     # MoE: use onehot dense matmul for small permute and unpermute/combine
