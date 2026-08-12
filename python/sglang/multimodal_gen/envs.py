@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     SGLANG_DIFFUSION_TPU_EAGER_MODE: str = "DEFER_AND_FUSE"
+    SGLANG_DIFFUSION_TPU_COMPILE_TRACER: str = "dynamo"
     SGLANG_DIFFUSION_TPU_DISABLE_DECODE_EVICTION: bool = False
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
@@ -214,6 +215,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the fused default is the validated fast configuration.
     "SGLANG_DIFFUSION_TPU_EAGER_MODE": _lazy_str(
         "SGLANG_DIFFUSION_TPU_EAGER_MODE", "DEFER_AND_FUSE"
+    ),
+    # DiT compile tracer on TPU: "dynamo" (torch.compile via TpuBackend) or
+    # "direct" (srt direct_compile: no Dynamo/AOTAutograd, JAX-style trace;
+    # much faster warmup, requires every reachable tensor to be an input,
+    # parameter, or buffer). Mirrors srt's --tpu-compile-tracer.
+    "SGLANG_DIFFUSION_TPU_COMPILE_TRACER": _lazy_str(
+        "SGLANG_DIFFUSION_TPU_COMPILE_TRACER", "dynamo"
     ),
     # Keep DiTs resident during VAE decode (HBM-rich configs; also isolates
     # eviction-related dynamo guard issues).

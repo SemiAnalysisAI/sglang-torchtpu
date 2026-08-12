@@ -324,6 +324,48 @@ class TpuPlatform(Platform):
         # path.
         return False
 
+    @classmethod
+    def compile_module_override(cls, module: Any) -> Any | None:
+        from sglang.multimodal_gen import envs
+
+        tracer = envs.SGLANG_DIFFUSION_TPU_COMPILE_TRACER
+        if tracer == "dynamo":
+            return None
+        if tracer != "direct":
+            raise ValueError(
+                f"SGLANG_DIFFUSION_TPU_COMPILE_TRACER={tracer!r} is not a "
+                "known tracer; valid values: dynamo, direct."
+            )
+        # srt's direct compilation: traces one straightline tensor graph per
+        # specialization (no Dynamo/AOTAutograd), lowering through TorchTPU
+        # to XLA. Non-tensor values are baked in; model params/buffers are
+        # lifted to graph inputs. Denoise steps repeat the same shapes, so
+        # the first step compiles and the rest reuse.
+        from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
+            direct_compile,
+        )
+
+        def _spec_key_leaf(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                return ("t", tuple(value.shape), str(value.dtype))
+            if isinstance(value, (list, tuple)):
+                return tuple(_spec_key_leaf(v) for v in value)
+            if isinstance(value, (bool, int, float, str, type(None))):
+                return value
+            return type(value).__name__
+
+        def _spec_key(*args: Any, **kwargs: Any) -> tuple:
+            return (
+                tuple(_spec_key_leaf(a) for a in args),
+                tuple(sorted((k, _spec_key_leaf(v)) for k, v in kwargs.items())),
+            )
+
+        return direct_compile(
+            torch.no_grad()(module.forward),
+            specialization_key=_spec_key,
+            model=module,
+        )
+
     # wrap_forward_for_compile stays the identity default: spmd_safe marks
     # the forward no-split, forcing one program whose arguments (all
     # weights) exceed HBM at compile time on large models.

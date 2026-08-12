@@ -459,6 +459,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if self._torch_compile_registry.is_compiled(module):
             return
 
+        platform_forward = current_platform.compile_module_override(module)
+        if platform_forward is not None:
+            self._torch_compile_registry.install_forward_once(
+                module, platform_forward
+            )
+            logger.info(
+                "Compiling %s via the platform direct tracer",
+                type(module).__name__,
+            )
+            return
+
         if current_platform.is_npu():
             compile_kwargs = build_torch_compile_kwargs(mode=None)
             logger.info("Compiling transformer with torchair backend on NPU")

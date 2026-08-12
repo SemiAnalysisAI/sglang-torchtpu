@@ -82,6 +82,15 @@ class CompiledModuleRegistry:
     def is_compiled(self, module: nn.Module) -> bool:
         return id(module) in self.module_ids
 
+    def install_forward_once(self, module: nn.Module, forward: Callable) -> bool:
+        """Install a pre-compiled forward instead of module.compile()."""
+        module_id = id(module)
+        if module_id in self.module_ids:
+            return False
+        module.forward = forward
+        self.module_ids.add(module_id)
+        return True
+
     def compile_once(
         self,
         module: nn.Module,

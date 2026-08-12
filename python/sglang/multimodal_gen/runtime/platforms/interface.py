@@ -480,6 +480,13 @@ class Platform:
         return True
 
     @classmethod
+    def compile_module_override(cls, module: Any) -> Callable | None:
+        """Platform-native compiled forward for ``module``, replacing the
+        torch.compile path entirely, or None to use torch.compile (default).
+        Mirrors srt's TPU tracer switch (--tpu-compile-tracer)."""
+        return None
+
+    @classmethod
     def supports_fsdp(cls) -> bool:
         """Whether FSDP sharding works on this platform. Platforms that return
         False load the component unsharded instead."""
