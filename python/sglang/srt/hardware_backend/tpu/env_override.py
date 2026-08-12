@@ -23,6 +23,14 @@ _SPARSE_CORE_OFFLOAD_OVERRIDES = (
     "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false",
 )
 
+_ASSOCIATIVE_SCAN_OVERRIDES = (
+    # TODO: drop once google-pytorch/torch_tpu#2898 is fixed.
+    # libtpu >= 0.0.44 miscompiles `scan(..., is_associative=true)`, so every
+    # cumulative op (cumsum/cumprod/cummax/cummin/logcumsumexp) silently returns
+    # wrong values when the scanned length is not a multiple of 1024.
+    "--xla_tpu_use_associative_scan_emitter=false",
+)
+
 
 def _override_libtpu_flags(flags: tuple[str, ...]) -> list[str]:
     existing = os.environ.get(_LIBTPU_INIT_ARGS, "")
@@ -37,7 +45,9 @@ def _override_libtpu_flags(flags: tuple[str, ...]) -> list[str]:
 
 def apply_tpu_env_overrides() -> None:
     """Apply TPU env overrides."""
-    appended = _override_libtpu_flags(_SPARSE_CORE_OFFLOAD_OVERRIDES)
+    appended = _override_libtpu_flags(
+        _SPARSE_CORE_OFFLOAD_OVERRIDES + _ASSOCIATIVE_SCAN_OVERRIDES
+    )
     if appended:
         logger.info(
             "TPU env_override appended %d LIBTPU_INIT_ARGS flag(s): %s",
@@ -45,4 +55,6 @@ def apply_tpu_env_overrides() -> None:
             " ".join(appended),
         )
     else:
-        logger.debug("TPU env_override: LIBTPU_INIT_ARGS already has SC-off flags")
+        logger.debug(
+            "TPU env_override: LIBTPU_INIT_ARGS already has the override flags"
+        )
