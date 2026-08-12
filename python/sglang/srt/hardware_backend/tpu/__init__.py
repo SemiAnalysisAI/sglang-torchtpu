@@ -14,6 +14,17 @@ from sglang.srt.hardware_backend.tpu.pallas_export import (
 
 logger = get_logger(__name__)
 
+# Public process-environment API. sglang.multimodal_gen's TPU platform calls
+# these to reuse srt's parent/worker env split (parent: slicebuilder env only;
+# worker: topology resolution) — keep signatures stable or update
+# multimodal_gen/runtime/platforms/tpu.py in the same change.
+from sglang.srt.hardware_backend.tpu.env_override import (  # noqa: E402
+    apply_tpu_env_overrides as apply_tpu_env_overrides,
+)
+from sglang.srt.hardware_backend.tpu.patches import (  # noqa: E402
+    _prepare_tpu_env as prepare_tpu_env,
+)
+
 
 def activate():
     """Return the TPU platform class path if torch_tpu is usable, else None.

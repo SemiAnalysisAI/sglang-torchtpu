@@ -214,9 +214,9 @@ class TpuPlatform(Platform):
     def prepare_server_environment(cls, *, world_size: int) -> None:
         # srt launcher helper: jax-env scrub, LIBTPU_INIT_ARGS overrides,
         # single-host slicebuilder env for the spawned workers.
-        from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
+        from sglang.srt.hardware_backend.tpu import prepare_tpu_env
 
-        _prepare_tpu_env(world_size=world_size)
+        prepare_tpu_env(world_size=world_size)
 
     @classmethod
     def worker_spawn_env(
@@ -242,9 +242,7 @@ class TpuPlatform(Platform):
         master_port: int,
     ) -> None:
         # Env overrides must precede the first device touch (deferred PJRT).
-        from sglang.srt.hardware_backend.tpu.env_override import (
-            apply_tpu_env_overrides,
-        )
+        from sglang.srt.hardware_backend.tpu import apply_tpu_env_overrides
 
         apply_tpu_env_overrides()
 
@@ -259,9 +257,9 @@ class TpuPlatform(Platform):
         # would initialize PJRT and steal a worker's chip). srt splits the same
         # helper the same way: parent sets the slicebuilder env, the worker
         # resolves topology. Env-only; the first device touch is still below.
-        from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
+        from sglang.srt.hardware_backend.tpu import prepare_tpu_env
 
-        _prepare_tpu_env(world_size, resolve_single_host_topology=True)
+        prepare_tpu_env(world_size, resolve_single_host_topology=True)
 
         # Chip selection comes from the slicebuilder env; local index is 0.
         torch.tpu.set_device(0)
