@@ -233,7 +233,13 @@ class TpuPlatform(Platform):
 
     @classmethod
     def init_worker_device_env(
-        cls, *, local_rank: int, rank: int, world_size: int, master_port: int
+        cls,
+        *,
+        local_rank: int,
+        rank: int,
+        world_size: int,
+        master_addr: str = "127.0.0.1",
+        master_port: int,
     ) -> None:
         # Env overrides must precede the first device touch (deferred PJRT).
         from sglang.srt.hardware_backend.tpu.env_override import (
@@ -242,7 +248,7 @@ class TpuPlatform(Platform):
 
         apply_tpu_env_overrides()
 
-        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = str(master_port)
         os.environ["LOCAL_RANK"] = str(local_rank)
         os.environ["RANK"] = str(rank)
