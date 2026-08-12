@@ -296,7 +296,7 @@ class PipelineExecutor(ABC):
                 del output
                 del batch
                 if current_platform.is_npu():
-                    torch.get_device_module().empty_cache()
+                    current_platform.empty_cache()
 
     @contextlib.contextmanager
     def profile_execution(self, batch: Req, dump_rank: int = 0):

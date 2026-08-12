@@ -545,7 +545,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 and output_batch.output is None
                 and not req.return_raw_frames
             ):
-                torch.get_device_module().empty_cache()
+                current_platform.empty_cache()
 
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 if not req.is_warmup:
@@ -582,7 +582,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._record_output_peak_memory(output_batch)
             # clean cache if OOM
             if not current_platform.is_cpu():
-                torch.get_device_module().empty_cache()
+                current_platform.empty_cache()
         return output_batch
 
     def _materialize_output_transport(
