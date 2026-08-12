@@ -834,6 +834,17 @@ class ServerArgs(DisaggServerArgsMixin):
                     )
                 self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
+        # Text encoders are causal; the TPU pallas backend is non-causal only
+        # and raises at construction, which the loader turns into a silent
+        # fallback to the native implementation (losing custom encoder APIs).
+        if current_platform.is_tpu() and self.backend != Backend.DIFFUSERS:
+            if self.component_attention_backends.get("text_encoder") is None:
+                logger.info(
+                    "Defaulting component text_encoder to torch_sdpa on TPU "
+                    "(pallas backend does not support causal attention)"
+                )
+                self.component_attention_backends["text_encoder"] = "torch_sdpa"
+
         if self.ring_degree > 1:
             if (
                 self.attention_backend is not None
