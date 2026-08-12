@@ -37,6 +37,10 @@ export TPU_PREMAPPED_BUFFER_SIZE=8589934592   # 8 GiB pinned host pool for trans
 # Optional: torch_tpu eager mode for the denoising loop (default DEFER_AND_FUSE).
 # DEFER_NEVER gives op-by-op execution for debugging / baselines.
 export SGLANG_DIFFUSION_TPU_EAGER_MODE=DEFER_AND_FUSE
+# Optional: DiT compile tracer for --enable-torch-compile (default dynamo).
+# "direct" uses srt's direct_compile (no Dynamo/AOTAutograd): measured
+# 2.68 s/it vs 8.55 s/it on a Wan2.2-TI2V-5B 4-step compiled run.
+export SGLANG_DIFFUSION_TPU_COMPILE_TRACER=dynamo
 ```
 
 `--enable-torch-compile` is supported (see the execution-mode table below).
@@ -61,6 +65,11 @@ Two invariants the platform enforces (both regression-tested):
    GPU code path; verified by running the full unit suite with the platform
    forced to the baseline and comparing the failure set against `main`
    (identical).
+
+Scope: single-host by design. `worker_spawn_env` pins the rendezvous to
+loopback and the slicebuilder env covers one host's chips; srt's multihost
+launcher branch is the extension path when a multihost diffusion workload
+exists.
 
 ## Execution modes (validated 2026-07-29)
 
@@ -120,7 +129,8 @@ documents each deliberate divergence:
 | Traceable collectives | registered custom all-reduce op (dynamo-traceable) | functional-collectives all-to-all | same principle, different collective |
 | P2P | avoided entirely (P/D moves bytes D2H → network → H2D) | avoided (`supports_p2p_communication() → False`) | — |
 | Bulk transfers | `batch_transfer` + mlock'd 32B-aligned staging pool for KV pages | plain `.cpu()`/`.to()` for DiT eviction | modules are shape-heterogeneous; the staged variant measured slower e2e — revisit with srt's staging-pool pattern |
-| Eager mode | process-global `DEFER_NEVER` (steady state is compiled; eager covers only glue ops) | loop-scoped `DEFER_AND_FUSE` (steady state is lazy; fusion is the throughput) | measured: 10.5 vs 13.5 s/step |
+| Eager mode | process-global `DEFER_NEVER` (steady state is compiled; eager covers only glue ops) | loop-scoped `DEFER_AND_FUSE` (steady state is lazy; fusion is the throughput) | measured: 10.5 vs 13.5 s/step. Paired knobs: `SGLANG_TPU_EAGER_MODE` (srt) / `SGLANG_DIFFUSION_TPU_EAGER_MODE` (diffusion) — same value space, deliberately different defaults per the measurement |
+| Compile tracer | `--tpu-compile-tracer {dynamo,direct}` server arg | `SGLANG_DIFFUSION_TPU_COMPILE_TRACER` env (default dynamo) | same `direct_compile` machinery (#306) behind the diffusion platform's `compile_module_override` hook |
 | Steady-state syncs | never device-wide; targeted tensor syncs only | one `synchronize()` per denoising step | bounds the lazy queue (HBM exhaustion without it); migrating to targeted tensor sync is planned |
 | Compile backend | `backend="tpu"` string (serialization ON) | `TpuBackend(enable_serialization=False)` | the serialized-cache key is a per-process constant; multi-graph processes (DiT + encoders) collide and crash (`e0102`). srt is latently exposed — masked by its single-compiled-model-per-process shape |
 | Compile discipline | 4 layers: post-warmup `set_stance("fail_on_recompile")`, dynamo limits, XLA-graph-count checker, strict shape/flag determinism | not yet adopted | planned (Phase A) |

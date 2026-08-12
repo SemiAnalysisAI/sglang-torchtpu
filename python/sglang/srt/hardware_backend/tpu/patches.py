@@ -58,7 +58,16 @@ def _configure_eager_mode() -> None:
     from torch_tpu._internal import execution_mode
 
     mode_name = envs.SGLANG_TPU_EAGER_MODE.get()
-    execution_mode.eager_mode = getattr(execution_mode.EagerMode, mode_name)
+    # EagerMode is a pybind11 enum: look up via __members__ so a typo fails
+    # with the valid values instead of a bare AttributeError.
+    mode = execution_mode.EagerMode.__members__.get(mode_name)
+    if mode is None:
+        valid = ", ".join(execution_mode.EagerMode.__members__)
+        raise ValueError(
+            f"SGLANG_TPU_EAGER_MODE={mode_name!r} is not a torch_tpu "
+            f"EagerMode; valid values: {valid}."
+        )
+    execution_mode.eager_mode = mode
     logger.info("TorchTPU eager mode set to %s.", mode_name)
 
 
