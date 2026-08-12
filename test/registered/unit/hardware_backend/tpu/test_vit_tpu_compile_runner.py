@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 from torch import nn
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
     Qwen3VLVisionTpuCompilePolicy,
     VisionPaddingContext,
@@ -18,7 +19,6 @@ from sglang.srt.layers.attention.vision import (
     VisionTpuAttention,
     _build_tpu_segment_ids,
 )
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
