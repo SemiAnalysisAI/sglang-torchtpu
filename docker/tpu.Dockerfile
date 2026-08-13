@@ -26,7 +26,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     SGLANG_PLATFORM=tpu
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git curl ca-certificates build-essential libgomp1 \
+        git curl ca-certificates build-essential libgomp1 netcat-openbsd procps \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /sgl-workspace/sglang
