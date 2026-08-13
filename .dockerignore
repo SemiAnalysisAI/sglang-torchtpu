@@ -270,6 +270,7 @@ inputs/
 
 # CUDA kernel develop, profile and debug
 .clangd
+.clang-format
 *.nsys-rep
 *.ncu-rep
 *.nvcudmp

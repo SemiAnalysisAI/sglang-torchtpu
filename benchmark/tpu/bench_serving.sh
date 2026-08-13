@@ -170,6 +170,7 @@ run_one() {
         --seed "$SEED"
         --output-file "$output_file"
     )
+    [[ -n "$TOKENIZER" ]] && args+=(--tokenizer "$TOKENIZER")
     [[ "$TOKENIZE_PROMPT" == "1" ]] && args+=(--tokenize-prompt)
 
     if [[ "$PROFILE" == "1" ]]; then
