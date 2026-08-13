@@ -35,6 +35,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = get_logger(__name__)
@@ -45,6 +46,10 @@ _COMPILE_BAR_FORMAT = (
     "{desc}: {percentage:3.0f}% Completed | "
     "{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
 )
+
+# XLA TopK has a static output width. Warm the physically qualified serving
+# width so the common candidate path does not compile on its first request.
+_DISTRIBUTED_TOP_K_WARMUP_K = 50
 
 
 def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None:
@@ -57,9 +62,14 @@ def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None
     """
     tensors: list[torch.Tensor] = []
 
-    next_token_logits = getattr(out, "next_token_logits", None)
-    if isinstance(next_token_logits, torch.Tensor):
-        tensors.append(next_token_logits)
+    for field in (
+        "next_token_logits",
+        "next_token_global_top_k_logits",
+        "next_token_global_top_k_token_ids",
+    ):
+        value = getattr(out, field, None)
+        if isinstance(value, torch.Tensor):
+            tensors.append(value)
 
     if getattr(attn_backend, "requires_kv_sync_after_compile", False):
         pool = token_to_kv_pool
@@ -102,9 +112,13 @@ def _unpad_decoder_outputs(out: Any, forward_batch: Any) -> Any:
     if real_q is None or real_b is None:
         return out
 
-    next_token_logits = getattr(out, "next_token_logits", None)
-    if next_token_logits is not None and real_b < next_token_logits.shape[0]:
-        out.next_token_logits = next_token_logits[:real_b]
+    trim_next_token_outputs = getattr(out, "trim_next_token_outputs", None)
+    if trim_next_token_outputs is not None:
+        trim_next_token_outputs(real_b)
+    else:
+        next_token_logits = getattr(out, "next_token_logits", None)
+        if next_token_logits is not None and real_b < next_token_logits.shape[0]:
+            out.next_token_logits = next_token_logits[:real_b]
 
     hidden_states = getattr(out, "hidden_states", None)
     if hidden_states is not None and real_q < hidden_states.shape[0]:
@@ -523,11 +537,33 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         *_args: Any,
         **_kwargs: Any,
     ) -> tuple[Any, ...]:
+        # Direct tracing omits sampling_info tensor inputs, although the logits
+        # processor branches on a host-only static k. Standard models expose
+        # their final model/layout capability so all full-logit cases share one
+        # executable. Unknown wrappers retain a conservative per-k key.
+        model = self.model_runner.model
+        logits_processor = getattr(model, "logits_processor", None)
+        lm_head = getattr(model, "lm_head", None)
+        selector = getattr(
+            logits_processor, "get_tpu_distributed_top_k_for_batch", None
+        )
+        if selector is not None and lm_head is not None:
+            distributed_top_k = selector(forward_batch, lm_head)
+        else:
+            from sglang.srt.hardware_backend.tpu.sampler import (
+                distributed_top_k_for_batch,
+            )
+
+            distributed_top_k = distributed_top_k_for_batch(
+                forward_batch,
+                sampling_backend=self.model_runner.server_args.sampling_backend,
+            )
         return (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
             input_ids.shape[0],
+            distributed_top_k,
         )
 
     def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
@@ -840,6 +876,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if getattr(self.model_runner, "model_is_mrope", False):
             mrope_positions = layout.positions.unsqueeze(0).expand(3, -1).contiguous()
 
+        sampling_info = (
+            self._make_top_k_warmup_sampling_info(bs) if spec_info is None else None
+        )
+
         return ForwardBatch(
             forward_mode=mode,
             batch_size=bs,
@@ -864,8 +904,39 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             # Model accesses ``capture_hidden_mode.need_capture()``; default
             # of None would raise AttributeError inside the compiled region.
             capture_hidden_mode=capture_hidden_mode,
+            sampling_info=sampling_info,
             spec_info=spec_info,
             mm_inputs=self._dummy_mm_inputs(bs),
+        )
+
+    def _make_top_k_warmup_sampling_info(self, bs: int) -> SamplingBatchInfo:
+        """Mirror an eligible serving batch for the common static TopK width.
+        This warms candidate graphs instead of an unused no-sampling specialization."""
+
+        device = self.model_runner.device
+        model_config = getattr(self.model_runner, "model_config", None)
+        vocab_size = int(
+            getattr(model_config, "vocab_size", _DISTRIBUTED_TOP_K_WARMUP_K)
+        )
+        return SamplingBatchInfo(
+            temperatures=torch.ones((bs, 1), dtype=torch.float32, device=device),
+            top_ps=torch.ones(bs, dtype=torch.float32, device=device),
+            top_ks=torch.full(
+                (bs,),
+                _DISTRIBUTED_TOP_K_WARMUP_K,
+                dtype=torch.int32,
+                device=device,
+            ),
+            min_ps=torch.zeros(bs, dtype=torch.float32, device=device),
+            is_all_greedy=False,
+            is_any_greedy=False,
+            need_top_p_sampling=False,
+            need_top_k_sampling=True,
+            need_min_p_sampling=False,
+            vocab_size=vocab_size,
+            return_sampling_masks=[False] * bs,
+            device=str(device),
+            uniform_top_k=_DISTRIBUTED_TOP_K_WARMUP_K,
         )
 
     def _dummy_layout(

@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -33,9 +34,20 @@ def _mock_model_runner(seq_len_fill_value: int = 1) -> MagicMock:
     return runner
 
 
-def _logits_output(num_rows: int) -> SimpleNamespace:
-    return SimpleNamespace(
+def _logits_output(num_rows: int) -> LogitsProcessorOutput:
+    return LogitsProcessorOutput(
         next_token_logits=torch.randn(num_rows, 16), hidden_states=None
+    )
+
+
+def _global_top_k_output(num_rows: int) -> LogitsProcessorOutput:
+    return LogitsProcessorOutput(
+        next_token_logits=None,
+        next_token_global_top_k_logits=torch.randn(num_rows, 8),
+        next_token_global_top_k_token_ids=torch.arange(num_rows * 8).reshape(
+            num_rows, 8
+        ),
+        hidden_states=None,
     )
 
 
@@ -142,6 +154,14 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         # Seeded sampling asserts positions rows == sampled (real) rows.
         self.assertEqual(fb.positions.shape[0], fb.batch_size)
 
+        global_top_k_output = _global_top_k_output(padded)
+        fb.post_forward_mlp_sync_batch(global_top_k_output)
+        self.assertIsNone(global_top_k_output.next_token_logits)
+        self.assertEqual(global_top_k_output.next_token_global_top_k_logits.shape[0], 3)
+        self.assertEqual(
+            global_top_k_output.next_token_global_top_k_token_ids.shape[0], 3
+        )
+
     def test_extend_post_forward_unpads_positions(self):
         fb = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
@@ -169,6 +189,15 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         # sample() derives prefill sampling positions from seq_lens - 1, so the
         # row count must match the real request count.
         self.assertEqual((fb.seq_lens - 1).shape[0], fb.batch_size)
+        self.assertEqual(logits_output.next_token_logits.shape[0], 7)
+
+        global_top_k_output = _global_top_k_output(10)
+        fb.post_forward_mlp_sync_batch(global_top_k_output)
+        self.assertIsNone(global_top_k_output.next_token_logits)
+        self.assertEqual(global_top_k_output.next_token_global_top_k_logits.shape[0], 2)
+        self.assertEqual(
+            global_top_k_output.next_token_global_top_k_token_ids.shape[0], 2
+        )
 
 
 if __name__ == "__main__":

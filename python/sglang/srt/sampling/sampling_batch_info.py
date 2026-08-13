@@ -83,6 +83,12 @@ class SamplingBatchInfo:
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
+    # Host-side specialization hint. ``None`` means the batch contains mixed
+    # top-k values. Keeping this on the host lets accelerator-specific samplers
+    # select a static top-k kernel without synchronizing ``top_ks`` from the
+    # device on every decode step.
+    uniform_top_k: Optional[int] = None
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         enable_deterministic = get_exec().deterministic.enable_deterministic_inference
@@ -104,8 +110,9 @@ class SamplingBatchInfo:
             dtype=torch.float,
             pin_memory=_pin,
         ).to(device, non_blocking=True)
+        top_k_values = [r.sampling_params.top_k for r in reqs]
         top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs],
+            top_k_values,
             dtype=torch.int32,
             pin_memory=_pin,
         ).to(device, non_blocking=True)
@@ -215,6 +222,11 @@ class SamplingBatchInfo:
             logit_bias=logit_bias,
             return_sampling_masks=return_sampling_masks,
             sampling_mask_max_top_k=sampling_mask_max_top_k,
+            uniform_top_k=(
+                top_k_values[0]
+                if top_k_values and all(k == top_k_values[0] for k in top_k_values)
+                else None
+            ),
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -447,6 +459,8 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+        if self.uniform_top_k != other.uniform_top_k:
+            self.uniform_top_k = None
 
         self.adjusted_merge_batch(other)
 

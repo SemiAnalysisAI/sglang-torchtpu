@@ -1636,14 +1636,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.out_cache_loc = self.output_cache_loc_backup
 
         elif self.forward_mode.is_decode() or self.forward_mode.is_idle():
-            logits_output.next_token_logits = logits_output.next_token_logits[:bs]
+            logits_output.trim_next_token_outputs(bs)
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
         elif self.forward_mode.is_extend():
             num_tokens = self.seq_lens_sum
-            logits_output.next_token_logits = logits_output.next_token_logits[
-                :num_tokens
-            ]
+            logits_output.trim_next_token_outputs(num_tokens, global_top_k_rows=bs)
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
 
