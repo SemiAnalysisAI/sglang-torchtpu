@@ -53,6 +53,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -146,6 +147,51 @@ class LogitsProcessorOutput:
     # workaround since ForwardBatch is local to forward_batch_generation().
     # They should be moved to GenerationBatchResult to keep this class clean.
     mm_input_embeds: Optional[torch.Tensor] = None
+
+    # Exact global TopK produced from sharded logits without gathering the full
+    # vocabulary. Both tensors have shape [#seq, k].
+    next_token_global_top_k_logits: Optional[torch.Tensor] = None
+    next_token_global_top_k_token_ids: Optional[torch.Tensor] = None
+
+    def __post_init__(self) -> None:
+        has_global_top_k_logits = self.next_token_global_top_k_logits is not None
+        has_global_top_k_token_ids = self.next_token_global_top_k_token_ids is not None
+        if has_global_top_k_logits != has_global_top_k_token_ids:
+            raise ValueError(
+                "global TopK logits and token IDs must be provided together"
+            )
+        if has_global_top_k_logits and self.next_token_logits is not None:
+            raise ValueError(
+                "full logits and global TopK logits are mutually exclusive"
+            )
+
+    @property
+    def has_next_token_global_top_k(self) -> bool:
+        """Report whether exact global TopK replaces full-vocabulary logits.
+        Construction guarantees logits and token IDs are paired and exclusive."""
+
+        return self.next_token_global_top_k_logits is not None
+
+    def trim_next_token_outputs(
+        self,
+        logits_rows: int,
+        global_top_k_rows: Optional[int] = None,
+    ) -> None:
+        """Remove padded rows while preserving global TopK pair alignment.
+        TopK rows default to the full-logits row count when not specified."""
+
+        if self.next_token_logits is not None:
+            self.next_token_logits = self.next_token_logits[:logits_rows]
+        if self.has_next_token_global_top_k:
+            global_top_k_rows = (
+                logits_rows if global_top_k_rows is None else global_top_k_rows
+            )
+            self.next_token_global_top_k_logits = self.next_token_global_top_k_logits[
+                :global_top_k_rows
+            ]
+            self.next_token_global_top_k_token_ids = (
+                self.next_token_global_top_k_token_ids[:global_top_k_rows]
+            )
 
 
 @dataclasses.dataclass
@@ -298,6 +344,7 @@ class LogitsProcessor(nn.Module):
         skip_all_gather: bool = False,
         logit_scale: Optional[float] = None,
         return_full_logits: bool = False,
+        requires_full_next_token_logits: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -330,6 +377,17 @@ class LogitsProcessor(nn.Module):
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        self.use_tpu_distributed_top_k = (
+            not requires_full_next_token_logits
+            and _is_tpu
+            and get_exec().kernel.sampling_backend == "tpu"
+        )
+        if self.use_tpu_distributed_top_k:
+            # Register before an optional fullgraph torch.compile trace reaches
+            # the logits processor. StableHLO export itself remains lazy.
+            from sglang.srt.hardware_backend.tpu.top_k import register_tpu_top_k_ops
+
+            register_tpu_top_k_ops()
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -348,6 +406,34 @@ class LogitsProcessor(nn.Module):
 
         self.input_logprob_processor = InputLogprobProcessor()
 
+    def get_tpu_distributed_top_k_for_batch(
+        self,
+        forward_batch: ForwardBatch,
+        lm_head: VocabParallelEmbedding,
+    ) -> Optional[int]:
+        """Return the static k only when this model can skip the TPU vocab gather.
+        Full-logit models, disabled/DP gathers, and non-sharded heads return ``None``.
+        """
+
+        if (
+            not self.use_tpu_distributed_top_k
+            or not self.do_tensor_parallel_all_gather
+            or self.do_tensor_parallel_all_gather_dp_attn
+        ):
+            return None
+
+        from sglang.srt.hardware_backend.tpu.sampler import (
+            distributed_top_k_for_batch,
+        )
+        from sglang.srt.hardware_backend.tpu.top_k import (
+            supports_distributed_tpu_top_k,
+        )
+
+        top_k = distributed_top_k_for_batch(forward_batch, sampling_backend="tpu")
+        if top_k is None or not supports_distributed_tpu_top_k(lm_head, top_k):
+            return None
+        return top_k
+
     def forward(
         self,
         input_ids,
@@ -359,8 +445,12 @@ class LogitsProcessor(nn.Module):
     ) -> LogitsProcessorOutput:
         # Extract MIS indices before ForwardBatch → LogitsMetadata conversion
         multi_item_delimiter_indices = None
+        distributed_top_k = None
         if isinstance(logits_metadata, ForwardBatch):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
+            distributed_top_k = self.get_tpu_distributed_top_k_for_batch(
+                logits_metadata, lm_head
+            )
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
         # Autotune dummy run discards this output; see _in_autotune_dummy_run.
@@ -411,6 +501,25 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            if distributed_top_k is not None:
+                global_top_k_logits, global_top_k_token_ids = (
+                    self._get_distributed_top_k(
+                        pruned_states,
+                        lm_head,
+                        distributed_top_k,
+                    )
+                )
+                if sample_indices is not None:
+                    global_top_k_logits = global_top_k_logits[sample_indices]
+                    global_top_k_token_ids = global_top_k_token_ids[sample_indices]
+                return LogitsProcessorOutput(
+                    next_token_logits=None,
+                    next_token_global_top_k_logits=global_top_k_logits,
+                    next_token_global_top_k_token_ids=global_top_k_token_ids,
+                    hidden_states=hidden_states_to_store,
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                )
+
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
@@ -676,6 +785,40 @@ class LogitsProcessor(nn.Module):
             hidden_states_to_store = hidden_states_to_store_before_norm
 
         return hidden_states_to_store
+
+    def _get_distributed_top_k(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        top_k: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Reduce sharded LM-head logits into an exact global TopK.
+        Monotonic final softcapping is applied after the global merge."""
+
+        from sglang.srt.distributed import get_attn_tp_group, get_tp_group
+        from sglang.srt.hardware_backend.tpu.top_k import (
+            TpuVocabShard,
+            distributed_tpu_top_k,
+        )
+
+        logits = self._compute_lm_head(hidden_states, lm_head)
+        if self.logit_scale is not None:
+            logits.mul_(self.logit_scale)
+        sanitize_nan_logits(logits, "distributed TPU top-k: local logits")
+
+        # Select k logits per vocabulary shard, then merge them into the exact
+        # global TopK shared by every tensor-parallel rank.
+        global_top_k_logits, global_top_k_token_ids = distributed_tpu_top_k(
+            logits,
+            TpuVocabShard.from_lm_head(lm_head),
+            top_k,
+            group=get_attn_tp_group() if self.use_attn_tp_group else get_tp_group(),
+        )
+        if self.final_logit_softcapping:
+            global_top_k_logits = self.final_logit_softcapping * torch.tanh(
+                global_top_k_logits / self.final_logit_softcapping
+            )
+        return global_top_k_logits, global_top_k_token_ids
 
     def _get_logits(
         self,

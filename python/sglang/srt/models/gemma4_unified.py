@@ -202,7 +202,11 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         else:
             self.lm_head = PPMissingLayer()
 
-        self.logits_processor = LogitsProcessor(text_config)
+        # Gemma4 masks input-only tokens after LogitsProcessor, so it requires the
+        # complete [batch, vocabulary] next-token logits instead of a global TopK.
+        self.logits_processor = LogitsProcessor(
+            text_config, requires_full_next_token_logits=True
+        )
         self.capture_aux_hidden_states = False
 
         # The unified checkpoint folds mm-projection vectors into the eoi/eoa

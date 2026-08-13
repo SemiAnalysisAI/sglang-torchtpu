@@ -3936,13 +3936,15 @@ class Scheduler(
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
-        # sampling_info with vocab_mask) and logits_output (which holds
-        # next_token_logits). Without clearing these, they stay alive via
-        # batch_result in result_queue and batch_record_buf until the next
-        # iteration, causing a steady VRAM leak with structured output.
+        # sampling_info with vocab_mask) and logits_output (which holds either
+        # full logits or the exact global TPU TopK). Without clearing these, they
+        # stay alive via batch_result until the next iteration and waste device
+        # memory, especially with structured output.
         batch_result.delay_sample_func = None
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
+            batch_result.logits_output.next_token_global_top_k_logits = None
+            batch_result.logits_output.next_token_global_top_k_token_ids = None
 
     @scheduler_nvtx_method("scheduler.process_batch_result")
     def process_batch_result(

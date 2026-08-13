@@ -102,6 +102,13 @@ class TpuSRTPlatform(SRTPlatform):
                 attention_backend=self.get_default_attention_backend(),
             )
 
+        if server_args.sampling_backend is None:
+            declare_late_resolution(
+                server_args,
+                "tpu.apply_server_args_defaults",
+                sampling_backend="tpu",
+            )
+
         declare_late_resolution(
             server_args,
             "tpu.apply_server_args_defaults",

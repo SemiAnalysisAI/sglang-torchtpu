@@ -206,6 +206,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         defaults = dict(
             dtype=None,
             attention_backend=None,
+            sampling_backend=None,
             disable_cuda_graph=False,
             disable_piecewise_cuda_graph=False,
             enable_torch_compile=False,
@@ -243,6 +244,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
         self.assertEqual(args.dtype, "bfloat16")
         self.assertEqual(args.attention_backend, "pallas_tpu_rpa_v3")
+        self.assertEqual(args.sampling_backend, "tpu")
         self.assertTrue(args.disable_cuda_graph)
         self.assertTrue(args.disable_piecewise_cuda_graph)
         # enable_torch_compile is opt-in on TPU and must not be forced off.
@@ -337,6 +339,11 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         args = self._args(mem_fraction_static=0.60)
         self._apply(args)
         self.assertEqual(args.mem_fraction_static, 0.60)
+
+    def test_explicit_sampling_backend_not_overridden(self):
+        args = self._args(sampling_backend="pytorch")
+        self._apply(args)
+        self.assertEqual(args.sampling_backend, "pytorch")
 
 
 class TestTpuPlatformFactoryMethods(CustomTestCase):
