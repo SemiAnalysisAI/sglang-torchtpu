@@ -10,16 +10,25 @@ import torch
 
 from sglang.test.test_utils import CustomTestCase
 
-try:
-    import jax
 
-    _HAS_TPU = any(getattr(d, "platform", "") == "tpu" for d in jax.devices())
-except Exception:  # pragma: no cover
-    _HAS_TPU = False
-
-
-@unittest.skipUnless(_HAS_TPU, "Requires JAX and a visible TPU backend")
 class TestTpuTopK(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import torch_tpu  # noqa: F401
+
+            from sglang.srt.hardware_backend.tpu.env_override import (
+                apply_tpu_env_overrides,
+            )
+
+            # CustomTestCase intentionally keeps JAX on CPU for exported-op
+            # tracing. Probe the registered TorchTPU device instead: checking
+            # jax.devices() here would therefore skip on every TPU CI worker.
+            apply_tpu_env_overrides()
+            torch.zeros(1, device="tpu")
+        except Exception as exc:
+            raise unittest.SkipTest(f"TorchTPU device not available: {exc}")
+
     def test_exact_top_k_50_at_serving_vocab(self):
         batch, vocab, k = 2, 202_048, 50
         generator = torch.Generator().manual_seed(7)
