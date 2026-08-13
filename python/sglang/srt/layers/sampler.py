@@ -25,6 +25,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_tpu,
 )
 
 if is_cuda():
@@ -65,6 +66,7 @@ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+_TPU_FAST_TOP_K_MAX = 64
 
 
 class Sampler(nn.Module):
@@ -82,6 +84,12 @@ class Sampler(nn.Module):
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
         self.use_ascend_backend = get_exec().kernel.sampling_backend == "ascend"
+        # Opt-in until this exact path is qualified for each production TPU
+        # model shape. It avoids the full-vocabulary sort used by the generic
+        # PyTorch fallback when every request has the same small top-k.
+        self.use_tpu_fast_top_k = is_tpu() and get_bool_env_var(
+            "SGLANG_TPU_FAST_TOPK_SAMPLING"
+        )
 
         self.output_logprob_processor = OutputLogprobProcessor()
 
@@ -265,6 +273,21 @@ class Sampler(nn.Module):
             )
         else:
             backend = get_exec().kernel.sampling_backend
+            if (
+                self.use_tpu_fast_top_k
+                and backend == "pytorch"
+                and sampling_info.need_top_k_sampling
+                and not sampling_info.need_top_p_sampling
+                and not sampling_info.need_min_p_sampling
+                and sampling_info.uniform_top_k is not None
+                and 1 < sampling_info.uniform_top_k <= _TPU_FAST_TOP_K_MAX
+            ):
+                return top_k_sampling_from_probs_tpu(
+                    probs,
+                    sampling_info.uniform_top_k,
+                    sampling_info.sampling_seed,
+                    positions,
+                )
             if backend == "flashinfer":
                 assert (
                     sampling_info.sampling_seed is None
@@ -616,6 +639,34 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     probs_idx = probs_idx.to(torch.int32)
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
     return batch_next_token_ids
+
+
+def top_k_sampling_from_probs_tpu(
+    probs: torch.Tensor,
+    top_k: int,
+    sampling_seed: Optional[torch.Tensor],
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Sample from a small exact top-k candidate tensor on TPU.
+
+    The generic PyTorch fallback sorts and cumulatively sums the full vocab on
+    every token. This path asks XLA for only ``top_k`` values/ids and runs the
+    existing multinomial implementation over that small candidate dimension.
+    """
+
+    from sglang.srt.hardware_backend.tpu.top_k import tpu_top_k
+
+    candidate_probs, candidate_ids = tpu_top_k(probs, top_k)
+    sampled_candidate = sampling_from_probs_torch(
+        candidate_probs,
+        sampling_seed=sampling_seed,
+        positions=positions,
+    )
+    return torch.gather(
+        candidate_ids,
+        dim=1,
+        index=sampled_candidate.to(torch.int64).view(-1, 1),
+    ).view(-1)
 
 
 def top_k_top_p_min_p_sampling_from_logits_ascend(
