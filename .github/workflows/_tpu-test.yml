@@ -39,6 +39,14 @@ on:
         required: false
         type: string
         default: ""
+      run_quality_tests:
+        required: false
+        type: boolean
+        default: false
+      timeout_per_file:
+        required: false
+        type: number
+        default: 3600
       run_name:
         required: false
         type: string
@@ -98,7 +106,9 @@ jobs:
             --exec '${{ inputs.exec_cmd }}' \
             --hosts '${{ inputs.hosts }}' \
             --weights-pvc '${{ inputs.weights_pvc }}' \
+            --timeout-per-file '${{ inputs.timeout_per_file }}' \
             --name '${{ inputs.run_name }}' \
+            ${{ inputs.run_quality_tests && '--run-quality-tests' || '' }} \
             ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml
           echo "== rendered (key fields) =="
           grep -nE 'completions:|gke-tpu-topology:|ci-tpu-pool:|claimName:|bash "benchmark|for f in|run_suite.py' /tmp/job.yaml | head
