@@ -34,21 +34,19 @@ jobs:
       image: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:9d1c789433aefab8eda687309b3a6f9eec1998325ced959f8ab3272eda7473df
       hosts: 1
       exec_cmd: >-
-        for f in
-        test/registered/tpu/test_pallas_fused_moe.py
-        test/registered/tpu/test_fp8_fused_rs_kernel.py
-        test/registered/tpu/test_distributed_top_k_sampling.py
-        test/registered/tpu/test_ray_bundle_order.py
-        test/registered/tpu/test_gdn_attention_v3.py
-        test/registered/tpu/test_pallas_rpa_batched_backend.py
-        test/registered/tpu/test_batched_rpa_stacked_kernel.py
-        test/registered/tpu/test_pallas_rpa_v3_dispatch.py
-        test/registered/tpu/test_pallas_moe_op_registration.py
-        test/registered/tpu/test_kv_pool_fp8.py
-        test/registered/tpu/test_tpu_compile_tracer.py
-        test/registered/tpu/test_tpu_basic_inference.py
-        test/registered/tpu/test_torch_compile_bundle.py;
-        do echo "== $f =="; python3 "$f" || exit $?; done
+        python3 test/registered/tpu/test_pallas_fused_moe.py &&
+        python3 test/registered/tpu/test_fp8_fused_rs_kernel.py &&
+        python3 test/registered/tpu/test_distributed_top_k_sampling.py &&
+        python3 test/registered/tpu/test_ray_bundle_order.py &&
+        python3 test/registered/tpu/test_gdn_attention_v3.py &&
+        python3 test/registered/tpu/test_pallas_rpa_batched_backend.py &&
+        python3 test/registered/tpu/test_batched_rpa_stacked_kernel.py &&
+        python3 test/registered/tpu/test_pallas_rpa_v3_dispatch.py &&
+        python3 test/registered/tpu/test_pallas_moe_op_registration.py &&
+        python3 test/registered/tpu/test_kv_pool_fp8.py &&
+        python3 test/registered/tpu/test_tpu_compile_tracer.py &&
+        python3 test/registered/tpu/test_tpu_basic_inference.py &&
+        python3 test/registered/tpu/test_torch_compile_bundle.py
       run_name: pr364-remaining-tests
     permissions:
       contents: read
