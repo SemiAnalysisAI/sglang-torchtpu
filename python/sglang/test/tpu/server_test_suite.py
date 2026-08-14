@@ -1,0 +1,348 @@
+"""Reusable single-server fixture and quality helpers for TPU integration tests.
+
+Each feature test subclasses :class:`SGLangTPUServerTestSuite`, supplies its
+complete ``server_args`` dictionary, and writes ordinary unittest methods. One
+``sgl.Engine`` is created for the subclass and reused by all of its tests::
+
+    class TestSpecDecoding(SGLangTPUServerTestSuite):
+        server_args = {
+            "model_path": "Qwen/Qwen3-1.7B",
+            "speculative_algorithm": "EAGLE3",
+            "speculative_draft_model_path": "draft-model",
+        }
+
+        def test_generates_with_speculation(self):
+            output = self.engine.generate("Hello", {"max_new_tokens": 8})
+            self.assertGreater(output["meta_info"]["spec_verify_ct"], 0)
+"""
+
+import os
+import statistics
+import unittest
+from pathlib import Path
+from typing import Any, ClassVar, Mapping
+
+
+def resolve_tpu_model_path(model_id: str) -> str:
+    """Prefer an explicit root or the standard CI mount, then Hugging Face."""
+
+    configured_root = os.environ.get("SGLANG_TPU_WEIGHTS_ROOT")
+    root = Path(configured_root or "/weights")
+    if not root.exists():
+        if configured_root:
+            raise FileNotFoundError(
+                "configured TPU weights root does not exist: "
+                f"SGLANG_TPU_WEIGHTS_ROOT={configured_root!r}"
+            )
+        return model_id
+
+    candidates = (root / model_id, root / model_id.rsplit("/", 1)[-1])
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    raise FileNotFoundError(
+        f"{model_id!r} was not found under TPU weights root {str(root)!r}"
+    )
+
+
+class GSM8KQualityTestSuite:
+    """Batched five-shot GSM8K scorer for a test class owning ``engine``.
+
+    The prompt construction and answer extraction match SGLang's established
+    completion-style GSM8K evaluator. Test classes keep the policy choices—sample
+    count, batch size, sampling parameters, and threshold—next to their server
+    configuration.
+    """
+
+    engine: ClassVar[Any]
+    quality_test_env = "SGLANG_TPU_RUN_QUALITY_TESTS"
+
+    @classmethod
+    def quality_test(cls, test_method):
+        """Skip a quality test unless its opt-in environment flag is true."""
+
+        enabled = os.environ.get(cls.quality_test_env, "").lower() in ("1", "true")
+        reason = f"set {cls.quality_test_env}=true to run quality tests"
+        return unittest.skipUnless(enabled, reason)(test_method)
+
+    @classmethod
+    def verify_gsm8k_quality(
+        cls,
+        *,
+        min_accuracy: float,
+        num_samples: int,
+        batch_size: int,
+        num_shots: int = 5,
+        sampling_params: dict[str, Any] | None = None,
+        data_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Run GSM8K in batches, assert its accuracy, and return detailed metrics."""
+
+        from sglang.test.simple_eval_mixed_prefix_gsm8k import (
+            GSM8K_URL,
+            INVALID,
+            get_answer_value,
+            get_few_shot_examples,
+            get_one_example,
+        )
+        from sglang.utils import download_and_cache_file, read_jsonl
+
+        if num_samples == 0 or num_samples < -1:
+            raise ValueError(
+                f"num_samples must be positive or -1 for all, got {num_samples}"
+            )
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        if num_shots < 0:
+            raise ValueError(f"num_shots must be non-negative, got {num_shots}")
+
+        filename = data_path or download_and_cache_file(GSM8K_URL)
+        lines = list(read_jsonl(filename))
+        if len(lines) <= num_shots:
+            raise ValueError(
+                f"GSM8K data has {len(lines)} rows, but num_shots={num_shots} "
+                "leaves no evaluation examples"
+            )
+
+        eval_lines = lines[num_shots:]
+        if num_samples != -1:
+            eval_lines = eval_lines[:num_samples]
+        few_shot_prompt = get_few_shot_examples(lines, num_shots)
+        prompts = [
+            few_shot_prompt + get_one_example(eval_lines, i, include_answer=False)
+            for i in range(len(eval_lines))
+        ]
+        labels = [get_answer_value(row["answer"]) for row in eval_lines]
+        if any(label == INVALID for label in labels):
+            raise AssertionError(
+                "GSM8K dataset contains an unparsable reference answer"
+            )
+
+        params = {
+            "temperature": 0.0,
+            "max_new_tokens": 512,
+            "stop": ["Question", "Assistant:", "<|separator|>"],
+        }
+        if sampling_params:
+            params.update(sampling_params)
+
+        outputs = []
+        for start in range(0, len(prompts), batch_size):
+            batch = prompts[start : start + batch_size]
+            batch_outputs = cls.engine.generate(
+                batch,
+                [dict(params) for _ in batch],
+            )
+            if len(batch_outputs) != len(batch):
+                raise AssertionError(
+                    f"engine returned {len(batch_outputs)} responses for "
+                    f"a batch of {len(batch)} GSM8K prompts"
+                )
+            outputs.extend(batch_outputs)
+
+        predictions = [get_answer_value(output.get("text", "")) for output in outputs]
+        scores = [
+            float(prediction == label) for prediction, label in zip(predictions, labels)
+        ]
+        accuracy = statistics.fmean(scores)
+        invalid_rate = statistics.fmean(
+            float(prediction == INVALID) for prediction in predictions
+        )
+        metrics = {
+            "accuracy": accuracy,
+            "invalid_rate": invalid_rate,
+            "num_samples": len(scores),
+            "batch_size": batch_size,
+            "outputs": outputs,
+        }
+        if accuracy < min_accuracy:
+            raise AssertionError(
+                f"GSM8K accuracy={accuracy:.4f}, expected >= {min_accuracy:.4f}; "
+                f"invalid_rate={invalid_rate:.4f}, samples={len(scores)}, "
+                f"batch_size={batch_size}"
+            )
+        return metrics
+
+
+class SGLangTPUServerTestSuite(unittest.TestCase):
+    """Bring up and sanity-check one local TPU engine per test subclass.
+
+    Distributed and prefill/decode tests use separate fixtures instead of adding
+    orchestration responsibilities to this single-server base.
+    """
+
+    server_args: ClassVar[Mapping[str, Any]] = {}
+    engine: ClassVar[Any | None] = None
+
+    @classmethod
+    def get_server_args(cls) -> dict[str, Any]:
+        """Return a copy so engine setup cannot mutate the class declaration."""
+
+        return dict(cls.server_args)
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        os.environ["SGLANG_PLATFORM"] = "tpu"
+
+        # A single-host test may run in a pod carrying multihost TPU variables.
+        # Remove them before libtpu initializes so it does not wait for peers.
+        for name in (
+            "TPU_WORKER_ID",
+            "TPU_WORKER_HOSTNAMES",
+            "TPU_PROCESS_ADDRESSES",
+            "TPU_PROCESS_PORT",
+        ):
+            os.environ.pop(name, None)
+
+        import sglang as sgl
+
+        args = {
+            "device": "tpu",
+            "disable_radix_cache": False,
+            **cls.get_server_args(),
+        }
+        cls.engine = sgl.Engine(**args)
+        try:
+            cls.verify_prefix_cache_reuse()
+        except Exception:
+            # unittest does not call tearDownClass when setUpClass fails.
+            cls.engine.shutdown()
+            cls.engine = None
+            raise
+
+    @classmethod
+    def verify_prefix_cache_reuse(cls) -> None:
+        """Require every integration server to reuse a basic cached prefix."""
+
+        prompt = (
+            "Continue this integer sequence, comma separated:\n"
+            + ", ".join(str(i) for i in range(1, 401))
+            + ","
+        )
+        try:
+            cls.assert_prefix_cache_reuse(
+                prompt,
+                sampling_params={"temperature": 0.0, "max_new_tokens": 1},
+            )
+        finally:
+            # Feature tests must not inherit state from the bring-up check.
+            cls.engine.flush_cache()
+
+    @classmethod
+    def generate(cls, prompt, sampling_params=None):
+        """Generate with deterministic integration-test defaults."""
+
+        params = {"temperature": 0.0, "max_new_tokens": 64}
+        if sampling_params:
+            params.update(sampling_params)
+        return cls.engine.generate(prompt, params)
+
+    @classmethod
+    def assert_prefix_cache_reuse(
+        cls, prompt, *, sampling_params=None, min_cached_tokens=1
+    ):
+        """Populate a prefix, repeat it, and return the cold and warm outputs."""
+
+        cls.engine.flush_cache()
+        cold = cls.generate(prompt, sampling_params)
+        warm = cls.generate(prompt, sampling_params)
+        cached_tokens = warm["meta_info"].get("cached_tokens", 0)
+        if cached_tokens < min_cached_tokens:
+            raise AssertionError(
+                "prefix-cache reuse failed: the repeated request reported "
+                f"cached_tokens={cached_tokens}, expected >= {min_cached_tokens}"
+            )
+        return cold, warm
+
+    @classmethod
+    def assert_spec_accept_length(cls, outputs, *, min_accept_length=1.0):
+        """Verify a series of spec responses and return mean acceptance length."""
+
+        accept_lengths = []
+        for index, output in enumerate(outputs):
+            meta = output["meta_info"]
+            verify_count = meta.get("spec_verify_ct", 0)
+            if verify_count <= 0:
+                continue
+
+            completion_tokens = meta.get("completion_tokens")
+            if completion_tokens is None:
+                raise AssertionError(
+                    f"response {index} did not report completion_tokens"
+                )
+            accept_lengths.append(completion_tokens / verify_count)
+
+        if not accept_lengths:
+            raise AssertionError("no spec verifications were recorded")
+
+        mean_accept_length = statistics.fmean(accept_lengths)
+        if mean_accept_length <= min_accept_length:
+            raise AssertionError(
+                f"mean accept_length={mean_accept_length:.4f}, "
+                f"expected > {min_accept_length:.4f} "
+                f"over {len(accept_lengths)} responses"
+            )
+        return mean_accept_length
+
+    @classmethod
+    def verify_spec_decoding(
+        cls, prompt, *, sampling_params=None, min_accept_length=1.0
+    ):
+        """Generate once and return its speculative acceptance length."""
+
+        output = cls.generate(prompt, sampling_params)
+        accept_length = cls.assert_spec_accept_length(
+            [output],
+            min_accept_length=min_accept_length,
+        )
+        return output, accept_length
+
+    @classmethod
+    def verify_spec_decoding_prompts(
+        cls,
+        prompts,
+        *,
+        batch_size,
+        sampling_params=None,
+        min_accept_length=1.0,
+    ):
+        """Generate prompts in batches and verify mean acceptance length."""
+
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+        params = {"temperature": 0.0, "max_new_tokens": 64}
+        if sampling_params:
+            params.update(sampling_params)
+
+        # Match the feature-combo concurrent-wave test: a prompt list and one
+        # sampling-parameter dictionary per request form a real engine batch.
+        outputs = []
+        prompts = list(prompts)
+        for start in range(0, len(prompts), batch_size):
+            batch = prompts[start : start + batch_size]
+            batch_outputs = cls.engine.generate(
+                batch,
+                [dict(params) for _ in batch],
+            )
+            if len(batch_outputs) != len(batch):
+                raise AssertionError(
+                    f"engine returned {len(batch_outputs)} responses for "
+                    f"a batch of {len(batch)} prompts"
+                )
+            outputs.extend(batch_outputs)
+        mean_accept_length = cls.assert_spec_accept_length(
+            outputs,
+            min_accept_length=min_accept_length,
+        )
+        return outputs, mean_accept_length
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            if cls.engine is not None:
+                cls.engine.shutdown()
+        finally:
+            cls.engine = None
+            super().tearDownClass()
