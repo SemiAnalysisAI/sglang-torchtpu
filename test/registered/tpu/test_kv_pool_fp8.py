@@ -29,7 +29,12 @@ from sglang.test.test_utils import CustomTestCase
 
 def _skip_if_no_tpu() -> bool:
     try:
-        return importlib.util.find_spec("torch_tpu") is None
+        if importlib.util.find_spec("torch_tpu") is None:
+            return True
+        import torch_tpu  # noqa: F401
+
+        torch.zeros(1, dtype=torch.int32).to("tpu")
+        return False
     except Exception:
         return True
 

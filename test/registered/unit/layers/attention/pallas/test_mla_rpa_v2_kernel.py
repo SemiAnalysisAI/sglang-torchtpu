@@ -242,9 +242,14 @@ def _ref_attention(case, *, sm_scale, sliding_window, soft_cap, mask_value):
     return np.concatenate(outputs, axis=0)
 
 
-@unittest.skipUnless(
-    any(d.platform == "tpu" for d in jax.devices()), "needs a TPU device"
-)
+def _has_tpu_via_jax() -> bool:
+    try:
+        return any(getattr(d, "platform", "") == "tpu" for d in jax.devices())
+    except Exception:
+        return False
+
+
+@unittest.skipUnless(_has_tpu_via_jax(), "needs a TPU device")
 class TestMlaRaggedPagedAttentionV2(CustomTestCase):
     """Kernel-level accuracy for ``mla_ragged_paged_attention``.
 
