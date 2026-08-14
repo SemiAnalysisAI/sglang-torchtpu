@@ -40,6 +40,8 @@ def resolve_tpu_model_path(model_id: str) -> str:
     for candidate in candidates:
         if candidate.exists():
             return str(candidate)
+    if not configured_root:
+        return model_id
     raise FileNotFoundError(
         f"{model_id!r} was not found under TPU weights root {str(root)!r}"
     )
@@ -172,7 +174,9 @@ class SGLangTPUServerTestSuite(unittest.TestCase):
     """
 
     server_args: ClassVar[Mapping[str, Any]] = {}
+    server_env: ClassVar[Mapping[str, str]] = {}
     engine: ClassVar[Any | None] = None
+    _original_server_env: ClassVar[dict[str, str | None]] = {}
 
     @classmethod
     def get_server_args(cls) -> dict[str, Any]:
@@ -181,8 +185,25 @@ class SGLangTPUServerTestSuite(unittest.TestCase):
         return dict(cls.server_args)
 
     @classmethod
+    def _apply_server_env(cls) -> None:
+        cls._original_server_env = {
+            name: os.environ.get(name) for name in cls.server_env
+        }
+        os.environ.update(cls.server_env)
+
+    @classmethod
+    def _restore_server_env(cls) -> None:
+        for name, value in cls._original_server_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        cls._original_server_env = {}
+
+    @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
+        cls._apply_server_env()
         os.environ["SGLANG_PLATFORM"] = "tpu"
 
         # A single-host test may run in a pod carrying multihost TPU variables.
@@ -195,20 +216,24 @@ class SGLangTPUServerTestSuite(unittest.TestCase):
         ):
             os.environ.pop(name, None)
 
-        import sglang as sgl
-
-        args = {
-            "device": "tpu",
-            "disable_radix_cache": False,
-            **cls.get_server_args(),
-        }
-        cls.engine = sgl.Engine(**args)
         try:
+            import sglang as sgl
+
+            args = {
+                "device": "tpu",
+                "disable_radix_cache": False,
+                **cls.get_server_args(),
+            }
+            cls.engine = sgl.Engine(**args)
             cls.verify_prefix_cache_reuse()
         except Exception:
             # unittest does not call tearDownClass when setUpClass fails.
-            cls.engine.shutdown()
-            cls.engine = None
+            try:
+                if cls.engine is not None:
+                    cls.engine.shutdown()
+            finally:
+                cls.engine = None
+                cls._restore_server_env()
             raise
 
     @classmethod
@@ -345,4 +370,5 @@ class SGLangTPUServerTestSuite(unittest.TestCase):
                 cls.engine.shutdown()
         finally:
             cls.engine = None
+            cls._restore_server_env()
             super().tearDownClass()

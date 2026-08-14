@@ -25,7 +25,7 @@ from sglang.test.tpu.server_test_suite import (
 )
 
 register_tpu_ci(
-    est_time=7200,
+    est_time=10800,
     suite="nightly-tpu-integration",
     nightly=True,
 )
@@ -170,6 +170,126 @@ class TestQwen31P7BSpecDecoding(GSM8KQualityTestSuite, SGLangTPUServerTestSuite)
                 "top_p": 0.9,
                 "sampling_seed": 0,
                 "max_new_tokens": 256,
+            },
+            min_accept_length=self.expected_non_greedy_accept_length,
+        )
+        verified_responses = sum(
+            output["meta_info"].get("spec_verify_ct", 0) > 0 for output in outputs
+        )
+        print(
+            "SPEED-Bench non-greedy "
+            f"temperature=0.7 top_p=0.9 mean accept_length={accept_length:.4f} "
+            f"over {verified_responses}/{len(prompts)} verified prompts "
+            f"at batch_size={SPEED_BENCH_BATCH_SIZE}"
+        )
+
+
+@unittest.skipUnless(is_tpu(), "TPU required")
+class TestGPTOss120BSpecDecoding(GSM8KQualityTestSuite, SGLangTPUServerTestSuite):
+    # Establish tighter model-specific gates after collecting a stable v7x baseline.
+    expected_accept_length = 1.0
+    expected_non_greedy_accept_length = 1.0
+    expected_speed_bench_accept_length = 1.0
+    expected_gsm8k_accuracy = 0.65
+    gsm8k_num_samples = 200
+    gsm8k_batch_size = 16
+
+    server_env = {
+        # GPT-OSS EXTEND has a symbolic token dimension that the SparseCore
+        # ragged-gather path cannot lower.
+        "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
+    }
+    server_args = {
+        "model_path": resolve_tpu_model_path("openai/gpt-oss-120b"),
+        "dtype": "bfloat16",
+        "tp_size": 8,
+        "ep_size": 8,
+        "page_size": 64,
+        # The checkpoint declares MXFP4 itself; do not force quantization.
+        "kv_cache_dtype": "fp8_e4m3",
+        # GPT-OSS needs attention sinks and hybrid-SWA index mapping.
+        "attention_backend": "pallas_tpu_rpa_v3",
+        "tpu_compile_tracer": "direct",
+        "max_total_tokens": 8192,
+        "mem_fraction_static": 0.6,
+        "max_prefill_tokens": 2048,
+        "max_running_requests": 16,
+        "tpu_compile_bs": [1, 2, 4],
+        "tpu_compile_tokens": [512, 2048],
+        "enable_torch_compile": True,
+        "speculative_algorithm": "EAGLE3",
+        "speculative_draft_model_path": resolve_tpu_model_path(
+            "lmsys/EAGLE3-gpt-oss-120b-bf16"
+        ),
+        "speculative_num_steps": 3,
+        "speculative_eagle_topk": 1,
+        "speculative_num_draft_tokens": 4,
+    }
+
+    def test_accept_length_single_prompt(self):
+        output, accept_length = self.verify_spec_decoding(
+            SPEC_TEST_PROMPT,
+            min_accept_length=self.expected_accept_length,
+        )
+        meta = output["meta_info"]
+        print(
+            "single-prompt spec decoding: "
+            f"model={self.server_args['model_path']}, "
+            f"prompt_tokens={meta.get('prompt_tokens')}, "
+            f"completion_tokens={meta.get('completion_tokens')}, "
+            f"spec_verify_ct={meta.get('spec_verify_ct')}, "
+            f"accept_length={accept_length:.4f}, "
+            f"expected>{self.expected_accept_length:.4f}"
+        )
+
+    @GSM8KQualityTestSuite.quality_test
+    def test_gsm8k_quality(self):
+        metrics = self.verify_gsm8k_quality(
+            min_accuracy=self.expected_gsm8k_accuracy,
+            num_samples=self.gsm8k_num_samples,
+            batch_size=self.gsm8k_batch_size,
+        )
+        accept_length = self.assert_spec_accept_length(
+            metrics["outputs"], min_accept_length=self.expected_accept_length
+        )
+        print(
+            "GSM8K spec-decoding quality: "
+            f"model={self.server_args['model_path']}, "
+            f"accuracy={metrics['accuracy']:.4f}, "
+            f"expected>={self.expected_gsm8k_accuracy:.4f}, "
+            f"invalid_rate={metrics['invalid_rate']:.4f}, "
+            f"mean_accept_length={accept_length:.4f}, "
+            f"samples={metrics['num_samples']}, "
+            f"batch_size={metrics['batch_size']}"
+        )
+
+    def test_speed_bench_accept_length(self):
+        prompts = load_speed_bench_prompts()
+        outputs, accept_length = self.verify_spec_decoding_prompts(
+            prompts,
+            batch_size=SPEED_BENCH_BATCH_SIZE,
+            sampling_params={"max_new_tokens": 512},
+            min_accept_length=self.expected_speed_bench_accept_length,
+        )
+        verified_responses = sum(
+            output["meta_info"].get("spec_verify_ct", 0) > 0 for output in outputs
+        )
+        print(
+            f"SPEED-Bench mean accept_length={accept_length:.4f} "
+            f"over {verified_responses}/{len(prompts)} verified prompts "
+            f"at batch_size={SPEED_BENCH_BATCH_SIZE}"
+        )
+
+    def test_speed_bench_non_greedy_accept_length(self):
+        prompts = load_speed_bench_prompts()
+        outputs, accept_length = self.verify_spec_decoding_prompts(
+            prompts,
+            batch_size=SPEED_BENCH_BATCH_SIZE,
+            sampling_params={
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "sampling_seed": 0,
+                "max_new_tokens": 512,
             },
             min_accept_length=self.expected_non_greedy_accept_length,
         )
