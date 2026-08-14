@@ -22,72 +22,34 @@ on:
         options: [all, singlehost, multihost, pd, spec]
 
 concurrency:
-  group: tpu-combo
-  cancel-in-progress: false   # let a running combo finish; don't stack them
+  group: pr364-validation
+  cancel-in-progress: false
 
 jobs:
-  build:
-    uses: ./.github/workflows/_tpu-build.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-    permissions:
-      contents: read
-      id-token: write
-
-  stage-a:
-    needs: build
-    name: stage-a-test-tpu-unit
+  singlehost-validation:
+    name: pr364-remaining-tests
     uses: ./.github/workflows/_tpu-test.yml
     with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      hosts: 1
-      suite: stage-a-test-tpu-unit
-      run_name: pr364-stage-a-exact-head
-    permissions:
-      contents: read
-      id-token: write
-
-  singlehost-combo:
-    needs: [build, stage-a]
-    if: ${{ contains(fromJSON('["all","singlehost"]'), inputs.target || 'all') }}
-    name: singlehost-combo-test
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
+      ref: 7ed078f0e2b527413f60b5ec04e467cce21903c1
+      image: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:9d1c789433aefab8eda687309b3a6f9eec1998325ced959f8ab3272eda7473df
       hosts: 1
       exec_cmd: >-
-        python3 test/registered/tpu/test_tpu_compile_tracer.py &&
-        python3 test/registered/tpu/test_tpu_basic_inference.py &&
-        python3 test/registered/tpu/test_torch_compile_bundle.py
-      run_name: pr364-stage-b-without-prefix-cache
-    permissions:
-      contents: read
-      id-token: write
-
-  multihost-combo:
-    needs: build
-    if: ${{ contains(fromJSON('["all","multihost","pd","spec"]'), inputs.target || 'all') }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # matrix context is unavailable in job-level `if`; selection shapes the matrix.
-        row: ${{ (inputs.target == 'pd' && fromJSON('["pd"]')) || (inputs.target == 'spec' && fromJSON('["spec"]')) || fromJSON('["pd","spec"]') }}
-    name: multihost-combo-test-${{ matrix.row }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      hosts: 2
-      # pd: FP8 30B from the shared disk (functional oracle -- quant-safe).
-      # spec: gated Llama-3.1-8B from HF (HF_TOKEN needs Meta license access).
-      exec_cmd: >-
-        ${{ matrix.row == 'pd'
-            && 'env MODEL=/weights/Qwen3-30B-A3B-FP8 python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py pd'
-            || 'python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec' }}
-      weights_pvc: model-weights-rox
-      run_name: multihost-combo-test-${{ matrix.row }}
+        for f in
+        test/registered/tpu/test_pallas_fused_moe.py
+        test/registered/tpu/test_fp8_fused_rs_kernel.py
+        test/registered/tpu/test_distributed_top_k_sampling.py
+        test/registered/tpu/test_ray_bundle_order.py
+        test/registered/tpu/test_gdn_attention_v3.py
+        test/registered/tpu/test_pallas_rpa_batched_backend.py
+        test/registered/tpu/test_batched_rpa_stacked_kernel.py
+        test/registered/tpu/test_pallas_rpa_v3_dispatch.py
+        test/registered/tpu/test_pallas_moe_op_registration.py
+        test/registered/tpu/test_kv_pool_fp8.py
+        test/registered/tpu/test_tpu_compile_tracer.py
+        test/registered/tpu/test_tpu_basic_inference.py
+        test/registered/tpu/test_torch_compile_bundle.py;
+        do echo "== $f =="; python3 "$f" || exit $?; done
+      run_name: pr364-remaining-tests
     permissions:
       contents: read
       id-token: write
