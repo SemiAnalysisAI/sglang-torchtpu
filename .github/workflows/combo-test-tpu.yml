@@ -34,8 +34,22 @@ jobs:
       contents: read
       id-token: write
 
-  singlehost-combo:
+  stage-a:
     needs: build
+    name: stage-a-test-tpu-unit
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      hosts: 1
+      suite: stage-a-test-tpu-unit
+      run_name: pr364-stage-a-exact-head
+    permissions:
+      contents: read
+      id-token: write
+
+  singlehost-combo:
+    needs: [build, stage-a]
     if: ${{ contains(fromJSON('["all","singlehost"]'), inputs.target || 'all') }}
     name: singlehost-combo-test
     uses: ./.github/workflows/_tpu-test.yml
@@ -43,8 +57,11 @@ jobs:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
       hosts: 1
-      exec_cmd: python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py all
-      run_name: singlehost-combo-test
+      exec_cmd: >-
+        python3 test/registered/tpu/test_tpu_compile_tracer.py &&
+        python3 test/registered/tpu/test_tpu_basic_inference.py &&
+        python3 test/registered/tpu/test_torch_compile_bundle.py
+      run_name: pr364-stage-b-without-prefix-cache
     permissions:
       contents: read
       id-token: write
