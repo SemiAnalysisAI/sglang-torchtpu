@@ -43,8 +43,12 @@ jobs:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
       hosts: 1
-      exec_cmd: python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py all
-      run_name: singlehost-combo-test
+      exec_cmd: >-
+        python3 test/registered/unit/layers/attention/pallas/test_mla_rpa_v2_kernel.py &&
+        python3 test/registered/tpu/test_tpu_compile_tracer.py &&
+        python3 test/registered/tpu/test_tpu_basic_inference.py &&
+        python3 test/registered/tpu/test_torch_compile_bundle.py
+      run_name: pr364-stage-b-without-prefix-cache
     permissions:
       contents: read
       id-token: write
