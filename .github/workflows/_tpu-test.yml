@@ -57,7 +57,7 @@ concurrency:
   # Runs sharing a slice must serialize (no gang scheduler -> two multi-host JobSets on
   # one pool could deadlock). Key on host count == the slice: all multi-host runs
   # (hosts=2) serialize on the 2x2x2 pool; single-host (hosts=1) runs on pr-gate.
-  group: tpu-slice-${{ inputs.hosts }}
+  group: pr364-validation-tpu-slice-${{ inputs.hosts }}
   cancel-in-progress: false
 
 env:
