@@ -186,11 +186,13 @@ class TestQwen31P7BSpecDecoding(GSM8KQualityTestSuite, SGLangTPUServerTestSuite)
 
 @unittest.skipUnless(is_tpu(), "TPU required")
 class TestGPTOss120BSpecDecoding(GSM8KQualityTestSuite, SGLangTPUServerTestSuite):
-    # Establish tighter model-specific gates after collecting a stable v7x baseline.
     expected_accept_length = 1.0
-    expected_non_greedy_accept_length = 1.0
-    expected_speed_bench_accept_length = 1.0
-    expected_gsm8k_accuracy = 0.65
+    # v7x reference: 1.5808 over 64 prompts at bs=16; gate at 90%.
+    expected_non_greedy_accept_length = 1.42
+    # v7x reference: 1.7898 over 64 prompts at bs=16; gate at 90%.
+    expected_speed_bench_accept_length = 1.61
+    # v7x reference: 0.7850 over 200 samples at bs=16; gate below 90%.
+    expected_gsm8k_accuracy = 0.70
     gsm8k_num_samples = 200
     gsm8k_batch_size = 16
 
@@ -212,10 +214,10 @@ class TestGPTOss120BSpecDecoding(GSM8KQualityTestSuite, SGLangTPUServerTestSuite
         "tpu_compile_tracer": "direct",
         "max_total_tokens": 8192,
         "mem_fraction_static": 0.6,
-        "max_prefill_tokens": 2048,
+        "max_prefill_tokens": 4096,
         "max_running_requests": 16,
         "tpu_compile_bs": [1, 2, 4],
-        "tpu_compile_tokens": [512, 2048],
+        "tpu_compile_tokens": [512, 2048, 4096],
         "enable_torch_compile": True,
         "speculative_algorithm": "EAGLE3",
         "speculative_draft_model_path": resolve_tpu_model_path(
