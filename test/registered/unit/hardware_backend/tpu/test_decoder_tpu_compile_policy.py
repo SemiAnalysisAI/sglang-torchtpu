@@ -22,11 +22,14 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
     Qwen3VLDecoderTpuCompilePolicy,
     _materialize_out,
+    _unpad_decoder_outputs,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
     SpecDecodeCompilePolicyMixin,
     SpecDecoderTpuCompilePolicy,
 )
+from sglang.srt.hardware_backend.tpu.sampler import distributed_top_k_for_batch
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -34,6 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -143,6 +147,94 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             CustomPolicy.model_extra_tensor_attrs,
         )
         self.assertIs(kwargs["kv_pool"], kv_pool)
+
+    def test_specialization_uses_the_models_final_top_k_capability(self):
+        model_runner = _model_runner()
+        model_runner.server_args.sampling_backend = "tpu"
+        selector = MagicMock(return_value=None)
+        model_runner.model.logits_processor = SimpleNamespace(
+            get_tpu_distributed_top_k_for_batch=selector
+        )
+        model_runner.model.lm_head = object()
+        policy = _make_policy(model_runner)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            batch_size=64,
+        )
+
+        fallback_key = policy._direct_compile_specialization_key(
+            None,
+            torch.arange(64),
+            torch.arange(64),
+            forward_batch,
+        )
+        selector.return_value = 50
+        candidate_key = policy._direct_compile_specialization_key(
+            None,
+            torch.arange(64),
+            torch.arange(64),
+            forward_batch,
+        )
+
+        self.assertIsNone(fallback_key[-1])
+        self.assertEqual(candidate_key[-1], 50)
+        selector.assert_called_with(forward_batch, model_runner.model.lm_head)
+
+    def test_warmup_at_default_cutoff_selects_candidate_specialization(self):
+        model_runner = _model_runner()
+        model_runner.server_args.sampling_backend = "tpu"
+        selector = MagicMock(
+            side_effect=lambda batch, _lm_head: distributed_top_k_for_batch(
+                batch, sampling_backend="tpu"
+            )
+        )
+        model_runner.model.logits_processor = SimpleNamespace(
+            get_tpu_distributed_top_k_for_batch=selector
+        )
+        model_runner.model.lm_head = object()
+        policy = _make_policy(model_runner, bs_buckets=(1, 64))
+        forward_batch = policy._make_dummy_forward_batch(
+            num_tokens=64,
+            bs=64,
+            mode=ForwardMode.DECODE,
+        )
+
+        key = policy._direct_compile_specialization_key(
+            None,
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+        )
+
+        self.assertEqual(key[-1], 50)
+        selector.assert_called_once_with(forward_batch, model_runner.model.lm_head)
+
+
+class TestDecoderOutputUnpadding(CustomTestCase):
+    def test_global_top_k_rows_follow_the_real_batch_size(self):
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            next_token_global_top_k_logits=torch.randn(4, 8),
+            next_token_global_top_k_token_ids=torch.arange(32).reshape(4, 8),
+            hidden_states=torch.randn(6, 16),
+        )
+        forward_batch = SimpleNamespace(
+            _tpu_real_q=3,
+            _tpu_real_b=2,
+            batch_size=4,
+            input_ids=torch.arange(6),
+            positions=torch.arange(6),
+        )
+
+        _unpad_decoder_outputs(output, forward_batch)
+
+        self.assertIsNone(output.next_token_logits)
+        self.assertEqual(output.next_token_global_top_k_logits.shape[0], 2)
+        self.assertEqual(output.next_token_global_top_k_token_ids.shape[0], 2)
+        self.assertEqual(output.hidden_states.shape[0], 3)
+        self.assertEqual(forward_batch.batch_size, 2)
+        self.assertEqual(forward_batch.input_ids.shape[0], 3)
 
 
 class TestInstallExtendCap(CustomTestCase):
@@ -495,6 +587,20 @@ class TestMakeDummyForwardBatch(CustomTestCase):
         self.assertIsNone(fb.extend_num_tokens)
         self.assertIsNone(fb.extend_logprob_start_lens_cpu)
 
+    def test_plain_warmup_uses_serving_sampling_info(self):
+        policy = _make_policy()
+
+        fb = policy._make_dummy_forward_batch(
+            num_tokens=4,
+            bs=4,
+            mode=ForwardMode.DECODE,
+        )
+
+        self.assertIsInstance(fb.sampling_info, SamplingBatchInfo)
+        self.assertEqual(fb.sampling_info.uniform_top_k, 50)
+        self.assertEqual(fb.sampling_info.top_ks.tolist(), [50] * 4)
+        self.assertIsNone(fb.sampling_info.penalizer_orchestrator)
+
 
 class TestPrecompileLoops(CustomTestCase):
     """``precompile`` fires one forward per TPU precompile variant:
@@ -632,8 +738,9 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
         no_grad.assert_called_once_with()
         cm.__enter__.assert_called_once()
 
-    def test_materialize_out_syncs_logits_and_flagged_kv_side_effects(self):
-        logits = torch.zeros(1)
+    def test_materialize_out_syncs_global_top_k_and_flagged_kv_side_effects(self):
+        global_top_k_logits = torch.zeros(1)
+        global_top_k_token_ids = torch.zeros(1, dtype=torch.int32)
         kv0 = torch.ones(1)
         kv1 = torch.ones(1) * 2
         pool = SimpleNamespace(
@@ -664,13 +771,19 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
             "torch_tpu._internal.sync.sync.synchronize"
         ) as sync:
             _materialize_out(
-                SimpleNamespace(next_token_logits=logits),
+                LogitsProcessorOutput(
+                    next_token_logits=None,
+                    next_token_global_top_k_logits=global_top_k_logits,
+                    next_token_global_top_k_token_ids=global_top_k_token_ids,
+                ),
                 forward_batch.attn_backend,
                 forward_batch.token_to_kv_pool,
             )
         sync.assert_called_once()
         tensors, kwargs = sync.call_args
-        self.assertEqual(tensors[0], [logits, kv0, kv1])
+        self.assertEqual(
+            tensors[0], [global_top_k_logits, global_top_k_token_ids, kv0, kv1]
+        )
         self.assertEqual(kwargs, {"wait": True})
         self.assertEqual(pool.get_fused_kv_buffer.call_args_list[0].args, (2,))
         self.assertEqual(pool.get_fused_kv_buffer.call_args_list[1].args, (3,))
@@ -816,6 +929,7 @@ class TestSpecDummyForwardBatch(CustomTestCase):
         )
         self.assertEqual(fb.capture_hidden_mode, CaptureHiddenMode.FULL)
         self.assertIsNotNone(fb.spec_info)
+        self.assertIsNone(fb.sampling_info)
         # Runtime TARGET_VERIFY is decode-like and leaves extend metadata unset.
         self.assertIsNone(fb.extend_seq_lens)
         self.assertIsNone(fb.extend_prefix_lens)

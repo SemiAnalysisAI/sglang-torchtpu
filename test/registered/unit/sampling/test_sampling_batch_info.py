@@ -394,6 +394,22 @@ class TestMergeBatch(CustomTestCase):
         self.assertTrue(info1.need_top_k_sampling)  # OR semantics
         self.assertTrue(info1.need_min_p_sampling)  # OR semantics
 
+    def test_merge_preserves_matching_uniform_top_k(self):
+        info1 = _make_info(batch_size=1, uniform_top_k=50)
+        info2 = _make_info(batch_size=2, uniform_top_k=50)
+
+        info1.merge_batch(info2)
+
+        self.assertEqual(info1.uniform_top_k, 50)
+
+    def test_merge_clears_mixed_uniform_top_k(self):
+        info1 = _make_info(batch_size=1, uniform_top_k=50)
+        info2 = _make_info(batch_size=1, uniform_top_k=32)
+
+        info1.merge_batch(info2)
+
+        self.assertIsNone(info1.uniform_top_k)
+
     def test_merge_with_logit_bias(self):
         """Test that merge pads missing logit_bias with zeros before concatenation."""
         info1 = _make_info(batch_size=1)
@@ -516,6 +532,17 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertAlmostEqual(info.temperatures[0, 0].item(), 0.8, places=5)
         self.assertAlmostEqual(info.top_ps[0].item(), 0.9, places=5)
         self.assertEqual(info.top_ks[0].item(), 50)
+        self.assertEqual(info.uniform_top_k, 50)
+
+    def test_mixed_top_k_has_no_uniform_specialization(self):
+        reqs = [self._make_req(top_k=50), self._make_req(top_k=32)]
+        batch = MagicMock()
+        batch.reqs = reqs
+        batch.device = DEVICE
+
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+
+        self.assertIsNone(info.uniform_top_k)
 
     def test_greedy_detection(self):
         """Test that top_k=1 sets is_all_greedy=True."""

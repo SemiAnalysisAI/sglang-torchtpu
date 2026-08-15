@@ -1730,6 +1730,11 @@ class ModelRunner:
         # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
         #       was executed after we processed last batch's results.
 
+        # The TPU fast path returns only the global TopK, so there are no
+        # full-vocabulary logits to preprocess.
+        if logits_output.has_next_token_global_top_k:
+            return
+
         # Calculate logits bias and apply it to next_token_logits.
         sampling_info.update_regex_vocab_mask()
         sampling_info.apply_logits_bias(logits_output.next_token_logits)

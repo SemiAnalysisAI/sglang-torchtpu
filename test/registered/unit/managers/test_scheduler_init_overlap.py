@@ -198,6 +198,21 @@ class TestLaunchBatchSampleStreamGating(CustomTestCase):
         s.forward_stream.wait_stream.assert_called_once_with(s.schedule_stream)
         br.copy_to_cpu.assert_called_once()
 
+    def test_delayed_sample_releases_global_top_k_tensors(self):
+        s = self._make_self(use_overlap_streams=False)
+        br = self._make_batch_result()
+        br.logits_output = SimpleNamespace(
+            next_token_logits=object(),
+            next_token_global_top_k_logits=object(),
+            next_token_global_top_k_token_ids=object(),
+        )
+
+        Scheduler.launch_batch_sample_if_needed(s, br, self._make_cur_batch())
+
+        self.assertIsNone(br.logits_output.next_token_logits)
+        self.assertIsNone(br.logits_output.next_token_global_top_k_logits)
+        self.assertIsNone(br.logits_output.next_token_global_top_k_token_ids)
+
     def test_no_delay_sample_func_is_noop(self):
         s = self._make_self(use_overlap_streams=False)
         # cur_batch=None proves the early return never touches the batch.

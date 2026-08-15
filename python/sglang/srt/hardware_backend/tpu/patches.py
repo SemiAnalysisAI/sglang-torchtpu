@@ -69,6 +69,24 @@ def _register_tpu_compile_backend() -> None:
     import torch_tpu._internal.compile  # noqa: F401
 
 
+_tpu_sampler_backend_registered = False
+
+
+def _register_tpu_sampler_backend() -> None:
+    """Register the TPU sampler factory once during backend initialization.
+    Idempotence protects repeated platform setup in tests and worker processes."""
+
+    global _tpu_sampler_backend_registered
+    if _tpu_sampler_backend_registered:
+        return
+
+    from sglang.srt.hardware_backend.tpu.sampler import TpuSampler
+    from sglang.srt.layers.sampler import register_sampler_backend
+
+    register_sampler_backend("tpu", TpuSampler)
+    _tpu_sampler_backend_registered = True
+
+
 def _unwrap_dynamic_compile_fns() -> None:
     global _dynamic_compile_unwrapped
     if _dynamic_compile_unwrapped:
@@ -700,6 +718,7 @@ def apply_tpu_patches() -> None:
     """
     _configure_eager_mode()
     _register_tpu_compile_backend()
+    _register_tpu_sampler_backend()
     _unwrap_dynamic_compile_fns()
     _patch_set_device_tolerate_mismatch()
     _patch_compute_position_torch()

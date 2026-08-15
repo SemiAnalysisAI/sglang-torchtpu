@@ -108,7 +108,7 @@ logger = logging.getLogger(__name__)
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 
-SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend", "tpu"}
 if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
     SAMPLING_BACKEND_CHOICES.add("token_oracle")
 

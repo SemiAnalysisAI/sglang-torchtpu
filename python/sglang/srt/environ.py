@@ -1371,6 +1371,9 @@ class Envs:
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
     SGLANG_TPU_REQ_TO_TOKEN_ON_HOST = EnvBool(True)
     SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
+    # Physical TPU v7 TP8 measurements favor distributed TopK from batch 64.
+    # Deployments can override this cutoff after measuring their topology.
+    SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = EnvInt(64)
 
     # Vision-encoder precompile ladder. Unset uses the computed square-grid
     # ladder; set-but-empty disables precompile entirely.

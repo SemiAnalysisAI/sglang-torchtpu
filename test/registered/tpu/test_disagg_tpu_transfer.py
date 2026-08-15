@@ -187,7 +187,8 @@ class TestTpuTransferDataPlane(CustomTestCase):
         self.assertTrue(info.if_send_aux_data)
 
     def test_compute_lane_slice_gqa_prefill_replication(self):
-        # total_kv_heads=2 < prefill_tp=4: src_replication=2. Under always-send, all ranks send.
+        # total_kv_heads=2 < prefill_tp=4: src_replication=2. For FAN_IN,
+        # primary ranks 0/2 send while replicated ranks 1/3 are skipped.
         kvp, total = 2, 2
         info = self._make_info(4, 2, 0, 0, total, kvp)
         self.assertEqual(info.src_lane_idx, 0)
@@ -196,7 +197,7 @@ class TestTpuTransferDataPlane(CustomTestCase):
         self.assertTrue(info.if_send_aux_data)
 
         info = self._make_info(4, 2, 1, 0, total, kvp)
-        self.assertFalse(info.if_skip_sending)
+        self.assertTrue(info.if_skip_sending)
         self.assertTrue(info.if_send_aux_data)
 
         info = self._make_info(4, 2, 2, 0, total, kvp)
@@ -206,7 +207,7 @@ class TestTpuTransferDataPlane(CustomTestCase):
         self.assertTrue(info.if_send_aux_data)
 
         info = self._make_info(4, 2, 3, 0, total, kvp)
-        self.assertFalse(info.if_skip_sending)
+        self.assertTrue(info.if_skip_sending)
         self.assertTrue(info.if_send_aux_data)
 
     def test_compute_lane_slice_gqa_decode_replication(self):
@@ -1009,10 +1010,10 @@ class TestTpuReshardingProtocol(CustomTestCase):
                 )
         self.assertTrue(torch.equal(daux[0][3], paux[0][6]))
 
-        # The replica arriving afterwards is deduped: prefill always sends, but
-        # decode drops it (never enqueued) instead of a redundant re-scatter.
+        # The replica arriving afterwards is deduped at prefill, so no redundant
+        # message is sent or enqueued for a second scatter.
+        self.assertTrue(info1.if_skip_sending)
         p1.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         with decode.decode_pending_lock:
             self.assertEqual(len(decode.decode_pending[room]), 0)
         decode.process_decode_pending(room)
