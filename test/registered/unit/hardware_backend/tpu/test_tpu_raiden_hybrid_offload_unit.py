@@ -401,6 +401,69 @@ class TestDraftSidecarPlatformHook(CustomTestCase):
         self.assertEqual(built["kwargs"]["pool_label"], "draft")
 
 
+class _FakeFusedPool:
+    """Minimal stand-in for TpuFusedMHATokenToKVPool geometry."""
+
+    def __init__(self, size=64, page_size=16, layer_num=1, page_shape=(16, 1, 2, 8)):
+        self.size = size
+        self.page_size = page_size
+        self.layer_num = layer_num
+        self.start_layer = 0
+        self._page_shape = page_shape
+
+    def get_fused_kv_buffer(self, layer_id):
+        return torch.zeros((self.size // self.page_size, *self._page_shape))
+
+
+class TestPackedMtpDraft(CustomTestCase):
+    def test_geometry_mismatch_rejected(self):
+        # raiden applies one page-id list to every wrapped tensor; a draft
+        # pool with different slot layout or page geometry would be addressed
+        # with the target's page ids and silently corrupt KV.
+        from sglang.srt.hardware_backend.tpu.raiden_transfer import (
+            validate_extra_layer_pools,
+        )
+
+        target = _FakeFusedPool()
+        validate_extra_layer_pools(target, (_FakeFusedPool(),))
+        for bad in (
+            _FakeFusedPool(size=128),
+            _FakeFusedPool(page_size=8),
+            _FakeFusedPool(page_shape=(16, 1, 2, 4)),
+        ):
+            with self.assertRaises(ValueError):
+                validate_extra_layer_pools(target, (bad,))
+
+    def test_host_sizing_covers_draft_tail_layers(self):
+        # Host blocks span target + packed draft layers; sizing from the
+        # target layer count alone would under-provision the raiden host pool.
+        from sglang.srt.hardware_backend.tpu.kv_pool_host import TpuRaidenHostKVCache
+
+        pool = object.__new__(TpuRaidenHostKVCache)
+        pool.device_pool = _FakeFusedPool(layer_num=2)
+        pool.start_layer = 0
+        pool.page_size = 16
+        pool.layer_num = 2
+        pool.transfer_layer_num = 3
+        with_tail = pool.get_size_per_token()
+        pool.transfer_layer_num = 2
+        without_tail = pool.get_size_per_token()
+        self.assertEqual(with_tail, without_tail // 2 * 3)
+
+    def test_controller_registers_mtp_pools_on_batch_counter(self):
+        # The draft forward gates on its pool's transfer counter; without this
+        # registration it would consume reloaded MTP KV before the DMA lands.
+        ctrl = _make_controller()
+        ctrl.mtp_draft_device_pools = ()
+        pools = (MagicMock(), MagicMock())
+        ctrl.set_mtp_draft_pools(pools)
+        self.assertTrue(ctrl.has_mtp_draft)
+        for pool in pools:
+            pool.register_layer_transfer_counter.assert_called_once_with(
+                ctrl.layer_done_counter
+            )
+
+
 class TestDispatch(CustomTestCase):
     def test_raiden_io_backend_selects_tpu_hybrid_controller(self):
         with patch.object(

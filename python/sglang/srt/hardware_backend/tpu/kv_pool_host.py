@@ -66,10 +66,6 @@ class TpuRaidenHostKVCache(HostKVCache):
         pool_label: str = "kv",
         mtp_draft_device_pools: tuple = (),
     ):
-        if mtp_draft_device_pools:
-            raise NotImplementedError(
-                "MTP draft KV offload is not supported on the TPU raiden path."
-            )
         # Deliberately do NOT call ``HostKVCache.__init__``: it allocates a
         # torch host buffer via ``init_kv_buffer`` and does a psutil RAM check.
         # raiden owns (and bounds-checks) the host pool, so we only replicate
@@ -86,6 +82,13 @@ class TpuRaidenHostKVCache(HostKVCache):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
         self.layer_num = device_pool.layer_num
+        # Packed MTP draft pools append their layers to this pool's host
+        # blocks and share its page ids (see RaidenKVTransfer); layer_num
+        # keeps the target-only count the HostKVCache interface promises.
+        self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
+        self.transfer_layer_num = self.layer_num + sum(
+            pool.layer_num for pool in self.mtp_draft_device_pools
+        )
 
         self.size_per_token = self.get_size_per_token()
         if host_size > 0:
@@ -103,7 +106,11 @@ class TpuRaidenHostKVCache(HostKVCache):
 
         from sglang.srt.hardware_backend.tpu.raiden_transfer import RaidenKVTransfer
 
-        self.transfer = RaidenKVTransfer(device_pool, self.page_num)
+        self.transfer = RaidenKVTransfer(
+            device_pool,
+            self.page_num,
+            extra_layer_pools=self.mtp_draft_device_pools,
+        )
 
         self.lock = threading.RLock()
         self.clear()
@@ -122,7 +129,7 @@ class TpuRaidenHostKVCache(HostKVCache):
         fused = self.device_pool.get_fused_kv_buffer(self.start_layer)
         page_bytes = int(np.prod(fused.shape[1:])) * fused.element_size()
         per_token = page_bytes // self.page_size
-        return per_token * self.layer_num
+        return per_token * self.transfer_layer_num
 
     def init_kv_buffer(self):
         # raiden owns host memory; there is no torch host buffer.

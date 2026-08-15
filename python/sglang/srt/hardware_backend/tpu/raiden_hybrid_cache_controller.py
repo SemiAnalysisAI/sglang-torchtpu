@@ -96,9 +96,13 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         )
 
     def set_mtp_draft_pools(self, mtp_draft_device_pools):
-        raise NotImplementedError(
-            "MTP draft KV offload is not supported on the TPU raiden hybrid path."
-        )
+        super().set_mtp_draft_pools(mtp_draft_device_pools)
+        # Packed MTP draft layers ride the host pools' tail layers (the raiden
+        # engines wrap the draft device buffers at construction), so transfers
+        # need no extra DMA here; the draft forward gates on the whole-batch
+        # reload counter like every other consumer.
+        for pool in self.mtp_draft_device_pools:
+            pool.register_layer_transfer_counter(self.layer_done_counter)
 
     # ----- sidecar registration ----------------------------------------------
 

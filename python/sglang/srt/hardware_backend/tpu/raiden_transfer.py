@@ -99,6 +99,29 @@ class CombinedFutureEvent:
         return None
 
 
+def validate_extra_layer_pools(
+    device_pool: TpuFusedMHATokenToKVPool, extra_layer_pools: tuple
+) -> None:
+    """Reject extra (packed MTP draft) pools whose pages raiden cannot address
+    with the primary pool's page ids: every wrapped tensor sees the same page-id
+    list, so page count, page size, and per-page geometry must all match."""
+    for pool in extra_layer_pools:
+        if pool.size != device_pool.size or pool.page_size != device_pool.page_size:
+            raise ValueError(
+                "Packed MTP draft pool must mirror the target pool's slot "
+                f"layout (draft size={pool.size} page={pool.page_size}, "
+                f"target size={device_pool.size} page={device_pool.page_size})."
+            )
+        draft = pool.get_fused_kv_buffer(pool.start_layer)
+        target = device_pool.get_fused_kv_buffer(device_pool.start_layer)
+        if draft.shape[1:] != target.shape[1:] or draft.dtype != target.dtype:
+            raise ValueError(
+                "Packed MTP draft pool must match the target pool's fused page "
+                f"geometry (draft {tuple(draft.shape[1:])} {draft.dtype}, "
+                f"target {tuple(target.shape[1:])} {target.dtype})."
+            )
+
+
 class RaidenKVTransfer:
     """Owns a raiden ``KVCacheManager`` over a TPU fused KV pool and issues
     page-granular D2H / H2D transfers.
@@ -112,18 +135,30 @@ class RaidenKVTransfer:
         self,
         device_pool: TpuFusedMHATokenToKVPool,
         num_host_pages: int,
+        *,
+        extra_layer_pools: tuple = (),
     ):
         from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
 
+        validate_extra_layer_pools(device_pool, extra_layer_pools)
         self.device_pool = device_pool
         self.num_host_pages = num_host_pages
-        self.layer_num = device_pool.layer_num
+        self.layer_num = device_pool.layer_num + sum(
+            pool.layer_num for pool in extra_layer_pools
+        )
 
         # outer list = layer, inner list = shard (one shard per TPU core here).
         # Keep-alive: held on self so the underlying buffers outlive raiden.
+        # Extra pools (packed MTP draft KV) append as tail layers: raiden
+        # applies one page-id list across every wrapped tensor, which is
+        # exactly the packed contract (draft pages share the target's slots).
         self._device_tensors = [
             [device_pool.get_fused_kv_buffer(device_pool.start_layer + i)]
-            for i in range(self.layer_num)
+            for i in range(device_pool.layer_num)
+        ] + [
+            [pool.get_fused_kv_buffer(pool.start_layer + i)]
+            for pool in extra_layer_pools
+            for i in range(pool.layer_num)
         ]
         # Local offload has no control plane; port 0 opens no control listener.
         self._mgr = KVCacheManager(
