@@ -30,23 +30,13 @@ jobs:
     name: pr364-remaining-tests
     uses: ./.github/workflows/_tpu-test.yml
     with:
-      ref: 7ed078f0e2b527413f60b5ec04e467cce21903c1
-      image: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:9d1c789433aefab8eda687309b3a6f9eec1998325ced959f8ab3272eda7473df
+      ref: 6a2f6793199543a4ed70820a6ffa3c13754af8e4
+      image: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:6b40f6babf3f1437bf538e4d8dc74ff929a90f474bce0aa1a8c69e7b08b94ee5
       hosts: 1
       exec_cmd: >-
-        python3 test/registered/tpu/test_pallas_fused_moe.py &&
-        python3 test/registered/tpu/test_fp8_fused_rs_kernel.py &&
-        python3 test/registered/tpu/test_distributed_top_k_sampling.py &&
-        python3 test/registered/tpu/test_ray_bundle_order.py &&
-        python3 test/registered/tpu/test_gdn_attention_v3.py &&
-        python3 test/registered/tpu/test_pallas_rpa_batched_backend.py &&
-        python3 test/registered/tpu/test_batched_rpa_stacked_kernel.py &&
-        python3 test/registered/tpu/test_pallas_rpa_v3_dispatch.py &&
-        python3 test/registered/tpu/test_pallas_moe_op_registration.py &&
-        python3 test/registered/tpu/test_kv_pool_fp8.py &&
-        python3 test/registered/tpu/test_tpu_compile_tracer.py &&
-        python3 test/registered/tpu/test_tpu_basic_inference.py &&
-        python3 test/registered/tpu/test_torch_compile_bundle.py
+        python3 test/run_suite.py --hw tpu --suite stage-a-test-tpu-unit --enable-retry &&
+        mv test/registered/tpu/test_prefix_cache.py /tmp/test_prefix_cache.py &&
+        python3 test/run_suite.py --hw tpu --suite stage-b-test-tpu-4-v7 --enable-retry
       run_name: pr364-remaining-tests
     permissions:
       contents: read
