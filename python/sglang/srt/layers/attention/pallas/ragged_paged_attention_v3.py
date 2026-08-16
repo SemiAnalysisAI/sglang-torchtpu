@@ -371,7 +371,6 @@ def _ragged_paged_attention_kernel_loop(
     bkv_csz,  # bkv compute size
     case: RpaCase = RpaCase.MIXED,
     skip_kv_mask: bool = False,
-    tpu_version: int = 6,
     debug_mode: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
@@ -484,11 +483,10 @@ def _ragged_paged_attention_kernel_loop(
         if soft_cap is not None:
             s = soft_cap * jnp.tanh(s / soft_cap)
 
-        # Use int16 for span computations when safe: non-f32 dtype on TPU v6+
-        # with causal mask. Custom mask shapes can trigger a Mosaic compiler bug.
+        # Do not use int16 here unless every intermediate is proven to fit:
+        # positions overflow at context lengths >= 32,768, and
+        # k_span + sliding_window can overflow even earlier.
         int_ty = jnp.int32
-        if get_dtype_packing(q.dtype) != 1 and tpu_version >= 6 and use_causal_mask:
-            int_ty = jnp.int16
         processed_q_len_int = processed_q_len.astype(int_ty)
         processed_kv_len_int = processed_kv_len.astype(int_ty)
         effective_kv_len_int = effective_kv_len.astype(int_ty)
@@ -1956,7 +1954,6 @@ def ragged_paged_attention(
                 bkv_csz=bkv_csz,
                 case=case,
                 skip_kv_mask=skip_kv_mask,
-                tpu_version=tpu_version,
                 debug_mode=debug_mode,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
