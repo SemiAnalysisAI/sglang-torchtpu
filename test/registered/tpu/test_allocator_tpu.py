@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
 import unittest
+from unittest.mock import MagicMock
 
 import torch
 
@@ -30,6 +31,33 @@ def _make_allocator(
         kvcache=None,
         need_sort=need_sort,
     )
+
+
+def _make_swa_allocator(
+    *,
+    page_size: int = 4,
+    full_free_pages: tuple[int, ...],
+    swa_free_pages: tuple[int, ...],
+):
+    """Build an SWA composite with disjoint full and SWA page namespaces."""
+    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+
+    full_allocator = _make_allocator(size=128, page_size=page_size)
+    swa_allocator = _make_allocator(size=128, page_size=page_size)
+    full_allocator.free_pages = torch.tensor(full_free_pages, dtype=torch.int32)
+    swa_allocator.free_pages = torch.tensor(swa_free_pages, dtype=torch.int32)
+
+    allocator = object.__new__(SWATokenToKVPoolAllocator)
+    allocator.page_size = page_size
+    allocator.device = "cpu"
+    allocator.full_attn_allocator = MagicMock(wraps=full_allocator)
+    allocator.swa_attn_allocator = MagicMock(wraps=swa_allocator)
+    allocator.full_to_swa_index_mapping = torch.zeros(256, dtype=torch.int64)
+    allocator.full_to_swa_index_mapping[-1] = -1
+    allocator.translate_loc_from_full_to_swa = (
+        lambda loc: allocator.full_to_swa_index_mapping[loc.to(torch.int64)]
+    )
+    return allocator
 
 
 def _detect_tpu() -> bool:
@@ -511,6 +539,98 @@ class TestAllocExtend(CustomTestCase):
                 self.assertGreaterEqual(int(out.min()), 0)
                 self.assertLess(int(out.max()), 256)
                 self.assertEqual(len(a.free_pages), free_before - pages)
+
+
+class TestSWAAllocExtend(CustomTestCase):
+    def test_host_output_uses_full_attention_locations_across_page_boundary(self):
+        """A supplied host buffer must contain full-attention locations.
+
+        With page_size=4, the three-token prefix occupies full slots 8..10
+        and SWA slots 80..82. Extending to six tokens first fills slots 11/83,
+        then uses full page 3 (12, 13) and SWA page 21 (84, 85).
+
+        The composite returns full locations, so both its return value and the
+        caller-owned host buffer must be [11, 12, 13]. The mapping must connect
+        those to [83, 84, 85]. If the buffer were also passed to the SWA
+        allocator, that second allocation would overwrite it with SWA slots.
+        """
+        allocator = _make_swa_allocator(
+            full_free_pages=(3, 4),
+            swa_free_pages=(21, 22),
+        )
+        allocator.full_to_swa_index_mapping[10] = 82
+        prefix_lens = torch.tensor([3], dtype=torch.int32)
+        seq_lens = torch.tensor([6], dtype=torch.int32)
+        last_loc = torch.tensor([10], dtype=torch.int32)
+        host_out = torch.full((3,), -1, dtype=torch.int32)
+
+        out = allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens.clone(),
+            seq_lens,
+            seq_lens.clone(),
+            last_loc,
+            extend_num_tokens=3,
+            out_indices_cpu=host_out,
+        )
+
+        expected_full = torch.tensor([11, 12, 13], dtype=torch.int32)
+        expected_swa = torch.tensor([83, 84, 85], dtype=torch.int32)
+        self.assertTrue(torch.equal(out, expected_full))
+        self.assertTrue(torch.equal(host_out, expected_full))
+        self.assertFalse(torch.equal(host_out, expected_swa))
+        self.assertTrue(
+            torch.equal(
+                allocator.full_to_swa_index_mapping[out.to(torch.int64)],
+                expected_swa.to(torch.int64),
+            )
+        )
+
+        full_kwargs = allocator.full_attn_allocator.alloc_extend.call_args.kwargs
+        swa_kwargs = allocator.swa_attn_allocator.alloc_extend.call_args.kwargs
+        self.assertIs(full_kwargs["out_indices_cpu"], host_out)
+        self.assertNotIn("out_indices_cpu", swa_kwargs)
+
+    def test_without_host_output_returns_full_attention_locations(self):
+        """Omitting the host buffer preserves the existing allocation path.
+
+        From an empty prefix, full pages 5 and 6 produce [20, 21, 22, 23, 24],
+        while SWA pages 25 and 26 produce [100, 101, 102, 103, 104]. The
+        composite must return the full locations, build the full-to-SWA
+        mapping, and avoid passing an unsupported output-buffer keyword to
+        either sub-allocator.
+        """
+        allocator = _make_swa_allocator(
+            full_free_pages=(5, 6),
+            swa_free_pages=(25, 26),
+        )
+        prefix_lens = torch.tensor([0], dtype=torch.int32)
+        seq_lens = torch.tensor([5], dtype=torch.int32)
+        last_loc = torch.tensor([-1], dtype=torch.int32)
+
+        out = allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens.clone(),
+            seq_lens,
+            seq_lens.clone(),
+            last_loc,
+            extend_num_tokens=5,
+        )
+
+        expected_full = torch.tensor([20, 21, 22, 23, 24], dtype=torch.int32)
+        expected_swa = torch.tensor([100, 101, 102, 103, 104], dtype=torch.int32)
+        self.assertTrue(torch.equal(out, expected_full))
+        self.assertTrue(
+            torch.equal(
+                allocator.full_to_swa_index_mapping[out.to(torch.int64)],
+                expected_swa.to(torch.int64),
+            )
+        )
+
+        full_kwargs = allocator.full_attn_allocator.alloc_extend.call_args.kwargs
+        swa_kwargs = allocator.swa_attn_allocator.alloc_extend.call_args.kwargs
+        self.assertNotIn("out_indices_cpu", full_kwargs)
+        self.assertNotIn("out_indices_cpu", swa_kwargs)
 
 
 class TestNeedSortMergePath(CustomTestCase):
