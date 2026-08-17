@@ -84,10 +84,45 @@ export LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"--xla_tpu_scoped_vmem_limit_kib=327
 --xla_tpu_enable_sparse_core_collective_offload_all_gather=false \
 --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false"}
 
-# Threshold BELOW which the MoE permute uses a dense one-hot matmul instead of a
-# gather. Decode (m = batch) stays under it and takes the cheap dense path; a
-# 4096-token prefill chunk is far above it and takes the SparseCore gather.
-export SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD=${SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD:-1024}
+# Threshold BELOW which the MoE permute/unpermute use a dense one-hot matmul
+# instead of a gather. Decode should be under it and take the cheap dense path;
+# a prefill chunk should be far above it and take the SparseCore gather.
+#
+# It must SCALE WITH CONCURRENCY, and a fixed 1024 silently breaks at scale.
+# fused_moe_op.py gates the two halves on different quantities:
+#
+#     use_dense_permute   = m       < threshold
+#     use_dense_unpermute = m*topk  < threshold
+#
+# so with topk=10 a decode batch above 102 keeps the dense *permute* but drops the
+# *unpermute* onto the gather path -- including its `argsort(argsort_idx)`. Measured
+# at CONC=128 (batch 128, m*topk=1280), ISL 8192/OSL 1024, TP8/EP8:
+#
+#     threshold 1024 -> median ITL 36.28, TPOT 80.76   (unpermute on gather)
+#     threshold 2048 -> median ITL 33.44, TPOT 77.83   (both dense)
+#     threshold 4096 -> median ITL 33.42, TPOT 77.78   (both dense)
+#
+# i.e. **ITL -7.9%, TPOT -3.7%**, and 2048 vs 4096 are indistinguishable (0.04 ms
+# across three samples) -- what matters is clearing `m*topk`, not the magnitude. No
+# TTFT effect (median TTFT noise at this concurrency is ~2.5%).
+#
+# Rule: above `MAX_RUNNING * topk`, and at most CHUNK. The upper bound is `<=`, not
+# `<`: prefill takes the dense permute iff `m < threshold`, so `threshold == CHUNK`
+# still leaves a full chunk on the gather (this is the measured 4096 case above).
+# Exceeding CHUNK is what must be avoided -- it would build a [chunk*topk, chunk]
+# one-hot for prefill (168M elements at 4096) instead of a gather.
+# topk is 10 for this checkpoint (`num_experts_per_tok`).
+_TOPK=10
+_DENSE_MIN=$(( MAX_RUNNING * _TOPK + 1 ))
+_DENSE_THR=1024
+while [ "$_DENSE_THR" -lt "$_DENSE_MIN" ] && [ $(( _DENSE_THR * 2 )) -le "$CHUNK" ]; do
+  _DENSE_THR=$(( _DENSE_THR * 2 ))
+done
+if [ "$_DENSE_THR" -lt "$_DENSE_MIN" ]; then
+  echo "WARNING: MAX_RUNNING=$MAX_RUNNING (x topk $_TOPK = $_DENSE_MIN) does not fit" \
+       "under CHUNK=$CHUNK; MoE decode unpermute will use the gather path." >&2
+fi
+export SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD=${SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD:-$_DENSE_THR}
 
 # Build the RoPE cache at the served context, not the checkpoint's 262144
 # positions. Safe here because this recipe serves text only; MRoPE video
