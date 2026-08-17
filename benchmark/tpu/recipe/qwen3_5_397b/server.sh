@@ -38,9 +38,93 @@ export MAX_RUNNING=${MAX_RUNNING:-$((CONCUR + 4))}
 # This is the configuration measured at CONCUR=4 (53328 here vs 54352 measured):
 # p99 TTFT 1108 ms, median ITL 8.10, 396 tok/s. Sizing instead for MAX_RUNNING
 # full contexts would be ~2x larger and is untested.
+# Remembered before the default is applied, so the DP block below can tell an
+# explicit caller value from this derived one and leave the former alone.
+_MAX_TOTAL_FROM_CALLER=${MAX_TOTAL_TOKENS:-}
 export MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-$((CONCUR * CONTEXT_LEN + MAX_RUNNING * 2048))}
 
 CHUNK=${CHUNK:-4096}
+
+# ------------------------------------------------------------------ DP attention
+# DP_SIZE>1 gives each rank its own attention shard while the MoE stays EP8. It is
+# how this model is served at high concurrency; DP_SIZE=1 leaves everything below
+# inert and the recipe behaves exactly as before.
+#
+# Two knobs are load-bearing here, and neither default is right on TPU.
+#
+# 1. `--chunked-prefill-size` is a GLOBAL budget that sglang divides by dp_size.
+#    Passing 4096 under DP8 chunks each rank at 512 -- half of vLLM's baseline and
+#    an 8192-token request then needs 16 chunks per rank instead of 2. Scale it by
+#    DP_SIZE so CHUNK means per-rank, as it does on the TP path.
+#
+# 2. `--prefill-delayer-max-delay-passes` defaults to 30 and wants ~250 here.
+#    Under DP attention every rank runs the same forward mode each step, and
+#    `DpPaddingMode.MAX_LEN` (forced on TPU for static shapes) pads every rank to
+#    the global max -- so a prefill step where only k of 8 ranks have work still
+#    costs the full 8-rank shape, wasting (8-k)/8. The delayer holds prefill
+#    admission until ranks line up, but its `"mixed"` branch (only some ranks
+#    prefillable -- exactly the misaligned case) is bounded ONLY by this pass
+#    count. 30 passes x ~18 ms/decode step = ~530 ms of patience, while a rank
+#    receives new prefill work only when one of its requests completes:
+#    1024 tokens x ~29 ms ITL / ~15 running = ~1.96 s. It was ~4x too impatient.
+#
+#    Measured at ISL 8192 / OSL 1024 / CONCUR 128, DP8_EP8, 4 chips:
+#      passes=30   2140.4 tok/s   52.5% of prefill steps have all 8 ranks active
+#      passes=100  2379.5 tok/s   88.9%
+#      passes=250  2424.4 tok/s   99.2%   (n=2: 2416.8 / 2432.0)
+#    +13.3%, with median ITL 29.13 -> 27.66 and median TTFT unchanged. Alignment
+#    saturates at 250, so raising it further buys nothing.
+#
+#    `--prefill-delayer-max-delay-ms` bounds only the `"all"` branch (the already
+#    aligned case), which is why sweeping it measured null.
+#
+# NOT set, deliberately: `--load-balance-method total_tokens`. Measured -4.0%
+# throughput and +157% median TTFT. round_robin spreads 8 consecutive arrivals
+# over 8 distinct ranks, which is what alignment needs; dispatching to the
+# momentarily-lightest rank piles arrivals onto one rank and drops all-8
+# alignment 99.2% -> 92.0%.
+DP_SIZE=${DP_SIZE:-1}
+dp_args=()
+if [ "$DP_SIZE" -gt 1 ]; then
+  CHUNK=$((CHUNK * DP_SIZE))
+  # ...but not past a whole context per rank, and keep it page-aligned: the
+  # scaled-up global budget is meaningless beyond what one rank can hold.
+  _ctx_cap=$((CONTEXT_LEN * DP_SIZE))
+  [ "$CHUNK" -gt "$_ctx_cap" ] && CHUNK=$_ctx_cap
+  CHUNK=$((CHUNK / 256 * 256))
+  [ "$CHUNK" -lt 256 ] && CHUNK=256
+
+  _per_rank_bs=$(((MAX_RUNNING + DP_SIZE - 1) / DP_SIZE))
+  [ "$_per_rank_bs" -lt 1 ] && _per_rank_bs=1
+  _per_rank_conc=$(((CONCUR + DP_SIZE - 1) / DP_SIZE))
+  [ "$_per_rank_conc" -lt 1 ] && _per_rank_conc=1
+
+  # `--max-total-tokens` is a PER-RANK cap -- `_apply_token_constraints` min()s it
+  # against each rank's own profiled capacity -- unlike --max-running-requests and
+  # --max-mamba-cache-size, which are global and divided by dp_size internally. So
+  # the global budget computed above has to be divided here, or every rank sizes a
+  # KV pool for the whole cluster's load. At CONCUR 128 / DP8 that is 1509888
+  # tokens per rank instead of 188736, which leaves so little HBM that the server
+  # dies during warmup: sglang's startup warmup sends a dummy multimodal request,
+  # the one-time ViT compile it triggers asks for 1.36 GB, and only ~279 MB is
+  # free. Measured -- the recipe could not launch at its own headline operating
+  # point until this line existed.
+  export MAX_TOTAL_TOKENS=${_MAX_TOTAL_FROM_CALLER:-$((_per_rank_conc * CONTEXT_LEN + _per_rank_bs * 2048))}
+
+  # The compiled decode batch bucket is per rank, so a global MAX_RUNNING here
+  # makes every rank precompile buckets it can never fill (bs up to 160 at
+  # CONCUR 128, against a real per-rank batch of ~20) -- pure warmup time and HBM.
+  export TORCH_COMPILE_MAX_BS=$_per_rank_bs
+  dp_args=(
+    --enable-dp-attention
+    --dp-size "$DP_SIZE"
+    --enable-dp-lm-head
+    --enable-prefill-delayer
+    --prefill-delayer-queue-min-ratio 0.5
+    --prefill-delayer-max-delay-ms 2000
+    --prefill-delayer-max-delay-passes "${DELAYER_PASSES:-250}"
+  )
+fi
 
 export MODEL=${MODEL:-Qwen/Qwen3.5-397B-A17B-FP8}
 export TP_SIZE=8
@@ -53,7 +137,8 @@ export MEM_FRACTION_STATIC=0.85
 export CHUNKED_PREFILL_SIZE=$CHUNK
 export MAX_PREFILL_TOKENS=$CHUNK
 export ENABLE_TORCH_COMPILE=1
-export TORCH_COMPILE_MAX_BS=$MAX_RUNNING
+# Already set to the per-rank batch by the DP block above when DP_SIZE>1.
+export TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$MAX_RUNNING}
 
 # XLA / libtpu. Two deliberate departures from common_env.sh's default set:
 #
@@ -137,6 +222,7 @@ export SGLANG_TPU_VIT_PRECOMPILE_SIZES=${SGLANG_TPU_VIT_PRECOMPILE_SIZES-}
 extra_args=(
   --language-only
   --tpu-fp8-runtime channelwise
+  "${dp_args[@]}"
   # NOT set, deliberately:
   #  --enable-fused-qk-norm-rope   the Pallas op is validated for head_dim 128
   #                                and this model is 256, so the flag is a
