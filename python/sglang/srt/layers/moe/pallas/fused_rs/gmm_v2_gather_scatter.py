@@ -31,6 +31,21 @@ def get_maybe_quantize_lhs(
     return True
 
 
+def _online_quantize(block, axis, quant_dtype):
+    """Quantize one activation block and return its dequantization scale."""
+    if jnp.issubdtype(quant_dtype, jnp.floating):
+        dtype_max = float(jnp.finfo(quant_dtype).max)
+    else:
+        dtype_max = float(jnp.iinfo(quant_dtype).max)
+
+    block_f32 = block.astype(jnp.float32)
+    amax = jnp.max(jnp.abs(block_f32), axis=axis, keepdims=True)
+    amax_safe = jnp.where(amax == 0, jnp.ones_like(amax), amax)
+    block_q = (block_f32 / amax_safe * dtype_max).astype(quant_dtype)
+    block_scale = amax / dtype_max
+    return block_q, block_scale
+
+
 # Util.
 def align_to(x, a):
     return pl.cdiv(x, a) * a
@@ -257,6 +272,8 @@ def inner_kernel(
     _num_k: int | None = None,
     _gm_id: int | None = None,
     _n_id: int | None = None,
+    prequantized_lhs_scale_ref=None,
+    prequantized_lhs_scale_start: int = 0,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -311,19 +328,6 @@ def inner_kernel(
         def _get_scale_slice(b_id, start_n, end_n):
             rhs_scale = tiled_rhs_ref.get_scale()
             return rhs_scale[..., b_id, :, start_n:end_n]
-
-        def _online_quantize(block, axis, quant_dtype):
-            if jnp.issubdtype(quant_dtype, jnp.floating):
-                dtype_max = float(jnp.finfo(quant_dtype).max)
-            else:
-                dtype_max = float(jnp.iinfo(quant_dtype).max)
-
-            block_f32 = block.astype(jnp.float32)
-            amax = jnp.max(jnp.abs(block_f32), axis=axis, keepdims=True)
-            amax_safe = jnp.where(amax == 0, jnp.ones_like(amax), amax)
-            block_q = (block_f32 / amax_safe * dtype_max).astype(quant_dtype)
-            block_scale = amax / dtype_max
-            return block_q, block_scale
 
         valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
         if is_last_k_step and valid_k != 0:
@@ -414,9 +418,25 @@ def inner_kernel(
                         block_rhs_for_quant = block_rhs.astype(jnp.bfloat16)
 
                     if fp8_activation_quant:
-                        block_lhs_for_matmul, lhs_scale = _online_quantize(
-                            block_lhs, axis=1, quant_dtype=cfgs.lhs_cfgs.quant_dtype
-                        )
+                        if prequantized_lhs_scale_ref is None:
+                            block_lhs_for_matmul, lhs_scale = _online_quantize(
+                                block_lhs,
+                                axis=1,
+                                quant_dtype=cfgs.lhs_cfgs.quant_dtype,
+                            )
+                        else:
+                            # The producer quantized the FP32 activation before
+                            # storing it. Consume that payload and its exact
+                            # dequantization scale; online-quantizing the FP8
+                            # scratch again would change both rounding and scale.
+                            block_lhs_for_matmul = block_lhs
+                            lhs_scales = prequantized_lhs_scale_ref.reshape(
+                                -1, prequantized_lhs_scale_ref.shape[-1]
+                            )
+                            scale_id = (
+                                prequantized_lhs_scale_start + start_k // q_block_size
+                            )
+                            lhs_scale = lhs_scales[:, scale_id : scale_id + 1]
                         if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
                             # Fold small RHS scale blocks into RHS first, then
                             # requantize to the activation quant dtype so

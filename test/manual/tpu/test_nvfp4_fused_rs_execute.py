@@ -109,15 +109,18 @@ def main() -> None:
 
     from sglang.srt.hardware_backend.tpu.fp4_moe import (
         prepare_tpu_nvfp4_moe_weights,
+        resolve_tpu_nvfp4_numerics,
     )
     from sglang.srt.layers.moe.pallas import fused_moe_rs_op
 
     global_experts = 256
     local_experts = global_experts // world_size
     hidden_size = 4096
-    intermediate_size = 4096
+    intermediate_size = 14336
     topk = 8
     device = torch.device("tpu")
+    numerics_mode = os.environ.get("SGLANG_TPU_NVFP4_NUMERICS_MODE", "baseline")
+    numerics = resolve_tpu_nvfp4_numerics(numerics_mode)
 
     layer = _make_local_nvfp4_layer(
         local_experts, hidden_size, intermediate_size, rank
@@ -137,6 +140,8 @@ def main() -> None:
     no_post_norm = torch.zeros(1, dtype=torch.bfloat16, device=device)
 
     def kernel(hidden_states, topk_weights, topk_ids):
+        if numerics.fp32_combine:
+            topk_weights = topk_weights.float()
         return fused_moe_rs_op.fused_moe_rs_call(
             hidden_states=hidden_states,
             w1=layer.w13_weight,
@@ -151,6 +156,9 @@ def main() -> None:
             activation="silu",
             has_post_expert_norm=False,
             fp8_direct_write=False,
+            fp32_combine=numerics.fp32_combine,
+            direct_fp8_intermediate=numerics.direct_fp8_intermediate,
+            fp32_gmm2_output=numerics.fp32_gmm2_output,
         )
 
     compiled = torch.compile(kernel, fullgraph=True, dynamic=False)
@@ -177,6 +185,7 @@ def main() -> None:
             print(
                 "NVFP4_FUSED_RS_EXECUTE_PASS "
                 f"rank={rank} physical_id={physical_id} tokens={tokens} "
+                f"numerics={numerics_mode} "
                 f"iteration={iteration} shape={tuple(actual.shape)} "
                 f"checksum={checksum:.6f}",
                 flush=True,

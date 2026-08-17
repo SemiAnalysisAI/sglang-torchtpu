@@ -93,7 +93,7 @@ class TestFusedMoeRsOp(CustomTestCase):
                 fused_moe_rs_op,
                 "fused_moe_rs_call",
                 return_value=token_shard,
-            ),
+            ) as fused_call,
         ):
             output = fused_moe_rs_op.fused_moe_rs_gather(
                 hidden_states=torch.zeros(8, 1),
@@ -108,12 +108,19 @@ class TestFusedMoeRsOp(CustomTestCase):
                 topk=1,
                 activation="silu",
                 has_post_expert_norm=False,
-                fp8_direct_write=True,
+                fp8_direct_write=False,
                 physical_order_to_tp_rank=physical_order_to_tp_rank,
+                fp32_combine=True,
+                direct_fp8_intermediate=True,
+                fp32_gmm2_output=True,
             )
 
         torch.testing.assert_close(output, torch.arange(8).reshape(8, 1))
         tp_group.all_gather.assert_called_once_with(token_shard, dim=0)
+        call = fused_call.call_args.kwargs
+        self.assertTrue(call["fp32_combine"])
+        self.assertTrue(call["direct_fp8_intermediate"])
+        self.assertTrue(call["fp32_gmm2_output"])
 
 
 if __name__ == "__main__":

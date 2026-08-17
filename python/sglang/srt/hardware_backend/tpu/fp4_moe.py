@@ -10,6 +10,8 @@ supported because they regress performance. The static ``input_scale`` is unused
 
 from __future__ import annotations
 
+import dataclasses
+
 import torch
 
 from sglang.srt.hardware_backend.tpu.fp8_moe import _clear_replaced_param
@@ -38,6 +40,45 @@ _POST_EXPERT_NORM_WEIGHT_GETTER = "tpu_fused_rs_post_expert_norm_weight"
 # EXTEND4096 precompile on tpu7x. Chunking the call at 1024 tokens avoids it, so
 # do not raise this without re-validating that precompile shape on device.
 _FUSED_RS_MAX_TOKENS_PER_CALL = 1024
+
+
+@dataclasses.dataclass(frozen=True)
+class TpuNvfp4Numerics:
+    """Static W4A8 precision choices for one compiled NVFP4 MoE layer."""
+
+    fp32_combine: bool = False
+    direct_fp8_intermediate: bool = False
+    fp32_gmm2_output: bool = False
+
+
+_TPU_NVFP4_NUMERICS_MODES = {
+    "baseline": TpuNvfp4Numerics(),
+    "fp32_combine": TpuNvfp4Numerics(fp32_combine=True),
+    "direct_fp8": TpuNvfp4Numerics(direct_fp8_intermediate=True),
+    "direct_fp8_fp32_combine": TpuNvfp4Numerics(
+        fp32_combine=True, direct_fp8_intermediate=True
+    ),
+    # Preserving the GMM2 accumulator through normalization and reduction
+    # necessarily includes the FP32-combine boundary.
+    "fp32_gmm2_output": TpuNvfp4Numerics(fp32_combine=True, fp32_gmm2_output=True),
+    "direct_fp8_fp32_gmm2_output": TpuNvfp4Numerics(
+        fp32_combine=True,
+        direct_fp8_intermediate=True,
+        fp32_gmm2_output=True,
+    ),
+}
+
+
+def resolve_tpu_nvfp4_numerics(mode: str) -> TpuNvfp4Numerics:
+    """Resolve a fail-closed W4A8 numerical experiment mode."""
+    normalized = mode.strip().lower()
+    try:
+        return _TPU_NVFP4_NUMERICS_MODES[normalized]
+    except KeyError as error:
+        choices = ", ".join(sorted(_TPU_NVFP4_NUMERICS_MODES))
+        raise ValueError(
+            "SGLANG_TPU_NVFP4_NUMERICS_MODE must be one of " f"{choices}; got {mode!r}."
+        ) from error
 
 
 def has_tpu_fused_rs_post_expert_norm(layer: torch.nn.Module) -> bool:
@@ -339,7 +380,14 @@ def apply_tpu_nvfp4_moe(
 
         hidden_states = dispatch_output.hidden_states
         topk_weights, topk_ids, _ = dispatch_output.topk_output
-        topk_weights = topk_weights.to(hidden_states.dtype)
+        fp32_combine = getattr(layer, "_tpu_nvfp4_fp32_combine", False)
+        direct_fp8_intermediate = getattr(
+            layer, "_tpu_nvfp4_direct_fp8_intermediate", False
+        )
+        fp32_gmm2_output = getattr(layer, "_tpu_nvfp4_fp32_gmm2_output", False)
+        topk_weights = topk_weights.to(
+            torch.float32 if fp32_combine else hidden_states.dtype
+        )
         topk_ids = topk_ids.to(torch.int32)
         valid = topk_ids >= 0
         topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
@@ -380,6 +428,9 @@ def apply_tpu_nvfp4_moe(
                 # intermediate for no bandwidth win, so keep the bf16 payload.
                 fp8_direct_write=False,
                 physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
+                fp32_combine=fp32_combine,
+                direct_fp8_intermediate=direct_fp8_intermediate,
+                fp32_gmm2_output=fp32_gmm2_output,
             )
             outputs.append(output[: token_end - token_start])
         return StandardCombineInput(hidden_states=torch.cat(outputs, dim=0))

@@ -496,10 +496,64 @@ class TestNvfp4Block512Contract(CustomTestCase):
         call = fused_moe_rs_gather.call_args.kwargs
         self.assertFalse(call["fp8_direct_write"])
         self.assertFalse(call["has_post_expert_norm"])
+        self.assertFalse(call["fp32_combine"])
+        self.assertFalse(call["direct_fp8_intermediate"])
+        self.assertFalse(call["fp32_gmm2_output"])
         self.assertNotIn("collective_id", call)
         self.assertEqual(call["topk_ids"][1, 1].item(), 0)
         self.assertEqual(call["topk_weights"][1, 1].item(), 0)
         self.assertEqual(tuple(result.hidden_states.shape), (3, HIDDEN_SIZE))
+
+    def test_fused_apply_forwards_w4a8_numerics_mode(self):
+        from sglang.srt.hardware_backend.tpu import fp4_moe
+        from sglang.srt.layers.moe.pallas import fused_moe_rs_op
+
+        hidden_states = torch.randn(2, HIDDEN_SIZE, dtype=torch.bfloat16)
+        topk_weights = torch.rand(2, 2, dtype=torch.bfloat16)
+        dispatch_output = types.SimpleNamespace(
+            hidden_states=hidden_states,
+            topk_output=(topk_weights, torch.zeros(2, 2, dtype=torch.int64), None),
+        )
+        layer = _make_block512_layer(include_unused_params=False)
+        layer._tpu_fused_rs_has_post_expert_norm = False
+        layer._tpu_fused_rs_group_offset = torch.tensor([0, 0], dtype=torch.int32)
+        layer._tpu_fused_rs_physical_order = torch.tensor([0], dtype=torch.int64)
+        layer._tpu_nvfp4_fp32_combine = True
+        layer._tpu_nvfp4_direct_fp8_intermediate = True
+        layer._tpu_nvfp4_fp32_gmm2_output = True
+        fused_moe_rs_gather = mock.create_autospec(
+            fused_moe_rs_op.fused_moe_rs_gather,
+            return_value=hidden_states,
+        )
+
+        with mock.patch.object(
+            fused_moe_rs_op, "fused_moe_rs_gather", fused_moe_rs_gather
+        ):
+            fp4_moe.apply_tpu_nvfp4_moe(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+                apply_router_weight_on_input=False,
+                use_fused_rs=True,
+            )
+
+        call = fused_moe_rs_gather.call_args.kwargs
+        self.assertTrue(call["fp32_combine"])
+        self.assertTrue(call["direct_fp8_intermediate"])
+        self.assertTrue(call["fp32_gmm2_output"])
+        self.assertIs(call["topk_weights"].dtype, torch.float32)
+
+    def test_w4a8_numerics_modes_fail_closed(self):
+        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+            resolve_tpu_nvfp4_numerics,
+        )
+
+        combined = resolve_tpu_nvfp4_numerics(" direct_fp8_fp32_gmm2_output ")
+        self.assertTrue(combined.fp32_combine)
+        self.assertTrue(combined.direct_fp8_intermediate)
+        self.assertTrue(combined.fp32_gmm2_output)
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            resolve_tpu_nvfp4_numerics("fp4_magic")
 
     def test_fused_apply_chunks_large_prefills(self):
         from sglang.srt.hardware_backend.tpu import fp4_moe
@@ -1156,6 +1210,19 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         self.assertTrue(resolved)
         self.assertTrue(prepared["use_fused_rs"])
 
+    def test_gate_caches_selected_w4a8_numerics(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_TPU_NVFP4_NUMERICS_MODE.override(
+            "direct_fp8_fp32_gmm2_output"
+        ):
+            _, resolved, _, layer = self._run_gate()
+
+        self.assertTrue(resolved)
+        self.assertTrue(layer._tpu_nvfp4_fp32_combine)
+        self.assertTrue(layer._tpu_nvfp4_direct_fp8_intermediate)
+        self.assertTrue(layer._tpu_nvfp4_fp32_gmm2_output)
+
     def test_gate_still_declines_an_unsupported_layout(self):
         # EP 2 inside a world of 4 is the mixed TP/EP shape the requirement
         # list rejects; deferring the decision must not soften the gate.
@@ -1163,6 +1230,15 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
 
         self.assertFalse(resolved)
         self.assertFalse(prepared["use_fused_rs"])
+
+    def test_numerics_mode_fails_if_fused_rs_is_unavailable(self):
+        from sglang.srt.environ import envs
+
+        with (
+            envs.SGLANG_TPU_NVFP4_NUMERICS_MODE.override("fp32_combine"),
+            self.assertRaisesRegex(ValueError, "requires the Pallas fused-RS path"),
+        ):
+            self._run_gate(ep_size=2, world_size=4)
 
     def test_explicit_pallas_backend_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "Unmet requirements"):

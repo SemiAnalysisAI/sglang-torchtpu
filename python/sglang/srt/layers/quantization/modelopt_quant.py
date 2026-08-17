@@ -3059,6 +3059,7 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         """Resolve the TPU MoE backend after the model publishes its contract."""
         from sglang.srt.hardware_backend.tpu.fp4_moe import (
             has_tpu_fused_rs_post_expert_norm,
+            resolve_tpu_nvfp4_numerics,
             unmet_tpu_nvfp4_fused_rs_requirements,
         )
 
@@ -3080,9 +3081,26 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             group_size=self.quant_config.group_size,
             no_combine=self.moe_runner_config.no_combine,
         )
+        numerics_mode = envs.SGLANG_TPU_NVFP4_NUMERICS_MODE.get()
+        normalized_numerics_mode = numerics_mode.strip().lower()
+        numerics = resolve_tpu_nvfp4_numerics(numerics_mode)
         self.handles_moe_reduction = not unmet_requirements
         if self.handles_moe_reduction:
+            layer._tpu_nvfp4_fp32_combine = numerics.fp32_combine
+            layer._tpu_nvfp4_direct_fp8_intermediate = numerics.direct_fp8_intermediate
+            layer._tpu_nvfp4_fp32_gmm2_output = numerics.fp32_gmm2_output
             logger.info("Using TPU Pallas NVFP4 fused-RS MoE backend")
+            if normalized_numerics_mode != "baseline":
+                logger.info(
+                    "Using TPU NVFP4 W4A8 numerics mode %s",
+                    numerics_mode,
+                )
+        elif normalized_numerics_mode != "baseline":
+            raise ValueError(
+                f"TPU NVFP4 W4A8 numerics mode {numerics_mode!r} requires the "
+                "Pallas fused-RS path. Unmet requirements: "
+                + ", ".join(unmet_requirements)
+            )
         elif moe_runner_backend.is_pallas_tpu_fused_rs():
             raise ValueError(
                 "--moe-runner-backend pallas_tpu_fused_rs cannot honor this "

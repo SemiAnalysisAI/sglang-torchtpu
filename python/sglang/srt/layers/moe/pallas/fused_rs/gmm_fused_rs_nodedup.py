@@ -33,6 +33,7 @@ from sglang.srt.layers.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
     MetadataRef,
     TileSizes,
     WeightsRef,
+    _online_quantize,
     align_to,
     calculate_tiling,
     dma_gather_gm_start,
@@ -49,6 +50,7 @@ from sglang.srt.layers.moe.pallas.gmm_v2 import recover_quant_block_size
 
 # TODO(rupliu) when the model is small, latency bound, needs to increase pipeline depth
 _IN_KERNEL_RECV_COUNT_MAX_M = 2048
+_FP8_SCALE_TABLE_WIDTH = 128
 
 # =============================================================================
 # Phase 1: Pre-kernel metadata computation (JAX level)
@@ -88,6 +90,27 @@ def compute_send_routing(output_indices, chunk_size):
     send_dest_chips = output_indices // chunk_size
     send_local_rows = output_indices % chunk_size
     return send_dest_chips, send_local_rows
+
+
+def _quantize_fp8_blockwise(values: jax.Array, block_size: int):
+    """Quantize FP32 values to E4M3 with one exact FP32 scale per K block.
+
+    The scale is the dequantization multiplier. A zero block is represented by
+    an all-zero payload and a zero scale, matching ``inner_kernel``'s online
+    quantization convention without introducing a reciprocal or bf16 rounding.
+    """
+    if values.shape[-1] % block_size:
+        raise ValueError(
+            f"K={values.shape[-1]} must be divisible by block_size={block_size}"
+        )
+    num_blocks = values.shape[-1] // block_size
+    blocks_f32 = values.astype(jnp.float32).reshape(
+        values.shape[:-1] + (num_blocks, block_size)
+    )
+    quantized, scale = _online_quantize(
+        blocks_f32, axis=-1, quant_dtype=jnp.float8_e4m3fn
+    )
+    return quantized.reshape(values.shape), scale[..., 0]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,6 +153,8 @@ def _select_fused_rs_block_sizes(
     act_fn: str | None,
     vmem_limit_bytes: int | None = None,
     fp8_direct_write: bool = False,
+    direct_fp8_intermediate: bool = False,
+    fp32_gmm2_output: bool = False,
 ) -> FusedRsBlockSizes:
     """Deterministic selection of all tile/block sizes for fused_rs.
 
@@ -155,6 +180,7 @@ def _select_fused_rs_block_sizes(
     # --- Step 1: Pad dimensions ---
     num_lanes = pltpu.get_tpu_info().num_lanes
     sls = pltpu.get_tpu_info().get_sublane_tiling(out_dtype)
+    gmm2_output_dtype = jnp.float32 if fp32_gmm2_output else out_dtype
 
     tile_k_unit = num_lanes * sls
     padded_k1 = align_to(size_k1, tile_k_unit)
@@ -167,19 +193,23 @@ def _select_fused_rs_block_sizes(
         new_k2 = size_k2
     padded_k2 = new_k2
 
-    out_sls = pltpu.get_tpu_info().get_sublane_tiling(out_dtype)
+    out_sls = pltpu.get_tpu_info().get_sublane_tiling(gmm2_output_dtype)
     aligned_n2 = align_to(size_n2, num_lanes * out_sls)
 
     # --- Step 2: VMEM budget ---
     fixed_vmem = (
         2 * 256 * size_k1 * jax.dtypes.itemsize_bits(out_dtype) // 8
-        + 2 * 256 * aligned_n2 * jax.dtypes.itemsize_bits(out_dtype) // 8
+        + 2 * 256 * aligned_n2 * jax.dtypes.itemsize_bits(gmm2_output_dtype) // 8
         + 256 * (aligned_n1 // 2 if act_fn else aligned_n1) * 4
+        # Deliberately budget the baseline bf16 intermediate even when the
+        # direct-FP8 experiment stores one byte per element. This keeps its
+        # tile layout identical to baseline, isolating the numerical boundary
+        # instead of changing the FP32 K-reduction partition as a side effect.
         + 256 * padded_k2 * jax.dtypes.itemsize_bits(out_dtype) // 8
         + 256
         * (aligned_n2 // num_lanes)
         * num_lanes
-        * jax.dtypes.itemsize_bits(out_dtype)
+        * jax.dtypes.itemsize_bits(gmm2_output_dtype)
         // 8
     )
     spill_budget = 6 * 1024 * 1024
@@ -224,7 +254,11 @@ def _select_fused_rs_block_sizes(
     )
     tiles2 = calculate_tiling(
         dims2,
-        InputConfigs(quant_dtype=None, quant_block_size=padded_k2, dtype=out_dtype),
+        InputConfigs(
+            quant_dtype=None,
+            quant_block_size=padded_k2,
+            dtype=out_dtype,
+        ),
         rhs2_cfgs,
         fused_vmem,
     )
@@ -240,8 +274,29 @@ def _select_fused_rs_block_sizes(
     )
 
     # --- Step 4: Tuned lookup ---
-    tile_m, tile_k1, tile_n1, tile_k2, tile_n2, num_w1_bufs, num_w2_bufs = (
-        get_fused_rs_tuned_block_sizes(
+    if fp32_gmm2_output:
+        # Existing tuned entries assume a bf16 GMM2 output and can exceed VMEM
+        # when its output/scatter buffers are widened. Keep the deterministic
+        # selector until this arm has dedicated measurements.
+        (
+            tile_m,
+            tile_k1,
+            tile_n1,
+            tile_k2,
+            tile_n2,
+            num_w1_bufs,
+            num_w2_bufs,
+        ) = default_tiles
+    else:
+        (
+            tile_m,
+            tile_k1,
+            tile_n1,
+            tile_k2,
+            tile_n2,
+            num_w1_bufs,
+            num_w2_bufs,
+        ) = get_fused_rs_tuned_block_sizes(
             size_m,
             size_k1,
             aligned_n1,
@@ -255,7 +310,6 @@ def _select_fused_rs_block_sizes(
             fuse_act=act_fn,
             fp8_direct_write=fp8_direct_write,
         )
-    )
     # --- Step 5: Alignment post-processing ---
     k_align1 = num_lanes
     if tile_k1 % k_align1 != 0:
@@ -280,12 +334,13 @@ def _select_fused_rs_block_sizes(
         while tile_n2 > num_lanes and size_n2 % tile_n2 != 0:
             tile_n2 -= num_lanes
 
-    if tile_k2 % num_lanes != 0:
-        tile_k2 = (tile_k2 // num_lanes) * num_lanes or num_lanes
+    k2_alignment = 512 if direct_fp8_intermediate else num_lanes
+    if tile_k2 % k2_alignment != 0:
+        tile_k2 = (tile_k2 // k2_alignment) * k2_alignment or k2_alignment
     if padded_k2 % tile_k2 != 0:
         tk2_adj = tile_k2
-        while tk2_adj > num_lanes and padded_k2 % tk2_adj != 0:
-            tk2_adj -= num_lanes
+        while tk2_adj > k2_alignment and padded_k2 % tk2_adj != 0:
+            tk2_adj -= k2_alignment
         tile_k2 = tk2_adj if (tk2_adj > 0 and padded_k2 % tk2_adj == 0) else padded_k2
 
     # NOTE: fp8 direct-write tile_m sizing is now handled in Step 4
@@ -300,6 +355,8 @@ def _select_fused_rs_block_sizes(
     assert (
         padded_k2 % tile_k2 == 0
     ), f"tile_k2={tile_k2} must divide padded_k2={padded_k2}"
+    if direct_fp8_intermediate:
+        assert tile_k2 % 512 == 0, f"tile_k2={tile_k2} must preserve FP8 blocks"
     assert (
         aligned_n1 % tile_n1 == 0
     ), f"tile_n1={tile_n1} must divide aligned_n1={aligned_n1}"
@@ -407,6 +464,7 @@ def kernel_main_fused_rs(
     top_k: int,
     pack_indices: bool = True,
     fp8_direct_write: bool = False,
+    direct_fp8_intermediate: bool = False,
     use_in_kernel_recv_count: bool = True,
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
@@ -815,6 +873,17 @@ def kernel_main_fused_rs(
         lhs_data = intermediate_ref[
             pl.ds(0, m_rows // dims.size_lhs_sublane), :, pl.ds(k_id * tile_k2, tile_k2)
         ]
+        if direct_fp8_intermediate:
+            lhs_quant_block_size = cfgs2.lhs_cfgs.quant_block_size
+            scale_blocks_per_tile = tile_k2 // lhs_quant_block_size
+            lhs_scale = gmm1_out_ref.at[
+                pl.ds(0, m_rows),
+                pl.ds(0, _FP8_SCALE_TABLE_WIDTH),
+            ]
+            lhs_scale_start = k_id * scale_blocks_per_tile
+        else:
+            lhs_scale = None
+            lhs_scale_start = 0
         w2_tile = w2_buf_ref.at[buf_id]
         w2_sc = w2_scale_buf_ref.at[buf_id] if has_scale else None
         inner_kernel(
@@ -836,6 +905,8 @@ def kernel_main_fused_rs(
             _num_k=num_k2,
             _gm_id=0,
             _n_id=n_id,
+            prequantized_lhs_scale_ref=lhs_scale,
+            prequantized_lhs_scale_start=lhs_scale_start,
         )
 
     # Initialize per-slot DMA counts to 0.
@@ -1096,8 +1167,10 @@ def kernel_main_fused_rs(
                         start_w1_dma(_i, next_e, _i // num_k1, _i % num_k1)
 
             with jax.named_scope("interlude"):
-                # Copy gmm1_out (f32) to intermediate_ref (bf16, scatter layout).
-                # Activation was already applied inside inner_kernel via fuse_act.
+                # Activation was already applied in FP32 inside inner_kernel.
+                # Baseline rounds that result to bf16 scratch. The W4A8
+                # experiment instead quantizes FP32 directly to E4M3 and keeps
+                # its FP32 block scales in the now-dead GMM1 accumulator.
                 def _interlude(m_rows):
                     gmm1_result = gmm1_out_ref[pl.ds(0, m_rows)]
                     k2_pad = dims.size_k2 - gmm1_result.shape[1]
@@ -1110,9 +1183,29 @@ def kernel_main_fused_rs(
                             axis=1,
                         )
                     m_sub = m_rows // dims.size_lhs_sublane
-                    intermediate_ref[pl.ds(0, m_sub)] = gmm1_result.astype(
-                        out_dtype
-                    ).reshape(m_sub, dims.size_lhs_sublane, dims.size_k2)
+                    if direct_fp8_intermediate:
+                        lhs_quant_block_size = cfgs2.lhs_cfgs.quant_block_size
+                        quantized, scales = _quantize_fp8_blockwise(
+                            gmm1_result, lhs_quant_block_size
+                        )
+                        intermediate_ref[pl.ds(0, m_sub)] = quantized.reshape(
+                            m_sub, dims.size_lhs_sublane, dims.size_k2
+                        )
+                        num_scale_blocks = dims.size_k2 // lhs_quant_block_size
+                        scale_table = jnp.pad(
+                            scales,
+                            (
+                                (0, 0),
+                                (0, _FP8_SCALE_TABLE_WIDTH - num_scale_blocks),
+                            ),
+                        )
+                        gmm1_out_ref[
+                            pl.ds(0, m_rows), pl.ds(0, _FP8_SCALE_TABLE_WIDTH)
+                        ] = scale_table
+                    else:
+                        intermediate_ref[pl.ds(0, m_sub)] = gmm1_result.astype(
+                            out_dtype
+                        ).reshape(m_sub, dims.size_lhs_sublane, dims.size_k2)
 
                 _dispatch(_interlude)
 
@@ -1433,6 +1526,7 @@ def kernel_main_fused_rs_fp8(
     ep_axis_name: str,
     top_k: int,
     pack_indices: bool = True,
+    direct_fp8_intermediate: bool = False,
     use_in_kernel_recv_count: bool = True,
 ):
     """FP8 direct-write wrapper with output refs ordered for pallas_call."""
@@ -1505,6 +1599,7 @@ def kernel_main_fused_rs_fp8(
         top_k=top_k,
         pack_indices=pack_indices,
         fp8_direct_write=True,
+        direct_fp8_intermediate=direct_fp8_intermediate,
         use_in_kernel_recv_count=use_in_kernel_recv_count,
     )
 
@@ -1523,6 +1618,8 @@ def kernel_main_fused_rs_fp8(
         "ep_axis_name",
         "top_k",
         "fp8_direct_write",
+        "direct_fp8_intermediate",
+        "fp32_gmm2_output",
         "use_in_kernel_recv_count",
     ],
 )
@@ -1551,6 +1648,8 @@ def gmm_v2_fused_rs(
     max_num_gm: jax.Array,
     top_k: int,
     fp8_direct_write: bool = False,
+    direct_fp8_intermediate: bool = False,
+    fp32_gmm2_output: bool = False,
     use_in_kernel_recv_count: bool | None = None,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
@@ -1566,6 +1665,10 @@ def gmm_v2_fused_rs(
         use_in_kernel_recv_count = size_m <= _IN_KERNEL_RECV_COUNT_MAX_M
 
     is_quantized = w1_scale is not None
+    if direct_fp8_intermediate and not is_quantized:
+        raise ValueError("direct FP8 intermediate requires quantized W4A8 weights")
+    if fp32_gmm2_output and fp8_direct_write:
+        raise ValueError("FP32 GMM2 output is incompatible with FP8 direct-write")
     if is_quantized:
         assert w2_scale is not None
         rhs1_quant_block_size = recover_quant_block_size(size_k1, w1_scale.shape[1])
@@ -1604,6 +1707,8 @@ def gmm_v2_fused_rs(
     num_lanes = pltpu.get_tpu_info().num_lanes
     sls = pltpu.get_tpu_info().get_sublane_tiling(hidden_states.dtype)
     out_dtype = hidden_states.dtype
+    intermediate_dtype = jnp.float8_e4m3fn if direct_fp8_intermediate else out_dtype
+    gmm2_output_dtype = jnp.float32 if fp32_gmm2_output else out_dtype
     intermediate_size = size_n1 // 2
 
     # --- Single source of truth for all block/tile sizes ---
@@ -1625,6 +1730,8 @@ def gmm_v2_fused_rs(
         act_fn=act_fn,
         vmem_limit_bytes=vmem_limit_bytes,
         fp8_direct_write=fp8_direct_write,
+        direct_fp8_intermediate=direct_fp8_intermediate,
+        fp32_gmm2_output=fp32_gmm2_output,
     )
     tile_m = block_sizes.tile_m
     tile_k1 = block_sizes.tile_k1
@@ -1763,6 +1870,25 @@ def gmm_v2_fused_rs(
     rhs2_packing = (32 // jax.dtypes.itemsize_bits(w2.dtype)) if is_quantized else 1
     lhs1_quant_block_size = min(256 if rhs1_quant_block_size < 512 else 512, size_k1)
     lhs2_quant_block_size = min(256 if rhs2_quant_block_size < 512 else 512, size_k2)
+    if direct_fp8_intermediate:
+        if not get_maybe_quantize_lhs(
+            w2.dtype, rhs2_quant_block_size, lhs2_quant_block_size
+        ):
+            raise ValueError("direct FP8 intermediate requires the W4A8 GMM2 path")
+        if size_k2 % lhs2_quant_block_size:
+            raise ValueError(
+                "direct FP8 intermediate requires K2 to divide its activation "
+                f"block size exactly, got K2={size_k2}, "
+                f"block={lhs2_quant_block_size}"
+            )
+        num_lhs2_scale_blocks = size_k2 // lhs2_quant_block_size
+        if size_k2 < _FP8_SCALE_TABLE_WIDTH or (
+            num_lhs2_scale_blocks > _FP8_SCALE_TABLE_WIDTH
+        ):
+            raise ValueError(
+                "direct FP8 intermediate scale table does not fit the recycled "
+                f"GMM1 accumulator: K2={size_k2}, blocks={num_lhs2_scale_blocks}"
+            )
 
     cfgs1 = GmmConfigs(
         dims=Dimensions(
@@ -1821,7 +1947,7 @@ def gmm_v2_fused_rs(
                 else None
             ),
             quant_block_size=lhs2_quant_block_size,
-            dtype=out_dtype,
+            dtype=intermediate_dtype,
         ),
         rhs_cfgs=InputConfigs(
             quant_dtype=w2.dtype if is_quantized else None,
@@ -1832,7 +1958,7 @@ def gmm_v2_fused_rs(
             packing=rhs2_packing,
             num_quant_blocks=total_scale_blocks2 if is_quantized else 1,
         ),
-        out_dtype=out_dtype,
+        out_dtype=gmm2_output_dtype,
         acc_dtype=jnp.float32,
         zero_init=False,
     )
@@ -1857,12 +1983,15 @@ def gmm_v2_fused_rs(
         # gmm1_out_ref
         pltpu.VMEM((tile_m, size_n1 // 2 if act_fn else size_n1), jnp.float32),
         # intermediate_ref
-        pltpu.VMEM((tile_m // size_lhs_sublane, size_lhs_sublane, size_k2), out_dtype),
+        pltpu.VMEM(
+            (tile_m // size_lhs_sublane, size_lhs_sublane, size_k2),
+            intermediate_dtype,
+        ),
         # tiled_out_2x_ref
-        pltpu.VMEM((2, tile_m, aligned_n2), out_dtype),
+        pltpu.VMEM((2, tile_m, aligned_n2), gmm2_output_dtype),
         # scatter_staging_3x_ref — 4D: first-dim selects triple-buffer slot,
         # avoids dynamic offset that triggers Mosaic VMEM tiling alignment error.
-        pltpu.VMEM((3, tile_m, n2_cols, num_lanes), out_dtype),
+        pltpu.VMEM((3, tile_m, n2_cols, num_lanes), gmm2_output_dtype),
         # partial_out1_ref
         pltpu.VMEM((size_lhs_sublane, tile_n1 * 2 if act_fn else tile_n1), jnp.float32),
         # partial_out2_ref
@@ -1996,7 +2125,7 @@ def gmm_v2_fused_rs(
     # Output buffer — also serves as ICI DMA target. In the FP8 direct-write
     # path this stores quantized payload rows; row scales are returned as a
     # second output and dequantized immediately after the kernel.
-    payload_dtype = jnp.float8_e4m3fn if fp8_direct_write else out_dtype
+    payload_dtype = jnp.float8_e4m3fn if fp8_direct_write else gmm2_output_dtype
     out_buf_init = jax.ShapeDtypeStruct(
         (chunk_size * top_k, n2_cols, num_lanes), payload_dtype
     )
@@ -2048,6 +2177,8 @@ def gmm_v2_fused_rs(
         f"-K1_{size_k1}-N1_{size_n1}-K2_{size_k2}-N2_{size_n2}"
         f"-EP_{ep_size}-TK_{top_k}"
         f"{'-packed' if pack_indices else ''}"
+        f"{'-direct-fp8-intermediate' if direct_fp8_intermediate else ''}"
+        f"{'-fp32-gmm2-output' if fp32_gmm2_output else ''}"
     )
     kernel_kwargs = dict(
         fused_dims=fused_dims,
@@ -2067,6 +2198,7 @@ def gmm_v2_fused_rs(
         ep_axis_name=ep_axis_name,
         top_k=top_k,
         pack_indices=pack_indices,
+        direct_fp8_intermediate=direct_fp8_intermediate,
         use_in_kernel_recv_count=use_in_kernel_recv_count,
     )
     in_specs = [
@@ -2103,7 +2235,7 @@ def gmm_v2_fused_rs(
             name=f"{pallas_name}-fp8-direct-write",
         )(*pallas_inputs)
         payload_2d = payload.reshape(chunk_size * top_k, aligned_n2).astype(jnp.float32)
-        return (payload_2d * row_scales[:, :1]).astype(out_dtype)[:, :size_n2]
+        return (payload_2d * row_scales[:, :1]).astype(gmm2_output_dtype)[:, :size_n2]
 
     result = pl.pallas_call(
         functools.partial(kernel_main_fused_rs, **kernel_kwargs),

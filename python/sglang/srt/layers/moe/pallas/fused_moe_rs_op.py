@@ -109,6 +109,9 @@ def _build_fused_moe_rs_op():
         activation: str,
         has_post_expert_norm: bool,
         fp8_direct_write: bool,
+        fp32_combine: bool,
+        direct_fp8_intermediate: bool,
+        fp32_gmm2_output: bool,
     ) -> jax.Array:
         num_tokens = hidden_states.shape[0]
         ep_size = mesh.shape["model"]
@@ -143,6 +146,9 @@ def _build_fused_moe_rs_op():
                 post_expert_norm_weight if has_post_expert_norm else None
             ),
             fp8_direct_write=fp8_direct_write,
+            fp32_combine=fp32_combine,
+            direct_fp8_intermediate=direct_fp8_intermediate,
+            fp32_gmm2_output=fp32_gmm2_output,
         )
         if not has_post_expert_norm:
             result = result + post_expert_norm_weight[0].astype(result.dtype) * 0
@@ -163,6 +169,9 @@ def _build_fused_moe_rs_op():
             P(),
             P(),
             P("model"),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -188,6 +197,9 @@ def fused_moe_rs_call(
     activation: str,
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
+    fp32_combine: bool = False,
+    direct_fp8_intermediate: bool = False,
+    fp32_gmm2_output: bool = False,
 ) -> torch.Tensor:
     return _build_fused_moe_rs_op()(
         hidden_states,
@@ -203,6 +215,9 @@ def fused_moe_rs_call(
         activation,
         has_post_expert_norm,
         fp8_direct_write,
+        fp32_combine,
+        direct_fp8_intermediate,
+        fp32_gmm2_output,
     )
 
 
@@ -223,6 +238,9 @@ def fused_moe_rs_gather(
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
     physical_order_to_tp_rank: torch.Tensor,
+    fp32_combine: bool = False,
+    direct_fp8_intermediate: bool = False,
+    fp32_gmm2_output: bool = False,
 ) -> torch.Tensor:
     from sglang.srt.distributed import get_tp_group
 
@@ -240,6 +258,9 @@ def fused_moe_rs_gather(
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=fp8_direct_write,
+        fp32_combine=fp32_combine,
+        direct_fp8_intermediate=direct_fp8_intermediate,
+        fp32_gmm2_output=fp32_gmm2_output,
     )
     output = get_tp_group().all_gather(token_shard, dim=0)
     shard_tokens = token_shard.shape[0]

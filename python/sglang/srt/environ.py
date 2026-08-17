@@ -683,6 +683,9 @@ class Envs:
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
+    # TPU block-512 NVFP4 W4A8 numerical experiment. The accepted modes are
+    # validated by the TPU adapter before the first fused-RS compilation.
+    SGLANG_TPU_NVFP4_NUMERICS_MODE = EnvStr("baseline")
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
