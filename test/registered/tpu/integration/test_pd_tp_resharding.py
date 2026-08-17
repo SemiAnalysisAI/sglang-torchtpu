@@ -495,6 +495,41 @@ _PROMPTS = (
 )
 
 
+class GenerationRecord(msgspec.Struct, frozen=True, kw_only=True):
+    text: str
+    prompt_tokens: int
+    completion_tokens: int
+    latency_seconds: float
+
+
+def _generate(
+    base_url: str, prompt: str, max_new_tokens: int = 32
+) -> GenerationRecord:
+    started = time.perf_counter()
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/generate",
+        data=json.dumps(
+            {
+                "text": prompt,
+                "sampling_params": {
+                    "temperature": 0.0,
+                    "max_new_tokens": max_new_tokens,
+                },
+            }
+        ).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=900) as resp:
+        payload = json.loads(resp.read())
+    meta = payload.get("meta_info") or {}
+    return GenerationRecord(
+        text=payload["text"],
+        prompt_tokens=int(meta.get("prompt_tokens") or 0),
+        completion_tokens=int(meta.get("completion_tokens") or 0),
+        latency_seconds=round(time.perf_counter() - started, 3),
+    )
+
+
 def run_tp_resharding_probe(base_url: str, profile: ModelProfile) -> None:
     records = []
     for i, prompt in enumerate(_PROMPTS):
@@ -525,6 +560,30 @@ def run_tp_resharding_probe(base_url: str, profile: ModelProfile) -> None:
     )
 
 
+def run_gsm8k(base_url: str, profile: ModelProfile, config: Gsm8kConfig) -> float:
+    from sglang.test.run_eval import run_eval
+
+    metrics = run_eval(
+        SimpleNamespace(
+            base_url=base_url.rstrip("/"),
+            model=profile.served_name,
+            eval_name="gsm8k",
+            api="chat",
+            num_examples=config.num_examples,
+            num_threads=config.num_threads,
+            num_shots=5,
+            max_tokens=config.max_tokens,
+            temperature=0.0,
+            top_p=1.0,
+            reasoning_effort=profile.reasoning_effort,
+            chat_template_kwargs=profile.chat_template_kwargs,
+            gsm8k_data_path=None,
+        )
+    )
+    return float(metrics["score"])
+
+
+# --------------------------- process/launch plumbing -------------------------
 
 
 def _launch(script: str, extra_env: Dict[str, str], log_path: str) -> subprocess.Popen:
@@ -536,7 +595,7 @@ def _launch(script: str, extra_env: Dict[str, str], log_path: str) -> subprocess
         env=env,
         stdout=log,
         stderr=subprocess.STDOUT,
-        preexec_fn=os.setsid,  # own pgid so teardown can killpg
+        preexec_fn=os.setsid,
         cwd=BENCH,
     )
 
@@ -558,7 +617,7 @@ def _http_ok(url: str, timeout: int = 5) -> bool:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
             return 200 <= r.status < 300
-    except Exception:  # noqa: BLE001 - any transport error means "not healthy"
+    except Exception:
         return False
 
 
@@ -574,81 +633,72 @@ def _wait_http_200(url: str, secs: int, procs: Tuple = ()) -> None:
     raise TimeoutError(f"{url} not ready after {secs}s")
 
 
-def _assert_raiden_engaged(log_path: str) -> None:
-    with open(log_path, "rb") as f:
-        log = f.read().decode(errors="replace")
-    if RAIDEN_READY_MARKER not in log:
-        raise AssertionError(
-            f"{RAIDEN_READY_MARKER!r} never appeared in {log_path} -- the raiden "
-            "offload engine did not initialize on the prefill engine"
-        )
-
-
 # ------------------------------- leader case ---------------------------------
 
 
-
 class TestPdTpResharding(unittest.TestCase):
+    """Prefill leader (role=prefill rank=0): orchestrates and asserts the run."""
+
+    procs: list[subprocess.Popen] = []
+    topo: PodTopology
+    profile: ModelProfile
+
     @classmethod
     def setUpClass(cls) -> None:
         if SGLANG_IMPORT_ERROR is not None:
             raise unittest.SkipTest(
                 f"SGLang runtime unavailable: {SGLANG_IMPORT_ERROR}"
             )
-        cls.profile = select_profile(E("MODEL_PROFILE", ""))
-        cls.gsm8k_config = Gsm8kConfig.from_env(cls.profile)
         cls.topo = PodTopology.from_env()
-        validate_model_source(cls.profile, resolve_model_path(cls.profile))
+        cls.profile = select_profile(E("MODEL_PROFILE", ""))
+        model_path = resolve_model_path(cls.profile)
+        validate_model_source(cls.profile, model_path)
+        cls.gsm8k_config = Gsm8kConfig.from_env(cls.profile)
+        cls.procs = []
 
-        cls.procs: list[subprocess.Popen] = []
-        try:
-            prefill_env = build_prefill_env(cls.profile, cls.topo.group_hosts)
-            cls.procs.append(
-                _launch("launch_prefill.sh", prefill_env, PREFILL_LOG)
-            )
+        self_host = cls.topo.group_hostnames[0]
+        decode_host = peer_group_hostname(
+            self_host, from_role=ROLE_PREFILL, to_role=ROLE_DECODE
+        )
 
-            decode_host = peer_group_hostname(
-                cls.topo.group_hostnames[0],
-                from_role=ROLE_PREFILL,
-                to_role=ROLE_DECODE,
+        cls.procs.append(
+            _launch(
+                "launch_prefill.sh",
+                build_prefill_env(cls.profile, cls.topo.group_hosts),
+                PREFILL_LOG,
             )
-            _wait_healthy(
-                "decode",
-                f"http://{decode_host}:{DECODE_PORT}/health",
-                timeout=WAIT_SECS,
-            )
+        )
+        _wait_http_200(
+            f"http://127.0.0.1:{PREFILL_PORT}/health", WAIT_SECS, tuple(cls.procs)
+        )
+        _wait_http_200(f"http://{decode_host}:{DECODE_PORT}/health", WAIT_SECS)
 
-            _wait_healthy(
-                "prefill",
-                f"http://127.0.0.1:{PREFILL_PORT}/health",
-                proc=cls.procs[0],
-                timeout=WAIT_SECS,
+        # The mini-LB injects the --prefill hostname into requests as the KV
+        # bootstrap address the decode pods dial -- it must be this pod's
+        # cluster-reachable name, never 127.0.0.1.
+        cls.procs.append(
+            subprocess.Popen(
+                [
+                    PYTHON,
+                    "-m",
+                    "sglang_router.launch_router",
+                    "--pd-disaggregation",
+                    "--mini-lb",
+                    "--prefill",
+                    f"http://{self_host}:{PREFILL_PORT}",
+                    "--decode",
+                    f"http://{decode_host}:{DECODE_PORT}",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    str(LB_PORT),
+                ],
+                stdout=open(LB_LOG, "ab"),
+                stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid,
             )
-
-            lb_env = {
-                "PYTHON": PYTHON,
-                "PREFILL_HOST": "127.0.0.1",
-                "PREFILL_PORT": str(PREFILL_PORT),
-                "DECODE_HOST": decode_host,
-                "DECODE_PORT": str(DECODE_PORT),
-                "LB_PORT": str(LB_PORT),
-            }
-            cls.procs.append(
-                _launch(
-                    "recipe/pd_lb.py" if os.path.isfile(os.path.join(BENCH, "recipe/pd_lb.py")) else "profile/pd_lb.py",
-                    lb_env,
-                    LB_LOG,
-                )
-            )
-            _wait_healthy(
-                "pd_lb",
-                f"http://127.0.0.1:{LB_PORT}/health",
-                proc=cls.procs[-1],
-                timeout=120,
-            )
-        except Exception:
-            cls.tearDownClass()
-            raise
+        )
+        _wait_http_200(f"http://127.0.0.1:{LB_PORT}/health", 300, tuple(cls.procs))
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -680,6 +730,60 @@ class TestPdTpResharding(unittest.TestCase):
         )
         print(f"gsm8k score={score:.4f} floor={self.gsm8k_config.threshold:.4f}")
         self.assertGreaterEqual(score, self.gsm8k_config.threshold)
+
+
+# ------------------------------ worker serving -------------------------------
+
+
+def _serve_role(topo: PodTopology, profile: ModelProfile) -> int:
+    """Non-leader pods: serve this pod's engine role until the leader is done.
+
+    No cross-slice shutdown channel exists, so workers watch the leader's
+    prefill server: healthy once and then gone means the verdict is in. A pod's
+    own engine dying early still gates -- the leader fails independently when a
+    peer it needs is broken, and unambiguous local deaths return nonzero.
+    """
+    if topo.role == ROLE_DECODE:
+        script, env, log = (
+            "launch_decode.sh",
+            build_decode_env(profile, topo.group_hosts),
+            DECODE_LOG,
+        )
+        leader_host = peer_group_hostname(
+            topo.group_hostnames[0], from_role=ROLE_DECODE, to_role=ROLE_PREFILL
+        )
+    else:
+        script, env, log = (
+            "launch_prefill.sh",
+            build_prefill_env(profile, topo.group_hosts),
+            PREFILL_LOG,
+        )
+        leader_host = topo.group_hostnames[0]
+
+    proc = _launch(script, env, log)
+    leader_url = f"http://{leader_host}:{PREFILL_PORT}/health"
+    leader_seen, misses, waited = False, 0, 0
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            if leader_seen and not _http_ok(leader_url):
+                print(f"[{topo.role}:{topo.group_rank}] exited during teardown")
+                return 0
+            return rc
+        if _http_ok(leader_url):
+            leader_seen, misses = True, 0
+        elif leader_seen:
+            misses += 1
+            if misses >= 6:
+                print(f"[{topo.role}:{topo.group_rank}] leader gone; stopping")
+                _kill(proc)
+                return 0
+        elif waited > WAIT_SECS + 600:
+            print(f"[{topo.role}:{topo.group_rank}] leader never healthy; stopping")
+            _kill(proc)
+            return 0
+        time.sleep(10)
+        waited += 10
 
 
 class TestPdTpReshardingConfiguration(unittest.TestCase):
