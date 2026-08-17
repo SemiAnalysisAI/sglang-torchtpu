@@ -24,6 +24,7 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _restore_forward_batch_inputs,
     build_bucketers,
 )
+from sglang.srt.hardware_backend.tpu.real_token_count import publish_real_token_count
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
@@ -578,6 +579,30 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         setattr(forward_batch, _REAL_Q_KEY, real_q)
         setattr(forward_batch, _REAL_B_KEY, real_b)
+        # Publish the real token count for the MoE's padded-row skip. Here,
+        # because this runs *before* the compiled decoder, so the in-place buffer
+        # update is not traced and the value is free to vary per step.
+        #
+        # Extend only: decode fills its bs bucket almost exactly (`#running-req 4`
+        # into a bucket of 4 in 268/289 batches), so there is no padding to skip,
+        # and enabling it on decode measured median ITL 7.657 -> 8.048 ms (+5.1%)
+        # -- the per-layer arange/compare/where is pure added op count on a step
+        # that is op-count-bound. Extend and decode compile separately, so
+        # switching the gate on forward mode does not add a graph.
+        #
+        # NOT under DP attention: a sparse layer's `mlp_mode` is `ScatterMode.FULL`,
+        # so `LayerCommunicator.prepare_mlp` dp-gathers into the global buffer and
+        # the MoE sees every rank's rows, laid out rank-major. `real_q` is this
+        # rank's count, so one positional threshold would retire all of the other
+        # ranks' rows. Expressing it there needs a per-rank mask over the gathered
+        # layout, which is not what was measured.
+        publish_real_token_count(
+            device=forward_batch.input_ids.device,
+            real_q=real_q,
+            enabled=(
+                forward_batch.forward_mode.is_extend() and not is_dp_attention_enabled()
+            ),
+        )
         spec_info = forward_batch.spec_info
         if spec_info is not None:
             spec_info.record_padding(

@@ -22,6 +22,7 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     _get_hbm_usage_mb,
     _hbm_delta_str,
 )
+from sglang.srt.hardware_backend.tpu.real_token_count import publish_real_token_count
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -661,6 +662,13 @@ class SpecDecodeCompilePolicyMixin:
 
     def _pad_draft_extend(self, forward_batch: ForwardBatch) -> None:
         """Bucket V2 draft-extend before attention metadata is constructed."""
+        # Draft extend bypasses DecoderTpuCompilePolicy.prepare_forward_batch, so
+        # clear the MoE padded-row channel rather than letting the previous
+        # extend's count stay published: it describes a different token layout,
+        # and a stale count would retire real draft rows.
+        publish_real_token_count(
+            device=forward_batch.input_ids.device, real_q=0, enabled=False
+        )
         if self.b_bucketer is None:
             return
         draft_extend_input = forward_batch.spec_info

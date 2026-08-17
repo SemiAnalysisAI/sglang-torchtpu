@@ -10,6 +10,10 @@ import torch.nn.functional as F
 import sglang.srt.hardware_backend.tpu.fp8_moe as tpu_fp8_moe
 import sglang.srt.layers.moe.pallas.fused_moe_op as fused_moe_op_module
 import sglang.srt.layers.quantization.fp8 as fp8_mod
+from sglang.srt.hardware_backend.tpu.real_token_count import (
+    publish_real_token_count,
+    reset_real_token_count,
+)
 from sglang.srt.layers.moe.pallas.fused_moe_op import (
     _build_fused_moe_op,
     fused_moe_call,
@@ -199,9 +203,117 @@ class TestTpuFp8MoE(CustomTestCase):
             captured["topk_weights"],
             torch.tensor([[0.75, 0.0], [1.0, 0.5]], dtype=torch.bfloat16),
         )
+        # The -1 slot is retired to a SENTINEL id of 2, not to expert 0. There
+        # are 2 local experts (w13_weight.shape[0]) and no EP, so 2 is out of
+        # range for the group one-hot in `_fused_moe_jax` and the retired slot
+        # joins no group -- expert 0 would have made the matmul do its work.
         torch.testing.assert_close(
-            captured["topk_ids"], torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)
+            captured["topk_ids"], torch.tensor([[0, 2], [1, 0]], dtype=torch.int32)
         )
+
+    def test_fp8_moe_retires_bucket_padded_rows(self):
+        """A published real token count must retire the rows past it.
+
+        This is the wiring test for the padded-row skip: the compile policy
+        publishes the count outside the compiled region, and the MoE has to pick
+        it up here and point those rows at the sentinel with zero weight. Without
+        it the bucket's padding rows route like ordinary tokens and the grouped
+        matmul streams expert weights for them.
+        """
+        method = object.__new__(Fp8MoEMethod)
+        method.moe_runner_config = SimpleNamespace(
+            activation="silu",
+            apply_router_weight_on_input=False,
+            no_combine=False,
+        )
+        method.block_quant = False
+        hidden_states = torch.randn(2, 8, dtype=torch.bfloat16)
+        topk_weights = torch.tensor([[0.75, 0.25], [1.0, 0.5]], dtype=torch.bfloat16)
+        topk_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
+        layer = SimpleNamespace(
+            num_fused_shared_experts=0,
+            w13_weight=torch.empty(2, 8, 16, dtype=torch.float8_e4m3fn),
+            w2_weight=torch.empty(2, 8, 8, dtype=torch.float8_e4m3fn),
+            w13_weight_scale=torch.ones(2, 1, 1, 16, dtype=torch.float32),
+            w2_weight_scale=torch.ones(2, 1, 1, 8, dtype=torch.float32),
+        )
+        dispatch_output = SimpleNamespace(
+            hidden_states=hidden_states,
+            topk_output=(topk_weights, topk_ids, None),
+        )
+        # Row 0 is real, row 1 stands in for the bucket's padding.
+        publish_real_token_count(device=torch.device("cpu"), real_q=1, enabled=True)
+        self.addCleanup(reset_real_token_count)
+        with (
+            patch.object(fp8_mod, "_is_tpu", True),
+            patch.object(
+                tpu_fp8_moe,
+                "get_parallel",
+                return_value=SimpleNamespace(moe_ep_size=1, moe_ep_rank=0),
+            ),
+            patch.object(
+                tpu_fp8_moe,
+                "fused_moe_call",
+                side_effect=lambda **kw: torch.zeros_like(kw["hidden_states"]),
+            ) as fused_moe,
+        ):
+            method.apply(layer, dispatch_output)
+
+        captured = fused_moe.call_args.kwargs
+        torch.testing.assert_close(
+            captured["topk_ids"], torch.tensor([[0, 1], [2, 2]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            captured["topk_weights"],
+            torch.tensor([[0.75, 0.25], [0.0, 0.0]], dtype=torch.bfloat16),
+        )
+
+    def test_fp8_moe_keeps_every_row_when_no_count_is_published(self):
+        """No published count means "no padding info", so nothing is retired.
+
+        The failure mode this guards is the inverse reading -- treating an absent
+        count as "no row is real" would silently drop the whole batch.
+        """
+        reset_real_token_count()
+        method = object.__new__(Fp8MoEMethod)
+        method.moe_runner_config = SimpleNamespace(
+            activation="silu",
+            apply_router_weight_on_input=False,
+            no_combine=False,
+        )
+        method.block_quant = False
+        hidden_states = torch.randn(2, 8, dtype=torch.bfloat16)
+        topk_weights = torch.tensor([[0.75, 0.25], [1.0, 0.5]], dtype=torch.bfloat16)
+        topk_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
+        layer = SimpleNamespace(
+            num_fused_shared_experts=0,
+            w13_weight=torch.empty(2, 8, 16, dtype=torch.float8_e4m3fn),
+            w2_weight=torch.empty(2, 8, 8, dtype=torch.float8_e4m3fn),
+            w13_weight_scale=torch.ones(2, 1, 1, 16, dtype=torch.float32),
+            w2_weight_scale=torch.ones(2, 1, 1, 8, dtype=torch.float32),
+        )
+        dispatch_output = SimpleNamespace(
+            hidden_states=hidden_states,
+            topk_output=(topk_weights, topk_ids, None),
+        )
+        with (
+            patch.object(fp8_mod, "_is_tpu", True),
+            patch.object(
+                tpu_fp8_moe,
+                "get_parallel",
+                return_value=SimpleNamespace(moe_ep_size=1, moe_ep_rank=0),
+            ),
+            patch.object(
+                tpu_fp8_moe,
+                "fused_moe_call",
+                side_effect=lambda **kw: torch.zeros_like(kw["hidden_states"]),
+            ) as fused_moe,
+        ):
+            method.apply(layer, dispatch_output)
+
+        captured = fused_moe.call_args.kwargs
+        torch.testing.assert_close(captured["topk_ids"], topk_ids.to(torch.int32))
+        torch.testing.assert_close(captured["topk_weights"], topk_weights)
 
     def test_fp8_moe_forwards_ep_metadata_multi_rank(self):
         """EP enabled (world size 4, rank 2): the FP8 caller must compute

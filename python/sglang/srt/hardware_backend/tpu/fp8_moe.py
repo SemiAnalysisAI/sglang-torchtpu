@@ -12,10 +12,13 @@ native torch here without touching the generic FP8 quantization method.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.real_token_count import real_token_count
 from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
@@ -310,6 +313,45 @@ def prepare_tpu_fp8_moe_weights(
     # after this layer's process_weights_after_loading returns.
 
 
+def _retire_dead_moe_rows(
+    *,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sentinel_expert_id: int,
+    real_tokens: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Point rows that must do no expert work at ``sentinel_expert_id``.
+
+    Dead rows are (a) ``topk_ids < 0``, the router's own "no expert" marker, and
+    (b) rows at or past ``real_tokens`` -- the compiled-graph token bucket pads a
+    3328-token prefill chunk up to 4096, and those 768 rows carry the embedding of
+    token id 0 through a full router pass, so they reach here indistinguishable
+    from real tokens. ``real_tokens=None`` means no padding information, so every
+    row counts as real.
+
+    The sentinel is out of range for the ``one_hot(topk_ids, route_num_experts)``
+    that builds ``group_sizes`` in ``_fused_moe_jax``, so these rows join no
+    group, sort to the end of the permutation, and the grouped matmul never
+    visits them. Sending them to expert 0 instead -- which is what this path used
+    to do -- keeps them in ``group_sizes[0]``, so the matmul still streams w1/w2
+    and does their FLOPs; zeroing the weights only stops them corrupting the
+    output, it does not save the work.
+    """
+    live = topk_ids >= 0
+    if real_tokens is not None:
+        # Padding is appended, so real tokens occupy [0, real_tokens) and a
+        # positional compare is exact. Kept as a tensor compare, never a Python
+        # int, so a per-request chunk length cannot become a Dynamo guard.
+        rows = torch.arange(
+            topk_ids.shape[0], device=topk_ids.device, dtype=torch.int32
+        )
+        live = live & (rows < real_tokens).unsqueeze(-1)
+    topk_ids = torch.where(
+        live, topk_ids, torch.full_like(topk_ids, sentinel_expert_id)
+    )
+    return topk_ids, topk_weights * live.to(topk_weights.dtype)
+
+
 def apply_tpu_fp8_moe(
     *,
     layer: torch.nn.Module,
@@ -332,11 +374,6 @@ def apply_tpu_fp8_moe(
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)
-    # Padded tokens might have expert index of -1, override the expert
-    # selection to expert 0.
-    valid = topk_ids >= 0
-    topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
-    topk_weights = topk_weights * valid.to(topk_weights.dtype)
     if layer.num_fused_shared_experts:
         raise NotImplementedError(
             "Fused shared experts are not supported on the TPU MoE path."
@@ -352,6 +389,16 @@ def apply_tpu_fp8_moe(
     if ep_size > 1:
         global_num_experts = layer.num_local_experts * ep_size
         expert_group_offset = ep_rank * layer.num_local_experts
+
+    topk_ids, topk_weights = _retire_dead_moe_rows(
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        # Must match ``_fused_moe_jax``'s ``route_num_experts`` exactly: it is
+        # ``global_num_experts`` when EP splits the experts, else this rank's
+        # local expert count, which is ``w13_weight.shape[0]``.
+        sentinel_expert_id=max(global_num_experts, layer.w13_weight.shape[0]),
+        real_tokens=real_token_count(),
+    )
 
     # TODO(torch_tpu): try native torch._scaled_grouped_mm for channelwise
     # scales and torch._scaled_grouped_mm_v2 for block scales once torch_tpu

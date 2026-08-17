@@ -421,7 +421,18 @@ def _fused_moe_jax(
     # zero-initializes on both paths. The dense un-permute multiplies every
     # row (unwritten ones by weight 0), so unwritten rows must be zeros,
     # not garbage — 0 * NaN would poison the sum.
-    if use_sc_gather and not no_combine and not use_dense_unpermute:
+    #
+    # `use_group_offset` is required too: rows a caller retired by pointing them
+    # at an out-of-range expert id join no group, so the GMM never writes them.
+    # Only the ragged (`_valid_rows_mask`) gather-reduce below skips those rows;
+    # the maskless `dense_gather_reduce` variant reads every row and would
+    # multiply garbage by weight 0.
+    if (
+        use_sc_gather
+        and not no_combine
+        and not use_dense_unpermute
+        and use_group_offset
+    ):
         zero_init = False
     else:
         zero_init = True

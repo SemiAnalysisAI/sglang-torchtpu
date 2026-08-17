@@ -285,6 +285,84 @@ class TestFusedMoEJaxKernelVsReference(unittest.TestCase):
 
 
 @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
+class TestFusedMoEJaxRetiredRows(unittest.TestCase):
+    """Rows retired to an out-of-range expert id must cost nothing and change nothing.
+
+    ``fp8_moe._retire_dead_moe_rows`` points bucket-padded rows at
+    ``route_num_experts`` instead of expert 0 so the grouped matmul never visits
+    them. That only holds if the kernel really treats an out-of-range id as
+    "no group": ``group_sizes`` must not count it, and the live rows must come out
+    exactly as they do when the same rows are parked on expert 0 with zero weight
+    (the behaviour this replaced).
+    """
+
+    M, K, N, G, TOPK = 64, 128, 128, 8, 4
+    REAL = 40  # rows [40, 64) stand in for bucket padding
+
+    def _arms(self):
+        hidden, w1, w2, w_tk, ids = _make_inputs(
+            self.M, self.K, self.N, self.G, self.TOPK, seed=7
+        )
+        # Weight-zeroed dead rows are common to both arms; only the id differs.
+        weights = w_tk.at[self.REAL :, :].set(0)
+        parked = ids.at[self.REAL :, :].set(0)  # old: real expert 0
+        retired = ids.at[self.REAL :, :].set(self.G)  # new: out-of-range sentinel
+        return hidden, w1, w2, weights, parked, retired
+
+    def _run(self, hidden, w1, w2, weights, ids):
+        return jnp.asarray(
+            jax.block_until_ready(
+                _call_production_kernel(hidden, w1, w2, weights, ids, activation="silu")
+            )
+        ).astype(jnp.float32)
+
+    def test_retired_rows_do_not_change_live_output(self):
+        hidden, w1, w2, weights, parked, retired = self._arms()
+        parked_out = self._run(hidden, w1, w2, weights, parked)
+        retired_out = self._run(hidden, w1, w2, weights, retired)
+        self.assertTrue(bool(jnp.all(jnp.isfinite(retired_out))))
+        self.assertEqual(retired_out.shape, parked_out.shape)
+        # Live rows are bit-identical: the retired rows contributed nothing to
+        # them under either routing, so the only way this drifts is if the
+        # sentinel perturbed the permutation the live rows ride on.
+        self.assertTrue(
+            bool(jnp.array_equal(retired_out[: self.REAL], parked_out[: self.REAL])),
+            "sentinel routing changed the live rows",
+        )
+
+    def test_retired_rows_are_zero_not_garbage(self):
+        """Unvisited rows must be zeros. 0 * NaN would poison the combine."""
+        hidden, w1, w2, weights, _, retired = self._arms()
+        retired_out = self._run(hidden, w1, w2, weights, retired)
+        self.assertTrue(
+            bool(jnp.all(retired_out[self.REAL :] == 0.0)),
+            "retired rows came back non-zero",
+        )
+
+    def test_retired_rows_leave_no_group_to_visit(self):
+        """The mechanism itself: an out-of-range id one-hots to nothing.
+
+        ``group_sizes`` drives the gmm_v2 grid, so a group that stays at its
+        natural size is a group whose weights are never streamed for these rows.
+        """
+        _, _, _, _, parked, retired = self._arms()
+        width = self.G  # route_num_experts when every expert is local
+        parked_groups = jax.nn.one_hot(parked.reshape(-1), width, dtype=jnp.int32).sum(
+            axis=0
+        )
+        retired_groups = jax.nn.one_hot(
+            retired.reshape(-1), width, dtype=jnp.int32
+        ).sum(axis=0)
+        dead_slots = (self.M - self.REAL) * self.TOPK
+        self.assertEqual(
+            int(parked_groups[0]) - int(retired_groups[0]),
+            dead_slots,
+            "expert 0 should shed exactly the dead slots",
+        )
+        self.assertEqual(int(jnp.sum(retired_groups)), self.REAL * self.TOPK)
+
+
+@unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
 class TestFusedMoEJaxKernelGuards(unittest.TestCase):
     """Negative tests pinning the kernel's documented error contracts
     (raised via the module-level ``_fuse_act_name`` helper)."""
