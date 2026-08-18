@@ -49,9 +49,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
 )
-<<<<<<< HEAD
-from sglang.srt.utils import is_hip, is_tpu
-=======
 from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
@@ -59,8 +56,7 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.utils import is_hip
->>>>>>> upstream/main
+from sglang.srt.utils import is_hip, is_tpu
 from sglang.srt.utils.common import (
     ceil_align,
     get_eager_max_batch_size,

@@ -21,13 +21,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-<<<<<<< HEAD
-from sglang.srt.mem_cache.pool_host.common import get_allocator_type
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.platforms import current_platform
-=======
 from sglang.srt.runtime_context import get_schedule
->>>>>>> upstream/main
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import ceil_align
 
@@ -61,32 +55,7 @@ class DecodeKVCacheOffloadManager:
                 self.page_size, (env_stride // self.page_size) * self.page_size
             )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-<<<<<<< HEAD
-        allocator_type = get_allocator_type(server_args)
-
-        if isinstance(kv_cache, MHATokenToKVPool):
-            host_pool_cls = current_platform.get_mha_kv_pool_host_cls(kv_cache)
-            self.decode_host_mem_pool = host_pool_cls(
-                kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=allocator_type,
-            )
-        elif isinstance(kv_cache, MLATokenToKVPool):
-            self.decode_host_mem_pool = MLATokenToKVPoolHost(
-                kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=allocator_type,
-            )
-        else:
-=======
         if not isinstance(kv_cache, (MHATokenToKVPool, MLATokenToKVPool)):
->>>>>>> upstream/main
             raise ValueError("Unsupported KV cache type for decode offload")
         self.decode_host_mem_pool = build_kv_host_pool(
             kv_pool=kv_cache,

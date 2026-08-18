@@ -31,11 +31,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
-<<<<<<< HEAD
-from sglang.srt.runtime_context import get_parallel
-=======
-from sglang.srt.runtime_context import get_exec, get_lora
->>>>>>> upstream/main
+from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,

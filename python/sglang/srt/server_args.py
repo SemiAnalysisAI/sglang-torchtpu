@@ -275,11 +275,8 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "humming",
     "experimental_sgl_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
-<<<<<<< HEAD
-    "pallas_tpu_fused_rs",
-=======
     "megamoe",
->>>>>>> upstream/main
+    "pallas_tpu_fused_rs",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -2091,21 +2088,10 @@ class ServerArgs:
         NS("exec.graph"),
     ] = None
     torch_compile_max_bs: A[
-<<<<<<< HEAD
         Optional[int],
         "Set the maximum batch size when using torch compile.",
         NS("exec.graph"),
     ] = None
-    torchao_config: A[
-        str,
-        "Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
-        NS("exec.graph"),
-    ] = ""
-
-=======
-        int, "Set the maximum batch size when using torch compile.", NS("exec.graph")
-    ] = 32
->>>>>>> upstream/main
     # -------------------------------------------------------------------------
     # Speculative decoding
     # -------------------------------------------------------------------------

@@ -40,15 +40,11 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         # Pre-calculate total size
         total_size = sum(req.extend_range.length for req in reqs)
-<<<<<<< HEAD
+        extend_num_tokens = total_size
         out_cache_loc_device = "cpu" if _is_tpu else self.device
         out_cache_loc = torch.empty(
             total_size, dtype=torch.int64, device=out_cache_loc_device
         )
-=======
-        extend_num_tokens = total_size
-        out_cache_loc = torch.empty(total_size, dtype=torch.int64, device=self.device)
->>>>>>> upstream/main
 
         # Fill the tensor in one pass
         offset = 0

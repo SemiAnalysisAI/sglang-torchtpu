@@ -25,12 +25,8 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-<<<<<<< HEAD
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple, Union
-=======
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
->>>>>>> upstream/main
 
 from sglang.srt.runtime_context import (
     attention_backends,

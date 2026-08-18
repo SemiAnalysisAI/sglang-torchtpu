@@ -4,15 +4,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-<<<<<<< HEAD
-from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
-=======
-from sglang.kernels.ops.speculative.cache_locs import (
-    assign_draft_cache_locs_contiguous,
-)
-from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
->>>>>>> upstream/main
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,

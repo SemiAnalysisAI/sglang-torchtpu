@@ -673,15 +673,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         if (
-<<<<<<< HEAD
-            self.num_v_heads // self.num_k_heads in [1, 2, 4]
+            self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
             and not _is_npu
             # TPU has no Triton; fall through to the pure-torch split below.
             and not _is_tpu
-=======
-            self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
-            and not _is_npu
->>>>>>> upstream/main
         ):
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size

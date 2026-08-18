@@ -1,11 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-<<<<<<< HEAD
-from typing import Any, List, NamedTuple, Union
-=======
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
->>>>>>> upstream/main
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 

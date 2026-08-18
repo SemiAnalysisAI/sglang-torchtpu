@@ -54,33 +54,6 @@ def _get_device_module():
     return device_module
 
 
-<<<<<<< HEAD
-@cache
-def _timing_events_supported() -> bool:
-    try:
-        _get_device_module().Event(enable_timing=True)
-        return True
-    except (TypeError, NotImplementedError):
-        logger.warning(
-            "%s.Event does not support enable_timing=True; load-back "
-            "duration metric will be skipped on this backend.",
-            _get_device_module().__name__,
-        )
-        return False
-
-
-def make_timing_event_pair():
-    timing_enabled = _timing_events_supported()
-    kwargs = {"enable_timing": True} if timing_enabled else {}
-    return (
-        _get_device_module().Event(**kwargs),
-        _get_device_module().Event(**kwargs),
-        timing_enabled,
-    )
-
-
-=======
->>>>>>> upstream/main
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
@@ -428,12 +401,7 @@ class HiCacheController:
         self.ack_load_queue: List[HiCacheAck] = []
         self.ack_write_queue: List[HiCacheAck] = []
 
-<<<<<<< HEAD
-        self.write_stream = _get_device_module().Stream()
-        self.load_stream = _get_device_module().Stream()
-=======
         self.l2_transfer_engine = L2TransferEngine(io_backend)
->>>>>>> upstream/main
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -846,37 +814,9 @@ class HiCacheController:
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
 
-<<<<<<< HEAD
-        start_event = _get_device_module().Event()
-        ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
-
-        start_event.record()
-        with _get_device_module().stream(self.write_stream):
-            start_event.wait(self.write_stream)
-            ack_start_event.record()
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device, host_indices, device_indices, self.io_backend
-            )
-            if self.has_draft:
-                self.mem_pool_host_draft.backup_from_device_all_layer(
-                    self.mem_pool_device_draft,
-                    host_indices,
-                    device_indices,
-                    self.io_backend,
-                )
-            ack_finish_event.record()
-            # NOTE: We must save the host indices and device indices here,
-            # this is because we need to guarantee that these tensors are
-            # still alive when the write stream is executing.
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.write_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.write_stream)
-=======
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
         )
->>>>>>> upstream/main
 
         self.ack_write_queue.append(
             HiCacheAck(
@@ -1007,45 +947,12 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
-<<<<<<< HEAD
-        ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
-
-        with _get_device_module().stream(self.load_stream):
-            producer_event.start_event.wait(self.load_stream)
-            ack_start_event.record()
-            for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
-                    host_indices,
-                    device_indices,
-                    i,
-                    self.io_backend,
-                )
-                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
-                        host_indices,
-                        device_indices,
-                        i,
-                        self.io_backend,
-                    )
-                producer_event.complete(i)
-            ack_finish_event.record()
-            # NOTE: We must save the host indices and device indices here,
-            # this is because we need to guarantee that these tensors are
-            # still alive when the load stream is executing.
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.load_stream)
-=======
         completion = self.l2_transfer_engine.submit_host_to_device(
             self._l2_load_transfers(host_indices, device_indices, pool_transfers),
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             layer_num=self.layer_num,
         )
->>>>>>> upstream/main
 
         self.ack_load_queue.append(
             HiCacheAck(

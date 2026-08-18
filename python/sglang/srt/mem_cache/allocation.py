@@ -208,21 +208,19 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-<<<<<<< HEAD
-    attn_backend = get_exec().kernel.attention_backend
-    uses_triton_dispatch = attn_backend not in (
+    prefill_backend, decode_backend = attention_backends()
+    # The TPU Pallas backends have no Triton either, so they take the same
+    # non-Triton dispatch as ascend / torch_native.
+    _no_triton_backends = (
         "ascend",
         "torch_native",
         "pallas_tpu_rpa_v3",
         "pallas_tpu_rpa_batched",
     )
-=======
-    prefill_backend, decode_backend = attention_backends()
-    uses_triton_dispatch = prefill_backend not in (
-        "ascend",
-        "torch_native",
-    ) and decode_backend not in ("ascend", "torch_native")
->>>>>>> upstream/main
+    uses_triton_dispatch = (
+        prefill_backend not in _no_triton_backends
+        and decode_backend not in _no_triton_backends
+    )
 
     if _is_hip and uses_triton_dispatch:
         # HIP-only: the legacy get_last_loc_triton kernel emits a
@@ -310,13 +308,8 @@ def alloc_paged_token_slots_extend(
         # Per-call per-req table for the C128 KV last_loc lookup.
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
-<<<<<<< HEAD
-        if dsv4_state_lens is not None:
-            extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
     if out_cache_loc_host is not None:
         extra_alloc_kwargs["out_indices_cpu"] = out_cache_loc_host
-=======
->>>>>>> upstream/main
 
     out = allocator.alloc_extend(
         prefix_lens,
