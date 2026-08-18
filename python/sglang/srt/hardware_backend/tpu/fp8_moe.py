@@ -16,7 +16,6 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.utils import copy_or_rebind_param
@@ -126,6 +125,17 @@ def _requantize_tpu_fp8_moe_block_to_channelwise(
     layer.weight_block_size = None
 
 
+def _own_storage(t: torch.Tensor) -> torch.Tensor:
+    """Return ``t`` backed by its own buffer of exactly ``t``'s shape.
+
+    ``base[:, None, None, :]`` on a contiguous ``[E, N]`` tensor is *already*
+    contiguous, so ``.contiguous()`` returns the view unchanged and the
+    parameter keeps the base's 2-D device buffer while declaring a 4-D shape.
+    torch_tpu then has to reconcile the two on every use.
+    """
+    return t if t._base is None else t.clone()
+
+
 def _to_tpu_fp8_moe_scale_layout(
     scale: torch.Tensor,
     out_size: int,
@@ -152,13 +162,13 @@ def _to_tpu_fp8_moe_scale_layout(
                 "Unsupported TPU FP8 MoE scale shape: "
                 f"{tuple(scale.shape)} for {out_size=}"
             )
-        return scale.contiguous()
+        return _own_storage(scale.contiguous())
     else:
         raise ValueError(
             "Unsupported TPU FP8 MoE scale rank: "
             f"{scale.dim()} for shape {tuple(scale.shape)}"
         )
-    return scale[:, None, None, :].contiguous()
+    return _own_storage(scale[:, None, None, :].contiguous())
 
 
 def _to_tpu_fp8_moe_block_scale_layout(
@@ -179,7 +189,7 @@ def _to_tpu_fp8_moe_block_scale_layout(
                 f"{tuple(scale.shape)} for {out_size=}"
             )
         if scale.shape[-1] == out_size:
-            return scale.contiguous()
+            return _own_storage(scale.contiguous())
         scale = scale.squeeze(2)
     if scale.dim() != 3:
         raise ValueError(
@@ -203,7 +213,9 @@ def _to_tpu_fp8_moe_block_scale_layout(
         or (compact_w2 and out_size == 6144)
     )
     if not use_compact_scales:
-        return scale.repeat_interleave(block_n, dim=2)[:, :, None, :].contiguous()
+        return _own_storage(
+            scale.repeat_interleave(block_n, dim=2)[:, :, None, :].contiguous()
+        )
     if block_n > scale_block_n:
         if block_n % scale_block_n != 0:
             raise ValueError(
@@ -240,7 +252,7 @@ def _to_tpu_fp8_moe_block_scale_layout(
                 scale[:, :, src_start : src_start + scale_blocks_per_tile]
             )
         scale = tiled_scale
-    return scale[:, :, None, :].contiguous()
+    return _own_storage(scale[:, :, None, :].contiguous())
 
 
 def prepare_tpu_fp8_moe_weights(
@@ -352,6 +364,13 @@ def apply_tpu_fp8_moe(
     if ep_size > 1:
         global_num_experts = layer.num_local_experts * ep_size
         expert_group_offset = ep_rank * layer.num_local_experts
+
+    # Imported here, not at module scope: the Pallas chain pulls in JAX, which
+    # the hosted CPU CI agents do not have. Keeping it local lets the weight
+    # layout helpers above -- pure host-side torch -- be unit-tested on the CPU
+    # lane. See test/registered/unit/hardware_backend/tpu/
+    # test_fp8_moe_scale_layout.py.
+    from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 
     # TODO(torch_tpu): try native torch._scaled_grouped_mm for channelwise
     # scales and torch._scaled_grouped_mm_v2 for block scales once torch_tpu
