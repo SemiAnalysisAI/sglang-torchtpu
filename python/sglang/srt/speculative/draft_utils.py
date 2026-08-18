@@ -502,8 +502,11 @@ class DraftBackendFactory:
             TpuPallasRpaV3MultiStepDraftBackend,
         )
 
-        return TpuPallasRpaV3MultiStepDraftBackend(
-            self.draft_model_runner, self.topk, self.speculative_num_steps
+        return (
+            "pallas_tpu_rpa_v3",
+            TpuPallasRpaV3MultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            ),
         )
 
     def _create_tpu_pallas_rpa_v3_prefill_backend(self):
@@ -511,7 +514,10 @@ class DraftBackendFactory:
             TpuPallasRpaV3AttnBackend,
         )
 
-        return TpuPallasRpaV3AttnBackend(self.draft_model_runner)
+        return (
+            "pallas_tpu_rpa_v3",
+            TpuPallasRpaV3AttnBackend(self.draft_model_runner),
+        )
 
     def _create_flashmla_prefill_backend(self):
         from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
