@@ -82,7 +82,7 @@ def main() -> None:
         "CHUNKED_PREFILL_SIZE": "4096",
         "MAX_PREFILL_TOKENS": "4096",
         "MAX_TOTAL_TOKENS": "131072",
-        "MEM_FRACTION_STATIC": "0.05",
+        "MEM_FRACTION_STATIC": "0.8",
         "MAX_RUNNING": "32",
         "TORCH_COMPILE_MAX_BS": "32",
         "QUANTIZATION": "fp8",
