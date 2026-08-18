@@ -41,6 +41,10 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
 )
+from sglang.srt.disaggregation.raiden.host_pool import (
+    slot_host_bytes,
+    slots_within_budget,
+)
 from sglang.srt.disaggregation.raiden.serde import (
     MessageTag,
     pack_blocks,
@@ -269,8 +273,9 @@ class RaidenKVManager(CommonKVManager):
         # dim as a page, matching the TPU fused KV pool ([num_blocks, page, ...]).
         from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
+        engines = 2 if self._swa_kv_caches else 1
         max_blocks = self._max_request_blocks()
-        num_slots = self._num_slots()
+        num_slots = self._num_slots(self._kv_caches, max_blocks, engines)
         # Reshard staging is indexed 1-to-1 by device block id. Size it to
         # the fused tensor's block count with a single slot.
         if self._reshard_enabled:
@@ -297,7 +302,7 @@ class RaidenKVManager(CommonKVManager):
         if self._swa_kv_caches:
             self.swa_raiden_endpoint = f"{self.local_ip}:{self._control_port + 2}"
             swa_max_blocks = self._swa_max_request_blocks()
-            swa_num_slots = self._num_slots()
+            swa_num_slots = self._num_slots(self._swa_kv_caches, swa_max_blocks, 2)
             self._swa_engine = KVCacheManager(
                 kv_caches=self._swa_kv_caches,
                 node_id=self._local_rank,
@@ -337,8 +342,60 @@ class RaidenKVManager(CommonKVManager):
         max_tokens = window_size + self.kv_args.page_size - 1
         return max(1, math.ceil(max_tokens / self.kv_args.page_size))
 
-    def _num_slots(self) -> int:
-        return max(1, int(os.environ.get("SGLANG_RAIDEN_NUM_SLOTS", "16")))
+    def _slot_ceiling(self) -> int:
+        """Slots that can ever be claimed at once.
+
+        A transfer holds one slot from the moment it is issued until its H2D
+        lands. The decode admits a request into the transfer queue before it
+        joins the running batch, so the reach is the batch plus the extra
+        in-transfer slots reserved alongside it; past that, slots are
+        unclaimable.
+        """
+        batch = int(self.server_args.max_running_requests or 64)
+        in_transfer = int(
+            getattr(self.server_args, "disaggregation_decode_extra_slots", 0) or 0
+        )
+        return max(1, batch + in_transfer)
+
+    def _num_slots(
+        self, kv_caches: List[Any], max_blocks: int, engines: int = 1
+    ) -> int:
+        """Slots this engine can afford within the host staging budget.
+
+        ``SGLANG_RAIDEN_NUM_SLOTS`` pins the count outright. Otherwise the
+        budget is split across the ranks sharing a host and across the engines
+        this rank builds, then divided by what one slot costs. Deriving the
+        count keeps a large context length from turning into a host allocation
+        that fails at startup -- it lowers the transfer concurrency instead.
+        """
+        override = int(os.environ.get("SGLANG_RAIDEN_NUM_SLOTS", "0"))
+        if override > 0:
+            ceiling = self._slot_ceiling()
+            if override < ceiling:
+                logger.warning(
+                    "RaidenKVManager rank%d SGLANG_RAIDEN_NUM_SLOTS=%d is below "
+                    "the running batch of %d; the pool bounds how many KV "
+                    "transfers a rank can have in flight at once",
+                    self.attn_tp_rank,
+                    override,
+                    ceiling,
+                )
+            return override
+        budget = float(os.environ.get("SGLANG_RAIDEN_HOST_POOL_GB", "128")) * 1024**3
+        local_ranks = max(1, self.attn_tp_size * max(1, self.attn_dp_size))
+        budget /= local_ranks * max(1, engines)
+        slot_bytes = slot_host_bytes(kv_caches, max_blocks)
+        slots = slots_within_budget(budget, slot_bytes, self._slot_ceiling())
+        logger.info(
+            "RaidenKVManager rank%d slot budget | max_blocks=%d slot=%.1fMB "
+            "rank_budget=%.1fGB slots=%d",
+            self.attn_tp_rank,
+            max_blocks,
+            slot_bytes / (1024**2),
+            budget / (1024**3),
+            slots,
+        )
+        return slots
 
     def _ensure_engine(self) -> Any:
         if self._engine is None:
