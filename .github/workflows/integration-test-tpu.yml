@@ -1,0 +1,54 @@
+# TPU integration tests for major features and feature combinations.
+#
+# Trigger with:
+#   gh workflow run integration-test-tpu.yml --ref BRANCH \
+#     -f ref=BRANCH -f model=all
+name: Integration Test (TPU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test"
+        required: false
+        default: main
+      model:
+        description: "Model profile to test"
+        required: false
+        default: all
+        type: choice
+        options: [all, gpt_oss_120b, qwen3_coder_480b]
+
+concurrency:
+  group: tpu-integration
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/_tpu-build.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+    permissions:
+      contents: read
+      id-token: write
+
+  integration:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ${{ inputs.model == 'gpt_oss_120b' && fromJSON('["gpt_oss_120b"]') || inputs.model == 'qwen3_coder_480b' && fromJSON('["qwen3_coder_480b"]') || fromJSON('["gpt_oss_120b","qwen3_coder_480b"]') }}
+    name: prefix-caching-kv-offload-${{ matrix.profile }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      hosts: 1
+      exec_cmd: env MODEL_PROFILE=${{ matrix.profile }} python3 test/registered/tpu/test_prefix_caching_kv_offload.py
+      weights_pvc: model-weights-rox
+      # Keep the Kubernetes JobSet/Job/Pod name below its 63-character limit.
+      # The GitHub job name above remains descriptive.
+      run_name: pc-kvo-${{ matrix.profile }}
+    permissions:
+      contents: read
+      id-token: write

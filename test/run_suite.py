@@ -184,6 +184,9 @@ OTHER_SUITES = {
     HWBackend.CPU: [
         "default",
     ],
+    HWBackend.TPU: [
+        "tpu-integration",
+    ],
     HWBackend.CUDA: [
         "stress",
         # `stage="weekly"` -- same shape. The three dicts group names for
