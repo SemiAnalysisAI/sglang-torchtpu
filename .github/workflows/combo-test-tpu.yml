@@ -41,6 +41,7 @@ concurrency:
 
 jobs:
   build:
+    if: inputs.target != 'qwen480-eval'
     uses: ./.github/workflows/_tpu-build.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -68,7 +69,6 @@ jobs:
       id-token: write
 
   qwen480-eval:
-    needs: build
     if: ${{ inputs.target == 'qwen480-eval' }}
     strategy:
       fail-fast: false
@@ -78,13 +78,13 @@ jobs:
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
+      image: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:f3f58699eaaf724d456827e1b1cb289a57d9c17381cbd4bf2393b814af05b76c
       hosts: 1
       exec_cmd: >-
         python3 test/manual/tpu/run_qwen3_coder_480b_rpa_eval.py
         --backend ${{ matrix.backend }}
       weights_pvc: qwen3-coder-480b-rox
-      run_name: qwen480-${{ matrix.backend }}-gpqa-aime25
+      run_name: q480-${{ matrix.backend }}
     permissions:
       contents: read
       id-token: write
