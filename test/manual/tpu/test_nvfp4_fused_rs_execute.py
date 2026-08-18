@@ -116,7 +116,10 @@ def main() -> None:
     global_experts = 256
     local_experts = global_experts // world_size
     hidden_size = 4096
-    intermediate_size = 14336
+    # Tier-5's dense MLP is wider, but the routed experts use I=4096.  Keep
+    # this execution gate on the contraction observed in the serving HLO
+    # (N1=8192, K2=4096).
+    intermediate_size = 4096
     topk = 8
     device = torch.device("tpu")
     numerics_mode = os.environ.get("SGLANG_TPU_NVFP4_NUMERICS_MODE", "baseline")
