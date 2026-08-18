@@ -82,6 +82,10 @@ def _rpa_kernel_spec(backend: str | None):
         from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
             RPA_V3_SPEC as spec,
         )
+    elif backend == "pallas_tpu_rpa_v4":
+        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v4 import (
+            RPA_V4_SPEC as spec,
+        )
     else:
         return None
     return spec
@@ -349,6 +353,7 @@ class TpuSRTPlatform(SRTPlatform):
 
         if backend in (
             "pallas_tpu_rpa_v3",
+            "pallas_tpu_rpa_v4",
             "pallas_tpu_rpa_batched",
         ):
             from sglang.srt.hardware_backend.tpu.kv_pool import (

@@ -43,8 +43,10 @@ class TestPallasBackendRegistration(CustomTestCase):
 
         self.assertIn("pallas_tpu_flash", ATTENTION_BACKENDS)
         self.assertIn("pallas_tpu_rpa_v3", ATTENTION_BACKENDS)
+        self.assertIn("pallas_tpu_rpa_v4", ATTENTION_BACKENDS)
         self.assertTrue(callable(ATTENTION_BACKENDS["pallas_tpu_flash"]))
         self.assertTrue(callable(ATTENTION_BACKENDS["pallas_tpu_rpa_v3"]))
+        self.assertTrue(callable(ATTENTION_BACKENDS["pallas_tpu_rpa_v4"]))
         # The two factories must be distinct — registering both names to the
         # same factory would silently make the flag meaningless.
         self.assertIsNot(
@@ -68,7 +70,11 @@ class TestMHAKVPoolSelection(CustomTestCase):
             TpuFusedMHATokenToKVPool,
         )
 
-        for backend in ("pallas_tpu_rpa_v3", "pallas_tpu_rpa_batched"):
+        for backend in (
+            "pallas_tpu_rpa_v3",
+            "pallas_tpu_rpa_v4",
+            "pallas_tpu_rpa_batched",
+        ):
             with self.subTest(backend=backend):
                 self.assertIs(self._pool_cls_for(backend), TpuFusedMHATokenToKVPool)
 

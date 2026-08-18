@@ -203,6 +203,7 @@ ATTENTION_BACKEND_CHOICES = [
     # TPU specific
     "pallas_tpu_flash",
     "pallas_tpu_rpa_v3",
+    "pallas_tpu_rpa_v4",
     "pallas_tpu_rpa_batched",
     "pallas_tpu_mla",
     # Other platforms
@@ -5501,6 +5502,7 @@ class ServerArgs:
                     "aiter",
                     # TPU
                     "pallas_tpu_rpa_v3",
+                    "pallas_tpu_rpa_v4",
                     "pallas_tpu_rpa_batched",
                 ]
                 prefill_attn_backend, decode_attn_backend = (
