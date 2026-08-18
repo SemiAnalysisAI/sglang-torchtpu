@@ -3994,8 +3994,11 @@ class Scheduler(
 
         # Run device-to-host copy on a separate stream to avoid blocking the
         # forward stream. The copy waits for the sampled result and can overlap
-        # with subsequent forward computation.
-        self.copy_stream.wait_stream(self.forward_stream)
+        # with subsequent forward computation. Guarded like every other
+        # cross-stream wait: a single-queue backend (torch_tpu) never builds
+        # copy_stream, and copy_stream_ctx is a nullcontext there.
+        if self.use_overlap_streams:
+            self.copy_stream.wait_stream(self.forward_stream)
         with self.copy_stream_ctx:
             batch_result.copy_to_cpu(
                 return_logprob=cur_batch.return_logprob,
