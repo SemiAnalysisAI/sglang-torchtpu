@@ -8,6 +8,14 @@ on:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    # A PR with more commits than paths-filter's initial-fetch-depth makes it list
+    # the changed files through the GitHub API instead of git, and that call needs
+    # pull-requests: read (the repo's default token is otherwise too narrow). The
+    # upstream-sync PRs are the ones that hit it -- see pr-test-tpu.yml, which
+    # already carries this block for the same reason.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
