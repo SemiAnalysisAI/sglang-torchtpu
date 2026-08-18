@@ -36,7 +36,7 @@ on:
         options: [all, "1", "2", "3"]
 
 concurrency:
-  group: tpu-combo
+  group: tpu-rpa-eval-${{ github.run_id }}
   cancel-in-progress: false   # let a running combo finish; don't stack them
 
 jobs:
