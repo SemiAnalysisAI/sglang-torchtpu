@@ -123,6 +123,7 @@ class ModelProfile(msgspec.Struct, frozen=True, kw_only=True):
     display_name: str
     served_name: str
     default_model_path: str
+    hf_repo_id: str
     model_env: str
     page_size: int
     mem_fraction_prefill: str
@@ -146,6 +147,7 @@ MODEL_PROFILES = {
         display_name="GPT-OSS-120B",
         served_name="gpt-oss-120b",
         default_model_path="/weights/gpt-oss-120b",
+        hf_repo_id="openai/gpt-oss-120b",
         model_env="GPT_OSS_MODEL",
         page_size=64,
         mem_fraction_prefill="0.35",
@@ -170,6 +172,7 @@ MODEL_PROFILES = {
         display_name="Qwen3-Coder-480B",
         served_name="qwen3-coder-480b",
         default_model_path="/weights/Qwen3-Coder-480B-A35B-Instruct-FP8",
+        hf_repo_id="Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
         model_env="QWEN3_CODER_MODEL",
         page_size=64,
         mem_fraction_prefill="0.6",
@@ -302,11 +305,12 @@ def resolve_model_path(
     profile: ModelProfile, env: Optional[Mapping[str, str]] = None
 ) -> str:
     values = os.environ if env is None else env
-    return (
-        values.get(profile.model_env)
-        or values.get("MODEL")
-        or profile.default_model_path
-    )
+    explicit = values.get(profile.model_env) or values.get("MODEL")
+    if explicit:
+        return explicit
+    if os.path.isdir(profile.default_model_path):
+        return profile.default_model_path
+    return profile.hf_repo_id
 
 
 def validate_model_source(profile: ModelProfile, model_path: str) -> None:
@@ -743,6 +747,8 @@ def _serve_role(topo: PodTopology, profile: ModelProfile) -> int:
     own engine dying early still gates -- the leader fails independently when a
     peer it needs is broken, and unambiguous local deaths return nonzero.
     """
+    model_path = resolve_model_path(profile)
+    validate_model_source(profile, model_path)
     if topo.role == ROLE_DECODE:
         script, env, log = (
             "launch_decode.sh",
@@ -769,6 +775,13 @@ def _serve_role(topo: PodTopology, profile: ModelProfile) -> int:
             if leader_seen and not _http_ok(leader_url):
                 print(f"[{topo.role}:{topo.group_rank}] exited during teardown")
                 return 0
+            print(f"[{topo.role}:{topo.group_rank}] server exited unexpectedly rc={rc}")
+            if os.path.isfile(log):
+                with open(log, "rb") as f:
+                    lines = f.readlines()
+                    print(f"=== Last {min(50, len(lines))} lines of {log} ===")
+                    for line in lines[-50:]:
+                        sys.stdout.buffer.write(line)
             return rc
         if _http_ok(leader_url):
             leader_seen, misses = True, 0
