@@ -48,6 +48,22 @@ WEIGHTS_VOLUME_TMPL = (
     "                    claimName: {pvc}\n"
     "                    readOnly: true"
 )
+# Pod-level nodeAffinity restricting the pod to this (lane, hosts)'s pools. Indented to sit
+# under the pod spec, same level as nodeSelector. Kueue's ResourceFlavor injects the exact
+# ci-tpu-pool via nodeSelector on admission; this is the outer bound, and it is what keeps a
+# JobSet Kueue is NOT managing off the dev pools (manageJobsWithoutQueueName is false).
+POOL_AFFINITY_TMPL = (
+    "              affinity:\n"
+    "                nodeAffinity:\n"
+    "                  requiredDuringSchedulingIgnoredDuringExecution:\n"
+    "                    nodeSelectorTerms:\n"
+    "                      - matchExpressions:\n"
+    "                          - key: ci-tpu-pool\n"
+    "                            operator: In\n"
+    "                            values: [{pools}]"
+)
+
+
 WEIGHTS_MOUNT_TMPL = (
     "                    - name: weights\n"
     "                      mountPath: /weights\n"
@@ -119,6 +135,9 @@ def main():
     # Plain words only -- the command is inlined into the pod script unquoted.
     ap.add_argument("--exec", dest="exec_cmd", default="")
     ap.add_argument("--hosts", type=int, default=1)
+    # Which lane's pools to use. pr-gate and nightly both own 1- and 2-host slices, so a
+    # host count alone no longer identifies a pool (see topology.yaml).
+    ap.add_argument("--lane", default="pr-gate")
     ap.add_argument("--weights-pvc", default="")
     ap.add_argument("--name", default="")  # multi-host run label
     ap.add_argument("--dir", default=".github/tpu-ci")
@@ -137,7 +156,10 @@ def main():
     if not a.image:
         ap.error("--image is required when rendering")
 
-    slices = yaml.safe_load(open(f"{a.dir}/topology.yaml"))["slices"]
+    lanes = yaml.safe_load(open(f"{a.dir}/topology.yaml"))["lanes"]
+    if a.lane not in lanes:
+        ap.error(f"unknown --lane {a.lane!r}; topology.yaml has {sorted(lanes)}")
+    slices = lanes[a.lane]
 
     if a.launch_script:
         if a.hosts < 1:
@@ -164,7 +186,10 @@ def main():
 
     sl = slices.get(hosts, slices.get(str(hosts)))
     if not sl:
-        sys.exit(f"no slice for hosts={hosts} in topology.yaml")
+        sys.exit(
+            f"no slice for lane={a.lane} hosts={hosts} in topology.yaml "
+            f"(lane has {sorted(slices)})"
+        )
 
     # Suite mode runs every registered file sequentially, so its deadline scales
     # with the suite (same est_time formula as _tpu-test's poll budget, keeping the
@@ -186,7 +211,9 @@ def main():
         "EXEC_CMD": a.exec_cmd,
         "HOSTS": str(hosts),
         "TOPOLOGY": sl["topology"],
-        "POOL": sl["pool"],
+        "POOL_AFFINITY": POOL_AFFINITY_TMPL.format(pools=", ".join(sl["pools"])),
+        "POOL_LIST": " ".join(sl["pools"]),
+        "QUEUE": sl["queue"],
         "RUN_NAME": run_name,
         "SUITE": suite,
         "NIGHTLY_FLAG": "--nightly" if a.nightly else "",

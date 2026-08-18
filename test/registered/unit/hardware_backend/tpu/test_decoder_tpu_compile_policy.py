@@ -25,7 +25,7 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     _unpad_decoder_outputs,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
-    SpecDecodeCompilePolicyMixin,
+    Eagle3CompilePolicyMixin,
     SpecDecoderTpuCompilePolicy,
 )
 from sglang.srt.hardware_backend.tpu.sampler import distributed_top_k_for_batch
@@ -512,9 +512,7 @@ class TestQwen3VLDecoderPolicy(CustomTestCase):
         self.assertEqual(result["residual"].shape, (5, 4))
 
     def test_spec_policy_delegates_raw_vl_output_unpadding(self):
-        class _SpecQwenPolicy(
-            SpecDecodeCompilePolicyMixin, Qwen3VLDecoderTpuCompilePolicy
-        ):
+        class _SpecQwenPolicy(Eagle3CompilePolicyMixin, Qwen3VLDecoderTpuCompilePolicy):
             pass
 
         policy = object.__new__(_SpecQwenPolicy)

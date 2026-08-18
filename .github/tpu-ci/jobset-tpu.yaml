@@ -19,11 +19,17 @@
 #     model + config); rank 0 runs each of the group's TEST_FILES in LIVE-SERVER mode
 #     against the one server; workers serve until the leader tears down, then exit 0.
 #     Files sharing an identical launch spec share this one server (grouping).
+# ci-tpu-pools: ${POOL_LIST}
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
   generateName: tpu-ci-${RUN_NAME}-
   namespace: tpu-ci
+  labels:
+    # Created suspended; Kueue releases it when a whole slice is free (kueue-tpu.yaml).
+    # The ci-tpu-pool nodeSelector below is redundant with the flavor, but keeps pods off
+    # the dev pools if Kueue is absent -- drop it when a second slice flavor is added.
+    kueue.x-k8s.io/queue-name: ${QUEUE}
 spec:
   ttlSecondsAfterFinished: 7200
   failurePolicy:
@@ -49,7 +55,7 @@ spec:
               nodeSelector:
                 cloud.google.com/gke-tpu-accelerator: tpu7x
                 cloud.google.com/gke-tpu-topology: ${TOPOLOGY}
-                ci-tpu-pool: ${POOL}
+${POOL_AFFINITY}
               tolerations:
                 - key: google.com/tpu
                   operator: Exists

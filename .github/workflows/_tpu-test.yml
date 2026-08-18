@@ -35,6 +35,12 @@ on:
         required: false
         type: number
         default: 1
+      # Which lane's pools to use (topology.yaml). Both lanes own 1- and 2-host slices, so
+      # host count alone no longer picks a pool. nightly-test-tpu.yml passes `nightly`.
+      lane:
+        required: false
+        type: string
+        default: pr-gate
       weights_pvc:
         required: false
         type: string
@@ -54,10 +60,9 @@ permissions:
   id-token: write
 
 concurrency:
-  # Runs sharing a slice must serialize (no gang scheduler -> two multi-host JobSets on
-  # one pool could deadlock). Key on host count == the slice: all multi-host runs
-  # (hosts=2) serialize on the 2x2x2 pool; single-host (hosts=1) runs on pr-gate.
-  group: tpu-slice-${{ inputs.hosts }}
+  # Keyed per job so it never gates: Kueue owns slice admission now (kueue-tpu.yaml), and
+  # the callers' workflow-level groups already stop a workflow stacking on itself.
+  group: tpu-test-${{ github.run_id }}-${{ inputs.run_name || inputs.suite }}
   cancel-in-progress: false
 
 env:
@@ -70,6 +75,7 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 360   # GitHub's hard cap for hosted runners; cannot be raised
     steps:
       - uses: actions/checkout@v4
         with:
@@ -88,6 +94,7 @@ jobs:
         run: |
           set -euo pipefail
           label='${{ inputs.run_name || inputs.suite }}'
+          JOB_CEILING_S=21600        # 360m, the GitHub cap
           suite='${{ inputs.suite }}'
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
           python3 .github/tpu-ci/render_jobset.py \
@@ -97,41 +104,103 @@ jobs:
             --files '${{ inputs.files }}' \
             --exec '${{ inputs.exec_cmd }}' \
             --hosts '${{ inputs.hosts }}' \
+            --lane '${{ inputs.lane }}' \
             --weights-pvc '${{ inputs.weights_pvc }}' \
             --name '${{ inputs.run_name }}' \
             ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml
           echo "== rendered (key fields) =="
           grep -nE 'completions:|gke-tpu-topology:|ci-tpu-pool:|claimName:|bash "benchmark|for f in|run_suite.py' /tmp/job.yaml | head
+          # Quota tracks live capacity, checked here rather than on a timer: it only has to
+          # be right at the moment admission is decided. Fails open -- a stale quota is
+          # survivable (waitForPodsReady evicts and requeues), a blocked test is not.
+          # A (lane, hosts) can own several interchangeable slices, so reconcile each of its
+          # pools: --pool drives the one-slice-per-pool guard, and a resized multi-host pool
+          # must fail the job that would have straddled it.
+          for p in $(grep -o '^# ci-tpu-pools: .*' /tmp/job.yaml | cut -d' ' -f3-); do
+            python3 .github/tpu-ci/reconcile_quota.py --pool="$p"
+          done
+
           name="$(kubectl -n tpu-ci create -f /tmp/job.yaml -o name)"
           echo "Created ${name}"
           trap 'kubectl -n tpu-ci delete '"${name}"' --ignore-not-found --wait=false' EXIT
 
           short="${name##*/}"
           sel="jobset.sigs.k8s.io/jobset-name=${short}"
-          for _ in $(seq 1 120); do
-            [ -n "$(kubectl -n tpu-ci get pods -l "$sel" -o name 2>/dev/null)" ] && break || sleep 5
+
+          # No Workload means Kueue ignored this JobSet and it would run with no gang
+          # admission -- silent, and on a multi-host slice it ends as two half-placed gangs
+          # deadlocked until their deadline. Fail closed instead.
+          uid="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.metadata.uid}')"
+          wl_sel="kueue.x-k8s.io/job-uid=${uid}"
+          for _ in $(seq 1 15); do
+            [ -n "$(kubectl -n tpu-ci get workloads -l "$wl_sel" -o name 2>/dev/null)" ] && break
+            sleep 2
+          done
+          if [ -z "$(kubectl -n tpu-ci get workloads -l "$wl_sel" -o name 2>/dev/null)" ]; then
+            echo "❌ ${label}: no Kueue Workload for ${short} -- admission control is OFF."
+            echo "   Check: queue-name label on the JobSet, jobset in integrations.frameworks,"
+            echo "   and that LocalQueue $(grep -o 'queue-name: .*' /tmp/job.yaml | awk '{print $2}') exists in tpu-ci."
+            kubectl -n tpu-ci get localqueues 2>/dev/null || true
+            exit 1
+          fi
+          echo "Kueue Workload present; admission control active."
+
+          # Runtime budget, computed here because the admission budget is whatever is left
+          # of the runner's lifetime after it.
+          #   * single-host: scales with the suite's registered est_time (static AST scan in
+          #     render_jobset.py -> max(sum(est_time)*1.5, 360s)). run_suite's
+          #     --timeout-per-file still bounds each file.
+          #   * multi-host: the JobSet caps the run at activeDeadlineSeconds (9000s for
+          #     launch mode: ~30m bring-up + 2 files x `timeout 3600`, gsm8k on R1 needs
+          #     the full hour), and this must OUTLAST it so the JobSet -- not this loop --
+          #     decides the outcome.
+          if [ -n "${{ inputs.launch_script }}" ]; then
+            wait_s=9600          # activeDeadlineSeconds 9000 + streaming/scheduling margin
+          elif [ -n "${{ inputs.exec_cmd }}" ]; then
+            wait_s=7800          # outlast exec mode's activeDeadlineSeconds=7200 + margin
+          else
+            # +600 for the same reason as the other two modes: the JobSet's deadline is
+            # the same est_time figure, and the poll must outlast it so the JobSet reports
+            # the outcome rather than this loop racing it to a generic timeout.
+            wait_s=$(( $(python3 .github/tpu-ci/render_jobset.py --suite "$suite" --print-wait-seconds) + 600 ))
+          fi
+
+          # One slice runs one job at a time, so the wait is however long everything queued
+          # ahead finishes in -- there is no useful smaller number. Spend the whole runner
+          # budget on it: ceiling minus this job's own runtime, the bind/pull window and
+          # setup. A fixed 1h was the reason four of five multi-host jobs failed in run
+          # 31834592348 while the slice was busy.
+          admit_s=$(( JOB_CEILING_S - wait_s - 900 - 600 ))
+          echo "budgets for ${label}: admission ${admit_s}s, runtime ${wait_s}s"
+          echo "queued in this ClusterQueue right now:"
+          kubectl -n tpu-ci get workloads 2>/dev/null | tail -n +2 | wc -l | xargs echo "  workloads:"
+          admit_deadline=$(( $(date +%s) + admit_s ))
+          until [ -n "$(kubectl -n tpu-ci get pods -l "$sel" -o name 2>/dev/null)" ]; do
+            if [ "$(date +%s)" -ge "$admit_deadline" ]; then
+              echo "❌ ${label} NOT ADMITTED after ${admit_s}s -- slice quota never freed"
+              kubectl -n tpu-ci get workloads 2>/dev/null | grep -- "${short}" || true
+              kubectl -n tpu-ci describe "$name" 2>/dev/null | tail -n 40 || true
+              exit 1
+            fi
+            sleep 10
+          done
+
+          # Admitted, but pods still bind and pull -- don't charge the pull to the test.
+          running_deadline=$(( $(date +%s) + 900 ))
+          until kubectl -n tpu-ci get pods -l "$sel" \
+                  -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q Running; do
+            if [ "$(date +%s)" -ge "$running_deadline" ]; then
+              echo "⚠️  ${label}: no pod Running 900s after admission; continuing anyway"
+              break
+            fi
+            sleep 5
           done
 
           # Stream logs from every host (best effort; may restart while pods come up).
           kubectl -n tpu-ci logs -f -l "$sel" --all-containers=true --prefix=true \
             --max-log-requests=10 --pod-running-timeout=15m --tail=-1 || true
 
-          # Poll budget = how long we watch the JobSet before declaring a timeout.
-          #   * single-host: scales with the suite's registered est_time (static AST scan
-          #     in render_jobset.py -> max(sum(est_time)*1.5, 360s)) so long suites don't
-          #     hit a fixed ceiling. run_suite's --timeout-per-file still bounds each file.
-          #   * multi-host: the JobSet itself caps the run at activeDeadlineSeconds=9000s
-          #     (~30m server bring-up + up to 2 files x `timeout 3600`; gsm8k on R1
-          #     needs the full hour). The poll must OUTLAST that so the JobSet -- not
-          #     this loop -- decides the outcome, hence 9600s = 9000 + margin.
-          if [ -n "${{ inputs.launch_script }}" ]; then
-            wait_s=9600
-          elif [ -n "${{ inputs.exec_cmd }}" ]; then
-            wait_s=7800   # outlast exec mode's activeDeadlineSeconds=7200 + margin
-          else
-            wait_s="$(python3 .github/tpu-ci/render_jobset.py --suite "$suite" --print-wait-seconds)"
-          fi
-          echo "CI poll budget for ${label}: ${wait_s}s"
+          # Runtime clock starts now: queue time is not charged to the test.
           deadline=$(( $(date +%s) + wait_s ))
           while [ "$(date +%s)" -lt "$deadline" ]; do
             ok="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
