@@ -9,18 +9,35 @@ import torch
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
-device_module = get_device_module()
+
+_device_module = None
+
+
+def device_module():
+    """Resolve the device module on first use, never at import.
+
+    On TPU ``get_device_module()`` builds a PjRt client, and a client is an
+    exclusive claim on the chips. Resolving at import meant any process that
+    merely imported ``cache_controller`` (which imports this module) -- notably
+    ``run_suite.py``'s parent -- took the TPU, and every engine subprocess it
+    later spawned died with "The TPU is already in use by process with pid N".
+    ``cache_controller`` memoizes the same call for the same reason.
+    """
+    global _device_module
+    if _device_module is None:
+        _device_module = get_device_module()
+    return _device_module
 
 
 @cache
 def _timing_events_supported() -> bool:
     try:
-        device_module.Event(enable_timing=True)
+        device_module().Event(enable_timing=True)
         return True
     except (TypeError, NotImplementedError):
         logger.warning(
             "%s.Event does not support timing; L2 transfer timing is disabled",
-            device_module.__name__,
+            device_module().__name__,
         )
         return False
 
@@ -28,7 +45,11 @@ def _timing_events_supported() -> bool:
 def make_timing_event_pair():
     timing_enabled = _timing_events_supported()
     kwargs = {"enable_timing": True} if timing_enabled else {}
-    return device_module.Event(**kwargs), device_module.Event(**kwargs), timing_enabled
+    return (
+        device_module().Event(**kwargs),
+        device_module().Event(**kwargs),
+        timing_enabled,
+    )
 
 
 class L2Transfer(NamedTuple):
@@ -51,13 +72,13 @@ class L2TransferEngine:
 
     def __init__(self, io_backend: str):
         self.io_backend = io_backend
-        self.device_to_host_stream = device_module.Stream()
-        self.host_to_device_stream = device_module.Stream()
+        self.device_to_host_stream = device_module().Stream()
+        self.host_to_device_stream = device_module().Stream()
 
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
         start_event = self._start_event(None)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
-        with device_module.stream(self.device_to_host_stream):
+        with device_module().stream(self.device_to_host_stream):
             start_event.wait(self.device_to_host_stream)
             ack_start.record()
             for transfer in transfers:
@@ -82,7 +103,7 @@ class L2TransferEngine:
         start_event = self._start_event(start_event)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
         primary = transfers[0] if transfers else None
-        with device_module.stream(self.host_to_device_stream):
+        with device_module().stream(self.host_to_device_stream):
             start_event.wait(self.host_to_device_stream)
             ack_start.record()
             for layer_id in range(layer_num):
@@ -115,7 +136,7 @@ class L2TransferEngine:
     @staticmethod
     def _start_event(start_event):
         if start_event is None:
-            start_event = device_module.Event()
+            start_event = device_module().Event()
             start_event.record()
         return start_event
 
