@@ -24,14 +24,22 @@ do **not** depend on torch_tpu or the SGLang server runtime.
 
 from __future__ import annotations
 
-from sglang.test.ci.ci_register import register_tpu_ci
-
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
-
+import os
+import sys
 import unittest
 from typing import Optional
 
 import numpy as np
+
+from sglang.test.ci.ci_register import register_tpu_ci
+
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+
+# This is a standalone raw-JAX kernel test, not a TorchTPU runtime process.
+# SGLang platform discovery selects CPU-only JAX for export, so select the
+# physical backend before the first JAX import.
+assert "jax" not in sys.modules
+os.environ["JAX_PLATFORMS"] = "tpu"
 
 
 def _has_jax_tpu() -> bool:
@@ -337,6 +345,22 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         inputs = self._build_inputs([(33, 8)])
         self._run_and_compare(inputs, distribution=(0, 0, 1))
 
+    def test_extend_across_int16_boundary(self):
+        """Causal spans remain valid at absolute positions >= 32,768."""
+        kv_len = 32_772
+        self.PAGES_PER_SEQ = (kv_len + self.PAGE_SIZE - 1) // self.PAGE_SIZE
+        self.TOTAL_NUM_PAGES = self.PAGES_PER_SEQ
+        inputs = self._build_inputs([(kv_len, 8)])
+        self._run_and_compare(inputs, distribution=(0, 0, 1))
+
+    def test_extend_128k_context(self):
+        """Causal attention remains correct across repeated int16 wraps."""
+        kv_len = 128 * 1024
+        self.PAGES_PER_SEQ = (kv_len + self.PAGE_SIZE - 1) // self.PAGE_SIZE
+        self.TOTAL_NUM_PAGES = self.PAGES_PER_SEQ
+        inputs = self._build_inputs([(kv_len, 8)])
+        self._run_and_compare(inputs, distribution=(0, 0, 1))
+
     # ------------------------------------------------------------------ #
     # Additional cases.
     # ------------------------------------------------------------------ #
@@ -362,6 +386,14 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         Hits the sliding-window precise-skipping path in the kernel."""
         inputs = self._build_inputs([(33, 1)])
         self._run_and_compare(inputs, distribution=(1, 1, 1), sliding_window=8)
+
+    def test_extend_sliding_window_span_addition_overflow(self):
+        """Sliding-window masking stays correct past the int16 limit."""
+        kv_len = 32_752
+        self.PAGES_PER_SEQ = (kv_len + self.PAGE_SIZE - 1) // self.PAGE_SIZE
+        self.TOTAL_NUM_PAGES = self.PAGES_PER_SEQ
+        inputs = self._build_inputs([(kv_len, 8)])
+        self._run_and_compare(inputs, distribution=(0, 0, 1), sliding_window=32)
 
     def test_decode_soft_cap(self):
         """soft_cap rescales logits with tanh before softmax. Verifies the
@@ -427,6 +459,20 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
 
         inputs = self._build_fp8_inputs(
             [(33, 8)], kv_dtype=jnp.float8_e4m3fn, k_scale=1.0, v_scale=1.0
+        )
+        self._run_and_compare(
+            inputs, distribution=(0, 0, 1), tolerance=self.FP8_TOLERANCE
+        )
+
+    def test_extend_across_int16_boundary_fp8_e4m3(self):
+        """FP8 cache causal spans remain valid at positions >= 32,768."""
+        import jax.numpy as jnp
+
+        kv_len = 32_772
+        self.PAGES_PER_SEQ = (kv_len + self.PAGE_SIZE - 1) // self.PAGE_SIZE
+        self.TOTAL_NUM_PAGES = self.PAGES_PER_SEQ
+        inputs = self._build_fp8_inputs(
+            [(kv_len, 8)], kv_dtype=jnp.float8_e4m3fn, k_scale=1.0, v_scale=1.0
         )
         self._run_and_compare(
             inputs, distribution=(0, 0, 1), tolerance=self.FP8_TOLERANCE
