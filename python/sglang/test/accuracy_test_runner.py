@@ -9,7 +9,6 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
-    dump_metric,
     popen_launch_server,
     write_github_step_summary,
 )
@@ -39,6 +38,10 @@ class AccuracyTestParams:
     runner: Optional[Callable[[str], dict]] = None
     extra_eval_args: Optional[dict] = None  # merged into run_eval's namespace
     label: Optional[str] = None  # display/metric name; defaults to `dataset`
+    seed: Optional[int] = None  # pin for reproducibility when temperature > 0
+    # sgl-eval-backed datasets only: force chat_template_kwargs.thinking instead
+    # of letting _run_sgl_eval infer it from the model name.
+    sgl_eval_thinking: Optional[bool] = None
 
     @property
     def name(self) -> str:
@@ -136,6 +139,8 @@ def _run_simple_eval(
     top_k: Optional[int] = None,
     repeat: Optional[int] = None,
     api: Optional[str] = None,
+    seed: Optional[int] = None,
+    sgl_eval_thinking: Optional[bool] = None,
     extra_eval_args: Optional[dict] = None,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
     """Run evaluation using simple_eval backend (run_eval.py).
@@ -175,6 +180,12 @@ def _run_simple_eval(
 
         if repeat is not None:
             args.repeat = repeat
+
+        if seed is not None:
+            args.seed = seed
+
+        if sgl_eval_thinking is not None:
+            args.sgl_eval_thinking = sgl_eval_thinking
 
         for key, value in (extra_eval_args or {}).items():
             setattr(args, key, value)
@@ -522,6 +533,8 @@ def _dispatch_eval(
         top_k=params.top_k,
         repeat=params.repeat,
         api=params.api,
+        seed=params.seed,
+        sgl_eval_thinking=params.sgl_eval_thinking,
         extra_eval_args=params.extra_eval_args,
     )
 
