@@ -39,7 +39,7 @@ def _run_eval(backend: str, eval_name: str) -> dict:
         "MODEL": MODEL,
         "BASE_URL": BASE_URL,
         "EVAL_NAME": eval_name,
-        "NUM_THREADS": "32",
+        "NUM_THREADS": "8",
         "OUTPUT_DIR": str(output_dir),
         "HEALTH_TIMEOUT": "30",
         "EXTRA_ARGS": "--max-tokens 4096 --temperature 0 --thinking-mode qwen-3",
@@ -81,10 +81,10 @@ def main() -> None:
         "CONTEXT_LEN": "8192",
         "CHUNKED_PREFILL_SIZE": "4096",
         "MAX_PREFILL_TOKENS": "4096",
-        "MAX_TOTAL_TOKENS": "131072",
+        "MAX_TOTAL_TOKENS": "65536",
         "MEM_FRACTION_STATIC": "0.8",
-        "MAX_RUNNING": "32",
-        "TORCH_COMPILE_MAX_BS": "32",
+        "MAX_RUNNING": "8",
+        "TORCH_COMPILE_MAX_BS": "8",
         "QUANTIZATION": "fp8",
         "KV_CACHE_DTYPE": "fp8_e4m3",
         "ATTENTION_BACKEND": args.backend,
@@ -108,6 +108,9 @@ def main() -> None:
                 eval_name: _run_eval(args.backend, eval_name)
                 for eval_name in ("gpqa", "aime25")
             }
+        except Exception:
+            print(SERVER_LOG.read_text(errors="replace")[-20000:])
+            raise
         finally:
             _stop_server(process)
 
