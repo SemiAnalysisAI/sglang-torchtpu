@@ -85,6 +85,7 @@ def main() -> None:
         "MEM_FRACTION_STATIC": "0.8",
         "MAX_RUNNING": "8",
         "TORCH_COMPILE_MAX_BS": "8",
+        "TPU_COMPILE_TOKENS": "64 128 256 512 1024 2048 4096",
         "QUANTIZATION": "fp8",
         "KV_CACHE_DTYPE": "fp8_e4m3",
         "ATTENTION_BACKEND": args.backend,
