@@ -21,7 +21,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, singlehost, multihost, pd, spec]
+        options: [all, singlehost, multihost, pd, spec, qwen480-eval]
       singlehost_model:
         description: "Model profile for the single-host combos"
         required: false
@@ -63,6 +63,28 @@ jobs:
             || format('python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py --model-profile qwen3-1.7b {0}', inputs.singlehost_combo || 'all') }}
       weights_pvc: ${{ inputs.singlehost_model == 'qwen3-coder-480b' && 'qwen3-coder-480b-rox' || '' }}
       run_name: combo-${{ inputs.singlehost_model || 'qwen3-1.7b' }}-${{ inputs.singlehost_combo || 'all' }}
+    permissions:
+      contents: read
+      id-token: write
+
+  qwen480-eval:
+    needs: build
+    if: ${{ inputs.target == 'qwen480-eval' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [pallas_tpu_rpa_v3, pallas_tpu_rpa_v4]
+    name: qwen480-${{ matrix.backend }}-gpqa-aime25
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      hosts: 1
+      exec_cmd: >-
+        python3 test/manual/tpu/run_qwen3_coder_480b_rpa_eval.py
+        --backend ${{ matrix.backend }}
+      weights_pvc: qwen3-coder-480b-rox
+      run_name: qwen480-${{ matrix.backend }}-gpqa-aime25
     permissions:
       contents: read
       id-token: write
