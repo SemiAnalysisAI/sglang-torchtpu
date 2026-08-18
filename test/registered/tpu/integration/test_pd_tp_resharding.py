@@ -175,11 +175,10 @@ MODEL_PROFILES = {
         hf_repo_id="Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
         model_env="QWEN3_CODER_MODEL",
         page_size=64,
-        mem_fraction_prefill="0.6",
-        mem_fraction_decode="0.6",
+        mem_fraction_prefill="0.8",
+        mem_fraction_decode="0.8",
         quantization="fp8",
         kv_cache_dtype="fp8_e4m3",
-        # Small device pool so a short churn pass forces host offload.
         max_total_tokens=32768,
         device_pool_tokens_hint=32768,
         gsm8k_threshold=0.80,
@@ -368,7 +367,9 @@ def build_prefill_env(
     profile: ModelProfile, group_hosts: int, env: Optional[Mapping[str, str]] = None
 ) -> Dict[str, str]:
     values = os.environ if env is None else env
-    served = ("--served-model-name", profile.served_name)
+    prefill_args = ["--served-model-name", profile.served_name]
+    if profile.max_total_tokens is not None:
+        prefill_args += ["--max-total-tokens", str(profile.max_total_tokens)]
     tp_size = int(values.get("TP_SIZE", str(8 * group_hosts)))
     return {
         **_common_launch_env(profile, group_hosts, values),
@@ -383,7 +384,7 @@ def build_prefill_env(
         "BOOTSTRAP_PORT": str(BOOTSTRAP_PORT),
         "EXTRA_ARGS": " ".join(
             (
-                *served,
+                *prefill_args,
                 *profile.extra_server_args,
                 values.get("EXTRA_PREFILL_ARGS", ""),
             )
@@ -660,49 +661,61 @@ class TestPdTpResharding(unittest.TestCase):
         cls.gsm8k_config = Gsm8kConfig.from_env(cls.profile)
         cls.procs = []
 
-        self_host = cls.topo.group_hostnames[0]
-        decode_host = peer_group_hostname(
-            self_host, from_role=ROLE_PREFILL, to_role=ROLE_DECODE
-        )
-
-        cls.procs.append(
-            _launch(
-                "launch_prefill.sh",
-                build_prefill_env(cls.profile, cls.topo.group_hosts),
-                PREFILL_LOG,
+        try:
+            self_host = cls.topo.group_hostnames[0]
+            decode_host = peer_group_hostname(
+                self_host, from_role=ROLE_PREFILL, to_role=ROLE_DECODE
             )
-        )
-        _wait_http_200(
-            f"http://127.0.0.1:{PREFILL_PORT}/health", WAIT_SECS, tuple(cls.procs)
-        )
-        _wait_http_200(f"http://{decode_host}:{DECODE_PORT}/health", WAIT_SECS)
 
-        # The mini-LB injects the --prefill hostname into requests as the KV
-        # bootstrap address the decode pods dial -- it must be this pod's
-        # cluster-reachable name, never 127.0.0.1.
-        cls.procs.append(
-            subprocess.Popen(
-                [
-                    PYTHON,
-                    "-m",
-                    "sglang_router.launch_router",
-                    "--pd-disaggregation",
-                    "--mini-lb",
-                    "--prefill",
-                    f"http://{self_host}:{PREFILL_PORT}",
-                    "--decode",
-                    f"http://{decode_host}:{DECODE_PORT}",
-                    "--host",
-                    "0.0.0.0",
-                    "--port",
-                    str(LB_PORT),
-                ],
-                stdout=open(LB_LOG, "ab"),
-                stderr=subprocess.STDOUT,
-                preexec_fn=os.setsid,
+            cls.procs.append(
+                _launch(
+                    "launch_prefill.sh",
+                    build_prefill_env(cls.profile, cls.topo.group_hosts),
+                    PREFILL_LOG,
+                )
             )
-        )
-        _wait_http_200(f"http://127.0.0.1:{LB_PORT}/health", 300, tuple(cls.procs))
+            _wait_http_200(
+                f"http://127.0.0.1:{PREFILL_PORT}/health", WAIT_SECS, tuple(cls.procs)
+            )
+            _wait_http_200(f"http://{decode_host}:{DECODE_PORT}/health", WAIT_SECS)
+
+            # The mini-LB injects the --prefill hostname into requests as the KV
+            # bootstrap address the decode pods dial -- it must be this pod's
+            # cluster-reachable name, never 127.0.0.1.
+            cls.procs.append(
+                subprocess.Popen(
+                    [
+                        PYTHON,
+                        "-m",
+                        "sglang_router.launch_router",
+                        "--pd-disaggregation",
+                        "--mini-lb",
+                        "--prefill",
+                        f"http://{self_host}:{PREFILL_PORT}",
+                        "--decode",
+                        f"http://{decode_host}:{DECODE_PORT}",
+                        "--host",
+                        "0.0.0.0",
+                        "--port",
+                        str(LB_PORT),
+                    ],
+                    stdout=open(LB_LOG, "ab"),
+                    stderr=subprocess.STDOUT,
+                    preexec_fn=os.setsid,
+                )
+            )
+            _wait_http_200(f"http://127.0.0.1:{LB_PORT}/health", 300, tuple(cls.procs))
+        except Exception:
+            for log_file, name in [(PREFILL_LOG, "prefill"), (DECODE_LOG, "decode"), (LB_LOG, "lb")]:
+                if os.path.isfile(log_file):
+                    with open(log_file, "rb") as f:
+                        lines = f.readlines()
+                        print(f"=== Last {min(50, len(lines))} lines of {name} ({log_file}) ===", flush=True)
+                        for line in lines[-50:]:
+                            sys.stdout.buffer.write(line)
+                        sys.stdout.flush()
+            cls.tearDownClass()
+            raise
 
     @classmethod
     def tearDownClass(cls) -> None:
