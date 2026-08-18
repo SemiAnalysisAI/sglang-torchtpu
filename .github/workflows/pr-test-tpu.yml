@@ -1,14 +1,14 @@
 # PR gate: runs the registered TPU per-commit suite on a single-host 2x2x1 slice.
 #
-# Runs when EITHER:
+# Runs when any of these conditions match:
 #   * the PR touches a TPU-explicit path (auto), OR
-#   * the PR carries the `tpu` label (manual opt-in -- for shared-code changes a
-#     maintainer judges need TPU coverage but that don't match those paths).
+#   * the PR carries the `tpu` label (TPU-specific manual opt-in), OR
+#   * the PR carries the `run-ci` label (full PR CI opt-in, including TPU).
 #
 # Why path-OR-label instead of the label alone: a label added by the labeler bot's
 # GITHUB_TOKEN does NOT trigger a new workflow run, so relying on the label alone
-# would miss the auto case. The path check makes auto reliable; the label covers
-# manual. Keep the `tpu` path list below in sync with .github/labeler.yml.
+# would miss the auto case. The path check makes auto reliable; the labels cover
+# manual cases. Keep the `tpu` path list below in sync with .github/labeler.yml.
 name: PR Test (TPU)
 
 on:
@@ -75,7 +75,8 @@ jobs:
             echo "Draft PR without run-ci; skipping TPU CI"
             echo "run=false" >> "$GITHUB_OUTPUT"
           elif [[ "${{ steps.paths.outputs.tpu }}" == "true" || \
-                  "${{ contains(fromJson(steps.pr.outputs.labels), 'tpu') }}" == "true" ]]; then
+                  "${{ contains(fromJson(steps.pr.outputs.labels), 'tpu') }}" == "true" || \
+                  "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" == "true" ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
