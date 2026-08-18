@@ -430,13 +430,16 @@ def inner_kernel(
                             # dequantization scale; online-quantizing the FP8
                             # scratch again would change both rounding and scale.
                             block_lhs_for_matmul = block_lhs
-                            lhs_scales = prequantized_lhs_scale_ref.reshape(
-                                -1, prequantized_lhs_scale_ref.shape[-1]
-                            )
                             scale_id = (
                                 prequantized_lhs_scale_start + start_k // q_block_size
                             )
-                            lhs_scale = lhs_scales[:, scale_id : scale_id + 1]
+                            # The producer passes an already-2D [M, blocks]
+                            # VMEM view.  Keep that tiled view intact: Mosaic
+                            # cannot reshape this non-contiguous memref even to
+                            # the same logical shape.
+                            lhs_scale = prequantized_lhs_scale_ref[
+                                :, scale_id : scale_id + 1
+                            ]
                         if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
                             # Fold small RHS scale blocks into RHS first, then
                             # requantize to the activation quant dtype so
