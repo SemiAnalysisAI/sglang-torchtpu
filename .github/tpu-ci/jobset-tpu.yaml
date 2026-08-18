@@ -24,6 +24,11 @@ kind: JobSet
 metadata:
   generateName: tpu-ci-${RUN_NAME}-
   namespace: tpu-ci
+  labels:
+    # Created suspended; Kueue releases it when a whole slice is free (kueue-tpu.yaml).
+    # The ci-tpu-pool nodeSelector below is redundant with the flavor, but keeps pods off
+    # the dev pools if Kueue is absent -- drop it when a second slice flavor is added.
+    kueue.x-k8s.io/queue-name: ${QUEUE}
 spec:
   ttlSecondsAfterFinished: 7200
   failurePolicy:
