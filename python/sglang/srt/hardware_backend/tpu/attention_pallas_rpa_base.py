@@ -61,7 +61,7 @@ def should_use_stacked_rpa(
     has_sinks: bool,
     has_sliding_window: bool,
 ) -> bool:
-    """Use split-K only when no request-level decode parallelism is available."""
+    """Select the single-request lane-packed decode export."""
     return (
         decode
         and enabled
@@ -79,7 +79,7 @@ def should_use_split_k_run(
     has_sinks: bool,
     has_sliding_window: bool,
 ) -> bool:
-    """Enable adaptive in-kernel split-K planning for batched decode."""
+    """Select the multi-request lane-packed decode export."""
     return (
         decode
         and enabled
@@ -183,7 +183,7 @@ class RpaKernelSpec:
     # Which draft-extend forward-mode variant this backend recognizes: v3 uses
     # the ``*_v2`` modes; batched uses the plain ones.
     uses_draft_extend_v2: bool
-    # Whether decode may use the kernel's split-K stacked schedule.
+    # Whether decode may select lane-packed export variants.
     supports_stacked_decode: bool = False
     # Whether the wrapper can omit its empty mixed-mode launch during decode.
     supports_decode_only: bool = False

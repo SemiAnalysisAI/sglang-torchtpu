@@ -189,13 +189,12 @@ class RpaConfigs:
         available_bytes = smem_limit_bytes - fixed_bytes
 
         # Per step per batch item:
-        # s_idx, q_idx, k_idx, is_last_k, do_writeback, is_finalize,
-        # finalize_source_mask, reset_acc: 8 * 4 = 32
+        # s_idx, q_idx, k_idx, is_last_k, do_writeback: 5 * 4 = 20
         # dma_q: 2 * 4 = 8
         # dma_kv_cache: bkv_p_cache * 3 * 4 = 12 * bkv_p_cache
         # dma_kv_new: bkv_p_new * self.dma_kv_new_size * 4
         bytes_per_step = (
-            40 + 12 * self.bkv_p_cache + 4 * self.dma_kv_new_size * self.bkv_p_new
+            28 + 12 * self.bkv_p_cache + 4 * self.dma_kv_new_size * self.bkv_p_new
         )
         bytes_per_step *= self.block.batch_size
         # Add 16 bytes for the 4 total_wait fields (total_wait_kv_in, total_wait_kv_out,
@@ -407,7 +406,8 @@ class RpaConfigs:
 
         if kv_cache.shape != expected_kv_cache_shape:
             raise ValueError(
-                f"Expected {kv_cache.shape=} to be equal to {expected_kv_cache_shape=}"
+                f"Expected {kv_cache.shape=} to be equal to"
+                f" {expected_kv_cache_shape=}"
             )
 
         # Integer kv quantization is currently not supported.

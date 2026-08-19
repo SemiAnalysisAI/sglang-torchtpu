@@ -1,7 +1,7 @@
 # Qwen3-30B skewed long-context decode
 
-This recipe targets the schedule imbalance that stacked or adaptive split-K RPA
-is intended to address. The default C16 workload contains two independent
+This recipe measures the lane-packed batched-RPA scheduler on skewed decode.
+The default C16 workload contains two independent
 240K-token requests and fourteen 512-token requests. It preloads the long KV
 prefixes into the radix cache before profiling so the trace covers steady-state
 decode rather than long-prefill work.
@@ -12,8 +12,11 @@ Start the compiled TP8/EP8 FP8 server:
 ./benchmark/tpu/recipe/qwen3_30b_stacked_rpa/server.sh
 ```
 
-The recipe enables the expert stacked/adaptive planner gate. Run the matching
-regular-RPA control with:
+The recipe enables distinct C1 and multi-request export labels for profiling.
+Current main already places consecutive KV blocks across the lane slots in a
+schedule row and chains online-softmax state across them, so disabling the gate
+is a control for export/dispatch overhead rather than the pre-#344
+request-parallel scheduler:
 
 ```bash
 SGLANG_USE_TPU_STACKED_RPA=0 \
@@ -34,15 +37,14 @@ python benchmark/tpu/recipe/qwen3_30b_stacked_rpa/bench.py \
   --concurrency 32 --long-requests 3
 ```
 
-At C1 the planner uses the striped static stacked schedule. At C2 and above it
-keeps the regular request scheduler and splits only cached-prefix runs that are
-long, skewed, and predicted to save enough schedule rows to pay for their merge
-row. Uniform or short batches remain on the ordinary request-parallel schedule.
+At both C1 and larger batches, current main's scheduler fills a row with
+consecutive KV blocks. The kernel carries the online-softmax state across lane
+slots and later rows, and resets it when a request's final KV block is reached.
+This supersedes the branch's former per-lane scratch plus explicit merge row.
 
-The validated Qwen3-30B C16 default produced 748 output tok/s with adaptive
-split-K versus 612 output tok/s for the exact regular control, with identical
-output-token hashes. A uniform C8/64K control remained flat at about 300 output
-tok/s because the planner rejected splitting.
+The older 748 versus 612 output tok/s result was measured before that mainline
+scheduler rewrite and must not be treated as a current-tree A/B result. Re-run
+both arms on the same current commit before publishing a performance delta.
 
 To test the 512K regime, use RPA v3 for prefill because the batched mixed-prefill
 kernel currently halts while populating a 520K prefix:
@@ -57,9 +59,7 @@ python benchmark/tpu/recipe/qwen3_30b_stacked_rpa/bench.py \
   --context-limit 524288 --no-profile
 ```
 
-With the default 600K token pool, use one 520K request rather than two. In the
-validated A/B, the adaptive gain grew from +34.6% at 240K to +66.7% at 520K;
-the attention kernel was 4.64 ms adaptive versus 18.67 ms regular at 520K.
+With the default 600K token pool, use one 520K request rather than two.
 
 The same skewed workload also scales to a populated C64 batch:
 
@@ -73,8 +73,5 @@ python benchmark/tpu/recipe/qwen3_30b_stacked_rpa/bench.py \
   --context-limit 262144 --no-profile
 ```
 
-At C64/240K, adaptive produced 4760 output tok/s versus 3291 for regular RPA
-(+44.6%), with identical output hashes. At C32/520K, adaptive produced 2112
-output tok/s versus 1074 regular (+96.6%); first-token IDs matched, while full
-256-token hashes differed because split-K changes reduction order beyond the
-model's native context.
+Record output hashes as well as throughput because changing KV reduction order
+can affect long-context outputs outside the model's native context window.

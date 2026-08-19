@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TPU correctness coverage for adaptive split-K batched RPA decode.
+"""TPU correctness coverage for lane-packed batched RPA decode.
 
 This is a direct-JAX TPU test, so it intentionally avoids ``CustomTestCase``.
 Importing the SGLang runtime test helpers activates the CPU-only JAX export
@@ -36,8 +36,8 @@ def _has_jax_tpu() -> bool:
 
 
 @unittest.skipIf(not _has_jax_tpu(), "Requires JAX with a TPU device")
-class TestBatchedRpaAdaptiveSplitKernel(unittest.TestCase):
-    """Compare the real split/merge kernel against pure-JAX attention."""
+class TestBatchedRpaLanePackedKernel(unittest.TestCase):
+    """Compare main's lane-chained decode kernel against pure-JAX attention."""
 
     PAGE_SIZE = 256
     PAGES_PER_SEQ = 257
@@ -66,17 +66,14 @@ class TestBatchedRpaAdaptiveSplitKernel(unittest.TestCase):
         import jax
         import jax.numpy as jnp
 
-        # Stacked mode forces bkv=1024 here. Three KV blocks therefore leave
-        # one of the four lanes idle, exercising the finalize source mask.
+        # Nine KV blocks occupy two full four-lane rows and one partial row,
+        # exercising the lane-chained softmax state with three idle slots.
         self._run_decode_case(
             jax,
             jnp,
             jnp.bfloat16,
             kv_lens_host=np.asarray([2049], dtype=np.int32),
-            # Exercise production block-size selection with Qwen3's local
-            # attention shape. The stacked override must cap the normal b8
-            # decode choice so its 1K KV tiles fit in v7 VMEM.
-            kernel_batch_size=None,
+            kernel_batch_size=4,
             num_q_heads=16,
             num_kv_heads=8,
             stacked=True,
@@ -87,9 +84,8 @@ class TestBatchedRpaAdaptiveSplitKernel(unittest.TestCase):
         import jax
         import jax.numpy as jnp
 
-        # The split-capable kernel remains selected for a multi-request decode
-        # bucket, but these uniform short requests fail the planner's length
-        # threshold and must execute the ordinary request-parallel schedule.
+        # Uniform short requests still share a row without carrying softmax
+        # state between requests because every request marks its last KV block.
         self._run_decode_case(
             jax,
             jnp,
@@ -126,10 +122,10 @@ class TestBatchedRpaAdaptiveSplitKernel(unittest.TestCase):
             ref_ragged_paged_attention,
         )
 
-        # The first request has 64K cached tokens. At bkv=256 the adaptive
-        # planner splits its 256-block cached prefix across all four lanes,
-        # merges the online-softmax partials, then processes the new-token
-        # writeback block on the root lane. The other requests stay short.
+        # The first request has 64K cached tokens. At bkv=256 the scheduler
+        # places consecutive KV blocks across four lane slots per row and the
+        # kernel chains online-softmax state across those slots and later rows.
+        # The other requests stay short and reset the state at request boundaries.
         num_seqs = len(kv_lens_host)
         total_q_tokens = num_seqs
         padded_q_tokens = 8

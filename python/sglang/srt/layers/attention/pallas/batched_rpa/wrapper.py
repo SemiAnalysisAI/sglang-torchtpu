@@ -499,9 +499,9 @@ def ragged_paged_attention(
             layer reads its entire K/V span from the cache slot written by its
             target layer earlier in the same forward pass, ignores its own k/v
             inputs, and does not write the cache back.
-        stacked: Whether decode splits each sequence's KV work across lanes.
+        stacked: Whether to label the single-request lane-packed decode export.
         decode_only: Whether to omit the mixed kernel for a decode-only batch.
-        split_k_run: Whether decode adaptively splits schedule-dominating KV runs.
+        split_k_run: Whether to label the multi-request lane-packed decode export.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
