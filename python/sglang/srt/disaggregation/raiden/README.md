@@ -69,7 +69,7 @@ reuse, `dst_tp > src_tp`.
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `SGLANG_RAIDEN_KV_PORT` | `30000` | base control port; local rank uses `base + 4*(dp_rank*tp_size + tp_rank)` (data = `+1`, SWA engine control/data = `+2`/`+3`) |
-| `SGLANG_RAIDEN_RESHARD` | `1` | on by default; activates only for asymmetric attn TP (`dst_tp < src_tp`) — symmetric traffic is unaffected. Set `0` to disable (asymmetric TP then raises) and keep the multi-slot host pool instead of the reshard device-shadow sizing. |
+| `SGLANG_RAIDEN_RESHARD` | `0` | set `1` for asymmetric attn TP (`dst_tp < src_tp`); it resizes every engine's host staging to a device shadow with one slot, so leave it off for symmetric TP (asymmetric TP raises with instructions when unset) |
 | `SGLANG_RAIDEN_NUM_SLOTS` | `16` | raiden host-pool transfer slots |
 | `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | max pages/request; auto = `ceil(context_len/page_size)` |
 | `SGLANG_RAIDEN_MAX_MODEL_LEN` | `8192` | fallback when `--context-length` is unset |

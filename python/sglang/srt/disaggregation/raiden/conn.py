@@ -131,13 +131,15 @@ class RaidenKVManager(CommonKVManager):
         self._local_rank = self.attn_dp_rank * self.attn_tp_size + self.attn_tp_rank
         self._control_port = base_port + 4 * self._local_rank
         self._timeout_s = float(os.environ.get("SGLANG_RAIDEN_TIMEOUT_S", "120"))
-        # Strided push-resharding for asymmetric TP (decode TP < prefill TP),
-        # on by default and auto-engaged per request only when a
-        # decode rank is fed by several prefill ranks; symmetric traffic never
-        # enters this path. Set SGLANG_RAIDEN_RESHARD=0 to disable it (an
-        # asymmetric topology then raises) and keep the multi-slot host staging
-        # pool instead of the device-shadow sizing the reshard receiver needs.
-        self._reshard_enabled = bool(int(os.environ.get("SGLANG_RAIDEN_RESHARD", "1")))
+        # Strided push-resharding for asymmetric TP (decode TP < prefill TP).
+        # Off by default: enabling it resizes host staging to a full device
+        # shadow with a single transfer slot, which every engine pays -- on a
+        # symmetric deployment that silently ignores SGLANG_RAIDEN_NUM_SLOTS,
+        # serializes transfers, and pins host memory equal to the device KV
+        # pool. Set SGLANG_RAIDEN_RESHARD=1 only when decode attention TP is
+        # smaller than prefill attention TP; a symmetric topology never needs
+        # it, and an asymmetric one raises with instructions if it is unset.
+        self._reshard_enabled = bool(int(os.environ.get("SGLANG_RAIDEN_RESHARD", "0")))
 
         # Completion sets, drained from raiden and keyed by str(room). Persist
         # until clear() so repeated poll() calls before the framework advances
@@ -565,8 +567,8 @@ class RaidenKVManager(CommonKVManager):
             raise NotImplementedError(
                 "Raiden asymmetric attention TP (got "
                 f"{len(bootstrap_infos)} prefill sources for one decode rank) "
-                "needs strided push-resharding, but it is disabled "
-                "(SGLANG_RAIDEN_RESHARD=0); unset it to enable."
+                "needs strided push-resharding; set SGLANG_RAIDEN_RESHARD=1 "
+                "on both instances to enable it."
             )
         with self._state_lock:
             self._local_blocks[room] = local_blocks
