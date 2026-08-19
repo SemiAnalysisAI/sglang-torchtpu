@@ -441,6 +441,10 @@ _OVERRIDDEN_AND_READ = {
     ("speculative/standalone_worker_v2.py", "speculative_num_steps"),
     ("utils/common.py", "speculative_num_draft_tokens"),
     ("utils/common.py", "speculative_num_steps"),
+    # TPU fork surface
+    ("hardware_backend/tpu/tpu_platform.py", "dp_size"),
+    ("hardware_backend/tpu/tpu_platform.py", "dtype"),
+    ("speculative/eagle_worker_v2.py", "disable_cuda_graph"),
 }
 
 
