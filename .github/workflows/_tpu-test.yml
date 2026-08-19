@@ -49,6 +49,10 @@ on:
         required: false
         type: number
         default: 3600
+      timeout_from_est_time:
+        required: false
+        type: boolean
+        default: false
       run_name:
         required: false
         type: string
@@ -132,6 +136,7 @@ jobs:
             --pd-decode-hosts '${{ inputs.pd_decode_hosts }}' \
             --weights-pvc '${{ inputs.weights_pvc }}' \
             --timeout-per-file '${{ inputs.timeout_per_file }}' \
+            ${{ inputs.timeout_from_est_time && '--timeout-from-est-time' || '' }} \
             --name '${{ inputs.run_name }}' \
             ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml
           echo "== rendered (key fields) =="
@@ -175,7 +180,7 @@ jobs:
           # of the runner's lifetime after it.
           #   * single-host: scales with the suite's registered est_time (static AST scan in
           #     render_jobset.py -> max(sum(est_time)*1.5, 360s)). run_suite's
-          #     --timeout-per-file still bounds each file.
+          #     nightly single-host runs use each file's registered est_time.
           #   * multi-host: the JobSet caps the run at activeDeadlineSeconds (9000s for
           #     launch mode: ~30m bring-up + 2 files x `timeout 3600`, gsm8k on R1 needs
           #     the full hour), and this must OUTLAST it so the JobSet -- not this loop --

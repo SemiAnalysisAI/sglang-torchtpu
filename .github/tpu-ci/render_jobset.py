@@ -157,6 +157,7 @@ def main():
     ap.add_argument("--pd-decode-hosts", type=int, default=0)
     ap.add_argument("--weights-pvc", default="")
     ap.add_argument("--timeout-per-file", type=int, default=3600)
+    ap.add_argument("--timeout-from-est-time", action="store_true")
     ap.add_argument("--name", default="")  # multi-host run label
     ap.add_argument("--dir", default=".github/tpu-ci")
     ap.add_argument("--tests-dir", default="test/registered")
@@ -277,7 +278,7 @@ def main():
         hosts = 1
         run_name = dns_safe(a.suite)
         suite = a.suite
-        if a.timeout_per_file <= 0:
+        if not a.timeout_from_est_time and a.timeout_per_file <= 0:
             ap.error("--timeout-per-file must be a positive integer")
 
     sl = slice_for(hosts)
@@ -315,7 +316,11 @@ def main():
         "TEST_FILES": a.files,
         "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",
         "WEIGHTS_MOUNT": WEIGHTS_MOUNT_TMPL if pvc else "",
-        "TIMEOUT_PER_FILE": str(a.timeout_per_file),
+        "TIMEOUT_FLAG": (
+            "--timeout-from-est-time"
+            if a.timeout_from_est_time
+            else f"--timeout-per-file {a.timeout_per_file}"
+        ),
     }
 
     tpl = open(f"{a.dir}/jobset-tpu.yaml").read()

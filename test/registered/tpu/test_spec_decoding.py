@@ -3,7 +3,7 @@
 Run all model configurations with:
 
     SGLANG_PLATFORM=tpu SPEED_BENCH_NUM_PROMPTS=64 \
-        python test/registered/tpu/integration/test_spec_decoding.py
+        python test/registered/tpu/test_spec_decoding.py
 
 Set ``SPEED_BENCH_NUM_PROMPTS=-1`` to run the entire qualitative split.
 
@@ -24,7 +24,7 @@ from sglang.test.tpu.server_test_suite import (
 
 register_tpu_ci(
     est_time=10800,
-    suite="nightly-tpu-integration",
+    suite="nightly-tpu-4-v7",
     nightly=True,
 )
 
