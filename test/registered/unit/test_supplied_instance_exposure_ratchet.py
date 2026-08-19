@@ -353,6 +353,28 @@ _EXPOSED = {
     ("utils/common.py", "speculative_num_steps"),
     ("utils/cuda_vmm_transport_utils.py", "mm_feature_transport"),
     ("utils/hf_transformers/processor.py", "image_processor_backend"),
+    # TPU fork surface
+    ("hardware_backend/tpu/tpu_platform.py", "attention_backend"),
+    ("hardware_backend/tpu/tpu_platform.py", "dp_size"),
+    ("hardware_backend/tpu/tpu_platform.py", "dtype"),
+    ("hardware_backend/tpu/tpu_platform.py", "enable_dp_attention"),
+    ("hardware_backend/tpu/tpu_platform.py", "enable_dp_lm_head"),
+    ("hardware_backend/tpu/tpu_platform.py", "hicache_io_backend"),
+    ("hardware_backend/tpu/tpu_platform.py", "kv_cache_dtype"),
+    ("hardware_backend/tpu/tpu_platform.py", "mem_fraction_static"),
+    ("hardware_backend/tpu/tpu_platform.py", "page_size"),
+    ("hardware_backend/tpu/tpu_platform.py", "sampling_backend"),
+    ("hardware_backend/tpu/tpu_platform.py", "speculative_algorithm"),
+    ("hardware_backend/tpu/tpu_platform.py", "speculative_eagle_topk"),
+    ("layers/dp_attention.py", "device"),
+    ("managers/scheduler.py", "enable_dp_attention"),
+    ("model_executor/model_runner.py", "ep_dispatch_algorithm"),
+    ("model_executor/model_runner.py", "expert_distribution_recorder_mode"),
+    ("model_executor/model_runner_components/spec_aux_hidden_state.py", "kv_cache_dtype"),
+    ("ray/engine.py", "device"),
+    ("ray/engine.py", "pp_size"),
+    ("speculative/eagle_worker_v2.py", "disable_cuda_graph"),
+    ("utils/patch_torch.py", "device"),
 }
 
 # Pairs whose resolution write only happens on a CUDA host (capability or
