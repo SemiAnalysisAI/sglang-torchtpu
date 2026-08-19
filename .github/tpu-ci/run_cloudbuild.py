@@ -15,6 +15,7 @@ printed to stdout, so callers can capture it with ``digest="$(... )"``.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import sys
 import time
@@ -69,13 +70,15 @@ def main() -> None:
             },
         )
         try:
-            with urllib.request.urlopen(req) as r:
+            with urllib.request.urlopen(req, timeout=30) as r:
                 return r.status, json.load(r)
         except urllib.error.HTTPError as e:
             try:
                 return e.code, json.load(e)
             except Exception:
                 return e.code, {"error": e.read().decode()[:500]}
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+            return 599, {"error": str(e)}
 
     cfg = _load_config(args.config)
     build = {
