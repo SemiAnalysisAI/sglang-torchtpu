@@ -7,6 +7,12 @@ from typing import Dict, List, Optional
 
 import tabulate
 
+# Ensure the workspace's python/ directory takes precedence in sys.path
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_PYTHON_DIR = os.path.join(_REPO_ROOT, "python")
+if _PYTHON_DIR not in sys.path:
+    sys.path.insert(0, _PYTHON_DIR)
+
 from sglang.test.ci.ci_register import (
     CIRegistry,
     HWBackend,
@@ -14,6 +20,10 @@ from sglang.test.ci.ci_register import (
     collect_tests,
 )
 from sglang.test.ci.ci_utils import run_unittest_files
+
+# Defensive fallback in case sglang is loaded from an external environment missing TPU
+if not hasattr(HWBackend, "TPU"):
+    setattr(HWBackend, "TPU", object())
 
 HW_MAPPING = {
     "cpu": HWBackend.CPU,
