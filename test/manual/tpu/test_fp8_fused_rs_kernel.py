@@ -83,6 +83,15 @@ def main():
         os.environ.get("SGLANG_TPU_FUSED_RS_TEST_POST_EXPERT_NORM", "0") == "1"
     )
     test_blockwise = os.environ.get("SGLANG_TPU_FUSED_RS_TEST_BLOCKWISE", "0") == "1"
+    test_divergent_weights = (
+        os.environ.get("SGLANG_TPU_FUSED_RS_TEST_DIVERGENT_WEIGHTS", "0") == "1"
+    )
+    test_divergent_ids = (
+        os.environ.get("SGLANG_TPU_FUSED_RS_TEST_DIVERGENT_IDS", "0") == "1"
+    )
+    fp8_direct_write = (
+        os.environ.get("SGLANG_TPU_FUSED_RS_TEST_FP8_DIRECT_WRITE", "0") == "1"
+    )
     tokens = int(os.environ.get("SGLANG_TPU_FUSED_RS_TEST_TOKENS", "64"))
     topk = int(os.environ.get("SGLANG_TPU_FUSED_RS_TEST_TOPK", "2"))
     hidden_size = intermediate_size = 1024 if test_blockwise else 256
@@ -126,6 +135,18 @@ def main():
     device = torch.device("tpu")
     physical_id = tpu_distributed.global_device_id()
     local_expert = rank
+    kernel_topk_ids = topk_ids
+    if test_divergent_ids and physical_id != 0:
+        # A synthetic mismatch ensures that the synchronized ID slice remains
+        # in the compiled dataflow. It does not imply that production routing
+        # IDs have been observed to diverge.
+        kernel_topk_ids = (topk_ids + physical_id) % world_size
+    kernel_topk_weights = topk_weights
+    if test_divergent_weights and physical_id != 0:
+        # The compiled fused-RS path must consume physical device 0's routing
+        # weights. Keep IDs identical because production ablations do not show
+        # that routing IDs diverge or need to be canonicalized.
+        kernel_topk_weights = topk_weights * (physical_id + 1)
 
     from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
         _build_fused_moe_rs_op,
@@ -152,7 +173,7 @@ def main():
             topk=topk,
             activation="silu",
             has_post_expert_norm=test_post_expert_norm,
-            fp8_direct_write=True,
+            fp8_direct_write=fp8_direct_write,
         )
 
     compiled = torch.compile(kernel, fullgraph=True, dynamic=False)
@@ -167,8 +188,8 @@ def main():
         w2_quantized[local_expert : local_expert + 1].to(device),
         w1_scale_local.to(device),
         w2_scale_local.to(device),
-        topk_weights.to(device),
-        topk_ids.to(device),
+        kernel_topk_weights.to(device),
+        kernel_topk_ids.to(device),
         torch.tensor([local_expert, physical_id], dtype=torch.int32, device=device),
     )
     actual = compiled(
@@ -194,7 +215,9 @@ def main():
     print(
         f"FP8_FUSED_RS_KERNEL_PASS rank={rank} physical_id={physical_id} "
         f"shape={tuple(actual.shape)} post_norm={test_post_expert_norm} "
-        f"blockwise={test_blockwise}"
+        f"blockwise={test_blockwise} divergent_ids={test_divergent_ids} "
+        f"divergent_weights={test_divergent_weights} "
+        f"fp8_direct_write={fp8_direct_write}"
     )
     dist.destroy_process_group()
 
