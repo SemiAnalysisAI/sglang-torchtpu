@@ -20,12 +20,8 @@ from typing import List, Optional
 
 import ray
 import zmq
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from sglang.srt.entrypoints.engine import (
-    _calculate_rank_ranges,
-    _compute_parallelism_ranks,
-)
+from sglang.srt.entrypoints.engine import _calculate_rank_ranges
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.data_parallel_controller import DataParallelController
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times

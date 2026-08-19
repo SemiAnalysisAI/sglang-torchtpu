@@ -65,6 +65,7 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 
+
 class TpuFusedMHATokenToKVPoolHost(HostKVCache):
     """Host (L2) pool for the TPU fused MHA device pool (rpa_v3).
 

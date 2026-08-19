@@ -87,12 +87,12 @@ spec:
                     - |
                       set -eo pipefail
                       export PYTHONUNBUFFERED=1
-                      
+
                       # 2. Remap container package to editable NFS source code
                       echo "Remapping Python packages to editable NFS source code..."
                       cd /mnt/sglang-nfs/<your_repo_name>
                       pip install -e python/ --no-deps
-                      
+
                       # 3. Launch application server
                       bash benchmark/tpu/launch_server.sh
 ```
