@@ -130,6 +130,24 @@ class TestDistributedTopKEligibility(CustomTestCase):
 
         torch.testing.assert_close(actual, expected)
 
+    def test_below_cutoff_does_not_guard_on_request_metadata(self):
+        batch = _forward_batch(batch_size=63)
+        batch.spec_algorithm = None
+
+        @torch.compile(fullgraph=True, backend="eager", dynamic=False)
+        def select_top_k(value):
+            top_k = distributed_top_k_for_batch(batch, sampling_backend="tpu")
+            return value + (top_k or 0)
+
+        value = torch.ones(1)
+        expected = select_top_k(value)
+        batch.spec_algorithm = SpeculativeAlgorithm.EAGLE
+
+        with torch.compiler.set_stance("fail_on_recompile"):
+            actual = select_top_k(value)
+
+        torch.testing.assert_close(actual, expected)
+
     def test_explicitly_skipped_tensor_parallel_gather_falls_back(self):
         processor = SimpleNamespace(
             use_tpu_distributed_top_k=True,
@@ -171,12 +189,13 @@ class TestDistributedTopKEligibility(CustomTestCase):
             with self.subTest(name=name):
                 self.assertIsNone(
                     distributed_top_k_for_batch(
-                        _forward_batch(**overrides), sampling_backend="tpu"
+                        _forward_batch(batch_size=64, **overrides),
+                        sampling_backend="tpu",
                     )
                 )
 
     def test_non_tpu_and_logprob_batches_fall_back(self):
-        batch = _forward_batch()
+        batch = _forward_batch(batch_size=64)
         self.assertIsNone(
             distributed_top_k_for_batch(batch, sampling_backend="pytorch")
         )
@@ -184,7 +203,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
         self.assertIsNone(distributed_top_k_for_batch(batch, sampling_backend="tpu"))
 
     def test_speculative_batch_falls_back(self):
-        batch = _forward_batch()
+        batch = _forward_batch(batch_size=64)
         batch.spec_algorithm = SpeculativeAlgorithm.EAGLE
 
         self.assertIsNone(distributed_top_k_for_batch(batch, sampling_backend="tpu"))
@@ -233,6 +252,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
             enable_dp_lm_head=False,
             tp_size=8,
             attn_dp_size=1,
+            nnodes=1,
         )
         config = SimpleNamespace(vocab_size=128)
 
@@ -256,6 +276,45 @@ class TestDistributedTopKEligibility(CustomTestCase):
             processor = LogitsProcessor(config, requires_full_next_token_logits=True)
 
         self.assertFalse(processor.use_tpu_distributed_top_k)
+
+    def test_multihost_disables_global_top_k(self):
+        execution = SimpleNamespace(
+            features=SimpleNamespace(enable_fp32_lm_head=False, enable_mis=False),
+            deterministic=SimpleNamespace(rl_on_policy_target=None),
+            kernel=SimpleNamespace(sampling_backend="tpu"),
+        )
+        parallel = SimpleNamespace(
+            enable_dp_lm_head=False,
+            tp_size=16,
+            attn_dp_size=1,
+            nnodes=2,
+        )
+        config = SimpleNamespace(vocab_size=128)
+
+        with (
+            patch.object(logits_processor_module, "_is_tpu", True),
+            patch.object(logits_processor_module, "get_exec", return_value=execution),
+            patch.object(
+                logits_processor_module, "get_parallel", return_value=parallel
+            ),
+            patch.object(
+                logits_processor_module.triton_symm_mem_ag,
+                "recommended_max_tokens",
+                return_value=128,
+            ),
+            patch.object(
+                logits_processor_module.triton_symm_mem_ag,
+                "MultimemAllGatherer",
+                return_value=object(),
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.top_k.register_tpu_top_k_ops"
+            ) as register_top_k,
+        ):
+            processor = LogitsProcessor(config)
+
+        self.assertFalse(processor.use_tpu_distributed_top_k)
+        register_top_k.assert_not_called()
 
 
 class TestTpuSamplerGlobalTopK(CustomTestCase):

@@ -44,6 +44,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -77,6 +78,7 @@ def _model_runner(device="cpu"):
         token_to_kv_pool_allocator=SimpleNamespace(
             free_pages=torch.arange(4, dtype=torch.int32)
         ),
+        spec_algorithm=SpeculativeAlgorithm.NONE,
         server_args=SimpleNamespace(page_size=1, dp_size=1),
     )
 
@@ -598,21 +600,35 @@ class TestMakeDummyForwardBatch(CustomTestCase):
         self.assertEqual(fb.sampling_info.uniform_top_k, 50)
         self.assertEqual(fb.sampling_info.top_ks.tolist(), [50] * 4)
         self.assertIsNone(fb.sampling_info.penalizer_orchestrator)
+        self.assertIs(fb.spec_algorithm, policy.model_runner.spec_algorithm)
+
+    def test_greedy_warmup_uses_full_vocab_sampling_info(self):
+        policy = _make_policy()
+
+        fb = policy._make_dummy_forward_batch(
+            num_tokens=4,
+            bs=4,
+            mode=ForwardMode.DECODE,
+            sampling_variant="greedy",
+        )
+
+        self.assertTrue(fb.sampling_info.is_all_greedy)
+        self.assertTrue(fb.sampling_info.is_any_greedy)
+        self.assertEqual(fb.sampling_info.uniform_top_k, 1)
+        self.assertEqual(fb.sampling_info.top_ks.tolist(), [1] * 4)
 
 
 class TestPrecompileLoops(CustomTestCase):
-    """``precompile`` fires one forward per TPU precompile variant:
-    EXTEND covers token buckets at the fixed batch cap, and DECODE varies bs
-    (tokens == bs)."""
+    """Precompile covers every TPU shape for TopK and greedy sampling."""
 
     def test_extend_iterates_token_buckets_at_fixed_batch_cap(self):
         mr = _model_runner()
         policy = _make_policy(mr, token_buckets=(8, 64, 256), bs_buckets=(1, 4))
         _run_cases(policy, ForwardMode.EXTEND)
-        self.assertEqual(mr.model.forward.call_count, 3)
+        self.assertEqual(mr.model.forward.call_count, 6)
         self.assertEqual(
             mr.attn_backend.calls,
-            [(8, 4), (64, 4), (256, 4)],
+            [(8, 4), (8, 4), (64, 4), (64, 4), (256, 4), (256, 4)],
         )
 
     def test_mixed_chunk_adds_fixed_decode_max_column(self):
@@ -629,7 +645,18 @@ class TestPrecompileLoops(CustomTestCase):
 
         self.assertEqual(
             mr.attn_backend.calls,
-            [(16, 16), (64, 16), (128, 16), (64, 64), (128, 64)],
+            [
+                (16, 16),
+                (16, 16),
+                (64, 16),
+                (64, 16),
+                (128, 16),
+                (128, 16),
+                (64, 64),
+                (64, 64),
+                (128, 64),
+                (128, 64),
+            ],
         )
         self.assertEqual(
             [call.args[2].forward_mode for call in mr.model.forward.call_args_list],
@@ -637,6 +664,11 @@ class TestPrecompileLoops(CustomTestCase):
                 ForwardMode.EXTEND,
                 ForwardMode.EXTEND,
                 ForwardMode.EXTEND,
+                ForwardMode.EXTEND,
+                ForwardMode.EXTEND,
+                ForwardMode.EXTEND,
+                ForwardMode.MIXED,
+                ForwardMode.MIXED,
                 ForwardMode.MIXED,
                 ForwardMode.MIXED,
             ],
@@ -670,8 +702,8 @@ class TestPrecompileLoops(CustomTestCase):
         mr = _model_runner()
         policy = _make_policy(mr, token_buckets=(4, 64), bs_buckets=(1, 8))
         _run_cases(policy, ForwardMode.EXTEND)
-        self.assertEqual(mr.model.forward.call_count, 1)
-        self.assertEqual(mr.attn_backend.calls, [(64, 8)])
+        self.assertEqual(mr.model.forward.call_count, 2)
+        self.assertEqual(mr.attn_backend.calls, [(64, 8), (64, 8)])
 
     def test_extend_batch_cap_clamped_to_token_bucket(self):
         # The extend batch cap is clamped to the largest token bucket
@@ -680,24 +712,27 @@ class TestPrecompileLoops(CustomTestCase):
         mr = _model_runner()
         policy = _make_policy(mr, token_buckets=(4,), bs_buckets=(8,))
         _run_cases(policy, ForwardMode.EXTEND)
-        self.assertEqual(mr.model.forward.call_count, 1)
-        self.assertEqual(mr.attn_backend.calls, [(4, 4)])
+        self.assertEqual(mr.model.forward.call_count, 2)
+        self.assertEqual(mr.attn_backend.calls, [(4, 4), (4, 4)])
 
     def test_decode_loop_iterates_bs(self):
         mr = _model_runner()
         policy = _make_policy(mr, token_buckets=(64,), bs_buckets=(1, 4, 8))
         _run_cases(policy, ForwardMode.DECODE)
-        self.assertEqual(mr.model.forward.call_count, 3)
+        self.assertEqual(mr.model.forward.call_count, 6)
         # Decode: tokens == bs for each call.
-        self.assertEqual(mr.attn_backend.calls, [(1, 1), (4, 4), (8, 8)])
+        self.assertEqual(
+            mr.attn_backend.calls,
+            [(1, 1), (1, 1), (4, 4), (4, 4), (8, 8), (8, 8)],
+        )
 
     def test_precompile_combines_extend_and_decode(self):
         mr = _model_runner()
         policy = _make_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
         with get_parallel().override(tp_rank=1):
             policy.precompile()
-        # EXTEND: (8,4), (64,4) = 2. DECODE: (1,1), (4,4) = 2.
-        self.assertEqual(mr.model.forward.call_count, 4)
+        # Two sampling variants for two EXTEND and two DECODE shapes.
+        self.assertEqual(mr.model.forward.call_count, 8)
 
 
 class TestRunOneCallsCompiledForward(CustomTestCase):
