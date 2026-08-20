@@ -22,7 +22,9 @@ Import this module early (before any ``from_pretrained`` call) to activate
 all patches.  It is safe to import multiple times -- patches are idempotent.
 """
 
+import functools
 import inspect
+import os
 
 from sglang.srt.utils import logger
 
@@ -64,6 +66,7 @@ def apply_all():
     # v5 general patches
     _ensure_clean_up_tokenization_compat()
     _ensure_is_torch_fx_available_compat()
+    _patch_dynamic_module_cache_lock()
 
     # CI-only: neutralize HF API calls inside tokenizer from_pretrained
     patch_is_base_mistral_in_ci()
@@ -420,6 +423,69 @@ def _ensure_is_torch_fx_available_compat() -> None:
         return
 
     _import_utils.is_torch_fx_available = lambda: True
+
+
+# Long enough to sit behind another rank copying remote code, short enough that
+# a wedged holder fails startup instead of hanging it.
+_DYNAMIC_MODULE_LOCK_TIMEOUT_S = 300
+
+_dynamic_module_locks = {}
+
+
+def _dynamic_module_cache_lock():
+    """Return the cross-process lock guarding ``HF_MODULES_CACHE``.
+
+    The instance is cached per cache directory because ``filelock`` counts
+    re-entrant acquisitions per object -- ``get_cached_module_file`` recurses
+    into itself for relative imports, and a second lock object on the same path
+    would deadlock against the first.
+    """
+    import filelock
+    from transformers.dynamic_module_utils import HF_MODULES_CACHE
+
+    lock = _dynamic_module_locks.get(HF_MODULES_CACHE)
+    if lock is None:
+        lock = filelock.FileLock(
+            os.path.join(HF_MODULES_CACHE, "sglang_remote_code.lock"),
+            timeout=_DYNAMIC_MODULE_LOCK_TIMEOUT_S,
+            mode=0o666,
+        )
+        _dynamic_module_locks[HF_MODULES_CACHE] = lock
+    return lock
+
+
+def _patch_dynamic_module_cache_lock() -> None:
+    """Serialize remote-code cache writes across processes.
+
+    ``get_cached_module_file()`` copies a ``trust_remote_code`` source file into
+    ``HF_MODULES_CACHE`` with a non-atomic ``shutil.copyfile``, guarded only by
+    an ``exists()``/``filecmp`` check and an in-process threading lock.  Ranks
+    that start together share one cache (multi-host serving spawns a scheduler
+    per TPU rank on each node), so one process truncates the file another is
+    importing.  A truncated import still succeeds and silently drops every
+    class defined past the cut, surfacing later as e.g. ``AttributeError:
+    module 'transformers_modules...tokenization_kimi' has no attribute
+    'TikTokenTokenizer'``.
+
+    Holding a file lock across the whole call keeps partial writes visible only
+    to the writer, so every reader imports a complete module.  A lock timeout
+    propagates: falling back to an unlocked copy would reintroduce the race.
+
+    TODO(upstream): drop once transformers writes remote code atomically.
+    """
+    import transformers.dynamic_module_utils as _dmu
+
+    original = _dmu.get_cached_module_file
+    if getattr(original, "_sglang_cross_process_locked", False):
+        return
+
+    @functools.wraps(original)
+    def _locked_get_cached_module_file(*args, **kwargs):
+        with _dynamic_module_cache_lock():
+            return original(*args, **kwargs)
+
+    _locked_get_cached_module_file._sglang_cross_process_locked = True
+    _dmu.get_cached_module_file = _locked_get_cached_module_file
 
 
 # ---------------------------------------------------------------------------
