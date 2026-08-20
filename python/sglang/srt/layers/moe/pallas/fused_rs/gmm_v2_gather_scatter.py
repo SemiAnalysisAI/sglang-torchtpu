@@ -12,6 +12,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes, recover_quant_block_size
 
+_recover_quant_block_size = recover_quant_block_size
+
 
 def get_maybe_quantize_lhs(
     rhs_dtype=None,

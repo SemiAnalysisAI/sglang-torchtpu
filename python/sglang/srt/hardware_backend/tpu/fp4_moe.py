@@ -379,7 +379,7 @@ def apply_tpu_nvfp4_moe(
                 # payload as fp8 as well would re-quantize an already-lossy
                 # intermediate for no bandwidth win, so keep the bf16 payload.
                 fp8_direct_write=False,
-                physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
+                tp_rank_to_device_id=layer._tpu_fused_rs_tp_rank_to_device_id,
             )
             outputs.append(output[: token_end - token_start])
         return StandardCombineInput(hidden_states=torch.cat(outputs, dim=0))

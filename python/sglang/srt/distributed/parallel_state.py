@@ -1301,7 +1301,11 @@ class GroupCoordinator:
         else:
             self.all_gather_into_tensor(output_tensor, input_)
 
-        # Reshape
+        # Fast-path for dim == 0: output_tensor is already (world_size * input_size[0], *input_size[1:])
+        if dim == 0:
+            return output_tensor
+
+        # Reshape for dim != 0
         output_tensor = output_tensor.reshape((world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(
