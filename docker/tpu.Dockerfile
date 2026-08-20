@@ -61,3 +61,14 @@ RUN python -c "import torch, libtpu; print('torch', torch.__version__, '| libtpu
        || echo "warn: torch_tpu import needs a TPU device; deferring to the on-hardware test")
 
 CMD ["/bin/bash"]
+
+# Temporary validation stage for PR #447. Reuse the immutable TPU runtime image
+# that passed the exact TP16 fallback reproduction, then overlay this branch's
+# source so Cloud Build does not need to resolve the private TPU dependency set.
+FROM us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:9eb8dad24312b6b5a2f11f4a8d51875e2b662ce5c06b9d1df3af36ab543da809 AS validation
+
+WORKDIR /sgl-workspace/sglang
+COPY python ./python
+COPY test ./test
+COPY scripts ./scripts
+COPY benchmark ./benchmark
