@@ -359,17 +359,18 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         server_args = self.model_runner.server_args
         is_draft_worker = bool(getattr(self.model_runner, "is_draft_worker", False))
-        compile_owner = self.owner.model if is_draft_worker else self.owner
-        compile_fn = compile_owner.forward if is_draft_worker else fn
+        split_logits = self._should_split_logits_compile_region(is_draft_worker)
+        compile_owner = self.owner.model if split_logits else self.owner
+        compile_fn = compile_owner.forward if split_logits else fn
 
         compiled = self._compile(compile_fn)
         compiled.__signature__ = inspect.signature(compile_fn)
         setattr(
             compile_owner,
-            "forward" if is_draft_worker else self.method_name,
+            "forward" if split_logits else self.method_name,
             compiled,
         )
-        if is_draft_worker:
+        if split_logits:
             logits_fn = self.owner.logits_processor.forward
             compiled_logits = torch.compile(
                 torch.no_grad()(logits_fn),
@@ -379,6 +380,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
             compiled_logits.__signature__ = inspect.signature(logits_fn)
             self.owner.logits_processor.forward = compiled_logits
+            if not is_draft_worker:
+                logger.info(
+                    "[decoder compile policy] Isolating multi-host distributed "
+                    "TopK in a separate logits compile region."
+                )
         # max_t = smallest positive prefill/context limit (extend never runs
         # longer). max_b = the reconciled compile-batch ceiling, already grown to
         # cover the scheduler concurrency in ServerArgs.__post_init__ via
@@ -421,10 +427,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         outer_model.prepare_forward_batch = _prepare
 
-        # Keep draft logits out of the compiled model-forward graph. The outer
-        # forward calls the backbone and logits processor as independent
-        # compiled regions.
-        shim_target = fn if is_draft_worker else compiled
+        # The eager outer forward calls the backbone and logits processor as
+        # independent compiled regions when split_logits is set.
+        shim_target = fn if split_logits else compiled
         self.compiled_forward_shim = CompiledForwardShim(shim_target, policy=self)
         setattr(self.owner, self.method_name, self.compiled_forward_shim)
         self.model_runner.compile_policy = self
@@ -442,6 +447,37 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             self.b_bucketer.name,
         )
         return True
+
+    def _should_split_logits_compile_region(self, is_draft_worker: bool) -> bool:
+        """Keep communication-heavy logits out of unsafe mixed TPU graphs.
+
+        Draft workers already require independently compiled backbone/logits
+        regions. Do the same when multi-host distributed TopK can replace the
+        vocab gather: embedding its candidate exchange in the full model graph
+        mixes it with communicating Pallas MoE kernels and can halt TPU
+        SparseCores at execution time. The split preserves shard-local TopK and
+        exchanges only the compact candidates; it does not restore the
+        full-vocabulary all-gather. See
+        https://github.com/sgl-project/sglang-torchtpu/issues/308 and
+        https://github.com/google-pytorch/torch_tpu/issues/2794.
+        """
+
+        if is_draft_worker:
+            return True
+        model = self.model_runner.model
+        logits_processor = getattr(model, "logits_processor", None)
+        backbone = getattr(model, "model", None)
+        return (
+            self.owner is model
+            and getattr(self.model_runner.server_args, "nnodes", 1) > 1
+            and getattr(logits_processor, "use_tpu_distributed_top_k", False)
+            and getattr(logits_processor, "do_tensor_parallel_all_gather", False)
+            and not getattr(
+                logits_processor, "do_tensor_parallel_all_gather_dp_attn", False
+            )
+            and callable(getattr(backbone, "forward", None))
+            and callable(getattr(logits_processor, "forward", None))
+        )
 
     def _compile(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         if self.tracer == "direct":
