@@ -32,20 +32,20 @@ def distributed_top_k_for_batch(
 
     if sampling_backend != "tpu":
         return None
-    if forward_batch is None or getattr(forward_batch, "sampling_info", None) is None:
+    if forward_batch is None:
         return None
-    spec_algorithm = getattr(forward_batch, "spec_algorithm", None)
-    has_speculative_decode = spec_algorithm is not None and not spec_algorithm.is_none()
     # TPU compilation pads logical batches to static physical buckets before
     # this selector runs. The cutoff describes the work the compiled graph
     # executes, so use the padded size. Reading _tpu_real_b here would also make
     # Dynamo guard on each logical size and recompile within the same bucket.
     batch_size = getattr(forward_batch, "batch_size", 0)
-    if (
-        getattr(forward_batch, "return_logprob", False)
-        or has_speculative_decode
-        or batch_size < _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
-    ):
+    if batch_size < _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE:
+        return None
+    if getattr(forward_batch, "sampling_info", None) is None:
+        return None
+    spec_algorithm = getattr(forward_batch, "spec_algorithm", None)
+    has_speculative_decode = spec_algorithm is not None and not spec_algorithm.is_none()
+    if getattr(forward_batch, "return_logprob", False) or has_speculative_decode:
         return None
 
     mode = forward_batch.forward_mode

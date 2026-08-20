@@ -381,6 +381,10 @@ class LogitsProcessor(nn.Module):
             not requires_full_next_token_logits
             and _is_tpu
             and get_exec().kernel.sampling_backend == "tpu"
+            # The native TopK collective currently hard-halts TPU v7 SparseCores
+            # when tensor parallelism spans hosts. Keep the full-vocabulary
+            # gather on multi-host deployments until that kernel is supported.
+            and getattr(get_parallel(), "nnodes", 1) == 1
         )
         if self.use_tpu_distributed_top_k:
             # Register before an optional fullgraph torch.compile trace reaches
