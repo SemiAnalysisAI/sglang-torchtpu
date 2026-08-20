@@ -893,9 +893,10 @@ class TestSpecPrecompileLoops(CustomTestCase):
         # in spec_decode_compile_policy. One topology override serves both.
         with get_parallel().override(tp_rank=1):
             policy.precompile()
-        # EXTEND (8,4),(64,4)=2  DECODE (1,1),(4,4)=2
+        # EXTEND (8,4),(64,4) x greedy/top-k=4
+        # DECODE (1,1),(4,4) x greedy/top-k=4
         # TARGET_VERIFY buckets bs: (4,1),(16,4)=2  EXTEND(FULL) 2
-        self.assertEqual(mr.model.forward.call_count, 8)
+        self.assertEqual(mr.model.forward.call_count, 12)
         self.assertIn((16, 4), mr.attn_backend.calls)
         self.assertIn((4, 1), mr.attn_backend.calls)
 
