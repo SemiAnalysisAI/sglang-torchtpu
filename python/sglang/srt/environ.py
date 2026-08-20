@@ -1382,6 +1382,8 @@ class Envs:
     # Physical TPU v7 TP8 measurements favor distributed TopK from batch 64.
     # Deployments can override this cutoff after measuring their topology.
     SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = EnvInt(64)
+    # Rollout kill switch for the direct-HBM Pallas candidate exchange.
+    SGLANG_TPU_DISABLE_PALLAS_DISTRIBUTED_TOP_K = EnvBool(False)
 
     # Vision-encoder precompile ladder. Unset uses the computed square-grid
     # ladder; set-but-empty disables precompile entirely.
