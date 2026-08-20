@@ -2,13 +2,17 @@
 """Exact TPU TopK primitives for vocab-parallel token sampling.
 Sharded reduction communicates only local TopK logits and global token IDs."""
 
+import os
 from collections.abc import Callable
 from typing import NamedTuple
 
 import torch
 
+from sglang.srt.environ import envs
+
 _TPU_TOP_K_OP: Callable | None = None
 _TPU_SHARDED_TOP_K_OP: Callable | None = None
+_PALLAS_WORLD_SIZES = frozenset((8, 16))
 
 
 def supports_distributed_tpu_top_k(lm_head, top_k: int) -> bool:
@@ -39,6 +43,7 @@ class TpuVocabShard(NamedTuple):
 
     width: int
     global_vocab_size: int
+    org_vocab_size: int
     org_vocab_start: int
     org_vocab_count: int
     org_vocab_padded_count: int
@@ -56,6 +61,7 @@ class TpuVocabShard(NamedTuple):
         shard = cls(
             width=lm_head.num_embeddings_per_partition,
             global_vocab_size=lm_head.num_embeddings,
+            org_vocab_size=getattr(lm_head, "org_vocab_size", lm_head.num_embeddings),
             org_vocab_start=indices.org_vocab_start_index,
             org_vocab_count=indices.num_org_elements,
             org_vocab_padded_count=indices.num_org_elements_padded,
@@ -69,7 +75,96 @@ class TpuVocabShard(NamedTuple):
             )
         if shard.org_vocab_padded_count + shard.added_vocab_count > shard.width:
             raise ValueError("added vocabulary exceeds LM-head shard width")
+        if not 0 < shard.org_vocab_size <= shard.global_vocab_size:
+            raise ValueError("original vocabulary must fit the global vocabulary")
         return shard
+
+
+def _validate_tpu_sharded_top_k(
+    values: torch.Tensor,
+    shard: TpuVocabShard,
+    k: int,
+) -> None:
+    if values.device.type != "tpu":
+        raise ValueError(
+            f"tpu_sharded_top_k requires a TPU tensor, got {values.device}"
+        )
+    if values.ndim != 2:
+        raise ValueError(
+            f"tpu_sharded_top_k expects a 2D tensor, got shape {values.shape}"
+        )
+    if values.shape[-1] != shard.width:
+        raise ValueError(
+            "vocab shard width does not match local logits: "
+            f"{shard.width} != {values.shape[-1]}"
+        )
+    if not 0 < k <= shard.width or k > shard.global_vocab_size:
+        raise ValueError(
+            "k must fit both the local padded shard and global vocabulary, "
+            f"got k={k}, shard_width={shard.width}, "
+            f"global_vocab_size={shard.global_vocab_size}"
+        )
+
+
+def _is_canonical_pallas_shard(shard: TpuVocabShard, rank: int) -> bool:
+    """Whether rank-based Pallas ID reconstruction matches this shard."""
+
+    org_start = min(rank * shard.org_vocab_padded_count, shard.org_vocab_size)
+    org_end = min(
+        (rank + 1) * shard.org_vocab_padded_count,
+        shard.org_vocab_size,
+    )
+    added_width = shard.width - shard.org_vocab_padded_count
+    added_start = min(
+        shard.org_vocab_size + rank * added_width,
+        shard.global_vocab_size,
+    )
+    added_end = min(
+        shard.org_vocab_size + (rank + 1) * added_width,
+        shard.global_vocab_size,
+    )
+    return (
+        added_width >= 0
+        and shard.org_vocab_start == org_start
+        and shard.org_vocab_count == org_end - org_start
+        and shard.added_vocab_start == added_start
+        and shard.added_vocab_count == added_end - added_start
+    )
+
+
+def supports_pallas_distributed_tpu_top_k(
+    shard: TpuVocabShard,
+    k: int,
+    *,
+    group_world_size: int,
+    model_rank: int | None,
+) -> bool:
+    """Return whether static metadata guarantees the direct-HBM path.
+
+    Multi-host callers use this before skipping the full-vocabulary gather.
+    That prevents a later Pallas miss from reaching the native collective,
+    which is not supported across TPU v7 hosts.
+    """
+
+    return (
+        supports_pallas_distributed_tpu_top_k_topology(group_world_size)
+        and isinstance(model_rank, int)
+        and 0 <= model_rank < group_world_size
+        and shard.width >= 64
+        and 0 < k <= 64
+        and _is_canonical_pallas_shard(shard, model_rank)
+    )
+
+
+def supports_pallas_distributed_tpu_top_k_topology(group_world_size: int) -> bool:
+    """Return whether a process group can use the full-world Pallas ring."""
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    return (
+        not envs.SGLANG_TPU_DISABLE_PALLAS_DISTRIBUTED_TOP_K.get()
+        and group_world_size == world_size
+        and world_size in _PALLAS_WORLD_SIZES
+    )
 
 
 def _get_tpu_top_k_op() -> Callable:
@@ -189,25 +284,7 @@ def tpu_sharded_top_k(
     """Select one shard's exact TopK while excluding padded columns.
     Returned int32 IDs already refer to the unpadded global vocabulary."""
 
-    if values.device.type != "tpu":
-        raise ValueError(
-            f"tpu_sharded_top_k requires a TPU tensor, got {values.device}"
-        )
-    if values.ndim != 2:
-        raise ValueError(
-            f"tpu_sharded_top_k expects a 2D tensor, got shape {values.shape}"
-        )
-    if values.shape[-1] != shard.width:
-        raise ValueError(
-            "vocab shard width does not match local logits: "
-            f"{shard.width} != {values.shape[-1]}"
-        )
-    if not 0 < k <= shard.width or k > shard.global_vocab_size:
-        raise ValueError(
-            "k must fit both the local padded shard and global vocabulary, "
-            f"got k={k}, shard_width={shard.width}, "
-            f"global_vocab_size={shard.global_vocab_size}"
-        )
+    _validate_tpu_sharded_top_k(values, shard, k)
     return _get_tpu_sharded_top_k_op()(
         values,
         k,
@@ -225,17 +302,26 @@ def register_tpu_top_k_ops() -> None:
 
     _get_tpu_top_k_op()
     _get_tpu_sharded_top_k_op()
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if (
+        world_size in _PALLAS_WORLD_SIZES
+        and not envs.SGLANG_TPU_DISABLE_PALLAS_DISTRIBUTED_TOP_K.get()
+    ):
+        from sglang.srt.hardware_backend.tpu.distributed_topk_pallas import (
+            register_pallas_distributed_top_k_op,
+        )
+
+        register_pallas_distributed_top_k_op(world_size)
 
 
-def distributed_tpu_top_k(
+def distributed_tpu_top_k_collective(
     local_logits: torch.Tensor,
     shard: TpuVocabShard,
     k: int,
     *,
     group,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Merge exact sharded TopK logits into a replicated global TopK.
-    Only k logits and token IDs per shard cross the tensor-parallel group."""
+    """Merge shard-local TopK candidates with Torch collectives."""
 
     sharded_top_k_logits, sharded_top_k_token_ids = tpu_sharded_top_k(
         local_logits, shard, k
@@ -276,3 +362,54 @@ def distributed_tpu_top_k(
         index=global_top_k_positions.to(torch.int64),
     )
     return global_top_k_logits.float(), global_top_k_token_ids.to(torch.int32)
+
+
+def distributed_tpu_top_k(
+    local_logits: torch.Tensor,
+    shard: TpuVocabShard,
+    k: int,
+    *,
+    group,
+    require_pallas: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge exact sharded TopK logits into a replicated global TopK."""
+
+    _validate_tpu_sharded_top_k(local_logits, shard, k)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    model_rank = getattr(group, "rank_in_group", None)
+    if (
+        supports_pallas_distributed_tpu_top_k(
+            shard,
+            k,
+            group_world_size=group.world_size,
+            model_rank=model_rank,
+        )
+        and local_logits.shape[0] > 0
+        and local_logits.dtype in (torch.bfloat16, torch.float32)
+    ):
+        from sglang.srt.hardware_backend.tpu.distributed_topk_pallas import (
+            pallas_distributed_top_k,
+        )
+
+        return pallas_distributed_top_k(
+            local_logits,
+            org_vocab_size=shard.org_vocab_size,
+            global_vocab_size=shard.global_vocab_size,
+            org_vocab_padded_count=shard.org_vocab_padded_count,
+            k=k,
+            world_size=world_size,
+            model_rank=model_rank,
+        )
+
+    if require_pallas:
+        raise RuntimeError(
+            "multi-host distributed TPU TopK lost Pallas eligibility; "
+            "select the full-vocabulary gather before computing local logits"
+        )
+
+    return distributed_tpu_top_k_collective(
+        local_logits,
+        shard,
+        k,
+        group=group,
+    )
