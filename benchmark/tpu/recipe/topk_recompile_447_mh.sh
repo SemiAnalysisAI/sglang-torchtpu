@@ -5,12 +5,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."  # recipe/ -> benchmark/tpu
 
-# Keep the logical-batch guard test isolated from the independent TP=16
-# distributed-TopK kernel halt seen during startup precompile. The largest
-# physical compile bucket is 128; the old code still guards on _tpu_real_b
-# while evaluating this cutoff, whereas PR #447 does not.
 exec env \
-  SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE=129 \
   MODEL="${MODEL:-/weights/Qwen3-Coder-480B-A35B-Instruct-FP8}" \
   TP_SIZE=16 \
   EP_SIZE=16 \
