@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Reproduce PR #396's logical-batch Dynamo guard after a B=1 prime."""
+"""Exercise PR #447 sampling-mode transitions on a frozen TP16 server."""
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import urllib.request
+from pathlib import Path
 
 from sglang.test.ci.ci_register import register_tpu_ci
-
 
 register_tpu_ci(est_time=1800, suite="nightly-tpu-multihost", nightly=True)
 
@@ -19,9 +18,7 @@ MULTIHOST_LAUNCH = {
 }
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
-MODEL = os.environ.get(
-    "MODEL", "/weights/Qwen3-Coder-480B-A35B-Instruct-FP8"
-)
+MODEL = os.environ.get("MODEL", "/weights/Qwen3-Coder-480B-A35B-Instruct-FP8")
 SERVER_LOG = Path(os.environ.get("SERVER_LOG", "/tmp/server.log"))
 
 
@@ -33,6 +30,28 @@ def request_json(path: str, payload: dict, timeout: int = 1200) -> dict:
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.load(response)
+
+
+def request_batch(label: str, sampling_params: dict) -> None:
+    print(f"== {label} ==", flush=True)
+    result = request_json(
+        "/generate",
+        {
+            "text": ["Hello"] * 64,
+            "sampling_params": {
+                "max_new_tokens": 2,
+                "ignore_eos": True,
+                **sampling_params,
+            },
+        },
+    )
+    if not isinstance(result, list) or len(result) != 64:
+        raise SystemExit(
+            f"{label} returned an unexpected batch response: "
+            f"{type(result).__name__}"
+        )
+    with urllib.request.urlopen(f"{BASE_URL}/health", timeout=30) as response:
+        print(f"{label} health: HTTP {response.status}", flush=True)
 
 
 def main() -> None:
@@ -73,43 +92,50 @@ def main() -> None:
     if bench.returncode:
         raise SystemExit(f"B=64 benchmark failed with rc={bench.returncode}")
 
-    print("== exercise TP16 distributed TopK at B=64 ==", flush=True)
-    distributed = request_json(
-        "/generate",
-        {
-            "text": ["Hello"] * 64,
-            "sampling_params": {
-                "temperature": 1,
-                "top_k": 50,
-                "max_new_tokens": 2,
-            },
-        },
+    request_batch(
+        "exercise TP16 distributed TopK=50 at B=64",
+        {"temperature": 0.7, "top_k": 50},
     )
-    if not isinstance(distributed, list) or len(distributed) != 64:
-        raise SystemExit(
-            "TP16 distributed TopK returned an unexpected batch response: "
-            f"{type(distributed).__name__}"
-        )
-
-    with urllib.request.urlopen(f"{BASE_URL}/health", timeout=30) as response:
-        print(f"post-TopK health: HTTP {response.status}", flush=True)
+    request_batch(
+        "switch fixed candidate path to TopK=7 at B=64",
+        {"temperature": 0.7, "top_k": 7},
+    )
+    request_batch(
+        "switch to default full-vocabulary sampling at B=64",
+        {"temperature": 0.7},
+    )
 
     log = SERVER_LOG.read_text(errors="replace") if SERVER_LOG.exists() else ""
-    guard_signatures = (
+    failure_signatures = (
         "Detected recompile when torch.compile stance is 'fail_on_recompile'",
         "args[2]._tpu_real_b ==",
+        "RuntimeUnexpectedCoreHalt",
+        "UserFatal",
+        "RuntimeBufferAllocationFailure",
     )
-    found = [signature for signature in guard_signatures if signature in log]
+    found = [signature for signature in failure_signatures if signature in log]
     print(
-        "guard scan: "
-        + (f"FOUND {found}" if found else "clean (no recompile guard)"),
+        "failure scan: "
+        + (f"FOUND {found}" if found else "clean (no recompile/halt signature)"),
         flush=True,
     )
     if found:
-        raise SystemExit(f"recompile regression reproduced: {found}")
+        raise SystemExit(f"serving regression reproduced: {found}")
+
+    required_path_markers = (
+        "path=candidate:1 candidate_width=64 logical_batch=64 physical_batch=64",
+        "path=candidate:50 candidate_width=64 logical_batch=64 physical_batch=64",
+        "path=candidate:7 candidate_width=64 logical_batch=64 physical_batch=64",
+        "path=full_vocab:1073741824 candidate_width=64 logical_batch=64 "
+        "physical_batch=64",
+    )
+    missing = [marker for marker in required_path_markers if marker not in log]
+    if missing:
+        raise SystemExit(f"missing post-forward path evidence: {missing}")
+    print("path scan: candidate and full-vocabulary branches confirmed", flush=True)
 
     print(
-        "PASS: B=1 prime, B=64 greedy, and B=64 distributed TopK completed",
+        "PASS: B=1 prime and B=64 greedy/TopK/default transitions completed",
         flush=True,
     )
 

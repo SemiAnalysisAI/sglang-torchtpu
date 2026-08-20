@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Temporary two-host launch recipe for reproducing PR #396's Dynamo guard
+# Temporary two-host launch recipe for reproducing PR #447's Dynamo guard
 # failure against the fix in PR #447.
 set -euo pipefail
 

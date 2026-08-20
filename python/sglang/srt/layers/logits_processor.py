@@ -938,6 +938,29 @@ class LogitsProcessor(nn.Module):
             forward_batch, lm_head
         )
 
+        requested_top_k = getattr(
+            getattr(forward_batch, "sampling_info", None), "uniform_top_k", None
+        )
+        logical_batch = getattr(forward_batch, "_tpu_real_b", forward_batch.batch_size)
+        validation_path = (
+            f"candidate:{distributed_top_k}"
+            if distributed_top_k is not None
+            else f"full_vocab:{requested_top_k}"
+        )
+        validation_key = (validation_path, logical_batch, forward_batch.batch_size)
+        logged_paths = getattr(self, "_pr447_validation_paths", set())
+        if validation_key not in logged_paths:
+            logger.info(
+                "PR447_VALIDATION path=%s candidate_width=%d "
+                "logical_batch=%d physical_batch=%d",
+                validation_path,
+                candidate_width,
+                logical_batch,
+                forward_batch.batch_size,
+            )
+            logged_paths.add(validation_key)
+            self._pr447_validation_paths = logged_paths
+
         if distributed_top_k is not None:
             global_top_k_logits, global_top_k_token_ids = (
                 self._reduce_tpu_distributed_top_k(
