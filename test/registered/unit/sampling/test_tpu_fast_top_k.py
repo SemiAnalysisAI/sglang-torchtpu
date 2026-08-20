@@ -187,13 +187,6 @@ class TestDistributedTopKEligibility(CustomTestCase):
                     _forward_batch(batch_size=127), sampling_backend="tpu"
                 )
             )
-            padded_batch = _forward_batch(batch_size=128)
-            padded_batch._tpu_real_b = 127
-            self.assertIsNone(
-                tpu_sampler_module.distributed_top_k_for_batch(
-                    padded_batch, sampling_backend="tpu"
-                )
-            )
             self.assertEqual(
                 tpu_sampler_module.distributed_top_k_for_batch(
                     _forward_batch(batch_size=128), sampling_backend="tpu"
@@ -203,6 +196,27 @@ class TestDistributedTopKEligibility(CustomTestCase):
         finally:
             # Restore the process-start configuration for the remaining tests.
             importlib.reload(tpu_sampler_module)
+
+    def test_cutoff_reads_the_padded_bucket_not_the_real_batch_size(self):
+        """Eligibility must not depend on the unpadded batch size.
+
+        The check runs inside the compiled forward, so dynamo specializes on
+        whatever int it reads. The real batch size varies from step to step
+        within one padded bucket, so reading it forces a recompile that the
+        ``fail_on_recompile`` stance turns into a fatal scheduler error.
+        """
+
+        with patch.object(tpu_sampler_module, "_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE", 64):
+            for real_b in (1, 63, 64, 100, 128):
+                with self.subTest(real_b=real_b):
+                    padded_batch = _forward_batch(batch_size=128)
+                    padded_batch._tpu_real_b = real_b
+                    self.assertEqual(
+                        distributed_top_k_for_batch(
+                            padded_batch, sampling_backend="tpu"
+                        ),
+                        50,
+                    )
 
     def test_model_requiring_full_logits_disables_global_top_k(self):
         execution = SimpleNamespace(

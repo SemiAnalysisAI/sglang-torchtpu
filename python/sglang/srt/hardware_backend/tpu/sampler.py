@@ -36,11 +36,10 @@ def distributed_top_k_for_batch(
         return None
     spec_algorithm = getattr(forward_batch, "spec_algorithm", None)
     has_speculative_decode = spec_algorithm is not None and not spec_algorithm.is_none()
-    batch_size = getattr(
-        forward_batch,
-        "_tpu_real_b",
-        getattr(forward_batch, "batch_size", 0),
-    )
+    # Padded bucket, never `_tpu_real_b`: this runs inside the compiled graph,
+    # so dynamo specializes on the int it reads, and the real batch size varies
+    # within one bucket (recompile -> crash under fail_on_recompile).
+    batch_size = getattr(forward_batch, "batch_size", 0) or 0
     if (
         getattr(forward_batch, "return_logprob", False)
         or has_speculative_decode
