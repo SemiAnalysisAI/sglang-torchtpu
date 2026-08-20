@@ -235,6 +235,62 @@ def _gmm2_tile_source(lhs, w2, w2_scale, num_experts, *, w2_packed):
     return _lookup_tile_info(lhs, w2, w2_scale, num_experts, packed_fp4=True)
 
 
+# 3 pipelined rhs buffers + the unpack staging tile, leaving room for the
+# per-block scales, lhs, accumulator and output.
+_PACKED_RHS_VMEM_DIVISOR = 5
+
+
+def _vmem_safe_packed_tile_n(base_tile_info):
+    """Wrap a gmm_v2 ``tile_info`` so a pre-packed sub-byte rhs tile leaves room
+    for the staging copy the kernel's own VMEM estimate does not model.
+
+    ``calculate_tiling`` sizes the rhs tile from the *stored* bit width and
+    budgets three pipelined buffers. A W4A16 rhs is additionally unpacked into a
+    staging tile before the matmul, so the real demand is about a buffer higher
+    than the estimate. At Kimi-K2.6's GMM1 (k=7168, n=4096, int4 packed 8-per
+    int32, 32-element quant blocks) that gap is what pushes the kernel over its
+    own limit -- measured 62.77 MB against 57.60 MB, which Mosaic reports as
+    ``CompileTimeScopedVmemOom``.
+
+    Only pre-packed quantized weights carry ``packing > 1``, so this is a no-op
+    for bf16 and FP8 MoE, and for packed FP4, which resolves its tiles through
+    ``_lookup_tile_info`` instead. Kimi's GMM2 (k=2048, n=7168) already fits and
+    keeps its tile.
+    """
+    import dataclasses
+
+    import jax
+
+    from sglang.srt.layers.moe.pallas.gmm_v2 import (
+        TileSizes,
+        _largest_aligned_divisor_at_most,
+    )
+
+    def wrapped(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act=None):
+        if isinstance(base_tile_info, TileSizes):
+            tiles = base_tile_info
+        else:
+            tiles = base_tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+        if rhs_cfgs.packing <= 1:
+            return tiles
+
+        rhs_bits = jax.dtypes.itemsize_bits(rhs_cfgs.dtype)
+        budget = vmem_limit_bytes // _PACKED_RHS_VMEM_DIVISOR
+        tile_n = tiles.tile_n
+        while tile_n > 128 and tiles.tile_k * tile_n * rhs_bits // 8 > budget:
+            try:
+                tile_n = _largest_aligned_divisor_at_most(dims.size_n, tile_n // 2, 128)
+            except ValueError:
+                # Nothing smaller divides size_n; keep the kernel's own choice
+                # rather than turning a tile search into a hard failure.
+                return tiles
+        if tile_n == tiles.tile_n:
+            return tiles
+        return dataclasses.replace(tiles, tile_n=tile_n)
+
+    return wrapped
+
+
 def _dividing_tile_k(base_tile_info):
     """Wrap a gmm_v2 ``tile_info`` so the resolved ``tile_k`` always divides
     ``size_k`` (mirrors the kernel's N-gate, which has no K equivalent) and
@@ -458,7 +514,9 @@ def _fused_moe_jax(
 
     # Weights arrive lane-aligned from the loader (bf16: pad activations to
     # match; quantized: unpadded-at-load dims are unsupported)
-    gmm1_tiling = _dividing_tile_k(gmm1_tile_info or calculate_tiling)
+    gmm1_tiling = _dividing_tile_k(
+        _vmem_safe_packed_tile_n(gmm1_tile_info or calculate_tiling)
+    )
     if w1_scale is None:
         assert w1.shape[1] % 128 == 0, (
             f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight K "
@@ -527,7 +585,9 @@ def _fused_moe_jax(
             "pad weights AND scales jointly at load time."
         )
     gmm2_tiling = _dividing_tile_k(
-        _gmm2_tile_source(gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed)
+        _vmem_safe_packed_tile_n(
+            _gmm2_tile_source(gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed)
+        )
     )
     gmm2_out = gmm_v2(
         lhs=gmm1_out,
