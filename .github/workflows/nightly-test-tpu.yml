@@ -97,22 +97,28 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        row: [pd, spec]
-    name: multihost-combo-test-${{ matrix.row }}
+        include:
+          - label: topk-gather-singlehost-w800
+            hosts: 1
+            args: gather-scan 800
+          - label: topk-gather-multihost-w400-w800
+            hosts: 2
+            args: gather-scan 400 800
+          - label: topk-original-multihost
+            hosts: 2
+            args: original
+          - label: topk-fused-multihost
+            hosts: 2
+            args: fused
+    name: ${{ matrix.label }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
       lane: nightly
-      hosts: 2
-      # pd: FP8 30B from the shared disk (functional oracle -- quant-safe).
-      # spec: gated Llama-3.1-8B from HF (HF_TOKEN needs Meta license access).
-      exec_cmd: >-
-        ${{ matrix.row == 'pd'
-            && 'env MODEL=/weights/Qwen3-30B-A3B-FP8 python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py pd'
-            || 'python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec' }}
-      weights_pvc: model-weights-rox
-      run_name: multihost-combo-test-${{ matrix.row }}
+      hosts: ${{ matrix.hosts }}
+      exec_cmd: bash benchmark/tpu/topk_multihost_probe.sh ${{ matrix.args }}
+      run_name: ${{ matrix.label }}
     permissions:
       contents: read
       id-token: write
