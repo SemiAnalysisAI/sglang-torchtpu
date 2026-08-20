@@ -112,6 +112,24 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 50,
             )
 
+    def test_compiled_selector_ignores_logical_size_within_physical_bucket(self):
+        batch = _forward_batch(batch_size=64)
+        batch._tpu_real_b = 64
+
+        @torch.compile(fullgraph=True, backend="eager", dynamic=False)
+        def select_top_k(value):
+            top_k = distributed_top_k_for_batch(batch, sampling_backend="tpu")
+            return value + (top_k or 0)
+
+        value = torch.ones(1)
+        expected = select_top_k(value)
+        batch._tpu_real_b = 1
+
+        with torch.compiler.set_stance("fail_on_recompile"):
+            actual = select_top_k(value)
+
+        torch.testing.assert_close(actual, expected)
+
     def test_explicitly_skipped_tensor_parallel_gather_falls_back(self):
         processor = SimpleNamespace(
             use_tpu_distributed_top_k=True,
@@ -189,10 +207,11 @@ class TestDistributedTopKEligibility(CustomTestCase):
             )
             padded_batch = _forward_batch(batch_size=128)
             padded_batch._tpu_real_b = 127
-            self.assertIsNone(
+            self.assertEqual(
                 tpu_sampler_module.distributed_top_k_for_batch(
                     padded_batch, sampling_backend="tpu"
-                )
+                ),
+                50,
             )
             self.assertEqual(
                 tpu_sampler_module.distributed_top_k_for_batch(
