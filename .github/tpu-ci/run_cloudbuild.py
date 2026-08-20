@@ -121,6 +121,32 @@ def main() -> None:
         if b.get("failureInfo"):
             _log("failureInfo: " + json.dumps(b["failureInfo"]))
         _log("logUrl: " + b.get("logUrl", "?"))
+        log_filter = (
+            'resource.type="build" AND ' f'resource.labels.build_id="{build_id}"'
+        )
+        log_code, log_response = call(
+            "POST",
+            "https://logging.googleapis.com/v2/entries:list",
+            {
+                "resourceNames": [f"projects/{args.project}"],
+                "filter": log_filter,
+                "orderBy": "timestamp asc",
+                "pageSize": 1000,
+            },
+        )
+        if log_code == 200:
+            _log("Cloud Build log tail:")
+            entries = log_response.get("entries", [])
+            for entry in entries[-200:]:
+                payload = entry.get("textPayload")
+                if payload is None:
+                    payload = json.dumps(entry.get("jsonPayload", {}))
+                _log(payload.rstrip())
+        else:
+            _log(
+                "Could not fetch Cloud Build logs: "
+                f"HTTP {log_code}: {json.dumps(log_response)[:300]}"
+            )
         sys.exit(1)
 
     images = b.get("results", {}).get("images", [])
