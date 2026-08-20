@@ -67,6 +67,33 @@ def main() -> None:
         check=False,
     )
 
+    with urllib.request.urlopen(f"{BASE_URL}/health", timeout=30) as response:
+        print(f"post-benchmark health: HTTP {response.status}", flush=True)
+
+    if bench.returncode:
+        raise SystemExit(f"B=64 benchmark failed with rc={bench.returncode}")
+
+    print("== exercise TP16 distributed TopK at B=64 ==", flush=True)
+    distributed = request_json(
+        "/generate",
+        {
+            "text": ["Hello"] * 64,
+            "sampling_params": {
+                "temperature": 1,
+                "top_k": 50,
+                "max_new_tokens": 2,
+            },
+        },
+    )
+    if not isinstance(distributed, list) or len(distributed) != 64:
+        raise SystemExit(
+            "TP16 distributed TopK returned an unexpected batch response: "
+            f"{type(distributed).__name__}"
+        )
+
+    with urllib.request.urlopen(f"{BASE_URL}/health", timeout=30) as response:
+        print(f"post-TopK health: HTTP {response.status}", flush=True)
+
     log = SERVER_LOG.read_text(errors="replace") if SERVER_LOG.exists() else ""
     guard_signatures = (
         "Detected recompile when torch.compile stance is 'fail_on_recompile'",
@@ -78,17 +105,11 @@ def main() -> None:
         + (f"FOUND {found}" if found else "clean (no recompile guard)"),
         flush=True,
     )
-
-    with urllib.request.urlopen(f"{BASE_URL}/health", timeout=30) as response:
-        print(f"post-benchmark health: HTTP {response.status}", flush=True)
-
-    if bench.returncode:
-        raise SystemExit(f"B=64 benchmark failed with rc={bench.returncode}")
     if found:
         raise SystemExit(f"recompile regression reproduced: {found}")
 
     print(
-        "PASS: B=1 prime followed by B=64 completed without a Dynamo recompile",
+        "PASS: B=1 prime, B=64 greedy, and B=64 distributed TopK completed",
         flush=True,
     )
 
