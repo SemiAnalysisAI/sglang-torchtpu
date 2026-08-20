@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Temporary two-host launch recipe for reproducing PR #396's Dynamo guard
-# failure against the fix in PR #447.
+# Two-host launch recipe for exercising PR #447 with TP16 distributed TopK.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."  # recipe/ -> benchmark/tpu

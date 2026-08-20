@@ -1,14 +1,12 @@
-#!/usr/bin/env python3
-"""Reproduce PR #396's logical-batch Dynamo guard after a B=1 prime."""
+"""Exercise TP16 distributed TopK after a B=1 Dynamo prime."""
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import urllib.request
+from pathlib import Path
 
 from sglang.test.ci.ci_register import register_tpu_ci
-
 
 register_tpu_ci(est_time=1800, suite="nightly-tpu-multihost", nightly=True)
 
@@ -19,9 +17,7 @@ MULTIHOST_LAUNCH = {
 }
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
-MODEL = os.environ.get(
-    "MODEL", "/weights/Qwen3-Coder-480B-A35B-Instruct-FP8"
-)
+MODEL = os.environ.get("MODEL", "/weights/Qwen3-Coder-480B-A35B-Instruct-FP8")
 SERVER_LOG = Path(os.environ.get("SERVER_LOG", "/tmp/server.log"))
 
 
@@ -74,8 +70,7 @@ def main() -> None:
     )
     found = [signature for signature in guard_signatures if signature in log]
     print(
-        "guard scan: "
-        + (f"FOUND {found}" if found else "clean (no recompile guard)"),
+        "guard scan: " + (f"FOUND {found}" if found else "clean (no recompile guard)"),
         flush=True,
     )
 

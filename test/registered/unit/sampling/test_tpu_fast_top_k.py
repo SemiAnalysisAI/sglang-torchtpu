@@ -278,7 +278,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
 
         self.assertFalse(processor.use_tpu_distributed_top_k)
 
-    def test_multihost_disables_global_top_k(self):
+    def test_multihost_enables_global_top_k(self):
         execution = SimpleNamespace(
             features=SimpleNamespace(enable_fp32_lm_head=False, enable_mis=False),
             deterministic=SimpleNamespace(rl_on_policy_target=None),
@@ -314,8 +314,8 @@ class TestDistributedTopKEligibility(CustomTestCase):
         ):
             processor = LogitsProcessor(config)
 
-        self.assertFalse(processor.use_tpu_distributed_top_k)
-        register_top_k.assert_not_called()
+        self.assertTrue(processor.use_tpu_distributed_top_k)
+        register_top_k.assert_called_once_with()
 
 
 class TestTpuSamplerGlobalTopK(CustomTestCase):
