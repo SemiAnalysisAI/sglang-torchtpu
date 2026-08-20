@@ -54,9 +54,9 @@ import math
 from typing import Optional
 
 import torch
+from torch_tpu._internal.pallas import jax_op
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.pallas_jax_op import cpu_export_jax_op
 
 logger = logging.getLogger(__name__)
 
@@ -660,7 +660,7 @@ def _build_fused_moe_op():
             permute_dense_threshold,
         )
 
-    custom_op = cpu_export_jax_op(op_name, _wrapped)
+    custom_op = jax_op(op_name, _wrapped)
 
     def _fake_impl(
         hidden_states: torch.Tensor,
