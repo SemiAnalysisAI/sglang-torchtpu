@@ -1383,6 +1383,8 @@ class Envs:
     # rows. Compiled serving applies this to the padded physical batch.
     # Deployments can override this cutoff after measuring their topology.
     SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = EnvInt(64)
+    # Rollout kill switch: production falls back to full-vocabulary sampling.
+    SGLANG_TPU_DISABLE_PALLAS_DISTRIBUTED_TOP_K = EnvBool(False)
 
     # Vision-encoder precompile ladder. Unset uses the computed square-grid
     # ladder; set-but-empty disables precompile entirely.

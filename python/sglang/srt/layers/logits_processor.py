@@ -347,24 +347,29 @@ class LogitsProcessor(nn.Module):
         requires_full_next_token_logits: bool = False,
     ):
         super().__init__()
+        parallel = get_parallel()
         self.config = config
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
-        self.use_attn_tp_group = get_parallel().enable_dp_lm_head
+        self.use_attn_tp_group = parallel.enable_dp_lm_head
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head
         if self.use_attn_tp_group:
-            self.attn_tp_size = get_parallel().attn_tp_size
+            self.attn_tp_size = parallel.attn_tp_size
             self.do_tensor_parallel_all_gather = (
                 not skip_all_gather and self.attn_tp_size > 1
             )
             self.do_tensor_parallel_all_gather_dp_attn = False
+            self.tpu_top_k_group_size = self.attn_tp_size
+            self.tpu_top_k_group_rank = parallel.attn_tp_rank
         else:
             self.do_tensor_parallel_all_gather = (
-                not skip_all_gather and get_parallel().tp_size > 1
+                not skip_all_gather and parallel.tp_size > 1
             )
             self.do_tensor_parallel_all_gather_dp_attn = (
-                self.do_tensor_parallel_all_gather and get_parallel().attn_dp_size != 1
+                self.do_tensor_parallel_all_gather and parallel.attn_dp_size != 1
             )
+            self.tpu_top_k_group_size = parallel.tp_size
+            self.tpu_top_k_group_rank = getattr(parallel, "tp_rank", 0)
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -377,11 +382,27 @@ class LogitsProcessor(nn.Module):
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        self.require_pallas_distributed_top_k = getattr(parallel, "nnodes", 1) > 1
         self.use_tpu_distributed_top_k = (
             not requires_full_next_token_logits
             and _is_tpu
             and get_exec().kernel.sampling_backend == "tpu"
+            # This is the rollout kill switch. Disable the whole pre-gather
+            # path so multi-host deployments fall back before local logits.
+            and not envs.SGLANG_TPU_DISABLE_PALLAS_DISTRIBUTED_TOP_K.get()
         )
+        if self.use_tpu_distributed_top_k and self.require_pallas_distributed_top_k:
+            from sglang.srt.hardware_backend.tpu.top_k import (
+                supports_pallas_distributed_tpu_top_k_topology,
+            )
+
+            # The shard-specific check happens once the LM head is available.
+            # This cheap sentinel rejects non-full-world process groups early.
+            self.use_tpu_distributed_top_k = (
+                supports_pallas_distributed_tpu_top_k_topology(
+                    self.tpu_top_k_group_size
+                )
+            )
         if self.use_tpu_distributed_top_k:
             # Register before an optional fullgraph torch.compile trace reaches
             # the logits processor. StableHLO export itself remains lazy.
@@ -453,7 +474,9 @@ class LogitsProcessor(nn.Module):
 
         from sglang.srt.hardware_backend.tpu.sampler import MAX_DISTRIBUTED_TOP_K
         from sglang.srt.hardware_backend.tpu.top_k import (
+            TpuVocabShard,
             supports_distributed_tpu_top_k,
+            supports_pallas_distributed_tpu_top_k,
         )
 
         candidate_width = min(
@@ -463,6 +486,15 @@ class LogitsProcessor(nn.Module):
         )
         if candidate_width <= 1 or not supports_distributed_tpu_top_k(
             lm_head, candidate_width
+        ):
+            return None
+        if getattr(self, "require_pallas_distributed_top_k", False) and not (
+            supports_pallas_distributed_tpu_top_k(
+                TpuVocabShard.from_lm_head(lm_head),
+                candidate_width,
+                group_world_size=self.tpu_top_k_group_size,
+                model_rank=self.tpu_top_k_group_rank,
+            )
         ):
             return None
         return candidate_width
@@ -846,6 +878,7 @@ class LogitsProcessor(nn.Module):
             TpuVocabShard.from_lm_head(lm_head),
             top_k,
             group=get_attn_tp_group() if self.use_attn_tp_group else get_tp_group(),
+            require_pallas=self.require_pallas_distributed_top_k,
         )
         if self.final_logit_softcapping:
             global_top_k_logits = self.final_logit_softcapping * torch.tanh(
