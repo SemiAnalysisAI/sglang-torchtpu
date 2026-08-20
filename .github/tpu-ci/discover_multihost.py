@@ -31,6 +31,10 @@ def _literal(node):
 def _scan(root, suite, nightly_only):
     found = {}
     for path in glob.glob(f"{root}/**/*.py", recursive=True):
+        # Isolated PR #447 validation branch: run only the exact B=1 -> B=64
+        # distributed-top-k reproducer, not the full nightly multi-host matrix.
+        if not path.endswith("test_topk_recompile_447.py"):
+            continue
         try:
             tree = ast.parse(open(path).read())
         except SyntaxError:
