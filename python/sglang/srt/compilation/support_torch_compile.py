@@ -7,6 +7,8 @@ how to install, pad, and precompile annotated module boundaries.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, TypeVar
 
 if TYPE_CHECKING:
@@ -64,6 +66,12 @@ class CompilePolicy(ABC):
 
 class DecoderCompilePolicy(CompilePolicy):
     """Compile policy for decoder boundaries driven by a ForwardBatch."""
+
+    @contextmanager
+    def compiled_forward_context(self, forward_batch: ForwardBatch) -> Iterator[None]:
+        """Temporarily adapt host metadata observed by a compiled forward."""
+
+        yield
 
     def precompile_draft(
         self, draft_attn_backend: Any, draft_extend_attn_backend: Any

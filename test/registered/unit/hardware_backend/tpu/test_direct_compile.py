@@ -10,6 +10,7 @@ import torch
 from jax import tree_util
 
 from sglang.srt.hardware_backend.tpu.compilation import direct_compile
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -83,6 +84,54 @@ class _KVPool:
 
 
 class TestDirectCompile(CustomTestCase):
+    def test_forward_batch_preserves_deferred_logits_marker_during_trace(self):
+        traced_defer_values = []
+
+        def fn(forward_batch):
+            traced_defer_values.append(forward_batch.tpu_defer_logits_postprocess)
+            return forward_batch.input_ids + 1
+
+        compiled = direct_compile.direct_compile(
+            fn,
+            specialization_key=lambda forward_batch: (forward_batch.batch_size,),
+        )
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=1,
+            input_ids=torch.ones(1, dtype=torch.int64),
+            req_pool_indices=torch.zeros(1, dtype=torch.int64),
+            seq_lens=torch.ones(1, dtype=torch.int64),
+            out_cache_loc=torch.zeros(1, dtype=torch.int64),
+            seq_lens_sum=1,
+            tpu_defer_logits_postprocess=True,
+        )
+        expected = torch.full((1,), 2, dtype=torch.int64)
+        compiler = direct_compile.tpu_torch_compile
+
+        with (
+            patch.object(
+                direct_compile,
+                "_is_tpu_tensor",
+                side_effect=lambda value: isinstance(value, torch.Tensor),
+            ),
+            patch.object(
+                direct_compile.execution_mode,
+                "set_eager_mode",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
+            ),
+            patch.object(
+                compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
+            ),
+            patch.object(compiler, "execute", return_value=[expected]),
+        ):
+            actual = compiled(forward_batch)
+
+        self.assertEqual(traced_defer_values, [True])
+        torch.testing.assert_close(actual, expected)
+
     @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
     def test_torch_tpu_cache_hit_for_equivalent_compilations(self):
         def fn(value):

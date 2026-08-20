@@ -29,7 +29,8 @@ from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy impo
     SpecDecoderTpuCompilePolicy,
 )
 from sglang.srt.hardware_backend.tpu.sampler import distributed_top_k_for_batch
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -38,6 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -212,8 +214,110 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         self.assertEqual(key[-1], 50)
         selector.assert_called_once_with(forward_batch, model_runner.model.lm_head)
 
+    def test_deferred_logits_make_direct_key_sampling_independent(self):
+        model_runner = _model_runner()
+        model_runner.server_args.sampling_backend = "tpu"
+        selector = MagicMock(return_value=50)
+        model_runner.model.logits_processor = SimpleNamespace(
+            get_tpu_distributed_top_k_for_batch=selector
+        )
+        model_runner.model.lm_head = object()
+        policy = _make_policy(model_runner)
+        policy._tpu_logits_postprocessor = (
+            model_runner.model.logits_processor,
+            model_runner.model.lm_head,
+            64,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            batch_size=64,
+            tpu_defer_logits_postprocess=True,
+        )
+
+        top_k_key = policy._direct_compile_specialization_key(
+            None,
+            torch.arange(64),
+            torch.arange(64),
+            forward_batch,
+        )
+        selector.return_value = None
+        full_vocab_key = policy._direct_compile_specialization_key(
+            None,
+            torch.arange(64),
+            torch.arange(64),
+            forward_batch,
+        )
+
+        self.assertEqual(top_k_key, full_vocab_key)
+        self.assertEqual(len(top_k_key), 5)
+        selector.assert_not_called()
+
+    def test_backbone_only_direct_key_is_sampling_independent(self):
+        model_runner = _model_runner()
+        selector = MagicMock(return_value=50)
+        model_runner.model.logits_processor = SimpleNamespace(
+            get_tpu_distributed_top_k_for_batch=selector
+        )
+        model_runner.model.lm_head = object()
+        policy = _make_policy(model_runner)
+        policy._compiled_forward_reads_sampling_info = False
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            batch_size=64,
+        )
+
+        key = policy._direct_compile_specialization_key(
+            None,
+            torch.arange(64),
+            torch.arange(64),
+            forward_batch,
+        )
+
+        self.assertEqual(len(key), 5)
+        selector.assert_not_called()
+
+    def test_multihost_fail_closed_direct_key_is_sampling_independent(self):
+        model_runner = _model_runner()
+        model_runner.server_args.nnodes = 2
+        selector = MagicMock(return_value=50)
+        model_runner.model.logits_processor = SimpleNamespace(
+            get_tpu_distributed_top_k_for_batch=selector
+        )
+        model_runner.model.lm_head = object()
+        policy = _make_policy(model_runner)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            batch_size=64,
+        )
+
+        key = policy._direct_compile_specialization_key(
+            None,
+            torch.arange(64),
+            torch.arange(64),
+            forward_batch,
+        )
+
+        self.assertEqual(len(key), 5)
+        selector.assert_not_called()
+
 
 class TestDecoderOutputUnpadding(CustomTestCase):
+    def test_prepare_does_not_leak_deferred_logits_into_other_forwards(self):
+        policy = _make_policy()
+        policy._tpu_logits_postprocessor = (object(), object(), 64)
+        forward_batch = policy._make_dummy_forward_batch(
+            num_tokens=4,
+            bs=4,
+            mode=ForwardMode.DECODE,
+        )
+
+        self.assertFalse(forward_batch.tpu_defer_logits_postprocess)
+        policy.prepare_forward_batch(forward_batch)
+        self.assertFalse(forward_batch.tpu_defer_logits_postprocess)
+
     def test_global_top_k_rows_follow_the_real_batch_size(self):
         output = LogitsProcessorOutput(
             next_token_logits=None,
@@ -238,8 +342,126 @@ class TestDecoderOutputUnpadding(CustomTestCase):
         self.assertEqual(forward_batch.batch_size, 2)
         self.assertEqual(forward_batch.input_ids.shape[0], 3)
 
+    def test_deferred_logits_are_resolved_before_rows_are_unpadded(self):
+        policy = _make_policy()
+        logits_processor = SimpleNamespace()
+        lm_head = object()
+        seen_batch_sizes = []
+
+        def finalize(output, forward_batch, actual_lm_head, candidate_width):
+            seen_batch_sizes.append(forward_batch.batch_size)
+            self.assertIs(actual_lm_head, lm_head)
+            self.assertEqual(candidate_width, 64)
+            output.next_token_sharded_logits = None
+            output.next_token_logits = torch.randn(4, 8)
+            return output
+
+        logits_processor.finalize_tpu_deferred_logits = finalize
+        policy._tpu_logits_postprocessor = (logits_processor, lm_head, 64)
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            next_token_sharded_logits=torch.randn(4, 2),
+        )
+        forward_batch = SimpleNamespace(
+            _tpu_real_q=3,
+            _tpu_real_b=2,
+            batch_size=4,
+            input_ids=torch.arange(6),
+            positions=torch.arange(6),
+        )
+
+        result = policy.finalize_forward_batch(output, forward_batch)
+
+        self.assertEqual(seen_batch_sizes, [4])
+        self.assertEqual(result.next_token_logits.shape, (2, 8))
+        self.assertEqual(forward_batch.batch_size, 2)
+
 
 class TestInstallExtendCap(CustomTestCase):
+    @staticmethod
+    def _install_deferred_logits_boundary(
+        *,
+        logits_processor,
+        lm_head,
+        is_draft_worker=False,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        use_inner_owner=False,
+    ):
+        model = SimpleNamespace(
+            logits_processor=logits_processor,
+            lm_head=lm_head,
+        )
+        model_runner = SimpleNamespace(
+            model=model,
+            spec_algorithm=spec_algorithm,
+        )
+        owner = SimpleNamespace() if use_inner_owner else model
+        policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=owner)
+        policy._install_tpu_logits_postprocessor(is_draft_worker=is_draft_worker)
+        return policy
+
+    def test_deferred_logits_boundary_excludes_draft_speculative_and_inner_models(self):
+        cases = (
+            ("draft", True, SpeculativeAlgorithm.NONE, False),
+            ("speculative", False, SpeculativeAlgorithm.EAGLE, False),
+            ("inner", False, SpeculativeAlgorithm.NONE, True),
+        )
+        for name, is_draft_worker, spec_algorithm, use_inner_owner in cases:
+            with self.subTest(name=name):
+                get_candidate_width = MagicMock(return_value=64)
+                policy = self._install_deferred_logits_boundary(
+                    logits_processor=SimpleNamespace(
+                        get_tpu_deferred_top_k_width=get_candidate_width,
+                    ),
+                    lm_head=object(),
+                    is_draft_worker=is_draft_worker,
+                    spec_algorithm=spec_algorithm,
+                    use_inner_owner=use_inner_owner,
+                )
+
+                self.assertIsNone(policy._tpu_logits_postprocessor)
+                get_candidate_width.assert_not_called()
+
+    def test_deferred_logits_boundary_excludes_dp_attention(self):
+        processor = SimpleNamespace(
+            use_tpu_distributed_top_k=True,
+            do_tensor_parallel_all_gather=True,
+            do_tensor_parallel_all_gather_dp_attn=True,
+        )
+        processor.get_tpu_deferred_top_k_width = lambda lm_head: (
+            LogitsProcessor.get_tpu_deferred_top_k_width(processor, lm_head)
+        )
+        lm_head = SimpleNamespace(
+            enable_tp=True,
+            num_embeddings=128,
+            num_embeddings_per_partition=16,
+            shard_indices=object(),
+        )
+
+        policy = self._install_deferred_logits_boundary(
+            logits_processor=processor,
+            lm_head=lm_head,
+        )
+
+        self.assertIsNone(policy._tpu_logits_postprocessor)
+
+    def test_deferred_logits_boundary_excludes_nonlast_pipeline_rank(self):
+        processor = SimpleNamespace(
+            use_tpu_distributed_top_k=True,
+            do_tensor_parallel_all_gather=True,
+            do_tensor_parallel_all_gather_dp_attn=False,
+        )
+        processor.get_tpu_deferred_top_k_width = lambda lm_head: (
+            LogitsProcessor.get_tpu_deferred_top_k_width(processor, lm_head)
+        )
+
+        policy = self._install_deferred_logits_boundary(
+            logits_processor=processor,
+            lm_head=PPMissingLayer(),
+        )
+
+        self.assertIsNone(policy._tpu_logits_postprocessor)
+
     def _install_policy(self, *, prefill_max_requests, dp_attention):
         model = SimpleNamespace(
             forward=MagicMock(),
@@ -343,6 +565,138 @@ class TestInstallExtendCap(CustomTestCase):
         compile_mock.assert_called_once()
         self.assertIs(compile_mock.call_args.args[0].__wrapped__, original_outer)
 
+    def test_target_model_defers_sampling_dependent_logits_communication(self):
+        original_outer = MagicMock(name="outer_forward")
+        logits_processor = SimpleNamespace(
+            get_tpu_deferred_top_k_width=MagicMock(return_value=64),
+        )
+        lm_head = object()
+        model = SimpleNamespace(
+            forward=original_outer,
+            prepare_forward_batch=MagicMock(),
+            logits_processor=logits_processor,
+            lm_head=lm_head,
+        )
+        model_runner = SimpleNamespace(
+            model=model,
+            forward=MagicMock(),
+            is_draft_worker=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            model_config=SimpleNamespace(context_len=4096),
+            server_args=SimpleNamespace(
+                chunked_prefill_size=None,
+                max_prefill_tokens=2048,
+                torch_compile_max_bs=64,
+                prefill_max_requests=16,
+                unsafe_save_torch_compile_bundle=None,
+                unsafe_load_torch_compile_bundle=None,
+            ),
+        )
+        policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
+        policy.backend = "eager"
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "build_bucketers",
+            return_value=(
+                Bucketer(name="Token", buckets=[64, 2048]),
+                Bucketer(name="Bs", buckets=[16, 32, 64]),
+            ),
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "is_dp_attention_enabled",
+            return_value=False,
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "torch.compile",
+            return_value=MagicMock(),
+        ) as compile_mock:
+            self.assertTrue(policy.install())
+
+        self.assertEqual(
+            policy._tpu_logits_postprocessor,
+            (logits_processor, lm_head, 64),
+        )
+        self.assertFalse(policy._compiled_forward_reads_sampling_info)
+        logits_processor.get_tpu_deferred_top_k_width.assert_called_once_with(lm_head)
+        compile_mock.assert_called_once()
+
+    def test_target_model_resolves_a_tied_embedding_output_head(self):
+        tied_head = object()
+        logits_processor = SimpleNamespace(
+            get_tpu_deferred_top_k_width=MagicMock(return_value=32),
+        )
+        model = SimpleNamespace(
+            forward=MagicMock(),
+            prepare_forward_batch=MagicMock(),
+            model=SimpleNamespace(embed_tokens=tied_head),
+            config=SimpleNamespace(tie_word_embeddings=True),
+            logits_processor=logits_processor,
+        )
+        model_runner = SimpleNamespace(
+            model=model,
+            forward=MagicMock(),
+            is_draft_worker=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            model_config=SimpleNamespace(context_len=4096),
+            server_args=SimpleNamespace(
+                chunked_prefill_size=None,
+                max_prefill_tokens=2048,
+                torch_compile_max_bs=64,
+                prefill_max_requests=16,
+                unsafe_save_torch_compile_bundle=None,
+                unsafe_load_torch_compile_bundle=None,
+            ),
+        )
+        policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
+        policy.backend = "eager"
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "build_bucketers",
+            return_value=(
+                Bucketer(name="Token", buckets=[64, 2048]),
+                Bucketer(name="Bs", buckets=[16, 32, 64]),
+            ),
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "is_dp_attention_enabled",
+            return_value=False,
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "torch.compile",
+            return_value=MagicMock(),
+        ):
+            self.assertTrue(policy.install())
+
+        self.assertEqual(
+            policy._tpu_logits_postprocessor,
+            (logits_processor, tied_head, 32),
+        )
+        logits_processor.get_tpu_deferred_top_k_width.assert_called_once_with(tied_head)
+
+    def test_pipeline_output_head_wins_over_a_missing_input_embedding(self):
+        output_head = object()
+        missing_input_embedding = object()
+        model = SimpleNamespace(
+            lm_head=output_head,
+            model=SimpleNamespace(embed_tokens=missing_input_embedding),
+            config=SimpleNamespace(tie_word_embeddings=True),
+        )
+
+        policy_head = DecoderTpuCompilePolicy._resolve_output_head(model)
+        self.assertIs(policy_head, output_head)
+        self.assertIsNot(policy_head, missing_input_embedding)
+
+    def test_does_not_guess_an_untied_output_head(self):
+        input_embedding = object()
+        model = SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=input_embedding),
+            config=SimpleNamespace(tie_word_embeddings=False),
+        )
+
+        self.assertIsNone(DecoderTpuCompilePolicy._resolve_output_head(model))
+
     def test_draft_compiles_backbone_and_logits_as_separate_regions(self):
         original_outer = MagicMock(name="outer_forward")
         original_backbone = MagicMock(name="backbone_forward")
@@ -395,6 +749,7 @@ class TestInstallExtendCap(CustomTestCase):
         self.assertIs(model.model.forward, compiled_backbone)
         self.assertIs(logits_processor.forward, compiled_logits)
         self.assertIs(policy.compiled_forward_shim.fn, original_outer)
+        self.assertFalse(policy._compiled_forward_reads_sampling_info)
 
 
 class TestQwen3VLDecoderPolicy(CustomTestCase):
@@ -602,24 +957,38 @@ class TestMakeDummyForwardBatch(CustomTestCase):
         self.assertIsNone(fb.sampling_info.penalizer_orchestrator)
         self.assertIs(fb.spec_algorithm, policy.model_runner.spec_algorithm)
 
-    def test_greedy_warmup_uses_full_vocab_sampling_info(self):
+    def test_top_k_warmup_fits_a_small_model_static_candidate_width(self):
+        policy = _make_policy()
+        policy._tpu_logits_postprocessor = (object(), object(), 32)
+
+        fb = policy._make_dummy_forward_batch(
+            num_tokens=4,
+            bs=4,
+            mode=ForwardMode.DECODE,
+        )
+
+        self.assertEqual(fb.sampling_info.uniform_top_k, 32)
+        self.assertEqual(fb.sampling_info.top_ks.tolist(), [32] * 4)
+
+    def test_full_vocab_warmup_uses_unconstrained_sampling_info(self):
         policy = _make_policy()
 
         fb = policy._make_dummy_forward_batch(
             num_tokens=4,
             bs=4,
             mode=ForwardMode.DECODE,
-            sampling_variant="greedy",
+            sampling_variant="full_vocab",
         )
 
-        self.assertTrue(fb.sampling_info.is_all_greedy)
-        self.assertTrue(fb.sampling_info.is_any_greedy)
-        self.assertEqual(fb.sampling_info.uniform_top_k, 1)
-        self.assertEqual(fb.sampling_info.top_ks.tolist(), [1] * 4)
+        self.assertFalse(fb.sampling_info.is_all_greedy)
+        self.assertFalse(fb.sampling_info.is_any_greedy)
+        self.assertFalse(fb.sampling_info.need_top_k_sampling)
+        self.assertEqual(fb.sampling_info.uniform_top_k, TOP_K_ALL)
+        self.assertEqual(fb.sampling_info.top_ks.tolist(), [TOP_K_ALL] * 4)
 
 
 class TestPrecompileLoops(CustomTestCase):
-    """Precompile covers every TPU shape for TopK and greedy sampling."""
+    """Precompile covers every TPU shape for TopK and full-vocab sampling."""
 
     def test_extend_iterates_token_buckets_at_fixed_batch_cap(self):
         mr = _model_runner()
@@ -893,8 +1262,8 @@ class TestSpecPrecompileLoops(CustomTestCase):
         # in spec_decode_compile_policy. One topology override serves both.
         with get_parallel().override(tp_rank=1):
             policy.precompile()
-        # EXTEND (8,4),(64,4) x greedy/top-k=4
-        # DECODE (1,1),(4,4) x greedy/top-k=4
+        # EXTEND (8,4),(64,4) x full-vocab/top-k=4
+        # DECODE (1,1),(4,4) x full-vocab/top-k=4
         # TARGET_VERIFY buckets bs: (4,1),(16,4)=2  EXTEND(FULL) 2
         self.assertEqual(mr.model.forward.call_count, 12)
         self.assertIn((16, 4), mr.attn_backend.calls)

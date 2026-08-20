@@ -470,6 +470,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
     spec_algorithm: SpeculativeAlgorithm = None
+    # TPU compiled outer-model forwards emit rank-local logits and resolve their
+    # sampling-dependent communication immediately after the graph. Other
+    # entry points, including split prefill, leave this disabled.
+    tpu_defer_logits_postprocess: bool = False
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
     # Whether to return pooled hidden states (pre-head transformer output)

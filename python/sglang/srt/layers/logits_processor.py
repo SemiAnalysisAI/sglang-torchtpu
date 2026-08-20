@@ -153,6 +153,11 @@ class LogitsProcessorOutput:
     next_token_global_top_k_logits: Optional[torch.Tensor] = None
     next_token_global_top_k_token_ids: Optional[torch.Tensor] = None
 
+    # Rank-local logits awaiting TPU post-forward reduction. This is an
+    # internal compile-boundary representation and must be resolved before the
+    # sampler observes the output. Shape: [#seq, local_vocab_size].
+    next_token_sharded_logits: Optional[torch.Tensor] = None
+
     def __post_init__(self) -> None:
         has_global_top_k_logits = self.next_token_global_top_k_logits is not None
         has_global_top_k_token_ids = self.next_token_global_top_k_token_ids is not None
@@ -160,9 +165,15 @@ class LogitsProcessorOutput:
             raise ValueError(
                 "global TopK logits and token IDs must be provided together"
             )
-        if has_global_top_k_logits and self.next_token_logits is not None:
+        has_full_logits = self.next_token_logits is not None
+        has_sharded_logits = self.next_token_sharded_logits is not None
+        if (
+            (has_full_logits and has_sharded_logits)
+            or (has_full_logits and has_global_top_k_logits)
+            or (has_sharded_logits and has_global_top_k_logits)
+        ):
             raise ValueError(
-                "full logits and global TopK logits are mutually exclusive"
+                "full, sharded, and global TopK logits are mutually exclusive"
             )
 
     @property
@@ -171,6 +182,12 @@ class LogitsProcessorOutput:
         Construction guarantees logits and token IDs are paired and exclusive."""
 
         return self.next_token_global_top_k_logits is not None
+
+    @property
+    def has_next_token_sharded_logits(self) -> bool:
+        """Report whether TPU post-forward processing is still required."""
+
+        return self.next_token_sharded_logits is not None
 
     def trim_next_token_outputs(
         self,
@@ -182,6 +199,10 @@ class LogitsProcessorOutput:
 
         if self.next_token_logits is not None:
             self.next_token_logits = self.next_token_logits[:logits_rows]
+        if self.next_token_sharded_logits is not None:
+            self.next_token_sharded_logits = self.next_token_sharded_logits[
+                :logits_rows
+            ]
         if self.has_next_token_global_top_k:
             global_top_k_rows = (
                 logits_rows if global_top_k_rows is None else global_top_k_rows
@@ -381,10 +402,6 @@ class LogitsProcessor(nn.Module):
             not requires_full_next_token_logits
             and _is_tpu
             and get_exec().kernel.sampling_backend == "tpu"
-            # The native TopK collective currently hard-halts TPU v7 SparseCores
-            # when tensor parallelism spans hosts. Keep the full-vocabulary
-            # gather on multi-host deployments until that kernel is supported.
-            and getattr(get_parallel(), "nnodes", 1) == 1
         )
         if self.use_tpu_distributed_top_k:
             # Register before an optional fullgraph torch.compile trace reaches
@@ -426,6 +443,17 @@ class LogitsProcessor(nn.Module):
         ):
             return None
 
+        # A multi-host candidate collective must not share an executable with
+        # the compiled model's Pallas kernels. Recognized outer-model policies
+        # set this marker and move the collective to finalize_forward_batch;
+        # eager and inner-model call sites are already separate boundaries.
+        if (
+            torch.compiler.is_compiling()
+            and getattr(get_parallel(), "nnodes", 1) > 1
+            and not getattr(forward_batch, "tpu_defer_logits_postprocess", False)
+        ):
+            return None
+
         from sglang.srt.hardware_backend.tpu.sampler import (
             distributed_top_k_for_batch,
         )
@@ -437,6 +465,41 @@ class LogitsProcessor(nn.Module):
         if top_k is None or not supports_distributed_tpu_top_k(lm_head, top_k):
             return None
         return top_k
+
+    def get_tpu_deferred_top_k_width(
+        self,
+        lm_head: VocabParallelEmbedding,
+    ) -> Optional[int]:
+        """Return the model-static candidate width for deferred TPU logits.
+
+        This is a model/layout capability check, deliberately independent of
+        request sampling parameters. The post-forward reducer always uses the
+        widest candidate set supported by both the sampler and this vocabulary
+        shard, so every eligible request has the same device shapes.
+        """
+
+        if (
+            not self.use_tpu_distributed_top_k
+            or not self.do_tensor_parallel_all_gather
+            or self.do_tensor_parallel_all_gather_dp_attn
+        ):
+            return None
+
+        from sglang.srt.hardware_backend.tpu.sampler import MAX_DISTRIBUTED_TOP_K
+        from sglang.srt.hardware_backend.tpu.top_k import (
+            supports_distributed_tpu_top_k,
+        )
+
+        candidate_width = min(
+            MAX_DISTRIBUTED_TOP_K,
+            getattr(lm_head, "num_embeddings", 0),
+            getattr(lm_head, "num_embeddings_per_partition", 0),
+        )
+        if candidate_width <= 1:
+            return None
+        if not supports_distributed_tpu_top_k(lm_head, candidate_width):
+            return None
+        return candidate_width
 
     def forward(
         self,
@@ -450,11 +513,14 @@ class LogitsProcessor(nn.Module):
         # Extract MIS indices before ForwardBatch → LogitsMetadata conversion
         multi_item_delimiter_indices = None
         distributed_top_k = None
+        defer_tpu_logits_postprocess = False
         if isinstance(logits_metadata, ForwardBatch):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
-            distributed_top_k = self.get_tpu_distributed_top_k_for_batch(
-                logits_metadata, lm_head
-            )
+            defer_tpu_logits_postprocess = logits_metadata.tpu_defer_logits_postprocess
+            if not defer_tpu_logits_postprocess:
+                distributed_top_k = self.get_tpu_distributed_top_k_for_batch(
+                    logits_metadata, lm_head
+                )
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
         # Autotune dummy run discards this output; see _in_autotune_dummy_run.
@@ -505,6 +571,21 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            if defer_tpu_logits_postprocess:
+                sharded_logits, _ = self._get_local_logits(
+                    pruned_states,
+                    lm_head,
+                    logits_metadata,
+                )
+                if sample_indices is not None:
+                    sharded_logits = sharded_logits[sample_indices]
+                return LogitsProcessorOutput(
+                    next_token_logits=None,
+                    next_token_sharded_logits=sharded_logits,
+                    hidden_states=hidden_states_to_store,
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                )
+
             if distributed_top_k is not None:
                 global_top_k_logits, global_top_k_token_ids = (
                     self._get_distributed_top_k(
@@ -799,21 +880,31 @@ class LogitsProcessor(nn.Module):
         """Reduce sharded LM-head logits into an exact global TopK.
         Monotonic final softcapping is applied after the global merge."""
 
+        logits = self._compute_lm_head(hidden_states, lm_head)
+        if self.logit_scale is not None:
+            logits.mul_(self.logit_scale)
+        return self._reduce_tpu_distributed_top_k(logits, lm_head, top_k)
+
+    def _reduce_tpu_distributed_top_k(
+        self,
+        sharded_logits: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        top_k: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Reduce already-computed shard-local logits to exact global TopK."""
+
         from sglang.srt.distributed import get_attn_tp_group, get_tp_group
         from sglang.srt.hardware_backend.tpu.top_k import (
             TpuVocabShard,
             distributed_tpu_top_k,
         )
 
-        logits = self._compute_lm_head(hidden_states, lm_head)
-        if self.logit_scale is not None:
-            logits.mul_(self.logit_scale)
-        sanitize_nan_logits(logits, "distributed TPU top-k: local logits")
+        sanitize_nan_logits(sharded_logits, "distributed TPU top-k: local logits")
 
         # Select k logits per vocabulary shard, then merge them into the exact
         # global TopK shared by every tensor-parallel rank.
         global_top_k_logits, global_top_k_token_ids = distributed_tpu_top_k(
-            logits,
+            sharded_logits,
             TpuVocabShard.from_lm_head(lm_head),
             top_k,
             group=get_attn_tp_group() if self.use_attn_tp_group else get_tp_group(),
@@ -824,24 +915,64 @@ class LogitsProcessor(nn.Module):
             )
         return global_top_k_logits, global_top_k_token_ids
 
-    def _get_logits(
+    def finalize_tpu_deferred_logits(
+        self,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+        lm_head: VocabParallelEmbedding,
+        candidate_width: int,
+    ) -> LogitsProcessorOutput:
+        """Resolve the sampling-independent compiled output before unpadding.
+
+        Eligible small-k requests communicate a fixed-width candidate set.
+        Requests that require full-vocabulary semantics use the existing logits
+        gather. This method intentionally executes outside the compiled model,
+        so sampling-mode changes cannot specialize or recompile that graph.
+        """
+
+        sharded_logits = logits_output.next_token_sharded_logits
+        if sharded_logits is None:
+            return logits_output
+
+        distributed_top_k = self.get_tpu_distributed_top_k_for_batch(
+            forward_batch, lm_head
+        )
+
+        if distributed_top_k is not None:
+            global_top_k_logits, global_top_k_token_ids = (
+                self._reduce_tpu_distributed_top_k(
+                    sharded_logits,
+                    lm_head,
+                    candidate_width,
+                )
+            )
+            logits_output.next_token_sharded_logits = None
+            logits_output.next_token_global_top_k_logits = global_top_k_logits
+            logits_output.next_token_global_top_k_token_ids = global_top_k_token_ids
+            return logits_output
+
+        logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        full_logits = self._finalize_full_logits(
+            sharded_logits,
+            None,
+            logits_metadata,
+        )
+        logits_output.next_token_sharded_logits = None
+        logits_output.next_token_logits = full_logits
+        return logits_output
+
+    def _get_local_logits(
         self,
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
-        use_logits_buffer: bool = True,
-    ) -> torch.Tensor:
-        """Get logits from hidden_states.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute scaled logits before tensor-parallel communication."""
 
-        If sampled_logits_only is True, it means hidden_states only contain the
-        last position (e.g., extend without input logprobs). The caller should
-        guarantee the given hidden_states follow this constraint.
-        """
         hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
             hidden_states, logits_metadata
         )
-
         logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
 
         if self.logit_scale is not None:
@@ -869,16 +1000,29 @@ class LogitsProcessor(nn.Module):
         ):
             logits = logits.contiguous().float()
 
+        return logits, local_hidden_states
+
+    def _finalize_full_logits(
+        self,
+        logits: torch.Tensor,
+        local_hidden_states: Optional[torch.Tensor],
+        logits_metadata: LogitsMetadata,
+        *,
+        use_logits_buffer: bool = True,
+    ) -> torch.Tensor:
+        """Gather and apply processing required by full-vocabulary consumers."""
+
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             else:
                 logits = self._logits_gatherer(logits)
 
-        logits = self._scatter_dp_attn_logits(
-            logits, local_hidden_states, logits_metadata
-        )
-
+        if self.do_tensor_parallel_all_gather_dp_attn:
+            assert local_hidden_states is not None
+            logits = self._scatter_dp_attn_logits(
+                logits, local_hidden_states, logits_metadata
+            )
         logits = self._copy_logits_to_buffer(
             logits, logits_metadata, use_buffer=use_logits_buffer
         )
@@ -890,8 +1034,34 @@ class LogitsProcessor(nn.Module):
                 logits = self.final_logit_softcapping * torch.tanh(
                     logits / self.final_logit_softcapping
                 )
-
         return logits
+
+    def _get_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+        embedding_bias: Optional[torch.Tensor] = None,
+        use_logits_buffer: bool = True,
+    ) -> torch.Tensor:
+        """Get logits from hidden_states.
+
+        If sampled_logits_only is True, it means hidden_states only contain the
+        last position (e.g., extend without input logprobs). The caller should
+        guarantee the given hidden_states follow this constraint.
+        """
+        logits, local_hidden_states = self._get_local_logits(
+            hidden_states,
+            lm_head,
+            logits_metadata,
+            embedding_bias,
+        )
+        return self._finalize_full_logits(
+            logits,
+            local_hidden_states,
+            logits_metadata,
+            use_logits_buffer=use_logits_buffer,
+        )
 
     def _compute_lm_head(
         self,

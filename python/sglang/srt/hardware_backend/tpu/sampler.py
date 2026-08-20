@@ -56,8 +56,7 @@ def distributed_top_k_for_batch(
     top_k = info.uniform_top_k
     if (
         top_k is None
-        or not 1 < top_k <= MAX_DISTRIBUTED_TOP_K
-        or info.is_any_greedy
+        or not 0 < top_k <= MAX_DISTRIBUTED_TOP_K
         or info.sampling_seed is not None
         or not info.need_top_k_sampling
         or info.need_top_p_sampling
@@ -66,7 +65,11 @@ def distributed_top_k_for_batch(
         return None
     if info.has_custom_logit_processor or info.logit_bias is not None:
         return None
-    if any(info.grammars or ()) or getattr(info, "sampling_mask_max_top_k", 0) > 0:
+    if (
+        any(info.grammars or ())
+        or any(info.return_sampling_masks or ())
+        or getattr(info, "sampling_mask_max_top_k", 0) > 0
+    ):
         return None
     if (
         info.acc_additive_penalties is not None
@@ -84,9 +87,25 @@ def distributed_top_k_for_batch(
 def sample_from_global_top_k_logits(
     global_top_k_logits: torch.Tensor,
     temperatures: torch.Tensor,
+    top_ks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Normalize temperature-scaled global TopK logits and sample a position.
-    Returned positions index global TopK token IDs, not the full vocabulary."""
+    Returned positions index global TopK token IDs, not the full vocabulary.
+
+    The deferred TPU path always reduces to one model-static candidate width
+    (at most ``MAX_DISTRIBUTED_TOP_K``), so its device shapes do not vary with
+    the requested k. Masking the sorted tail here recovers the exact per-request
+    TopK distribution without another model or collective specialization.
+    """
+
+    if top_ks is not None:
+        candidate_positions = torch.arange(
+            global_top_k_logits.shape[-1],
+            dtype=top_ks.dtype,
+            device=global_top_k_logits.device,
+        )
+        keep = candidate_positions.view(1, -1) < top_ks.view(-1, 1)
+        global_top_k_logits = global_top_k_logits.masked_fill(~keep, -torch.inf)
 
     global_top_k_probs = torch.softmax(global_top_k_logits / temperatures, dim=-1)
     return sampling_from_probs_torch(global_top_k_probs)
@@ -108,6 +127,12 @@ class TpuSampler(Sampler):
         """Sample from exact global TopK when full logits gathering was skipped.
         Full-logit outputs retain the base sampler's processing and return contract."""
 
+        if logits_output.has_next_token_sharded_logits:
+            raise RuntimeError(
+                "TPU sampler received unresolved shard-local logits; the decoder "
+                "compile policy must finalize them before sampling"
+            )
+
         # No global TopK: sample from the full-vocabulary logits instead.
         if not logits_output.has_next_token_global_top_k:
             return super().forward(
@@ -121,10 +146,18 @@ class TpuSampler(Sampler):
 
         if return_logprob:
             raise ValueError("distributed TPU top-k cannot return full logprobs")
-        sampled_top_k_position = sample_from_global_top_k_logits(
-            logits_output.next_token_global_top_k_logits,
-            sampling_info.temperatures,
-        )
+        if sampling_info.is_all_greedy:
+            sampled_top_k_position = torch.zeros(
+                logits_output.next_token_global_top_k_logits.shape[0],
+                dtype=torch.int64,
+                device=logits_output.next_token_global_top_k_logits.device,
+            )
+        else:
+            sampled_top_k_position = sample_from_global_top_k_logits(
+                logits_output.next_token_global_top_k_logits,
+                sampling_info.temperatures,
+                sampling_info.top_ks,
+            )
         batch_next_token_ids = torch.gather(
             logits_output.next_token_global_top_k_token_ids,
             dim=1,

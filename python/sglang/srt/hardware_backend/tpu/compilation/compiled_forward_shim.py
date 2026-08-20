@@ -539,12 +539,13 @@ class CompiledForwardShim:
         # (max_new_tokens=0) has no sampling metadata to run the sampler
         # with — so the original value is restored even if the forward
         # raises.
-        orig_prefill_only = forward_batch.is_prefill_only
-        forward_batch.is_prefill_only = False
-        try:
-            out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
-        finally:
-            forward_batch.is_prefill_only = orig_prefill_only
+        with self.policy.compiled_forward_context(forward_batch):
+            orig_prefill_only = forward_batch.is_prefill_only
+            forward_batch.is_prefill_only = False
+            try:
+                out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
+            finally:
+                forward_batch.is_prefill_only = orig_prefill_only
         spec_info = forward_batch.spec_info
         if spec_info is None or not spec_info.keep_outputs_padded:
             out = self.policy.finalize_forward_batch(out, forward_batch)

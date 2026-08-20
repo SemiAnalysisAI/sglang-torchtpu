@@ -583,6 +583,38 @@ class TestCompiledForwardShim(CustomTestCase):
         self.assertIs(seen["during"], False)
         self.assertIs(fb.is_prefill_only, True)
 
+    def test_scopes_deferred_logits_marker_to_compiled_call(self):
+        seen = {}
+
+        def compiled(input_ids, positions, forward_batch):
+            seen["during"] = forward_batch.tpu_defer_logits_postprocess
+            return SimpleNamespace()
+
+        policy = DecoderTpuCompilePolicy()
+        policy._tpu_logits_postprocessor = (object(), object(), 64)
+        shim = CompiledForwardShim(compiled, policy=policy)
+        fb = self._forward_batch(tpu_defer_logits_postprocess=False)
+
+        shim(None, None, fb)
+
+        self.assertIs(seen["during"], True)
+        self.assertIs(fb.tpu_defer_logits_postprocess, False)
+
+    def test_restores_deferred_logits_marker_when_compiled_call_raises(self):
+        def compiled(input_ids, positions, forward_batch):
+            self.assertTrue(forward_batch.tpu_defer_logits_postprocess)
+            raise RuntimeError("compiled failure")
+
+        policy = DecoderTpuCompilePolicy()
+        policy._tpu_logits_postprocessor = (object(), object(), 64)
+        shim = CompiledForwardShim(compiled, policy=policy)
+        fb = self._forward_batch(tpu_defer_logits_postprocess=False)
+
+        with self.assertRaisesRegex(RuntimeError, "compiled failure"):
+            shim(None, None, fb)
+
+        self.assertIs(fb.tpu_defer_logits_postprocess, False)
+
 
 class TestBuildBucketers(CustomTestCase):
     @staticmethod
