@@ -99,16 +99,21 @@ def _make_per_tensor_scale_parameter(
     return scale
 
 
-try:
-    from flashinfer import mm_fp4 as flashinfer_fp4_gemm
-    from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
+from sglang.srt.utils.common import is_cuda, is_flashinfer_available
 
-    enable_flashinfer_fp4_gemm = True
-except ImportError:
-    enable_flashinfer_fp4_gemm = False
-    reorder_rows_for_gated_act_gemm = None
-    shuffle_matrix_a = None
-    shuffle_matrix_sf_a = None
+enable_flashinfer_fp4_gemm = False
+reorder_rows_for_gated_act_gemm = None
+shuffle_matrix_a = None
+shuffle_matrix_sf_a = None
+
+if is_cuda() and is_flashinfer_available():
+    try:
+        from flashinfer import mm_fp4 as flashinfer_fp4_gemm
+        from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
+
+        enable_flashinfer_fp4_gemm = True
+    except (ImportError, AttributeError):
+        pass
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)

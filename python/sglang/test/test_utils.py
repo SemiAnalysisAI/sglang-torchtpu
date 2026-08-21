@@ -546,7 +546,7 @@ def _subprocess_popen_with_outputs(
 ) -> subprocess.Popen:
     # Release allocator-cached GPU memory to the driver before spawning a
     # server: cached blocks stay cudaMalloc'd and shrink the child's memory.
-    if torch.cuda.is_initialized():
+    if is_cuda() and torch.cuda.is_initialized():
         torch.cuda.empty_cache()
 
     if not return_stdout_stderr:
@@ -2125,6 +2125,8 @@ class CustomTestCase(unittest.TestCase):
         orig_func = setup.__func__
 
         def safe_setUpClass(klass):
+            if getattr(klass, "__unittest_skip__", False):
+                return
             try:
                 _wait_for_gpu_idle_in_ci()
                 orig_func(klass)
@@ -2387,8 +2389,10 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
 
 
 def get_gpu_count():
-    if get_device() == "cpu":
+    if get_device() in ("cpu", "tpu"):
         gpu_count = 0
+    elif is_cuda():
+        gpu_count = torch.cuda.device_count()
     else:
         gpu_count = torch.accelerator.device_count()
     return gpu_count

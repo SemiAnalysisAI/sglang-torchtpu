@@ -190,7 +190,6 @@ NIGHTLY_SUITES = {
     ],
     HWBackend.TPU: [
         "nightly-tpu-4-v7",
-        "nightly-tpu-integration",
         "nightly-tpu-multihost",
         "nightly-perf-tpu",
     ],
@@ -205,11 +204,6 @@ NIGHTLY_SUITES = {
 OTHER_SUITES = {
     HWBackend.CPU: [
         "default",
-    ],
-    HWBackend.TPU: [
-        # P/D-disaggregation integration rows (integration-test-tpu.yml); the
-        # workflow runs the registered files in exec mode, one profile per run.
-        "tpu-integration",
     ],
     HWBackend.CUDA: [
         "stress",

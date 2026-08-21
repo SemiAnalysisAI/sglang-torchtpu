@@ -626,7 +626,7 @@ def get_amdgpu_memory_capacity():
 
 
 def get_device_sm():
-    if torch.cuda.is_available() or is_musa():
+    if is_cuda() or is_musa():
         major, minor = torch.cuda.get_device_capability()
         return major * 10 + minor
     return 0
@@ -641,7 +641,7 @@ def _cuda_mem_fallback(reason: str) -> int:
     Returns the total memory in MiB, or raises RuntimeError if CUDA is
     unavailable or mem_get_info() fails.
     """
-    if not torch.cuda.is_available():
+    if not is_cuda():
         raise RuntimeError(reason)
     try:
         device_count = torch.cuda.device_count()
@@ -856,7 +856,12 @@ def get_device_memory_capacity(device: str = None):
 
 
 def get_device_name(device_id: int = 0) -> str:
-    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
+    if current_platform.is_out_of_tree() or current_platform.is_tpu():
+        return current_platform.get_device_name(device_id)
+
+    if (
+        is_cuda() and hasattr(torch, "cuda") and torch.cuda.is_available()
+    ) or is_musa():
         return torch.cuda.get_device_name(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
@@ -875,6 +880,8 @@ def is_mnnvl_fabric_device() -> bool:
     the device name: the GB200/GB300 superchips. Used to auto-select
     fabric-dependent communication paths (NCCL cuMem/MNNVL, custom all-reduce
     v2 multinode, DCP fi_a2a)."""
+    if not is_cuda():
+        return False
     if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
         return False
     name = (torch.cuda.get_device_name(0) or "").upper()
@@ -953,7 +960,12 @@ def get_device(device_id: Optional[int] = None) -> str:
 
 @lru_cache(maxsize=1)
 def get_device_count() -> int:
-    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
+    if is_tpu():
+        return 0
+
+    if (
+        is_cuda() and hasattr(torch, "cuda") and torch.cuda.is_available()
+    ) or is_musa():
         try:
             return torch.cuda.device_count()
         except RuntimeError:
@@ -978,7 +990,11 @@ def get_device_count() -> int:
 
 
 def get_device_core_count(device_id: int = 0) -> int:
-    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
+    if current_platform.is_out_of_tree() or current_platform.is_tpu():
+        return current_platform.get_device_core_count(device_id)
+    if (
+        is_cuda() and hasattr(torch, "cuda") and torch.cuda.is_available()
+    ) or is_musa():
         return torch.cuda.get_device_properties(device_id).multi_processor_count
     elif hasattr(torch, "xpu") and torch.xpu.is_available():
         return torch.xpu.get_device_properties(device_id).gpu_eu_count
@@ -988,7 +1004,9 @@ def get_device_core_count(device_id: int = 0) -> int:
 
 def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
-    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
+    if (
+        is_cuda() and hasattr(torch, "cuda") and torch.cuda.is_available()
+    ) or is_musa():
         major, minor = torch.cuda.get_device_capability(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
@@ -1529,9 +1547,9 @@ def set_random_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
+    if is_cuda() and torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    if torch.xpu.is_available():
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
         torch.xpu.manual_seed_all(seed)
 
 

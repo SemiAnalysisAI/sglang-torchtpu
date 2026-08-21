@@ -362,6 +362,7 @@ _EXPOSED = {
     ("hardware_backend/tpu/tpu_platform.py", "hicache_io_backend"),
     ("hardware_backend/tpu/tpu_platform.py", "kv_cache_dtype"),
     ("hardware_backend/tpu/tpu_platform.py", "mem_fraction_static"),
+    ("hardware_backend/tpu/tpu_platform.py", "model_path"),
     ("hardware_backend/tpu/tpu_platform.py", "page_size"),
     ("hardware_backend/tpu/tpu_platform.py", "sampling_backend"),
     ("hardware_backend/tpu/tpu_platform.py", "speculative_algorithm"),
@@ -444,6 +445,7 @@ _OVERRIDDEN_AND_READ = {
     # TPU fork surface
     ("hardware_backend/tpu/tpu_platform.py", "dp_size"),
     ("hardware_backend/tpu/tpu_platform.py", "dtype"),
+    ("hardware_backend/tpu/tpu_platform.py", "model_path"),
     ("speculative/eagle_worker_v2.py", "disable_cuda_graph"),
 }
 

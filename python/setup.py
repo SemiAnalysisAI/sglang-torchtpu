@@ -180,6 +180,8 @@ def _declared_rust_extensions():
     # (e.g. from an sdist) still work.
     if (os.environ.get(_BUILD_RUST_EXTS_ENV) or "").strip().lower() == "none":
         return []
+    if not (_RUST_WORKSPACE_DIR / "Cargo.toml").is_file():
+        return []
     return _pyproject_rust_extensions(_discovered_rust_extensions())
 
 

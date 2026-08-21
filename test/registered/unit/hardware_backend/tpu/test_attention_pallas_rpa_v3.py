@@ -10,6 +10,7 @@ from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
     TpuPallasRpaV3AttnBackend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -28,8 +29,17 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
         req_to_token_device="cpu",
     ):
         pool_width = self.POOL_WIDTH if pool_width is None else pool_width
+        override = get_context().override_server_args(
+            speculative_num_draft_tokens=self.DRAFT_TOKENS,
+            speculative_algorithm="EAGLE3",
+            speculative_num_steps=None,
+            speculative_eagle_topk=1,
+            page_size=self.PAGE_SIZE,
+        )
+        override.install()
+        self.addCleanup(override.restore)
         server_args = SimpleNamespace(
-            max_speculative_num_draft_tokens=self.DRAFT_TOKENS,
+            speculative_num_draft_tokens=self.DRAFT_TOKENS,
             speculative_algorithm="EAGLE3",
             speculative_num_steps=None,
             speculative_eagle_topk=1,

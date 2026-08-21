@@ -38,6 +38,16 @@ register_tpu_ci(est_time=600, suite="stage-b-test-tpu-4-v7")
 import os
 import unittest
 
+import requests
+
+from sglang.srt.utils import kill_process_tree
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
+
 PAGE_SIZE = 64
 MAX_NEW = 12
 POOL = 4096  # small KV pool so the same engine can be driven into eviction
@@ -84,24 +94,36 @@ CHURN = [
 ]
 
 
-def _gen(engine, prompt, n=MAX_NEW):
-    out = engine.generate(prompt, {"temperature": 0.0, "max_new_tokens": n})
-    if isinstance(out, list):
-        out = out[0]
-    return out["text"], out["meta_info"].get("cached_tokens", 0)
+def _gen(base_url, prompt, n=MAX_NEW):
+    res = requests.post(
+        f"{base_url}/generate",
+        json={
+            "text": prompt,
+            "sampling_params": {"temperature": 0.0, "max_new_tokens": n},
+        },
+    ).json()
+    if isinstance(res, list):
+        res = res[0]
+    return res["text"], res["meta_info"].get("cached_tokens", 0)
 
 
-def _gen_batch(engine, prompts, n=MAX_NEW):
+def _gen_batch(base_url, prompts, n=MAX_NEW):
     # n: shared decode length, or a per-prompt list for heterogeneous batches.
     ns = n if isinstance(n, list) else [n] * len(prompts)
-    outs = engine.generate(
-        prompts, [{"temperature": 0.0, "max_new_tokens": m} for m in ns]
-    )
-    return [(o["text"], o["meta_info"].get("cached_tokens", 0)) for o in outs]
+    res = requests.post(
+        f"{base_url}/generate",
+        json={
+            "text": prompts,
+            "sampling_params": [{"temperature": 0.0, "max_new_tokens": m} for m in ns],
+        },
+    ).json()
+    if not isinstance(res, list):
+        res = [res]
+    return [(o["text"], o["meta_info"].get("cached_tokens", 0)) for o in res]
 
 
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
-class TestTpuPrefixCache(unittest.TestCase):
+class TestTpuPrefixCache(CustomTestCase):
     MODEL = "Qwen/Qwen3-0.6B"
     TP_SIZE = 1
     MEM_FRACTION_STATIC = 0.4
@@ -110,64 +132,73 @@ class TestTpuPrefixCache(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         os.environ["SGLANG_PLATFORM"] = "tpu"
-        os.environ.setdefault("TPU_VISIBLE_CHIPS", "0")
 
-        from transformers import AutoTokenizer
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--device",
+            "tpu",
+            "--dtype",
+            "bfloat16",
+            "--tp-size",
+            str(cls.TP_SIZE),
+            "--page-size",
+            str(PAGE_SIZE),
+            "--mem-fraction-static",
+            str(cls.MEM_FRACTION_STATIC),
+            "--max-total-tokens",
+            str(POOL),
+            "--chunked-prefill-size",
+            "512",
+            "--context-length",
+            "1024",
+            "--torch-compile-max-bs",
+            "4",
+            "--tpu-compile-tokens",
+            "64",
+            "512",
+            "--tpu-compile-bs",
+            "1",
+            "4",
+            "--enable-torch-compile",
+            "--grammar-backend",
+            "none",
+        ]
+        for k, v in cls.EXTRA_ENGINE_KWARGS.items():
+            other_args.extend([f"--{k.replace('_', '-')}", str(v)])
 
-        tok = AutoTokenizer.from_pretrained(cls.MODEL)
-        assert len(tok.encode(COUNT_LONG)) >= 3 * PAGE_SIZE, (
-            f"COUNT_LONG tokenizes to fewer than {3 * PAGE_SIZE} tokens; "
-            "test_1 and test_5 assertions will always fail"
-        )
-        assert len(tok.encode(SYSTEM)) >= PAGE_SIZE, (
-            f"SYSTEM tokenizes to fewer than {PAGE_SIZE} tokens; "
-            "test_2 and test_3 assertions will always fail"
-        )
-
-        import sglang as sgl
-
-        cls.engine = sgl.Engine(
-            model_path=cls.MODEL,
+        cls.process = popen_launch_server(
+            cls.MODEL,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
             device="tpu",
-            tp_size=cls.TP_SIZE,
-            dtype="bfloat16",
-            page_size=PAGE_SIZE,
-            disable_radix_cache=False,
-            mem_fraction_static=cls.MEM_FRACTION_STATIC,
-            max_total_tokens=POOL,
-            skip_server_warmup=True,
-            # torch.compile is opt-in on TPU; enabling it auto-disables the
-            # tc_piecewise prefill graph, which is unimplemented on TPU and
-            # otherwise crashes during engine init.
-            enable_torch_compile=True,
-            **cls.EXTRA_ENGINE_KWARGS,
         )
 
     @classmethod
     def tearDownClass(cls):
-        if getattr(cls, "engine", None) is not None:
-            cls.engine.shutdown()
+        if getattr(cls, "process", None) is not None:
+            kill_process_tree(cls.process.pid)
 
     def setUp(self):
         # Isolate each scenario: start from an empty cache.
-        self.engine.flush_cache()
+        requests.post(f"{self.base_url}/flush_cache")
 
     # (1) Long, multi-page prompt: a cache hit must not change the output. --- #
     def test_1_long_prompt_multipage_reuse(self):
-        cold, cold_c = _gen(self.engine, COUNT_LONG)
-        warm, warm_c = _gen(self.engine, COUNT_LONG)
+        cold, cold_c = _gen(self.base_url, COUNT_LONG)
+        warm, warm_c = _gen(self.base_url, COUNT_LONG)
         self.assertEqual(cold_c, 0, "cold run after flush must not hit cache")
         self.assertGreaterEqual(warm_c, 3 * PAGE_SIZE, "expected multi-page reuse")
         self.assertEqual(warm, cold, "cache reuse changed the long-prompt output")
 
     # (2) Many prompts sharing a long system prefix reuse it (sequential). --- #
     def test_2_multiple_prompts_shared_prefix(self):
-        first = [_gen(self.engine, SYSTEM + q) for q in QUESTIONS]
+        first = [_gen(self.base_url, SYSTEM + q) for q in QUESTIONS]
         for i, (_, c) in enumerate(first[1:], start=1):
             self.assertGreaterEqual(
                 c, PAGE_SIZE, f"Q{i} did not reuse the shared system prefix"
             )
-        second = [_gen(self.engine, SYSTEM + q) for q in QUESTIONS]
+        second = [_gen(self.base_url, SYSTEM + q) for q in QUESTIONS]
         self.assertEqual(
             [t for t, _ in first],
             [t for t, _ in second],
@@ -177,11 +208,11 @@ class TestTpuPrefixCache(unittest.TestCase):
     # (3) Primer-invariance: cached prefix must be independent of its writer. - #
     def test_3_primer_invariance(self):
         target = SYSTEM + QUESTIONS[-1]
-        _gen(self.engine, SYSTEM + QUESTIONS[0])  # primer A
-        a, _ = _gen(self.engine, target)
-        self.engine.flush_cache()
-        _gen(self.engine, SYSTEM + QUESTIONS[1])  # primer B
-        c, cc = _gen(self.engine, target)
+        _gen(self.base_url, SYSTEM + QUESTIONS[0])  # primer A
+        a, _ = _gen(self.base_url, target)
+        requests.post(f"{self.base_url}/flush_cache")
+        _gen(self.base_url, SYSTEM + QUESTIONS[1])  # primer B
+        c, cc = _gen(self.base_url, target)
         self.assertGreaterEqual(cc, PAGE_SIZE, "target did not reuse the shared prefix")
         self.assertEqual(
             a, c, "cached prefix KV depends on primer -> cross-request bug"
@@ -190,8 +221,8 @@ class TestTpuPrefixCache(unittest.TestCase):
     # (4) Concurrent batch sharing the prefix: completes, hits, deterministic. #
     def test_4_concurrent_batch(self):
         prompts = [SYSTEM + q for q in QUESTIONS]
-        b1 = _gen_batch(self.engine, prompts)
-        b2 = _gen_batch(self.engine, prompts)
+        b1 = _gen_batch(self.base_url, prompts)
+        b2 = _gen_batch(self.base_url, prompts)
         self.assertTrue(all(t for t, _ in b1), "a concurrent request returned empty")
         self.assertEqual(
             [t for t, _ in b1], [t for t, _ in b2], "concurrent batch not deterministic"
@@ -206,13 +237,13 @@ class TestTpuPrefixCache(unittest.TestCase):
     def test_5_eviction_path(self):
         # Starting cache state is irrelevant: counting is deterministic, so
         # out1 (warm or cold) must equal out2 (cold recompute after eviction).
-        out1, _ = _gen(self.engine, COUNT_LONG)
+        out1, _ = _gen(self.base_url, COUNT_LONG)
         for p in CHURN:
-            txt, _ = _gen(self.engine, p)
+            txt, _ = _gen(self.base_url, p)
             self.assertTrue(txt, "a churn request returned empty (alloc/evict failed)")
         # COUNT_LONG was cached first and is LRU; cumulative churn KV > POOL, so
         # it must have been evicted -> this requery is a miss (recompute).
-        out2, c2 = _gen(self.engine, COUNT_LONG)
+        out2, c2 = _gen(self.base_url, COUNT_LONG)
         self.assertLess(c2, PAGE_SIZE, "expected COUNT_LONG to be evicted (cache miss)")
         self.assertEqual(out1, out2, "output changed after eviction (pool corruption)")
 
@@ -264,6 +295,8 @@ class TestTpuSwaPrefixCache(TestTpuPrefixCache):
 
     @classmethod
     def setUpClass(cls):
+        if getattr(cls, "__unittest_skip__", False):
+            return
         # The SparseCore ragged-gather MoE path (default ON) cannot be lowered
         # for GPT-OSS: ragged_gather_v2's pltpu.async_copy indexer needs a
         # static row count and the EXTEND graph reaches it with a symbolic
@@ -299,11 +332,11 @@ class TestTpuSwaPrefixCache(TestTpuPrefixCache):
     #     prefix's SWA KV is only valid for the tail window, and the extension
     #     allocates with prefix_lens > 0 (full->swa last_loc translation).
     def test_6_swa_extend_from_cached_prefix(self):
-        cold_ext, c0 = _gen(self.engine, COUNT_EXT)
+        cold_ext, c0 = _gen(self.base_url, COUNT_EXT)
         self.assertEqual(c0, 0, "cold run after flush must not hit cache")
-        self.engine.flush_cache()
-        _gen(self.engine, COUNT_LONG)  # prime: caches a prefix > window
-        warm_ext, c1 = _gen(self.engine, COUNT_EXT)
+        requests.post(f"{self.base_url}/flush_cache")
+        _gen(self.base_url, COUNT_LONG)  # prime: caches a prefix > window
+        warm_ext, c1 = _gen(self.base_url, COUNT_EXT)
         self.assertGreaterEqual(
             c1, self.window, "extension did not reuse a beyond-window prefix"
         )
@@ -315,11 +348,11 @@ class TestTpuSwaPrefixCache(TestTpuPrefixCache):
     #     in-window on reuse, and the result must not depend on the primer.
     def test_7_swa_subwindow_shared_prefix(self):
         target = SHORT_PREFIX + SUF_B
-        cold, c0 = _gen(self.engine, target)
+        cold, c0 = _gen(self.base_url, target)
         self.assertEqual(c0, 0, "cold run after flush must not hit cache")
-        self.engine.flush_cache()
-        _gen(self.engine, SHORT_PREFIX + SUF_A)  # primer writes the prefix
-        warm, c1 = _gen(self.engine, target)
+        requests.post(f"{self.base_url}/flush_cache")
+        _gen(self.base_url, SHORT_PREFIX + SUF_A)  # primer writes the prefix
+        warm, c1 = _gen(self.base_url, target)
         self.assertGreaterEqual(
             c1, PAGE_SIZE, "target did not reuse the sub-window shared prefix"
         )
@@ -329,9 +362,9 @@ class TestTpuSwaPrefixCache(TestTpuPrefixCache):
     #     A re-query must NOT reuse the tombstoned prefix (match-past-tombstone
     #     gate) and must recompute bit-identically (no corruption from free_swa).
     def test_8_swa_window_slide_long_decode(self):
-        out1, _ = _gen(self.engine, COUNT_LONG, n=self.LONG_NEW)
+        out1, _ = _gen(self.base_url, COUNT_LONG, n=self.LONG_NEW)
         self.assertTrue(out1, "long decode returned empty")
-        out2, c2 = _gen(self.engine, COUNT_LONG, n=self.LONG_NEW)
+        out2, c2 = _gen(self.base_url, COUNT_LONG, n=self.LONG_NEW)
         self.assertLess(c2, PAGE_SIZE, "reused a tombstoned (window-slid) prefix")
         self.assertEqual(out2, out1, "recompute after window slide changed output")
 
@@ -339,11 +372,11 @@ class TestTpuSwaPrefixCache(TestTpuPrefixCache):
     #     live tail >= window, so extending it MAY reuse across the tombstone
     #     and must equal a cold full recompute.
     def test_9_swa_match_past_tombstone(self):
-        out1, _ = _gen(self.engine, COUNT_LONG, n=self.LONG_NEW)
+        out1, _ = _gen(self.base_url, COUNT_LONG, n=self.LONG_NEW)
         ext = COUNT_LONG + out1
-        warm, cw = _gen(self.engine, ext)
-        self.engine.flush_cache()
-        cold, c0 = _gen(self.engine, ext)
+        warm, cw = _gen(self.base_url, ext)
+        requests.post(f"{self.base_url}/flush_cache")
+        cold, c0 = _gen(self.base_url, ext)
         self.assertEqual(c0, 0, "cold run after flush must not hit cache")
         self.assertGreaterEqual(
             cw, self.window, "extension did not reuse across the tombstone"
@@ -354,10 +387,10 @@ class TestTpuSwaPrefixCache(TestTpuPrefixCache):
     #      swa-LRU eviction (not full-pool eviction) must reclaim COUNT_LONG;
     #      the requery must miss and recompute identically.
     def test_10_swa_pool_bound_eviction(self):
-        out1, _ = _gen(self.engine, COUNT_LONG)
-        txt, _ = _gen(self.engine, BIG_DOC)
+        out1, _ = _gen(self.base_url, COUNT_LONG)
+        txt, _ = _gen(self.base_url, BIG_DOC)
         self.assertTrue(txt, "SWA-pool-overflow request returned empty")
-        out2, c2 = _gen(self.engine, COUNT_LONG)
+        out2, c2 = _gen(self.base_url, COUNT_LONG)
         self.assertLess(c2, PAGE_SIZE, "expected SWA-pool eviction of COUNT_LONG")
         self.assertEqual(out2, out1, "output changed after SWA-pool eviction")
 
@@ -370,12 +403,12 @@ class TestTpuSwaPrefixCache(TestTpuPrefixCache):
 
         refs = []
         for p, n in zip(prompts, news):
-            self.engine.flush_cache()
-            refs.append(_gen(self.engine, p, n=n)[0])
+            requests.post(f"{self.base_url}/flush_cache")
+            refs.append(_gen(self.base_url, p, n=n)[0])
 
-        self.engine.flush_cache()
-        _gen(self.engine, COUNT_LONG)  # prime the shared prefix into the tree
-        outs = _gen_batch(self.engine, prompts, n=news)
+        requests.post(f"{self.base_url}/flush_cache")
+        _gen(self.base_url, COUNT_LONG)  # prime the shared prefix into the tree
+        outs = _gen_batch(self.base_url, prompts, n=news)
         texts = [t for t, _ in outs]
         cached = [c for _, c in outs]
 
