@@ -21,6 +21,9 @@ _LANES = 128
 _SUBLANES = 8
 _TOKEN_BLOCK = 32
 _VOCAB_ALIGNMENT = 128
+# Keep TopK's barrier semaphore distinct from the communicating model kernels
+# that use collective ID 0 in the same compiled executable.
+_COLLECTIVE_ID = 1
 
 _OPS: dict[int, Callable] = {}
 _OPS_LOCK = Lock()
@@ -690,7 +693,13 @@ def _ring_candidates(
             out_specs=output_specs,
             scratch_shapes=scratch_shapes,
         ),
-        compiler_params=pltpu.CompilerParams(collective_id=0),
+        compiler_params=pltpu.CompilerParams(
+            # Program 0 owns the all-rank entry barrier.  The token blocks must
+            # execute in grid order so no later program can issue remote DMA
+            # before that barrier has completed.
+            dimension_semantics=("arbitrary",),
+            collective_id=_COLLECTIVE_ID,
+        ),
         name=f"distributed_topk_ring_tp{world_size}",
     )(rank_input, local_logits)
 
