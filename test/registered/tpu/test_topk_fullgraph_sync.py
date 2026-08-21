@@ -21,9 +21,11 @@ BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 MODEL = os.environ.get("MODEL", "/weights/Qwen3-Coder-480B-A35B-Instruct-FP8")
 SERVER_LOG = Path(os.environ.get("SERVER_LOG", "/tmp/server.log"))
 FREEZE_SIGNATURE = "froze torch.compile via set_stance('fail_on_recompile')"
-FAILURE_SIGNATURES = (
+RECOMPILE_SIGNATURES = (
     "Detected recompile when torch.compile stance is 'fail_on_recompile'",
     "new XLA program(s) compiled at serving time",
+)
+HALT_SIGNATURES = (
     "RuntimeUnexpectedCoreHalt",
     "SparseCoreSequencer",
 )
@@ -74,8 +76,12 @@ def request_batch(label: str, batch_size: int, sampling_params: dict) -> None:
 
 
 def main() -> None:
-    if FREEZE_SIGNATURE in read_server_log():
-        raise RuntimeError("Dynamo was frozen before the reported B=1 prime request")
+    # Startup intentionally builds every configured executable. Only messages
+    # emitted after this boundary can represent serving-time recompilation.
+    initial_log = read_server_log()
+    serving_log_offset = len(initial_log)
+    if FREEZE_SIGNATURE in initial_log:
+        print("Dynamo was frozen by server warmup before the B=1 request", flush=True)
 
     print("== Prime Dynamo with the reported B=1 greedy request ==", flush=True)
     request_json(
@@ -150,7 +156,11 @@ def main() -> None:
     )
 
     log = read_server_log()
-    found = [signature for signature in FAILURE_SIGNATURES if signature in log]
+    serving_log = log[serving_log_offset:]
+    found = [
+        signature for signature in RECOMPILE_SIGNATURES if signature in serving_log
+    ]
+    found.extend(signature for signature in HALT_SIGNATURES if signature in log)
     if found:
         raise RuntimeError(f"server log contains failure signatures: {found}")
 
