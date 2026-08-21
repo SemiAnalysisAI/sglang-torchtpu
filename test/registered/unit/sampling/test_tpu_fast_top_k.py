@@ -34,7 +34,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 
 
-def _forward_batch(*, batch_size=1, **info_overrides):
+def _forward_batch(*, batch_size=64, **info_overrides):
     info = SimpleNamespace(
         uniform_top_k=50,
         is_any_greedy=False,
@@ -71,11 +71,14 @@ def _forward_batch(*, batch_size=1, **info_overrides):
 
 
 class TestDistributedTopKEligibility(CustomTestCase):
-    def test_tp16_small_batches_can_lower_cutoff(self):
+    def test_candidate_width_is_static_across_request_and_batch_sizes(self):
         processor = SimpleNamespace(
             use_tpu_distributed_top_k=True,
             do_tensor_parallel_all_gather=True,
             do_tensor_parallel_all_gather_dp_attn=False,
+        )
+        processor.get_tpu_distributed_top_k_width = lambda lm_head: (
+            LogitsProcessor.get_tpu_distributed_top_k_width(processor, lm_head)
         )
         tp16_lm_head = SimpleNamespace(
             enable_tp=True,
@@ -86,14 +89,19 @@ class TestDistributedTopKEligibility(CustomTestCase):
 
         with patch.object(tpu_sampler_module, "_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE", 1):
             for batch_size in (1, 2, 4, 8, 16):
-                with self.subTest(batch_size=batch_size):
-                    batch = _forward_batch(batch_size=batch_size)
-                    self.assertEqual(
-                        LogitsProcessor.get_tpu_distributed_top_k_for_batch(
-                            processor, batch, tp16_lm_head
-                        ),
-                        50,
-                    )
+                for top_k in (2, 7, 50, 64):
+                    with self.subTest(batch_size=batch_size, top_k=top_k):
+                        batch = _forward_batch(
+                            batch_size=batch_size,
+                            uniform_top_k=top_k,
+                            top_ks=torch.tensor([top_k], dtype=torch.int32),
+                        )
+                        self.assertEqual(
+                            LogitsProcessor.get_tpu_distributed_top_k_for_batch(
+                                processor, batch, tp16_lm_head
+                            ),
+                            64,
+                        )
 
     def test_measured_default_uses_distributed_top_k_from_batch_64(self):
         cutoff = envs.SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
@@ -118,6 +126,9 @@ class TestDistributedTopKEligibility(CustomTestCase):
             do_tensor_parallel_all_gather=False,
             do_tensor_parallel_all_gather_dp_attn=False,
         )
+        processor.get_tpu_distributed_top_k_width = lambda lm_head: (
+            LogitsProcessor.get_tpu_distributed_top_k_width(processor, lm_head)
+        )
         sharded_lm_head = SimpleNamespace(
             enable_tp=True,
             num_embeddings=128,
@@ -134,8 +145,8 @@ class TestDistributedTopKEligibility(CustomTestCase):
     def test_full_vocab_features_fall_back(self):
         cases = {
             "mixed top-k": {"uniform_top_k": None},
+            "greedy row": {"uniform_top_k": 1, "is_any_greedy": True},
             "large top-k": {"uniform_top_k": 65},
-            "greedy row": {"is_any_greedy": True},
             "seeded sampling": {"sampling_seed": torch.tensor([17])},
             "top-p": {"need_top_p_sampling": True},
             "min-p": {"need_min_p_sampling": True},
@@ -189,10 +200,11 @@ class TestDistributedTopKEligibility(CustomTestCase):
             )
             padded_batch = _forward_batch(batch_size=128)
             padded_batch._tpu_real_b = 127
-            self.assertIsNone(
+            self.assertEqual(
                 tpu_sampler_module.distributed_top_k_for_batch(
                     padded_batch, sampling_backend="tpu"
-                )
+                ),
+                50,
             )
             self.assertEqual(
                 tpu_sampler_module.distributed_top_k_for_batch(
@@ -298,6 +310,20 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
         torch.testing.assert_close(
             sample.call_args.args[0], torch.softmax(torch.tensor([[2.0, 1.0]]), -1)
         )
+
+    def test_global_top_k_sampling_masks_requested_tail(self):
+        logits = torch.tensor([[4.0, 3.0, 2.0], [6.0, 5.0, 4.0]])
+        top_ks = torch.tensor([2, 2], dtype=torch.int32)
+        with patch.object(
+            tpu_sampler_module,
+            "sampling_from_probs_torch",
+            return_value=torch.tensor([0, 1], dtype=torch.int32),
+        ) as sample:
+            sample_from_global_top_k_logits(logits, torch.ones(2, 1), top_ks)
+
+        probs = sample.call_args.args[0]
+        torch.testing.assert_close(probs[:, 2], torch.zeros(2))
+        torch.testing.assert_close(probs[:, :2].sum(dim=1), torch.ones(2))
 
     def test_fallback_uses_generic_pytorch_sampler(self):
         sampler = SimpleNamespace()

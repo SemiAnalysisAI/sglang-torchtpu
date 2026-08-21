@@ -411,9 +411,38 @@ class LogitsProcessor(nn.Module):
         forward_batch: ForwardBatch,
         lm_head: VocabParallelEmbedding,
     ) -> Optional[int]:
-        """Return the static k only when this model can skip the TPU vocab gather.
-        Full-logit models, disabled/DP gathers, and non-sharded heads return ``None``.
+        """Return a model-static candidate width or ``None`` for full logits.
+
+        Compiled TPU execution resolves ``tpu_use_distributed_top_k`` before
+        tracing, so this branch never inspects request sampling metadata in the
+        model graph. Eager execution leaves the field as ``None`` and selects
+        the same mode dynamically.
         """
+
+        candidate_width = self.get_tpu_distributed_top_k_width(lm_head)
+        if candidate_width is None:
+            return None
+
+        selected = getattr(forward_batch, "tpu_use_distributed_top_k", None)
+        if selected is not None:
+            return candidate_width if selected else None
+
+        from sglang.srt.hardware_backend.tpu.sampler import (
+            distributed_top_k_for_batch,
+        )
+
+        requested_top_k = distributed_top_k_for_batch(
+            forward_batch, sampling_backend="tpu"
+        )
+        if requested_top_k is None or requested_top_k > candidate_width:
+            return None
+        return candidate_width
+
+    def get_tpu_distributed_top_k_width(
+        self,
+        lm_head: VocabParallelEmbedding,
+    ) -> Optional[int]:
+        """Return the fixed candidate width supported by this model layout."""
 
         if (
             not self.use_tpu_distributed_top_k
@@ -422,17 +451,21 @@ class LogitsProcessor(nn.Module):
         ):
             return None
 
-        from sglang.srt.hardware_backend.tpu.sampler import (
-            distributed_top_k_for_batch,
-        )
+        from sglang.srt.hardware_backend.tpu.sampler import MAX_DISTRIBUTED_TOP_K
         from sglang.srt.hardware_backend.tpu.top_k import (
             supports_distributed_tpu_top_k,
         )
 
-        top_k = distributed_top_k_for_batch(forward_batch, sampling_backend="tpu")
-        if top_k is None or not supports_distributed_tpu_top_k(lm_head, top_k):
+        candidate_width = min(
+            MAX_DISTRIBUTED_TOP_K,
+            int(getattr(lm_head, "num_embeddings", 0)),
+            int(getattr(lm_head, "num_embeddings_per_partition", 0)),
+        )
+        if candidate_width <= 1 or not supports_distributed_tpu_top_k(
+            lm_head, candidate_width
+        ):
             return None
-        return top_k
+        return candidate_width
 
     def forward(
         self,
