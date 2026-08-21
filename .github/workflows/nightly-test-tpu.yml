@@ -133,7 +133,7 @@ jobs:
       - id: d
         run: |
           set -euo pipefail
-          groups="$(python3 .github/tpu-ci/discover_multihost.py --suite nightly-tpu-multihost)"
+          groups="$(python3 .github/tpu-ci/discover_multihost.py --suite topk-fullgraph-validation)"
           echo "groups=$groups" >> "$GITHUB_OUTPUT"
           echo "discovered groups: $groups"
 

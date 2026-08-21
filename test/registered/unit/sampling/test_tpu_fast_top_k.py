@@ -385,7 +385,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 processor.get_tpu_distributed_top_k_for_batch(
                     _forward_batch(batch_size=64), lm_head
                 ),
-                50,
+                64,
             )
             shard_indices.org_vocab_start_index = 1
             self.assertIsNone(
