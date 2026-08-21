@@ -407,8 +407,8 @@ class TestNvfp4Block512Contract(CustomTestCase):
             # Mirrors fused_moe_rs_op.prepare_fused_moe_rs, which cannot run
             # here (it needs an initialized TP group). Keep the attribute names
             # in sync with that function.
-            prepared_layer._tpu_fused_rs_physical_order = torch.tensor(
-                [0], dtype=torch.int64
+            prepared_layer._tpu_fused_rs_tp_rank_to_device_id = torch.tensor(
+                [0], dtype=torch.int32
             )
             prepared_layer._tpu_fused_rs_group_offset = torch.tensor(
                 [0, 0], dtype=torch.int32
@@ -455,7 +455,8 @@ class TestNvfp4Block512Contract(CustomTestCase):
         self.assertNotIn("collective_id", call)
         self.assertIs(call["group_offset"], layer._tpu_fused_rs_group_offset)
         self.assertIs(
-            call["physical_order_to_tp_rank"], layer._tpu_fused_rs_physical_order
+            call["tp_rank_to_device_id"],
+            layer._tpu_fused_rs_tp_rank_to_device_id,
         )
         self.assertFalse(call["has_post_expert_norm"])
 
@@ -472,7 +473,9 @@ class TestNvfp4Block512Contract(CustomTestCase):
         layer = _make_block512_layer(include_unused_params=False)
         layer._tpu_fused_rs_has_post_expert_norm = False
         layer._tpu_fused_rs_group_offset = torch.tensor([0, 0], dtype=torch.int32)
-        layer._tpu_fused_rs_physical_order = torch.tensor([0], dtype=torch.int64)
+        layer._tpu_fused_rs_tp_rank_to_device_id = torch.tensor(
+            [0], dtype=torch.int32
+        )
         from sglang.srt.layers.moe.pallas import fused_moe_rs_op
 
         # Autospec is intentional: it catches adapter/backend API skew during a
@@ -515,7 +518,9 @@ class TestNvfp4Block512Contract(CustomTestCase):
         layer = _make_block512_layer(include_unused_params=False)
         layer._tpu_fused_rs_has_post_expert_norm = False
         layer._tpu_fused_rs_group_offset = torch.tensor([0, 0], dtype=torch.int32)
-        layer._tpu_fused_rs_physical_order = torch.tensor([0], dtype=torch.int64)
+        layer._tpu_fused_rs_tp_rank_to_device_id = torch.tensor(
+            [0], dtype=torch.int32
+        )
         fused_moe_rs_gather = mock.Mock(
             side_effect=lambda **kwargs: kwargs["hidden_states"]
         )
@@ -598,7 +603,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         ):
             fp4_moe.prepare_tpu_nvfp4_moe_weights(layer, use_fused_rs=True)
 
-    def test_fused_rs_group_offset_stays_model_sharded(self):
+    def test_fused_rs_topology_metadata_has_expected_sharding(self):
         package_root = pathlib.Path(__file__).resolve().parents[5] / "python"
         wrapper = (
             package_root / "sglang/srt/layers/moe/pallas/fused_moe_rs_op.py"
@@ -607,7 +612,8 @@ class TestNvfp4Block512Contract(CustomTestCase):
             package_root / "sglang/srt/layers/moe/pallas/fused_rs/fused_moe.py"
         ).read_text()
 
-        self.assertIn('P("model"),\n            None,', wrapper)
+        self.assertIn("P(),  # group_offset", wrapper)
+        self.assertIn("P(),  # tp_rank_to_device_id", wrapper)
         self.assertIn("ep_p_spec,  # group_offset", body)
 
     def test_fused_packed_transpose_preserves_codes(self):

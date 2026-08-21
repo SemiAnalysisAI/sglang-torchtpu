@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the TorchTPU CPU-only JAX export environment."""
+"""Unit tests for TorchTPU abstract-device JAX export topology."""
 
 import importlib.util
 import json
@@ -10,88 +10,135 @@ import sys
 import textwrap
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import torch
 
 from sglang.srt.hardware_backend.tpu import pallas_export
+from sglang.srt.runtime_context import get_resources
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit")
 
 
 class TestPallasExportEnvironment(CustomTestCase):
-    def setUp(self):
-        env_patcher = patch.dict(os.environ, {}, clear=False)
-        env_patcher.start()
-        self.addCleanup(env_patcher.stop)
-        os.environ.pop("JAX_PLATFORMS", None)
-        os.environ.pop("XLA_FLAGS", None)
-        self.fake_sys = SimpleNamespace(modules={})
-        sys_patcher = patch.object(pallas_export, "sys", self.fake_sys)
-        sys_patcher.start()
-        self.addCleanup(sys_patcher.stop)
+    def tearDown(self):
+        get_resources().tpu_group_routes.clear()
 
-    def test_configures_cpu_platform_and_distinct_device_count(self):
-        pallas_export.configure_jax_export_env(8)
-
-        self.assertEqual(os.environ["JAX_PLATFORMS"], "cpu")
-        self.assertIn(
-            "--xla_force_host_platform_device_count=8", os.environ["XLA_FLAGS"]
+    def test_tp8_device_metadata_reproduces_validated_routes(self):
+        routes = pallas_export.device_attributes_to_group_routes(
+            tuple(
+                {"id": device_id, "slice_index": 0}
+                for device_id in (0, 1, 4, 5, 6, 7, 2, 3)
+            )
         )
 
-    def test_preserves_unrelated_xla_flags(self):
-        os.environ["XLA_FLAGS"] = "--xla_tpu_enable_async_collective_fusion=true"
+        self.assertEqual(routes, (0, 1, 4, 5, 6, 7, 2, 3))
 
-        pallas_export.configure_jax_export_env(4)
-
-        self.assertEqual(
-            os.environ["XLA_FLAGS"],
-            "--xla_tpu_enable_async_collective_fusion=true "
-            "--xla_force_host_platform_device_count=4",
+    def test_two_host_tp16_device_metadata_produces_complete_routes(self):
+        expected = (
+            8,
+            9,
+            12,
+            13,
+            14,
+            15,
+            10,
+            11,
+            0,
+            1,
+            4,
+            5,
+            6,
+            7,
+            2,
+            3,
+        )
+        routes = pallas_export.device_attributes_to_group_routes(
+            tuple(
+                {"id": device_id, "slice_index": 0} for device_id in expected
+            )
         )
 
-    def test_rejects_conflicting_platform_or_device_count(self):
-        os.environ["JAX_PLATFORMS"] = "tpu"
-        with self.assertRaisesRegex(RuntimeError, "requires JAX_PLATFORMS=cpu"):
-            pallas_export.configure_jax_export_env(8)
+        self.assertEqual(routes, expected)
+        self.assertEqual(sorted(routes), list(range(16)))
 
-        os.environ["JAX_PLATFORMS"] = "cpu"
-        os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
-        with self.assertRaisesRegex(RuntimeError, "must equal WORLD_SIZE=8"):
-            pallas_export.configure_jax_export_env(8)
+    def test_rejects_invalid_route_ids_or_multiple_slices(self):
+        with self.assertRaisesRegex(ValueError, "permutation"):
+            pallas_export.device_attributes_to_group_routes(
+                ({"id": 0, "slice_index": 0}, {"id": 0, "slice_index": 0})
+            )
+        with self.assertRaisesRegex(ValueError, "single TPU slice"):
+            pallas_export.device_attributes_to_group_routes(
+                ({"id": 0, "slice_index": 0}, {"id": 1, "slice_index": 1})
+            )
 
-    def test_rejects_late_jax_import_or_backend_initialization(self):
-        self.fake_sys.modules["jax"] = object()
-        with self.assertRaisesRegex(RuntimeError, "JAX was imported before"):
-            pallas_export.configure_jax_export_platform()
-
-        os.environ["JAX_PLATFORMS"] = "cpu"
-        self.fake_sys.modules["jax._src.xla_bridge"] = SimpleNamespace(
-            _backends={"cpu": object()}
+    def test_gathers_topology_over_cpu_process_group(self):
+        device_ids = (0, 1, 4, 5, 6, 7, 2, 3)
+        attributes = tuple(
+            {
+                "id": device_id,
+                "coords": (rank, 0, 0),
+                "core_on_chip": 0,
+                "device_kind": "TPU v7",
+                "process_index": 0,
+                "slice_index": 0,
+            }
+            for rank, device_id in enumerate(device_ids)
         )
-        with self.assertRaisesRegex(RuntimeError, "JAX backend was initialized"):
-            pallas_export.configure_jax_export_env(8)
+        device_module = SimpleNamespace(
+            get_local_device_attributes=Mock(return_value=attributes[0])
+        )
+        cpu_group = object()
 
-    def test_worker_reuses_driver_world_size_configuration(self):
-        from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
+        def gather(output, _local, *, group):
+            self.assertIs(group, cpu_group)
+            output[:] = attributes
 
-        os.environ["WORLD_SIZE"] = "8"
-        with patch(
-            "sglang.srt.hardware_backend.tpu.env_override.apply_tpu_env_overrides"
+        with (
+            patch.object(torch, "get_device_module", return_value=device_module),
+            patch(
+                "torch.distributed.all_gather_object", side_effect=gather
+            ) as gather_op,
         ):
-            _prepare_tpu_env(8, setup_slicebuilder=False)
-            _prepare_tpu_env(setup_slicebuilder=False)
+            routes = pallas_export.get_tpu_group_rank_to_device_id(
+                tuple(range(8)),
+                cpu_group,
+            )
+            cached_routes = pallas_export.get_tpu_group_rank_to_device_id(
+                tuple(range(8)),
+                cpu_group,
+            )
 
-        self.assertIn(
-            "--xla_force_host_platform_device_count=8", os.environ["XLA_FLAGS"]
-        )
+        self.assertEqual(routes, device_ids)
+        self.assertEqual(cached_routes, device_ids)
+        gather_op.assert_called_once()
 
-    def test_rejects_pre_distributed_world_size_fallback(self):
-        pallas_export.configure_jax_export_env(16)
+    def test_abstract_export_devices_scale_with_runtime_topology(self):
+        routes = (8, 9, 12, 13, 14, 15, 10, 11, 0, 1, 4, 5, 6, 7, 2, 3)
+        with patch.object(
+            pallas_export,
+            "get_pallas_tpu_device_kind",
+            return_value="TPU7x",
+        ):
+            devices = pallas_export.get_torchtpu_export_devices(routes)
 
-        with self.assertRaisesRegex(RuntimeError, "must equal WORLD_SIZE=1"):
-            pallas_export.configure_jax_export_env(1)
+        self.assertEqual(tuple(device.id for device in devices), routes)
+        self.assertEqual(devices[0].client.device_count(), 16)
+        self.assertTrue(all(device.client is devices[0].client for device in devices))
+
+    def test_configure_export_environment_does_not_force_cpu(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("JAX_PLATFORMS", None)
+            os.environ.pop("XLA_FLAGS", None)
+
+            pallas_export.configure_jax_export_platform()
+            pallas_export.configure_jax_export_env(16)
+
+            self.assertNotIn("JAX_PLATFORMS", os.environ)
+            self.assertNotIn("XLA_FLAGS", os.environ)
 
     def test_maps_torchtpu_device_kind_to_pallas_spelling(self):
         cases = (
@@ -110,7 +157,7 @@ class TestPallasExportEnvironment(CustomTestCase):
                 )
 
     @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
-    def test_cpu_export_context_reports_and_restores_tpu_target(self):
+    def test_abstract_export_context_reports_and_restores_tpu_target(self):
         from jax._src.pallas.mosaic import tpu_info
         from jax.experimental.pallas import tpu as pltpu
 
@@ -133,216 +180,14 @@ class TestPallasExportEnvironment(CustomTestCase):
         self.assertIs(tpu_info.get_device_kind, original_device_kind)
         self.assertIs(tpu_info.is_tpu_device, original_is_tpu_device)
 
-    @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
-    def test_distinct_mesh_exports_collective_with_world_size_partitions(self):
-        script = textwrap.dedent("""
-            import base64
-            import inspect
-            import json
-            import numpy as np
-            from unittest.mock import patch
-
-            from sglang.srt.hardware_backend.tpu import pallas_export
-
-            pallas_export.configure_jax_export_env(4)
-            devices = pallas_export.get_jax_export_devices(4)
-
-            import jax
-            import jax.numpy as jnp
-            from jax import lax
-            from jax._src.interpreters import mlir as jax_mlir
-            from jax.experimental import pallas as pl
-            from jax.experimental.pallas import tpu as pltpu
-            from jax.sharding import Mesh, PartitionSpec as P
-            from jaxlib.mlir import ir
-            from jaxlib.mlir.dialects import sdy, stablehlo
-            from jaxlib.mosaic.python import tpu as mosaic_tpu
-
-            mesh = Mesh(np.asarray(devices).reshape(1, 4), ("data", "model"))
-            if hasattr(jax, "shard_map"):
-                shard_map = jax.shard_map
-            else:
-                from jax.experimental.shard_map import shard_map
-            check_arg = (
-                {"check_vma": False}
-                if "check_vma" in inspect.signature(shard_map).parameters
-                else {"check_rep": False}
-            )
-            mapped = jax.jit(
-                shard_map(
-                    lambda x: lax.psum(x, "model"),
-                    mesh=mesh,
-                    in_specs=P("model"),
-                    out_specs=P("model"),
-                    **check_arg,
-                )
-            )
-            x = jnp.arange(4, dtype=jnp.float32)
-            exported = jax.export.export(mapped)(
-                jax.ShapeDtypeStruct((4,), jnp.float32)
-            )
-
-            def remote_copy_kernel(x_ref, y_ref, send_sem, recv_sem):
-                rank = lax.axis_index("model")
-                destination = (rank + 1) % lax.axis_size("model")
-                copy = pltpu.make_async_remote_copy(
-                    src_ref=x_ref,
-                    dst_ref=y_ref,
-                    send_sem=send_sem,
-                    recv_sem=recv_sem,
-                    device_id={"model": destination},
-                    device_id_type=pl.DeviceIdType.MESH,
-                )
-                copy.start()
-                copy.wait()
-
-            def remote_copy_shard(x_local):
-                block_spec = pl.BlockSpec(x_local.shape)
-                return pl.pallas_call(
-                    remote_copy_kernel,
-                    out_shape=jax.ShapeDtypeStruct(x_local.shape, x_local.dtype),
-                    grid_spec=pltpu.PrefetchScalarGridSpec(
-                        num_scalar_prefetch=0,
-                        in_specs=[block_spec],
-                        out_specs=block_spec,
-                        scratch_shapes=(
-                            pltpu.SemaphoreType.DMA,
-                            pltpu.SemaphoreType.DMA,
-                        ),
-                    ),
-                    compiler_params=pltpu.CompilerParams(
-                        vmem_limit_bytes=1024 * 1024
-                    ),
-                )(x_local)
-
-            remote_copy = jax.jit(
-                shard_map(
-                    remote_copy_shard,
-                    mesh=mesh,
-                    in_specs=P("model"),
-                    out_specs=P("model"),
-                    **check_arg,
-                )
-            )
-            exporter = jax.export.export(
-                remote_copy,
-                platforms=["tpu"],
-                disabled_checks=[
-                    jax.export.DisabledSafetyCheck.custom_call("ALL")
-                ],
-            )
-            with patch.object(
-                pallas_export,
-                "get_pallas_tpu_device_kind",
-                return_value="TPU7x",
-            ), pallas_export.tpu_info_for_cpu_export():
-                pallas_exported = exporter(
-                    jax.ShapeDtypeStruct((32,), jnp.float32)
-                )
-
-            outer_context = ir.Context()
-            outer_context.allow_unregistered_dialects = True
-            outer_context.append_dialect_registry(jax_mlir.upstream_dialects)
-            sdy.register_dialect(outer_context)
-            stablehlo.register_dialect(outer_context)
-            outer_context.load_all_available_dialects()
-            outer_module = ir.Module.parse(
-                pallas_exported.mlir_module(), outer_context
-            )
-
-            def walk_operations(operation):
-                yield operation
-                for region in operation.regions:
-                    for block in region.blocks:
-                        for child in block.operations:
-                            yield from walk_operations(child.operation)
-
-            mosaic_bodies = []
-            for operation in walk_operations(outer_module.operation):
-                if operation.name != "stablehlo.custom_call":
-                    continue
-                try:
-                    backend_config = ir.StringAttr(
-                        operation.attributes["backend_config"]
-                    ).value
-                except KeyError:
-                    continue
-                config = json.loads(backend_config)
-                body = config.get("custom_call_config", {}).get("body")
-                if body is not None:
-                    mosaic_bodies.append(body)
-
-            if len(mosaic_bodies) != 1:
-                raise AssertionError(
-                    f"Expected one serialized Mosaic body, got {len(mosaic_bodies)}"
-                )
-            mosaic_bytecode = base64.b64decode(mosaic_bodies[0], validate=True)
-            context = ir.Context()
-            context.allow_unregistered_dialects = True
-            mosaic_tpu.register_dialect(context)
-            mosaic_module = str(ir.Module.parse(mosaic_bytecode, context)).lower()
-
-            print(
-                json.dumps(
-                    {
-                        "device_ids": [device.id for device in devices],
-                        "mesh_shape": dict(mesh.shape),
-                        "nr_devices": exported.nr_devices,
-                        "has_all_reduce": (
-                            "all_reduce" in exported.mlir_module().lower()
-                        ),
-                        "serialized_size": len(exported.mlir_module_serialized),
-                        "result": np.asarray(mapped(x)).tolist(),
-                        "pallas_nr_devices": pallas_exported.nr_devices,
-                        "has_enqueue_dma": (
-                            "stable_mosaic.tpu.enqueue_dma" in mosaic_module
-                        ),
-                        "has_wait_dma": (
-                            "stable_mosaic.tpu.wait_dma2" in mosaic_module
-                        ),
-                    }
-                )
-            )
-            """)
-        env = os.environ.copy()
-        env.pop("JAX_PLATFORMS", None)
-        env.pop("XLA_FLAGS", None)
-        completed = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=30,
-        )
-        self.assertEqual(
-            completed.returncode,
-            0,
-            f"subprocess stderr:\n{completed.stderr}",
-        )
-        result = json.loads(completed.stdout.strip().splitlines()[-1])
-
-        self.assertEqual(result["device_ids"], [0, 1, 2, 3])
-        self.assertEqual(result["mesh_shape"], {"data": 1, "model": 4})
-        self.assertEqual(result["nr_devices"], 4)
-        self.assertTrue(result["has_all_reduce"])
-        self.assertGreater(result["serialized_size"], 0)
-        self.assertEqual(result["result"], [6.0, 6.0, 6.0, 6.0])
-        self.assertEqual(result["pallas_nr_devices"], 4)
-        self.assertTrue(result["has_enqueue_dma"])
-        self.assertTrue(result["has_wait_dma"])
-
     @unittest.skipUnless(
         importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
         "requires JAX and TorchTPU",
     )
-    def test_cpu_export_jax_op_preserves_unused_input(self):
+    def test_jax_op_preserves_unused_input_without_forcing_cpu(self):
         script = textwrap.dedent("""
             import json
             import os
-
-            from sglang.srt.hardware_backend.tpu import pallas_export
-
-            pallas_export.configure_jax_export_env(1)
 
             import jax
             import torch
@@ -356,18 +201,17 @@ class TestPallasExportEnvironment(CustomTestCase):
                 return x + 1
 
             op = cpu_export_jax_op(
-                "sglang_tpu_test::cpu_export_add_one",
+                "sglang_tpu_test::abstract_export_add_one",
                 add_one,
             )
             x = torch.arange(8, dtype=torch.float32, device="tpu")
-            # Torch keeps both operands, so JAX must not remove this one.
             unused = torch.zeros(8, dtype=torch.float32, device="tpu")
             y = op(x, unused)
             torch.tpu.synchronize()
             print(
                 json.dumps(
                     {
-                        "jax_platforms": os.environ["JAX_PLATFORMS"],
+                        "jax_platforms": os.environ.get("JAX_PLATFORMS"),
                         "result": y.cpu().tolist(),
                     }
                 )
@@ -389,7 +233,7 @@ class TestPallasExportEnvironment(CustomTestCase):
             f"subprocess stderr:\n{completed.stderr}",
         )
         result = json.loads(completed.stdout.strip().splitlines()[-1])
-        self.assertEqual(result["jax_platforms"], "cpu")
+        self.assertIsNone(result["jax_platforms"])
         self.assertEqual(result["result"], [float(value) for value in range(1, 9)])
 
 

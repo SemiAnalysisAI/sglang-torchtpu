@@ -348,7 +348,7 @@ def expert_parallel_gmm_rs(
         else jnp.arange(0, num_experts, num_experts_per_shard)
     )
     if tp_rank_to_device_id is None:
-        tp_rank_to_device_id = jnp.array([0, 1, 4, 5, 6, 7, 2, 3], dtype=jnp.int32)
+        raise ValueError("TPU rank-to-mesh routing metadata is required")
 
     w1_scale_spec = None if w1_scale is None else ep_p_spec
     w1_bias_spec = None if w1_bias is None else ep_p_spec

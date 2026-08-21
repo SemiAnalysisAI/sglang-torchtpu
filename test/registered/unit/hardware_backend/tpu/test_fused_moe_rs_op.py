@@ -2,8 +2,8 @@
 
 """Unit tests for the TPU fused-RS Torch wrapper."""
 
-import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -33,51 +33,52 @@ class TestFusedMoeRsOp(CustomTestCase):
                 self.assertEqual(actual % ep_size, 0)
                 self.assertEqual((actual * topk) % 16, 0)
 
-    def test_prepare_sets_physical_rank_metadata(self):
+    def test_prepare_uses_runtime_topology_for_tp16(self):
         layer = torch.nn.Module()
-        layer.num_local_experts = 16
+        layer.num_local_experts = 8
         layer.w13_weight = torch.empty(1)
+        routes = (8, 9, 12, 13, 14, 15, 10, 11, 0, 1, 4, 5, 6, 7, 2, 3)
+        cpu_group = object()
+        tp_group = SimpleNamespace(ranks=list(range(16)), cpu_group=cpu_group)
 
         with (
-            patch.dict(
-                os.environ,
-                {"TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS": "false"},
-            ),
-            patch.object(
-                fused_moe_rs_op,
-                "_get_physical_rank_metadata",
-                return_value=(4, (0, 1, 6, 7, 2, 3, 4, 5)),
-            ),
+            patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
             patch(
-                "sglang.srt.distributed.parallel_state." "get_moe_expert_parallel_rank",
-                return_value=2,
+                "sglang.srt.hardware_backend.tpu.pallas_export."
+                "get_tpu_group_rank_to_device_id",
+                return_value=routes,
+            ) as get_routes,
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(moe_ep_rank=11),
             ),
             patch.object(fused_moe_rs_op, "_build_fused_moe_rs_op") as build,
         ):
             fused_moe_rs_op.prepare_fused_moe_rs(layer)
-            fused_moe_rs_op.prepare_fused_moe_rs(layer)
-            self.assertEqual(
-                os.environ["TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"],
-                "false",
-            )
 
+        get_routes.assert_called_once_with(tuple(range(16)), cpu_group)
         torch.testing.assert_close(
-            layer._tpu_fused_rs_physical_order,
-            torch.tensor([0, 1, 6, 7, 2, 3, 4, 5], dtype=torch.int64),
+            layer._tpu_fused_rs_tp_rank_to_device_id,
+            torch.tensor(routes, dtype=torch.int32),
         )
         torch.testing.assert_close(
             layer._tpu_fused_rs_group_offset,
-            torch.tensor([32, 4], dtype=torch.int32),
+            torch.tensor([88, 0], dtype=torch.int32),
         )
-        self.assertIn("_tpu_fused_rs_physical_order", layer._buffers)
+        self.assertIn("_tpu_fused_rs_tp_rank_to_device_id", layer._buffers)
         self.assertIn("_tpu_fused_rs_group_offset", layer._buffers)
-        self.assertIn("_tpu_fused_rs_physical_order", layer._non_persistent_buffers_set)
-        self.assertIn("_tpu_fused_rs_group_offset", layer._non_persistent_buffers_set)
-        self.assertEqual(build.call_count, 2)
+        self.assertIn(
+            "_tpu_fused_rs_tp_rank_to_device_id",
+            layer._non_persistent_buffers_set,
+        )
+        self.assertIn(
+            "_tpu_fused_rs_group_offset", layer._non_persistent_buffers_set
+        )
+        build.assert_called_once_with(routes)
 
-    def test_gather_reorders_tp_ranks_to_physical_device_order(self):
-        rank_order_shards = torch.tensor([[0], [1], [4], [5], [6], [7], [2], [3]])
-        physical_order_to_tp_rank = torch.tensor([0, 1, 6, 7, 2, 3, 4, 5])
+    def test_gather_preserves_tp_group_rank_order(self):
+        rank_order_shards = torch.arange(8).reshape(8, 1)
+        rank_to_device_id = torch.tensor([0, 1, 4, 5, 6, 7, 2, 3])
         tp_group = Mock(
             world_size=8,
             all_gather=Mock(return_value=rank_order_shards),
@@ -85,15 +86,12 @@ class TestFusedMoeRsOp(CustomTestCase):
         token_shard = torch.zeros(1, 1)
 
         with (
-            patch(
-                "sglang.srt.distributed.get_tp_group",
-                return_value=tp_group,
-            ),
+            patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
             patch.object(
                 fused_moe_rs_op,
                 "fused_moe_rs_call",
                 return_value=token_shard,
-            ),
+            ) as fused_call,
         ):
             output = fused_moe_rs_op.fused_moe_rs_gather(
                 hidden_states=torch.zeros(8, 1),
@@ -109,10 +107,14 @@ class TestFusedMoeRsOp(CustomTestCase):
                 activation="silu",
                 has_post_expert_norm=False,
                 fp8_direct_write=True,
-                physical_order_to_tp_rank=physical_order_to_tp_rank,
+                tp_rank_to_device_id=rank_to_device_id,
             )
 
-        torch.testing.assert_close(output, torch.arange(8).reshape(8, 1))
+        torch.testing.assert_close(output, rank_order_shards)
+        self.assertIs(
+            fused_call.call_args.kwargs["tp_rank_to_device_id"],
+            rank_to_device_id,
+        )
         tp_group.all_gather.assert_called_once_with(token_shard, dim=0)
 
 

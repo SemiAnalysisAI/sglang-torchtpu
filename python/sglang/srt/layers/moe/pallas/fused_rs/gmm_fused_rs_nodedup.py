@@ -1939,7 +1939,7 @@ def gmm_v2_fused_rs(
         secondary_idx_ref = topk_indices
 
     if tp_rank_to_device_id is None:
-        tp_rank_to_device_id = jnp.array([0, 1, 4, 5, 6, 7, 2, 3], dtype=jnp.int32)
+        raise ValueError("TPU rank-to-mesh routing metadata is required")
 
     pallas_inputs = (
         group_sizes,
@@ -2166,6 +2166,7 @@ def run_gmm_fused_rs(
             ep_axis_name=ep_axis_name,
             max_num_gm=max_num_gm,
             top_k=top_k,
+            tp_rank_to_device_id=jnp.arange(ep_size, dtype=jnp.int32),
         )
 
         # Post-kernel reduction: apply topk_weights and sum over top_k.

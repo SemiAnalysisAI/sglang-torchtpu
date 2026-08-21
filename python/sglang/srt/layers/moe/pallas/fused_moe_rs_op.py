@@ -3,12 +3,12 @@
 
 import functools
 import math
-import os
 
 import torch
 
 _FUSED_MOE_RS_OP_NAME = "sglang_tpu_pallas::fused_moe_rs"
 _FUSED_MOE_RS_OP = None
+_FUSED_MOE_RS_ROUTE = None
 _FUSED_RS_ROUTED_ROW_ALIGNMENT = 16
 
 
@@ -23,8 +23,17 @@ def fused_moe_rs_padded_tokens(num_tokens: int, topk: int, ep_size: int) -> int:
 
 def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
     """Prepare physical-rank metadata before Dynamo captures the MoE layer."""
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.hardware_backend.tpu.pallas_export import (
+        get_tpu_group_rank_to_device_id,
+    )
     from sglang.srt.runtime_context import get_parallel
 
+    tp_group = get_tp_group()
+    rank_to_device_id = get_tpu_group_rank_to_device_id(
+        tuple(tp_group.ranks),
+        tp_group.cpu_group,
+    )
     group_offset = torch.tensor(
         [
             get_parallel().moe_ep_rank * layer.num_local_experts,
@@ -34,7 +43,7 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
         device=layer.w13_weight.device,
     )
     tp_rank_to_device_id_tensor = torch.tensor(
-        [0, 1, 4, 5, 6, 7, 2, 3],
+        rank_to_device_id,
         dtype=torch.int32,
         device=layer.w13_weight.device,
     )
@@ -44,11 +53,11 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
         tp_rank_to_device_id_tensor,
         persistent=False,
     )
-    _build_fused_moe_rs_op()
+    _build_fused_moe_rs_op(rank_to_device_id)
 
 
 @functools.cache
-def _get_mesh():
+def _get_mesh(rank_to_device_id: tuple[int, ...]):
     import numpy as np
     from jax.sharding import Mesh
 
@@ -56,15 +65,31 @@ def _get_mesh():
         get_torchtpu_export_devices,
     )
 
-    world_size = int(os.environ.get("WORLD_SIZE", "8"))
-    export_devices = np.asarray(get_torchtpu_export_devices(world_size)).reshape(1, -1)
+    export_devices = np.asarray(
+        get_torchtpu_export_devices(rank_to_device_id)
+    ).reshape(1, -1)
     return Mesh(export_devices, ("data", "model"))
 
 
-def _build_fused_moe_rs_op():
-    global _FUSED_MOE_RS_OP
+def _build_fused_moe_rs_op(
+    rank_to_device_id: tuple[int, ...] | None = None,
+):
+    global _FUSED_MOE_RS_OP, _FUSED_MOE_RS_ROUTE
     if _FUSED_MOE_RS_OP is not None:
+        if (
+            rank_to_device_id is not None
+            and rank_to_device_id != _FUSED_MOE_RS_ROUTE
+        ):
+            raise RuntimeError(
+                "The fused MoE reduce-scatter op was already built for route "
+                f"{_FUSED_MOE_RS_ROUTE}, got {rank_to_device_id}"
+            )
         return _FUSED_MOE_RS_OP
+    if rank_to_device_id is None:
+        raise RuntimeError(
+            "prepare_fused_moe_rs must initialize TPU topology before the fused "
+            "MoE reduce-scatter op is used"
+        )
 
     import jax
     import jax.numpy as jnp
@@ -74,7 +99,7 @@ def _build_fused_moe_rs_op():
     from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
     from sglang.srt.layers.moe.pallas.fused_rs.fused_moe import _MOE_GMM_LOCAL_RS
 
-    mesh = _get_mesh()
+    mesh = _get_mesh(rank_to_device_id)
 
     def _wrapped(
         hidden_states: jax.Array,
@@ -109,12 +134,10 @@ def _build_fused_moe_rs_op():
                 else jnp.zeros((1,), dtype=hidden_states.dtype)
             )
             if tp_rank_to_device_id is None:
-                tp_rank_to_device_id = jnp.array(
-                    [0, 1, 4, 5, 6, 7, 2, 3], dtype=jnp.int32
-                )
+                raise ValueError("TPU rank-to-mesh routing metadata is required")
 
-            # Wrap with shard_map to provide the multi-device mesh context required by Pallas ICI DMAs.
-            # Inputs and outputs are local per-rank tensors, so all partition specs are P().
+            # shard_map supplies the multi-device context required by Pallas
+            # ICI DMAs. Inputs and outputs are local, so all specs are P().
             result = jax.shard_map(
                 functools.partial(
                     _MOE_GMM_LOCAL_RS,
@@ -197,6 +220,7 @@ def _build_fused_moe_rs_op():
 
     custom_op.register_fake(_fake_impl)
     _FUSED_MOE_RS_OP = custom_op
+    _FUSED_MOE_RS_ROUTE = rank_to_device_id
     return _FUSED_MOE_RS_OP
 
 
@@ -218,11 +242,7 @@ def fused_moe_rs_call(
     tp_rank_to_device_id: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if tp_rank_to_device_id is None:
-        tp_rank_to_device_id = torch.tensor(
-            [0, 1, 4, 5, 6, 7, 2, 3],
-            dtype=torch.int32,
-            device=hidden_states.device,
-        )
+        raise ValueError("TPU rank-to-mesh routing metadata is required")
     return _build_fused_moe_rs_op()(
         hidden_states,
         w1,

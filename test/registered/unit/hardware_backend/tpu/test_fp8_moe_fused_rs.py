@@ -133,7 +133,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
                 apply_router_weight_on_input=False,
                 no_combine=False,
             ),
-            _tpu_fused_rs_physical_order=torch.arange(8),
+            _tpu_fused_rs_tp_rank_to_device_id=torch.arange(8, dtype=torch.int32),
             weight_block_size=[1, 512] if block_quantized else None,
         )
         expected = raw + 1
@@ -186,7 +186,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
             w2_weight=torch.zeros(1, 4, 4),
             w13_weight_scale_inv=w13_scale_inv,
             w2_weight_scale_inv=w2_scale_inv,
-            _tpu_fused_rs_physical_order=torch.arange(8),
+            _tpu_fused_rs_tp_rank_to_device_id=torch.arange(8, dtype=torch.int32),
             _tpu_fused_rs_group_offset=torch.tensor([0, 0], dtype=torch.int32),
         )
 

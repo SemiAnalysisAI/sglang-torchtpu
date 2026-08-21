@@ -450,6 +450,9 @@ class Resources(_FlagGroupBase):
     # Accessors with bespoke semantics (grow-only, per-device keys) manage
     # their entries directly.
     buffers: dict = dataclasses.field(default_factory=dict)
+    # TPU group-rank tuples -> Pallas mesh route tuples, discovered once over
+    # the CPU process group before distributed kernels are captured.
+    tpu_group_routes: dict = dataclasses.field(default_factory=dict)
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
     tbo_event_pool: dict = dataclasses.field(default_factory=dict)

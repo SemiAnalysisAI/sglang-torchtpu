@@ -9,22 +9,15 @@ accelerators (Megachip / Torus 2x2x1 and 2x2x4 topologies).
 ARCHITECTURAL HARDWARE INVARIANTS FOR TPU v7x PALLAS KERNELS
 ===============================================================================
 
-1. Hardware Optical Torus Decoder Ring (`tp_rank_to_device_id`):
+1. Hardware Optical Torus Routing (`tp_rank_to_device_id`):
    - `device_id={'model': target_device_id}` in `make_async_remote_copy` with
-     `device_id_type=pltpu.DeviceIdType.MESH` addresses the physical optical torus
-     routing engine directly rather than indexing through Python's `Mesh.devices`.
-   - On Cloud TPU v7x topologies, logical ranks map to physical routing device IDs as:
-       RANK/Process ID 0 -> device_id 0
-       RANK/Process ID 1 -> device_id 1
-       RANK/Process ID 2 -> device_id 4
-       RANK/Process ID 3 -> device_id 5
-       RANK/Process ID 4 -> device_id 6
-       RANK/Process ID 5 -> device_id 7
-       RANK/Process ID 6 -> device_id 2
-       RANK/Process ID 7 -> device_id 3
-   - To send from logical TP rank to destination TP rank `D`, the kernel must map
-     through `TPU_V7X_TP_RANK_TO_DEVICE_ID = (0, 1, 4, 5, 6, 7, 2, 3)`:
-       `target_device_id = tp_rank_to_device_id[D]`
+     `device_id_type=pltpu.DeviceIdType.MESH` consumes the PJRT mesh device ID
+     reported by TorchTPU for the destination rank.
+   - Launcher rank assignment is not guaranteed to follow the physical torus.
+     The route for each TP/EP rank must therefore be gathered from TorchTPU's
+     per-device topology metadata after distributed initialization.
+   - To send to destination TP rank `D`, the kernel maps through the cached
+     rank-to-device-ID tensor passed as a scalar-prefetch argument.
 
 2. Explicit DMA Lifecycle (`.start()` -> `.wait()`):
    - `make_async_copy` and `make_async_remote_copy` construct lazy DMA descriptors.
@@ -52,27 +45,21 @@ ARCHITECTURAL HARDWARE INVARIANTS FOR TPU v7x PALLAS KERNELS
      across successive kernel calls.
 
 6. Zero-Initialization for Top-K Reductions:
-   - In fused MoE kernels whose epilogue performs post-reduction (`sum(out_3d) * topk_weight`),
+   - In fused MoE kernels whose epilogue performs post-reduction
+     (`sum(out_3d) * topk_weight`),
      all rows in `out_buf_ref` must be zero-initialized before peer ICI writes land,
      guaranteeing unwritten slots contribute exactly 0.0 to the token reduction sum.
 """
 
-import os
-import re
-import sys
 import threading
 from contextlib import contextmanager
+from typing import Any
 
 _TPU_INFO_PATCH_LOCK = threading.RLock()
 _PALLAS_DEVICE_KIND_BY_TORCHTPU = {
     "TPU v6e": "TPU v6 lite",
     "TPU v7": "TPU7x",
 }
-
-# Physical optical torus routing decoder ring for Cloud TPU v7x
-TPU_V7X_TP_RANK_TO_DEVICE_ID = (0, 1, 4, 5, 6, 7, 2, 3)
-TPU_V7X_ORDERED_DEVICE_IDS = (0, 1, 4, 5, 6, 7, 2, 3)
-
 
 class _ExportMockClient:
     """Mock PJRT client for abstract AOT compilation devices."""
@@ -81,11 +68,14 @@ class _ExportMockClient:
     platform_version: str = "TPU v7"
     runtime_type: str = "tpu"
 
+    def __init__(self, device_count: int):
+        self._device_count = device_count
+
     def process_index(self) -> int:
         return 0
 
     def device_count(self) -> int:
-        return 8
+        return self._device_count
 
     def devices(self) -> list:
         return []
@@ -94,11 +84,8 @@ class _ExportMockClient:
         return []
 
 
-_MOCK_CLIENT = _ExportMockClient()
-
-
 class ExportAbstractDevice:
-    """Compile-only abstract device compatible with JAX mesh/sharding property inspection."""
+    """Compile-only device supporting JAX mesh and sharding inspection."""
 
     def __init__(
         self,
@@ -107,16 +94,20 @@ class ExportAbstractDevice:
         platform: str = "tpu",
         id: int = 0,
         process_index: int = 0,
+        client: _ExportMockClient | None = None,
     ):
         self.device_kind = device_kind
         self.num_cores = num_cores
         self.platform = platform
         self.id = id
         self.process_index = process_index
-        self.client = _MOCK_CLIENT
+        self.client = client or _ExportMockClient(1)
 
     def __repr__(self) -> str:
-        return f"AbstractDevice(id={self.id}, device_kind='{self.device_kind}', platform='{self.platform}')"
+        return (
+            f"AbstractDevice(id={self.id}, device_kind='{self.device_kind}', "
+            f"platform='{self.platform}')"
+        )
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, ExportAbstractDevice):
@@ -132,18 +123,78 @@ class ExportAbstractDevice:
 
 
 def configure_jax_export_platform() -> None:
-    """No-op stub for backward compatibility with sglang.srt.hardware_backend.tpu.__init__."""
+    """Keep the legacy initialization hook without forcing a JAX platform."""
     pass
 
 
 def configure_jax_export_env(world_size: int = 8) -> None:
-    """No-op stub for backward compatibility with sglang.srt.hardware_backend.tpu.__init__."""
+    """Keep the legacy initialization hook without creating CPU devices."""
     pass
 
 
-def get_torchtpu_export_devices(world_size: int = 8):
-    """Return the ordered abstract TPU devices for global partitions without calling jax.devices()."""
+def device_attributes_to_group_routes(
+    device_attributes_by_group_rank: tuple[dict[str, Any], ...],
+) -> tuple[int, ...]:
+    """Return the Pallas DMA route ID reported by each TorchTPU group rank."""
+    routes = tuple(
+        int(attributes["id"]) for attributes in device_attributes_by_group_rank
+    )
+    if sorted(routes) != list(range(len(routes))):
+        raise ValueError(
+            "TPU route IDs must be a permutation of "
+            f"range({len(routes)}), got {routes}"
+        )
+    slice_indices = {
+        int(attributes.get("slice_index", 0))
+        for attributes in device_attributes_by_group_rank
+    }
+    if len(slice_indices) != 1:
+        raise ValueError("Fused MoE reduce-scatter requires a single TPU slice")
+    return routes
+
+
+def get_tpu_group_rank_to_device_id(
+    group_ranks: tuple[int, ...],
+    cpu_group,
+) -> tuple[int, ...]:
+    """Return the PJRT device ID addressed by each TorchTPU group rank."""
+    import torch
+    import torch.distributed as dist
+
+    from sglang.srt.runtime_context import get_resources
+
+    route_cache = get_resources().tpu_group_routes
+    cached = route_cache.get(group_ranks)
+    if cached is not None:
+        return cached
+
+    local_attributes = dict(
+        torch.get_device_module("tpu").get_local_device_attributes()
+    )
+    gathered_attributes = [None] * len(group_ranks)
+    dist.all_gather_object(
+        gathered_attributes,
+        local_attributes,
+        group=cpu_group,
+    )
+    routes = device_attributes_to_group_routes(tuple(gathered_attributes))
+    route_cache[group_ranks] = routes
+    return routes
+
+
+def get_torchtpu_export_devices(
+    rank_to_device_id: tuple[int, ...],
+):
+    """Return abstract TPU devices ordered consistently with TorchTPU ranks."""
+    world_size = len(rank_to_device_id)
+    if sorted(rank_to_device_id) != list(range(world_size)):
+        raise ValueError(
+            "Rank-to-device IDs must be a permutation of "
+            f"range({world_size}), got {rank_to_device_id}"
+        )
+
     device_kind = get_pallas_tpu_device_kind()
+    client = _ExportMockClient(world_size)
     abstract_devices = [
         ExportAbstractDevice(
             device_kind=device_kind,
@@ -151,26 +202,27 @@ def get_torchtpu_export_devices(world_size: int = 8):
             platform="tpu",
             id=i,
             process_index=0,
+            client=client,
         )
         for i in range(world_size)
     ]
-    if world_size == 8:
-        return tuple(abstract_devices[i] for i in TPU_V7X_ORDERED_DEVICE_IDS)
-    return tuple(abstract_devices)
+    return tuple(abstract_devices[i] for i in rank_to_device_id)
 
 
 get_jax_export_devices = get_torchtpu_export_devices
 
 
 def get_jax_mesh(
-    world_size: int = 8,
+    rank_to_device_id: tuple[int, ...],
     axis_names: tuple[str, ...] = ("data", "model"),
 ):
-    """Return the logical TPU mesh using abstract devices with explicit optical ring ordering."""
+    """Return an abstract TPU mesh using the runtime-derived rank ordering."""
     import numpy as np
     from jax.sharding import Mesh
 
-    ordered_devices = np.asarray(get_torchtpu_export_devices(world_size))
+    ordered_devices = np.asarray(
+        get_torchtpu_export_devices(rank_to_device_id)
+    )
     if len(axis_names) == 2:
         ordered_devices = ordered_devices.reshape(1, -1)
     return Mesh(ordered_devices, tuple(axis_names))
