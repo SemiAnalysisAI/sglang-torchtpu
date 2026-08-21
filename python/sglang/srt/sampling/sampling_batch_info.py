@@ -89,6 +89,12 @@ class SamplingBatchInfo:
     # device on every decode step.
     uniform_top_k: Optional[int] = None
 
+    # Host-side upper bound for per-request top-k. Unlike ``uniform_top_k``,
+    # this remains useful for mixed batches and lets accelerator backends pick
+    # a fixed-width candidate graph without reading ``top_ks`` back from the
+    # device. Filtering keeps this value conservative; merging takes the max.
+    max_top_k: Optional[int] = None
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         enable_deterministic = get_exec().deterministic.enable_deterministic_inference
@@ -227,6 +233,7 @@ class SamplingBatchInfo:
                 if top_k_values and all(k == top_k_values[0] for k in top_k_values)
                 else None
             ),
+            max_top_k=max(top_k_values, default=None),
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -461,6 +468,10 @@ class SamplingBatchInfo:
         self.need_min_p_sampling |= other.need_min_p_sampling
         if self.uniform_top_k != other.uniform_top_k:
             self.uniform_top_k = None
+        if self.max_top_k is None or other.max_top_k is None:
+            self.max_top_k = None
+        else:
+            self.max_top_k = max(self.max_top_k, other.max_top_k)
 
         self.adjusted_merge_batch(other)
 

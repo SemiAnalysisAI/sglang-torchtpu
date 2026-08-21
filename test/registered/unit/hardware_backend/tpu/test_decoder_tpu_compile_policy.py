@@ -148,19 +148,14 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         )
         self.assertIs(kwargs["kv_pool"], kv_pool)
 
-    def test_specialization_uses_the_models_final_top_k_capability(self):
+    def test_specialization_uses_only_the_preselected_logits_mode(self):
         model_runner = _model_runner()
-        model_runner.server_args.sampling_backend = "tpu"
-        selector = MagicMock(return_value=None)
-        model_runner.model.logits_processor = SimpleNamespace(
-            get_tpu_distributed_top_k_for_batch=selector
-        )
-        model_runner.model.lm_head = object()
         policy = _make_policy(model_runner)
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             batch_size=64,
+            tpu_use_distributed_top_k=False,
         )
 
         fallback_key = policy._direct_compile_specialization_key(
@@ -169,7 +164,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             torch.arange(64),
             forward_batch,
         )
-        selector.return_value = 50
+        forward_batch.tpu_use_distributed_top_k = True
         candidate_key = policy._direct_compile_specialization_key(
             None,
             torch.arange(64),
@@ -177,20 +172,23 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             forward_batch,
         )
 
-        self.assertIsNone(fallback_key[-1])
-        self.assertEqual(candidate_key[-1], 50)
-        selector.assert_called_with(forward_batch, model_runner.model.lm_head)
+        self.assertFalse(fallback_key[-1])
+        self.assertTrue(candidate_key[-1])
 
-    def test_warmup_at_default_cutoff_selects_candidate_specialization(self):
+    def test_prepare_selects_candidate_mode_at_physical_cutoff(self):
         model_runner = _model_runner()
-        model_runner.server_args.sampling_backend = "tpu"
+        model_runner.is_draft_worker = False
         selector = MagicMock(
-            side_effect=lambda batch, _lm_head: distributed_top_k_for_batch(
-                batch, sampling_backend="tpu"
+            side_effect=lambda batch, _lm_head: (
+                64
+                if distributed_top_k_for_batch(batch, sampling_backend="tpu")
+                is not None
+                else None
             )
         )
         model_runner.model.logits_processor = SimpleNamespace(
-            get_tpu_distributed_top_k_for_batch=selector
+            get_tpu_distributed_top_k_for_batch=selector,
+            get_tpu_distributed_top_k_width=MagicMock(return_value=64),
         )
         model_runner.model.lm_head = object()
         policy = _make_policy(model_runner, bs_buckets=(1, 64))
@@ -199,6 +197,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             bs=64,
             mode=ForwardMode.DECODE,
         )
+        policy.prepare_forward_batch(forward_batch)
 
         key = policy._direct_compile_specialization_key(
             None,
@@ -207,8 +206,33 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             forward_batch,
         )
 
-        self.assertEqual(key[-1], 50)
+        self.assertTrue(key[-1])
         selector.assert_called_once_with(forward_batch, model_runner.model.lm_head)
+
+    def test_inner_decoder_leaves_outer_logits_selection_automatic(self):
+        model_runner = _model_runner()
+        model_runner.is_draft_worker = False
+        model_runner.model.logits_processor = SimpleNamespace(
+            get_tpu_distributed_top_k_width=MagicMock(return_value=64)
+        )
+        model_runner.model.lm_head = object()
+        policy = DecoderTpuCompilePolicy(
+            model_runner=model_runner,
+            t_bucketer=Bucketer(name="Token", buckets=[64]),
+            b_bucketer=Bucketer(name="Bs", buckets=[64]),
+            owner=SimpleNamespace(forward=MagicMock()),
+        )
+        forward_batch = policy._make_dummy_forward_batch(
+            num_tokens=64,
+            bs=64,
+            mode=ForwardMode.DECODE,
+        )
+        forward_batch.tpu_use_distributed_top_k = True
+
+        policy.prepare_forward_batch(forward_batch)
+
+        self.assertIsNone(forward_batch.tpu_use_distributed_top_k)
+        self.assertEqual(policy._sampling_warmup_variants(64), ("full_vocab",))
 
 
 class TestDecoderOutputUnpadding(CustomTestCase):
@@ -596,8 +620,22 @@ class TestMakeDummyForwardBatch(CustomTestCase):
 
         self.assertIsInstance(fb.sampling_info, SamplingBatchInfo)
         self.assertEqual(fb.sampling_info.uniform_top_k, 50)
+        self.assertEqual(fb.sampling_info.max_top_k, 50)
         self.assertEqual(fb.sampling_info.top_ks.tolist(), [50] * 4)
         self.assertIsNone(fb.sampling_info.penalizer_orchestrator)
+
+    def test_full_vocab_warmup_uses_unconstrained_sampling(self):
+        policy = _make_policy()
+
+        fb = policy._make_dummy_forward_batch(
+            num_tokens=4,
+            bs=4,
+            mode=ForwardMode.DECODE,
+            sampling_variant="full_vocab",
+        )
+
+        self.assertFalse(fb.sampling_info.need_top_k_sampling)
+        self.assertEqual(fb.sampling_info.max_top_k, 1 << 30)
 
 
 class TestPrecompileLoops(CustomTestCase):
@@ -690,6 +728,27 @@ class TestPrecompileLoops(CustomTestCase):
         self.assertEqual(mr.model.forward.call_count, 3)
         # Decode: tokens == bs for each call.
         self.assertEqual(mr.attn_backend.calls, [(1, 1), (4, 4), (8, 8)])
+
+    def test_candidate_capable_shape_warms_both_complete_graphs(self):
+        mr = _model_runner()
+        mr.is_draft_worker = False
+        mr.model.lm_head = object()
+        mr.model.logits_processor = SimpleNamespace(
+            get_tpu_distributed_top_k_width=MagicMock(return_value=64)
+        )
+        policy = _make_policy(mr, token_buckets=(64,), bs_buckets=(1, 64))
+        policy._run_one = MagicMock()
+
+        with get_parallel().override(tp_rank=1):
+            policy._precompile_decode()
+
+        self.assertEqual(
+            [
+                (call.kwargs["bs"], call.kwargs["sampling_variant"])
+                for call in policy._run_one.call_args_list
+            ],
+            [(1, "full_vocab"), (64, "top_k"), (64, "full_vocab")],
+        )
 
     def test_precompile_combines_extend_and_decode(self):
         mr = _model_runner()
