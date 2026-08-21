@@ -22,5 +22,6 @@ exec env \
   ATTENTION_BACKEND=pallas_tpu_rpa_batched \
   QUANTIZATION=fp8 \
   KV_CACHE_DTYPE=fp8_e4m3 \
+  SGLANG_TPU_CHECK_RECOMPILATION=1 \
   EXTRA_ARGS="--trust-remote-code --tpu-compile-tracer dynamo --tpu-fp8-runtime channelwise --sampling-defaults openai --enable-fused-qk-norm-rope" \
   bash launch_server.sh
