@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import urllib.request
 from pathlib import Path
 
@@ -16,6 +17,7 @@ MULTIHOST_LAUNCH = {
 }
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
+MODEL = os.environ.get("MODEL", "/weights/Qwen3-Coder-480B-A35B-Instruct-FP8")
 SERVER_LOG = Path(os.environ.get("SERVER_LOG", "/tmp/server.log"))
 
 
@@ -51,11 +53,37 @@ def request_batch(label: str, batch_size: int, sampling_params: dict) -> None:
 
 
 def main() -> None:
-    request_batch(
-        "B=1 greedy/full-vocabulary",
-        1,
-        {"temperature": 0, "max_new_tokens": 4},
+    print("== Prime Dynamo with the reported B=1 greedy request ==", flush=True)
+    request_json(
+        {
+            "text": "Hello",
+            "sampling_params": {"temperature": 0, "max_new_tokens": 2},
+        }
     )
+    check_health("post-B=1-prime health")
+
+    print("== Run the reported B=64 greedy trigger ==", flush=True)
+    bench_env = os.environ.copy()
+    bench_env.update(
+        {
+            "MODEL": MODEL,
+            "DATASET_NAME": "random-ids",
+            "TOKENIZE_PROMPT": "1",
+            "BATCH_SIZE": "64",
+            "NUM_PROMPTS": "64",
+            "ISL": "64",
+            "OSL": "8",
+            "WARMUP_REQUESTS": "0",
+            "DUMP_META": "0",
+        }
+    )
+    subprocess.run(
+        ["bash", "benchmark/tpu/bench_serving.sh"], env=bench_env, check=True
+    )
+    check_health("post-B=64-greedy-trigger health")
+
+    # Exercise every candidate boundary and vary logical batch size within the
+    # same B=64 physical bucket after the exact regression sequence passes.
     for batch_size, top_k in ((33, 2), (63, 7), (64, 50), (64, 64)):
         request_batch(
             f"B={batch_size} TopK-{top_k}/fixed-candidates",
@@ -96,7 +124,8 @@ def main() -> None:
         raise RuntimeError(f"server log contains failure signatures: {found}")
 
     print(
-        "PASS: intact TP16 model served both precompiled logits contracts",
+        "PASS: exact B=1 -> B=64 greedy repro and both intact TP16 logits "
+        "contracts completed without a recompile or SparseCore halt",
         flush=True,
     )
 
