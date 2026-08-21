@@ -36,6 +36,7 @@ from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = get_logger(__name__)
@@ -47,9 +48,10 @@ _COMPILE_BAR_FORMAT = (
     "{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
 )
 
-# XLA TopK has a static output width. Warm the physically qualified serving
-# width so the common candidate path does not compile on its first request.
+# XLA TopK has a static output width. At shapes where candidate reduction can
+# run, warm both complete model graphs before serving freezes compilation.
 _DISTRIBUTED_TOP_K_WARMUP_K = 50
+_SAMPLING_WARMUP_VARIANTS = ("top_k", "full_vocab")
 
 
 def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None:
@@ -537,34 +539,83 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         *_args: Any,
         **_kwargs: Any,
     ) -> tuple[Any, ...]:
-        # Direct tracing omits sampling_info tensor inputs, although the logits
-        # processor branches on a host-only static k. Standard models expose
-        # their final model/layout capability so all full-logit cases share one
-        # executable. Unknown wrappers retain a conservative per-k key.
-        model = self.model_runner.model
-        logits_processor = getattr(model, "logits_processor", None)
-        lm_head = getattr(model, "lm_head", None)
-        selector = getattr(
-            logits_processor, "get_tpu_distributed_top_k_for_batch", None
-        )
-        if selector is not None and lm_head is not None:
-            distributed_top_k = selector(forward_batch, lm_head)
-        else:
-            from sglang.srt.hardware_backend.tpu.sampler import (
-                distributed_top_k_for_batch,
-            )
-
-            distributed_top_k = distributed_top_k_for_batch(
-                forward_batch,
-                sampling_backend=self.model_runner.server_args.sampling_backend,
-            )
+        # Direct tracing deliberately omits sampling_info. Resolve the logits
+        # mode before constructing the key so request-level values never enter
+        # either the trace or its cache identity.
+        if getattr(forward_batch, "tpu_use_distributed_top_k", None) is None:
+            self._select_tpu_logits_mode(forward_batch)
         return (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
             input_ids.shape[0],
-            distributed_top_k,
+            forward_batch.tpu_use_distributed_top_k,
         )
+
+    @staticmethod
+    def _resolve_output_head(model: Any) -> Any | None:
+        """Resolve the module passed to an outer model's logits processor."""
+
+        get_output_embeddings = getattr(model, "get_output_embeddings", None)
+        if callable(get_output_embeddings):
+            output_head = get_output_embeddings()
+            if output_head is not None:
+                return output_head
+
+        lm_head = getattr(model, "lm_head", None)
+        if lm_head is not None:
+            return lm_head
+
+        config = getattr(model, "config", None)
+        nested_model = getattr(model, "model", None)
+        if getattr(config, "tie_word_embeddings", False):
+            return getattr(nested_model, "embed_tokens", None)
+        return None
+
+    def _tpu_candidate_width(self) -> int | None:
+        """Return the candidate width when this compiled boundary owns logits."""
+
+        model = self.model_runner.model
+        if self.owner is not model or bool(
+            getattr(self.model_runner, "is_draft_worker", False)
+        ):
+            return None
+        logits_processor = getattr(model, "logits_processor", None)
+        selector = getattr(logits_processor, "get_tpu_distributed_top_k_width", None)
+        lm_head = self._resolve_output_head(model)
+        if selector is None or lm_head is None:
+            return None
+        return selector(lm_head)
+
+    def _select_tpu_logits_mode(self, forward_batch: ForwardBatch) -> None:
+        """Resolve automatic request policy to one compile-static bool."""
+
+        # Reset first so LogitsProcessor evaluates host sampling metadata rather
+        # than treating a value left by an earlier preparation as authoritative.
+        forward_batch.tpu_use_distributed_top_k = None
+        candidate_width = self._tpu_candidate_width()
+        if candidate_width is None:
+            forward_batch.tpu_use_distributed_top_k = False
+            return
+
+        model = self.model_runner.model
+        selected_width = model.logits_processor.get_tpu_distributed_top_k_for_batch(
+            forward_batch, self._resolve_output_head(model)
+        )
+        forward_batch.tpu_use_distributed_top_k = selected_width is not None
+
+    def _sampling_warmup_variants(self, batch_size: int) -> tuple[str, ...]:
+        """Return distinct logits modes reachable at one physical shape."""
+
+        if self._tpu_candidate_width() is None:
+            return ("full_vocab",)
+        from sglang.srt.hardware_backend.tpu.sampler import (
+            distributed_top_k_min_batch_size,
+        )
+
+        if batch_size < distributed_top_k_min_batch_size():
+            return ("full_vocab",)
+        return _SAMPLING_WARMUP_VARIANTS
 
     def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Bucket a normal or target forward before attention planning."""
@@ -578,6 +629,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         setattr(forward_batch, _REAL_Q_KEY, real_q)
         setattr(forward_batch, _REAL_B_KEY, real_b)
+        self._select_tpu_logits_mode(forward_batch)
         spec_info = forward_batch.spec_info
         if spec_info is not None:
             spec_info.record_padding(
@@ -655,33 +707,43 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 f"extend batch cap {self._extend_compile_cap()}."
             )
 
+        compile_items = [
+            (num_tokens, bs, mode, sampling_variant)
+            for num_tokens, bs, mode in compile_cases
+            for sampling_variant in self._sampling_warmup_variants(bs)
+        ]
         logger.info(
-            "[decoder compile policy] EXTEND/MIXED: %d cases "
+            "[decoder compile policy] EXTEND/MIXED: %d complete graph variants "
             "(mode_caps=%s, token_buckets=%s)",
-            len(compile_cases),
+            len(compile_items),
             sorted({(mode.name, batch_size) for _, batch_size, mode in compile_cases}),
             list(self.t_bucketer.buckets),
         )
         compile_range = (
             tqdm.tqdm(
-                compile_cases,
+                compile_items,
                 desc="Compiling EXTEND/MIXED",
                 bar_format=_COMPILE_BAR_FORMAT,
             )
             if get_parallel().tp_rank == 0
-            else compile_cases
+            else compile_items
         )
-        for num_tokens, bs, mode in compile_range:
+        for num_tokens, bs, mode, sampling_variant in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
-            self._run_one(num_tokens=num_tokens, bs=bs, mode=mode)
+            self._run_one(
+                num_tokens=num_tokens,
+                bs=bs,
+                mode=mode,
+                sampling_variant=sampling_variant,
+            )
             if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
-                    f"Compiled {mode.name} (tokens={num_tokens}, bs={bs}) "
-                    f"in {elapsed:.1f}s{hbm_str}"
+                    f"Compiled {mode.name} (tokens={num_tokens}, bs={bs}, "
+                    f"logits={sampling_variant}) in {elapsed:.1f}s{hbm_str}"
                 )
 
     def _precompile_decode(self) -> None:
@@ -689,30 +751,41 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         assert self.b_bucketer is not None
 
         bs_buckets = list(self.b_bucketer.buckets)
+        compile_items = [
+            (bs, sampling_variant)
+            for bs in bs_buckets
+            for sampling_variant in self._sampling_warmup_variants(bs)
+        ]
         logger.info(
-            "[decoder compile policy] DECODE: %d shapes (bs=%s)",
-            len(bs_buckets),
+            "[decoder compile policy] DECODE: %d complete graph variants (bs=%s)",
+            len(compile_items),
             bs_buckets,
         )
         compile_range = (
             tqdm.tqdm(
-                bs_buckets,
+                compile_items,
                 desc="Compiling DECODE",
                 bar_format=_COMPILE_BAR_FORMAT,
             )
             if get_parallel().tp_rank == 0
-            else bs_buckets
+            else compile_items
         )
-        for bs in compile_range:
+        for bs, sampling_variant in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
-            self._run_one(num_tokens=bs, bs=bs, mode=ForwardMode.DECODE)
+            self._run_one(
+                num_tokens=bs,
+                bs=bs,
+                mode=ForwardMode.DECODE,
+                sampling_variant=sampling_variant,
+            )
             if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
-                    f"Compiled DECODE (bs={bs}) in {elapsed:.1f}s{hbm_str}"
+                    f"Compiled DECODE (bs={bs}, logits={sampling_variant}) "
+                    f"in {elapsed:.1f}s{hbm_str}"
                 )
 
     def _make_warmup_inputs(
@@ -722,6 +795,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         bs: int,
         mode: ForwardMode,
         variant: str = "plain",
+        sampling_variant: Literal["top_k", "full_vocab"] = "top_k",
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
         spec_info: SpecInput | None = None,
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
@@ -730,6 +804,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             num_tokens=num_tokens,
             bs=bs,
             mode=mode,
+            sampling_variant=sampling_variant,
             capture_hidden_mode=capture_hidden_mode,
             spec_info=spec_info,
         )
@@ -742,6 +817,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         bs: int,
         mode: ForwardMode,
         variant: str = "plain",
+        sampling_variant: Literal["top_k", "full_vocab"] = "top_k",
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
         spec_info: SpecInput | None = None,
         attn_backend: Any | None = None,
@@ -752,6 +828,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             bs=bs,
             mode=mode,
             variant=variant,
+            sampling_variant=sampling_variant,
             capture_hidden_mode=capture_hidden_mode,
             spec_info=spec_info,
         )
@@ -863,6 +940,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         bs: int,
         mode: ForwardMode,
         *,
+        sampling_variant: Literal["top_k", "full_vocab"] = "top_k",
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
         spec_info: Any | None = None,
     ) -> ForwardBatch:
@@ -876,9 +954,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if getattr(self.model_runner, "model_is_mrope", False):
             mrope_positions = layout.positions.unsqueeze(0).expand(3, -1).contiguous()
 
-        sampling_info = (
-            self._make_top_k_warmup_sampling_info(bs) if spec_info is None else None
-        )
+        if spec_info is not None:
+            sampling_info = None
+        elif sampling_variant == "top_k":
+            sampling_info = self._make_top_k_warmup_sampling_info(bs)
+        elif sampling_variant == "full_vocab":
+            sampling_info = self._make_full_vocab_warmup_sampling_info(bs)
+        else:
+            raise ValueError(f"Unknown sampling warmup variant: {sampling_variant}")
 
         return ForwardBatch(
             forward_mode=mode,
@@ -906,6 +989,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             capture_hidden_mode=capture_hidden_mode,
             sampling_info=sampling_info,
             spec_info=spec_info,
+            # Serving copies this process-wide enum from ScheduleBatch. Match
+            # it here so warmup and live calls have the same static metadata.
+            spec_algorithm=getattr(self.model_runner, "spec_algorithm", None),
             mm_inputs=self._dummy_mm_inputs(bs),
         )
 
@@ -914,16 +1000,18 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         This warms candidate graphs instead of an unused no-sampling specialization."""
 
         device = self.model_runner.device
-        model_config = getattr(self.model_runner, "model_config", None)
-        vocab_size = int(
-            getattr(model_config, "vocab_size", _DISTRIBUTED_TOP_K_WARMUP_K)
+        top_k = min(
+            _DISTRIBUTED_TOP_K_WARMUP_K,
+            self._tpu_candidate_width() or _DISTRIBUTED_TOP_K_WARMUP_K,
         )
+        model_config = getattr(self.model_runner, "model_config", None)
+        vocab_size = int(getattr(model_config, "vocab_size", top_k))
         return SamplingBatchInfo(
             temperatures=torch.ones((bs, 1), dtype=torch.float32, device=device),
             top_ps=torch.ones(bs, dtype=torch.float32, device=device),
             top_ks=torch.full(
                 (bs,),
-                _DISTRIBUTED_TOP_K_WARMUP_K,
+                top_k,
                 dtype=torch.int32,
                 device=device,
             ),
@@ -936,7 +1024,31 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             vocab_size=vocab_size,
             return_sampling_masks=[False] * bs,
             device=str(device),
-            uniform_top_k=_DISTRIBUTED_TOP_K_WARMUP_K,
+            uniform_top_k=top_k,
+            max_top_k=top_k,
+        )
+
+    def _make_full_vocab_warmup_sampling_info(self, bs: int) -> SamplingBatchInfo:
+        """Mirror unconstrained sampling, which requires full-vocabulary logits."""
+
+        device = self.model_runner.device
+        model_config = getattr(self.model_runner, "model_config", None)
+        vocab_size = int(getattr(model_config, "vocab_size", 1))
+        return SamplingBatchInfo(
+            temperatures=torch.ones((bs, 1), dtype=torch.float32, device=device),
+            top_ps=torch.ones(bs, dtype=torch.float32, device=device),
+            top_ks=torch.full((bs,), TOP_K_ALL, dtype=torch.int32, device=device),
+            min_ps=torch.zeros(bs, dtype=torch.float32, device=device),
+            is_all_greedy=False,
+            is_any_greedy=False,
+            need_top_p_sampling=False,
+            need_top_k_sampling=False,
+            need_min_p_sampling=False,
+            vocab_size=vocab_size,
+            return_sampling_masks=[False] * bs,
+            device=str(device),
+            uniform_top_k=TOP_K_ALL,
+            max_top_k=TOP_K_ALL,
         )
 
     def _dummy_layout(
@@ -1141,6 +1253,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         bs: int,
         mode: ForwardMode,
         variant: str = "plain",
+        sampling_variant: Literal["top_k", "full_vocab"] = "top_k",
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
         spec_info: Any | None = None,
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
@@ -1150,6 +1263,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 bs=bs,
                 mode=mode,
                 variant=variant,
+                sampling_variant=sampling_variant,
                 capture_hidden_mode=capture_hidden_mode,
                 spec_info=spec_info,
             )
@@ -1158,6 +1272,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             num_tokens=num_tokens,
             bs=bs,
             mode=mode,
+            sampling_variant=sampling_variant,
             capture_hidden_mode=capture_hidden_mode,
             spec_info=spec_info,
         )

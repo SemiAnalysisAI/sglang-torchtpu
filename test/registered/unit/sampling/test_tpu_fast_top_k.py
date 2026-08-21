@@ -21,6 +21,7 @@ from sglang.srt.hardware_backend.tpu.sampler import (
 )
 from sglang.srt.hardware_backend.tpu.top_k import (
     TpuVocabShard,
+    _prefer_lowest_token_id_for_tied_max,
     distributed_tpu_top_k,
     supports_distributed_tpu_top_k,
     tpu_top_k,
@@ -34,9 +35,11 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 
 
-def _forward_batch(*, batch_size=1, **info_overrides):
+def _forward_batch(*, batch_size=64, **info_overrides):
     info = SimpleNamespace(
         uniform_top_k=50,
+        max_top_k=50,
+        is_all_greedy=False,
         is_any_greedy=False,
         need_top_k_sampling=True,
         need_top_p_sampling=False,
@@ -77,6 +80,9 @@ class TestDistributedTopKEligibility(CustomTestCase):
             do_tensor_parallel_all_gather=True,
             do_tensor_parallel_all_gather_dp_attn=False,
         )
+        processor.get_tpu_distributed_top_k_width = lambda lm_head: (
+            LogitsProcessor.get_tpu_distributed_top_k_width(processor, lm_head)
+        )
         tp16_lm_head = SimpleNamespace(
             enable_tp=True,
             num_embeddings=202_048,
@@ -92,7 +98,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
                         LogitsProcessor.get_tpu_distributed_top_k_for_batch(
                             processor, batch, tp16_lm_head
                         ),
-                        50,
+                        64,
                     )
 
     def test_measured_default_uses_distributed_top_k_from_batch_64(self):
@@ -118,6 +124,9 @@ class TestDistributedTopKEligibility(CustomTestCase):
             do_tensor_parallel_all_gather=False,
             do_tensor_parallel_all_gather_dp_attn=False,
         )
+        processor.get_tpu_distributed_top_k_width = lambda lm_head: (
+            LogitsProcessor.get_tpu_distributed_top_k_width(processor, lm_head)
+        )
         sharded_lm_head = SimpleNamespace(
             enable_tp=True,
             num_embeddings=128,
@@ -133,9 +142,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
 
     def test_full_vocab_features_fall_back(self):
         cases = {
-            "mixed top-k": {"uniform_top_k": None},
-            "large top-k": {"uniform_top_k": 65},
-            "greedy row": {"is_any_greedy": True},
+            "large top-k": {"uniform_top_k": 65, "max_top_k": 65},
             "seeded sampling": {"sampling_seed": torch.tensor([17])},
             "top-p": {"need_top_p_sampling": True},
             "min-p": {"need_min_p_sampling": True},
@@ -143,6 +150,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
             "logit bias": {"logit_bias": torch.zeros(1, 8)},
             "grammar": {"grammars": [object()]},
             "sampling mask": {"sampling_mask_max_top_k": 50},
+            "returned sampling mask": {"return_sampling_masks": [True]},
             "additive penalty": {"acc_additive_penalties": torch.zeros(1, 8)},
             "scaling penalty": {"acc_scaling_penalties": torch.ones(1, 8)},
             "live penalizer": {
@@ -156,6 +164,17 @@ class TestDistributedTopKEligibility(CustomTestCase):
                         _forward_batch(**overrides), sampling_backend="tpu"
                     )
                 )
+
+    def test_mixed_top_k_and_greedy_rows_use_one_candidate_mode(self):
+        batch = _forward_batch(
+            uniform_top_k=None,
+            max_top_k=64,
+            is_any_greedy=True,
+            top_ks=torch.tensor([1, 7, 64], dtype=torch.int32),
+            temperatures=torch.ones(3, 1),
+        )
+
+        self.assertEqual(distributed_top_k_for_batch(batch, sampling_backend="tpu"), 64)
 
     def test_non_tpu_and_logprob_batches_fall_back(self):
         batch = _forward_batch()
@@ -189,10 +208,11 @@ class TestDistributedTopKEligibility(CustomTestCase):
             )
             padded_batch = _forward_batch(batch_size=128)
             padded_batch._tpu_real_b = 127
-            self.assertIsNone(
+            self.assertEqual(
                 tpu_sampler_module.distributed_top_k_for_batch(
                     padded_batch, sampling_backend="tpu"
-                )
+                ),
+                50,
             )
             self.assertEqual(
                 tpu_sampler_module.distributed_top_k_for_batch(
@@ -299,6 +319,48 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
             sample.call_args.args[0], torch.softmax(torch.tensor([[2.0, 1.0]]), -1)
         )
 
+    def test_global_top_k_sampling_masks_each_rows_requested_tail(self):
+        logits = torch.tensor([[4.0, 3.0, 2.0], [6.0, 5.0, 4.0]])
+        top_ks = torch.tensor([1, 2], dtype=torch.int32)
+        with patch.object(
+            tpu_sampler_module,
+            "sampling_from_probs_torch",
+            return_value=torch.tensor([0, 1], dtype=torch.int32),
+        ) as sample:
+            sample_from_global_top_k_logits(logits, torch.ones(2, 1), top_ks)
+
+        probs = sample.call_args.args[0]
+        torch.testing.assert_close(probs[0], torch.tensor([1.0, 0.0, 0.0]))
+        torch.testing.assert_close(probs[1, 2], torch.tensor(0.0))
+        torch.testing.assert_close(probs[1, :2].sum(), torch.tensor(1.0))
+
+    def test_all_greedy_uses_first_candidate_without_sampling(self):
+        sampler = SimpleNamespace(_sync_token_ids_across_tp=MagicMock())
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            next_token_global_top_k_logits=torch.tensor([[3.0, 2.0]]),
+            next_token_global_top_k_token_ids=torch.tensor([[91, 17]]),
+        )
+        info = _forward_batch(
+            is_all_greedy=True,
+            is_any_greedy=True,
+            uniform_top_k=1,
+            max_top_k=1,
+            top_ks=torch.ones(1, dtype=torch.int32),
+            temperatures=torch.ones(1, 1),
+        ).sampling_info
+
+        with patch.object(
+            tpu_sampler_module,
+            "sample_from_global_top_k_logits",
+        ) as sample:
+            actual = TpuSampler.forward(
+                sampler, output, info, False, [0], [[]], torch.tensor([7])
+            )
+
+        torch.testing.assert_close(actual, torch.tensor([91], dtype=torch.int64))
+        sample.assert_not_called()
+
     def test_fallback_uses_generic_pytorch_sampler(self):
         sampler = SimpleNamespace()
         probs = torch.rand(1, 128)
@@ -355,6 +417,21 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
 
 
 class TestTpuTopKLayout(CustomTestCase):
+    def test_tied_max_prefers_the_lowest_global_token_id(self):
+        candidate_logits = torch.tensor([[9.0, 9.0, 8.0]])
+        candidate_token_ids = torch.tensor([[17, 3, 8]], dtype=torch.int32)
+
+        corrected = _prefer_lowest_token_id_for_tied_max(
+            candidate_logits,
+            candidate_token_ids,
+            torch.tensor([[17, 3]], dtype=torch.int32),
+        )
+
+        torch.testing.assert_close(
+            corrected,
+            torch.tensor([[3, 17]], dtype=torch.int32),
+        )
+
     def test_distributed_path_requires_a_sharded_lm_head(self):
         layout = SimpleNamespace(
             enable_tp=True,

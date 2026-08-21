@@ -509,6 +509,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Borrowed from ScheduleBatch: compound (carry their own device tensors) ===
     # Sampling info
     sampling_info: SamplingBatchInfo = None
+    # TPU compile policy resolves this once per padded batch. ``None`` keeps
+    # eager execution automatic; compiled execution always sees a static bool.
+    tpu_use_distributed_top_k: Optional[bool] = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
 

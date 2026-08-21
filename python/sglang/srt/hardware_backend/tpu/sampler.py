@@ -22,13 +22,23 @@ _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = max(
 )
 
 
+def distributed_top_k_min_batch_size() -> int:
+    """Return the process-static physical batch cutoff for candidate mode."""
+
+    return _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
+
+
 def distributed_top_k_for_batch(
     forward_batch,
     *,
     sampling_backend: str,
 ) -> Optional[int]:
-    """Return k only when pre-gather reduction preserves sampling semantics.
-    Full-vocabulary transforms and batches below the configured cutoff fall back."""
+    """Return the largest requested k when candidate reduction is exact.
+
+    The returned value is an eligibility bound, not the graph output width.
+    The logits processor emits a model-static candidate width so changing
+    per-row top-k values does not create another compiled executable.
+    """
 
     if sampling_backend != "tpu":
         return None
@@ -36,11 +46,10 @@ def distributed_top_k_for_batch(
         return None
     spec_algorithm = getattr(forward_batch, "spec_algorithm", None)
     has_speculative_decode = spec_algorithm is not None and not spec_algorithm.is_none()
-    batch_size = getattr(
-        forward_batch,
-        "_tpu_real_b",
-        getattr(forward_batch, "batch_size", 0),
-    )
+    # Compiled TPU batches are padded before mode selection. Use the physical
+    # size because that is the work performed by the selected executable, and
+    # never guard a graph on the logical size stored in ``_tpu_real_b``.
+    batch_size = getattr(forward_batch, "batch_size", 0)
     if (
         getattr(forward_batch, "return_logprob", False)
         or has_speculative_decode
@@ -53,11 +62,14 @@ def distributed_top_k_for_batch(
         return None
 
     info = forward_batch.sampling_info
-    top_k = info.uniform_top_k
+    max_top_k = getattr(info, "max_top_k", None)
+    if max_top_k is None:
+        # Backward-compatible fallback for backend-specific SamplingBatchInfo
+        # subclasses and tests that have not populated the mixed-batch hint.
+        max_top_k = info.uniform_top_k
     if (
-        top_k is None
-        or not 1 < top_k <= MAX_DISTRIBUTED_TOP_K
-        or info.is_any_greedy
+        max_top_k is None
+        or not 0 < max_top_k <= MAX_DISTRIBUTED_TOP_K
         or info.sampling_seed is not None
         or not info.need_top_k_sampling
         or info.need_top_p_sampling
@@ -66,7 +78,11 @@ def distributed_top_k_for_batch(
         return None
     if info.has_custom_logit_processor or info.logit_bias is not None:
         return None
-    if any(info.grammars or ()) or getattr(info, "sampling_mask_max_top_k", 0) > 0:
+    if (
+        any(info.grammars or ())
+        or any(info.return_sampling_masks or ())
+        or getattr(info, "sampling_mask_max_top_k", 0) > 0
+    ):
         return None
     if (
         info.acc_additive_penalties is not None
@@ -78,15 +94,30 @@ def distributed_top_k_for_batch(
         and info.penalizer_orchestrator.is_required
     ):
         return None
-    return top_k
+    return max_top_k
 
 
 def sample_from_global_top_k_logits(
     global_top_k_logits: torch.Tensor,
     temperatures: torch.Tensor,
+    top_ks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Normalize temperature-scaled global TopK logits and sample a position.
-    Returned positions index global TopK token IDs, not the full vocabulary."""
+    Returned positions index global TopK token IDs, not the full vocabulary.
+
+    The model always returns one static candidate width. Masking each sorted
+    row here recovers its requested top-k distribution, including mixed
+    batches, without specializing the model graph.
+    """
+
+    if top_ks is not None:
+        candidate_positions = torch.arange(
+            global_top_k_logits.shape[-1],
+            dtype=top_ks.dtype,
+            device=global_top_k_logits.device,
+        )
+        keep = candidate_positions.view(1, -1) < top_ks.view(-1, 1)
+        global_top_k_logits = global_top_k_logits.masked_fill(~keep, -torch.inf)
 
     global_top_k_probs = torch.softmax(global_top_k_logits / temperatures, dim=-1)
     return sampling_from_probs_torch(global_top_k_probs)
@@ -121,10 +152,18 @@ class TpuSampler(Sampler):
 
         if return_logprob:
             raise ValueError("distributed TPU top-k cannot return full logprobs")
-        sampled_top_k_position = sample_from_global_top_k_logits(
-            logits_output.next_token_global_top_k_logits,
-            sampling_info.temperatures,
-        )
+        if sampling_info.is_all_greedy:
+            sampled_top_k_position = torch.zeros(
+                logits_output.next_token_global_top_k_logits.shape[0],
+                dtype=torch.int64,
+                device=logits_output.next_token_global_top_k_logits.device,
+            )
+        else:
+            sampled_top_k_position = sample_from_global_top_k_logits(
+                logits_output.next_token_global_top_k_logits,
+                sampling_info.temperatures,
+                sampling_info.top_ks,
+            )
         batch_next_token_ids = torch.gather(
             logits_output.next_token_global_top_k_token_ids,
             dim=1,

@@ -227,6 +227,30 @@ def register_tpu_top_k_ops() -> None:
     _get_tpu_sharded_top_k_op()
 
 
+def _prefer_lowest_token_id_for_tied_max(
+    candidate_logits: torch.Tensor,
+    candidate_token_ids: torch.Tensor,
+    top_k_token_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Preserve ``torch.argmax`` tie-breaking for candidate-mode greedy rows."""
+
+    max_logits = candidate_logits.amax(dim=-1, keepdim=True)
+    id_sentinel = torch.iinfo(candidate_token_ids.dtype).max
+    lowest_max_ids = torch.where(
+        candidate_logits == max_logits,
+        candidate_token_ids,
+        id_sentinel,
+    ).amin(dim=-1, keepdim=True)
+
+    first_ids = top_k_token_ids[:, :1]
+    top_k_token_ids = torch.where(
+        top_k_token_ids == lowest_max_ids,
+        first_ids,
+        top_k_token_ids,
+    )
+    return torch.cat((lowest_max_ids, top_k_token_ids[:, 1:]), dim=1)
+
+
 def distributed_tpu_top_k(
     local_logits: torch.Tensor,
     shard: TpuVocabShard,
@@ -274,5 +298,10 @@ def distributed_tpu_top_k(
         gathered_sharded_top_k_token_ids,
         dim=1,
         index=global_top_k_positions.to(torch.int64),
+    )
+    global_top_k_token_ids = _prefer_lowest_token_id_for_tied_max(
+        gathered_sharded_top_k_logits,
+        gathered_sharded_top_k_token_ids,
+        global_top_k_token_ids,
     )
     return global_top_k_logits.float(), global_top_k_token_ids.to(torch.int32)
