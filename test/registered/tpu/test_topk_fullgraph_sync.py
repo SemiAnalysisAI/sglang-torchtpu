@@ -6,15 +6,22 @@ import subprocess
 import time
 import urllib.request
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=1800, suite="topk-fullgraph-validation", nightly=True)
+# The dispatched workflow itself comes from the default branch and discovers
+# this established suite. A dedicated launch script still isolates this test
+# into its own TP16 server group.
+register_tpu_ci(est_time=1800, suite="nightly-tpu-multihost", nightly=True)
 
 MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/topk_fullgraph_sync_mh.sh",
     "weights_pvc": "model-weights-rox",
+    # This file lives only on the validation branch; avoid provisioning every
+    # unrelated nightly multi-host model for a manual #447 repro run.
+    "exclusive": True,
 }
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
@@ -23,7 +30,6 @@ SERVER_LOG = Path(os.environ.get("SERVER_LOG", "/tmp/server.log"))
 FREEZE_SIGNATURE = "froze torch.compile via set_stance('fail_on_recompile')"
 RECOMPILE_SIGNATURES = (
     "Detected recompile when torch.compile stance is 'fail_on_recompile'",
-    "new XLA program(s) compiled at serving time",
 )
 HALT_SIGNATURES = (
     "RuntimeUnexpectedCoreHalt",
@@ -111,9 +117,42 @@ def main() -> None:
             "SGLANG_IS_IN_CI": "false",
         }
     )
-    subprocess.run(
-        ["bash", "benchmark/tpu/bench_serving.sh"], env=bench_env, check=True
-    )
+    with TemporaryDirectory(prefix="pr447-richard-b64-") as output_dir:
+        # bench_serving can exit zero even when only part of a request set
+        # succeeds. Capture its machine-readable summary and make Richard's
+        # required 64/64 completion an explicit acceptance gate.
+        bench_env["OUTPUT_DIR"] = output_dir
+        subprocess.run(
+            ["bash", "benchmark/tpu/bench_serving.sh"], env=bench_env, check=True
+        )
+        summaries = list(Path(output_dir).glob("*.jsonl"))
+        if len(summaries) != 1:
+            raise RuntimeError(
+                "B=64 benchmark produced "
+                f"{len(summaries)} JSONL summaries; expected exactly one"
+            )
+        records = [
+            json.loads(line)
+            for line in summaries[0].read_text().splitlines()
+            if line.strip()
+        ]
+        if len(records) != 1:
+            raise RuntimeError(
+                "B=64 benchmark summary contains "
+                f"{len(records)} records; expected exactly one"
+            )
+        benchmark_result = records[0]
+        if benchmark_result.get("completed") != 64:
+            raise RuntimeError(
+                "B=64 benchmark completed "
+                f"{benchmark_result.get('completed')!r}/64 requests"
+            )
+        # Newer bench versions may persist request errors in the JSONL. Keep
+        # this fail-closed check while remaining compatible with versions where
+        # completed==64 is the only persisted success signal.
+        errors = benchmark_result.get("errors", [])
+        if any(errors):
+            raise RuntimeError(f"B=64 benchmark reported request errors: {errors}")
     check_health("post-B=64-greedy-trigger health")
 
     # A single list request makes all 64 greedy rows visible to the scheduler at

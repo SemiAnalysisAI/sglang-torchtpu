@@ -62,8 +62,17 @@ def main():
     ap.add_argument("--nightly", action="store_true", default=True)
     a = ap.parse_args()
 
+    discovered = _scan(a.root, a.suite, a.nightly)
+    # Dedicated validation branches can mark an expensive repro exclusive so
+    # a manual workflow dispatch consumes TPU time only for that repro. Normal
+    # nightly tests do not set this key and retain the existing grouping.
+    exclusive = {
+        path: spec for path, spec in discovered.items() if spec.get("exclusive")
+    }
+    selected = exclusive or discovered
+
     groups = {}
-    for path, spec in sorted(_scan(a.root, a.suite, a.nightly).items()):
+    for path, spec in sorted(selected.items()):
         try:
             ls, hosts = spec["launch_script"], int(spec.get("hosts", 2))
         except (KeyError, TypeError, ValueError):
