@@ -3975,14 +3975,16 @@ class Scheduler(
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
         # sampling_info with vocab_mask) and logits_output (which holds either
-        # full logits or the exact global TPU TopK). Without clearing these, they
-        # stay alive via batch_result until the next iteration and waste device
-        # memory, especially with structured output.
+        # full logits or the raw shard-local logits used by distributed TopK).
+        # Without clearing these, they stay alive via batch_result until the next
+        # iteration and waste device memory, especially with structured output.
         batch_result.delay_sample_func = None
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
-            batch_result.logits_output.next_token_global_top_k_logits = None
-            batch_result.logits_output.next_token_global_top_k_token_ids = None
+            batch_result.logits_output.next_token_sharded_logits = None
+            # Clear the matching metadata too, preserving the output object's
+            # mutually exclusive contract after delayed sampling completes.
+            batch_result.logits_output.tpu_top_k_vocab_shard = None
 
     @scheduler_nvtx_method("scheduler.process_batch_result")
     def process_batch_result(

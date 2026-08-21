@@ -1730,9 +1730,11 @@ class ModelRunner:
         # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
         #       was executed after we processed last batch's results.
 
-        # The TPU fast path returns only the global TopK, so there are no
-        # full-vocabulary logits to preprocess.
-        if logits_output.has_next_token_global_top_k:
+        # The TPU fast path returns materialized FP32 shard-local logits.
+        # Eligibility excludes every feature handled by this preprocessing
+        # stage, so all local TopK and bounded communication can safely wait for
+        # the eager sampler.
+        if logits_output.has_next_token_sharded_logits:
             return
 
         # Calculate logits bias and apply it to next_token_logits.

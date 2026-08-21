@@ -229,11 +229,10 @@ def _run_distributed_worker() -> None:
     sorted_values, sorted_ids = gathered_logits.sort(dim=-1, descending=True)
     for top_k in (2, 50, 64):
         actual_values, actual_ids = top_k_module.distributed_tpu_top_k(
-            correctness_logits,
-            shard,
-            top_k,
-            group=group,
+            correctness_logits, shard, top_k, group=group
         )
+        # This helper represents production's eager post-model merge and must
+        # return exact global IDs already aligned with its sorted logits.
         torch.testing.assert_close(
             actual_values,
             sorted_values[:, :top_k],
@@ -337,6 +336,8 @@ def _run_distributed_worker() -> None:
                 )
             )
             sampled = sample_from_global_top_k_logits(global_top_k_logits, temperatures)
+            # Include both candidate all-gathers, global selection, and final
+            # sampled-ID lookup in the production eager-boundary latency.
             return torch.gather(
                 global_top_k_token_ids,
                 1,

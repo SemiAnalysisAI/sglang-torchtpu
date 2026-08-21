@@ -220,11 +220,71 @@ def tpu_sharded_top_k(
 
 
 def register_tpu_top_k_ops() -> None:
-    """Register local and global TopK ops before full-graph tracing begins.
-    Eager registration keeps custom-op schemas visible to torch.compile."""
+    """Register sampler TopK ops before full-graph tracing begins.
+
+    Registration only makes the schemas available; the candidate model path
+    deliberately does not execute either op until its contiguous FP32 logits
+    are materialized.
+    """
 
     _get_tpu_top_k_op()
     _get_tpu_sharded_top_k_op()
+
+
+def merge_tpu_top_k_candidates(
+    sharded_top_k_logits: torch.Tensor,
+    sharded_top_k_token_ids: torch.Tensor,
+    k: int,
+    *,
+    group,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge bounded shard-local candidates outside the compiled model.
+
+    Both tensors are only ``k`` columns wide per rank. Eight exact 480B runs
+    showed that composing a TP all-gather with any global selector or ID layout
+    operation inside the complete model executable can halt TPU SparseCore.
+    A ninth run showed local TopK is unsafe there too, so callers must invoke
+    this helper only after materializing the shard-local model output.
+    """
+
+    if sharded_top_k_logits.shape != sharded_top_k_token_ids.shape:
+        raise ValueError(
+            "sharded TopK logits and token IDs must have identical shapes, got "
+            f"{sharded_top_k_logits.shape} and {sharded_top_k_token_ids.shape}"
+        )
+    if sharded_top_k_logits.ndim != 2:
+        raise ValueError(
+            "sharded TopK candidates must be two-dimensional, got "
+            f"{sharded_top_k_logits.shape}"
+        )
+    if sharded_top_k_token_ids.dtype != torch.int32:
+        raise ValueError(
+            "sharded TopK token IDs must remain int32, got "
+            f"{sharded_top_k_token_ids.dtype}"
+        )
+    if not 0 < k <= sharded_top_k_logits.shape[-1]:
+        raise ValueError(f"k must be in [1, {sharded_top_k_logits.shape[-1]}], got {k}")
+
+    if group.world_size == 1:
+        # Local TopK is already sorted and IDs are already global vocabulary
+        # IDs, so a one-rank group needs neither communication nor reselection.
+        return sharded_top_k_logits.float(), sharded_top_k_token_ids
+
+    # Keep both candidate payloads bounded at TP*k. This remains distributed
+    # TopK; only the execution boundary changes to avoid composing the merge
+    # into the graph that contains all 480B model operations.
+    gathered_top_k_logits = group.all_gather(sharded_top_k_logits.float(), dim=-1)
+    gathered_top_k_token_ids = group.all_gather(sharded_top_k_token_ids, dim=-1)
+    global_top_k_logits, global_top_k_positions = tpu_top_k(gathered_top_k_logits, k)
+    # PyTorch gather requires int64 indices. This conversion and lookup are
+    # safe here because the compiled 480B model has already materialized; they
+    # must never move back into LogitsProcessor._get_tpu_sharded_logits.
+    global_top_k_token_ids = torch.gather(
+        gathered_top_k_token_ids,
+        1,
+        global_top_k_positions.to(torch.int64),
+    )
+    return global_top_k_logits.float(), global_top_k_token_ids
 
 
 def distributed_tpu_top_k(
@@ -234,45 +294,21 @@ def distributed_tpu_top_k(
     *,
     group,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Merge exact sharded TopK logits into a replicated global TopK.
-    Only k logits and token IDs per shard cross the tensor-parallel group."""
+    """Compute exact distributed TopK outside a compiled model boundary.
+
+    The TPU sampler calls this only after synchronizing contiguous FP32
+    shard-local logits. Keeping local TopK here is essential: the ninth exact
+    480B run halted when this custom op was still part of the complete compiled
+    model executable.
+    """
 
     sharded_top_k_logits, sharded_top_k_token_ids = tpu_sharded_top_k(
         local_logits, shard, k
     )
 
-    if group.world_size > 1:
-        if shard.global_vocab_size <= 2**24:
-            # Token IDs are exact in fp32 for every practical serving
-            # vocabulary. Packing values and IDs halves collective latency at
-            # the cost of a tiny payload increase over bf16 + int32.
-            packed_sharded_top_k = torch.stack(
-                (sharded_top_k_logits.float(), sharded_top_k_token_ids.float()),
-                dim=-1,
-            )
-            gathered_sharded_top_k = group.all_gather(packed_sharded_top_k, dim=-2)
-            gathered_sharded_top_k_logits = gathered_sharded_top_k[..., 0]
-            gathered_sharded_top_k_token_ids = gathered_sharded_top_k[..., 1].to(
-                torch.int32
-            )
-        else:
-            # Preserve exact IDs for unusually large vocabularies.
-            gathered_sharded_top_k_logits = group.all_gather(
-                sharded_top_k_logits, dim=-1
-            )
-            gathered_sharded_top_k_token_ids = group.all_gather(
-                sharded_top_k_token_ids, dim=-1
-            )
-    else:
-        gathered_sharded_top_k_logits = sharded_top_k_logits
-        gathered_sharded_top_k_token_ids = sharded_top_k_token_ids
-
-    global_top_k_logits, global_top_k_positions = tpu_top_k(
-        gathered_sharded_top_k_logits, k
+    return merge_tpu_top_k_candidates(
+        sharded_top_k_logits,
+        sharded_top_k_token_ids,
+        k,
+        group=group,
     )
-    global_top_k_token_ids = torch.gather(
-        gathered_sharded_top_k_token_ids,
-        dim=1,
-        index=global_top_k_positions.to(torch.int64),
-    )
-    return global_top_k_logits.float(), global_top_k_token_ids.to(torch.int32)

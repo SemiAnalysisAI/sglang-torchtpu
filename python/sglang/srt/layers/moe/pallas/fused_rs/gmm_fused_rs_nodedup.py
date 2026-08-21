@@ -1367,6 +1367,15 @@ def kernel_main_fused_rs(
                 dst_ref=out_scale_ref.at[pl.ds(0, total_recv), :],
                 sem=scale_recv_sem_ref.at[0],
             ).wait()
+
+    # The send-side rendezvous above cannot prove that every peer has also
+    # finished draining its incoming DMA semaphores. With skewed routing --
+    # especially when EP spans hosts -- a fast participant can otherwise
+    # return while a slower participant still owns receive-side scratch state.
+    # Close the receive phase collectively before Mosaic releases the kernel's
+    # scratch semaphores for reuse by a later fused-RS invocation.
+    sync_barrier()
+
     # All ICI DMA writes go directly to out_buf_ref (the pallas_call output).
     # No input_output_aliases needed — avoids XLA tiling copy on weight inputs.
 
