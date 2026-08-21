@@ -28,7 +28,6 @@ from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy impo
     Eagle3CompilePolicyMixin,
     SpecDecoderTpuCompilePolicy,
 )
-from sglang.srt.hardware_backend.tpu.sampler import distributed_top_k_for_batch
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
