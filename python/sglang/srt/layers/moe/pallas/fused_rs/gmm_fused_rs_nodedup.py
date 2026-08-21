@@ -1367,6 +1367,11 @@ def kernel_main_fused_rs(
                 dst_ref=out_scale_ref.at[pl.ds(0, total_recv), :],
                 sem=scale_recv_sem_ref.at[0],
             ).wait()
+
+    # Strong exit rendezvous: no rank may leave fused-RS until every rank has
+    # drained both its source/local DMA state and all incoming DMA state.
+    sync_barrier()
+
     # All ICI DMA writes go directly to out_buf_ref (the pallas_call output).
     # No input_output_aliases needed — avoids XLA tiling copy on weight inputs.
 
