@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+import time
 import urllib.request
 from pathlib import Path
 
@@ -19,6 +20,13 @@ MULTIHOST_LAUNCH = {
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 MODEL = os.environ.get("MODEL", "/weights/Qwen3-Coder-480B-A35B-Instruct-FP8")
 SERVER_LOG = Path(os.environ.get("SERVER_LOG", "/tmp/server.log"))
+FREEZE_SIGNATURE = "froze torch.compile via set_stance('fail_on_recompile')"
+FAILURE_SIGNATURES = (
+    "Detected recompile when torch.compile stance is 'fail_on_recompile'",
+    "new XLA program(s) compiled at serving time",
+    "RuntimeUnexpectedCoreHalt",
+    "SparseCoreSequencer",
+)
 
 
 def request_json(payload: dict, timeout: int = 1200):
@@ -34,6 +42,19 @@ def request_json(payload: dict, timeout: int = 1200):
 def check_health(label: str) -> None:
     with urllib.request.urlopen(f"{BASE_URL}/health", timeout=30) as response:
         print(f"{label}: HTTP {response.status}", flush=True)
+
+
+def read_server_log() -> str:
+    return SERVER_LOG.read_text(errors="replace") if SERVER_LOG.exists() else ""
+
+
+def wait_for_log(signature: str, timeout: float = 60) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if signature in read_server_log():
+            return
+        time.sleep(0.5)
+    raise RuntimeError(f"server log did not contain {signature!r} within {timeout}s")
 
 
 def request_batch(label: str, batch_size: int, sampling_params: dict) -> None:
@@ -53,6 +74,9 @@ def request_batch(label: str, batch_size: int, sampling_params: dict) -> None:
 
 
 def main() -> None:
+    if FREEZE_SIGNATURE in read_server_log():
+        raise RuntimeError("Dynamo was frozen before the reported B=1 prime request")
+
     print("== Prime Dynamo with the reported B=1 greedy request ==", flush=True)
     request_json(
         {
@@ -61,6 +85,7 @@ def main() -> None:
         }
     )
     check_health("post-B=1-prime health")
+    wait_for_log(FREEZE_SIGNATURE)
 
     print("== Run the reported B=64 greedy trigger ==", flush=True)
     bench_env = os.environ.copy()
@@ -75,12 +100,23 @@ def main() -> None:
             "OSL": "8",
             "WARMUP_REQUESTS": "0",
             "DUMP_META": "0",
+            # The literal user command is not run under SGLANG_IS_IN_CI; avoid
+            # the benchmark's CI-only /flush_cache request here as well.
+            "SGLANG_IS_IN_CI": "false",
         }
     )
     subprocess.run(
         ["bash", "benchmark/tpu/bench_serving.sh"], env=bench_env, check=True
     )
     check_health("post-B=64-greedy-trigger health")
+
+    # A single list request makes all 64 greedy rows visible to the scheduler at
+    # once, independently of client arrival jitter in bench_serving.
+    request_batch(
+        "B=64 greedy/full-vocabulary",
+        64,
+        {"temperature": 0, "max_new_tokens": 8},
+    )
 
     # Exercise every candidate boundary and vary logical batch size within the
     # same B=64 physical bucket after the exact regression sequence passes.
@@ -113,13 +149,8 @@ def main() -> None:
         {"temperature": 0, "max_new_tokens": 8},
     )
 
-    log = SERVER_LOG.read_text(errors="replace") if SERVER_LOG.exists() else ""
-    failure_signatures = (
-        "Detected recompile when torch.compile stance is 'fail_on_recompile'",
-        "RuntimeUnexpectedCoreHalt",
-        "SparseCoreSequencer",
-    )
-    found = [signature for signature in failure_signatures if signature in log]
+    log = read_server_log()
+    found = [signature for signature in FAILURE_SIGNATURES if signature in log]
     if found:
         raise RuntimeError(f"server log contains failure signatures: {found}")
 

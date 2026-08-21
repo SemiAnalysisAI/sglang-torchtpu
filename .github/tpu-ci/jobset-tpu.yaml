@@ -111,13 +111,15 @@ ${WEIGHTS_VOLUME}
                       fi
 
                       # Multi-host: every host runs the launch group's recipe (owns model+config).
-                      ( HOST=127.0.0.1 PORT=30000 ENABLE_PROFILER_ENDPOINT=0 ENABLE_COMPILE_CACHE=0 \
+                      ( HOST=127.0.0.1 PORT=30000 \
                           bash "benchmark/tpu/${LAUNCH_SCRIPT}" ) > >(tee /tmp/server.log) 2>&1 &
                       spid=$!
                       if [ "$RANK" = "0" ]; then
                         ok=0
                         for i in $(seq 1 300); do
-                          curl -sf --max-time 5 http://127.0.0.1:30000/health_generate >/dev/null 2>&1 && { ok=1; break; }
+                          # Keep readiness passive: this validation's first
+                          # generation must be the explicit B=1 prime request.
+                          curl -sf --max-time 5 http://127.0.0.1:30000/health >/dev/null 2>&1 && { ok=1; break; }
                           kill -0 "$spid" 2>/dev/null || { echo "server exited early"; break; }
                           sleep 10
                         done
@@ -129,6 +131,10 @@ ${WEIGHTS_VOLUME}
                           echo "== live-server test: $f =="
                           SGLANG_TPU_USE_LIVE_SERVER=1 BASE_URL=http://127.0.0.1:30000 timeout 3600 python3 "$f" || rc=1
                         done
+                        if grep -Eq "Detected recompile when torch.compile stance is 'fail_on_recompile'|new XLA program\(s\) compiled at serving time|RuntimeUnexpectedCoreHalt|SparseCoreSequencer" /tmp/server.log; then
+                          echo "FAIL: rank-0 server log contains a recompile or SparseCore-halt signature"
+                          rc=1
+                        fi
                         kill "$spid" 2>/dev/null || true
                         exit $rc
                       else
@@ -143,6 +149,10 @@ ${WEIGHTS_VOLUME}
                         # launch, which MULTIHOST_LAUNCH does not model yet). Teardown-
                         # induced exits (leader gone -> peer disconnect / SIGTERM 143) pass.
                         wait "$spid"; src=$?
+                        if grep -Eq "Detected recompile when torch.compile stance is 'fail_on_recompile'|new XLA program\(s\) compiled at serving time|RuntimeUnexpectedCoreHalt|SparseCoreSequencer" /tmp/server.log; then
+                          echo "worker rank=$RANK: recompile or SparseCore-halt signature found"
+                          exit 1
+                        fi
                         # 137 is ALSO how normal teardown manifests: rank-0 finishes its
                         # test files and exits first, this worker's scheduler dies on the
                         # severed request-broadcast socket ("Connection reset by peer"),
@@ -154,8 +164,8 @@ ${WEIGHTS_VOLUME}
                           echo "worker rank=$RANK: leader closed (teardown); success"; exit 0
                         fi
                         case "$src" in
-                          137|139) echo "worker rank=$RANK server crashed rc=$src"; exit 1 ;;
-                          *)       echo "worker rank=$RANK done (server rc=$src)"; exit 0 ;;
+                          0|143)   echo "worker rank=$RANK normal teardown rc=$src"; exit 0 ;;
+                          *)       echo "worker rank=$RANK server exited unexpectedly rc=$src"; exit 1 ;;
                         esac
                       fi
                   resources:
