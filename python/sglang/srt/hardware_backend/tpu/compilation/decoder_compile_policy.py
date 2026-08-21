@@ -576,9 +576,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """Return the candidate width when this compiled boundary owns logits."""
 
         model = self.model_runner.model
-        if self.owner is not model or bool(
-            getattr(self.model_runner, "is_draft_worker", False)
-        ):
+        if not self._compiled_boundary_owns_logits():
             return None
         logits_processor = getattr(model, "logits_processor", None)
         selector = getattr(logits_processor, "get_tpu_distributed_top_k_width", None)
@@ -587,12 +585,20 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             return None
         return selector(lm_head)
 
+    def _compiled_boundary_owns_logits(self) -> bool:
+        return self.owner is self.model_runner.model and not bool(
+            getattr(self.model_runner, "is_draft_worker", False)
+        )
+
     def _select_tpu_logits_mode(self, forward_batch: ForwardBatch) -> None:
         """Resolve automatic request policy to one compile-static bool."""
 
         # Reset first so LogitsProcessor evaluates host sampling metadata rather
         # than treating a value left by an earlier preparation as authoritative.
         forward_batch.tpu_use_distributed_top_k = None
+        if not self._compiled_boundary_owns_logits():
+            return
+
         candidate_width = self._tpu_candidate_width()
         if candidate_width is None:
             forward_batch.tpu_use_distributed_top_k = False

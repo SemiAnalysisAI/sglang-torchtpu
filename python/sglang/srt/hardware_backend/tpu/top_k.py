@@ -313,6 +313,7 @@ def register_tpu_top_k_ops() -> None:
 
         register_pallas_distributed_top_k_op(world_size)
 
+
 def _prefer_lowest_token_id_for_tied_max(
     candidate_logits: torch.Tensor,
     candidate_token_ids: torch.Tensor,

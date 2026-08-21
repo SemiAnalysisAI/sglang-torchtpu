@@ -209,6 +209,31 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         self.assertTrue(key[-1])
         selector.assert_called_once_with(forward_batch, model_runner.model.lm_head)
 
+    def test_inner_decoder_leaves_outer_logits_selection_automatic(self):
+        model_runner = _model_runner()
+        model_runner.is_draft_worker = False
+        model_runner.model.logits_processor = SimpleNamespace(
+            get_tpu_distributed_top_k_width=MagicMock(return_value=64)
+        )
+        model_runner.model.lm_head = object()
+        policy = DecoderTpuCompilePolicy(
+            model_runner=model_runner,
+            t_bucketer=Bucketer(name="Token", buckets=[64]),
+            b_bucketer=Bucketer(name="Bs", buckets=[64]),
+            owner=SimpleNamespace(forward=MagicMock()),
+        )
+        forward_batch = policy._make_dummy_forward_batch(
+            num_tokens=64,
+            bs=64,
+            mode=ForwardMode.DECODE,
+        )
+        forward_batch.tpu_use_distributed_top_k = True
+
+        policy.prepare_forward_batch(forward_batch)
+
+        self.assertIsNone(forward_batch.tpu_use_distributed_top_k)
+        self.assertEqual(policy._sampling_warmup_variants(64), ("full_vocab",))
+
 
 class TestDecoderOutputUnpadding(CustomTestCase):
     def test_global_top_k_rows_follow_the_real_batch_size(self):
