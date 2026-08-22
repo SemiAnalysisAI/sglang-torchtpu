@@ -4,6 +4,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."  # recipe/ -> benchmark/tpu
 
+# Validation-only instrumentation for the pre-health-check fused-RS halt.  The
+# ordinary launcher already sources this file; sourcing it here lets us append
+# the semaphore watchdog without replacing Richard's production TPU flags.
+# This must be removed before the unchanged-command acceptance run.
+source ./common_env.sh
+export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS} \
+--xla_tpu_debug_sflag_wait_timeout_ms=120000 \
+--xla_tpu_debug_sflag_wait_shalt_on_detection=true"
+
 # Match the reported shell command: CI otherwise injects a 300-second soft
 # watchdog that can tear down this large model while it is still precompiling.
 # Dynamo's fail-on-recompile stance is the authoritative guard for the reported
