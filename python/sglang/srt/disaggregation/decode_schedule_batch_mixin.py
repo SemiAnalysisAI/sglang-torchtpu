@@ -57,8 +57,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             assert (
                 offset + req.extend_range.length <= total_size
             ), f"Exceeds total size: offset={offset}, req.extend_range.length={req.extend_range.length}, total_size={total_size}"
-            if not _is_tpu:
-                out_cache_loc[offset : offset + req.extend_range.length] = chunk
+            out_cache_loc[offset : offset + req.extend_range.length] = chunk
             offset += req.extend_range.length
 
             seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
