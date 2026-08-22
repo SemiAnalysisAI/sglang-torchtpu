@@ -26,7 +26,9 @@ on:
         options: [all, single-host, integration, multihost, combo, singlehost-combo, multihost-combo]
 
 concurrency:
-  group: tpu-slice-nightly
+  # This disposable exact-validation branch must not wait behind the scheduled
+  # all-suite nightly. Kueue still enforces the shared TPU slice quota.
+  group: tpu-slice-nightly-${{ github.ref_name }}
   cancel-in-progress: false   # let a running nightly finish; don't stack them
 
 jobs:
