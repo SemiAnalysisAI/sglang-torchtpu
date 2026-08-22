@@ -10,6 +10,10 @@ cd "$(dirname "$0")/.."  # recipe/ -> benchmark/tpu
 # compiled-model specialization. The global XLA cache counter also counts
 # shape-specific eager sampler programs and is not part of Richard's command,
 # so this recipe intentionally does not enable that broader diagnostic.
+#
+# Diagnostic control only: if this survives while the otherwise identical
+# fused-RS run halts, the fault is upstream of distributed TopK. This is not a
+# production fallback and must never be copied into the PR source.
 exec env \
   MODEL="${MODEL:-/weights/Qwen3-Coder-480B-A35B-Instruct-FP8}" \
   TP_SIZE=16 \
@@ -29,5 +33,5 @@ exec env \
   QUANTIZATION=fp8 \
   KV_CACHE_DTYPE=fp8_e4m3 \
   SGLANG_IS_IN_CI=false \
-  EXTRA_ARGS="--trust-remote-code --tpu-compile-tracer dynamo --tpu-fp8-runtime channelwise --sampling-defaults openai --enable-fused-qk-norm-rope" \
+  EXTRA_ARGS="--trust-remote-code --tpu-compile-tracer dynamo --tpu-fp8-runtime channelwise --sampling-defaults openai --enable-fused-qk-norm-rope --moe-runner-backend triton" \
   bash launch_server.sh
