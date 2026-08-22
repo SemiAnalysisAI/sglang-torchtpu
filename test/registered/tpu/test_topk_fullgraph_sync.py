@@ -29,6 +29,10 @@ MODEL = os.environ.get("MODEL", "/weights/Qwen3-Coder-480B-A35B-Instruct-FP8")
 SERVER_LOG = Path(os.environ.get("SERVER_LOG", "/tmp/server.log"))
 FREEZE_SIGNATURE = "froze torch.compile via set_stance('fail_on_recompile')"
 RECOMPILE_SIGNATURES = (
+    # fail_on_recompile normally emits the exception string below. Also reject
+    # Dynamo's lower-level diagnostic so a wording change cannot make this
+    # reliability gate silently accept a serving-time specialization.
+    "[__recompiles] Recompiling function",
     "Detected recompile when torch.compile stance is 'fail_on_recompile'",
 )
 HALT_SIGNATURES = (
