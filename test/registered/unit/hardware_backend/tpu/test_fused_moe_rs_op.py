@@ -115,6 +115,63 @@ class TestFusedMoeRsOp(CustomTestCase):
         torch.testing.assert_close(output, torch.arange(8).reshape(8, 1))
         tp_group.all_gather.assert_called_once_with(token_shard, dim=0)
 
+    def test_qwen_tp16_gather_stays_below_sparsecore_scratch_limit(self):
+        # Richard's 480B startup bucket has 1024 tokens across TP16, leaving a
+        # 64x6144 BF16 shard per rank. A single gather is about 12 MiB, so this
+        # exact shape guards the SparseCore halt that motivated the fix.
+        tp_size = 16
+        shard_tokens = 64
+        hidden_size = 6144
+        token_shard = torch.zeros(shard_tokens, hidden_size, dtype=torch.bfloat16)
+        physical_order_to_tp_rank = torch.tensor(
+            [8, 9, 12, 13, 14, 15, 10, 11, 0, 1, 4, 5, 6, 7, 2, 3]
+        )
+
+        def gather_chunk(chunk, dim):
+            self.assertEqual(dim, 0)
+            aggregate_bytes = chunk.numel() * chunk.element_size() * tp_size
+            self.assertLessEqual(
+                aggregate_bytes,
+                fused_moe_rs_op._FUSED_RS_ALL_GATHER_PAYLOAD_BYTES,
+            )
+            return torch.cat(
+                [torch.full_like(chunk, rank) for rank in range(tp_size)], dim=0
+            )
+
+        tp_group = Mock(world_size=tp_size, all_gather=Mock(side_effect=gather_chunk))
+        with (
+            patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
+            patch.object(
+                fused_moe_rs_op,
+                "fused_moe_rs_call",
+                return_value=token_shard,
+            ),
+        ):
+            output = fused_moe_rs_op.fused_moe_rs_gather(
+                hidden_states=torch.zeros(
+                    tp_size * shard_tokens, hidden_size, dtype=torch.bfloat16
+                ),
+                w1=torch.empty(1),
+                w2=torch.empty(1),
+                w1_scale=torch.empty(1),
+                w2_scale=torch.empty(1),
+                topk_weights=torch.empty(1),
+                topk_ids=torch.empty(1),
+                post_expert_norm_weight=torch.empty(1),
+                group_offset=torch.empty(1),
+                topk=8,
+                activation="silu",
+                has_post_expert_norm=False,
+                fp8_direct_write=False,
+                physical_order_to_tp_rank=physical_order_to_tp_rank,
+            )
+
+        # Seven chunks are the minimum needed to put this TP16 payload below
+        # 2 MiB; the reconstructed rows must retain physical-device order.
+        self.assertEqual(tp_group.all_gather.call_count, 7)
+        expected_ranks = physical_order_to_tp_rank.repeat_interleave(shard_tokens)
+        torch.testing.assert_close(output[:, 0].to(torch.int64), expected_ranks)
+
 
 if __name__ == "__main__":
     unittest.main()

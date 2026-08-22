@@ -11,6 +11,10 @@ from torch_tpu._internal.distributed.spmd_util import spmd_safe
 _FUSED_MOE_RS_OP = None
 _FUSED_MOE_RS_OP_NAME = "sglang_tpu_pallas::fused_moe_rs"
 _FUSED_RS_ROUTED_ROW_ALIGNMENT = 16
+# SparseCore has 2.5 MiB of scratch space, but a collective also needs scratch
+# for bookkeeping. Keep the aggregate all-gather payload below 2 MiB so the
+# fused-RS result cannot exhaust that scratch space in a full compiled graph.
+_FUSED_RS_ALL_GATHER_PAYLOAD_BYTES = 2 * 1024 * 1024
 
 
 def fused_moe_rs_padded_tokens(num_tokens: int, topk: int, ep_size: int) -> int:
@@ -241,8 +245,29 @@ def fused_moe_rs_gather(
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=fp8_direct_write,
     )
-    output = get_tp_group().all_gather(token_shard, dim=0)
+
     shard_tokens = token_shard.shape[0]
-    return output.reshape(
-        physical_order_to_tp_rank.shape[0], shard_tokens, output.shape[-1]
-    )[physical_order_to_tp_rank].reshape(-1, output.shape[-1])
+    hidden_size = token_shard.shape[1]
+    tp_size = physical_order_to_tp_rank.shape[0]
+
+    # all_gather stages the combined payload from every TP rank in SparseCore
+    # scratch. Split only on complete token rows and derive the split count from
+    # static tensor metadata, so large TP16 shapes stay within the hardware
+    # limit without introducing request-dependent Dynamo specializations.
+    bytes_per_token = hidden_size * token_shard.element_size()
+    max_chunk_bytes_per_rank = _FUSED_RS_ALL_GATHER_PAYLOAD_BYTES // tp_size
+    max_chunk_tokens = max(1, max_chunk_bytes_per_rank // bytes_per_token)
+    num_chunks = max(1, (shard_tokens + max_chunk_tokens - 1) // max_chunk_tokens)
+
+    tp_group = get_tp_group()
+    gathered_chunks = []
+    for chunk in token_shard.chunk(num_chunks, dim=0):
+        gathered_chunk = tp_group.all_gather(chunk, dim=0)
+        # Collectives return logical TP-rank order, while the fused kernel
+        # routes rows by physical TPU ID. Restore physical order per chunk
+        # before joining the token dimension back together.
+        gathered_chunk = gathered_chunk.reshape(tp_size, chunk.shape[0], hidden_size)[
+            physical_order_to_tp_rank
+        ].contiguous()
+        gathered_chunks.append(gathered_chunk)
+    return torch.cat(gathered_chunks, dim=1).reshape(-1, hidden_size)

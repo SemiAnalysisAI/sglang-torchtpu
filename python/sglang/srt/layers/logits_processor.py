@@ -16,7 +16,7 @@
 import dataclasses
 import logging
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -63,6 +63,9 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.tpu.top_k import TpuVocabShard
 
 _is_npu = is_npu()
 _is_tpu = is_tpu()
@@ -148,50 +151,62 @@ class LogitsProcessorOutput:
     # They should be moved to GenerationBatchResult to keep this class clean.
     mm_input_embeds: Optional[torch.Tensor] = None
 
-    # Exact global TopK produced from sharded logits without gathering the full
-    # vocabulary. Both tensors have shape [#seq, k].
-    next_token_global_top_k_logits: Optional[torch.Tensor] = None
-    next_token_global_top_k_token_ids: Optional[torch.Tensor] = None
+    # Contiguous FP32 shard-local logits emitted instead of gathered
+    # full-vocabulary logits. The eager TPU sampler performs *all* TopK custom
+    # ops and bounded TP communication only after this compiled model output is
+    # materialized.
+    next_token_sharded_logits: Optional[torch.Tensor] = None
+    # Static host metadata needed to mask padded LM-head columns and map local
+    # positions to global token IDs. Keeping it beside the tensor avoids making
+    # rank/layout assumptions in the sampler (notably for added vocabulary).
+    tpu_top_k_vocab_shard: Optional["TpuVocabShard"] = None
 
     def __post_init__(self) -> None:
-        has_global_top_k_logits = self.next_token_global_top_k_logits is not None
-        has_global_top_k_token_ids = self.next_token_global_top_k_token_ids is not None
-        if has_global_top_k_logits != has_global_top_k_token_ids:
+        has_sharded_logits = self.next_token_sharded_logits is not None
+        has_vocab_shard = self.tpu_top_k_vocab_shard is not None
+        # These are Python-static presence checks during Dynamo tracing. Keep
+        # the contract explicit so no tensor value can specialize this branch.
+        if has_sharded_logits != has_vocab_shard:
             raise ValueError(
-                "global TopK logits and token IDs must be provided together"
+                "shard-local logits and TPU vocabulary metadata must be provided "
+                "together"
             )
-        if has_global_top_k_logits and self.next_token_logits is not None:
+        if has_sharded_logits and self.next_token_logits is not None:
             raise ValueError(
-                "full logits and global TopK logits are mutually exclusive"
+                "full logits and shard-local logits are mutually exclusive"
             )
 
     @property
-    def has_next_token_global_top_k(self) -> bool:
-        """Report whether exact global TopK replaces full-vocabulary logits.
-        Construction guarantees logits and token IDs are paired and exclusive."""
+    def has_next_token_sharded_logits(self) -> bool:
+        """Report whether local logits replace full-vocabulary logits.
+        Construction guarantees their static vocabulary metadata is present."""
 
-        return self.next_token_global_top_k_logits is not None
+        return self.next_token_sharded_logits is not None
 
     def trim_next_token_outputs(
         self,
         logits_rows: int,
-        global_top_k_rows: Optional[int] = None,
+        sharded_logits_rows: Optional[int] = None,
     ) -> None:
-        """Remove padded rows while preserving global TopK pair alignment.
-        TopK rows default to the full-logits row count when not specified."""
+        """Remove padded rows from either mutually exclusive logits output.
+        Sharded rows default to the full-logits row count when not specified."""
 
-        if self.next_token_logits is not None:
+        if (
+            self.next_token_logits is not None
+            and logits_rows < self.next_token_logits.shape[0]
+        ):
             self.next_token_logits = self.next_token_logits[:logits_rows]
-        if self.has_next_token_global_top_k:
-            global_top_k_rows = (
-                logits_rows if global_top_k_rows is None else global_top_k_rows
+        if self.has_next_token_sharded_logits:
+            sharded_logits_rows = (
+                logits_rows if sharded_logits_rows is None else sharded_logits_rows
             )
-            self.next_token_global_top_k_logits = self.next_token_global_top_k_logits[
-                :global_top_k_rows
-            ]
-            self.next_token_global_top_k_token_ids = (
-                self.next_token_global_top_k_token_ids[:global_top_k_rows]
-            )
+            if sharded_logits_rows < self.next_token_sharded_logits.shape[0]:
+                # Avoid a same-size slice at the materialization boundary. In
+                # particular, serving B64 should present the exact tensor/layout
+                # that startup used to prewarm the eager distributed TopK.
+                self.next_token_sharded_logits = self.next_token_sharded_logits[
+                    :sharded_logits_rows
+                ]
 
 
 @dataclasses.dataclass
@@ -411,9 +426,38 @@ class LogitsProcessor(nn.Module):
         forward_batch: ForwardBatch,
         lm_head: VocabParallelEmbedding,
     ) -> Optional[int]:
-        """Return the static k only when this model can skip the TPU vocab gather.
-        Full-logit models, disabled/DP gathers, and non-sharded heads return ``None``.
+        """Return a model-static candidate width or ``None`` for full logits.
+
+        Compiled TPU execution resolves ``tpu_use_distributed_top_k`` before
+        tracing, so this branch never inspects request sampling metadata in the
+        model graph. Eager execution leaves the field as ``None`` and selects
+        the same mode dynamically.
         """
+
+        candidate_width = self.get_tpu_distributed_top_k_width(lm_head)
+        if candidate_width is None:
+            return None
+
+        selected = getattr(forward_batch, "tpu_use_distributed_top_k", None)
+        if selected is not None:
+            return candidate_width if selected else None
+
+        from sglang.srt.hardware_backend.tpu.sampler import (
+            distributed_top_k_for_batch,
+        )
+
+        requested_top_k = distributed_top_k_for_batch(
+            forward_batch, sampling_backend="tpu"
+        )
+        if requested_top_k is None or requested_top_k > candidate_width:
+            return None
+        return candidate_width
+
+    def get_tpu_distributed_top_k_width(
+        self,
+        lm_head: VocabParallelEmbedding,
+    ) -> Optional[int]:
+        """Return the fixed candidate width supported by this model layout."""
 
         if (
             not self.use_tpu_distributed_top_k
@@ -422,17 +466,23 @@ class LogitsProcessor(nn.Module):
         ):
             return None
 
-        from sglang.srt.hardware_backend.tpu.sampler import (
-            distributed_top_k_for_batch,
-        )
+        from sglang.srt.hardware_backend.tpu.sampler import MAX_DISTRIBUTED_TOP_K
         from sglang.srt.hardware_backend.tpu.top_k import (
             supports_distributed_tpu_top_k,
         )
 
-        top_k = distributed_top_k_for_batch(forward_batch, sampling_backend="tpu")
-        if top_k is None or not supports_distributed_tpu_top_k(lm_head, top_k):
+        # The fixed width must fit both the global vocabulary and every local
+        # shard; otherwise a rank could not contribute that many candidates.
+        candidate_width = min(
+            MAX_DISTRIBUTED_TOP_K,
+            int(getattr(lm_head, "num_embeddings", 0)),
+            int(getattr(lm_head, "num_embeddings_per_partition", 0)),
+        )
+        if candidate_width <= 1 or not supports_distributed_tpu_top_k(
+            lm_head, candidate_width
+        ):
             return None
-        return top_k
+        return candidate_width
 
     def forward(
         self,
@@ -502,20 +552,18 @@ class LogitsProcessor(nn.Module):
 
         if not logits_metadata.extend_return_logprob:
             if distributed_top_k is not None:
-                global_top_k_logits, global_top_k_token_ids = (
-                    self._get_distributed_top_k(
-                        pruned_states,
-                        lm_head,
-                        distributed_top_k,
-                    )
+                sharded_logits, vocab_shard = self._get_tpu_sharded_logits(
+                    pruned_states,
+                    lm_head,
                 )
                 if sample_indices is not None:
-                    global_top_k_logits = global_top_k_logits[sample_indices]
-                    global_top_k_token_ids = global_top_k_token_ids[sample_indices]
+                    # Candidate mode normally has no sample_indices, but retain
+                    # the same sampled-row semantics as the full-logits path.
+                    sharded_logits = sharded_logits[sample_indices]
                 return LogitsProcessorOutput(
                     next_token_logits=None,
-                    next_token_global_top_k_logits=global_top_k_logits,
-                    next_token_global_top_k_token_ids=global_top_k_token_ids,
+                    next_token_sharded_logits=sharded_logits,
+                    tpu_top_k_vocab_shard=vocab_shard,
                     hidden_states=hidden_states_to_store,
                     mm_input_embeds=logits_metadata.mm_input_embeds,
                 )
@@ -786,39 +834,38 @@ class LogitsProcessor(nn.Module):
 
         return hidden_states_to_store
 
-    def _get_distributed_top_k(
+    def _get_tpu_sharded_logits(
         self,
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
-        top_k: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Reduce sharded LM-head logits into an exact global TopK.
-        Monotonic final softcapping is applied after the global merge."""
+    ) -> Tuple[torch.Tensor, "TpuVocabShard"]:
+        """Return a fixed-shape model output for eager distributed TopK.
 
-        from sglang.srt.distributed import get_attn_tp_group, get_tp_group
-        from sglang.srt.hardware_backend.tpu.top_k import (
-            TpuVocabShard,
-            distributed_tpu_top_k,
-        )
+        Keeping TopK and collectives in the separately prewarmed sampler makes
+        the compiled model's candidate contract independent of requested K.
+        """
+
+        from sglang.srt.hardware_backend.tpu.top_k import TpuVocabShard
 
         logits = self._compute_lm_head(hidden_states, lm_head)
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
         sanitize_nan_logits(logits, "distributed TPU top-k: local logits")
 
-        # Select k logits per vocabulary shard, then merge them into the exact
-        # global TopK shared by every tensor-parallel rank.
-        global_top_k_logits, global_top_k_token_ids = distributed_tpu_top_k(
-            logits,
-            TpuVocabShard.from_lm_head(lm_head),
-            top_k,
-            group=get_attn_tp_group() if self.use_attn_tp_group else get_tp_group(),
-        )
+        # Candidate mode bypasses _copy_logits_to_buffer, which makes the
+        # full-vocabulary output contiguous FP32. Give the smaller local shard
+        # the same explicit dtype/layout contract before it leaves the model.
+        logits = logits.contiguous().float()
+
         if self.final_logit_softcapping:
-            global_top_k_logits = self.final_logit_softcapping * torch.tanh(
-                global_top_k_logits / self.final_logit_softcapping
+            # The full-vocabulary path also casts before softcapping. Keeping
+            # that order makes candidate values identical before eager TopK.
+            logits = self.final_logit_softcapping * torch.tanh(
+                logits / self.final_logit_softcapping
             )
-        return global_top_k_logits, global_top_k_token_ids
+        # The tensor is the only candidate-specific device output of the model.
+        # The NamedTuple contains host integers and adds no device operation.
+        return logits, TpuVocabShard.from_lm_head(lm_head)
 
     def _get_logits(
         self,

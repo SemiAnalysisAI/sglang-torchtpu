@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.top_k import TpuVocabShard
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
@@ -40,13 +41,13 @@ def _logits_output(num_rows: int) -> LogitsProcessorOutput:
     )
 
 
-def _global_top_k_output(num_rows: int) -> LogitsProcessorOutput:
+def _sharded_logits_output(num_rows: int) -> LogitsProcessorOutput:
     return LogitsProcessorOutput(
         next_token_logits=None,
-        next_token_global_top_k_logits=torch.randn(num_rows, 8),
-        next_token_global_top_k_token_ids=torch.arange(num_rows * 8).reshape(
-            num_rows, 8
-        ),
+        next_token_sharded_logits=torch.randn(num_rows, 8),
+        # Static metadata is row-independent and remains intact while padded
+        # raw-logits rows are trimmed before eager distributed TopK.
+        tpu_top_k_vocab_shard=TpuVocabShard(8, 16, 0, 8, 8, 16, 0),
         hidden_states=None,
     )
 
@@ -154,13 +155,11 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         # Seeded sampling asserts positions rows == sampled (real) rows.
         self.assertEqual(fb.positions.shape[0], fb.batch_size)
 
-        global_top_k_output = _global_top_k_output(padded)
-        fb.post_forward_mlp_sync_batch(global_top_k_output)
-        self.assertIsNone(global_top_k_output.next_token_logits)
-        self.assertEqual(global_top_k_output.next_token_global_top_k_logits.shape[0], 3)
-        self.assertEqual(
-            global_top_k_output.next_token_global_top_k_token_ids.shape[0], 3
-        )
+        sharded_logits_output = _sharded_logits_output(padded)
+        fb.post_forward_mlp_sync_batch(sharded_logits_output)
+        self.assertIsNone(sharded_logits_output.next_token_logits)
+        self.assertEqual(sharded_logits_output.next_token_sharded_logits.shape[0], 3)
+        self.assertIsNotNone(sharded_logits_output.tpu_top_k_vocab_shard)
 
     def test_extend_post_forward_unpads_positions(self):
         fb = ForwardBatch(
@@ -191,13 +190,11 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         self.assertEqual((fb.seq_lens - 1).shape[0], fb.batch_size)
         self.assertEqual(logits_output.next_token_logits.shape[0], 7)
 
-        global_top_k_output = _global_top_k_output(10)
-        fb.post_forward_mlp_sync_batch(global_top_k_output)
-        self.assertIsNone(global_top_k_output.next_token_logits)
-        self.assertEqual(global_top_k_output.next_token_global_top_k_logits.shape[0], 2)
-        self.assertEqual(
-            global_top_k_output.next_token_global_top_k_token_ids.shape[0], 2
-        )
+        sharded_logits_output = _sharded_logits_output(10)
+        fb.post_forward_mlp_sync_batch(sharded_logits_output)
+        self.assertIsNone(sharded_logits_output.next_token_logits)
+        self.assertEqual(sharded_logits_output.next_token_sharded_logits.shape[0], 2)
+        self.assertIsNotNone(sharded_logits_output.tpu_top_k_vocab_shard)
 
 
 if __name__ == "__main__":
