@@ -9,18 +9,27 @@ import torch
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
-device_module = get_device_module()
+
+device_module = None
+
+
+def _get_device_module():
+    global device_module
+    if device_module is None:
+        device_module = get_device_module()
+    return device_module
 
 
 @cache
 def _timing_events_supported() -> bool:
+    dev_mod = _get_device_module()
     try:
-        device_module.Event(enable_timing=True)
+        dev_mod.Event(enable_timing=True)
         return True
     except (TypeError, NotImplementedError):
         logger.warning(
             "%s.Event does not support timing; L2 transfer timing is disabled",
-            device_module.__name__,
+            dev_mod.__name__,
         )
         return False
 
@@ -28,7 +37,8 @@ def _timing_events_supported() -> bool:
 def make_timing_event_pair():
     timing_enabled = _timing_events_supported()
     kwargs = {"enable_timing": True} if timing_enabled else {}
-    return device_module.Event(**kwargs), device_module.Event(**kwargs), timing_enabled
+    dev_mod = _get_device_module()
+    return dev_mod.Event(**kwargs), dev_mod.Event(**kwargs), timing_enabled
 
 
 class L2Transfer(NamedTuple):
@@ -51,13 +61,14 @@ class L2TransferEngine:
 
     def __init__(self, io_backend: str):
         self.io_backend = io_backend
-        self.device_to_host_stream = device_module.Stream()
-        self.host_to_device_stream = device_module.Stream()
+        dev_mod = _get_device_module()
+        self.device_to_host_stream = dev_mod.Stream()
+        self.host_to_device_stream = dev_mod.Stream()
 
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
         start_event = self._start_event(None)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
-        with device_module.stream(self.device_to_host_stream):
+        with _get_device_module().stream(self.device_to_host_stream):
             start_event.wait(self.device_to_host_stream)
             ack_start.record()
             for transfer in transfers:
@@ -82,7 +93,7 @@ class L2TransferEngine:
         start_event = self._start_event(start_event)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
         primary = transfers[0] if transfers else None
-        with device_module.stream(self.host_to_device_stream):
+        with _get_device_module().stream(self.host_to_device_stream):
             start_event.wait(self.host_to_device_stream)
             ack_start.record()
             for layer_id in range(layer_num):
@@ -115,7 +126,7 @@ class L2TransferEngine:
     @staticmethod
     def _start_event(start_event):
         if start_event is None:
-            start_event = device_module.Event()
+            start_event = _get_device_module().Event()
             start_event.record()
         return start_event
 
