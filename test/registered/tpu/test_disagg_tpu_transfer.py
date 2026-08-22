@@ -382,7 +382,7 @@ def _bare_manager(
     m._socket_send_locks = {}
 
     sock = ctx.socket(zmq.PULL)
-    sock.setsockopt(zmq.RCVTIMEO, 5000)
+    sock.setsockopt(zmq.RCVTIMEO, 30000)
     port = sock.bind_to_random_port("tcp://127.0.0.1")
     m.server_socket = sock
     m.local_ip = "127.0.0.1"
