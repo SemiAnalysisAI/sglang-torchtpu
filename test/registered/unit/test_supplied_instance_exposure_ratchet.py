@@ -401,6 +401,7 @@ _OVERRIDDEN_AND_READ = {
     ("entrypoints/engine.py", "tool_call_parser"),
     ("configs/model_config.py", "dtype"),
     ("configs/model_config.py", "model_path"),
+    ("disaggregation/decode_kvcache_offload_manager.py", "hicache_ratio"),
     ("disaggregation/decode_kvcache_offload_manager.py", "hicache_storage_backend"),
     (
         "disaggregation/decode_kvcache_offload_manager.py",
