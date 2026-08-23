@@ -252,6 +252,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._swa_engine = Mock()
         mgr._pulling = SlotAdmission(1)
         mgr._engine_max_blocks = 2
+        mgr._swa_engine_max_blocks = 1
         mgr._local_blocks = {room: [8, 9]}
         mgr._local_swa_blocks = {room: [7]}
         mgr._remote_blocks = {room: [1, 2, 3]}
@@ -274,6 +275,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._engine = Mock()
         mgr._swa_engine = None
         mgr._pulling = SlotAdmission(1)
+        mgr._pulling_cleared = set()
         mgr._engine_max_blocks = 4
         mgr._completed_recv = set()
         mgr._failed = set()
@@ -294,6 +296,113 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._engine.start_read.assert_called_with(
             str(second), second, "127.0.0.1:31020", [2], [9]
         )
+
+    @staticmethod
+    def _decode_mgr(capacity, full_limit, swa_limit=None):
+        mgr = object.__new__(RaidenKVManager)
+        mgr._state_lock = threading.Lock()
+        mgr._engine = Mock()
+        mgr._swa_engine = Mock() if swa_limit is not None else None
+        mgr._pulling = SlotAdmission(capacity)
+        mgr._pulling_cleared = set()
+        mgr._engine_max_blocks = full_limit
+        mgr._swa_engine_max_blocks = swa_limit or 0
+        mgr._completed_send = set()
+        mgr._completed_recv = set()
+        mgr._failed = set()
+        mgr._local_blocks = {}
+        mgr._local_swa_blocks = {}
+        mgr._remote_blocks = {}
+        mgr._remote_swa_blocks = {}
+        mgr._remote_endpoint = {}
+        mgr._remote_swa_endpoint = {}
+        mgr.attn_tp_rank = 0
+        mgr.record_failure = Mock()
+        # clear_room sweeps the reshard bookkeeping too.
+        mgr._reshard_slot_of = {}
+        mgr._reshard_slot_rooms = [None]
+        return mgr
+
+    @staticmethod
+    def _announce(mgr, room, full_pages, swa_pages=0):
+        mgr._local_blocks[room] = list(range(100, 100 + full_pages))
+        mgr._remote_blocks[room] = list(range(full_pages))
+        mgr._remote_endpoint[room] = "127.0.0.1:31020"
+        if mgr._swa_engine is not None:
+            mgr._local_swa_blocks[room] = list(range(200, 200 + swa_pages))
+            mgr._remote_swa_blocks[room] = list(range(swa_pages))
+            mgr._remote_swa_endpoint[room] = "127.0.0.1:31022"
+
+    def test_hybrid_swa_checks_each_pool_against_its_own_page_limit(self):
+        # gpt-oss at page 64: a 128-token window is 3 pages, the full pool 128.
+        room = 31
+        mgr = self._decode_mgr(capacity=4, full_limit=128, swa_limit=3)
+        self._announce(mgr, room, full_pages=40, swa_pages=3)
+
+        self.assertTrue(mgr.maybe_start_pull(room))
+        mgr._engine.start_read.assert_called_once()
+        mgr._swa_engine.start_read.assert_called_once()
+        mgr.record_failure.assert_not_called()
+
+        too_wide = 32
+        self._announce(mgr, too_wide, full_pages=4, swa_pages=5)
+        self.assertFalse(mgr.maybe_start_pull(too_wide))
+        self.assertIn(str(too_wide), mgr._failed)
+        self.assertIn(
+            "SGLANG_RAIDEN_SWA_MAX_BLOCKS", mgr.record_failure.call_args.args[1]
+        )
+        self.assertEqual(mgr._engine.start_read.call_count, 1)
+
+    def test_cleared_room_keeps_its_slot_until_the_read_settles(self):
+        first, second = 33, 34
+        mgr = self._decode_mgr(capacity=1, full_limit=8)
+        self._announce(mgr, first, full_pages=2)
+        self._announce(mgr, second, full_pages=2)
+        mgr._send_blocks = {}
+
+        self.assertTrue(mgr.maybe_start_pull(first))
+        # The framework aborts the request while raiden still holds the read.
+        mgr.clear_room(first)
+        self.assertFalse(mgr.maybe_start_pull(second))
+
+        mgr._completed_recv.add(str(first))
+        with mgr._state_lock:
+            mgr._release_pull_slots_locked()
+        self.assertTrue(mgr.maybe_start_pull(second))
+        self.assertNotIn(str(first), mgr._completed_recv)
+        self.assertFalse(mgr._pulling_cleared)
+
+    def test_cleared_settled_room_releases_its_slot_at_once(self):
+        first, second = 35, 36
+        mgr = self._decode_mgr(capacity=1, full_limit=8)
+        self._announce(mgr, first, full_pages=2)
+        self._announce(mgr, second, full_pages=2)
+        mgr._send_blocks = {}
+
+        self.assertTrue(mgr.maybe_start_pull(first))
+        mgr._completed_recv.add(str(first))
+        mgr.clear_room(first)
+        self.assertTrue(mgr.maybe_start_pull(second))
+        self.assertNotIn(str(first), mgr._completed_recv)
+
+    def test_hybrid_swa_slot_is_held_until_both_engines_settle(self):
+        first, second = 37, 38
+        mgr = self._decode_mgr(capacity=1, full_limit=8, swa_limit=3)
+        self._announce(mgr, first, full_pages=2, swa_pages=1)
+        self._announce(mgr, second, full_pages=2, swa_pages=1)
+
+        self.assertTrue(mgr.maybe_start_pull(first))
+        # The full-attention read fails while the sliding-window read is
+        # still in flight on the other engine.
+        mgr._failed.add(str(first))
+        with mgr._state_lock:
+            mgr._release_pull_slots_locked()
+        self.assertFalse(mgr.maybe_start_pull(second))
+
+        mgr._completed_recv.add(mgr._swa_req_id(first))
+        with mgr._state_lock:
+            mgr._release_pull_slots_locked()
+        self.assertTrue(mgr.maybe_start_pull(second))
 
     def test_hybrid_swa_rejects_asymmetric_tp_before_reshard(self):
         mgr = object.__new__(RaidenKVManager)

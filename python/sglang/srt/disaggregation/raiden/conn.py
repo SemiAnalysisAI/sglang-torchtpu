@@ -151,7 +151,12 @@ class RaidenKVManager(CommonKVManager):
         # seat, so the decode side admits at most one pull per slot and leaves
         # the rest in the transfer queue.
         self._pulling: Optional[SlotAdmission] = None
+        # Rooms the framework dropped while their read was still in flight.
+        # Raiden cannot cancel a read, so the room keeps its admission until
+        # the engine reports the read settled.
+        self._pulling_cleared: Set[int] = set()
         self._engine_max_blocks = 0
+        self._swa_engine_max_blocks = 0
         self._engine_lock = threading.Lock()
         self._push_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -315,7 +320,7 @@ class RaidenKVManager(CommonKVManager):
             )
             # A room occupies a slot in both engines; the tighter pool binds.
             self._pulling.capacity = min(self._pulling.capacity, swa_num_slots)
-            self._engine_max_blocks = min(self._engine_max_blocks, swa_max_blocks)
+            self._swa_engine_max_blocks = swa_max_blocks
             logger.info(
                 "RaidenKVManager rank%d SWA engine up | endpoint=%s "
                 "max_blocks=%d num_slots=%d",
@@ -611,24 +616,47 @@ class RaidenKVManager(CommonKVManager):
             local = local[: len(remote)]
         return remote, local
 
+    def _pull_settled_locked(self, room: int) -> bool:
+        """Whether every engine has reported the room's read done or failed.
+
+        Raiden holds a read's host staging until it completes or times out,
+        whichever engine it is on, so the room's admission stays claimed until
+        both the full-attention and (for a hybrid model) the sliding-window
+        read have settled.
+        """
+        rid, swa_rid = str(room), self._swa_req_id(room)
+        full_settled = rid in self._completed_recv or rid in self._failed
+        swa_settled = (
+            self._swa_engine is None
+            or swa_rid in self._completed_recv
+            or swa_rid in self._failed
+        )
+        return full_settled and swa_settled
+
     def _release_pull_slots_locked(self) -> None:
         """Hand back the slots of transfers that have settled."""
         if self._pulling is None:
             return
         for room in self._pulling.rooms():
-            rid, swa_rid = str(room), self._swa_req_id(room)
-            done = rid in self._completed_recv and (
-                self._swa_engine is None or swa_rid in self._completed_recv
-            )
-            if done or rid in self._failed or swa_rid in self._failed:
-                self._pulling.release(room)
+            if not self._pull_settled_locked(room):
+                continue
+            self._pulling.release(room)
+            if room in self._pulling_cleared:
+                # The framework already dropped this room; nothing will read
+                # its completion, so drop it too.
+                self._pulling_cleared.discard(room)
+                for rid in (str(room), self._swa_req_id(room)):
+                    self._completed_recv.discard(rid)
+                    self._failed.discard(rid)
 
-    def _reject_oversized_pull(self, room: int, pages: int) -> None:
+    def _reject_oversized_pull(
+        self, room: int, pages: int, limit: int, env: str
+    ) -> None:
         """Fail a request whose pages cannot fit one host staging slot."""
         reason = (
             f"Raiden receive failed: request needs {pages} pages but a host "
-            f"staging slot holds {self._engine_max_blocks}. Lower the context "
-            f"length or raise SGLANG_RAIDEN_MAX_BLOCKS."
+            f"staging slot holds {limit}. Lower the context length or raise "
+            f"{env}."
         )
         self.record_failure(room, reason)
         with self._state_lock:
@@ -673,14 +701,28 @@ class RaidenKVManager(CommonKVManager):
         engine = self._ensure_engine()
         pages = len(set(local))
         if pages > self._engine_max_blocks:
-            self._reject_oversized_pull(room, pages)
+            self._reject_oversized_pull(
+                room, pages, self._engine_max_blocks, "SGLANG_RAIDEN_MAX_BLOCKS"
+            )
             return False
+        # Each engine stages into its own pool, so the sliding-window pages
+        # are checked against the sliding-window limit, not the full one.
+        if self._swa_engine is not None:
+            remote_swa, local_swa = self._pair_blocks(remote_swa, local_swa)
+            swa_pages = len(set(local_swa))
+            if swa_pages > self._swa_engine_max_blocks:
+                self._reject_oversized_pull(
+                    room,
+                    swa_pages,
+                    self._swa_engine_max_blocks,
+                    "SGLANG_RAIDEN_SWA_MAX_BLOCKS",
+                )
+                return False
         with self._state_lock:
             if not self._pulling.admit(room):
                 return False
         engine.start_read(str(room), room, endpoint, remote, local)
         if self._swa_engine is not None:
-            remote_swa, local_swa = self._pair_blocks(remote_swa, local_swa)
             self._swa_engine.start_read(
                 self._swa_req_id(room), room, swa_endpoint, remote_swa, local_swa
             )
@@ -1002,12 +1044,20 @@ class RaidenKVManager(CommonKVManager):
         rid = str(room)
         swa_rid = self._swa_req_id(room)
         with self._state_lock:
+            if self._pulling is not None and room in self._pulling.rooms():
+                if self._pull_settled_locked(room):
+                    self._pulling.release(room)
+                else:
+                    # Raiden cannot cancel the read and keeps its host staging
+                    # until it settles; the admission follows the staging.
+                    self._pulling_cleared.add(room)
             self._completed_send.discard(rid)
             self._completed_send.discard(swa_rid)
-            self._completed_recv.discard(rid)
-            self._completed_recv.discard(swa_rid)
-            self._failed.discard(rid)
-            self._failed.discard(swa_rid)
+            if room not in self._pulling_cleared:
+                self._completed_recv.discard(rid)
+                self._completed_recv.discard(swa_rid)
+                self._failed.discard(rid)
+                self._failed.discard(swa_rid)
             for d in (
                 getattr(self, "_send_blocks", None),
                 getattr(self, "_send_swa_blocks", None),
@@ -1026,8 +1076,6 @@ class RaidenKVManager(CommonKVManager):
             ):
                 if d is not None:
                     d.pop(room, None)
-            if self._pulling is not None:
-                self._pulling.release(room)
             if hasattr(self, "_replied"):
                 self._replied.discard(room)
             for s in (
