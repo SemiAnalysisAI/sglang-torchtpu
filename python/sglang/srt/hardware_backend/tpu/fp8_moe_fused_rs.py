@@ -16,6 +16,18 @@ import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+_FUSED_RS_INLINE_MAX_SIZE_M = 2048
+# Unpartitioned Qwen TP16 graphs pass two layers at routed M=8192 but halt with
+# three, while the 8192-token bucket (M=65536) is only proven safe one layer at
+# a time. Materialize every large layer's existing output all-gather so each
+# compiled segment owns at most one communicating fused-RS region. Decode and
+# small-prefill shapes stay inline in the full graph.
+
+
+def should_partition_fp8_fused_rs(size_m: int) -> bool:
+    """Return whether this fused-RS shape needs its own compiled segment."""
+    return size_m > _FUSED_RS_INLINE_MAX_SIZE_M
+
 
 def supports_fp8_fused_rs(
     *,
@@ -153,7 +165,6 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
         layer.__dict__["_tpu_fused_rs_unsupported_reason"] = unsupported_reason
         return False
     layer.__dict__.pop("_tpu_fused_rs_unsupported_reason", None)
-
     # prepare_tpu_fp8_moe_weights stores weights as (E, K, N) and scales as
     # (E, 1, 1, N) channelwise or (E, K // block, 1, N) blockwise.
     from sglang.srt.layers.moe.pallas.fused_moe_rs_op import prepare_fused_moe_rs
@@ -187,6 +198,7 @@ def _apply_fp8_fused_rs(
     has_post_expert_norm = post_expert_norm_weight is not None
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk = int(topk_ids.shape[-1])
+    size_m = x.shape[0] * topk
     block_quantized = getattr(layer, "weight_block_size", None) is not None
     from sglang.srt.layers.moe.pallas.fused_moe_rs_op import fused_moe_rs_gather
 
@@ -222,5 +234,6 @@ def _apply_fp8_fused_rs(
         # reducing the subsequent collective's traffic.
         fp8_direct_write=False,
         physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
+        materialize_gather=should_partition_fp8_fused_rs(size_m),
     )
     return StandardCombineInput(hidden_states=result[: x.shape[0]])
