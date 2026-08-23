@@ -1,0 +1,126 @@
+# Self-contained E2E: run Qwen3-Coder-480B (tp=16) on Meta's (Project B) 2x2x2 slice and
+# capture the pod logs to GCS -- regardless of pass/fail. Push-triggered so it runs the
+# moment this branch is pushed (no default-branch/merge needed), entirely cloud-side.
+# This is the fast validation path; the polished nightly-lane integration is separate.
+name: meta-e2e-480b
+
+on:
+  push:
+    branches: [meta-nightly-integration]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  WIF_PROVIDER: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc
+  CI_SA: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
+  B_PROJECT: msl-gcp-ext-2-2hcwz
+  B_CLUSTER: msl-gcp-usc1-ext-2-tpu
+  B_REGION: us-central1
+  B_NS: default
+  IMAGE: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:018f8a0e8c8c33db740c6099b8cb8d978a3f38b6d88aa87581dd7be7a039cc5f
+  BUCKET: gs://sglang-torchtpu-ci-artifacts
+  USE_GKE_GCLOUD_AUTH_PLUGIN: "True"
+
+jobs:
+  meta-480b:
+    runs-on: ubuntu-latest
+    steps:
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.CI_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: gke auth plugin
+        run: gcloud components install gke-gcloud-auth-plugin --quiet || true
+      - name: connect to Project B (DNS/IAM endpoint)
+        run: |
+          gcloud container clusters get-credentials "$B_CLUSTER" \
+            --region "$B_REGION" --project "$B_PROJECT" --dns-endpoint
+
+      - name: deploy 480B JobSet on 2x2x2
+        run: |
+          set -euo pipefail
+          RUN="meta-480b-${{ github.run_id }}"
+          echo "RUN=$RUN" >> "$GITHUB_ENV"
+          cat > /tmp/job.yaml <<EOF
+          apiVersion: jobset.x-k8s.io/v1alpha2
+          kind: JobSet
+          metadata:
+            name: ${RUN}
+            namespace: ${B_NS}
+          spec:
+            ttlSecondsAfterFinished: 3600
+            failurePolicy: { maxRestarts: 0 }
+            network: { enableDNSHostnames: true }
+            replicatedJobs:
+              - name: slice
+                replicas: 1
+                template:
+                  spec:
+                    backoffLimit: 0
+                    completions: 2
+                    parallelism: 2
+                    activeDeadlineSeconds: 1800
+                    template:
+                      metadata: { labels: { app: meta-480b } }
+                      spec:
+                        restartPolicy: Never
+                        nodeSelector:
+                          cloud.google.com/gke-tpu-accelerator: tpu7x
+                          cloud.google.com/gke-tpu-topology: 2x2x2
+                        tolerations:
+                          - { key: google.com/tpu, operator: Exists, effect: NoSchedule }
+                        containers:
+                          - name: run
+                            image: ${IMAGE}
+                            imagePullPolicy: IfNotPresent
+                            command: ["bash", "-lc"]
+                            args:
+                              - |
+                                set -uo pipefail
+                                cd /sgl-workspace/sglang
+                                echo "=== meta-480b host=\$(hostname) rank=\${TPU_WORKER_ID:-?} topo=\${TPU_TOPOLOGY:-?} ==="
+                                echo "TPU_WORKER_HOSTNAMES=\${TPU_WORKER_HOSTNAMES:-<unset>}"
+                                export SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                                bash benchmark/tpu/recipe/qwen3_coder_480b_agentic_mh.sh 2>&1 || echo "recipe exited \$?"
+                                echo "=== DONE host=\$(hostname) rank=\${TPU_WORKER_ID:-?} ==="
+                            resources:
+                              limits:
+                                google.com/tpu: "4"
+          EOF
+          kubectl -n "$B_NS" apply -f /tmp/job.yaml
+          kubectl -n "$B_NS" get jobset "$RUN"
+
+      - name: wait for terminal (bounded)
+        run: |
+          for _ in $(seq 1 100); do
+            ts=$(kubectl -n "$B_NS" get jobset "$RUN" -o jsonpath='{.status.terminalState}' 2>/dev/null || true)
+            ph=$(kubectl -n "$B_NS" get pods -l app=meta-480b --no-headers 2>/dev/null | awk '{print $3}' | sort | uniq -c | tr '\n' ' ')
+            echo "[$(date -u +%H:%M:%S)] terminalState='${ts}' pods: ${ph}"
+            case "$ts" in Completed|Failed) break;; esac
+            sleep 20
+          done
+
+      - name: capture logs to GCS (always)
+        if: always()
+        run: |
+          RUN="${RUN:-meta-480b-${{ github.run_id }}}"
+          tok="$(mktemp)"; gcloud auth print-access-token > "$tok"
+          dst="${BUCKET}/meta-e2e-480b/${{ github.run_id }}"
+          kubectl -n "$B_NS" get jobset "$RUN" -o yaml > /tmp/jobset.yaml 2>&1 || true
+          gcloud storage cp /tmp/jobset.yaml "${dst}/jobset.yaml" --access-token-file="$tok" || true
+          for p in $(kubectl -n "$B_NS" get pods -l app=meta-480b -o name 2>/dev/null); do
+            n="$(basename "$p")"
+            kubectl -n "$B_NS" logs "$p" --all-containers=true --tail=-1 > "/tmp/${n}.log" 2>&1 || true
+            gcloud storage cp "/tmp/${n}.log" "${dst}/${n}.log" --access-token-file="$tok" || true
+          done
+          echo "Logs written under ${dst}"
+          gcloud storage ls -r "${dst}" --access-token-file="$tok" || true
+
+      - name: cleanup
+        if: always()
+        run: kubectl -n "$B_NS" delete jobset "${RUN:-meta-480b-${{ github.run_id }}}" --ignore-not-found --wait=false || true
