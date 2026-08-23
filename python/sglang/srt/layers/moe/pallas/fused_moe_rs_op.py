@@ -11,10 +11,6 @@ from torch_tpu._internal.distributed.spmd_util import spmd_safe
 _FUSED_MOE_RS_OP = None
 _FUSED_MOE_RS_OP_NAME = "sglang_tpu_pallas::fused_moe_rs"
 _FUSED_RS_ROUTED_ROW_ALIGNMENT = 16
-# SparseCore has 2.5 MiB of scratch space, but a collective also needs scratch
-# for bookkeeping. Keep the aggregate all-gather payload below 2 MiB so the
-# fused-RS result cannot exhaust that scratch space in a full compiled graph.
-_FUSED_RS_ALL_GATHER_PAYLOAD_BYTES = 2 * 1024 * 1024
 
 
 def fused_moe_rs_padded_tokens(num_tokens: int, topk: int, ep_size: int) -> int:
@@ -48,6 +44,11 @@ def _get_physical_rank_metadata() -> tuple[int, tuple[int, ...]]:
 def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
     """Prepare physical-rank metadata before Dynamo captures the MoE layer."""
     from sglang.srt.runtime_context import get_parallel
+
+    # Large fused-RS prefills selectively expose their existing output
+    # all-gather as a compiler boundary. TorchTPU only splits on that collective
+    # when materialization is enabled before Dynamo compiles the decoder.
+    os.environ["TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"] = "true"
 
     global_device_id, physical_order = _get_physical_rank_metadata()
 
@@ -210,8 +211,7 @@ def fused_moe_rs_call(
     )
 
 
-@spmd_safe
-def fused_moe_rs_gather(
+def _fused_moe_rs_gather_impl(
     *,
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -227,6 +227,7 @@ def fused_moe_rs_gather(
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
     physical_order_to_tp_rank: torch.Tensor,
+    materialize_gather: bool,
 ) -> torch.Tensor:
     from sglang.srt.distributed import get_tp_group
 
@@ -246,28 +247,72 @@ def fused_moe_rs_gather(
         fp8_direct_write=fp8_direct_write,
     )
 
-    shard_tokens = token_shard.shape[0]
-    hidden_size = token_shard.shape[1]
-    tp_size = physical_order_to_tp_rank.shape[0]
-
-    # all_gather stages the combined payload from every TP rank in SparseCore
-    # scratch. Split only on complete token rows and derive the split count from
-    # static tensor metadata, so large TP16 shapes stay within the hardware
-    # limit without introducing request-dependent Dynamo specializations.
-    bytes_per_token = hidden_size * token_shard.element_size()
-    max_chunk_bytes_per_rank = _FUSED_RS_ALL_GATHER_PAYLOAD_BYTES // tp_size
-    max_chunk_tokens = max(1, max_chunk_bytes_per_rank // bytes_per_token)
-    num_chunks = max(1, (shard_tokens + max_chunk_tokens - 1) // max_chunk_tokens)
-
     tp_group = get_tp_group()
-    gathered_chunks = []
-    for chunk in token_shard.chunk(num_chunks, dim=0):
-        gathered_chunk = tp_group.all_gather(chunk, dim=0)
-        # Collectives return logical TP-rank order, while the fused kernel
-        # routes rows by physical TPU ID. Restore physical order per chunk
-        # before joining the token dimension back together.
-        gathered_chunk = gathered_chunk.reshape(tp_size, chunk.shape[0], hidden_size)[
-            physical_order_to_tp_rank
-        ].contiguous()
-        gathered_chunks.append(gathered_chunk)
-    return torch.cat(gathered_chunks, dim=1).reshape(-1, hidden_size)
+    if materialize_gather:
+        output = torch.ops._c10d_functional.all_gather_into_tensor(
+            token_shard,
+            tp_group.world_size,
+            tp_group.device_group.group_name,
+        )
+        output = torch.ops._c10d_functional.wait_tensor(output)
+    else:
+        output = tp_group.all_gather(token_shard, dim=0)
+    shard_tokens = token_shard.shape[0]
+    # Torch collectives return logical TP-rank order, while fused-RS routes
+    # rows by physical TPU ID.  Restore physical order before flattening the
+    # gathered token shards back into the model's replicated token dimension.
+    return output.reshape(
+        physical_order_to_tp_rank.shape[0], shard_tokens, output.shape[-1]
+    )[physical_order_to_tp_rank].reshape(-1, output.shape[-1])
+
+
+@spmd_safe
+def _fused_moe_rs_gather_inline(**kwargs) -> torch.Tensor:
+    return _fused_moe_rs_gather_impl(**kwargs, materialize_gather=False)
+
+
+def _fused_moe_rs_gather_boundary(**kwargs) -> torch.Tensor:
+    # This is the same output all-gather as the inline path. Keeping it outside
+    # an SPMD-safe region makes TorchTPU compile the adjacent Pallas regions as
+    # separate executables instead of combining multiple size-dependent
+    # communicating regions into one unsafe device program.
+    return _fused_moe_rs_gather_impl(**kwargs, materialize_gather=True)
+
+
+def fused_moe_rs_gather(
+    *,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    post_expert_norm_weight: torch.Tensor,
+    group_offset: torch.Tensor,
+    topk: int,
+    activation: str,
+    has_post_expert_norm: bool,
+    fp8_direct_write: bool,
+    physical_order_to_tp_rank: torch.Tensor,
+    materialize_gather: bool = False,
+) -> torch.Tensor:
+    kwargs = dict(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        post_expert_norm_weight=post_expert_norm_weight,
+        group_offset=group_offset,
+        topk=topk,
+        activation=activation,
+        has_post_expert_norm=has_post_expert_norm,
+        fp8_direct_write=fp8_direct_write,
+        physical_order_to_tp_rank=physical_order_to_tp_rank,
+    )
+    if materialize_gather:
+        return _fused_moe_rs_gather_boundary(**kwargs)
+    return _fused_moe_rs_gather_inline(**kwargs)

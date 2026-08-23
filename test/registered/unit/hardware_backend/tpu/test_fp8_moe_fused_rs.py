@@ -11,6 +11,7 @@ import torch
 from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
     apply_fp8_fused_rs,
     fp8_fused_rs_unsupported_reason,
+    should_partition_fp8_fused_rs,
     supports_fp8_fused_rs,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -152,6 +153,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
         self.assertIs(fused.call_args.kwargs["w1_scale"], w13_scale_inv)
         self.assertIs(fused.call_args.kwargs["w2_scale"], w2_scale_inv)
         self.assertFalse(fused.call_args.kwargs["fp8_direct_write"])
+        self.assertFalse(fused.call_args.kwargs["materialize_gather"])
 
     def test_large_fused_prefill_uses_bf16_direct_write(self):
         tokens, hidden, topk = 8192, 4, 8
@@ -185,6 +187,14 @@ class TestFp8MoeFusedRs(CustomTestCase):
             )
 
         self.assertFalse(fused.call_args.kwargs["fp8_direct_write"])
+        self.assertTrue(fused.call_args.kwargs["materialize_gather"])
+
+    def test_partitions_every_large_prefill(self):
+        self.assertFalse(should_partition_fp8_fused_rs(1))
+        self.assertFalse(should_partition_fp8_fused_rs(2048))
+        self.assertTrue(should_partition_fp8_fused_rs(2049))
+        self.assertTrue(should_partition_fp8_fused_rs(8192))
+        self.assertTrue(should_partition_fp8_fused_rs(65536))
 
     def test_skips_only_ep_reduction_for_reduced_expert_output(self):
         # Upstream's dwdp gate reads the published parallel context, which
