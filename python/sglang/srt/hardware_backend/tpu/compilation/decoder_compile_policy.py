@@ -701,8 +701,12 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def precompile(self) -> None:
         """Warm decoder graphs for this policy's bucket grid."""
         overall = time.perf_counter()
-        self._precompile_extend()
-        self._precompile_decode()
+        server_args = getattr(self.model_runner, "server_args", None)
+        disagg_mode = getattr(server_args, "disaggregation_mode", None)
+        if disagg_mode != "decode":
+            self._precompile_extend()
+        if disagg_mode != "prefill":
+            self._precompile_decode()
         logger.info(
             "[decoder compile policy] precompile done in %.1fs.",
             time.perf_counter() - overall,

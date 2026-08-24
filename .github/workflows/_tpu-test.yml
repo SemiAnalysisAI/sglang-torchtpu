@@ -150,7 +150,6 @@ jobs:
           name="$(kubectl -n tpu-ci create -f /tmp/job.yaml -o name)"
           echo "Created ${name}"
           trap 'kubectl -n tpu-ci delete '"${name}"' --ignore-not-found --wait=false' EXIT
-
           short="${name##*/}"
           sel="jobset.sigs.k8s.io/jobset-name=${short}"
 
@@ -298,6 +297,7 @@ jobs:
           # The stream may have run for a long time; poll with a fresh token.
           refresh_cluster_token || echo "credential refresh failed; continuing with the current token"
           next_refresh=$(( $(date +%s) + 2400 ))
+          iter=0
           while [ "$(date +%s)" -lt "$deadline" ]; do
             if [ "$(date +%s)" -ge "$next_refresh" ]; then
               if refresh_cluster_token; then
@@ -307,6 +307,14 @@ jobs:
                 next_refresh=$(( $(date +%s) + 45 ))
               fi
             fi
+            # Multi-host pods can sit unschedulable for a long time with nothing
+            # else printed between the log stream and the verdict; surface where
+            # each pod landed once a minute (12 x the 5s poll below).
+            if [ $(( iter % 12 )) -eq 0 ]; then
+              echo "--- [$(date +%T)] Pod Status for ${label} ---"
+              kubectl -n tpu-ci get pods -l "$sel" -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,NODE:.spec.nodeName,IP:.status.podIP 2>/dev/null || true
+            fi
+            iter=$(( iter + 1 ))
             # A dead kubectl looks identical to "no condition yet" with errors
             # suppressed, so track it explicitly instead of polling blind until
             # the budget runs out; try one refresh before giving up.
