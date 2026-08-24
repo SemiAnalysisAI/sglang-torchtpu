@@ -300,43 +300,46 @@ async def lifespan(fast_api_app: FastAPI):
         trace_set_thread_info(thread_label)
 
     # Initialize OpenAI serving handlers
-    fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
-        _global_state.tokenizer_manager, _global_state.template_manager
-    )
-    fast_api_app.state.openai_serving_chat = (
-        _global_state.tokenizer_manager.serving_chat_class(
+    if _global_state.tokenizer_manager is not None:
+        fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
             _global_state.tokenizer_manager, _global_state.template_manager
         )
-    )
-    fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
-        _global_state.tokenizer_manager, _global_state.template_manager
-    )
-    fast_api_app.state.openai_serving_classify = OpenAIServingClassify(
-        _global_state.tokenizer_manager, _global_state.template_manager
-    )
-    fast_api_app.state.openai_serving_score = OpenAIServingScore(
-        _global_state.tokenizer_manager
-    )
-    fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
-        _global_state.tokenizer_manager, _global_state.template_manager
-    )
-    fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
-        _global_state.tokenizer_manager, _global_state.template_manager
-    )
-    fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
-        _global_state.tokenizer_manager
-    )
-    fast_api_app.state.openai_serving_transcription = OpenAIServingTranscription(
-        _global_state.tokenizer_manager
-    )
+        fast_api_app.state.openai_serving_chat = (
+            _global_state.tokenizer_manager.serving_chat_class(
+                _global_state.tokenizer_manager, _global_state.template_manager
+            )
+        )
+        fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
+            _global_state.tokenizer_manager, _global_state.template_manager
+        )
+        fast_api_app.state.openai_serving_classify = OpenAIServingClassify(
+            _global_state.tokenizer_manager, _global_state.template_manager
+        )
+        fast_api_app.state.openai_serving_score = OpenAIServingScore(
+            _global_state.tokenizer_manager
+        )
+        fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
+            _global_state.tokenizer_manager, _global_state.template_manager
+        )
+        fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
+            _global_state.tokenizer_manager, _global_state.template_manager
+        )
+        fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
+            _global_state.tokenizer_manager
+        )
+        fast_api_app.state.openai_serving_transcription = OpenAIServingTranscription(
+            _global_state.tokenizer_manager
+        )
 
-    # Initialize Ollama-compatible serving handler
-    fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
+        # Initialize Ollama-compatible serving handler
+        fast_api_app.state.ollama_serving = OllamaServing(
+            _global_state.tokenizer_manager
+        )
 
-    # Initialize Anthropic-compatible serving handler
-    fast_api_app.state.anthropic_serving = AnthropicServing(
-        fast_api_app.state.openai_serving_chat
-    )
+        # Initialize Anthropic-compatible serving handler
+        fast_api_app.state.anthropic_serving = AnthropicServing(
+            fast_api_app.state.openai_serving_chat
+        )
 
     # Launch tool server
     tool_server = None

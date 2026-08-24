@@ -28,12 +28,15 @@ class OpenAIServingBase(ABC):
 
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
+        server_args = (
+            getattr(self.tokenizer_manager, "server_args", None)
+            if self.tokenizer_manager is not None
+            else None
+        )
         self.allowed_custom_labels = (
-            set(
-                self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
-            )
-            if isinstance(self.tokenizer_manager.server_args, ServerArgs)
-            and self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
+            set(server_args.tokenizer_metrics_allowed_custom_labels)
+            if isinstance(server_args, ServerArgs)
+            and server_args.tokenizer_metrics_allowed_custom_labels
             else None
         )
 

@@ -128,7 +128,9 @@ class MiniLoadBalancer:
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
-                total=self.timeout
+                total=self.timeout,
+                sock_read=self.timeout,
+                sock_connect=300,
             )  # Add timeout for request reliability
         ) as session:
 
@@ -182,7 +184,9 @@ class MiniLoadBalancer:
         async def stream_results():
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(
-                    total=self.timeout
+                    total=self.timeout,
+                    sock_read=self.timeout,
+                    sock_connect=300,
                 )  # Add timeout for request reliability
             ) as session:
                 # Create the tasks for both prefill and decode requests
