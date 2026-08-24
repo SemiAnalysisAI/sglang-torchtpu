@@ -483,6 +483,18 @@ def _run_all():
 
 
 if __name__ == "__main__":
-    if ARGS.combo == "all":
-        sys.exit(_run_all())
-    unittest.main(argv=[sys.argv[0], *UNITTEST_ARGS], verbosity=2)
+    # Temporary validation routing for the fused-RS/TopK reproducer branch.
+    repro_cases = {
+        "1": ["--tokens", "5248"],
+        "2": ["--tokens", "5120", "--distributed-top-k"],
+        "3": ["--tokens", "5248", "--distributed-top-k"],
+    }
+    sys.exit(
+        subprocess.call(
+            [
+                sys.executable,
+                "test/manual/tpu/repro_fused_rs_distributed_topk_halt.py",
+                *repro_cases[COMBO],
+            ]
+        )
+    )
