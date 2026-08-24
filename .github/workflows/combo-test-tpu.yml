@@ -5,7 +5,8 @@
 # Both run in the `nightly` lane (topology.yaml), same pools as nightly-test-tpu.yml.
 # The same layers run nightly (nightly-test-tpu.yml); this action is the isolated
 # trigger:
-#   gh workflow run combo-test-tpu.yml [-f target=singlehost|multihost|pd|spec] \
+#   gh workflow run combo-test-tpu.yml \
+#     [-f target=singlehost|multihost|pd|spec|fused-rs-topk-repro] \
 #     [-f singlehost_model=qwen3-1.7b|qwen3-coder-480b] \
 #     [-f singlehost_combo=1|2|3|all] [-f ref=<branch>]
 name: Combo Test (TPU)
@@ -22,7 +23,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, singlehost, multihost, pd, spec]
+        options: [all, singlehost, multihost, pd, spec, fused-rs-topk-repro]
       singlehost_model:
         description: "Model profile for the single-host combos"
         required: false
@@ -94,6 +95,38 @@ jobs:
             || 'python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec' }}
       weights_pvc: model-weights-rox
       run_name: multihost-combo-test-${{ matrix.row }}
+    permissions:
+      contents: read
+      id-token: write
+
+  fused-rs-topk-repro:
+    needs: build
+    if: ${{ inputs.target == 'fused-rs-topk-repro' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: full-vocabulary-m41984-control
+            tokens: 5248
+            topk_arg: ""
+          - label: distributed-topk-m40960-control
+            tokens: 5120
+            topk_arg: --distributed-top-k
+          - label: distributed-topk-m41984-repro
+            tokens: 5248
+            topk_arg: --distributed-top-k
+    name: ${{ matrix.label }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      exec_cmd: >-
+        env SGLANG_PLATFORM=tpu python3
+        test/manual/tpu/repro_fused_rs_distributed_topk_halt.py
+        --tokens ${{ matrix.tokens }} ${{ matrix.topk_arg }}
+      run_name: ${{ matrix.label }}
     permissions:
       contents: read
       id-token: write
