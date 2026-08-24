@@ -213,7 +213,7 @@ class SWAComponent(TreeComponent):
             cd = node.component_data[ct]
             if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
-                if rebuild_swa_on_hit and (node.backuped or not node.evicted):
+                if rebuild_swa_on_hit:
                     return True
                 return False
             state["len"] += len(node.key)
