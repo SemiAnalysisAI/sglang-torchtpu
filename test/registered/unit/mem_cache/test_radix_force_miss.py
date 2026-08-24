@@ -44,6 +44,36 @@ class _StubReq:
         return max(input_len - 1, 0)
 
 
+class _TailHoldbackTree:
+    def __init__(self, reprefill_tail):
+        self.reprefill_tail = reprefill_tail
+        self.match_params = None
+        self.root = object()
+
+    def swa_reprefill_tail_tokens(self):
+        return self.reprefill_tail
+
+    def match_prefix(self, params):
+        self.match_params = params
+        return MatchResult(
+            device_indices=torch.empty((0,), dtype=torch.int64),
+            last_device_node=self.root,
+            last_host_node=self.root,
+            best_match_node=self.root,
+        )
+
+
+class TestMatchPrefixForReqSWAHoldback(unittest.TestCase):
+    def test_caps_match_before_one_window_tail(self):
+        for input_len, expected_limit in ((2051, 3), (1024, 0)):
+            with self.subTest(input_len=input_len):
+                tree = _TailHoldbackTree(reprefill_tail=2048)
+                req = _StubReq(range(input_len))
+                with envs.SGLANG_RADIX_FORCE_MISS.override(False):
+                    match_prefix_for_req(tree, req)
+                self.assertEqual(tree.match_params.key.limit, expected_limit)
+
+
 class TestZeroMatchResult(unittest.TestCase):
     def test_zero_replaces_indices_and_nodes(self):
         tree = RadixCache.create_simulated()

@@ -107,6 +107,7 @@ class CacheConfig:
 
     # SWA
     sliding_window_size: Optional[int] = None
+    swa_kv_size: Optional[int] = None
 
     # Mamba
     enable_mamba_extra_buffer: bool = False
@@ -352,9 +353,10 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
         )
 
     if cfg.has_swa:
+        swa_kv_size = cfg.swa_kv_size or cfg.kv_size
         kv_pool = SWAKVPool(
             size=cfg.kv_size,
-            size_swa=cfg.kv_size,
+            size_swa=swa_kv_size,
             page_size=cfg.page_size,
             dtype=cfg.dtype,
             head_num=cfg.head_num,
@@ -365,7 +367,7 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
         )
         allocator = SWATokenToKVPoolAllocator(
             size=cfg.kv_size,
-            size_swa=cfg.kv_size,
+            size_swa=swa_kv_size,
             page_size=cfg.page_size,
             dtype=cfg.dtype,
             device=device,
@@ -426,6 +428,97 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
     cache.cache_init_params = cache_init_params
 
     return cache, allocator, req_to_token_pool
+
+
+class TestUnifiedRadixCacheSWAPrefixRetention(CustomTestCase):
+    cfg = CacheConfig(
+        page_size=1,
+        components=(ComponentType.FULL, ComponentType.SWA),
+        sliding_window_size=4,
+        kv_size=32,
+        swa_kv_size=16,
+        max_context_len=32,
+    )
+
+    def _cache_finished_prefix(self, cache, allocator, req_to_token_pool, tokens):
+        req = Req(
+            rid=f"prefix-{tokens[0]}",
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req_to_token_pool.alloc([req])
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(tokens))
+        req.kv_committed_len = len(tokens)
+        req.kv = ReqKvInfo(kv_allocated_len=len(tokens), swa_evicted_seqlen=0)
+        req.last_node = cache.root_node.id
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+
+        kv_indices = allocator.alloc(len(tokens))
+        self.assertIsNotNone(kv_indices)
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+        cache.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
+        )
+
+        return req
+
+    def test_finished_prefixes_keep_full_kv_but_only_one_swa_window(self):
+        with mock.patch(f"{__name__}.get_device", return_value="cpu"):
+            cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        full_available = allocator.full_available_size()
+        swa_available = allocator.swa_available_size()
+        prefixes = [list(range(start, start + 8)) for start in (1, 101, 201)]
+
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            for tokens in prefixes:
+                req = self._cache_finished_prefix(
+                    cache, allocator, req_to_token_pool, tokens
+                )
+                self.assertEqual(req.kv.swa_evicted_seqlen, 4)
+            self.assertEqual(allocator.full_available_size(), full_available - 24)
+            self.assertEqual(allocator.swa_available_size(), swa_available - 12)
+            for tokens in prefixes:
+                match = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens)))
+                )
+                self.assertEqual(len(match.device_indices), len(tokens))
+                capped_match = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens), limit=4))
+                )
+                self.assertEqual(len(capped_match.device_indices), 4)
+            cache.sanity_check()
+
+    def test_reclaimed_hybrid_swa_rebuilds_one_window_after_a_hit(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.components = {
+            ComponentType.SWA: mock.Mock(sliding_window_size=2048),
+        }
+        cache.cache_controller = None
+
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            self.assertEqual(cache.swa_reprefill_tail_tokens(), 2048)
+
+    def test_plain_hybrid_swa_preserves_existing_hit_behavior(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.components = {
+            ComponentType.SWA: mock.Mock(sliding_window_size=2048),
+        }
+        cache.cache_controller = None
+
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(False):
+            self.assertEqual(cache.swa_reprefill_tail_tokens(), 0)
+
+    def test_non_swa_cache_has_no_reprefill_holdback(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.components = {}
+        cache.cache_controller = None
+
+        self.assertEqual(cache.swa_reprefill_tail_tokens(), 0)
 
 
 class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):

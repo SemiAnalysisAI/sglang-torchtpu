@@ -687,6 +687,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
 
+            if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+                for comp in self._components_tuple:
+                    comp.free_out_of_window_slots(
+                        req, effective_cache_len, insert_params
+                    )
+
             # Truncate if needed; the tail free is deferred and batched with
             # the unaligned tail below so a shared boundary page is emitted once.
             kv_indices_full = kv_indices
@@ -2077,21 +2083,34 @@ class UnifiedRadixCache(BasePrefixCache):
         return self._sliding_window_size
 
     def swa_reprefill_tail_tokens(self) -> int:
-        """
-        Only unified_kv + HiCache needs this: SWA lives in a per-request ring
-        (state_slot/pos), not content-stable and never offloaded to host, so a
-        reused prefix's trailing sliding window would read another request's
-        stale ring slots. Re-prefilling that window rewrites this request's ring
-        (what plain radix reuse does via its SWA match gate). 0 for every other
-        layout.
+        """Return the SWA tail that must be rebuilt after a prefix-cache hit.
+
+        Plain hybrid-SWA radix reuse keeps old Full KV while reclaiming SWA KV
+        outside the active window. Reusing the cached active SWA tail is not
+        content-equivalent to cold prefill on TPU. Hold back one complete window
+        so its SWA metadata and KV are rebuilt for the current request.
+
+        Enable this for caches that reclaim out-of-window SWA pages and for the
+        existing HiCache layout whose SWA ring is never stored in the host pool.
         """
         swa = self.components.get(ComponentType.SWA)
+        if swa is None:
+            return 0
+
         unified_compress_only_hicache = (
-            self.cache_controller is not None
-            and swa is not None
-            and not self.tree_core.has_swa_host_pool
+            self.cache_controller is not None and not self.tree_core.has_swa_host_pool
         )
-        return swa.sliding_window_size if unified_compress_only_hicache else 0
+        rebuild_swa_on_hit = (
+            envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
+            or unified_compress_only_hicache
+        )
+        if not rebuild_swa_on_hit:
+            return 0
+        if swa.sliding_window_size is None:
+            raise RuntimeError(
+                "UnifiedRadixCache has an SWA component without a sliding window"
+            )
+        return swa.sliding_window_size
 
     def supports_swa(self) -> bool:
         return self.is_swa_enabled

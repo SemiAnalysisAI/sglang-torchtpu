@@ -204,19 +204,16 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         state = {"len": float("inf")}
 
-        # unified_kv never caches the SWA ring (per-request, not content-stable),
-        # so SWA bookkeeping must not gate the match here.
-        swa_device_only_hicache = (
-            not self.tree_core.has_swa_host_pool and self.tree_core.enable_hicache
-        )
+        # The scheduler holds back one complete SWA window and rebuilds it for
+        # every hit. A tombstone before that boundary must therefore not reject
+        # otherwise-resident Full KV.
+        rebuild_swa_on_hit = self.cache.swa_reprefill_tail_tokens() > 0
 
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
-            # HiCache: a host-only tombstone is a valid match boundary too
-            # — load_back will restore SWA from host before use.
             if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
-                if swa_device_only_hicache and (node.backuped or not node.evicted):
+                if rebuild_swa_on_hit and (node.backuped or not node.evicted):
                     return True
                 return False
             state["len"] += len(node.key)
@@ -739,8 +736,8 @@ class SWAComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
-        # Unfinished requests can already have an SWA-evicted prefix; preserve
-        # that boundary so insertion creates a tombstone instead of live SWA KV.
+        # Requests can already have an SWA-evicted prefix; preserve that boundary
+        # so insertion creates a tombstone instead of live SWA KV.
         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
         return None
 
