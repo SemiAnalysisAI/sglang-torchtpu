@@ -65,6 +65,20 @@ class TestTpuVocabShardFullgraphCompile(CustomTestCase):
         torch.testing.assert_close(compiled(values), build_and_read(values))
 
 
+def _skip_if_not_tp8() -> bool:
+    try:
+        import importlib.util
+
+        if importlib.util.find_spec("torch_tpu") is None:
+            return True
+        from torch_tpu._internal.utils import hardware
+
+        return hardware.get_tpu_device_count() < 8
+    except Exception:
+        return True
+
+
+@unittest.skipIf(_skip_if_not_tp8(), "Requires 8 TPU devices (TP8)")
 class TestDistributedTopKSampling(CustomTestCase):
     """Run exactness and paired latency checks on a physical TPU v7 TP8.
     A subprocess owns the complete distributed runtime for test isolation."""
