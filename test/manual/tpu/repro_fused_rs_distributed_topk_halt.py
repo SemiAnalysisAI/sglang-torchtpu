@@ -113,8 +113,6 @@ def main() -> None:
             "fp8",
             "--kv-cache-dtype",
             "fp8_e4m3",
-            "--sampling-backend",
-            "tpu",
             "--tp-size",
             "8",
             "--ep-size",
