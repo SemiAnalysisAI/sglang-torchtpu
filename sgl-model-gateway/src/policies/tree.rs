@@ -1125,7 +1125,10 @@ mod tests {
             tree.get_used_size_per_tenant().is_empty(),
             "cold matches must not attach a tenant to any node"
         );
-        assert_eq!(get_maintained_counts(&tree), tree.get_used_size_per_tenant());
+        assert_eq!(
+            get_maintained_counts(&tree),
+            tree.get_used_size_per_tenant()
+        );
 
         // Same for a node that lost its last tenant. Matching "hello" while tenant1 still
         // owns the root populates the root's `last_tenant` cache, and `remove_tenant` does
@@ -1138,7 +1141,10 @@ mod tests {
             assert_eq!(tenant, "empty");
         }
         assert!(!tree.get_used_size_per_tenant().contains_key("empty"));
-        assert_eq!(get_maintained_counts(&tree), tree.get_used_size_per_tenant());
+        assert_eq!(
+            get_maintained_counts(&tree),
+            tree.get_used_size_per_tenant()
+        );
     }
 
     #[test]
