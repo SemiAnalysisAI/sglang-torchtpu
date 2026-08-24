@@ -35,10 +35,10 @@ Run one model profile per invocation on hardware:
 
 Without CI_PD_ROLE the file runs only its host-side configuration tests.
 """
+
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -51,23 +51,36 @@ from typing import Any, Dict, Mapping, Optional, Tuple, Union
 try:
     import msgspec
 except ModuleNotFoundError:
+
     class _MsgspecShim:
         class Struct:
             def __init_subclass__(cls, **kwargs):
                 super().__init_subclass__()
+
                 def _init(self, **kw):
                     for base in reversed(cls.__mro__):
                         for k, v in base.__dict__.items():
-                            if not k.startswith("_") and not callable(v) and not isinstance(v, (property, classmethod, staticmethod)):
+                            if (
+                                not k.startswith("_")
+                                and not callable(v)
+                                and not isinstance(
+                                    v, (property, classmethod, staticmethod)
+                                )
+                            ):
                                 setattr(self, k, v)
                     for k, v in kw.items():
                         setattr(self, k, v)
+
                 cls.__init__ = _init
 
         @staticmethod
         def to_builtins(obj):
             if hasattr(obj, "__dict__"):
-                return {k: _MsgspecShim.to_builtins(v) for k, v in obj.__dict__.items() if not k.startswith("_")}
+                return {
+                    k: _MsgspecShim.to_builtins(v)
+                    for k, v in obj.__dict__.items()
+                    if not k.startswith("_")
+                }
             return obj
 
     msgspec = _MsgspecShim()
@@ -493,9 +506,7 @@ class GenerationRecord(msgspec.Struct, frozen=True, kw_only=True):
     latency_seconds: float
 
 
-def _generate(
-    base_url: str, prompt: str, max_new_tokens: int = 32
-) -> GenerationRecord:
+def _generate(base_url: str, prompt: str, max_new_tokens: int = 32) -> GenerationRecord:
     started = time.perf_counter()
     req = urllib.request.Request(
         base_url.rstrip("/") + "/generate",
