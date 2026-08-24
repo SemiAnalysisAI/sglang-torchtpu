@@ -20,17 +20,17 @@ on:
       ref:
         description: "Git ref to test"
         required: false
-        default: chenjincheng/combo-test-mh-pd-resharding
+        default: main
       suite:
         description: "Which integration test suite to run"
         required: false
-        default: pd_tp_resharding
+        default: all
         type: choice
         options: [all, pd_prefix_caching_kv_offload, pd_tp_resharding]
       model:
         description: "Which model profile(s) to run"
         required: false
-        default: qwen3_coder_480b
+        default: all
         type: choice
         options: [all, qwen3_coder_480b, gpt_oss_120b]
 
@@ -42,7 +42,7 @@ jobs:
   build:
     uses: ./.github/workflows/_tpu-build.yml
     with:
-      ref: ${{ inputs.ref || 'chenjincheng/combo-test-mh-pd-resharding' }}
+      ref: ${{ inputs.ref || 'main' }}
     permissions:
       contents: read
       id-token: write
@@ -59,7 +59,7 @@ jobs:
     name: pd-prefix-caching-kv-offload-${{ matrix.model }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
-      ref: ${{ inputs.ref || 'chenjincheng/combo-test-mh-pd-resharding' }}
+      ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
       hosts: 2
       lane: nightly
@@ -84,9 +84,13 @@ jobs:
     name: pd-tp-resharding-${{ matrix.model }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
-      ref: ${{ inputs.ref || 'chenjincheng/combo-test-mh-pd-resharding' }}
+      ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
+      # hosts feeds only the slice concurrency group; the P/D topology below
+      # sizes the JobSet (2-host prefill slice + 2-host decode slice).
       hosts: 2
+      # The nightly lane is the only one owning two 2x2x2 slices, which is what a
+      # prefill engine and a decode engine need at the same time.
       lane: nightly
       pd_prefill_hosts: 2
       pd_decode_hosts: 2
