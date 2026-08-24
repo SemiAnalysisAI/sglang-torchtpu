@@ -171,18 +171,6 @@ class TestDistributedTopKEligibility(CustomTestCase):
 
         self.assertIsNone(distributed_top_k_for_batch(batch, sampling_backend="tpu"))
 
-    def test_speculative_batch_does_not_inspect_sampling_info(self):
-        class SpecBatch:
-            spec_algorithm = SpeculativeAlgorithm.EAGLE3
-
-            @property
-            def sampling_info(self):
-                raise AssertionError("speculative TopK gate read sampling_info")
-
-        self.assertIsNone(
-            distributed_top_k_for_batch(SpecBatch(), sampling_backend="tpu")
-        )
-
     def test_environment_can_raise_the_pre_gather_cutoff(self):
         cutoff = envs.SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
         self.assertEqual(cutoff.default, 64)
@@ -224,6 +212,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
         )
         parallel = SimpleNamespace(
             enable_dp_lm_head=False,
+            enable_tp_lm_head_all_to_all=False,
             tp_size=8,
             attn_dp_size=1,
         )

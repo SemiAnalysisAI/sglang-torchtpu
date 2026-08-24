@@ -329,8 +329,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         self.speculative_step_id = speculative_step_id
         self.page_size = model_runner.page_size
         self.max_context_len = (
-            model_runner.model_config.context_len
-            + get_req_to_token_extra_context_len(model_runner.server_args)
+            model_runner.model_config.context_len + get_req_to_token_extra_context_len()
         )
         self.req_to_token_pool = model_runner.req_to_token_pool
         req_to_token_width = self.req_to_token_pool.req_to_token.shape[1]

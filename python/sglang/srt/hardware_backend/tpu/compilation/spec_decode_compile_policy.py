@@ -219,12 +219,7 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
         bs = self._extend_compile_cap()
-        valid_shapes = [
-            (t, bs, has_spec_info)
-            for t in self.t_bucketer.buckets
-            if t >= bs
-            for has_spec_info in (False, True)
-        ]
+        valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
         logger.info(
             "[spec compile policy] EXTEND(FULL): %d shapes "
             "(bs=%d, token_buckets=%s)",
@@ -241,7 +236,7 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
             if get_parallel().tp_rank == 0
             else valid_shapes
         )
-        for num_tokens, bs, has_spec_info in compile_range:
+        for num_tokens, bs in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             self._run_one(
@@ -249,15 +244,14 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
                 bs=bs,
                 mode=ForwardMode.EXTEND,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
-                spec_info=self._make_null_spec_info() if has_spec_info else None,
+                spec_info=self._make_null_spec_info(),
             )
             if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
-                    f"Compiled EXTEND(FULL) (tokens={num_tokens}, bs={bs}, "
-                    f"spec_info={'set' if has_spec_info else 'none'})"
+                    f"Compiled EXTEND(FULL) (tokens={num_tokens}, bs={bs})"
                     f" in {elapsed:.1f}s{hbm_str}"
                 )
 
