@@ -54,7 +54,7 @@ jobs:
 
   singlehost-combo:
     needs: build
-    if: ${{ contains(fromJSON('["all","singlehost"]'), inputs.target || 'all') }}
+    if: ${{ (inputs.target || 'all') == 'all' }}
     name: singlehost-combo-test
     uses: ./.github/workflows/_tpu-test.yml
     with:
@@ -101,7 +101,7 @@ jobs:
 
   fused-rs-topk-repro:
     needs: build
-    if: ${{ inputs.target == 'fused-rs-topk-repro' }}
+    if: ${{ inputs.target == 'singlehost' }}
     strategy:
       fail-fast: false
       matrix:
