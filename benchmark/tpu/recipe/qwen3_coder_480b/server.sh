@@ -11,12 +11,12 @@ export MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-$((CONCUR * CONTEXT_LEN))}
 CHUNK=${CHUNK:-$ISL}
 
 export MODEL=${MODEL:-Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8}
-export TP_SIZE=8
-export EP_SIZE=8
-export QUANTIZATION=fp8
-export KV_CACHE_DTYPE=fp8_e4m3
+export TP_SIZE=${TP_SIZE:-8}
+export EP_SIZE=${EP_SIZE:-8}
+export QUANTIZATION=${QUANTIZATION:-fp8}
+export KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8_e4m3}
 export ATTENTION_BACKEND=${ATTENTION_BACKEND:-pallas_tpu_rpa_batched}
-export PAGE_SIZE=256
+export PAGE_SIZE=${PAGE_SIZE:-256}
 # The batched RPA kernel needs dynamic SMEM negotiation. Without it the
 # kernel's DMA pipeline serializes and runs much slower.
 export TORCH_TPU_INTERNAL_XLA_OPTIONS="xla_tpu_use_dynamic_smem_negotiation=true${TORCH_TPU_INTERNAL_XLA_OPTIONS:+ $TORCH_TPU_INTERNAL_XLA_OPTIONS}"

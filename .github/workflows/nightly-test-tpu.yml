@@ -72,6 +72,38 @@ jobs:
       contents: read
       id-token: write
 
+  # Keep the large-model feature gate in separate jobs. Each model gets an
+  # independent result and server lifecycle while sharing the nightly build.
+  prefix-caching-kv-offload:
+    needs: build
+    if: ${{ (inputs.only || 'all') == 'all' || inputs.only == 'integration' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: gpt_oss_120b
+            model_env: GPT_OSS_MODEL
+            model_path: /weights/gpt-oss-120b
+          - profile: qwen3_coder_480b
+            model_env: QWEN3_CODER_MODEL
+            model_path: /weights/Qwen3-Coder-480B-A35B-Instruct-FP8
+    name: prefix-caching-kv-offload-${{ matrix.profile }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      exec_cmd: >-
+        env MODEL_PROFILE=${{ matrix.profile }}
+        ${{ matrix.model_env }}=${{ matrix.model_path }}
+        python3 test/registered/tpu/integration/test_prefix_caching_kv_offload.py
+      weights_pvc: model-weights-rox
+      run_name: sh-kvoff-${{ matrix.profile }}
+    permissions:
+      contents: read
+      id-token: write
+
   # Feature-combination layers: same exec-mode runs as the standalone
   # combo-test-tpu.yml action; these jobs add nightly cadence.
   singlehost-combo:
