@@ -799,7 +799,15 @@ class CommonKVManager(BaseKVManager):
             sock = self._zmq_ctx.socket(zmq.PUSH)
             if is_ipv6:
                 sock.setsockopt(zmq.IPV6, 1)
-            sock.setsockopt(zmq.RECONNECT_IVL, -1)
+            # Retry with backoff rather than RECONNECT_IVL=-1. The rebuild path
+            # above is driven by EVENT_DISCONNECTED, which libzmq only raises for
+            # a connection that was established and then dropped -- an initial
+            # connect that never completes emits no event, so with retries off
+            # nothing ever revives the socket. PUSH does not block in that state
+            # either: connect() creates the pipe up front, so send() queues and
+            # returns success while the bytes sit undeliverable forever.
+            sock.setsockopt(zmq.RECONNECT_IVL, 100)
+            sock.setsockopt(zmq.RECONNECT_IVL_MAX, 5000)
             sock.setsockopt(zmq.SNDTIMEO, 30000)
             sock.setsockopt(zmq.LINGER, 0)
             sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
