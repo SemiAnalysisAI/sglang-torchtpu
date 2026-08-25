@@ -636,6 +636,29 @@ def _kill(proc: Optional[subprocess.Popen]) -> None:
         pass
 
 
+def _start_host_watch() -> None:
+    """[probe] Stream kernel kill evidence and host-memory headroom to stdout.
+
+    A rank that dies without a Python traceback leaves nothing in the pod log;
+    the kernel ring buffer (OOM kills, segfaults) and the memory slope are the
+    only way to tell an OOM kill from a native abort. Privileged CI pods can
+    read the host ring buffer.
+    """
+    script = (
+        "(dmesg -w 2>/dev/null || echo '[hostwatch] dmesg unavailable') | "
+        "grep --line-buffered -iE "
+        "'out of memory|oom|killed process|segfault|hostwatch' | "
+        "sed -u 's/^/[hostwatch:dmesg] /' & "
+        "while :; do "
+        "echo \"[hostwatch:mem] $(grep -E 'MemTotal|MemAvailable' /proc/meminfo"
+        " | tr -s ' \\n' ' ')\"; "
+        "ps -eo rss,pid,comm --sort=-rss | head -4 | tail -3 | "
+        "sed 's/^/[hostwatch:rss] /'; "
+        "sleep 20; done"
+    )
+    subprocess.Popen(["bash", "-c", script], start_new_session=True)
+
+
 def _http_ok(url: str, timeout: int = 5) -> bool:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
@@ -961,6 +984,7 @@ if __name__ == "__main__":
         sys.argv = [sys.argv[0], "TestPdIntegrationConfiguration"]
         unittest.main(verbosity=2)
     topology = PodTopology.from_env()
+    _start_host_watch()
     if not topology.is_leader:
         sys.exit(_serve_role(topology, select_profile(E("MODEL_PROFILE", ""))))
     sys.argv = [sys.argv[0], "TestPdPrefixCachingKvOffload"]
