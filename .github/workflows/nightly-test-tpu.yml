@@ -23,7 +23,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, single-host, integration, multihost, combo, singlehost-combo, multihost-combo, perf]
+        options: [all, single-host, integration, pd-integration, multihost, combo, singlehost-combo, multihost-combo, perf]
 
 concurrency:
   group: tpu-slice-nightly
@@ -68,6 +68,51 @@ jobs:
       nightly: true
       weights_pvc: model-weights-rox
       timeout_per_file: 16200
+    permissions:
+      contents: read
+      id-token: write
+
+  # P/D disaggregation integration tests: same JobSets as the standalone
+  # integration-test-tpu.yml action, which is workflow_dispatch-only. Only
+  # SCHEDULED runs are ingested by the CI dashboard, so a dispatch-only test
+  # never earns a history row -- this job is what gives these two a nightly
+  # cadence and therefore a green/red trend.
+  pd-integration:
+    needs: build
+    if: ${{ contains(fromJSON('["all","pd-integration"]'), inputs.only || 'all') }}
+    strategy:
+      fail-fast: false
+      # Each row holds BOTH 2x2x2 nightly slices at once (one per engine role),
+      # i.e. the whole tpu-nightly-2h quota, so the rows cannot overlap -- and
+      # they serialize behind multihost/multihost-combo, which draw on the same
+      # queue. See the runner-cap gap in .github/tpu-ci/README.md.
+      max-parallel: 1
+      matrix:
+        include:
+          - name: pd-kvoff
+            model: gpt_oss_120b
+            file: test/registered/tpu/integration/test_pd_prefix_caching_kv_offload.py
+          - name: pd-tpreshard
+            model: qwen3_coder_480b
+            file: test/registered/tpu/integration/test_pd_tp_resharding.py
+    name: ${{ matrix.name }}-${{ matrix.model }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      # hosts feeds only the slice concurrency group; the P/D topology below
+      # sizes the JobSet (2-host prefill slice + 2-host decode slice).
+      hosts: 2
+      # The nightly lane is the only one owning two 2x2x2 slices, which is what
+      # a prefill engine and a decode engine need at the same time.
+      lane: nightly
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: env MODEL_PROFILE=${{ matrix.model }} python3 ${{ matrix.file }}
+      # Names the dashboard row and the TIMINGS record; required in P/D mode.
+      files: ${{ matrix.file }}
+      weights_pvc: model-weights-rox
+      run_name: ${{ matrix.name }}-${{ matrix.model }}
     permissions:
       contents: read
       id-token: write
