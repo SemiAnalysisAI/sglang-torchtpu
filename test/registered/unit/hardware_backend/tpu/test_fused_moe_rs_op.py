@@ -115,6 +115,80 @@ class TestFusedMoeRsOp(CustomTestCase):
         torch.testing.assert_close(output, torch.arange(8).reshape(8, 1))
         tp_group.all_gather.assert_called_once_with(token_shard, dim=0)
 
+    def test_identity_layout_returns_local_shard_without_gather(self):
+        tp_group = Mock(world_size=8)
+        token_shard = torch.tensor([[3]])
+
+        with (
+            patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
+            patch.object(
+                fused_moe_rs_op,
+                "fused_moe_rs_call",
+                return_value=token_shard,
+            ),
+        ):
+            output = fused_moe_rs_op.fused_moe_rs_gather(
+                hidden_states=torch.zeros(8, 1),
+                w1=torch.empty(1),
+                w2=torch.empty(1),
+                w1_scale=torch.empty(1),
+                w2_scale=torch.empty(1),
+                topk_weights=torch.empty(1),
+                topk_ids=torch.empty(1),
+                post_expert_norm_weight=torch.empty(1),
+                group_offset=torch.empty(1),
+                topk=1,
+                activation="silu",
+                has_post_expert_norm=False,
+                fp8_direct_write=False,
+                physical_order_to_tp_rank=torch.arange(8),
+                keep_token_shard=True,
+                identity_rank_order=True,
+                logical_tp_rank=3,
+            )
+
+        self.assertIs(output, token_shard)
+        tp_group.all_gather.assert_not_called()
+
+    def test_permuted_layout_falls_back_and_selects_logical_shard(self):
+        rank_order_shards = torch.tensor([[0], [1], [4], [5], [6], [7], [2], [3]])
+        physical_order_to_tp_rank = torch.tensor([0, 1, 6, 7, 2, 3, 4, 5])
+        tp_group = Mock(
+            world_size=8,
+            all_gather=Mock(return_value=rank_order_shards),
+        )
+
+        with (
+            patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
+            patch.object(
+                fused_moe_rs_op,
+                "fused_moe_rs_call",
+                return_value=torch.zeros(1, 1),
+            ),
+        ):
+            output = fused_moe_rs_op.fused_moe_rs_gather(
+                hidden_states=torch.zeros(8, 1),
+                w1=torch.empty(1),
+                w2=torch.empty(1),
+                w1_scale=torch.empty(1),
+                w2_scale=torch.empty(1),
+                topk_weights=torch.empty(1),
+                topk_ids=torch.empty(1),
+                post_expert_norm_weight=torch.empty(1),
+                group_offset=torch.empty(1),
+                topk=1,
+                activation="silu",
+                has_post_expert_norm=False,
+                fp8_direct_write=False,
+                physical_order_to_tp_rank=physical_order_to_tp_rank,
+                keep_token_shard=True,
+                identity_rank_order=False,
+                logical_tp_rank=6,
+            )
+
+        torch.testing.assert_close(output, torch.tensor([[6]]))
+        tp_group.all_gather.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

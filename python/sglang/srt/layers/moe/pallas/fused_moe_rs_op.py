@@ -64,6 +64,9 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
         "_tpu_fused_rs_physical_order", physical_order_tensor, persistent=False
     )
     layer.register_buffer("_tpu_fused_rs_group_offset", group_offset, persistent=False)
+    layer._tpu_fused_rs_identity_rank_order = physical_order == tuple(
+        range(len(physical_order))
+    )
     _build_fused_moe_rs_op()
 
 
@@ -223,6 +226,9 @@ def fused_moe_rs_gather(
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
     physical_order_to_tp_rank: torch.Tensor,
+    keep_token_shard: bool = False,
+    identity_rank_order: bool = False,
+    logical_tp_rank: int = 0,
 ) -> torch.Tensor:
     from sglang.srt.distributed import get_tp_group
 
@@ -241,8 +247,18 @@ def fused_moe_rs_gather(
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=fp8_direct_write,
     )
+    # Direct-write destinations use physical TPU IDs. On an identity layout,
+    # the local result is already this process's logical TP shard. A permuted
+    # layout uses the established gather/reorder fallback before selecting the
+    # requested logical shard.
+    if keep_token_shard and identity_rank_order:
+        return token_shard
     output = get_tp_group().all_gather(token_shard, dim=0)
     shard_tokens = token_shard.shape[0]
-    return output.reshape(
+    output = output.reshape(
         physical_order_to_tp_rank.shape[0], shard_tokens, output.shape[-1]
     )[physical_order_to_tp_rank].reshape(-1, output.shape[-1])
+    if keep_token_shard:
+        start = logical_tp_rank * shard_tokens
+        return output[start : start + shard_tokens].contiguous()
+    return output

@@ -203,6 +203,17 @@ def _apply_fp8_fused_rs(
     )
     w1_scale = layer.w13_weight_scale_inv if block_quantized else layer.w13_weight_scale
     w2_scale = layer.w2_weight_scale_inv if block_quantized else layer.w2_weight_scale
+    keep_token_shard = bool(
+        getattr(layer, "use_tpu_fused_rs_sequence_parallel", lambda: False)()
+    )
+    logical_tp_rank = 0
+    tp_world_size = int(layer._tpu_fused_rs_physical_order.shape[0])
+    if keep_token_shard:
+        from sglang.srt.distributed import get_tp_group
+
+        tp_group = get_tp_group()
+        logical_tp_rank = tp_group.rank_in_group
+        tp_world_size = tp_group.world_size
 
     result = fused_moe_rs_gather(
         hidden_states=x,
@@ -222,5 +233,9 @@ def _apply_fp8_fused_rs(
         # reducing the subsequent collective's traffic.
         fp8_direct_write=False,
         physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
+        keep_token_shard=keep_token_shard,
+        identity_rank_order=getattr(layer, "_tpu_fused_rs_identity_rank_order", False),
+        logical_tp_rank=logical_tp_rank,
     )
-    return StandardCombineInput(hidden_states=result[: x.shape[0]])
+    output_rows = x.shape[0] // tp_world_size if keep_token_shard else x.shape[0]
+    return StandardCombineInput(hidden_states=result[:output_rows])

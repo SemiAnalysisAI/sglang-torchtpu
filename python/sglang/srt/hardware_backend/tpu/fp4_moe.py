@@ -365,6 +365,23 @@ def apply_tpu_nvfp4_moe(
             if has_post_expert_norm
             else hidden_states.new_zeros((1,))
         )
+        keep_token_shard = bool(
+            getattr(layer, "use_tpu_fused_rs_sequence_parallel", lambda: False)()
+        )
+        # Each fused-RS call partitions its own row range. Multiple 1K calls
+        # would interleave logical shards, so larger shapes retain the proven
+        # replicated gather and let the model take one contiguous shard.
+        keep_token_shard = (
+            keep_token_shard and hidden_states.shape[0] <= _FUSED_RS_MAX_TOKENS_PER_CALL
+        )
+        logical_tp_rank = 0
+        tp_world_size = int(layer._tpu_fused_rs_physical_order.shape[0])
+        if keep_token_shard:
+            from sglang.srt.distributed import get_tp_group
+
+            tp_group = get_tp_group()
+            logical_tp_rank = tp_group.rank_in_group
+            tp_world_size = tp_group.world_size
         outputs = []
         for token_start in range(
             0, hidden_states.shape[0], _FUSED_RS_MAX_TOKENS_PER_CALL
@@ -392,8 +409,16 @@ def apply_tpu_nvfp4_moe(
                 # re-quantize an already-lossy intermediate.
                 fp8_direct_write=False,
                 physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
+                keep_token_shard=keep_token_shard,
+                identity_rank_order=getattr(
+                    layer, "_tpu_fused_rs_identity_rank_order", False
+                ),
+                logical_tp_rank=logical_tp_rank,
             )
-            outputs.append(output[: token_end - token_start])
+            output_rows = token_end - token_start
+            if keep_token_shard:
+                output_rows //= tp_world_size
+            outputs.append(output[:output_rows])
         return StandardCombineInput(hidden_states=torch.cat(outputs, dim=0))
 
     x = dispatch_output.hidden_states

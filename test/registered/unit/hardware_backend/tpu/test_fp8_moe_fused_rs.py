@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.fp4_moe import apply_tpu_nvfp4_moe
 from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
     apply_fp8_fused_rs,
     fp8_fused_rs_unsupported_reason,
@@ -185,6 +186,134 @@ class TestFp8MoeFusedRs(CustomTestCase):
             )
 
         self.assertFalse(fused.call_args.kwargs["fp8_direct_write"])
+
+    def test_narrow_sp_keeps_one_logical_token_shard(self):
+        tokens, hidden, world = 1024, 4, 16
+        x = torch.zeros(tokens, hidden)
+        dispatch_output = SimpleNamespace(
+            hidden_states=x,
+            topk_output=(
+                torch.ones(tokens, 1),
+                torch.zeros(tokens, 1, dtype=torch.int32),
+                None,
+            ),
+        )
+        layer = SimpleNamespace(
+            weight_block_size=None,
+            w13_weight=torch.zeros(1, hidden, 2 * hidden),
+            w2_weight=torch.zeros(1, hidden, hidden),
+            w13_weight_scale=torch.ones(1, 1, 1, 2 * hidden),
+            w2_weight_scale=torch.ones(1, 1, 1, hidden),
+            _tpu_fused_rs_physical_order=torch.arange(world),
+            _tpu_fused_rs_group_offset=torch.tensor([0, 0], dtype=torch.int32),
+            _tpu_fused_rs_identity_rank_order=True,
+            use_tpu_fused_rs_sequence_parallel=lambda: True,
+        )
+        tp_group = SimpleNamespace(world_size=world, rank_in_group=7)
+        local = torch.zeros(tokens // world, hidden)
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
+                return_value=local,
+            ) as fused,
+            patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
+        ):
+            actual = apply_fp8_fused_rs(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+            )
+
+        self.assertEqual(actual.hidden_states.shape, (tokens // world, hidden))
+        self.assertTrue(fused.call_args.kwargs["keep_token_shard"])
+        self.assertTrue(fused.call_args.kwargs["identity_rank_order"])
+        self.assertEqual(fused.call_args.kwargs["logical_tp_rank"], 7)
+
+    def test_nvfp4_narrow_sp_keeps_one_logical_token_shard_at_safe_bucket(self):
+        tokens, hidden, world = 1024, 4, 16
+        x = torch.zeros(tokens, hidden)
+        dispatch_output = SimpleNamespace(
+            hidden_states=x,
+            topk_output=(
+                torch.ones(tokens, 1),
+                torch.zeros(tokens, 1, dtype=torch.int32),
+                None,
+            ),
+        )
+        layer = SimpleNamespace(
+            w13_weight=torch.zeros(1),
+            w2_weight=torch.zeros(1),
+            w13_weight_scale=torch.ones(1),
+            w2_weight_scale=torch.ones(1),
+            _tpu_fused_rs_has_post_expert_norm=False,
+            _tpu_fused_rs_physical_order=torch.arange(world),
+            _tpu_fused_rs_group_offset=torch.tensor([0, 0], dtype=torch.int32),
+            _tpu_fused_rs_identity_rank_order=True,
+            use_tpu_fused_rs_sequence_parallel=lambda: True,
+        )
+        tp_group = SimpleNamespace(world_size=world, rank_in_group=5)
+        local = torch.zeros(tokens // world, hidden)
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
+                return_value=local,
+            ) as fused,
+            patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
+        ):
+            actual = apply_tpu_nvfp4_moe(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+                apply_router_weight_on_input=False,
+                use_fused_rs=True,
+            )
+
+        self.assertEqual(actual.hidden_states.shape, (tokens // world, hidden))
+        self.assertTrue(fused.call_args.kwargs["keep_token_shard"])
+        self.assertEqual(fused.call_args.kwargs["logical_tp_rank"], 5)
+
+    def test_nvfp4_large_shape_uses_replicated_safe_fallback(self):
+        tokens, hidden, world = 2048, 4, 16
+        x = torch.zeros(tokens, hidden)
+        dispatch_output = SimpleNamespace(
+            hidden_states=x,
+            topk_output=(
+                torch.ones(tokens, 1),
+                torch.zeros(tokens, 1, dtype=torch.int32),
+                None,
+            ),
+        )
+        layer = SimpleNamespace(
+            w13_weight=torch.zeros(1),
+            w2_weight=torch.zeros(1),
+            w13_weight_scale=torch.ones(1),
+            w2_weight_scale=torch.ones(1),
+            _tpu_fused_rs_has_post_expert_norm=False,
+            _tpu_fused_rs_physical_order=torch.arange(world),
+            _tpu_fused_rs_group_offset=torch.tensor([0, 0], dtype=torch.int32),
+            _tpu_fused_rs_identity_rank_order=True,
+            use_tpu_fused_rs_sequence_parallel=lambda: True,
+        )
+
+        with patch(
+            "sglang.srt.layers.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
+            side_effect=lambda **kwargs: torch.zeros_like(kwargs["hidden_states"]),
+        ) as fused:
+            actual = apply_tpu_nvfp4_moe(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+                apply_router_weight_on_input=False,
+                use_fused_rs=True,
+            )
+
+        self.assertEqual(actual.hidden_states.shape, x.shape)
+        self.assertEqual(fused.call_count, 2)
+        self.assertTrue(
+            all(not call.kwargs["keep_token_shard"] for call in fused.call_args_list)
+        )
 
     def test_skips_only_ep_reduction_for_reduced_expert_output(self):
         # Upstream's dwdp gate reads the published parallel context, which
