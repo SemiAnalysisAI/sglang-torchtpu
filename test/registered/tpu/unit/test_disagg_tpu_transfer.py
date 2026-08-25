@@ -366,6 +366,16 @@ def _close_manager(m) -> None:
     if m._push_pool is not None:
         m._push_pool.shutdown(wait=True, cancel_futures=True)
 
+    # Detach every monitor before closing anything. Closing a socket that is
+    # still monitored wedges the shared context: within two or three manager
+    # lifecycles new connections stop being accepted at all and bound ports are
+    # never released, so later tests fail with "connections accepted: 0" and
+    # look exactly like the stranded-push bug. Both directions matter -- the
+    # server socket's accept monitor and the PUSH monitors _connect attaches.
+    for sock in [m.server_socket, *m._socket_cache.values()]:
+        if not sock.closed:
+            sock.disable_monitor()
+
     sockets = [
         m.server_socket,
         m._accept_monitor,
@@ -407,12 +417,13 @@ def _recv_kvdata(m):
             except zmq.Again:
                 break
         detail = (
-            "no sender ever connected, so the push was stranded rather than "
-            "slow -- check that _connect still enables reconnection "
-            "(see test_push_socket_reconnect)"
+            "no TCP connection reached this socket, so the bytes never left the "
+            "sender: either its connect failed and was not retried (see "
+            "test_push_socket_reconnect) or this socket is not the one the "
+            "sender addressed"
             if accepted == 0
-            else "the sender did connect, so the transport is fine and the "
-            "fault is in the push path itself"
+            else "the sender connected, so the transport is fine and the fault "
+            "is in the push path itself"
         )
         raise AssertionError(
             f"no KV data within {m.server_socket.getsockopt(zmq.RCVTIMEO)}ms on "
