@@ -160,10 +160,17 @@ class DecodeReqToTokenPool:
         # inheriting ReqToTokenPool.alloc, which bumps it.
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
 
-    def write(self, req_pool_idx: int, cur_len: int, token_ids: torch.Tensor):
-        if self.host_resident and token_ids.device != self.req_to_token.device:
-            token_ids = token_ids.cpu()
-        self.req_to_token[req_pool_idx, cur_len : cur_len + len(token_ids)] = token_ids
+    def write(self, indices, values):
+        # Host-resident pool: move device index/value tensors to host scatter.
+        # FIXME: please refactor this inherit from ReqToTokenPool
+        if self.req_to_token.device.type == "cpu":
+            if isinstance(indices, tuple):
+                indices = tuple(i.cpu() if torch.is_tensor(i) else i for i in indices)
+            elif torch.is_tensor(indices):
+                indices = indices.cpu()
+            if torch.is_tensor(values):
+                values = values.cpu()
+        self.req_to_token[indices] = values
 
     def available_size(self):
         return len(self.free_slots)
@@ -490,6 +497,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
+        kv_args.sliding_window_size = self.scheduler.sliding_window_size
+        if not self.is_mla_backend:
+            kv_args.kv_head_num = self.token_to_kv_pool.head_num
+            kv_args.total_kv_head_num = (
+                self.scheduler.model_config.get_total_num_kv_heads()
+            )
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
