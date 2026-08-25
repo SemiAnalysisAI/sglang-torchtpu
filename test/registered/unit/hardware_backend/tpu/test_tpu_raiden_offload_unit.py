@@ -256,7 +256,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._engine = Mock()
         mgr._swa_engine = Mock()
         mgr._pulling = SlotAdmission(1)
-        mgr._engine_max_blocks = 2
+        mgr._full_engine_max_blocks = 2
         mgr._swa_engine_max_blocks = 1
         mgr._local_blocks = {room: [8, 9]}
         mgr._local_swa_blocks = {room: [7]}
@@ -275,6 +275,88 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             mgr._swa_req_id(room), room, "127.0.0.1:31022", [5], [7]
         )
 
+    def _make_hybrid_swa_decode_manager(
+        self,
+        *,
+        full_pages,
+        swa_pages,
+        full_max_blocks=128,
+        swa_max_blocks=33,
+    ):
+        room = 29
+        mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
+        mgr.chunked_transfer = False
+        mgr._state_lock = threading.Lock()
+        mgr._engine = Mock()
+        mgr._swa_engine = Mock()
+        mgr._pulling = SlotAdmission(1)
+        mgr._pulling_cleared = set()
+        mgr._full_engine_max_blocks = full_max_blocks
+        mgr._swa_engine_max_blocks = swa_max_blocks
+        mgr._completed_recv = set()
+        mgr._failed = set()
+        mgr.record_failure = Mock()
+        mgr._local_blocks = {room: list(range(1000, 1000 + full_pages))}
+        mgr._local_swa_blocks = {room: list(range(2000, 2000 + swa_pages))}
+        mgr._remote_blocks = {room: list(range(full_pages))}
+        mgr._remote_swa_blocks = {room: list(range(swa_pages))}
+        mgr._remote_endpoint = {room: "127.0.0.1:31020"}
+        mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
+        return room, mgr
+
+    def test_hybrid_swa_decode_accepts_full_request_larger_than_swa_window(self):
+        room, mgr = self._make_hybrid_swa_decode_manager(
+            full_pages=128,
+            swa_pages=33,
+        )
+
+        self.assertTrue(mgr.maybe_start_pull(room))
+        mgr._engine.start_read.assert_called_once_with(
+            str(room),
+            room,
+            "127.0.0.1:31020",
+            list(range(128)),
+            list(range(1000, 1128)),
+        )
+        mgr._swa_engine.start_read.assert_called_once_with(
+            mgr._swa_req_id(room),
+            room,
+            "127.0.0.1:31022",
+            list(range(33)),
+            list(range(2000, 2033)),
+        )
+
+    def test_hybrid_swa_decode_rejects_oversized_full_attention_pull(self):
+        room, mgr = self._make_hybrid_swa_decode_manager(
+            full_pages=129,
+            swa_pages=33,
+        )
+
+        self.assertFalse(mgr.maybe_start_pull(room))
+        reason = mgr.record_failure.call_args.args[1]
+        self.assertIn("full-attention", reason)
+        self.assertIn("129 pages", reason)
+        self.assertIn("holds 128", reason)
+        self.assertIn("SGLANG_RAIDEN_MAX_BLOCKS", reason)
+        mgr._engine.start_read.assert_not_called()
+        mgr._swa_engine.start_read.assert_not_called()
+
+    def test_hybrid_swa_decode_rejects_oversized_swa_pull(self):
+        room, mgr = self._make_hybrid_swa_decode_manager(
+            full_pages=128,
+            swa_pages=34,
+        )
+
+        self.assertFalse(mgr.maybe_start_pull(room))
+        reason = mgr.record_failure.call_args.args[1]
+        self.assertIn("SWA", reason)
+        self.assertIn("34 pages", reason)
+        self.assertIn("holds 33", reason)
+        self.assertIn("SGLANG_RAIDEN_SWA_MAX_BLOCKS", reason)
+        mgr._engine.start_read.assert_not_called()
+        mgr._swa_engine.start_read.assert_not_called()
+
     def test_decode_defers_pull_until_a_staging_slot_frees(self):
         first, second = 29, 30
         mgr = object.__new__(RaidenKVManager)
@@ -284,7 +366,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._swa_engine = None
         mgr._pulling = SlotAdmission(1)
         mgr._pulling_cleared = set()
-        mgr._engine_max_blocks = 4
+        mgr._full_engine_max_blocks = 4
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._local_blocks = {first: [8], second: [9]}
@@ -314,7 +396,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._swa_engine = Mock() if swa_limit is not None else None
         mgr._pulling = SlotAdmission(capacity)
         mgr._pulling_cleared = set()
-        mgr._engine_max_blocks = full_limit
+        mgr._full_engine_max_blocks = full_limit
         mgr._swa_engine_max_blocks = swa_limit or 0
         mgr._completed_send = set()
         mgr._completed_recv = set()
@@ -602,7 +684,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._swa_engine = None
         mgr.chunked_transfer = True
         mgr._pulling = SlotAdmission(capacity)
-        mgr._engine_max_blocks = 64
+        mgr._full_engine_max_blocks = 64
         mgr._swa_engine_max_blocks = 2
         mgr.attn_tp_rank = 0
         mgr.record_failure = Mock()
@@ -681,7 +763,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         local = list(range(200, 264))
         remote = list(range(100, 164))
         mgr = self._decode(room, local, capacity=4)
-        mgr._engine_max_blocks = 8
+        mgr._full_engine_max_blocks = 8
         mgr._chunk_queue[room] = [("43#0", 11, 0, remote[0:16], "127.0.0.1:31020")]
 
         self.assertFalse(mgr.maybe_start_pull(room))

@@ -171,7 +171,7 @@ class RaidenKVManager(CommonKVManager):
         # keeps delivering into the plan, so the plan stays registered until
         # the engine reports the push settled.
         self._cleared_plans: Dict[str, int] = {}
-        self._engine_max_blocks = 0
+        self._full_engine_max_blocks = 0
         self._swa_engine_max_blocks = 0
         self._engine_lock = threading.Lock()
         # Orders chunk announcements against the closing reply. Both travel
@@ -367,7 +367,7 @@ class RaidenKVManager(CommonKVManager):
             timeout_s=self._timeout_s,
         )
         self._pulling = SlotAdmission(num_slots)
-        self._engine_max_blocks = max_blocks
+        self._full_engine_max_blocks = max_blocks
         logger.info(
             "RaidenKVManager rank%d engine up | endpoint=%s max_blocks=%d "
             "num_slots=%d chunked=%d",
@@ -914,13 +914,18 @@ class RaidenKVManager(CommonKVManager):
                     self._failed.discard(rid)
 
     def _reject_oversized_pull(
-        self, room: int, pages: int, limit: int, env: str
+        self,
+        room: int,
+        pages: int,
+        max_blocks: int,
+        cache_kind: str,
+        override_env: str,
     ) -> None:
         """Fail a request whose pages cannot fit one host staging slot."""
         reason = (
-            f"Raiden receive failed: request needs {pages} pages but a host "
-            f"staging slot holds {limit}. Lower the context length or raise "
-            f"{env}."
+            f"Raiden {cache_kind} receive failed: request needs {pages} pages "
+            f"but a host staging slot holds {max_blocks}. Raise {override_env} "
+            "if this request size is expected."
         )
         self.record_failure(room, reason)
         with self._state_lock:
@@ -964,10 +969,11 @@ class RaidenKVManager(CommonKVManager):
                     # for the first decode token.
                     queue.pop(0)
                     continue
-                if window.length > self._engine_max_blocks:
+                if window.length > self._full_engine_max_blocks:
                     oversized = (
                         window.length,
-                        self._engine_max_blocks,
+                        self._full_engine_max_blocks,
+                        "full-attention",
                         "SGLANG_RAIDEN_MAX_BLOCKS",
                     )
                     break
@@ -985,6 +991,7 @@ class RaidenKVManager(CommonKVManager):
                         oversized = (
                             swa_pages,
                             self._swa_engine_max_blocks,
+                            "SWA",
                             "SGLANG_RAIDEN_SWA_MAX_BLOCKS",
                         )
                         break
@@ -1038,14 +1045,16 @@ class RaidenKVManager(CommonKVManager):
         # which would select the whole list).
         remote, local = self._pair_blocks(remote, local)
         engine = self._ensure_engine()
-        pages = len(set(local))
-        if pages > self._engine_max_blocks:
+        full_pages = len(set(local))
+        if full_pages > self._full_engine_max_blocks:
             self._reject_oversized_pull(
-                room, pages, self._engine_max_blocks, "SGLANG_RAIDEN_MAX_BLOCKS"
+                room,
+                full_pages,
+                self._full_engine_max_blocks,
+                "full-attention",
+                "SGLANG_RAIDEN_MAX_BLOCKS",
             )
             return False
-        # Each engine stages into its own pool, so the sliding-window pages
-        # are checked against the sliding-window limit, not the full one.
         if self._swa_engine is not None:
             remote_swa, local_swa = self._pair_blocks(remote_swa, local_swa)
             swa_pages = len(set(local_swa))
@@ -1054,6 +1063,7 @@ class RaidenKVManager(CommonKVManager):
                     room,
                     swa_pages,
                     self._swa_engine_max_blocks,
+                    "SWA",
                     "SGLANG_RAIDEN_SWA_MAX_BLOCKS",
                 )
                 return False
