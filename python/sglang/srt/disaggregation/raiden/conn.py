@@ -1891,6 +1891,11 @@ class RaidenKVSender(CommonKVSender):
             and self.kv_mgr.check_status(self.bootstrap_room) == KVPoll.Bootstrapping
         ):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+        # Arm the inherited stall->Failed net. `_check_bootstrap_timeout` no-ops
+        # while `init_time` is None, and CommonKVSender leaves it None for each
+        # backend to stamp (mooncake does it here too), so without this the
+        # timeout call in poll() below would be silently dead code.
+        self.init_time = time.time()
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         super().init(num_kv_indices, aux_index)
@@ -1923,6 +1928,10 @@ class RaidenKVSender(CommonKVSender):
             self._started = True
             self.kv_mgr.finalize_send(self.bootstrap_room, self.aux_index)
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Transferring)
+            # Restart the clock once the send is actually staged, for the same
+            # reason as the receiver below: time spent queued in prefill before
+            # this point must not count against the transfer's budget.
+            self.init_time = time.time()
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
@@ -1937,6 +1946,15 @@ class RaidenKVSender(CommonKVSender):
         if self.kv_mgr.is_send_done(self.bootstrap_room):
             self.conclude_state = KVPoll.Success
             return KVPoll.Success
+        # Stall net. Ungated on purpose: a stalled send sits in Transferring, so
+        # gating this on Bootstrapping the way MooncakeKVSender does would make
+        # it unreachable here -- raiden is consumer-pull and __init__ above
+        # leaves Bootstrapping immediately. Safe to run ungated because send()
+        # re-stamps init_time when the send is staged, so the budget measures the
+        # transfer rather than the prefill queue wait.
+        timeout_result = self._check_bootstrap_timeout()
+        if timeout_result is not None:
+            return timeout_result
         return self.kv_mgr.check_status(self.bootstrap_room)
 
     def failure_exception(self):
@@ -1977,6 +1995,12 @@ class RaidenKVReceiver(CommonKVReceiver):
             self.bootstrap_infos,
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+        # Arm the inherited stall->Failed net (see RaidenKVSender.__init__). This
+        # is the decode side, where not arming it means a PERMANENT KV leak: the
+        # preallocated blocks are released only by
+        # DecodeTransferQueue.pop_transferred on KVPoll.Failed, so a transfer that
+        # never concludes pins them for the life of the process.
+        self.init_time = time.time()
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
@@ -1991,6 +2015,24 @@ class RaidenKVReceiver(CommonKVReceiver):
         if self.kv_mgr.maybe_start_pull(self.bootstrap_room) and not self._started:
             self._started = True
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Transferring)
+            # RESTART the clock when the pull actually begins. init_time was
+            # stamped at registration in send_metadata, but the interval between
+            # registration and pull start is dominated by waiting to allocate KV:
+            # on a production deployment kv_transfer_alloc_ms averaged ~228s
+            # against the 300s default budget, while a healthy pull is
+            # sub-second. Measuring from registration therefore spends the whole
+            # budget on the alloc wait and fails requests that were merely
+            # queued. Re-stamp here so the deadline measures the transfer, which
+            # is the thing that can actually stall.
+            self.init_time = time.time()
+        # Ungated on purpose: a stalled pull sits in Transferring, so gating this
+        # on WaitingForInput would exclude exactly the population that leaks.
+        # With the clock re-stamped above a healthy pull concludes far inside the
+        # budget, so anything still transferring 300s after its own pull started
+        # is genuinely stuck.
+        timeout_result = self._check_waiting_timeout()
+        if timeout_result is not None:
+            return timeout_result
         return self.kv_mgr.check_status(self.bootstrap_room)
 
     def failure_exception(self):
