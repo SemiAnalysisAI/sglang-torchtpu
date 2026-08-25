@@ -335,7 +335,32 @@ class TestTpuTransferDataPlane(CustomTestCase):
 # --------------------------------------------------------------------------
 
 
+def _close_manager(m) -> None:
+    """Release every socket and thread a ``_bare_manager`` allocated.
+
+    Registered by ``_bare_manager`` via ``addCleanup``; see the note there for
+    why leaking these breaks later tests rather than this one.
+
+    The push pool is drained first: a push in flight owns sockets we are about
+    to close, and zmq sockets are not thread-safe. The wait is bounded — a
+    wedged send hits the socket's own 30s SNDTIMEO and raises.
+    """
+    if m._push_pool is not None:
+        m._push_pool.shutdown(wait=True, cancel_futures=True)
+
+    sockets = [m.server_socket, *m._socket_cache.values(), *m._monitor_cache.values()]
+    for channel_socks in m._chan_socks.values():
+        sockets.extend(channel_socks)
+    for sock in sockets:
+        # _chan_socks aliases _socket_cache (_connect caches per endpoint), so
+        # the same socket shows up twice; close() is idempotent. linger=0 drops
+        # anything unsent instead of blocking teardown on a dead peer.
+        if sock is not None and not sock.closed:
+            sock.close(linger=0)
+
+
 def _bare_manager(
+    test,
     mode,
     pool,
     aux_tensors,
@@ -344,7 +369,11 @@ def _bare_manager(
     total_kv_head_num=0,
 ):
     """Construct a TpuKVManager with only the CommonKVManager state our data
-    /control-plane methods touch — bypassing distributed/bootstrap init."""
+    /control-plane methods touch — bypassing distributed/bootstrap init.
+
+    ``test`` is the calling TestCase: every manager is registered for teardown
+    so its sockets cannot outlive the test that made them.
+    """
     m = object.__new__(TpuKVManager)
     m._name = "TpuKVManager"
     m.disaggregation_mode = mode
@@ -380,6 +409,11 @@ def _bare_manager(
     m._socket_lock = threading.Lock()
     # Read by _send_multipart_locked.
     m._socket_send_locks = {}
+    # Set on both modes (only prefill populates them) so _close_manager can
+    # read them straight rather than probing for their existence.
+    m._push_pool = None
+    m._chan_socks = {}
+    m._chan_socks_lock = threading.Lock()
 
     sock = ctx.socket(zmq.PULL)
     sock.setsockopt(zmq.RCVTIMEO, 30000)
@@ -387,6 +421,10 @@ def _bare_manager(
     m.server_socket = sock
     m.local_ip = "127.0.0.1"
     m.rank_port = port
+    # Registered here rather than at the end: everything _close_manager touches
+    # exists by now, so a failure in the mode-specific setup below still frees
+    # the port this socket just bound.
+    test.addCleanup(_close_manager, m)
 
     if mode == DisaggregationMode.PREFILL:
         m.transfer_infos = {}
@@ -399,8 +437,6 @@ def _bare_manager(
         # mirror its opt-in-feature defaults: stats off, single push channel.
         m._gather_stats = None
         m._n_channels = 1
-        m._chan_socks = {}
-        m._chan_socks_lock = threading.Lock()
     else:
         m.decode_states = {}
         m.decode_states_lock = threading.Lock()
@@ -428,8 +464,8 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         # decode aux buffers: [size, K] int32 (mimics MetadataBuffers.output_ids)
         paux = [torch.arange(8 * 16, dtype=torch.int32).reshape(8, 16)]
         daux = [torch.zeros(8, 16, dtype=torch.int32)]
-        prefill = _bare_manager(DisaggregationMode.PREFILL, ppool, paux)
-        decode = _bare_manager(DisaggregationMode.DECODE, dpool, daux)
+        prefill = _bare_manager(self, DisaggregationMode.PREFILL, ppool, paux)
+        decode = _bare_manager(self, DisaggregationMode.DECODE, dpool, daux)
         return prefill, decode, ppool, dpool, paux, daux
 
     def _assert_pages_equal(self, ppool, dpool, src_pages, dst_pages):
@@ -687,7 +723,7 @@ class TestTpuReshardingProtocol(CustomTestCase):
         )
 
     def _mgr(self, mode, pool, aux, attn_tp_size: int, engine_rank: int):
-        return _bare_manager(mode, pool, aux, attn_tp_size, engine_rank)
+        return _bare_manager(self, mode, pool, aux, attn_tp_size, engine_rank)
 
     def test_fan_in_two_prefill_into_one_decode(self):
         # prefill_tp=2 (each rank holds 2 KV heads == 2 lanes) -> decode_tp=1
@@ -835,9 +871,9 @@ class TestTpuReshardingProtocol(CustomTestCase):
         daux = [torch.zeros(8, 16, dtype=torch.int32)]
 
         kw = dict(total_kv_head_num=2)  # 1 real head/rank; shape would infer 2
-        p0 = _bare_manager(DisaggregationMode.PREFILL, p0pool, paux, 2, 0, **kw)
-        p1 = _bare_manager(DisaggregationMode.PREFILL, p1pool, paux, 2, 1, **kw)
-        decode = _bare_manager(DisaggregationMode.DECODE, dpool, daux, 1, 0, **kw)
+        p0 = _bare_manager(self, DisaggregationMode.PREFILL, p0pool, paux, 2, 0, **kw)
+        p1 = _bare_manager(self, DisaggregationMode.PREFILL, p1pool, paux, 2, 1, **kw)
+        decode = _bare_manager(self, DisaggregationMode.DECODE, dpool, daux, 1, 0, **kw)
 
         room = 902
         src_pages = np.array([2, 5, 9], dtype=np.int64)
@@ -897,9 +933,9 @@ class TestTpuReshardingProtocol(CustomTestCase):
         daux = [torch.zeros(8, 16, dtype=torch.int32)]
 
         kw = dict(total_kv_head_num=8)
-        p0 = _bare_manager(DisaggregationMode.PREFILL, p0pool, paux, 2, 0, **kw)
-        p1 = _bare_manager(DisaggregationMode.PREFILL, p1pool, paux, 2, 1, **kw)
-        decode = _bare_manager(DisaggregationMode.DECODE, dpool, daux, 1, 0, **kw)
+        p0 = _bare_manager(self, DisaggregationMode.PREFILL, p0pool, paux, 2, 0, **kw)
+        p1 = _bare_manager(self, DisaggregationMode.PREFILL, p1pool, paux, 2, 1, **kw)
+        decode = _bare_manager(self, DisaggregationMode.DECODE, dpool, daux, 1, 0, **kw)
 
         room = 903
         src_pages = np.array([2, 5, 9], dtype=np.int64)
@@ -971,9 +1007,9 @@ class TestTpuReshardingProtocol(CustomTestCase):
 
         kw = dict(total_kv_head_num=4)  # 1 head/rank on both sides
         # prefill ranks 0 and 1 are GQA replicas of head 0 -> decode rank 0.
-        p0 = _bare_manager(DisaggregationMode.PREFILL, p0pool, paux, 8, 0, **kw)
-        p1 = _bare_manager(DisaggregationMode.PREFILL, p1pool, paux, 8, 1, **kw)
-        decode = _bare_manager(DisaggregationMode.DECODE, dpool, daux, 4, 0, **kw)
+        p0 = _bare_manager(self, DisaggregationMode.PREFILL, p0pool, paux, 8, 0, **kw)
+        p1 = _bare_manager(self, DisaggregationMode.PREFILL, p1pool, paux, 8, 1, **kw)
+        decode = _bare_manager(self, DisaggregationMode.DECODE, dpool, daux, 4, 0, **kw)
 
         room = 904
         src_pages = np.array([2, 5, 9], dtype=np.int64)
@@ -1046,6 +1082,7 @@ class TestTpuReshardTransferTimeFailure(CustomTestCase):
     def _prefill(self, attn_tp_size: int, lanes: int, engine_rank: int = 0):
         aux = [torch.zeros(8, 16, dtype=torch.int32)]
         return _bare_manager(
+            self,
             DisaggregationMode.PREFILL,
             self._fp8_pool(lanes),
             aux,
@@ -1327,8 +1364,8 @@ class TestTpuKVManagerStagingOnDevice(CustomTestCase):
         paux = [torch.arange(8 * 16, dtype=torch.int32).reshape(8, 16)]
         daux = [torch.zeros(8, 16, dtype=torch.int32)]
 
-        prefill = _bare_manager(DisaggregationMode.PREFILL, src, paux)
-        decode = _bare_manager(DisaggregationMode.DECODE, dst, daux)
+        prefill = _bare_manager(self, DisaggregationMode.PREFILL, src, paux)
+        decode = _bare_manager(self, DisaggregationMode.DECODE, dst, daux)
         # Turn on the pooled-staging data path on both sides (what _init_prefill
         # / _init_decode set in production; _bare_manager omits them).
         prefill._stage_pool = PinnedHostPool()
