@@ -5,6 +5,7 @@ import functools
 
 import jax
 import numpy as np
+from jax import dtypes as jax_dtypes
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -24,6 +25,72 @@ def align_to(value: int, alignment: int) -> int:
 def get_vmem_size_bytes() -> int:
     """Return the current TPU's per-core VMEM capacity."""
     return pltpu.get_tpu_info().vmem_capacity_bytes
+
+
+def storage_bytes_for_elements(elements: int, dtype) -> int:
+    """Return packed storage bytes, including for sub-byte JAX dtypes."""
+    if elements < 0:
+        raise ValueError("tensor element count must be nonnegative")
+    return (elements * jax_dtypes.itemsize_bits(dtype) + 7) // 8
+
+
+def estimate_activation_compute_cost(
+    activation: str | None,
+    elements: int,
+    *,
+    multiply_by_up: bool = False,
+) -> tuple[int, int]:
+    """Return ordinary FLOPs and special-function operations."""
+    if elements < 0:
+        raise ValueError("activation element count must be nonnegative")
+    if activation is None:
+        return 0, 0
+    if activation == "sigmoid":
+        flops_per_element, transcendentals_per_element = 3, 1
+    elif activation == "silu":
+        flops_per_element, transcendentals_per_element = 4, 1
+    elif activation == "gelu":
+        flops_per_element, transcendentals_per_element = 8, 1
+    elif activation == "swigluoai":
+        if not multiply_by_up:
+            raise ValueError("swigluoai cost requires multiply_by_up=True")
+        return 7 * elements, elements
+    else:
+        raise ValueError(f"unsupported activation {activation!r}")
+    if multiply_by_up:
+        flops_per_element += 1
+    return elements * flops_per_element, elements * transcendentals_per_element
+
+
+def cost_estimate_metadata(
+    *,
+    flops_basis: str,
+    bytes_accessed_basis: str,
+    remote_bytes_transferred: int | None = None,
+    remote_bytes_transferred_basis: str | None = None,
+    flops_kind: str | None = None,
+    bytes_accessed_kind: str | None = None,
+) -> dict[str, str]:
+    """Return stable metadata describing a manual Pallas cost estimate."""
+    metadata = {
+        "cost_model_version": "v1",
+        "cost_flops_basis": flops_basis,
+        "cost_bytes_accessed_basis": bytes_accessed_basis,
+        "cost_bytes_accessed_contract": "modeled_hbm_reads_and_writes",
+    }
+    if remote_bytes_transferred is not None:
+        if remote_bytes_transferred < 0:
+            raise ValueError("remote bytes transferred must be nonnegative")
+        if remote_bytes_transferred_basis is None:
+            raise ValueError("remote bytes transferred metadata requires a basis")
+        metadata["cost_remote_bytes_transferred"] = str(remote_bytes_transferred)
+    if remote_bytes_transferred_basis is not None:
+        metadata["cost_remote_bytes_transferred_basis"] = remote_bytes_transferred_basis
+    if flops_kind is not None:
+        metadata["cost_flops_kind"] = flops_kind
+    if bytes_accessed_kind is not None:
+        metadata["cost_bytes_accessed_kind"] = bytes_accessed_kind
+    return metadata
 
 
 def hypercube_device_order(devices) -> list:
@@ -110,10 +177,13 @@ def local_barrier(left_neighbor_id, right_neighbor_id, double_barrier=True):
 __all__ = [
     "align_to",
     "cdiv",
+    "cost_estimate_metadata",
+    "estimate_activation_compute_cost",
     "get_vmem_size_bytes",
     "hypercube_device_order",
     "is_2x2x2_topology",
     "local_barrier",
     "make_hypercube_tp_mesh",
     "make_ring_tp_mesh",
+    "storage_bytes_for_elements",
 ]
