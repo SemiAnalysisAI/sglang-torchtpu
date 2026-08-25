@@ -24,7 +24,8 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.disaggregation.base.conn import BaseKVSender, StateType
+from sglang.srt.disaggregation.base.conn import BaseKVSender, KVArgs, StateType
+from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.raiden.conn import (
     RaidenKVManager,
     RaidenKVSender,
@@ -32,6 +33,7 @@ from sglang.srt.disaggregation.raiden.conn import (
 )
 from sglang.srt.disaggregation.raiden.host_pool import SlotAdmission
 from sglang.srt.disaggregation.raiden.serde import MessageTag, unpack_blocks
+from sglang.srt.disaggregation.utils import KVClassType, TransferBackend
 from sglang.srt.hardware_backend.tpu.kv_pool_host import (
     RAIDEN_LAYOUT,
     TpuRaidenHostKVCache,
@@ -79,6 +81,71 @@ def _make_host_pool(page_size=4, page_num=3):
 
 
 class TestRaidenHostPoolPaging(CustomTestCase):
+    def test_decode_kv_args_include_raiden_metadata(self):
+        captured = {}
+
+        class _KVPool:
+            page_size = 128
+            head_num = 4
+
+            def get_contiguous_buf_infos(self):
+                return [11], [22], [33]
+
+        class _Manager:
+            def __init__(self, kv_args, *_args):
+                captured["kv_args"] = kv_args
+
+        def _get_kv_class(_backend, class_type):
+            if class_type == KVClassType.KVARGS:
+                return KVArgs
+            return _Manager
+
+        model_config = SimpleNamespace(
+            num_hidden_layers=2,
+            get_total_num_kv_heads=Mock(return_value=8),
+        )
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.transfer_backend = TransferBackend.RAIDEN
+        queue.tp_rank = 1
+        queue.pp_rank = 0
+        queue.scheduler = SimpleNamespace(
+            ps=SimpleNamespace(dp_rank=2, gpu_id=3),
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(kv_cache_dtype_str="bfloat16")
+            ),
+            enable_hisparse=False,
+            sliding_window_size=4096,
+            model_config=model_config,
+            server_args=SimpleNamespace(disaggregation_ib_device="mlx5_0"),
+        )
+        queue.token_to_kv_pool = _KVPool()
+        queue.draft_token_to_kv_pool = None
+        queue.metadata_buffers = SimpleNamespace(
+            get_buf_infos=Mock(return_value=([], [], []))
+        )
+        queue.is_mla_backend = False
+        queue.enable_staging = False
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.get_parallel",
+                return_value=SimpleNamespace(attn_tp_size=2),
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.get_kv_class",
+                side_effect=_get_kv_class,
+            ),
+            patch("sglang.srt.disaggregation.decode.setup_state_kv_args"),
+        ):
+            queue._init_kv_manager()
+
+        kv_args = captured["kv_args"]
+        self.assertEqual(kv_args.page_size, 128)
+        self.assertEqual(kv_args.sliding_window_size, 4096)
+        self.assertEqual(kv_args.kv_head_num, 4)
+        self.assertEqual(kv_args.total_kv_head_num, 8)
+        model_config.get_total_num_kv_heads.assert_called_once_with()
+
     def test_sender_matches_base_api_contract(self):
         for method_name in ("__init__", "send"):
             base_params = inspect.signature(
