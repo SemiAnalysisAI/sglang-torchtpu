@@ -275,6 +275,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "humming",
     "experimental_sgl_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
+    "pallas_tpu",
     "pallas_tpu_fused_rs",
     "megamoe",
 ]
@@ -5031,6 +5032,9 @@ class ServerArgs:
                 self.torch_compile_max_bs,
                 self.tpu_compile_bs,
                 self.max_running_requests,
+                attn_dp_size=(
+                    self.dp_size if self._resolved().enable_dp_attention else 1
+                ),
             )
             logger.info(
                 "TPU batch limits after reconciliation: "
