@@ -33,7 +33,10 @@ import jax.numpy as jnp
 from . import util
 from ._matmul_tp_intra_bcast import _matmul_all_gather_tp_intra_bcast
 from ._matmul_tp_intra_local import _matmul_intra_tp_local_output
-from ._matmul_tp_intra_topo import _matmul_all_gather_tp_intra_topo
+from ._matmul_tp_intra_topo import (
+    _matmul_all_gather_tp_intra_topo,
+    matmul_intra_tp_all_gather_post_moe_epilogue,
+)
 from ._routing import _is_2x2x2_slice
 
 P = jax.sharding.PartitionSpec

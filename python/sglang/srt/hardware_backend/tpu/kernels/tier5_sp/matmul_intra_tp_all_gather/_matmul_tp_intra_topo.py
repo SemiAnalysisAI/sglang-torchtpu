@@ -37,10 +37,16 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang.srt.hardware_backend.tpu.kernels.tier5_sp.common import (
+    cost_estimate_metadata,
+    estimate_activation_compute_cost,
+    logical_comm_bytes,
+)
 from sglang.srt.hardware_backend.tpu.kernels.tier5_sp.fused_moe_ops.fused_attention_moe_prelude import (
     _prelude_values,
 )
 from sglang.srt.hardware_backend.tpu.kernels.tier5_sp.fused_moe_ops.fused_moe_router import (
+    estimate_moe_routing_compute_cost,
     route_hidden_block,
 )
 
@@ -58,6 +64,303 @@ from ._routing import (
 )
 
 P = jax.sharding.PartitionSpec
+
+
+def get_matmul_all_gather_cost_estimate(
+    *,
+    m: int,
+    k: int,
+    n: int,
+    tp_size: int,
+    core_size: int,
+    x_dtype,
+    w_dtype,
+    out_dtype,
+    x_scale_dtype=None,
+) -> pl.CostEstimate:
+    """Estimate one rank's half-weight matmul and logical gathered payload."""
+    m_local = m // tp_size
+    m_chip = core_size * m_local
+    half_n = n // core_size
+    x_bytes = m_local * k * jnp.dtype(x_dtype).itemsize
+    x_scale_bytes = (
+        m_local * jnp.dtype(x_scale_dtype).itemsize if x_scale_dtype is not None else 0
+    )
+    local_output_bytes = m_chip * half_n * jnp.dtype(out_dtype).itemsize
+    gathered_output_bytes = m * n * jnp.dtype(out_dtype).itemsize
+    # Later topology stages forward already-written HBM pieces: 3 reads in ICI
+    # step 2, 1 in step 3, and 8 in the on-chip bridge.
+    forwarding_read_bytes = 12 * local_output_bytes
+    remote_bytes_transferred = logical_comm_bytes(
+        x_bytes + x_scale_bytes + local_output_bytes,
+        x_bytes + x_scale_bytes + gathered_output_bytes,
+    )
+    return pl.CostEstimate(
+        flops=int(2 * m_chip * k * half_n),
+        bytes_accessed=int(
+            x_bytes
+            + half_n * k * jnp.dtype(w_dtype).itemsize
+            + x_scale_bytes
+            + gathered_output_bytes
+            + forwarding_read_bytes
+        ),
+        transcendentals=0,
+        remote_bytes_transferred=int(remote_bytes_transferred),
+    )
+
+
+def get_matmul_all_gather_cost_metadata(
+    cost_estimate: pl.CostEstimate,
+) -> dict[str, str]:
+    """Describe the topology matmul/all-gather cost estimate."""
+    return cost_estimate_metadata(
+        flops_basis="static per-rank half-weight matmul shapes",
+        bytes_accessed_basis=(
+            "modeled HBM input reads, replicated-output writes, and topology "
+            "forwarding reads"
+        ),
+        remote_bytes_transferred=cost_estimate.remote_bytes_transferred,
+        remote_bytes_transferred_basis=(
+            "logical max of communicated input and output payloads across "
+            "the core exchange and topology gather; not physical TPU-link traffic"
+        ),
+    )
+
+
+def get_fused_attention_moe_prelude_cost_estimate(
+    *,
+    m: int,
+    k: int,
+    n: int,
+    num_experts: int,
+    topk: int,
+    tp_size: int,
+    core_size: int,
+    block_tokens: int,
+    norm_block_tokens: int,
+    attn_dtype,
+    residual_dtype,
+    post_weight_dtype,
+    gate_dtype,
+    pre_weight_dtype,
+    router_weight_dtype,
+    expert_bias_dtype,
+    pooler_weight_dtype,
+    pre_expert_weight_dtype,
+    has_post_weight: bool,
+    has_pre_expert_weight: bool,
+    norm_zero_centered_gamma: bool,
+    score_normalization: str,
+) -> pl.CostEstimate:
+    """Estimate the fused prelude, router, pooler, and pre-expert norm."""
+    m_local = m // tp_size
+    m_chip = core_size * m_local
+    half_n = n // core_size
+    num_token_blocks = m_local // block_tokens
+    norm_grid = m // norm_block_tokens
+
+    prelude_elements = m_local * k
+    gate_sigmoid_flops, gate_sigmoid_transcendentals = estimate_activation_compute_cost(
+        "sigmoid", 2 * k * num_token_blocks
+    )
+    prelude_flops = (
+        10 * prelude_elements
+        + 2 * m_local
+        + 4 * k * num_token_blocks
+        + gate_sigmoid_flops
+    )
+    if has_post_weight:
+        prelude_flops += prelude_elements
+    prelude_transcendentals = (
+        2 * m_local + gate_sigmoid_transcendentals + k * num_token_blocks
+    )
+
+    router_flops, router_transcendentals = estimate_moe_routing_compute_cost(
+        tokens=m_local,
+        num_experts=num_experts,
+        topk=topk,
+        score_normalization=score_normalization,
+    )
+    router_flops += 2 * m_local * k * num_experts
+
+    pooler_flops = 2 * m_chip * k * half_n
+    norm_elements = m * n
+    norm_flops = 3 * norm_elements + m
+    if has_pre_expert_weight:
+        norm_flops += norm_elements
+        if norm_zero_centered_gamma:
+            norm_flops += n * norm_grid
+    norm_transcendentals = m
+
+    attn_itemsize = jnp.dtype(attn_dtype).itemsize
+    residual_itemsize = jnp.dtype(residual_dtype).itemsize
+    bytes_accessed = (
+        m_local * k * attn_itemsize
+        + m_local * k * residual_itemsize
+        # These operands are loaded into resident VMEM refs once by program 0;
+        # their repeated uses inside the token loop are VMEM traffic, not HBM.
+        + (k * jnp.dtype(post_weight_dtype).itemsize if has_post_weight else 0)
+        + k * jnp.dtype(gate_dtype).itemsize
+        + k * jnp.dtype(pre_weight_dtype).itemsize
+        + num_experts * k * jnp.dtype(router_weight_dtype).itemsize
+        + num_experts * jnp.dtype(expert_bias_dtype).itemsize
+        + half_n * k * jnp.dtype(pooler_weight_dtype).itemsize
+        + (
+            norm_grid * n * jnp.dtype(pre_expert_weight_dtype).itemsize
+            if has_pre_expert_weight
+            else 0
+        )
+        + m_local * k * residual_itemsize
+        # pooled_hbm is written by the gather, read for normalization, and
+        # returned; prepared_expert_hbm is a separate output write.
+        + 3 * m * n * attn_itemsize
+        + m_local
+        * topk
+        * (jnp.dtype(jnp.float32).itemsize + jnp.dtype(jnp.uint8).itemsize)
+    )
+    local_activation_bytes = m_local * k * attn_itemsize
+    local_pooler_output_bytes = m_chip * half_n * attn_itemsize
+    gathered_pooler_output_bytes = m * n * attn_itemsize
+    forwarding_read_bytes = 12 * local_pooler_output_bytes
+    bytes_accessed += forwarding_read_bytes
+    remote_bytes_transferred = logical_comm_bytes(
+        local_activation_bytes + local_pooler_output_bytes,
+        local_activation_bytes + gathered_pooler_output_bytes,
+    )
+    return pl.CostEstimate(
+        flops=int(prelude_flops + router_flops + pooler_flops + norm_flops),
+        bytes_accessed=int(bytes_accessed),
+        transcendentals=int(
+            prelude_transcendentals + router_transcendentals + norm_transcendentals
+        ),
+        remote_bytes_transferred=int(remote_bytes_transferred),
+    )
+
+
+def get_fused_attention_moe_prelude_cost_metadata(
+    cost_estimate: pl.CostEstimate,
+) -> dict[str, str]:
+    """Describe the fused prelude/router/pooler topology cost estimate."""
+    return cost_estimate_metadata(
+        flops_basis=(
+            "static per-rank prelude, router, half-weight pooler, and norm shapes"
+        ),
+        bytes_accessed_basis=(
+            "modeled HBM reads and writes, including repeated resident-vector "
+            "reads, pooled-output reread, and topology forwarding reads"
+        ),
+        remote_bytes_transferred=cost_estimate.remote_bytes_transferred,
+        remote_bytes_transferred_basis=(
+            "logical max of communicated input and output payloads across "
+            "the core exchange and topology gather; not physical TPU-link traffic"
+        ),
+    )
+
+
+def get_post_moe_epilogue_cost_estimate(
+    *,
+    m: int,
+    k: int,
+    n: int,
+    tp_size: int,
+    core_size: int,
+    x_dtype,
+    w_dtype,
+    residual_dtype,
+    norm_weight_dtype,
+    residual_gate_dtype,
+    unpooler_bias_dtype,
+    bn: int,
+    has_norm_weight: bool,
+    norm_weight_before: bool,
+    norm_zero_centered_gamma: bool,
+    has_unpooler_bias: bool,
+    use_residual_gate: bool,
+) -> pl.CostEstimate:
+    """Estimate the two-pass unpooler and fused post-MoE epilogue."""
+    m_local = m // tp_size
+    m_chip = core_size * m_local
+    half_n = n // core_size
+    grid_n = half_n // bn
+    local_elements = m_chip * half_n
+
+    flops = 4 * m_chip * k * half_n
+    # First-pass sum of squares plus the second-pass normalization multiply.
+    flops += 3 * local_elements + m_chip
+    flops += 2 * m_chip * grid_n
+    if has_unpooler_bias:
+        flops += 2 * local_elements
+    if has_norm_weight:
+        flops += 2 * local_elements if norm_weight_before else local_elements
+        if norm_zero_centered_gamma:
+            flops += 2 * half_n if norm_weight_before else half_n
+    if use_residual_gate:
+        gate_sigmoid_flops, gate_sigmoid_transcendentals = (
+            estimate_activation_compute_cost("sigmoid", 2 * half_n)
+        )
+        flops += 4 * half_n + gate_sigmoid_flops + 3 * local_elements
+        transcendentals = m_chip * grid_n + gate_sigmoid_transcendentals + half_n
+    else:
+        flops += local_elements
+        transcendentals = m_chip * grid_n
+
+    x_itemsize = jnp.dtype(x_dtype).itemsize
+    residual_itemsize = jnp.dtype(residual_dtype).itemsize
+    norm_weight_reads = (
+        half_n * (2 if norm_weight_before else 1) if has_norm_weight else 0
+    )
+    residual_gate_reads = half_n if use_residual_gate else 0
+    unpooler_bias_reads = 2 * half_n if has_unpooler_bias else 0
+    bytes_accessed = (
+        m_local * k * x_itemsize
+        + 2 * half_n * k * jnp.dtype(w_dtype).itemsize
+        + m_local * n * residual_itemsize
+        + norm_weight_reads * jnp.dtype(norm_weight_dtype).itemsize
+        + residual_gate_reads * jnp.dtype(residual_gate_dtype).itemsize
+        + unpooler_bias_reads * jnp.dtype(unpooler_bias_dtype).itemsize
+        + m * n * residual_itemsize
+    )
+    x_exchange_bytes = m_local * k * x_itemsize
+    residual_exchange_bytes = m_local * half_n * residual_itemsize
+    sumsq_exchange_bytes = m_chip * jnp.dtype(jnp.float32).itemsize
+    local_output_bytes = local_elements * residual_itemsize
+    gathered_output_bytes = m * n * residual_itemsize
+    forwarding_read_bytes = 12 * local_output_bytes
+    bytes_accessed += forwarding_read_bytes
+    remote_bytes_transferred = logical_comm_bytes(
+        x_exchange_bytes
+        + residual_exchange_bytes
+        + sumsq_exchange_bytes
+        + local_output_bytes,
+        x_exchange_bytes
+        + residual_exchange_bytes
+        + sumsq_exchange_bytes
+        + gathered_output_bytes,
+    )
+    return pl.CostEstimate(
+        flops=int(flops),
+        bytes_accessed=int(bytes_accessed),
+        transcendentals=int(transcendentals),
+        remote_bytes_transferred=int(remote_bytes_transferred),
+    )
+
+
+def get_post_moe_epilogue_cost_metadata(
+    cost_estimate: pl.CostEstimate,
+) -> dict[str, str]:
+    """Describe the two-pass post-MoE topology cost estimate."""
+    return cost_estimate_metadata(
+        flops_basis="static two-pass half-weight matmul and post-MoE arithmetic",
+        bytes_accessed_basis=(
+            "modeled HBM reads and writes, including both weight passes and "
+            "topology forwarding reads"
+        ),
+        remote_bytes_transferred=cost_estimate.remote_bytes_transferred,
+        remote_bytes_transferred_basis=(
+            "logical max of communicated input and output payloads across core "
+            "exchanges and topology gather; not physical TPU-link traffic"
+        ),
+    )
 
 
 def _mm_ag_tp_intra_topo_body(
@@ -97,13 +400,31 @@ def _mm_ag_tp_intra_topo_body(
     double_barrier: bool,
     w_transposed: bool,
     xchg_overlap_fn=None,
+    residual_ref=None,
+    residual_sib=None,
+    program_offset: int = 0,
+    inputs_preloaded: bool = False,
+    fuse_post_moe: bool = False,
+    post_moe_sumsq=None,
+    norm_weight_ref=None,
+    residual_gate_ref=None,
+    unpooler_bias_ref=None,
+    norm_eps: float = 0.0,
+    has_norm_weight: bool = False,
+    norm_weight_before: bool = False,
+    norm_zero_centered_gamma: bool = False,
+    norm_gain_center: float = 1.0,
+    has_unpooler_bias: bool = False,
+    use_residual_gate: bool = False,
+    residual_temperature: float = 1.0,
+    residual_eps: float = 0.0,
 ):
     # Software-pipelined store-and-forward (topo's 5-stage schedule) on HALF-W matmul pieces.
     # Stage `a` operates on tile `i-a`; the token exchange happens once at i==0 before a0's matmul.
     # Routing is by PHYSICAL coord (pos2phys/phys2pos) so any 2x2x2 mesh order works; piece identity
     # + 2D placement stay in RAVELED space (the token/output layout). core_axis == physical bit 0
     # (verified in the builder), so the weight N-half == my_pos%2 lines up with the core-bridge.
-    i = pl.program_id(0)  # 0 .. grid_n + 3
+    i = pl.program_id(0) - program_offset  # 0 .. grid_n + 3
     my_pos = util.combined_axis_index(
         axis_names, strides
     )  # raveled position (token/output layout)
@@ -174,52 +495,53 @@ def _mm_ag_tp_intra_topo_body(
         # via a STATIC concat (tile-safe for any m_local; see _matmul_tp_intra_bcast). When there's an
         # fp8 scale, START its exchange (separate xchg_scale_sem) CONCURRENTLY with the token DMA so
         # the tiny scale copy overlaps it instead of serializing after.
-        op = pltpu.make_async_remote_copy(
-            src_ref=x_ref,
-            dst_ref=x_sib,
-            send_sem=xchg_sem,
-            recv_sem=xchg_sem,
-            device_id=_nb(jnp.int32(BRIDGE_MASK)),
-            device_id_type=pltpu.DeviceIdType.MESH,
-        )
-        op.start()
-        if x_scale_ref is not None:
-            ops = pltpu.make_async_remote_copy(
-                src_ref=x_scale_ref,
-                dst_ref=x_sib_scale,
-                send_sem=xchg_scale_sem,
-                recv_sem=xchg_scale_sem,
+        if not inputs_preloaded:
+            op = pltpu.make_async_remote_copy(
+                src_ref=x_ref,
+                dst_ref=x_sib,
+                send_sem=xchg_sem,
+                recv_sem=xchg_sem,
                 device_id=_nb(jnp.int32(BRIDGE_MASK)),
                 device_id_type=pltpu.DeviceIdType.MESH,
             )
-            ops.start()
-        if xchg_overlap_fn is not None:
-            xchg_overlap_fn()
-        op.wait_send()
-        op.wait_recv()
-        own = x_ref[...]
-        sib_rows = x_sib[...]
-        lo = jnp.where(core == jnp.int32(0), own, sib_rows)
-        hi = jnp.where(core == jnp.int32(0), sib_rows, own)
-        x_full[...] = jnp.concatenate([lo, hi], axis=0)
-        if x_scale_ref is not None:
-            # Drain the (already in-flight) scale exchange and assemble x_full_scale with the SAME
-            # static concat, so reorder_matmul dequants the raw-fp8 x_full by its per-token scale.
-            ops.wait_send()
-            ops.wait_recv()
-            own_s = x_scale_ref[...]
-            sib_s = x_sib_scale[...]
-            lo_s = jnp.where(core == jnp.int32(0), own_s, sib_s)
-            hi_s = jnp.where(core == jnp.int32(0), sib_s, own_s)
-            x_full_scale[...] = jnp.concatenate([lo_s, hi_s], axis=0)
+            op.start()
+            if x_scale_ref is not None:
+                ops = pltpu.make_async_remote_copy(
+                    src_ref=x_scale_ref,
+                    dst_ref=x_sib_scale,
+                    send_sem=xchg_scale_sem,
+                    recv_sem=xchg_scale_sem,
+                    device_id=_nb(jnp.int32(BRIDGE_MASK)),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                )
+                ops.start()
+            if xchg_overlap_fn is not None:
+                xchg_overlap_fn()
+            op.wait_send()
+            op.wait_recv()
+            own = x_ref[...]
+            sib_rows = x_sib[...]
+            lo = jnp.where(core == jnp.int32(0), own, sib_rows)
+            hi = jnp.where(core == jnp.int32(0), sib_rows, own)
+            x_full[...] = jnp.concatenate([lo, hi], axis=0)
+            if x_scale_ref is not None:
+                # Drain the (already in-flight) scale exchange and assemble x_full_scale with the SAME
+                # static concat, so reorder_matmul dequants the raw-fp8 x_full by its per-token scale.
+                ops.wait_send()
+                ops.wait_recv()
+                own_s = x_scale_ref[...]
+                sib_s = x_sib_scale[...]
+                lo_s = jnp.where(core == jnp.int32(0), own_s, sib_s)
+                hi_s = jnp.where(core == jnp.int32(0), sib_s, own_s)
+                x_full_scale[...] = jnp.concatenate([lo_s, hi_s], axis=0)
 
     # ---- a0: tile i -- HALF-W matmul on the chip block, seed, ICI step 1 ----
-    @pl.when(i < grid_n)
+    @pl.when(jnp.logical_and(i >= 0, i < grid_n))
     def _a0():
         ti = i
         buf = lax.rem(ti, jnp.int32(2))
         rs = lax.rem(ti, jnp.int32(ring))
-        o_vmem.at[buf][...] = util.reorder_matmul(
+        branch = util.reorder_matmul(
             x_full[...],
             w_ref[...],
             w_transposed=w_transposed,  # [bn,k] ([N,K]) or [k,bn] ([K,N])
@@ -227,6 +549,53 @@ def _mm_ag_tp_intra_topo_body(
             x_scale=x_full_scale[...] if x_scale_ref is not None else None,
             preferred_element_type=jnp.float32,
         ).astype(o_vmem.dtype)
+        if fuse_post_moe:
+            feature_col = core * half_n + ti * bn
+            branch_f32 = branch.astype(jnp.float32)
+            if has_unpooler_bias:
+                branch_f32 = branch_f32 + unpooler_bias_ref.at[pl.ds(feature_col, bn)][
+                    ...
+                ].astype(jnp.float32)
+            norm_weight = norm_weight_ref.at[pl.ds(feature_col, bn)][...].astype(
+                jnp.float32
+            )
+            if norm_zero_centered_gamma:
+                norm_weight = norm_weight + norm_gain_center
+            if has_norm_weight and norm_weight_before:
+                branch_f32 = branch_f32 * norm_weight
+            normalized = branch_f32 * jax.lax.rsqrt(
+                post_moe_sumsq[...] / (2 * half_n) + norm_eps
+            )
+            if has_norm_weight and not norm_weight_before:
+                normalized = normalized * norm_weight
+            normalized = normalized.astype(o_vmem.dtype).astype(jnp.float32)
+            own_residual = residual_ref.at[:, pl.ds(feature_col, bn)][...]
+            sibling_residual = residual_sib.at[:, pl.ds(ti * bn, bn)][...]
+            residual_lo = jnp.where(
+                core == jnp.int32(0), own_residual, sibling_residual
+            )
+            residual_hi = jnp.where(
+                core == jnp.int32(0), sibling_residual, own_residual
+            )
+            residual_tile = jnp.concatenate([residual_lo, residual_hi], axis=0).astype(
+                jnp.float32
+            )
+            if use_residual_gate:
+                gate = (
+                    residual_gate_ref.at[pl.ds(feature_col, bn)][...].astype(
+                        jnp.float32
+                    )
+                    / residual_temperature
+                )
+                beta = jax.nn.sigmoid(gate)
+                alpha_sq = jax.nn.sigmoid(-gate) * (1.0 + beta)
+                alpha = jnp.sqrt(jnp.maximum(alpha_sq, residual_eps))
+                branch = alpha * residual_tile + beta * normalized
+            else:
+                branch = residual_tile + normalized
+            o_vmem.at[buf][...] = branch.astype(o_vmem.dtype)
+        else:
+            o_vmem.at[buf][...] = branch
         _seed_copy(ti, buf, rs).start()
         for entry in steps[0]:
             _ici(ti, buf, rs, 0, entry).start()
@@ -369,7 +738,9 @@ def _fused_prelude_router_mm_ag_tp_intra_topo_body(
                 pre_weight_ref[...],
                 **prelude_kwargs,
             )
-            prepared_vmem[rows, :] = prepared
+            # The serving residual can be FP32 while the FFN activation is BF16.
+            # Pallas Ref stores require an explicit conversion.
+            prepared_vmem[rows, :] = prepared.astype(prepared_vmem.dtype)
             # Both input tiles are dead after the prepared value is committed.
             # Reusing one for h permits a 256-row prelude tile without adding
             # another hidden-sized VMEM allocation.
@@ -450,39 +821,42 @@ def _fused_prelude_router_mm_ag_tp_intra_topo_body(
     def _pre_expert_norm():
         rows = pl.ds(norm_program * norm_block_tokens, norm_block_tokens)
         pooled_hidden = pooled_hbm_ref.shape[1]
-        norm_tile_vmem = x_full.at[
+        # The prepared FFN activation is dead after the pooler matmul and has
+        # the same dtype as the pooler output. Reuse its leading columns for
+        # norm so an FP32 residual stream does not promote the MoE activation
+        # or require another hidden-sized VMEM allocation.
+        norm_tile_vmem = prepared_vmem.at[
             pl.ds(0, norm_block_tokens),
             pl.ds(0, pooled_hidden),
         ]
-        norm_copy = pltpu.make_async_copy(
-            src_ref=pooled_hbm_ref.at[rows, :],
-            dst_ref=norm_tile_vmem,
-            sem=norm_copy_sem,
-        )
-        norm_copy.start()
-        norm_copy.wait()
-
-        pooled = norm_tile_vmem[...]
-        pooled_f32 = pooled.astype(jnp.float32)
-        variance = jnp.mean(pooled_f32 * pooled_f32, axis=1, keepdims=True)
-        normalized = (pooled_f32 * jax.lax.rsqrt(variance + norm_eps)).astype(
-            pooled.dtype
-        )
-        if has_pre_expert_weight:
-            weight = pre_expert_weight_ref[...]
-            if norm_zero_centered_gamma:
-                weight = weight + norm_gain_center
-            normalized = normalized * weight
-        norm_tile_vmem[...] = normalized.astype(pooled.dtype)
 
         @functools.partial(
             pl.run_scoped,
             prepared_expert_vmem=pltpu.VMEM(
                 (norm_block_tokens, pooled_hidden // 128, 128),
-                pooled.dtype,
+                pooled_hbm_ref.dtype,
             ),
         )
-        def _store_prepared(prepared_expert_vmem):
+        def _normalize_and_store(prepared_expert_vmem):
+            norm_copy = pltpu.make_async_copy(
+                src_ref=pooled_hbm_ref.at[rows, :],
+                dst_ref=norm_tile_vmem,
+                sem=norm_copy_sem,
+            )
+            norm_copy.start()
+            norm_copy.wait()
+
+            pooled = norm_tile_vmem[...]
+            pooled_f32 = pooled.astype(jnp.float32)
+            variance = jnp.mean(pooled_f32 * pooled_f32, axis=1, keepdims=True)
+            normalized = (pooled_f32 * jax.lax.rsqrt(variance + norm_eps)).astype(
+                pooled.dtype
+            )
+            if has_pre_expert_weight:
+                weight = pre_expert_weight_ref[...]
+                if norm_zero_centered_gamma:
+                    weight = weight + norm_gain_center
+                normalized = normalized * weight
             prepared_expert_vmem[...] = normalized.reshape(
                 norm_block_tokens, pooled_hidden // 128, 128
             ).astype(pooled.dtype)
@@ -622,6 +996,17 @@ def _matmul_all_gather_tp_intra_topo(
         ),
         grid=(grid_n + 4,),
     )
+    cost_estimate = get_matmul_all_gather_cost_estimate(
+        m=m,
+        k=k,
+        n=n,
+        tp_size=tp_size,
+        core_size=core_size,
+        x_dtype=x.dtype,
+        w_dtype=w.dtype,
+        out_dtype=od,
+        x_scale_dtype=x_scale.dtype if has_x_scale else None,
+    )
 
     def _call(*operands):
         # operands = (p2ph, ph2p, xx, ww[, ss]); ss (+ its BlockSpec) is None when there is no scale
@@ -656,6 +1041,8 @@ def _matmul_all_gather_tp_intra_topo(
                 vmem_limit_bytes=128 * 1024 * 1024,
                 disable_bounds_checks=disable_bounds_checks,
             ),
+            cost_estimate=cost_estimate,
+            metadata=get_matmul_all_gather_cost_metadata(cost_estimate),
             name=f"mm_ag_tp_intra_topo_bn{bn}",
         )(p2ph, ph2p, xx, ww, ss)
 
@@ -759,7 +1146,7 @@ def fused_attention_moe_prelude_router_pooler_topo(
         raise ValueError("core_axis must be the physical on-chip core pair")
 
     m_local = m // tp_size
-    router_block_tokens = 128
+    router_block_tokens = min(m_local, 128)
     if m_local % router_block_tokens:
         raise ValueError(
             f"local token count {m_local} must be divisible by {router_block_tokens}"
@@ -770,7 +1157,8 @@ def fused_attention_moe_prelude_router_pooler_topo(
         raise ValueError(f"half pooler width {half_n} must be divisible by bn={bn}")
     m_chip = core_size * m_local
     grid_n = half_n // bn
-    norm_block_tokens = min(m_chip, 512)
+    # The norm phase reuses the residual-stream tile after the prelude.
+    norm_block_tokens = block_tokens
     if m % norm_block_tokens:
         raise ValueError(
             f"token count {m} must be divisible by {norm_block_tokens} for norm"
@@ -805,6 +1193,8 @@ def fused_attention_moe_prelude_router_pooler_topo(
         pltpu.VMEM((m_local, k), attn_out.dtype),
         pltpu.VMEM((m_chip, 1), jnp.float32),
         pltpu.VMEM((m_local, 1), jnp.float32),
+        # The MoE activation follows the attention/FFN dtype, independently of
+        # the serving residual stream (which may remain FP32).
         pltpu.VMEM((2, m_chip, bn), attn_out.dtype),
         pltpu.SemaphoreType.DMA,
         pltpu.SemaphoreType.DMA,
@@ -836,6 +1226,30 @@ def fused_attention_moe_prelude_router_pooler_topo(
         out_specs=tuple(out_specs),
         scratch_shapes=tuple(scratch_shapes),
         grid=(grid_n + 4 + norm_grid,),
+    )
+    cost_estimate = get_fused_attention_moe_prelude_cost_estimate(
+        m=m,
+        k=k,
+        n=n,
+        num_experts=num_experts,
+        topk=topk,
+        tp_size=tp_size,
+        core_size=core_size,
+        block_tokens=block_tokens,
+        norm_block_tokens=norm_block_tokens,
+        attn_dtype=attn_out.dtype,
+        residual_dtype=residual_stream.dtype,
+        post_weight_dtype=post_weight.dtype,
+        gate_dtype=gate.dtype,
+        pre_weight_dtype=pre_weight.dtype,
+        router_weight_dtype=router_weight.dtype,
+        expert_bias_dtype=expert_bias.dtype,
+        pooler_weight_dtype=pooler_weight.dtype,
+        pre_expert_weight_dtype=pre_expert_weight.dtype,
+        has_post_weight=has_post_weight,
+        has_pre_expert_weight=has_pre_expert_weight,
+        norm_zero_centered_gamma=norm_zero_centered_gamma,
+        score_normalization=score_normalization,
     )
     prelude_kwargs = {
         "has_post_weight": has_post_weight,
@@ -889,8 +1303,8 @@ def fused_attention_moe_prelude_router_pooler_topo(
             ),
             out_shape=(
                 jax.ShapeDtypeStruct((m_local, k), residual_stream.dtype),
-                jax.ShapeDtypeStruct((m, n), residual_stream.dtype),
-                jax.ShapeDtypeStruct((m, n // 128, 128), residual_stream.dtype),
+                jax.ShapeDtypeStruct((m, n), attn_out.dtype),
+                jax.ShapeDtypeStruct((m, n // 128, 128), attn_out.dtype),
                 jax.ShapeDtypeStruct((m_local, topk), jnp.float32),
                 jax.ShapeDtypeStruct((m_local, topk), jnp.uint8),
             ),
@@ -900,6 +1314,8 @@ def fused_attention_moe_prelude_router_pooler_topo(
                 vmem_limit_bytes=128 * 1024 * 1024,
                 disable_bounds_checks=disable_bounds_checks,
             ),
+            cost_estimate=cost_estimate,
+            metadata=get_fused_attention_moe_prelude_cost_metadata(cost_estimate),
             name=f"fused_attention_router_mm_ag_topo_bn{bn}",
         )(p2ph, ph2p, aa, ss, pw, gg, prew, rw, eb, poolw, normw)
 
@@ -942,4 +1358,448 @@ def fused_attention_moe_prelude_router_pooler_topo(
         expert_bias,
         pooler_weight,
         pre_expert_weight,
+    )
+
+
+def _post_moe_stats_body(
+    pos2phys_ref,
+    phys2pos_ref,
+    x_ref,
+    w_ref,
+    residual_ref,
+    norm_weight_ref,
+    unpooler_bias_ref,
+    x_full,
+    x_sib,
+    residual_sib,
+    sumsq_vmem,
+    sumsq_sib,
+    xchg_sem,
+    residual_xchg_sem,
+    sumsq_xchg_sem,
+    *,
+    axis_names: tuple[str, ...],
+    strides: tuple[int, ...],
+    sizes: tuple[int, ...],
+    mesh_axis_names: tuple[str, ...],
+    m_chip: int,
+    half_n: int,
+    bn: int,
+    grid_n: int,
+    double_barrier: bool,
+    has_norm_weight: bool,
+    norm_weight_before: bool,
+    norm_zero_centered_gamma: bool,
+    norm_gain_center: float,
+    has_unpooler_bias: bool,
+    **_,
+):
+    """First unpooler pass: assemble chip tokens and reduce RMS statistics."""
+    i = pl.program_id(0)
+    my_pos = util.combined_axis_index(axis_names, strides)
+    my_phys = pos2phys_ref[my_pos]
+    core = lax.rem(my_pos, jnp.int32(2))
+    _peer = util.make_peer_id_fn(axis_names, strides, sizes, mesh_axis_names)
+
+    def _rav(mask):
+        return phys2pos_ref[lax.bitwise_xor(my_phys, mask)]
+
+    def _sibling():
+        return _peer(_rav(jnp.int32(BRIDGE_MASK)))
+
+    @pl.when(i == 0)
+    def _prepare_inputs():
+        util.hypercube_local_barrier([_sibling()], double_barrier=double_barrier)
+        x_op = pltpu.make_async_remote_copy(
+            src_ref=x_ref,
+            dst_ref=x_sib,
+            send_sem=xchg_sem,
+            recv_sem=xchg_sem,
+            device_id=_sibling(),
+            device_id_type=pltpu.DeviceIdType.MESH,
+        )
+        residual_op = pltpu.make_async_remote_copy(
+            src_ref=residual_ref.at[:, pl.ds((1 - core) * half_n, half_n)],
+            dst_ref=residual_sib,
+            send_sem=residual_xchg_sem,
+            recv_sem=residual_xchg_sem,
+            device_id=_sibling(),
+            device_id_type=pltpu.DeviceIdType.MESH,
+        )
+        x_op.start()
+        residual_op.start()
+        x_op.wait_send()
+        x_op.wait_recv()
+        residual_op.wait_send()
+        residual_op.wait_recv()
+
+        own_x = x_ref[...]
+        sibling_x = x_sib[...]
+        x_lo = jnp.where(core == jnp.int32(0), own_x, sibling_x)
+        x_hi = jnp.where(core == jnp.int32(0), sibling_x, own_x)
+        x_full[...] = jnp.concatenate([x_lo, x_hi], axis=0)
+
+        sumsq_vmem[...] = jnp.zeros((m_chip, 1), dtype=jnp.float32)
+
+    @pl.when(i < grid_n)
+    def _accumulate():
+        feature_col = core * half_n + i * bn
+        branch = util.reorder_matmul(
+            x_full[...],
+            w_ref[...],
+            w_transposed=True,
+            preferred_element_type=jnp.float32,
+        ).astype(residual_ref.dtype)
+        branch_f32 = branch.astype(jnp.float32)
+        if has_unpooler_bias:
+            branch_f32 = branch_f32 + unpooler_bias_ref.at[pl.ds(feature_col, bn)][
+                ...
+            ].astype(jnp.float32)
+        if has_norm_weight and norm_weight_before:
+            norm_weight = norm_weight_ref.at[pl.ds(feature_col, bn)][...].astype(
+                jnp.float32
+            )
+            if norm_zero_centered_gamma:
+                norm_weight = norm_weight + norm_gain_center
+            branch_f32 = branch_f32 * norm_weight
+        sumsq_vmem[...] = sumsq_vmem[...] + jnp.sum(
+            branch_f32 * branch_f32, axis=1, keepdims=True
+        )
+
+    @pl.when(i == grid_n)
+    def _combine_core_halves():
+        op = pltpu.make_async_remote_copy(
+            src_ref=sumsq_vmem,
+            dst_ref=sumsq_sib,
+            send_sem=sumsq_xchg_sem,
+            recv_sem=sumsq_xchg_sem,
+            device_id=_sibling(),
+            device_id_type=pltpu.DeviceIdType.MESH,
+        )
+        op.start()
+        op.wait_send()
+        op.wait_recv()
+        sumsq_vmem[...] = sumsq_vmem[...] + sumsq_sib[...]
+
+
+def _matmul_tp_intra_topo_post_moe_kernel(
+    pos2phys_ref,
+    phys2pos_ref,
+    x_ref,
+    w_ref,
+    residual_ref,
+    norm_weight_ref,
+    residual_gate_ref,
+    unpooler_bias_ref,
+    output_hbm_ref,
+    x_full,
+    x_sib,
+    x_full_scale,
+    x_sib_scale,
+    o_vmem,
+    residual_sib,
+    sumsq_vmem,
+    sumsq_sib,
+    xchg_sem,
+    xchg_scale_sem,
+    residual_xchg_sem,
+    sumsq_xchg_sem,
+    seed_sems,
+    ici_send_sems,
+    ici_recv_sems,
+    br_send_sems,
+    br_recv_sems,
+    *,
+    stats_kwargs,
+    route_kwargs,
+):
+    _post_moe_stats_body(
+        pos2phys_ref,
+        phys2pos_ref,
+        x_ref,
+        w_ref,
+        residual_ref,
+        norm_weight_ref,
+        unpooler_bias_ref,
+        x_full,
+        x_sib,
+        residual_sib,
+        sumsq_vmem,
+        sumsq_sib,
+        xchg_sem,
+        residual_xchg_sem,
+        sumsq_xchg_sem,
+        **stats_kwargs,
+    )
+    _mm_ag_tp_intra_topo_body(
+        pos2phys_ref,
+        phys2pos_ref,
+        x_ref,
+        w_ref,
+        None,
+        output_hbm_ref,
+        x_full,
+        x_sib,
+        x_full_scale,
+        x_sib_scale,
+        o_vmem,
+        xchg_sem,
+        xchg_scale_sem,
+        seed_sems,
+        ici_send_sems,
+        ici_recv_sems,
+        br_send_sems,
+        br_recv_sems,
+        residual_ref=residual_ref,
+        residual_sib=residual_sib,
+        fuse_post_moe=True,
+        post_moe_sumsq=sumsq_vmem,
+        norm_weight_ref=norm_weight_ref,
+        residual_gate_ref=residual_gate_ref,
+        unpooler_bias_ref=unpooler_bias_ref,
+        **route_kwargs,
+    )
+
+
+def matmul_intra_tp_all_gather_post_moe_epilogue(
+    x: jax.Array,
+    w: jax.Array,
+    residual: jax.Array,
+    norm_weight: jax.Array,
+    residual_gate: jax.Array,
+    unpooler_bias: jax.Array,
+    mesh: jax.sharding.AbstractMesh,
+    chip_axis: str,
+    core_axis: str,
+    *,
+    norm_eps: float,
+    has_norm_weight: bool,
+    norm_weight_before: bool,
+    norm_zero_centered_gamma: bool,
+    norm_gain_center: float,
+    has_unpooler_bias: bool,
+    use_residual_gate: bool,
+    residual_temperature: float,
+    residual_eps: float,
+    bn: int | None = None,
+    collective_id: int = 0,
+    double_barrier: bool = True,
+    disable_bounds_checks: bool = False,
+) -> jax.Array:
+    """Two-pass half-W unpooler with fused post-FFN norm and residual add.
+
+    The first pass computes the per-token RMS statistic across the two output
+    feature halves. The second pass recomputes each unpooler tile, normalizes it,
+    combines the matching token-sharded residual tile, and sends only the final
+    layer-output tile through the existing topology gather. No replicated
+    residual or packed HBM temporary is materialized.
+    """
+    axis_names = (chip_axis, core_axis)
+    tp_size, strides, sizes = util.axis_tuple_strides(mesh, axis_names)
+    if tp_size != NUM_DEVICES:
+        raise ValueError(f"post-MoE epilogue needs {NUM_DEVICES} cores, got {tp_size}")
+    if mesh.shape[core_axis] != 2:
+        raise ValueError("post-MoE epilogue requires a size-2 on-chip core axis")
+
+    pos_to_phys, phys_to_pos = _physical_topo_maps(mesh, axis_names)
+    if any((pos_to_phys[p] & 1) != (p & 1) for p in range(NUM_DEVICES)):
+        raise ValueError("core_axis must match the physical on-chip core pair")
+
+    if x.ndim != 2 or w.ndim != 2 or residual.ndim != 2:
+        raise ValueError("x, w, and residual must be rank-2")
+    m, k = x.shape
+    n = w.shape[0]
+    if w.shape[1] != k:
+        raise ValueError("post-MoE epilogue expects CPL-native w=[N,K]")
+    if residual.shape != (m, n):
+        raise ValueError(f"residual must have shape {(m, n)}, got {residual.shape}")
+    for name, value in (
+        ("norm_weight", norm_weight),
+        ("residual_gate", residual_gate),
+        ("unpooler_bias", unpooler_bias),
+    ):
+        if value.shape != (n,):
+            raise ValueError(f"{name} must have shape {(n,)}, got {value.shape}")
+    core_size = int(mesh.shape[core_axis])
+    m_local = m // tp_size
+    m_chip = core_size * m_local
+    half_n = n // core_size
+    if bn is None:
+        bn = _topo_bn(half_n, m, k, w.dtype.itemsize, x.dtype.itemsize)
+        # The T=8192 serving epilogue carries FP32 expert and residual streams.
+        # bn=512 makes its full-chip activation/residual scratch plus the
+        # double-buffered W/output tiles exceed v7x's 64 MiB VMEM by ~5.7 MiB.
+        # Halving only the streamed feature tile preserves FP32 residual math
+        # and brings the program below the hardware limit.
+        if m_local >= 512 and (x.dtype.itemsize > 2 or residual.dtype.itemsize > 2):
+            bn = min(bn, 256)
+    if half_n % bn:
+        raise ValueError(f"half_n ({half_n}) must be divisible by bn ({bn})")
+    if bn % 256:
+        raise ValueError("post-MoE epilogue bn must be a multiple of 256")
+    grid_n = half_n // bn
+    steps, n_ici = _flatten_ici_schedule()
+    ici_offsets = _ici_offsets()
+    n_bridge = len(ici_offsets)
+    split = antipode_core_split()
+    (l0, x0), (l1, x1) = split[0], split[1]
+    ring = _TOPO_RING
+    pos2phys = jnp.asarray(pos_to_phys, jnp.int32)
+    phys2pos = jnp.asarray(phys_to_pos, jnp.int32)
+    mesh_axis_names = tuple(mesh.axis_names)
+
+    route_offset = grid_n + 1
+
+    def _weight_index(i, *_):
+        stats_tile = jnp.minimum(i, grid_n - 1)
+        route_tile = jnp.minimum(jnp.maximum(i - route_offset, 0), grid_n - 1)
+        return (jnp.where(i < route_offset, stats_tile, route_tile), 0)
+
+    w_spec = pl.BlockSpec((bn, k), _weight_index)
+    hbm_output = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=2,
+        in_specs=(
+            pl.BlockSpec((m_local, k), lambda i, *_: (0, 0)),
+            w_spec,
+            pl.BlockSpec((m_local, n), lambda i, *_: (0, 0)),
+            pl.BlockSpec((n,), lambda i, *_: (0,)),
+            pl.BlockSpec((n,), lambda i, *_: (0,)),
+            pl.BlockSpec((n,), lambda i, *_: (0,)),
+        ),
+        out_specs=hbm_output,
+        scratch_shapes=(
+            pltpu.VMEM((m_chip, k), x.dtype),
+            pltpu.VMEM((m_local, k), x.dtype),
+            pltpu.VMEM((m_chip, 1), jnp.float32),
+            pltpu.VMEM((m_local, 1), jnp.float32),
+            pltpu.VMEM((2, m_chip, bn), residual.dtype),
+            pltpu.VMEM((m_local, half_n), residual.dtype),
+            pltpu.VMEM((m_chip, 1), jnp.float32),
+            pltpu.VMEM((m_chip, 1), jnp.float32),
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA((ring,)),
+            pltpu.SemaphoreType.DMA((ring, n_ici)),
+            pltpu.SemaphoreType.DMA((ring, n_ici)),
+            pltpu.SemaphoreType.DMA((ring, n_bridge)),
+            pltpu.SemaphoreType.DMA((ring, n_bridge)),
+        ),
+        grid=(route_offset + grid_n + 4,),
+    )
+    cost_estimate = get_post_moe_epilogue_cost_estimate(
+        m=m,
+        k=k,
+        n=n,
+        tp_size=tp_size,
+        core_size=core_size,
+        x_dtype=x.dtype,
+        w_dtype=w.dtype,
+        residual_dtype=residual.dtype,
+        norm_weight_dtype=norm_weight.dtype,
+        residual_gate_dtype=residual_gate.dtype,
+        unpooler_bias_dtype=unpooler_bias.dtype,
+        bn=bn,
+        has_norm_weight=has_norm_weight,
+        norm_weight_before=norm_weight_before,
+        norm_zero_centered_gamma=norm_zero_centered_gamma,
+        has_unpooler_bias=has_unpooler_bias,
+        use_residual_gate=use_residual_gate,
+    )
+    topo_kwargs = {
+        "steps": steps,
+        "all_masks": ICI_MASKS + (BRIDGE_MASK,),
+        "ici_offsets": ici_offsets,
+        "antipode_split": (l0, x0, l1, x1),
+        "axis_names": axis_names,
+        "strides": strides,
+        "sizes": sizes,
+        "mesh_axis_names": mesh_axis_names,
+        "m_local": m_local,
+        "m_chip": m_chip,
+        "half_n": half_n,
+        "bn": bn,
+        "grid_n": grid_n,
+        "ring": ring,
+        "double_barrier": double_barrier,
+        "w_transposed": True,
+    }
+    stats_kwargs = {
+        "axis_names": axis_names,
+        "strides": strides,
+        "sizes": sizes,
+        "mesh_axis_names": mesh_axis_names,
+        "m_chip": m_chip,
+        "half_n": half_n,
+        "bn": bn,
+        "grid_n": grid_n,
+        "double_barrier": double_barrier,
+        "has_norm_weight": has_norm_weight,
+        "norm_weight_before": norm_weight_before,
+        "norm_zero_centered_gamma": norm_zero_centered_gamma,
+        "norm_gain_center": norm_gain_center,
+        "has_unpooler_bias": has_unpooler_bias,
+    }
+    route_kwargs = {
+        **topo_kwargs,
+        "program_offset": route_offset,
+        "inputs_preloaded": True,
+        "norm_eps": norm_eps,
+        "has_norm_weight": has_norm_weight,
+        "norm_weight_before": norm_weight_before,
+        "norm_zero_centered_gamma": norm_zero_centered_gamma,
+        "norm_gain_center": norm_gain_center,
+        "has_unpooler_bias": has_unpooler_bias,
+        "use_residual_gate": use_residual_gate,
+        "residual_temperature": residual_temperature,
+        "residual_eps": residual_eps,
+    }
+
+    def _call(p2ph, ph2p, xx, ww, rr, nw, rg, ub):
+        return pl.pallas_call(
+            functools.partial(
+                _matmul_tp_intra_topo_post_moe_kernel,
+                stats_kwargs=stats_kwargs,
+                route_kwargs=route_kwargs,
+            ),
+            out_shape=jax.ShapeDtypeStruct((m, n), residual.dtype),
+            grid_spec=grid_spec,
+            compiler_params=pltpu.CompilerParams(
+                collective_id=collective_id,
+                vmem_limit_bytes=128 * 1024 * 1024,
+                disable_bounds_checks=disable_bounds_checks,
+            ),
+            cost_estimate=cost_estimate,
+            metadata=get_post_moe_epilogue_cost_metadata(cost_estimate),
+            name=f"unpooler_post_moe_two_pass_topo_bn{bn}",
+        )(p2ph, ph2p, xx, ww, rr, nw, rg, ub)
+
+    return jax.jit(
+        jax.shard_map(
+            _call,
+            mesh=mesh,
+            in_specs=(
+                P(None),
+                P(None),
+                P(axis_names, None),
+                P(core_axis, None),
+                P(axis_names, None),
+                P(),
+                P(),
+                P(),
+            ),
+            out_specs=P(None, None),
+            check_vma=False,
+        )
+    )(
+        pos2phys,
+        phys2pos,
+        x,
+        w,
+        residual,
+        norm_weight,
+        residual_gate,
+        unpooler_bias,
     )

@@ -14,6 +14,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from sglang.srt.hardware_backend.tpu.kernels.tier5_sp.matmul_intra_tp_all_gather import (
     matmul_intra_tp_all_gather,
+    matmul_intra_tp_all_gather_post_moe_epilogue,
 )
 from sglang.srt.hardware_backend.tpu.kernels.tier5_sp.common import (
     hypercube_device_order,
@@ -67,3 +68,75 @@ class TestMatmulIntraTpAllGather:
 
         assert output.shape == (m, n)
         assert float(output.addressable_data(0)[0, 0]) == k
+
+    @pytest.mark.parametrize("residual_dtype", [jnp.bfloat16, jnp.float32])
+    def test_post_moe_epilogue_matches_separate_ops(self, tp16_mesh, residual_dtype):
+        m, k, n = 256, 256, 512
+        token_sharding = NamedSharding(tp16_mesh, P(("chip", "core"), None))
+        weight_sharding = NamedSharding(tp16_mesh, P("core", None))
+        replicated = NamedSharding(tp16_mesh, P())
+
+        @functools.partial(
+            jax.jit,
+            out_shardings=(
+                token_sharding,
+                weight_sharding,
+                token_sharding,
+                replicated,
+                replicated,
+                replicated,
+            ),
+        )
+        def make_inputs():
+            keys = jax.random.split(jax.random.key(7), 6)
+            return (
+                jax.random.normal(keys[0], (m, k), dtype=jnp.float32) * 0.05,
+                jax.random.normal(keys[1], (n, k), dtype=jnp.bfloat16) * 0.05,
+                jax.random.normal(keys[2], (m, n), dtype=residual_dtype) * 0.05,
+                jax.random.normal(keys[3], (n,), dtype=jnp.bfloat16) * 0.01,
+                jax.random.normal(keys[4], (n,), dtype=jnp.bfloat16) * 0.01,
+                jax.random.normal(keys[5], (n,), dtype=jnp.bfloat16) * 0.01,
+            )
+
+        x, w, residual, norm_weight, gate, bias = make_inputs()
+        actual = matmul_intra_tp_all_gather_post_moe_epilogue(
+            x,
+            w,
+            residual,
+            norm_weight,
+            gate,
+            bias,
+            tp16_mesh,
+            "chip",
+            "core",
+            norm_eps=1e-8,
+            has_norm_weight=True,
+            norm_weight_before=True,
+            norm_zero_centered_gamma=True,
+            norm_gain_center=1.0,
+            has_unpooler_bias=True,
+            use_residual_gate=True,
+            residual_temperature=0.3,
+            residual_eps=1e-3,
+            bn=256,
+        )
+
+        branch = (x.astype(jnp.float32) @ w.astype(jnp.float32).T).astype(jnp.bfloat16)
+        branch_f32 = branch.astype(jnp.float32) + bias.astype(jnp.float32)
+        branch_f32 = branch_f32 * (norm_weight.astype(jnp.float32) + 1.0)
+        variance = jnp.mean(branch_f32 * branch_f32, axis=1, keepdims=True)
+        normalized = (branch_f32 * jax.lax.rsqrt(variance + 1e-8)).astype(jnp.bfloat16)
+        gate_f32 = gate.astype(jnp.float32) / 0.3
+        beta = jax.nn.sigmoid(gate_f32)
+        alpha = jnp.sqrt(jnp.maximum(jax.nn.sigmoid(-gate_f32) * (1.0 + beta), 1e-3))
+        expected = (
+            alpha * residual.astype(jnp.float32) + beta * normalized.astype(jnp.float32)
+        ).astype(residual_dtype)
+        expected = jax.device_put(expected, replicated)
+
+        np.testing.assert_allclose(
+            np.asarray(actual.addressable_data(0), dtype=np.float32),
+            np.asarray(expected.addressable_data(0), dtype=np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )

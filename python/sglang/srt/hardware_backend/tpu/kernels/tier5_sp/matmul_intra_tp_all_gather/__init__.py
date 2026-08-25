@@ -12,15 +12,17 @@ Public API:
 
 Each core reads only ``[N/2, K]`` of W; a pre-matmul core-bridge token exchange assembles the chip's
 ``[T/8, K]`` block so FLOPs stay non-redundant. ``core_axis`` (size 2) must be the physical on-chip
-pair. Bench: ``python -m sglang.srt.hardware_backend.tpu.kernels.tier5_sp.matmul_intra_tp_all_gather.bench --ms 128 256 512``.
+pair.
 """
 
 from .api import (
     matmul_intra_tp_all_gather,
+    matmul_intra_tp_all_gather_post_moe_epilogue,
     matmul_intra_tp_output_gather,
 )
 
 __all__ = [
     "matmul_intra_tp_all_gather",
+    "matmul_intra_tp_all_gather_post_moe_epilogue",
     "matmul_intra_tp_output_gather",
 ]

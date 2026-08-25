@@ -11,7 +11,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=600, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=900, suite="stage-a-test-tpu-unit")
 
 from sglang.srt.hardware_backend.tpu.kernels.tier5_sp.fused_moe_ops.fused_attention_moe_prelude import (
     build_fused_attention_moe_prelude_fn,
@@ -20,8 +20,17 @@ from sglang.srt.hardware_backend.tpu.kernels.tier5_sp.fused_moe_ops.fused_attent
     fused_attention_moe_prelude_router,
     ref_fused_attention_moe_prelude,
 )
+from sglang.srt.hardware_backend.tpu.kernels.tier5_sp.fused_moe_ops.fused_attention_moe_prelude_replicated import (
+    fused_attention_moe_prelude_router_pooler_replicated,
+)
+from sglang.srt.hardware_backend.tpu.kernels.tier5_sp.common import (
+    hypercube_device_order,
+)
 from sglang.srt.hardware_backend.tpu.kernels.tier5_sp.fused_moe_ops.fused_moe_router import (
     ref_fused_moe_router,
+)
+from sglang.srt.hardware_backend.tpu.kernels.tier5_sp.matmul_intra_tp_all_gather._matmul_tp_intra_topo import (
+    fused_attention_moe_prelude_router_pooler_topo,
 )
 
 
@@ -438,3 +447,349 @@ class TestFusedAttentionMoePrelude:
                 jax.device_put(expected, actual.sharding), tiled=True
             )
             np.testing.assert_array_equal(actual_global, expected_global)
+
+
+class TestFusedAttentionMoePreludeRouterPooler:
+    @pytest.fixture
+    def tp16_mesh(self):
+        devices = jax.devices()
+        if len(devices) != 16 or "TPU7" not in devices[0].device_kind:
+            pytest.skip("requires one TPU7x 2x2x2 TP16 slice")
+        ordered = np.asarray(hypercube_device_order(devices), dtype=object).reshape(
+            8, 2
+        )
+        return jax.sharding.Mesh(ordered, ("chip", "core"))
+
+    @pytest.mark.parametrize(
+        ("tokens", "hidden", "pooled_hidden", "bn", "stream_dtype"),
+        (
+            (256, 256, 256, 128, jnp.bfloat16),
+            (512, 256, 256, 128, jnp.bfloat16),
+            (512, 1024, 1024, 512, jnp.bfloat16),
+            (1024, 256, 256, 128, jnp.bfloat16),
+            (1024, 256, 256, 128, jnp.float32),
+            (2048, 256, 256, 128, jnp.bfloat16),
+            (4096, 256, 256, 128, jnp.float32),
+        ),
+        ids=(
+            "t256",
+            "t512",
+            "t512-bn512",
+            "t1024",
+            "t1024-fp32-stream",
+            "t2048",
+            "t4096-fp32-stream",
+        ),
+    )
+    def test_matches_separate_prelude_router_pooler_and_norm(
+        self, tp16_mesh, tokens, hidden, pooled_hidden, bn, stream_dtype
+    ):
+        experts, topk = 128, 8
+        token_sharding = NamedSharding(tp16_mesh, P(("chip", "core"), None))
+        replicated = NamedSharding(tp16_mesh, P())
+        pooler_sharding = NamedSharding(tp16_mesh, P("core", None))
+
+        @functools.partial(
+            jax.jit,
+            out_shardings=(
+                token_sharding,
+                token_sharding,
+                replicated,
+                replicated,
+                replicated,
+                replicated,
+                replicated,
+                pooler_sharding,
+                replicated,
+            ),
+        )
+        def make_inputs():
+            attn = jax.random.normal(
+                jax.random.key(60), (tokens, hidden), dtype=jnp.bfloat16
+            )
+            stream = jax.random.normal(
+                jax.random.key(61), (tokens, hidden), dtype=stream_dtype
+            )
+            post_weight = jax.random.uniform(
+                jax.random.key(62),
+                (hidden,),
+                dtype=jnp.float32,
+                minval=0.5,
+                maxval=1.5,
+            )
+            gate = jax.random.normal(jax.random.key(63), (hidden,), dtype=jnp.float32)
+            pre_weight = jax.random.uniform(
+                jax.random.key(64),
+                (hidden,),
+                dtype=jnp.bfloat16,
+                minval=0.5,
+                maxval=1.5,
+            )
+            router_weight = (
+                jax.random.normal(
+                    jax.random.key(65),
+                    (experts, hidden),
+                    dtype=jnp.float32,
+                )
+                * 0.02
+            )
+            expert_bias = jax.random.normal(
+                jax.random.key(66), (experts,), dtype=jnp.float32
+            )
+            pooler_weight = (
+                jax.random.normal(
+                    jax.random.key(67),
+                    (pooled_hidden, hidden),
+                    dtype=jnp.bfloat16,
+                )
+                * jnp.asarray(0.02, jnp.bfloat16)
+            ).astype(jnp.bfloat16)
+            pre_expert_weight = jax.random.uniform(
+                jax.random.key(68),
+                (pooled_hidden,),
+                dtype=jnp.bfloat16,
+                minval=0.5,
+                maxval=1.5,
+            )
+            return (
+                attn,
+                stream,
+                post_weight,
+                gate,
+                pre_weight,
+                router_weight,
+                expert_bias,
+                pooler_weight,
+                pre_expert_weight,
+            )
+
+        inputs = make_inputs()
+        kwargs = dict(
+            has_post_weight=True,
+            post_eps=1e-8,
+            pre_eps=1e-5,
+            topk=topk,
+            route_scale=2.5,
+            division_eps=1e-8,
+        )
+        (
+            actual_h,
+            actual_pooled,
+            actual_prepared_expert,
+            actual_weights,
+            actual_indices,
+        ) = fused_attention_moe_prelude_router_pooler_topo(
+            *inputs,
+            tp16_mesh,
+            "chip",
+            "core",
+            bn=bn,
+            **kwargs,
+        )
+
+        (
+            expected_h,
+            expected_prepared,
+            expected_weights,
+            expected_indices,
+        ) = build_fused_attention_moe_prelude_router_fn(
+            tp16_mesh, token_spec=P(("chip", "core"), None)
+        )(
+            *inputs[:7],
+            **kwargs,
+        )
+        expected_pooled = jnp.dot(
+            expected_prepared,
+            inputs[7].T,
+            preferred_element_type=jnp.float32,
+        ).astype(inputs[0].dtype)
+        pooled_f32 = actual_pooled.astype(jnp.float32)
+        expected_prepared_expert = (
+            pooled_f32
+            * jax.lax.rsqrt(
+                jnp.mean(pooled_f32 * pooled_f32, axis=-1, keepdims=True) + 1e-5
+            )
+        ).astype(inputs[0].dtype)
+        expected_prepared_expert = (expected_prepared_expert * inputs[8]).astype(
+            inputs[0].dtype
+        )
+        expected_prepared_expert = expected_prepared_expert.reshape(
+            tokens, pooled_hidden // 128, 128
+        )
+
+        def gather(value):
+            return np.asarray(multihost_utils.process_allgather(value, tiled=True))
+
+        assert actual_h.dtype == stream_dtype
+        assert actual_pooled.dtype == inputs[0].dtype
+        assert actual_prepared_expert.dtype == inputs[0].dtype
+        np.testing.assert_array_equal(gather(actual_h), gather(expected_h))
+        np.testing.assert_allclose(
+            gather(actual_pooled).astype(np.float32),
+            gather(expected_pooled).astype(np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        np.testing.assert_allclose(
+            gather(actual_weights), gather(expected_weights), rtol=1e-6, atol=1e-6
+        )
+        np.testing.assert_allclose(
+            gather(actual_prepared_expert).astype(np.float32),
+            gather(expected_prepared_expert).astype(np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        np.testing.assert_array_equal(
+            gather(actual_indices).reshape(-1),
+            gather(expected_indices).reshape(-1),
+        )
+
+    def test_replicated_path_matches_separate_ops(self, tp16_mesh):
+        tokens, hidden, pooled_hidden = 512, 256, 256
+        experts, topk = 128, 8
+        replicated = NamedSharding(tp16_mesh, P())
+        pooler_sharding = NamedSharding(tp16_mesh, P("core", None))
+
+        @functools.partial(
+            jax.jit,
+            out_shardings=(
+                replicated,
+                replicated,
+                replicated,
+                replicated,
+                replicated,
+                replicated,
+                replicated,
+                pooler_sharding,
+                replicated,
+            ),
+        )
+        def make_inputs():
+            attn = jax.random.normal(
+                jax.random.key(70), (tokens, hidden), dtype=jnp.bfloat16
+            )
+            stream = jax.random.normal(
+                jax.random.key(71), (tokens, hidden), dtype=jnp.bfloat16
+            )
+            post_weight = jax.random.uniform(
+                jax.random.key(72),
+                (hidden,),
+                dtype=jnp.float32,
+                minval=0.5,
+                maxval=1.5,
+            )
+            gate = jax.random.normal(jax.random.key(73), (hidden,), dtype=jnp.float32)
+            pre_weight = jax.random.uniform(
+                jax.random.key(74),
+                (hidden,),
+                dtype=jnp.bfloat16,
+                minval=0.5,
+                maxval=1.5,
+            )
+            router_weight = (
+                jax.random.normal(
+                    jax.random.key(75),
+                    (experts, hidden),
+                    dtype=jnp.float32,
+                )
+                * 0.02
+            )
+            expert_bias = jax.random.normal(
+                jax.random.key(76), (experts,), dtype=jnp.float32
+            )
+            pooler_weight = (
+                jax.random.normal(
+                    jax.random.key(77),
+                    (pooled_hidden, hidden),
+                    dtype=jnp.bfloat16,
+                )
+                * jnp.asarray(0.02, jnp.bfloat16)
+            ).astype(jnp.bfloat16)
+            pre_expert_weight = jax.random.uniform(
+                jax.random.key(78),
+                (pooled_hidden,),
+                dtype=jnp.bfloat16,
+                minval=0.5,
+                maxval=1.5,
+            )
+            return (
+                attn,
+                stream,
+                post_weight,
+                gate,
+                pre_weight,
+                router_weight,
+                expert_bias,
+                pooler_weight,
+                pre_expert_weight,
+            )
+
+        inputs = make_inputs()
+        kwargs = dict(
+            has_post_weight=True,
+            post_eps=1e-8,
+            pre_eps=1e-5,
+            topk=topk,
+            route_scale=2.5,
+            division_eps=1e-8,
+        )
+        actual = fused_attention_moe_prelude_router_pooler_replicated(
+            *inputs,
+            tp16_mesh,
+            "chip",
+            "core",
+            bn=128,
+            **kwargs,
+        )
+        (
+            expected_h,
+            expected_prepared,
+            expected_weights,
+            expected_indices,
+        ) = build_fused_attention_moe_prelude_router_fn(
+            tp16_mesh, token_spec=P(None, None)
+        )(
+            *inputs[:7],
+            **kwargs,
+        )
+        expected_pooled = jnp.dot(
+            expected_prepared,
+            inputs[7].T,
+            preferred_element_type=jnp.float32,
+        ).astype(jnp.bfloat16)
+        pooled_f32 = expected_pooled.astype(jnp.float32)
+        expected_prepared_expert = (
+            pooled_f32
+            * jax.lax.rsqrt(
+                jnp.mean(pooled_f32 * pooled_f32, axis=-1, keepdims=True) + 1e-5
+            )
+            * inputs[8].astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        expected_prepared_expert = expected_prepared_expert.reshape(
+            tokens, pooled_hidden // 128, 128
+        )
+
+        def gather(value):
+            return np.asarray(multihost_utils.process_allgather(value, tiled=True))
+
+        actual_h, actual_pooled, actual_expert, actual_weights, actual_indices = actual
+        np.testing.assert_array_equal(gather(actual_h), gather(expected_h))
+        np.testing.assert_allclose(
+            gather(actual_pooled).astype(np.float32),
+            gather(expected_pooled).astype(np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        np.testing.assert_allclose(
+            gather(actual_expert).astype(np.float32),
+            gather(expected_prepared_expert).astype(np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        np.testing.assert_allclose(
+            gather(actual_weights), gather(expected_weights), rtol=1e-6, atol=1e-6
+        )
+        np.testing.assert_array_equal(
+            gather(actual_indices).reshape(-1),
+            gather(expected_indices).reshape(-1),
+        )

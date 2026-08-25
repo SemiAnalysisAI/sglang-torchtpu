@@ -93,6 +93,15 @@ def cost_estimate_metadata(
     return metadata
 
 
+def logical_comm_bytes(
+    communicated_input_bytes: int, communicated_output_bytes: int
+) -> int:
+    """Estimate logical collective bytes from the larger payload leg."""
+    if communicated_input_bytes < 0 or communicated_output_bytes < 0:
+        raise ValueError("communicated payload sizes must be nonnegative")
+    return max(communicated_input_bytes, communicated_output_bytes)
+
+
 def hypercube_device_order(devices) -> list:
     """Order a 2x2x2 TPU slice by chip coordinates and on-chip core."""
     return sorted(
@@ -183,6 +192,7 @@ __all__ = [
     "hypercube_device_order",
     "is_2x2x2_topology",
     "local_barrier",
+    "logical_comm_bytes",
     "make_hypercube_tp_mesh",
     "make_ring_tp_mesh",
     "storage_bytes_for_elements",
