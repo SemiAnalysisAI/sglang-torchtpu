@@ -25,7 +25,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.disaggregation.base.conn import BaseKVSender, KVArgs, StateType
-from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeReqToTokenPool
 from sglang.srt.disaggregation.raiden.conn import (
     RaidenKVManager,
     RaidenKVSender,
@@ -78,6 +78,22 @@ def _make_host_pool(page_size=4, page_num=3):
     pool.transfer = _FakeTransfer()
     pool.clear()
     return pool
+
+
+class TestDecodeReqToTokenPool(CustomTestCase):
+    def test_write_matches_req_to_token_pool_api(self):
+        pool = DecodeReqToTokenPool(
+            size=4,
+            max_context_len=8,
+            device="tpu:0",
+            enable_memory_saver=False,
+            pre_alloc_size=4,
+        )
+        values = torch.tensor([11, 12, 13], dtype=torch.int32)
+
+        pool.write((2, slice(1, 4)), values)
+
+        torch.testing.assert_close(pool.req_to_token[2, 1:4], values)
 
 
 class TestRaidenHostPoolPaging(CustomTestCase):

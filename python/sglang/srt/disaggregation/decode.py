@@ -160,10 +160,17 @@ class DecodeReqToTokenPool:
         # inheriting ReqToTokenPool.alloc, which bumps it.
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
 
-    def write(self, req_pool_idx: int, cur_len: int, token_ids: torch.Tensor):
-        if self.host_resident and token_ids.device != self.req_to_token.device:
-            token_ids = token_ids.cpu()
-        self.req_to_token[req_pool_idx, cur_len : cur_len + len(token_ids)] = token_ids
+    def write(self, indices, values):
+        # Host-resident pool: move device index/value tensors to host scatter.
+        # FIXME: please refactor this inherit from ReqToTokenPool
+        if self.req_to_token.device.type == "cpu":
+            if isinstance(indices, tuple):
+                indices = tuple(i.cpu() if torch.is_tensor(i) else i for i in indices)
+            elif torch.is_tensor(indices):
+                indices = indices.cpu()
+            if torch.is_tensor(values):
+                values = values.cpu()
+        self.req_to_token[indices] = values
 
     def available_size(self):
         return len(self.free_slots)
