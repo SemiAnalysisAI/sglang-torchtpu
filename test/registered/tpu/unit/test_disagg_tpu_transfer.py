@@ -25,6 +25,8 @@ from sglang.test.ci.ci_register import register_tpu_ci
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
 import importlib.util
+import logging
+import sys
 import threading
 import time
 import unittest
@@ -61,6 +63,22 @@ from sglang.test.test_utils import CustomTestCase
 
 # Enable Perfetto tracing for tests to exercise tracing code paths
 envs.SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING.set(True)
+
+# conn.py logs the push path (gather start, push start, push finish) at INFO.
+# Nothing configures a handler for it under the CI runner, so logging's
+# last-resort handler drops everything below WARNING and a delivery failure
+# leaves no sender-side trace at all — the gap that made the stranded-push flake
+# take days to localise. Own the handler here so the record survives regardless
+# of the runner's root config; the volume is a few lines per transfer.
+_conn_logger = logging.getLogger("sglang.srt.disaggregation.tpu.conn")
+_conn_logger.setLevel(logging.INFO)
+if not _conn_logger.handlers:
+    _conn_handler = logging.StreamHandler(sys.stdout)
+    _conn_handler.setFormatter(logging.Formatter("[conn] %(levelname)s %(message)s"))
+    _conn_logger.addHandler(_conn_handler)
+# Our handler is the only one; propagating would double every line if the
+# runner installs a root handler later.
+_conn_logger.propagate = False
 
 
 def _skip_if_no_tpu() -> bool:
@@ -348,7 +366,12 @@ def _close_manager(m) -> None:
     if m._push_pool is not None:
         m._push_pool.shutdown(wait=True, cancel_futures=True)
 
-    sockets = [m.server_socket, *m._socket_cache.values(), *m._monitor_cache.values()]
+    sockets = [
+        m.server_socket,
+        m._accept_monitor,
+        *m._socket_cache.values(),
+        *m._monitor_cache.values(),
+    ]
     for channel_socks in m._chan_socks.values():
         sockets.extend(channel_socks)
     for sock in sockets:
@@ -357,6 +380,45 @@ def _close_manager(m) -> None:
         # anything unsent instead of blocking teardown on a dead peer.
         if sock is not None and not sock.closed:
             sock.close(linger=0)
+
+
+def _recv_kvdata(m):
+    """Receive one KV frame, turning a timeout into a diagnosis.
+
+    A push that was stranded by a failed connect looks exactly like a slow one
+    from the receiving end: nothing arrives, and the sender reports success
+    either way, because PUSH queues into a pipe created at connect() time. That
+    ambiguity is what made the original CI flake expensive -- the only artefact
+    was a bare zmq.Again with no counterpart error anywhere.
+
+    The accept monitor separates the two. Zero accepted connections means no
+    sender ever completed its TCP handshake, so the bytes went into a socket
+    with no peer; a non-zero count means the transport was fine and the fault
+    lies further up the push path.
+    """
+    try:
+        return m.server_socket.recv_multipart()
+    except zmq.Again:
+        accepted = 0
+        while True:
+            try:
+                m._accept_monitor.recv_multipart(zmq.NOBLOCK)
+                accepted += 1
+            except zmq.Again:
+                break
+        detail = (
+            "no sender ever connected, so the push was stranded rather than "
+            "slow -- check that _connect still enables reconnection "
+            "(see test_push_socket_reconnect)"
+            if accepted == 0
+            else "the sender did connect, so the transport is fine and the "
+            "fault is in the push path itself"
+        )
+        raise AssertionError(
+            f"no KV data within {m.server_socket.getsockopt(zmq.RCVTIMEO)}ms on "
+            f"port {m.rank_port}; sender connections accepted: {accepted} -- "
+            f"{detail}"
+        ) from None
 
 
 def _bare_manager(
@@ -417,6 +479,10 @@ def _bare_manager(
 
     sock = ctx.socket(zmq.PULL)
     sock.setsockopt(zmq.RCVTIMEO, 30000)
+    # Watched by _recv_kvdata to tell "the sender never connected" apart from
+    # "the sender was slow" when a receive times out. Attach before bind so no
+    # accept can slip through unrecorded.
+    m._accept_monitor = sock.get_monitor_socket(zmq.EVENT_ACCEPTED)
     port = sock.bind_to_random_port("tcp://127.0.0.1")
     m.server_socket = sock
     m.local_ip = "127.0.0.1"
@@ -520,7 +586,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         # gather (main thread) + push (bg); decode bg recv stashes; decode
         # main-thread process_decode_pending scatters.
         prefill.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        msg = decode.server_socket.recv_multipart()
+        msg = _recv_kvdata(decode)
         decode._handle_kvdata_ch(msg)
         self.assertNotIn(room, decode.request_status)  # not scattered yet
         decode.process_decode_pending(room)
@@ -543,12 +609,12 @@ class TestTpuKVManagerProtocol(CustomTestCase):
 
         # chunk 0: pages [0:2], not last
         prefill.gather_and_push(room, src_pages[:2], 0, False, aux_index=None)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(_recv_kvdata(decode))
         decode.process_decode_pending(room)
         self.assertNotIn(room, decode.request_status)  # not Success yet
         # chunk 1: pages [2:4], last, carries aux
         prefill.gather_and_push(room, src_pages[2:], 2, True, aux_index=5)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(_recv_kvdata(decode))
         decode.process_decode_pending(room)
 
         self._assert_pages_equal(ppool, dpool, src_pages, dst_pages)
@@ -573,14 +639,14 @@ class TestTpuKVManagerProtocol(CustomTestCase):
 
         # Push chunk 1 (pages [2:4], IS last, carries aux) FIRST, deliver + scatter.
         prefill.gather_and_push(room, src_pages[2:], 2, True, aux_index=5)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(_recv_kvdata(decode))
         decode.process_decode_pending(room)
         # is_last scattered, but pages [0:2] have not arrived -> NOT Success yet.
         self.assertNotEqual(decode.request_status.get(room), KVPoll.Success)
 
         # Now the earlier chunk 0 (pages [0:2], not last) arrives.
         prefill.gather_and_push(room, src_pages[:2], 0, False, aux_index=None)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(_recv_kvdata(decode))
         decode.process_decode_pending(room)
 
         self.assertEqual(decode.request_status[room], KVPoll.Success)
@@ -640,7 +706,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         prefill.gather_and_push(room, src_pages, 0, True, aux_index=5)
         # 2 channels -> 2 messages; route each into the reassembly buffer.
         for _ in range(2):
-            decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+            decode._handle_kvdata_ch(_recv_kvdata(decode))
         decode.process_decode_pending(room)
 
         self._assert_pages_equal(ppool, dpool, src_pages, dst_pages)
@@ -663,7 +729,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
             ep: prefill.get_prefill_transfer_info(room, ep, 3)
         }
         prefill.gather_and_push(room, np.array([2, 5, 9], dtype=np.int64), 0, True, 1)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(_recv_kvdata(decode))
         decode.process_decode_pending(room)
         self.assertEqual(decode.request_status[room], KVPoll.Failed)
 
@@ -756,11 +822,11 @@ class TestTpuReshardingProtocol(CustomTestCase):
 
         # Both prefill ranks pass aux_index; only rank0 should actually send it.
         p0.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(_recv_kvdata(decode))
         decode.process_decode_pending(room)
         self.assertNotEqual(decode.request_status.get(room), KVPoll.Success)  # half
         p1.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(_recv_kvdata(decode))
         decode.process_decode_pending(room)
 
         self.assertEqual(decode.request_status[room], KVPoll.Success)
@@ -826,8 +892,8 @@ class TestTpuReshardingProtocol(CustomTestCase):
         }
 
         prefill.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        d0._handle_kvdata_ch(d0.server_socket.recv_multipart())
-        d1._handle_kvdata_ch(d1.server_socket.recv_multipart())
+        d0._handle_kvdata_ch(_recv_kvdata(d0))
+        d1._handle_kvdata_ch(_recv_kvdata(d1))
         d0.process_decode_pending(room)
         d1.process_decode_pending(room)
 
@@ -890,11 +956,11 @@ class TestTpuReshardingProtocol(CustomTestCase):
 
         # First source alone must not conclude the room (2 chunks reassemble).
         p0.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(_recv_kvdata(decode))
         decode.process_decode_pending(room)
         self.assertNotEqual(decode.request_status.get(room), KVPoll.Success)
         p1.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(_recv_kvdata(decode))
         decode.process_decode_pending(room)
 
         self.assertEqual(decode.request_status[room], KVPoll.Success)
@@ -957,11 +1023,11 @@ class TestTpuReshardingProtocol(CustomTestCase):
         self.assertFalse(probe.require_reassemble)
 
         p0.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(_recv_kvdata(decode))
         decode.process_decode_pending(room)
         self.assertNotEqual(decode.request_status.get(room), KVPoll.Success)
         p1.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(_recv_kvdata(decode))
         decode.process_decode_pending(room)
 
         self.assertEqual(decode.request_status[room], KVPoll.Success)
@@ -1038,7 +1104,7 @@ class TestTpuReshardingProtocol(CustomTestCase):
         # the whole lane is copied verbatim -- dummy slots [2:4] are NOT polluted
         # with a second copy of the head.
         p0.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(_recv_kvdata(decode))
         decode.process_decode_pending(room)
         self.assertEqual(decode.request_status[room], KVPoll.Success)
         for li in range(layers):
@@ -1381,9 +1447,9 @@ class TestTpuKVManagerStagingOnDevice(CustomTestCase):
     def _recv_and_scatter(self, decode, n_channels, room):
         if n_channels > 1:
             for _ in range(n_channels):
-                decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+                decode._handle_kvdata_ch(_recv_kvdata(decode))
         else:
-            decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+            decode._handle_kvdata_ch(_recv_kvdata(decode))
         decode.process_decode_pending(room)
 
     def _run(self, async_d2h, n_channels):
