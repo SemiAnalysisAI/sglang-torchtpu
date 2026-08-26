@@ -202,6 +202,13 @@ def main():
             ap.error("P/D mode needs both --pd-prefill-hosts and --pd-decode-hosts")
         if not a.exec_cmd:
             ap.error("P/D mode needs --exec")
+        # The pod script announces --files and reports the run's verdict against
+        # them in TIMINGS format, which is the only thing that gives a P/D run a
+        # test name on the dashboard. Without it the run lands there named after
+        # the job, which reads as a test that does not exist -- so require it
+        # rather than emitting a record with an empty `file`.
+        if not a.files:
+            ap.error("P/D mode needs --files (the test file(s) --exec runs)")
         run_name = dns_safe(a.name or "pd")
         # Pods locate their peer slice by swapping the replicated-job segment
         # ("-prefill-"/"-decode-") of their own hostname; a run name containing
@@ -242,6 +249,7 @@ def main():
             "IMAGE": a.image,
             "ACTIVE_DEADLINE": str(_PD_ACTIVE_DEADLINE),
             "EXEC_CMD": a.exec_cmd,
+            "TEST_FILES": a.files,
             "RUN_NAME": run_name,
             "EXCLUSIVE_PLACEMENT": exclusive if multihost else "",
             "PREFILL_HOSTS": str(a.pd_prefill_hosts),
