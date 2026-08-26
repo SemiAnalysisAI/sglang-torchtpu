@@ -13,9 +13,11 @@ What each verification proves:
   * offload:    after churn evicts the device pool, a resend must reload the
                 prefix from the host tier (cached_tokens_details.host > 0), and
                 the prefill log must show the raiden transfer engine came up.
-  * KV transfer: every probe goes prefill -> decode across slices; greedy output
-                must stay bit-equal to the cold baseline, certifying the KV
-                crossed both the P/D wire and the host tier intact.
+  * KV transfer: every probe goes prefill -> decode across slices; the
+                device-hit and host-reload passes must produce bit-equal greedy
+                output, certifying the KV survived the host offload round trip
+                (the cold pass runs a different extend shape and is held to
+                liveness only; quality is gated by gsm8k).
 
 Roles (rank = slice-local TPU_WORKER_ID):
   prefill rank 0   launches the prefill engine, waits for decode, starts the
@@ -492,8 +494,17 @@ def validate_cache_probe(
 ) -> int:
     """The device-hit -> churn -> host-reload oracle; returns expected tokens.
 
-    Bit-equal greedy text across the three passes certifies the KV integrity of
-    both the P/D transfer and the host offload round trip.
+    Bit-equal greedy text between the device-hit and host-reload passes
+    certifies the KV integrity of the host offload round trip: both passes
+    recompute the same final page over the same stored prefix KV, so their
+    outputs are deterministic replicas unless the reloaded pages differ.
+
+    The cold pass is held to liveness only. Its prefill runs a different
+    extend shape (full prompt vs one page over cached prefix) and consumes
+    the prefix at compute dtype rather than KV-cache dtype, so its logits
+    differ by kernel-level epsilons and greedy ties may break differently.
+    Semantic quality of the cached path is gated by the gsm8k floor, whose
+    requests share their few-shot prefix through the same cache.
     """
     if cold.prompt_tokens < 2 * page_size:
         raise AssertionError(f"target prompt too short: {cold.prompt_tokens} tokens")
@@ -517,8 +528,8 @@ def validate_cache_probe(
         raise AssertionError(
             f"immediate resend loaded from host: {device_hit.host_cached_tokens}"
         )
-    if device_hit.text != cold.text:
-        raise AssertionError("device-hit greedy output diverged from cold baseline")
+    if not device_hit.text.strip() or device_hit.completion_tokens <= 0:
+        raise AssertionError("device-hit request produced no decode output")
 
     if host_reload.host_cached_tokens <= 0:
         raise AssertionError(
@@ -531,8 +542,11 @@ def validate_cache_probe(
             f"device={host_reload.device_cached_tokens} "
             f"host={host_reload.host_cached_tokens} expected>={expected}"
         )
-    if host_reload.text != cold.text:
-        raise AssertionError("host-reloaded greedy output diverged from cold baseline")
+    if host_reload.text != device_hit.text:
+        raise AssertionError(
+            "host-reloaded greedy output diverged from the device-hit pass -- "
+            "the offloaded KV pages did not survive the host round trip"
+        )
     return expected
 
 
@@ -547,6 +561,20 @@ def run_cache_probe(
         _generate(base_url, make_prompt(1000 + index, config.filler_words), 1)
     host_reload = _generate(base_url, target, config.max_new_tokens)
 
+    # Emitted before validation so a failed oracle still carries all three
+    # generations for diagnosis.
+    print(
+        json.dumps(
+            {
+                "cache_probe": profile.key,
+                "cold": msgspec.to_builtins(cold),
+                "device_hit": msgspec.to_builtins(device_hit),
+                "host_reload": msgspec.to_builtins(host_reload),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     expected = validate_cache_probe(
         cold=cold,
         device_hit=device_hit,
@@ -560,19 +588,7 @@ def run_cache_probe(
     dump_metric(
         "kv_offload_host_reload_tokens", host_reload.host_cached_tokens, labels=labels
     )
-    print(
-        json.dumps(
-            {
-                "cache_probe": profile.key,
-                "expected_cached_tokens": expected,
-                "cold": msgspec.to_builtins(cold),
-                "device_hit": msgspec.to_builtins(device_hit),
-                "host_reload": msgspec.to_builtins(host_reload),
-            },
-            sort_keys=True,
-        ),
-        flush=True,
-    )
+    print(f"cache probe passed: expected_cached_tokens={expected}", flush=True)
 
 
 def run_gsm8k(base_url: str, profile: ModelProfile, config: Gsm8kConfig) -> float:
@@ -652,8 +668,9 @@ def _start_host_watch() -> None:
         "while :; do "
         "echo \"[hostwatch:mem] $(grep -E 'MemTotal|MemAvailable' /proc/meminfo"
         " | tr -s ' \\n' ' ')\"; "
-        "ps -eo rss,pid,comm --sort=-rss | head -4 | tail -3 | "
-        "sed 's/^/[hostwatch:rss] /'; "
+        "for d in /proc/[0-9]*; do r=$(awk '{print $2}' $d/statm 2>/dev/null); "
+        '[ -n "$r" ] && echo "$((r*4/1024))MB ${d##*/} $(cat $d/comm 2>/dev/null)"; '
+        "done | sort -rn | head -3 | sed 's/^/[hostwatch:rss] /'; "
         "sleep 20; done"
     )
     subprocess.Popen(["bash", "-c", script], start_new_session=True)
