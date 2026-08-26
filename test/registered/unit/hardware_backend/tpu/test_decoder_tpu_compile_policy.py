@@ -28,11 +28,13 @@ from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy impo
     Eagle3CompilePolicyMixin,
     SpecDecoderTpuCompilePolicy,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.hardware_backend.tpu.sampler import select_logits_output_mode
+from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
+    LogitsOutputMode,
     PPProxyTensors,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -77,6 +79,7 @@ def _model_runner(device="cpu"):
         token_to_kv_pool_allocator=SimpleNamespace(
             free_pages=torch.arange(4, dtype=torch.int32)
         ),
+        is_draft_worker=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
         server_args=SimpleNamespace(page_size=1, dp_size=1),
     )
@@ -92,6 +95,32 @@ def _make_policy(model_runner=None, token_buckets=(64, 256), bs_buckets=(1, 4)):
         t_bucketer=t_bucketer,
         b_bucketer=b_bucketer,
         owner=model_runner.model,
+    )
+
+
+def _enable_distributed_top_k(model_runner):
+    model_runner.model.logits_processor = SimpleNamespace(
+        use_tpu_distributed_top_k=True,
+        do_tensor_parallel_all_gather=True,
+        do_tensor_parallel_all_gather_dp_attn=False,
+    )
+    model_runner.model.lm_head = SimpleNamespace(
+        enable_tp=True,
+        num_embeddings=202_048,
+        num_embeddings_per_partition=202_048 // 16,
+        shard_indices=object(),
+    )
+    return model_runner
+
+
+def _make_distributed_top_k_policy():
+    model_runner = _enable_distributed_top_k(_model_runner())
+    return _make_policy(model_runner, token_buckets=(64,), bs_buckets=(64,))
+
+
+def _select_logits_output_mode(policy, forward_batch):
+    forward_batch.logits_output_mode = select_logits_output_mode(
+        forward_batch, policy.model_runner.model
     )
 
 
@@ -149,88 +178,129 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         )
         self.assertIs(kwargs["kv_pool"], kv_pool)
 
-    def test_specialization_key_uses_normalized_candidate_width(self):
-        model_runner = _model_runner()
-        selector = MagicMock(return_value=None)
-        model_runner.model.logits_processor = SimpleNamespace(
-            get_tpu_distributed_top_k_for_batch=selector
-        )
-        model_runner.model.lm_head = object()
-        policy = _make_policy(model_runner)
+
+class TestLogitsOutputMode(CustomTestCase):
+    def test_specialization_key_uses_selected_logits_mode(self):
+        policy = _make_policy()
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             batch_size=64,
+            logits_output_mode=LogitsOutputMode.DISTRIBUTED_TOP_K,
         )
-
-        fallback_key = policy._direct_compile_specialization_key(
-            None,
-            torch.arange(64),
-            torch.arange(64),
-            forward_batch,
-        )
-        selector.return_value = 64
         candidate_key = policy._direct_compile_specialization_key(
-            None,
-            torch.arange(64),
-            torch.arange(64),
-            forward_batch,
+            None, torch.arange(64), None, forward_batch
+        )
+        forward_batch.logits_output_mode = LogitsOutputMode.FULL_VOCAB
+        fallback_key = policy._direct_compile_specialization_key(
+            None, torch.arange(64), None, forward_batch
         )
 
-        self.assertIsNone(fallback_key[-1])
-        self.assertEqual(candidate_key[-1], 64)
+        self.assertIs(candidate_key[-1], LogitsOutputMode.DISTRIBUTED_TOP_K)
+        self.assertIs(fallback_key[-1], LogitsOutputMode.FULL_VOCAB)
         self.assertEqual(fallback_key[:-1], candidate_key[:-1])
 
-    def test_warmup_covers_both_logits_modes_at_the_default_cutoff(self):
-        model_runner = _model_runner()
-        model_runner.model.logits_processor = SimpleNamespace(
-            use_tpu_distributed_top_k=True,
-            do_tensor_parallel_all_gather=True,
-            do_tensor_parallel_all_gather_dp_attn=False,
+    def test_non_logits_boundary_ignores_logits_output_mode(self):
+        policy = _make_policy()
+        policy.owner = object()
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            batch_size=64,
+            logits_output_mode=LogitsOutputMode.DISTRIBUTED_TOP_K,
         )
-        model_runner.model.lm_head = SimpleNamespace(
-            enable_tp=True,
-            num_embeddings=202_048,
-            num_embeddings_per_partition=202_048 // 16,
-            shard_indices=object(),
+        candidate_key = policy._direct_compile_specialization_key(
+            None, torch.arange(64), None, forward_batch
         )
-        policy = _make_policy(model_runner, bs_buckets=(1, 64))
+        forward_batch.logits_output_mode = LogitsOutputMode.FULL_VOCAB
 
-        with patch(
-            "sglang.srt.hardware_backend.tpu.sampler."
-            "distributed_top_k_min_batch_size",
-            return_value=64,
-        ):
-            self.assertEqual(policy._sampling_warmup_variants(1), ("full_vocab",))
-            self.assertEqual(
-                policy._sampling_warmup_variants(64),
-                ("candidates", "full_vocab"),
-            )
+        self.assertIsNone(candidate_key[-1])
+        self.assertEqual(
+            candidate_key,
+            policy._direct_compile_specialization_key(
+                None, torch.arange(64), None, forward_batch
+            ),
+        )
 
     def test_mode_selection_uses_the_padded_physical_batch(self):
-        model_runner = _model_runner()
-        model_runner.model.logits_processor = SimpleNamespace(
-            use_tpu_distributed_top_k=True,
-            do_tensor_parallel_all_gather=True,
-            do_tensor_parallel_all_gather_dp_attn=False,
-        )
-        model_runner.model.lm_head = SimpleNamespace(
-            enable_tp=True,
-            num_embeddings=202_048,
-            num_embeddings_per_partition=202_048 // 16,
-            shard_indices=object(),
-        )
-        policy = _make_policy(model_runner, token_buckets=(64,), bs_buckets=(64,))
+        policy = _make_distributed_top_k_policy()
         forward_batch = policy._make_dummy_forward_batch(
             num_tokens=1, bs=1, mode=ForwardMode.DECODE
         )
 
+        self.assertIs(forward_batch.logits_output_mode, LogitsOutputMode.FULL_VOCAB)
         policy.prepare_forward_batch(forward_batch)
+        _select_logits_output_mode(policy, forward_batch)
 
         self.assertEqual(forward_batch._tpu_real_b, 1)
         self.assertEqual(forward_batch.batch_size, 64)
-        self.assertEqual(forward_batch.sampling_info.uniform_top_k, 64)
+        self.assertEqual(forward_batch.sampling_info.uniform_top_k, 50)
         self.assertEqual(forward_batch.sampling_info.top_ks[0].item(), 50)
+        self.assertIs(
+            forward_batch.logits_output_mode,
+            LogitsOutputMode.DISTRIBUTED_TOP_K,
+        )
+
+    def test_compiled_logits_do_not_read_eager_logprob_metadata(self):
+        policy = _make_distributed_top_k_policy()
+        forward_batch = policy._make_dummy_forward_batch(
+            num_tokens=64, bs=64, mode=ForwardMode.EXTEND
+        )
+        forward_batch.return_logprob = True
+        forward_batch.top_logprobs_nums = [5] * 64
+        forward_batch.token_ids_logprobs = [[3, 7]] * 64
+        forward_batch.extend_input_logprob_token_ids_gpu = torch.tensor([3, 7])
+        forward_batch.extend_logprob_start_lens_cpu = list(
+            forward_batch.extend_seq_lens_cpu
+        )
+
+        policy.prepare_forward_batch(forward_batch)
+        _select_logits_output_mode(policy, forward_batch)
+        logits_processor = policy.model_runner.model.logits_processor
+        logits_processor.compute_input_logprobs = False
+
+        def consume_mode(value, batch):
+            metadata = LogitsMetadata.from_forward_batch(
+                batch,
+                compute_input_logprobs=logits_processor.compute_input_logprobs,
+            )
+            offset = (
+                64
+                if batch.logits_output_mode is LogitsOutputMode.DISTRIBUTED_TOP_K
+                else 0
+            )
+            return value + offset + int(metadata.extend_return_logprob)
+
+        torch._dynamo.reset()
+        self.addCleanup(torch._dynamo.reset)
+        compiled = torch.compile(consume_mode, backend="eager", fullgraph=True)
+        value = torch.zeros(1)
+        for mode in LogitsOutputMode:
+            forward_batch.logits_output_mode = mode
+            compiled(value, forward_batch)
+
+        forward_batch.top_logprobs_nums = [10] * 64
+        forward_batch.token_ids_logprobs = [[11, 13]] * 64
+        forward_batch.extend_input_logprob_token_ids_gpu = torch.tensor([11, 13])
+        with torch._dynamo.config.patch(error_on_recompile=True):
+            for mode in LogitsOutputMode:
+                forward_batch.logits_output_mode = mode
+                compiled(value, forward_batch)
+
+        logits_metadata = LogitsMetadata.from_forward_batch(
+            forward_batch, compute_input_logprobs=False
+        )
+
+        self.assertFalse(logits_metadata.extend_return_logprob)
+        self.assertIsNone(logits_metadata.top_logprobs_nums)
+        self.assertIsNone(logits_metadata.token_ids_logprobs)
+        self.assertIsNone(logits_metadata.extend_input_logprob_token_ids_gpu)
+        self.assertTrue(forward_batch.return_logprob)
+        self.assertEqual(forward_batch.top_logprobs_nums, [10] * 64)
+        self.assertEqual(forward_batch.token_ids_logprobs, [[11, 13]] * 64)
+        self.assertEqual(
+            forward_batch.extend_input_logprob_token_ids_gpu.tolist(), [11, 13]
+        )
 
 
 class TestDecoderOutputUnpadding(CustomTestCase):
@@ -320,6 +390,7 @@ class TestInstallExtendCap(CustomTestCase):
         model = SimpleNamespace(
             forward=original_outer,
             model=SimpleNamespace(forward=original_backbone),
+            logits_processor=SimpleNamespace(compute_input_logprobs=True),
             prepare_forward_batch=MagicMock(),
         )
         model_runner = SimpleNamespace(
@@ -359,6 +430,7 @@ class TestInstallExtendCap(CustomTestCase):
             self.assertTrue(policy.install())
 
         self.assertIs(model.model.forward, original_backbone)
+        self.assertFalse(model.logits_processor.compute_input_logprobs)
         self.assertIs(policy.compiled_forward_shim.fn, compiled_outer)
         compile_mock.assert_called_once()
         self.assertIs(compile_mock.call_args.args[0].__wrapped__, original_outer)
@@ -480,6 +552,7 @@ class TestQwen3VLDecoderPolicy(CustomTestCase):
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             batch_size=2,
+            logits_output_mode=LogitsOutputMode.FULL_VOCAB,
         )
         policy = Qwen3VLDecoderTpuCompilePolicy(
             model_runner=model_runner, owner=model_runner.model
@@ -666,6 +739,26 @@ class TestPrecompileLoops(CustomTestCase):
             [(8, 4), (64, 4), (256, 4)],
         )
 
+    def test_warmup_modes_follow_batch_size_cutoff(self):
+        policy = _make_distributed_top_k_policy()
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.sampler."
+            "distributed_top_k_min_batch_size",
+            return_value=64,
+        ):
+            self.assertEqual(
+                policy._warmup_logits_output_modes(1),
+                (LogitsOutputMode.FULL_VOCAB,),
+            )
+            self.assertEqual(
+                policy._warmup_logits_output_modes(64),
+                (
+                    LogitsOutputMode.DISTRIBUTED_TOP_K,
+                    LogitsOutputMode.FULL_VOCAB,
+                ),
+            )
+
     def test_mixed_chunk_adds_fixed_decode_max_column(self):
         mr = _model_runner()
         mr.server_args = SimpleNamespace(enable_mixed_chunk=True)
@@ -714,6 +807,36 @@ class TestPrecompileLoops(CustomTestCase):
         self.assertEqual(
             {call.kwargs["bs"] for call in policy._run_one.call_args_list},
             {16},
+        )
+
+    def test_qwen3_vl_warmup_crosses_logits_modes(self):
+        mr = _model_runner()
+        mr.model.get_image_feature = MagicMock()
+        mr.model.get_input_embeddings = MagicMock()
+        _enable_distributed_top_k(mr)
+        policy = Qwen3VLDecoderTpuCompilePolicy(
+            model_runner=mr,
+            t_bucketer=Bucketer(name="Token", buckets=[64]),
+            b_bucketer=Bucketer(name="Bs", buckets=[64]),
+            owner=mr.model,
+        )
+        policy._run_one = MagicMock()
+
+        with get_parallel().override(tp_rank=1):
+            policy._precompile_extend()
+            policy._precompile_decode()
+
+        self.assertEqual(
+            [
+                call.kwargs["logits_output_mode"]
+                for call in policy._run_one.call_args_list
+            ],
+            [
+                LogitsOutputMode.DISTRIBUTED_TOP_K,
+                LogitsOutputMode.FULL_VOCAB,
+                LogitsOutputMode.DISTRIBUTED_TOP_K,
+                LogitsOutputMode.FULL_VOCAB,
+            ],
         )
 
     def test_extend_skips_token_bucket_below_bs(self):

@@ -19,6 +19,7 @@ from sglang.srt.hardware_backend.tpu.sampler import (
     distributed_top_k_candidate_width,
     distributed_top_k_for_batch,
     sample_from_global_top_k_logits,
+    select_logits_output_mode,
 )
 from sglang.srt.hardware_backend.tpu.top_k import (
     TpuVocabShard,
@@ -31,6 +32,9 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
 )
+from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
+from sglang.srt.model_executor.runner import eager_runner as eager_runner_module
+from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 
@@ -68,27 +72,58 @@ def _forward_batch(*, batch_size=1, **info_overrides):
         return_logprob=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
         forward_mode=mode,
+        logits_output_mode=LogitsOutputMode.FULL_VOCAB,
+    )
+
+
+def _distributed_top_k_model(shard_width=202_048 // 16):
+    return SimpleNamespace(
+        logits_processor=SimpleNamespace(
+            use_tpu_distributed_top_k=True,
+            do_tensor_parallel_all_gather=True,
+            do_tensor_parallel_all_gather_dp_attn=False,
+        ),
+        lm_head=SimpleNamespace(
+            enable_tp=True,
+            num_embeddings=202_048,
+            num_embeddings_per_partition=shard_width,
+            shard_indices=object(),
+        ),
     )
 
 
 class TestDistributedTopKEligibility(CustomTestCase):
+    def test_eager_runner_selects_logits_output_mode_only_on_tpu(self):
+        model = _distributed_top_k_model()
+        runner = object.__new__(EagerRunner)
+        runner.model_runner = SimpleNamespace(model=model)
+        batch = _forward_batch(batch_size=64)
+
+        with patch.object(eager_runner_module, "_is_tpu", True):
+            runner._set_logits_output_mode(batch)
+            self.assertIs(
+                batch.logits_output_mode,
+                LogitsOutputMode.DISTRIBUTED_TOP_K,
+            )
+
+            batch.sampling_info.uniform_top_k = None
+            runner._set_logits_output_mode(batch)
+            self.assertIs(
+                batch.logits_output_mode,
+                LogitsOutputMode.FULL_VOCAB,
+            )
+
+        batch.logits_output_mode = LogitsOutputMode.DISTRIBUTED_TOP_K
+        with patch.object(eager_runner_module, "_is_tpu", False):
+            runner._set_logits_output_mode(batch)
+        self.assertIs(batch.logits_output_mode, LogitsOutputMode.DISTRIBUTED_TOP_K)
+
     def test_candidate_width_is_static_across_requested_top_k(self):
-        processor = SimpleNamespace(
-            use_tpu_distributed_top_k=True,
-            do_tensor_parallel_all_gather=True,
-            do_tensor_parallel_all_gather_dp_attn=False,
-        )
-        tp16_lm_head = SimpleNamespace(
-            enable_tp=True,
-            num_embeddings=202_048,
-            num_embeddings_per_partition=202_048 // 16,
-            shard_indices=object(),
-        )
+        model = _distributed_top_k_model()
+        processor, lm_head = model.logits_processor, model.lm_head
 
         with patch.object(tpu_sampler_module, "_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE", 1):
-            self.assertEqual(
-                distributed_top_k_candidate_width(processor, tp16_lm_head), 64
-            )
+            self.assertEqual(distributed_top_k_candidate_width(processor, lm_head), 64)
             for top_k in (2, 7, 50, 64):
                 with self.subTest(top_k=top_k):
                     batch = _forward_batch(
@@ -96,12 +131,16 @@ class TestDistributedTopKEligibility(CustomTestCase):
                         uniform_top_k=top_k,
                         top_ks=torch.tensor([top_k], dtype=torch.int32),
                     )
-                    self.assertEqual(
-                        LogitsProcessor.get_tpu_distributed_top_k_for_batch(
-                            processor, batch, tp16_lm_head
-                        ),
-                        top_k,
-                    )
+                    mode = select_logits_output_mode(batch, model)
+                    self.assertIs(mode, LogitsOutputMode.DISTRIBUTED_TOP_K)
+
+            lm_head.num_embeddings_per_partition = 32
+            self.assertIs(
+                select_logits_output_mode(
+                    _forward_batch(batch_size=1, uniform_top_k=50), model
+                ),
+                LogitsOutputMode.FULL_VOCAB,
+            )
 
     def test_measured_default_uses_distributed_top_k_from_batch_64(self):
         cutoff = envs.SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
@@ -133,10 +172,10 @@ class TestDistributedTopKEligibility(CustomTestCase):
             shard_indices=object(),
         )
 
-        self.assertIsNone(
-            LogitsProcessor.get_tpu_distributed_top_k_for_batch(
-                processor, _forward_batch(), sharded_lm_head
-            )
+        model = SimpleNamespace(logits_processor=processor, lm_head=sharded_lm_head)
+        self.assertIs(
+            select_logits_output_mode(_forward_batch(), model),
+            LogitsOutputMode.FULL_VOCAB,
         )
 
     def test_full_vocab_features_fall_back(self):

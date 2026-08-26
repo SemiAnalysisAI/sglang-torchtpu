@@ -14,6 +14,7 @@ from sglang.srt.layers.sampler import (
     sampling_from_probs_torch,
     top_k_top_p_min_p_sampling_from_probs_torch,
 )
+from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 MAX_DISTRIBUTED_TOP_K = 64
@@ -52,6 +53,24 @@ def distributed_top_k_candidate_width(logits_processor, lm_head) -> Optional[int
     ):
         return None
     return candidate_width
+
+
+def distributed_top_k_candidate_width_for_model(model) -> Optional[int]:
+    """Return the fixed candidate width supported by a model's output head."""
+
+    get_output_embeddings = getattr(model, "get_output_embeddings", None)
+    output_head = get_output_embeddings() if callable(get_output_embeddings) else None
+    if output_head is None:
+        output_head = getattr(model, "lm_head", None)
+    if output_head is None and getattr(
+        getattr(model, "config", None), "tie_word_embeddings", False
+    ):
+        output_head = getattr(getattr(model, "model", None), "embed_tokens", None)
+    if output_head is None:
+        return None
+    return distributed_top_k_candidate_width(
+        getattr(model, "logits_processor", None), output_head
+    )
 
 
 def _use_bsearch_filtering(probs: torch.Tensor) -> bool:
@@ -151,6 +170,18 @@ def distributed_top_k_for_batch(
     ):
         return None
     return top_k
+
+
+def select_logits_output_mode(forward_batch, model) -> LogitsOutputMode:
+    """Select full-vocabulary logits or distributed TopK candidates."""
+
+    candidate_width = distributed_top_k_candidate_width_for_model(model)
+    if candidate_width is None:
+        return LogitsOutputMode.FULL_VOCAB
+    requested_top_k = distributed_top_k_for_batch(forward_batch, sampling_backend="tpu")
+    if requested_top_k is None or requested_top_k > candidate_width:
+        return LogitsOutputMode.FULL_VOCAB
+    return LogitsOutputMode.DISTRIBUTED_TOP_K
 
 
 def sample_from_global_top_k_logits(

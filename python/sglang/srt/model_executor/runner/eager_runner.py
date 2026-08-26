@@ -214,6 +214,17 @@ class EagerRunner(BaseRunner):
             return self._execute_extend(forward_batch, pp_proxy_tensors)
         raise ValueError(f"Invalid forward mode for eager runner: {mode}")
 
+    def _set_logits_output_mode(self, forward_batch: ForwardBatch) -> None:
+        if not _is_tpu:
+            return
+        from sglang.srt.hardware_backend.tpu.sampler import (
+            select_logits_output_mode,
+        )
+
+        forward_batch.logits_output_mode = select_logits_output_mode(
+            forward_batch, self.model_runner.model
+        )
+
     def _resolve_decode_pdmux(
         self,
     ) -> Tuple[Any, contextlib.AbstractContextManager]:
@@ -243,6 +254,7 @@ class EagerRunner(BaseRunner):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
             attn_backend.init_forward_metadata(forward_batch)
+        self._set_logits_output_mode(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
 
@@ -310,6 +322,7 @@ class EagerRunner(BaseRunner):
         if not cp_v2_active:
             forward_batch.attn_cp_metadata = None
 
+        self._set_logits_output_mode(forward_batch)
         category = (
             "target_verify"
             if forward_batch.forward_mode.is_target_verify()
@@ -432,6 +445,7 @@ class EagerRunner(BaseRunner):
         else:
             model_runner.attn_backend.forward_metadata = None
 
+        self._set_logits_output_mode(forward_batch)
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
         with device_timer_ctx(model_runner.device_timer, "idle"):
             return model_runner.model.forward(
