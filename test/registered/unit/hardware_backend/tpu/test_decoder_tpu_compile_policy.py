@@ -177,6 +177,10 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             CustomPolicy.model_extra_tensor_attrs,
         )
         self.assertIs(kwargs["kv_pool"], kv_pool)
+        self.assertIn(
+            "forward_batch.extend_input_logprob_token_ids_gpu",
+            kwargs["ignored_argnames"],
+        )
 
 
 class TestLogitsOutputMode(CustomTestCase):
