@@ -185,7 +185,9 @@ class CacheProbeConfig(msgspec.Struct, frozen=True, kw_only=True):
     device_pool_tokens: int
     target_words: int
     filler_words: int
-    num_fillers: int
+    # None sizes the churn at runtime from the first filler's measured token
+    # count (churn_fillers_needed); an explicit value overrides that.
+    num_fillers: Optional[int]
     max_new_tokens: int
 
     @classmethod
@@ -198,22 +200,34 @@ class CacheProbeConfig(msgspec.Struct, frozen=True, kw_only=True):
                 "CACHE_PROBE_DEVICE_TOKENS", str(profile.device_pool_tokens_hint)
             )
         )
-        filler_words = int(values.get("CACHE_PROBE_FILLER_WORDS", "2048"))
-        # ~1.3 tokens/word; sized to push ~1.2x the pool through it so the
-        # churn evicts the warm target. Both are hints, not guarantees -- the
-        # host-reload assertion is what actually proves eviction happened.
-        filler_tokens_est = filler_words * 13 // 10
-        default_fillers = (12 * device_tokens) // (10 * filler_tokens_est) + 2
+        fillers_raw = values.get("CACHE_PROBE_NUM_FILLERS")
         return cls(
             page_size=profile.page_size,
             device_pool_tokens=device_tokens,
             target_words=int(values.get("CACHE_PROBE_TARGET_WORDS", "2048")),
-            filler_words=filler_words,
-            num_fillers=int(
-                values.get("CACHE_PROBE_NUM_FILLERS", str(default_fillers))
-            ),
+            filler_words=int(values.get("CACHE_PROBE_FILLER_WORDS", "2048")),
+            num_fillers=None if fillers_raw is None else int(fillers_raw),
             max_new_tokens=int(values.get("CACHE_PROBE_MAX_NEW_TOKENS", "16")),
         )
+
+
+def churn_fillers_needed(
+    *, measured_filler_tokens: int, device_pool_tokens: int
+) -> int:
+    """Fillers that push ~2x the device pool through the cache.
+
+    Sized from a measured filler's token count, not a tokens-per-word guess: a
+    guess that runs short leaves the churn below pool capacity, no eviction
+    ever fires, and the host-reload leg silently tests nothing (the 0.8x
+    undershoot observed in run 32927137148). The 2x margin also absorbs slack
+    between the configured pool bound and the allocator's effective capacity.
+    """
+    if measured_filler_tokens <= 0:
+        raise AssertionError(
+            f"measured filler prompt_tokens={measured_filler_tokens}; cannot "
+            "size the churn"
+        )
+    return (2 * device_pool_tokens) // measured_filler_tokens + 1
 
 
 class Gsm8kConfig(msgspec.Struct, frozen=True, kw_only=True):
@@ -565,7 +579,20 @@ def run_cache_probe(
     target = make_prompt(0, config.target_words)
     cold = _generate(base_url, target, config.max_new_tokens)
     device_hit = _generate(base_url, target, config.max_new_tokens)
-    for index in range(config.num_fillers):
+
+    first_filler = _generate(base_url, make_prompt(1000, config.filler_words), 1)
+    num_fillers = config.num_fillers
+    if num_fillers is None:
+        num_fillers = churn_fillers_needed(
+            measured_filler_tokens=first_filler.prompt_tokens,
+            device_pool_tokens=config.device_pool_tokens,
+        )
+    print(
+        f"churn: {num_fillers} fillers x {first_filler.prompt_tokens} tokens "
+        f"against a {config.device_pool_tokens}-token device pool",
+        flush=True,
+    )
+    for index in range(1, num_fillers):
         _generate(base_url, make_prompt(1000 + index, config.filler_words), 1)
     host_reload = _generate(base_url, target, config.max_new_tokens)
 
@@ -984,15 +1011,31 @@ class TestPdIntegrationConfiguration(unittest.TestCase):
         self.assertEqual(env["QUANTIZATION"], "")
 
     def test_churn_overflows_the_device_pool(self) -> None:
+        # The churn is sized from a measured filler length; whatever that
+        # measurement comes back as, the computed filler count must clear the
+        # pool with margin. The 1766-token case replays the observed filler
+        # length whose word-count estimate undershot the pool (run 32927137148).
         for profile in MODEL_PROFILES.values():
             config = CacheProbeConfig.from_env(profile, env={})
-            churn_tokens_est = config.num_fillers * config.filler_words * 13 // 10
-            self.assertGreater(
-                churn_tokens_est,
-                config.device_pool_tokens,
-                f"{profile.key}: churn (~{churn_tokens_est} tokens) cannot evict "
-                f"a {config.device_pool_tokens}-token device pool",
-            )
+            self.assertIsNone(config.num_fillers)
+            for measured in (1766, 2048, 2662):
+                fillers = churn_fillers_needed(
+                    measured_filler_tokens=measured,
+                    device_pool_tokens=config.device_pool_tokens,
+                )
+                self.assertGreaterEqual(
+                    fillers * measured,
+                    2 * config.device_pool_tokens,
+                    f"{profile.key}: churn of {fillers} x {measured}-token "
+                    f"fillers cannot evict a {config.device_pool_tokens}-token "
+                    "device pool",
+                )
+
+    def test_explicit_filler_count_overrides_calibration(self) -> None:
+        config = CacheProbeConfig.from_env(
+            MODEL_PROFILES["gpt_oss_120b"], env={"CACHE_PROBE_NUM_FILLERS": "7"}
+        )
+        self.assertEqual(config.num_fillers, 7)
 
     def test_peer_hostname_maps_only_the_role_segment(self) -> None:
         self.assertEqual(
