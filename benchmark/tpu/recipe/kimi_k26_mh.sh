@@ -9,9 +9,9 @@
 # covered.
 #
 # Sizing rationale:
-#   1.1T total, int4 experts -> ~37GB/device measured on K2.5 at tp=16 over 2
-#   hosts. MEM_FRACTION_STATIC=0.6 left ~45GB for the KV pool at CONTEXT_LEN
-#   8192; raising it starves KV, lowering it wastes HBM.
+#   1.1T total, int4 experts -> ~37GB/device at tp=16 over 2 hosts, confirmed on
+#   the K2.6 checkpoint. That is 5GB/device less than R1, so the memory knobs
+#   below can match the R1 recipe outright; see MEM_FRACTION_STATIC.
 #   ep=16 matches tp. EP=8 leaves tp-within-expert=2, whose per-rank intermediate
 #   has no 128-aligned divisor for the gmm tile ("pad the dim" ValueError) -- do
 #   not use.
@@ -54,21 +54,22 @@ export ATTENTION_BACKEND=${ATTENTION_BACKEND:-pallas_tpu_mla}
 # ladder grew past 612GB mid-EXTEND and got the pod OOM-killed, while a single
 # 8192-token graph peaked at 257GB. Chunked prefill caps every prefill at 8192
 # and shorter shapes pad up to it, so one token bucket is full coverage; the two
-# batch buckets cover the eval's ramp-up and steady state.
-# The batch cap is then bounded by KV, not by host memory. Kimi is MLA with a
-# single latent head, so the KV pool is replicated per rank, not sharded: ~65KB
-# per token per core, giving 443k tokens at mfs 0.70 and ~660k at 0.85. Measured
-# on the card protocol (2026-08-26), 32 concurrent GPQA requests averaged ~13k
-# tokens each and pinned the pool at 0.98. 64 is what ~660k absorbs without
-# leaning on retraction; R1's 128 does not carry over, because R1 generates at
-# most 32768 tokens per request against a comparable pool.
+# batch buckets mirror deepseek_r1_0528_mh.sh.
+# The batch cap is a ceiling, not a reservation: the scheduler admits against
+# free KV and retracts under pressure, so it self-limits. Measured on the card
+# protocol (2026-08-26), 32 concurrent GPQA requests held the pool at 0.98 with
+# zero retractions. Kimi is MLA with a single latent head, so the KV pool is
+# replicated per rank rather than sharded -- ~65KB per token per core, ~660k
+# tokens at mfs 0.85. Capping generation at 32768 (see CONTEXT_LEN) bounds the
+# per-request footprint the way R1's does, which is what lets the memory knobs
+# match deepseek_r1_0528_mh.sh outright.
 export MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.85}
-export MAX_RUNNING=${MAX_RUNNING:-64}
-export CONTEXT_LEN=${CONTEXT_LEN:-262144}
+export MAX_RUNNING=${MAX_RUNNING:-128}
+export CONTEXT_LEN=${CONTEXT_LEN:-40960}  # 32768 gen + 8192 prompt headroom
 export CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-8192}
 export MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-8192}
 export TPU_COMPILE_TOKENS=${TPU_COMPILE_TOKENS:-"8192"}
-export TPU_COMPILE_BS=${TPU_COMPILE_BS:-"32 64"}
+export TPU_COMPILE_BS=${TPU_COMPILE_BS:-"64 128"}
 export TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$MAX_RUNNING}
 
 # MoonViT's precompile ladder is a second graph family on top of the text ones,

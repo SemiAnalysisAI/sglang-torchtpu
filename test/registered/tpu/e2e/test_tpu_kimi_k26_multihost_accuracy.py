@@ -7,17 +7,19 @@ house defaults -- the card states them explicitly, and at 4096 tokens GPQA
 scores at chance because thinking is truncated mid-chain.
 
 Pass counts are set by wall clock, not by taste. Measured on a 2-host v7x slice
-(2026-08-26): under the card protocol Kimi clears 0.64 GPQA questions/minute at
-32 concurrent, so a single 198-question pass is ~2.6h at the recipe's cap of 64.
-The reasoning gates therefore run once; only MMLU, which is cheap, repeats. That
-makes the floors wide on purpose -- the job's role is "serves the card protocol
-end-to-end and lands in the right accuracy band", not a tight regression bound.
+(2026-08-26): at a 98304-token budget and 32 concurrent, Kimi clears 0.64 GPQA
+questions/minute, which puts one 198-question pass at ~5h. The 32768 cap and the
+128-request cap are what buy the headroom for two passes each.
+
+Floors are wide on purpose: with one server config the job's role is "serves the
+protocol end-to-end and lands in the right accuracy band", not a tight
+regression bound.
 
 Baselines:
   gpqa    0.905  card GPQA-Diamond, pass@1
   aime25  0.950  the card reports AIME 2026 (0.964), not AIME'25; this is a
-                 house estimate, and over one 30-question pass a single flipped
-                 answer moves the score 3.3pp
+                 house estimate, and at 30 questions/pass one flipped answer
+                 moves the averaged score 1.7pp
   mmlu    0.900  the card does not report MMLU; house default, and the same
                  floor the R1 nightly uses
 
@@ -26,9 +28,8 @@ disabled in the recipe; a vision gate (MMMU-Pro, card 0.794) is the follow-up.
 
 The whole file runs under one `timeout` in jobset-tpu.yaml, so MULTIHOST_LAUNCH
 declares the budget the six passes need (discovery takes the max across the
-group; see discover_multihost.py). Kimi decodes slower than R1 and its
-generation budget is 3x larger, hence the wider cap: ~2.6h for GPQA, ~0.5h for
-AIME, ~1.5h for two MMLU passes, plus bring-up.
+group; see discover_multihost.py). Kimi decodes slower than R1, hence the wider
+cap than the R1 nightly's 10800s.
 """
 
 import os
@@ -59,7 +60,8 @@ HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "3000"))
 # Card protocol, section "Evaluation Details".
 CARD_TEMPERATURE = 1.0
 CARD_TOP_P = 1.0
-REASONING_MAX_TOKENS = 98304
+# Below the card's 98304; see the truncation note in the docstring.
+REASONING_MAX_TOKENS = 32768
 
 MODEL_CONFIG = {
     "model": MODEL_PATH,
@@ -76,6 +78,7 @@ MODEL_CONFIG = {
             "label": "gpqa_diamond",
             "baseline": 0.905,
             "atol": 0.15,
+            "repeat": 2,
             "num_threads": 128,
             "temperature": CARD_TEMPERATURE,
             "top_p": CARD_TOP_P,
@@ -86,6 +89,7 @@ MODEL_CONFIG = {
             "label": "aime25",
             "baseline": 0.950,
             "atol": 0.20,
+            "repeat": 2,
             "num_threads": 128,
             "temperature": CARD_TEMPERATURE,
             "top_p": CARD_TOP_P,
@@ -101,8 +105,8 @@ MODEL_CONFIG = {
             "num_threads": 128,
             "temperature": CARD_TEMPERATURE,
             "top_p": CARD_TOP_P,
-            # Not a reasoning gate: MMLU is multiple-choice, so the card's
-            # 98304-token budget only buys wall clock here.
+            # Not a reasoning gate: MMLU is multiple-choice, so a large
+            # generation budget only buys wall clock here.
             "max_tokens": 16384,
         },
     ],
