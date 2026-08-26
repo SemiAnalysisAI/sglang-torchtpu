@@ -16,11 +16,12 @@ What each verification proves:
   * offload:    after churn evicts the device pool, a resend must reload the
                 prefix from the host tier (cached_tokens_details.host > 0), and
                 the prefill log must show the raiden transfer engine came up.
-  * KV transfer: every probe goes prefill -> decode across slices; all three
-                passes must produce identical greedy text on a forced verbatim
-                copy task, which kernel-level epsilon differences cannot flip
-                -- a difference means the KV values changed in the device
-                cache path or the host offload round trip.
+  * KV transfer: every probe goes prefill -> decode across slices; the three
+                cached passes (device hit, host reload, post-reload hit) run
+                the same extend shape and must produce identical greedy text
+                on a forced verbatim copy task -- a difference means stale or
+                corrupt KV in the host offload round trip. The cold pass runs
+                a different extend shape and is held to liveness only.
 
 Roles (rank = slice-local TPU_WORKER_ID):
   prefill rank 0   launches the prefill engine, waits for decode, starts the
@@ -553,17 +554,22 @@ def validate_cache_probe(
     cold: GenerationRecord,
     device_hit: GenerationRecord,
     host_reload: GenerationRecord,
+    post_reload_hit: GenerationRecord,
     page_size: int,
 ) -> int:
     """The device-hit -> churn -> host-reload oracle; returns expected tokens.
 
-    All three passes must produce identical greedy text. The target prompt's
-    continuation is a forced verbatim copy (make_target_prompt), which the
-    kernel-level epsilon differences between cache paths -- extend-bucket
-    shape, prefix at compute dtype vs KV-cache dtype -- cannot flip. A text
-    difference therefore means the KV VALUES changed: cold vs device-hit
-    catches a corrupt device cache path, device-hit vs host-reload catches a
-    corrupt host offload round trip, and both legs cross the P/D transfer.
+    The three cached passes run the same extend shape over the same stored
+    prefix KV, so their greedy text must be identical: device-hit vs
+    host-reload catches a stale or corrupt host round trip, and host-reload
+    vs post-reload-hit separates the two (a reload that raced its own
+    host->device DMA reads clean once the pages settle; corrupt values stay
+    wrong). Every pass crosses the P/D transfer.
+
+    The cold pass is held to cache-state and liveness checks only: its
+    prefill runs a different extend shape and consumes the prefix at compute
+    dtype rather than KV-cache dtype, so its logits differ at epsilon scale
+    and even the forced-copy prompt's preamble can break ties differently.
     """
     if cold.prompt_tokens < 2 * page_size:
         raise AssertionError(f"target prompt too short: {cold.prompt_tokens} tokens")
@@ -587,11 +593,8 @@ def validate_cache_probe(
         raise AssertionError(
             f"immediate resend loaded from host: {device_hit.host_cached_tokens}"
         )
-    if device_hit.text != cold.text:
-        raise AssertionError(
-            "device-hit copy output diverged from the cold pass -- the device "
-            "prefix cache returned different KV values"
-        )
+    if not device_hit.text.strip() or device_hit.completion_tokens <= 0:
+        raise AssertionError("device-hit request produced no decode output")
 
     if host_reload.host_cached_tokens <= 0:
         raise AssertionError(
@@ -605,9 +608,20 @@ def validate_cache_probe(
             f"host={host_reload.host_cached_tokens} expected>={expected}"
         )
     if host_reload.text != device_hit.text:
+        if post_reload_hit.text == device_hit.text:
+            raise AssertionError(
+                "host-reloaded copy output diverged from the device-hit pass "
+                "but the post-reload resend matches -- the reload raced its "
+                "own host->device transfer (no-stale gate not honored)"
+            )
         raise AssertionError(
             "host-reloaded copy output diverged from the device-hit pass -- "
             "the offloaded KV pages did not survive the host round trip"
+        )
+    if post_reload_hit.text != device_hit.text:
+        raise AssertionError(
+            "post-reload resend diverged from the device-hit pass -- the "
+            "reloaded device-resident pages hold different KV values"
         )
     return expected
 
@@ -636,11 +650,9 @@ def run_cache_probe(
     for index in range(1, num_fillers):
         _generate(base_url, make_prompt(1000 + index, config.filler_words), 1)
     host_reload = _generate(base_url, target, config.max_new_tokens)
-    # Diagnostic only: the reload leaves the prefix device-resident again, so
-    # this pass rereads the reloaded pages after any in-flight host->device
-    # transfers have settled. If host_reload is wrong but this pass is right,
-    # the reload raced its own load; if both are wrong, the reloaded values
-    # themselves are corrupt.
+    # The reload leaves the prefix device-resident again; this pass rereads
+    # the reloaded pages after any in-flight host->device transfers have
+    # settled, separating a racing reload from corrupt reloaded values.
     post_reload_hit = _generate(base_url, target, config.max_new_tokens)
 
     # Emitted before validation so a failed oracle still carries every
@@ -662,6 +674,7 @@ def run_cache_probe(
         cold=cold,
         device_hit=device_hit,
         host_reload=host_reload,
+        post_reload_hit=post_reload_hit,
         page_size=config.page_size,
     )
     labels = {"model": profile.served_name, "test": "pd_prefix_caching_kv_offload"}
