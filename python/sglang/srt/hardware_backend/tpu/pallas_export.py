@@ -84,22 +84,6 @@ def get_torchtpu_export_devices(world_size: int | None = None):
     return tuple(abstract_devices)
 
 
-def get_jax_mesh(
-    world_size: int | None = None,
-    axis_names: tuple[str, ...] = ("data", "model"),
-):
-    """Return the logical TPU mesh using abstract devices with explicit optical ring ordering."""
-    import numpy as np
-    from jax.sharding import Mesh
-
-    if world_size is None:
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    ordered_devices = np.asarray(get_torchtpu_export_devices(world_size))
-    if len(axis_names) == 2:
-        ordered_devices = ordered_devices.reshape(1, -1)
-    return Mesh(ordered_devices, tuple(axis_names))
-
-
 def get_torch_tpu_device_kind() -> str:
     """Return physical TPU hardware metadata."""
     from torch_tpu._internal.utils.hardware import get_tpu_device_name

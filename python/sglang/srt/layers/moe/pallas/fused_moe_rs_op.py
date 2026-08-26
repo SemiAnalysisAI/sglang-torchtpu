@@ -27,18 +27,14 @@ def _get_tp_rank_to_device_id_mapping() -> tuple[int, tuple[int, ...]]:
     from torch_tpu._internal.distributed import tpu_distributed
 
     global_device_id = tpu_distributed.global_device_id()
-    try:
-        from sglang.srt.distributed import get_tp_group
+    if not dist.is_initialized():
+        return global_device_id, (global_device_id,)
 
-        tp_group = get_tp_group()
-        world_size = tp_group.world_size
-        group = tp_group.cpu_group
-    except (AssertionError, RuntimeError):
-        if dist.is_initialized():
-            world_size = dist.get_world_size()
-            group = None
-        else:
-            return global_device_id, (global_device_id,)
+    from sglang.srt.distributed import get_tp_group
+
+    tp_group = get_tp_group()
+    world_size = tp_group.world_size
+    group = tp_group.cpu_group
 
     physical_ids = [None] * world_size
     dist.all_gather_object(physical_ids, global_device_id, group=group)
@@ -268,8 +264,6 @@ def fused_moe_rs_gather(
             return tp_group.all_gather(token_shard, dim=0)
     except (AssertionError, RuntimeError):
         pass
-
-    import torch.distributed as dist
 
     if dist.is_initialized():
         world_size = dist.get_world_size()
