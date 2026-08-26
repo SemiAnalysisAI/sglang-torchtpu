@@ -52,6 +52,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    LogitsOutputMode,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils.async_probe import sanitize_nan_logits
@@ -239,9 +240,14 @@ class LogitsMetadata:
     draft_extend_select_index: Optional[torch.Tensor] = None
 
     @classmethod
-    def from_forward_batch(cls, forward_batch: ForwardBatch):
+    def from_forward_batch(
+        cls, forward_batch: ForwardBatch, *, compute_input_logprobs: bool = True
+    ):
+        """Build metadata, optionally excluding request-specific prompt logprobs."""
+
         if (
-            forward_batch.forward_mode.is_extend()
+            compute_input_logprobs
+            and forward_batch.forward_mode.is_extend()
             and forward_batch.return_logprob
             and not forward_batch.forward_mode.is_target_verify()
         ):
@@ -265,6 +271,17 @@ class LogitsMetadata:
                 extend_token_ids_logprob
             ) = extend_logprob_pruned_lens_cpu = False
 
+        if compute_input_logprobs:
+            top_logprobs_nums = forward_batch.top_logprobs_nums
+            token_ids_logprobs = forward_batch.token_ids_logprobs
+            extend_input_logprob_token_ids_gpu = (
+                forward_batch.extend_input_logprob_token_ids_gpu
+            )
+        else:
+            top_logprobs_nums = None
+            token_ids_logprobs = None
+            extend_input_logprob_token_ids_gpu = None
+
         if forward_batch.forward_mode.is_draft_extend_v2():
             draft_extend_select_index = forward_batch.spec_info.select_index
         else:
@@ -281,9 +298,9 @@ class LogitsMetadata:
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
-            top_logprobs_nums=forward_batch.top_logprobs_nums,
-            token_ids_logprobs=forward_batch.token_ids_logprobs,
-            extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
+            top_logprobs_nums=top_logprobs_nums,
+            token_ids_logprobs=token_ids_logprobs,
+            extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
@@ -407,34 +424,8 @@ class LogitsProcessor(nn.Module):
         )
 
         self.input_logprob_processor = InputLogprobProcessor()
-
-    def get_tpu_distributed_top_k_for_batch(
-        self,
-        forward_batch: ForwardBatch,
-        lm_head: VocabParallelEmbedding,
-    ) -> Optional[int]:
-        """Return the static k only when this model can skip the TPU vocab gather.
-        Full-logit models, disabled/DP gathers, and non-sharded heads return ``None``.
-        """
-
-        if (
-            not self.use_tpu_distributed_top_k
-            or not self.do_tensor_parallel_all_gather
-            or self.do_tensor_parallel_all_gather_dp_attn
-        ):
-            return None
-
-        from sglang.srt.hardware_backend.tpu.sampler import (
-            distributed_top_k_for_batch,
-        )
-        from sglang.srt.hardware_backend.tpu.top_k import (
-            supports_distributed_tpu_top_k,
-        )
-
-        top_k = distributed_top_k_for_batch(forward_batch, sampling_backend="tpu")
-        if top_k is None or not supports_distributed_tpu_top_k(lm_head, top_k):
-            return None
-        return top_k
+        # TPU compilation disables prompt logprobs before tracing the model.
+        self.compute_input_logprobs = True
 
     def forward(
         self,
@@ -450,10 +441,19 @@ class LogitsProcessor(nn.Module):
         distributed_top_k = None
         if isinstance(logits_metadata, ForwardBatch):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
-            distributed_top_k = self.get_tpu_distributed_top_k_for_batch(
-                logits_metadata, lm_head
+            logits_output_mode = logits_metadata.logits_output_mode
+            if logits_output_mode is LogitsOutputMode.DISTRIBUTED_TOP_K:
+                from sglang.srt.hardware_backend.tpu.sampler import (
+                    distributed_top_k_candidate_width,
+                )
+
+                distributed_top_k = distributed_top_k_candidate_width(self, lm_head)
+                if distributed_top_k is None:
+                    raise RuntimeError("DISTRIBUTED_TOP_K is unsupported by this model")
+            logits_metadata = LogitsMetadata.from_forward_batch(
+                logits_metadata,
+                compute_input_logprobs=self.compute_input_logprobs,
             )
-            logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
         # Autotune dummy run discards this output. `is False` not `not`: None
         # means no autotune pass, which must not skip. Placed before the MIS /
