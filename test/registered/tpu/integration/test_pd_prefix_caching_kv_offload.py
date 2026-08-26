@@ -501,7 +501,7 @@ def make_target_prompt(nwords: int) -> Tuple[str, Tuple[int, ...]]:
         "Below is a list of items.\n"
         + "\n".join(lines)
         + f"\nOutput items {ask} from the list above exactly as written, "
-        "one per line, and nothing else."
+        "one per line, and nothing else.\nAnswer:\nitem "
     )
     return prompt, queried
 
@@ -636,9 +636,15 @@ def run_cache_probe(
     for index in range(1, num_fillers):
         _generate(base_url, make_prompt(1000 + index, config.filler_words), 1)
     host_reload = _generate(base_url, target, config.max_new_tokens)
+    # Diagnostic only: the reload leaves the prefix device-resident again, so
+    # this pass rereads the reloaded pages after any in-flight host->device
+    # transfers have settled. If host_reload is wrong but this pass is right,
+    # the reload raced its own load; if both are wrong, the reloaded values
+    # themselves are corrupt.
+    post_reload_hit = _generate(base_url, target, config.max_new_tokens)
 
-    # Emitted before validation so a failed oracle still carries all three
-    # generations for diagnosis.
+    # Emitted before validation so a failed oracle still carries every
+    # generation for diagnosis.
     print(
         json.dumps(
             {
@@ -646,6 +652,7 @@ def run_cache_probe(
                 "cold": msgspec.to_builtins(cold),
                 "device_hit": msgspec.to_builtins(device_hit),
                 "host_reload": msgspec.to_builtins(host_reload),
+                "post_reload_hit": msgspec.to_builtins(post_reload_hit),
             },
             sort_keys=True,
         ),
