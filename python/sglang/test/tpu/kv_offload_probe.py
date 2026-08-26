@@ -8,6 +8,11 @@ workload and asserts which cache tier served each read, so it self-gates via
 Split three ways on purpose. ``plan_eviction`` and ``validate_probe`` are pure and
 carry every judgement the gate makes, so the reasoning is readable and reviewable
 apart from the transport. ``run_probe`` owns the HTTP and nothing else.
+
+``spec_failures`` is an opt-in fourth judgement, for the lane that runs offloading
+and speculative decoding together. The three reads already carry the draft worker's
+verify counts, so proving speculation survived a host reload costs no extra
+requests.
 """
 
 import math
@@ -62,11 +67,18 @@ _REQUEST_TIMEOUT = 900
 
 
 class CacheObservation(msgspec.Struct, frozen=True):
-    """One /generate round trip, with the tier that served its prefix."""
+    """One /generate round trip, with the tier that served its prefix.
+
+    ``spec_verify_ct`` is the number of speculative verify forwards the read
+    took, and is 0 on a server with speculation off. It is only read by the
+    optional spec checks -- see ``spec_failures``.
+    """
 
     text: str
     device_tokens: int
     host_tokens: int
+    completion_tokens: int
+    spec_verify_ct: int
 
 
 class KvOffloadProbe(msgspec.Struct, frozen=True):
@@ -115,6 +127,15 @@ def plan_eviction(
         num_fillers=num_fillers,
         host_pool_tokens=host_pool_tokens,
         backed_up_tokens=backed_up_tokens,
+    )
+
+
+def _labelled_reads(probe: KvOffloadProbe):
+    """The three reads, in the order the gate reports them."""
+    return (
+        ("cold", probe.cold),
+        ("device-hit", probe.warm),
+        ("host-reload", probe.reload),
     )
 
 
@@ -202,15 +223,57 @@ def validate_probe(
     # Every tier, not just the reload: the same check on the cold prefill and the
     # device hit is what makes a host-reload failure mean the host, since a bug that
     # breaks all three is not about offloading.
-    for label, observation in (
-        ("cold", probe.cold),
-        ("device-hit", probe.warm),
-        ("host-reload", probe.reload),
-    ):
+    for label, observation in _labelled_reads(probe):
         counting_failure = _counting_failure(label=label, text=observation.text)
         if counting_failure is not None:
             failures.append(counting_failure)
 
+    return failures
+
+
+def mean_accept_length(*, probe: KvOffloadProbe) -> float:
+    """Draft tokens accepted per verify forward, averaged over the three reads.
+
+    1.0 is the floor a server reaches by accepting nothing: every verify commits
+    the one token the target would have produced anyway. Above 1.0 means drafts
+    are landing. Returns 0.0 when no read ran a verify forward at all.
+    """
+    verifies = sum(read.spec_verify_ct for _, read in _labelled_reads(probe))
+    if not verifies:
+        return 0.0
+    return sum(read.completion_tokens for _, read in _labelled_reads(probe)) / verifies
+
+
+def spec_failures(*, probe: KvOffloadProbe, min_accept_length: float) -> List[str]:
+    """Reject a run where speculation did not survive being combined with HiCache.
+
+    Two failures with different causes. No verify forwards on a read means the
+    draft worker never ran: a server that quietly dropped to plain decoding
+    instead of building the draft host pool would still pass every cache
+    assertion above and still score a normal GSM8K. All three reads are checked,
+    not just the host-reload one, so a failure there points at the reload rather
+    than at speculation being broken outright.
+
+    Accept length is then gated on the mean rather than per read, since a single
+    16-token read landing no drafts is noise while a mean at the floor is a draft
+    model that runs and contributes nothing.
+    """
+    failures = [
+        f"speculative decoding did not run on the {label} read: spec_verify_ct=0 "
+        f"over {read.completion_tokens} completion tokens"
+        for label, read in _labelled_reads(probe)
+        if read.spec_verify_ct <= 0
+    ]
+    if failures:
+        return failures
+
+    accept_length = mean_accept_length(probe=probe)
+    if accept_length <= min_accept_length:
+        failures.append(
+            f"mean accept length {accept_length:.2f} over the three probe reads is "
+            f"not above {min_accept_length:.2f}, so the draft model ran but its "
+            "tokens were never accepted"
+        )
     return failures
 
 
@@ -287,6 +350,10 @@ def generate_with_cache_report(
         text=output["text"],
         device_tokens=details.get("device", 0),
         host_tokens=details.get("host", 0),
+        completion_tokens=meta_info.get("completion_tokens", 0),
+        # Absent, not zero, on a server with speculation off. Both read as "spec
+        # did not run", which is what the optional spec checks gate on.
+        spec_verify_ct=meta_info.get("spec_verify_ct") or 0,
     )
 
 
@@ -335,6 +402,7 @@ def kv_offload_runner(
     page_size: int,
     probe_tokens: int,
     hicache_ratio: float,
+    min_accept_length: Optional[float] = None,
 ):
     """Build an ``AccuracyTestParams.runner`` gating prefix caching + KV offload.
 
@@ -359,6 +427,11 @@ def kv_offload_runner(
     ``hicache_ratio`` is the server's, and is checked rather than used, so a config
     whose host pool cannot hold the probe plus every filler is refused here instead
     of passing vacuously on the hardware.
+
+    ``min_accept_length`` opts into also gating speculative decoding, and is only
+    for a server booted with a draft model. Leave it None everywhere else, since
+    a server with speculation off correctly reports no verify forwards and would
+    fail the check. See ``spec_failures``.
     """
     plan = plan_eviction(
         device_pool_tokens=device_pool_tokens,
@@ -385,6 +458,20 @@ def kv_offload_runner(
         dump_metric(
             f"{test_name}.host_cached_tokens", probe.reload.host_tokens, labels=labels
         )
+
+        if min_accept_length is not None:
+            accept_length = mean_accept_length(probe=probe)
+            verifies = ", ".join(
+                f"{label}={read.spec_verify_ct}"
+                for label, read in _labelled_reads(probe)
+            )
+            print(
+                f"[kv-offload] {test_name}: spec verify forwards {verifies}, mean "
+                f"accept length {accept_length:.2f} against floor {min_accept_length}",
+                flush=True,
+            )
+            dump_metric(f"{test_name}.spec_accept_length", accept_length, labels=labels)
+            failures += spec_failures(probe=probe, min_accept_length=min_accept_length)
 
         return {
             "score": probe.reload.host_tokens,
