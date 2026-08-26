@@ -23,7 +23,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, single-host, integration, pd-integration, multihost, combo, singlehost-combo, multihost-combo, perf, accuracy, pd-e2e, pd-singlehost-e2e]
+        options: [all, single-host, integration, pd-integration, multihost, combo, singlehost-combo, multihost-combo, perf, accuracy, pd-e2e, pd-singlehost-e2e, singlehost-offload-spec-e2e]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -119,6 +119,27 @@ jobs:
 
   # Feature-combination layers: same exec-mode runs as the standalone
   # combo-test-tpu.yml action; these jobs add nightly cadence.
+  # TEMPORARY -- dispatch-only shortcut that runs the offload+spec lane on its
+  # own instead of waiting for the whole nightly-tpu-4-v7 suite it belongs to.
+  # Not for merge.
+  singlehost-offload-spec-e2e:
+    needs: build
+    if: ${{ inputs.only == 'singlehost-offload-spec-e2e' }}
+    name: singlehost-offload-spec-e2e
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_singlehost_prefix_cache_kv_offload_spec_gsm8k.py
+      timeout_per_file: 7200
+      weights_pvc: model-weights-rox
+      run_name: gpt-oss-offload-spec-e2e
+    permissions:
+      contents: read
+      id-token: write
+
   singlehost-combo:
     needs: build
     if: ${{ contains(fromJSON('["all","combo","singlehost-combo"]'), inputs.only || 'all') }}
