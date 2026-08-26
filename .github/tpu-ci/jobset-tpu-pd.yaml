@@ -11,6 +11,9 @@
 #   EXEC_CMD             every pod of both slices runs this command; the test
 #                        dispatches roles from CI_PD_ROLE + the slice-local
 #                        TPU worker env, and the prefill leader's exit gates
+#   TEST_FILES           the file(s) EXEC_CMD runs; announced by every pod and
+#                        reported by the prefill leader in TIMINGS format, which
+#                        is what names this run's row on the CI dashboard
 #   ACTIVE_DEADLINE      per-Job runtime cap (seconds)
 #   PREFILL_HOSTS / DECODE_HOSTS           pods (= hosts) per slice
 #   PREFILL_TOPOLOGY / PREFILL_POOL        node labels for the prefill slice
@@ -96,12 +99,32 @@ ${WEIGHTS_VOLUME}
                       # (the KV transfer is application-level), so drop it.
                       for v in $(compgen -e | grep '^MEGASCALE'); do unset "$v"; done
                       echo "run=${RUN_NAME} role=$CI_PD_ROLE rank=${TPU_WORKER_ID:-0}"
+                      # Name the test BEFORE anything can fail. A P/D run can
+                      # spend an hour in weight load and compile before dying,
+                      # and with no test named the dashboard files the red row
+                      # under the job -- which reads as a test that does not
+                      # exist. Printed unconditionally, as in jobset-tpu.yaml.
+                      echo "== test files: ${TEST_FILES} =="
+                      t0=$SECONDS
                       ${EXEC_CMD}
                       rc=$?
                       # Only the prefill leader's verdict gates; a teardown
                       # SIGTERM on any other pod is success.
                       if [ "${TPU_WORKER_ID:-0}" != "0" ] && [ "$rc" = 143 ]; then
                         echo "worker teardown SIGTERM; success"; rc=0
+                      fi
+                      # Per-file verdict in run_suite's TIMINGS format, so the
+                      # dashboard reads P/D, multi-host and single-host through
+                      # one parser. Leader only: all four pods run the same
+                      # command, but only rank 0's exit code carries the verdict
+                      # and four records would be four duplicate rows.
+                      if [ "${TPU_WORKER_ID:-0}" = "0" ]; then
+                        passed=true
+                        [ "$rc" -eq 0 ] || passed=false
+                        echo "========== TIMINGS BEGIN =========="
+                        printf '{"file": "%s", "passed": %s, "elapsed": %s}\n' \
+                          "${TEST_FILES}" "$passed" "$((SECONDS - t0))"
+                        echo "========== TIMINGS END =========="
                       fi
                       exit $rc
                   resources:
@@ -173,6 +196,9 @@ ${WEIGHTS_VOLUME}
                       # (the KV transfer is application-level), so drop it.
                       for v in $(compgen -e | grep '^MEGASCALE'); do unset "$v"; done
                       echo "run=${RUN_NAME} role=$CI_PD_ROLE rank=${TPU_WORKER_ID:-0}"
+                      # Same announcement as the prefill side; the verdict is
+                      # the prefill leader's alone, so no TIMINGS record here.
+                      echo "== test files: ${TEST_FILES} =="
                       ${EXEC_CMD}
                       rc=$?
                       # Decode pods never gate on teardown SIGTERM.
