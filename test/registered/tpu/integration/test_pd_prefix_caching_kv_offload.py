@@ -7,7 +7,10 @@ prefill engine through the raiden HiCache io backend. The CI JobSet
 roles are dispatched from the CI_PD_ROLE env plus the slice-local TPU worker env.
 
 What each verification proves:
-  * quality:    gsm8k through the LB must clear the model's accuracy floor.
+  * quality:    gsm8k through the LB must clear the model's accuracy floor,
+                and the cached fraction of its prefill tokens must dominate
+                (>= 0.5), so the score gates the cached prefill path rather
+                than cold traffic.
   * cache hit:  an immediate resend of a long prompt must hit the device radix
                 cache (cached_tokens_details.device).
   * offload:    after churn evicts the device pool, a resend must reload the
@@ -38,6 +41,7 @@ Model paths, pool sizes, churn workload, and gsm8k floors are env-overridable
 
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -144,7 +148,11 @@ MODEL_PROFILES = {
         # validated clean on both counts.
         max_total_tokens=786_432,
         device_pool_tokens_hint=786_432,
-        gsm8k_threshold=0.72,
+        # Measured 0.98 (1p1d, 2026-08-15) and 0.97 (2p2d, run 32908499644),
+        # both over 100 examples; binomial sigma there is ~1.5 points, so 0.90
+        # sits several sigma below measurement while still failing on a real
+        # quality regression rather than only on catastrophic KV corruption.
+        gsm8k_threshold=0.90,
         extra_server_args=("--reasoning-parser", "gpt-oss"),
         # The SparseCore ragged-gather MoE path cannot be lowered for GPT-OSS
         # (dynamic token dim in the extend graph).
@@ -228,7 +236,7 @@ class Gsm8kConfig(msgspec.Struct, frozen=True, kw_only=True):
         if not 0.0 <= threshold <= 1.0:
             raise ValueError(f"GSM8K threshold must be in [0, 1], got {threshold}")
         return cls(
-            num_examples=int(values.get("GSM8K_NUM_EXAMPLES", "100")),
+            num_examples=int(values.get("GSM8K_NUM_EXAMPLES", "200")),
             num_threads=int(values.get("GSM8K_NUM_THREADS", "8")),
             max_tokens=int(values.get("GSM8K_MAX_TOKENS", "2048")),
             threshold=threshold,
@@ -696,6 +704,26 @@ def _wait_http_200(url: str, secs: int, procs: Tuple = ()) -> None:
     raise TimeoutError(f"{url} not ready after {secs}s")
 
 
+PREFILL_BATCH_RE = re.compile(
+    r"Prefill batch.*?#new-token: (\d+), #cached-token: (\d+)"
+)
+
+
+def prefill_cache_coverage(log_text: str) -> Tuple[int, int, int]:
+    """Sum (batches, new tokens, cached tokens) over scheduler prefill lines.
+
+    The scheduler's per-batch accounting is the only per-request cache-hit
+    signal that reaches the pod, so a traffic window's cache coverage is read
+    from the engine log rather than from HTTP responses.
+    """
+    batches, new_tokens, cached_tokens = 0, 0, 0
+    for match in PREFILL_BATCH_RE.finditer(log_text):
+        batches += 1
+        new_tokens += int(match.group(1))
+        cached_tokens += int(match.group(2))
+    return batches, new_tokens, cached_tokens
+
+
 def _assert_raiden_engaged(log_path: str) -> None:
     with open(log_path, "rb") as f:
         log = f.read().decode(errors="replace")
@@ -789,20 +817,49 @@ class TestPdPrefixCachingKvOffload(unittest.TestCase):
         )
 
     def test_02_gsm8k_quality(self) -> None:
+        eval_log_offset = os.path.getsize(PREFILL_LOG)
         score = run_gsm8k(
             base_url=f"http://127.0.0.1:{LB_PORT}",
             profile=self.profile,
             config=self.gsm8k_config,
         )
-        dump_metric(
-            "gsm8k_score",
-            score,
-            labels={
-                "model": self.profile.served_name,
-                "test": "pd_prefix_caching_kv_offload",
-            },
-        )
+        labels = {
+            "model": self.profile.served_name,
+            "test": "pd_prefix_caching_kv_offload",
+        }
+        dump_metric("gsm8k_score", score, labels=labels)
         print(f"gsm8k score={score:.4f} floor={self.gsm8k_config.threshold:.4f}")
+
+        # The quality gate certifies the CACHED prefill path only if the eval
+        # traffic actually hits the prefix cache: every request past the first
+        # shares the few-shot prefix, so the cached fraction of its prefill
+        # tokens must dominate. A regression that silently disables caching
+        # would otherwise leave the score gating cold traffic only.
+        with open(PREFILL_LOG, "rb") as f:
+            f.seek(eval_log_offset)
+            eval_log = f.read().decode(errors="replace")
+        batches, new_tokens, cached_tokens = prefill_cache_coverage(eval_log)
+        total = new_tokens + cached_tokens
+        if total < 100 * self.gsm8k_config.num_examples:
+            raise AssertionError(
+                "gsm8k prefill accounting looks wrong: "
+                f"{batches} batches / {total} prompt tokens for "
+                f"{self.gsm8k_config.num_examples} examples -- the eval did "
+                "not route through this prefill engine, or the scheduler's "
+                "batch log format changed"
+            )
+        coverage = cached_tokens / total
+        dump_metric("gsm8k_prefill_cached_token_fraction", coverage, labels=labels)
+        print(
+            f"gsm8k prefill cache coverage={coverage:.3f} "
+            f"({cached_tokens}/{total} tokens over {batches} batches)"
+        )
+        self.assertGreaterEqual(
+            coverage,
+            0.5,
+            "gsm8k traffic barely hit the prefix cache; its score does not "
+            "gate the cached prefill path",
+        )
         self.assertGreaterEqual(score, self.gsm8k_config.threshold)
 
 
@@ -981,6 +1038,20 @@ class TestPdIntegrationConfiguration(unittest.TestCase):
                 }
             ).is_leader
         )
+
+    def test_prefill_cache_coverage_reads_scheduler_batch_lines(self) -> None:
+        # The regex mirrors the scheduler's batch-accounting line; decode
+        # batches carry no cache counters and must not match.
+        log = "\n".join(
+            (
+                "[2026-08-25 23:21:41 TP0 EP0] Prefill batch, #new-seq: 1, "
+                "#new-token: 2112, #cached-token: 0, full token usage: 0.00,",
+                "[2026-08-25 23:21:42 TP0 EP0] Prefill batch, #new-seq: 1, "
+                "#new-token: 64, #cached-token: 2048, full token usage: 0.00,",
+                "[2026-08-25 23:21:43 TP0 EP0] Decode batch, #running-req: 1,",
+            )
+        )
+        self.assertEqual(prefill_cache_coverage(log), (2, 2176, 2048))
 
     def test_model_specific_gsm8k_threshold_wins(self) -> None:
         config = Gsm8kConfig.from_env(
