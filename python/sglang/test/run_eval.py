@@ -211,6 +211,36 @@ def _run_sgl_eval(eval_name, args) -> dict:
     return metrics
 
 
+def print_truncation_summary(samplers: list, max_tokens: int) -> None:
+    """Report how many responses ran out of generation budget.
+
+    A reasoning model whose thinking is cut mid-chain answers wrong for a
+    reason that has nothing to do with the serving path, and the score alone
+    cannot tell the two apart. completion_tokens at the cap is the signal:
+    if it is a few percent the budget is fine, if it is a third the score is
+    measuring max_tokens."""
+
+    lengths = [
+        n for sampler in samplers for n in getattr(sampler, "_completion_tokens", [])
+    ]
+    print("=" * 20)
+    if not lengths or not max_tokens:
+        print("Truncation: no per-request completion_tokens in responses.")
+    else:
+        at_cap = sum(1 for n in lengths if n >= max_tokens)
+        lengths_sorted = sorted(lengths)
+        p50 = lengths_sorted[len(lengths_sorted) // 2]
+        p95 = lengths_sorted[
+            min(len(lengths_sorted) - 1, int(len(lengths_sorted) * 0.95))
+        ]
+        print(
+            f"Truncation: {at_cap}/{len(lengths)} responses "
+            f"({at_cap / len(lengths):.1%}) hit max_tokens={max_tokens}; "
+            f"completion_tokens p50={p50} p95={p95} max={lengths_sorted[-1]}"
+        )
+    print("=" * 20)
+
+
 def print_accept_length_summary(samplers: list) -> None:
     accept_lengths = [
         m["spec_accept_length"]
@@ -424,6 +454,7 @@ def run_eval(args):
         executor.shutdown()
 
     print_accept_length_summary(samplers)
+    print_truncation_summary(samplers, getattr(args, "max_tokens", None) or 2048)
 
     # Dump reports
     file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"
