@@ -198,6 +198,17 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.DLLM_EXTEND
 
 
+class LogitsOutputMode(IntEnum):
+    """Representation of next-token logits returned by a model forward.
+
+    TPU runners select this before entering the model, so the logits processor
+    never needs to inspect request-level sampling metadata.
+    """
+
+    FULL_VOCAB = auto()
+    DISTRIBUTED_TOP_K = auto()
+
+
 @total_ordering
 class CaptureHiddenMode(IntEnum):
     # Do not capture anything.
@@ -434,6 +445,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     return_logprob: bool = False
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    # Selected before a TPU model forward; full vocabulary is the safe default.
+    logits_output_mode: LogitsOutputMode = LogitsOutputMode.FULL_VOCAB
     spec_algorithm: SpeculativeAlgorithm = None
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
