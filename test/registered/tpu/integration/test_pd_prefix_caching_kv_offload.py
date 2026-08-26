@@ -16,11 +16,11 @@ What each verification proves:
   * offload:    after churn evicts the device pool, a resend must reload the
                 prefix from the host tier (cached_tokens_details.host > 0), and
                 the prefill log must show the raiden transfer engine came up.
-  * KV transfer: every probe goes prefill -> decode across slices; the
-                device-hit and host-reload passes must produce bit-equal greedy
-                output, certifying the KV survived the host offload round trip
-                (the cold pass runs a different extend shape and is held to
-                liveness only; quality is gated by gsm8k).
+  * KV transfer: every probe goes prefill -> decode across slices; all three
+                passes must produce identical greedy text on a forced verbatim
+                copy task, which kernel-level epsilon differences cannot flip
+                -- a difference means the KV values changed in the device
+                cache path or the host offload round trip.
 
 Roles (rank = slice-local TPU_WORKER_ID):
   prefill rank 0   launches the prefill engine, waits for decode, starts the
@@ -207,7 +207,8 @@ class CacheProbeConfig(msgspec.Struct, frozen=True, kw_only=True):
             target_words=int(values.get("CACHE_PROBE_TARGET_WORDS", "2048")),
             filler_words=int(values.get("CACHE_PROBE_FILLER_WORDS", "2048")),
             num_fillers=None if fillers_raw is None else int(fillers_raw),
-            max_new_tokens=int(values.get("CACHE_PROBE_MAX_NEW_TOKENS", "16")),
+            # Room for all four copied item lines plus any preamble.
+            max_new_tokens=int(values.get("CACHE_PROBE_MAX_NEW_TOKENS", "64")),
         )
 
 
@@ -465,6 +466,46 @@ def make_prompt(index: int, nwords: int) -> str:
     return f"Document {index} header alpha{index} beta{index * 7}. " + " ".join(words)
 
 
+_ITEM_NOUNS = (
+    "lantern kettle walnut anchor violet magnet saddle donkey harbor pencil "
+    "quartz turnip magpie helmet donkey copper barrel falcon garnet hammer "
+    "island jasper kitten locket mirror needle onward parrot quiver ribbon "
+    "sombra tundra"
+).split()
+
+
+def make_target_prompt(nwords: int) -> Tuple[str, Tuple[int, ...]]:
+    """A numbered item list ending in a verbatim copy instruction.
+
+    Returns (prompt, queried item numbers). The greedy continuation is forced:
+    the model must repeat four distinctive lines drawn from across the list,
+    read through full attention from the queried positions' KV. Kernel-level
+    epsilon differences between cache paths cannot flip a forced copy, so any
+    output difference between passes means the KV values themselves changed.
+    (The repetitive filler prompts have near-tie logits at every step, where
+    any epsilon flips the text -- useless as a correctness oracle.)
+    """
+    num_items = max(40, nwords // 6)
+    lines = []
+    for i in range(1, num_items + 1):
+        noun = _ITEM_NOUNS[(i * 2654435761 & 0xFFFFFFFF) % len(_ITEM_NOUNS)]
+        lines.append(f"item {i}: {noun}-{i * 7 % 97}")
+    queried = (
+        num_items // 8,
+        num_items // 3,
+        (2 * num_items) // 3,
+        num_items - 5,
+    )
+    ask = ", ".join(str(q) for q in queried)
+    prompt = (
+        "Below is a list of items.\n"
+        + "\n".join(lines)
+        + f"\nOutput items {ask} from the list above exactly as written, "
+        "one per line, and nothing else."
+    )
+    return prompt, queried
+
+
 class GenerationRecord(msgspec.Struct, frozen=True, kw_only=True):
     text: str
     prompt_tokens: int
@@ -516,17 +557,13 @@ def validate_cache_probe(
 ) -> int:
     """The device-hit -> churn -> host-reload oracle; returns expected tokens.
 
-    Bit-equal greedy text between the device-hit and host-reload passes
-    certifies the KV integrity of the host offload round trip: both passes
-    recompute the same final page over the same stored prefix KV, so their
-    outputs are deterministic replicas unless the reloaded pages differ.
-
-    The cold pass is held to liveness only. Its prefill runs a different
-    extend shape (full prompt vs one page over cached prefix) and consumes
-    the prefix at compute dtype rather than KV-cache dtype, so its logits
-    differ by kernel-level epsilons and greedy ties may break differently.
-    Semantic quality of the cached path is gated by the gsm8k floor, whose
-    requests share their few-shot prefix through the same cache.
+    All three passes must produce identical greedy text. The target prompt's
+    continuation is a forced verbatim copy (make_target_prompt), which the
+    kernel-level epsilon differences between cache paths -- extend-bucket
+    shape, prefix at compute dtype vs KV-cache dtype -- cannot flip. A text
+    difference therefore means the KV VALUES changed: cold vs device-hit
+    catches a corrupt device cache path, device-hit vs host-reload catches a
+    corrupt host offload round trip, and both legs cross the P/D transfer.
     """
     if cold.prompt_tokens < 2 * page_size:
         raise AssertionError(f"target prompt too short: {cold.prompt_tokens} tokens")
@@ -550,8 +587,11 @@ def validate_cache_probe(
         raise AssertionError(
             f"immediate resend loaded from host: {device_hit.host_cached_tokens}"
         )
-    if not device_hit.text.strip() or device_hit.completion_tokens <= 0:
-        raise AssertionError("device-hit request produced no decode output")
+    if device_hit.text != cold.text:
+        raise AssertionError(
+            "device-hit copy output diverged from the cold pass -- the device "
+            "prefix cache returned different KV values"
+        )
 
     if host_reload.host_cached_tokens <= 0:
         raise AssertionError(
@@ -566,7 +606,7 @@ def validate_cache_probe(
         )
     if host_reload.text != device_hit.text:
         raise AssertionError(
-            "host-reloaded greedy output diverged from the device-hit pass -- "
+            "host-reloaded copy output diverged from the device-hit pass -- "
             "the offloaded KV pages did not survive the host round trip"
         )
     return expected
@@ -576,7 +616,8 @@ def run_cache_probe(
     base_url: str, flush_url: str, profile: ModelProfile, config: CacheProbeConfig
 ) -> None:
     _flush_cache(flush_url)
-    target = make_prompt(0, config.target_words)
+    target, queried = make_target_prompt(config.target_words)
+    print(f"cache probe target queries items {queried}", flush=True)
     cold = _generate(base_url, target, config.max_new_tokens)
     device_hit = _generate(base_url, target, config.max_new_tokens)
 
@@ -1030,6 +1071,22 @@ class TestPdIntegrationConfiguration(unittest.TestCase):
                     f"fillers cannot evict a {config.device_pool_tokens}-token "
                     "device pool",
                 )
+
+    def test_target_prompt_queries_resolve_to_unique_lines(self) -> None:
+        # The copy oracle only forces the continuation if every queried item
+        # exists exactly once, and only spans the prefix if the queries spread
+        # across it.
+        prompt, queried = make_target_prompt(2048)
+        lines = prompt.split("\n")
+        positions = []
+        for number in queried:
+            matches = [
+                i for i, l in enumerate(lines) if l.startswith(f"item {number}: ")
+            ]
+            self.assertEqual(len(matches), 1, f"item {number}")
+            positions.append(matches[0])
+        self.assertLess(positions[0], len(lines) // 4)
+        self.assertGreater(positions[-1], (3 * len(lines)) // 4)
 
     def test_explicit_filler_count_overrides_calibration(self) -> None:
         config = CacheProbeConfig.from_env(
