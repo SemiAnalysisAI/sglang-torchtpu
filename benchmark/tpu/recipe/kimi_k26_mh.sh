@@ -54,14 +54,21 @@ export ATTENTION_BACKEND=${ATTENTION_BACKEND:-pallas_tpu_mla}
 # ladder grew past 612GB mid-EXTEND and got the pod OOM-killed, while a single
 # 8192-token graph peaked at 257GB. Chunked prefill caps every prefill at 8192
 # and shorter shapes pad up to it, so one token bucket is full coverage; the two
-# batch buckets mirror deepseek_r1_0528_mh.sh.
+# batch buckets cover the eval's ramp-up and steady state.
+# The batch cap is then bounded by KV, not by host memory. Kimi is MLA with a
+# single latent head, so the KV pool is replicated per rank, not sharded: ~65KB
+# per token per core, giving 443k tokens at mfs 0.70 and ~660k at 0.85. Measured
+# on the card protocol (2026-08-26), 32 concurrent GPQA requests averaged ~13k
+# tokens each and pinned the pool at 0.98. 64 is what ~660k absorbs without
+# leaning on retraction; R1's 128 does not carry over, because R1 generates at
+# most 32768 tokens per request against a comparable pool.
 export MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.85}
-export MAX_RUNNING=${MAX_RUNNING:-128}
+export MAX_RUNNING=${MAX_RUNNING:-64}
 export CONTEXT_LEN=${CONTEXT_LEN:-262144}
 export CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-8192}
 export MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-8192}
 export TPU_COMPILE_TOKENS=${TPU_COMPILE_TOKENS:-"8192"}
-export TPU_COMPILE_BS=${TPU_COMPILE_BS:-"64 128"}
+export TPU_COMPILE_BS=${TPU_COMPILE_BS:-"32 64"}
 export TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$MAX_RUNNING}
 
 # MoonViT's precompile ladder is a second graph family on top of the text ones,

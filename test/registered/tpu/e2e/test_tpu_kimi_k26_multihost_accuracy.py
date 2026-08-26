@@ -1,21 +1,23 @@
 """Kimi-K2.6 (1T MoE, int4 W4A16, MoonViT VL) multi-host e2e accuracy.
 
 The JobSet launches the server (recipe/kimi_k26_mh.sh, 2 hosts, tp=16); this
-file attaches to it. Each dataset runs twice (repeat=2, scores averaged) under
-the K2.6 card protocol: temperature 1.0, top_p 1.0, context 262144, and a
-98304-token generation budget for the reasoning gates. Those are not the usual
+file attaches to it, under the K2.6 card protocol: temperature 1.0, top_p 1.0,
+context 262144, and a 98304-token generation budget for the reasoning gates. Those are not the usual
 house defaults -- the card states them explicitly, and at 4096 tokens GPQA
 scores at chance because thinking is truncated mid-chain.
 
-Floors are wide on purpose: with one server config and 2 passes the job's role
-is "serves the card protocol end-to-end and lands in the right accuracy band",
-not a tight regression bound.
+Pass counts are set by wall clock, not by taste. Measured on a 2-host v7x slice
+(2026-08-26): under the card protocol Kimi clears 0.64 GPQA questions/minute at
+32 concurrent, so a single 198-question pass is ~2.6h at the recipe's cap of 64.
+The reasoning gates therefore run once; only MMLU, which is cheap, repeats. That
+makes the floors wide on purpose -- the job's role is "serves the card protocol
+end-to-end and lands in the right accuracy band", not a tight regression bound.
 
 Baselines:
   gpqa    0.905  card GPQA-Diamond, pass@1
   aime25  0.950  the card reports AIME 2026 (0.964), not AIME'25; this is a
-                 house estimate, and at 30 questions/pass one flipped answer
-                 moves the averaged score 1.7pp
+                 house estimate, and over one 30-question pass a single flipped
+                 answer moves the score 3.3pp
   mmlu    0.900  the card does not report MMLU; house default, and the same
                  floor the R1 nightly uses
 
@@ -25,7 +27,8 @@ disabled in the recipe; a vision gate (MMMU-Pro, card 0.794) is the follow-up.
 The whole file runs under one `timeout` in jobset-tpu.yaml, so MULTIHOST_LAUNCH
 declares the budget the six passes need (discovery takes the max across the
 group; see discover_multihost.py). Kimi decodes slower than R1 and its
-generation budget is 3x larger, hence the wider cap.
+generation budget is 3x larger, hence the wider cap: ~2.6h for GPQA, ~0.5h for
+AIME, ~1.5h for two MMLU passes, plus bring-up.
 """
 
 import os
@@ -73,7 +76,6 @@ MODEL_CONFIG = {
             "label": "gpqa_diamond",
             "baseline": 0.905,
             "atol": 0.15,
-            "repeat": 2,
             "num_threads": 128,
             "temperature": CARD_TEMPERATURE,
             "top_p": CARD_TOP_P,
@@ -84,7 +86,6 @@ MODEL_CONFIG = {
             "label": "aime25",
             "baseline": 0.950,
             "atol": 0.20,
-            "repeat": 2,
             "num_threads": 128,
             "temperature": CARD_TEMPERATURE,
             "top_p": CARD_TOP_P,
