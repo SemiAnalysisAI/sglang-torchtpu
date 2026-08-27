@@ -53,8 +53,14 @@ export ATTENTION_BACKEND=${ATTENTION_BACKEND:-pallas_tpu_mla}
 # batch cap. Measured on a 963Gi node (2026-08-26): bs=64 with the 8-rung token
 # ladder grew past 612GB mid-EXTEND and got the pod OOM-killed, while a single
 # 8192-token graph peaked at 257GB. Chunked prefill caps every prefill at 8192
-# and shorter shapes pad up to it, so one token bucket is full coverage; the two
-# batch buckets mirror deepseek_r1_0528_mh.sh.
+# and shorter shapes pad up to it, so one token bucket is full coverage.
+#
+# The batch grid is one bucket for the same reason, and it is not a trim either:
+# the bucketer returns the smallest bucket >= n, so a single bucket at the cap
+# covers every batch width by padding up to it. Two buckets is what breaks --
+# TPU_COMPILE_BS="64 128" left no graph live at 128 and the first decode batch
+# that wide tripped fail_on_recompile and killed the server (2026-08-26). Keep
+# TPU_COMPILE_BS a single value equal to MAX_RUNNING.
 # The batch cap is a ceiling, not a reservation: the scheduler admits against
 # free KV and retracts under pressure, so it self-limits. Measured on the card
 # protocol (2026-08-26), 32 concurrent GPQA requests held the pool at 0.98 with
@@ -69,7 +75,7 @@ export CONTEXT_LEN=${CONTEXT_LEN:-40960}  # 32768 gen + 8192 prompt headroom
 export CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-8192}
 export MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-8192}
 export TPU_COMPILE_TOKENS=${TPU_COMPILE_TOKENS:-"8192"}
-export TPU_COMPILE_BS=${TPU_COMPILE_BS:-"64 128"}
+export TPU_COMPILE_BS=${TPU_COMPILE_BS:-"128"}
 export TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$MAX_RUNNING}
 
 # MoonViT's precompile ladder is a second graph family on top of the text ones,
