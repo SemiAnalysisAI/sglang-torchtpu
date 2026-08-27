@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
+    IncLockRefResult,
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
