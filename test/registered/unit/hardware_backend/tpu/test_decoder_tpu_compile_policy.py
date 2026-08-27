@@ -24,6 +24,7 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     CompiledForwardShim,
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+    _TEXT_IDS_WARMUP_VARIANT,
     DecoderTpuCompilePolicy,
     Qwen3VLDecoderTpuCompilePolicy,
     _materialize_out,
@@ -967,6 +968,45 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
             deepstack_key, policy._direct_compile_specialization_key(None, **kwargs)
         )
 
+    def test_text_ids_warmup_uses_the_positional_serving_convention(self):
+        """A multimodal model still serves text-only requests.
+
+        Those call the decoder positionally, and Dynamo guards on len(args), so
+        a graph warmed through the input_embeds keyword convention can never
+        satisfy them. Warming only the embeds convention left every text graph
+        to be compiled lazily at serving time, where the first batch width that
+        had not been seen yet tripped fail_on_recompile and killed the server.
+        """
+
+        model_runner = _model_runner()
+        model_runner.model.get_image_feature = MagicMock()
+        model_runner.model.get_input_embeddings = MagicMock(
+            return_value=torch.nn.Embedding(2, 4)
+        )
+        forward_batch = SimpleNamespace(
+            input_ids=torch.ones(8, dtype=torch.int64),
+            positions=torch.arange(8),
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            batch_size=8,
+        )
+        policy = Qwen3VLDecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model_runner.model
+        )
+        policy._make_dummy_forward_batch = MagicMock(return_value=forward_batch)
+
+        args, kwargs = policy._make_warmup_inputs(
+            num_tokens=8,
+            bs=8,
+            mode=ForwardMode.DECODE,
+            variant=_TEXT_IDS_WARMUP_VARIANT,
+        )
+
+        self.assertEqual(kwargs, {})
+        self.assertEqual(len(args), 3)
+        self.assertIs(args[0], forward_batch.input_ids)
+        self.assertIs(args[2], forward_batch)
+
     def test_slices_hidden_and_aux_tuple(self):
         policy = Qwen3VLDecoderTpuCompilePolicy()
         hidden = torch.zeros(5, 4)
@@ -1223,10 +1263,49 @@ class TestPrecompileLoops(_PolicyTestCase):
         with get_parallel().override(tp_rank=1):
             policy._precompile_extend()
 
-        self.assertEqual(policy._run_one.call_count, 2)
+        # 2 token buckets x 2 conventions: the input_embeds one a VL request
+        # takes, and the positional one a text-only request takes.
+        self.assertEqual(policy._run_one.call_count, 4)
         self.assertEqual(
             {call.kwargs["bs"] for call in policy._run_one.call_args_list},
             {16},
+        )
+        self.assertEqual(
+            {call.kwargs["variant"] for call in policy._run_one.call_args_list},
+            {"text_only", _TEXT_IDS_WARMUP_VARIANT},
+        )
+
+    def test_qwen3_vl_decode_warms_both_call_conventions(self):
+        """Text-only requests reach the decoder positionally, so every batch
+        bucket needs a graph in that convention. Warming only the input_embeds
+        one left them to compile lazily at serving time, where the first
+        unseen batch width tripped fail_on_recompile and killed the server."""
+
+        mr = _model_runner()
+        mr.model.get_image_feature = MagicMock()
+        mr.model.get_input_embeddings = MagicMock()
+        policy = Qwen3VLDecoderTpuCompilePolicy(
+            model_runner=mr,
+            b_bucketer=Bucketer(name="Bs", buckets=[64, 128]),
+            owner=mr.model,
+        )
+        policy._run_one = MagicMock()
+
+        with get_parallel().override(tp_rank=1):
+            policy._precompile_decode()
+
+        warmed = {
+            (call.kwargs["bs"], call.kwargs["variant"])
+            for call in policy._run_one.call_args_list
+        }
+        self.assertEqual(
+            warmed,
+            {
+                (64, "text_only"),
+                (128, "text_only"),
+                (64, _TEXT_IDS_WARMUP_VARIANT),
+                (128, _TEXT_IDS_WARMUP_VARIANT),
+            },
         )
 
     def test_qwen3_vl_warmup_crosses_logits_modes(self):
