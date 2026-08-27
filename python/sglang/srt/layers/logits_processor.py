@@ -977,6 +977,18 @@ class LogitsProcessor(nn.Module):
         return hidden_states, hidden_states
 
     def _gather_attn_tp_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        if logits.shape[0] == 0:
+            # An idle DP rank has no tokens, so there is nothing to gather --
+            # but XLA rejects an all-gather whose operand is zero-length along
+            # the gather dim ("dimension size of operand at 'all_gather_dim'
+            # cannot be zero"), which killed every idle rank on TPU the moment
+            # a DP-attention server took its first request.
+            #
+            # Skipping is collective-safe: attention is TP-sharded *within* a
+            # DP group, so all attn_tp ranks of a group share its batch and go
+            # idle together. Either every rank in the group takes this branch or
+            # none does; the group never splits.
+            return logits.new_empty((0, self.vocab_size))
         if self.vocab_size % self.attn_tp_size == 0:
             global_logits = torch.empty(
                 (
