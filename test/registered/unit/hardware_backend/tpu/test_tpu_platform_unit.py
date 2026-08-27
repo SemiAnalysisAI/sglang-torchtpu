@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import torch.compiler.config as compiler_config
 
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -252,24 +253,26 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         args = self._args(enable_torch_compile=False)
         self._apply(args)
 
-        self.assertEqual(args.dtype, "bfloat16")
-        self.assertEqual(args.attention_backend, "pallas_tpu_rpa_v3")
-        self.assertEqual(args.sampling_backend, "tpu")
-        self.assertTrue(args.disable_cuda_graph)
-        self.assertTrue(args.disable_piecewise_cuda_graph)
+        self.assertEqual(resolution_result(args, "dtype"), "bfloat16")
+        self.assertEqual(
+            resolution_result(args, "attention_backend"), "pallas_tpu_rpa_v3"
+        )
+        self.assertEqual(resolution_result(args, "sampling_backend"), "tpu")
+        self.assertTrue(resolution_result(args, "disable_cuda_graph"))
+        self.assertTrue(resolution_result(args, "disable_piecewise_cuda_graph"))
         # enable_torch_compile is opt-in on TPU and must not be forced off.
         self.assertFalse(args.enable_torch_compile)
         # Overlap is enabled on TPU via the thread-based path in
         # scheduler_overlap_mixin; the platform must NOT force-disable it.
         self.assertFalse(args.disable_overlap_schedule)
-        self.assertEqual(args.mem_fraction_static, 0.40)
+        self.assertEqual(resolution_result(args, "mem_fraction_static"), 0.40)
 
     def test_rpa_backends_default_to_fp8_kv_cache(self):
         for backend in ("pallas_tpu_rpa_v3", "pallas_tpu_rpa_batched"):
             with self.subTest(backend=backend):
                 args = self._args(attention_backend=backend)
                 self._apply(args)
-                self.assertEqual(args.kv_cache_dtype, "fp8_e4m3")
+                self.assertEqual(resolution_result(args, "kv_cache_dtype"), "fp8_e4m3")
 
     def test_explicit_kv_cache_dtype_not_overridden(self):
         args = self._args(
@@ -284,12 +287,12 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         args = self._args(attention_backend="pallas_tpu_mla")
         self._apply(args)
         self.assertEqual(args.kv_cache_dtype, "auto")
-        self.assertEqual(args.page_size, 64)
+        self.assertEqual(resolution_result(args, "page_size"), 64)
 
     def test_batched_rpa_page_size_default_meets_the_kernel_floor(self):
         args = self._args(attention_backend="pallas_tpu_rpa_batched")
         self._apply(args)
-        self.assertEqual(args.page_size, 256)
+        self.assertEqual(resolution_result(args, "page_size"), 256)
 
     def test_batched_rpa_rejects_a_page_size_below_the_floor(self):
         args = self._args(attention_backend="pallas_tpu_rpa_batched", page_size=64)
@@ -299,7 +302,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
     def test_explicit_page_size_above_the_floor_is_kept(self):
         args = self._args(attention_backend="pallas_tpu_rpa_batched", page_size=512)
         self._apply(args)
-        self.assertEqual(args.page_size, 512)
+        self.assertEqual(resolution_result(args, "page_size"), 512)
 
     def test_enable_torch_compile_preserved_when_opted_in(self):
         args = self._args(enable_torch_compile=True)

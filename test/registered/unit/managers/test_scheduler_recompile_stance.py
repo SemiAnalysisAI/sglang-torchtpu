@@ -30,23 +30,40 @@ def _make_scheduler(*, speculative_algorithm, enable_dp_attention=False):
     return scheduler
 
 
+def _runtime_config(speculative_algorithm):
+    return (
+        patch(
+            f"{_SCHED_MOD}.get_exec",
+            return_value=SimpleNamespace(
+                graph=SimpleNamespace(enable_torch_compile=True)
+            ),
+        ),
+        patch(
+            f"{_SCHED_MOD}.get_spec",
+            return_value=SimpleNamespace(speculative_algorithm=speculative_algorithm),
+        ),
+    )
+
+
 class TestSchedulerRecompileStance(unittest.TestCase):
     def test_spec_freezes_recompiles_by_default(self):
         scheduler = _make_scheduler(speculative_algorithm="EAGLE3")
+        exec_config, spec_config = _runtime_config("EAGLE3")
 
-        with envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(False), patch(
-            f"{_SCHED_MOD}.torch.compiler.set_stance"
-        ) as set_stance:
+        with exec_config, spec_config, envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(
+            False
+        ), patch(f"{_SCHED_MOD}.torch.compiler.set_stance") as set_stance:
             scheduler._maybe_arm_fail_on_recompile()
 
         set_stance.assert_called_once_with("fail_on_recompile")
 
     def test_env_allows_spec_recompiles(self):
         scheduler = _make_scheduler(speculative_algorithm="EAGLE3")
+        exec_config, spec_config = _runtime_config("EAGLE3")
 
-        with envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(True), patch(
-            f"{_SCHED_MOD}.torch.compiler.set_stance"
-        ) as set_stance:
+        with exec_config, spec_config, envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(
+            True
+        ), patch(f"{_SCHED_MOD}.torch.compiler.set_stance") as set_stance:
             scheduler._maybe_arm_fail_on_recompile()
 
         set_stance.assert_not_called()
@@ -55,20 +72,22 @@ class TestSchedulerRecompileStance(unittest.TestCase):
         scheduler = _make_scheduler(
             speculative_algorithm="EAGLE3", enable_dp_attention=True
         )
+        exec_config, spec_config = _runtime_config("EAGLE3")
 
-        with envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(False), patch(
-            f"{_SCHED_MOD}.torch.compiler.set_stance"
-        ) as set_stance:
+        with exec_config, spec_config, envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(
+            False
+        ), patch(f"{_SCHED_MOD}.torch.compiler.set_stance") as set_stance:
             scheduler._maybe_arm_fail_on_recompile()
 
         set_stance.assert_called_once_with("fail_on_recompile")
 
     def test_env_does_not_affect_non_spec(self):
         scheduler = _make_scheduler(speculative_algorithm=None)
+        exec_config, spec_config = _runtime_config(None)
 
-        with envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(True), patch(
-            f"{_SCHED_MOD}.torch.compiler.set_stance"
-        ) as set_stance:
+        with exec_config, spec_config, envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(
+            True
+        ), patch(f"{_SCHED_MOD}.torch.compiler.set_stance") as set_stance:
             scheduler._maybe_arm_fail_on_recompile()
 
         set_stance.assert_called_once_with("fail_on_recompile")

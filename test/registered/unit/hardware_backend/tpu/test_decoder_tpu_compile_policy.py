@@ -69,6 +69,7 @@ def _model_runner(device="cpu"):
     by ``DecoderTpuCompilePolicy.install()``)."""
     return SimpleNamespace(
         device=device,
+        page_size=1,
         model=SimpleNamespace(
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
@@ -969,6 +970,7 @@ def _spec_model_runner(device="cpu", is_draft_worker=False, num_steps=3):
     """ModelRunner stand-in with the spec config SpecDecoderTpuCompilePolicy reads."""
     return SimpleNamespace(
         device=device,
+        page_size=1,
         model=SimpleNamespace(
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
@@ -1019,13 +1021,20 @@ _DECODER_POLICY = "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_p
 @contextlib.contextmanager
 def _dp_attention(enabled: bool, *, attn_tp_size: int = 1):
     """Override DP attention and its parallel width for policy tests."""
+    parallel = SimpleNamespace(
+        attn_tp_size=attn_tp_size,
+        config=SimpleNamespace(dp_size=1),
+    )
     with patch(_SPEC_POLICY + "is_dp_attention_enabled", return_value=enabled), patch(
         _DECODER_POLICY + "is_dp_attention_enabled", return_value=enabled
     ), patch(
         "sglang.srt.layers.dp_attention.is_dp_attention_enabled", return_value=enabled
     ), patch(
         _SPEC_POLICY + "get_parallel",
-        return_value=SimpleNamespace(attn_tp_size=attn_tp_size),
+        return_value=parallel,
+    ), patch(
+        _DECODER_POLICY + "get_parallel",
+        return_value=parallel,
     ):
         yield
 
@@ -1118,7 +1127,7 @@ class TestSpecPrecompileLoops(CustomTestCase):
 
     def test_draft_precompiles_all_serving_forward_families(self):
         mr = _spec_model_runner(is_draft_worker=True, num_steps=3)
-        mr.server_args.page_size = 8
+        mr.page_size = 8
         policy = _make_spec_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
         decode_backends = [_FakeAttnBackend(), _FakeAttnBackend()]
         draft_backend = SimpleNamespace(attn_backends=decode_backends)
@@ -1223,7 +1232,7 @@ class TestSpecDummyForwardBatch(CustomTestCase):
 
     def test_draft_extend_uses_per_request_kv_pages(self):
         mr = _spec_model_runner(is_draft_worker=True, num_steps=3)
-        mr.server_args.page_size = 8
+        mr.page_size = 8
         policy = _make_spec_policy(mr, bs_buckets=(1, 4))
         fb = policy._make_dummy_forward_batch(
             num_tokens=16,
@@ -1256,7 +1265,7 @@ class TestSpecDummyForwardBatch(CustomTestCase):
 
     def test_draft_extend_uses_multiple_pages_when_tokens_exceed_page(self):
         mr = _spec_model_runner(is_draft_worker=True, num_steps=3)
-        mr.server_args.page_size = 2
+        mr.page_size = 2
         policy = _make_spec_policy(mr, bs_buckets=(1, 2))
         fb = policy._make_dummy_forward_batch(
             num_tokens=8,

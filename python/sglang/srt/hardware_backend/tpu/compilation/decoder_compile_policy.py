@@ -11,6 +11,7 @@ import msgspec
 import torch
 import tqdm
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.hardware_backend.tpu._logging import get_logger
@@ -343,7 +344,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         mode_caps = [(ForwardMode.EXTEND, self._extend_compile_cap())]
         server_args = getattr(self.model_runner, "server_args", None)
-        if getattr(server_args, "enable_mixed_chunk", False):
+        cfg = resolving_view(server_args) if server_args is not None else None
+        if cfg is not None and getattr(cfg, "enable_mixed_chunk", False):
             mode_caps.append(
                 (
                     ForwardMode.MIXED,
@@ -389,7 +391,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
             return False
 
-        server_args = self.model_runner.server_args
+        cfg = resolving_view(self.model_runner.server_args)
         is_draft_worker = bool(getattr(self.model_runner, "is_draft_worker", False))
         compile_owner = self.owner.model if is_draft_worker else self.owner
         compile_fn = compile_owner.forward if is_draft_worker else fn
@@ -427,8 +429,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         t_candidates = [
             c
             for c in (
-                server_args.chunked_prefill_size,
-                server_args.max_prefill_tokens,
+                cfg.chunked_prefill_size,
+                cfg.max_prefill_tokens,
                 self.model_runner.model_config.context_len,
             )
             if c and c > 0
@@ -439,15 +441,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 "chunked_prefill_size, max_prefill_tokens, and context_len are all unset."
             )
         max_t = min(t_candidates)
-        max_b = server_args.torch_compile_max_bs
-        t_bucketer, b_bucketer = build_bucketers(server_args, max_t=max_t, max_b=max_b)
+        max_b = cfg.torch_compile_max_bs
+        t_bucketer, b_bucketer = build_bucketers(cfg, max_t=max_t, max_b=max_b)
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
         if is_dp_attention_enabled():
             self.extend_bs = b_bucketer.max_val
         else:
             self.extend_bs = min(
-                server_args.prefill_max_requests or b_bucketer.max_val,
+                cfg.prefill_max_requests or b_bucketer.max_val,
                 b_bucketer.max_val,
             )
 
@@ -487,10 +489,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if self.tracer == "direct":
             return self._direct_compile(fn)
 
-        server_args = self.model_runner.server_args
+        cfg = resolving_view(self.model_runner.server_args)
         use_bundle = (
-            server_args.unsafe_save_torch_compile_bundle is not None
-            or server_args.unsafe_load_torch_compile_bundle is not None
+            cfg.unsafe_save_torch_compile_bundle is not None
+            or cfg.unsafe_load_torch_compile_bundle is not None
         )
         compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
         return compiler(
@@ -765,7 +767,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """Warm decoder graphs for this policy's bucket grid."""
         overall = time.perf_counter()
         server_args = getattr(self.model_runner, "server_args", None)
-        disagg_mode = getattr(server_args, "disaggregation_mode", None)
+        cfg = resolving_view(server_args) if server_args is not None else None
+        disagg_mode = getattr(cfg, "disaggregation_mode", None)
         if disagg_mode != "decode":
             self._precompile_extend()
         if disagg_mode != "prefill":
@@ -973,7 +976,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """
         from sglang.srt.layers.dp_attention import DpPaddingMode
 
-        dp_size = self.model_runner.server_args.dp_size
+        dp_size = get_parallel().config.dp_size
         device = self.model_runner.device
         global_num_tokens = [num_tokens] * dp_size
         forward_batch.dp_padding_mode = DpPaddingMode.MAX_LEN
@@ -1144,7 +1147,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 bs,
                 tokens_per_req,
                 device=device,
-                page_size=self.model_runner.server_args.page_size,
+                page_size=self.model_runner.page_size,
                 out_cache_loc_dtype=self._dummy_out_cache_loc_dtype(mode),
             )
         return _DummyForwardBatchFields.default(

@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 import tqdm
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
@@ -163,10 +164,10 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        server_args = self.model_runner.server_args
-        self.speculative_num_steps = server_args.speculative_num_steps or 0
-        self.speculative_algorithm = server_args.speculative_algorithm
-        self.speculative_eagle_topk = server_args.speculative_eagle_topk or 1
+        cfg = resolving_view(self.model_runner.server_args)
+        self.speculative_num_steps = cfg.speculative_num_steps or 0
+        self.speculative_algorithm = cfg.speculative_algorithm
+        self.speculative_eagle_topk = cfg.speculative_eagle_topk or 1
         self.is_draft_worker = self.model_runner.is_draft_worker
 
         if self.speculative_algorithm and self.speculative_algorithm != "EAGLE3":
@@ -178,7 +179,7 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         # Draft tokens verified per request = the TARGET_VERIFY width. This
         # equals speculative_num_steps + 1 only for a topk=1 chain; use the
         # configured value so tree drafts (topk > 1) size correctly.
-        self.draft_token_num = server_args.speculative_num_draft_tokens or (
+        self.draft_token_num = cfg.speculative_num_draft_tokens or (
             self.speculative_num_steps + 1 if self.speculative_num_steps else 0
         )
         # Width of ``spec_info.hidden_states`` the EAGLE3 draft model expects.

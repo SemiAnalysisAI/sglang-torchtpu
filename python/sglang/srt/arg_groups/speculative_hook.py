@@ -33,17 +33,18 @@ def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
 
 
 def _validate_tpu_speculative_args(server_args: ServerArgs, model_config) -> None:
-    if server_args.device != "tpu":
+    cfg = resolving_view(server_args)
+    if cfg.device != "tpu":
         return
-    if server_args.speculative_eagle_topk != 1:
+    if cfg.speculative_eagle_topk != 1:
         raise ValueError(
             "TPU speculative decoding requires --speculative-eagle-topk=1."
         )
-    if server_args.speculative_use_rejection_sampling:
+    if cfg.speculative_use_rejection_sampling:
         raise ValueError(
             "TPU speculative decoding does not support rejection sampling."
         )
-    if server_args.kv_canary != "none":
+    if cfg.kv_canary != "none":
         raise ValueError("TPU speculative decoding does not support KV canary.")
     if getattr(model_config.hf_config, "index_share_for_mtp_iteration", False):
         raise ValueError("TPU speculative decoding does not support DSA index sharing.")

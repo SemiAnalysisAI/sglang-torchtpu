@@ -104,20 +104,24 @@ def _apply_page_size_default(server_args) -> None:
     width -- must not silently receive the generic default, or it fails deep
     inside the Pallas trace with a shape error that reads like a kernel bug.
     """
-    from sglang.srt.arg_groups.overrides import declare_late_resolution
+    from sglang.srt.arg_groups.overrides import (
+        declare_late_resolution,
+        resolving_view,
+    )
 
-    spec = _rpa_kernel_spec(server_args.attention_backend)
+    cfg = resolving_view(server_args)
+    spec = _rpa_kernel_spec(cfg.attention_backend)
     floor = spec.min_page_size if spec is not None else None
-    if server_args.page_size is None:
+    if cfg.page_size is None:
         default = max(_DEFAULT_PAGE_SIZE, floor or 0)
         declare_late_resolution(
             server_args, "tpu.apply_server_args_defaults", page_size=default
         )
         return
-    if floor is not None and server_args.page_size < floor:
+    if floor is not None and cfg.page_size < floor:
         raise ValueError(
-            f"--attention-backend {server_args.attention_backend} needs "
-            f"--page-size >= {floor}, got {server_args.page_size}."
+            f"--attention-backend {cfg.attention_backend} needs "
+            f"--page-size >= {floor}, got {cfg.page_size}."
         )
 
 
@@ -135,11 +139,15 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
     and ``pallas_tpu_flash`` has no dequantization scale, so defaulting either
     to fp8 breaks or silently degrades it.
     """
-    from sglang.srt.arg_groups.overrides import declare_late_resolution
+    from sglang.srt.arg_groups.overrides import (
+        declare_late_resolution,
+        resolving_view,
+    )
 
-    if server_args.kv_cache_dtype != "auto":
+    cfg = resolving_view(server_args)
+    if cfg.kv_cache_dtype != "auto":
         return
-    if _rpa_kernel_spec(server_args.attention_backend) is None:
+    if _rpa_kernel_spec(cfg.attention_backend) is None:
         return
     declare_late_resolution(
         server_args, "tpu.apply_server_args_defaults", kv_cache_dtype="fp8_e4m3"
@@ -178,8 +186,13 @@ class TpuSRTPlatform(SRTPlatform):
 
     def apply_server_args_defaults(self, server_args: ServerArgs) -> None:
         # Pre-publish resolution writes go through declare_late_resolution.
-        from sglang.srt.arg_groups.overrides import declare_late_resolution
+        from sglang.srt.arg_groups.overrides import (
+            declare_late_resolution,
+            resolving_view,
+        )
         from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
+
+        cfg = resolving_view(server_args)
 
         # Under Ray the slicebuilder/topology env is built per-rank after the
         # cluster's real node IPs are discovered (multihost: per-actor from Ray
@@ -189,32 +202,30 @@ class TpuSRTPlatform(SRTPlatform):
         # (localhost) env that never applies to the actual ranks. Still apply
         # the libtpu/env overrides now so actors inherit them before importing
         # torch_tpu.
-        _prepare_tpu_env(
-            server_args.tp_size, setup_slicebuilder=not server_args.use_ray
-        )
+        _prepare_tpu_env(cfg.tp_size, setup_slicebuilder=not cfg.use_ray)
 
         from sglang.srt.hardware_backend.tpu.env_override import (
             apply_small_kv_pool_vmem_prefetch_override,
         )
 
         apply_small_kv_pool_vmem_prefetch_override(
-            max_total_tokens=server_args.max_total_tokens,
-            num_hidden_layers=_resolve_num_hidden_layers(server_args),
+            max_total_tokens=cfg.max_total_tokens,
+            num_hidden_layers=_resolve_num_hidden_layers(cfg),
         )
 
-        if server_args.dtype is None or server_args.dtype == "auto":
+        if cfg.dtype is None or cfg.dtype == "auto":
             declare_late_resolution(
                 server_args, "tpu.apply_server_args_defaults", dtype="bfloat16"
             )
 
-        if server_args.attention_backend is None:
+        if cfg.attention_backend is None:
             declare_late_resolution(
                 server_args,
                 "tpu.apply_server_args_defaults",
                 attention_backend=self.get_default_attention_backend(),
             )
 
-        if server_args.sampling_backend is None:
+        if cfg.sampling_backend is None:
             declare_late_resolution(
                 server_args,
                 "tpu.apply_server_args_defaults",
@@ -238,7 +249,7 @@ class TpuSRTPlatform(SRTPlatform):
         # Leave it enabled by default; users can opt out via
         # ``--disable-overlap-schedule``.
 
-        if server_args.mem_fraction_static is None:
+        if cfg.mem_fraction_static is None:
             declare_late_resolution(
                 server_args, "tpu.apply_server_args_defaults", mem_fraction_static=0.40
             )
@@ -248,7 +259,7 @@ class TpuSRTPlatform(SRTPlatform):
         # host-resident: a device-resident req_to_token would put the other
         # nodes' prefix indices on device and mix devices in the prefix cat. Pin
         # SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 for raiden.
-        if server_args.hicache_io_backend == "raiden":
+        if cfg.hicache_io_backend == "raiden":
             if os.environ.get("SGLANG_TPU_REQ_TO_TOKEN_ON_HOST") == "0":
                 logger.warning(
                     "Overriding SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=0 -> 1: the "
@@ -264,9 +275,9 @@ class TpuSRTPlatform(SRTPlatform):
         # token-granular and turns KV fetches into many tiny DMAs.
         # Builtin TPU speculative decoding currently supports EAGLE3 only.
         # Registered algorithms own their validation and backend integration.
-        spec_algo = server_args.speculative_algorithm
+        spec_algo = cfg.speculative_algorithm
         if spec_algo is not None:
-            if server_args.attention_backend == "pallas_tpu_rpa_batched":
+            if cfg.attention_backend == "pallas_tpu_rpa_batched":
                 # It has no draft-backend wiring in speculative.draft_utils,
                 # so reject here with a clear message rather than failing later
                 # during draft-backend creation.
@@ -277,11 +288,11 @@ class TpuSRTPlatform(SRTPlatform):
                     "decoding."
                 )
             if spec_algo == "EAGLE3":
-                if server_args.speculative_use_rejection_sampling:
+                if cfg.speculative_use_rejection_sampling:
                     raise NotImplementedError(
                         "EAGLE3 rejection sampling is not supported on TPU yet."
                     )
-                if (server_args.speculative_eagle_topk or 1) > 1:
+                if (cfg.speculative_eagle_topk or 1) > 1:
                     raise NotImplementedError(
                         "EAGLE3 topk > 1 is not supported on TPU yet."
                     )
@@ -297,12 +308,12 @@ class TpuSRTPlatform(SRTPlatform):
                         "yet (only EAGLE3 among builtin algorithms)."
                     )
 
-        if server_args.enable_dp_attention:
-            attn_tp_size = server_args.tp_size // server_args.dp_size
-            if attn_tp_size > 1 and not server_args.enable_dp_lm_head:
+        if cfg.enable_dp_attention:
+            attn_tp_size = cfg.tp_size // cfg.dp_size
+            if attn_tp_size > 1 and not cfg.enable_dp_lm_head:
                 raise ValueError(
                     f"When attention TP > 1 under DP attention on TPU (attn_tp_size={attn_tp_size} "
-                    f"from tp_size={server_args.tp_size} and dp_size={server_args.dp_size}), "
+                    f"from tp_size={cfg.tp_size} and dp_size={cfg.dp_size}), "
                     "--enable-dp-lm-head must be enabled."
                 )
 

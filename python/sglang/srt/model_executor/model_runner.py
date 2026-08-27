@@ -706,11 +706,12 @@ class ModelRunner:
         # ~22s at startup; for configs without EP dispatch / EPLB / distribution
         # recording, the metadata is never read (see expert_location_dispatch.py
         # and fused_moe_triton/layer.py which handle None).
+        moe_config = get_exec().moe
         needs_expert_location_metadata = (
-            self.server_args.enable_eplb
-            or self.server_args.ep_dispatch_algorithm is not None
-            or self.server_args.expert_distribution_recorder_mode is not None
-            or self.server_args.init_expert_location != "trivial"
+            moe_config.enable_eplb
+            or moe_config.ep_dispatch_algorithm is not None
+            or moe_config.expert_distribution_recorder_mode is not None
+            or moe_config.init_expert_location != "trivial"
         )
         set_global_expert_location_metadata(
             compute_initial_expert_location_metadata(

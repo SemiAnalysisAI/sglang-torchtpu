@@ -47,7 +47,14 @@ class TestSchedulerInternalStateEnvVars(unittest.TestCase):
             return_value=SimpleNamespace(resolved_server_args_dict=dict),
         ), patch(
             "sglang.srt.managers.scheduler.get_exec",
-            return_value=SimpleNamespace(moe=SimpleNamespace(elastic_ep_backend=None)),
+            return_value=SimpleNamespace(
+                graph=SimpleNamespace(
+                    enable_torch_compile=False,
+                    unsafe_save_torch_compile_bundle=None,
+                    unsafe_load_torch_compile_bundle=None,
+                ),
+                moe=SimpleNamespace(elastic_ep_backend=None),
+            ),
         ), patch(
             "sglang.srt.managers.scheduler.compute_world_size", return_value=1
         ), patch(

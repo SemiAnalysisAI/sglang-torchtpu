@@ -477,7 +477,22 @@ class TestDraftTorchCompileInstall(CustomTestCase):
             f"{self._SETUP_MOD}.prealloc_symmetric_memory_pool"
         ), patch(
             f"{self._SETUP_MOD}.capture_decode_graph"
-        ) as decode_capture, get_flags().capture.override(
+        ) as decode_capture, patch(
+            f"{self._SETUP_MOD}.get_spec",
+            return_value=SimpleNamespace(
+                speculative_moe_runner_backend=None,
+                speculative_moe_a2a_backend=None,
+            ),
+        ), patch(
+            f"{self._SETUP_MOD}.get_exec",
+            return_value=SimpleNamespace(
+                moe=SimpleNamespace(
+                    moe_runner_backend="triton",
+                    moe_a2a_backend="none",
+                ),
+                comm=SimpleNamespace(enable_symm_mem=False),
+            ),
+        ), get_flags().capture.override(
             enable_torch_compile=enable_torch_compile
         ):
             capture_cuda_graphs(model_runner=runner, capture_decode_cuda_graph=False)

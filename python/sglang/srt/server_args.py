@@ -4706,32 +4706,32 @@ class ServerArgs:
             )
 
     def _handle_tpu_compile_tracer(self) -> None:
-        if self.tpu_compile_tracer == "dynamo":
+        cfg = self._resolved()
+        if cfg.tpu_compile_tracer == "dynamo":
             return
-        if self.device != "tpu":
+        if cfg.device != "tpu":
             raise ValueError("--tpu-compile-tracer direct is supported only on TPU")
-        if self.speculative_algorithm is not None:
+        if cfg.speculative_algorithm is not None:
             from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-            spec_algorithm = SpeculativeAlgorithm.from_string(
-                self.speculative_algorithm
-            )
+            spec_algorithm = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
             if not spec_algorithm.supports_tpu_direct_compile():
                 raise ValueError(
                     "--tpu-compile-tracer direct does not support speculative "
-                    f"algorithm {self.speculative_algorithm}"
+                    f"algorithm {cfg.speculative_algorithm}"
                 )
         if (
-            self.unsafe_save_torch_compile_bundle is not None
-            or self.unsafe_load_torch_compile_bundle is not None
+            cfg.unsafe_save_torch_compile_bundle is not None
+            or cfg.unsafe_load_torch_compile_bundle is not None
         ):
             raise ValueError(
                 "--tpu-compile-tracer direct does not support torch.compile bundles"
             )
 
     def _handle_unsafe_torch_compile_bundle(self) -> None:
-        save_dir = self.unsafe_save_torch_compile_bundle
-        load_dir = self.unsafe_load_torch_compile_bundle
+        cfg = self._resolved()
+        save_dir = cfg.unsafe_save_torch_compile_bundle
+        load_dir = cfg.unsafe_load_torch_compile_bundle
         if save_dir is not None and load_dir is not None:
             raise ValueError(
                 "--unsafe-save-torch-compile-bundle and "
@@ -4739,12 +4739,12 @@ class ServerArgs:
             )
         if save_dir is None and load_dir is None:
             return
-        if self.device != "tpu":
+        if cfg.device != "tpu":
             raise ValueError(
                 "torch.compile bundles are currently supported only on TPU"
             )
         assert (
-            self.enable_torch_compile
+            cfg.enable_torch_compile
         ), "torch.compile bundles require --enable-torch-compile"
 
     def _handle_modelscope_paths(self):
@@ -5463,7 +5463,7 @@ class ServerArgs:
             ), "cuda_graph_config[decode].bs should contain positive batch sizes"
             decode_cuda_graph_config.max_bs = cfg.torch_compile_max_bs
 
-        if self.device == "tpu":
+        if cfg.device == "tpu":
             # Couple the compile-bucket max (torch_compile_max_bs) with the
             # scheduler (max_running_requests) so a decode batch can never fall
             # outside the compiled buckets.
@@ -5471,25 +5471,27 @@ class ServerArgs:
                 reconcile_tpu_batch_limits,
             )
 
-            (
-                self.torch_compile_max_bs,
-                self.tpu_compile_bs,
-                self.max_running_requests,
-            ) = reconcile_tpu_batch_limits(
-                self.torch_compile_max_bs,
-                self.tpu_compile_bs,
-                self.max_running_requests,
-                attn_dp_size=(
-                    self.dp_size if self._resolved().enable_dp_attention else 1
-                ),
+            torch_compile_max_bs, tpu_compile_bs, max_running_requests = (
+                reconcile_tpu_batch_limits(
+                    cfg.torch_compile_max_bs,
+                    cfg.tpu_compile_bs,
+                    cfg.max_running_requests,
+                    attn_dp_size=(cfg.dp_size if cfg.enable_dp_attention else 1),
+                )
+            )
+            self._declare(
+                "_handle_gpu_memory_settings",
+                torch_compile_max_bs=torch_compile_max_bs,
+                tpu_compile_bs=tpu_compile_bs,
+                max_running_requests=max_running_requests,
             )
             logger.info(
                 "TPU batch limits after reconciliation: "
                 "torch_compile_max_bs=%d, tpu_compile_bs=%s, "
                 "max_running_requests=%d",
-                self.torch_compile_max_bs,
-                self.tpu_compile_bs,
-                self.max_running_requests,
+                torch_compile_max_bs,
+                tpu_compile_bs,
+                max_running_requests,
             )
 
         if prefill_cuda_graph_config.max_bs is None:
@@ -9199,19 +9201,19 @@ class ServerArgs:
                 "--disable-priority-preemption when priority scheduling is enabled."
             )
         if (
-            self.disaggregation_decode_retraction_backup == "host_pool"
-            and self.device == "tpu"
+            cfg.disaggregation_decode_retraction_backup == "host_pool"
+            and cfg.device == "tpu"
             and (
-                self.hicache_io_backend not in ("torch_tpu", "raiden")
-                or self.hicache_mem_layout != "page_first_fused"
+                cfg.hicache_io_backend not in ("torch_tpu", "raiden")
+                or cfg.hicache_mem_layout != "page_first_fused"
             )
         ):
             raise ValueError(
                 "--disaggregation-decode-retraction-backup=host_pool on TPU "
                 "builds the TPU host pool, which requires --hicache-mem-layout "
                 "page_first_fused and --hicache-io-backend torch_tpu or raiden; "
-                f"got layout {self.hicache_mem_layout!r} and io backend "
-                f"{self.hicache_io_backend!r}."
+                f"got layout {cfg.hicache_mem_layout!r} and io backend "
+                f"{cfg.hicache_io_backend!r}."
             )
 
         if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:
