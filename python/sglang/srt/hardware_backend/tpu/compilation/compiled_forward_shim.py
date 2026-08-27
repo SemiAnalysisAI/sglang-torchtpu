@@ -643,11 +643,9 @@ def reconcile_tpu_batch_limits(
     return tcmb, tpu_compile_bs, max_running_requests
 
 
-def build_bucketers(
-    server_args: Any, max_t: int, max_b: int
-) -> tuple[Bucketer, Bucketer]:
+def build_bucketers(config: Any, max_t: int, max_b: int) -> tuple[Bucketer, Bucketer]:
     """Build token and batch size bucketers."""
-    token_paddings = server_args.tpu_compile_tokens
+    token_paddings = config.tpu_compile_tokens
     if token_paddings:
         # Token buckets are consumed only by the EXTEND path, and extend never
         # runs longer than max_t (= min(chunked_prefill_size, max_prefill_tokens,
@@ -671,7 +669,7 @@ def build_bucketers(
             name="TokenBucketer", min_val=64, max_val=max_t, power=2
         )
 
-    bs_paddings = server_args.tpu_compile_bs
+    bs_paddings = config.tpu_compile_bs
     if bs_paddings:
         bs_bucketer: Bucketer = Bucketer(
             name="BatchSizeBucketer", buckets=list(bs_paddings)

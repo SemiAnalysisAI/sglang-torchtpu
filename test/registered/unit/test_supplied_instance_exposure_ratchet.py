@@ -136,24 +136,8 @@ _PASSED = frozenset({"model_path", "device", "random_seed"})
 
 # Only fork-specific readers remain after the upstream config-bag migration.
 _EXPOSED = {
-    ("hardware_backend/tpu/tpu_platform.py", "attention_backend"),
-    ("hardware_backend/tpu/tpu_platform.py", "dp_size"),
-    ("hardware_backend/tpu/tpu_platform.py", "dtype"),
-    ("hardware_backend/tpu/tpu_platform.py", "enable_dp_attention"),
-    ("hardware_backend/tpu/tpu_platform.py", "enable_dp_lm_head"),
-    ("hardware_backend/tpu/tpu_platform.py", "hicache_io_backend"),
-    ("hardware_backend/tpu/tpu_platform.py", "kv_cache_dtype"),
-    ("hardware_backend/tpu/tpu_platform.py", "mem_fraction_static"),
     ("hardware_backend/tpu/tpu_platform.py", "model_path"),
-    ("hardware_backend/tpu/tpu_platform.py", "page_size"),
-    ("hardware_backend/tpu/tpu_platform.py", "sampling_backend"),
-    ("hardware_backend/tpu/tpu_platform.py", "speculative_algorithm"),
-    ("hardware_backend/tpu/tpu_platform.py", "speculative_eagle_topk"),
     ("layers/dp_attention.py", "device"),
-    ("managers/scheduler.py", "enable_dp_attention"),
-    ("model_executor/model_runner.py", "ep_dispatch_algorithm"),
-    ("model_executor/model_runner.py", "expert_distribution_recorder_mode"),
-    ("speculative/eagle_worker_v2.py", "disable_cuda_graph"),
     ("utils/patch_torch.py", "device"),
 }
 
@@ -169,10 +153,7 @@ _EXPOSED_CUDA_ONLY: frozenset = frozenset()
 # some code overrides post-publish. Each needs an ordering judgment, not a blanket
 # conversion; the list exists so a new one is a decision made when it is written.
 _OVERRIDDEN_AND_READ = {
-    ("hardware_backend/tpu/tpu_platform.py", "dp_size"),
-    ("hardware_backend/tpu/tpu_platform.py", "dtype"),
     ("hardware_backend/tpu/tpu_platform.py", "model_path"),
-    ("speculative/eagle_worker_v2.py", "disable_cuda_graph"),
 }
 
 
