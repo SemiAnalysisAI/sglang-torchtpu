@@ -40,6 +40,7 @@ Model paths, pool sizes, churn workload, and gsm8k floors are env-overridable
 (see the *Config structs below).
 """
 
+import atexit
 import json
 import os
 import re
@@ -759,21 +760,36 @@ def _start_host_watch() -> None:
     the kernel ring buffer (OOM kills, segfaults) and the memory slope are the
     only way to tell an OOM kill from a native abort. Privileged CI pods can
     read the host ring buffer.
+
+    The watcher must not outlive this process. It inherits stdout, which under
+    the CI JobSet is the write end of the pipe feeding the container's ``tee``,
+    so a watcher that survives holds that pipe open, ``tee`` never reads EOF,
+    the container command never returns, and the pod sits Running until the
+    JobSet deadline fails the lane. Run 33005576428 cleared every assertion and
+    still went red that way, after three hours of emitting nothing but these
+    heartbeats from all four pods. Two guards, because they cover different
+    exits: atexit for a normal or raised exit, and the parent-liveness check
+    for a signal that skips atexit. ``kill 0`` takes the backgrounded dmesg
+    pipeline down with the loop, since start_new_session puts the whole watcher
+    in one process group of its own.
     """
+    watched_pid = os.getpid()
     script = (
         "(dmesg -w 2>/dev/null || echo '[hostwatch] dmesg unavailable') | "
         "grep --line-buffered -iE "
         "'out of memory|oom|killed process|segfault|hostwatch' | "
         "sed -u 's/^/[hostwatch:dmesg] /' & "
-        "while :; do "
+        f"while [ -e /proc/{watched_pid} ]; do "
         "echo \"[hostwatch:mem] $(grep -E 'MemTotal|MemAvailable' /proc/meminfo"
         " | tr -s ' \\n' ' ')\"; "
         "for d in /proc/[0-9]*; do r=$(awk '{print $2}' $d/statm 2>/dev/null); "
         '[ -n "$r" ] && echo "$((r*4/1024))MB ${d##*/} $(cat $d/comm 2>/dev/null)"; '
         "done | sort -rn | head -3 | sed 's/^/[hostwatch:rss] /'; "
-        "sleep 20; done"
+        "sleep 20; done; "
+        "kill 0 2>/dev/null"
     )
-    subprocess.Popen(["bash", "-c", script], start_new_session=True)
+    watcher = subprocess.Popen(["bash", "-c", script], start_new_session=True)
+    atexit.register(_kill, watcher)
 
 
 def _http_ok(url: str, timeout: int = 5) -> bool:

@@ -72,8 +72,8 @@ class RaidenKVCacheGroups:
     swa: List[Any]
 
 
-def get_raiden_kv_caches(pool) -> RaidenKVCacheGroups:
-    """Group per-layer device KV tensors by their page-index namespace.
+def _split_pool_by_page_namespace(pool) -> Tuple[List[Any], List[Any]]:
+    """Split one pool's per-layer device KV tensors into (full, swa).
 
     The TPU fused KV pool stores one [num_blocks, page_size, ...] tensor per
     layer in ``kv_buffer`` and exposes them via ``get_fused_kv_buffer``. Hybrid
@@ -91,14 +91,38 @@ def get_raiden_kv_caches(pool) -> RaidenKVCacheGroups:
             f"{type(pool).__name__}"
         )
     layers_mapping = getattr(pool, "layers_mapping", None)
-    if layers_mapping:
-        full = []
-        swa = []
-        for offset, buf in enumerate(buffers):
-            layer_id = pool.start_layer + offset
-            (swa if layers_mapping[layer_id][1] else full).append(buf)
-    else:
-        full, swa = buffers, []
+    if not layers_mapping:
+        return buffers, []
+    full = []
+    swa = []
+    for offset, buf in enumerate(buffers):
+        layer_id = pool.start_layer + offset
+        (swa if layers_mapping[layer_id][1] else full).append(buf)
+    return full, swa
+
+
+def get_raiden_kv_caches(pool, *, draft_pool=None) -> RaidenKVCacheGroups:
+    """Group per-layer device KV tensors by their page-index namespace.
+
+    ``draft_pool`` is the speculative draft model's pool, and it belongs in the
+    same groups as the target's rather than in an engine of its own. The draft
+    allocator does not allocate: it is indexed by the target's page ids, so its
+    buffers already live in the target's block-id namespace and a block id that
+    names a target page names the matching draft page. Leaving it out is what
+    made the EAGLE3-over-P/D lanes generate fluent nonsense, since mooncake and
+    nixl pick the draft pool up from ``kv_args.kv_data_ptrs`` and raiden reads
+    none of that, so the decode engine drafted against pages nothing had
+    written for the prompt.
+
+    The uniform-block-count check below is what keeps this honest. It now spans
+    both pools, so a draft pool whose page geometry does not match the target's
+    fails loudly at bootstrap instead of transferring into the wrong pages.
+    """
+    full, swa = _split_pool_by_page_namespace(pool)
+    if draft_pool is not None:
+        draft_full, draft_swa = _split_pool_by_page_namespace(draft_pool)
+        full = full + draft_full
+        swa = swa + draft_swa
 
     for name, group in (("full", full), ("SWA", swa)):
         block_counts = {int(buf.shape[0]) for buf in group}

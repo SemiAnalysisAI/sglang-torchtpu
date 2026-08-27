@@ -48,6 +48,17 @@ WAIT_SECS = int(E("WAIT_SECS", "3600"))
 KEEP_UP = E("KEEP_UP", "0") == "1"
 PYTHON = E("PYTHON", "python3")
 
+# The JobSet renderer, which lives under .dockerignore's .github/ entry and so
+# is absent from the runtime image. Anything that shells out to it only works
+# from a checkout, which is why the dry-run test below is guarded on this path.
+RENDER_JOBSET = os.path.join(REPO, ".github", "tpu-ci", "render_jobset.py")
+
+# The JobSet label for this lane, and the only variable part of the pod names
+# JobSet generates from it, which k8s caps at 63 characters. A longer one gets
+# the whole manifest rejected at submission, after the image build and the
+# queue wait. test_run_name_fits_the_generated_pod_name pins the budget.
+RUN_NAME = "gpt-oss-120b-pd-gsm8k"
+
 
 class Role(str, enum.Enum):
     """Execution roles in the P/D cluster."""
@@ -72,6 +83,9 @@ QUANTIZATION = ""
 KV_CACHE_DTYPE = "fp8_e4m3"
 MAX_TOTAL_TOKENS = 786432
 DISAGG_TRANSFER_BACKEND = "raiden"
+# Everything this lane moves between device and host rides raiden: the P/D hop,
+# and the retraction host pool the decode engine builds for itself.
+HICACHE_IO_BACKEND = "raiden"
 EXTRA_SERVER_ARGS: Tuple[str, ...] = ("--reasoning-parser", "gpt-oss")
 EXTRA_LAUNCH_ENV: Dict[str, str] = {"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"}
 
@@ -239,6 +253,15 @@ def build_decode_env(
         *EXTRA_SERVER_ARGS,
         "--disaggregation-transfer-backend",
         DISAGG_TRANSFER_BACKEND,
+        # A PD decode server switches on a host_pool retraction backup by
+        # itself and builds it from the device pool, which under RPA v3 is
+        # fused. raiden is the only io backend that can mirror it here: gpt-oss
+        # is hybrid-SWA, and the fused host pool covers the full-attention
+        # sub-pool alone, which server_args rejects rather than half-serves.
+        "--hicache-mem-layout",
+        "page_first_fused",
+        "--hicache-io-backend",
+        HICACHE_IO_BACKEND,
         "--skip-server-warmup",
         "--sampling-backend",
         "pytorch",
@@ -431,6 +454,14 @@ def _serve_prefill_leader(topology: PodTopology) -> int:
 
 def serve_role(topology: PodTopology, role: Role) -> int:
     """Dispatch and execute service behavior according to role and rank."""
+    # The gates run under model_config_main, which ends in a bare
+    # unittest.main() and so reads sys.argv. The pod is started as
+    # "python3 <script> integration", and left in place that mode word is
+    # taken for a test name: the loader fails to find it, reports one error
+    # and exits before a single gate runs, on a pair of engines that booted
+    # fine. Dropping it here makes the loader collect the synthesised gate
+    # case instead, which is what the run is for.
+    sys.argv = [sys.argv[0]]
     if topology.is_prefill_leader:
         return _serve_prefill_leader(topology)
     return _serve_worker(topology, role)
@@ -440,13 +471,13 @@ def render_jobset_yaml(
     image: str = "us-central1-docker.pkg.dev/sgl-project/tpu-ci/sglang:latest",
     lane: str = "nightly",
     weights_pvc: str = "model-weights-rox",
-    run_name: str = "gpt-oss-120b-pd-gsm8k",
+    run_name: str = RUN_NAME,
 ) -> str:
     """Render the Kubernetes JobSet YAML for this test."""
     rel_path = os.path.relpath(__file__, REPO)
     cmd = [
         PYTHON,
-        os.path.join(REPO, ".github", "tpu-ci", "render_jobset.py"),
+        RENDER_JOBSET,
         "--pd-prefill-hosts",
         "2",
         "--pd-decode-hosts",
@@ -459,6 +490,11 @@ def render_jobset_yaml(
         weights_pvc,
         "--name",
         run_name,
+        # Names the dashboard row and the TIMINGS record. The renderer rejects
+        # P/D mode without it rather than emit a record with an empty `file`,
+        # so this has to match what --exec actually runs.
+        "--files",
+        rel_path,
         "--exec",
         f"python3 {rel_path} integration",
     ]
@@ -485,9 +521,18 @@ class TestPdGptOss120bConfiguration(unittest.TestCase):
     def test_no_hierarchical_cache_or_speculative_features(self) -> None:
         for env_fn in (build_prefill_env, build_decode_env):
             env = env_fn(2, env={})
-            self.assertNotIn("hicache", env["EXTRA_ARGS"])
             self.assertNotIn("hierarchical-cache", env["EXTRA_ARGS"])
             self.assertNotIn("speculative", env["EXTRA_ARGS"])
+        # Prefill never retracts, so only decode carries the host-pool flags.
+        self.assertNotIn("hicache", build_prefill_env(2, env={})["EXTRA_ARGS"])
+
+    def test_decode_retraction_host_pool_stays_on_raiden(self) -> None:
+        # server_args rejects torch_tpu for a hybrid-SWA model, so this is the
+        # one io backend that lets the decode engine finish booting.
+        decode_args = build_decode_env(2, env={})["EXTRA_ARGS"]
+        self.assertIn("--hicache-mem-layout page_first_fused", decode_args)
+        self.assertIn("--hicache-io-backend raiden", decode_args)
+        self.assertNotIn("torch_tpu", decode_args)
 
     def test_raiden_port_does_not_collide_with_service_ports(self) -> None:
         for env_fn in (build_prefill_env, build_decode_env):
@@ -553,6 +598,23 @@ class TestPdGptOss120bConfiguration(unittest.TestCase):
             validate_model_source("/weights/definitely-missing-gpt-oss-120b")
         validate_model_source(HF_REPO_ID)
 
+    def test_run_name_fits_the_generated_pod_name(self) -> None:
+        # Regression: two lanes shipped with a run name a few characters too
+        # long and the JobSet webhook rejected the whole manifest, so the lane
+        # died at submission with no pod and no log to read. k8s caps a pod
+        # name at 63, and JobSet builds it from the run name plus a fixed
+        # tail -- the JobSet's own generated suffix, the longer of the two
+        # role names, the job and pod indices, and the pod suffix.
+        pod_name = f"tpu-ci-{RUN_NAME}-xxxxx-prefill-0-0-xxxxx"
+        self.assertLessEqual(len(pod_name), 63, pod_name)
+
+    # Skipped in-pod: the gates run under model_config_main, whose bare
+    # unittest.main() collects this class too, and the renderer this shells
+    # out to is excluded from the image by .dockerignore. Left unguarded it
+    # fails a lane whose engines and gates were all green.
+    @unittest.skipUnless(
+        os.path.exists(RENDER_JOBSET), "renderer is not shipped in the runtime image"
+    )
     def test_dry_run_render_jobset_yaml(self) -> None:
         yaml_content = render_jobset_yaml()
         self.assertIn("generateName: tpu-ci-gpt-oss-120b-pd-gsm8k-", yaml_content)
@@ -563,7 +625,7 @@ class TestPdGptOss120bConfiguration(unittest.TestCase):
         self.assertIn("name: decode", yaml_content)
         self.assertIn("CI_PD_ROLE", yaml_content)
         self.assertIn(
-            "python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_multihost_pd_gsm8k.py integration",
+            "python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_gsm8k.py integration",
             yaml_content,
         )
 

@@ -19,11 +19,11 @@ on:
         default: main
       # Scheduled runs (inputs empty) run everything.
       only:
-        description: "Run only one part (combo = both combo layers)"
+        description: "Run only one part (combo = both combo layers, pd-all = every P/D E2E lane)"
         required: false
         default: all
         type: choice
-        options: [all, single-host, integration, pd-integration, multihost, combo, singlehost-combo, multihost-combo, perf, accuracy, pd-e2e]
+        options: [all, single-host, integration, pd-integration, multihost, combo, singlehost-combo, multihost-combo, perf, accuracy, pd-e2e, pd-all, pd-multihost-spec-e2e, pd-multihost-offload-spec-e2e, pd-singlehost-spec-e2e]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -162,10 +162,112 @@ jobs:
       contents: read
       id-token: write
 
-  # P/D Disaggregation multihost accuracy E2E tests on Nightly lane.
-  pd-e2e:
+  # P/D Disaggregation multihost accuracy E2E gates on the Nightly lane.
+  #
+  # The three form a chain, each one needing the previous. They all land in
+  # _tpu-test.yml's tpu-pd-lock concurrency group, and that group holds at most one
+  # running plus one pending entry -- a third arrival cancels the pending one.
+  # Queued together they would lose a gate, so the chain keeps exactly one of them
+  # in the group at a time. It costs no wall clock, since the lock already ran them
+  # one at a time. Each link guards on !cancelled() rather than the default so a
+  # red or skipped upstream lane does not skip the rest of the chain.
+  #
+  # pd-e2e sits last because it is the only one already green on main, so it reads
+  # as a regression check on the shared raiden change rather than as a gate that
+  # might discover something.
+  #
+  # `only: pd-all` runs the whole chain off a single image build, which is what
+  # makes it cheaper than dispatching the lanes one at a time.
+  #
+  # Same P/D topology as pd-e2e with a draft model on top. Its own job rather
+  # than a matrix row of pd-e2e because a red run here with pd-e2e green is
+  # EAGLE3 across the transport, which is a different owner and a different fix.
+  pd-multihost-spec-e2e:
     needs: build
-    if: ${{ contains(fromJSON('["all","pd-e2e"]'), inputs.only || 'all') }}
+    if: ${{ contains(fromJSON('["all","pd-all","pd-multihost-spec-e2e"]'), inputs.only || 'all') }}
+    name: pd-multihost-spec-e2e-gpt-oss-120b-gsm8k
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 2
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py integration
+      # Names the dashboard row and the TIMINGS record. Required in P/D mode:
+      # the renderer refuses to emit a record with an empty `file`.
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py
+      weights_pvc: model-weights-rox
+      run_name: gpt-oss-pd-multihost-spec
+    permissions:
+      contents: read
+      id-token: write
+
+  # The same lane at one host per engine, and the only reason it exists is to
+  # split the red above in two. Speculation is green at TP8 without P/D and P/D
+  # is green at TP16 without speculation, so the failure is either the handover
+  # or the wider fabric, and the multihost shape varies both at once. Dropping to
+  # one host per engine keeps every other flag identical and changes only TP.
+  # Deliberately out of `all` and `pd-all`: it re-runs a lane that is already in
+  # the chain and would double the nightly's P/D hours for no new coverage.
+  pd-singlehost-spec-e2e:
+    needs: build
+    if: ${{ contains(fromJSON('["pd-singlehost-spec-e2e"]'), inputs.only || 'all') }}
+    name: pd-singlehost-spec-e2e-gpt-oss-120b-gsm8k
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      # `env` rather than a bare assignment prefix. The container expands
+      # EXEC_CMD unquoted, and bash only recognises an assignment prefix before
+      # expansion, so `VAR=1 python3 ...` would arrive as a command name.
+      exec_cmd: env PD_HOSTS_PER_ENGINE=1 python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py integration
+      # Names the dashboard row and the TIMINGS record. Required in P/D mode:
+      # the renderer refuses to emit a record with an empty `file`.
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py
+      weights_pvc: model-weights-rox
+      run_name: gpt-oss-pd-singlehost-spec
+    permissions:
+      contents: read
+      id-token: write
+
+  # Top of the feature matrix: P/D, HiCache offload and EAGLE3 at once. The
+  # pairwise lanes are covered elsewhere (pd-e2e, integration-test-tpu.yml's
+  # pd-prefix-caching-kv-offload, pd-multihost-spec-e2e above), so this one is only
+  # worth reading when all three of those are green.
+  pd-multihost-offload-spec-e2e:
+    needs: [build, pd-multihost-spec-e2e]
+    if: ${{ !cancelled() && needs.build.result == 'success' && contains(fromJSON('["all","pd-all","pd-multihost-offload-spec-e2e"]'), inputs.only || 'all') }}
+    name: pd-multihost-offload-spec-e2e-gpt-oss-120b-gsm8k
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 2
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_gsm8k.py integration
+      # Names the dashboard row and the TIMINGS record. Required in P/D mode:
+      # the renderer refuses to emit a record with an empty `file`.
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_gsm8k.py
+      weights_pvc: model-weights-rox
+      run_name: gpt-oss-pd-multihost-kvoff-spec
+    permissions:
+      contents: read
+      id-token: write
+
+  # The plain 2P+2D baseline, last in the chain. Green on main already, so what
+  # it checks here is that pinning raiden as the transfer backend did not move
+  # its GSM8K score.
+  pd-e2e:
+    needs: [build, pd-multihost-offload-spec-e2e]
+    if: ${{ !cancelled() && needs.build.result == 'success' && contains(fromJSON('["all","pd-all","pd-e2e"]'), inputs.only || 'all') }}
     name: pd-e2e-gpt-oss-120b-gsm8k
     uses: ./.github/workflows/_tpu-test.yml
     with:
@@ -175,7 +277,10 @@ jobs:
       hosts: 2
       pd_prefill_hosts: 2
       pd_decode_hosts: 2
-      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_multihost_pd_gsm8k.py integration
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_gsm8k.py integration
+      # Names the dashboard row and the TIMINGS record. Required in P/D mode:
+      # the renderer refuses to emit a record with an empty `file`.
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_gsm8k.py
       weights_pvc: model-weights-rox
       run_name: pd-gpt-oss-120b-gsm8k
     permissions:

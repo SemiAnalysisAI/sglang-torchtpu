@@ -106,12 +106,33 @@ ${WEIGHTS_VOLUME}
                       # exist. Printed unconditionally, as in jobset-tpu.yaml.
                       echo "== test files: ${TEST_FILES} =="
                       t0=$SECONDS
-                      ${EXEC_CMD}
-                      rc=$?
-                      # Only the prefill leader's verdict gates; a teardown
-                      # SIGTERM on any other pod is success.
-                      if [ "${TPU_WORKER_ID:-0}" != "0" ] && [ "$rc" = 143 ]; then
-                        echo "worker teardown SIGTERM; success"; rc=0
+                      # Tee'd because the non-leader exit check below reads the
+                      # failure signature back out, and the pod log is the only
+                      # egress, so both have to see the one stream.
+                      ${EXEC_CMD} 2>&1 | tee /tmp/pd_role.log
+                      rc=${PIPESTATUS[0]}
+                      # Only the prefill leader's verdict gates. A non-leader is
+                      # a TP shard of the leader's engine, so a real crash there
+                      # also fails the leader's inference, and the leader's own
+                      # exit code carries that. What never reaches the leader is
+                      # teardown: rank 0 finishes its files and exits, this
+                      # host's scheduler dies on the severed request-broadcast
+                      # socket, and sglang's crash handler SIGKILLs the server.
+                      # Match on the disconnect signature rather than on a code,
+                      # because the code depends on how far the death is relayed
+                      # (serve_role returns the launch pipeline's pipefail status
+                      # of 137, a kubelet SIGTERM is 143). A purely local death
+                      # such as an OOM-kill leaves no signature and stays red.
+                      # The rc and the outcome are echoed so a future teardown
+                      # shape that slips through says so in the pod log.
+                      if [ "${TPU_WORKER_ID:-0}" != "0" ] && [ "$rc" != 0 ]; then
+                        echo "worker rank=${TPU_WORKER_ID:-0} exited rc=$rc"
+                        if grep -qE "Connection (closed|reset) by peer" \
+                             /tmp/pd_role.log /tmp/*_prefill.log /tmp/*_decode.log 2>/dev/null; then
+                          echo "worker rank=${TPU_WORKER_ID:-0} leader closed (teardown), success"; rc=0
+                        else
+                          echo "worker rank=${TPU_WORKER_ID:-0} no teardown signature, failing"
+                        fi
                       fi
                       # Per-file verdict in run_suite's TIMINGS format, so the
                       # dashboard reads P/D, multi-host and single-host through
@@ -199,11 +220,20 @@ ${WEIGHTS_VOLUME}
                       # Same announcement as the prefill side; the verdict is
                       # the prefill leader's alone, so no TIMINGS record here.
                       echo "== test files: ${TEST_FILES} =="
-                      ${EXEC_CMD}
-                      rc=$?
-                      # Decode pods never gate on teardown SIGTERM.
-                      if [ "$rc" = 143 ]; then
-                        echo "worker teardown SIGTERM; success"; rc=0
+                      # Tee'd for the same reason as the prefill side.
+                      ${EXEC_CMD} 2>&1 | tee /tmp/pd_role.log
+                      rc=${PIPESTATUS[0]}
+                      # The prefill leader's exit severs this slice's peers too.
+                      # Same signature gate as the prefill side, and since no
+                      # decode pod carries the verdict it covers every rank.
+                      if [ "$rc" != 0 ]; then
+                        echo "decode rank=${TPU_WORKER_ID:-0} exited rc=$rc"
+                        if grep -qE "Connection (closed|reset) by peer" \
+                             /tmp/pd_role.log /tmp/*_prefill.log /tmp/*_decode.log 2>/dev/null; then
+                          echo "decode rank=${TPU_WORKER_ID:-0} leader closed (teardown), success"; rc=0
+                        else
+                          echo "decode rank=${TPU_WORKER_ID:-0} no teardown signature, failing"
+                        fi
                       fi
                       exit $rc
                   resources:
