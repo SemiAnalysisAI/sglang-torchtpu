@@ -5,8 +5,8 @@ Implements the Ragged Paged Attention (RPA) algorithm
 (https://arxiv.org/abs/2604.15464), adapted from vllm/tpu-inference
 (https://github.com/vllm-project/tpu-inference/tree/main/tpu_inference/kernels/).
 
-Both ``attention_pallas_rpa_v3`` and ``attention_pallas_rpa_batched`` are thin
-subclasses of :class:`BaseTpuPallasRpaAttnBackend` that differ only in a small
+The RPA implementations are thin subclasses of
+:class:`BaseTpuPallasRpaAttnBackend` that differ only in a small
 :class:`RpaKernelSpec` (which kernel to import, how to invoke it, the extend
 ``distribution`` encoding, and the draft-extend forward-mode variant). The
 shared logic — metadata building, fp8 KV quantization, the torch custom-op
@@ -17,8 +17,7 @@ Design notes
 
 * The kernel writes K/V into the fused KV cache itself. The backend therefore
   ignores ``save_kv_cache``: the cache is always updated.
-* The fused KV cache must be allocated by
-  :class:`sglang.srt.hardware_backend.tpu.kv_pool.TpuFusedMHATokenToKVPool`.
+* The KV cache pool is selected from the kernel spec and the resolved layout.
 * All attention metadata (cu_q_lens, cu_kv_lens, page_indices, distribution)
   is built once per forward pass in :meth:`init_forward_metadata` and reused
   by every layer.
@@ -40,6 +39,7 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
@@ -170,6 +170,37 @@ class RpaKernelSpec:
     # Minimum KV page/block size the kernel needs (None = no floor). Consumed by
     # the TPU platform's page-size defaulting, not by this module.
     min_page_size: int | None = None
+    # Whether this kernel can consume the SEQ_ALONG_LANE cache layout, and its
+    # layout-specific page-size floor. None means the layout is unsupported.
+    seq_along_lane_min_page_size: int | None = None
+    # Whether this backend always uses SEQ_ALONG_LANE instead of consulting the
+    # rollout flag. This keeps layout selection explicit for sequence-only
+    # kernels while batched RPA can continue to support either layout.
+    seq_along_lane_only: bool = False
+
+    def uses_seq_along_lane_kv(self) -> bool:
+        if self.seq_along_lane_only:
+            if self.seq_along_lane_min_page_size is None:
+                raise ValueError(
+                    f"{self.op_name} requires SEQ_ALONG_LANE but does not declare "
+                    "its page-size floor"
+                )
+            return True
+
+        enabled = envs.SGLANG_TPU_USE_SEQ_ALONG_LANE_KV.get()
+        if enabled and self.seq_along_lane_min_page_size is None:
+            raise ValueError(
+                f"{self.op_name} does not support SGLANG_TPU_USE_SEQ_ALONG_LANE_KV"
+            )
+        return enabled
+
+    def page_size_floor(self) -> int | None:
+        if not self.uses_seq_along_lane_kv():
+            return self.min_page_size
+
+        seq_floor = self.seq_along_lane_min_page_size
+        assert seq_floor is not None
+        return max(self.min_page_size or 0, seq_floor)
 
 
 # torch custom ops are process-global; cache one per op_name so repeated backend

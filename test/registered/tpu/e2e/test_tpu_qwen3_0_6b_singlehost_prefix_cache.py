@@ -224,7 +224,7 @@ class TestTpuQwen306bSinglehostPrefixCache(CustomTestCase):
 
     # (4) Concurrent batch sharing the prefix: completes, hits, deterministic. #
     def test_4_concurrent_batch(self):
-        prompts = [SYSTEM + q for q in QUESTIONS]
+        prompts = [_count_prompt(120 + i) for i in range(len(QUESTIONS))]
         b1 = _gen_batch(self.base_url, prompts)
         b2 = _gen_batch(self.base_url, prompts)
         self.assertTrue(all(t for t, _ in b1), "a concurrent request returned empty")
@@ -250,6 +250,12 @@ class TestTpuQwen306bSinglehostPrefixCache(CustomTestCase):
         out2, c2 = _gen(self.base_url, COUNT_LONG)
         self.assertLess(c2, PAGE_SIZE, "expected COUNT_LONG to be evicted (cache miss)")
         self.assertEqual(out1, out2, "output changed after eviction (pool corruption)")
+
+
+class TestTpuQwen306bSinglehostPrefixCacheRpaSeq(TestTpuQwen306bSinglehostPrefixCache):
+    """Run the prefix-cache suite against the opt-in rpa_seq backend."""
+
+    EXTRA_ENGINE_KWARGS = {"attention_backend": "pallas_tpu_rpa_seq"}
 
 
 COUNT_EXT = _count_prompt(150)

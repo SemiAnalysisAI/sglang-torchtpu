@@ -1,10 +1,9 @@
-"""Correctness tests for the vendored Pallas ragged-paged-attention v3 kernel.
+"""Correctness tests for the vendored Pallas ragged-paged-attention kernels.
 
-The kernel and its pure-JAX ``ref_ragged_paged_attention`` reference both
-live in ``sglang.srt.layers.attention.pallas.ragged_paged_attention_v3``.
-These tests build small inputs in both formats (fused/packed for the
-kernel, unpacked pages for the reference) and assert the outputs match
-within bfloat16 tolerance.
+The kernels and their pure-JAX ``ref_ragged_paged_attention`` references live
+in the ``ragged_paged_attention_v3`` and ``ragged_paged_attention_seq``
+packages. These tests build small inputs in the layouts each version expects
+and assert that the outputs and rpa_seq cache writeback match their references.
 
 Cases covered:
 
@@ -24,6 +23,7 @@ do **not** depend on torch_tpu or the SGLang server runtime.
 
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 import unittest
@@ -33,7 +33,7 @@ import numpy as np
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=360, suite="stage-a-test-tpu-unit")
 
 # This is a standalone raw-JAX kernel test, not a TorchTPU runtime process.
 # SGLang platform discovery selects CPU-only JAX for export, so select the
@@ -60,6 +60,8 @@ _SKIP_REASON = "Requires JAX with a TPU device"
 class TestRaggedPagedAttentionV3(unittest.TestCase):
     """Compare the Pallas kernel against the in-file reference impl."""
 
+    KERNEL_MODULE = "sglang.srt.layers.attention.pallas.ragged_paged_attention_v3"
+
     NUM_Q_HEADS = 4
     NUM_KV_HEADS = 1
     HEAD_DIM = 128
@@ -81,6 +83,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         kv_dtype=None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        page_indices_2d=None,
     ):
         """Build matching kernel/reference inputs for one or more sequences.
 
@@ -185,11 +188,17 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             v_scale,
         )
 
-        # 2D ref page table [num_seqs, pages_per_seq] with disjoint, contiguous
-        # absolute pages per seq.
-        page_indices_2d = np.arange(
-            num_seqs * self.PAGES_PER_SEQ, dtype=np.int32
-        ).reshape(num_seqs, self.PAGES_PER_SEQ)
+        # 2D ref page table [num_seqs, pages_per_seq]. Most tests use disjoint,
+        # contiguous pages; prefix-cache regressions can supply aliased rows.
+        if page_indices_2d is None:
+            page_indices_2d = np.arange(
+                num_seqs * self.PAGES_PER_SEQ, dtype=np.int32
+            ).reshape(num_seqs, self.PAGES_PER_SEQ)
+        else:
+            page_indices_2d = np.asarray(page_indices_2d, dtype=np.int32)
+            assert page_indices_2d.shape == (num_seqs, self.PAGES_PER_SEQ)
+            assert np.all(page_indices_2d >= 0)
+            assert np.all(page_indices_2d < self.TOTAL_NUM_PAGES)
 
         ref_kpages = k_pages
         ref_vpages = v_pages
@@ -269,10 +278,9 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         """Run kernel + reference with matching kwargs and assert close."""
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
-            ragged_paged_attention,
-            ref_ragged_paged_attention,
-        )
+        kernel_module = importlib.import_module(self.KERNEL_MODULE)
+        ragged_paged_attention = kernel_module.ragged_paged_attention
+        ref_ragged_paged_attention = kernel_module.ref_ragged_paged_attention
 
         sm_scale = 1.0 / float(np.sqrt(self.HEAD_DIM))
         # ``ref_ragged_paged_attention`` accepts a subset of the kernel
@@ -291,6 +299,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         if inputs.get("v_scale") is not None:
             scale_kwargs["v_scale"] = inputs["v_scale"]
 
+        distribution = jnp.asarray(distribution, dtype=jnp.int32)
         ref_out = ref_ragged_paged_attention(
             inputs["q"][: inputs["total_q_tokens"]],
             inputs["ref_kpages"],
@@ -313,7 +322,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             inputs["page_indices_flat"],
             inputs["cu_q_lens"],
             inputs["cu_kv_lens"],
-            jnp.asarray(distribution, dtype=jnp.int32),
+            distribution,
             None,  # custom_mask
             None,  # attention_sink
             sm_scale=sm_scale,
@@ -513,6 +522,107 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             [(17, 1)], kv_dtype=jnp.float8_e5m2, k_scale=1.0, v_scale=1.0
         )
         self._run_and_compare(inputs, distribution=(1, 1, 1), tolerance=0.2)
+
+
+@unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
+class TestRaggedPagedAttentionSeq(unittest.TestCase):
+    """Exercise the sequence-along-lane implementation."""
+
+    KERNEL_MODULE = "sglang.srt.layers.attention.pallas.ragged_paged_attention_seq"
+
+    def _run_seq_along_lane(self, *, q_lens, kv_lens, distribution):
+        import jax
+        import jax.numpy as jnp
+
+        kernel_module = importlib.import_module(self.KERNEL_MODULE)
+        num_q_heads = 8
+        num_kv_heads = 1
+        head_dim = 64
+        page_size = 128
+        pages_per_seq = 8
+        num_seqs = len(q_lens)
+        total_tokens = sum(q_lens)
+        total_pages = num_seqs * pages_per_seq
+
+        key = jax.random.PRNGKey(0)
+        q_key, k_key, v_key = jax.random.split(key, 3)
+        queries = jax.random.normal(
+            q_key, (total_tokens, num_q_heads, head_dim), dtype=jnp.bfloat16
+        )
+        keys = jax.random.normal(
+            k_key, (total_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16
+        )
+        values = jax.random.normal(
+            v_key, (total_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16
+        )
+        cache_shape = kernel_module.get_kv_cache_shape(
+            total_pages,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            jnp.bfloat16,
+        )
+        cache = jnp.zeros(cache_shape, dtype=jnp.bfloat16)
+        kv_lens_array = jnp.asarray(kv_lens, dtype=jnp.int32)
+        cu_q_lens = jnp.asarray(
+            [0] + list(np.cumsum(q_lens, dtype=np.int32)), dtype=jnp.int32
+        )
+        page_indices = jnp.arange(total_pages, dtype=jnp.int32)
+        distribution_array = jnp.asarray(distribution, dtype=jnp.int32)
+
+        args = (
+            queries,
+            keys,
+            values,
+            cache,
+            kv_lens_array,
+            page_indices,
+            cu_q_lens,
+            distribution_array,
+        )
+        kwargs = {
+            "num_kv_pages_per_block": 1,
+            "num_queries_per_block": 16,
+        }
+        ref_out, ref_cache = kernel_module.ref_ragged_paged_attention(*args)
+        out, updated_cache = kernel_module.ragged_paged_attention(*args, **kwargs)
+        np.testing.assert_allclose(out, ref_out, rtol=0.02, atol=0.02)
+
+        kernel_impl = importlib.import_module(f"{self.KERNEL_MODULE}.kernel")
+        unpack = kernel_impl.unpack_seq_along_lane_kv_cache
+        actual_k, actual_v = unpack(updated_cache, head_dim)
+        expected_k, expected_v = unpack(ref_cache, head_dim)
+        for seq_idx, kv_len in enumerate(kv_lens):
+            num_pages = (kv_len + page_size - 1) // page_size
+            page_start = seq_idx * pages_per_seq
+            indices = np.arange(page_start, page_start + num_pages)
+            for actual, expected in (
+                (actual_k, expected_k),
+                (actual_v, expected_v),
+            ):
+                actual_tokens = np.asarray(actual)[indices].reshape(
+                    -1, num_kv_heads, head_dim
+                )
+                expected_tokens = np.asarray(expected)[indices].reshape(
+                    -1, num_kv_heads, head_dim
+                )
+                np.testing.assert_allclose(
+                    actual_tokens[:kv_len],
+                    expected_tokens[:kv_len],
+                    rtol=0.02,
+                    atol=0.02,
+                )
+
+    def test_seq_along_lane_mixed(self):
+        self._run_seq_along_lane(q_lens=[5, 7], kv_lens=[5, 7], distribution=(0, 0, 2))
+
+    def test_seq_along_lane_continuation(self):
+        self._run_seq_along_lane(
+            q_lens=[3, 4], kv_lens=[11, 20], distribution=(0, 0, 2)
+        )
+
+    def test_seq_along_lane_decode(self):
+        self._run_seq_along_lane(q_lens=[1, 1], kv_lens=[9, 17], distribution=(2, 2, 2))
 
 
 if __name__ == "__main__":

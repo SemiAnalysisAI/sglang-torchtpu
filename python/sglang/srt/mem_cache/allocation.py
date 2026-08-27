@@ -213,6 +213,7 @@ def get_last_loc(
         "ascend",
         "torch_native",
         "pallas_tpu_rpa_v3",
+        "pallas_tpu_rpa_seq",
         "pallas_tpu_rpa_batched",
     )
     uses_triton_dispatch = (

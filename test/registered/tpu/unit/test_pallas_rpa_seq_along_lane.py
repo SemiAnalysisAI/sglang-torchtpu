@@ -49,9 +49,11 @@ class TestKvLayoutSelection(CustomTestCase):
         original = server_args_mod.get_global_server_args
         server_args_mod.get_global_server_args = lambda: sa
         try:
-            self.assertIs(
-                TpuSRTPlatform().get_mha_kv_pool_cls(), TpuFusedMHATokenToKVPool
-            )
+            with envs.SGLANG_TPU_USE_SEQ_ALONG_LANE_KV.override(False):
+                self.assertIs(
+                    TpuSRTPlatform().get_mha_kv_pool_cls(),
+                    TpuFusedMHATokenToKVPool,
+                )
             with envs.SGLANG_TPU_USE_SEQ_ALONG_LANE_KV.override(True):
                 self.assertIs(
                     TpuSRTPlatform().get_mha_kv_pool_cls(), TpuSeqAlongLaneKVPool

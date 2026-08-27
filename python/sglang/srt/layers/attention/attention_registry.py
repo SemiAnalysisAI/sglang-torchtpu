@@ -525,6 +525,15 @@ def create_pallas_tpu_rpa_v3_backend(runner):
     return TpuPallasRpaV3AttnBackend(runner)
 
 
+@register_attention_backend("pallas_tpu_rpa_seq")
+def create_pallas_tpu_rpa_seq_backend(runner):
+    from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_seq import (
+        TpuPallasRpaSeqAttnBackend,
+    )
+
+    return TpuPallasRpaSeqAttnBackend(runner)
+
+
 @register_attention_backend("pallas_tpu_rpa_batched")
 def create_pallas_tpu_rpa_batched_backend(runner):
     from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
