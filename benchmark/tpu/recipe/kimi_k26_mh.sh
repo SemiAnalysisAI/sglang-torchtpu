@@ -61,21 +61,29 @@ export ATTENTION_BACKEND=${ATTENTION_BACKEND:-pallas_tpu_mla}
 # TPU_COMPILE_BS="64 128" left no graph live at 128 and the first decode batch
 # that wide tripped fail_on_recompile and killed the server (2026-08-26). Keep
 # TPU_COMPILE_BS a single value equal to MAX_RUNNING.
-# The batch cap is a ceiling, not a reservation: the scheduler admits against
-# free KV and retracts under pressure, so it self-limits. Measured on the card
-# protocol (2026-08-26), 32 concurrent GPQA requests held the pool at 0.98 with
-# zero retractions. Kimi is MLA with a single latent head, so the KV pool is
-# replicated per rank rather than sharded -- ~65KB per token per core, ~660k
-# tokens at mfs 0.85. Capping generation at 32768 (see CONTEXT_LEN) bounds the
-# per-request footprint the way R1's does, which is what lets the memory knobs
-# match deepseek_r1_0528_mh.sh outright.
+# The batch cap is set by the KV pool, and 128 is past it. Kimi is MLA with a
+# single latent head, so the pool is replicated per rank rather than sharded:
+# ~65KB per token per core, ~660k tokens at mfs 0.85. Under the card protocol
+# its reasoning chains average ~13.5k tokens, so the pool holds ~48 of them.
+#
+# Measured on a 2-host v7x slice (2026-08-26). At 128 the pool pins at 1.00 and
+# the scheduler retracts to make room: 816 retraction events against 78
+# completions, each retracted request losing its KV and re-prefilling. Forward
+# progress collapsed -- 30 completions in the first half hour, then 23, 8, 10,
+# 5, 2 -- while aggregate decode throughput looked healthy at ~345 tok/s. The
+# throughput number is the trap: the tokens were going into re-prefilling work
+# already done. At 32 against a 443k pool the same eval held 0.64 q/min with
+# zero retractions.
+#
+# So size the cap to pool/avg_chain, not to what the scheduler will admit. It
+# admits 128 happily and then thrashes.
 export MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.85}
-export MAX_RUNNING=${MAX_RUNNING:-128}
+export MAX_RUNNING=${MAX_RUNNING:-48}
 export CONTEXT_LEN=${CONTEXT_LEN:-40960}  # 32768 gen + 8192 prompt headroom
 export CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-8192}
 export MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-8192}
 export TPU_COMPILE_TOKENS=${TPU_COMPILE_TOKENS:-"8192"}
-export TPU_COMPILE_BS=${TPU_COMPILE_BS:-"128"}
+export TPU_COMPILE_BS=${TPU_COMPILE_BS:-"48"}
 export TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$MAX_RUNNING}
 
 # MoonViT's precompile ladder is a second graph family on top of the text ones,
