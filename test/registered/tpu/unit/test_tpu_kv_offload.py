@@ -121,25 +121,45 @@ def _seed_pages(dev, dev_page_ids):
 
 
 def _make_controller(target_dev, target_host, draft_dev=None, draft_host=None):
-    """Minimal TpuHiCacheController carrying only the data-plane state the
+    """Minimal TpuHybridCacheController carrying only the data-plane state the
     write/load rounds touch (the full __init__ wires storage/prefetch threads
     irrelevant to these tests)."""
-    from sglang.srt.hardware_backend.tpu.kv_copy_worker import TpuKvCopyWorker
-    from sglang.srt.managers.cache_controller import (
-        BatchDoneCounter,
-        TpuHiCacheController,
+    from sglang.srt.hardware_backend.tpu.hybrid_cache_controller import (
+        TpuHybridCacheController,
     )
+    from sglang.srt.hardware_backend.tpu.kv_copy_worker import TpuKvCopyWorker
+    from sglang.srt.managers.cache_controller import BatchDoneCounter
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 
-    controller = TpuHiCacheController.__new__(TpuHiCacheController)
+    entries = [
+        PoolEntry(
+            name=PoolName.KV,
+            host_pool=target_host,
+            device_pool=target_dev,
+            layer_mapper=lambda layer_id: layer_id,
+            is_primary_index_anchor=True,
+        )
+    ]
+    if draft_dev is not None:
+        entries.append(
+            PoolEntry(
+                name=PoolName.DRAFT,
+                host_pool=draft_host,
+                device_pool=draft_dev,
+                layer_mapper=lambda layer_id: layer_id,
+            )
+        )
+
+    controller = TpuHybridCacheController.__new__(TpuHybridCacheController)
     controller.io_backend = "torch_tpu"
     controller.device = target_dev.device  # move_indices re-pins onto this
     controller.mem_pool_device = target_dev
-    controller.mem_pool_host = target_host
-    controller.has_draft = False
-    controller.mem_pool_device_draft = None
-    controller.mem_pool_host_draft = None
+    controller.mem_pool_host = HostPoolGroup(entries)
     controller.layer_done_counter = BatchDoneCounter()
     target_dev.register_layer_transfer_counter(controller.layer_done_counter)
+    if draft_dev is not None:
+        draft_dev.register_layer_transfer_counter(controller.layer_done_counter)
     controller._load_worker = TpuKvCopyWorker("test-kv-offload-h2d")
     controller._backup_worker = TpuKvCopyWorker("test-kv-offload-d2h")
     controller._backup_inflight = None
@@ -154,8 +174,6 @@ def _make_controller(target_dev, target_host, draft_dev=None, draft_host=None):
     controller.storage_backend = None
     controller.storage_backend_type = None
     controller.enable_storage_metrics = False
-    if draft_dev is not None:
-        controller.set_draft_kv_pool(draft_dev, draft_host)
     return controller
 
 
@@ -262,8 +280,7 @@ class TestTpuFusedHostPool(CustomTestCase):
 
 @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
 class TestTpuDraftKvOffload(CustomTestCase):
-    """Draft (speculative) KV piggyback: the controller reuses the target's
-    host/device index pair for a 1-layer draft pool on every round."""
+    """Draft KV rides the unified cache as a sidecar pool."""
 
     def test_draft_single_layer_roundtrip(self):
         # EAGLE3 draft = 1 layer; exercises the fused host pool at layer_num=1
@@ -272,17 +289,19 @@ class TestTpuDraftKvOffload(CustomTestCase):
         _assert_backup_load_roundtrip(self, dev, host, [3, 0, 6])
 
     def test_draft_pool_gates_on_shared_counter(self):
-        # set_draft_kv_pool must hand the whole-batch gate to the draft device pool: the draft forward waits via its OWN pool's counter.
+        # The draft forward waits via its own pool's transfer counter.
         target_dev, target_host = _make_pools(layer_num=2)
         draft_dev, draft_host = _make_pools(layer_num=1)
         controller = _make_controller(target_dev, target_host, draft_dev, draft_host)
-        self.assertTrue(controller.has_draft)
         self.assertIs(draft_dev.layer_transfer_counter, controller.layer_done_counter)
         self.assertIs(target_dev.layer_transfer_counter, controller.layer_done_counter)
 
     def test_controller_round_piggybacks_draft(self):
         # One write + one load round through the controller must round-trip
-        from sglang.srt.managers.cache_controller import CacheOperation
+        from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            CacheOperation,
+        )
 
         target_dev, target_host = _make_pools(layer_num=2)
         draft_dev, draft_host = _make_pools(layer_num=1)
@@ -301,7 +320,19 @@ class TestTpuDraftKvOffload(CustomTestCase):
         self.assertIsNotNone(host_indices)
 
         controller.write_queue.append(
-            CacheOperation(host_indices, device_indices, node_id=0)
+            CacheOperation(
+                host_indices,
+                device_indices,
+                node_id=0,
+                pool_transfers=[
+                    PoolTransfer(
+                        name=PoolName.DRAFT,
+                        host_indices=host_indices,
+                        device_indices=device_indices,
+                        indices_from_pool=PoolName.KV,
+                    )
+                ],
+            )
         )
         controller.start_writing()
         controller._backup_inflight.synchronize()
@@ -311,7 +342,19 @@ class TestTpuDraftKvOffload(CustomTestCase):
                 dev.kv_buffer[layer][pages] = 0
 
         controller.load_queue.append(
-            CacheOperation(host_indices, device_indices, node_id=0)
+            CacheOperation(
+                host_indices,
+                device_indices,
+                node_id=0,
+                pool_transfers=[
+                    PoolTransfer(
+                        name=PoolName.DRAFT,
+                        host_indices=host_indices,
+                        device_indices=device_indices,
+                        indices_from_pool=PoolName.KV,
+                    )
+                ],
+            )
         )
         producer_id = controller.start_loading()
         self.assertGreaterEqual(producer_id, 0)
@@ -331,7 +374,9 @@ class TestTpuDraftKvOffload(CustomTestCase):
 
     def test_controller_round_without_draft_unchanged(self):
         # No-draft config: the piggyback branches must stay dormant.
-        from sglang.srt.managers.cache_controller import CacheOperation
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            CacheOperation,
+        )
 
         target_dev, target_host = _make_pools(layer_num=2)
         controller = _make_controller(target_dev, target_host)

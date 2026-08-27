@@ -24,6 +24,7 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
@@ -55,6 +56,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     LogitsOutputMode,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
 from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     is_cpu,
@@ -141,6 +143,10 @@ class LogitsProcessorOutput:
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
 
+    # Beam search only: raw pre-sample logits for the scheduler-side joint
+    # selection; see beam_search.logits_capture.
+    beam: Optional[BeamLogitsCapture] = None
+
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
 
@@ -194,6 +200,9 @@ class LogitsProcessorOutput:
             self.next_token_global_top_k_token_ids = (
                 self.next_token_global_top_k_token_ids[:global_top_k_rows]
             )
+
+    # Scheduler-local output copied alongside the ordinary generation result.
+    auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
 
 @dataclasses.dataclass
@@ -368,8 +377,10 @@ class LogitsProcessor(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
-        self.use_attn_tp_group = get_parallel().enable_dp_lm_head
-        self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
+        self.use_attn_tp_group = get_parallel().config.enable_dp_lm_head
+        self.use_tp_lm_head_all_to_all = (
+            get_parallel().config.enable_tp_lm_head_all_to_all
+        )
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size

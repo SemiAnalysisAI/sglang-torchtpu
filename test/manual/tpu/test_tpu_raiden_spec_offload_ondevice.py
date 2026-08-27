@@ -6,7 +6,7 @@ Requires a TPU + a built tpu_sync extension + torch_tpu. NOT a CI unit test
     PYTHONPATH=/path/to/sglang-torchtpu/python \
         python3 test/manual/tpu/test_tpu_raiden_spec_offload_ondevice.py
 
-Drives a write round + a load round through ``TpuRaidenHiCacheController`` with
+Drives a write round + a load round through ``TpuRaidenHybridCacheController`` with
 a target pool AND an EAGLE-style 1-layer draft pool, each backed by its own
 raiden manager (real DMA), and checks bit-exact data movement on both pools.
 
@@ -24,10 +24,13 @@ import torch
 
 from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang.srt.hardware_backend.tpu.kv_pool_host import TpuRaidenHostKVCache
-from sglang.srt.hardware_backend.tpu.raiden_cache_controller import (
-    TpuRaidenHiCacheController,
+from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
+    TpuRaidenHybridCacheController,
 )
-from sglang.srt.managers.cache_controller import BatchDoneCounter, CacheOperation
+from sglang.srt.managers.cache_controller import BatchDoneCounter
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import CacheOperation
+from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 
 DEVICE = "tpu:0"
 PAGE_SIZE = 16
@@ -93,15 +96,29 @@ def _make_host_pool(pool):
 
 
 def _make_controller(target_dev, target_host, draft_dev, draft_host):
-    controller = object.__new__(TpuRaidenHiCacheController)
+    controller = object.__new__(TpuRaidenHybridCacheController)
     controller.io_backend = "raiden"
     controller.mem_pool_device = target_dev
-    controller.mem_pool_host = target_host
-    controller.has_draft = False
-    controller.mem_pool_device_draft = None
-    controller.mem_pool_host_draft = None
+    controller.mem_pool_host = HostPoolGroup(
+        [
+            PoolEntry(
+                name=PoolName.KV,
+                host_pool=target_host,
+                device_pool=target_dev,
+                layer_mapper=lambda layer_id: layer_id,
+                is_primary_index_anchor=True,
+            ),
+            PoolEntry(
+                name=PoolName.DRAFT,
+                host_pool=draft_host,
+                device_pool=draft_dev,
+                layer_mapper=lambda layer_id: layer_id,
+            ),
+        ]
+    )
     controller.layer_done_counter = BatchDoneCounter()
     target_dev.register_layer_transfer_counter(controller.layer_done_counter)
+    draft_dev.register_layer_transfer_counter(controller.layer_done_counter)
     controller._async_h2d = False
     controller._load_worker = None
     controller.write_queue = []
@@ -112,7 +129,6 @@ def _make_controller(target_dev, target_host, draft_dev, draft_host):
     controller.storage_backend = None
     controller.storage_backend_type = None
     controller.enable_storage_metrics = False
-    controller.set_draft_kv_pool(draft_dev, draft_host)
     return controller
 
 
@@ -138,7 +154,6 @@ def test_controller_round_piggybacks_draft():
     target_host = _make_host_pool(target_dev)
     draft_host = _make_host_pool(draft_dev)
     controller = _make_controller(target_dev, target_host, draft_dev, draft_host)
-    assert controller.has_draft
     assert draft_dev.layer_transfer_counter is controller.layer_done_counter
 
     host_indices = target_host.alloc(len(SRC_PAGES) * PAGE_SIZE)
@@ -146,7 +161,19 @@ def test_controller_round_piggybacks_draft():
 
     # Write round: SRC_PAGES of BOTH pools -> host (one ack over both DMAs).
     controller.write_queue.append(
-        CacheOperation(host_indices, _page_tokens(SRC_PAGES), node_id=0)
+        CacheOperation(
+            host_indices,
+            _page_tokens(SRC_PAGES),
+            node_id=0,
+            pool_transfers=[
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    host_indices=host_indices,
+                    device_indices=_page_tokens(SRC_PAGES),
+                    indices_from_pool=PoolName.KV,
+                )
+            ],
+        )
     )
     controller.start_writing()
     (write_ack,) = controller.ack_write_queue
@@ -154,7 +181,19 @@ def test_controller_round_piggybacks_draft():
 
     # Load round: host -> DST_PAGES of BOTH pools.
     controller.load_queue.append(
-        CacheOperation(host_indices, _page_tokens(DST_PAGES), node_id=0)
+        CacheOperation(
+            host_indices,
+            _page_tokens(DST_PAGES),
+            node_id=0,
+            pool_transfers=[
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    host_indices=host_indices,
+                    device_indices=_page_tokens(DST_PAGES),
+                    indices_from_pool=PoolName.KV,
+                )
+            ],
+        )
     )
     producer_id = controller.start_loading()
     assert producer_id >= 0

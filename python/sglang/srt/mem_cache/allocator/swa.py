@@ -303,12 +303,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             alloc_full_indices[-swa_tail_len:], alloc_swa_indices
         )
         if swa_tail_len < extend_num_tokens:
-            mapping = self.full_to_swa_index_mapping
-            reset_indices = alloc_full_indices[:-swa_tail_len].to(torch.int64)
-            if _is_tpu:
-                # TPU mapping is host-resident; align the device alloc indices.
-                reset_indices = reset_indices.to(mapping.device)
-            mapping[reset_indices] = 0
+            self.clear_full_to_swa_mapping(alloc_full_indices[:-swa_tail_len])
         return alloc_full_indices
 
     def alloc_decode(
@@ -386,38 +381,37 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_indices = swa_indices.to(mapping.dtype)
             mapping[full_indices] = swa_indices
 
+    def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
+        if full_indices.numel() == 0:
+            return
+        # index_fill_ passes the 0 as a kernel argument; mapping[idx] = 0 copies a
+        # host-resident scalar and blocks until the stream drains.
+        mapping = self.full_to_swa_index_mapping
+        mapping.index_fill_(0, full_indices.to(mapping.device, torch.int64), 0)
+
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
 
-        if not self.is_not_in_free_group:
-            self.swa_free_group.append(self._copy_for_free_group(free_index))
-            return
-
-        if _is_tpu:
-            # TPU: mapping is host-resident and the free_index bookkeeping is
-            # host-side (#29/#107). Gather/scatter on the mapping's device using
-            # the raw (non-page-expanded) indices; free() handles placement.
-            # Do NOT route through _expand_to_full_pages here — its torch.unique
-            # produces a variable output shape and reintroduces the per-page TPU
-            # recompiles the host-resident redesign removed.
-            mapping = self.full_to_swa_index_mapping
-            idx = free_index.to(mapping.device)
-            swa_indices = mapping[idx]
-            swa_indices = swa_indices[swa_indices > 0]
-            self.swa_attn_allocator.free(swa_indices)
-            mapping[idx] = 0
-            return
-
-        if self.page_size == 1:
+        # TPU bookkeeping is host-resident and already tracks the raw token
+        # indices. Expanding them with torch.unique would move this path back to
+        # the accelerator and reintroduce per-request recompilation.
+        if self.page_size == 1 or _is_tpu:
             mapping_indices = free_index
         else:
             mapping_indices = self._expand_to_full_pages(free_index)
 
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
         swa_indices = swa_indices[swa_indices > 0]
+        self.clear_full_to_swa_mapping(mapping_indices)
+
+        if not self.is_not_in_free_group:
+            # Resolve ownership now. A cache action later in this group may
+            # install a new mapping for the same full index.
+            self.swa_free_group.append(swa_indices)
+            return
+
         self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[mapping_indices] = 0
 
     def free_group_begin(self):
         super().free_group_begin()
@@ -428,7 +422,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.swa_free_group:
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
-            self.free_swa(torch.cat(swa_free_group))
+            self.swa_attn_allocator.free(torch.cat(swa_free_group))
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
         pages = torch.unique(indices // self.page_size)

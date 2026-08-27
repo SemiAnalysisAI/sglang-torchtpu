@@ -130,6 +130,31 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
 
+    def test_idle_draft_runs_each_eager_forward_without_tree_layout(self):
+        worker = object.__new__(EagleDraftWorker)
+        worker.speculative_num_steps = 3
+        worker.draft_attn_backend = SimpleNamespace(attn_backends=[object(), object()])
+        worker.draft_runner = SimpleNamespace(
+            canary_manager=None,
+            forward=MagicMock(),
+        )
+        spec_info = SimpleNamespace(hidden_states=torch.empty((0, 8), device=DEVICE))
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE,
+            input_ids=torch.empty((0,), dtype=torch.long, device=DEVICE),
+            out_cache_loc=torch.empty((0,), dtype=torch.long, device=DEVICE),
+            spec_info=spec_info,
+        )
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.forward_context",
+            side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
+        ):
+            result = worker.draft_forward(forward_batch)
+
+        self.assertEqual(result, (None, None, None, None))
+        self.assertEqual(worker.draft_runner.forward.call_count, 2)
+
 
 class TestEagleWorkerV2FusedDraft(CustomTestCase):
     def test_fused_steps_bypass_direct_tracer(self):
