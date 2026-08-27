@@ -197,7 +197,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
         # other checks on this path are context-free on TPU.
         with patch(
             "sglang.srt.layers.moe.utils.get_parallel",
-            return_value=SimpleNamespace(dwdp_size=1),
+            return_value=SimpleNamespace(config=SimpleNamespace(dwdp_size=1)),
         ):
             self.assertTrue(
                 should_skip_post_experts_all_reduce(

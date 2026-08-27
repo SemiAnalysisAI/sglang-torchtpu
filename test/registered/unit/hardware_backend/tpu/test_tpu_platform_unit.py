@@ -421,16 +421,36 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
         cls = self.platform.get_paged_allocator_cls()
         self.assertEqual(cls.__name__, "TpuPagedTokenToKVPoolAllocator")
 
-    def test_mha_kv_pool_cls(self):
-        # get_mha_kv_pool_cls picks the pool by the resolved attention backend
-        # read off the global server args; a non-RPA backend yields the flat
-        # MHATokenToKVPool.
+    def test_mha_kv_pool_cls_for_non_rpa_backend(self):
+        # A non-RPA backend uses the flat upstream KV pool.
         with patch(
-            "sglang.srt.server_args.get_global_server_args",
-            return_value=SimpleNamespace(attention_backend="torch_native"),
+            "sglang.srt.runtime_context.get_exec",
+            return_value=SimpleNamespace(
+                kernel=SimpleNamespace(attention_backend="torch_native")
+            ),
         ):
             cls = self.platform.get_mha_kv_pool_cls()
         self.assertEqual(cls.__name__, "MHATokenToKVPool")
+
+    def test_mha_kv_pool_cls_uses_resolved_rpa_backend(self):
+        # Platform defaults are declarations, so factory selection must read
+        # the published resolved config rather than raw ServerArgs fields.
+        with patch(
+            "sglang.srt.runtime_context.get_exec",
+            return_value=SimpleNamespace(
+                kernel=SimpleNamespace(attention_backend="pallas_tpu_rpa_v3")
+            ),
+        ):
+            cls = self.platform.get_mha_kv_pool_cls()
+        self.assertEqual(cls.__name__, "TpuFusedMHATokenToKVPool")
+
+    def test_mha_kv_pool_host_cls_uses_resolved_raiden_backend(self):
+        with patch(
+            "sglang.srt.runtime_context.get_memory",
+            return_value=SimpleNamespace(hicache_io_backend="raiden"),
+        ):
+            cls = self.platform.get_mha_kv_pool_host_cls(object())
+        self.assertEqual(cls.__name__, "TpuRaidenHostKVCache")
 
     def test_nsa_raises(self):
         with self.assertRaises(NotImplementedError):

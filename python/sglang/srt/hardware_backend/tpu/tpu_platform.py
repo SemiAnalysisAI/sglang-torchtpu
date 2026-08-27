@@ -370,11 +370,10 @@ class TpuSRTPlatform(SRTPlatform):
     def get_mha_kv_pool_cls(self) -> type:
         # RPA v3 uses the fused 5D KV layout; pallas_tpu_flash and torch_native
         # read the flat MHATokenToKVPool. Pick per the resolved attention backend
-        # — it's on the (scheduler-child) global server args by pool-creation
-        # time (set in ModelRunner.__init__, before _init_pools).
-        from sglang.srt.server_args import get_global_server_args
+        # published before ModelRunner creates its pools.
+        from sglang.srt.runtime_context import get_exec
 
-        backend = get_global_server_args().attention_backend
+        backend = get_exec().kernel.attention_backend
         if backend == "pallas_tpu_rpa_batched" and _uses_seq_along_lane_kv():
             # SEQ_ALONG_LANE puts the token index on the lane axis, so the
             # buffer shape differs from the fused one the other backends read.
@@ -415,11 +414,11 @@ class TpuSRTPlatform(SRTPlatform):
         # into the mem_cache.pool_host package; TpuFusedMHATokenToKVPoolHost is the
         # fork's own class and still lives in memory_pool_host.
         from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_memory
 
         # raiden offloads through tpu-raiden's DMA-pinned host pool instead of the
         # torch-copy fused host pool; native (torch_tpu) keeps the fused pool.
-        if get_global_server_args().hicache_io_backend == "raiden":
+        if get_memory().hicache_io_backend == "raiden":
             from sglang.srt.hardware_backend.tpu.kv_pool_host import (
                 TpuRaidenHostKVCache,
             )

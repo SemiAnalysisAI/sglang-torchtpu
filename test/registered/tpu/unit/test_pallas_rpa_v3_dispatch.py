@@ -58,8 +58,10 @@ class TestMHAKVPoolSelection(CustomTestCase):
         from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 
         with patch(
-            "sglang.srt.server_args.get_global_server_args",
-            return_value=types.SimpleNamespace(attention_backend=attention_backend),
+            "sglang.srt.runtime_context.get_exec",
+            return_value=types.SimpleNamespace(
+                kernel=types.SimpleNamespace(attention_backend=attention_backend)
+            ),
         ):
             return TpuSRTPlatform().get_mha_kv_pool_cls()
 
