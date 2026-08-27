@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit")
 
 import importlib.util
 import itertools
@@ -89,11 +89,29 @@ def _fill_random(pool):
         buf.copy_(torch.randn(buf.shape, dtype=torch.float32).to(buf.dtype))
 
 
+# P/D is moving off the tpu (ZMQ) connector onto raiden, so its classes stop
+# running here. Skipped rather than deleted: the connector still ships and is
+# still selectable as --disaggregation-transfer-backend tpu, so the tests should
+# stay available to anyone working on it until it is removed.
+#
+# Applied only to classes that exercise disaggregation/tpu/. The three at the
+# bottom of this file -- TestPrepareForPrebuiltTpuPadding,
+# TestTpuPagedTokenToKVPoolAllocatorCpuAssertion and
+# TestDecodeReqToTokenPoolTpuHostResident -- cover schedule-batch padding and
+# pool/allocator behaviour that has nothing to do with the connector. They keep
+# running, and must outlive this file when the connector is deleted.
+_TPU_CONNECTOR_RETIRED = unittest.skip(
+    "tpu (ZMQ) connector is being retired in favour of raiden; rendezvous "
+    "coverage now lives in test_disagg_raiden_transfer.py"
+)
+
+
 # --------------------------------------------------------------------------
 # 1. Data-plane unit tests (CPU only)
 # --------------------------------------------------------------------------
 
 
+@_TPU_CONNECTOR_RETIRED
 class TestTpuTransferDataPlane(CustomTestCase):
     def _roundtrip_for_dtype(self, dtype):
         src = _FakePool(8, 4, (2, 2, 16), layers=3, dtype=dtype)
@@ -541,6 +559,7 @@ def _bare_manager(
     return m
 
 
+@_TPU_CONNECTOR_RETIRED
 class TestTpuKVManagerProtocol(CustomTestCase):
     TAIL = (2, 2, 16)
     DTYPE = torch.bfloat16
@@ -790,6 +809,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
 # --------------------------------------------------------------------------
 
 
+@_TPU_CONNECTOR_RETIRED
 class TestTpuReshardingProtocol(CustomTestCase):
     """Drive the real gather_and_push / _handle_kvdata_ch / process_decode_pending
     paths across heterogeneous attn_tp, asserting each prefill rank's KV-head
@@ -1146,6 +1166,7 @@ class TestTpuReshardingProtocol(CustomTestCase):
                 )
 
 
+@_TPU_CONNECTOR_RETIRED
 class TestTpuReshardTransferTimeFailure(CustomTestCase):
     """An unsupported fp8 reshard is NOT pre-flighted at handshake — a Failed set
     on the TRSFR recv thread would be clobbered by the sender's later
@@ -1221,6 +1242,7 @@ class TestTpuReshardTransferTimeFailure(CustomTestCase):
 # --------------------------------------------------------------------------
 
 
+@_TPU_CONNECTOR_RETIRED
 class TestPinnedHostPool(CustomTestCase):
     def test_acquire_release_reuse_and_budget(self):
         from sglang.srt.disaggregation.tpu.host_staging import PinnedHostPool
@@ -1276,6 +1298,7 @@ class TestPinnedHostPool(CustomTestCase):
 
 
 @unittest.skipIf(_skip_if_no_tpu(), "Requires torch_tpu / a TPU device")
+@_TPU_CONNECTOR_RETIRED
 class TestTpuTransferOnDevice(CustomTestCase):
     def test_device_gather_scatter_roundtrip(self):
         from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -1420,6 +1443,7 @@ class TestTpuTransferOnDevice(CustomTestCase):
 
 
 @unittest.skipIf(_skip_if_no_tpu(), "Requires torch_tpu / a TPU device")
+@_TPU_CONNECTOR_RETIRED
 class TestTpuKVManagerStagingOnDevice(CustomTestCase):
     # 4 blocks (size/page_size), 4 layers so 2 channels shard 2 layers each.
     POOL_KWARGS = dict(
@@ -1630,6 +1654,7 @@ class TestDecodeReqToTokenPoolTpuHostResident(CustomTestCase):
         self.assertEqual(pool.req_to_token.device.type, "cpu")
 
 
+@_TPU_CONNECTOR_RETIRED
 class TestPendingChunkReassembly(CustomTestCase):
     def test_process_incoming_chunk_no_reassemble(self):
         pending_queue = deque()
@@ -1939,6 +1964,7 @@ class TestPendingChunkReassembly(CustomTestCase):
         print("=" * 80 + "\n")
 
 
+@_TPU_CONNECTOR_RETIRED
 class TestFanInOddHeadReassembleLayout(CustomTestCase):
     """Regression guard for FP8 odd-head FAN-IN reassembly on the fused 5D packed
     layout (num_pages, page_size, n_lanes, kv_packing, head_dim).
