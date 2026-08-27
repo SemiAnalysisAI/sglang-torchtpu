@@ -287,8 +287,10 @@ class TestDistributedTopKEligibility(CustomTestCase):
             kernel=SimpleNamespace(sampling_backend="tpu"),
         )
         parallel = SimpleNamespace(
-            enable_dp_lm_head=False,
-            enable_tp_lm_head_all_to_all=False,
+            config=SimpleNamespace(
+                enable_dp_lm_head=False,
+                enable_tp_lm_head_all_to_all=False,
+            ),
             tp_size=8,
             attn_dp_size=1,
         )
