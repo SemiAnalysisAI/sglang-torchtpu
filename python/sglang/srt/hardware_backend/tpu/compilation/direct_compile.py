@@ -314,9 +314,7 @@ class CompiledFunction:
         # placeholders. The goal is to get a flat list of output Tensors.
         with (
             dynamo_timed("direct_compile_trace"),
-            execution_mode.set_eager_mode(
-                execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
-            ),
+            execution_mode.set_eager_mode(execution_mode.EagerMode.INTERNAL_DEFER_ALL),
             ExitStack() as stack,
         ):
             # Respect torch.compiler.is_compiling() during tracing by returning True.
