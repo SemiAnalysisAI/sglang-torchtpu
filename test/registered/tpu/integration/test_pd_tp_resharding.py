@@ -150,8 +150,11 @@ class ModelProfile(msgspec.Struct, frozen=True, kw_only=True):
     max_total_tokens: Optional[int]
     device_pool_tokens_hint: int
     gsm8k_threshold: float
-    # Appended after the launcher's default so it wins (argparse keeps the
-    # last occurrence).
+    # Appended after the launcher's default so it wins (argparse keeps the last
+    # occurrence). The ZMQ "tpu" connector is being sunset -- raiden is the
+    # go-forward transfer backend, and it is the only one that carries strided
+    # push-reshard schedules (raiden/reshard_schedule.py) for the asymmetric
+    # attention TP this test exercises.
     disagg_transfer_backend: str = "raiden"
     extra_server_args: Tuple[str, ...] = ()
     extra_launch_env: Dict[str, str] = {}
@@ -160,6 +163,14 @@ class ModelProfile(msgspec.Struct, frozen=True, kw_only=True):
 
 
 MODEL_PROFILES = {
+    # BLOCKED on hardware: GPT-OSS is hybrid-SWA, and raiden's Scope (v1)
+    # excludes "hybrid-SWA under push-resharding" -- a hybrid model keeps two
+    # pools with distinct page-id spaces while a reshard plan carries a single
+    # block-id space, so a decode rank fed by >1 prefill rank raises
+    # NotImplementedError in raiden/conn.py::register_decode_request (run
+    # 33091543516). The profile stays so it is ready when raiden grows SWA
+    # reshard schedules; until then this model needs either symmetric attention
+    # TP (see test_pd_prefix_caching_kv_offload.py) or --disable-hybrid-swa-memory.
     "gpt_oss_120b": ModelProfile(
         key="gpt_oss_120b",
         display_name="GPT-OSS-120B",
@@ -374,6 +385,9 @@ def _common_launch_env(
         "TPU_TELEMETRY_INTERVAL_SEC": "86400",
         "TPU_DIAGNOSTIC_HARVESTER_INTERVAL_SEC": "86400",
         "PYTHON": PYTHON,
+        # The raiden connector's per-rank control ports start at this base;
+        # its default (30000) collides with rank 0's HTTP server port.
+        "SGLANG_RAIDEN_KV_PORT": values.get("SGLANG_RAIDEN_KV_PORT", "31000"),
         **profile.extra_launch_env,
     }
 
@@ -938,6 +952,34 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
         bound = f"--max-total-tokens {profile.max_total_tokens}"
         self.assertIn(bound, build_prefill_env(profile, 2, env={})["EXTRA_ARGS"])
         self.assertIn(bound, build_decode_env(profile, 2, env={})["EXTRA_ARGS"])
+
+    def test_both_engines_transfer_over_raiden(self) -> None:
+        # The ZMQ "tpu" connector is being sunset; every profile here must ride
+        # raiden, and both engines must agree -- a one-sided backend desyncs the
+        # transfer handshake, and the mismatch only shows after a full hardware
+        # bring-up.
+        for profile in MODEL_PROFILES.values():
+            self.assertEqual(profile.disagg_transfer_backend, "raiden")
+            for env in (
+                build_prefill_env(profile, 2, env={}),
+                build_decode_env(profile, 2, env={}),
+            ):
+                self.assertIn(
+                    "--disaggregation-transfer-backend raiden", env["EXTRA_ARGS"]
+                )
+                # raiden claims 4 ports per rank at
+                # base + 4*(attn_dp_rank*attn_tp_size + attn_tp_rank); its 30000
+                # default would land on rank 0's HTTP server port.
+                raiden_base = int(env["SGLANG_RAIDEN_KV_PORT"])
+                claimed = range(raiden_base, raiden_base + 4 * 32)
+                for port in (
+                    PREFILL_PORT,
+                    DECODE_PORT,
+                    LB_PORT,
+                    BOOTSTRAP_PORT,
+                    DIST_PORT,
+                ):
+                    self.assertNotIn(port, claimed)
 
     def test_gpt_oss_does_not_force_quantization(self) -> None:
         env = build_prefill_env(MODEL_PROFILES["gpt_oss_120b"], 2, env={})
