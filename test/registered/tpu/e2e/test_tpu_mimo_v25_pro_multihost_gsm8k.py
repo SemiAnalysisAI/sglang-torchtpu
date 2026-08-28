@@ -30,7 +30,12 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 from sglang.test.tpu import model_config_main
 
-register_tpu_ci(est_time=5400, suite="nightly-tpu-multihost", nightly=True)
+register_tpu_ci(
+    est_time=5400,
+    suite="nightly-tpu-multihost",
+    nightly=True,
+    disabled="ITERATION-ONLY (branch chenjincheng/480b-agentic-log-egress): muted so `only=mh` discovers just the 480B agentic group. MUST NOT MERGE -- revert before review.",
+)
 
 # Own launch group: MiMo-V2.5-Pro DP-attention recipe + the MiMo ROX weights volume.
 MULTIHOST_LAUNCH = {
