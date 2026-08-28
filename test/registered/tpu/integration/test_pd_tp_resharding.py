@@ -757,6 +757,60 @@ def run_chat_termination_probe(base_url: str, profile: ModelProfile) -> None:
         )
 
 
+_REPEAT_COUNT = 12
+
+
+def run_repeat_consistency_probe(base_url: str, profile: ModelProfile) -> None:
+    """The same long prompt many times: measures the corruption's rate and shape.
+
+    Run 33202570607 answered a 897-token /generate correctly and then spewed on a
+    905-token chat request seconds later, so neither prompt length nor the chat
+    path decides it -- the corruption is per-request. What it looks like across
+    repeats says where to look next:
+
+      * strict alternation -- one of the two DP decode replicas holds bad KV, so
+        the fan-in placed one decode rank's heads wrongly;
+      * a run of good then all bad -- state that degrades, e.g. staging slots or
+        page reuse;
+      * scattered -- a race in the transfer itself.
+
+    Identical prompts also make the greedy outputs comparable: any difference
+    between them is itself corruption, since temperature is 0.
+    """
+    outcomes = []
+    for i in range(_REPEAT_COUNT):
+        rec = _generate(base_url, _long_context_question(), 64)
+        outcomes.append(
+            {
+                "i": i,
+                "answered": _PROBE_ANSWER in rec.text,
+                "spew": looks_degenerate(rec.text),
+                "sample_output": rec.text[:60],
+            }
+        )
+    pattern = "".join("." if o["answered"] else "X" for o in outcomes)
+    distinct = sorted({o["sample_output"] for o in outcomes})
+    print(
+        json.dumps(
+            {
+                "repeat_probe": profile.key,
+                "pattern": pattern,
+                "distinct_outputs": len(distinct),
+                "outcomes": outcomes,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    bad = [o for o in outcomes if not o["answered"]]
+    if bad:
+        raise AssertionError(
+            f"{len(bad)}/{_REPEAT_COUNT} identical long-context requests came back "
+            f"wrong (pattern {pattern!r}, '.'=ok 'X'=bad; {len(distinct)} distinct "
+            f"outputs at temperature 0). First bad: {bad[0]['sample_output']!r}"
+        )
+
+
 def run_tp_resharding_probe(base_url: str, profile: ModelProfile) -> None:
     records = []
     for i, prompt in enumerate(_PROMPTS):
@@ -764,6 +818,14 @@ def run_tp_resharding_probe(base_url: str, profile: ModelProfile) -> None:
         if not rec.text.strip() or rec.completion_tokens <= 0:
             raise AssertionError(
                 f"Request {i} produced empty decode output -- TP resharding P/D transfer failed"
+            )
+        # Emptiness and the resend check below both pass on the corrupted state:
+        # its spew is non-empty and, being greedy, identical on resend. Only a
+        # content check separates it (runs 33187228615, 33202570607).
+        if looks_degenerate(rec.text):
+            raise AssertionError(
+                f"Request {i} produced degenerate output -- the KV that crossed "
+                f"the reshard is corrupt. First 200 chars: {rec.text[:200]!r}"
             )
         records.append(rec)
 
@@ -1081,7 +1143,14 @@ class TestPdTpResharding(unittest.TestCase):
             profile=self.profile,
         )
 
-    def test_03_chat_completion_terminates(self) -> None:
+    def test_03_repeat_consistency(self) -> None:
+        self._probe(
+            run_repeat_consistency_probe,
+            base_url=f"http://127.0.0.1:{LB_PORT}",
+            profile=self.profile,
+        )
+
+    def test_04_chat_completion_terminates(self) -> None:
         self._probe(
             run_chat_termination_probe,
             base_url=f"http://127.0.0.1:{LB_PORT}",
@@ -1089,14 +1158,14 @@ class TestPdTpResharding(unittest.TestCase):
         )
 
     def _probe(self, fn, **kwargs) -> None:
-        """Run a probe, remembering a corrupt verdict for test_04 to act on."""
+        """Run a probe, remembering a corrupt verdict for gsm8k to act on."""
         try:
             fn(**kwargs)
         except AssertionError as exc:
             type(self).degenerate_verdict = str(exc)
             raise
 
-    def test_04_gsm8k_quality(self) -> None:
+    def test_05_gsm8k_quality(self) -> None:
         if self.degenerate_verdict is not None:
             # The probes already proved the pair emits garbage; gsm8k then spends
             # ~62min generating maximum-length spew to reach a foregone 0.0 (run
