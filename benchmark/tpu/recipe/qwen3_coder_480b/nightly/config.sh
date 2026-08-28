@@ -111,9 +111,32 @@ LONG_TARGET_CONTEXT=${LONG_TARGET_CONTEXT:-262144} # long session ctx target
 
 # ===== FIXED: parallelism per mode =====
 COLOCATED_TP=16
-COLOCATED_DP=4                  # -> attn_tp = 16/4 = 4
+# DP size is not just a throughput knob here: each DP group owns its own KV pool
+# and radix tree, and dispatch is round_robin (the only non-PD option sglang
+# offers -- none of round_robin / total_requests / total_tokens is cache-aware).
+# A multi-turn session sends its rounds sequentially, so round r lands on the
+# rank that last saw round r-dp, and only that rank's history is a usable prefix.
+# The reachable fraction of the single-cache ideal is therefore
+#     (R-dp)(R-dp+1) / (R(R-1))
+# which is exactly ZERO whenever R <= dp. At the old dp=4 with a 3-round session
+# that is 0, and the measured hit rate was 0.0% on every c1 leg -- the prefix
+# cache could not hit even once. dp=2 with the 6-round session set below reaches
+# 2/3 of the ideal; measured 50.02% against a predicted 50.5%.
+# Overridable so a sweep can vary it without editing this file.
+COLOCATED_DP=${COLOCATED_DP:-2} # -> attn_tp = 16/2 = 8
 PD_TP=8
 PD_DP=2                         # -> attn_tp = 8/2 = 4
+
+# Pin the KV pool. Left unset it is derived from MEM_FRACTION_STATIC and sized
+# per DP group, so it scales inversely with DP: at dp=4 that landed on 877440
+# tokens (12.97 GB of K and of V per rank), and simply halving DP doubled it to
+# 1864192 / 27.56 GB. With ~30 GB of FP8 weights per chip that leaves nothing for
+# compile temporaries and the extend graph dies before the server is ever
+# healthy -- "ran out of memory on HBM, HLO temporaries (110.23G) exceeds
+# available HBM (94.74G)". Pinning makes the pool independent of DP, so this
+# cannot silently return the next time the parallelism changes.
+MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-877440}
+export MAX_TOTAL_TOKENS
 
 # ===== CONTRACT DEFAULT: prefill chunking =====
 # 4096 = TURN_INPUT_TOKENS, so one agentic round's new input is exactly one
@@ -250,11 +273,22 @@ case "$PROFILE" in
         LONG_RAMP_TOKENS=${LONG_RAMP_TOKENS_OVERRIDE:-16384}
         SWEEP_BS=${SWEEP_BS_OVERRIDE:-"1 16"}
         SWEEP_LONG=${SWEEP_LONG_OVERRIDE:-"0 1"}
-        # TARGET_CONTEXT is left at the contract's 16384: a normal session is
-        # already only 3 rounds, so there is nothing to time-box, and shrinking
-        # it further would flatten the CI legs toward single-turn.
+        # 6 rounds, not the contract's 3. A session must outlast the DP count for
+        # any round to find its prefix (see COLOCATED_DP), and at dp=2 three
+        # rounds reach only a third of the single-cache ideal -- under the 60%
+        # gate, so the leg would report throughput measured with a cache that
+        # barely engages. Six rounds reach two thirds and leave real margin.
+        # This does move the normal session off the Mooncake toolagent p90
+        # (16.8k) the 16384 default was anchored to; 31k is still inside the
+        # corpus's range (max 126k).
+        TARGET_CONTEXT=${TARGET_CONTEXT_OVERRIDE:-30720}   # 30720/5130 -> 6 rounds
         LONG_TARGET_CONTEXT=${LONG_TARGET_CONTEXT_OVERRIDE:-65536}
-        MAX_LEG_SECONDS=${MAX_LEG_SECONDS_OVERRIDE:-420}
+        # Twice the rounds, and prefill grows with history, so a leg costs about
+        # 1.9x what it did: c1-long0 went 80.8s -> 150.1s measured. The largest
+        # leg was 275.9s, which scales past the old 420s cap and would be
+        # time-boxed -- and a time-boxed leg measures something else. 900s keeps
+        # every leg intact; four legs at ~1200s total still fit SWEEP_TIMEOUT.
+        MAX_LEG_SECONDS=${MAX_LEG_SECONDS_OVERRIDE:-900}
         ;;
     smoke)
         SWEEP_BS=${SWEEP_BS_OVERRIDE:-"1 2"}
