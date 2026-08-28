@@ -89,9 +89,10 @@ def main():
     out = []
     for (ls, wp, hosts), entry in groups.items():
         files = entry["files"]
-        slug = re.sub(
-            r"[^a-z0-9]+", "-", os.path.basename(ls).lower().removesuffix(".sh")
-        ).strip("-")
+        # Recipes are named *_mh.sh; drop that redundant suffix so the job reads
+        # mh-<model> rather than mh-<model>-mh.
+        base = os.path.basename(ls).lower().removesuffix(".sh").removesuffix("_mh")
+        slug = re.sub(r"[^a-z0-9]+", "-", base).strip("-")
         out.append(
             {
                 "name": f"mh-{slug}",
