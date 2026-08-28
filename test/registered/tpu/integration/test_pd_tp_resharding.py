@@ -13,12 +13,19 @@ both slices; roles are dispatched from the CI_PD_ROLE env plus the slice-local
 TPU worker env.
 
 What each verification proves:
-  * quality:          gsm8k through the LB must clear the model's accuracy floor
-                      under TP resharding.
   * KV resharding:    generation requests dispatched to prefill -> decode across
                       both DP replicas produce valid, deterministic, and bit-equal
                       greedy text, certifying that KV cache was resharded and
                       transferred intact.
+  * chat termination: a gsm8k-sized chat-formatted request stops on its own. The
+                      greedy probe above uses short raw-text /generate and stays
+                      green even when every chat completion runs to its token cap
+                      and gsm8k scores 0.0; this catches that in ~2min rather than
+                      after an hour-long eval that returns nothing parseable.
+  * quality:          gsm8k through the LB must clear the model's accuracy floor
+                      under TP resharding. Below the floor the sampled responses
+                      are dumped from run_eval's report, which otherwise dies with
+                      the pod and leaves only a bare score.
 
 Roles (rank = slice-local TPU_WORKER_ID):
   prefill rank 0   launches the prefill engine, waits for decode, starts the
@@ -38,6 +45,7 @@ Without CI_PD_ROLE the file runs only its host-side configuration tests.
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -548,6 +556,116 @@ def _generate(base_url: str, prompt: str, max_new_tokens: int = 32) -> Generatio
     )
 
 
+class ChatRecord(msgspec.Struct, frozen=True, kw_only=True):
+    text: str
+    finish_reason: str
+    completion_tokens: int
+    prompt_tokens: int
+
+
+def chat_body(prompt: str, profile: ModelProfile, max_tokens: int) -> Dict[str, Any]:
+    """The /v1/chat/completions payload, carrying the profile's template controls.
+
+    gsm8k reaches the model through this path rather than /generate, and run_eval
+    forwards these same two profile fields to its sampler. The probe only sees
+    what gsm8k sees while this keeps mirroring them.
+    """
+    body: Dict[str, Any] = {
+        "model": profile.served_name,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        "max_tokens": max_tokens,
+    }
+    if profile.chat_template_kwargs is not None:
+        body["chat_template_kwargs"] = profile.chat_template_kwargs
+    if profile.reasoning_effort is not None:
+        body["reasoning_effort"] = profile.reasoning_effort
+    return body
+
+
+def _chat(
+    base_url: str, prompt: str, profile: ModelProfile, max_tokens: int
+) -> ChatRecord:
+    body = chat_body(prompt, profile, max_tokens)
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=900) as resp:
+        payload = json.loads(resp.read())
+    choice = (payload.get("choices") or [{}])[0]
+    usage = payload.get("usage") or {}
+    return ChatRecord(
+        text=(choice.get("message") or {}).get("content") or "",
+        finish_reason=choice.get("finish_reason") or "",
+        completion_tokens=int(usage.get("completion_tokens") or 0),
+        prompt_tokens=int(usage.get("prompt_tokens") or 0),
+    )
+
+
+# gsm8k's 5-shot prompt runs ~900 tokens; the failure below only appears once the
+# prompt is that long, so pad to the same order rather than sending one line.
+_LONG_CONTEXT_FILLER = (
+    "Background note {i}: a delivery van carries {i} crates, each crate holds "
+    "{i} boxes, and every box contains a packing slip that lists the crate id, "
+    "the depot of origin, and the arrival time recorded by the dispatcher. "
+)
+_CHAT_PROBE_CAP = 256
+
+
+def _long_context_question(paragraphs: int = 18) -> str:
+    """~700 words, i.e. ~900 tokens -- the size of gsm8k's 5-shot prompt."""
+    filler = "".join(_LONG_CONTEXT_FILLER.format(i=i) for i in range(paragraphs))
+    return (
+        f"{filler}\n\n"
+        "Ignore the notes above. Question: what is 17 plus 25? "
+        "Reply with only the number and nothing else."
+    )
+
+
+def run_chat_termination_probe(base_url: str, profile: ModelProfile) -> None:
+    """A long chat-formatted request must stop on its own.
+
+    The greedy /generate probe below passes even when the engine pair is in the
+    state where every chat completion runs to its cap and gsm8k scores exactly
+    0.0 (runs 33098546292 on the tpu backend, 33123385123 and 33135561031 on
+    raiden -- all three at prompt+cap tokens with the eval taking ~62min instead
+    of ~5). That state is invisible to short raw-text generation, so without this
+    check the first signal is an hour-long gsm8k returning nothing parseable.
+
+    A one-number answer under a 256-token cap is far below what any healthy
+    response needs, so `finish_reason == "length"` here means non-termination,
+    not a prompt that legitimately needed more room.
+    """
+    rec = _chat(base_url, _long_context_question(), profile, _CHAT_PROBE_CAP)
+    print(
+        json.dumps(
+            {
+                "chat_termination_probe": profile.key,
+                "finish_reason": rec.finish_reason,
+                "prompt_tokens": rec.prompt_tokens,
+                "completion_tokens": rec.completion_tokens,
+                "sample_output": rec.text[:200],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    if rec.finish_reason == "length":
+        raise AssertionError(
+            "Chat completion never terminated: hit the "
+            f"{_CHAT_PROBE_CAP}-token cap on a prompt asking for one number "
+            f"({rec.prompt_tokens} prompt tokens). This is the state that scores "
+            f"gsm8k 0.0. First 200 chars: {rec.text[:200]!r}"
+        )
+    if not rec.text.strip():
+        raise AssertionError(
+            f"Chat completion returned empty content (finish_reason="
+            f"{rec.finish_reason!r}) -- gsm8k would score 0.0 on this engine pair"
+        )
+
+
 def run_tp_resharding_probe(base_url: str, profile: ModelProfile) -> None:
     records = []
     for i, prompt in enumerate(_PROMPTS):
@@ -576,6 +694,60 @@ def run_tp_resharding_probe(base_url: str, profile: ModelProfile) -> None:
         ),
         flush=True,
     )
+
+
+def gsm8k_report_path(profile: ModelProfile) -> str:
+    """Where run_eval dumps its per-example report (make_report over the convos)."""
+    stem = f"gsm8k_{profile.served_name.replace('/', '_')}"
+    return os.path.join("/tmp", f"{stem}.html")
+
+
+def _strip_tags(html: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
+
+
+def parse_gsm8k_samples(report: str) -> Tuple[Tuple[str, str], ...]:
+    """(response, results) per example, from simple_eval_common's HTML_JINJA.
+
+    That template lays each example out as ``Prompt conversation`` ->
+    ``Sampled message`` -> ``Results``.
+    """
+    blocks = re.findall(
+        r"<h3>Sampled message</h3>(.*?)<h3>Results</h3>(.*?)"
+        r"(?=<h3>Prompt conversation</h3>|\Z)",
+        report,
+        flags=re.S,
+    )
+    return tuple(
+        (_strip_tags(sampled), _strip_tags(results)) for sampled, results in blocks
+    )
+
+
+def dump_gsm8k_samples(profile: ModelProfile, limit: int = 3, chars: int = 900) -> None:
+    """Print a few sampled responses from run_eval's report.
+
+    A bare ``score=0.0`` cannot tell apart a model that answers wrongly from one
+    that never stops generating -- runs 33098546292, 33123385123 and 33135561031
+    all failed with every response pinned at the token cap, and the responses
+    themselves were the one thing the log did not carry. run_eval already writes
+    them to /tmp, but the pod is torn down with the file, so lift an excerpt into
+    stdout where CI keeps it.
+    """
+    path = gsm8k_report_path(profile)
+    if not os.path.isfile(path):
+        print(f"[gsm8k] no report at {path}; cannot show sampled responses")
+        return
+    with open(path, "r", errors="replace") as f:
+        blocks = parse_gsm8k_samples(f.read())
+    if not blocks:
+        print(f"[gsm8k] report at {path} has no sampled messages to show")
+        return
+    print(f"=== first {min(limit, len(blocks))} of {len(blocks)} gsm8k samples ===")
+    for i, (text, results) in enumerate(blocks[:limit]):
+        print(f"--- sample {i}: {len(text)} chars ---")
+        print(text[:chars])
+        print(f"    {results}")
+    print("=== end gsm8k samples ===", flush=True)
 
 
 def run_gsm8k(base_url: str, profile: ModelProfile, config: Gsm8kConfig) -> float:
@@ -808,7 +980,13 @@ class TestPdTpResharding(unittest.TestCase):
             profile=self.profile,
         )
 
-    def test_02_gsm8k_quality(self) -> None:
+    def test_02_chat_completion_terminates(self) -> None:
+        run_chat_termination_probe(
+            base_url=f"http://127.0.0.1:{LB_PORT}",
+            profile=self.profile,
+        )
+
+    def test_03_gsm8k_quality(self) -> None:
         score = run_gsm8k(
             base_url=f"http://127.0.0.1:{LB_PORT}",
             profile=self.profile,
@@ -823,6 +1001,8 @@ class TestPdTpResharding(unittest.TestCase):
             },
         )
         print(f"gsm8k score={score:.4f} floor={self.gsm8k_config.threshold:.4f}")
+        if score < self.gsm8k_config.threshold:
+            dump_gsm8k_samples(self.profile)
         self.assertGreaterEqual(score, self.gsm8k_config.threshold)
 
 
@@ -980,6 +1160,46 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
                     DIST_PORT,
                 ):
                     self.assertNotIn(port, claimed)
+
+    def test_chat_probe_mirrors_the_gsm8k_request_shape(self) -> None:
+        # The probe's only value is reproducing what gsm8k sends: run_eval hands
+        # these two fields to its sampler, so a probe that drops them can pass
+        # while gsm8k fails on the very thing it was added to catch.
+        for profile in MODEL_PROFILES.values():
+            body = chat_body("q", profile, 256)
+            self.assertEqual(body["model"], profile.served_name)
+            self.assertEqual(body["temperature"], 0.0)
+            self.assertEqual(
+                body.get("chat_template_kwargs"), profile.chat_template_kwargs
+            )
+            self.assertEqual(body.get("reasoning_effort"), profile.reasoning_effort)
+
+    def test_chat_probe_prompt_is_long_enough_to_expose_the_failure(self) -> None:
+        # The non-termination state only shows on a gsm8k-sized prompt (~900
+        # tokens); a one-line question is served correctly even while gsm8k
+        # scores 0.0, so a shrunken prompt would silently defeat the probe.
+        question = _long_context_question()
+        self.assertGreater(len(question.split()), 600)
+        self.assertIn("Reply with only the number", question)
+
+    def test_gsm8k_sample_dump_parses_the_report_layout(self) -> None:
+        # Guards the extraction against simple_eval_common's HTML_JINJA layout
+        # drifting: a silently non-matching regex would leave a failing run with
+        # no responses again, which is the gap this dump exists to close.
+        report = (
+            "<h3>Prompt conversation</h3><p>ignored</p>"
+            "<h3>Sampled message</h3><p>first answer</p>"
+            "<h3>Results</h3><p>Score: 0.0</p>"
+            "<h3>Prompt conversation</h3><p>ignored</p>"
+            "<h3>Sampled message</h3><p>second answer</p>"
+            "<h3>Results</h3><p>Score: 1.0</p>"
+        )
+        blocks = parse_gsm8k_samples(report)
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0][0], "first answer")
+        self.assertEqual(blocks[1][0], "second answer")
+        self.assertIn("Score: 1.0", blocks[1][1])
+        self.assertEqual(parse_gsm8k_samples("<h3>nothing here</h3>"), ())
 
     def test_gpt_oss_does_not_force_quantization(self) -> None:
         env = build_prefill_env(MODEL_PROFILES["gpt_oss_120b"], 2, env={})
