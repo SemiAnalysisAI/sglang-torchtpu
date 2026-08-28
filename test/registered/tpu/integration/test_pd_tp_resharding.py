@@ -17,11 +17,12 @@ What each verification proves:
                       both DP replicas produce valid, deterministic, and bit-equal
                       greedy text, certifying that KV cache was resharded and
                       transferred intact.
-  * long context:     a gsm8k-sized (~900 token) prompt through raw /generate
-                      must still read as prose. The greedy probe above sends
-                      ~15-token prompts and stays green even when longer ones come
-                      back as token spew, so it alone certifies nothing about the
-                      page counts gsm8k actually drives through the reshard.
+  * context sweep:    raw /generate at growing prompt lengths must all read as
+                      prose. The greedy probe above sends ~15-token prompts and
+                      stays green even when longer ones come back as token spew;
+                      sweeping localizes the first bad length, which separates a
+                      per-page reshard fault (breaks past one 64-token page) from
+                      a bad compiled bucket (breaks at 64/256/1024).
   * chat termination: the same long prompt through /v1/chat/completions stops on
                       its own and says something. Together with the probe above
                       this separates prompt length from the chat path, which the
@@ -642,35 +643,58 @@ def looks_degenerate(text: str) -> bool:
     return sum(c.isalpha() for c in stripped) / len(stripped) < 0.3
 
 
-def run_long_context_generate_probe(base_url: str, profile: ModelProfile) -> None:
-    """A gsm8k-sized prompt through raw /generate, with no chat template.
+# Paragraph counts chosen so the resulting prompts straddle both candidate
+# boundaries: the KV page size (64 tokens) and the compiled token buckets
+# (TPU_COMPILE_TOKENS "64 256 1024"). Where output first degenerates says which.
+# 0 is the known-good baseline (~28 tokens: one page, bucket 64). The page and
+# bucket boundaries coincide at 64, so those two only separate higher up: 2 pages
+# still inside bucket 256 clean, with 5+ pages in bucket 1024 dirty, would clear
+# page count and indict the bucket.
+_SWEEP_PARAGRAPHS = (0, 1, 2, 6, 18)
 
-    Isolates the two variables the chat probe moves at once. In the bad state a
-    ~900-token chat request returns backslash spew while the ~15-token /generate
-    requests stay coherent, so either the chat path or the prompt length is to
-    blame. Degenerate output here indicts length alone -- i.e. the number of KV
-    pages the 2:1 fan-in has to place, which is this test's subject -- while
-    clean output here puts it on the chat path instead.
+
+def run_context_length_sweep_probe(base_url: str, profile: ModelProfile) -> None:
+    """Raw /generate at growing prompt lengths; every length must read as prose.
+
+    Run 33187228615 answered a 897-token /generate with backslash spew while
+    ~15-token prompts on the same engine pair stayed coherent, so prompt length
+    alone drives the corruption (no chat template is involved). Two mechanisms
+    fit that, and they predict different break points:
+
+      * KV pages: a 2:1 fan-in that misplaces pages beyond the first breaks as
+        soon as the prompt exceeds one page (>64 tokens).
+      * compiled buckets: a bad graph for one of TPU_COMPILE_TOKENS
+        (64/256/1024) breaks only once the prompt reaches that bucket.
+
+    Sweeping localizes the first bad length instead of leaving both live, and
+    keeps doing so for whatever regresses next.
     """
-    rec = _generate(base_url, _long_context_question(), 64)
+    results = []
+    for paragraphs in _SWEEP_PARAGRAPHS:
+        rec = _generate(base_url, _long_context_question(paragraphs), 64)
+        results.append(
+            {
+                "paragraphs": paragraphs,
+                "prompt_tokens": rec.prompt_tokens,
+                "pages": -(-rec.prompt_tokens // profile.page_size),
+                "degenerate": looks_degenerate(rec.text),
+                "sample_output": rec.text[:120],
+            }
+        )
     print(
         json.dumps(
-            {
-                "long_context_generate_probe": profile.key,
-                "prompt_tokens": rec.prompt_tokens,
-                "completion_tokens": rec.completion_tokens,
-                "sample_output": rec.text[:200],
-            },
-            sort_keys=True,
+            {"context_length_sweep": profile.key, "results": results}, sort_keys=True
         ),
         flush=True,
     )
-    if looks_degenerate(rec.text):
+    bad = [r for r in results if r["degenerate"]]
+    if bad:
+        first = bad[0]
         raise AssertionError(
-            "Long-context raw /generate returned degenerate output at "
-            f"{rec.prompt_tokens} prompt tokens while short prompts stay "
-            "coherent -- the chat template is not involved, so the KV that "
-            f"crossed the 2:1 reshard is corrupt. First 200 chars: {rec.text[:200]!r}"
+            "Raw /generate returned degenerate output from "
+            f"{first['prompt_tokens']} prompt tokens ({first['pages']} KV pages) "
+            f"upward; clean below that. No chat template is involved, so the "
+            f"context the model reads is corrupt. Sample: {first['sample_output']!r}"
         )
 
 
@@ -1034,9 +1058,9 @@ class TestPdTpResharding(unittest.TestCase):
             profile=self.profile,
         )
 
-    def test_02_long_context_generation(self) -> None:
+    def test_02_context_length_sweep(self) -> None:
         self._probe(
-            run_long_context_generate_probe,
+            run_context_length_sweep_probe,
             base_url=f"http://127.0.0.1:{LB_PORT}",
             profile=self.profile,
         )
