@@ -22,9 +22,11 @@ from __future__ import annotations
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit")
 
 import importlib.util
+import itertools
+import queue
 import threading
 import time
 import unittest
@@ -87,11 +89,29 @@ def _fill_random(pool):
         buf.copy_(torch.randn(buf.shape, dtype=torch.float32).to(buf.dtype))
 
 
+# P/D is moving off the tpu (ZMQ) connector onto raiden, so its classes stop
+# running here. Skipped rather than deleted: the connector still ships and is
+# still selectable as --disaggregation-transfer-backend tpu, so the tests should
+# stay available to anyone working on it until it is removed.
+#
+# Applied only to classes that exercise disaggregation/tpu/. The three at the
+# bottom of this file -- TestPrepareForPrebuiltTpuPadding,
+# TestTpuPagedTokenToKVPoolAllocatorCpuAssertion and
+# TestDecodeReqToTokenPoolTpuHostResident -- cover schedule-batch padding and
+# pool/allocator behaviour that has nothing to do with the connector. They keep
+# running, and must outlive this file when the connector is deleted.
+_TPU_CONNECTOR_RETIRED = unittest.skip(
+    "tpu (ZMQ) connector is being retired in favour of raiden; rendezvous "
+    "coverage now lives in test_disagg_raiden_transfer.py"
+)
+
+
 # --------------------------------------------------------------------------
 # 1. Data-plane unit tests (CPU only)
 # --------------------------------------------------------------------------
 
 
+@_TPU_CONNECTOR_RETIRED
 class TestTpuTransferDataPlane(CustomTestCase):
     def _roundtrip_for_dtype(self, dtype):
         src = _FakePool(8, 4, (2, 2, 16), layers=3, dtype=dtype)
@@ -335,7 +355,121 @@ class TestTpuTransferDataPlane(CustomTestCase):
 # --------------------------------------------------------------------------
 
 
+# --- In-process loopback standing in for the ZMQ transport ---------------
+#
+# These tests verify resharding geometry, page mapping and completion
+# bookkeeping — arithmetic, none of it about networking. They used to move the
+# bytes over a real localhost ZMQ socket, which made the socket the only piece
+# of the outside world in an otherwise self-contained test, and the only piece
+# that could misbehave. It did: transfers intermittently vanished with the
+# receiver timing out and the sender reporting success, because _connect
+# attaches a monitor to every PUSH socket that nothing ever detaches, and
+# closing a monitored socket degrades the shared zmq context until delivery
+# stops. One test in this file is already permanently skipped for it
+# ("Resource temporarily unavailable in CI due to zmq socket contention").
+#
+# The frames are the interesting artefact, not the pipe they travel down, so we
+# hand them straight to the receiver instead. No ports, no context, no monitors
+# — the failure mode is gone by construction rather than mitigated. What is
+# deliberately kept: the real managers, the real frame encoding, and the real
+# push thread pool, so out-of-order drain and completion counting stay covered.
+
+_LOOPBACK_RECV_TIMEOUT_S = 5
+
+# endpoint -> _Inbox. Endpoints are minted from a counter and unregistered at
+# test teardown, so no two managers can ever alias one another.
+_LOOPBACK_INBOXES: dict[str, _Inbox] = {}
+_LOOPBACK_PORTS = itertools.count(50000)
+
+
+class _Delivered:
+    """Stand-in for zmq's send tracker. The loopback copies each frame eagerly,
+    so a send is complete the moment it returns and staging buffers are free."""
+
+    done = True
+
+    def wait(self, timeout=None):
+        return None
+
+
+_DELIVERED = _Delivered()
+
+
+class _Inbox:
+    """Stand-in for a manager's bound PULL socket."""
+
+    def __init__(self, endpoint: str):
+        self.endpoint = endpoint
+        self._frames = queue.Queue()
+
+    def deliver(self, frames: list[bytes]) -> None:
+        self._frames.put(frames)
+
+    def recv_multipart(self, copy: bool = True, **_kwargs):
+        """Block for one frame list. Raises ``zmq.Again`` on timeout, matching
+        the real socket so ``_serve``'s recv loop keeps working unchanged."""
+        try:
+            return self._frames.get(timeout=_LOOPBACK_RECV_TIMEOUT_S)
+        except queue.Empty:
+            raise zmq.Again(
+                f"loopback inbox {self.endpoint} empty after "
+                f"{_LOOPBACK_RECV_TIMEOUT_S}s — the sender produced no frame"
+            ) from None
+
+    def getsockopt(self, _opt):
+        return _LOOPBACK_RECV_TIMEOUT_S * 1000
+
+
+class _LoopbackSender:
+    """Stand-in for a PUSH socket connected to ``endpoint``.
+
+    The receiver is resolved per send, not at construction, so managers can be
+    built in any order.
+    """
+
+    def __init__(self, endpoint: str):
+        self.endpoint = endpoint
+
+    def send_multipart(self, msg, copy: bool = True, track: bool = False):
+        inbox = _LOOPBACK_INBOXES.get(self.endpoint)
+        if inbox is None:
+            raise AssertionError(f"no loopback receiver bound to {self.endpoint}")
+        # Copy out of the caller's buffers now: with copy=False the real socket
+        # borrows pinned staging memory until its tracker drains, and the
+        # caller recycles those slots straight after.
+        inbox.deliver([bytes(part) for part in msg])
+        return _DELIVERED if track else None
+
+
+def _install_loopback_transport(m) -> None:
+    """Point the manager's ``_connect`` at the loopback instead of a real PUSH.
+
+    Mirrors ``CommonKVManager._connect``'s per-endpoint caching, including the
+    fact that asking for N channels hands back the same socket N times.
+    """
+
+    def _connect(endpoint: str, is_ipv6: bool = False):
+        m._socket_send_locks.setdefault(endpoint, threading.Lock())
+        sender = m._socket_cache.get(endpoint)
+        if sender is None:
+            sender = _LoopbackSender(endpoint)
+            m._socket_cache[endpoint] = sender
+        return sender
+
+    m._connect = _connect
+
+
+def _release_manager(m) -> None:
+    """Unbind the manager's endpoint and stop its push threads."""
+    if m._push_pool is not None:
+        # Bounded: the loopback never blocks, so any in-flight push is already
+        # finishing. Drained before unbinding so a late send still lands.
+        m._push_pool.shutdown(wait=True, cancel_futures=True)
+    _LOOPBACK_INBOXES.pop(m.server_socket.endpoint, None)
+
+
 def _bare_manager(
+    test,
     mode,
     pool,
     aux_tensors,
@@ -344,7 +478,11 @@ def _bare_manager(
     total_kv_head_num=0,
 ):
     """Construct a TpuKVManager with only the CommonKVManager state our data
-    /control-plane methods touch — bypassing distributed/bootstrap init."""
+    /control-plane methods touch — bypassing distributed/bootstrap init.
+
+    ``test`` is the calling TestCase, used to unbind the loopback endpoint and
+    stop the push pool at teardown.
+    """
     m = object.__new__(TpuKVManager)
     m._name = "TpuKVManager"
     m.disaggregation_mode = mode
@@ -373,20 +511,24 @@ def _bare_manager(
     )
     m._aux_keepalive = aux_tensors  # keep buffers alive for ctypes
 
-    ctx = zmq.Context.instance()
-    m._zmq_ctx = ctx
+    m._zmq_ctx = None  # unused: the loopback replaces _connect wholesale
     m._socket_cache = {}
     m._monitor_cache = {}
     m._socket_lock = threading.Lock()
     # Read by _send_multipart_locked.
     m._socket_send_locks = {}
+    # Set on both modes (only prefill populates it) so _release_manager can read
+    # it straight rather than probing for its existence.
+    m._push_pool = None
 
-    sock = ctx.socket(zmq.PULL)
-    sock.setsockopt(zmq.RCVTIMEO, 30000)
-    port = sock.bind_to_random_port("tcp://127.0.0.1")
-    m.server_socket = sock
+    port = next(_LOOPBACK_PORTS)
+    endpoint = _tcp_endpoint("127.0.0.1", port)
+    m.server_socket = _Inbox(endpoint)
+    _LOOPBACK_INBOXES[endpoint] = m.server_socket
     m.local_ip = "127.0.0.1"
     m.rank_port = port
+    _install_loopback_transport(m)
+    test.addCleanup(_release_manager, m)
 
     if mode == DisaggregationMode.PREFILL:
         m.transfer_infos = {}
@@ -417,6 +559,7 @@ def _bare_manager(
     return m
 
 
+@_TPU_CONNECTOR_RETIRED
 class TestTpuKVManagerProtocol(CustomTestCase):
     TAIL = (2, 2, 16)
     DTYPE = torch.bfloat16
@@ -428,8 +571,8 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         # decode aux buffers: [size, K] int32 (mimics MetadataBuffers.output_ids)
         paux = [torch.arange(8 * 16, dtype=torch.int32).reshape(8, 16)]
         daux = [torch.zeros(8, 16, dtype=torch.int32)]
-        prefill = _bare_manager(DisaggregationMode.PREFILL, ppool, paux)
-        decode = _bare_manager(DisaggregationMode.DECODE, dpool, daux)
+        prefill = _bare_manager(self, DisaggregationMode.PREFILL, ppool, paux)
+        decode = _bare_manager(self, DisaggregationMode.DECODE, dpool, daux)
         return prefill, decode, ppool, dpool, paux, daux
 
     def _assert_pages_equal(self, ppool, dpool, src_pages, dst_pages):
@@ -444,9 +587,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         prefill, decode, *_ = self._make_pair()
         prefill._serve(MessageTag.TRSFR, prefill._handle_transfer)
         room = 4242
-        push = zmq.Context.instance().socket(zmq.PUSH)
-        push.connect(_tcp_endpoint("127.0.0.1", prefill.rank_port))
-        push.send_multipart(
+        prefill.server_socket.deliver(
             [
                 MessageTag.TRSFR,
                 str(room).encode(),
@@ -668,6 +809,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
 # --------------------------------------------------------------------------
 
 
+@_TPU_CONNECTOR_RETIRED
 class TestTpuReshardingProtocol(CustomTestCase):
     """Drive the real gather_and_push / _handle_kvdata_ch / process_decode_pending
     paths across heterogeneous attn_tp, asserting each prefill rank's KV-head
@@ -687,7 +829,7 @@ class TestTpuReshardingProtocol(CustomTestCase):
         )
 
     def _mgr(self, mode, pool, aux, attn_tp_size: int, engine_rank: int):
-        return _bare_manager(mode, pool, aux, attn_tp_size, engine_rank)
+        return _bare_manager(self, mode, pool, aux, attn_tp_size, engine_rank)
 
     def test_fan_in_two_prefill_into_one_decode(self):
         # prefill_tp=2 (each rank holds 2 KV heads == 2 lanes) -> decode_tp=1
@@ -835,9 +977,9 @@ class TestTpuReshardingProtocol(CustomTestCase):
         daux = [torch.zeros(8, 16, dtype=torch.int32)]
 
         kw = dict(total_kv_head_num=2)  # 1 real head/rank; shape would infer 2
-        p0 = _bare_manager(DisaggregationMode.PREFILL, p0pool, paux, 2, 0, **kw)
-        p1 = _bare_manager(DisaggregationMode.PREFILL, p1pool, paux, 2, 1, **kw)
-        decode = _bare_manager(DisaggregationMode.DECODE, dpool, daux, 1, 0, **kw)
+        p0 = _bare_manager(self, DisaggregationMode.PREFILL, p0pool, paux, 2, 0, **kw)
+        p1 = _bare_manager(self, DisaggregationMode.PREFILL, p1pool, paux, 2, 1, **kw)
+        decode = _bare_manager(self, DisaggregationMode.DECODE, dpool, daux, 1, 0, **kw)
 
         room = 902
         src_pages = np.array([2, 5, 9], dtype=np.int64)
@@ -897,9 +1039,9 @@ class TestTpuReshardingProtocol(CustomTestCase):
         daux = [torch.zeros(8, 16, dtype=torch.int32)]
 
         kw = dict(total_kv_head_num=8)
-        p0 = _bare_manager(DisaggregationMode.PREFILL, p0pool, paux, 2, 0, **kw)
-        p1 = _bare_manager(DisaggregationMode.PREFILL, p1pool, paux, 2, 1, **kw)
-        decode = _bare_manager(DisaggregationMode.DECODE, dpool, daux, 1, 0, **kw)
+        p0 = _bare_manager(self, DisaggregationMode.PREFILL, p0pool, paux, 2, 0, **kw)
+        p1 = _bare_manager(self, DisaggregationMode.PREFILL, p1pool, paux, 2, 1, **kw)
+        decode = _bare_manager(self, DisaggregationMode.DECODE, dpool, daux, 1, 0, **kw)
 
         room = 903
         src_pages = np.array([2, 5, 9], dtype=np.int64)
@@ -948,9 +1090,6 @@ class TestTpuReshardingProtocol(CustomTestCase):
                 )
         self.assertTrue(torch.equal(daux[0][3], paux[0][6]))
 
-    @unittest.skip(
-        "Resource temporarily unavailable in CI due to zmq socket contention"
-    )
     def test_fan_in_fp8_gqa_replica_no_reassemble(self):
         # total_num_head=4, prefill_tp=8 -> decode_tp=4: each rank holds exactly 1
         # head (fp8 lane == [head, dummy]), so src_heads == dst_heads. This is
@@ -971,9 +1110,9 @@ class TestTpuReshardingProtocol(CustomTestCase):
 
         kw = dict(total_kv_head_num=4)  # 1 head/rank on both sides
         # prefill ranks 0 and 1 are GQA replicas of head 0 -> decode rank 0.
-        p0 = _bare_manager(DisaggregationMode.PREFILL, p0pool, paux, 8, 0, **kw)
-        p1 = _bare_manager(DisaggregationMode.PREFILL, p1pool, paux, 8, 1, **kw)
-        decode = _bare_manager(DisaggregationMode.DECODE, dpool, daux, 4, 0, **kw)
+        p0 = _bare_manager(self, DisaggregationMode.PREFILL, p0pool, paux, 8, 0, **kw)
+        p1 = _bare_manager(self, DisaggregationMode.PREFILL, p1pool, paux, 8, 1, **kw)
+        decode = _bare_manager(self, DisaggregationMode.DECODE, dpool, daux, 4, 0, **kw)
 
         room = 904
         src_pages = np.array([2, 5, 9], dtype=np.int64)
@@ -1027,6 +1166,7 @@ class TestTpuReshardingProtocol(CustomTestCase):
                 )
 
 
+@_TPU_CONNECTOR_RETIRED
 class TestTpuReshardTransferTimeFailure(CustomTestCase):
     """An unsupported fp8 reshard is NOT pre-flighted at handshake — a Failed set
     on the TRSFR recv thread would be clobbered by the sender's later
@@ -1046,6 +1186,7 @@ class TestTpuReshardTransferTimeFailure(CustomTestCase):
     def _prefill(self, attn_tp_size: int, lanes: int, engine_rank: int = 0):
         aux = [torch.zeros(8, 16, dtype=torch.int32)]
         return _bare_manager(
+            self,
             DisaggregationMode.PREFILL,
             self._fp8_pool(lanes),
             aux,
@@ -1101,6 +1242,7 @@ class TestTpuReshardTransferTimeFailure(CustomTestCase):
 # --------------------------------------------------------------------------
 
 
+@_TPU_CONNECTOR_RETIRED
 class TestPinnedHostPool(CustomTestCase):
     def test_acquire_release_reuse_and_budget(self):
         from sglang.srt.disaggregation.tpu.host_staging import PinnedHostPool
@@ -1156,6 +1298,7 @@ class TestPinnedHostPool(CustomTestCase):
 
 
 @unittest.skipIf(_skip_if_no_tpu(), "Requires torch_tpu / a TPU device")
+@_TPU_CONNECTOR_RETIRED
 class TestTpuTransferOnDevice(CustomTestCase):
     def test_device_gather_scatter_roundtrip(self):
         from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -1300,6 +1443,7 @@ class TestTpuTransferOnDevice(CustomTestCase):
 
 
 @unittest.skipIf(_skip_if_no_tpu(), "Requires torch_tpu / a TPU device")
+@_TPU_CONNECTOR_RETIRED
 class TestTpuKVManagerStagingOnDevice(CustomTestCase):
     # 4 blocks (size/page_size), 4 layers so 2 channels shard 2 layers each.
     POOL_KWARGS = dict(
@@ -1327,8 +1471,8 @@ class TestTpuKVManagerStagingOnDevice(CustomTestCase):
         paux = [torch.arange(8 * 16, dtype=torch.int32).reshape(8, 16)]
         daux = [torch.zeros(8, 16, dtype=torch.int32)]
 
-        prefill = _bare_manager(DisaggregationMode.PREFILL, src, paux)
-        decode = _bare_manager(DisaggregationMode.DECODE, dst, daux)
+        prefill = _bare_manager(self, DisaggregationMode.PREFILL, src, paux)
+        decode = _bare_manager(self, DisaggregationMode.DECODE, dst, daux)
         # Turn on the pooled-staging data path on both sides (what _init_prefill
         # / _init_decode set in production; _bare_manager omits them).
         prefill._stage_pool = PinnedHostPool()
@@ -1510,6 +1654,7 @@ class TestDecodeReqToTokenPoolTpuHostResident(CustomTestCase):
         self.assertEqual(pool.req_to_token.device.type, "cpu")
 
 
+@_TPU_CONNECTOR_RETIRED
 class TestPendingChunkReassembly(CustomTestCase):
     def test_process_incoming_chunk_no_reassemble(self):
         pending_queue = deque()
@@ -1819,6 +1964,7 @@ class TestPendingChunkReassembly(CustomTestCase):
         print("=" * 80 + "\n")
 
 
+@_TPU_CONNECTOR_RETIRED
 class TestFanInOddHeadReassembleLayout(CustomTestCase):
     """Regression guard for FP8 odd-head FAN-IN reassembly on the fused 5D packed
     layout (num_pages, page_size, n_lanes, kv_packing, head_dim).
