@@ -58,6 +58,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
@@ -757,7 +758,13 @@ def run_chat_termination_probe(base_url: str, profile: ModelProfile) -> None:
         )
 
 
-_REPEAT_COUNT = 12
+# Every request the test has ever sent went out one at a time, so nothing here
+# has exercised concurrent transfers even though the engines run with
+# --max-running-requests 8. A race in the reshard handshake, the receiver plan
+# or staging-slot reuse cannot fire serially, which would explain why the
+# corruption survives every deterministic theory. Match the server's limit.
+_REPEAT_COUNT = 40
+_REPEAT_CONCURRENCY = 8
 
 
 def run_repeat_consistency_probe(base_url: str, profile: ModelProfile) -> None:
@@ -777,9 +784,9 @@ def run_repeat_consistency_probe(base_url: str, profile: ModelProfile) -> None:
     Identical prompts also make the greedy outputs comparable: any difference
     between them is itself corruption, since temperature is 0.
     """
-    outcomes = []
     question = _long_context_question()
-    for i in range(_REPEAT_COUNT):
+
+    def _one(i: int) -> Dict[str, Any]:
         # Alternate the two paths at identical settings. Chat has failed in 3 of
         # 5 runs while long /generate failed once in ~25 attempts, but those
         # differed in token cap (256 vs 64) as well as in the template, so the
@@ -791,15 +798,18 @@ def run_repeat_consistency_probe(base_url: str, profile: ModelProfile) -> None:
         else:
             grec = _generate(base_url, question, _CHAT_PROBE_CAP)
             text, ptoks = grec.text, grec.prompt_tokens
-        outcomes.append(
-            {
-                "i": i,
-                "path": "chat" if via_chat else "generate",
-                "prompt_tokens": ptoks,
-                "answered": _PROBE_ANSWER in text,
-                "spew": looks_degenerate(text),
-                "sample_output": text[:60],
-            }
+        return {
+            "i": i,
+            "path": "chat" if via_chat else "generate",
+            "prompt_tokens": ptoks,
+            "answered": _PROBE_ANSWER in text,
+            "spew": looks_degenerate(text),
+            "sample_output": text[:60],
+        }
+
+    with ThreadPoolExecutor(max_workers=_REPEAT_CONCURRENCY) as pool:
+        outcomes = sorted(
+            pool.map(_one, range(_REPEAT_COUNT)), key=lambda o: int(o["i"])
         )
     pattern = "".join("." if o["answered"] else "X" for o in outcomes)
     distinct = sorted({o["sample_output"] for o in outcomes})
