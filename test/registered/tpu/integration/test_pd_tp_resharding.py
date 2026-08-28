@@ -17,11 +17,15 @@ What each verification proves:
                       both DP replicas produce valid, deterministic, and bit-equal
                       greedy text, certifying that KV cache was resharded and
                       transferred intact.
-  * chat termination: a gsm8k-sized chat-formatted request stops on its own. The
-                      greedy probe above uses short raw-text /generate and stays
-                      green even when every chat completion runs to its token cap
-                      and gsm8k scores 0.0; this catches that in ~2min rather than
-                      after an hour-long eval that returns nothing parseable.
+  * long context:     a gsm8k-sized (~900 token) prompt through raw /generate
+                      must still read as prose. The greedy probe above sends
+                      ~15-token prompts and stays green even when longer ones come
+                      back as token spew, so it alone certifies nothing about the
+                      page counts gsm8k actually drives through the reshard.
+  * chat termination: the same long prompt through /v1/chat/completions stops on
+                      its own and says something. Together with the probe above
+                      this separates prompt length from the chat path, which the
+                      failing runs moved at once.
   * quality:          gsm8k through the LB must clear the model's accuracy floor
                       under TP resharding. Below the floor the sampled responses
                       are dumped from run_eval's report, which otherwise dies with
@@ -624,8 +628,54 @@ def _long_context_question(paragraphs: int = 18) -> str:
     )
 
 
+def looks_degenerate(text: str) -> bool:
+    """Whether a sample is the token spew the corrupted-context state emits.
+
+    Run 33171526086 answered every ~900-token request with 8k characters of
+    backslashes ('________\\\\\\...', extracted answer -9999999) while short
+    prompts on the same engine pair stayed coherent. Prose runs ~75-80% letters
+    and that spew ~0%, so the threshold sits far from both.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return True
+    return sum(c.isalpha() for c in stripped) / len(stripped) < 0.3
+
+
+def run_long_context_generate_probe(base_url: str, profile: ModelProfile) -> None:
+    """A gsm8k-sized prompt through raw /generate, with no chat template.
+
+    Isolates the two variables the chat probe moves at once. In the bad state a
+    ~900-token chat request returns backslash spew while the ~15-token /generate
+    requests stay coherent, so either the chat path or the prompt length is to
+    blame. Degenerate output here indicts length alone -- i.e. the number of KV
+    pages the 2:1 fan-in has to place, which is this test's subject -- while
+    clean output here puts it on the chat path instead.
+    """
+    rec = _generate(base_url, _long_context_question(), 64)
+    print(
+        json.dumps(
+            {
+                "long_context_generate_probe": profile.key,
+                "prompt_tokens": rec.prompt_tokens,
+                "completion_tokens": rec.completion_tokens,
+                "sample_output": rec.text[:200],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    if looks_degenerate(rec.text):
+        raise AssertionError(
+            "Long-context raw /generate returned degenerate output at "
+            f"{rec.prompt_tokens} prompt tokens while short prompts stay "
+            "coherent -- the chat template is not involved, so the KV that "
+            f"crossed the 2:1 reshard is corrupt. First 200 chars: {rec.text[:200]!r}"
+        )
+
+
 def run_chat_termination_probe(base_url: str, profile: ModelProfile) -> None:
-    """A long chat-formatted request must stop on its own.
+    """A long chat-formatted request must stop on its own and say something.
 
     The greedy /generate probe below passes even when the engine pair is in the
     state where every chat completion runs to its cap and gsm8k scores exactly
@@ -659,10 +709,11 @@ def run_chat_termination_probe(base_url: str, profile: ModelProfile) -> None:
             f"({rec.prompt_tokens} prompt tokens). This is the state that scores "
             f"gsm8k 0.0. First 200 chars: {rec.text[:200]!r}"
         )
-    if not rec.text.strip():
+    if looks_degenerate(rec.text):
         raise AssertionError(
-            f"Chat completion returned empty content (finish_reason="
-            f"{rec.finish_reason!r}) -- gsm8k would score 0.0 on this engine pair"
+            "Chat completion returned degenerate output (finish_reason="
+            f"{rec.finish_reason!r}, {rec.prompt_tokens} prompt tokens) -- gsm8k "
+            f"would score 0.0 on this engine pair. First 200 chars: {rec.text[:200]!r}"
         )
 
 
@@ -878,6 +929,9 @@ class TestPdTpResharding(unittest.TestCase):
     procs: list[subprocess.Popen] = []
     topo: PodTopology
     profile: ModelProfile
+    # A probe's verdict that the engine pair emits garbage, carried forward so
+    # gsm8k can skip instead of spending an hour confirming it.
+    degenerate_verdict: Optional[str] = None
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -980,13 +1034,36 @@ class TestPdTpResharding(unittest.TestCase):
             profile=self.profile,
         )
 
-    def test_02_chat_completion_terminates(self) -> None:
-        run_chat_termination_probe(
+    def test_02_long_context_generation(self) -> None:
+        self._probe(
+            run_long_context_generate_probe,
             base_url=f"http://127.0.0.1:{LB_PORT}",
             profile=self.profile,
         )
 
-    def test_03_gsm8k_quality(self) -> None:
+    def test_03_chat_completion_terminates(self) -> None:
+        self._probe(
+            run_chat_termination_probe,
+            base_url=f"http://127.0.0.1:{LB_PORT}",
+            profile=self.profile,
+        )
+
+    def _probe(self, fn, **kwargs) -> None:
+        """Run a probe, remembering a corrupt verdict for test_04 to act on."""
+        try:
+            fn(**kwargs)
+        except AssertionError as exc:
+            type(self).degenerate_verdict = str(exc)
+            raise
+
+    def test_04_gsm8k_quality(self) -> None:
+        if self.degenerate_verdict is not None:
+            # The probes already proved the pair emits garbage; gsm8k then spends
+            # ~62min generating maximum-length spew to reach a foregone 0.0 (run
+            # 33171526086), delaying a verdict that is already in.
+            raise unittest.SkipTest(
+                f"probe already found degenerate output: {self.degenerate_verdict}"
+            )
         score = run_gsm8k(
             base_url=f"http://127.0.0.1:{LB_PORT}",
             profile=self.profile,
@@ -1173,6 +1250,22 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
                 body.get("chat_template_kwargs"), profile.chat_template_kwargs
             )
             self.assertEqual(body.get("reasoning_effort"), profile.reasoning_effort)
+
+    def test_degeneracy_check_separates_spew_from_prose(self) -> None:
+        # The literal shape observed in run 33171526086 -- if the threshold ever
+        # drifts past real prose, the probes go quiet and the pair's corruption
+        # is again only visible as an hour-long gsm8k scoring 0.0.
+        self.assertTrue(looks_degenerate("________" + "\\" * 200))
+        self.assertTrue(looks_degenerate(""))
+        self.assertTrue(looks_degenerate("   "))
+        self.assertFalse(
+            looks_degenerate(
+                "General relativity is a theory developed by Albert Einstein "
+                "that describes how gravity works."
+            )
+        )
+        # Short numeric answers are what the probe's prompt asks for.
+        self.assertFalse(looks_degenerate("The answer is 42."))
 
     def test_chat_probe_prompt_is_long_enough_to_expose_the_failure(self) -> None:
         # The non-termination state only shows on a gsm8k-sized prompt (~900
