@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeReqToTok
 from sglang.srt.disaggregation.raiden.conn import (
     RaidenKVManager,
     RaidenKVSender,
+    _TransferIntervalTracker,
     get_raiden_kv_caches,
 )
 from sglang.srt.disaggregation.raiden.host_pool import SlotAdmission
@@ -67,6 +68,12 @@ class _FakeTransfer:
     def load(self, host_pages, device_pages):
         self.loads.append((list(host_pages), list(device_pages)))
         return RaidenFutureEvent(None)
+
+
+def _new_raiden_manager():
+    manager = object.__new__(RaidenKVManager)
+    manager._send_intervals = _TransferIntervalTracker()
+    return manager
 
 
 def _make_host_pool(page_size=4, page_num=3):
@@ -226,7 +233,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self.assertEqual(groups.swa, [_Pool.buffers[1], _Pool.buffers[3]])
 
     def test_hybrid_swa_max_blocks_is_sized_from_sliding_window(self):
-        mgr = object.__new__(RaidenKVManager)
+        mgr = _new_raiden_manager()
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -241,7 +248,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             self.assertEqual(mgr._swa_max_request_blocks(), 33)
 
     def test_hybrid_swa_max_blocks_override_is_independent(self):
-        mgr = object.__new__(RaidenKVManager)
+        mgr = _new_raiden_manager()
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -267,7 +274,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         blocks = [3, 9]
         for finalize_first in (False, True):
             with self.subTest(finalize_first=finalize_first):
-                mgr = object.__new__(RaidenKVManager)
+                mgr = _new_raiden_manager()
                 mgr._aborted = {}
                 mgr._send_reads = {}
                 mgr.failure_records = {}
@@ -321,7 +328,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         room = 23
         full_blocks = [3, 9]
         swa_blocks = [5, 7]
-        mgr = object.__new__(RaidenKVManager)
+        mgr = _new_raiden_manager()
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -376,7 +383,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_hybrid_swa_decode_starts_both_pulls_with_separate_pages(self):
         room = 29
-        mgr = object.__new__(RaidenKVManager)
+        mgr = _new_raiden_manager()
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -416,7 +423,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         swa_max_blocks=33,
     ):
         room = 29
-        mgr = object.__new__(RaidenKVManager)
+        mgr = _new_raiden_manager()
         mgr.attn_tp_rank = 0
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
@@ -497,7 +504,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_decode_defers_pull_until_a_staging_slot_frees(self):
         first, second = 29, 30
-        mgr = object.__new__(RaidenKVManager)
+        mgr = _new_raiden_manager()
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -534,7 +541,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     @staticmethod
     def _decode_mgr(capacity, full_limit, swa_limit=None):
-        mgr = object.__new__(RaidenKVManager)
+        mgr = _new_raiden_manager()
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -651,7 +658,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self.assertTrue(mgr.maybe_start_pull(second))
 
     def test_hybrid_swa_rejects_asymmetric_tp_before_reshard(self):
-        mgr = object.__new__(RaidenKVManager)
+        mgr = _new_raiden_manager()
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -748,7 +755,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
 
     @staticmethod
     def _prefill():
-        mgr = object.__new__(RaidenKVManager)
+        mgr = _new_raiden_manager()
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -849,7 +856,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
 
     @staticmethod
     def _decode(room, local, capacity):
-        mgr = object.__new__(RaidenKVManager)
+        mgr = _new_raiden_manager()
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -1291,7 +1298,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         return ReshardGeometry(src_tp, dst_tp, 1024, 8)
 
     def _prefill(self):
-        mgr = object.__new__(RaidenKVManager)
+        mgr = _new_raiden_manager()
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -1483,7 +1490,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertTrue(mgr.is_send_done(room))
 
     def _decode(self):
-        mgr = object.__new__(RaidenKVManager)
+        mgr = _new_raiden_manager()
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}

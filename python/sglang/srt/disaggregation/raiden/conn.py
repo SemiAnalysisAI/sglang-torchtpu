@@ -80,6 +80,69 @@ class RaidenKVCacheGroups:
     swa: List[Any]
 
 
+class _TransferIntervalTracker:
+    """Unions completed per-chunk sender intervals, excluding gaps between them."""
+
+    def __init__(self) -> None:
+        self._starts: Dict[str, Tuple[int, float]] = {}
+        self._intervals: Dict[int, List[Tuple[float, float]]] = {}
+        self._lock = threading.Lock()
+
+    def start(self, room: int, transfer_ids: List[str]) -> None:
+        now = time.perf_counter()
+        with self._lock:
+            for transfer_id in transfer_ids:
+                if transfer_id in self._starts:
+                    logger.error(
+                        "Raiden transfer interval %s started twice; "
+                        "preserving its original start time",
+                        transfer_id,
+                    )
+                    continue
+                self._starts[transfer_id] = (room, now)
+
+    def cancel(self, transfer_ids: List[str]) -> None:
+        with self._lock:
+            for transfer_id in transfer_ids:
+                self._starts.pop(transfer_id, None)
+
+    def finish(self, transfer_ids: List[str]) -> None:
+        now = time.perf_counter()
+        with self._lock:
+            for transfer_id in transfer_ids:
+                started = self._starts.pop(transfer_id, None)
+                if started is None:
+                    continue
+                room, start = started
+                self._intervals.setdefault(room, []).append((start, now))
+
+    def duration(self, room: int) -> float:
+        with self._lock:
+            intervals = list(self._intervals.get(room, ()))
+        if not intervals:
+            return 0.0
+
+        intervals.sort()
+        total = 0.0
+        start, end = intervals[0]
+        for next_start, next_end in intervals[1:]:
+            if next_start <= end:
+                end = max(end, next_end)
+            else:
+                total += end - start
+                start, end = next_start, next_end
+        return total + end - start
+
+    def clear(self, room: int) -> None:
+        with self._lock:
+            self._starts = {
+                transfer_id: started
+                for transfer_id, started in self._starts.items()
+                if started[0] != room
+            }
+            self._intervals.pop(room, None)
+
+
 def get_raiden_kv_caches(pool) -> RaidenKVCacheGroups:
     """Group per-layer device KV tensors by their page-index namespace.
 
@@ -177,6 +240,7 @@ class RaidenKVManager(CommonKVManager):
         self._completed_send: Set[str] = set()
         self._completed_recv: Set[str] = set()
         self._failed: Set[str] = set()
+        self._send_intervals = _TransferIntervalTracker()
         # Transfer ids the engine reported failed. Only these mean raiden has
         # released the transfer's staging; a room failed for a logical reason
         # (abort, timeout, peer death) shares its id with its closing read, so
@@ -1098,11 +1162,13 @@ class RaidenKVManager(CommonKVManager):
             if room in self._aborted:
                 return
             self._send_reads.setdefault(room, set()).add(req_id)
+            self._send_intervals.start(room, [req_id])
         try:
             accepted = bool(engine.register_read(req_id, uuid, block_ids))
         except Exception as exc:
             with self._state_lock:
                 self._discard_sender_read_locked(room, req_id)
+                self._send_intervals.cancel([req_id])
                 if room not in self._aborted:
                     self._mark_aborted_locked(room)
                     self._fail_room_locked(
@@ -1113,6 +1179,7 @@ class RaidenKVManager(CommonKVManager):
         if not accepted:
             with self._state_lock:
                 self._discard_sender_read_locked(room, req_id)
+                self._send_intervals.cancel([req_id])
 
     def _discard_sender_read_locked(self, room: int, req_id: str) -> None:
         reads = self._send_reads.get(room)
@@ -1125,6 +1192,9 @@ class RaidenKVManager(CommonKVManager):
     def _settle_sender_reads_locked(self) -> None:
         settled = self._completed_send | self._native_failed
         for room, reads in list(self._send_reads.items()):
+            settled_reads = reads & settled
+            if settled_reads:
+                self._send_intervals.finish(list(settled_reads))
             reads -= settled
             if not reads:
                 self._send_reads.pop(room, None)
@@ -2197,50 +2267,60 @@ class RaidenKVManager(CommonKVManager):
         # receiver matches on src_block_id (the prefill device blocks it
         # learned via RESHARD_BLOCKS), which is unaffected by where the bytes
         # are staged.
-        engine.register_active_plan(uuid, req, is_sender=True)
-        fut = None
+        self._send_intervals.start(room, [req_id])
         try:
-            host_blocks = engine.plan_host_blocks(uuid, prefill_blocks)
-            fut = engine.d2h(prefill_blocks, host_blocks, [1] * n)
-            deadline = self._monotonic() + self._timeout_s
-            while fut is not None and not fut.is_ready():
-                if self._monotonic() > deadline:
-                    raise TimeoutError(
-                        f"raiden reshard D2H stage for room {room} timed out"
+            engine.register_active_plan(uuid, req, is_sender=True)
+            fut = None
+            try:
+                host_blocks = engine.plan_host_blocks(uuid, prefill_blocks)
+                fut = engine.d2h(prefill_blocks, host_blocks, [1] * n)
+                deadline = self._monotonic() + self._timeout_s
+                while fut is not None and not fut.is_ready():
+                    if self._monotonic() > deadline:
+                        raise TimeoutError(
+                            f"raiden reshard D2H stage for room {room} timed out"
+                        )
+                    time.sleep(0.0005)
+                # is_ready() is true even for a ready-with-error future, so check
+                # ok() before pushing -- otherwise a failed d2h would push stale
+                # staging.
+                if fut is not None and not fut.ok():
+                    raise RuntimeError(
+                        f"raiden reshard D2H stage for room {room} failed: "
+                        f"{fut.error_message()}"
                     )
-                time.sleep(0.0005)
-            # is_ready() is true even for a ready-with-error future, so check
-            # ok() before pushing -- otherwise a failed d2h would push stale
-            # staging.
-            if fut is not None and not fut.ok():
-                raise RuntimeError(
-                    f"raiden reshard D2H stage for room {room} failed: "
-                    f"{fut.error_message()}"
-                )
-            # raiden runs SyncPush unlocked, so serialize pushes across workers
-            # (concurrent pushes to a decode peer corrupt its shared transport).
-            with self._reshard_push_lock:
-                # The receiver's completion barrier is total_blocks * num_layers,
-                # and each push counts its blocks once regardless of how many
-                # layers it carries, so push one layer per request to deliver
-                # every layer.
-                for layer_idx in range(len(self._kv_caches)):
-                    engine.push_registered_plan(
-                        uuid, push_endpoint, prefill_blocks, decode_blocks, layer_idx
-                    )
+                # raiden runs SyncPush unlocked, so serialize pushes across workers
+                # (concurrent pushes to a decode peer corrupt its shared transport).
+                with self._reshard_push_lock:
+                    # The receiver's completion barrier is total_blocks * num_layers,
+                    # and each push counts its blocks once regardless of how many
+                    # layers it carries, so push one layer per request to deliver
+                    # every layer.
+                    for layer_idx in range(len(self._kv_caches)):
+                        engine.push_registered_plan(
+                            uuid,
+                            push_endpoint,
+                            prefill_blocks,
+                            decode_blocks,
+                            layer_idx,
+                        )
+            finally:
+                # Frees the plan's staging on the sender; the receiver's is freed
+                # when its upload completes. A copy that timed out but is still
+                # running keeps the plan until it settles -- unregistering would
+                # free the staging while the copy writes it.
+                if fut is not None and not fut.is_ready():
+                    with self._state_lock:
+                        self._stale_plans.append((uuid, room, fut))
+                    threading.Thread(
+                        target=self._reap_stale_plan,
+                        args=(uuid, room, fut),
+                        daemon=True,
+                    ).start()
+                else:
+                    engine.unregister_active_plan(uuid)
         finally:
-            # Frees the plan's staging on the sender; the receiver's is freed
-            # when its upload completes. A copy that timed out but is still
-            # running keeps the plan until it settles -- unregistering would
-            # free the staging while the copy writes it.
-            if fut is not None and not fut.is_ready():
-                with self._state_lock:
-                    self._stale_plans.append((uuid, room, fut))
-                threading.Thread(
-                    target=self._reap_stale_plan, args=(uuid, room, fut), daemon=True
-                ).start()
-            else:
-                engine.unregister_active_plan(uuid)
+            self._send_intervals.finish([req_id])
         if not self.chunked_transfer:
             with self._state_lock:
                 self._completed_send.add(str(room))
@@ -2256,6 +2336,9 @@ class RaidenKVManager(CommonKVManager):
         return rid in self._completed_send and (
             self._swa_engine is None or self._swa_req_id(room) in self._completed_send
         )
+
+    def send_active_latency_s(self, room: int) -> float:
+        return self._send_intervals.duration(room)
 
     def is_recv_done(self, room: int) -> bool:
         if self.chunked_transfer:
@@ -2406,6 +2489,7 @@ class RaidenKVManager(CommonKVManager):
                 # well, so clear and publication have one total order.
                 with self.failure_lock:
                     self.failure_records.pop(room, None)
+        self._send_intervals.clear(room)
         for uuid in settled_plans:
             self._unregister_plan(uuid)
 
@@ -2499,6 +2583,9 @@ class RaidenKVSender(CommonKVSender):
             self.conclude_state = KVPoll.Failed
             return KVPoll.Failed
         if self.kv_mgr.is_send_done(self.bootstrap_room):
+            transfer_latency_s = self.kv_mgr.send_active_latency_s(self.bootstrap_room)
+            if transfer_latency_s > 0:
+                self._transfer_metric.transfer_latency_s = transfer_latency_s
             self.conclude_state = KVPoll.Success
             return KVPoll.Success
         if status == KVPoll.Success:
