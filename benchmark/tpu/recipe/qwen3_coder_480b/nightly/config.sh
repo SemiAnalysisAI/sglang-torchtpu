@@ -111,7 +111,10 @@ LONG_TARGET_CONTEXT=${LONG_TARGET_CONTEXT:-262144} # long session ctx target
 
 # ===== FIXED: parallelism per mode =====
 COLOCATED_TP=16
-COLOCATED_DP=4                  # -> attn_tp = 16/4 = 4
+# Overridable so a diagnostic can vary DP without editing this file. Each DP
+# group owns its own KV pool and radix tree, so DP size and the prefix-cache
+# hit rate are coupled -- see the round-robin note on TARGET_CONTEXT below.
+COLOCATED_DP=${COLOCATED_DP:-4} # -> attn_tp = 16/4 = 4
 PD_TP=8
 PD_DP=2                         # -> attn_tp = 8/2 = 4
 
@@ -248,13 +251,25 @@ case "$PROFILE" in
         # numbers are for regression tracking, not a full pareto curve. Raise
         # SWEEP_* on a slice you own.
         LONG_RAMP_TOKENS=${LONG_RAMP_TOKENS_OVERRIDE:-16384}
-        SWEEP_BS=${SWEEP_BS_OVERRIDE:-"1 16"}
-        SWEEP_LONG=${SWEEP_LONG_OVERRIDE:-"0 1"}
-        # TARGET_CONTEXT is left at the contract's 16384: a normal session is
-        # already only 3 rounds, so there is nothing to time-box, and shrinking
-        # it further would flatten the CI legs toward single-turn.
+        # ================= DIAGNOSTIC -- DO NOT MERGE =================
+        # Round-robin DP dispatch sends a sequential session's round r to the
+        # rank that last saw round r-dp, whose history is a PREFIX of round r's
+        # prompt. So the hit rate a leg can reach is
+        #     ratio_to_achievable = (R-dp)(R-dp+1) / (R(R-1))
+        # which is 0 for every R <= dp -- exactly the 0.0% both c1 legs measured
+        # at dp=4, R=3. This run tests that model: dp=2 with R=6 predicts a 47.6%
+        # absolute hit rate against a 42.9% floor. One leg, since c1 is where the
+        # effect is deterministic (concurrent sessions interleave and blur it).
+        COLOCATED_DP=2
+        TARGET_CONTEXT=${TARGET_CONTEXT_OVERRIDE:-30720}   # 30720/5130 -> 6 rounds
+        SWEEP_BS=${SWEEP_BS_OVERRIDE:-"1"}
+        SWEEP_LONG=${SWEEP_LONG_OVERRIDE:-"0"}
+        # 6 rounds instead of 3, and prefill grows with history, so the 420s cap
+        # sized for a 3-round leg would time-box this one and change what it
+        # measures. Only one leg runs, so SWEEP_TIMEOUT still has room.
+        MAX_LEG_SECONDS=${MAX_LEG_SECONDS_OVERRIDE:-900}
+        # ================= end DIAGNOSTIC =================
         LONG_TARGET_CONTEXT=${LONG_TARGET_CONTEXT_OVERRIDE:-65536}
-        MAX_LEG_SECONDS=${MAX_LEG_SECONDS_OVERRIDE:-420}
         ;;
     smoke)
         SWEEP_BS=${SWEEP_BS_OVERRIDE:-"1 2"}
