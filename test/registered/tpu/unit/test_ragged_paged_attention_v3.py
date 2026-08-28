@@ -81,6 +81,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         kv_dtype=None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        max_num_tokens_override: Optional[int] = None,
     ):
         """Build matching kernel/reference inputs for one or more sequences.
 
@@ -129,6 +130,9 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         # Pad max_num_tokens to a multiple of 8 so the kernel's tile shapes
         # are happy; the real q region is total_q_tokens.
         max_num_tokens = max(8, ((total_q_tokens + 7) // 8) * 8)
+        if max_num_tokens_override is not None:
+            assert max_num_tokens_override >= max_num_tokens
+            max_num_tokens = max_num_tokens_override
 
         def _maybe_quant(t, scale):
             """Quantize bf16 -> kv_dtype if fp8, else pass through.
@@ -218,10 +222,23 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             num_kv_heads * 2,
             self.HEAD_DIM,
         )
+        aligned_kv_heads_x2 = (
+            (num_kv_heads * 2 + kv_packing - 1) // kv_packing
+        ) * kv_packing
+        kv_interleaved = jnp.pad(
+            kv_interleaved,
+            (
+                (0, 0),
+                (0, 0),
+                (0, aligned_kv_heads_x2 - num_kv_heads * 2),
+                (0, 0),
+            ),
+            constant_values=0,
+        )
         kv_fused = kv_interleaved.reshape(
             self.TOTAL_NUM_PAGES,
             self.PAGE_SIZE,
-            (num_kv_heads * 2) // kv_packing,
+            aligned_kv_heads_x2 // kv_packing,
             kv_packing,
             self.HEAD_DIM,
         )
@@ -451,6 +468,57 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         )
         self._run_and_compare(
             inputs, distribution=(1, 1, 1), tolerance=self.FP8_TOLERANCE
+        )
+
+    def test_decode_single_kv_head_fp8_e4m3(self):
+        """FP8 packing pads one local KV head to a four-element lane."""
+        import jax.numpy as jnp
+
+        inputs = self._build_inputs(
+            [(17, 1)],
+            num_q_heads=2,
+            num_kv_heads=1,
+            kv_dtype=jnp.float8_e4m3fn,
+            k_scale=1.0,
+            v_scale=1.0,
+        )
+        self._run_and_compare(
+            inputs, distribution=(1, 1, 1), tolerance=self.FP8_TOLERANCE
+        )
+
+    def test_extend_single_kv_head_fp8_e4m3(self):
+        """The kernel also writes correctly into the half-filled FP8 lane."""
+        import jax.numpy as jnp
+
+        inputs = self._build_inputs(
+            [(33, 8)],
+            num_q_heads=2,
+            num_kv_heads=1,
+            kv_dtype=jnp.float8_e4m3fn,
+            k_scale=1.0,
+            v_scale=1.0,
+        )
+        self._run_and_compare(
+            inputs, distribution=(0, 0, 1), tolerance=self.FP8_TOLERANCE
+        )
+
+    def test_prefill_single_kv_head_fp8_e4m3(self):
+        """Match the failing TP8 server's 38-active-token / 64-token bucket."""
+        import jax.numpy as jnp
+
+        self.PAGE_SIZE = 64
+        self.PAGES_PER_SEQ = 1
+        inputs = self._build_inputs(
+            [(38, 38)],
+            num_q_heads=2,
+            num_kv_heads=1,
+            kv_dtype=jnp.float8_e4m3fn,
+            k_scale=1.0,
+            v_scale=1.0,
+            max_num_tokens_override=64,
+        )
+        self._run_and_compare(
+            inputs, distribution=(0, 0, 1), tolerance=self.FP8_TOLERANCE
         )
 
     def test_extend_single_seq_fp8_e4m3(self):

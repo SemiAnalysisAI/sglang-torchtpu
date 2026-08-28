@@ -177,21 +177,36 @@ class RpaKernelSpec:
 _OP_CACHE: dict = {}
 
 
+_PALLAS_E4M3_SAFE_MAX = 240.0
+
+
+def _pallas_fp8_kv_scale(scale: float, fp8_dtype: torch.dtype) -> float:
+    """Preserve E4M3's real range without emitting TPU-unsafe encodings."""
+    if fp8_dtype == torch.float8_e4m3fn:
+        return scale * (float(torch.finfo(fp8_dtype).max) / _PALLAS_E4M3_SAFE_MAX)
+    return scale
+
+
 def _quantize_kv_to_fp8(
     t: torch.Tensor, scale: float, fp8_dtype: torch.dtype
 ) -> torch.Tensor:
     """Static per-tensor quantization of K or V into ``fp8_dtype``.
 
-    Mirrors the GPU path's ``set_kv_buffer`` quantization (``cache_k.div_(scale)
-    .to(fp8)``) and vllm/tpu-inference's ``quantize_kv``
-    (https://github.com/vllm-project/tpu-inference/tree/main/tpu_inference/kernels/):
-    divide by the per-tensor scale, clamp to the
-    fp8 representable range, then cast. The kernel undoes
-    this by multiplying the attention scores / output by the same scale.
+    Like the GPU path's ``set_kv_buffer`` quantization, divide by the
+    per-tensor scale, clamp, and cast. On TPU, E4M3 is restricted to the safe
+    Pallas VMEM range described below. The kernel undoes the quantization by
+    multiplying the attention scores / output by the same adjusted scale.
     """
     finfo = torch.finfo(fp8_dtype)
+    # TPU Pallas single-token DMA canonicalizes E4M3 exponent-0xf encodings
+    # (absolute values 256..448) to NaN when copying through VMEM. Restrict the
+    # stored encoding to exponent <= 0xe. The caller expands the dequant scale
+    # by 448/240 so this retains the same real-value range as ordinary E4M3.
+    max_value = (
+        _PALLAS_E4M3_SAFE_MAX if fp8_dtype == torch.float8_e4m3fn else float(finfo.max)
+    )
     scaled = t.to(torch.float32) / scale
-    scaled = torch.clamp(scaled, finfo.min, finfo.max)
+    scaled = torch.clamp(scaled, -max_value, max_value)
     return scaled.to(fp8_dtype)
 
 
@@ -873,6 +888,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         if self.kv_cache_quant_dtype is not None:
             k_scale = layer.k_scale_float if layer.k_scale_float is not None else 1.0
             v_scale = layer.v_scale_float if layer.v_scale_float is not None else 1.0
+            k_scale = _pallas_fp8_kv_scale(k_scale, self.kv_cache_quant_dtype)
+            v_scale = _pallas_fp8_kv_scale(v_scale, self.kv_cache_quant_dtype)
             k = _quantize_kv_to_fp8(k, k_scale, self.kv_cache_quant_dtype)
             v = _quantize_kv_to_fp8(v, v_scale, self.kv_cache_quant_dtype)
         else:
@@ -902,7 +919,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             k_scale,
             v_scale,
         )
-
         capture_mode = getattr(forward_batch, "capture_hidden_mode", None)
         # FULL capture retains padded rows for later EAGLE steps.
         if capture_mode is not None and capture_mode.is_full():
