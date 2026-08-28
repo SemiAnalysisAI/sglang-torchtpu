@@ -526,8 +526,11 @@ class DraftBackendFactory:
             TpuPallasRpaSeqMultiStepDraftBackend,
         )
 
-        return TpuPallasRpaSeqMultiStepDraftBackend(
-            self.draft_model_runner, self.topk, self.speculative_num_steps
+        return (
+            "tpu_pallas_rpa_seq",
+            TpuPallasRpaSeqMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            ),
         )
 
     def _create_tpu_pallas_rpa_seq_prefill_backend(self):
@@ -535,7 +538,10 @@ class DraftBackendFactory:
             TpuPallasRpaSeqAttnBackend,
         )
 
-        return TpuPallasRpaSeqAttnBackend(self.draft_model_runner)
+        return (
+            "tpu_pallas_rpa_seq",
+            TpuPallasRpaSeqAttnBackend(self.draft_model_runner),
+        )
 
     def _create_flashmla_prefill_backend(self):
         from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
