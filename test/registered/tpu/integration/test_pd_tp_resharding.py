@@ -778,14 +778,27 @@ def run_repeat_consistency_probe(base_url: str, profile: ModelProfile) -> None:
     between them is itself corruption, since temperature is 0.
     """
     outcomes = []
+    question = _long_context_question()
     for i in range(_REPEAT_COUNT):
-        rec = _generate(base_url, _long_context_question(), 64)
+        # Alternate the two paths at identical settings. Chat has failed in 3 of
+        # 5 runs while long /generate failed once in ~25 attempts, but those
+        # differed in token cap (256 vs 64) as well as in the template, so the
+        # comparison was never clean. Same cap here isolates the template.
+        via_chat = i % 2 == 1
+        if via_chat:
+            crec = _chat(base_url, question, profile, _CHAT_PROBE_CAP)
+            text, ptoks = crec.text, crec.prompt_tokens
+        else:
+            grec = _generate(base_url, question, _CHAT_PROBE_CAP)
+            text, ptoks = grec.text, grec.prompt_tokens
         outcomes.append(
             {
                 "i": i,
-                "answered": _PROBE_ANSWER in rec.text,
-                "spew": looks_degenerate(rec.text),
-                "sample_output": rec.text[:60],
+                "path": "chat" if via_chat else "generate",
+                "prompt_tokens": ptoks,
+                "answered": _PROBE_ANSWER in text,
+                "spew": looks_degenerate(text),
+                "sample_output": text[:60],
             }
         )
     pattern = "".join("." if o["answered"] else "X" for o in outcomes)
@@ -804,10 +817,14 @@ def run_repeat_consistency_probe(base_url: str, profile: ModelProfile) -> None:
     )
     bad = [o for o in outcomes if not o["answered"]]
     if bad:
+        by_path = {
+            p: sum(1 for o in bad if o["path"] == p) for p in ("generate", "chat")
+        }
         raise AssertionError(
             f"{len(bad)}/{_REPEAT_COUNT} identical long-context requests came back "
-            f"wrong (pattern {pattern!r}, '.'=ok 'X'=bad; {len(distinct)} distinct "
-            f"outputs at temperature 0). First bad: {bad[0]['sample_output']!r}"
+            f"wrong (pattern {pattern!r}, '.'=ok 'X'=bad, odd slots are chat; "
+            f"bad by path {by_path}; {len(distinct)} distinct outputs at "
+            f"temperature 0). First bad: {bad[0]['sample_output']!r}"
         )
 
 
