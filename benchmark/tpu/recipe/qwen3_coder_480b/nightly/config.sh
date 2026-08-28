@@ -262,6 +262,14 @@ case "$PROFILE" in
         # effect is deterministic (concurrent sessions interleave and blur it).
         COLOCATED_DP=2
         TARGET_CONTEXT=${TARGET_CONTEXT_OVERRIDE:-30720}   # 30720/5130 -> 6 rounds
+        # The KV pool is mem_fraction-derived (max_total_tokens unset), so it is
+        # sized per DP group: halving DP doubled it, 877440 -> 1864192 tokens and
+        # 12.97 -> 27.56 GB of KV per rank. With ~30 GB of FP8 weights per chip
+        # that leaves nothing for compile temporaries, and the extend graph OOMed
+        # at 110.23G > 94.74G HBM before the server ever went healthy. Pin the
+        # pool to what dp=4 derived and compiled cleanly; one c1 leg reaching a
+        # ~31k context needs a tiny fraction of it.
+        export MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS_OVERRIDE:-877440}
         SWEEP_BS=${SWEEP_BS_OVERRIDE:-"1"}
         SWEEP_LONG=${SWEEP_LONG_OVERRIDE:-"0"}
         # 6 rounds instead of 3, and prefill grows with history, so the 420s cap
