@@ -182,6 +182,9 @@ class RaidenKVManager(CommonKVManager):
         # (abort, timeout, peer death) shares its id with its closing read, so
         # room failure must never read as native settlement.
         self._native_failed: Set[str] = set()
+        # Sender-read leases, populated only on the prefill branch below; stays
+        # None on the decode so _drain_engine's settle is a no-op there.
+        self._send_reads: Optional[Dict[int, Set[str]]] = None
         # Rooms whose pull is issued and not yet settled. Raiden borrows one
         # host staging slot per in-flight transfer and rejects a read it cannot
         # seat, so the decode side admits at most one pull per slot and leaves
@@ -233,7 +236,7 @@ class RaidenKVManager(CommonKVManager):
             # when the engine reports the read served or failed, and ages
             # out after the transfer deadline for a read the decode never
             # comes for.
-            self._send_reads: Dict[int, Set[str]] = {}
+            self._send_reads = {}
             # Chunks announced before the decode asked for the room, held until
             # a PULL_REQ names it (a resharded room never gets one).
             self._held_chunks: Dict[int, List[Tuple[int, List[int]]]] = {}
@@ -1123,6 +1126,11 @@ class RaidenKVManager(CommonKVManager):
             self._send_reads.pop(room, None)
 
     def _settle_sender_reads_locked(self) -> None:
+        # _send_reads is populated only on the prefill (sender) manager and left
+        # None on the decode. _drain_engine runs on both roles, so no-op here or
+        # the decode's first completed pull raises. (Regression from e433dfa88f.)
+        if self._send_reads is None:
+            return
         settled = self._completed_send | self._native_failed
         for room, reads in list(self._send_reads.items()):
             reads -= settled

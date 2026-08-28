@@ -1237,5 +1237,26 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         self.assertNotIn(ROOM, mgr.request_status)
 
 
+class TestSettleSenderReads(unittest.TestCase):
+    def test_settle_is_noop_when_send_reads_is_none(self):
+        # _drain_engine runs on both roles but _send_reads is populated only on
+        # the prefill (sender); it stays None on the decode, where the settle
+        # must no-op rather than dereference None.
+        mgr = SimpleNamespace(_send_reads=None)
+        mgr._settle_sender_reads_locked = types.MethodType(
+            RaidenKVManager._settle_sender_reads_locked, mgr
+        )
+        mgr._settle_sender_reads_locked()  # must not raise
+        self.assertIsNone(mgr._send_reads)
+
+    def test_settle_drops_settled_rooms_on_prefill(self):
+        mgr = _prefill_manager()
+        mgr._send_reads = {1: {"a", "b"}, 2: {"c"}}
+        mgr._completed_send = {"a"}
+        mgr._native_failed = {"c"}
+        mgr._settle_sender_reads_locked()
+        self.assertEqual(mgr._send_reads, {1: {"b"}})  # room 2 fully settled
+
+
 if __name__ == "__main__":
     unittest.main()
