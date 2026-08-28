@@ -629,18 +629,31 @@ def _long_context_question(paragraphs: int = 18) -> str:
     )
 
 
+# 17 + 25. Trivial, greedy-decoded, and the probe prompt asks for just this, so
+# its presence is a sharper check than any guess at what healthy prose looks
+# like: the corrupted state cannot produce it, and a correct engine always does.
+_PROBE_ANSWER = "42"
+# The corrupted state emits one character over and over ('\\' in runs of
+# thousands). 20 is far above anything real text repeats and far below the runs
+# observed, so it does not depend on a tuned ratio.
+_SPEW_RUN = 20
+
+
 def looks_degenerate(text: str) -> bool:
     """Whether a sample is the token spew the corrupted-context state emits.
 
-    Run 33171526086 answered every ~900-token request with 8k characters of
+    Run 33171526086 answered every ~900-token request with ~8k characters of
     backslashes ('________\\\\\\...', extracted answer -9999999) while short
-    prompts on the same engine pair stayed coherent. Prose runs ~75-80% letters
-    and that spew ~0%, so the threshold sits far from both.
+    prompts on the same engine pair stayed coherent.
+
+    Keyed on a long single-character run, NOT on the fraction of letters: run
+    33200976580 showed a correct ' 42' is 0% alphabetic, so a ratio test fails
+    healthy engines on exactly the answer this probe asks for.
     """
     stripped = text.strip()
     if not stripped:
         return True
-    return sum(c.isalpha() for c in stripped) / len(stripped) < 0.3
+    return re.search(r"(.)\1{%d,}" % (_SPEW_RUN - 1), stripped) is not None
 
 
 # Paragraph counts chosen so the resulting prompts straddle both candidate
@@ -677,7 +690,8 @@ def run_context_length_sweep_probe(base_url: str, profile: ModelProfile) -> None
                 "paragraphs": paragraphs,
                 "prompt_tokens": rec.prompt_tokens,
                 "pages": -(-rec.prompt_tokens // profile.page_size),
-                "degenerate": looks_degenerate(rec.text),
+                "answered": _PROBE_ANSWER in rec.text,
+                "spew": looks_degenerate(rec.text),
                 "sample_output": rec.text[:120],
             }
         )
@@ -687,14 +701,15 @@ def run_context_length_sweep_probe(base_url: str, profile: ModelProfile) -> None
         ),
         flush=True,
     )
-    bad = [r for r in results if r["degenerate"]]
+    bad = [r for r in results if not r["answered"]]
     if bad:
         first = bad[0]
         raise AssertionError(
-            "Raw /generate returned degenerate output from "
-            f"{first['prompt_tokens']} prompt tokens ({first['pages']} KV pages) "
-            f"upward; clean below that. No chat template is involved, so the "
-            f"context the model reads is corrupt. Sample: {first['sample_output']!r}"
+            f"Raw /generate stopped answering {_PROBE_ANSWER!r} from "
+            f"{first['prompt_tokens']} prompt tokens ({first['pages']} KV pages, "
+            f"spew={first['spew']}) upward; correct below that. No chat template "
+            "is involved, so the context the model reads is corrupt. "
+            f"Sample: {first['sample_output']!r}"
         )
 
 
@@ -733,11 +748,12 @@ def run_chat_termination_probe(base_url: str, profile: ModelProfile) -> None:
             f"({rec.prompt_tokens} prompt tokens). This is the state that scores "
             f"gsm8k 0.0. First 200 chars: {rec.text[:200]!r}"
         )
-    if looks_degenerate(rec.text):
+    if _PROBE_ANSWER not in rec.text:
         raise AssertionError(
-            "Chat completion returned degenerate output (finish_reason="
-            f"{rec.finish_reason!r}, {rec.prompt_tokens} prompt tokens) -- gsm8k "
-            f"would score 0.0 on this engine pair. First 200 chars: {rec.text[:200]!r}"
+            f"Chat completion did not answer {_PROBE_ANSWER!r} (finish_reason="
+            f"{rec.finish_reason!r}, {rec.prompt_tokens} prompt tokens, "
+            f"spew={looks_degenerate(rec.text)}) -- gsm8k would score 0.0 on this "
+            f"engine pair. First 200 chars: {rec.text[:200]!r}"
         )
 
 
@@ -1275,21 +1291,24 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
             )
             self.assertEqual(body.get("reasoning_effort"), profile.reasoning_effort)
 
-    def test_degeneracy_check_separates_spew_from_prose(self) -> None:
-        # The literal shape observed in run 33171526086 -- if the threshold ever
-        # drifts past real prose, the probes go quiet and the pair's corruption
-        # is again only visible as an hour-long gsm8k scoring 0.0.
+    def test_degeneracy_check_separates_spew_from_real_answers(self) -> None:
+        # Spew as observed in run 33171526086.
         self.assertTrue(looks_degenerate("________" + "\\" * 200))
         self.assertTrue(looks_degenerate(""))
         self.assertTrue(looks_degenerate("   "))
+        # Regression, run 33200976580: the first version thresholded on the
+        # fraction of alphabetic characters, so a correct bare " 42" -- exactly
+        # what the probe prompt asks for -- read as 0% letters and failed a
+        # healthy engine pair at every sweep length, voiding the run.
+        self.assertFalse(looks_degenerate(" 42"))
+        self.assertFalse(looks_degenerate("42"))
+        self.assertFalse(looks_degenerate(" Answer: 42."))
         self.assertFalse(
             looks_degenerate(
                 "General relativity is a theory developed by Albert Einstein "
                 "that describes how gravity works."
             )
         )
-        # Short numeric answers are what the probe's prompt asks for.
-        self.assertFalse(looks_degenerate("The answer is 42."))
 
     def test_chat_probe_prompt_is_long_enough_to_expose_the_failure(self) -> None:
         # The non-termination state only shows on a gsm8k-sized prompt (~900
