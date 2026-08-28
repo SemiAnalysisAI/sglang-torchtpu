@@ -2435,6 +2435,11 @@ class RaidenKVSender(CommonKVSender):
         self._last_chunk = False
         self._started = False
         self.init_time = time.time()
+        # Wire-time window for sglang:kv_transfer_{latency_ms,speed_gb_s}. Kept
+        # separate from `init_time` on purpose: that one is the stall->Failed
+        # budget and is re-stamped as the transfer progresses, so measuring from
+        # it would reproduce the very skew this field exists to remove.
+        self._transfer_start_time: Optional[float] = None
         # Raiden is consumer-pull: the prefill need not wait for any decode
         # handshake before computing (decode pulls once prefill registers its
         # blocks). Advance straight to WaitingForInput so the bootstrap queue
@@ -2462,6 +2467,13 @@ class RaidenKVSender(CommonKVSender):
         if self.kv_mgr.is_dummy_cp_rank or self.kv_mgr.is_aborted(self.bootstrap_room):
             return
         self._record_transfer_indices(kv_indices, state_indices)
+        # Open the window on the first chunk that actually carries payload, so it
+        # spans the same bytes `_record_transfer_indices` accumulates into
+        # `transfer_total_bytes`. Mirrors NixlKVSender.send().
+        if self._transfer_start_time is None and (
+            len(kv_indices) > 0 or state_indices is not None
+        ):
+            self._transfer_start_time = time.perf_counter()
         swa_blocks = (
             self.kv_mgr._swa_blocks_from_state_indices(state_indices)
             if state_indices is not None
@@ -2482,6 +2494,32 @@ class RaidenKVSender(CommonKVSender):
             # overwrite a Failed that landed in between.
             self.kv_mgr.finalize_send(self.bootstrap_room, self.aux_index)
 
+    def _close_transfer_latency_window(self) -> None:
+        """Publish the measured transfer duration for the KV-transfer metrics.
+
+        `CommonKVSender` leaves `transfer_latency_s` unset and, before this,
+        only NixlKVSender filled it in. With it unset,
+        `ReqTimeStats.compute_and_observe_kv_transfer_metrics` falls back to a
+        window that opens when the LAST chunk is staged, while
+        `transfer_total_bytes` accumulates over EVERY chunk -- so
+        `sglang:kv_transfer_speed_gb_s` was inflated by roughly the chunk count
+        (a 1024-token chunked prefill of a 40k-token prompt reported ~30-40x
+        line rate). Supplying the value here keeps numerator and denominator
+        over the same interval.
+
+        Note the window includes the consumer's bootstrap/allocate time: raiden
+        is consumer-pull, so the sender cannot see when the decode actually
+        began pulling. It is therefore an end-to-end handoff duration, and a
+        lower bound on link bandwidth rather than a measurement of it.
+        """
+        if (
+            self._transfer_start_time is not None
+            and self._transfer_metric.transfer_latency_s is None
+        ):
+            self._transfer_metric.transfer_latency_s = (
+                time.perf_counter() - self._transfer_start_time
+            )
+
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
@@ -2499,9 +2537,11 @@ class RaidenKVSender(CommonKVSender):
             self.conclude_state = KVPoll.Failed
             return KVPoll.Failed
         if self.kv_mgr.is_send_done(self.bootstrap_room):
+            self._close_transfer_latency_window()
             self.conclude_state = KVPoll.Success
             return KVPoll.Success
         if status == KVPoll.Success:
+            self._close_transfer_latency_window()
             self.conclude_state = status
             return status
         # Raiden is consumer-pull: the prefill computes without waiting for
