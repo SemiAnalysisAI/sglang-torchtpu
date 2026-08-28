@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.raiden.conn import (
     RaidenKVManager,
     RaidenKVReceiver,
     RaidenKVSender,
+    _TransferIntervalTracker,
 )
 from sglang.srt.disaggregation.raiden.serde import MessageTag
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -43,6 +44,7 @@ def _prefill_manager():
     mgr._completed_send = set()
     mgr._completed_recv = set()
     mgr._failed = set()
+    mgr._send_intervals = _TransferIntervalTracker()
     mgr._native_failed = set()
     mgr._swa_engine = None
     mgr._send_blocks = {}
