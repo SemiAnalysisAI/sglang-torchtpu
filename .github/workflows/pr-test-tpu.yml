@@ -94,7 +94,9 @@ jobs:
   # reserved slice for trusted branches only.
   build:
     needs: decide
-    if: ${{ false }}
+    if: >-
+      needs.decide.outputs.run == 'true'
+      && github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/_tpu-build.yml
     with:
       # PR head SHA (immutable, matches the pushed code) rather than the test-merge
@@ -134,51 +136,11 @@ jobs:
       contents: read
       id-token: write
 
-  source-bisect-before-topk:
-    name: source-bisect-before-topk
-    needs: decide
-    if: ${{ false }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      image: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:0cf0437297be93b06249fa7f09fe58452d9dba5a69ebb97317458e686d1a833f
-      exec_cmd: echo c2V0IC1ldW8gcGlwZWZhaWwKcHl0aG9uMyAtYyAiaW1wb3J0IGltcG9ydGxpYi5tZXRhZGF0YTsgcHJpbnQoXCJUT1JDSF9UUFVfVkVSU0lPTj1cIiArIGltcG9ydGxpYi5tZXRhZGF0YS52ZXJzaW9uKFwidG9yY2gtdHB1XCIpKSIKZXhlYyBweXRob24zIHRlc3QvcmVnaXN0ZXJlZC90cHUvZTJlL3Rlc3RfdHB1X2dwdF9vc3NfMTIwYl9zaW5nbGVob3N0X3ByZWZpeF9jYWNoZV9rdl9vZmZsb2FkX2dzbThrLnB5IC1mCg== | base64 -d | bash
-      hosts: 1
-      weights_pvc: model-weights-rox
-      run_name: source-bisect-before-topk
-    permissions:
-      contents: read
-      id-token: write
-
-  source-bisect-after-topk:
-    name: source-bisect-after-topk
-    needs: decide
-    if: needs.decide.outputs.run == 'true'
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      image: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:0cf0437297be93b06249fa7f09fe58452d9dba5a69ebb97317458e686d1a833f
-      exec_cmd: echo c2V0IC1ldW8gcGlwZWZhaWwKVE9LRU49JChjdXJsIC1zZiAtSCBNZXRhZGF0YS1GbGF2b3I6R29vZ2xlIGh0dHA6Ly9tZXRhZGF0YS5nb29nbGUuaW50ZXJuYWwvY29tcHV0ZU1ldGFkYXRhL3YxL2luc3RhbmNlL3NlcnZpY2UtYWNjb3VudHMvZGVmYXVsdC90b2tlbiB8IHB5dGhvbjMgLWMgImltcG9ydCBqc29uLHN5czsgcHJpbnQoanNvbi5sb2FkKHN5cy5zdGRpbilbXCJhY2Nlc3NfdG9rZW5cIl0pIiApCnB5dGhvbjMgLW0gcGlwIGluc3RhbGwgLS1mb3JjZS1yZWluc3RhbGwgLS1uby1kZXBzIC0taW5kZXgtdXJsICJodHRwczovL29hdXRoMmFjY2Vzc3Rva2VuOiR7VE9LRU59QHVzLXB5dGhvbi5wa2cuZGV2L21sLW9zcy1hcnRpZmFjdHMtdHJhbnNpZW50L3RvcmNoLXRwdS10ZXN0aW5nLXJlZ2lzdHJ5L3NpbXBsZS8iICJ0b3JjaC10cHU9PTAuMS4xLmRldjIwMjYwODI4MDg1NjQzIgpweXRob24zIC1jICJpbXBvcnQgaW1wb3J0bGliLm1ldGFkYXRhOyBwcmludChcIlRPUkNIX1RQVV9WRVJTSU9OPVwiICsgaW1wb3J0bGliLm1ldGFkYXRhLnZlcnNpb24oXCJ0b3JjaC10cHVcIikpIgpleGVjIHB5dGhvbjMgdGVzdC9yZWdpc3RlcmVkL3RwdS9lMmUvdGVzdF90cHVfZ3B0X29zc18xMjBiX3NpbmdsZWhvc3RfcHJlZml4X2NhY2hlX2t2X29mZmxvYWRfZ3NtOGsucHkgLWYK | base64 -d | bash
-      hosts: 1
-      weights_pvc: model-weights-rox
-      run_name: source-bisect-after-topk
-    permissions:
-      contents: read
-      id-token: write
-
   # Aggregator finish job for branch protection / required status checks.
   # If tests are skipped (non-TPU PR), this finishes green immediately.
   # If tests are run, it blocks until all TPU stages finish and fails if any fail.
   pr-test-tpu-finish:
-    needs:
-      [
-        decide,
-        build,
-        unit,
-        e2e,
-        source-bisect-before-topk,
-        source-bisect-after-topk,
-      ]
+    needs: [decide, build, unit, e2e]
     if: always()
     runs-on: ubuntu-latest
     steps:
