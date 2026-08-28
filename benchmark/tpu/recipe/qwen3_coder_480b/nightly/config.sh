@@ -272,6 +272,15 @@ case "$PROFILE" in
         export MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS_OVERRIDE:-877440}
         SWEEP_BS=${SWEEP_BS_OVERRIDE:-"1"}
         SWEEP_LONG=${SWEEP_LONG_OVERRIDE:-"0"}
+        # MAX_RUNNING and TORCH_COMPILE_MAX_BS both default to max(SWEEP_BS)
+        # further down, so shrinking the sweep to one c1 leg also shrank the
+        # compile buckets to bs=1 -- and DP-attention padding then asked for
+        # bucket 8 and killed every scheduler with "Requested size 8 exceeds the
+        # maximum bucket size 1". Pin both to the dp=4 baseline's per-rank 16 so
+        # the server config is identical to the run being compared against and
+        # only DP_SIZE differs.
+        MAX_RUNNING=16
+        TORCH_COMPILE_MAX_BS=16
         # 6 rounds instead of 3, and prefill grows with history, so the 420s cap
         # sized for a 3-round leg would time-box this one and change what it
         # measures. Only one leg runs, so SWEEP_TIMEOUT still has room.
