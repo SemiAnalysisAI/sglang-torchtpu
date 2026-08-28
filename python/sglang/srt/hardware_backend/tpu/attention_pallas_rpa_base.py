@@ -103,6 +103,7 @@ def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch
     # TorchTPU compiled execution binds a view's contiguous base buffer. Without
     # the clone, changing non_empty_bs changes that base from [old_bs + 1] to
     # [new_bs + 1] even though the scalar's logical shape remains unchanged.
+    # Compiler-level tracking: https://github.com/sgl-project/sglang-torchtpu/issues/565
     return cu_q_lens[non_empty_bs].clone()
 
 
