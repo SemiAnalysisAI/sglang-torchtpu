@@ -1,0 +1,74 @@
+name: Refresh TPU Dashboard
+
+# Self-service refresh of https://radixark.github.io/tpu-ci-dashboard/ for PRs
+# carrying the `tpu-dashboard-refresh` label. Two ways in:
+#   * the label being ADDED refreshes immediately (remove + re-add to poke again);
+#   * any TPU test workflow finishing on a branch whose open PR carries the label
+#     refreshes unattended, so a dispatched run's verdict appears without asking.
+#
+# A refresh can NOT move the accuracy/perf trends or the history grid: keel's
+# sync archives only event=schedule runs of the nightly on main, and everything
+# else lands solely in the overview's 24h "latest" snapshot. Labels are
+# triage-gated, so only collaborators can arm this; the dispatched workflow
+# takes no inputs, so nothing PR-controlled reaches keel.
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_run:
+    workflows:
+      - Nightly Test (TPU)
+      - Accuracy Test (TPU)
+      - Perf Test (TPU)
+      - Combo Test (TPU)
+      - Integration Test (TPU)
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# Matrix jobs finishing together collapse into at most one queued refresh here;
+# keel's own concurrency group serializes the syncs themselves.
+concurrency:
+  group: refresh-tpu-dashboard
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    if: >-
+      github.event_name == 'workflow_run' ||
+      github.event.label.name == 'tpu-dashboard-refresh'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # The scheduled nightly also completes here with head_branch=main and no
+      # labeled PR, so the gate filters it -- the nightly has its own sync cron.
+      - name: Gate on a labeled open PR for this run's branch
+        id: gate
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          n=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+                --head "$BRANCH" --label tpu-dashboard-refresh \
+                --json number --jq length)
+          echo "labeled open PR(s) on $BRANCH: $n"
+          echo "hit=$n" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch keel's dashboard sync
+        if: github.event_name == 'pull_request' || steps.gate.outputs.hit != '0'
+        env:
+          # Actions:write on radixark/keel only. Inert until the secret exists,
+          # mirroring the sync workflow's own enablement guard.
+          GH_TOKEN: ${{ secrets.TPU_DASHBOARD_SYNC_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "TPU_DASHBOARD_SYNC_DISPATCH_TOKEN is not set; skipping." >&2
+            exit 0
+          fi
+          gh workflow run tpu-dashboard-sync.yml --repo radixark/keel
+          echo "dashboard sync dispatched"
