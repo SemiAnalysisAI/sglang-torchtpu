@@ -18,7 +18,12 @@ from sglang.test.test_utils import (
 )
 
 register_tpu_ci(est_time=300, suite="stage-b-test-tpu-4-v7")
-register_tpu_ci(est_time=300, suite="nightly-tpu-4-v7", nightly=True)
+register_tpu_ci(
+    est_time=300,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "qwen3-0.6b", "smoke"],
+)
 
 MODEL = "Qwen/Qwen3-0.6B"
 

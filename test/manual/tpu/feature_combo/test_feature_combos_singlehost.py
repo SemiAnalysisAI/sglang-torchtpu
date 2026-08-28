@@ -37,6 +37,21 @@ import sys
 import unittest
 import warnings
 
+# Namespace registration only: this file is launched by path from
+# nightly-test-tpu.yml (exec_cmd), never selected through run_suite. The labels
+# feed the CI dashboard's tag filter.
+try:
+    from sglang.test.ci.ci_register import register_tpu_ci
+except ImportError:  # standalone use outside the CI image
+
+    def register_tpu_ci(*_args, **_kwargs):
+        return None
+
+
+register_tpu_ci(
+    est_time=7200, suite="tpu-feature-combo-exec", labels=["singlehost", "combo"]
+)
+
 MAX_NEW = 12
 HICACHE_RATIO = 3
 

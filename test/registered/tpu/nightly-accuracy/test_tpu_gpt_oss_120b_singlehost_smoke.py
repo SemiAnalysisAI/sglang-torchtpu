@@ -53,7 +53,12 @@ from sglang.test.tpu import gpqa_openai_runner, model_config_main
 # est_time drives the JobSet poll budget, so an under-estimate kills the run. Measured
 # 1913s / 1944s on the 2026-08-05 and 08-04 nightlies; 2400 leaves headroom for GPQA's
 # temperature-1.0 variance. Not auto-refreshed: update_est_time.py omits the tpu backend.
-register_tpu_ci(est_time=2400, suite="nightly-tpu-accuracy-gpt-oss-120b", nightly=True)
+register_tpu_ci(
+    est_time=2400,
+    suite="nightly-tpu-accuracy-gpt-oss-120b",
+    nightly=True,
+    labels=["singlehost", "gpt-oss-120b", "accuracy"],
+)
 
 # Must match --served-model-name in LAUNCH_ENV: every gate sends this as the model id,
 # and it is what the server echoes back in its responses.

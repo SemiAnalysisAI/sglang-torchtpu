@@ -33,7 +33,12 @@ import requests
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase, dump_metric
 
-register_tpu_ci(est_time=1800, suite="nightly-tpu-multihost", nightly=True)
+register_tpu_ci(
+    est_time=1800,
+    suite="nightly-tpu-multihost",
+    nightly=True,
+    labels=["multihost", "qwen3-coder-480b", "agentic"],
+)
 
 # Own launch group: the 480B agentic recipe + the shared ROX weights volume.
 MULTIHOST_LAUNCH = {
