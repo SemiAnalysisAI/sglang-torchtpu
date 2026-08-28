@@ -82,18 +82,13 @@ def _rpa_kernel_spec(backend: str | None):
         from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
             RPA_V3_SPEC as spec,
         )
+    elif backend == "pallas_tpu_rpa_seq":
+        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_seq import (
+            RPA_SEQ_SPEC as spec,
+        )
     else:
         return None
     return spec
-
-
-def _uses_seq_along_lane_kv() -> bool:
-    """Ask the backend, so the pool cannot disagree with the kernel."""
-    from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
-        uses_seq_along_lane_kv,
-    )
-
-    return uses_seq_along_lane_kv()
 
 
 def _apply_page_size_default(server_args) -> None:
@@ -107,7 +102,7 @@ def _apply_page_size_default(server_args) -> None:
     from sglang.srt.arg_groups.overrides import declare_late_resolution
 
     spec = _rpa_kernel_spec(server_args.attention_backend)
-    floor = spec.min_page_size if spec is not None else None
+    floor = spec.page_size_floor() if spec is not None else None
     if server_args.page_size is None:
         default = max(_DEFAULT_PAGE_SIZE, floor or 0)
         declare_late_resolution(
@@ -266,13 +261,17 @@ class TpuSRTPlatform(SRTPlatform):
         # Registered algorithms own their validation and backend integration.
         spec_algo = server_args.speculative_algorithm
         if spec_algo is not None:
-            if server_args.attention_backend == "pallas_tpu_rpa_batched":
-                # It has no draft-backend wiring in speculative.draft_utils,
-                # so reject here with a clear message rather than failing later
-                # during draft-backend creation.
+            unsupported_backends = {
+                server_args.attention_backend,
+                getattr(server_args, "decode_attention_backend", None),
+            } & {"pallas_tpu_rpa_batched", "pallas_tpu_rpa_seq"}
+            if unsupported_backends:
+                # These backends have no draft-backend wiring in
+                # speculative.draft_utils, so reject here with a clear message
+                # rather than failing later during draft-backend creation.
                 raise NotImplementedError(
                     "Speculative decoding is not supported with "
-                    "--attention-backend pallas_tpu_rpa_batched yet. "
+                    f"{', '.join(sorted(unsupported_backends))} yet. "
                     "Use --attention-backend pallas_tpu_rpa_v3 for speculative "
                     "decoding."
                 )
@@ -314,11 +313,13 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     def get_default_attention_backend(self) -> str:
-        # Three Pallas backends are registered for TPU:
-        #   - "pallas_tpu_rpa_v3" (default): ragged_paged_attention v3 kernel
+        # Four Pallas backends are registered for TPU:
+        #   - "pallas_tpu_rpa_v3" (default): ragged-paged-attention v3 kernel
         #     in `pallas/ragged_paged_attention_v3.py`. Single unified kernel
         #     for prefill + decode, fused KV cache (interleaved K/V, packed),
         #     decode-native batched call.
+        #   - "pallas_tpu_rpa_seq": the separately selectable, sequence-layout
+        #     kernel in `pallas/ragged_paged_attention_seq`.
         #   - "pallas_tpu_rpa_batched": the batched RPA kernel in
         #     `pallas/batched_rpa`, a thin subclass of the same shared base as
         #     v3 (see `attention_pallas_rpa_base`). Same fused KV cache, batches
@@ -364,7 +365,13 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang.srt.server_args import get_global_server_args
 
         backend = get_global_server_args().attention_backend
-        if backend == "pallas_tpu_rpa_batched" and _uses_seq_along_lane_kv():
+        spec = _rpa_kernel_spec(backend)
+        if spec is not None and spec.kv_cache_rank == 4:
+            from sglang.srt.hardware_backend.tpu.kv_pool import TpuRpaSeqKVPool
+
+            return TpuRpaSeqKVPool
+
+        if spec is not None and spec.uses_seq_along_lane_kv():
             # SEQ_ALONG_LANE puts the token index on the lane axis, so the
             # buffer shape differs from the fused one the other backends read.
             from sglang.srt.hardware_backend.tpu.kv_pool import (
@@ -373,10 +380,7 @@ class TpuSRTPlatform(SRTPlatform):
 
             return TpuSeqAlongLaneKVPool
 
-        if backend in (
-            "pallas_tpu_rpa_v3",
-            "pallas_tpu_rpa_batched",
-        ):
+        if spec is not None:
             from sglang.srt.hardware_backend.tpu.kv_pool import (
                 TpuFusedMHATokenToKVPool,
             )

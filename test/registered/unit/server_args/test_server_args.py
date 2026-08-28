@@ -1319,13 +1319,16 @@ class TestHiCacheArgs(unittest.TestCase):
                 )
 
     def _make_tpu_offload_args(
-        self, io_backend: str, is_hybrid_swa: bool
+        self,
+        io_backend: str,
+        is_hybrid_swa: bool,
+        attention_backend: str = "pallas_tpu_rpa_v3",
     ) -> ServerArgs:
         args = self._make_args(
             enable_hierarchical_cache=True,
             hicache_io_backend=io_backend,
             hicache_mem_layout="page_first_fused",
-            attention_backend="pallas_tpu_rpa_v3",
+            attention_backend=attention_backend,
         )
         # Short-circuit get_model_config(): the TPU io-backend guards only read
         # attention_arch (use_mla_backend) and is_hybrid_swa.
@@ -1354,6 +1357,15 @@ class TestHiCacheArgs(unittest.TestCase):
         args = self._make_tpu_offload_args("raiden", is_hybrid_swa=False)
         args._handle_hicache()
         self.assertEqual(args.hicache_io_backend, "raiden")
+
+    def test_tpu_io_backend_rejects_rpa_seq_layout(self):
+        args = self._make_tpu_offload_args(
+            "raiden",
+            is_hybrid_swa=False,
+            attention_backend="pallas_tpu_rpa_seq",
+        )
+        with self.assertRaisesRegex(ValueError, "SEQ_ALONG_LANE"):
+            args._handle_hicache()
 
     def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
         args = self._make_args(

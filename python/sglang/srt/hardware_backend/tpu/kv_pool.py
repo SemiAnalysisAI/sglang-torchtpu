@@ -448,11 +448,11 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
 
 
 class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
-    """MHA KV pool in the SEQ_ALONG_LANE layout the batched-RPA kernel reads.
+    """MHA KV pool in the SEQ_ALONG_LANE layout supported by RPA kernels.
 
-    Selected when SGLANG_TPU_USE_SEQ_ALONG_LANE_KV is set. Same paged
-    bookkeeping as the fused pool, different buffer shape -- it must match
-    ``batched_rpa.wrapper.get_kv_cache_shape`` for that layout::
+    Selected when the attention backend resolves to SEQ_ALONG_LANE. Same paged
+    bookkeeping as the fused pool, different buffer shape -- it must match each
+    kernel's ``get_kv_cache_shape`` for that layout::
 
         [num_blocks, num_kv_heads * 2,
          align(head_dim, num_sublanes * kv_packing) // kv_packing, kv_packing,
@@ -487,14 +487,17 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
         tile = num_sublanes * self.kv_packing
         return _cdiv(self.head_dim, tile) * tile
 
-    def _create_buffers(self):
-        shape = (
+    def _buffer_shape(self) -> tuple[int, ...]:
+        return (
             self.num_blocks,
             self.head_num * 2,
             self._head_dim_lanes() // self.kv_packing,
             self.kv_packing,
             self.page_size,
         )
+
+    def _create_buffers(self):
+        shape = self._buffer_shape()
         logger.info(
             "Allocating SEQ_ALONG_LANE TPU KV buffers: layers=%d, shape per layer=%s, "
             "dtype=%s",
@@ -544,12 +547,37 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
         raise NotImplementedError(
             "CPU offloading is not supported for the SEQ_ALONG_LANE KV layout: "
             "a token is a lane, not a row, so the fused pool's row gather does "
-            "not apply. Use --attention-backend pallas_tpu_rpa_batched or v3."
+            "not apply. Select a standard-layout attention backend."
         )
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         raise NotImplementedError(
             "CPU offloading is not supported for the SEQ_ALONG_LANE KV layout."
+        )
+
+
+class TpuRpaSeqKVPool(TpuSeqAlongLaneKVPool):
+    """Native rank-4 cache for the specialized RPA sequence-prefill kernel.
+
+    The head dimension remains contiguous instead of being split into packing
+    axes::
+
+        [num_blocks, num_kv_heads * 2, aligned_head_dim, page_size]
+    """
+
+    def _buffer_shape(self) -> tuple[int, ...]:
+        return (
+            self.num_blocks,
+            self.head_num * 2,
+            self._head_dim_lanes(),
+            self.page_size,
+        )
+
+    def _logical_kv_view(self, layer_id: int) -> torch.Tensor:
+        buf = self.kv_buffer[layer_id - self.start_layer]
+        n_blocks, kv_heads_x2, head_dim, page_size = buf.shape
+        return buf.permute(0, 3, 1, 2).reshape(
+            n_blocks * page_size, kv_heads_x2, head_dim
         )
 
 

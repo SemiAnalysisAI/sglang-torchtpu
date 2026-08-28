@@ -18,7 +18,6 @@ The kernel reads either of two KV cache layouts, chosen once here from
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
 # attention_pallas_rpa_base for why torch_tpu's jax_op needs real annotations).
 
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
     BaseTpuPallasRpaMultiStepDraftBackend,
@@ -31,17 +30,7 @@ __all__ = [
     "TpuPallasRpaBatchedAttnBackend",
     "TpuPallasRpaBatchedMultiStepDraftBackend",
     "kv_layout",
-    "uses_seq_along_lane_kv",
 ]
-
-
-def uses_seq_along_lane_kv() -> bool:
-    """Whether the KV cache is in the seq-along-lane layout.
-
-    The kernel, the pool that allocates the buffer and the page-size floor all
-    have to agree, so they all ask here instead of reading the flag separately.
-    """
-    return envs.SGLANG_TPU_USE_SEQ_ALONG_LANE_KV.get()
 
 
 def kv_layout():
@@ -51,7 +40,7 @@ def kv_layout():
     """
     from sglang.srt.layers.attention.pallas.batched_rpa import configs
 
-    if uses_seq_along_lane_kv():
+    if RPA_BATCHED_SPEC.uses_seq_along_lane_kv():
         return configs.KVLayout.SEQ_ALONG_LANE
     return configs.KVLayout.HEAD_ALONG_SUBLANE
 
@@ -123,6 +112,7 @@ RPA_BATCHED_SPEC = RpaKernelSpec(
     extend_distribution_mask=(0, 0, 1),  # [0, 0, n] (MIXED-only)
     uses_draft_extend_v2=False,
     min_page_size=_MIN_PAGE_SIZE,
+    seq_along_lane_min_page_size=_MIN_PAGE_SIZE,
 )
 
 

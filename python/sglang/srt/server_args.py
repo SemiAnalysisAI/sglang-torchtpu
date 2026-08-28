@@ -205,6 +205,7 @@ ATTENTION_BACKEND_CHOICES = [
     # TPU specific
     "pallas_tpu_flash",
     "pallas_tpu_rpa_v3",
+    "pallas_tpu_rpa_seq",
     "pallas_tpu_rpa_batched",
     "pallas_tpu_mla",
     # Other platforms
@@ -5684,6 +5685,7 @@ class ServerArgs:
                     "aiter",
                     # TPU
                     "pallas_tpu_rpa_v3",
+                    "pallas_tpu_rpa_seq",
                     "pallas_tpu_rpa_batched",
                 ]
                 prefill_attn_backend, decode_attn_backend = (
@@ -7587,11 +7589,18 @@ class ServerArgs:
                     "the TPU KV-offload io backend."
                 )
 
+            if self.attention_backend == "pallas_tpu_rpa_seq":
+                raise ValueError(
+                    "TPU KV offloading does not support the SEQ_ALONG_LANE "
+                    "cache layout. Select pallas_tpu_rpa_v3 or disable "
+                    "hierarchical cache."
+                )
+
             if self.attention_backend != "pallas_tpu_rpa_v3":
                 raise ValueError(
                     f"{self.hicache_io_backend} KV offloading requires "
-                    "--attention-backend pallas_tpu_rpa_v3 (the only TPU backend "
-                    "with the HiCache reload-commit hook and fused KV pool), but "
+                    "the pallas_tpu_rpa_v3 backend with the HiCache "
+                    "reload-commit hook, but "
                     f"got {self.attention_backend!r}. Re-run with "
                     "--attention-backend pallas_tpu_rpa_v3, or disable KV offload."
                 )

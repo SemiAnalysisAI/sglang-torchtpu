@@ -1553,11 +1553,10 @@ class Envs:
     SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
     # Workaround for a TPU v7 warmup crash; disable to debug the root cause.
     SGLANG_TPU_ENABLE_CONTIGUOUS_FLOAT_LOGITS = EnvBool(True)
-    # Read the RPA KV cache in the SEQ_ALONG_LANE layout (token index on the
-    # lane axis) instead of the token-major fused one. num_kv_heads*2 is
-    # unpadded there, so at one KV head per rank and fp8 KV it is 256 bytes per
-    # token against 512, which is what lets long context and large batches fit.
-    # Opt-in: it changes the KV pool's buffer shape.
+    # Select SEQ_ALONG_LANE for RPA backends that support both layouts (currently
+    # batched RPA). The pallas_tpu_rpa_seq backend always uses SEQ_ALONG_LANE.
+    # num_kv_heads*2 is unpadded there, so at one KV head per rank and fp8 KV it
+    # is 256 bytes per token instead of 512. Opt-in changes the KV pool's shape.
     SGLANG_TPU_USE_SEQ_ALONG_LANE_KV = EnvBool(False)
     # Pin the RPA prefill/MIXED k-block instead of deriving it from the VMEM
     # budget. Escape hatch for a shape or a chip where that derivation is

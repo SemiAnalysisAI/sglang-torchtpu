@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import torch.compiler.config as compiler_config
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -134,6 +135,7 @@ class TestTpuCompileCache(CustomTestCase):
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_base.py",
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_batched.py",
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_v3.py",
+                srt_root / "hardware_backend/tpu/attention_pallas_rpa_seq.py",
                 srt_root / "hardware_backend/tpu/kernels/kernel.py",
                 srt_root / "hardware_backend/tpu/pallas_export.py",
                 srt_root / "hardware_backend/tpu/pallas_jax_op.py",
@@ -265,7 +267,11 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         self.assertEqual(args.mem_fraction_static, 0.40)
 
     def test_rpa_backends_default_to_fp8_kv_cache(self):
-        for backend in ("pallas_tpu_rpa_v3", "pallas_tpu_rpa_batched"):
+        for backend in (
+            "pallas_tpu_rpa_v3",
+            "pallas_tpu_rpa_seq",
+            "pallas_tpu_rpa_batched",
+        ):
             with self.subTest(backend=backend):
                 args = self._args(attention_backend=backend)
                 self._apply(args)
@@ -301,6 +307,22 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         self._apply(args)
         self.assertEqual(args.page_size, 512)
 
+    def test_rpa_seq_layout_uses_its_page_size_floor(self):
+        with envs.SGLANG_TPU_USE_SEQ_ALONG_LANE_KV.override(False):
+            args = self._args(attention_backend="pallas_tpu_rpa_seq")
+            self._apply(args)
+            self.assertEqual(args.page_size, 128)
+
+            with self.assertRaisesRegex(ValueError, "page-size >= 128"):
+                self._apply(
+                    self._args(attention_backend="pallas_tpu_rpa_seq", page_size=64)
+                )
+
+    def test_legacy_v3_rejects_seq_layout(self):
+        with envs.SGLANG_TPU_USE_SEQ_ALONG_LANE_KV.override(True):
+            with self.assertRaisesRegex(ValueError, "does not support"):
+                self._apply(self._args(attention_backend="pallas_tpu_rpa_v3"))
+
     def test_enable_torch_compile_preserved_when_opted_in(self):
         args = self._args(enable_torch_compile=True)
         self._apply(args)
@@ -315,6 +337,14 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
     def test_unsupported_builtin_spec_algorithm_is_rejected(self):
         args = self._args(speculative_algorithm="NGRAM")
         with self.assertRaisesRegex(NotImplementedError, "only EAGLE3"):
+            self._apply(args)
+
+    def test_rpa_seq_rejects_speculative_decoding(self):
+        args = self._args(
+            attention_backend="pallas_tpu_rpa_seq",
+            speculative_algorithm="EAGLE3",
+        )
+        with self.assertRaisesRegex(NotImplementedError, "pallas_tpu_rpa_seq"):
             self._apply(args)
 
     def test_dp_attention_requires_dp_lm_head_when_attn_tp_gt_1(self):
