@@ -109,6 +109,21 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
         )
         return backend._build_metadata(forward_batch, non_empty_bs=1)
 
+    def _build_padded_decode_metadata(self, backend, active_bs):
+        physical_bs = 128
+        seq_lens = torch.full((physical_bs,), 100, dtype=torch.int32)
+        req_pool_indices = torch.zeros(physical_bs, dtype=torch.int64)
+        forward_batch = SimpleNamespace(
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.clone(),
+            req_pool_indices=req_pool_indices,
+            req_pool_indices_cpu=req_pool_indices.clone(),
+            forward_mode=ForwardMode.DECODE,
+            extend_seq_lens=None,
+            spec_info=None,
+        )
+        return backend._build_metadata(forward_batch, non_empty_bs=active_bs)
+
     def test_pages_per_seq_uses_context_plus_spec_headroom(self):
         backend = self._make_backend()
         # extra = max(4 + draft, 2*max(steps*topk, draft) + page - 1) = 79
@@ -220,6 +235,27 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
         )
         meta_empty_list = backend._build_metadata(fb_empty_list, non_empty_bs=0)
         self.assertIsNotNone(meta_empty_list)
+
+    def test_active_num_tokens_owns_scalar_storage_for_padded_decode(self):
+        for req_to_token_device in ("cpu", "meta"):
+            with self.subTest(req_to_token_device=req_to_token_device):
+                backend = self._make_backend(req_to_token_device=req_to_token_device)
+                for active_bs in (128, 125):
+                    with self.subTest(active_bs=active_bs):
+                        metadata = self._build_padded_decode_metadata(
+                            backend, active_bs
+                        )
+
+                        self.assertEqual(metadata.cu_q_lens.shape, (129,))
+                        self.assertEqual(metadata.active_num_tokens.shape, ())
+                        self.assertEqual(metadata.active_num_tokens.item(), active_bs)
+                        self.assertNotEqual(
+                            metadata.active_num_tokens.untyped_storage().data_ptr(),
+                            metadata.cu_q_lens.untyped_storage().data_ptr(),
+                        )
+
+                        metadata.cu_q_lens[active_bs] = -1
+                        self.assertEqual(metadata.active_num_tokens.item(), active_bs)
 
 
 class TestInactiveRpaRows(unittest.TestCase):

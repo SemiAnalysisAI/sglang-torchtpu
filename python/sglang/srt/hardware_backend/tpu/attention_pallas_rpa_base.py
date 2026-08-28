@@ -98,6 +98,14 @@ class PallasForwardMetadata:
     swa_page_indices: torch.Tensor | None = None
 
 
+def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
+    """Return an owned scalar whose compiled input layout is batch-independent."""
+    # TorchTPU compiled execution binds a view's contiguous base buffer. Without
+    # the clone, changing non_empty_bs changes that base from [old_bs + 1] to
+    # [new_bs + 1] even though the scalar's logical shape remains unchanged.
+    return cu_q_lens[non_empty_bs].clone()
+
+
 def _zero_inactive_rpa_rows(
     output: torch.Tensor, active_num_tokens: torch.Tensor
 ) -> torch.Tensor:
@@ -657,7 +665,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             cu_kv_lens=cu_kv_lens,
             page_indices=page_indices,
             distribution=distribution,
-            active_num_tokens=cu_q_lens[non_empty_bs],
+            active_num_tokens=_make_active_num_tokens(cu_q_lens, non_empty_bs),
             swa_page_indices=swa_page_indices,
         )
 
@@ -777,7 +785,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             cu_kv_lens=cu_kv_lens.to(device, non_blocking=True),
             page_indices=page_indices.to(device, non_blocking=True),
             distribution=distribution,
-            active_num_tokens=cu_q_lens[non_empty_bs],
+            active_num_tokens=_make_active_num_tokens(cu_q_lens, non_empty_bs),
             swa_page_indices=swa_page_indices,
         )
 
