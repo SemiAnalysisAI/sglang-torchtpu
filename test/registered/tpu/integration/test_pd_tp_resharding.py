@@ -363,6 +363,13 @@ def _common_launch_env(
         "QUANTIZATION": profile.quantization,
         "KV_CACHE_DTYPE": profile.kv_cache_dtype,
         "DISABLE_RADIX_CACHE": "0",
+        # Raiden gives rank r the control port base + 4*r, so the default base
+        # of 30000 puts rank 0 exactly on PREFILL_PORT/DECODE_PORT. The engine
+        # binds first, then uvicorn fails with "[Errno 98] address already in
+        # use", shuts the app down and takes the process tree with it -- the
+        # server never becomes healthy and no transfer is ever attempted. Every
+        # other P/D test already moves the base to 31000; this one did not.
+        "SGLANG_RAIDEN_KV_PORT": values.get("SGLANG_RAIDEN_KV_PORT", "31000"),
         "ENABLE_TORCH_COMPILE": values.get("ENABLE_TORCH_COMPILE", "1"),
         "TORCH_COMPILE_MAX_BS": values.get("TORCH_COMPILE_MAX_BS", "8"),
         "TPU_ENABLE_DIAGNOSTIC_COORDINATOR": "0",
@@ -942,6 +949,20 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
     def test_gpt_oss_does_not_force_quantization(self) -> None:
         env = build_prefill_env(MODEL_PROFILES["gpt_oss_120b"], 2, env={})
         self.assertEqual(env["QUANTIZATION"], "")
+
+    def test_raiden_port_does_not_collide_with_service_ports(self) -> None:
+        """Raiden binds base + 4*rank per rank, so a base of 30000 puts rank 0
+        on the HTTP port and uvicorn dies with EADDRINUSE before the server is
+        ever healthy -- observed as a bring-up crash with no transfer attempted
+        (combo run 33256868716). Same guard the other P/D tests carry."""
+        for profile in MODEL_PROFILES.values():
+            for env in (
+                build_prefill_env(profile, 2, env={}),
+                build_decode_env(profile, 2, env={}),
+            ):
+                raiden_base = int(env["SGLANG_RAIDEN_KV_PORT"])
+                for port in (PREFILL_PORT, DECODE_PORT, LB_PORT, BOOTSTRAP_PORT):
+                    self.assertNotIn(port, range(raiden_base, raiden_base + 4 * 16))
 
     def test_peer_hostname_maps_only_the_role_segment(self) -> None:
         self.assertEqual(
