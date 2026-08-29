@@ -117,8 +117,10 @@ def _dump_leg_metrics(leg):
         dump_metric(f"{tag}.{field}", value, labels=labels)
 
 
-def _print_leg_digest(summary) -> None:
-    """One short line per leg, printed BEFORE the results payload.
+def _print_workload_digest(summary) -> None:
+    """One short line per workload, printed BEFORE the results payload.
+
+    "workload" matches the metric labels; summary.json's schema still says legs.
 
     The payload is the fragile half of the egress (see `_emit_result_json`), and
     on 2026-08-26 and 08-28 the job log ended on the RESULT_BEGIN marker -- so the
@@ -127,11 +129,11 @@ def _print_leg_digest(summary) -> None:
     dozen bytes each and carry exactly the fields the gates below read, so a
     triage never depends on the payload surviving.
     """
-    for leg in summary.get("legs") or []:
-        derived = leg.get("feature_derived") or {}
-        metrics = leg.get("metrics") or {}
+    for workload in summary.get("legs") or []:
+        derived = workload.get("feature_derived") or {}
+        metrics = workload.get("metrics") or {}
         print(
-            f"[leg] {leg.get('tag')} status={leg.get('status')} "
+            f"[workload] {workload.get('tag')} status={workload.get('status')} "
             f"prefix_cache_hit_rate={derived.get('prefix_cache_hit_rate')} "
             f"output_throughput={metrics.get('output_throughput')}",
             flush=True,
@@ -299,7 +301,7 @@ class TestTpuQwen3Coder480bMultihostAgentic(CustomTestCase):
             )
         with open(summary_path) as f:
             summary = json.load(f)
-        _print_leg_digest(summary)
+        _print_workload_digest(summary)
         _emit_result_json(summary)
         return summary
 

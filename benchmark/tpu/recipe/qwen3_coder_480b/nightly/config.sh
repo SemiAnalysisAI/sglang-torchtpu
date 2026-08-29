@@ -123,6 +123,10 @@ COLOCATED_TP=16
 # cache could not hit even once. dp=2 with the 6-round session set below reaches
 # 2/3 of the ideal; measured 50.02% against a predicted 50.5%.
 # Overridable so a sweep can vary it without editing this file.
+#
+# TODO(revisit): dp=2 is for cache reachability, not speed -- attn_tp=2 (dp=8)
+# is typically the faster TPU v7 layout. It needs cache-aware routing first: by
+# the formula above, dp=8 alone would want R >= 34 (~174k context per session).
 COLOCATED_DP=${COLOCATED_DP:-2} # -> attn_tp = 16/2 = 8
 PD_TP=8
 PD_DP=2                         # -> attn_tp = 8/2 = 4
