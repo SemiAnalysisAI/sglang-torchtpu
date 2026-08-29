@@ -5,10 +5,10 @@ import argparse
 import ast
 import glob
 import json
-import os
-import re
 import shlex
 import sys
+
+from test_names import names_from_path
 
 
 def _literal(node):
@@ -89,11 +89,10 @@ def _multihost_entries(found):
         )
     output = []
     for (script, weights, hosts), entry in groups.items():
-        base = os.path.basename(script).lower().removesuffix(".sh").removesuffix("_mh")
-        slug = re.sub(r"[^a-z0-9]+", "-", base).strip("-")
+        names = names_from_path(sorted(entry["files"])[0])
         output.append(
             {
-                "name": f"mh-{slug}",
+                **names,
                 "launch_script": script,
                 "weights_pvc": weights,
                 "hosts": hosts,
