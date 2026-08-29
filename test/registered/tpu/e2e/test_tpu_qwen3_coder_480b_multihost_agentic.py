@@ -117,6 +117,55 @@ def _dump_leg_metrics(leg):
         dump_metric(f"{tag}.{field}", value, labels=labels)
 
 
+def _print_workload_digest(summary) -> None:
+    """One short line per workload, printed BEFORE the results payload.
+
+    "workload" matches the metric labels; summary.json's schema still says legs.
+
+    The payload is the fragile half of the egress (see `_emit_result_json`), and
+    on 2026-08-26 and 08-28 the job log ended on the RESULT_BEGIN marker -- so the
+    gsm8k-style verdict, the failing assertion and the TIMINGS record were all
+    lost behind it and the red run said nothing about why. These lines are a few
+    dozen bytes each and carry exactly the fields the gates below read, so a
+    triage never depends on the payload surviving.
+    """
+    for workload in summary.get("legs") or []:
+        derived = workload.get("feature_derived") or {}
+        metrics = workload.get("metrics") or {}
+        print(
+            f"[workload] {workload.get('tag')} status={workload.get('status')} "
+            f"prefix_cache_hit_rate={derived.get('prefix_cache_hit_rate')} "
+            f"output_throughput={metrics.get('output_throughput')}",
+            flush=True,
+        )
+
+
+def _emit_result_json(summary) -> None:
+    """Print the summary between the markers, shaped to survive the log stream.
+
+    The only egress from a TPU JobSet is the streamed pod log, and containerd caps
+    a single log record at 16 KiB -- a summary emitted as one long line is split
+    into CRI partial records and has twice taken the rest of the job log with it.
+    `indent` keeps every line short without changing what the consumer sees:
+    _tpu-test.yml's awk rejoins the block with newlines, and pretty-printed JSON
+    only ever breaks BETWEEN tokens, so the rejoined text parses identically.
+    Chunking a single line at a fixed width would not -- it would drop a newline
+    inside a string literal and corrupt the payload.
+    """
+    try:
+        blob = json.dumps(summary, sort_keys=True, default=str, indent=1)
+    except (TypeError, ValueError) as exc:
+        # sort_keys raises on mixed-type keys. A lost payload is recoverable from
+        # the digest above; an exception here happens in setUpClass and would take
+        # down every gate in the file, reporting nothing about the sweep itself.
+        print(f"{RESULT_BEGIN}\n{RESULT_END}", flush=True)
+        print(f"[480b-agentic] summary not serializable, payload skipped: {exc!r}")
+        return
+    print(RESULT_BEGIN, flush=True)
+    print(blob, flush=True)
+    print(RESULT_END, flush=True)
+
+
 def _achievable_prefix_hit_rate(config):
     """Prefix-cache hit rate a leg of this shape would get with a perfect cache.
 
@@ -252,10 +301,8 @@ class TestTpuQwen3Coder480bMultihostAgentic(CustomTestCase):
             )
         with open(summary_path) as f:
             summary = json.load(f)
-        # Only egress from the JobSet is this log; _tpu-test.yml lifts it out.
-        print(RESULT_BEGIN, flush=True)
-        print(json.dumps(summary, sort_keys=True, default=str), flush=True)
-        print(RESULT_END, flush=True)
+        _print_workload_digest(summary)
+        _emit_result_json(summary)
         return summary
 
     def _legs(self):
