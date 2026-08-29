@@ -247,10 +247,6 @@ class RaidenKVManager(CommonKVManager):
             # pushes still running, so the room counts as sent only after the
             # last one.
             self._reshard_chunks: Dict[int, Dict[int, Tuple[int, List[int]]]] = {}
-            # Page spans whose chunk plan this decode registered; the
-            # closing plan covers exactly the pages outside their union, so a
-            # chunk that lost its race anywhere in the range is not skipped.
-            self._reshard_covered: Dict[int, List[Tuple[int, int]]] = {}
             # Pages each decode declared for its closing push, from its
             # RESHARD_READY. The closing push moves exactly these.
             self._reshard_ready_pages: Dict[int, List[int]] = {}
@@ -296,6 +292,17 @@ class RaidenKVManager(CommonKVManager):
             # closing plan waits for them so completion never overtakes one.
             self._reshard_chunk_registering: Dict[int, Set[int]] = {}
             self._reshard_plans: Dict[int, Dict[str, int]] = {}
+            # Page spans whose chunk plan this decode registered; the closing
+            # plan covers exactly the pages outside their union, so a chunk
+            # that lost its race anywhere in the range is not skipped. Decode
+            # state: _on_reshard_chunk records the spans and
+            # _register_receiver_and_signal takes their complement. It used to
+            # be declared in the prefill branch above, where neither reader
+            # could see it -- the decode died with "object has no attribute
+            # '_reshard_covered'" the first time a resharding room announced a
+            # chunk. Nothing caught it because until now no CI run reached the
+            # decode-side chunked reshard path at all.
+            self._reshard_covered: Dict[int, List[Tuple[int, int]]] = {}
             self._uuid_seq = 0
 
         # Asymmetric-TP resharding state, populated lazily on the push path.
