@@ -322,7 +322,7 @@ case "$MODE" in
         # P/D is disabled: the TPU CI's multi-host primitive runs ONE recipe on every
         # host (a single global TP group), so it cannot bring up a prefill engine and
         # a decode engine as separate roles -- jobset-tpu.yaml says as much ("true
-        # per-group gating for P/D is future work... which MULTIHOST_LAUNCH does not
+        # per-group gating for P/D is future work... which TPU_LAUNCH does not
         # model yet"). The engines and the router below still work when you launch
         # them yourself, so this is a guard, not a removal.
         if [[ "${ALLOW_PD:-0}" != "1" ]]; then

@@ -189,8 +189,9 @@ NIGHTLY_SUITES = {
         "full-16-npu-a3",
     ],
     HWBackend.TPU: [
-        "nightly-tpu-4-v7",
+        "nightly-tpu-singlehost",
         "nightly-tpu-multihost",
+        "nightly-tpu-pd",
         # One suite per perf model, so the nightly can fan them out as separate
         # jobs on separate slices instead of one sequential single-host job.
         "nightly-tpu-perf-gpt-oss-120b",

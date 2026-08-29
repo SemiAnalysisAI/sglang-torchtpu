@@ -5,7 +5,7 @@
 # This mirrors the E2E-validated recipe/mimo/launch_mimo_25_pro_multihost.sh (PR #155)
 # -- keep the two in sync. It re-states that env rather than exec'ing it because the
 # validated recipe hardcodes its prefill sizing; the CI variant differs only in:
-#   * MODEL defaults to the ROX Hyperdisk mount (MULTIHOST_LAUNCH.weights_pvc;
+#   * MODEL defaults to the ROX Hyperdisk mount (TPU_LAUNCH.weights_pvc;
 #     hydrate via .github/tpu-ci/hydrate-mimo25pro.yaml)
 #   * CHUNKED_PREFILL_SIZE / MAX_PREFILL_TOKENS raised 4096 -> 8192, and 8192 added
 #     to TPU_COMPILE_TOKENS: a prefill shape outside the precompiled buckets takes

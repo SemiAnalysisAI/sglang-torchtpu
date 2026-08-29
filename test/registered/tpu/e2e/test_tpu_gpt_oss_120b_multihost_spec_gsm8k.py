@@ -8,7 +8,8 @@ from sglang.test.tpu import model_config_main
 
 register_tpu_ci(est_time=3600, suite="nightly-tpu-multihost", nightly=True)
 
-MULTIHOST_LAUNCH = {
+TPU_LAUNCH = {
+    "mode": "multihost",
     "hosts": 2,
     "launch_script": "recipe/gpt_120b_spec_mh.sh",
     "weights_pvc": "model-weights-rox",

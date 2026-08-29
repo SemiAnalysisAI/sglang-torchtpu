@@ -4,7 +4,7 @@ The JobSet -- not this file -- brings the server up, so the model config supplie
 ExternalServerLauncher: the shared runner waits for /health_generate and never
 launches or kills anything.
 
-Its MULTIHOST_LAUNCH forms its own launch group: recipe/mimo_v25_pro_mh.sh on 2 hosts.
+Its TPU_LAUNCH forms its own launch group: recipe/mimo_v25_pro_mh.sh on 2 hosts.
 The recipe mirrors the E2E-validated DP-attention config from
 recipe/mimo/launch_mimo_25_pro_multihost.sh (PR #155): tp=16, ep=16, dp=2 ->
 attention_tp=8, mem_fraction 0.7, max_running 8 -- with prefill raised to 8192.
@@ -33,7 +33,8 @@ from sglang.test.tpu import model_config_main
 register_tpu_ci(est_time=5400, suite="nightly-tpu-multihost", nightly=True)
 
 # Own launch group: MiMo-V2.5-Pro DP-attention recipe + the MiMo ROX weights volume.
-MULTIHOST_LAUNCH = {
+TPU_LAUNCH = {
+    "mode": "multihost",
     "hosts": 2,
     "launch_script": "recipe/mimo_v25_pro_mh.sh",
     "weights_pvc": "model-weights-rox",

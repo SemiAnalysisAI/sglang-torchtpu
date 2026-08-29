@@ -16,7 +16,7 @@ as does ${SERVICE_ACCOUNT} (empty -> namespace default KSA).
 
 Also computes the CI poll budget for a suite (--print-wait-seconds): a static AST scan
 of the registered tree sums est_time over the suite's enabled tests -- no sglang import
-needed (same technique as discover_multihost.py). The workflow uses it so the poll
+needed (same technique as discover_tpu.py). The workflow uses it so the poll
 timeout scales with the suite instead of a fixed ceiling.
 
 A third mode renders jobset-tpu-pd.yaml instead: P/D disaggregation across TWO

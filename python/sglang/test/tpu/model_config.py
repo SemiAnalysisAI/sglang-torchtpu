@@ -4,7 +4,7 @@ Adding a model means copying a test file and editing its dict. This module turns
 dict into the launcher, the ``AccuracyTestParams`` list and the ``run_combined_tests``
 call, so a test file is a register call, a dict, and two lines to run it:
 
-    register_tpu_ci(est_time=10800, suite="nightly-tpu-4-v7", nightly=True)
+    register_tpu_ci(est_time=10800, suite="nightly-tpu-singlehost", nightly=True)
 
     MODEL_CONFIG = {
         "model": "/weights/gpt-oss-120b",

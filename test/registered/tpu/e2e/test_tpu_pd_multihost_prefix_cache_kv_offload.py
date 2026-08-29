@@ -75,7 +75,15 @@ except ModuleNotFoundError as exc:
 
 # One invocation runs ONE model profile: two engines (weight load + compile),
 # the cache probe with device-pool churn, and gsm8k.
-register_tpu_ci(est_time=10800, suite="tpu-integration")
+register_tpu_ci(est_time=10800, suite="nightly-tpu-pd", nightly=True)
+TPU_LAUNCH = {
+    "mode": "pd",
+    "name": "pd-mh-gpt-120b-pc-offload",
+    "prefill_hosts": 2,
+    "decode_hosts": 2,
+    "env": {"MODEL_PROFILE": "gpt_oss_120b"},
+    "weights_pvc": "model-weights-rox",
+}
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, *[".."] * 4))

@@ -24,11 +24,12 @@ from sglang.test.tpu import model_config_main
 
 # Out of the nightly lane while W4A16 int4 MoE and MoonViT torch.compile support
 # land: on-demand suite, discovered by accuracy-test-tpu.yml
-# (-f model=kimi-k26). `disabled=` did not park it -- discover_multihost.py does
+# (-f model=kimi-k26). `disabled=` did not park it -- discover_tpu.py does
 # not read that field -- so the suite name is what keeps it out of the nightly.
 register_tpu_ci(est_time=7200, suite="nightly-tpu-multihost-ondemand", nightly=True)
 
-MULTIHOST_LAUNCH = {
+TPU_LAUNCH = {
+    "mode": "multihost",
     "hosts": 2,
     "launch_script": "recipe/kimi_k26_mh.sh",
     "weights_pvc": "model-weights-rox",

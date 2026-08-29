@@ -1,7 +1,7 @@
 """Qwen3-Coder-480B-A35B-Instruct-FP8 multi-turn agentic serving benchmark
 (live-server mode), the colocated half of the team's standard 480B contract.
 
-Its MULTIHOST_LAUNCH forms its own launch group: recipe/qwen3_coder_480b_agentic_mh.sh
+Its TPU_LAUNCH forms its own launch group: recipe/qwen3_coder_480b_agentic_mh.sh
 on 2 hosts, i.e. tp=16 / ep=16 / dp=4 -> attention_tp=4, prefix caching + HiCache
 KV offload on, 1M server context. The CI runs this file on rank-0 against the
 server the JobSet brought up; it skips unless a live server is provided.
@@ -36,7 +36,8 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase, dump_me
 register_tpu_ci(est_time=1800, suite="nightly-tpu-multihost", nightly=True)
 
 # Own launch group: the 480B agentic recipe + the shared ROX weights volume.
-MULTIHOST_LAUNCH = {
+TPU_LAUNCH = {
+    "mode": "multihost",
     "hosts": 2,
     "launch_script": "recipe/qwen3_coder_480b_agentic_mh.sh",
     "weights_pvc": "model-weights-rox",

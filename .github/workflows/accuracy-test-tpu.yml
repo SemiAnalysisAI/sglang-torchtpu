@@ -88,7 +88,8 @@ jobs:
           MODEL: ${{ inputs.model || 'all' }}
         run: |
           set -euo pipefail
-          groups="$(python3 .github/tpu-ci/discover_multihost.py \
+          groups="$(python3 .github/tpu-ci/discover_tpu.py \
+                      --mode multihost \
                       --suite nightly-tpu-multihost-ondemand)"
           if [ "$MODEL" != "all" ]; then
             groups="$(jq -c --arg m "$MODEL" \

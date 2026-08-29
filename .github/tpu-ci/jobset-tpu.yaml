@@ -171,7 +171,7 @@ ${WEIGHTS_VOLUME}
                         # may not exercise every group. NOTE: this JobSet runs ONE global
                         # TP group (every host runs the same recipe; TP spans all hosts) --
                         # true per-group gating for P/D is future work (needs role-aware
-                        # launch, which MULTIHOST_LAUNCH does not model yet). Teardown-
+                        # launch, which TPU_LAUNCH does not model yet). Teardown-
                         # induced exits (leader gone -> peer disconnect / SIGTERM 143) pass.
                         wait "$spid"; src=$?
                         # 137 is ALSO how normal teardown manifests: rank-0 finishes its

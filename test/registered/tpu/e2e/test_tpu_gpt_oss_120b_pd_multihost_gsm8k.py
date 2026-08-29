@@ -32,7 +32,15 @@ except ModuleNotFoundError as exc:
         return None
 
 
-register_tpu_ci(est_time=7200, suite="tpu-integration", nightly=True)
+register_tpu_ci(est_time=7200, suite="nightly-tpu-pd", nightly=True)
+TPU_LAUNCH = {
+    "mode": "pd",
+    "name": "pd-mh-gpt-120b",
+    "prefill_hosts": 2,
+    "decode_hosts": 2,
+    "args": "integration",
+    "weights_pvc": "model-weights-rox",
+}
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, *[".."] * 4))

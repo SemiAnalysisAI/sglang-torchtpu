@@ -77,24 +77,31 @@ container branches on `NNODES` (from GKE's `TPU_WORKER_HOSTNAMES`):
 ### Multi-host = test-owned launch, grouped by setup
 
 The model+config is **not** bound to a suite — each multi-host test file declares its
-own launch in a module-level `MULTIHOST_LAUNCH` dict:
+own launch in a module-level `TPU_LAUNCH` dict:
 
 ```python
-MULTIHOST_LAUNCH = {"hosts": 2, "launch_script": "recipe/qwen3_30b_a3b_fp8_mh.sh",
-                    "weights_pvc": "model-weights-rox"}   # weights_pvc optional
+TPU_LAUNCH = {"mode": "multihost", "hosts": 2,
+              "launch_script": "recipe/qwen3_30b_a3b_fp8_mh.sh",
+              "weights_pvc": "model-weights-rox"}   # weights_pvc optional
 ```
 
 `launch_script` is a recipe under `benchmark/tpu/recipe/` that sets `MODEL`/`EP_SIZE`/…
-and execs `launch_server.sh`. `discover_multihost.py` scans the files registered to a
+and execs `launch_server.sh`. `discover_tpu.py` scans the files registered to a
 suite, **groups** those with an identical `(launch_script, weights_pvc, hosts)`, and
 emits one group per unique setup. Each group → **one** JobSet: launch the server once,
 rank 0 runs every file in the group against it. So files with the same setup **share a
 launched server** (no redundant bring-up); different setups get their own server.
 
 To add a **single-host** suite: `register_*_ci(..., suite="…")`, add it to `run_suite.py`,
-and call `_tpu-test` with that `suite`. To add a **multi-host** test: drop a file with a
-`MULTIHOST_LAUNCH` dict (+ a recipe) registered to `nightly-tpu-multihost` — discovery
+and call `_tpu-test` with that `suite`. Standard single-host tests omit `TPU_LAUNCH`;
+its absence means the ordinary one-host suite runner. To add a **multi-host** test: drop a
+file with a
+`TPU_LAUNCH` dict (+ a recipe) registered to `nightly-tpu-multihost` — discovery
 picks it up and groups it automatically; identical setup joins an existing group's server.
+
+P/D tests use the same declaration with `"mode": "pd"`, plus `prefill_hosts`,
+`decode_hosts`, and a stable `name`. `discover_tpu.py --mode pd` emits one matrix entry
+per test instead of grouping them, because each entry renders separate prefill and decode roles.
 
 ## Pipelines
 
@@ -105,13 +112,13 @@ picks it up and groups it automatically; identical setup joins an existing group
 ```
 build ─────────────────────────────────┐
   ├─▶ single-host           (hosts=1)  3 LPT shards, max-parallel: 1
-  │    suite: nightly-tpu-4-v7
+  │    suite: nightly-tpu-singlehost
   ├─▶ singlehost-combo      (hosts=1)  │  exec: feature_combo singlehost
   ├─▶ combo-mh-spec         (hosts=2)  │  exec: feature_combo spec
   └─▶ discover ─▶ multi-host (hosts=2) ┘  matrix over discovered launch groups
 ```
 
-`discover` AST-scans `test/registered/**` for `MULTIHOST_LAUNCH` on files registered to
+`discover` AST-scans `test/registered/**` for `TPU_LAUNCH` on files registered to
 `nightly-tpu-multihost`, groups those with an identical `(launch_script, weights_pvc,
 hosts)`, and emits one matrix entry per group — so files sharing a spec share one server
 and the expensive bring-up happens once per group, not once per file.
@@ -167,7 +174,7 @@ The nightly single-host suite uses three deterministic LPT partitions with
 `max-parallel: 1`, so the shards reuse one image build and one TPU slice.
 
 **Adding a nightly test.** Single-host: `register_tpu_ci(est_time=…, suite=…, nightly=True)`
-plus the suite in `run_suite.py`. Multi-host: drop a file with a `MULTIHOST_LAUNCH` dict
+plus the suite in `run_suite.py`. Multi-host: drop a file with a `TPU_LAUNCH` dict
 registered to `nightly-tpu-multihost` — discovery groups it automatically, and an identical
 spec joins an existing group's server for free.
 
@@ -204,7 +211,7 @@ _TODO._
 | `.github/tpu-ci/jobset-tpu.yaml` | **Unified** JobSet template (any host count); rendered by `render_jobset.py` |
 | `.github/tpu-ci/render_jobset.py` | Renders the JobSet — single-host suite mode or multi-host group mode |
 | `.github/tpu-ci/reconcile_quota.py` | Sets each ClusterQueue's `nominalQuota` from live allocatable chips; refuses to run if a multi-host pool holds more than one slice. Run by `_tpu-test.yml` before every submission; `--dry-run` locally |
-| `.github/tpu-ci/discover_multihost.py` | Scans `MULTIHOST_LAUNCH` decls, groups files by launch spec → matrix JSON |
+| `.github/tpu-ci/discover_tpu.py` | Scans `TPU_LAUNCH` decls, groups files by launch spec → matrix JSON |
 | `benchmark/tpu/recipe/*_mh.sh` | Per-model multi-host launch recipes (own `MODEL`/`EP_SIZE`/…, exec `launch_server.sh`) |
 | `.github/workflows/_tpu-build.yml` | Reusable: build once → output digest |
 | `.github/workflows/_tpu-test.yml` | Reusable: render JobSet (suite or group) → wait for Kueue admission → stream logs → gate on JobSet condition |
@@ -428,7 +435,7 @@ the parser picks it up from `run_suite.py`'s `Test Summary` / `TIMINGS` block, o
 the multi-host loop's per-file records:
 
 ```python
-register_tpu_ci(est_time=3000, suite="nightly-tpu-4-v7", nightly=True)
+register_tpu_ci(est_time=3000, suite="nightly-tpu-singlehost", nightly=True)
 ```
 
 Only **scheduled** nightlies are ingested; a `workflow_dispatch` run is not a data point.
@@ -507,7 +514,7 @@ IMG=us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu:man
 python3 .github/tpu-ci/render_jobset.py --image "$IMG" --suite stage-b-test-tpu-4-v7 \
   | kubectl -n tpu-ci create --dry-run=server -f -
 # multi-host groups (as the nightly builds them):
-python3 .github/tpu-ci/discover_multihost.py --suite nightly-tpu-multihost   # -> groups JSON
+python3 .github/tpu-ci/discover_tpu.py --mode multihost --suite nightly-tpu-multihost   # -> groups JSON
 ```
 
 The old per-manifest files (`job-integration.yaml`, `job-nightly.yaml`,

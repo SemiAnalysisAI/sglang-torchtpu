@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Multi-host launch recipe: Qwen3-30B-A3B-FP8 MoE (tp = hosts x chips, EP=8). Weights
 # load from the ReadOnlyMany Hyperdisk mounted at /weights (the test declares the PVC via
-# MULTIHOST_LAUNCH.weights_pvc). This script IS the model+config spec; the CI runs it on
+# TPU_LAUNCH.weights_pvc). This script IS the model+config spec; the CI runs it on
 # every host. GKE injects TPU_WORKER_* so launch_server.sh auto-derives NNODES / rank.
 # FP8 + MoE are auto-detected from the checkpoint; EP_SIZE must divide TP.
 set -uo pipefail

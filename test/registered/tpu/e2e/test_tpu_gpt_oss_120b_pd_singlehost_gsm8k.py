@@ -29,7 +29,15 @@ except ModuleNotFoundError as exc:
 
 
 # Expected runtime: 45 minutes; CI uses this for scheduling and timeouts.
-register_tpu_ci(est_time=2700, suite="tpu-integration", nightly=True)
+register_tpu_ci(est_time=2700, suite="nightly-tpu-pd", nightly=True)
+TPU_LAUNCH = {
+    "mode": "pd",
+    "name": "pd-sh-gpt-120b",
+    "prefill_hosts": 1,
+    "decode_hosts": 1,
+    "args": "integration",
+    "weights_pvc": "model-weights-rox",
+}
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, *[".."] * 4))

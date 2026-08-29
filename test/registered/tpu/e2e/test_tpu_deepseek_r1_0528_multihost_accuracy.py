@@ -12,8 +12,8 @@ AIME'25 0.875 are pass@1 averaged over 64 samples; a 2026-08-25 one-pass run
 on the 2x2x2 dev slice measured GPQA 0.793.
 
 The whole file runs under one `timeout` in jobset-tpu.yaml, so
-MULTIHOST_LAUNCH declares the 10800s budget the six passes need (discovery
-takes the max across the group; see discover_multihost.py).
+TPU_LAUNCH declares the 10800s budget the six passes need (discovery
+takes the max across the group; see discover_tpu.py).
 """
 
 import os
@@ -23,13 +23,14 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 from sglang.test.tpu import model_config_main
 
 # est_time is the expected wall clock (bookkeeping); the enforced per-file
-# cap is MULTIHOST_LAUNCH.timeout_per_file below.
+# cap is TPU_LAUNCH.timeout_per_file below.
 # Temporarily out of the nightly lane: on-demand suite, discovered by
 # accuracy-test-tpu.yml (-f model=deepseek-r1-0528). Move the suite back to
 # "nightly-tpu-multihost" to restore the nightly trend.
 register_tpu_ci(est_time=7200, suite="nightly-tpu-multihost-ondemand", nightly=True)
 
-MULTIHOST_LAUNCH = {
+TPU_LAUNCH = {
+    "mode": "multihost",
     "hosts": 2,
     "launch_script": "recipe/deepseek_r1_0528_mh.sh",
     "weights_pvc": "model-weights-rox",
