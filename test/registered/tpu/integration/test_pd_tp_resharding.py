@@ -440,7 +440,11 @@ def build_prefill_env(
         "ENABLE_DP_ATTENTION": "0",
         "MAX_RUNNING": values.get("MAX_RUNNING", "8"),
         "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1"),
-        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024"),
+        # Must cover --chunked-prefill-size (4096): a batch of concurrent
+        # requests is bucketed by its TOTAL tokens, and anything above the
+        # largest bucket raises ValueError in TokenBucketer and takes the
+        # scheduler down (run 33218374055: 8 x ~900 tokens -> 3623, HTTP 500).
+        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024 4096"),
         "MEM_FRACTION_STATIC": values.get(
             "MEM_FRACTION_STATIC", profile.mem_fraction_prefill
         ),
@@ -489,7 +493,11 @@ def build_decode_env(
         "ENABLE_DP_ATTENTION": "1",
         "MAX_RUNNING": values.get("MAX_RUNNING", "8"),
         "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1 2 4 8"),
-        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024"),
+        # Must cover --chunked-prefill-size (4096): a batch of concurrent
+        # requests is bucketed by its TOTAL tokens, and anything above the
+        # largest bucket raises ValueError in TokenBucketer and takes the
+        # scheduler down (run 33218374055: 8 x ~900 tokens -> 3623, HTTP 500).
+        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024 4096"),
         "MEM_FRACTION_STATIC": values.get(
             "MEM_FRACTION_STATIC", profile.mem_fraction_decode
         ),
@@ -659,7 +667,7 @@ def looks_degenerate(text: str) -> bool:
 
 # Paragraph counts chosen so the resulting prompts straddle both candidate
 # boundaries: the KV page size (64 tokens) and the compiled token buckets
-# (TPU_COMPILE_TOKENS "64 256 1024"). Where output first degenerates says which.
+# (TPU_COMPILE_TOKENS). Where output first degenerates says which.
 # 0 is the known-good baseline (~28 tokens: one page, bucket 64). The page and
 # bucket boundaries coincide at 64, so those two only separate higher up: 2 pages
 # still inside bucket 256 clean, with 5+ pages in bucket 1024 dirty, would clear
@@ -677,8 +685,8 @@ def run_context_length_sweep_probe(base_url: str, profile: ModelProfile) -> None
 
       * KV pages: a 2:1 fan-in that misplaces pages beyond the first breaks as
         soon as the prompt exceeds one page (>64 tokens).
-      * compiled buckets: a bad graph for one of TPU_COMPILE_TOKENS
-        (64/256/1024) breaks only once the prompt reaches that bucket.
+      * compiled buckets: a bad graph for one of TPU_COMPILE_TOKENS breaks
+        only once the prompt reaches that bucket.
 
     Sweeping localizes the first bad length instead of leaving both live, and
     keeps doing so for whatever regresses next.
@@ -1405,6 +1413,21 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
                 "that describes how gravity works."
             )
         )
+
+    def test_compile_buckets_cover_a_full_prefill_batch(self) -> None:
+        # The engines batch concurrent requests and bucket them by TOTAL tokens,
+        # so the largest bucket has to reach the launcher's
+        # --chunked-prefill-size. Below it, TokenBucketer raises and the
+        # scheduler dies mid-run (run 33218374055: 8 x ~900 tokens -> 3623 vs a
+        # 1024 ceiling -> HTTP 500 on every request).
+        chunked_prefill_size = 4096  # benchmark/tpu/launch_{prefill,decode}.sh
+        for build in (build_prefill_env, build_decode_env):
+            for profile in MODEL_PROFILES.values():
+                buckets = [
+                    int(t)
+                    for t in build(profile, 2, env={})["TPU_COMPILE_TOKENS"].split()
+                ]
+                self.assertGreaterEqual(max(buckets), chunked_prefill_size)
 
     def test_chat_probe_prompt_is_long_enough_to_expose_the_failure(self) -> None:
         # The non-termination state only shows on a gsm8k-sized prompt (~900
