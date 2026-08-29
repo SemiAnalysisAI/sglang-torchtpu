@@ -215,6 +215,7 @@ def get_last_loc(
         "pallas_tpu_rpa_v3",
         "pallas_tpu_rpa_seq",
         "pallas_tpu_rpa_batched",
+        "pallas_tpu_rpa_stacked",
     )
     uses_triton_dispatch = (
         prefill_backend not in non_triton and decode_backend not in non_triton
