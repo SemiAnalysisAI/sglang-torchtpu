@@ -169,11 +169,14 @@ class ModelProfile(msgspec.Struct, frozen=True, kw_only=True):
     device_pool_tokens_hint: int
     gsm8k_threshold: float
     # Appended after the launcher's default so it wins (argparse keeps the last
-    # occurrence). The ZMQ "tpu" connector is being sunset -- raiden is the
-    # go-forward transfer backend, and it is the only one that carries strided
-    # push-reshard schedules (raiden/reshard_schedule.py) for the asymmetric
-    # attention TP this test exercises.
-    disagg_transfer_backend: str = "raiden"
+    # occurrence). raiden is the go-forward backend (the ZMQ "tpu" connector is
+    # being sunset), but its push-reshard path is not yet dependable here: runs
+    # 33256857825 and 33221711248 timed out every transfer at 300s in
+    # WaitingForInput. "tpu" is the configuration this combo was first verified
+    # on (run 32758850630), so profiles default to it until raiden's reshard
+    # path is understood. It is flaky too (2 green / 2 red), which is the point
+    # of getting one backend to a dependable green before switching.
+    disagg_transfer_backend: str = "tpu"
     extra_server_args: Tuple[str, ...] = ()
     extra_launch_env: Dict[str, str] = {}
     reasoning_effort: Optional[str] = None
@@ -210,6 +213,10 @@ MODEL_PROFILES = {
         max_total_tokens=786_432,
         device_pool_tokens_hint=786_432,
         gsm8k_threshold=0.72,
+        # The "tpu" connector cannot read this model's hybrid SWAKVPool at all
+        # (get_layer_page_buffers, run 33021942686), so it stays on raiden -- it
+        # gets further, even though the reshard branch then rejects hybrid SWA.
+        disagg_transfer_backend="raiden",
         extra_server_args=("--reasoning-parser", "gpt-oss"),
         # The SparseCore ragged-gather MoE path cannot be lowered for GPT-OSS
         # (dynamic token dim in the extend graph).
@@ -1370,19 +1377,26 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
         self.assertIn(bound, build_prefill_env(profile, 2, env={})["EXTRA_ARGS"])
         self.assertIn(bound, build_decode_env(profile, 2, env={})["EXTRA_ARGS"])
 
-    def test_both_engines_transfer_over_raiden(self) -> None:
-        # The ZMQ "tpu" connector is being sunset; every profile here must ride
-        # raiden, and both engines must agree -- a one-sided backend desyncs the
-        # transfer handshake, and the mismatch only shows after a full hardware
-        # bring-up.
+    def test_both_engines_agree_on_the_transfer_backend(self) -> None:
+        # Both engines must name the same backend -- a one-sided choice desyncs
+        # the transfer handshake, and the mismatch only shows after a full
+        # hardware bring-up. qwen rides the "tpu" connector it was first
+        # verified on; gpt-oss must use raiden because "tpu" cannot read its
+        # hybrid SWA pool.
+        self.assertEqual(
+            MODEL_PROFILES["qwen3_coder_480b"].disagg_transfer_backend, "tpu"
+        )
+        self.assertEqual(
+            MODEL_PROFILES["gpt_oss_120b"].disagg_transfer_backend, "raiden"
+        )
         for profile in MODEL_PROFILES.values():
-            self.assertEqual(profile.disagg_transfer_backend, "raiden")
             for env in (
                 build_prefill_env(profile, 2, env={}),
                 build_decode_env(profile, 2, env={}),
             ):
                 self.assertIn(
-                    "--disaggregation-transfer-backend raiden", env["EXTRA_ARGS"]
+                    f"--disaggregation-transfer-backend {profile.disagg_transfer_backend}",
+                    env["EXTRA_ARGS"],
                 )
                 # raiden claims 4 ports per rank at
                 # base + 4*(attn_dp_rank*attn_tp_size + attn_tp_rank); its 30000
