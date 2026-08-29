@@ -132,6 +132,10 @@ BOOTSTRAP_PORT = int(E("BOOTSTRAP_PORT", "8998"))
 DIST_PORT = int(E("DIST_PORT", "10011"))
 WAIT_SECS = int(E("WAIT_SECS", "3600"))
 KEEP_UP = E("KEEP_UP", "0") == "1"
+# Root-causing only needs the probes, which rule within ~3min of bring-up.
+# gsm8k then costs ~5min healthy but ~62min corrupt, i.e. most of a debug
+# iteration spent re-confirming a verdict the probes already returned.
+PROBE_ONLY = E("PROBE_ONLY", "0") == "1"
 PYTHON = E("PYTHON", "python3")
 
 ROLE_PREFILL = "prefill"
@@ -1211,6 +1215,8 @@ class TestPdTpResharding(unittest.TestCase):
             raise
 
     def test_05_gsm8k_quality(self) -> None:
+        if PROBE_ONLY:
+            raise unittest.SkipTest("PROBE_ONLY=1: skipping the accuracy gate")
         if self.degenerate_verdict is not None:
             # The probes already proved the pair emits garbage; gsm8k then spends
             # ~62min generating maximum-length spew to reach a foregone 0.0 (run

@@ -41,6 +41,11 @@ on:
         default: all
         type: choice
         options: [all, "1", "2", "3"]
+      pd_extra_env:
+        description: "Extra env for the pd-tpreshard row, e.g. PROBE_ONLY=1"
+        required: false
+        default: ""
+        type: string
       pd_model:
         description: "Model profile(s) for the pd-tpreshard row"
         required: false
@@ -138,7 +143,7 @@ jobs:
       lane: nightly
       pd_prefill_hosts: 2
       pd_decode_hosts: 2
-      exec_cmd: env MODEL_PROFILE=${{ matrix.model }} python3 test/registered/tpu/integration/test_pd_tp_resharding.py
+      exec_cmd: env MODEL_PROFILE=${{ matrix.model }} ${{ inputs.pd_extra_env }} python3 test/registered/tpu/integration/test_pd_tp_resharding.py
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/integration/test_pd_tp_resharding.py
       weights_pvc: model-weights-rox
