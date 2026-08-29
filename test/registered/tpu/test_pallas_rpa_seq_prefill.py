@@ -211,5 +211,14 @@ class TestPallasRpaSeqPrefill(unittest.TestCase):
                 self._run_and_compare([(128, 128), (64, 192)], kv_dtype)
 
 
+class TestPallasRpaSeqPrefillWideHeads(TestPallasRpaSeqPrefill):
+    """Cover a high-GQA, 128-wide-head shape with larger cache pages."""
+
+    PAGE_SIZE = 512
+    NUM_Q_HEADS = 12
+    NUM_KV_HEADS = 1
+    HEAD_DIM = 128
+
+
 if __name__ == "__main__":
     unittest.main()
