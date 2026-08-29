@@ -407,6 +407,16 @@ class TestRaidenAuxSidecar(RaidenRendezvousTestCase):
 
 
 class TestRaidenDecodeBookkeeping(RaidenRendezvousTestCase):
+    def test_decode_drains_completed_receive(self):
+        """Decode must process engine completions without prefill-only state."""
+        decode = self._decode()
+        room = 7200
+        decode._engine._stats = ([], [str(room)], [])
+
+        decode._drain_engine()
+
+        self.assertTrue(decode.is_recv_done(room))
+
     def test_blocks_reply_records_the_remote_side_for_the_read(self):
         """The decode issues its read against these, so they must survive the
         hop unchanged and in order."""

@@ -246,6 +246,14 @@ class RaidenKVManager(CommonKVManager):
         # (abort, timeout, peer death) shares its id with its closing read, so
         # room failure must never read as native settlement.
         self._native_failed: Set[str] = set()
+        # Reads registered for the decode to pull, by request id and
+        # publish time. This is populated only by prefill managers, but the
+        # shared engine-drain path settles it for both manager roles. A lease
+        # is the room's claim on its pages: it starts before the (possibly
+        # blocking) registration, settles when the engine reports the read
+        # served or failed, and ages out after the transfer deadline for a
+        # read the decode never comes for.
+        self._send_reads: Dict[int, Set[str]] = {}
         # Rooms whose pull is issued and not yet settled. Raiden borrows one
         # host staging slot per in-flight transfer and rejects a read it cannot
         # seat, so the decode side admits at most one pull per slot and leaves
@@ -291,13 +299,6 @@ class RaidenKVManager(CommonKVManager):
             self._send_aux: Dict[int, bytes] = {}
             self._decode_addr: Dict[int, Tuple[str, int]] = {}
             self._replied: Set[int] = set()
-            # Reads registered for the decode to pull, by request id and
-            # publish time. A lease is the room's claim on its pages: it
-            # starts before the (possibly blocking) registration, settles
-            # when the engine reports the read served or failed, and ages
-            # out after the transfer deadline for a read the decode never
-            # comes for.
-            self._send_reads: Dict[int, Set[str]] = {}
             # Chunks announced before the decode asked for the room, held until
             # a PULL_REQ names it (a resharded room never gets one).
             self._held_chunks: Dict[int, List[Tuple[int, List[int]]]] = {}
