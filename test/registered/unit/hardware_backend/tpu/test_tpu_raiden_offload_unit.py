@@ -650,29 +650,58 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             mgr._release_pull_slots_locked()
         self.assertTrue(mgr.maybe_start_pull(second))
 
-    def test_hybrid_swa_rejects_asymmetric_tp_before_reshard(self):
+    @staticmethod
+    def _reshard_decode_mgr():
         mgr = object.__new__(RaidenKVManager)
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
+        mgr._state_lock = threading.RLock()
+        mgr._completed_recv = set()
         mgr._swa_engine = Mock()
+        mgr._dynamic_host_staging = True
+        mgr.update_status = Mock()
+        return mgr
+
+    def test_hybrid_swa_reshard_forwards_its_window_pages(self):
+        """Asymmetric TP used to reject hybrid models outright. It now forwards
+        the sliding-window pages too, so the second engine can be given its own
+        reshard plan -- without them the window would never reach decode."""
+        mgr = self._reshard_decode_mgr()
         mgr._register_reshard_request = Mock()
 
-        with self.assertRaisesRegex(
-            NotImplementedError,
-            "cannot reshard hybrid SWA KV caches.*2 prefill sources",
-        ):
-            mgr.register_decode_request(
-                room=31,
-                local_blocks=[8, 9],
-                local_swa_blocks=[6, 7],
-                aux_index=None,
-                bootstrap_infos=[{}, {}],
-            )
+        mgr.register_decode_request(
+            room=31,
+            local_blocks=[8, 9],
+            local_swa_blocks=[6, 7],
+            aux_index=None,
+            bootstrap_infos=[{}, {}],
+        )
+
+        mgr._register_reshard_request.assert_called_once_with(
+            31, [8, 9], [6, 7], None, [{}, {}]
+        )
+
+    def test_hybrid_swa_reshard_prefix_hit_settles_both_engines(self):
+        """A full prefix hit receives nothing on either engine. Settling only
+        the full-attention id would hang is_recv_done, which requires the
+        sliding-window id too whenever a second engine exists."""
+        mgr = self._reshard_decode_mgr()
+        mgr._register_reshard_request = Mock()
+
+        mgr.register_decode_request(
+            room=31,
+            local_blocks=[],
+            local_swa_blocks=[6, 7],
+            aux_index=None,
+            bootstrap_infos=[{}, {}],
+        )
 
         mgr._register_reshard_request.assert_not_called()
+        self.assertIn("31", mgr._completed_recv)
+        self.assertIn(mgr._swa_req_id(31), mgr._completed_recv)
 
     def test_alloc_returns_page_aligned_token_runs(self):
         pool = _make_host_pool(page_size=4, page_num=3)
