@@ -89,8 +89,17 @@ class TpuPallasRpaSeqAttnBackend(BaseTpuPallasRpaAttnBackend):
 
     kernel_spec = RPA_SEQ_SPEC
 
+    def __init__(self, model_runner, speculative_step_id=0):
+        decode_backend = model_runner.decode_attention_backend_str
+        if decode_backend != "pallas_tpu_rpa_stacked":
+            raise ValueError(
+                "pallas_tpu_rpa_seq is prefill-only and requires "
+                "--decode-attention-backend pallas_tpu_rpa_stacked."
+            )
+        super().__init__(model_runner, speculative_step_id)
+
     def forward_decode(self, *args, **kwargs):
         raise NotImplementedError(
-            "pallas_tpu_rpa_seq is prefill-only. Configure a compatible "
-            "rank-4 decode attention backend."
+            "pallas_tpu_rpa_seq is prefill-only. Configure "
+            "--decode-attention-backend pallas_tpu_rpa_stacked."
         )

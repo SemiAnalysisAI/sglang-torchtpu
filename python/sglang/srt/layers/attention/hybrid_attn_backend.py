@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -30,6 +30,7 @@ class HybridAttnBackend(AttentionBackend):
         self.model_runner = model_runner
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
+        self._active_backend: AttentionBackend = prefill_backend
         self.data_type = model_runner.kv_cache_dtype
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -86,6 +87,18 @@ class HybridAttnBackend(AttentionBackend):
         else:
             return self.prefill_backend
 
+    def _activate_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
+        self._active_backend = self._select_backend(forward_mode)
+        return self._active_backend
+
+    @property
+    def forward_metadata(self) -> Any:
+        return self._active_backend.forward_metadata
+
+    @forward_metadata.setter
+    def forward_metadata(self, value: Any) -> None:
+        self._active_backend.forward_metadata = value
+
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return self._select_backend(fm).shared_read_ends(fm)
 
@@ -108,15 +121,15 @@ class HybridAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        backend = self._select_backend(forward_batch.forward_mode)
+        backend = self._activate_backend(forward_batch.forward_mode)
         backend.init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        backend = self._select_backend(forward_batch.forward_mode)
+        backend = self._activate_backend(forward_batch.forward_mode)
         backend.init_forward_metadata_in_graph(forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        backend = self._select_backend(forward_batch.forward_mode)
+        backend = self._activate_backend(forward_batch.forward_mode)
         backend.init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):

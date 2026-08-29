@@ -212,6 +212,11 @@ class TestAttentionPallasRpaSeq(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "prefill-only"):
             backend.forward_decode()
 
+    def test_backend_requires_stacked_decode(self):
+        runner = SimpleNamespace(decode_attention_backend_str="pallas_tpu_rpa_v3")
+        with self.assertRaisesRegex(ValueError, "prefill-only"):
+            TpuPallasRpaSeqAttnBackend(runner)
+
 
 if __name__ == "__main__":
     unittest.main()

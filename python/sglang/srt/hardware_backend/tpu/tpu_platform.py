@@ -74,7 +74,11 @@ def _rpa_kernel_spec(backend: str | None):
     to know about them -- the page-size floor, whether they read fp8 KV -- is
     declared on the spec rather than restated here.
     """
-    if backend == "pallas_tpu_rpa_batched":
+    if backend == "pallas_tpu_rpa_stacked":
+        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_stacked import (
+            RPA_STACKED_SPEC as spec,
+        )
+    elif backend == "pallas_tpu_rpa_batched":
         from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
             RPA_BATCHED_SPEC as spec,
         )
@@ -264,7 +268,11 @@ class TpuSRTPlatform(SRTPlatform):
             unsupported_backends = {
                 server_args.attention_backend,
                 getattr(server_args, "decode_attention_backend", None),
-            } & {"pallas_tpu_rpa_batched", "pallas_tpu_rpa_seq"}
+            } & {
+                "pallas_tpu_rpa_batched",
+                "pallas_tpu_rpa_seq",
+                "pallas_tpu_rpa_stacked",
+            }
             if unsupported_backends:
                 # These backends have no draft-backend wiring in
                 # speculative.draft_utils, so reject here with a clear message
@@ -324,6 +332,8 @@ class TpuSRTPlatform(SRTPlatform):
         #     `pallas/batched_rpa`, a thin subclass of the same shared base as
         #     v3 (see `attention_pallas_rpa_base`). Same fused KV cache, batches
         #     sequences for higher throughput. No speculative decoding.
+        #   - "pallas_tpu_rpa_stacked": the standalone decode-only stacked-RPA
+        #     kernel. Pair it with RPA-seq prefill and its KV layout.
         #   - "pallas_tpu_flash": flash_attention for prefill/extend +
         #     `jax.experimental.pallas.ops.tpu.paged_attention` for decode.
         #     Original implementation from PR #5, works against the flat
@@ -358,10 +368,9 @@ class TpuSRTPlatform(SRTPlatform):
         return None
 
     def get_mha_kv_pool_cls(self) -> type:
-        # RPA v3 uses the fused 5D KV layout; pallas_tpu_flash and torch_native
-        # read the flat MHATokenToKVPool. Pick per the resolved attention backend
-        # — it's on the (scheduler-child) global server args by pool-creation
-        # time (set in ModelRunner.__init__, before _init_pools).
+        # RPA v3 uses a fused 5D KV layout. RPA-seq prefill uses the native
+        # rank-4 SEQ_ALONG_LANE layout shared with stacked decode.
+        # pallas_tpu_flash and torch_native read the flat MHATokenToKVPool.
         from sglang.srt.server_args import get_global_server_args
 
         backend = get_global_server_args().attention_backend
@@ -370,7 +379,6 @@ class TpuSRTPlatform(SRTPlatform):
             from sglang.srt.hardware_backend.tpu.kv_pool import TpuRpaSeqKVPool
 
             return TpuRpaSeqKVPool
-
         if spec is not None and spec.uses_seq_along_lane_kv():
             # SEQ_ALONG_LANE puts the token index on the lane axis, so the
             # buffer shape differs from the fused one the other backends read.

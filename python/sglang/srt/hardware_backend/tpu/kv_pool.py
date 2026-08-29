@@ -2,8 +2,8 @@
 # Adapted from https://github.com/sgl-project/sglang-jax/blob/main/python/sgl_jax/srt/mem_cache/memory_pool.py
 """TPU fused KV cache pool used by the Pallas ragged-paged-attention backend.
 
-The Pallas v3 kernel expects KV cache laid out as a single 5D buffer per
-layer with shape::
+The Pallas kernels expect KV cache laid out as one fused buffer per layer.
+Most variants use a 5D buffer with shape::
 
     [num_blocks, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
 
@@ -17,7 +17,8 @@ when ``save_kv_cache=True``.
 To stay compatible with the rest of SGLang (radix cache, HiCache, etc.)
 the pool still exposes ``get_key_buffer`` / ``get_value_buffer`` as logical
 views into the fused buffer; the contiguous storage is the 5D fused
-buffer.
+buffer. Specialized RPA-seq prefill and stacked decode instead use the native
+rank-4 SEQ_ALONG_LANE layout owned by :class:`TpuRpaSeqKVPool`.
 """
 
 from __future__ import annotations
@@ -557,7 +558,7 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
 
 
 class TpuRpaSeqKVPool(TpuSeqAlongLaneKVPool):
-    """Native rank-4 cache for the specialized RPA sequence-prefill kernel.
+    """Native rank-4 cache shared by RPA sequence prefill and stacked decode.
 
     The head dimension remains contiguous instead of being split into packing
     axes::

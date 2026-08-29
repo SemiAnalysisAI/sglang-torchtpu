@@ -153,7 +153,7 @@ class RpaKernelSpec:
     """Declares how one RPA kernel variant differs from the shared base.
 
     Every field maps to a concrete code path that actually differs between the
-    v3 and batched backends — nothing speculative.
+    RPA backends — nothing speculative.
     """
 
     # torch custom-op name (must be unique per variant; the compile cache keys
@@ -169,9 +169,8 @@ class RpaKernelSpec:
     # rather than silently dropping a passed sink.
     supports_attention_sink: bool
     # Per-slot on/off mask selecting which of the three extend/prefill
-    # ``distribution`` slots get the active-sequence count: v3 = (0, 1, 1)
-    # ([0, n, n]); batched = (0, 0, 1) ([0, 0, n], MIXED-only — the batched
-    # kernel never runs the pure-prefill range). Decode is always [n, n, n].
+    # ``distribution`` slots get the active-sequence count. Decode is always
+    # [n, n, n]. Decode-only backends should reject extend before invocation.
     extend_distribution_mask: tuple[int, int, int]
     # Which draft-extend forward-mode variant this backend recognizes: v3 uses
     # the ``*_v2`` modes; batched uses the plain ones.
@@ -187,7 +186,7 @@ class RpaKernelSpec:
     # kernels while batched RPA can continue to support either layout.
     seq_along_lane_only: bool = False
     # Rank of the backend's native fused KV cache. Standard and batched RPA use
-    # rank 5; the specialized sequence-prefill kernel uses rank 4.
+    # rank 5; specialized sequence prefill and stacked decode share rank 4.
     kv_cache_rank: int = 5
 
     def uses_seq_along_lane_kv(self) -> bool:
@@ -373,10 +372,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
     """Shared SGLang attention backend for the Pallas ragged-paged-attention kernels.
 
     Subclasses set :attr:`kernel_spec` to a :class:`RpaKernelSpec` and inherit
-    everything else. Requires the fused KV layout supplied by
-    :class:`sglang.srt.hardware_backend.tpu.kv_pool.TpuFusedMHATokenToKVPool`,
-    which ``TpuSRTPlatform.get_mha_kv_pool_cls`` returns for these backends and
-    the model_runner passes as ``token_to_kv_pool_class``.
+    everything else. Requires one of the fused KV layouts supplied by the TPU
+    platform according to the selected kernel specification.
     """
 
     # Set by each subclass to select the kernel variant; None on the base only.

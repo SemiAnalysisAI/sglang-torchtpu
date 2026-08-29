@@ -134,6 +134,7 @@ class TestTpuCompileCache(CustomTestCase):
                 srt_root / "hardware_backend/tpu/attention_pallas.py",
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_base.py",
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_batched.py",
+                srt_root / "hardware_backend/tpu/attention_pallas_rpa_stacked.py",
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_v3.py",
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_seq.py",
                 srt_root / "hardware_backend/tpu/kernels/kernel.py",
@@ -271,6 +272,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             "pallas_tpu_rpa_v3",
             "pallas_tpu_rpa_seq",
             "pallas_tpu_rpa_batched",
+            "pallas_tpu_rpa_stacked",
         ):
             with self.subTest(backend=backend):
                 args = self._args(attention_backend=backend)
