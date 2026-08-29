@@ -440,11 +440,16 @@ def build_prefill_env(
         "ENABLE_DP_ATTENTION": "0",
         "MAX_RUNNING": values.get("MAX_RUNNING", "8"),
         "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1"),
-        # Must cover --chunked-prefill-size (4096): a batch of concurrent
-        # requests is bucketed by its TOTAL tokens, and anything above the
-        # largest bucket raises ValueError in TokenBucketer and takes the
-        # scheduler down (run 33218374055: 8 x ~900 tokens -> 3623, HTTP 500).
-        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024 4096"),
+        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024"),
+        # A batch is bucketed by its TOTAL tokens, so the per-forward cap
+        # must not exceed the largest compiled bucket: above it TokenBucketer
+        # raises and takes the scheduler down (run 33218374055, 8 concurrent
+        # ~900-token requests -> 3623 tokens vs a 1024 ceiling -> HTTP 500).
+        # Capping the batch is far cheaper than compiling a 4096-token graph,
+        # which pushed bring-up past the 3h JobSet deadline (run 33249352657),
+        # and it exercises the multi-chunk transfer path that a 4096 cap never
+        # reached with these prompt sizes.
+        "CHUNKED_PREFILL_SIZE": values.get("CHUNKED_PREFILL_SIZE", "1024"),
         "MEM_FRACTION_STATIC": values.get(
             "MEM_FRACTION_STATIC", profile.mem_fraction_prefill
         ),
@@ -493,11 +498,16 @@ def build_decode_env(
         "ENABLE_DP_ATTENTION": "1",
         "MAX_RUNNING": values.get("MAX_RUNNING", "8"),
         "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1 2 4 8"),
-        # Must cover --chunked-prefill-size (4096): a batch of concurrent
-        # requests is bucketed by its TOTAL tokens, and anything above the
-        # largest bucket raises ValueError in TokenBucketer and takes the
-        # scheduler down (run 33218374055: 8 x ~900 tokens -> 3623, HTTP 500).
-        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024 4096"),
+        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024"),
+        # A batch is bucketed by its TOTAL tokens, so the per-forward cap
+        # must not exceed the largest compiled bucket: above it TokenBucketer
+        # raises and takes the scheduler down (run 33218374055, 8 concurrent
+        # ~900-token requests -> 3623 tokens vs a 1024 ceiling -> HTTP 500).
+        # Capping the batch is far cheaper than compiling a 4096-token graph,
+        # which pushed bring-up past the 3h JobSet deadline (run 33249352657),
+        # and it exercises the multi-chunk transfer path that a 4096 cap never
+        # reached with these prompt sizes.
+        "CHUNKED_PREFILL_SIZE": values.get("CHUNKED_PREFILL_SIZE", "1024"),
         "MEM_FRACTION_STATIC": values.get(
             "MEM_FRACTION_STATIC", profile.mem_fraction_decode
         ),
@@ -1420,14 +1430,11 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
         # --chunked-prefill-size. Below it, TokenBucketer raises and the
         # scheduler dies mid-run (run 33218374055: 8 x ~900 tokens -> 3623 vs a
         # 1024 ceiling -> HTTP 500 on every request).
-        chunked_prefill_size = 4096  # benchmark/tpu/launch_{prefill,decode}.sh
         for build in (build_prefill_env, build_decode_env):
             for profile in MODEL_PROFILES.values():
-                buckets = [
-                    int(t)
-                    for t in build(profile, 2, env={})["TPU_COMPILE_TOKENS"].split()
-                ]
-                self.assertGreaterEqual(max(buckets), chunked_prefill_size)
+                env = build(profile, 2, env={})
+                buckets = [int(t) for t in env["TPU_COMPILE_TOKENS"].split()]
+                self.assertGreaterEqual(max(buckets), int(env["CHUNKED_PREFILL_SIZE"]))
 
     def test_chat_probe_prompt_is_long_enough_to_expose_the_failure(self) -> None:
         # The non-termination state only shows on a gsm8k-sized prompt (~900
