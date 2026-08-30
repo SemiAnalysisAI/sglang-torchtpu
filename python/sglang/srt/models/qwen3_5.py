@@ -1868,6 +1868,7 @@ if current_platform.supports_torch_compile():
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
+    decode_embeds_in_language_model = current_platform.is_tpu()
 
     supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 
@@ -2038,6 +2039,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
+    decode_embeds_in_language_model = current_platform.is_tpu()
 
     supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 
