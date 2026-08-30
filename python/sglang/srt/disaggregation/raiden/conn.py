@@ -2435,6 +2435,7 @@ class RaidenKVSender(CommonKVSender):
         )
         self._last_chunk = False
         self._started = False
+        self._transfer_start_time: Optional[float] = None
         self.init_time = time.time()
         # Raiden is consumer-pull: the prefill need not wait for any decode
         # handshake before computing (decode pulls once prefill registers its
@@ -2462,6 +2463,10 @@ class RaidenKVSender(CommonKVSender):
     ):
         if self.kv_mgr.is_dummy_cp_rank or self.kv_mgr.is_aborted(self.bootstrap_room):
             return
+        if self._transfer_start_time is None and (
+            len(kv_indices) > 0 or state_indices is not None
+        ):
+            self._transfer_start_time = time.perf_counter()
         self._record_transfer_indices(kv_indices, state_indices)
         swa_blocks = (
             self.kv_mgr._swa_blocks_from_state_indices(state_indices)
@@ -2483,6 +2488,15 @@ class RaidenKVSender(CommonKVSender):
             # overwrite a Failed that landed in between.
             self.kv_mgr.finalize_send(self.bootstrap_room, self.aux_index)
 
+    def _finalize_transfer_latency(self) -> None:
+        if (
+            self._transfer_start_time is not None
+            and self._transfer_metric.transfer_latency_s is None
+        ):
+            self._transfer_metric.transfer_latency_s = (
+                time.perf_counter() - self._transfer_start_time
+            )
+
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
@@ -2500,9 +2514,11 @@ class RaidenKVSender(CommonKVSender):
             self.conclude_state = KVPoll.Failed
             return KVPoll.Failed
         if self.kv_mgr.is_send_done(self.bootstrap_room):
+            self._finalize_transfer_latency()
             self.conclude_state = KVPoll.Success
             return KVPoll.Success
         if status == KVPoll.Success:
+            self._finalize_transfer_latency()
             self.conclude_state = status
             return status
         # Raiden is consumer-pull: the prefill computes without waiting for
