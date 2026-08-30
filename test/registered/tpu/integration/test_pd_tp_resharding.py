@@ -139,6 +139,9 @@ PROBE_ONLY = E("PROBE_ONLY", "0") == "1"
 # Run only what the green baseline ran (run 32758850630: the short generation
 # probe plus gsm8k), so a regression hunt can compare like with like.
 BASELINE_ONLY = E("BASELINE_ONLY", "0") == "1"
+# Opt the repeat probe back in on top of a baseline client. It runs LAST so a
+# failing probe cannot skip gsm8k -- the two verdicts are collected per run.
+REPEAT_PROBE = E("REPEAT_PROBE", "0") == "1"
 PYTHON = E("PYTHON", "python3")
 
 ROLE_PREFILL = "prefill"
@@ -1187,15 +1190,6 @@ class TestPdTpResharding(unittest.TestCase):
             profile=self.profile,
         )
 
-    def test_03_repeat_consistency(self) -> None:
-        if BASELINE_ONLY:
-            raise unittest.SkipTest("BASELINE_ONLY=1: baseline client only")
-        self._probe(
-            run_repeat_consistency_probe,
-            base_url=f"http://127.0.0.1:{LB_PORT}",
-            profile=self.profile,
-        )
-
     def test_04_chat_completion_terminates(self) -> None:
         if BASELINE_ONLY:
             raise unittest.SkipTest("BASELINE_ONLY=1: baseline client only")
@@ -1240,6 +1234,17 @@ class TestPdTpResharding(unittest.TestCase):
         if score < self.gsm8k_config.threshold:
             dump_gsm8k_samples(self.profile)
         self.assertGreaterEqual(score, self.gsm8k_config.threshold)
+
+    def test_06_repeat_consistency(self) -> None:
+        # Last on purpose: a failing probe must not skip the accuracy gate, so
+        # one run yields both verdicts.
+        if BASELINE_ONLY and not REPEAT_PROBE:
+            raise unittest.SkipTest("BASELINE_ONLY=1: baseline client only")
+        self._probe(
+            run_repeat_consistency_probe,
+            base_url=f"http://127.0.0.1:{LB_PORT}",
+            profile=self.profile,
+        )
 
 
 # ------------------------------ worker serving -------------------------------
