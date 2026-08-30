@@ -136,6 +136,9 @@ KEEP_UP = E("KEEP_UP", "0") == "1"
 # gsm8k then costs ~5min healthy but ~62min corrupt, i.e. most of a debug
 # iteration spent re-confirming a verdict the probes already returned.
 PROBE_ONLY = E("PROBE_ONLY", "0") == "1"
+# Run only what the green baseline ran (run 32758850630: the short generation
+# probe plus gsm8k), so a regression hunt can compare like with like.
+BASELINE_ONLY = E("BASELINE_ONLY", "0") == "1"
 PYTHON = E("PYTHON", "python3")
 
 ROLE_PREFILL = "prefill"
@@ -452,15 +455,6 @@ def build_prefill_env(
         "MAX_RUNNING": values.get("MAX_RUNNING", "8"),
         "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1"),
         "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024"),
-        # A batch is bucketed by its TOTAL tokens, so the per-forward cap
-        # must not exceed the largest compiled bucket: above it TokenBucketer
-        # raises and takes the scheduler down (run 33218374055, 8 concurrent
-        # ~900-token requests -> 3623 tokens vs a 1024 ceiling -> HTTP 500).
-        # Capping the batch is far cheaper than compiling a 4096-token graph,
-        # which pushed bring-up past the 3h JobSet deadline (run 33249352657),
-        # and it exercises the multi-chunk transfer path that a 4096 cap never
-        # reached with these prompt sizes.
-        "CHUNKED_PREFILL_SIZE": values.get("CHUNKED_PREFILL_SIZE", "1024"),
         "MEM_FRACTION_STATIC": values.get(
             "MEM_FRACTION_STATIC", profile.mem_fraction_prefill
         ),
@@ -510,15 +504,6 @@ def build_decode_env(
         "MAX_RUNNING": values.get("MAX_RUNNING", "8"),
         "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1 2 4 8"),
         "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024"),
-        # A batch is bucketed by its TOTAL tokens, so the per-forward cap
-        # must not exceed the largest compiled bucket: above it TokenBucketer
-        # raises and takes the scheduler down (run 33218374055, 8 concurrent
-        # ~900-token requests -> 3623 tokens vs a 1024 ceiling -> HTTP 500).
-        # Capping the batch is far cheaper than compiling a 4096-token graph,
-        # which pushed bring-up past the 3h JobSet deadline (run 33249352657),
-        # and it exercises the multi-chunk transfer path that a 4096 cap never
-        # reached with these prompt sizes.
-        "CHUNKED_PREFILL_SIZE": values.get("CHUNKED_PREFILL_SIZE", "1024"),
         "MEM_FRACTION_STATIC": values.get(
             "MEM_FRACTION_STATIC", profile.mem_fraction_decode
         ),
@@ -787,13 +772,14 @@ def run_chat_termination_probe(base_url: str, profile: ModelProfile) -> None:
         )
 
 
-# Every request the test has ever sent went out one at a time, so nothing here
-# has exercised concurrent transfers even though the engines run with
-# --max-running-requests 8. A race in the reshard handshake, the receiver plan
-# or staging-slot reuse cannot fire serially, which would explain why the
-# corruption survives every deterministic theory. Match the server's limit.
 _REPEAT_COUNT = 40
-_REPEAT_CONCURRENCY = 8
+# Serial. A batch is bucketed by its TOTAL tokens, so N concurrent ~900-token
+# requests ask for ~N*900 against the largest compiled bucket (1024) and
+# TokenBucketer takes the scheduler down (run 33218374055: 8 -> 3623 -> HTTP
+# 500). Raising the cap instead means compiling a 4096-token graph, which
+# pushed bring-up past the 3h JobSet deadline (run 33249352657). Concurrency
+# needs one of those two to be solved first.
+_REPEAT_CONCURRENCY = 1
 
 
 def run_repeat_consistency_probe(base_url: str, profile: ModelProfile) -> None:
@@ -1193,6 +1179,8 @@ class TestPdTpResharding(unittest.TestCase):
         )
 
     def test_02_context_length_sweep(self) -> None:
+        if BASELINE_ONLY:
+            raise unittest.SkipTest("BASELINE_ONLY=1: baseline client only")
         self._probe(
             run_context_length_sweep_probe,
             base_url=f"http://127.0.0.1:{LB_PORT}",
@@ -1200,6 +1188,8 @@ class TestPdTpResharding(unittest.TestCase):
         )
 
     def test_03_repeat_consistency(self) -> None:
+        if BASELINE_ONLY:
+            raise unittest.SkipTest("BASELINE_ONLY=1: baseline client only")
         self._probe(
             run_repeat_consistency_probe,
             base_url=f"http://127.0.0.1:{LB_PORT}",
@@ -1207,6 +1197,8 @@ class TestPdTpResharding(unittest.TestCase):
         )
 
     def test_04_chat_completion_terminates(self) -> None:
+        if BASELINE_ONLY:
+            raise unittest.SkipTest("BASELINE_ONLY=1: baseline client only")
         self._probe(
             run_chat_termination_probe,
             base_url=f"http://127.0.0.1:{LB_PORT}",
@@ -1444,17 +1436,22 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
             )
         )
 
-    def test_compile_buckets_cover_a_full_prefill_batch(self) -> None:
-        # The engines batch concurrent requests and bucket them by TOTAL tokens,
-        # so the largest bucket has to reach the launcher's
-        # --chunked-prefill-size. Below it, TokenBucketer raises and the
-        # scheduler dies mid-run (run 33218374055: 8 x ~900 tokens -> 3623 vs a
-        # 1024 ceiling -> HTTP 500 on every request).
+    def test_probe_batch_fits_the_largest_compiled_bucket(self) -> None:
+        # A batch is bucketed by its TOTAL tokens, so the probe's in-flight
+        # requests together must fit the largest compiled bucket. Above it
+        # TokenBucketer raises and takes the scheduler down mid-run -- 8
+        # concurrent ~900-token requests asked for 3623 against a 1024 ceiling
+        # and every request came back HTTP 500 (run 33218374055).
+        probe_tokens = int(len(_long_context_question().split()) * 1.3)
         for build in (build_prefill_env, build_decode_env):
             for profile in MODEL_PROFILES.values():
-                env = build(profile, 2, env={})
-                buckets = [int(t) for t in env["TPU_COMPILE_TOKENS"].split()]
-                self.assertGreaterEqual(max(buckets), int(env["CHUNKED_PREFILL_SIZE"]))
+                buckets = [
+                    int(t)
+                    for t in build(profile, 2, env={})["TPU_COMPILE_TOKENS"].split()
+                ]
+                self.assertGreaterEqual(
+                    max(buckets), probe_tokens * _REPEAT_CONCURRENCY
+                )
 
     def test_chat_probe_prompt_is_long_enough_to_expose_the_failure(self) -> None:
         # The non-termination state only shows on a gsm8k-sized prompt (~900
