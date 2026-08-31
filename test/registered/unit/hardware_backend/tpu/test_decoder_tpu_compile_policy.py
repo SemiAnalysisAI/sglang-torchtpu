@@ -334,7 +334,15 @@ class TestDecoderOutputUnpadding(CustomTestCase):
 
 
 class TestInstallExtendCap(CustomTestCase):
-    def _install_policy(self, *, prefill_max_requests, dp_attention):
+    def _install_policy(
+        self,
+        *,
+        prefill_max_requests,
+        dp_attention,
+        context_len=4096,
+        chunked_prefill_size=None,
+        max_prefill_tokens=2048,
+    ):
         model = SimpleNamespace(
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
@@ -343,25 +351,29 @@ class TestInstallExtendCap(CustomTestCase):
             model=model,
             forward=MagicMock(),
             is_draft_worker=False,
-            model_config=SimpleNamespace(context_len=4096),
+            model_config=SimpleNamespace(context_len=context_len),
             server_args=SimpleNamespace(
-                chunked_prefill_size=None,
-                max_prefill_tokens=2048,
+                chunked_prefill_size=chunked_prefill_size,
+                max_prefill_tokens=max_prefill_tokens,
                 torch_compile_max_bs=64,
                 prefill_max_requests=prefill_max_requests,
                 unsafe_save_torch_compile_bundle=None,
                 unsafe_load_torch_compile_bundle=None,
             ),
         )
-        t_bucketer = Bucketer(name="Token", buckets=[64, 2048])
-        b_bucketer = Bucketer(name="Bs", buckets=[16, 32, 64])
         policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
         policy.backend = "eager"
+
+        def fake_build_bucketers(_server_args, *, max_t, max_b):
+            return (
+                Bucketer(name="Token", buckets=[64, max_t]),
+                Bucketer(name="Bs", buckets=[16, 32, max_b]),
+            )
 
         with patch(
             "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
             "build_bucketers",
-            return_value=(t_bucketer, b_bucketer),
+            side_effect=fake_build_bucketers,
         ), patch(
             "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
             "is_dp_attention_enabled",
@@ -388,6 +400,30 @@ class TestInstallExtendCap(CustomTestCase):
     def test_dp_attention_uses_decode_max(self):
         policy = self._install_policy(prefill_max_requests=16, dp_attention=True)
         self.assertEqual(policy.extend_bs, 64)
+
+    def test_aggregate_prefill_cap_can_exceed_request_context(self):
+        """Regression: a legal aggregate EXTEND must not be capped by one
+        request's context length when several requests prefill together."""
+        policy = self._install_policy(
+            prefill_max_requests=16,
+            dp_attention=False,
+            context_len=2048,
+            chunked_prefill_size=8192,
+            max_prefill_tokens=8192,
+        )
+
+        self.assertEqual(policy.t_bucketer.next_bucket(7392), 8192)
+
+    def test_context_is_fallback_without_aggregate_prefill_caps(self):
+        policy = self._install_policy(
+            prefill_max_requests=16,
+            dp_attention=False,
+            context_len=4096,
+            chunked_prefill_size=None,
+            max_prefill_tokens=None,
+        )
+
+        self.assertEqual(policy.t_bucketer.max_val, 4096)
 
     def test_target_model_keeps_outer_compile_boundary(self):
         original_outer = MagicMock(name="outer_forward")

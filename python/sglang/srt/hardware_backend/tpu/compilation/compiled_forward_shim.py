@@ -659,16 +659,16 @@ def build_bucketers(
     token_paddings = server_args.tpu_compile_tokens
     if token_paddings:
         # Token buckets are consumed only by the EXTEND path, and extend never
-        # runs longer than max_t (= min(chunked_prefill_size, max_prefill_tokens,
-        # context_len)). Drop any user buckets above it -- they'd compile dead
-        # shapes that serving can never reach.
+        # runs longer than max_t, which the compile policy derives from the
+        # scheduler's aggregate prefill limits. Drop any user buckets above it
+        # because serving cannot reach those shapes.
         capped = [t for t in token_paddings if t <= max_t]
         dropped = [t for t in token_paddings if t > max_t]
         if dropped:
             logger.warning(
                 "[compiled forward shim] Dropping --tpu-compile-tokens %s above the "
-                "max extend length %d; extend is capped there (chunked prefill / "
-                "context), so those buckets would never be used.",
+                "max extend length %d; the aggregate prefill limits cap extend "
+                "there, so those buckets would never be used.",
                 dropped,
                 max_t,
             )
