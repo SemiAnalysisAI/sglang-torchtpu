@@ -221,6 +221,6 @@ def _apply_fp8_fused_rs(
         # for the in-kernel writes adds row quantization and scale DMAs without
         # reducing the subsequent collective's traffic.
         fp8_direct_write=False,
-        physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
+        tp_rank_to_device_id=layer._tpu_fused_rs_tp_rank_to_device_id,
     )
     return StandardCombineInput(hidden_states=result[: x.shape[0]])
