@@ -213,8 +213,17 @@ MODEL_PROFILES = {
         mem_fraction_decode="0.6",
         quantization="fp8",
         kv_cache_dtype="fp8_e4m3",
-        max_total_tokens=32768,
-        device_pool_tokens_hint=32768,
+        # EXPERIMENT (qwen only): 32768 was uncommented and unexplained, and it
+        # is 24x smaller than the gpt-oss profile's pool. At page_size 64 it is
+        # 512 pages, so gsm8k's 100 x ~900-token requests (15 pages each) cycle
+        # it about three times, while gpt-oss's pool is barely touched -- and
+        # gpt-oss passes this test where qwen fails ~1 run in 3. Page reuse
+        # racing in-flight KV transfers would fit every symptom: short prompts
+        # (1 page) never fail, long ones do, and the verdict is fixed for a run.
+        # The cap is applied as min(profiled, cap), so raising it cannot
+        # over-allocate; it just stops pinching the pool.
+        max_total_tokens=262144,
+        device_pool_tokens_hint=262144,
         gsm8k_threshold=0.80,
         extra_server_args=("--tpu-fp8-runtime", "channelwise"),
         extra_launch_env={"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"},
