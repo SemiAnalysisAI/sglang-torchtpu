@@ -16,8 +16,8 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
-
 from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
@@ -597,6 +597,10 @@ class CompiledForwardShim:
         self.policy = policy
         self._recompilation_checker = None
         self._model_label = ""
+        # Read once: the flag decides which extend variant warmup compiled, so
+        # it is frozen for this shim's lifetime. Caching it also keeps the
+        # disabled path at a single attribute read per forward.
+        self._prompt_logprob_enabled = envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
         signature = getattr(compiled_fn, "__signature__", None)
         if signature is not None:
             self.__signature__ = signature
@@ -655,14 +659,24 @@ class CompiledForwardShim:
         # raises.
         orig_prefill_only = forward_batch.is_prefill_only
         forward_batch.is_prefill_only = False
-        # Input (prompt) logprobs. FULL capture is presented on *every* extend,
-        # not only the batches asking for logprobs: capture_hidden_mode is part
-        # of the graph's guard, so two values would mean two extend variants.
-        # Warmup compiles the FULL variant to match, replacing the NULL one
-        # rather than adding to it, which keeps precompile flat.
+        # Input (prompt) logprobs, when enabled. FULL capture is then presented
+        # on *every* extend, not only the batches asking for logprobs:
+        # capture_hidden_mode is part of the graph's guard, so two values would
+        # mean two extend variants (measured: 828s of precompile against 113s).
+        # That is precisely why this is opt-in -- returning every prefill row
+        # costs ~8% of prefill, and nobody who did not ask should pay it. With
+        # the flag off nothing below runs, the batch is never touched, and the
+        # extend graph is the NULL-capture one warmup has always compiled.
         wants_input_logprob = needs_input_logprob(forward_batch)
+        if wants_input_logprob and not self._prompt_logprob_enabled:
+            raise NotImplementedError(
+                "input/prompt logprobs (echo) need "
+                "SGLANG_TPU_ENABLE_PROMPT_LOGPROB=1 on the TPU compiled "
+                "backend; only output (next-token) logprobs are served by "
+                "default."
+            )
         saved: dict[str, Any] = {}
-        if forward_batch.forward_mode.is_extend():
+        if self._prompt_logprob_enabled and forward_batch.forward_mode.is_extend():
             saved["capture_hidden_mode"] = forward_batch.capture_hidden_mode
             forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             # LogitsMetadata reads len(extend_logprob_start_lens_cpu), so the

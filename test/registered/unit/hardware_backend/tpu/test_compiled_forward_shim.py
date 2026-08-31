@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
@@ -1175,7 +1176,7 @@ class TestShimInputLogprobPath(CustomTestCase):
             _tpu_real_b=2,
         )
 
-    def _shim(self, seen, *, model=None):
+    def _shim(self, seen, *, model=None, enabled=True):
         def compiled(input_ids, positions, forward_batch, *a, **kw):
             # Snapshot what the graph actually sees.
             seen["capture_hidden_mode"] = forward_batch.capture_hidden_mode
@@ -1186,7 +1187,11 @@ class TestShimInputLogprobPath(CustomTestCase):
                 hidden_states=torch.zeros(8, 5),
             )
 
-        return CompiledForwardShim(compiled, policy=_policy(model))
+        # Constructed inside the override on purpose: the flag decides which
+        # extend variant warmup compiled, so the shim reads it once and cannot
+        # honour a later change.
+        with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(enabled):
+            return CompiledForwardShim(compiled, policy=_policy(model))
 
     def test_graph_sees_full_capture_and_no_logprob_request(self):
         seen, fb = {}, self._fb()
@@ -1210,9 +1215,11 @@ class TestShimInputLogprobPath(CustomTestCase):
         self.assertFalse(fb.is_prefill_only)
 
     def test_state_is_restored_even_when_the_forward_raises(self):
-        shim = CompiledForwardShim(
-            MagicMock(side_effect=RuntimeError("boom")), policy=_policy(_StubModel())
-        )
+        with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True):
+            shim = CompiledForwardShim(
+                MagicMock(side_effect=RuntimeError("boom")),
+                policy=_policy(_StubModel()),
+            )
         fb = self._fb(starts=(1, 1))
 
         with self.assertRaises(RuntimeError):
@@ -1245,6 +1252,49 @@ class TestShimInputLogprobPath(CustomTestCase):
         fb = self._fb(starts=(4, 4))
         self._shim({}, model=model)(None, None, fb)
         self.assertEqual(model.calls, 0)
+
+    # --- Disabled by default. Serving prompt logprobs makes the compiled
+    # extend return every prefill row, which costs ~8% of prefill for everyone,
+    # so the no-regression guarantee has to be structural rather than measured:
+    # with the flag off, none of the above runs. Each case below goes red if
+    # the gate is dropped and the cost becomes unconditional again.
+
+    def test_disabled_leaves_the_extend_batch_untouched(self):
+        seen = {}
+        fb = self._fb(return_logprob=False)
+        starts_before = fb.extend_logprob_start_lens_cpu
+        self._shim(seen, model=_StubModel(), enabled=False)(None, None, fb)
+
+        # The graph sees the caller's capture mode -- the NULL-capture extend
+        # variant warmup has always compiled -- not FULL.
+        self.assertIs(seen["capture_hidden_mode"], CaptureHiddenMode.NULL)
+        self.assertIs(fb.capture_hidden_mode, CaptureHiddenMode.NULL)
+        # Identity, not equality: the list is never even swapped out.
+        self.assertIs(fb.extend_logprob_start_lens_cpu, starts_before)
+
+    def test_disabled_never_runs_the_eager_gather(self):
+        model = _StubModel()
+        self._shim({}, model=model, enabled=False)(
+            None, None, self._fb(return_logprob=False)
+        )
+        self.assertEqual(model.calls, 0)
+
+    def test_disabled_rejects_a_prompt_logprob_request(self):
+        # Fail loud and name the flag rather than silently returning nothing.
+        with self.assertRaisesRegex(
+            NotImplementedError, "SGLANG_TPU_ENABLE_PROMPT_LOGPROB"
+        ):
+            self._shim({}, model=_StubModel(), enabled=False)(None, None, self._fb())
+
+    def test_disabled_still_serves_output_logprobs(self):
+        # The pin is unconditional and must stay so: an output-logprob request
+        # guard-misses the warmed graph without it, which is fatal under
+        # set_stance("fail_on_recompile"). This is not part of the opt-in.
+        seen = {}
+        fb = self._fb(starts=(4, 4))
+        self._shim(seen, model=_StubModel(), enabled=False)(None, None, fb)
+        self.assertFalse(seen["return_logprob"])
+        self.assertTrue(fb.return_logprob)
 
 
 class TestAttachInputLogprobs(CustomTestCase):
