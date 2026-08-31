@@ -1510,6 +1510,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
             b"10.0.0.2:31000",
             pack_ints(self.DECODE_BLOCKS),
             b"4",
+            # SWA pages + SWA push endpoint; empty here (no window engine).
+            b"",
+            b"",
         ]
 
     def _sent(self, mgr, tag):
@@ -1768,6 +1771,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                         pack_ints(list(range(100 + 200 * rank, 164 + 200 * rank))),
                         str(rank).encode("ascii"),
                         b"",
+                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
                     ]
                 )
         self.assertEqual(seen_complete, [False])
@@ -1788,6 +1792,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                         pack_ints(list(range(100 + 200 * rank, 164 + 200 * rank))),
                         str(rank).encode("ascii"),
                         b"",
+                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
                     ]
                 )
         self.assertEqual(
@@ -2056,6 +2061,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                         pack_ints(src[rank]),
                         str(rank).encode("ascii"),
                         b"",
+                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
                     ]
                 )
             uuid, req = mgr._engine.register_active_plan.call_args.args
@@ -2104,6 +2110,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                         pack_ints(src[rank]),
                         str(rank).encode("ascii"),
                         b"",
+                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
                     ]
                 )
 
@@ -2145,6 +2152,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                         pack_ints(src[rank]),
                         str(rank).encode("ascii"),
                         b"",
+                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
                     ]
                 )
 
@@ -2181,6 +2189,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                         pack_ints(src[rank]),
                         str(rank).encode("ascii"),
                         b"",
+                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
                     ]
                 )
             seen_during_chunk_registration.append(
