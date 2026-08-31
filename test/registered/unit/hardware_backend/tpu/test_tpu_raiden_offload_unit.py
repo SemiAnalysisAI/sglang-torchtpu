@@ -1649,6 +1649,8 @@ class TestRaidenChunkedResharding(CustomTestCase):
             )
         }
         mgr._reshard_sources = {self.ROOM: {}}
+        # Same shape for the window pool; _on_reshard_blocks records both.
+        mgr._reshard_swa_sources = {self.ROOM: {}}
         mgr._reshard_registered = set()
         mgr._reshard_chunk_sources = {}
         mgr._reshard_covered = {}
