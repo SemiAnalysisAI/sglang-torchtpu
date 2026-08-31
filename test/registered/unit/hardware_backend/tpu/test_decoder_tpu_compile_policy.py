@@ -1143,6 +1143,8 @@ class TestPrecompileLoops(CustomTestCase):
             policy._precompile_extend()
             policy._precompile_decode()
 
+        # Both calling conventions (input_embeds and positional text ids)
+        # warm every logits mode, for EXTEND and DECODE alike.
         self.assertEqual(
             [
                 call.kwargs["logits_output_mode"]
@@ -1151,9 +1153,8 @@ class TestPrecompileLoops(CustomTestCase):
             [
                 LogitsOutputMode.DISTRIBUTED_TOP_K,
                 LogitsOutputMode.FULL_VOCAB,
-                LogitsOutputMode.DISTRIBUTED_TOP_K,
-                LogitsOutputMode.FULL_VOCAB,
-            ],
+            ]
+            * 4,
         )
 
     def test_extend_skips_token_bucket_below_bs(self):
