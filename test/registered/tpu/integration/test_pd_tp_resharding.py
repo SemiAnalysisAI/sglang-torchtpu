@@ -629,17 +629,50 @@ def _chat(
 
 # gsm8k's 5-shot prompt runs ~900 tokens; the failure below only appears once the
 # prompt is that long, so pad to the same order rather than sending one line.
-_LONG_CONTEXT_FILLER = (
-    "Background note {i}: a delivery van carries {i} crates, each crate holds "
-    "{i} boxes, and every box contains a packing slip that lists the crate id, "
-    "the depot of origin, and the arrival time recorded by the dispatcher. "
+# Varied prose, not a repeated sentence. The first version padded with 18 near
+# copies of one sentence, and heavy repetition is a known way to walk a model
+# into degenerate repetition on its own -- so a garbage answer could not be told
+# apart from corrupted KV. Distinct paragraphs keep the length without the
+# pathology, which is what makes a bad answer here evidence about the engines.
+_LONG_CONTEXT_PARAGRAPHS = (
+    "The harbour master keeps a ledger of every vessel that clears the outer "
+    "channel, noting draught, cargo class and the pilot who signed the release. "
+    "Ledgers from the winter months are stored in the annex because damp ruins "
+    "the binding glue. ",
+    "Cartographers working the northern survey preferred aneroid barometers to "
+    "mercury ones, since a broken column meant a week's delay waiting on resupply "
+    "from the coast. Their field notebooks record pressure hourly. ",
+    "A cooper's apprenticeship ran seven years: the first two spent only on "
+    "shaping staves, the next three on hooping and fitting heads, and the last "
+    "two on repairing casks returned from the brewers. ",
+    "The observatory's transit telescope was mounted on a pier sunk to bedrock so "
+    "that footsteps on the gallery floor would not disturb a sighting. Even so, "
+    "observers worked in stockinged feet. ",
+    "Millwrights judged a waterwheel by the sound of the buckets emptying rather "
+    "than by any gauge, and a wheel running dry at the crown was reset before the "
+    "grain was let down the chute. ",
+    "Copperplate engravers bevelled the edges of a finished plate so the press "
+    "blanket would not tear, and a plate that had printed four hundred sheets was "
+    "retired to be resurfaced and cut again. ",
+    "In the salt marshes the reed cutters worked from flat punts, taking only the "
+    "second-year growth, because first-year reed shrank in the thatch and left "
+    "the ridge line uneven within a season. ",
+    "Lighthouse keepers logged the hour the lamp was lit and doused, the weight "
+    "of oil drawn, and any vessel that passed close enough to hail. The logs went "
+    "to the board every quarter for audit. ",
+    "Bell founders buried the mould in a pit of packed sand so the metal cooled "
+    "slowly and evenly; a bell drawn too early rang false and was broken up and "
+    "returned to the furnace. ",
 )
 _CHAT_PROBE_CAP = 256
 
 
-def _long_context_question(paragraphs: int = 18) -> str:
+def _long_context_question(paragraphs: int = 20) -> str:
     """~700 words, i.e. ~900 tokens -- the size of gsm8k's 5-shot prompt."""
-    filler = "".join(_LONG_CONTEXT_FILLER.format(i=i) for i in range(paragraphs))
+    filler = "".join(
+        _LONG_CONTEXT_PARAGRAPHS[i % len(_LONG_CONTEXT_PARAGRAPHS)]
+        for i in range(paragraphs)
+    )
     return (
         f"{filler}\n\n"
         "Ignore the notes above. Question: what is 17 plus 25? "
@@ -681,7 +714,7 @@ def looks_degenerate(text: str) -> bool:
 # bucket boundaries coincide at 64, so those two only separate higher up: 2 pages
 # still inside bucket 256 clean, with 5+ pages in bucket 1024 dirty, would clear
 # page count and indict the bucket.
-_SWEEP_PARAGRAPHS = (0, 1, 2, 6, 18)
+_SWEEP_PARAGRAPHS = (0, 1, 2, 6, 20)
 
 
 def run_context_length_sweep_probe(base_url: str, profile: ModelProfile) -> None:
@@ -1211,12 +1244,22 @@ class TestPdTpResharding(unittest.TestCase):
         if PROBE_ONLY:
             raise unittest.SkipTest("PROBE_ONLY=1: skipping the accuracy gate")
         if self.degenerate_verdict is not None:
-            # The probes already proved the pair emits garbage; gsm8k then spends
-            # ~62min generating maximum-length spew to reach a foregone 0.0 (run
-            # 33171526086), delaying a verdict that is already in.
-            raise unittest.SkipTest(
-                f"probe already found degenerate output: {self.degenerate_verdict}"
+            # Deliberately NOT skipped. The skip assumed a probe verdict implies
+            # gsm8k's, but runs 33279920113, 33311192374 and 33311215019 failed
+            # the chat probe while gsm8k never ran, so the two have never been
+            # compared on the same engines -- and gsm8k has passed 0.95-0.99 far
+            # more often than the probe's ~50%, which the assumption cannot
+            # explain. gsm8k is the only independent chat measurement, so it runs
+            # even after a probe verdict; SKIP_GSM8K_AFTER_PROBE=1 restores the
+            # shortcut once the two are known to agree.
+            print(
+                f"[gsm8k] running despite probe verdict: {self.degenerate_verdict}",
+                flush=True,
             )
+            if E("SKIP_GSM8K_AFTER_PROBE", "0") == "1":
+                raise unittest.SkipTest(
+                    f"probe already found degenerate output: {self.degenerate_verdict}"
+                )
         score = run_gsm8k(
             base_url=f"http://127.0.0.1:{LB_PORT}",
             profile=self.profile,
