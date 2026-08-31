@@ -842,6 +842,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 bs=bs,
                 mode=mode,
                 logits_output_mode=logits_output_mode,
+                # Extend is warmed with FULL capture so input (prompt) logprobs
+                # have every prefill row to gather from. This REPLACES the NULL
+                # variant rather than adding a second one: capture_hidden_mode
+                # is part of the graph's guard, and the shim presents FULL on
+                # every extend to match. Warming both instead measured 828s of
+                # precompile against 113s for this.
+                capture_hidden_mode=CaptureHiddenMode.FULL,
             )
             if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
