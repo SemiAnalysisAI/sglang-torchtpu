@@ -38,6 +38,7 @@ Without CI_PD_ROLE the file runs only its host-side configuration tests.
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -554,6 +555,124 @@ def _generate(base_url: str, prompt: str, max_new_tokens: int = 32) -> Generatio
     )
 
 
+# The corrupted state emits one character over and over (backslash runs in the
+# thousands, e.g. runs 33098546292 and 33431633965 on qwen3_coder_480b). 20 is
+# far above anything real text repeats and far below the runs observed, so this
+# needs no tuned ratio -- and a correct short answer like " 42" is not caught.
+_SPEW_RUN = 20
+
+
+def looks_degenerate(text: str) -> bool:
+    """Whether a sample is the token spew the corrupted-context state emits."""
+    stripped = text.strip()
+    if not stripped:
+        return True
+    return re.search(r"(.)\1{%d,}" % (_SPEW_RUN - 1), stripped) is not None
+
+
+# Varied prose, cycled to gsm8k's ~900-token prompt size. Not one sentence
+# repeated: heavy repetition can walk a model into degenerate repetition by
+# itself, which would be indistinguishable from the corruption being probed.
+_LONG_CONTEXT_PARAGRAPHS = (
+    "The harbour master keeps a ledger of every vessel that clears the outer "
+    "channel, noting draught, cargo class and the pilot who signed the release. ",
+    "Cartographers working the northern survey preferred aneroid barometers to "
+    "mercury ones, since a broken column meant a week waiting on resupply. ",
+    "A cooper's apprenticeship ran seven years: two spent shaping staves, three "
+    "on hooping and fitting heads, and two repairing casks from the brewers. ",
+    "The observatory's transit telescope stood on a pier sunk to bedrock so that "
+    "footsteps on the gallery would not disturb a sighting. ",
+    "Millwrights judged a waterwheel by the sound of its buckets emptying rather "
+    "than by any gauge, and reset a wheel running dry at the crown. ",
+    "Copperplate engravers bevelled a finished plate so the press blanket would "
+    "not tear, retiring it for resurfacing after some hundreds of sheets. ",
+    "In the salt marshes the reed cutters worked from flat punts, taking only "
+    "second-year growth, because first-year reed shrank in the thatch. ",
+    "Lighthouse keepers logged the hour the lamp was lit and doused, the oil "
+    "drawn, and any vessel that passed close enough to hail. ",
+    "Bell founders buried the mould in packed sand so the metal cooled evenly; a "
+    "bell drawn too early rang false and went back to the furnace. ",
+)
+
+
+def long_context_question(paragraphs: int = 29) -> str:
+    """~700 words, i.e. ~900 tokens -- the size of gsm8k's 5-shot prompt."""
+    filler = "".join(
+        _LONG_CONTEXT_PARAGRAPHS[i % len(_LONG_CONTEXT_PARAGRAPHS)]
+        for i in range(paragraphs)
+    )
+    return (
+        f"{filler}\n\nIgnore the notes above. Question: what is 17 plus 25? "
+        "Reply with only the number and nothing else."
+    )
+
+
+def run_long_context_probe(base_url: str, profile: ModelProfile) -> None:
+    """A gsm8k-sized prompt must not come back as token spew.
+
+    The probe above sends ~15-token prompts and has passed in every run on
+    record, including ones where gsm8k scored 0.0 -- short prompts survive the
+    corrupted state. Catching it here costs ~2min instead of the ~74min a
+    corrupted gsm8k takes to report a bare 0.0 (run 33431633965).
+    """
+    rec = _generate(base_url, long_context_question(), 64)
+    print(
+        json.dumps(
+            {
+                "long_context_probe": profile.key,
+                "prompt_tokens": rec.prompt_tokens,
+                "completion_tokens": rec.completion_tokens,
+                "sample_output": rec.text[:160],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    if looks_degenerate(rec.text):
+        raise AssertionError(
+            f"Long-context generation returned degenerate output at "
+            f"{rec.prompt_tokens} prompt tokens while short prompts pass -- the "
+            f"context the model reads is corrupt. First 200 chars: {rec.text[:200]!r}"
+        )
+
+
+def gsm8k_report_path(profile: ModelProfile) -> str:
+    """Where run_eval dumps its per-example report."""
+    return os.path.join("/tmp", f"gsm8k_{profile.served_name.replace('/', '_')}.html")
+
+
+def parse_gsm8k_samples(report: str) -> Tuple[Tuple[str, str], ...]:
+    """(response, results) per example, from simple_eval_common's HTML_JINJA."""
+    strip = lambda h: re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", h)).strip()
+    blocks = re.findall(
+        r"<h3>Sampled message</h3>(.*?)<h3>Results</h3>(.*?)"
+        r"(?=<h3>Prompt conversation</h3>|\Z)",
+        report,
+        flags=re.S,
+    )
+    return tuple((strip(a), strip(b)) for a, b in blocks)
+
+
+def dump_gsm8k_samples(profile: ModelProfile, limit: int = 3) -> None:
+    """Print a few sampled responses when gsm8k misses its floor.
+
+    A bare score cannot tell a wrong answer from token spew, and run_eval writes
+    the responses to /tmp only for the pod to be torn down with them.
+    """
+    path = gsm8k_report_path(profile)
+    if not os.path.isfile(path):
+        print(f"[gsm8k] no report at {path}")
+        return
+    with open(path, "r", errors="replace") as f:
+        blocks = parse_gsm8k_samples(f.read())
+    print(f"=== first {min(limit, len(blocks))} of {len(blocks)} gsm8k samples ===")
+    for i, (text, results) in enumerate(blocks[:limit]):
+        print(f"--- sample {i}: {len(text)} chars ---")
+        print(text[:900])
+        print(f"    {results}")
+    print("=== end gsm8k samples ===", flush=True)
+
+
 def run_tp_resharding_probe(base_url: str, profile: ModelProfile) -> None:
     records = []
     for i, prompt in enumerate(_PROMPTS):
@@ -561,6 +680,13 @@ def run_tp_resharding_probe(base_url: str, profile: ModelProfile) -> None:
         if not rec.text.strip() or rec.completion_tokens <= 0:
             raise AssertionError(
                 f"Request {i} produced empty decode output -- TP resharding P/D transfer failed"
+            )
+        # Emptiness and the resend check below both pass on the corrupted state:
+        # its spew is non-empty and, being greedy, identical on resend.
+        if looks_degenerate(rec.text):
+            raise AssertionError(
+                f"Request {i} produced degenerate output -- the KV that crossed "
+                f"the reshard is corrupt. First 200 chars: {rec.text[:200]!r}"
             )
         records.append(rec)
 
@@ -814,6 +940,12 @@ class TestPdTpResharding(unittest.TestCase):
             profile=self.profile,
         )
 
+    def test_01b_long_context_generation(self) -> None:
+        run_long_context_probe(
+            base_url=f"http://127.0.0.1:{LB_PORT}",
+            profile=self.profile,
+        )
+
     def test_02_gsm8k_quality(self) -> None:
         score = run_gsm8k(
             base_url=f"http://127.0.0.1:{LB_PORT}",
@@ -829,6 +961,8 @@ class TestPdTpResharding(unittest.TestCase):
             },
         )
         print(f"gsm8k score={score:.4f} floor={self.gsm8k_config.threshold:.4f}")
+        if score < self.gsm8k_config.threshold:
+            dump_gsm8k_samples(self.profile)
         self.assertGreaterEqual(score, self.gsm8k_config.threshold)
 
     def test_03_sliding_window_crossed_the_reshard(self) -> None:
