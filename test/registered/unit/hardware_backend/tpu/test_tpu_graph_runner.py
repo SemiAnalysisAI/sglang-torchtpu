@@ -19,6 +19,7 @@ from sglang.srt.compilation.support_torch_compile import (
     support_torch_compile,
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+    CausalLMDecoderTpuCompilePolicy,
     DecoderTpuCompilePolicy,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
@@ -121,6 +122,12 @@ class TestTpuGraphRunner(CustomTestCase):
         precompile_patcher = patch(DECODER_POLICY_PRECOMPILE)
         self.mock_precompile = precompile_patcher.start()
         self.addCleanup(precompile_patcher.stop)
+        causal_precompile_patcher = patch(
+            "sglang.srt.hardware_backend.tpu.compilation."
+            "decoder_compile_policy.CausalLMDecoderTpuCompilePolicy.precompile"
+        )
+        self.mock_causal_precompile = causal_precompile_patcher.start()
+        self.addCleanup(causal_precompile_patcher.stop)
         platform_patcher = patch(
             "sglang.srt.model_executor.tpu_graph_runner.current_platform",
             SimpleNamespace(device_type="tpu"),
@@ -277,6 +284,19 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertEqual(runner.compile_policy.tracer, "direct")
         # Backend registration still happens — the gate is _can_torch_compile.
         self.mock_register.assert_called_once()
+
+    def test_no_annotation_uses_split_policy_for_causal_lm_boundary(self):
+        model = _model_with(
+            forward=MagicMock(),
+            model=_model_with(forward=MagicMock()),
+            logits_processor=_model_with(forward=MagicMock()),
+        )
+        runner = self._runner_for(model, tpu_compile_tracer="direct")
+
+        TpuGraphRunner(runner)
+
+        self.assertIsInstance(runner.compile_policy, CausalLMDecoderTpuCompilePolicy)
+        self.mock_causal_precompile.assert_called_once()
 
     def test_augment_spec_policy_mixes_spec_over_base_for_eagle3(self):
         # EAGLE3 spec composes the spec mixin over the resolved policy (both the

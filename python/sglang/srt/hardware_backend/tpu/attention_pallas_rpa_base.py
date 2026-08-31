@@ -731,8 +731,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         elif self._is_extend_including_draft(forward_batch.forward_mode):
             # EXTEND and DRAFT_EXTEND use current lengths.
             assert forward_batch.extend_seq_lens is not None
+            assert forward_batch.extend_seq_lens_cpu is not None
             kv_lens = forward_batch.seq_lens.to(torch.int32)
-            extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
+            extend_seq_lens = torch.tensor(
+                forward_batch.extend_seq_lens_cpu,
+                dtype=torch.int32,
+            )
         else:
             kv_lens = forward_batch.seq_lens.to(torch.int32)
             if (
