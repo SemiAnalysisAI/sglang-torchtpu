@@ -2016,7 +2016,15 @@ class RaidenKVManager(CommonKVManager):
         if self._swa_engine is None:
             return True
         if not local_swa_blocks:
-            # Nothing for the window engine to place; let is_recv_done settle.
+            # Let is_recv_done settle -- but this side has a window engine, so a
+            # room with no window pages to place means the two sides disagree
+            # about the model being hybrid. See the matching note on the push.
+            logger.warning(
+                "RaidenKVManager rank%d raiden reshard SWA receive SKIPPED "
+                "room=%s -- no local window pages, the window will not arrive",
+                self.attn_tp_rank,
+                room,
+            )
             with self._state_lock:
                 self._completed_recv.add(self._swa_req_id(room))
             return True
@@ -2073,6 +2081,17 @@ class RaidenKVManager(CommonKVManager):
                 self._unregister_plan(room)
                 return False
             self._reshard_plans.setdefault(room, {})[self._swa_req_id(room)] = room
+        # INFO for the same reason as the push: without it a skipped window and
+        # a transferred one produce identical logs.
+        logger.info(
+            "raiden reshard SWA receive room=%s decode_rank=%d sources=%d "
+            "pages=%d layers=%d",
+            room,
+            self.attn_tp_rank,
+            len(sources),
+            n,
+            len(self._swa_kv_caches),
+        )
         return True
 
     def _register_receiver_and_signal(self, room: int) -> None:
@@ -2276,8 +2295,22 @@ class RaidenKVManager(CommonKVManager):
         swa_push_endpoint = req_meta.get("swa_push_endpoint") or ""
         n = len(decode_swa_blocks)
         if not n or not swa_blocks or not swa_push_endpoint:
-            # Nothing to move (or the peer has no window engine): settle so the
-            # room is not held open on a transfer that will never be issued.
+            # Settle so the room is not held open on a transfer that will never
+            # be issued -- but say so. This side has a window engine, so a room
+            # arriving here with no window pages or no peer endpoint means the
+            # two sides disagree about the model being hybrid. Silence would let
+            # the run go green having moved only the full-attention KV, which
+            # accuracy alone may not catch.
+            logger.warning(
+                "RaidenKVManager rank%d raiden reshard SWA push SKIPPED room=%s "
+                "decode_pages=%d local_pages=%d peer=%r -- the window was not "
+                "transferred",
+                self.attn_tp_rank,
+                room,
+                n,
+                len(swa_blocks),
+                swa_push_endpoint,
+            )
             with self._state_lock:
                 self._completed_send.add(swa_req_id)
             return
@@ -2343,6 +2376,19 @@ class RaidenKVManager(CommonKVManager):
                         decode_swa_blocks,
                         layer_idx,
                     )
+            # INFO, not debug: this is the only evidence the window actually
+            # crossed. Everything else about a hybrid reshard looks identical
+            # whether or not it did, and the integration test greps for it.
+            logger.info(
+                "raiden reshard SWA pushed room=%s prefill_rank=%d decode_rank=%d "
+                "pages=%d layers=%d peer=%s",
+                room,
+                self.attn_tp_rank,
+                self.attn_tp_rank // geom.ratio,
+                n,
+                len(self._swa_kv_caches),
+                swa_push_endpoint,
+            )
         except Exception as e:
             reason = f"Raiden reshard SWA push for room {room} failed: {e}"
             logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
