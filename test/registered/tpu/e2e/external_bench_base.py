@@ -138,10 +138,22 @@ def build_matrix_test(*, bench_model: str, bench_recipe: str, workload: str):
     class ExternalBenchTest(CustomTestCase):
         base_url = BASE_URL
         summary = None
+        spec_probe_result = None
 
         @classmethod
         def setUpClass(cls):
             cls._wait_healthy()
+            if spec_expected:
+                # Probe BEFORE the sweep: on the fresh, healthy server the probe
+                # answers exactly "is EAGLE3 drafting in this configuration?".
+                # Probing after the sweep conflated that with load-tail state --
+                # on the first 4-host E2E the c64-long4 tail left P/D transfers
+                # timing out and the probe 500'd against a degraded server.
+                try:
+                    cls.spec_probe_result = _spec_probe(cls.base_url)
+                except Exception as exc:  # asserted in test_spec_decoding_active
+                    cls.spec_probe_result = exc
+                print(f"[ext-bench] spec probe: {cls.spec_probe_result}", flush=True)
             cls.summary = cls._run_sweep()
 
         @classmethod
@@ -299,9 +311,12 @@ def build_matrix_test(*, bench_model: str, bench_recipe: str, workload: str):
             def test_spec_decoding_active(self):
                 """The recipe claims EAGLE3; prove drafting actually ran (a
                 silent fallback to plain decode would still pass every other
-                gate while benchmarking the wrong configuration)."""
-                probe = _spec_probe(self.base_url)
-                print(f"[ext-bench] spec probe: {probe}", flush=True)
+                gate while benchmarking the wrong configuration). The probe
+                itself ran in setUpClass, before the sweep."""
+                probe = type(self).spec_probe_result
+                if isinstance(probe, Exception):
+                    raise AssertionError(f"spec probe request failed: {probe!r}")
+                self.assertIsNotNone(probe, "spec probe did not run")
                 self.assertGreater(
                     probe["spec_verify_ct"],
                     0,

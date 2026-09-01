@@ -189,6 +189,16 @@ if [[ "$SPEC_DECODE" == "1" ]]; then
     export SGLANG_TPU_ALLOW_SPEC_RECOMPILE=${SGLANG_TPU_ALLOW_SPEC_RECOMPILE:-1}
 fi
 
+# P/D: a long request's KV handoff is chunky (a 64k-token context is ~1 GB
+# per engine at fp8) and 4 of them land together at the c64-long4 point, so
+# the default 300s disaggregation waiting timeout trips at the leg tail
+# ("Raiden transfer failed on another attention TP/CP rank", observed
+# 2026-09-01 on the first 4-host E2E). sglang's own log message recommends
+# raising it; 900s bounds a wedged transfer without failing healthy ones.
+if [[ "$PD_DISAGG" == "1" ]]; then
+    export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=${SGLANG_DISAGGREGATION_WAITING_TIMEOUT:-900}
+fi
+
 # KV offload (HiCache) io backend: raiden skips the fused pool's whole-pool D2H
 # precompile staging (which needs ~2x the KV pool in HBM); ratio 1 keeps the
 # host pool inside the pod memory request.
