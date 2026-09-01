@@ -44,7 +44,7 @@ HEALTH_TIMEOUT = int(os.environ.get("HEALTH_TIMEOUT", "600"))
 # Must clear the ci profile's worst case (8 legs x MAX_LEG_SECONDS=480) and
 # stay under the file's timeout_per_file=5400 with room for the summary print.
 SWEEP_TIMEOUT = int(os.environ.get("SWEEP_TIMEOUT", "4500"))
-PROFILE = os.environ.get("EXTERNAL_BENCH_PROFILE", "ci")
+PROFILE = os.environ.get("EXTERNAL_BENCH_PROFILE", "e2e")  # e2e branch: single point c64-long4
 MIN_PREFIX_HIT_FRACTION = float(os.environ.get("MIN_PREFIX_HIT_FRACTION", "0.6"))
 MIN_PREFIX_HIT_RATE = os.environ.get("MIN_PREFIX_HIT_RATE")
 

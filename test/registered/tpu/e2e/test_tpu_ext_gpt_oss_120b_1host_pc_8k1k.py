@@ -21,7 +21,12 @@ from external_bench_base import build_matrix_test
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=5400, suite="external-nightly-2x2x2", nightly=True)
+register_tpu_ci(
+    est_time=5400,
+    suite="external-nightly-2x2x2",
+    nightly=True,
+    disabled="e2e bring-up: only the gpt-oss pd group runs on this branch",
+)
 
 MULTIHOST_LAUNCH = {
     "launch_script": "recipe/external_bench/gpt_oss_120b_1host_pc.sh",
