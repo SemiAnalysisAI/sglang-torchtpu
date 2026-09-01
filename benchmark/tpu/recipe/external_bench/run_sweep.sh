@@ -22,9 +22,17 @@ mkdir -p "$TRACE_CACHE_DIR"
 if [[ "$PD_DISAGG" == "1" ]]; then
     MODE_LABEL=pd
     # The mini-LB serves no /metrics; the cache/offload counters live on the
-    # prefill engine (local to rank 0, where this sweep runs). The decode
-    # engine's counters are snapshotted alongside for triage.
-    IFS=',' read -r -a _slice_hosts <<< "${TPU_WORKER_HOSTNAMES:-}"
+    # prefill engine, the spec/abort side on the decode engine. Engine leaders
+    # follow PHYSICAL host order (serve_group.sh's rendezvous writes the map
+    # for this pod), not pod-index order.
+    if [[ -s /tmp/ext_bench_phys_hosts ]]; then
+        mapfile -t _slice_hosts < /tmp/ext_bench_phys_hosts
+    else
+        IFS=',' read -r -a _slice_hosts <<< "${TPU_WORKER_HOSTNAMES:-}"
+    fi
+    if [[ -z "${PROBE_URL:-}" && ${#_slice_hosts[@]} -ge 1 ]]; then
+        PROBE_URL="http://${_slice_hosts[0]}:$PD_PREFILL_PORT"
+    fi
     PROBE_URL=${PROBE_URL:-http://127.0.0.1:$PD_PREFILL_PORT}
     if [[ -z "${PROBE_URL_2:-}" && ${#_slice_hosts[@]} -ge 3 ]]; then
         PROBE_URL_2="http://${_slice_hosts[2]}:$PD_DECODE_PORT"
