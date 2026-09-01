@@ -18,6 +18,7 @@ from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
     should_skip_post_experts_all_reduce,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -220,6 +221,21 @@ class TestFp8MoeFusedRs(CustomTestCase):
         layer.quant_method = SimpleNamespace(handles_moe_reduction=True)
         self.assertTrue(layer.handles_moe_reduction)
         layer.quant_method.handles_moe_reduction = False
+        self.assertFalse(layer.handles_moe_reduction)
+
+    def test_fp8_fused_rs_reduction_contract_is_eager_only(self):
+        method = object.__new__(Fp8MoEMethod)
+        method.handles_moe_reduction = True
+        layer = object.__new__(FusedMoE)
+        layer.quant_method = method
+
+        with patch("torch.compiler.is_compiling", return_value=False):
+            self.assertTrue(layer.handles_moe_reduction)
+
+        with patch("torch.compiler.is_compiling", return_value=True):
+            self.assertFalse(layer.handles_moe_reduction)
+
+        method.handles_moe_reduction = False
         self.assertFalse(layer.handles_moe_reduction)
 
 
