@@ -13,6 +13,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import ast
 import collections
 import inspect
 import os
@@ -30,6 +31,7 @@ import torch
 from sglang.srt.disaggregation.base.conn import BaseKVSender, KVArgs, StateType
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeReqToTokenPool
 from sglang.srt.disaggregation.raiden.conn import (
+    DEFAULT_KV_PORT,
     RaidenKVManager,
     RaidenKVSender,
     get_raiden_kv_caches,
@@ -697,29 +699,58 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             mgr._release_pull_slots_locked()
         self.assertTrue(mgr.maybe_start_pull(second))
 
-    def test_hybrid_swa_rejects_asymmetric_tp_before_reshard(self):
+    @staticmethod
+    def _reshard_decode_mgr():
         mgr = object.__new__(RaidenKVManager)
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
+        mgr._state_lock = threading.RLock()
+        mgr._completed_recv = set()
         mgr._swa_engine = Mock()
+        mgr._dynamic_host_staging = True
+        mgr.update_status = Mock()
+        return mgr
+
+    def test_hybrid_swa_reshard_forwards_its_window_pages(self):
+        """Asymmetric TP used to reject hybrid models outright. It now forwards
+        the sliding-window pages too, so the second engine can be given its own
+        reshard plan -- without them the window would never reach decode."""
+        mgr = self._reshard_decode_mgr()
         mgr._register_reshard_request = Mock()
 
-        with self.assertRaisesRegex(
-            NotImplementedError,
-            "cannot reshard hybrid SWA KV caches.*2 prefill sources",
-        ):
-            mgr.register_decode_request(
-                room=31,
-                local_blocks=[8, 9],
-                local_swa_blocks=[6, 7],
-                aux_index=None,
-                bootstrap_infos=[{}, {}],
-            )
+        mgr.register_decode_request(
+            room=31,
+            local_blocks=[8, 9],
+            local_swa_blocks=[6, 7],
+            aux_index=None,
+            bootstrap_infos=[{}, {}],
+        )
+
+        mgr._register_reshard_request.assert_called_once_with(
+            31, [8, 9], [6, 7], None, [{}, {}]
+        )
+
+    def test_hybrid_swa_reshard_prefix_hit_settles_both_engines(self):
+        """A full prefix hit receives nothing on either engine. Settling only
+        the full-attention id would hang is_recv_done, which requires the
+        sliding-window id too whenever a second engine exists."""
+        mgr = self._reshard_decode_mgr()
+        mgr._register_reshard_request = Mock()
+
+        mgr.register_decode_request(
+            room=31,
+            local_blocks=[],
+            local_swa_blocks=[6, 7],
+            aux_index=None,
+            bootstrap_infos=[{}, {}],
+        )
 
         mgr._register_reshard_request.assert_not_called()
+        self.assertIn("31", mgr._completed_recv)
+        self.assertIn(mgr._swa_req_id(31), mgr._completed_recv)
 
     def test_alloc_returns_page_aligned_token_runs(self):
         pool = _make_host_pool(page_size=4, page_num=3)
@@ -1254,6 +1285,125 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         self.assertFalse(mgr._completed_recv)
 
 
+class TestRaidenRoleStatePlacement(CustomTestCase):
+    """RaidenKVManager.__init__ splits its state between a prefill branch and a
+    decode branch, so state declared in the wrong one is simply absent at
+    runtime -- an AttributeError the first time that role reaches the code that
+    reads it, and only on a path CI happens to exercise.
+
+    `_reshard_covered` shipped in the prefill branch while both of its readers
+    are decode-side. Nothing caught it until a hybrid model first reached the
+    decode-side chunked reshard path on hardware, ~45 minutes into a two-slice
+    P/D run. This asserts statically what that run discovered.
+    """
+
+    # Handlers named by the message each side receives; the reshard handshake is
+    # decode-initiated, so RESHARD_REQ/READY/CHUNK_READY land on prefill.
+    DECODE_SIDE = frozenset(
+        {
+            "_on_reshard_blocks",
+            "_on_reshard_chunk",
+            "_register_receiver_and_signal",
+            "_register_reshard_request",
+            "_register_reshard_swa_receiver",
+            "_maybe_register_reshard_final",
+            "_publish_reshard_plan",
+            "register_decode_request",
+        }
+    )
+    PREFILL_SIDE = frozenset(
+        {
+            "_on_reshard_req",
+            "_on_reshard_ready",
+            "_on_reshard_chunk_ready",
+            "_run_reshard_push",
+            "_run_reshard_swa_push",
+            "_maybe_reshard_reply",
+            "_announce_reshard_chunk",
+        }
+    )
+
+    @staticmethod
+    def _self_attrs(nodes, *, stored_only):
+        found = set()
+        for node in nodes:
+            for sub in ast.walk(node):
+                if (
+                    isinstance(sub, ast.Attribute)
+                    and isinstance(sub.value, ast.Name)
+                    and sub.value.id == "self"
+                    and (not stored_only or isinstance(sub.ctx, ast.Store))
+                ):
+                    found.add(sub.attr)
+        return found
+
+    def test_role_state_is_declared_in_the_branch_that_reads_it(self):
+        source = inspect.getsource(sys.modules[RaidenKVManager.__module__])
+        cls = next(
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.ClassDef) and node.name == "RaidenKVManager"
+        )
+        methods = [
+            n
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef) and n.name != "__init__"
+        ]
+        init = next(
+            n
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+        )
+
+        prefill_only, decode_only = set(), set()
+        for stmt in init.body:
+            if isinstance(stmt, ast.If) and "PREFILL" in ast.dump(stmt.test):
+                p = self._self_attrs(stmt.body, stored_only=True)
+                d = self._self_attrs(stmt.orelse, stored_only=True)
+                prefill_only |= p - d
+                decode_only |= d - p
+        shared = prefill_only & decode_only
+        prefill_only -= shared
+        decode_only -= shared
+        self.assertIn(
+            "_reshard_covered",
+            decode_only,
+            "_reshard_covered is decode state; both readers run on decode",
+        )
+
+        readers = {}
+        for fn in methods:
+            for attr in self._self_attrs([fn], stored_only=False):
+                readers.setdefault(attr, set()).add(fn.name)
+
+        wrong = []
+        for attr in sorted(prefill_only):
+            used = sorted(readers.get(attr, set()) & self.DECODE_SIDE)
+            if used:
+                wrong.append(f"{attr}: prefill-only, read by decode-side {used}")
+        for attr in sorted(decode_only):
+            used = sorted(readers.get(attr, set()) & self.PREFILL_SIDE)
+            if used:
+                wrong.append(f"{attr}: decode-only, read by prefill-side {used}")
+        self.assertEqual(
+            wrong, [], "state declared in the wrong role branch:\n" + "\n".join(wrong)
+        )
+
+
+class TestRaidenDefaultPort(CustomTestCase):
+    def test_default_port_range_clears_the_serving_ports(self):
+        """Each rank takes `base + 4*local_rank`, so the default base decides
+        whether rank 0 lands on the HTTP serving port. At 30000 it did: the
+        engine won the bind, uvicorn died with EADDRINUSE and took the process
+        tree with it, so the server never went healthy and no transfer was ever
+        attempted -- a bring-up crash that reads as a raiden failure (combo run
+        33256868716). The ports below are the ones SGLang serves on by default.
+        """
+        reserved = range(DEFAULT_KV_PORT, DEFAULT_KV_PORT + 4 * 16)
+        for port in (30000, 8000, 8998, 10011):
+            self.assertNotIn(port, reserved)
+
+
 class TestNoPushLock(CustomTestCase):
     def test_every_send_goes_through_the_endpoint_send_lock(self):
         # The per-endpoint send helper replaced the old global push lock; a
@@ -1422,6 +1572,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
             b"10.0.0.2:31000",
             pack_ints(self.DECODE_BLOCKS),
             b"4",
+            # SWA pages + SWA push endpoint; empty here (no window engine).
+            b"",
+            b"",
         ]
 
     def _sent(self, mgr, tag):
@@ -1558,6 +1711,8 @@ class TestRaidenChunkedResharding(CustomTestCase):
             )
         }
         mgr._reshard_sources = {self.ROOM: {}}
+        # Same shape for the window pool; _on_reshard_blocks records both.
+        mgr._reshard_swa_sources = {self.ROOM: {}}
         mgr._reshard_registered = set()
         mgr._reshard_chunk_sources = {}
         mgr._reshard_covered = {}
@@ -1680,6 +1835,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                         pack_ints(list(range(100 + 200 * rank, 164 + 200 * rank))),
                         str(rank).encode("ascii"),
                         b"",
+                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
                     ]
                 )
         self.assertEqual(seen_complete, [False])
@@ -1700,6 +1856,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                         pack_ints(list(range(100 + 200 * rank, 164 + 200 * rank))),
                         str(rank).encode("ascii"),
                         b"",
+                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
                     ]
                 )
         self.assertEqual(
@@ -1968,6 +2125,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                         pack_ints(src[rank]),
                         str(rank).encode("ascii"),
                         b"",
+                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
                     ]
                 )
             uuid, req = mgr._engine.register_active_plan.call_args.args
@@ -2016,6 +2174,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                         pack_ints(src[rank]),
                         str(rank).encode("ascii"),
                         b"",
+                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
                     ]
                 )
 
@@ -2057,6 +2216,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                         pack_ints(src[rank]),
                         str(rank).encode("ascii"),
                         b"",
+                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
                     ]
                 )
 
@@ -2093,6 +2253,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                         pack_ints(src[rank]),
                         str(rank).encode("ascii"),
                         b"",
+                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
                     ]
                 )
             seen_during_chunk_registration.append(
