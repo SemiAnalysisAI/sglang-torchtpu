@@ -822,6 +822,10 @@ def mm_projection_auto(
 class KimiK25ForConditionalGeneration(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
+    # Decode goes through general_mm_embed_routine's precomputed input_embeds;
+    # the TPU decoder compile policy reads this to trace the same call shape.
+    decode_embeds_in_language_model: bool = False
+
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
     # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
     # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/config.json
