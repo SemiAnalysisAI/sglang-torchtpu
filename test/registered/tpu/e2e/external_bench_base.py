@@ -30,8 +30,17 @@ import urllib.request
 # One source of truth for the reachable prefix-hit formula.
 from test_tpu_qwen3_coder_480b_multihost_agentic import _reachable_prefix_hit_rate
 
-from sglang.test.ci.ci_register import register_tpu_ci  # noqa: F401 (re-export)
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase, dump_metric
+
+# run_suite requires every file under test/registered to carry a registration;
+# same convention as debug_utils/comparator/testing_helpers.py.
+register_tpu_ci(
+    est_time=0,
+    suite="external-nightly-2x2x2",
+    nightly=True,
+    disabled="helper module, no tests",
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, *[".."] * 4))
