@@ -254,7 +254,7 @@ def _fmt(value, spec: str = ".1f", dash: str = "-") -> str:
 def _markdown(summary: Dict) -> str:
     lines: List[str] = []
     run = summary["run"]
-    lines.append("## Qwen3-Coder-480B FP8 — TPU agentic benchmark")
+    lines.append(f"## {run.get('title') or 'TPU serving benchmark'}")
     lines.append("")
     lines.append(
         f"- model: `{run['model']}`  profile: `{run['profile']}`  "
@@ -359,6 +359,18 @@ def main() -> int:
     ap.add_argument("--md-out", required=True)
     ap.add_argument("--profile", default=os.environ.get("PROFILE", "unknown"))
     ap.add_argument("--mode", default=os.environ.get("MODE", "unknown"))
+    # Labels only -- so the external benchmark matrix (which reuses this
+    # summarizer for other models/recipes) does not report as the 480B run.
+    ap.add_argument(
+        "--benchmark-label",
+        default=os.environ.get("BENCH_SUMMARY_LABEL", "qwen3-coder-480b-tpu-agentic"),
+    )
+    ap.add_argument(
+        "--title",
+        default=os.environ.get(
+            "BENCH_SUMMARY_TITLE", "Qwen3-Coder-480B FP8 — TPU agentic benchmark"
+        ),
+    )
     args = ap.parse_args()
 
     run_root = os.path.abspath(args.run_root)
@@ -384,7 +396,8 @@ def main() -> int:
     summary = {
         "schema_version": SCHEMA_VERSION,
         "run": {
-            "benchmark": "qwen3-coder-480b-tpu-agentic",
+            "benchmark": args.benchmark_label,
+            "title": args.title,
             "profile": args.profile,
             "mode": args.mode,
             "model": cfg("model", os.environ.get("MODEL", "unknown")),

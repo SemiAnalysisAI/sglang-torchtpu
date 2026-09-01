@@ -132,8 +132,10 @@ jobs:
           trap cleanup EXIT
 
           # Render, apply, gate, and tear down ONE group's JobSet. Returns 0 pass / 1 fail.
+          # $3 = wait budget in seconds (sized from the group's per-file budgets so a
+          # long benchmark group is not declared dead while still inside its deadline).
           run_group() {
-            local job="$1" label="$2" name short sel rc=1
+            local job="$1" label="$2" wait_budget="${3:-9600}" name short sel rc=1
             name="$(kubectl -n "$ns" create -f "$job" -o name)" || { echo "❌ ${label}: create failed"; return 1; }
             CUR="$name"; short="${name##*/}"; sel="jobset.sigs.k8s.io/jobset-name=${short}"
             echo "Created ${name} for ${label}"
@@ -156,7 +158,7 @@ jobs:
               2>&1 | tee -a "$RUNNER_TEMP/external-pod-logs.txt" || true
 
             local deadline next_refresh auth_fails=0 iter=0 ok bad
-            deadline=$(( $(date +%s) + 9600 ))      # outlast the JobSet's activeDeadlineSeconds
+            deadline=$(( $(date +%s) + wait_budget ))  # outlast the JobSet's activeDeadlineSeconds
             next_refresh=$(( $(date +%s) + 2400 ))
             while [ "$(date +%s)" -lt "$deadline" ]; do
               if [ "$(date +%s)" -ge "$next_refresh" ]; then
@@ -204,6 +206,8 @@ jobs:
             weights="$(jq -r '.weights' <<<"$g")"
             gname="$(jq -r '.name' <<<"$g")"
             grun="$(jq -r '.run_name' <<<"$g")"
+            tpf="$(jq -r '.timeout_per_file // 3600' <<<"$g")"
+            nf="$(wc -w <<<"$files")"
             echo "::group::group $(( i + 1 ))/${n}: ${gname}"
             python3 .github/tpu-ci/external/render_external_jobset.py \
               --image '${{ inputs.image }}' \
@@ -213,9 +217,12 @@ jobs:
               --weights "$weights" \
               --nodepool "$NODEPOOL" \
               --extra-args '${{ inputs.extra_args }}' \
+              --timeout-per-file "$tpf" \
               --name "$grun" > /tmp/external-job.yaml || { echo "render failed for ${gname}"; overall=1; echo '::endgroup::'; continue; }
             grep -nE 'generateName:|completions:|gke-nodepool:|gke-tpu-topology:|bucketName:|TP_SIZE|bash "benchmark' /tmp/external-job.yaml | head
-            run_group /tmp/external-job.yaml "$gname" || overall=1
+            # Waiting outlasts the rendered activeDeadlineSeconds (same formula + slack).
+            wait_budget=$(( 4800 + nf * tpf )); (( wait_budget < 9600 )) && wait_budget=9600
+            run_group /tmp/external-job.yaml "$gname" "$wait_budget" || overall=1
             echo '::endgroup::'
           done
           echo "slice ${slice} done, overall rc=${overall}"
