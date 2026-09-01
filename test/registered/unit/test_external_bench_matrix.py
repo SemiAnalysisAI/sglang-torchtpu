@@ -43,10 +43,10 @@ WORKLOADS = ("agentic", "8k1k")
 
 
 def _scan_file(path):
-    """(suite, MULTIHOST_LAUNCH) the CI scanner would read, via the same AST
-    contract (literal kwargs / literal dict)."""
+    """(suite, MULTIHOST_LAUNCH, disabled) the CI scanner would read, via the
+    same AST contract (literal kwargs / literal dict)."""
     tree = ast.parse(open(path).read())
-    suite, launch = None, None
+    suite, launch, disabled = None, None, None
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Call)
@@ -55,11 +55,13 @@ def _scan_file(path):
             kw = {k.arg: k.value for k in node.keywords}
             if "suite" in kw:
                 suite = ast.literal_eval(kw["suite"])
+            if "disabled" in kw:
+                disabled = ast.literal_eval(kw["disabled"])
         elif isinstance(node, ast.Assign):
             for t in node.targets:
                 if isinstance(t, ast.Name) and t.id == "MULTIHOST_LAUNCH":
                     launch = ast.literal_eval(node.value)
-    return suite, launch
+    return suite, launch, disabled
 
 
 class TestExternalBenchMatrix(CustomTestCase):
@@ -76,7 +78,7 @@ class TestExternalBenchMatrix(CustomTestCase):
 
     def test_every_cell_names_an_existing_launch_wrapper(self):
         for path in self._cell_files():
-            _, launch = _scan_file(path)
+            _, launch, _ = _scan_file(path)
             self.assertIsNotNone(launch, f"{path}: no literal MULTIHOST_LAUNCH")
             script = os.path.join(REPO, "benchmark", "tpu", launch["launch_script"])
             self.assertTrue(
@@ -94,7 +96,7 @@ class TestExternalBenchMatrix(CustomTestCase):
                     path = os.path.join(
                         E2E, f"test_tpu_ext_{model}_{recipe}_{workload}.py"
                     )
-                    suite, launch = _scan_file(path)
+                    suite, launch, _ = _scan_file(path)
                     keys.add((suite, launch["launch_script"], launch["weights"]))
                 self.assertEqual(
                     len(keys),
@@ -107,7 +109,7 @@ class TestExternalBenchMatrix(CustomTestCase):
         """A pd cell on the 2-host suite (or a 1-host cell on the 4-host one)
         fails only at engine rendezvous, an hour into the run."""
         for path in self._cell_files():
-            suite, _ = _scan_file(path)
+            suite, _, _ = _scan_file(path)
             recipe = next(r for r in RECIPES if f"_{r}_" in os.path.basename(path))
             self.assertEqual(
                 suite,
@@ -157,8 +159,24 @@ class TestExternalBenchMatrix(CustomTestCase):
                     f"{g['name']}: discovery must carry the files' declared "
                     "timeout_per_file (the JobSet deadline is sized from it)",
                 )
-        self.assertEqual(per_suite.get("external-nightly-2x2x2"), 4)
-        self.assertEqual(per_suite.get("external-nightly-2x2x4"), 2)
+        # Expected group counts follow the files themselves: a cell disabled
+        # with a reason (e.g. the raiden P/D transfer finding) is skipped by
+        # discovery, and this test must not force it back on.
+        expected = {}
+        for path in self._cell_files():
+            suite, launch, disabled = _scan_file(path)
+            if disabled is not None:
+                continue
+            key = (suite, launch["launch_script"])
+            expected.setdefault(suite, set()).add(key)
+        self.assertEqual(
+            per_suite.get("external-nightly-2x2x2", 0),
+            len(expected.get("external-nightly-2x2x2", ())),
+        )
+        self.assertEqual(
+            per_suite.get("external-nightly-2x2x4", 0),
+            len(expected.get("external-nightly-2x2x4", ())),
+        )
 
     def test_config_resolves_the_tasks_sweep_grid(self):
         """config.sh must keep the task's grid: concurrency {1,16,64} x long
