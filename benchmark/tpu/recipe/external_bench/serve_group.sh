@@ -88,20 +88,27 @@ log_config
 engine_supervisor() {
     local tries=0 rc child=""
     # Teardown must never look like a crash: on TERM/INT forward the signal to
-    # the live engine and stop -- only an engine that died on its own retries.
-    trap 'kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 143' TERM INT
+    # the live engine's WHOLE process group and stop -- only an engine that
+    # died on its own retries.
+    trap 'kill -TERM -- "-$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 143' TERM INT
     while :; do
-        bash "$TPU_BENCH/launch_server.sh" &
+        # setsid: the attempt is its own process group, so a failed attempt can
+        # be reaped WHOLE before relaunching. sglang's schedulers are
+        # grandchildren -- killing only the wrapper orphaned them holding their
+        # ports, and every relaunch died on EADDRINUSE/TCPStore ping failures
+        # (iteration 16).
+        setsid bash "$TPU_BENCH/launch_server.sh" &
         child=$!
         wait "$child"
         rc=$?
+        kill -KILL -- "-$child" 2>/dev/null || true
         tries=$(( tries + 1 ))
         if (( tries >= 3 )); then
             echo "[serve_group] engine exited rc=$rc (attempt $tries/3); giving up" >&2
             return "$rc"
         fi
-        echo "[serve_group] engine exited rc=$rc (attempt $tries/3); relaunching in 20s" >&2
-        sleep 20
+        echo "[serve_group] engine exited rc=$rc (attempt $tries/3); relaunching in 30s" >&2
+        sleep 30
     done
 }
 
