@@ -112,7 +112,9 @@ spec:
                       spid=$!
                       if [ "$RANK" = "0" ]; then
                         ok=0
-                        for i in $(seq 1 300); do
+                        # 540 x 10s = 90 min: a 450G checkpoint's first gcsfuse read
+                        # plus tp=16 compile warmup can exceed the old 50 min cap.
+                        for i in $(seq 1 540); do
                           curl -sf --max-time 5 http://127.0.0.1:30000/health_generate >/dev/null 2>&1 && { ok=1; break; }
                           kill -0 "$spid" 2>/dev/null || { echo "server exited early"; break; }
                           sleep 10
