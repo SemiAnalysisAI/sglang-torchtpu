@@ -237,6 +237,7 @@ bench_argv_json=$("$PYTHON" -c 'import json,sys; print(json.dumps(sys.argv[1:]))
     --set kv_offload="$KV_OFFLOAD" \
     --set spec_decode="$SPEC_DECODE" \
     --set pd_disagg="$PD_DISAGG" \
+    --set pd_prefill_engines="$PD_PREFILL_ENGINES" \
     --set hicache_ratio="$HICACHE_RATIO" \
     --set seed="$SEED" \
     --set max_leg_seconds="$MAX_LEG_SECONDS" \

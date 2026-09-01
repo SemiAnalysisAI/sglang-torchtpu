@@ -28,7 +28,7 @@ register_tpu_ci(
     est_time=7200,
     suite="external-nightly-2x2x4",
     nightly=True,
-    disabled="raiden P/D KV transfer fails on the external cluster; see PR #600",
+    disabled="8k1k c64-long4 P/D leg times out on the 4 cold 64k-input long requests (raiden IPv6 rendezvous fixed in #606: the 60 normal 8k requests finish in ~100s and the agentic P/D leg runs at 1084 tok/s; the single-shot 64k KV handoff is a separate perf tail, run 33548460767)",
 )
 
 MULTIHOST_LAUNCH = {

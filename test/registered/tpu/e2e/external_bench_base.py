@@ -276,9 +276,10 @@ def build_matrix_test(*, bench_model: str, bench_recipe: str, workload: str):
                     # These recipes run dp=1, so the reachable rate is the
                     # single-cache ideal; still read dp back off the run so a
                     # future DP recipe cannot silently inherit a wrong floor.
+                    config = leg.get("config") or {}
                     dp_size = int((leg.get("server_info") or {}).get("dp_size") or 1)
                     reachable = _reachable_prefix_hit_rate(
-                        config=leg.get("config") or {}, dp_size=dp_size
+                        config=config, dp_size=dp_size
                     )
                     self.assertIsNotNone(
                         reachable,
@@ -291,10 +292,23 @@ def build_matrix_test(*, bench_model: str, bench_recipe: str, workload: str):
                         f"{leg['tag']}: no round can reach a cached prefix at "
                         f"dp={dp_size}; the leg measures nothing as it is.",
                     )
+                    # P/D: the mini-LB pairs every request with a uniformly
+                    # random prefill engine and each engine caches on its own,
+                    # so a round lands on the engine holding its previous round
+                    # with probability 1/N. A round that lands elsewhere still
+                    # hits that engine's older copy of the session, so 1/N of
+                    # the ideal is a floor, not an estimate.
+                    prefill_engines = int(config.get("pd_prefill_engines") or 1)
+                    reachable /= prefill_engines
+                    routing = (
+                        f" across {prefill_engines} randomly paired prefill engines"
+                        if prefill_engines > 1
+                        else ""
+                    )
                     floor = MIN_PREFIX_HIT_FRACTION * reachable
                     how = (
                         f"{MIN_PREFIX_HIT_FRACTION:.0%} of the {reachable:.1%} "
-                        f"this leg's round counts reach at dp={dp_size}"
+                        f"this leg's round counts reach at dp={dp_size}{routing}"
                     )
                 self.assertGreaterEqual(
                     rate,

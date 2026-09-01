@@ -160,10 +160,10 @@ env | grep -E '^TPU_' | sed 's/^/[serve_group]   /' || true
 # request time by the mini-LB. This is the raiden P/D topology every existing
 # gate validates (single-host engines; task-10 multihost PD likewise). The
 # 2-host-tp=16-per-engine variant on a subdivided slice brings up cleanly with
-# a consistently re-scoped libtpu env, but its raiden KV pulls NEVER complete
-# (every request rides the WaitingForInput timeout onto the fallback path;
-# 2026-09-01 iterations 4-11) -- surfaced upstream, revisit when raiden
-# supports engines subdivided from one slice.
+# a consistently re-scoped libtpu env; its 2026-09-01 "KV pulls never
+# complete" failures were the same IPv6 ZMQ rendezvous bug this topology hit
+# (PR #606), so it is untested since the fix rather than known-broken --
+# revisit if tp=16-per-engine P/D is wanted.
 if (( WORKER_ID < 2 )); then
     ROLE=prefill
     export PORT=$PD_PREFILL_PORT

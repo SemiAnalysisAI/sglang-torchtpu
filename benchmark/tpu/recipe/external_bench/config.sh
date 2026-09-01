@@ -179,10 +179,11 @@ case "$BENCH_RECIPE" in
         ;;
     pd_2p2d_pc_spec_kvoff)
         # FOUR single-host tp=8 engines (2 prefill + 2 decode) behind the
-        # mini-LB -- the raiden-validated topology. Two-host tp=16 engines
-        # subdivided from the slice bring up, but their raiden KV pulls never
-        # complete (see serve_group.sh).
+        # mini-LB -- the raiden-validated topology. (Two-host tp=16 engines
+        # subdivided from the slice also bring up; see serve_group.sh for why
+        # they are untested rather than known-broken.)
         RECIPE_HOSTS=4; TP_SIZE=8; EP_SIZE=8     # per engine, 1 host each
+        PD_PREFILL_ENGINES=2   # the mini-LB pairs requests with a random one
         PREFIX_CACHE=1; KV_OFFLOAD=1; SPEC_DECODE=1; PD_DISAGG=1
         ;;
     *)
@@ -190,6 +191,9 @@ case "$BENCH_RECIPE" in
         exit 2
         ;;
 esac
+# Prefill engines a request can be routed to; the agentic prefix-hit gate
+# scales its reachable rate by 1/N because each engine caches on its own.
+PD_PREFILL_ENGINES=${PD_PREFILL_ENGINES:-1}
 
 # Spec verify/draft graph capture is expensive and host-RAM hungry when the
 # grid is unbounded; bound it to the sweep's shapes (incl. bs=64 -- the EAGLE3
@@ -208,16 +212,12 @@ fi
 MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS-$((MAX_TOTAL_TOKENS_TP8 * TP_SIZE / 8))}
 MAX_TOTAL_TOKENS_PREFILL=${MAX_TOTAL_TOKENS_PREFILL-$MAX_TOTAL_TOKENS_TP8}
 
-# P/D disaggregation timeouts: keep the stock 300s. A stalled KV handoff on
-# the external cluster NEVER progresses (failures land exactly at the timeout
-# boundary in every run) and is recovered by the P/D retry loop
-# (optimistic_release_and_requeue) -- so a longer window only parks the
-# request 3x longer before the retry that actually completes it. Measured on
-# the identical 8k1k c64-long4 leg: 300s -> 216.5 tok/s (run 33478717664),
-# 900s -> 72.7 tok/s (run 33505299417), leg wall clock pinned at ~1x the
-# window by the stalled cohort. Overridable for experiments; if a run shows
-# transfers that COMPLETE slowly (failures strictly inside the window),
-# raising these becomes the right call.
+# P/D disaggregation timeouts: stock 300s. The 2026-09-01 external runs in
+# which every request failed exactly at the timeout boundary (216.5 tok/s at
+# 300s, 72.7 tok/s at 900s, empty response bodies) were the IPv6 ZMQ
+# rendezvous bug fixed in PR #606 -- the pods here are IPv6-only and the
+# raiden connector's PULL_REQ/BLOCKS were never delivered -- not slow
+# transfers, so the window is a safety net only. Overridable for experiments.
 #
 # Two separate knobs bound the two sides of a handoff: the decode's wait for
 # its KV (WAITING) and the prefill's wait for the decode to ask (BOOTSTRAP --

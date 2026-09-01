@@ -27,7 +27,6 @@ register_tpu_ci(
     est_time=7200,
     suite="external-nightly-2x2x4",
     nightly=True,
-    disabled="raiden P/D KV transfer fails on the external cluster; see PR #600",
 )
 
 MULTIHOST_LAUNCH = {
