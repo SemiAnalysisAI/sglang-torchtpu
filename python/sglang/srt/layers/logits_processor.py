@@ -206,6 +206,7 @@ class LogitsMetadata:
     extend_return_top_logprob: bool = False
     extend_token_ids_logprob: bool = False
     extend_seq_lens: Optional[torch.Tensor] = None
+    extend_start_loc: Optional[torch.Tensor] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
@@ -295,6 +296,7 @@ class LogitsMetadata:
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
             extend_seq_lens=forward_batch.extend_seq_lens,
+            extend_start_loc=forward_batch.extend_start_loc,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
@@ -592,17 +594,14 @@ class LogitsProcessor(nn.Module):
         ):
             # Prefill without input logprobs.
             if _is_tpu:
-                # Set dtype to int32 rather than cumsum's default int64.
-                # 32-bit integers are TPU native while s64 requires
-                # emulation, and its buggy lowering can run into
-                # "Unsupported conversion from vmreg/vreg to U64". int32
-                # is plenty for per-batch token counts.
+                assert logits_metadata.extend_start_loc is not None
+                # Reuse scheduler offsets: lowering this as a cumsum can
+                # deadlock XLA latency-hiding schedules for long full-model graphs.
+                # Compile padding appends zero-length batch rows. Keep their
+                # gather indices in bounds; finalize_forward_batch drops them.
                 last_index = (
-                    torch.cumsum(
-                        logits_metadata.extend_seq_lens,
-                        dim=0,
-                        dtype=torch.int32,
-                    )
+                    logits_metadata.extend_start_loc
+                    + torch.clamp_min(logits_metadata.extend_seq_lens, 1)
                     - 1
                 )
             else:

@@ -16,9 +16,11 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+import sglang.srt.layers.logits_processor as logits_processor_module
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.lora.utils import get_lm_head_pruned_lens
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -29,6 +31,26 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestLMHeadPruning(CustomTestCase):
+    def test_tpu_uses_precomputed_extend_start_locations_with_padding(self):
+        extend_seq_lens = torch.tensor([4, 5, 6, 0, 0], dtype=torch.int32)
+        metadata = LogitsMetadata(
+            forward_mode=ForwardMode.EXTEND,
+            extend_return_logprob=False,
+            extend_seq_lens=extend_seq_lens,
+            extend_start_loc=torch.tensor([0, 4, 9, 0, 0], dtype=torch.int32),
+        )
+        hidden_states = torch.arange(15)[:, None]
+
+        with (
+            patch.object(logits_processor_module, "_is_tpu", True),
+            patch.object(torch, "cumsum", side_effect=AssertionError("unexpected")),
+        ):
+            pruned_states = LogitsProcessor._get_pruned_states(
+                None, hidden_states, None, None, metadata
+            )[0]
+
+        self.assertEqual(pruned_states[:, 0].tolist(), [3, 8, 14, 0, 0])
+
     def test_lora_segments_match_pruned_rows_per_request(self):
         """Equal total rows must not hide routing one request through another LoRA."""
         cases = (

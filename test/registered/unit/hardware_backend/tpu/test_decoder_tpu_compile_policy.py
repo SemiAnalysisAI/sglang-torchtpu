@@ -21,6 +21,7 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
     Qwen3VLDecoderTpuCompilePolicy,
+    RpaSeqPrefillDecoderTpuCompilePolicy,
     _materialize_out,
     _unpad_decoder_outputs,
 )
@@ -134,6 +135,76 @@ def _run_cases(policy, mode):
             policy._precompile_extend()
         else:
             policy._precompile_decode()
+
+
+class TestRpaSeqPrefillDecoderTpuCompilePolicy(CustomTestCase):
+    def test_supports_standard_causal_lm_boundary(self):
+        owner = SimpleNamespace(
+            model=SimpleNamespace(forward=MagicMock()),
+            logits_processor=SimpleNamespace(forward=MagicMock()),
+        )
+        self.assertTrue(RpaSeqPrefillDecoderTpuCompilePolicy.supports(owner))
+        self.assertFalse(
+            RpaSeqPrefillDecoderTpuCompilePolicy.supports(
+                SimpleNamespace(model=SimpleNamespace(forward=MagicMock()))
+            )
+        )
+
+    def test_routes_extend_to_eager_and_decode_to_compiled(self):
+        eager_forward = MagicMock(return_value="eager")
+        compiled_forward = MagicMock(return_value="compiled")
+        owner = SimpleNamespace(
+            model=SimpleNamespace(forward=MagicMock()),
+            logits_processor=SimpleNamespace(forward=MagicMock()),
+            forward=eager_forward,
+        )
+        policy = RpaSeqPrefillDecoderTpuCompilePolicy(
+            model_runner=SimpleNamespace(model=owner), owner=owner
+        )
+        policy._compile = MagicMock(return_value=compiled_forward)
+        policy._compiles_logits_processor = MagicMock(return_value=False)
+        policy.model_runner.server_args = SimpleNamespace(
+            chunked_prefill_size=None,
+            max_prefill_tokens=2048,
+            torch_compile_max_bs=8,
+            prefill_max_requests=None,
+            tpu_compile_tokens=None,
+            tpu_compile_bs=None,
+        )
+        policy.model_runner.model_config = SimpleNamespace(context_len=2048)
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "build_bucketers",
+            return_value=(
+                Bucketer(name="Token", buckets=[2048]),
+                Bucketer(name="Bs", buckets=[8]),
+            ),
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "is_dp_attention_enabled",
+            return_value=False,
+        ):
+            self.assertTrue(policy.install())
+
+        args = (torch.arange(2), torch.arange(2))
+        phase_forward = policy.compiled_forward_shim.fn
+        self.assertEqual(
+            phase_forward(*args, SimpleNamespace(forward_mode=ForwardMode.EXTEND)),
+            "eager",
+        )
+        self.assertEqual(
+            phase_forward(*args, SimpleNamespace(forward_mode=ForwardMode.DECODE)),
+            "compiled",
+        )
+        self.assertEqual(
+            phase_forward(
+                *args, SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+            ),
+            "compiled",
+        )
+        eager_forward.assert_called_once()
+        self.assertEqual(compiled_forward.call_count, 2)
 
 
 class TestDirectCompileExtraModelState(CustomTestCase):
@@ -299,6 +370,7 @@ class TestLogitsOutputMode(CustomTestCase):
         self.assertIsNone(logits_metadata.top_logprobs_nums)
         self.assertIsNone(logits_metadata.token_ids_logprobs)
         self.assertIsNone(logits_metadata.extend_input_logprob_token_ids_gpu)
+        self.assertIs(logits_metadata.extend_start_loc, forward_batch.extend_start_loc)
         self.assertTrue(forward_batch.return_logprob)
         self.assertEqual(forward_batch.top_logprobs_nums, [10] * 64)
         self.assertEqual(forward_batch.token_ids_logprobs, [[11, 13]] * 64)

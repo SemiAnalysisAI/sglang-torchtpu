@@ -635,6 +635,7 @@ _PALLAS_TPU_BACKENDS = (
     "pallas_tpu_rpa_v3",
     "pallas_tpu_rpa_seq",
     "pallas_tpu_rpa_batched",
+    "pallas_tpu_rpa_stacked",
     "pallas_tpu_mla",
 )
 

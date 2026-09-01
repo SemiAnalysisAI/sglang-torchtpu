@@ -77,6 +77,7 @@ def _make_forward_batch(
     req_pool_indices: torch.Tensor,
     forward_mode: ForwardMode,
     extend_seq_lens: Optional[torch.Tensor] = None,
+    extend_seq_lens_cpu: Optional[list[int]] = None,
     spec_info=None,
     seq_lens_cpu: Optional[torch.Tensor] = None,
     req_pool_indices_cpu: Optional[torch.Tensor] = None,
@@ -89,6 +90,8 @@ def _make_forward_batch(
     """
     if req_pool_indices_cpu is None:
         req_pool_indices_cpu = req_pool_indices.clone()
+    if extend_seq_lens_cpu is None and extend_seq_lens is not None:
+        extend_seq_lens_cpu = extend_seq_lens.tolist()
 
     return types.SimpleNamespace(
         seq_lens=seq_lens,
@@ -96,6 +99,7 @@ def _make_forward_batch(
         req_pool_indices_cpu=req_pool_indices_cpu,
         forward_mode=forward_mode,
         extend_seq_lens=extend_seq_lens,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
         spec_info=spec_info,
         seq_lens_cpu=seq_lens_cpu,
     )
@@ -265,6 +269,18 @@ class TestPallasRpaV3MetadataExtend(CustomTestCase):
         meta = self._build()
         expected = torch.tensor([0, self.bs, self.bs], dtype=torch.int32)
         self.assertTrue(torch.equal(meta.distribution, expected))
+
+    def test_extend_uses_host_lengths(self):
+        fb = _make_forward_batch(
+            seq_lens=self.seq_lens,
+            req_pool_indices=self.req_pool_indices,
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens=torch.tensor([9, 9, 9, 9], dtype=torch.int32),
+            extend_seq_lens_cpu=[3, 5, 2, 1],
+        )
+        meta = _build_meta(self.backend, fb)
+        expected = torch.tensor([0, 3, 8, 10, 11], dtype=torch.int32)
+        self.assertTrue(torch.equal(meta.cu_q_lens, expected))
 
     def test_extend_requires_extend_seq_lens(self):
         # Extend mode without extend_seq_lens must raise — the assertion is

@@ -47,12 +47,15 @@ def _make_forward_batch(
     req_pool_indices: torch.Tensor,
     forward_mode: ForwardMode,
     extend_seq_lens: Optional[torch.Tensor] = None,
+    extend_seq_lens_cpu: Optional[list[int]] = None,
     spec_info=None,
     seq_lens_cpu: Optional[torch.Tensor] = None,
     req_pool_indices_cpu: Optional[torch.Tensor] = None,
 ):
     if req_pool_indices_cpu is None:
         req_pool_indices_cpu = req_pool_indices.clone()
+    if extend_seq_lens_cpu is None and extend_seq_lens is not None:
+        extend_seq_lens_cpu = extend_seq_lens.tolist()
 
     return types.SimpleNamespace(
         seq_lens=seq_lens,
@@ -60,6 +63,7 @@ def _make_forward_batch(
         req_pool_indices_cpu=req_pool_indices_cpu,
         forward_mode=forward_mode,
         extend_seq_lens=extend_seq_lens,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
         spec_info=spec_info,
         seq_lens_cpu=seq_lens_cpu,
     )

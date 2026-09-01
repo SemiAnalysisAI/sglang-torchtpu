@@ -20,6 +20,7 @@ from sglang.srt.compilation.support_torch_compile import (
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
+    RpaSeqPrefillDecoderTpuCompilePolicy,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
     Eagle3CompilePolicyMixin,
@@ -121,6 +122,12 @@ class TestTpuGraphRunner(CustomTestCase):
         precompile_patcher = patch(DECODER_POLICY_PRECOMPILE)
         self.mock_precompile = precompile_patcher.start()
         self.addCleanup(precompile_patcher.stop)
+        causal_precompile_patcher = patch(
+            "sglang.srt.hardware_backend.tpu.compilation."
+            "decoder_compile_policy.RpaSeqPrefillDecoderTpuCompilePolicy.precompile"
+        )
+        self.mock_causal_precompile = causal_precompile_patcher.start()
+        self.addCleanup(causal_precompile_patcher.stop)
         platform_patcher = patch(
             "sglang.srt.model_executor.tpu_graph_runner.current_platform",
             SimpleNamespace(device_type="tpu"),
@@ -149,6 +156,7 @@ class TestTpuGraphRunner(CustomTestCase):
         model: Any,
         enable_torch_compile: bool = True,
         tpu_compile_tracer: str = "dynamo",
+        **server_arg_overrides: Any,
     ) -> SimpleNamespace:
         server_args = SimpleNamespace(
             enable_torch_compile=enable_torch_compile,
@@ -161,6 +169,7 @@ class TestTpuGraphRunner(CustomTestCase):
             prefill_max_requests=None,
             chunked_prefill_size=None,
             max_prefill_tokens=2048,
+            **server_arg_overrides,
         )
 
         # Mirror ServerArgs.override: the _can_torch_compile=False path calls it
@@ -277,6 +286,26 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertEqual(runner.compile_policy.tracer, "direct")
         # Backend registration still happens — the gate is _can_torch_compile.
         self.mock_register.assert_called_once()
+
+    def test_no_annotation_uses_phase_policy_for_rpa_seq_causal_lm(self):
+        model = _model_with(
+            forward=MagicMock(),
+            model=_model_with(forward=MagicMock()),
+            logits_processor=_model_with(forward=MagicMock()),
+        )
+        runner = self._runner_for(
+            model,
+            tpu_compile_tracer="direct",
+            attention_backend="pallas_tpu_rpa_seq",
+            prefill_attention_backend=None,
+        )
+
+        TpuGraphRunner(runner)
+
+        self.assertIsInstance(
+            runner.compile_policy, RpaSeqPrefillDecoderTpuCompilePolicy
+        )
+        self.mock_causal_precompile.assert_called_once()
 
     def test_augment_spec_policy_mixes_spec_over_base_for_eagle3(self):
         # EAGLE3 spec composes the spec mixin over the resolved policy (both the

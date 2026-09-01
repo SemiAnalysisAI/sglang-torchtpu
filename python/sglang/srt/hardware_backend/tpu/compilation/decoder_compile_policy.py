@@ -1158,6 +1158,61 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
 
 
+class RpaSeqPrefillDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
+    """Keep RPA-seq prefill eager while compiling steady-state decode.
+
+    The full causal-LM prefill graph can be substantially different from the
+    decode graph. Route extend modes through the original forward while
+    preserving the compiled full-model boundary for decode.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._eager_forward: Callable[..., Any] | None = None
+
+    @staticmethod
+    def supports(owner: Any) -> bool:
+        """Whether ``owner`` exposes the standard causal-LM boundary."""
+        backbone = getattr(owner, "model", None)
+        logits_processor = getattr(owner, "logits_processor", None)
+        return callable(getattr(backbone, "forward", None)) and callable(
+            getattr(logits_processor, "forward", None)
+        )
+
+    def install(self) -> bool:
+        if self.owner is not None and self.method_name is not None:
+            self._eager_forward = getattr(self.owner, self.method_name, None)
+        if not super().install():
+            return False
+        if self._eager_forward is None or self.compiled_forward_shim is None:
+            raise RuntimeError("Causal-LM TPU compile policy is not installed.")
+
+        eager_forward = self._eager_forward
+        compiled_forward = self.compiled_forward_shim.fn
+
+        @functools.wraps(eager_forward)
+        def phase_forward(
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            forward_batch: ForwardBatch,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            target = (
+                eager_forward
+                if forward_batch.forward_mode.is_extend_without_speculative()
+                else compiled_forward
+            )
+            return target(input_ids, positions, forward_batch, *args, **kwargs)
+
+        self.compiled_forward_shim.fn = phase_forward
+        logger.info(
+            "[decoder compile policy] Using eager causal-LM forward for RPA-seq "
+            "prefill and compiled forward for decode."
+        )
+        return True
+
+
 class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
     """Qwen3-VL decoder policy that warms multimodal prefill call shapes."""
 
