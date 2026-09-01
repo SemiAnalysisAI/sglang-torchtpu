@@ -193,11 +193,18 @@ fi
 
 # KV pool, scaled with TP so the per-rank HBM cost stays what the tp=8 recipe
 # guidance was measured at. This is not a luxury for P/D: a multi-turn round
-# re-transfers its whole accumulated context prefill->decode, so the decode
+# re-transfers its whole accumulated context prefill->decode, so the DECODE
 # pool must hold ~concurrency x current-context -- at the tp=8 pool size the
 # agentic c64-long4 point sat at ~93% occupancy and the decode ABORTED
 # requests / failed 2542 transfers (first 4-host E2E, 2026-09-01).
+#
+# The PREFILL engine keeps the UNSCALED pool (serve_group.sh overrides): it
+# holds KV only until handoff and ran the same point clean at the tp=8 size,
+# while scaling it too ate the ~45 GB the 8k EXTEND-graph capture needs and
+# the engine OOM'd during bring-up ("the TPU ran out of memory while awaiting
+# the materialization", 2026-09-01 iteration 5).
 MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS-$((MAX_TOTAL_TOKENS_TP8 * TP_SIZE / 8))}
+MAX_TOTAL_TOKENS_PREFILL=${MAX_TOTAL_TOKENS_PREFILL-$MAX_TOTAL_TOKENS_TP8}
 
 # P/D: a long request's KV handoff is chunky (a 64k-token context is ~1 GB
 # per engine at fp8) and 4 of them land together at the c64-long4 point, so
