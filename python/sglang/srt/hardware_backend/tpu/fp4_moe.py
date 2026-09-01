@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.fp8_moe import _clear_replaced_param
+from sglang.srt.hardware_backend.tpu.fp8_moe import _clear_replaced_param, _own_storage
 from sglang.srt.hardware_backend.tpu.fused_rs_sequence_parallel import (
     get_tpu_fused_rs_post_expert_norm_weight,
     has_tpu_fused_rs_post_expert_norm,
@@ -105,8 +105,12 @@ def _to_gmm_v2_scale_layout(
     cutting the per-block scale stream 4x (fp8) / 2x (bf16) — gmm_v2 sizes its
     scale traffic from the tensor's own dtype, so no kernel change is needed
     beyond honoring ``scale.dtype``.
+
+    Materialize the declared rank-4 layout in its own buffer. Adding a size-1
+    dimension to a contiguous rank-3 tensor produces a contiguous view, so a
+    later ``contiguous()`` call alone cannot guarantee independent storage.
     """
-    return scale.permute(0, 2, 1).contiguous().unsqueeze(2).to(dtype)
+    return _own_storage(scale.to(dtype).unsqueeze(-1).permute(0, 2, 3, 1).contiguous())
 
 
 def _fold_w13_global_scale(

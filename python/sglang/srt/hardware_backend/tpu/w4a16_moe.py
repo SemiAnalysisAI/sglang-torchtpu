@@ -29,6 +29,7 @@ from __future__ import annotations
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.hardware_backend.tpu.fp8_moe import _own_storage
 from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
@@ -84,8 +85,10 @@ def prepare_tpu_w4a16_moe_weights(layer: torch.nn.Module, group_size: int) -> No
         packed = getattr(layer, packed_name).data
         num_blocks = old_scale.shape[1]
         # [E, num_blocks, out] -> [E, num_blocks, 1, out]; keep the
-        # checkpoint dtype — gmm_v2 casts scales to f32 per call.
-        new_scale = old_scale.unsqueeze(2).contiguous()
+        # checkpoint dtype — gmm_v2 casts scales to f32 per call. Since the
+        # unsqueezed contiguous tensor can remain a view, explicitly give the
+        # rank-4 layout independent storage.
+        new_scale = _own_storage(old_scale.unsqueeze(2).contiguous())
         assert packed.shape[1] * 8 == num_blocks * group_size, (
             f"{packed_name} packed K {packed.shape[1]}*8 inconsistent with "
             f"{scale_name} blocks {num_blocks}*group_size {group_size}"
