@@ -35,7 +35,6 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
-    RpaSeqPrefillDecoderTpuCompilePolicy,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
     Eagle3CompilePolicyMixin,
@@ -51,15 +50,6 @@ if TYPE_CHECKING:
 def _eagle3_enabled(model_runner: ModelRunner) -> bool:
     """Whether this runner uses the in-tree EAGLE3 implementation."""
     return model_runner.spec_algorithm.is_eagle3()
-
-
-def _uses_rpa_seq_prefill(model_runner: ModelRunner) -> bool:
-    """Whether prefill resolves to the RPA-seq attention backend."""
-    server_args = model_runner.server_args
-    prefill_backend = getattr(
-        server_args, "prefill_attention_backend", None
-    ) or getattr(server_args, "attention_backend", None)
-    return prefill_backend == "pallas_tpu_rpa_seq"
 
 
 def _augment_spec_policy(policy_cls: type, model_runner: ModelRunner) -> type:
@@ -252,12 +242,7 @@ class TpuGraphRunner:
 
         if not installed_any:
             server_args = model_runner.server_args
-            fallback_cls = (
-                RpaSeqPrefillDecoderTpuCompilePolicy
-                if _uses_rpa_seq_prefill(model_runner)
-                and RpaSeqPrefillDecoderTpuCompilePolicy.supports(self.model)
-                else DecoderTpuCompilePolicy
-            )
+            fallback_cls = DecoderTpuCompilePolicy
             fallback_cls = _augment_spec_policy(fallback_cls, model_runner)
             logger.info(
                 "enable_torch_compile=True but %s declares no TPU compile "

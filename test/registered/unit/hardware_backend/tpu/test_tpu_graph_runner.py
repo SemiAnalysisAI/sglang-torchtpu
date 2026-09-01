@@ -20,7 +20,6 @@ from sglang.srt.compilation.support_torch_compile import (
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
-    RpaSeqPrefillDecoderTpuCompilePolicy,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
     Eagle3CompilePolicyMixin,
@@ -122,12 +121,6 @@ class TestTpuGraphRunner(CustomTestCase):
         precompile_patcher = patch(DECODER_POLICY_PRECOMPILE)
         self.mock_precompile = precompile_patcher.start()
         self.addCleanup(precompile_patcher.stop)
-        causal_precompile_patcher = patch(
-            "sglang.srt.hardware_backend.tpu.compilation."
-            "decoder_compile_policy.RpaSeqPrefillDecoderTpuCompilePolicy.precompile"
-        )
-        self.mock_causal_precompile = causal_precompile_patcher.start()
-        self.addCleanup(causal_precompile_patcher.stop)
         platform_patcher = patch(
             "sglang.srt.model_executor.tpu_graph_runner.current_platform",
             SimpleNamespace(device_type="tpu"),
@@ -287,7 +280,7 @@ class TestTpuGraphRunner(CustomTestCase):
         # Backend registration still happens — the gate is _can_torch_compile.
         self.mock_register.assert_called_once()
 
-    def test_no_annotation_uses_phase_policy_for_rpa_seq_causal_lm(self):
+    def test_no_annotation_compiles_rpa_seq_causal_lm(self):
         model = _model_with(
             forward=MagicMock(),
             model=_model_with(forward=MagicMock()),
@@ -302,10 +295,8 @@ class TestTpuGraphRunner(CustomTestCase):
 
         TpuGraphRunner(runner)
 
-        self.assertIsInstance(
-            runner.compile_policy, RpaSeqPrefillDecoderTpuCompilePolicy
-        )
-        self.mock_causal_precompile.assert_called_once()
+        self.assertIsInstance(runner.compile_policy, DecoderTpuCompilePolicy)
+        self.mock_precompile.assert_called_once()
 
     def test_augment_spec_policy_mixes_spec_over_base_for_eagle3(self):
         # EAGLE3 spec composes the spec mixin over the resolved policy (both the
