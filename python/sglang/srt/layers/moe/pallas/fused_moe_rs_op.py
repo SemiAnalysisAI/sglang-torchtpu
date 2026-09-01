@@ -250,8 +250,41 @@ def fused_moe_rs_gather(
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
     tp_rank_to_device_id: torch.Tensor,
+    keep_token_shard: bool = False,
 ) -> torch.Tensor:
     import torch.distributed as dist
+
+    world_size = int(tp_rank_to_device_id.numel())
+    if keep_token_shard and hidden_states.shape[0] % world_size:
+        raise RuntimeError(
+            "TPU fused-RS sharded output requires input rows divisible by "
+            f"TP={world_size}, got {hidden_states.shape[0]}"
+        )
+
+    input_tokens = hidden_states.shape[0]
+    padded_tokens = fused_moe_rs_padded_tokens(input_tokens, topk, world_size)
+    logical_shard_rows = input_tokens // world_size if keep_token_shard else None
+    padded_shard_rows = padded_tokens // world_size
+
+    if keep_token_shard and padded_tokens != input_tokens:
+        # SP inputs are logical-rank-major. Pad each rank's block independently
+        # so padding cannot move a real row into another rank's output shard.
+        def _pad_rank_blocks(value: torch.Tensor) -> torch.Tensor:
+            rank_major = value.reshape(world_size, logical_shard_rows, *value.shape[1:])
+            padding = value.new_zeros(
+                (
+                    world_size,
+                    padded_shard_rows - logical_shard_rows,
+                    *value.shape[1:],
+                )
+            )
+            return torch.cat((rank_major, padding), dim=1).reshape(
+                padded_tokens, *value.shape[1:]
+            )
+
+        hidden_states = _pad_rank_blocks(hidden_states)
+        topk_weights = _pad_rank_blocks(topk_weights)
+        topk_ids = _pad_rank_blocks(topk_ids)
 
     token_shard = fused_moe_rs_call(
         hidden_states=hidden_states,
@@ -269,6 +302,18 @@ def fused_moe_rs_gather(
         fp8_direct_write=fp8_direct_write,
         tp_rank_to_device_id=tp_rank_to_device_id,
     )
+    if token_shard.ndim != 2 or token_shard.shape != (
+        padded_shard_rows,
+        hidden_states.shape[-1],
+    ):
+        raise RuntimeError(
+            "TPU fused-RS kernel returned an unexpected shard shape: got "
+            f"{tuple(token_shard.shape)}, expected "
+            f"({padded_shard_rows}, {hidden_states.shape[-1]})"
+        )
+    if keep_token_shard:
+        return token_shard[:logical_shard_rows].contiguous()
+
     try:
         from sglang.srt.distributed import get_tp_group
 
