@@ -33,7 +33,7 @@ Run one model profile per invocation on hardware:
   MODEL_PROFILE=gpt_oss_120b CI_PD_ROLE=prefill python3 \
       test/registered/tpu/integration/test_pd_tp_resharding.py
 
-  MODEL_PROFILE=gpt_oss_120b_eagle3 CI_PD_ROLE=prefill python3 \
+  MODEL_PROFILE=qwen3_coder_480b_eagle3 CI_PD_ROLE=prefill python3 \
       test/registered/tpu/integration/test_pd_tp_resharding.py
 
 Without CI_PD_ROLE the file runs only its host-side configuration tests.
@@ -198,40 +198,6 @@ MODEL_PROFILES = {
         extra_launch_env={"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"},
         reasoning_effort="low",
     ),
-    "gpt_oss_120b_eagle3": ModelProfile(
-        key="gpt_oss_120b_eagle3",
-        display_name="GPT-OSS-120B EAGLE3",
-        served_name="gpt-oss-120b",
-        default_model_path="/weights/gpt-oss-120b",
-        hf_repo_id="openai/gpt-oss-120b",
-        model_env="GPT_OSS_MODEL",
-        page_size=64,
-        mem_fraction_prefill="0.6",
-        mem_fraction_decode="0.6",
-        quantization="",
-        kv_cache_dtype="bfloat16",
-        max_total_tokens=8192,
-        device_pool_tokens_hint=8192,
-        gsm8k_threshold=0.70,
-        extra_server_args=("--reasoning-parser", "gpt-oss"),
-        extra_launch_env={
-            "CONTEXT_LEN": "8192",
-            "CHUNKED_PREFILL_SIZE": "4096",
-            "MAX_PREFILL_TOKENS": "4096",
-            "TORCH_COMPILE_MAX_BS": "16",
-            "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
-            "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
-        },
-        reasoning_effort="low",
-        default_draft_model_path="lmsys/EAGLE3-gpt-oss-120b-bf16",
-        draft_model_env="GPT_OSS_DRAFT_MODEL",
-        spec_accept_length_threshold=1.90,
-        max_running_requests=16,
-        prefill_compile_bs="1 2 4 16",
-        decode_compile_bs="1 2 4 16",
-        compile_tokens="512 2048 4096",
-        watchdog_timeout="7200",
-    ),
     "qwen3_coder_480b": ModelProfile(
         key="qwen3_coder_480b",
         display_name="Qwen3-Coder-480B",
@@ -250,6 +216,50 @@ MODEL_PROFILES = {
         extra_server_args=("--tpu-fp8-runtime", "channelwise"),
         extra_launch_env={"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"},
         chat_template_kwargs={"enable_thinking": False},
+    ),
+    "qwen3_coder_480b_eagle3": ModelProfile(
+        key="qwen3_coder_480b_eagle3",
+        display_name="Qwen3-Coder-480B EAGLE3",
+        served_name="qwen3-coder-480b",
+        default_model_path="/weights/Qwen3-Coder-480B-A35B-Instruct-FP8",
+        hf_repo_id="Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+        model_env="QWEN3_CODER_MODEL",
+        page_size=256,
+        mem_fraction_prefill="0.8",
+        mem_fraction_decode="0.8",
+        quantization="fp8",
+        kv_cache_dtype="fp8_e4m3",
+        max_total_tokens=8192,
+        device_pool_tokens_hint=8192,
+        gsm8k_threshold=0.65,
+        extra_server_args=(
+            "--tpu-fp8-runtime",
+            "channelwise",
+            "--sampling-defaults",
+            "openai",
+            "--enable-fused-qk-norm-rope",
+            "--tpu-compile-tracer",
+            "dynamo",
+        ),
+        extra_launch_env={
+            "CONTEXT_LEN": "8192",
+            "CHUNKED_PREFILL_SIZE": "4096",
+            "MAX_PREFILL_TOKENS": "4096",
+            "TORCH_COMPILE_MAX_BS": "16",
+            "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
+            "SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD": "2048",
+        },
+        chat_template_kwargs={"enable_thinking": False},
+        default_draft_model_path=(
+            "/weights/" "SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI"
+        ),
+        draft_model_env="QWEN3_CODER_DRAFT_MODEL",
+        spec_accept_length_threshold=1.90,
+        max_running_requests=16,
+        prefill_compile_bs="1 2 4 16",
+        decode_compile_bs="1 2 4 8",
+        compile_tokens="512 2048 4096",
+        watchdog_timeout="7200",
     ),
 }
 
@@ -1050,8 +1060,8 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
     def test_profile_selection_requires_exactly_one(self) -> None:
         self.assertIs(select_profile("gpt_oss_120b"), MODEL_PROFILES["gpt_oss_120b"])
         self.assertIs(
-            select_profile("gpt_oss_120b_eagle3"),
-            MODEL_PROFILES["gpt_oss_120b_eagle3"],
+            select_profile("qwen3_coder_480b_eagle3"),
+            MODEL_PROFILES["qwen3_coder_480b_eagle3"],
         )
         self.assertIs(
             select_profile("qwen3_coder_480b"), MODEL_PROFILES["qwen3_coder_480b"]

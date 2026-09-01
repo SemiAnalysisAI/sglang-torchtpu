@@ -30,7 +30,7 @@ on:
           - pd-mh-gpt-120b
           - pd-mh-gpt-120b-pc-offload
           - pd-mh-gpt-120b-spec
-          - pd-mh-gpt-120b-spec-tp-reshard
+          - pd-mh-qwen3-coder-480b-spec-tp-reshard
           - pd-mh-gpt-120b-pc-offload-spec
           - pd-mh-gpt-120b-tp-reshard
           - pd-sh-gpt-120b
@@ -161,10 +161,10 @@ jobs:
       contents: read
       id-token: write
 
-  pd-mh-gpt-120b-spec-tp-reshard:
+  pd-mh-qwen3-coder-480b-spec-tp-reshard:
     needs: build
-    if: ${{ contains(fromJSON('["all","pd-mh-gpt-120b-spec-tp-reshard"]'), inputs.only || 'all') }}
-    name: pd-mh-gpt-120b-spec-tp-reshard
+    if: ${{ contains(fromJSON('["all","pd-mh-qwen3-coder-480b-spec-tp-reshard"]'), inputs.only || 'all') }}
+    name: pd-mh-qwen3-coder-480b-spec-tp-reshard
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -173,10 +173,10 @@ jobs:
       lane: nightly
       pd_prefill_hosts: 2
       pd_decode_hosts: 2
-      exec_cmd: env MODEL_PROFILE=gpt_oss_120b_eagle3 GSM8K_NUM_EXAMPLES=200 GSM8K_NUM_THREADS=16 GSM8K_MAX_TOKENS=1024 python3 test/registered/tpu/integration/test_pd_tp_resharding.py
+      exec_cmd: env MODEL_PROFILE=qwen3_coder_480b_eagle3 GSM8K_NUM_EXAMPLES=200 GSM8K_NUM_THREADS=16 GSM8K_MAX_TOKENS=512 python3 test/registered/tpu/integration/test_pd_tp_resharding.py
       files: test/registered/tpu/integration/test_pd_tp_resharding.py
       weights_pvc: model-weights-rox
-      run_name: pd-mh-gpt-120b-spec-tp-reshard
+      run_name: pd-mh-qwen3-coder-480b-spec-tp-reshard
     permissions:
       contents: read
       id-token: write
