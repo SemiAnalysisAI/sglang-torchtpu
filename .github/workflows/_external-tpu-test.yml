@@ -179,10 +179,24 @@ jobs:
             kubectl -n "$ns" get pods -l "$sel" -o wide || true
 
             refresh_cluster_token || echo "credential refresh failed; continuing"
-            # Stream logs (best effort; the pod log is the only egress). Append per group.
-            kubectl -n "$ns" logs -f -l "$sel" --all-containers=true --prefix=true \
-              --max-log-requests=10 --pod-running-timeout=20m --tail=-1 \
-              2>&1 | tee -a "$RUNNER_TEMP/external-pod-logs.txt" || true
+            # Stream logs in the background, re-attaching if the stream dies while
+            # the JobSet is still live: the pod log is the ONLY egress for the
+            # benchmark results, so a dead stream silently discards them. The cap
+            # is 64 because unprivileged pods carry sidecars (gke-gcsfuse), so a
+            # 4-host group already needs >10 streams (2026-09-01: "12 log streams
+            # ... maximum allowed concurrency is 10" left a whole run logless).
+            ( first=1
+              while kubectl -n "$ns" get "$name" >/dev/null 2>&1; do
+                jok="$(kubectl -n "$ns" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
+                jbad="$(kubectl -n "$ns" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+                { [ "$jok" = "True" ] || [ "$jbad" = "True" ]; } && break
+                if [ "$first" = 1 ]; then tailn=-1; first=0; else tailn=20; fi
+                kubectl -n "$ns" logs -f -l "$sel" --all-containers=true --prefix=true \
+                  --max-log-requests=64 --pod-running-timeout=20m --tail="$tailn" \
+                  2>&1 | tee -a "$RUNNER_TEMP/external-pod-logs.txt" || true
+                sleep 20
+              done ) &
+            local stream_pid=$!
 
             local deadline next_refresh auth_fails=0 iter=0 ok bad
             deadline=$(( $(date +%s) + wait_budget ))  # outlast the JobSet's activeDeadlineSeconds
@@ -210,7 +224,7 @@ jobs:
               if [ "$bad" = "True" ]; then
                 echo "❌ ${label} FAILED"
                 kubectl -n "$ns" get pods -l "$sel" -o wide || true
-                kubectl -n "$ns" logs -l "$sel" --all-containers --prefix --tail=200 2>/dev/null || true
+                kubectl -n "$ns" logs -l "$sel" --all-containers --prefix --tail=200 --max-log-requests=64 2>/dev/null || true
                 kubectl -n "$ns" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 40 || true
                 kubectl -n "$ns" describe "$name" | tail -n 120 || true
                 rc=1; break
@@ -218,6 +232,11 @@ jobs:
               sleep 5
             done
             [ "$rc" = 0 ] || { [ "$iter" -gt 0 ] && echo "❌ ${label}: did not complete before deadline" || true; }
+            # Let a still-attached stream drain the final lines (the results JSON
+            # is printed at the very end) before tearing the JobSet down.
+            sleep 15
+            kill "$stream_pid" 2>/dev/null || true
+            wait "$stream_pid" 2>/dev/null || true
             kubectl -n "$ns" delete "$name" --ignore-not-found --wait=false 2>/dev/null || true
             CUR=""
             return "$rc"
