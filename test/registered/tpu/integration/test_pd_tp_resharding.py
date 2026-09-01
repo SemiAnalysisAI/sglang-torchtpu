@@ -455,6 +455,7 @@ def _common_launch_env(
         "TPU_TELEMETRY_INTERVAL_SECONDS": "86400",
         "TPU_TELEMETRY_INTERVAL_SEC": "86400",
         "TPU_DIAGNOSTIC_HARVESTER_INTERVAL_SEC": "86400",
+        "SGLANG_RAIDEN_KV_PORT": values.get("SGLANG_RAIDEN_KV_PORT", "31000"),
         "PYTHON": PYTHON,
         **profile.extra_launch_env,
     }
@@ -1126,6 +1127,21 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
                 from_role=ROLE_PREFILL,
                 to_role=ROLE_DECODE,
             )
+
+    def test_raiden_ports_do_not_overlap_service_ports(self) -> None:
+        for profile in MODEL_PROFILES.values():
+            raiden_base = int(
+                build_prefill_env(profile, 2, env={})["SGLANG_RAIDEN_KV_PORT"]
+            )
+            raiden_ports = range(raiden_base, raiden_base + 4 * 16)
+            for service_port in (
+                PREFILL_PORT,
+                DECODE_PORT,
+                LB_PORT,
+                BOOTSTRAP_PORT,
+                DIST_PORT,
+            ):
+                self.assertNotIn(service_port, raiden_ports)
 
     def test_launcher_directory_resolves_from_this_file(self) -> None:
         self.assertTrue(
