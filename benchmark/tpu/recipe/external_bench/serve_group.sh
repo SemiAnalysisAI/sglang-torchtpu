@@ -79,6 +79,32 @@ BASE_EXTRA_ARGS="$MODEL_EXTRA_ARGS ${EXTRA_ARGS:-}"
 
 log_config
 
+# Engine supervisor: relaunch on early death. TPU multi-host bring-up can fail
+# nondeterministically at graph capture ("error: replica id #N seen more than
+# once" from the collective's replica map -- observed 2026-09-01 iteration 6,
+# identical config compiled fine before and after). An engine's ranks die
+# together on such a failure, so each rank retrying independently re-forms the
+# rendezvous. Bounded: a deterministic failure still surfaces after 3 tries.
+engine_supervisor() {
+    local tries=0 rc child=""
+    # Teardown must never look like a crash: on TERM/INT forward the signal to
+    # the live engine and stop -- only an engine that died on its own retries.
+    trap 'kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 143' TERM INT
+    while :; do
+        bash "$TPU_BENCH/launch_server.sh" &
+        child=$!
+        wait "$child"
+        rc=$?
+        tries=$(( tries + 1 ))
+        if (( tries >= 3 )); then
+            echo "[serve_group] engine exited rc=$rc (attempt $tries/3); giving up" >&2
+            return "$rc"
+        fi
+        echo "[serve_group] engine exited rc=$rc (attempt $tries/3); relaunching in 20s" >&2
+        sleep 20
+    done
+}
+
 if [[ "$PD_DISAGG" != "1" ]]; then
     # ------------------------- single-host recipes -------------------------
     if [[ "$WORKER_ID" != "0" ]]; then
@@ -151,7 +177,7 @@ else
 --disaggregation-transfer-backend raiden"
 fi
 
-bash "$TPU_BENCH/launch_server.sh" &
+engine_supervisor &
 ENGINE_PID=$!
 CHILD_PIDS+=("$ENGINE_PID")
 
