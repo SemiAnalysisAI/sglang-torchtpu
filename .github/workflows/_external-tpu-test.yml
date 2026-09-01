@@ -162,9 +162,13 @@ jobs:
               # policy): no pod will ever run, the JobSet never turns Failed, and
               # waiting the full budget burns hours (2026-09-01: privileged
               # containers denied by 'cf-disallow-privileged-controllers').
-              if kubectl -n "$ns" get events --field-selector reason=JobCreationFailed 2>/dev/null | grep -q "${short}"; then
+              # "already exists" is EXCLUDED: the JobSet controller races its own
+              # reconcile and logs that as JobCreationFailed although the child
+              # Job is live and its pods start normally.
+              fatal_events="$(kubectl -n "$ns" get events --field-selector reason=JobCreationFailed 2>/dev/null | grep "${short}" | grep -v "already exists" || true)"
+              if [ -n "$fatal_events" ]; then
                 echo "❌ ${label}: Job creation rejected -- no pod will ever start:"
-                kubectl -n "$ns" get events --field-selector reason=JobCreationFailed 2>/dev/null | grep "${short}" | tail -n 3
+                echo "$fatal_events" | tail -n 3
                 kubectl -n "$ns" delete "$name" --ignore-not-found --wait=false 2>/dev/null || true
                 CUR=""
                 return 1
