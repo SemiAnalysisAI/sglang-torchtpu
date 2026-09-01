@@ -11,9 +11,11 @@ the compiled path this covers, and the test would pass on a broken build.
 
 import os
 import unittest
+from contextlib import ExitStack
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import (
@@ -48,6 +50,14 @@ class TestTpuQwen306bSinglehostPromptLogprob(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         os.environ["SGLANG_PLATFORM"] = "tpu"
+        # Prompt logprobs are opt-in: serving them warms the extend graph with
+        # FULL capture, which costs every prefill, so the default build rejects
+        # the request. override() mutates the real environment, so the server
+        # spawned below inherits it; the stack is closed in tearDownClass.
+        cls._env_stack = ExitStack()
+        cls._env_stack.enter_context(
+            envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True)
+        )
         cls.model = MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
@@ -84,6 +94,7 @@ class TestTpuQwen306bSinglehostPromptLogprob(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        cls._env_stack.close()
 
     def _generate(self, **extra):
         payload = {
