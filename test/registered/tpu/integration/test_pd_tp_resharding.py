@@ -239,7 +239,7 @@ MODEL_PROFILES = {
             "openai",
             "--enable-fused-qk-norm-rope",
             "--tpu-compile-tracer",
-            "direct",
+            "dynamo",
         ),
         extra_launch_env={
             "CONTEXT_LEN": "8192",
