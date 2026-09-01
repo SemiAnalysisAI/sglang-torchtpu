@@ -105,12 +105,26 @@ engine_supervisor() {
     done
 }
 
+# Strip the slice-wide multihost env before launching any SINGLE-host engine:
+# libtpu on GKE is env-driven (TPU_SKIP_MDS_QUERY=true), and the injected
+# TPU_WORKER_HOSTNAMES / TPU_PROCESS_ADDRESSES / TPU_TOPOLOGY describe the
+# WHOLE slice -- _prepare_tpu_env would build a slice-wide slicebuilder that
+# never forms (idle peers), and FORCE_SINGLE_HOST only stops launch_server's
+# own nnodes logic, not that env detection. Local hardware discovery then
+# resolves the single-host topology.
+strip_slice_env() {
+    unset TPU_WORKER_ID TPU_WORKER_HOSTNAMES TPU_PROCESS_ADDRESSES \
+          TPU_TOPOLOGY TPU_TOPOLOGY_WRAP TPU_TOPOLOGY_ALT TPU_HOST_BOUNDS \
+          TPU_ACCELERATOR_TYPE 2>/dev/null || true
+}
+
 if [[ "$PD_DISAGG" != "1" ]]; then
     # ------------------------- single-host recipes -------------------------
     if [[ "$WORKER_ID" != "0" ]]; then
         echo "[serve_group] rank $WORKER_ID idle for 1-host recipe; exiting 0"
         exit 0
     fi
+    strip_slice_env
     export FORCE_SINGLE_HOST=1
     export TP_SIZE EP_SIZE
     export PORT HOST=${HOST:-0.0.0.0}
@@ -135,41 +149,27 @@ for v in $(compgen -e | grep '^MEGASCALE' || true); do unset "$v"; done
 echo "[serve_group] injected TPU env:"
 env | grep -E '^TPU_' | sed 's/^/[serve_group]   /' || true
 
-PREFILL_LEADER=${SLICE_HOSTS[0]}
-DECODE_LEADER=${SLICE_HOSTS[2]}
+# FOUR single-host tp=8 engines: pods 0-1 prefill, pods 2-3 decode, paired at
+# request time by the mini-LB. This is the raiden P/D topology every existing
+# gate validates (single-host engines; task-10 multihost PD likewise). The
+# 2-host-tp=16-per-engine variant on a subdivided slice brings up cleanly with
+# a consistently re-scoped libtpu env, but its raiden KV pulls NEVER complete
+# (every request rides the WaitingForInput timeout onto the fallback path;
+# 2026-09-01 iterations 4-11) -- surfaced upstream, revisit when raiden
+# supports engines subdivided from one slice.
 if (( WORKER_ID < 2 )); then
     ROLE=prefill
-    SUB_HOSTS="${SLICE_HOSTS[0]},${SLICE_HOSTS[1]}"
-    LOCAL_RANK=$WORKER_ID
     export PORT=$PD_PREFILL_PORT
 else
     ROLE=decode
-    SUB_HOSTS="${SLICE_HOSTS[2]},${SLICE_HOSTS[3]}"
-    LOCAL_RANK=$(( WORKER_ID - 2 ))
     export PORT=$PD_DECODE_PORT
 fi
-echo "[serve_group] pd role=$ROLE local_rank=$LOCAL_RANK sub_hosts=$SUB_HOSTS"
-# The engine-leader host list for the test/sweep side on this pod.
+echo "[serve_group] pd role=$ROLE (single-host engine on ${SLICE_HOSTS[$WORKER_ID]})"
+# The engine host list for the test/sweep side on this pod.
 printf '%s\n' "${SLICE_HOSTS[@]}" > /tmp/ext_bench_phys_hosts
 
-# Re-scope the slice env to this engine's 2-host sub-slice -- the WHOLE
-# libtpu env set, consistently. GKE injects TPU_SKIP_MDS_QUERY=true plus a
-# full-slice TPU_PROCESS_ADDRESSES/TPU_ACCELERATOR_TYPE; leaving those at the
-# 4-host values while remapping TPU_WORKER_ID to 0/1 makes two pods claim the
-# same worker id WITHIN THE SAME libtpu process set -- collectives then
-# compile with "replica id #N seen more than once" (iterations 6/8; whether a
-# run survived depended on which env libtpu happened to consult first).
-export TPU_WORKER_HOSTNAMES="$SUB_HOSTS"
-export TPU_WORKER_ID="$LOCAL_RANK"
-export NODE_RANK="$LOCAL_RANK"
-export NNODES=2
-export TPU_TOPOLOGY=2x2x2   # the engine's sub-cube, not the slice's 2x2x4
-if [[ -n "${TPU_PROCESS_ADDRESSES:-}" ]]; then
-    _tpu_port=${TPU_PROCESS_PORT:-${TPU_PROCESS_ADDRESSES##*:}}
-    export TPU_PROCESS_ADDRESSES="${SUB_HOSTS%%,*}:${_tpu_port},${SUB_HOSTS##*,}:${_tpu_port}"
-fi
-[[ -n "${TPU_ACCELERATOR_TYPE:-}" ]] && export TPU_ACCELERATOR_TYPE=tpu7x-16
-[[ -n "${TPU_TOPOLOGY_WRAP:-}" ]] && export TPU_TOPOLOGY_WRAP=false,false,false
+strip_slice_env
+export FORCE_SINGLE_HOST=1
 export TP_SIZE EP_SIZE
 export HOST=0.0.0.0         # engines must be reachable across hosts
 export SGLANG_HOST_IP=${SGLANG_HOST_IP:-$(hostname -i | awk '{print $1}')}
@@ -177,11 +177,9 @@ export SGLANG_RAIDEN_KV_PORT=${SGLANG_RAIDEN_KV_PORT:-31000}
 export SGLANG_RAIDEN_RESHARD=${SGLANG_RAIDEN_RESHARD:-0}   # symmetric P/D TP
 
 if [[ "$ROLE" == "prefill" ]]; then
-    # Prefix caching + KV offload live on the prefill engine, where shared
-    # prefixes are matched; spec runs on BOTH engines (the P/D handoff
-    # carries the spec bootstrap state).
-    # Unscaled pool: prefill holds KV only until handoff, and the 8k
-    # EXTEND-graph capture needs the HBM the scaled pool would eat.
+    # Prefix caching + KV offload live on the prefill engines, where shared
+    # prefixes are matched; spec runs on BOTH roles (the P/D handoff carries
+    # the spec bootstrap state).
     export MAX_TOTAL_TOKENS=$MAX_TOTAL_TOKENS_PREFILL
     export KV_OFFLOAD HICACHE_RATIO HICACHE_IO_BACKEND HICACHE_MEM_LAYOUT
     export EXTRA_ARGS="$BASE_EXTRA_ARGS \
@@ -202,21 +200,22 @@ ENGINE_PID=$!
 CHILD_PIDS+=("$ENGINE_PID")
 
 if [[ "$WORKER_ID" == "0" ]]; then
-    # POD 0 (whatever its physical role) fronts both engines with the mini-LB
-    # on :30000 -- the port the JobSet health-gates and rank-0's test files
-    # bench, both of which run on this pod. The engine leaders are addressed
-    # by their cluster-reachable names (the --prefill hostname is injected
-    # into requests as the KV bootstrap address the decode engine dials, so
-    # it must never be 127.0.0.1).
+    # POD 0 fronts all four engines with the mini-LB on :30000 -- the port the
+    # JobSet health-gates and rank-0's test files bench, both on this pod. The
+    # --prefill hostnames are injected into requests as the KV bootstrap
+    # addresses the decode engines dial, so they must be the cluster-reachable
+    # names, never 127.0.0.1.
     LB_PORT=${LB_PORT:-30000}
-    _watch_pid=""
-    [[ "${SLICE_HOSTS[$WORKER_ID]}" == "$PREFILL_LEADER" ]] && _watch_pid=$ENGINE_PID
-    wait_url "http://$PREFILL_LEADER:$PD_PREFILL_PORT" "prefill engine" "$HEALTH_TIMEOUT" "$_watch_pid" || exit 1
-    wait_url "http://$DECODE_LEADER:$PD_DECODE_PORT" "decode engine" "$HEALTH_TIMEOUT" || exit 1
+    wait_url "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" "prefill engine 0" "$HEALTH_TIMEOUT" "$ENGINE_PID" || exit 1
+    wait_url "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "prefill engine 1" "$HEALTH_TIMEOUT" || exit 1
+    wait_url "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" "decode engine 0" "$HEALTH_TIMEOUT" || exit 1
+    wait_url "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" "decode engine 1" "$HEALTH_TIMEOUT" || exit 1
     "$PYTHON" -m sglang_router.launch_router \
         --pd-disaggregation --mini-lb \
-        --prefill "http://$PREFILL_LEADER:$PD_PREFILL_PORT" \
-        --decode "http://$DECODE_LEADER:$PD_DECODE_PORT" \
+        --prefill "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
+        --prefill "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
+        --decode "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" \
+        --decode "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" \
         --host 0.0.0.0 --port "$LB_PORT" > >(sed 's/^/[mini-lb] /') 2>&1 &
     CHILD_PIDS+=("$!")
 fi

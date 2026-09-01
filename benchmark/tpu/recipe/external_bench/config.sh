@@ -174,7 +174,11 @@ case "$BENCH_RECIPE" in
         PREFIX_CACHE=1; KV_OFFLOAD=1; SPEC_DECODE=1; PD_DISAGG=0
         ;;
     pd_2p2d_pc_spec_kvoff)
-        RECIPE_HOSTS=4; TP_SIZE=16; EP_SIZE=16   # per engine, 2 hosts each
+        # FOUR single-host tp=8 engines (2 prefill + 2 decode) behind the
+        # mini-LB -- the raiden-validated topology. Two-host tp=16 engines
+        # subdivided from the slice bring up, but their raiden KV pulls never
+        # complete (see serve_group.sh).
+        RECIPE_HOSTS=4; TP_SIZE=8; EP_SIZE=8     # per engine, 1 host each
         PREFIX_CACHE=1; KV_OFFLOAD=1; SPEC_DECODE=1; PD_DISAGG=1
         ;;
     *)
@@ -192,17 +196,11 @@ if [[ "$SPEC_DECODE" == "1" ]]; then
 fi
 
 # KV pool, scaled with TP so the per-rank HBM cost stays what the tp=8 recipe
-# guidance was measured at. This is not a luxury for P/D: a multi-turn round
-# re-transfers its whole accumulated context prefill->decode, so the DECODE
-# pool must hold ~concurrency x current-context -- at the tp=8 pool size the
-# agentic c64-long4 point sat at ~93% occupancy and the decode ABORTED
-# requests / failed 2542 transfers (first 4-host E2E, 2026-09-01).
-#
-# The PREFILL engine keeps the UNSCALED pool (serve_group.sh overrides): it
-# holds KV only until handoff and ran the same point clean at the tp=8 size,
-# while scaling it too ate the ~45 GB the 8k EXTEND-graph capture needs and
-# the engine OOM'd during bring-up ("the TPU ran out of memory while awaiting
-# the materialization", 2026-09-01 iteration 5).
+# guidance was measured at (scaling a tp=8 engine's pool past that ate the
+# ~45 GB the 8k EXTEND-graph capture needs and OOM'd bring-up -- iteration 5).
+# In the P/D recipe each single-host decode engine holds ~half the running
+# batch (two decodes behind the LB), so the tp=8 pool covers the c64 working
+# set with ~2x headroom.
 MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS-$((MAX_TOTAL_TOKENS_TP8 * TP_SIZE / 8))}
 MAX_TOTAL_TOKENS_PREFILL=${MAX_TOTAL_TOKENS_PREFILL-$MAX_TOTAL_TOKENS_TP8}
 

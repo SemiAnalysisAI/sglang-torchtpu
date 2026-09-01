@@ -1,5 +1,6 @@
-"""Qwen3-Coder-480B-A35B-Instruct-FP8 external-cluster serving benchmark: 4-host P/D disaggregation: 2-host prefill + 2-host decode engines
-(tp=16 each) over raiden, prefix caching + EAGLE3 spec + KV offload.
+"""Qwen3-Coder-480B-A35B-Instruct-FP8 external-cluster serving benchmark: 4-host P/D disaggregation: two single-host prefill + two single-host
+decode engines (tp=8 each) over raiden behind a mini-LB, prefix caching +
+EAGLE3 spec + KV offload.
 
 Workload: multi-turn agentic (4k in + 1k out per round to 16k context; long
 sessions ramp to 64k) -- the 480B nightly's workload shape. Prefix-cache
@@ -7,9 +8,9 @@ hit rate is gated against what the round count makes reachable.
 
 Sweep: concurrency {1,16,64} x long requests {0,1,4} (legs with more long
 requests than slots are skipped). One server serves every leg; the client's
-concurrency semaphore is what varies. The 2x2x4 slice is split into two 2x2x2 sub-slices by overriding the
-GKE-injected TPU_WORKER_HOSTNAMES / TPU_TOPOLOGY per engine; rank 0
-fronts both engines with the mini-LB on :30000 (the benched endpoint).
+concurrency semaphore is what varies. Pods 0-1 serve prefill, pods 2-3 decode, each a single-host engine
+(the raiden-validated P/D topology); pod 0 fronts all four with the mini-LB
+on :30000 (the benched endpoint).
 
 The two workload files of a (model, recipe) pair share one launch group (same
 launch_script + weights), so the JobSet brings the server up once and rank 0
