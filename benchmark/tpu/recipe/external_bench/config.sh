@@ -158,11 +158,15 @@ esac
 # ---------------------------------------------------------------------------
 # Recipe fragments: parallelism + features.
 # ---------------------------------------------------------------------------
+# --watchdog-timeout as in the validated spec gates: the verify/draft graph
+# captures keep the scheduler busy past the 300s default, which trips the
+# (soft) watchdog into repeated stack-dump attempts mid-compile.
 SPEC_ARGS="--speculative-algorithm EAGLE3 \
 --speculative-draft-model-path $DRAFT_MODEL \
 --speculative-num-steps 3 \
 --speculative-eagle-topk 1 \
---speculative-num-draft-tokens 4"
+--speculative-num-draft-tokens 4 \
+--watchdog-timeout 7200"
 
 case "$BENCH_RECIPE" in
     1host_pc)
