@@ -121,10 +121,11 @@ case "$BENCH_MODEL" in
         ATTENTION_BACKEND=pallas_tpu_rpa_v3
         PAGE_SIZE=${PAGE_SIZE:-64}
         CONTEXT_LEN=${CONTEXT_LEN:-131072}
-        # ~15.2 KB KV/token/rank (fp8 + hybrid-SWA second pool). 10x the
-        # context length, per the gpt_oss_120b recipe's HBM guidance: leaves
-        # the EXTEND-graph temporaries their headroom at mem 0.6.
-        MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS-1310720}
+        # ~15.2 KB KV/token/rank at tp=8 (fp8 + hybrid-SWA second pool). 10x
+        # the context length, per the gpt_oss_120b recipe's HBM guidance:
+        # leaves the EXTEND-graph temporaries their headroom at mem 0.6.
+        # Scaled by TP below (per-rank bytes stay constant).
+        MAX_TOTAL_TOKENS_TP8=1310720
         MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.6}
         # SparseCore ragged-gather MoE cannot lower for GPT-OSS's EXTEND graph.
         export SGLANG_TPU_FUSED_MOE_SC_GATHER=${SGLANG_TPU_FUSED_MOE_SC_GATHER:-0}
@@ -143,7 +144,8 @@ case "$BENCH_MODEL" in
         # Native window is 262144; 131072 needs no YaRN and matches GPT-OSS.
         CONTEXT_LEN=${CONTEXT_LEN:-131072}
         # ~15.9 KB KV/token/rank at tp=8 (62 layers x 1 kv head x 128 x K+V).
-        MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS-1179648}
+        # Scaled by TP below (per-rank bytes stay constant).
+        MAX_TOTAL_TOKENS_TP8=1179648
         MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.8}
         MODEL_EXTRA_ARGS="--tpu-fp8-runtime channelwise"
         ;;
@@ -188,6 +190,14 @@ if [[ "$SPEC_DECODE" == "1" ]]; then
     export TPU_COMPILE_BS=${TPU_COMPILE_BS:-"1 2 4 16 64"}
     export SGLANG_TPU_ALLOW_SPEC_RECOMPILE=${SGLANG_TPU_ALLOW_SPEC_RECOMPILE:-1}
 fi
+
+# KV pool, scaled with TP so the per-rank HBM cost stays what the tp=8 recipe
+# guidance was measured at. This is not a luxury for P/D: a multi-turn round
+# re-transfers its whole accumulated context prefill->decode, so the decode
+# pool must hold ~concurrency x current-context -- at the tp=8 pool size the
+# agentic c64-long4 point sat at ~93% occupancy and the decode ABORTED
+# requests / failed 2542 transfers (first 4-host E2E, 2026-09-01).
+MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS-$((MAX_TOTAL_TOKENS_TP8 * TP_SIZE / 8))}
 
 # P/D: a long request's KV handoff is chunky (a 64k-token context is ~1 GB
 # per engine at fp8) and 4 of them land together at the c64-long4 point, so
