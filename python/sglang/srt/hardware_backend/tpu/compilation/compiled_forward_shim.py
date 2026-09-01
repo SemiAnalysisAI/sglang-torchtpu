@@ -333,10 +333,12 @@ def _attach_input_logprobs(
 ) -> None:
     """Gather input (prompt) logprobs eagerly from the captured prefill rows.
 
-    Reuses the model's own process_logit rather than reimplementing the gather:
-    the off-by-one between a position's logits and the token it predicts is
-    already baked into extend_input_logprob_token_ids_gpu, and duplicating that
-    is how logprobs end up silently attached to the wrong tokens.
+    Re-runs the model's own LogitsProcessor rather than reimplementing the
+    gather: the off-by-one between a position's logits and the token it predicts
+    is already baked into extend_input_logprob_token_ids_gpu, and duplicating
+    that is how logprobs end up silently attached to the wrong tokens. Every
+    model reaches its logits through this same `logits_processor(input_ids,
+    hidden_states, lm_head, forward_batch)` call, so this stays model-agnostic.
     """
     hidden_states = logits_output.hidden_states
     if hidden_states is None:
@@ -348,14 +350,14 @@ def _attach_input_logprobs(
     previous = logits_processor.compute_input_logprobs
     logits_processor.compute_input_logprobs = True
     try:
-        eager = model.process_logit(
-            forward_batch.input_ids, hidden_states, forward_batch
+        eager = logits_processor(
+            forward_batch.input_ids, hidden_states, model.lm_head, forward_batch
         )
     finally:
         logits_processor.compute_input_logprobs = previous
     if eager.input_token_logprobs is None:
         raise RuntimeError(
-            "process_logit returned no input_token_logprobs despite "
+            "the logits processor returned no input_token_logprobs despite "
             "compute_input_logprobs being set"
         )
     logits_output.input_token_logprobs = eager.input_token_logprobs

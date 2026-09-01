@@ -1349,24 +1349,82 @@ class TestAttachInputLogprobs(CustomTestCase):
         self.assertFalse(model.logits_processor.compute_input_logprobs)
 
 
-class _StubModel:
-    """Stands in for the model's reference process_logit."""
+class TestGatherMatchesRealLogitsProcessor(CustomTestCase):
+    """Bookkeeping against the real LogitsProcessor, not the stub.
 
-    LOGPROBS = torch.tensor([-0.5, -1.5, -2.5])
+    An earlier revision gathered via `model.process_logit(...)`, which exists on
+    no upstream model. Every unit test passed -- a stub is free to implement an
+    API that is not there -- and the server died on AttributeError under the
+    first real request. These assertions run against the real class, so they go
+    red if the contract the shim depends on moves.
+    """
 
-    def __init__(self, input_token_logprobs=LOGPROBS):
-        self.logits_processor = SimpleNamespace(compute_input_logprobs=False)
+    def test_logits_processor_takes_the_arguments_the_shim_passes(self):
+        from sglang.srt.layers.logits_processor import LogitsProcessor
+
+        params = list(inspect.signature(LogitsProcessor.forward).parameters)
+        self.assertEqual(
+            params[:5],
+            ["self", "input_ids", "hidden_states", "lm_head", "logits_metadata"],
+        )
+
+    def test_stub_mirrors_the_real_signature(self):
+        from sglang.srt.layers.logits_processor import LogitsProcessor
+
+        real = list(inspect.signature(LogitsProcessor.forward).parameters)[:5]
+        stub = list(inspect.signature(_StubLogitsProcessor.__call__).parameters)
+        self.assertEqual(stub, real)
+
+    def test_compute_input_logprobs_is_a_real_attribute(self):
+        # The shim toggles this around the eager gather; if it is renamed the
+        # toggle silently stops working and prompt logprobs come back empty.
+        from sglang.srt.layers.logits_processor import LogitsProcessor
+
+        source = inspect.getsource(LogitsProcessor.__init__)
+        self.assertIn("self.compute_input_logprobs", source)
+
+
+class _StubLogitsProcessor:
+    """Stands in for LogitsProcessor.
+
+    The signature is copied from `LogitsProcessor.forward` deliberately. An
+    earlier version of this stub exposed a `process_logit(...)` method that
+    exists only on some models; the unit tests passed against it while the real
+    server died on AttributeError, because a stub is free to implement an API
+    that isn't there. Keep this in step with the real signature.
+    """
+
+    def __init__(self, input_token_logprobs):
+        self.compute_input_logprobs = False
         self._input_token_logprobs = input_token_logprobs
         self.calls = 0
         self.flag_during_call = None
 
-    def process_logit(self, input_ids, hidden_states, forward_batch):
+    def __call__(self, input_ids, hidden_states, lm_head, logits_metadata):
         self.calls += 1
-        self.flag_during_call = self.logits_processor.compute_input_logprobs
+        self.flag_during_call = self.compute_input_logprobs
         return LogitsProcessorOutput(
             next_token_logits=torch.zeros(1, 4),
             input_token_logprobs=self._input_token_logprobs,
         )
+
+
+class _StubModel:
+    """A model as the shim sees it: a logits_processor and an lm_head."""
+
+    LOGPROBS = torch.tensor([-0.5, -1.5, -2.5])
+
+    def __init__(self, input_token_logprobs=LOGPROBS):
+        self.logits_processor = _StubLogitsProcessor(input_token_logprobs)
+        self.lm_head = object()
+
+    @property
+    def calls(self):
+        return self.logits_processor.calls
+
+    @property
+    def flag_during_call(self):
+        return self.logits_processor.flag_during_call
 
 
 if __name__ == "__main__":
