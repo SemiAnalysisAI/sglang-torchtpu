@@ -44,7 +44,9 @@ HEALTH_TIMEOUT = int(os.environ.get("HEALTH_TIMEOUT", "600"))
 # Must clear the ci profile's worst case (8 legs x MAX_LEG_SECONDS=480) and
 # stay under the file's timeout_per_file=5400 with room for the summary print.
 SWEEP_TIMEOUT = int(os.environ.get("SWEEP_TIMEOUT", "4500"))
-PROFILE = os.environ.get("EXTERNAL_BENCH_PROFILE", "e2e")  # e2e branch: single point c64-long4
+PROFILE = os.environ.get(
+    "EXTERNAL_BENCH_PROFILE", "e2e"
+)  # e2e branch: single point c64-long4
 MIN_PREFIX_HIT_FRACTION = float(os.environ.get("MIN_PREFIX_HIT_FRACTION", "0.6"))
 MIN_PREFIX_HIT_RATE = os.environ.get("MIN_PREFIX_HIT_RATE")
 
@@ -138,10 +140,22 @@ def build_matrix_test(*, bench_model: str, bench_recipe: str, workload: str):
     class ExternalBenchTest(CustomTestCase):
         base_url = BASE_URL
         summary = None
+        spec_probe_result = None
 
         @classmethod
         def setUpClass(cls):
             cls._wait_healthy()
+            if spec_expected:
+                # Probe BEFORE the sweep: on the fresh, healthy server the probe
+                # answers exactly "is EAGLE3 drafting in this configuration?".
+                # Probing after the sweep conflated that with load-tail state --
+                # on the first 4-host E2E the c64-long4 tail left P/D transfers
+                # timing out and the probe 500'd against a degraded server.
+                try:
+                    cls.spec_probe_result = _spec_probe(cls.base_url)
+                except Exception as exc:  # asserted in test_spec_decoding_active
+                    cls.spec_probe_result = exc
+                print(f"[ext-bench] spec probe: {cls.spec_probe_result}", flush=True)
             cls.summary = cls._run_sweep()
 
         @classmethod
@@ -299,9 +313,12 @@ def build_matrix_test(*, bench_model: str, bench_recipe: str, workload: str):
             def test_spec_decoding_active(self):
                 """The recipe claims EAGLE3; prove drafting actually ran (a
                 silent fallback to plain decode would still pass every other
-                gate while benchmarking the wrong configuration)."""
-                probe = _spec_probe(self.base_url)
-                print(f"[ext-bench] spec probe: {probe}", flush=True)
+                gate while benchmarking the wrong configuration). The probe
+                itself ran in setUpClass, before the sweep."""
+                probe = type(self).spec_probe_result
+                if isinstance(probe, Exception):
+                    raise AssertionError(f"spec probe request failed: {probe!r}")
+                self.assertIsNotNone(probe, "spec probe did not run")
                 self.assertGreater(
                     probe["spec_verify_ct"],
                     0,
