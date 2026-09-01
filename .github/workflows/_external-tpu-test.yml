@@ -95,6 +95,22 @@ jobs:
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
           : > "$RUNNER_TEMP/external-pod-logs.txt"
 
+          # Mirror the accumulating pod log to the CI artifacts bucket every 10 min:
+          # GitHub only serves a job's log blob AFTER the job completes, and the
+          # pod-logs artifact uploads in the final step -- so without this, a
+          # multi-hour benchmark group cannot be triaged (or caught hanging) from
+          # outside the runner while it runs. The CI SA holds objectCreator (create,
+          # no overwrite), so each sync is a NEW cumulative snapshot; the newest
+          # object is the whole log so far. Best-effort (`|| true`). Read with:
+          #   gcloud storage cat "$(gcloud storage ls gs://sglang-torchtpu-ci-artifacts/ci-live-logs/<run_id>/<slice>/ | tail -1)"
+          LIVE_LOG_DIR="gs://sglang-torchtpu-ci-artifacts/ci-live-logs/${{ github.run_id }}/${slice}"
+          ( while true; do
+              sleep 600
+              gcloud storage cp "$RUNNER_TEMP/external-pod-logs.txt" \
+                "$LIVE_LOG_DIR/$(date -u +%Y%m%dT%H%M%SZ).log" >/dev/null 2>&1 || true
+            done ) &
+          LIVE_LOG_SYNC_PID=$!
+
           # Resolve this slice's nodepool from the secret named by nodepool_var (GitHub masks
           # the value in logs). Fail closed if the secret is unset.
           NODEPOOL="${!NODEPOOL_VAR:-}"
@@ -226,6 +242,9 @@ jobs:
             echo '::endgroup::'
           done
           echo "slice ${slice} done, overall rc=${overall}"
+          kill "$LIVE_LOG_SYNC_PID" 2>/dev/null || true
+          gcloud storage cp "$RUNNER_TEMP/external-pod-logs.txt" \
+            "$LIVE_LOG_DIR/$(date -u +%Y%m%dT%H%M%SZ)-final.log" >/dev/null 2>&1 || true
           exit "$overall"
 
       - name: Upload pod logs
