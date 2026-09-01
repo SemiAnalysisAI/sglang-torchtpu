@@ -28,7 +28,7 @@ register_tpu_ci(
     est_time=7200,
     suite="external-nightly-2x2x4",
     nightly=True,
-    disabled="8k1k c64-long4 P/D leg times out on the 4 cold 64k-input long requests (raiden IPv6 rendezvous fixed in #606: the 60 normal 8k requests finish in ~100s and the agentic P/D leg runs at 1084 tok/s; the single-shot 64k KV handoff is a separate perf tail, run 33548460767)",
+    disabled="one failed raiden transfer parks its request forever: the decode withholds KVPoll.Failed while an unsettled read keeps room_has_active_io true, so the request never terminalizes and the mini-LB never answers (run 33548460767: 56/64 done in ~100s, then all engines idle for 28min). Not a 64k perf tail; see /cache/share/task13-raiden-pd-settle-stall.md step 10",
 )
 
 MULTIHOST_LAUNCH = {
