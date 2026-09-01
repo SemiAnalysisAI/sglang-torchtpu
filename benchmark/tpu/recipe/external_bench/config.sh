@@ -213,7 +213,13 @@ MAX_TOTAL_TOKENS_PREFILL=${MAX_TOTAL_TOKENS_PREFILL-$MAX_TOTAL_TOKENS_TP8}
 # 2026-09-01 on the first 4-host E2E). sglang's own log message recommends
 # raising it; 900s bounds a wedged transfer without failing healthy ones.
 if [[ "$PD_DISAGG" == "1" ]]; then
+    # Two separate knobs bound the two sides of a handoff: the decode's wait
+    # for its KV (WAITING) and the prefill's wait for the decode to ask
+    # (BOOTSTRAP -- raiden is consumer-pull, so the prefill's handshake window
+    # is fail_decode_silence(bootstrap_timeout), raiden/conn.py:2529). Raising
+    # only the first still failed prefill-side at 300s (iteration 7).
     export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=${SGLANG_DISAGGREGATION_WAITING_TIMEOUT:-900}
+    export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=${SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT:-900}
 fi
 
 # KV offload (HiCache) io backend: raiden skips the fused pool's whole-pool D2H
