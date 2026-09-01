@@ -22,6 +22,7 @@ import glob
 import importlib.util
 import os
 import subprocess
+import sys
 import unittest
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -32,6 +33,11 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 3))
 E2E = os.path.join(REPO, "test", "registered", "tpu", "e2e")
 EXT_BENCH = os.path.join(REPO, "benchmark", "tpu", "recipe", "external_bench")
+
+# The budget constants live in one place (external_bench_base); this ratchet
+# checks every place that must agree with them.
+sys.path.insert(0, E2E)
+import external_bench_base as bench_base  # noqa: E402
 
 MODELS = ("gpt_oss_120b", "qwen3_coder_480b")
 RECIPES = {
@@ -155,7 +161,7 @@ class TestExternalBenchMatrix(CustomTestCase):
             for g in ours:
                 self.assertEqual(
                     g["timeout_per_file"],
-                    5400,
+                    bench_base.TIMEOUT_PER_FILE_BUDGET,
                     f"{g['name']}: discovery must carry the files' declared "
                     "timeout_per_file (the JobSet deadline is sized from it)",
                 )
@@ -202,6 +208,64 @@ class TestExternalBenchMatrix(CustomTestCase):
                 )
                 self.assertEqual(out.returncode, 0, f"{model}/{recipe}: {out.stderr}")
                 self.assertIn("BS=1 16 64|LONG=0 1 4", out.stdout)
+
+    def test_time_budget_chain(self):
+        """The chain from config.sh: worst-case sweep <= SWEEP_TIMEOUT <
+        TIMEOUT_PER_FILE. Its links live in three files (test literals, the
+        base's constants, config.sh's profile) that nothing else cross-checks;
+        this is what turns "we changed one number" into a red test instead of
+        a silently truncated benchmark (the ci leg cap once sat at 900 with an
+        8-leg sweep against a 4500s budget -- a pathological run would have
+        breached the file timeout)."""
+        # Every cell's literal must equal the base's budget constant.
+        for path in self._cell_files():
+            _, launch, _ = _scan_file(path)
+            self.assertEqual(
+                launch.get("timeout_per_file"),
+                bench_base.TIMEOUT_PER_FILE_BUDGET,
+                f"{path}: timeout_per_file literal drifted from "
+                "external_bench_base.TIMEOUT_PER_FILE_BUDGET",
+            )
+        # The sweep budget plus the health recheck must fit the file budget.
+        self.assertLess(
+            bench_base.SWEEP_TIMEOUT_DEFAULT + bench_base.HEALTH_RECHECK_BUDGET,
+            bench_base.TIMEOUT_PER_FILE_BUDGET,
+        )
+        # config.sh's ci profile: attempted legs x leg cap must fit the sweep
+        # budget (legs with long > bs are skipped and cost nothing).
+        out = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source ./config.sh && echo "$SWEEP_BS|$SWEEP_LONG|$MAX_LEG_SECONDS"',
+            ],
+            cwd=EXT_BENCH,
+            env={
+                **os.environ,
+                "BENCH_MODEL": "gpt_oss_120b",
+                "BENCH_RECIPE": "pd_2p2d_pc_spec_kvoff",
+                "WORKLOAD": "agentic",
+                "PROFILE": "ci",
+            },
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(out.returncode, 0, out.stderr)
+        bs_axis, long_axis, leg_cap = out.stdout.strip().split("|")
+        attempted = [
+            (b, l)
+            for b in map(int, bs_axis.split())
+            for l in map(int, long_axis.split())
+            if l <= b
+        ]
+        worst_case = len(attempted) * int(leg_cap)
+        self.assertLessEqual(
+            worst_case,
+            bench_base.SWEEP_TIMEOUT_DEFAULT,
+            f"{len(attempted)} attempted ci legs x MAX_LEG_SECONDS={leg_cap} "
+            f"= {worst_case}s exceeds SWEEP_TIMEOUT "
+            f"{bench_base.SWEEP_TIMEOUT_DEFAULT}s",
+        )
 
 
 if __name__ == "__main__":

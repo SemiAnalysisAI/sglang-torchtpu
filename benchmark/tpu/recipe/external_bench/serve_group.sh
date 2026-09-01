@@ -48,13 +48,13 @@ wait_url() { # url label timeout [watch_pid]
     local url="$1" label="$2" timeout="$3" watch_pid="${4:-}" start=$SECONDS code
     echo "[serve_group] waiting up to ${timeout}s for $label at $url"
     while :; do
-        code=$(curl -sS -o /dev/null -m 10 -w "%{http_code}" "$url/health" 2>/dev/null || echo 000)
+        code=$(curl -sS -o /dev/null -m "$CURL_MAX_TIME" -w "%{http_code}" "$url/health" 2>/dev/null || echo 000)
         [[ "$code" == "200" ]] && { echo "[serve_group] $label healthy after $((SECONDS - start))s"; return 0; }
         if [[ -n "$watch_pid" ]] && ! kill -0 "$watch_pid" 2>/dev/null; then
             echo "[serve_group] ERROR: $label process died before healthy" >&2; return 1
         fi
         (( SECONDS - start >= timeout )) && { echo "[serve_group] ERROR: $label not healthy in ${timeout}s (last=$code)" >&2; return 1; }
-        sleep 10
+        sleep "$HEALTH_POLL_INTERVAL"
     done
 }
 
@@ -103,12 +103,12 @@ engine_supervisor() {
         rc=$?
         kill -KILL -- "-$child" 2>/dev/null || true
         tries=$(( tries + 1 ))
-        if (( tries >= 3 )); then
-            echo "[serve_group] engine exited rc=$rc (attempt $tries/3); giving up" >&2
+        if (( tries >= ENGINE_LAUNCH_TRIES )); then
+            echo "[serve_group] engine exited rc=$rc (attempt $tries/$ENGINE_LAUNCH_TRIES); giving up" >&2
             return "$rc"
         fi
-        echo "[serve_group] engine exited rc=$rc (attempt $tries/3); relaunching in 30s" >&2
-        sleep 30
+        echo "[serve_group] engine exited rc=$rc (attempt $tries/$ENGINE_LAUNCH_TRIES); relaunching in ${ENGINE_RELAUNCH_DELAY}s" >&2
+        sleep "$ENGINE_RELAUNCH_DELAY"
     done
 }
 
@@ -180,7 +180,7 @@ export FORCE_SINGLE_HOST=1
 export TP_SIZE EP_SIZE
 export HOST=0.0.0.0         # engines must be reachable across hosts
 export SGLANG_HOST_IP=${SGLANG_HOST_IP:-$(hostname -i | awk '{print $1}')}
-export SGLANG_RAIDEN_KV_PORT=${SGLANG_RAIDEN_KV_PORT:-31000}
+export SGLANG_RAIDEN_KV_PORT=${SGLANG_RAIDEN_KV_PORT:-$RAIDEN_KV_BASE_PORT}
 export SGLANG_RAIDEN_RESHARD=${SGLANG_RAIDEN_RESHARD:-0}   # symmetric P/D TP
 
 if [[ "$ROLE" == "prefill" ]]; then
@@ -212,7 +212,7 @@ if [[ "$WORKER_ID" == "0" ]]; then
     # --prefill hostnames are injected into requests as the KV bootstrap
     # addresses the decode engines dial, so they must be the cluster-reachable
     # names, never 127.0.0.1.
-    LB_PORT=${LB_PORT:-30000}
+    LB_PORT=${LB_PORT:-$PORT}   # the health-gated/benched port
     wait_url "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" "prefill engine 0" "$HEALTH_TIMEOUT" "$ENGINE_PID" || exit 1
     wait_url "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "prefill engine 1" "$HEALTH_TIMEOUT" || exit 1
     wait_url "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" "decode engine 0" "$HEALTH_TIMEOUT" || exit 1

@@ -49,10 +49,23 @@ SWEEP_SCRIPT = os.path.join(
 )
 
 BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
-HEALTH_TIMEOUT = int(os.environ.get("HEALTH_TIMEOUT", "600"))
-# Must clear the ci profile's worst case (8 legs x MAX_LEG_SECONDS=480) and
-# stay under the file's timeout_per_file=5400 with room for the summary print.
-SWEEP_TIMEOUT = int(os.environ.get("SWEEP_TIMEOUT", "4500"))
+
+# --- The per-file slice of the time-budget chain (see config.sh's "THE
+# TIME-BUDGET CHAIN"). TIMEOUT_PER_FILE_BUDGET is what every cell's
+# MULTIHOST_LAUNCH declares literally as timeout_per_file (the CI scanner
+# reads it via AST, so the files cannot compute it); the matrix ratchet
+# asserts the literals match this constant and that the chain holds.
+TIMEOUT_PER_FILE_BUDGET = 5400
+# Re-checking a server the JobSet already gated healthy.
+HEALTH_RECHECK_BUDGET = 600
+# Headroom after the sweep for summarize + digest + result-JSON printing.
+RESULT_EGRESS_MARGIN = 300
+SWEEP_TIMEOUT_DEFAULT = (
+    TIMEOUT_PER_FILE_BUDGET - HEALTH_RECHECK_BUDGET - RESULT_EGRESS_MARGIN
+)
+
+HEALTH_TIMEOUT = int(os.environ.get("HEALTH_TIMEOUT", str(HEALTH_RECHECK_BUDGET)))
+SWEEP_TIMEOUT = int(os.environ.get("SWEEP_TIMEOUT", str(SWEEP_TIMEOUT_DEFAULT)))
 PROFILE = os.environ.get("EXTERNAL_BENCH_PROFILE", "ci")
 MIN_PREFIX_HIT_FRACTION = float(os.environ.get("MIN_PREFIX_HIT_FRACTION", "0.6"))
 MIN_PREFIX_HIT_RATE = os.environ.get("MIN_PREFIX_HIT_RATE")

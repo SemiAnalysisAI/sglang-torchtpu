@@ -115,14 +115,14 @@ fi
 echo "[leg $TAG] waiting up to ${HEALTH_TIMEOUT}s for $BASE_URL/health"
 health_start=$SECONDS
 while :; do
-    code=$(curl -sS -o /dev/null -m 10 -w "%{http_code}" "$BASE_URL/health" 2>/dev/null || echo "000")
+    code=$(curl -sS -o /dev/null -m "$CURL_MAX_TIME" -w "%{http_code}" "$BASE_URL/health" 2>/dev/null || echo "000")
     [[ "$code" == "200" ]] && break
     if (( SECONDS - health_start >= HEALTH_TIMEOUT )); then
         echo "failed:health" >"$STATUS_FILE"
         echo "ERROR: $BASE_URL/health never reached 200 (last=$code)" >&2
         exit 1
     fi
-    sleep 10
+    sleep "$HEALTH_POLL_INTERVAL"
 done
 
 if [[ "$FLUSH_CACHE" == "1" ]]; then
@@ -172,7 +172,7 @@ bench_args=(
 } | tee "$BENCH_LOG"
 
 set +e
-timeout -k 60 "$MAX_LEG_SECONDS" "$PYTHON" "${bench_args[@]}" 2>&1 | tee -a "$BENCH_LOG"
+timeout -k "$LEG_KILL_GRACE" "$MAX_LEG_SECONDS" "$PYTHON" "${bench_args[@]}" 2>&1 | tee -a "$BENCH_LOG"
 bench_rc=${PIPESTATUS[0]}
 set -e
 

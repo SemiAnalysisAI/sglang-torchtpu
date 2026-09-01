@@ -41,6 +41,33 @@ PROFILE=${PROFILE:-ci}
 PYTHON=${PYTHON:-python3}
 
 # ---------------------------------------------------------------------------
+# THE TIME-BUDGET CHAIN. Every timing knob in this harness must respect
+#
+#   worst-case sweep  <=  SWEEP_TIMEOUT  <  TIMEOUT_PER_FILE  <  JobSet deadline
+#
+# where worst-case sweep = (number of attempted legs) x MAX_LEG_SECONDS.
+# TIMEOUT_PER_FILE (5400) is declared literally in every test file's
+# MULTIHOST_LAUNCH (the CI scanner reads it via AST, so it cannot be computed
+# there); test/registered/unit/test_external_bench_matrix.py ASSERTS the whole
+# chain, so a change to any link that breaks another fails CI instead of
+# silently truncating a benchmark.
+# ---------------------------------------------------------------------------
+# Deadline for one leg's bench client. Not a typical duration (healthy c64
+# legs run 150-300s) -- the cap only bites hung legs, and it must leave the
+# ci profile's worst case (8 attempted legs) inside SWEEP_TIMEOUT.
+MAX_LEG_SECONDS_CI=480
+# e2e runs a single leg, so it can afford a far larger cap for bring-up-time
+# experiments on that one point.
+MAX_LEG_SECONDS_SINGLE_POINT=1800
+# Poll cadence for /health waits (server bring-up is minutes; finer polling
+# is noise) and the per-probe curl budget.
+HEALTH_POLL_INTERVAL=10
+CURL_MAX_TIME=10
+# SIGKILL grace after a leg's deadline SIGTERM (a stuck aiohttp client
+# ignores TERM).
+LEG_KILL_GRACE=60
+
+# ---------------------------------------------------------------------------
 # Sweep axes (the task's grid). e2e keeps only the point the 4-host bring-up
 # is validated with; smoke is a plumbing check.
 # ---------------------------------------------------------------------------
@@ -48,17 +75,17 @@ case "$PROFILE" in
     ci)
         SWEEP_BS=${SWEEP_BS:-"1 16 64"}
         SWEEP_LONG=${SWEEP_LONG:-"0 1 4"}
-        MAX_LEG_SECONDS=${MAX_LEG_SECONDS:-900}
+        MAX_LEG_SECONDS=${MAX_LEG_SECONDS:-$MAX_LEG_SECONDS_CI}
         ;;
     e2e)
         SWEEP_BS=${SWEEP_BS:-"64"}
         SWEEP_LONG=${SWEEP_LONG:-"4"}
-        MAX_LEG_SECONDS=${MAX_LEG_SECONDS:-1800}
+        MAX_LEG_SECONDS=${MAX_LEG_SECONDS:-$MAX_LEG_SECONDS_SINGLE_POINT}
         ;;
     smoke)
         SWEEP_BS=${SWEEP_BS:-"1 2"}
         SWEEP_LONG=${SWEEP_LONG:-"0 1"}
-        MAX_LEG_SECONDS=${MAX_LEG_SECONDS:-900}
+        MAX_LEG_SECONDS=${MAX_LEG_SECONDS:-$MAX_LEG_SECONDS_CI}
         ;;
     *)
         echo "ERROR: unknown PROFILE='$PROFILE' (want ci|e2e|smoke)" >&2
@@ -256,6 +283,15 @@ PORT=${PORT:-30000}
 PD_PREFILL_PORT=${PD_PREFILL_PORT:-30001}
 PD_DECODE_PORT=${PD_DECODE_PORT:-30002}
 PD_BOOTSTRAP_PORT=${PD_BOOTSTRAP_PORT:-8998}
+# raiden data-plane base port: each rank listens at base+rank (must not
+# collide with any of the HTTP/bootstrap ports above).
+RAIDEN_KV_BASE_PORT=${RAIDEN_KV_BASE_PORT:-31000}
+
+# Engine bring-up supervisor (serve_group.sh): bounded relaunches on a
+# nondeterministic bring-up death; the delay lets the reaped attempt's
+# listening sockets leave TIME_WAIT before the next bind.
+ENGINE_LAUNCH_TRIES=${ENGINE_LAUNCH_TRIES:-3}
+ENGINE_RELAUNCH_DELAY=${ENGINE_RELAUNCH_DELAY:-30}
 
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-3600}
 ENABLE_METRICS=1        # required: the per-leg deltas are how a leg proves

@@ -56,14 +56,14 @@ log_config | tee "$RUN_ROOT/config.log"
 echo "[sweep] waiting for $BASE_URL"
 start=$SECONDS
 while :; do
-    code=$(curl -sS -o /dev/null -m 10 -w "%{http_code}" "$BASE_URL/health" 2>/dev/null || echo 000)
+    code=$(curl -sS -o /dev/null -m "$CURL_MAX_TIME" -w "%{http_code}" "$BASE_URL/health" 2>/dev/null || echo 000)
     [[ "$code" == "200" ]] && break
     if (( SECONDS - start >= HEALTH_TIMEOUT )); then
         echo "[sweep] ERROR: $BASE_URL never healthy (last=$code)" >&2
         echo "failed:server" >"$OUT_DIR/MODE_STATUS"
         exit 1
     fi
-    sleep 15
+    sleep "$HEALTH_POLL_INTERVAL"
 done
 
 for bs in $SWEEP_BS; do
