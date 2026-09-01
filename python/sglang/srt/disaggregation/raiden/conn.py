@@ -72,6 +72,18 @@ logger = logging.getLogger(__name__)
 CHUNK_ANNOUNCE_TOKENS = 8192
 
 
+def _tcp_endpoint(ip: str, port: int) -> str:
+    """``tcp://`` endpoint of a peer rank's rendezvous socket.
+
+    Peer addresses travel as bare literals (``rank_ip`` from the bootstrap
+    server, the ip frame of PULL_REQ / RESHARD_REQ); an IPv6 literal must be
+    bracketed before a port is appended or the port merges into the address.
+    The bracket is also what ``_send_multipart_locked`` keys the IPv6 socket
+    option on.
+    """
+    return NetworkAddress(host=ip, port=int(port)).to_tcp()
+
+
 @dataclass(frozen=True)
 class RaidenKVCacheGroups:
     """Page-compatible cache groups registered with independent Raiden engines."""
@@ -382,7 +394,9 @@ class RaidenKVManager(CommonKVManager):
         engines = 2 if self._swa_kv_caches else 1
         max_blocks = self._max_request_blocks()
         num_slots = self._num_slots(self._kv_caches, max_blocks, engines)
-        self.raiden_endpoint = f"{self.local_ip}:{self._control_port}"
+        self.raiden_endpoint = NetworkAddress(
+            host=self.local_ip, port=self._control_port
+        ).to_host_port_str()
         self._engine = KVCacheManager(
             kv_caches=self._kv_caches,
             node_id=self._local_rank,
@@ -403,7 +417,9 @@ class RaidenKVManager(CommonKVManager):
             int(self.chunked_transfer),
         )
         if self._swa_kv_caches:
-            self.swa_raiden_endpoint = f"{self.local_ip}:{self._control_port + 2}"
+            self.swa_raiden_endpoint = NetworkAddress(
+                host=self.local_ip, port=self._control_port + 2
+            ).to_host_port_str()
             swa_max_blocks = self._swa_max_request_blocks()
             swa_num_slots = self._num_slots(self._swa_kv_caches, swa_max_blocks, 2)
             self._swa_engine = KVCacheManager(
@@ -637,7 +653,15 @@ class RaidenKVManager(CommonKVManager):
         cache; a sender that looked its socket up just before that would
         otherwise send on the closed object. Under the send lock the socket
         is only used while it is still the cached one.
+
+        A bracketed endpoint (see ``_tcp_endpoint``) is an IPv6 peer, and the
+        socket has to opt into IPv6: libzmq accepts a connect to an IPv6
+        literal on an IPv4-only socket, then fails the resolve in its I/O
+        thread and, with reconnects disabled, never retries -- the PUSH
+        socket queues every message and delivers none, so the rendezvous
+        stalls silently until the disaggregation timeouts fire.
         """
+        is_ipv6 = is_ipv6 or endpoint.startswith("tcp://[")
         while True:
             sock = self._connect(endpoint, is_ipv6=is_ipv6)
             with self._socket_send_locks[endpoint]:
@@ -1005,7 +1029,7 @@ class RaidenKVManager(CommonKVManager):
                 pack_blocks(block_ids),
                 (self.raiden_endpoint or "").encode("ascii"),
             ]
-            endpoint = f"tcp://{addr[0]}:{addr[1]}"
+            endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
             self._send_multipart_locked(endpoint, payload)
 
     def finalize_send(self, room: int, aux_index: Optional[int]) -> bool:
@@ -1180,7 +1204,7 @@ class RaidenKVManager(CommonKVManager):
                 # gone and its own handlers drop frames for the room.
                 if room in self._aborted:
                     return
-            endpoint = f"tcp://{addr[0]}:{addr[1]}"
+            endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
             payload = [
                 MessageTag.BLOCKS,
                 str(room).encode("ascii"),
@@ -1245,7 +1269,7 @@ class RaidenKVManager(CommonKVManager):
             str(len(local_blocks)).encode("ascii"),
         ]
         for info in bootstrap_infos:
-            endpoint = f"tcp://{info['rank_ip']}:{info['rank_port']}"
+            endpoint = _tcp_endpoint(ip=info["rank_ip"], port=info["rank_port"])
             self._send_multipart_locked(endpoint, payload)
 
     @staticmethod
@@ -1559,7 +1583,8 @@ class RaidenKVManager(CommonKVManager):
         source_ranks = list(range(r * ratio, (r + 1) * ratio))
         push_endpoint = self._ensure_engine().transfer_address
         ready_endpoints = [
-            f"tcp://{info['rank_ip']}:{info['rank_port']}" for info in bootstrap_infos
+            _tcp_endpoint(ip=info["rank_ip"], port=info["rank_port"])
+            for info in bootstrap_infos
         ]
         with self._state_lock:
             self._reshard_meta[room] = dict(
@@ -1582,7 +1607,7 @@ class RaidenKVManager(CommonKVManager):
             str(self.attn_tp_size).encode("ascii"),
         ]
         for info in bootstrap_infos:
-            endpoint = f"tcp://{info['rank_ip']}:{info['rank_port']}"
+            endpoint = _tcp_endpoint(ip=info["rank_ip"], port=info["rank_port"])
             self._send_multipart_locked(endpoint, payload)
 
     def _on_reshard_req(self, msg: List[bytes]) -> None:
@@ -1650,7 +1675,7 @@ class RaidenKVManager(CommonKVManager):
                 pack_ints(block_ids),
                 str(self._local_rank).encode("ascii"),
             ]
-            endpoint = f"tcp://{addr[0]}:{addr[1]}"
+            endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
             self._send_multipart_locked(endpoint, payload)
 
     def _on_reshard_chunk_ready(self, msg: List[bytes]) -> None:
@@ -1700,7 +1725,7 @@ class RaidenKVManager(CommonKVManager):
                 # Committed under the order lock: no announcement can follow.
                 self._reshard_replied.add(room)
                 self._reshard_replied_at[room] = time.time()
-            endpoint = f"tcp://{addr[0]}:{addr[1]}"
+            endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
             payload = [
                 MessageTag.RESHARD_BLOCKS,
                 str(room).encode("ascii"),
