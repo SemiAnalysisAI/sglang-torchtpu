@@ -165,5 +165,8 @@ spec:
                     - name: weights
                       mountPath: ${WEIGHTS_MOUNT_PATH}
                       readOnly: true
-                  securityContext:
-                    privileged: true
+                  # NO securityContext.privileged here: the external cluster's
+                  # ValidatingAdmissionPolicy 'cf-disallow-privileged-controllers'
+                  # rejects Job creation outright for privileged containers (the
+                  # in-project template runs privileged; GKE TPU access needs only
+                  # the google.com/tpu resource + device plugin).
