@@ -76,6 +76,8 @@ def _reference(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--layers", type=int, default=1)
+    parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--local-routing", action="store_true")
     parser.add_argument("--skewed-routing", action="store_true")
     args = parser.parse_args()
 
@@ -103,14 +105,37 @@ def main():
     assert layers >= 1
     tokens = int(os.environ.get("SGLANG_TPU_FUSED_RS_TEST_TOKENS", "64"))
     topk = int(os.environ.get("SGLANG_TPU_FUSED_RS_TEST_TOPK", "2"))
-    hidden_size = intermediate_size = 1024 if test_blockwise else 256
+    hidden_size = int(
+        os.environ.get(
+            "SGLANG_TPU_FUSED_RS_TEST_HIDDEN_SIZE",
+            "1024" if test_blockwise else "256",
+        )
+    )
+    intermediate_size = int(
+        os.environ.get(
+            "SGLANG_TPU_FUSED_RS_TEST_INTERMEDIATE_SIZE",
+            "1024" if test_blockwise else "256",
+        )
+    )
+    local_experts = int(os.environ.get("SGLANG_TPU_FUSED_RS_TEST_LOCAL_EXPERTS", "1"))
     hidden_states = torch.randn(tokens, hidden_size, dtype=torch.bfloat16) * 0.1
+    weight_experts = world_size if local_experts == 1 else local_experts
     w1_float = (
-        torch.randn(world_size, hidden_size, 2 * intermediate_size, dtype=torch.float32)
+        torch.randn(
+            weight_experts,
+            hidden_size,
+            2 * intermediate_size,
+            dtype=torch.float32,
+        )
         * 0.02
     )
     w2_float = (
-        torch.randn(world_size, intermediate_size, hidden_size, dtype=torch.float32)
+        torch.randn(
+            weight_experts,
+            intermediate_size,
+            hidden_size,
+            dtype=torch.float32,
+        )
         * 0.02
     )
     if test_blockwise:
@@ -125,7 +150,12 @@ def main():
         w1_dequantized = w1_quantized.float() * w1_scale.float()[:, None, :]
         w2_dequantized = w2_quantized.float() * w2_scale.float()[:, None, :]
 
-    if skewed_routing:
+    if args.local_routing:
+        chunk_size = tokens // world_size
+        owner = torch.arange(tokens, dtype=torch.int32) // chunk_size
+        slots = torch.arange(topk, dtype=torch.int32)[None, :]
+        topk_ids = owner[:, None] * local_experts + slots
+    elif skewed_routing:
         routed_rows = tokens * topk
         heavy_rows = int(routed_rows * 0.9)
         flattened_ids = torch.empty(routed_rows, dtype=torch.int32)
@@ -137,13 +167,13 @@ def main():
     else:
         token_ids = torch.arange(tokens, dtype=torch.int32)[:, None]
         slots = torch.arange(topk, dtype=torch.int32)[None, :]
-        topk_ids = (token_ids + slots) % world_size
+        topk_ids = (token_ids + slots) % (world_size * local_experts)
     topk_weights = torch.full((tokens, topk), 1 / topk, dtype=torch.bfloat16)
     post_expert_norm_weight = torch.linspace(
         -0.2, 0.2, hidden_size, dtype=torch.bfloat16
     )
     expected = None
-    if layers == 1:
+    if layers == 1 and local_experts == 1:
         expected = _reference(
             hidden_states,
             w1_dequantized,
@@ -161,7 +191,7 @@ def main():
         # A synthetic mismatch ensures that the synchronized ID slice remains
         # in the compiled dataflow. It does not imply that production routing
         # IDs have been observed to diverge.
-        kernel_topk_ids = (topk_ids + physical_id) % world_size
+        kernel_topk_ids = (topk_ids + physical_id) % (world_size * local_experts)
     kernel_topk_weights = topk_weights
     if test_divergent_weights and physical_id != 0:
         # The compiled fused-RS path must consume physical device 0's routing
@@ -206,33 +236,42 @@ def main():
         return outputs[0] if layers == 1 else tuple(outputs)
 
     compiled = torch.compile(kernel, fullgraph=True, dynamic=False)
-    w1_scale_local = w1_scale[local_expert : local_expert + 1]
-    w2_scale_local = w2_scale[local_expert : local_expert + 1]
+    expert_slice = (
+        slice(local_expert, local_expert + 1) if local_experts == 1 else slice(None)
+    )
+    w1_scale_local = w1_scale[expert_slice]
+    w2_scale_local = w2_scale[expert_slice]
     if not test_blockwise:
         w1_scale_local = w1_scale_local[:, None, None, :]
         w2_scale_local = w2_scale_local[:, None, None, :]
     kernel_args = (
         hidden_states.to(device),
-        w1_quantized[local_expert : local_expert + 1].to(device),
-        w2_quantized[local_expert : local_expert + 1].to(device),
+        w1_quantized[expert_slice].to(device),
+        w2_quantized[expert_slice].to(device),
         w1_scale_local.to(device),
         w2_scale_local.to(device),
         kernel_topk_weights.to(device),
         kernel_topk_ids.to(device),
-        torch.tensor([local_expert, physical_id], dtype=torch.int32, device=device),
-    )
-    actual_outputs = compiled(
-        *kernel_args,
-        (
-            post_expert_norm_weight.to(device)
-            if test_post_expert_norm
-            else torch.zeros(1, dtype=torch.bfloat16, device=device)
+        torch.tensor(
+            [rank * local_experts, physical_id], dtype=torch.int32, device=device
         ),
     )
-    if layers == 1:
-        actual_outputs = (actual_outputs,)
+    norm_weight = (
+        post_expert_norm_weight.to(device)
+        if test_post_expert_norm
+        else torch.zeros(1, dtype=torch.bfloat16, device=device)
+    )
+    repeated_outputs = []
+    for _ in range(args.repeats):
+        output = compiled(*kernel_args, norm_weight)
+        if layers == 1:
+            output = (output,)
+        repeated_outputs.append(tuple(item.cpu() for item in output))
 
-    assert len(actual_outputs) == layers
+    actual_outputs = repeated_outputs[0]
+    for output in repeated_outputs[1:]:
+        for actual, baseline in zip(output, actual_outputs):
+            torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
 
     padded_tokens = fused_moe_rs_padded_tokens(tokens, topk, world_size)
     if expected is not None and padded_tokens != tokens:
@@ -241,8 +280,7 @@ def main():
     shard = slice(physical_id * shard_size, (physical_id + 1) * shard_size)
     for layer, actual in enumerate(actual_outputs):
         actual = actual.cpu()
-        if layers == 1:
-            assert expected is not None
+        if expected is not None:
             torch.testing.assert_close(
                 actual,
                 expected[shard],
@@ -257,6 +295,7 @@ def main():
         f"blockwise={test_blockwise} divergent_ids={test_divergent_ids} "
         f"divergent_weights={test_divergent_weights} "
         f"fp8_direct_write={fp8_direct_write} layers={layers} "
+        f"repeats={args.repeats} local_routing={args.local_routing} "
         f"skewed_routing={skewed_routing}"
     )
     dist.destroy_process_group()

@@ -1475,14 +1475,10 @@ class FusedMoE(torch.nn.Module):
 
     @property
     def handles_moe_reduction(self) -> bool:
-        if self.quant_method is None:
-            return False
-        current_batch_contract = getattr(
-            self.quant_method, "handles_moe_reduction_for_current_batch", None
+        return bool(
+            self.quant_method is not None
+            and getattr(self.quant_method, "handles_moe_reduction", False)
         )
-        if current_batch_contract is not None:
-            return bool(current_batch_contract())
-        return bool(getattr(self.quant_method, "handles_moe_reduction", False))
 
     def forward_impl(
         self,

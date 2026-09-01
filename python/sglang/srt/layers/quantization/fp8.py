@@ -1234,15 +1234,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 is_sm100_supported() or is_sm90_supported() or is_sm120_supported()
             ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
 
-    def handles_moe_reduction_for_current_batch(self) -> bool:
-        if not self.handles_moe_reduction:
-            return False
-
-        # The TPU fused reduce-scatter kernel is not deterministic when it is
-        # embedded in a larger compiled graph. Use the regular Pallas MoE plus
-        # its explicit collective for compiled execution.
-        return not torch.compiler.is_compiling()
-
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled(
         moe_runner_backend=None, moe_a2a_backend=None
@@ -2591,7 +2582,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         moe_runner_config = self.moe_runner_config
 
         if _is_tpu:
-            if self.handles_moe_reduction_for_current_batch():
+            if self.handles_moe_reduction:
                 from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
                     apply_fp8_fused_rs,
                 )

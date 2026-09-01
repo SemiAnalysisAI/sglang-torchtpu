@@ -1068,20 +1068,6 @@ def kernel_main_fused_rs(
                 if step + num_w1_bufs < total_w1_steps:
                     ns = step + num_w1_bufs
                     start_w1_dma(ns % num_w1_bufs, expert_id, ns // num_k1, ns % num_k1)
-                if step == 0:
-
-                    @pl.when(gm_id + 1 < local_num_gm)
-                    def _():
-                        next_e = metadata_ref.gm_id_to_group_id[gm_id + 1]
-                        # Skip cross-prefetch when next gm reuses same expert
-                        # (caching only makes sense when buffers fit all tiles).
-                        next_same = jnp.logical_and(
-                            next_e == expert_id, jnp.bool_(can_cache_w1)
-                        )
-
-                        @pl.when(jnp.logical_not(next_same))
-                        def _():
-                            start_w1_dma(0, next_e, 0, 0)
 
             @pl.when(gm_id + 1 < local_num_gm)
             def _():
@@ -1092,7 +1078,10 @@ def kernel_main_fused_rs(
 
                 @pl.when(jnp.logical_not(next_same))
                 def _():
-                    for _i in range(1, min(num_w1_bufs, total_w1_steps)):
+                    # Start the next GM only after this GM has consumed every
+                    # rotating buffer. Prefetching buffer 0 from inside step 0
+                    # races the current GM's later refill of that same buffer.
+                    for _i in range(min(num_w1_bufs, total_w1_steps)):
                         start_w1_dma(_i, next_e, _i // num_k1, _i % num_k1)
 
             with jax.named_scope("interlude"):
