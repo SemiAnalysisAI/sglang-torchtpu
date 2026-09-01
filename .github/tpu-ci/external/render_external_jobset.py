@@ -70,7 +70,13 @@ def load_config(path):
 
 def dns_safe(name):
     s = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
-    return (s[:40].strip("-")) or "run"
+    s = (s[:40].strip("-")) or "run"
+    # The JobSet webhook enforces DNS-1035 on the derived child Job names,
+    # which must START WITH A LETTER -- and the compact run_name is a sha256
+    # prefix that can start with a digit (bit us with '24afde9fbae2...').
+    if not s[0].isalpha():
+        s = "g" + s[:39]
+    return s
 
 
 def list_groups(cfg, root, nightly_only):
