@@ -23,12 +23,7 @@ from external_bench_base import build_matrix_test
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(
-    est_time=7200,
-    suite="external-nightly-2x2x4",
-    nightly=True,
-    disabled="raiden P/D KV transfer fails on the external cluster; see PR #600",
-)
+register_tpu_ci(est_time=7200, suite="external-nightly-2x2x4", nightly=True)
 
 MULTIHOST_LAUNCH = {
     "launch_script": "recipe/external_bench/gpt_oss_120b_pd_2p2d_pc_spec_kvoff.sh",
