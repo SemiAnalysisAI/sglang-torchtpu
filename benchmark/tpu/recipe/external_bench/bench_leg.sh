@@ -56,21 +56,22 @@ normal_rounds=$(( (TARGET_CONTEXT + _normal_growth / 2) / _normal_growth ))
 (( long_rounds < 1 )) && long_rounds=1
 (( normal_rounds < 1 )) && normal_rounds=1
 
-# Replay normal sessions so the non-long slots stay busy while the long
-# sessions run; same policy as the 480B nightly.
-replays=$NORMAL_REPLAYS
-if [[ "$replays" == "auto" ]]; then
+# Fresh sessions per non-long slot, so those slots stay busy while the long
+# sessions run (see SESSIONS_PER_SLOT in config.sh; the 480B nightly's
+# NORMAL_REPLAYS is the same policy).
+sessions_per_slot=$SESSIONS_PER_SLOT
+if [[ "$sessions_per_slot" == "auto" ]]; then
     if (( NUM_LONG > 0 )); then
-        replays=$(( (long_rounds + normal_rounds - 1) / normal_rounds ))
-        (( replays > MAX_NORMAL_REPLAYS )) && replays=$MAX_NORMAL_REPLAYS
-        (( replays < 1 )) && replays=1
+        sessions_per_slot=$(( (long_rounds + normal_rounds - 1) / normal_rounds ))
+        (( sessions_per_slot > MAX_SESSIONS_PER_SLOT )) && sessions_per_slot=$MAX_SESSIONS_PER_SLOT
+        (( sessions_per_slot < 1 )) && sessions_per_slot=1
     else
-        replays=1
+        sessions_per_slot=1
     fi
 fi
 sessions_for() {
     local bs="$1" n
-    n=$(( NUM_LONG + (bs - NUM_LONG) * replays ))
+    n=$(( NUM_LONG + (bs - NUM_LONG) * sessions_per_slot ))
     (( n < bs )) && n=$bs
     echo "$n"
 }
@@ -165,7 +166,7 @@ bench_args=(
     echo "  base_url        = $BASE_URL  (metrics: $PROBE_URL)"
     echo "  concurrency     = $BS"
     echo "  long requests   = $NUM_LONG  (target ctx $LONG_TARGET_CONTEXT, ${long_rounds} round(s) each)"
-    echo "  normal sessions = $(( num_sessions - NUM_LONG ))  (target ctx $TARGET_CONTEXT, ${normal_rounds} round(s), ${replays} replay(s)/slot)"
+    echo "  normal sessions = $(( num_sessions - NUM_LONG ))  (target ctx $TARGET_CONTEXT, ${normal_rounds} round(s), ${sessions_per_slot} session(s)/slot)"
     echo "  per round       = $TURN_INPUT_TOKENS in / $TURN_OUTPUT_TOKENS out"
     echo "  deadline        = ${MAX_LEG_SECONDS}s"
     echo "=================="
@@ -223,7 +224,7 @@ bench_argv_json=$("$PYTHON" -c 'import json,sys; print(json.dumps(sys.argv[1:]))
     --set num_long_sessions="$NUM_LONG" \
     --set num_sessions="$num_sessions" \
     --set trace_sessions="$trace_sessions" \
-    --set normal_replays="$replays" \
+    --set sessions_per_slot="$sessions_per_slot" \
     --set rounds_per_long_session="$long_rounds" \
     --set rounds_per_normal_session="$normal_rounds" \
     --set turn_input_tokens="$TURN_INPUT_TOKENS" \

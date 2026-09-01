@@ -127,8 +127,16 @@ case "$WORKLOAD" in
         ;;
 esac
 
-NORMAL_REPLAYS=${NORMAL_REPLAYS:-auto}
-MAX_NORMAL_REPLAYS=${MAX_NORMAL_REPLAYS:-8}
+# How many FRESH normal sessions each non-long concurrency slot plays
+# back-to-back, so mixed-length legs keep all slots busy while the long
+# sessions run (otherwise the aggregate would average a full batch with a
+# mostly-idle tail while still claiming concurrency BS). "auto" sizes it from
+# the long/normal round ratio; capped so trace size stays bounded. Note: this
+# is a round-ratio heuristic -- it equalizes durations only when per-round
+# cost is similar (true for the agentic shape; the 8k1k long requests still
+# outlive their batch). The 480B nightly calls the same knob NORMAL_REPLAYS.
+SESSIONS_PER_SLOT=${SESSIONS_PER_SLOT:-${NORMAL_REPLAYS:-auto}}
+MAX_SESSIONS_PER_SLOT=${MAX_SESSIONS_PER_SLOT:-${MAX_NORMAL_REPLAYS:-8}}
 TRACE_CACHE_DIR=${TRACE_CACHE_DIR:-${XDG_CACHE_HOME:-/tmp}/sglang_tpu_ext_bench_traces}
 
 # ---------------------------------------------------------------------------
