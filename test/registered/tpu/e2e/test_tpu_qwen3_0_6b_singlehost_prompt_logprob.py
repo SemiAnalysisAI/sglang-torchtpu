@@ -113,10 +113,12 @@ class TestTpuQwen306bSinglehostPromptLogprob(CustomTestCase):
     def test_prompt_logprobs_are_returned(self):
         info = self._prompt_logprobs()
         entries = info["input_token_logprobs"]
-        # One logprob per predicted position: the first prompt token is
-        # conditioned on nothing, so it has none.
-        self.assertEqual(len(entries), info["prompt_tokens"] - 1)
-        for logprob, token_id, _text in entries:
+        # One entry per prompt token, and the first carries no score: nothing
+        # precedes it to condition on. Both are the cross-backend contract --
+        # see test_disaggregation_rust_server.py and test_srt_endpoint.py.
+        self.assertEqual(len(entries), info["prompt_tokens"])
+        self.assertIsNone(entries[0][0])
+        for logprob, token_id, _text in entries[1:]:
             self.assertIsNotNone(logprob)
             self.assertLessEqual(logprob, 0.0)
             self.assertEqual(logprob, logprob)  # not NaN
@@ -135,9 +137,9 @@ class TestTpuQwen306bSinglehostPromptLogprob(CustomTestCase):
         # A gather that silently read padded rows would still return the right
         # count, so also require the scores to vary: padding is uniform.
         info = self._prompt_logprobs()
-        logprobs = [entry[0] for entry in info["input_token_logprobs"]]
-        self.assertEqual(len(logprobs), info["prompt_tokens"] - 1)
-        self.assertGreater(len(set(logprobs)), 1)
+        scored = [entry[0] for entry in info["input_token_logprobs"][1:]]
+        self.assertEqual(len(scored), info["prompt_tokens"] - 1)
+        self.assertGreater(len(set(scored)), 1)
 
     def test_output_logprobs_still_work(self):
         # Output-only logprobs never entered the graph; guard the regression.
