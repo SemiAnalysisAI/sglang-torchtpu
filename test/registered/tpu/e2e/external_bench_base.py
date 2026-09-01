@@ -101,25 +101,33 @@ def _emit_result_json(summary) -> None:
     print(RESULT_END, flush=True)
 
 
-def _spec_probe(base_url: str) -> dict:
-    """One greedy /generate that reports whether EAGLE3 actually drafted."""
-    req = urllib.request.Request(
-        base_url.rstrip("/") + "/generate",
-        data=json.dumps(
-            {
-                "text": "List the first ten square numbers, one per line:",
-                "sampling_params": {"temperature": 0.0, "max_new_tokens": 64},
-            }
-        ).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        payload = json.loads(resp.read())
-    meta = payload.get("meta_info") or {}
-    return {
-        "completion_tokens": int(meta.get("completion_tokens") or 0),
-        "spec_verify_ct": int(meta.get("spec_verify_ct") or 0),
-    }
+def _spec_metrics_url(bench_recipe: str, base_url: str) -> str:
+    """Where the spec gauges live: the engine that decodes.
+
+    For P/D that is the decode leader (hosts[2] of the slice), never the
+    mini-LB -- the LB serves no /metrics, and its /generate path hangs against
+    this raiden P/D setup (prefill computes, decode never pulls; observed on a
+    fresh server, iteration 7), so a request-level probe through it cannot be
+    the oracle. For 1-host recipes the one server is the decode.
+    """
+    if bench_recipe.startswith("pd_"):
+        hosts = [h for h in os.environ.get("TPU_WORKER_HOSTNAMES", "").split(",") if h]
+        if len(hosts) >= 3:
+            port = os.environ.get("PD_DECODE_PORT", "30002")
+            return f"http://{hosts[2]}:{port}"
+    return base_url
+
+
+def _read_spec_accept_length(metrics_url: str) -> float:
+    """Max sglang:spec_accept_length across ranks; 0.0 when spec never ran."""
+    with urllib.request.urlopen(metrics_url.rstrip("/") + "/metrics", timeout=60) as r:
+        text = r.read().decode()
+    values = [
+        float(line.rsplit(" ", 1)[1])
+        for line in text.splitlines()
+        if line.startswith("sglang:spec_accept_length") and " " in line
+    ]
+    return max(values, default=0.0)
 
 
 def build_matrix_test(*, bench_model: str, bench_recipe: str, workload: str):
@@ -138,22 +146,10 @@ def build_matrix_test(*, bench_model: str, bench_recipe: str, workload: str):
     class ExternalBenchTest(CustomTestCase):
         base_url = BASE_URL
         summary = None
-        spec_probe_result = None
 
         @classmethod
         def setUpClass(cls):
             cls._wait_healthy()
-            if spec_expected:
-                # Probe BEFORE the sweep: on the fresh, healthy server the probe
-                # answers exactly "is EAGLE3 drafting in this configuration?".
-                # Probing after the sweep conflated that with load-tail state --
-                # on the first 4-host E2E the c64-long4 tail left P/D transfers
-                # timing out and the probe 500'd against a degraded server.
-                try:
-                    cls.spec_probe_result = _spec_probe(cls.base_url)
-                except Exception as exc:  # asserted in test_spec_decoding_active
-                    cls.spec_probe_result = exc
-                print(f"[ext-bench] spec probe: {cls.spec_probe_result}", flush=True)
             cls.summary = cls._run_sweep()
 
         @classmethod
@@ -311,17 +307,21 @@ def build_matrix_test(*, bench_model: str, bench_recipe: str, workload: str):
             def test_spec_decoding_active(self):
                 """The recipe claims EAGLE3; prove drafting actually ran (a
                 silent fallback to plain decode would still pass every other
-                gate while benchmarking the wrong configuration). The probe
-                itself ran in setUpClass, before the sweep."""
-                probe = type(self).spec_probe_result
-                if isinstance(probe, Exception):
-                    raise AssertionError(f"spec probe request failed: {probe!r}")
-                self.assertIsNotNone(probe, "spec probe did not run")
+                gate while benchmarking the wrong configuration). Oracle: the
+                decoding engine's own sglang:spec_accept_length gauge after
+                the sweep -- it stays 0.0 unless spec verify actually ran, and
+                needs no request through the mini-LB."""
+                url = _spec_metrics_url(bench_recipe, self.base_url)
+                accept_length = _read_spec_accept_length(url)
+                print(
+                    f"[ext-bench] spec_accept_length={accept_length} ({url})",
+                    flush=True,
+                )
                 self.assertGreater(
-                    probe["spec_verify_ct"],
-                    0,
-                    f"spec_verify_ct={probe['spec_verify_ct']}: speculative "
-                    "decoding did not run",
+                    accept_length,
+                    0.0,
+                    f"sglang:spec_accept_length is 0 on {url}: speculative "
+                    "decoding never ran during the sweep",
                 )
 
         def test_throughput_recorded(self):
