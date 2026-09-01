@@ -111,7 +111,15 @@ def _spec_metrics_url(bench_recipe: str, base_url: str) -> str:
     the oracle. For 1-host recipes the one server is the decode.
     """
     if bench_recipe.startswith("pd_"):
-        hosts = [h for h in os.environ.get("TPU_WORKER_HOSTNAMES", "").split(",") if h]
+        # Engine leaders follow PHYSICAL host order (serve_group.sh's
+        # rendezvous writes the map on this pod), not pod-index order.
+        try:
+            with open("/tmp/ext_bench_phys_hosts") as f:
+                hosts = [line.strip() for line in f if line.strip()]
+        except OSError:
+            hosts = [
+                h for h in os.environ.get("TPU_WORKER_HOSTNAMES", "").split(",") if h
+            ]
         if len(hosts) >= 3:
             port = os.environ.get("PD_DECODE_PORT", "30002")
             return f"http://{hosts[2]}:{port}"

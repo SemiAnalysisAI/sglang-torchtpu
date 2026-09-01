@@ -129,17 +129,45 @@ fi
 # these engines are independent sub-slices (KV moves at application level).
 for v in $(compgen -e | grep '^MEGASCALE' || true); do unset "$v"; done
 
-PREFILL_LEADER=${SLICE_HOSTS[0]}
-DECODE_LEADER=${SLICE_HOSTS[2]}
-if (( WORKER_ID < 2 )); then
+# Group hosts by PHYSICAL position, not pod index: GKE maps a pod's completion
+# index to a physical slice host arbitrarily, and a sub-slice grouping like
+# {phys0, phys2} folds two hosts onto the same 2x2x2 coordinates -- every
+# collective then dies at compile with "replica id #N seen more than once"
+# (iterations 6/8 with interleaved placements; 4/7 passed on aligned ones).
+# Each host's physical number is its instance metadata agent-worker-number;
+# phys_rendezvous.py exchanges them through pod index 0.
+PHYS_ID=$(curl -sf -H "Metadata-Flavor: Google" \
+    "http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number" || true)
+if [[ ! "$PHYS_ID" =~ ^[0-9]+$ ]]; then
+    echo "[serve_group] ERROR: cannot read agent-worker-number from instance metadata" >&2
+    exit 1
+fi
+rdv_args=(--self-phys "$PHYS_ID" --self-host "${SLICE_HOSTS[$WORKER_ID]}" \
+          --server-host "${SLICE_HOSTS[0]}" --num-hosts "${#SLICE_HOSTS[@]}")
+[[ "$WORKER_ID" == "0" ]] && rdv_args+=(--serve)
+mapfile -t _phys_lines < <("$PYTHON" "$HERE/phys_rendezvous.py" "${rdv_args[@]}")
+if (( ${#_phys_lines[@]} < 4 )); then
+    echo "[serve_group] ERROR: physical rendezvous failed (${#_phys_lines[@]} hosts)" >&2
+    exit 1
+fi
+PHYS_HOSTS=()
+for line in "${_phys_lines[@]}"; do PHYS_HOSTS+=("${line#* }"); done
+echo "[serve_group] physical host order: ${PHYS_HOSTS[*]} (self phys=$PHYS_ID)"
+# The physically-ordered host list, for the test/sweep side on this pod (the
+# metrics endpoints follow physical roles, not pod indices).
+printf '%s\n' "${PHYS_HOSTS[@]}" > /tmp/ext_bench_phys_hosts
+
+PREFILL_LEADER=${PHYS_HOSTS[0]}
+DECODE_LEADER=${PHYS_HOSTS[2]}
+if (( PHYS_ID < 2 )); then
     ROLE=prefill
-    SUB_HOSTS="${SLICE_HOSTS[0]},${SLICE_HOSTS[1]}"
-    LOCAL_RANK=$WORKER_ID
+    SUB_HOSTS="${PHYS_HOSTS[0]},${PHYS_HOSTS[1]}"
+    LOCAL_RANK=$PHYS_ID
     export PORT=$PD_PREFILL_PORT
 else
     ROLE=decode
-    SUB_HOSTS="${SLICE_HOSTS[2]},${SLICE_HOSTS[3]}"
-    LOCAL_RANK=$(( WORKER_ID - 2 ))
+    SUB_HOSTS="${PHYS_HOSTS[2]},${PHYS_HOSTS[3]}"
+    LOCAL_RANK=$(( PHYS_ID - 2 ))
     export PORT=$PD_DECODE_PORT
 fi
 echo "[serve_group] pd role=$ROLE local_rank=$LOCAL_RANK sub_hosts=$SUB_HOSTS"
@@ -181,14 +209,17 @@ engine_supervisor &
 ENGINE_PID=$!
 CHILD_PIDS+=("$ENGINE_PID")
 
-if [[ "$ROLE" == "prefill" && "$LOCAL_RANK" == "0" ]]; then
-    # Leader: once both engines answer, front them with the mini-LB on :30000
-    # (what the JobSet health-gates and the test files bench). The --prefill
-    # hostname is injected into requests as the KV bootstrap address the
-    # decode engine dials, so it must be the cluster-reachable name, never
-    # 127.0.0.1.
+if [[ "$WORKER_ID" == "0" ]]; then
+    # POD 0 (whatever its physical role) fronts both engines with the mini-LB
+    # on :30000 -- the port the JobSet health-gates and rank-0's test files
+    # bench, both of which run on this pod. The engine leaders are addressed
+    # by their cluster-reachable names (the --prefill hostname is injected
+    # into requests as the KV bootstrap address the decode engine dials, so
+    # it must never be 127.0.0.1).
     LB_PORT=${LB_PORT:-30000}
-    wait_url "http://127.0.0.1:$PD_PREFILL_PORT" "prefill engine" "$HEALTH_TIMEOUT" "$ENGINE_PID" || exit 1
+    _watch_pid=""
+    [[ "${SLICE_HOSTS[$WORKER_ID]}" == "$PREFILL_LEADER" ]] && _watch_pid=$ENGINE_PID
+    wait_url "http://$PREFILL_LEADER:$PD_PREFILL_PORT" "prefill engine" "$HEALTH_TIMEOUT" "$_watch_pid" || exit 1
     wait_url "http://$DECODE_LEADER:$PD_DECODE_PORT" "decode engine" "$HEALTH_TIMEOUT" || exit 1
     "$PYTHON" -m sglang_router.launch_router \
         --pd-disaggregation --mini-lb \
