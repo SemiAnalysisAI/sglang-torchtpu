@@ -158,6 +158,17 @@ jobs:
 
             local running_deadline; running_deadline=$(( $(date +%s) + 1200 ))
             until kubectl -n "$ns" get pods -l "$sel" -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q Running; do
+              # Fail fast when the JobSet's Jobs are REJECTED (e.g. an admission
+              # policy): no pod will ever run, the JobSet never turns Failed, and
+              # waiting the full budget burns hours (2026-09-01: privileged
+              # containers denied by 'cf-disallow-privileged-controllers').
+              if kubectl -n "$ns" get events --field-selector reason=JobCreationFailed 2>/dev/null | grep -q "${short}"; then
+                echo "❌ ${label}: Job creation rejected -- no pod will ever start:"
+                kubectl -n "$ns" get events --field-selector reason=JobCreationFailed 2>/dev/null | grep "${short}" | tail -n 3
+                kubectl -n "$ns" delete "$name" --ignore-not-found --wait=false 2>/dev/null || true
+                CUR=""
+                return 1
+              fi
               if [ "$(date +%s)" -ge "$running_deadline" ]; then
                 echo "⚠️  ${label}: no pod Running 1200s after apply; continuing anyway"
                 kubectl -n "$ns" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 30 || true
