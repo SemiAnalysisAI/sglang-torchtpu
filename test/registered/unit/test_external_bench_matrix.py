@@ -209,6 +209,22 @@ class TestExternalBenchMatrix(CustomTestCase):
                 self.assertEqual(out.returncode, 0, f"{model}/{recipe}: {out.stderr}")
                 self.assertIn("BS=1 16 64|LONG=0 1 4", out.stdout)
 
+    def test_reused_nightly_tools_exist(self):
+        """config.sh reaches into recipe/qwen3_coder_480b/nightly/ for the
+        trace generator, metrics probe, and summarizer instead of copying
+        them. A rename there would otherwise surface as failed:trace-gen legs
+        an hour into a TPU run -- the one self-location coupling in config.sh
+        whose failure is not loud at source time."""
+        nightly = os.path.join(
+            REPO, "benchmark", "tpu", "recipe", "qwen3_coder_480b", "nightly"
+        )
+        for tool in ("gen_agentic_workload.py", "metrics_probe.py", "summarize.py"):
+            self.assertTrue(
+                os.path.isfile(os.path.join(nightly, tool)),
+                f"{tool} moved out of {nightly}; update NIGHTLY_TOOLS_DIR in "
+                "benchmark/tpu/recipe/external_bench/config.sh",
+            )
+
     def test_time_budget_chain(self):
         """The chain from config.sh: worst-case sweep <= SWEEP_TIMEOUT <
         TIMEOUT_PER_FILE. Its links live in three files (test literals, the
