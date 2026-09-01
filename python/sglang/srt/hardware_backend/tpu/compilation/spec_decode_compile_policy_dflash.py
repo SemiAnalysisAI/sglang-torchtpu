@@ -193,6 +193,10 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 )
             if bs == 0:
                 return None
+            # Greedy TPU bookkeeping returns int64 while sampling may return
+            # int32. Normalize before the compiled boundary so both paths reuse
+            # the int32 graph created by the KV-appender warmup.
+            commit_lens = commit_lens.to(dtype=torch.int32)
             pad_bs = (
                 self.b_bucketer.next_bucket(bs) if self.b_bucketer is not None else bs
             )

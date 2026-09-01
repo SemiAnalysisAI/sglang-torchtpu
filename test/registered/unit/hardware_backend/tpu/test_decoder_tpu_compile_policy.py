@@ -1689,6 +1689,24 @@ class TestDFlashCompilePolicy(CustomTestCase):
         )
         self.assertIsNone(empty)
 
+    def test_pad_append_target_hidden_tpu_normalizes_commit_lens_dtype(self):
+        """Live greedy bookkeeping must reuse the int32 precompiled appender graph."""
+        policy, _ = self._make_dflash_policy(
+            token_buckets=(4,), bs_buckets=(1,), draft_token_num=4
+        )
+
+        padded = policy.pad_append_target_hidden_tpu(
+            target_hidden=torch.ones(4, 32),
+            cache_loc=torch.arange(4, dtype=torch.int64),
+            positions=torch.arange(4, dtype=torch.int64),
+            cache_loc_2d=torch.arange(4, dtype=torch.int64).view(1, 4),
+            commit_lens=torch.tensor([3], dtype=torch.int64),
+        )
+
+        self.assertIsNotNone(padded)
+        self.assertEqual(padded[4].dtype, torch.int32)
+        self.assertEqual(padded[4].tolist(), [3])
+
     def test_pad_append_target_hidden_tpu_verify_validation_errors(self):
         policy, _ = self._make_dflash_policy(bs_buckets=(1, 4), draft_token_num=4)
         target_hidden = torch.ones(8, 32)

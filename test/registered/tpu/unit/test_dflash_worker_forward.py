@@ -28,6 +28,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_utils import resolve_dflash_verify_mask_policy
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.test.test_utils import CustomTestCase
@@ -47,6 +48,45 @@ def _detect_tpu() -> bool:
 
 
 _TPU_AVAILABLE = _detect_tpu()
+
+
+class TestDFlashVerifyMaskPolicy(CustomTestCase):
+    def test_rpa_v3_skips_custom_verify_mask(self):
+        backend = type("TpuPallasRpaV3AttnBackend", (), {})()
+        backend_name, use_custom_mask = resolve_dflash_verify_mask_policy(backend)
+
+        self.assertEqual(backend_name, "TpuPallasRpaV3AttnBackend")
+        self.assertFalse(use_custom_mask)
+
+
+class TestDFlashTpuKVMaterializerInit(CustomTestCase):
+    def test_noop_compile_policy_does_not_require_tracer_attribute(self):
+        worker = object.__new__(DFlashWorkerV2)
+        worker.draft_model_runner = SimpleNamespace(
+            compile_policy=SimpleNamespace(),
+            server_args=SimpleNamespace(tpu_compile_tracer="dynamo"),
+        )
+        worker.draft_model = SimpleNamespace(supports_fused_context_kv=False)
+        worker.ps = SimpleNamespace(tp_rank=0)
+        worker._tpu_kv_materializer = None
+
+        worker._init_tpu_kv_materializer()
+
+        self.assertIsNone(worker._tpu_kv_materializer)
+
+    def test_direct_tracer_disables_vectorized_materializer(self):
+        worker = object.__new__(DFlashWorkerV2)
+        worker.draft_model_runner = SimpleNamespace(
+            compile_policy=SimpleNamespace(),
+            server_args=SimpleNamespace(tpu_compile_tracer="direct"),
+        )
+        worker.draft_model = SimpleNamespace(supports_fused_context_kv=True)
+        worker.ps = SimpleNamespace(tp_rank=0)
+        worker._tpu_kv_materializer = object()
+
+        worker._init_tpu_kv_materializer()
+
+        self.assertIsNone(worker._tpu_kv_materializer)
 
 
 class _ForceTpuContext:
@@ -194,6 +234,7 @@ def _create_dflash_worker_for_tpu(
 
     worker._use_fused_kv_materialize = False
     worker._fused_kv_helper = None
+    worker._tpu_kv_materializer = None
     worker._use_triton_prepare_block = False
     worker._use_triton_accept_bonus = False
     worker._use_triton_compact_rebuild = False
@@ -367,7 +408,7 @@ def _make_schedule_batch(
         seq_lens_cpu=seq_lens_cpu,
         seq_lens_sum=int(seq_lens.sum().item()),
         req_pool_indices=req_pool_indices,
-        req_pool_indices_cpu=req_pool_indices.cpu().tolist(),
+        req_pool_indices_cpu=req_pool_indices.cpu(),
         reqs=reqs,
         out_cache_loc=out_cache_loc,
         extend_lens=extend_lens,

@@ -335,6 +335,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._fused_kv_helper: object | None = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+        self._tpu_kv_materializer: object | None = None
 
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
@@ -385,6 +386,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        if _is_tpu:
+            self._init_tpu_kv_materializer()
 
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
@@ -575,6 +578,60 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             self._use_fused_kv_materialize = False
             self._fused_kv_helper = None
+
+    def _init_tpu_kv_materializer(self) -> None:
+        """Prepare the vectorized projection and donated RPA-v3 cache writer."""
+        if (
+            getattr(
+                self.draft_model_runner.server_args,
+                "tpu_compile_tracer",
+                "dynamo",
+            )
+            == "direct"
+        ):
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DFLASH TPU vectorized KV materialization disabled for the "
+                    "direct compile tracer."
+                )
+            self._tpu_kv_materializer = None
+            return
+        if not self.draft_model.supports_fused_context_kv:
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DFLASH TPU vectorized KV materialization disabled: "
+                    "draft model requires per-layer context preparation."
+                )
+            self._tpu_kv_materializer = None
+            return
+
+        try:
+            from sglang.srt.hardware_backend.tpu.dflash_kv_materialize import (
+                TpuDFlashKVMaterializer,
+            )
+
+            self._tpu_kv_materializer = TpuDFlashKVMaterializer(
+                draft_model=self.draft_model,
+                token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
+                token_buckets=self.draft_model_runner.server_args.tpu_compile_tokens,
+            )
+            if self.ps.tp_rank == 0:
+                first_attn = self.draft_model.layers[0].self_attn
+                logger.info(
+                    "DFLASH TPU vectorized KV materialization enabled. "
+                    "n_layers=%d, num_kv_heads=%d, head_dim=%d, token_buckets=%s",
+                    len(self.draft_model.layers),
+                    first_attn.num_kv_heads,
+                    first_attn.head_dim,
+                    self._tpu_kv_materializer.token_buckets,
+                )
+        except Exception as error:  # noqa: BLE001 - safe sequential fallback
+            logger.warning(
+                "DFLASH TPU vectorized KV initialization failed; using the "
+                "sequential path: %s",
+                error,
+            )
+            self._tpu_kv_materializer = None
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
         cap = (
@@ -1254,7 +1311,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
-
             if cache_loc_2d is not None:
                 bs = int(commit_lens.shape[0])
                 if int(cache_loc_2d.shape[0]) != bs:
@@ -1434,8 +1490,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
         with torch.no_grad():
-            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
-
             if cache_loc_2d is not None:
                 assert commit_lens is not None
                 bs = int(commit_lens.shape[0])
@@ -1453,12 +1507,29 @@ class DFlashWorkerV2(BaseSpecWorker):
                 valid_mask = (
                     row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
                 ).reshape(-1)
+                if self._tpu_kv_materializer is not None:
+                    self._tpu_kv_materializer.materialize(
+                        target_hidden=target_hidden,
+                        positions=positions,
+                        cache_loc=cache_loc_2d.reshape(-1),
+                        valid_mask=valid_mask,
+                    )
+                    return
                 cache_loc = torch.where(
                     valid_mask,
                     cache_loc_2d.reshape(-1),
                     torch.zeros_like(cache_loc_2d.reshape(-1)),
                 )
 
+            if self._tpu_kv_materializer is not None:
+                self._tpu_kv_materializer.materialize(
+                    target_hidden=target_hidden,
+                    positions=positions,
+                    cache_loc=cache_loc,
+                )
+                return
+
+            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
             self._append_target_hidden_sequential_tpu(
                 ctx_hidden=ctx_hidden,
                 ctx_positions=positions,
@@ -1879,8 +1950,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch_size=bs,
                 draft_token_num=block_size,
                 device=device,
+                host_req_pool_indices=(batch.req_pool_indices_cpu if _is_tpu else None),
+                host_seq_lens=batch.seq_lens_cpu if _is_tpu else None,
             )
-            verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
+            if _is_tpu:
+                verify_out_cache_loc_2d = verify_out_cache_loc.view(bs, block_size)
+            else:
+                verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
         noise_embedding = embed_module(block_ids)
         if self._noise_embed_scale != 1.0:
