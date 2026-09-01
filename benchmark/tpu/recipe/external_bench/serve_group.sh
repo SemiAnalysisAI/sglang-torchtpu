@@ -134,6 +134,9 @@ if [[ "$ROLE" == "prefill" ]]; then
     # Prefix caching + KV offload live on the prefill engine, where shared
     # prefixes are matched; spec runs on BOTH engines (the P/D handoff
     # carries the spec bootstrap state).
+    # Unscaled pool: prefill holds KV only until handoff, and the 8k
+    # EXTEND-graph capture needs the HBM the scaled pool would eat.
+    export MAX_TOTAL_TOKENS=$MAX_TOTAL_TOKENS_PREFILL
     export KV_OFFLOAD HICACHE_RATIO HICACHE_IO_BACKEND HICACHE_MEM_LAYOUT
     export EXTRA_ARGS="$BASE_EXTRA_ARGS \
 --disaggregation-mode prefill \
