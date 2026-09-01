@@ -98,15 +98,30 @@ def _dump_leg_metrics(leg):
     Only the per-leg output_throughput carries `workload`, which is what routes it
     to the dashboard's performance tab; everything else the leg measured is dumped
     as kind=bench_detail -- stored in the dashboard's archive forever (a field not
-    recorded tonight cannot be back-filled once the job log expires), charted
-    nowhere. The leg tag is in the metric name because several legs share a run,
-    and the dashboard keys a night's point on (test_file, metric_name, model).
+    recorded tonight cannot be back-filled once the job log expires). The dashboard
+    still charts the bench_detail rows whose trailing field matches one of its
+    dropdown families (total/decode throughput, TTFT/TPOT/ITL). The leg tag is in
+    the metric name because several legs share a run, and the dashboard keys a
+    night's point on (test_file, metric_name, model).
     """
     tag = leg["tag"]
     numbers = {
         **(leg.get("metrics") or {}),
         **{f"derived.{k}": v for k, v in (leg.get("derived") or {}).items()},
     }
+    # bench_serving cannot account input tokens for a multi-turn replay, so its
+    # total_throughput degenerates to exactly output_throughput and its
+    # input_throughput to 0 (see nightly/README.md "Reading a result"). The
+    # dashboard picks its Total-throughput charts by the trailing field name, so
+    # dumping the degenerate value under `total_throughput` plotted a Total chart
+    # identical to the Decode one. Chart the corrected total (server-side prompt
+    # counter + output tokens, computed by summarize.py) under that name instead,
+    # and drop the two degenerate fields -- they carry no information to archive.
+    numbers.pop("input_throughput", None)
+    numbers.pop("total_throughput", None)
+    real_total = numbers.pop("derived.total_throughput", None)
+    if real_total is not None:
+        numbers["total_throughput"] = real_total
     for field, value in sorted(numbers.items()):
         if not isinstance(value, (int, float)):
             continue
