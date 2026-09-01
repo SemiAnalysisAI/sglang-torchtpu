@@ -33,6 +33,9 @@ Run one model profile per invocation on hardware:
   MODEL_PROFILE=gpt_oss_120b CI_PD_ROLE=prefill python3 \
       test/registered/tpu/integration/test_pd_tp_resharding.py
 
+  MODEL_PROFILE=gpt_oss_120b_eagle3 CI_PD_ROLE=prefill python3 \
+      test/registered/tpu/integration/test_pd_tp_resharding.py
+
 Without CI_PD_ROLE the file runs only its host-side configuration tests.
 """
 
@@ -169,6 +172,14 @@ class ModelProfile(msgspec.Struct, frozen=True, kw_only=True):
     extra_launch_env: Dict[str, str] = {}
     reasoning_effort: Optional[str] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    default_draft_model_path: Optional[str] = None
+    draft_model_env: Optional[str] = None
+    spec_accept_length_threshold: Optional[float] = None
+    max_running_requests: int = 8
+    prefill_compile_bs: str = "1"
+    decode_compile_bs: str = "1 2 4 8"
+    compile_tokens: str = "64 256 1024"
+    watchdog_timeout: str = "3600"
 
 
 MODEL_PROFILES = {
@@ -199,6 +210,41 @@ MODEL_PROFILES = {
         # (dynamic token dim in the extend graph).
         extra_launch_env={"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"},
         reasoning_effort="low",
+    ),
+    "gpt_oss_120b_eagle3": ModelProfile(
+        key="gpt_oss_120b_eagle3",
+        display_name="GPT-OSS-120B EAGLE3",
+        served_name="gpt-oss-120b",
+        default_model_path="/weights/gpt-oss-120b",
+        hf_repo_id="openai/gpt-oss-120b",
+        model_env="GPT_OSS_MODEL",
+        page_size=64,
+        mem_fraction_prefill="0.6",
+        mem_fraction_decode="0.6",
+        quantization="",
+        kv_cache_dtype="bfloat16",
+        max_total_tokens=8192,
+        device_pool_tokens_hint=8192,
+        gsm8k_threshold=0.70,
+        hybrid_swa=True,
+        extra_server_args=("--reasoning-parser", "gpt-oss"),
+        extra_launch_env={
+            "CONTEXT_LEN": "8192",
+            "CHUNKED_PREFILL_SIZE": "4096",
+            "MAX_PREFILL_TOKENS": "4096",
+            "TORCH_COMPILE_MAX_BS": "16",
+            "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
+            "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
+        },
+        reasoning_effort="low",
+        default_draft_model_path="lmsys/EAGLE3-gpt-oss-120b-bf16",
+        draft_model_env="GPT_OSS_DRAFT_MODEL",
+        spec_accept_length_threshold=1.90,
+        max_running_requests=16,
+        prefill_compile_bs="1 2 4 16",
+        decode_compile_bs="1 2 4 16",
+        compile_tokens="512 2048 4096",
+        watchdog_timeout="7200",
     ),
     "qwen3_coder_480b": ModelProfile(
         key="qwen3_coder_480b",
@@ -346,16 +392,53 @@ def resolve_model_path(
     return profile.hf_repo_id
 
 
-def validate_model_source(profile: ModelProfile, model_path: str) -> None:
+def resolve_draft_model_path(
+    profile: ModelProfile, env: Optional[Mapping[str, str]] = None
+) -> Optional[str]:
+    if profile.default_draft_model_path is None:
+        return None
+    values = os.environ if env is None else env
+    if profile.draft_model_env and values.get(profile.draft_model_env):
+        return values[profile.draft_model_env]
+    return profile.default_draft_model_path
+
+
+def validate_model_source(
+    profile: ModelProfile,
+    model_path: str,
+    *,
+    label: str = "target",
+    model_env: Optional[str] = None,
+) -> None:
     """Fail clearly when CI points at an unprovisioned local checkpoint."""
     if not os.path.isabs(model_path):
         return  # HF repo ids resolve remotely
     if not os.path.isfile(os.path.join(model_path, "config.json")):
         raise FileNotFoundError(
-            f"{profile.display_name} checkpoint incomplete or missing at "
+            f"{profile.display_name} {label} checkpoint incomplete or missing at "
             f"{model_path}; provision it on the weights volume or set "
-            f"{profile.model_env}"
+            f"{model_env or profile.model_env}"
         )
+
+
+def speculative_server_args(
+    profile: ModelProfile, env: Optional[Mapping[str, str]] = None
+) -> Tuple[str, ...]:
+    draft_model = resolve_draft_model_path(profile, env)
+    if draft_model is None:
+        return ()
+    return (
+        "--speculative-algorithm",
+        "EAGLE3",
+        "--speculative-draft-model-path",
+        draft_model,
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+    )
 
 
 def _common_launch_env(
@@ -408,9 +491,9 @@ def build_prefill_env(
         "--disaggregation-transfer-backend",
         profile.disagg_transfer_backend,
         "--watchdog-timeout",
-        "3600",
+        profile.watchdog_timeout,
         "--soft-watchdog-timeout",
-        "3600",
+        profile.watchdog_timeout,
         # A disagg engine's warmup generation cannot complete without
         # its peer + the LB pairing them, so warmup just times out.
         "--skip-server-warmup",
@@ -430,9 +513,9 @@ def build_prefill_env(
         "EP_SIZE": values.get("EP_SIZE", str(tp_size)),
         "DP_SIZE": "1",
         "ENABLE_DP_ATTENTION": "0",
-        "MAX_RUNNING": values.get("MAX_RUNNING", "8"),
-        "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1"),
-        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024"),
+        "MAX_RUNNING": values.get("MAX_RUNNING", str(profile.max_running_requests)),
+        "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", profile.prefill_compile_bs),
+        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", profile.compile_tokens),
         "MEM_FRACTION_STATIC": values.get(
             "MEM_FRACTION_STATIC", profile.mem_fraction_prefill
         ),
@@ -442,6 +525,7 @@ def build_prefill_env(
             (
                 *prefill_args,
                 *profile.extra_server_args,
+                *speculative_server_args(profile, values),
                 values.get("EXTRA_PREFILL_ARGS", ""),
             )
         ).strip(),
@@ -464,9 +548,9 @@ def build_decode_env(
         "--disaggregation-transfer-backend",
         profile.disagg_transfer_backend,
         "--watchdog-timeout",
-        "3600",
+        profile.watchdog_timeout,
         "--soft-watchdog-timeout",
-        "3600",
+        profile.watchdog_timeout,
         "--skip-server-warmup",
         "--sampling-backend",
         "pytorch",
@@ -479,9 +563,9 @@ def build_decode_env(
         "EP_SIZE": values.get("EP_SIZE", str(tp_size)),
         "DP_SIZE": str(dp_size),
         "ENABLE_DP_ATTENTION": "1",
-        "MAX_RUNNING": values.get("MAX_RUNNING", "8"),
-        "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1 2 4 8"),
-        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024"),
+        "MAX_RUNNING": values.get("MAX_RUNNING", str(profile.max_running_requests)),
+        "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", profile.decode_compile_bs),
+        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", profile.compile_tokens),
         "MEM_FRACTION_STATIC": values.get(
             "MEM_FRACTION_STATIC", profile.mem_fraction_decode
         ),
@@ -490,6 +574,7 @@ def build_decode_env(
             (
                 *decode_args,
                 *profile.extra_server_args,
+                *speculative_server_args(profile, values),
                 values.get("EXTRA_DECODE_ARGS", ""),
             )
         ).strip(),
@@ -653,6 +738,11 @@ def _http_ok(url: str, timeout: int = 5) -> bool:
         return False
 
 
+def _get_json(url: str, timeout: int = 60) -> Dict[str, Any]:
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        return json.loads(response.read())
+
+
 def _wait_http_200(url: str, secs: int, procs: Tuple = ()) -> None:
     deadline = time.time() + secs
     waited = 0
@@ -723,6 +813,14 @@ class TestPdTpResharding(unittest.TestCase):
         cls.profile = select_profile(E("MODEL_PROFILE", ""))
         model_path = resolve_model_path(cls.profile)
         validate_model_source(cls.profile, model_path)
+        draft_model_path = resolve_draft_model_path(cls.profile)
+        if draft_model_path is not None:
+            validate_model_source(
+                cls.profile,
+                draft_model_path,
+                label="draft",
+                model_env=cls.profile.draft_model_env,
+            )
         cls.gsm8k_config = Gsm8kConfig.from_env(cls.profile)
         cls.procs = []
 
@@ -731,6 +829,8 @@ class TestPdTpResharding(unittest.TestCase):
             decode_host = peer_group_hostname(
                 self_host, from_role=ROLE_PREFILL, to_role=ROLE_DECODE
             )
+            cls.prefill_url = f"http://127.0.0.1:{PREFILL_PORT}"
+            cls.decode_url = f"http://{decode_host}:{DECODE_PORT}"
 
             cls.procs.append(
                 _launch(
@@ -825,13 +925,70 @@ class TestPdTpResharding(unittest.TestCase):
             score,
             labels={
                 "model": self.profile.served_name,
-                "test": "pd_tp_resharding",
+                "test": (
+                    "pd_spec_tp_resharding"
+                    if self.profile.spec_accept_length_threshold is not None
+                    else "pd_tp_resharding"
+                ),
             },
         )
         print(f"gsm8k score={score:.4f} floor={self.gsm8k_config.threshold:.4f}")
         self.assertGreaterEqual(score, self.gsm8k_config.threshold)
 
-    def test_03_sliding_window_crossed_the_reshard(self) -> None:
+    def test_03_spec_accept_length(self) -> None:
+        threshold = self.profile.spec_accept_length_threshold
+        if threshold is None:
+            self.skipTest("non-speculative model profile")
+
+        for label, url in (
+            (ROLE_PREFILL, self.prefill_url),
+            (ROLE_DECODE, self.decode_url),
+        ):
+            info = _get_json(f"{url}/server_info")
+            self.assertEqual(
+                str(info.get("speculative_algorithm", "")).upper(),
+                "EAGLE3",
+                f"{label} did not launch EAGLE3",
+            )
+
+        decode_info = _get_json(f"{self.decode_url}/server_info")
+        internal_states = decode_info.get("internal_states") or []
+        self.assertEqual(
+            len(internal_states),
+            2,
+            "DP2 decode should report one speculative state per DP replica",
+        )
+        accept_lengths = [
+            state.get("avg_spec_accept_length") for state in internal_states
+        ]
+        self.assertTrue(
+            all(value is not None for value in accept_lengths),
+            f"missing avg_spec_accept_length in decode states: {internal_states}",
+        )
+        print(
+            "speculative accept lengths="
+            f"{[round(float(value), 4) for value in accept_lengths]} "
+            f"floor={threshold:.4f}",
+            flush=True,
+        )
+        for dp_rank, value in enumerate(accept_lengths):
+            value = float(value)
+            dump_metric(
+                "spec_accept_length",
+                value,
+                labels={
+                    "model": self.profile.served_name,
+                    "test": "pd_spec_tp_resharding",
+                    "dp_rank": str(dp_rank),
+                },
+            )
+            self.assertGreaterEqual(
+                value,
+                threshold,
+                f"decode DP rank {dp_rank} speculative acceptance regressed",
+            )
+
+    def test_04_sliding_window_crossed_the_reshard(self) -> None:
         """A hybrid model's window must actually be resharded, not just its
         full-attention pool.
 
@@ -879,6 +1036,14 @@ def _serve_role(topo: PodTopology, profile: ModelProfile) -> int:
     """
     model_path = resolve_model_path(profile)
     validate_model_source(profile, model_path)
+    draft_model_path = resolve_draft_model_path(profile)
+    if draft_model_path is not None:
+        validate_model_source(
+            profile,
+            draft_model_path,
+            label="draft",
+            model_env=profile.draft_model_env,
+        )
     if topo.role == ROLE_DECODE:
         script, env, log = (
             "launch_decode.sh",
@@ -938,6 +1103,10 @@ def _serve_role(topo: PodTopology, profile: ModelProfile) -> int:
 class TestPdTpReshardingConfiguration(unittest.TestCase):
     def test_profile_selection_requires_exactly_one(self) -> None:
         self.assertIs(select_profile("gpt_oss_120b"), MODEL_PROFILES["gpt_oss_120b"])
+        self.assertIs(
+            select_profile("gpt_oss_120b_eagle3"),
+            MODEL_PROFILES["gpt_oss_120b_eagle3"],
+        )
         self.assertIs(
             select_profile("qwen3_coder_480b"), MODEL_PROFILES["qwen3_coder_480b"]
         )
