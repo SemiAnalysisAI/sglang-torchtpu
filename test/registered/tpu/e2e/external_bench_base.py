@@ -414,3 +414,10 @@ def build_matrix_test(*, bench_model: str, bench_recipe: str, workload: str):
         f"TestExtBench_{bench_model}_{bench_recipe}_{workload}"
     )
     return ExternalBenchTest
+
+
+if __name__ == "__main__":
+    # The matrix cells assign build_matrix_test() classes into their own
+    # __main__ and run there; this satisfies the dead-TestCase lint for the
+    # factory-defined class in this helper (nothing is collected here).
+    unittest.main()
