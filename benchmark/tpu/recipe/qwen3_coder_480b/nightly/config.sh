@@ -211,14 +211,17 @@ HICACHE_RATIO=${HICACHE_RATIO:-1}
 # D2H needing ~2x the KV pool in HBM.
 HICACHE_IO_BACKEND=${HICACHE_IO_BACKEND:-raiden}
 
-# Normal-session replay depth. During a leg with long sessions, the short
-# sessions finish sooner than the long ones; without replays the leg spends
-# most of its wall clock at (bs - long) idle slots and the aggregate numbers
-# describe a batch that was never full. Replaying costs no extra wall clock (the
-# long sessions set the leg's length) -- only trace size and generation time,
-# hence the cap.
-NORMAL_REPLAYS=${NORMAL_REPLAYS:-auto}
-MAX_NORMAL_REPLAYS=${MAX_NORMAL_REPLAYS:-8}
+# How many FRESH normal sessions each non-long concurrency slot plays
+# back-to-back. During a leg with long sessions, the short sessions finish
+# sooner than the long ones; without the extra sessions the leg spends most
+# of its wall clock at (bs - long) idle slots and the aggregate numbers
+# describe a batch that was never full. The extra sessions cost no wall clock
+# (the long sessions set the leg's length) -- only trace size and generation
+# time, hence the cap. Formerly named NORMAL_REPLAYS, which wrongly suggested
+# re-sending the same session (each is distinct -- no artificial prefix-cache
+# hits); the old env names still work.
+SESSIONS_PER_SLOT=${SESSIONS_PER_SLOT:-${NORMAL_REPLAYS:-auto}}
+MAX_SESSIONS_PER_SLOT=${MAX_SESSIONS_PER_SLOT:-${MAX_NORMAL_REPLAYS:-8}}
 
 # How the long sessions ramp to LONG_TARGET_CONTEXT. Contract value is
 # TURN_INPUT_TOKENS; the nightly profile raises it purely to bound wall clock
@@ -421,7 +424,7 @@ log_config() {
   concurrency sweep      = $SWEEP_BS
   long-session sweep     = $SWEEP_LONG
   long ramp tokens/round = $LONG_RAMP_TOKENS $([[ "$LONG_RAMP_TOKENS" != "$TURN_INPUT_TOKENS" ]] && echo "(TIME-BOXED: differs from the $TURN_INPUT_TOKENS-token contract)")
-  normal replays         = $NORMAL_REPLAYS (cap $MAX_NORMAL_REPLAYS)
+  sessions per slot      = $SESSIONS_PER_SLOT (cap $MAX_SESSIONS_PER_SLOT)
   --- limits ---
   max_leg_seconds        = $MAX_LEG_SECONDS
   health_timeout         = $HEALTH_TIMEOUT
