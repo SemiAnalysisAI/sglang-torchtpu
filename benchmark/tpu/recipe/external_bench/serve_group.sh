@@ -136,10 +136,21 @@ for v in $(compgen -e | grep '^MEGASCALE' || true); do unset "$v"; done
 # (iterations 6/8 with interleaved placements; 4/7 passed on aligned ones).
 # Each host's physical number is its instance metadata agent-worker-number;
 # phys_rendezvous.py exchanges them through pod index 0.
-PHYS_ID=$(curl -sf -H "Metadata-Flavor: Google" \
-    "http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number" || true)
+_md() { curl -sf -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/$1" 2>/dev/null || true; }
+PHYS_ID=$(_md "instance/attributes/agent-worker-number")
 if [[ ! "$PHYS_ID" =~ ^[0-9]+$ ]]; then
-    echo "[serve_group] ERROR: cannot read agent-worker-number from instance metadata" >&2
+    # GKE TPU nodes carry the physical worker id inside the tpu-env attribute
+    # (a YAML-ish blob with WORKER_ID: 'N'); agent-worker-number is the Cloud
+    # TPU VM spelling and is absent here (iteration 9).
+    PHYS_ID=$(_md "instance/attributes/tpu-env" \
+        | sed -n "s/^WORKER_ID:[[:space:]]*'\{0,1\}\([0-9]\{1,\}\)'\{0,1\}.*/\1/p" | head -1)
+fi
+if [[ ! "$PHYS_ID" =~ ^[0-9]+$ ]]; then
+    echo "[serve_group] ERROR: no physical worker id in instance metadata;" \
+         "available attributes:" >&2
+    _md "instance/attributes/" | head -30 >&2
+    echo "[serve_group] tpu-env head:" >&2
+    _md "instance/attributes/tpu-env" | head -15 >&2
     exit 1
 fi
 rdv_args=(--self-phys "$PHYS_ID" --self-host "${SLICE_HOSTS[$WORKER_ID]}" \
