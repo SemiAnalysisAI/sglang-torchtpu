@@ -129,66 +129,47 @@ fi
 # these engines are independent sub-slices (KV moves at application level).
 for v in $(compgen -e | grep '^MEGASCALE' || true); do unset "$v"; done
 
-# Group hosts by PHYSICAL position, not pod index: GKE maps a pod's completion
-# index to a physical slice host arbitrarily, and a sub-slice grouping like
-# {phys0, phys2} folds two hosts onto the same 2x2x2 coordinates -- every
-# collective then dies at compile with "replica id #N seen more than once"
-# (iterations 6/8 with interleaved placements; 4/7 passed on aligned ones).
-# Each host's physical number is its instance metadata agent-worker-number;
-# phys_rendezvous.py exchanges them through pod index 0.
-_md() { curl -sf -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/$1" 2>/dev/null || true; }
-PHYS_ID=$(_md "instance/attributes/agent-worker-number")
-if [[ ! "$PHYS_ID" =~ ^[0-9]+$ ]]; then
-    # GKE TPU nodes carry the physical worker id inside the tpu-env attribute
-    # (a YAML-ish blob with WORKER_ID: 'N'); agent-worker-number is the Cloud
-    # TPU VM spelling and is absent here (iteration 9).
-    PHYS_ID=$(_md "instance/attributes/tpu-env" \
-        | sed -n "s/^WORKER_ID:[[:space:]]*'\{0,1\}\([0-9]\{1,\}\)'\{0,1\}.*/\1/p" | head -1)
-fi
-if [[ ! "$PHYS_ID" =~ ^[0-9]+$ ]]; then
-    echo "[serve_group] ERROR: no physical worker id in instance metadata;" \
-         "available attributes:" >&2
-    _md "instance/attributes/" | head -30 >&2
-    echo "[serve_group] tpu-env head:" >&2
-    _md "instance/attributes/tpu-env" | head -15 >&2
-    exit 1
-fi
-rdv_args=(--self-phys "$PHYS_ID" --self-host "${SLICE_HOSTS[$WORKER_ID]}" \
-          --server-host "${SLICE_HOSTS[0]}" --num-hosts "${#SLICE_HOSTS[@]}")
-[[ "$WORKER_ID" == "0" ]] && rdv_args+=(--serve)
-mapfile -t _phys_lines < <("$PYTHON" "$HERE/phys_rendezvous.py" "${rdv_args[@]}")
-if (( ${#_phys_lines[@]} < 4 )); then
-    echo "[serve_group] ERROR: physical rendezvous failed (${#_phys_lines[@]} hosts)" >&2
-    exit 1
-fi
-PHYS_HOSTS=()
-for line in "${_phys_lines[@]}"; do PHYS_HOSTS+=("${line#* }"); done
-echo "[serve_group] physical host order: ${PHYS_HOSTS[*]} (self phys=$PHYS_ID)"
-# The physically-ordered host list, for the test/sweep side on this pod (the
-# metrics endpoints follow physical roles, not pod indices).
-printf '%s\n' "${PHYS_HOSTS[@]}" > /tmp/ext_bench_phys_hosts
+# What the GKE TPU webhook injected, before any override -- libtpu on GKE is
+# env-driven (TPU_SKIP_MDS_QUERY=true), so this is the topology ground truth
+# and the debugging record for any grouping issue.
+echo "[serve_group] injected TPU env:"
+env | grep -E '^TPU_' | sed 's/^/[serve_group]   /' || true
 
-PREFILL_LEADER=${PHYS_HOSTS[0]}
-DECODE_LEADER=${PHYS_HOSTS[2]}
-if (( PHYS_ID < 2 )); then
+PREFILL_LEADER=${SLICE_HOSTS[0]}
+DECODE_LEADER=${SLICE_HOSTS[2]}
+if (( WORKER_ID < 2 )); then
     ROLE=prefill
-    SUB_HOSTS="${PHYS_HOSTS[0]},${PHYS_HOSTS[1]}"
-    LOCAL_RANK=$PHYS_ID
+    SUB_HOSTS="${SLICE_HOSTS[0]},${SLICE_HOSTS[1]}"
+    LOCAL_RANK=$WORKER_ID
     export PORT=$PD_PREFILL_PORT
 else
     ROLE=decode
-    SUB_HOSTS="${PHYS_HOSTS[2]},${PHYS_HOSTS[3]}"
-    LOCAL_RANK=$(( PHYS_ID - 2 ))
+    SUB_HOSTS="${SLICE_HOSTS[2]},${SLICE_HOSTS[3]}"
+    LOCAL_RANK=$(( WORKER_ID - 2 ))
     export PORT=$PD_DECODE_PORT
 fi
 echo "[serve_group] pd role=$ROLE local_rank=$LOCAL_RANK sub_hosts=$SUB_HOSTS"
+# The engine-leader host list for the test/sweep side on this pod.
+printf '%s\n' "${SLICE_HOSTS[@]}" > /tmp/ext_bench_phys_hosts
 
-# Re-scope the slice env to this engine's 2-host sub-slice.
+# Re-scope the slice env to this engine's 2-host sub-slice -- the WHOLE
+# libtpu env set, consistently. GKE injects TPU_SKIP_MDS_QUERY=true plus a
+# full-slice TPU_PROCESS_ADDRESSES/TPU_ACCELERATOR_TYPE; leaving those at the
+# 4-host values while remapping TPU_WORKER_ID to 0/1 makes two pods claim the
+# same worker id WITHIN THE SAME libtpu process set -- collectives then
+# compile with "replica id #N seen more than once" (iterations 6/8; whether a
+# run survived depended on which env libtpu happened to consult first).
 export TPU_WORKER_HOSTNAMES="$SUB_HOSTS"
 export TPU_WORKER_ID="$LOCAL_RANK"
 export NODE_RANK="$LOCAL_RANK"
 export NNODES=2
 export TPU_TOPOLOGY=2x2x2   # the engine's sub-cube, not the slice's 2x2x4
+if [[ -n "${TPU_PROCESS_ADDRESSES:-}" ]]; then
+    _tpu_port=${TPU_PROCESS_PORT:-${TPU_PROCESS_ADDRESSES##*:}}
+    export TPU_PROCESS_ADDRESSES="${SUB_HOSTS%%,*}:${_tpu_port},${SUB_HOSTS##*,}:${_tpu_port}"
+fi
+[[ -n "${TPU_ACCELERATOR_TYPE:-}" ]] && export TPU_ACCELERATOR_TYPE=tpu7x-16
+[[ -n "${TPU_TOPOLOGY_WRAP:-}" ]] && export TPU_TOPOLOGY_WRAP=false,false,false
 export TP_SIZE EP_SIZE
 export HOST=0.0.0.0         # engines must be reachable across hosts
 export SGLANG_HOST_IP=${SGLANG_HOST_IP:-$(hostname -i | awk '{print $1}')}
