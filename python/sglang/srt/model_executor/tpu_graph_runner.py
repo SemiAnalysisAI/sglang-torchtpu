@@ -34,7 +34,6 @@ from sglang.srt.compilation.support_torch_compile import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-    CausalLMDecoderTpuCompilePolicy,
     DecoderTpuCompilePolicy,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
@@ -243,12 +242,7 @@ class TpuGraphRunner:
 
         if not installed_any:
             server_args = model_runner.server_args
-            fallback_cls = (
-                CausalLMDecoderTpuCompilePolicy
-                if CausalLMDecoderTpuCompilePolicy.supports(self.model)
-                else DecoderTpuCompilePolicy
-            )
-            fallback_cls = _augment_spec_policy(fallback_cls, model_runner)
+            fallback_cls = _augment_spec_policy(DecoderTpuCompilePolicy, model_runner)
             logger.info(
                 "enable_torch_compile=True but %s declares no TPU compile "
                 "policies; falling back to %s on forward.",

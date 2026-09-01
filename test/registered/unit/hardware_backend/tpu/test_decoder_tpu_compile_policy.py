@@ -19,7 +19,6 @@ from sglang.srt.compilation.support_torch_compile import (
 )
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-    CausalLMDecoderTpuCompilePolicy,
     DecoderTpuCompilePolicy,
     Qwen3VLDecoderTpuCompilePolicy,
     _materialize_out,
@@ -182,69 +181,6 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             "forward_batch.extend_input_logprob_token_ids_gpu",
             kwargs["ignored_argnames"],
         )
-
-
-class TestCausalLMDecoderTpuCompilePolicy(CustomTestCase):
-    def test_supports_standard_causal_lm_boundary(self):
-        owner = SimpleNamespace(
-            model=SimpleNamespace(forward=MagicMock()),
-            logits_processor=SimpleNamespace(forward=MagicMock()),
-        )
-        self.assertTrue(CausalLMDecoderTpuCompilePolicy.supports(owner))
-        self.assertFalse(
-            CausalLMDecoderTpuCompilePolicy.supports(
-                SimpleNamespace(model=SimpleNamespace(forward=MagicMock()))
-            )
-        )
-
-    def test_routes_prefill_through_compiled_backbone_and_decode_through_outer(self):
-        eager_backbone = MagicMock(return_value="hidden_states")
-        compiled_backbone = MagicMock(return_value="compiled_hidden_states")
-        backbone = SimpleNamespace(forward=eager_backbone)
-
-        def eager_causal_lm(input_ids, positions, forward_batch):
-            return (backbone.forward(input_ids, positions, forward_batch), "logits")
-
-        compiled_causal_lm = MagicMock(return_value="compiled_logits")
-        owner = SimpleNamespace(model=backbone, forward=eager_causal_lm)
-        policy = CausalLMDecoderTpuCompilePolicy(
-            model_runner=SimpleNamespace(model=owner), owner=owner
-        )
-        policy._eager_causal_lm_forward = eager_causal_lm
-        policy._compiled_causal_lm_forward = compiled_causal_lm
-        policy.compiled_forward_shim = SimpleNamespace(fn=compiled_causal_lm)
-        policy._compile = MagicMock(return_value=compiled_backbone)
-
-        policy._install_prefill_backbone()
-
-        args = (torch.arange(2), torch.arange(2))
-        extend_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
-        decode_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
-        self.assertEqual(
-            policy.compiled_forward_shim.fn(*args, extend_batch),
-            ("compiled_hidden_states", "logits"),
-        )
-        self.assertEqual(
-            policy.compiled_forward_shim.fn(*args, decode_batch),
-            "compiled_logits",
-        )
-        policy._compile.assert_called_once_with(eager_backbone)
-        compiled_backbone.assert_called_once_with(*args, extend_batch)
-        compiled_causal_lm.assert_called_once_with(*args, decode_batch)
-
-    def test_precompile_warms_decode_before_replacing_backbone(self):
-        model_runner = SimpleNamespace(
-            server_args=SimpleNamespace(disaggregation_mode=None)
-        )
-        policy = CausalLMDecoderTpuCompilePolicy(model_runner=model_runner)
-        order = []
-        policy._precompile_decode = lambda: order.append("decode")
-        policy._install_prefill_backbone = lambda: order.append("install_backbone")
-        policy._precompile_extend = lambda: order.append("extend")
-
-        policy.precompile()
-
-        self.assertEqual(order, ["decode", "install_backbone", "extend"])
 
 
 class TestLogitsOutputMode(CustomTestCase):
