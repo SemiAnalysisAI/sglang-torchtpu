@@ -71,6 +71,12 @@ logger = logging.getLogger(__name__)
 # pieces of this size keep the overlap while costing a few reads per request.
 CHUNK_ANNOUNCE_TOKENS = 8192
 
+# Base of the per-rank control ports (`base + 4*local_rank`). Not 30000: that
+# puts rank 0 on the default HTTP serving port, and the engine wins the bind --
+# uvicorn then dies with EADDRINUSE and takes the server down before any
+# transfer is attempted.
+DEFAULT_KV_PORT = 31000
+
 
 @dataclass(frozen=True)
 class RaidenKVCacheGroups:
@@ -146,7 +152,7 @@ class RaidenKVManager(CommonKVManager):
         # rank counts every worker on the node -- attention-TP ranks of every
         # context-parallel, attention-DP, and system-DP replica -- so
         # replicas never share a port, an engine id, or a uuid namespace.
-        base_port = int(os.environ.get("SGLANG_RAIDEN_KV_PORT", "30000"))
+        base_port = int(os.environ.get("SGLANG_RAIDEN_KV_PORT", str(DEFAULT_KV_PORT)))
         self._local_rank = node_worker_rank(
             self.attn_tp_rank,
             self.attn_tp_size,
@@ -2295,24 +2301,28 @@ class RaidenKVManager(CommonKVManager):
         swa_push_endpoint = req_meta.get("swa_push_endpoint") or ""
         n = len(decode_swa_blocks)
         if not n or not swa_blocks or not swa_push_endpoint:
-            # Settle so the room is not held open on a transfer that will never
-            # be issued -- but say so. This side has a window engine, so a room
-            # arriving here with no window pages or no peer endpoint means the
-            # two sides disagree about the model being hybrid. Silence would let
-            # the run go green having moved only the full-attention KV, which
-            # accuracy alone may not catch.
-            logger.warning(
-                "RaidenKVManager rank%d raiden reshard SWA push SKIPPED room=%s "
-                "decode_pages=%d local_pages=%d peer=%r -- the window was not "
-                "transferred",
-                self.attn_tp_rank,
-                room,
-                n,
-                len(swa_blocks),
-                swa_push_endpoint,
+            # None of these is reachable in a healthy run, so fail the room
+            # rather than skip the window. This side has a window engine, so:
+            # an empty peer endpoint means the decode has none, i.e. the two
+            # sides disagree about the model being hybrid; empty pages on
+            # either side mean a hybrid room carrying no window. The one
+            # legitimate empty case -- a full prefix hit -- returns in
+            # register_decode_request without ever sending a RESHARD_REQ, so it
+            # cannot arrive here. Skipping would move only the full-attention KV
+            # and still report success, which accuracy alone may not catch.
+            reason = (
+                f"Raiden reshard SWA push: hybrid room {room} has nothing to "
+                f"send (decode_pages={n} local_pages={len(swa_blocks)} "
+                f"peer={swa_push_endpoint!r})"
             )
+            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
             with self._state_lock:
+                self._failed.add(str(room))
+                # Settled even on failure: the room is reported through
+                # _failed, and leaving swa:<room> absent would hang
+                # is_send_done instead of surfacing the reason.
                 self._completed_send.add(swa_req_id)
+                self.record_failure(room, reason)
             return
         if len(swa_blocks) > n:
             # Decode kept fewer window pages (prefix hit); pair the tail, as the

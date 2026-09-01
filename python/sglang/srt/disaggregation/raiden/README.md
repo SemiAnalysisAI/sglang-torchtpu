@@ -89,7 +89,7 @@ speculative draft KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `SGLANG_RAIDEN_KV_PORT` | `30000` | base control port; local rank uses `base + 4*node_worker_rank` over every CP/DP replica's TP ranks (data = `+1`, SWA engine control/data = `+2`/`+3`) |
+| `SGLANG_RAIDEN_KV_PORT` | `31000` | base control port, kept clear of the default serving ports; local rank uses `base + 4*node_worker_rank` over every CP/DP replica's TP ranks (data = `+1`, SWA engine control/data = `+2`/`+3`) |
 | `SGLANG_RAIDEN_HOST_POOL_GB` | `128` | host staging ceiling per node, split across local ranks and engines; the pool holds as many in-flight transfers as fit it, at most the running batch. Startup fails with the required and available sizes when not even one transfer fits |
 | `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | full-attention max pages/request; auto = `ceil(context_len/page_size)` |
 | `SGLANG_RAIDEN_SWA_MAX_BLOCKS` | `0` (auto) | SWA max pages/request; auto includes one page for an unaligned window start |

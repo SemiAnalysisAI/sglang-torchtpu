@@ -31,6 +31,7 @@ import torch
 from sglang.srt.disaggregation.base.conn import BaseKVSender, KVArgs, StateType
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeReqToTokenPool
 from sglang.srt.disaggregation.raiden.conn import (
+    DEFAULT_KV_PORT,
     RaidenKVManager,
     RaidenKVSender,
     get_raiden_kv_caches,
@@ -1340,6 +1341,20 @@ class TestRaidenRoleStatePlacement(CustomTestCase):
         self.assertEqual(
             wrong, [], "state declared in the wrong role branch:\n" + "\n".join(wrong)
         )
+
+
+class TestRaidenDefaultPort(CustomTestCase):
+    def test_default_port_range_clears_the_serving_ports(self):
+        """Each rank takes `base + 4*local_rank`, so the default base decides
+        whether rank 0 lands on the HTTP serving port. At 30000 it did: the
+        engine won the bind, uvicorn died with EADDRINUSE and took the process
+        tree with it, so the server never went healthy and no transfer was ever
+        attempted -- a bring-up crash that reads as a raiden failure (combo run
+        33256868716). The ports below are the ones SGLang serves on by default.
+        """
+        reserved = range(DEFAULT_KV_PORT, DEFAULT_KV_PORT + 4 * 16)
+        for port in (30000, 8000, 8998, 10011):
+            self.assertNotIn(port, reserved)
 
 
 class TestNoPushLock(CustomTestCase):
