@@ -610,6 +610,47 @@ class CompiledForwardShim:
         self._default_kwargs = _static_default_kwargs(compiled_fn)
         functools.update_wrapper(self, compiled_fn)
 
+    def _prompt_logprob_rejection(self) -> str | None:
+        """Why this server cannot serve input logprobs, or None if it can.
+
+        Consulted only for requests that actually ask for them, so none of this
+        lands on anyone else's forward.
+        """
+        if not self._prompt_logprob_enabled:
+            return (
+                "input/prompt logprobs (echo) need "
+                "SGLANG_TPU_ENABLE_PROMPT_LOGPROB=1 on the TPU compiled "
+                "backend; only output (next-token) logprobs are served by "
+                "default."
+            )
+        server_args = self.policy.model_runner.server_args
+        # Read off server_args rather than get_attention_dp_size(), which
+        # asserts on process-global state that only a live DP server sets.
+        attn_dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
+        # _attach_input_logprobs re-runs the LogitsProcessor, whose logits path
+        # enters the attention-TP/DP collectives. Wanting input logprobs is a
+        # property of the local batch, so under DP attention a rank holding
+        # such a request would join a collective its peers never reach and the
+        # worker group would hang.
+        if attn_dp_size > 1:
+            return (
+                "input/prompt logprobs are not supported with DP attention "
+                "(attn_dp_size > 1): the eager gather re-enters the logits "
+                "collectives, which only the ranks holding such a request "
+                "would reach. TODO: reduce the request flag across the DP "
+                "group and have every rank run the gather."
+            )
+        # Non-final pipeline stages return PPProxyTensors, which carries no
+        # hidden states for the gather to read.
+        if server_args.pp_size > 1:
+            return (
+                "input/prompt logprobs are not supported with pipeline "
+                "parallelism (pp_size > 1): non-final stages return "
+                "PPProxyTensors, which carries no hidden states. TODO: run "
+                "the gather on the last stage only."
+            )
+        return None
+
     def set_recompilation_checker(self, checker: Any, model_label: str = "") -> None:
         """Set the serving-time recompilation checker."""
         self._recompilation_checker = checker
@@ -671,13 +712,10 @@ class CompiledForwardShim:
         # the flag off nothing below runs, the batch is never touched, and the
         # extend graph is the NULL-capture one warmup has always compiled.
         wants_input_logprob = needs_input_logprob(forward_batch)
-        if wants_input_logprob and not self._prompt_logprob_enabled:
-            raise NotImplementedError(
-                "input/prompt logprobs (echo) need "
-                "SGLANG_TPU_ENABLE_PROMPT_LOGPROB=1 on the TPU compiled "
-                "backend; only output (next-token) logprobs are served by "
-                "default."
-            )
+        if wants_input_logprob:
+            rejection = self._prompt_logprob_rejection()
+            if rejection is not None:
+                raise NotImplementedError(rejection)
         saved: dict[str, Any] = {}
         if self._prompt_logprob_enabled and forward_batch.forward_mode.is_extend():
             saved["capture_hidden_mode"] = forward_batch.capture_hidden_mode

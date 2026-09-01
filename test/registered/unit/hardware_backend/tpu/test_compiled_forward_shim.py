@@ -1059,13 +1059,18 @@ class TestHiCacheReloadGate(CustomTestCase):
         counter.wait.assert_not_called()
 
 
-def _policy(model):
+def _policy(model, *, pp_size=1, dp_size=1, enable_dp_attention=False):
     """Policy whose model_runner exposes just what the shim reads."""
     policy = DecoderTpuCompilePolicy()
     policy.model_runner = SimpleNamespace(
         model=model,
         # Read by the HiCache reload gate on every eager call.
         token_to_kv_pool=SimpleNamespace(layer_transfer_counter=None),
+        server_args=SimpleNamespace(
+            pp_size=pp_size,
+            dp_size=dp_size,
+            enable_dp_attention=enable_dp_attention,
+        ),
     )
     return policy
 
@@ -1176,7 +1181,7 @@ class TestShimInputLogprobPath(CustomTestCase):
             _tpu_real_b=2,
         )
 
-    def _shim(self, seen, *, model=None, enabled=True):
+    def _shim(self, seen, *, model=None, enabled=True, pp_size=1, **policy_kw):
         def compiled(input_ids, positions, forward_batch, *a, **kw):
             # Snapshot what the graph actually sees.
             seen["capture_hidden_mode"] = forward_batch.capture_hidden_mode
@@ -1191,7 +1196,9 @@ class TestShimInputLogprobPath(CustomTestCase):
         # extend variant warmup compiled, so the shim reads it once and cannot
         # honour a later change.
         with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(enabled):
-            return CompiledForwardShim(compiled, policy=_policy(model))
+            return CompiledForwardShim(
+                compiled, policy=_policy(model, pp_size=pp_size, **policy_kw)
+            )
 
     def test_graph_sees_full_capture_and_no_logprob_request(self):
         seen, fb = {}, self._fb()
@@ -1285,6 +1292,33 @@ class TestShimInputLogprobPath(CustomTestCase):
             NotImplementedError, "SGLANG_TPU_ENABLE_PROMPT_LOGPROB"
         ):
             self._shim({}, model=_StubModel(), enabled=False)(None, None, self._fb())
+
+    def test_dp_attention_rejects_prompt_logprobs(self):
+        # The eager gather re-runs the LogitsProcessor, whose logits path
+        # enters the attention-TP/DP collectives. Wanting input logprobs is a
+        # property of the local batch, so under DP attention one rank would
+        # join a collective its peers never reach: the worker group hangs
+        # rather than failing. Reject up front instead.
+        model = _StubModel()
+        shim = self._shim({}, model=model, dp_size=2, enable_dp_attention=True)
+        with self.assertRaisesRegex(NotImplementedError, "DP attention"):
+            shim(None, None, self._fb())
+        self.assertEqual(model.calls, 0)
+
+    def test_pipeline_parallelism_rejects_prompt_logprobs(self):
+        # Non-final PP stages return PPProxyTensors, which carries no hidden
+        # states, so the gather would fail on an attribute that isn't there.
+        model = _StubModel()
+        with self.assertRaisesRegex(NotImplementedError, "pipeline"):
+            self._shim({}, model=model, pp_size=2)(None, None, self._fb())
+        self.assertEqual(model.calls, 0)
+
+    def test_single_rank_config_is_not_rejected(self):
+        # The negative side of the two guards above: the ordinary
+        # attn_dp_size == 1, pp_size == 1 server must still serve them.
+        model = _StubModel()
+        out = self._shim({}, model=model)(None, None, self._fb())
+        self.assertIsNotNone(out.input_token_logprobs)
 
     def test_disabled_still_serves_output_logprobs(self):
         # The pin is unconditional and must stay so: an output-logprob request
