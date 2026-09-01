@@ -208,20 +208,24 @@ fi
 MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS-$((MAX_TOTAL_TOKENS_TP8 * TP_SIZE / 8))}
 MAX_TOTAL_TOKENS_PREFILL=${MAX_TOTAL_TOKENS_PREFILL-$MAX_TOTAL_TOKENS_TP8}
 
-# P/D: a long request's KV handoff is chunky (a 64k-token context is ~1 GB
-# per engine at fp8) and 4 of them land together at the c64-long4 point, so
-# the default 300s disaggregation waiting timeout trips at the leg tail
-# ("Raiden transfer failed on another attention TP/CP rank", observed
-# 2026-09-01 on the first 4-host E2E). sglang's own log message recommends
-# raising it; 900s bounds a wedged transfer without failing healthy ones.
+# P/D disaggregation timeouts: keep the stock 300s. A stalled KV handoff on
+# the external cluster NEVER progresses (failures land exactly at the timeout
+# boundary in every run) and is recovered by the P/D retry loop
+# (optimistic_release_and_requeue) -- so a longer window only parks the
+# request 3x longer before the retry that actually completes it. Measured on
+# the identical 8k1k c64-long4 leg: 300s -> 216.5 tok/s (run 33478717664),
+# 900s -> 72.7 tok/s (run 33505299417), leg wall clock pinned at ~1x the
+# window by the stalled cohort. Overridable for experiments; if a run shows
+# transfers that COMPLETE slowly (failures strictly inside the window),
+# raising these becomes the right call.
+#
+# Two separate knobs bound the two sides of a handoff: the decode's wait for
+# its KV (WAITING) and the prefill's wait for the decode to ask (BOOTSTRAP --
+# raiden is consumer-pull; fail_decode_silence(bootstrap_timeout),
+# raiden/conn.py:2529).
 if [[ "$PD_DISAGG" == "1" ]]; then
-    # Two separate knobs bound the two sides of a handoff: the decode's wait
-    # for its KV (WAITING) and the prefill's wait for the decode to ask
-    # (BOOTSTRAP -- raiden is consumer-pull, so the prefill's handshake window
-    # is fail_decode_silence(bootstrap_timeout), raiden/conn.py:2529). Raising
-    # only the first still failed prefill-side at 300s (iteration 7).
-    export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=${SGLANG_DISAGGREGATION_WAITING_TIMEOUT:-900}
-    export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=${SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT:-900}
+    [[ -n "${SGLANG_DISAGGREGATION_WAITING_TIMEOUT:-}" ]] && export SGLANG_DISAGGREGATION_WAITING_TIMEOUT
+    [[ -n "${SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT:-}" ]] && export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT
 fi
 
 # KV offload (HiCache) io backend: raiden skips the fused pool's whole-pool D2H
