@@ -17,6 +17,7 @@ from sglang.srt.compilation.support_torch_compile import (
     get_torch_compile_policy,
     support_torch_compile,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     CompiledForwardShim,
@@ -849,6 +850,39 @@ class TestPrecompileLoops(CustomTestCase):
             mr.attn_backend.calls,
             [(8, 4), (64, 4), (256, 4)],
         )
+
+    def test_extend_warms_null_capture_by_default(self):
+        # The other half of the prompt-logprob opt-in. Serving them needs the
+        # extend graph warmed with FULL capture, which makes every prefill
+        # return all its rows (~8% slower) whether or not anyone asked. With
+        # the flag off the warmed variant must stay exactly what it has always
+        # been -- this goes red if the choice is ever hardcoded to FULL.
+        policy = _make_policy(_model_runner(), token_buckets=(8,), bs_buckets=(1, 4))
+        policy._run_one = MagicMock()
+
+        with get_parallel().override(tp_rank=1):
+            policy._precompile_extend()
+
+        modes = {
+            call.kwargs["capture_hidden_mode"]
+            for call in policy._run_one.call_args_list
+        }
+        self.assertEqual(modes, {CaptureHiddenMode.NULL})
+
+    def test_extend_warms_full_capture_when_prompt_logprobs_enabled(self):
+        policy = _make_policy(_model_runner(), token_buckets=(8,), bs_buckets=(1, 4))
+        policy._run_one = MagicMock()
+
+        with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True):
+            with get_parallel().override(tp_rank=1):
+                policy._precompile_extend()
+
+        modes = {
+            call.kwargs["capture_hidden_mode"]
+            for call in policy._run_one.call_args_list
+        }
+        # One variant, not two: FULL replaces NULL rather than joining it.
+        self.assertEqual(modes, {CaptureHiddenMode.FULL})
 
     def test_warmup_modes_follow_batch_size_cutoff(self):
         policy = _make_distributed_top_k_policy()
