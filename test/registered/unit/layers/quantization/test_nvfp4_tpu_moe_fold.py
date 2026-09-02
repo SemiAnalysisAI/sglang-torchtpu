@@ -125,6 +125,39 @@ class TestNvfp4Block512Contract(CustomTestCase):
         ):
             self.assertIsNone(layer._parameters[name])
 
+    def test_scale_layout_owns_its_declared_rank4_buffer(self):
+        """The layout helper must return an independently backed rank-4 tensor.
+
+        Appending a size-1 dimension to a contiguous rank-3 tensor produces a
+        contiguous view. Shape, value, and contiguity checks therefore do not
+        detect the alias; ownership must be asserted directly on the helper's
+        return value.
+        """
+        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+            _to_gmm_v2_scale_layout,
+        )
+
+        for out_size in (2 * INTERMEDIATE_SIZE, HIDDEN_SIZE):
+            for scale_dtype in (torch.float32, torch.bfloat16):
+                with self.subTest(out_size=out_size, scale_dtype=scale_dtype):
+                    source = torch.rand(EXPERTS, out_size, HIDDEN_SIZE // BLOCK_SIZE)
+
+                    out = _to_gmm_v2_scale_layout(source, scale_dtype)
+
+                    self.assertIsNone(out._base, "scale is still a view of its source")
+                    self.assertTrue(out.is_contiguous())
+                    self.assertEqual(
+                        tuple(out.shape),
+                        (EXPERTS, HIDDEN_SIZE // BLOCK_SIZE, 1, out_size),
+                    )
+                    expected = (
+                        source.permute(0, 2, 1)
+                        .contiguous()
+                        .unsqueeze(2)
+                        .to(scale_dtype)
+                    )
+                    self.assertTrue(torch.equal(out, expected))
+
     def test_rejects_block16(self):
         from sglang.srt.hardware_backend.tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,

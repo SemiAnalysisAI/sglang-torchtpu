@@ -97,7 +97,18 @@ class TestGmmV2W4A16(CustomTestCase):
                     to_torch(scale, torch.bfloat16), requires_grad=False
                 ),
             )
+        checkpoint_scale_buffers = {
+            name: getattr(layer, f"{name}_weight_scale").data_ptr()
+            for name in ("w13", "w2")
+        }
         prepare_tpu_w4a16_moe_weights(layer, self.GROUP_SIZE)
+
+        for name in ("w13", "w2"):
+            self.assertNotEqual(
+                getattr(layer, f"{name}_weight_scale").data_ptr(),
+                checkpoint_scale_buffers[name],
+                f"{name} scale still aliases the checkpoint buffer",
+            )
 
         out = []
         for name in ("w13", "w2"):
