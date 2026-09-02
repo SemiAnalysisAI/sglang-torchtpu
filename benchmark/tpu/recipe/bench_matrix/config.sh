@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Single source of truth for the external-cluster TPU benchmark matrix
+# Single source of truth for the TPU benchmark matrix
 # (GPT-OSS-120B and Qwen3-Coder-480B x three serving recipes x two workloads).
 # Sourced by serve_group.sh / bench_leg.sh / run_sweep.sh so every leg of every
 # run uses identical settings.
@@ -48,7 +48,7 @@ PYTHON=${PYTHON:-python3}
 # where worst-case sweep = (number of attempted legs) x MAX_LEG_SECONDS.
 # TIMEOUT_PER_FILE (5400) is declared literally in every test file's
 # MULTIHOST_LAUNCH (the CI scanner reads it via AST, so it cannot be computed
-# there); test/registered/unit/test_external_bench_matrix.py ASSERTS the whole
+# there); test/registered/unit/test_bench_matrix.py ASSERTS the whole
 # chain, so a change to any link that breaks another fails CI instead of
 # silently truncating a benchmark.
 # ---------------------------------------------------------------------------
@@ -152,11 +152,11 @@ esac
 # outlive their batch). The 480B nightly calls the same knob NORMAL_REPLAYS.
 SESSIONS_PER_SLOT=${SESSIONS_PER_SLOT:-${NORMAL_REPLAYS:-auto}}
 MAX_SESSIONS_PER_SLOT=${MAX_SESSIONS_PER_SLOT:-${MAX_NORMAL_REPLAYS:-8}}
-TRACE_CACHE_DIR=${TRACE_CACHE_DIR:-${XDG_CACHE_HOME:-/tmp}/sglang_tpu_ext_bench_traces}
+TRACE_CACHE_DIR=${TRACE_CACHE_DIR:-${XDG_CACHE_HOME:-/tmp}/sglang_tpu_bench_matrix_traces}
 
 # ---------------------------------------------------------------------------
 # Model fragments. MODEL / DRAFT_MODEL default to the gcsfuse bucket layout
-# the external JobSet mounts; the template's injected MODEL env wins.
+# the CI JobSet mounts; the template's injected MODEL env wins.
 # ---------------------------------------------------------------------------
 GCS_WEIGHTS_ROOT=${GCS_WEIGHTS_ROOT:-/gcs-weights/weights}
 case "$BENCH_MODEL" in
@@ -303,7 +303,7 @@ TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$MAX_CONCURRENCY}
 CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-8192}
 
 # ---------------------------------------------------------------------------
-# Ports / endpoints. The external JobSet's rank-0 health-gates and benches
+# Ports / endpoints. The CI JobSet's rank-0 health-gates and benches
 # 127.0.0.1:30000, so that port is the single-host server, or the mini-LB in
 # the P/D recipe (engines then sit on the PD_* ports).
 # ---------------------------------------------------------------------------
@@ -353,7 +353,7 @@ MODEL_SLUG=$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' 
 # ---------------------------------------------------------------------------
 log_config() {
     cat <<EOF
-==== external tpu benchmark config ====
+==== tpu benchmark matrix config ====
   bench_model / recipe   = $BENCH_MODEL / $BENCH_RECIPE
   workload / profile     = $WORKLOAD / $PROFILE
   model                  = $MODEL

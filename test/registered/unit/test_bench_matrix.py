@@ -1,8 +1,8 @@
-"""Bookkeeping guards for the external TPU benchmark matrix (no TPU needed).
+"""Bookkeeping guards for the TPU benchmark matrix (no TPU needed).
 
 The matrix is stitched together by convention across three places -- the
 test files' MULTIHOST_LAUNCH dicts (AST-scanned), the launch wrappers under
-benchmark/tpu/recipe/external_bench/, and config.sh's (model, recipe,
+benchmark/tpu/recipe/bench_matrix/, and config.sh's (model, recipe,
 workload) axes -- and nothing else in CI checks the stitching without a TPU
 slice. Each case here answers "someone extended X without updating Y":
 
@@ -32,12 +32,12 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 3))
 E2E = os.path.join(REPO, "test", "registered", "tpu", "e2e")
-EXT_BENCH = os.path.join(REPO, "benchmark", "tpu", "recipe", "external_bench")
+BENCH_MATRIX = os.path.join(REPO, "benchmark", "tpu", "recipe", "bench_matrix")
 
-# The budget constants live in one place (external_bench_base); this ratchet
+# The budget constants live in one place (bench_matrix_base); this ratchet
 # checks every place that must agree with them.
 sys.path.insert(0, E2E)
-import external_bench_base as bench_base  # noqa: E402
+import bench_matrix_base as bench_base  # noqa: E402
 
 MODELS = ("gpt_oss_120b", "qwen3_coder_480b")
 RECIPES = {
@@ -70,14 +70,14 @@ def _scan_file(path):
     return suite, launch, disabled
 
 
-class TestExternalBenchMatrix(CustomTestCase):
+class TestBenchMatrix(CustomTestCase):
     def _cell_files(self):
-        files = sorted(glob.glob(os.path.join(E2E, "test_tpu_ext_*.py")))
+        files = sorted(glob.glob(os.path.join(E2E, "test_tpu_bench_*.py")))
         self.assertEqual(
             len(files),
             len(MODELS) * len(RECIPES) * len(WORKLOADS),
             "the matrix is 2 models x 3 recipes x 2 workloads; a missing or "
-            "extra test_tpu_ext_* file means a cell was added or dropped "
+            "extra test_tpu_bench_* file means a cell was added or dropped "
             "without updating this inventory",
         )
         return files
@@ -100,7 +100,7 @@ class TestExternalBenchMatrix(CustomTestCase):
                 keys = set()
                 for workload in WORKLOADS:
                     path = os.path.join(
-                        E2E, f"test_tpu_ext_{model}_{recipe}_{workload}.py"
+                        E2E, f"test_tpu_bench_{model}_{recipe}_{workload}.py"
                     )
                     suite, launch, _ = _scan_file(path)
                     keys.add((suite, launch["launch_script"], launch["weights"]))
@@ -147,12 +147,12 @@ class TestExternalBenchMatrix(CustomTestCase):
             ours = [
                 g
                 for g in sl["groups"]
-                if g["launch_script"].startswith("recipe/external_bench/")
+                if g["launch_script"].startswith("recipe/bench_matrix/")
             ]
             self.assertLessEqual(
                 len(ours),
                 1,
-                f"{sl['name']}: {len(ours)} external_bench groups serialize on "
+                f"{sl['name']}: {len(ours)} bench_matrix groups serialize on "
                 f"one slice -- the matrix is sized to fill each slice exactly "
                 f"once ({[g['name'] for g in ours]})",
             )
@@ -195,7 +195,7 @@ class TestExternalBenchMatrix(CustomTestCase):
                         "-c",
                         'source ./config.sh && echo "BS=$SWEEP_BS|LONG=$SWEEP_LONG"',
                     ],
-                    cwd=EXT_BENCH,
+                    cwd=BENCH_MATRIX,
                     env={
                         **os.environ,
                         "BENCH_MODEL": model,
@@ -222,7 +222,7 @@ class TestExternalBenchMatrix(CustomTestCase):
             self.assertTrue(
                 os.path.isfile(os.path.join(nightly, tool)),
                 f"{tool} moved out of {nightly}; update NIGHTLY_TOOLS_DIR in "
-                "benchmark/tpu/recipe/external_bench/config.sh",
+                "benchmark/tpu/recipe/bench_matrix/config.sh",
             )
 
     def test_time_budget_chain(self):
@@ -240,7 +240,7 @@ class TestExternalBenchMatrix(CustomTestCase):
                 launch.get("timeout_per_file"),
                 bench_base.TIMEOUT_PER_FILE_BUDGET,
                 f"{path}: timeout_per_file literal drifted from "
-                "external_bench_base.TIMEOUT_PER_FILE_BUDGET",
+                "bench_matrix_base.TIMEOUT_PER_FILE_BUDGET",
             )
         # The sweep budget plus the health recheck must fit the file budget.
         self.assertLess(
@@ -255,7 +255,7 @@ class TestExternalBenchMatrix(CustomTestCase):
                 "-c",
                 'source ./config.sh && echo "$SWEEP_BS|$SWEEP_LONG|$MAX_LEG_SECONDS"',
             ],
-            cwd=EXT_BENCH,
+            cwd=BENCH_MATRIX,
             env={
                 **os.environ,
                 "BENCH_MODEL": "gpt_oss_120b",

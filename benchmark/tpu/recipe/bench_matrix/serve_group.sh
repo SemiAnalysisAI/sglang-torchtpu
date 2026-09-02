@@ -1,25 +1,19 @@
 #!/usr/bin/env bash
-# Launch-group entry point for the external TPU benchmark matrix. The external
-# JobSet runs this on EVERY host of the slice (via a thin per-group wrapper
-# that sets BENCH_MODEL/BENCH_RECIPE); what a host does depends on the recipe
-# and its TPU_WORKER_ID:
+# Launch-group entry point for the TPU benchmark matrix. The CI JobSet runs
+# this on EVERY host of the slice (via a thin per-group wrapper that sets
+# BENCH_MODEL/BENCH_RECIPE); what a host does depends on the recipe and its
+# TPU_WORKER_ID:
 #
 #   1host_*                rank 0 serves a single-host tp=8 engine on :30000
 #                          (FORCE_SINGLE_HOST); every other rank exits 0 and
-#                          leaves its host idle. A 2x2x2 slice is the smallest
-#                          the external cluster offers, so a 1-host recipe
-#                          deliberately strands the second host.
-#   pd_2p2d_pc_spec_kvoff  4-host slice split into two 2-host engines:
-#                          ranks 0-1 form the PREFILL engine (tp=16), ranks
-#                          2-3 the DECODE engine (tp=16), KV moving over
-#                          raiden. Rank 0 additionally fronts both with the
-#                          mini-LB on :30000 -- the port the JobSet
+#                          leaves its host idle (the registered suite's
+#                          smallest slice is 2 hosts, so a 1-host recipe
+#                          deliberately strands the second).
+#   pd_2p2d_pc_spec_kvoff  4-host slice, four single-host tp=8 engines:
+#                          ranks 0-1 PREFILL, ranks 2-3 DECODE, KV moving
+#                          over raiden. Rank 0 additionally fronts all four
+#                          with the mini-LB on :30000 -- the port the JobSet
 #                          health-gates and rank-0's test files bench.
-#
-# The sub-slice split works by overriding the GKE-injected slice env per
-# engine: TPU_WORKER_HOSTNAMES is cut to the engine's 2 hosts (worker id
-# remapped to 0/1) and TPU_TOPOLOGY is overridden to the 2x2x2 sub-cube, which
-# is what _prepare_tpu_env derives the slicebuilder + TORCH_TPU_TOPOLOGY from.
 set -uo pipefail
 
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -140,7 +134,7 @@ else
 fi
 echo "[serve_group] pd role=$ROLE (single-host engine on ${SLICE_HOSTS[$WORKER_ID]})"
 # The engine host list for the test/sweep side on this pod.
-printf '%s\n' "${SLICE_HOSTS[@]}" > /tmp/ext_bench_phys_hosts
+printf '%s\n' "${SLICE_HOSTS[@]}" > /tmp/bench_matrix_phys_hosts
 
 strip_slice_env
 export FORCE_SINGLE_HOST=1

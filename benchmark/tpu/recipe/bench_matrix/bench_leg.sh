@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run ONE leg of the external benchmark matrix: (concurrency BS) x (NUM_LONG
+# Run ONE leg of the TPU benchmark matrix: (concurrency BS) x (NUM_LONG
 # long requests/sessions) against an already-running endpoint. Adapted from
 # recipe/qwen3_coder_480b/nightly/bench_leg.sh; the tools it drives
 # (gen_agentic_workload.py, metrics_probe.py, dump_meta.py) are reused from

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Sweep driver for the external TPU benchmark matrix. Live-server only: the
-# external JobSet owns the server (serve_group.sh), so this sweeps BASE_URL
+# Sweep driver for the TPU benchmark matrix. Live-server only: the
+# CI JobSet owns the server (serve_group.sh), so this sweeps BASE_URL
 # across (SWEEP_BS x SWEEP_LONG), then writes one summary.json + summary.md
 # via the 480B nightly's summarize.py.
 #
@@ -25,8 +25,8 @@ if [[ "$PD_DISAGG" == "1" ]]; then
     # prefill engine, the spec/abort side on the decode engine. Engine leaders
     # follow PHYSICAL host order (serve_group.sh's rendezvous writes the map
     # for this pod), not pod-index order.
-    if [[ -s /tmp/ext_bench_phys_hosts ]]; then
-        mapfile -t _slice_hosts < /tmp/ext_bench_phys_hosts
+    if [[ -s /tmp/bench_matrix_phys_hosts ]]; then
+        mapfile -t _slice_hosts < /tmp/bench_matrix_phys_hosts
     else
         IFS=',' read -r -a _slice_hosts <<< "${TPU_WORKER_HOSTNAMES:-}"
     fi
@@ -92,8 +92,8 @@ summarize_rc=0
     --md-out "$RUN_ROOT/summary.md" \
     --profile "$PROFILE" \
     --mode external \
-    --benchmark-label "ext-${BENCH_MODEL}-${BENCH_RECIPE}-${WORKLOAD}" \
-    --title "$BENCH_MODEL — external TPU benchmark ($BENCH_RECIPE, $WORKLOAD)" \
+    --benchmark-label "${BENCH_MODEL}-${BENCH_RECIPE}-${WORKLOAD}" \
+    --title "$BENCH_MODEL — TPU benchmark matrix ($BENCH_RECIPE, $WORKLOAD)" \
     || summarize_rc=$?
 
 [[ -f "$RUN_ROOT/summary.md" ]] && cat "$RUN_ROOT/summary.md"
