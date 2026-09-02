@@ -424,26 +424,31 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
             compiled_logits.__signature__ = inspect.signature(logits_fn)
             self.owner.logits_processor.forward = compiled_logits
-        # max_t = smallest positive prefill/context limit (extend never runs
-        # longer). max_b = the reconciled compile-batch ceiling, already grown to
-        # cover the scheduler concurrency in ServerArgs.__post_init__ via
-        # reconcile_tpu_batch_limits, so the grid covers every decode batch the
-        # scheduler can form (Task #40).
-        t_candidates = [
+        # EXTEND's token dimension is the aggregate number of tokens in the
+        # scheduled batch, so it can exceed any one request's context length.
+        # Bound it by the scheduler's aggregate prefill limits and use the
+        # context length only when neither aggregate limit is configured.
+        prefill_t_candidates = [
             c
             for c in (
                 server_args.chunked_prefill_size,
                 server_args.max_prefill_tokens,
-                self.model_runner.model_config.context_len,
             )
             if c and c > 0
         ]
-        if not t_candidates:
+        if prefill_t_candidates:
+            max_t = min(prefill_t_candidates)
+        else:
+            max_t = self.model_runner.model_config.context_len
+        if not max_t or max_t <= 0:
             raise ValueError(
                 "Cannot determine max_t for TPU compile bucketing: "
                 "chunked_prefill_size, max_prefill_tokens, and context_len are all unset."
             )
-        max_t = min(t_candidates)
+        # max_b is the reconciled compile-batch ceiling, already grown to cover
+        # scheduler concurrency in ServerArgs.__post_init__ via
+        # reconcile_tpu_batch_limits, so the grid covers every decode batch the
+        # scheduler can form (Task #40).
         max_b = server_args.torch_compile_max_bs
         t_bucketer, b_bucketer = build_bucketers(server_args, max_t=max_t, max_b=max_b)
         self.t_bucketer = t_bucketer
