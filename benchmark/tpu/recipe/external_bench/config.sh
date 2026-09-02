@@ -315,11 +315,6 @@ PD_BOOTSTRAP_PORT=${PD_BOOTSTRAP_PORT:-8998}
 # collide with any of the HTTP/bootstrap ports above).
 RAIDEN_KV_BASE_PORT=${RAIDEN_KV_BASE_PORT:-31000}
 
-# Engine bring-up supervisor (serve_group.sh): bounded relaunches on a
-# nondeterministic bring-up death; the delay lets the reaped attempt's
-# listening sockets leave TIME_WAIT before the next bind.
-ENGINE_LAUNCH_TRIES=${ENGINE_LAUNCH_TRIES:-3}
-ENGINE_RELAUNCH_DELAY=${ENGINE_RELAUNCH_DELAY:-30}
 
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-3600}
 ENABLE_METRICS=1        # required: the per-leg deltas are how a leg proves

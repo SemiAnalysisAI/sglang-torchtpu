@@ -79,39 +79,6 @@ BASE_EXTRA_ARGS="$MODEL_EXTRA_ARGS ${EXTRA_ARGS:-}"
 
 log_config
 
-# Engine supervisor: relaunch on early death. TPU multi-host bring-up can fail
-# nondeterministically at graph capture ("error: replica id #N seen more than
-# once" from the collective's replica map -- observed 2026-09-01 iteration 6,
-# identical config compiled fine before and after). An engine's ranks die
-# together on such a failure, so each rank retrying independently re-forms the
-# rendezvous. Bounded: a deterministic failure still surfaces after 3 tries.
-engine_supervisor() {
-    local tries=0 rc child=""
-    # Teardown must never look like a crash: on TERM/INT forward the signal to
-    # the live engine's WHOLE process group and stop -- only an engine that
-    # died on its own retries.
-    trap 'kill -TERM -- "-$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 143' TERM INT
-    while :; do
-        # setsid: the attempt is its own process group, so a failed attempt can
-        # be reaped WHOLE before relaunching. sglang's schedulers are
-        # grandchildren -- killing only the wrapper orphaned them holding their
-        # ports, and every relaunch died on EADDRINUSE/TCPStore ping failures
-        # (iteration 16).
-        setsid bash "$TPU_BENCH/launch_server.sh" &
-        child=$!
-        wait "$child"
-        rc=$?
-        kill -KILL -- "-$child" 2>/dev/null || true
-        tries=$(( tries + 1 ))
-        if (( tries >= ENGINE_LAUNCH_TRIES )); then
-            echo "[serve_group] engine exited rc=$rc (attempt $tries/$ENGINE_LAUNCH_TRIES); giving up" >&2
-            return "$rc"
-        fi
-        echo "[serve_group] engine exited rc=$rc (attempt $tries/$ENGINE_LAUNCH_TRIES); relaunching in ${ENGINE_RELAUNCH_DELAY}s" >&2
-        sleep "$ENGINE_RELAUNCH_DELAY"
-    done
-}
-
 # Strip the slice-wide multihost env before launching any SINGLE-host engine:
 # libtpu on GKE is env-driven (TPU_SKIP_MDS_QUERY=true), and the injected
 # TPU_WORKER_HOSTNAMES / TPU_PROCESS_ADDRESSES / TPU_TOPOLOGY describe the
@@ -202,7 +169,11 @@ else
 --disaggregation-transfer-backend raiden"
 fi
 
-engine_supervisor &
+# No bring-up retry here on purpose: the one nondeterministic death this
+# harness ever hit (duplicate replica ids at graph capture) was root-caused to
+# the partial libtpu env re-scope and fixed; a JobSet-level restart would also
+# rerun the TEST files on a legitimately red run. Fail once, loudly.
+bash "$TPU_BENCH/launch_server.sh" &
 ENGINE_PID=$!
 CHILD_PIDS+=("$ENGINE_PID")
 
