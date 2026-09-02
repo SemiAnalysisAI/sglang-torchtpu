@@ -1625,6 +1625,11 @@ class Envs:
     SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE = EnvBool(False)
     # Preserve FP32 expert scales and apply GMM partial scales in FP32.
     SGLANG_TPU_FP8_MOE_FP32_SCALES = EnvBool(False)
+    # INT4 MoE execution mode. "fp8-requant" converts weights to channelwise
+    # FP8 at load time (doubling weight bytes). "a8-kernel" keeps packed INT4
+    # weights and dequantizes groups in VMEM before BF16 matmul in gmm_v2;
+    # despite its historical name, this mode does not quantize activations.
+    SGLANG_TPU_USE_W4A8_MOE = EnvStr(None)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
