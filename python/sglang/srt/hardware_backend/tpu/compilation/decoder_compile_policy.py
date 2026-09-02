@@ -424,21 +424,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
             compiled_logits.__signature__ = inspect.signature(logits_fn)
             self.owner.logits_processor.forward = compiled_logits
-        # EXTEND's token dimension is aggregate across the scheduled batch,
-        # not bounded by any one request's context length.
-        max_t = server_args.max_prefill_buffer_tokens()
-        if max_t <= 0:
-            # Without chunking, one forward may contain a full context or the
-            # scheduler's aggregate prefill budget, whichever is larger.
-            max_t = max(
-                server_args.max_prefill_tokens or 0,
-                self.model_runner.model_config.context_len or 0,
-            )
-        if not max_t or max_t <= 0:
-            raise ValueError(
-                "Cannot determine max_t for TPU compile bucketing: "
-                "chunked_prefill_size, max_prefill_tokens, and context_len are all unset."
-            )
+        # max_t is the largest flattened EXTEND token dimension compiled for one
+        # scheduled batch. It sums tokens across requests, so a per-request
+        # context length must not cap it.
+        max_t = server_args.max_prefill_buffer_tokens() or max(
+            server_args.max_prefill_tokens or 0,
+            self.model_runner.model_config.context_len,
+        )
         # max_b is the reconciled compile-batch ceiling, already grown to cover
         # scheduler concurrency in ServerArgs.__post_init__ via
         # reconcile_tpu_batch_limits, so the grid covers every decode batch the
