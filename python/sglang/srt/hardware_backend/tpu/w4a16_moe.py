@@ -52,6 +52,112 @@ def _drop_param(layer: torch.nn.Module, name: str) -> None:
     setattr(layer, name, None)
 
 
+def _unpack_int4_offset_binary(packed: torch.Tensor) -> torch.Tensor:
+    """[.., K//8, N] int32 of LSB-first offset-binary nibbles -> [.., K, N] int8."""
+    shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=packed.device)
+    nibbles = (packed.unsqueeze(-2) >> shifts.view(1, -1, 1)) & 0xF
+    values = (nibbles - 8).to(torch.int8)
+    return values.reshape(*packed.shape[:-2], packed.shape[-2] * 8, packed.shape[-1])
+
+
+def prepare_tpu_w4a8_moe_weights(layer: torch.nn.Module, group_size: int) -> None:
+    """Requantize pack-quantized int4 group weights to channelwise fp8.
+
+    The SGLANG_TPU_USE_W4A8_MOE=fp8-requant mode: dequant the int4 groups to
+    f32 on the host, take one fp8 scale per (expert, out-channel), and hand the
+    result to the fused fp8 grouped-GEMM path (``apply_tpu_fp8_moe``, dynamic
+    fp8 activation quant). Weight bytes double; decode measured 6.3x W4A16.
+    """
+    if getattr(layer, "is_tpu_w4a8_converted", False):
+        return
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8_dtype).max
+    for packed_name, scale_name, out_name in (
+        ("w13_weight_packed", "w13_weight_scale", "w13_weight"),
+        ("w2_weight_packed", "w2_weight_scale", "w2_weight"),
+    ):
+        packed_param = getattr(layer, packed_name)
+        scale_param = getattr(layer, scale_name)
+        packed_cpu = packed_param.data.cpu()
+        gscale_cpu = scale_param.data.float().cpu()
+        # Whole layer on host: [E, K, N] f32 is ~3 GB at EP16 -- fine per rank.
+        w = _unpack_int4_offset_binary(packed_cpu).float()
+        w *= gscale_cpu.repeat_interleave(group_size, dim=1)
+        ch_scale = torch.clamp(w.abs().amax(dim=1, keepdim=True) / fp8_max, min=1e-12)
+        w = torch.clamp(w / ch_scale, min=-fp8_max, max=fp8_max).to(fp8_dtype)
+        setattr(
+            layer,
+            out_name,
+            Parameter(w.to(packed_param.data.device), requires_grad=False),
+        )
+        # gmm_v2 RHS scale layout [E, 1, 1, N]; frees the group scales' storage.
+        from sglang.srt.hardware_backend.tpu.fp8_moe import (
+            _to_tpu_fp8_moe_scale_layout,
+        )
+
+        old_scale = scale_param.data
+        new_scale = _to_tpu_fp8_moe_scale_layout(ch_scale.squeeze(1), w.shape[-1]).to(
+            old_scale.device
+        )
+        copy_or_rebind_param(layer, scale_name, new_scale)
+        _free_replaced_storage(old_scale, getattr(layer, scale_name).data)
+        _drop_param(layer, packed_name)
+
+    for name in (
+        "w13_weight_g_idx",
+        "w2_weight_g_idx",
+        "w13_g_idx_sort_indices",
+        "w2_g_idx_sort_indices",
+        "w13_weight_shape",
+        "w2_weight_shape",
+    ):
+        _drop_param(layer, name)
+
+    layer.weight_block_size = None
+    layer.is_tpu_w4a8_converted = True
+
+
+def _repack_nibbles_k_major_to_n_minor(packed: torch.Tensor) -> torch.Tensor:
+    """[E, K//8, N] int32 (8 K-values/word) -> [E, K, N//8] int32 (8 N-values/word).
+
+    The vendored tpu-inference kernel consumes an int4[E, K, N] array, which the
+    JAX bridge produces by bitcasting these N-minor words -- XLA S4 packs values
+    2-per-byte along the minor axis, LSB-first, matching this word layout.
+    """
+    e, k8, n = packed.shape
+    words = packed.view(torch.int32).to(torch.int64)
+    shifts = torch.arange(0, 32, 4, dtype=torch.int64).view(1, 1, 8, 1)
+    nibbles = (words.unsqueeze(2) >> shifts) & 0xF  # [E, K//8, 8, N]
+    nibbles = nibbles.reshape(e, k8 * 8, n)  # [E, K, N]
+    nibbles = nibbles.reshape(e, k8 * 8, n // 8, 8)
+    out = (nibbles << shifts.view(1, 1, 1, 8)).sum(dim=3)
+    return (out & 0xFFFFFFFF).to(torch.uint32).view(torch.int32).contiguous()
+
+
+def prepare_tpu_w4a8_int4_moe_weights(layer: torch.nn.Module, group_size: int) -> None:
+    """Format weights for the vendored int4 x int8 grouped-GEMM (a8-kernel mode).
+
+    Same XOR-to-two's-complement and scale layout as W4A16, then a one-time
+    host-side relayout of the packed nibbles from K-major words to N-minor words
+    so the JAX bridge can bitcast them straight to an int4[E, K, N] array.
+    """
+    if getattr(layer, "is_tpu_w4a8_int4_converted", False):
+        return
+    prepare_tpu_w4a16_moe_weights(layer, group_size=group_size)
+    for packed_name in ("w13_weight_packed", "w2_weight_packed"):
+        param = getattr(layer, packed_name)
+        old = param.data
+        # Per-expert CPU chunks bound the int64 unpack transient (~0.7 GB/expert).
+        chunks = [
+            _repack_nibbles_k_major_to_n_minor(old[e : e + 1].cpu())
+            for e in range(old.shape[0])
+        ]
+        new = torch.cat(chunks, dim=0).to(old.device)
+        copy_or_rebind_param(layer, packed_name, new)
+        _free_replaced_storage(old, getattr(layer, packed_name).data)
+    layer.is_tpu_w4a8_int4_converted = True
+
+
 def prepare_tpu_w4a16_moe_weights(layer: torch.nn.Module, group_size: int) -> None:
     """One-time post-load formatting for the Pallas W4A16 MoE path.
 

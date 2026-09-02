@@ -741,6 +741,24 @@ class TpuCompressedTensorsWNA16MoE(CompressedTensorsWNA16MoE):
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_TPU_USE_W4A8_MOE.get() == "fp8-requant":
+            from sglang.srt.hardware_backend.tpu.w4a16_moe import (
+                prepare_tpu_w4a8_moe_weights,
+            )
+
+            prepare_tpu_w4a8_moe_weights(layer, group_size=self.group_size)
+            return
+
+        if envs.SGLANG_TPU_USE_W4A8_MOE.get() == "a8-kernel":
+            from sglang.srt.hardware_backend.tpu.w4a16_moe import (
+                prepare_tpu_w4a8_int4_moe_weights,
+            )
+
+            prepare_tpu_w4a8_int4_moe_weights(layer, group_size=self.group_size)
+            return
+
         from sglang.srt.hardware_backend.tpu.w4a16_moe import (
             prepare_tpu_w4a16_moe_weights,
         )
@@ -760,9 +778,21 @@ class TpuCompressedTensorsWNA16MoE(CompressedTensorsWNA16MoE):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        cfg = self.moe_runner_config
+        if getattr(layer, "is_tpu_w4a8_converted", False):
+            from sglang.srt.hardware_backend.tpu.fp8_moe import apply_tpu_fp8_moe
+
+            return apply_tpu_fp8_moe(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation=cfg.activation,
+                block_quant=False,
+                apply_router_weight_on_input=cfg.apply_router_weight_on_input,
+                no_combine=cfg.no_combine,
+            )
+
         from sglang.srt.hardware_backend.tpu.w4a16_moe import apply_tpu_w4a16_moe
 
-        cfg = self.moe_runner_config
         return apply_tpu_w4a16_moe(
             layer=layer,
             dispatch_output=dispatch_output,

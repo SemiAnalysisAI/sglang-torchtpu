@@ -407,11 +407,19 @@ def _fused_moe_jax(
 
     rhs_quant_dtype = None
     maybe_quantize_lhs = True
+    use_tpuinf_int4 = False
     if w_quant_bits:
         assert w_quant_bits == 4, f"unsupported w_quant_bits={w_quant_bits}"
-        # W4A16: checkpoint-packed int4 rhs (8 per int32), bf16 activations.
-        rhs_quant_dtype = jnp.int4
-        maybe_quantize_lhs = False
+        # Checkpoint-packed int4 rhs. Default W4A16: our gmm_v2, bf16
+        # activations, K-major packed words. SGLANG_TPU_USE_W4A8_MOE=a8-kernel
+        # routes to the vendored tpu-inference kernel (4.5x faster int4
+        # pipeline): weights arrive as N-minor words the loader prepared, get
+        # bitcast to int4[E, K, N], and activations quantize to int8 in-kernel.
+        from sglang.srt.environ import envs
+
+        use_tpuinf_int4 = envs.SGLANG_TPU_USE_W4A8_MOE.get() == "a8-kernel"
+        rhs_quant_dtype = None if use_tpuinf_int4 else jnp.int4
+        maybe_quantize_lhs = use_tpuinf_int4
 
     # gmm_v2 needs the routed-row count ``m*topk`` to be a multiple of its LHS
     # sublane tiling (16 for the bf16 activations this path runs on). Padding
@@ -552,23 +560,47 @@ def _fused_moe_jax(
     else:
         zero_init = True
 
-    gmm1_out = gmm_v2(
-        lhs=x_sorted,
-        rhs=w1,
-        group_sizes=group_sizes,
-        rhs_scale=w1_scale,
-        rhs_bias=w1_bias,
-        group_offset=group_offset,
-        zero_initialize=zero_init,
-        preferred_element_type=out_dtype,
-        # MXFP4 keeps the fuse_act-aware default tiling (tile_n is per-projection
-        # when fused); compact FP8 pins an unfused tile.
-        tile_info=gmm1_tiling,
-        fuse_act=gmm1_fuse_act,
-        packed_fp4=w1_packed,
-        maybe_quantize_lhs=maybe_quantize_lhs,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
+    if use_tpuinf_int4:
+        from sglang.srt.layers.moe.pallas.gmm_v2_tpuinf import gmm_v2 as gmm_v2_int4
+
+        def _as_int4(w):
+            # N-minor packed words -> int4[E, K, N]; a pure reinterpret (XLA S4
+            # packs 2/byte along the minor axis, LSB-first, same as the words).
+            cast = jax.lax.bitcast_convert_type(w, jnp.int4)
+            return cast.reshape(w.shape[0], w.shape[1], w.shape[2] * 8)
+
+        w1 = _as_int4(w1)
+        w2 = _as_int4(w2)
+
+        gmm1_out = gmm_v2_int4(
+            lhs=x_sorted,
+            rhs=w1,
+            group_sizes=group_sizes,
+            rhs_scale=w1_scale,
+            rhs_bias=w1_bias,
+            group_offset=group_offset,
+            zero_initialize=zero_init,
+            preferred_element_type=out_dtype,
+            maybe_quantize_lhs=True,
+        )
+    else:
+        gmm1_out = gmm_v2(
+            lhs=x_sorted,
+            rhs=w1,
+            group_sizes=group_sizes,
+            rhs_scale=w1_scale,
+            rhs_bias=w1_bias,
+            group_offset=group_offset,
+            zero_initialize=zero_init,
+            preferred_element_type=out_dtype,
+            # MXFP4 keeps the fuse_act-aware default tiling (tile_n is per-projection
+            # when fused); compact FP8 pins an unfused tile.
+            tile_info=gmm1_tiling,
+            fuse_act=gmm1_fuse_act,
+            packed_fp4=w1_packed,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
     if unfused_gmm1:
         gmm1_out = apply_act_fn(
             gmm1_out, int(gmm1_out.shape[-1] // 2), _fuse_act_name(activation_name)
@@ -584,28 +616,48 @@ def _fused_moe_jax(
             f"{gmm1_out.shape[1]}, hidden {hidden_size}) is unsupported: "
             "pad weights AND scales jointly at load time."
         )
-    gmm2_tiling = _dividing_tile_k(
-        _vmem_safe_packed_tile_n(
-            _gmm2_tile_source(gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed)
+    gmm2_tiling = None
+    if not use_tpuinf_int4:  # the vendored kernel picks its own tiling
+        gmm2_tiling = _dividing_tile_k(
+            _vmem_safe_packed_tile_n(
+                _gmm2_tile_source(
+                    gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed
+                )
+            )
         )
-    )
-    gmm2_out = gmm_v2(
-        lhs=gmm1_out,
-        rhs=w2,
-        group_sizes=group_sizes,
-        rhs_scale=w2_scale,
-        rhs_bias=w2_bias,
-        group_offset=group_offset,
-        zero_initialize=zero_init,
-        preferred_element_type=out_dtype,
-        tile_info=gmm2_tiling,
-        packed_fp4=w2_packed,
-        maybe_quantize_lhs=maybe_quantize_lhs,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )[
-        :,
-        :hidden_size,
-    ]  # [m*topk, k]
+    if use_tpuinf_int4:
+        gmm2_out = gmm_v2_int4(
+            lhs=gmm1_out,
+            rhs=w2,
+            group_sizes=group_sizes,
+            rhs_scale=w2_scale,
+            rhs_bias=w2_bias,
+            group_offset=group_offset,
+            zero_initialize=zero_init,
+            preferred_element_type=out_dtype,
+            maybe_quantize_lhs=True,
+        )[
+            :,
+            :hidden_size,
+        ]
+    else:
+        gmm2_out = gmm_v2(
+            lhs=gmm1_out,
+            rhs=w2,
+            group_sizes=group_sizes,
+            rhs_scale=w2_scale,
+            rhs_bias=w2_bias,
+            group_offset=group_offset,
+            zero_initialize=zero_init,
+            preferred_element_type=out_dtype,
+            tile_info=gmm2_tiling,
+            packed_fp4=w2_packed,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )[
+            :,
+            :hidden_size,
+        ]  # [m*topk, k]
 
     # Un-permute back to token-major order. Models that apply a post-expert
     # norm ask the runner for no_combine output so they can RMSNorm each top-k

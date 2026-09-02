@@ -1528,6 +1528,13 @@ class Envs:
     # structural, so the VL wrappers undo the slice in _restore_full_rope_cache
     # (the config cannot tell -- the text checkpoint carries mrope_section too).
     SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE = EnvBool(False)
+    # Serve pack-quantized int4 MoE checkpoints (Kimi-K2.x) as W4A8 instead of
+    # W4A16. "fp8-requant": dequant the int4 groups at load and requantize to
+    # channelwise fp8 (weights double to 8-bit, fused fp8 grouped-GEMM; measured
+    # 6.3x W4A16 decode). "a8-kernel": weights stay 4-bit and gmm_v2 quantizes
+    # activations to int8 in-kernel (memory-neutral but slow until the gmm
+    # unfused-GMM1/per-group-scale path is optimized; measured ~1.2x W4A16).
+    SGLANG_TPU_USE_W4A8_MOE = EnvStr(None)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
