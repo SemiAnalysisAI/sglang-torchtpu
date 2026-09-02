@@ -355,6 +355,7 @@ class TestInstallExtendCap(CustomTestCase):
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 chunked_prefill_size=None,
+                max_prefill_buffer_tokens=lambda: 0,
                 max_prefill_tokens=2048,
                 torch_compile_max_bs=64,
                 prefill_max_requests=prefill_max_requests,
@@ -401,6 +402,50 @@ class TestInstallExtendCap(CustomTestCase):
         policy = self._install_policy(prefill_max_requests=16, dp_attention=True)
         self.assertEqual(policy.extend_bs, 64)
 
+    def test_context_length_does_not_cap_aggregate_chunked_prefill(self):
+        model = SimpleNamespace(
+            forward=MagicMock(),
+            prepare_forward_batch=MagicMock(),
+        )
+        model_runner = SimpleNamespace(
+            model=model,
+            forward=MagicMock(),
+            is_draft_worker=False,
+            # The context limit applies to each request, while the flattened
+            # token dimension covers the aggregate prefill batch.
+            model_config=SimpleNamespace(context_len=4096),
+            server_args=SimpleNamespace(
+                chunked_prefill_size=8192,
+                max_prefill_buffer_tokens=lambda: 8192,
+                max_prefill_tokens=16384,
+                torch_compile_max_bs=16,
+                prefill_max_requests=16,
+                tpu_compile_tokens=[1024, 4096, 8192],
+                tpu_compile_bs=[16],
+                unsafe_save_torch_compile_bundle=None,
+                unsafe_load_torch_compile_bundle=None,
+            ),
+        )
+        policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
+        policy.backend = "eager"
+
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "is_dp_attention_enabled",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "torch.compile",
+                return_value=MagicMock(),
+            ),
+        ):
+            self.assertTrue(policy.install())
+
+        self.assertEqual(policy.t_bucketer.buckets, [1024, 4096, 8192])
+        self.assertEqual(policy.t_bucketer.next_bucket(8192), 8192)
+
     def test_target_model_keeps_outer_compile_boundary(self):
         original_outer = MagicMock(name="outer_forward")
         original_backbone = MagicMock(name="backbone_forward")
@@ -417,6 +462,7 @@ class TestInstallExtendCap(CustomTestCase):
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 chunked_prefill_size=None,
+                max_prefill_buffer_tokens=lambda: 0,
                 max_prefill_tokens=2048,
                 torch_compile_max_bs=64,
                 prefill_max_requests=16,
@@ -474,6 +520,7 @@ class TestInstallExtendCap(CustomTestCase):
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 chunked_prefill_size=None,
+                max_prefill_buffer_tokens=lambda: 0,
                 max_prefill_tokens=2048,
                 torch_compile_max_bs=64,
                 prefill_max_requests=16,
@@ -528,6 +575,7 @@ class TestInstallExtendCap(CustomTestCase):
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 chunked_prefill_size=None,
+                max_prefill_buffer_tokens=lambda: 0,
                 max_prefill_tokens=2048,
                 torch_compile_max_bs=64,
                 prefill_max_requests=16,

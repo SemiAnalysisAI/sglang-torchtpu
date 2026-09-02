@@ -424,26 +424,17 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
             compiled_logits.__signature__ = inspect.signature(logits_fn)
             self.owner.logits_processor.forward = compiled_logits
-        # max_t = smallest positive prefill/context limit (extend never runs
-        # longer). max_b = the reconciled compile-batch ceiling, already grown to
-        # cover the scheduler concurrency in ServerArgs.__post_init__ via
+        # max_t is the largest flattened EXTEND token dimension compiled for one
+        # scheduled batch. It sums tokens across requests, so a per-request
+        # context length must not cap it.
+        max_t = server_args.max_prefill_buffer_tokens() or max(
+            server_args.max_prefill_tokens or 0,
+            self.model_runner.model_config.context_len,
+        )
+        # max_b is the reconciled compile-batch ceiling, already grown to cover
+        # scheduler concurrency in ServerArgs.__post_init__ via
         # reconcile_tpu_batch_limits, so the grid covers every decode batch the
         # scheduler can form (Task #40).
-        t_candidates = [
-            c
-            for c in (
-                server_args.chunked_prefill_size,
-                server_args.max_prefill_tokens,
-                self.model_runner.model_config.context_len,
-            )
-            if c and c > 0
-        ]
-        if not t_candidates:
-            raise ValueError(
-                "Cannot determine max_t for TPU compile bucketing: "
-                "chunked_prefill_size, max_prefill_tokens, and context_len are all unset."
-            )
-        max_t = min(t_candidates)
         max_b = server_args.torch_compile_max_bs
         t_bucketer, b_bucketer = build_bucketers(server_args, max_t=max_t, max_b=max_b)
         self.t_bucketer = t_bucketer
