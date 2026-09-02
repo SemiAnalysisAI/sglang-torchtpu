@@ -265,7 +265,7 @@ class TestBenchMatrix(CustomTestCase):
             env={
                 **os.environ,
                 "BENCH_MODEL": "gpt_oss_120b",
-                "BENCH_RECIPE": "pd_2p2d_pc_spec_kvoff",
+                "BENCH_RECIPE": "1host_pc_spec_kvoff",
                 "WORKLOAD": "agentic",
                 "PROFILE": "ci",
             },

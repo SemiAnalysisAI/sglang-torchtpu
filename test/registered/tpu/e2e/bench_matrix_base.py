@@ -15,7 +15,7 @@ clusters by editing only its suite.
 
 Consumers:
   * the benchmark matrix cells (test_tpu_bench_*: GPT-OSS-120B /
-    Qwen3-Coder-480B x three recipes x two workloads) via
+    Qwen3-Coder-480B across serving recipes and workloads) via
     build_matrix_test(); their sweep harness is
     benchmark/tpu/recipe/bench_matrix/run_sweep.sh, and two files sharing a
     (suite, launch_script, weights) triple share one server;

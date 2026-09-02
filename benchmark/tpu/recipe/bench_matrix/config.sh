@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Single source of truth for the TPU benchmark matrix
-# (GPT-OSS-120B and Qwen3-Coder-480B x three serving recipes x two workloads).
+# (GPT-OSS-120B and Qwen3-Coder-480B across serving recipes and workloads).
 # Sourced by serve_group.sh / bench_leg.sh / run_sweep.sh so every leg of every
 # run uses identical settings.
 #
