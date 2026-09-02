@@ -751,14 +751,6 @@ class TpuCompressedTensorsWNA16MoE(CompressedTensorsWNA16MoE):
             prepare_tpu_w4a8_moe_weights(layer, group_size=self.group_size)
             return
 
-        if envs.SGLANG_TPU_USE_W4A8_MOE.get() == "a8-kernel":
-            from sglang.srt.hardware_backend.tpu.w4a16_moe import (
-                prepare_tpu_w4a8_int4_moe_weights,
-            )
-
-            prepare_tpu_w4a8_int4_moe_weights(layer, group_size=self.group_size)
-            return
-
         from sglang.srt.hardware_backend.tpu.w4a16_moe import (
             prepare_tpu_w4a16_moe_weights,
         )

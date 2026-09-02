@@ -563,15 +563,10 @@ def _fused_moe_jax(
     if use_tpuinf_int4:
         from sglang.srt.layers.moe.pallas.gmm_v2_tpuinf import gmm_v2 as gmm_v2_int4
 
-        def _as_int4(w):
-            # N-minor packed words -> int4[E, K, N]; a pure reinterpret (XLA S4
-            # packs 2/byte along the minor axis, LSB-first, same as the words).
-            cast = jax.lax.bitcast_convert_type(w, jnp.int4)
-            return cast.reshape(w.shape[0], w.shape[1], w.shape[2] * 8)
-
-        w1 = _as_int4(w1)
-        w2 = _as_int4(w2)
-
+        # w1/w2 stay the checkpoint's K-major packed int32 words (the W4A16
+        # loader format); the kernel bitcasts tiles to int4 in VMEM. An
+        # XLA-level cast here instead materializes per-layer weight copies
+        # (160G of HLO temporaries on Kimi-K2.6).
         gmm1_out = gmm_v2_int4(
             lhs=x_sorted,
             rhs=w1,
@@ -582,6 +577,7 @@ def _fused_moe_jax(
             zero_initialize=zero_init,
             preferred_element_type=out_dtype,
             maybe_quantize_lhs=True,
+            rhs_packed_int4=True,
         )
     else:
         gmm1_out = gmm_v2(
@@ -636,6 +632,7 @@ def _fused_moe_jax(
             zero_initialize=zero_init,
             preferred_element_type=out_dtype,
             maybe_quantize_lhs=True,
+            rhs_packed_int4=True,
         )[
             :,
             :hidden_size,

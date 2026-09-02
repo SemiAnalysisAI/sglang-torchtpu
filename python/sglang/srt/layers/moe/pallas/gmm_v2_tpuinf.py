@@ -3,7 +3,8 @@
 # Serves ONLY the packed-int4 MoE path (SGLANG_TPU_USE_W4A8_MOE=a8-kernel):
 # its int4 rhs pipeline measures 4.5x our gmm_v2 on Kimi shapes (0.39ms vs
 # 1.75ms best-tiled, GMM1 E24 K7168 N4096 g32). Every other quantization mode
-# stays on gmm_v2.py. Do not edit in place -- re-vendor and re-run
+# stays on gmm_v2.py. Carries LOCAL PATCH blocks (packed-int4 rhs; grep
+# rhs_packed_int4). Re-apply them when re-vendoring, and re-run
 # test_w4a8_moe_requant + the kernelspike bench when syncing.
 # Copyright 2026 Google LLC
 #
@@ -163,6 +164,21 @@ class WeightsRef(RhsRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
+class PackedInt4WeightsRef(WeightsRef):
+    """LOCAL PATCH: rhs held as int32 words of 8 int4 nibbles along K (the
+    compressed-tensors checkpoint layout, sign-flipped to two's complement at
+    load). torch cannot hold int4 tensors, and an XLA-level int32->int4
+    bitcast materializes per-layer weight copies (160G of HLO temporaries on
+    Kimi-K2.6), so the reinterpret happens here on the VMEM tile --
+    pltpu.bitcast expands the sublane dim 8x: [tile_k//8, tile_n] -> [tile_k, tile_n].
+    """
+
+    def get_weight(self) -> jax.Array:
+        return pltpu.bitcast(self.weight[...], jnp.int4)
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
 class FusedWeightsRef(RhsRef):
     """Dataclass for gate and up weights used in fused activation."""
 
@@ -248,6 +264,7 @@ class GmmConfigs:
     acc_dtype: jnp.dtype
     zero_init: bool
     fuse_act: str | None
+    rhs_packed_int4: bool = False  # LOCAL PATCH: see PackedInt4WeightsRef
 
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
@@ -325,8 +342,12 @@ def generate_block_specs(
         index_map.lhs_index_map,
     )
 
+    rhs_tile_k = cfgs.tiles.tile_k
+    if cfgs.rhs_packed_int4:  # LOCAL PATCH: physical K dim is words of 8 nibbles
+        assert rhs_tile_k % 8 == 0, rhs_tile_k
+        rhs_tile_k = rhs_tile_k // 8
     rhs_weight_spec = pl.BlockSpec(
-        (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
+        (None, rhs_tile_k, cfgs.tiles.tile_n),
         index_map.rhs_weight_index_map,
         pipeline_mode=pl.Buffered(buffer_count=3),
     )
@@ -342,7 +363,8 @@ def generate_block_specs(
             index_map.rhs_scale_index_map,
         )
 
-    rhs_block_spec = WeightsRef(
+    rhs_ref_cls = PackedInt4WeightsRef if cfgs.rhs_packed_int4 else WeightsRef
+    rhs_block_spec = rhs_ref_cls(
         weight=rhs_weight_spec,
         scale=rhs_scale_block_spec,
         bias=rhs_bias_block_spec,
@@ -1030,16 +1052,25 @@ def validate_inputs(
     group_sizes: jax.Array,
     group_offset: jax.Array,
     fuse_act: str | None = None,
+    rhs_packed_int4: bool = False,
 ) -> Dimensions:
     """Validates the inputs for the GMM kernel."""
 
     size_m = lhs.shape[0]
     size_group, size_k, size_n = rhs.shape
+    if rhs_packed_int4:  # LOCAL PATCH: 8 int4 K-values per int32 word
+        assert rhs.dtype == jnp.int32, rhs.dtype
+        assert fuse_act is None, "packed int4 rhs does not support fuse_act"
+        size_k = size_k * 8
     size_lhs_group = group_sizes.shape[0]
 
     assert size_group <= size_lhs_group
     assert lhs.shape == (size_m, size_k)
-    assert rhs.shape == (size_group, size_k, size_n)
+    assert rhs.shape == (
+        size_group,
+        size_k if not rhs_packed_int4 else size_k // 8,
+        size_n,
+    )
     if rhs_bias is not None:
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
@@ -1128,16 +1159,24 @@ def make_gmm_configs(
     maybe_quantize_lhs: bool,
     zero_initialize: bool,
     fuse_act: str | None = None,
+    rhs_packed_int4: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
     dims = validate_inputs(
-        lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset, fuse_act
+        lhs,
+        rhs,
+        rhs_scale,
+        rhs_bias,
+        group_sizes,
+        group_offset,
+        fuse_act,
+        rhs_packed_int4=rhs_packed_int4,
     )
 
     if rhs_scale is not None:
         has_scale = True
-        rhs_quant_dtype = rhs.dtype
+        rhs_quant_dtype = jnp.int4.dtype if rhs_packed_int4 else rhs.dtype
         num_blocks = rhs_scale.shape[1]
         block_size = dims.size_k // num_blocks
     else:
@@ -1206,6 +1245,7 @@ def make_gmm_configs(
         acc_dtype=jnp.dtype(acc_dtype),
         zero_init=zero_initialize,
         fuse_act=fuse_act,
+        rhs_packed_int4=rhs_packed_int4,
     )
 
 
@@ -1230,6 +1270,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "maybe_quantize_lhs",
         "zero_initialize",
         "fuse_act",
+        "rhs_packed_int4",
     ]
 )
 def gmm_v2(
@@ -1248,6 +1289,7 @@ def gmm_v2(
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
     fuse_act: str | None = None,
+    rhs_packed_int4: bool = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1300,6 +1342,7 @@ def gmm_v2(
         maybe_quantize_lhs=maybe_quantize_lhs,
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
+        rhs_packed_int4=rhs_packed_int4,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
@@ -1356,7 +1399,9 @@ def gmm_v2(
 
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
-    rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
+    # LOCAL PATCH: the ref/spec pytrees must use the same node class.
+    rhs_ref_cls = PackedInt4WeightsRef if rhs_packed_int4 else WeightsRef
+    rhs_weights = rhs_ref_cls(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
     return pl.pallas_call(
         functools.partial(kernel_main, cfgs=cfgs),
@@ -1365,7 +1410,7 @@ def gmm_v2(
             num_scalar_prefetch=2,
             in_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),
-                WeightsRef(
+                rhs_ref_cls(
                     weight=pl.BlockSpec(memory_space=pltpu.HBM),
                     scale=rhs_scale_spec,
                     bias=rhs_bias_spec,

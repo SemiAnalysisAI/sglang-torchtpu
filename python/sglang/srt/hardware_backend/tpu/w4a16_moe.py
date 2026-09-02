@@ -117,47 +117,6 @@ def prepare_tpu_w4a8_moe_weights(layer: torch.nn.Module, group_size: int) -> Non
     layer.is_tpu_w4a8_converted = True
 
 
-def _repack_nibbles_k_major_to_n_minor(packed: torch.Tensor) -> torch.Tensor:
-    """[E, K//8, N] int32 (8 K-values/word) -> [E, K, N//8] int32 (8 N-values/word).
-
-    The vendored tpu-inference kernel consumes an int4[E, K, N] array, which the
-    JAX bridge produces by bitcasting these N-minor words -- XLA S4 packs values
-    2-per-byte along the minor axis, LSB-first, matching this word layout.
-    """
-    e, k8, n = packed.shape
-    words = packed.view(torch.int32).to(torch.int64)
-    shifts = torch.arange(0, 32, 4, dtype=torch.int64).view(1, 1, 8, 1)
-    nibbles = (words.unsqueeze(2) >> shifts) & 0xF  # [E, K//8, 8, N]
-    nibbles = nibbles.reshape(e, k8 * 8, n)  # [E, K, N]
-    nibbles = nibbles.reshape(e, k8 * 8, n // 8, 8)
-    out = (nibbles << shifts.view(1, 1, 1, 8)).sum(dim=3)
-    return (out & 0xFFFFFFFF).to(torch.uint32).view(torch.int32).contiguous()
-
-
-def prepare_tpu_w4a8_int4_moe_weights(layer: torch.nn.Module, group_size: int) -> None:
-    """Format weights for the vendored int4 x int8 grouped-GEMM (a8-kernel mode).
-
-    Same XOR-to-two's-complement and scale layout as W4A16, then a one-time
-    host-side relayout of the packed nibbles from K-major words to N-minor words
-    so the JAX bridge can bitcast them straight to an int4[E, K, N] array.
-    """
-    if getattr(layer, "is_tpu_w4a8_int4_converted", False):
-        return
-    prepare_tpu_w4a16_moe_weights(layer, group_size=group_size)
-    for packed_name in ("w13_weight_packed", "w2_weight_packed"):
-        param = getattr(layer, packed_name)
-        old = param.data
-        # Per-expert CPU chunks bound the int64 unpack transient (~0.7 GB/expert).
-        chunks = [
-            _repack_nibbles_k_major_to_n_minor(old[e : e + 1].cpu())
-            for e in range(old.shape[0])
-        ]
-        new = torch.cat(chunks, dim=0).to(old.device)
-        copy_or_rebind_param(layer, packed_name, new)
-        _free_replaced_storage(old, getattr(layer, packed_name).data)
-    layer.is_tpu_w4a8_int4_converted = True
-
-
 def prepare_tpu_w4a16_moe_weights(layer: torch.nn.Module, group_size: int) -> None:
     """One-time post-load formatting for the Pallas W4A16 MoE path.
 
