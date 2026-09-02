@@ -58,7 +58,7 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 380   # > WAIT_SLACK + 2 files x 8100s (= 350 min) + job setup
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,8 +92,35 @@ jobs:
           set -uo pipefail
           slice='${{ inputs.slice_name }}'
           ns='${{ env.EXTERNAL_NAMESPACE }}'
+          # --- named budgets/limits (one place; the rest of the step only uses these) ---
+          POD_RUNNING_DEADLINE=1200   # pods not Running by then -> dump events, keep waiting on the JobSet
+          WAIT_FLOOR=9600             # minimum JobSet wait, outlasts the renderer's deadline floor
+          WAIT_SLACK=4800             # wait = slack + files x timeout_per_file (mirrors the renderer's formula + margin)
+          TOKEN_REFRESH_EVERY=2400    # re-mint the CI SA token well inside its 3600s lifetime
+          TOKEN_RETRY_DELAY=45        # retry a failed re-mint quickly, not at the full cadence
+          AUTH_FAIL_LIMIT=12          # consecutive unreadable-JobSet polls before declaring access lost
+          LIVE_LOG_SYNC_EVERY=600     # cumulative pod-log snapshot to GCS (full copy per sync -> keep coarse)
+          LOG_STREAM_MAX=64           # kubectl log streams: pods x (test + sidecars); 10 was too few at 4 pods
+          POLL=5                      # JobSet condition poll
+          PODS_PRINT_EVERY=12         # print the pod table every POLL x this seconds
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
           : > "$RUNNER_TEMP/external-pod-logs.txt"
+
+          # Mirror the accumulating pod log to the CI artifacts bucket every 10 min:
+          # GitHub only serves a job's log blob AFTER the job completes, and the
+          # pod-logs artifact uploads in the final step -- so without this, a
+          # multi-hour benchmark group cannot be triaged (or caught hanging) from
+          # outside the runner while it runs. The CI SA holds objectCreator (create,
+          # no overwrite), so each sync is a NEW cumulative snapshot; the newest
+          # object is the whole log so far. Best-effort (`|| true`). Read with:
+          #   gcloud storage cat "$(gcloud storage ls gs://sglang-torchtpu-ci-artifacts/ci-live-logs/<run_id>/<slice>/ | tail -1)"
+          LIVE_LOG_DIR="gs://sglang-torchtpu-ci-artifacts/ci-live-logs/${{ github.run_id }}/${slice}"
+          ( while true; do
+              sleep "$LIVE_LOG_SYNC_EVERY"
+              gcloud storage cp "$RUNNER_TEMP/external-pod-logs.txt" \
+                "$LIVE_LOG_DIR/$(date -u +%Y%m%dT%H%M%SZ).log" >/dev/null 2>&1 || true
+            done ) &
+          LIVE_LOG_SYNC_PID=$!
 
           # Resolve this slice's nodepool from the secret named by nodepool_var (GitHub masks
           # the value in logs). Fail closed if the secret is unset.
@@ -132,38 +159,68 @@ jobs:
           trap cleanup EXIT
 
           # Render, apply, gate, and tear down ONE group's JobSet. Returns 0 pass / 1 fail.
+          # $3 = wait budget in seconds (sized from the group's per-file budgets so a
+          # long benchmark group is not declared dead while still inside its deadline).
           run_group() {
-            local job="$1" label="$2" name short sel rc=1
+            local job="$1" label="$2" wait_budget="${3:-9600}" name short sel rc=1
             name="$(kubectl -n "$ns" create -f "$job" -o name)" || { echo "❌ ${label}: create failed"; return 1; }
             CUR="$name"; short="${name##*/}"; sel="jobset.sigs.k8s.io/jobset-name=${short}"
             echo "Created ${name} for ${label}"
 
-            local running_deadline; running_deadline=$(( $(date +%s) + 1200 ))
+            local running_deadline; running_deadline=$(( $(date +%s) + POD_RUNNING_DEADLINE ))
             until kubectl -n "$ns" get pods -l "$sel" -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q Running; do
+              # Fail fast when the JobSet's Jobs are REJECTED (e.g. an admission
+              # policy denying the pod spec): no pod will ever run, the JobSet
+              # never turns Failed, and waiting the full budget burns hours.
+              # "already exists" is EXCLUDED: the JobSet controller races its own
+              # reconcile and logs that as JobCreationFailed although the child
+              # Job is live and its pods start normally.
+              fatal_events="$(kubectl -n "$ns" get events --field-selector reason=JobCreationFailed 2>/dev/null | grep "${short}" | grep -v "already exists" || true)"
+              if [ -n "$fatal_events" ]; then
+                echo "❌ ${label}: Job creation rejected -- no pod will ever start:"
+                echo "$fatal_events" | tail -n 3
+                kubectl -n "$ns" delete "$name" --ignore-not-found --wait=false 2>/dev/null || true
+                CUR=""
+                return 1
+              fi
               if [ "$(date +%s)" -ge "$running_deadline" ]; then
-                echo "⚠️  ${label}: no pod Running 1200s after apply; continuing anyway"
+                echo "⚠️  ${label}: no pod Running ${POD_RUNNING_DEADLINE}s after apply; continuing anyway"
                 kubectl -n "$ns" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 30 || true
                 break
               fi
-              sleep 10
+              sleep "$POLL"
             done
             kubectl -n "$ns" get pods -l "$sel" -o wide || true
 
             refresh_cluster_token || echo "credential refresh failed; continuing"
-            # Stream logs (best effort; the pod log is the only egress). Append per group.
-            kubectl -n "$ns" logs -f -l "$sel" --all-containers=true --prefix=true \
-              --max-log-requests=10 --pod-running-timeout=20m --tail=-1 \
-              2>&1 | tee -a "$RUNNER_TEMP/external-pod-logs.txt" || true
+            # Stream logs in the background, re-attaching if the stream dies while
+            # the JobSet is still live: the pod log is the ONLY egress for the
+            # benchmark results, so a dead stream silently discards them. The cap
+            # is 64 because unprivileged pods carry sidecars (gke-gcsfuse), so a
+            # 4-host group already needs more streams than kubectl's default
+            # concurrency cap of 10 allows.
+            ( first=1
+              while kubectl -n "$ns" get "$name" >/dev/null 2>&1; do
+                jok="$(kubectl -n "$ns" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
+                jbad="$(kubectl -n "$ns" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+                { [ "$jok" = "True" ] || [ "$jbad" = "True" ]; } && break
+                if [ "$first" = 1 ]; then tailn=-1; first=0; else tailn=20; fi
+                kubectl -n "$ns" logs -f -l "$sel" --all-containers=true --prefix=true \
+                  --max-log-requests="$LOG_STREAM_MAX" --pod-running-timeout=20m --tail="$tailn" \
+                  2>&1 | tee -a "$RUNNER_TEMP/external-pod-logs.txt" || true
+                sleep 20
+              done ) &
+            local stream_pid=$!
 
             local deadline next_refresh auth_fails=0 iter=0 ok bad
-            deadline=$(( $(date +%s) + 9600 ))      # outlast the JobSet's activeDeadlineSeconds
-            next_refresh=$(( $(date +%s) + 2400 ))
+            deadline=$(( $(date +%s) + wait_budget ))  # outlast the JobSet's activeDeadlineSeconds
+            next_refresh=$(( $(date +%s) + TOKEN_REFRESH_EVERY ))
             while [ "$(date +%s)" -lt "$deadline" ]; do
               if [ "$(date +%s)" -ge "$next_refresh" ]; then
-                refresh_cluster_token && next_refresh=$(( $(date +%s) + 2400 )) \
-                  || { echo "refresh failed; retry in 45s"; next_refresh=$(( $(date +%s) + 45 )); }
+                refresh_cluster_token && next_refresh=$(( $(date +%s) + TOKEN_REFRESH_EVERY )) \
+                  || { echo "refresh failed; retry in ${TOKEN_RETRY_DELAY}s"; next_refresh=$(( $(date +%s) + TOKEN_RETRY_DELAY )); }
               fi
-              if [ $(( iter % 12 )) -eq 0 ]; then
+              if [ $(( iter % PODS_PRINT_EVERY )) -eq 0 ]; then
                 echo "--- [$(date +%T)] ${label} pods ---"
                 kubectl -n "$ns" get pods -l "$sel" -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,NODE:.spec.nodeName 2>/dev/null || true
               fi
@@ -171,8 +228,8 @@ jobs:
               if ! kubectl -n "$ns" get "$name" >/dev/null 2>&1; then
                 auth_fails=$((auth_fails + 1))
                 [ "$auth_fails" -eq 3 ] && refresh_cluster_token || true
-                if [ "$auth_fails" -ge 12 ]; then echo "❌ ${label}: lost cluster access; outcome unknown"; break; fi
-                sleep 5; continue
+                if [ "$auth_fails" -ge "$AUTH_FAIL_LIMIT" ]; then echo "❌ ${label}: lost cluster access; outcome unknown"; break; fi
+                sleep "$POLL"; continue
               fi
               auth_fails=0
               ok="$(kubectl -n "$ns" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
@@ -181,14 +238,19 @@ jobs:
               if [ "$bad" = "True" ]; then
                 echo "❌ ${label} FAILED"
                 kubectl -n "$ns" get pods -l "$sel" -o wide || true
-                kubectl -n "$ns" logs -l "$sel" --all-containers --prefix --tail=200 2>/dev/null || true
+                kubectl -n "$ns" logs -l "$sel" --all-containers --prefix --tail=200 --max-log-requests=64 2>/dev/null || true
                 kubectl -n "$ns" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 40 || true
                 kubectl -n "$ns" describe "$name" | tail -n 120 || true
                 rc=1; break
               fi
-              sleep 5
+              sleep "$POLL"
             done
             [ "$rc" = 0 ] || { [ "$iter" -gt 0 ] && echo "❌ ${label}: did not complete before deadline" || true; }
+            # Let a still-attached stream drain the final lines (the results JSON
+            # is printed at the very end) before tearing the JobSet down.
+            sleep 15
+            kill "$stream_pid" 2>/dev/null || true
+            wait "$stream_pid" 2>/dev/null || true
             kubectl -n "$ns" delete "$name" --ignore-not-found --wait=false 2>/dev/null || true
             CUR=""
             return "$rc"
@@ -204,6 +266,8 @@ jobs:
             weights="$(jq -r '.weights' <<<"$g")"
             gname="$(jq -r '.name' <<<"$g")"
             grun="$(jq -r '.run_name' <<<"$g")"
+            tpf="$(jq -r '.timeout_per_file // 3600' <<<"$g")"
+            nf="$(wc -w <<<"$files")"
             echo "::group::group $(( i + 1 ))/${n}: ${gname}"
             python3 .github/tpu-ci/external/render_external_jobset.py \
               --image '${{ inputs.image }}' \
@@ -213,12 +277,18 @@ jobs:
               --weights "$weights" \
               --nodepool "$NODEPOOL" \
               --extra-args '${{ inputs.extra_args }}' \
+              --timeout-per-file "$tpf" \
               --name "$grun" > /tmp/external-job.yaml || { echo "render failed for ${gname}"; overall=1; echo '::endgroup::'; continue; }
             grep -nE 'generateName:|completions:|gke-nodepool:|gke-tpu-topology:|bucketName:|TP_SIZE|bash "benchmark' /tmp/external-job.yaml | head
-            run_group /tmp/external-job.yaml "$gname" || overall=1
+            # Waiting outlasts the rendered activeDeadlineSeconds (same formula + slack).
+            wait_budget=$(( WAIT_SLACK + nf * tpf )); (( wait_budget < WAIT_FLOOR )) && wait_budget=$WAIT_FLOOR
+            run_group /tmp/external-job.yaml "$gname" "$wait_budget" || overall=1
             echo '::endgroup::'
           done
           echo "slice ${slice} done, overall rc=${overall}"
+          kill "$LIVE_LOG_SYNC_PID" 2>/dev/null || true
+          gcloud storage cp "$RUNNER_TEMP/external-pod-logs.txt" \
+            "$LIVE_LOG_DIR/$(date -u +%Y%m%dT%H%M%SZ)-final.log" >/dev/null 2>&1 || true
           exit "$overall"
 
       - name: Upload pod logs

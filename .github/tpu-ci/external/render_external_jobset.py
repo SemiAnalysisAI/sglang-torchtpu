@@ -59,8 +59,14 @@ sys.path.insert(0, os.path.dirname(HERE))
 from discover_multihost import _scan as _scan_suite  # noqa: E402
 from test_names import names_from_path  # noqa: E402
 
-# ~30m bring-up (weight load over gcsfuse + compile warmup) + rank-0's test files + margin.
+# Bring-up allowance before any test file's own budget counts: gcsfuse weight
+# load + engine compile warmup, measured 15-30 min on the benchmark groups.
+_BRINGUP_ALLOWANCE = 3600
+# Floor for the JobSet deadline (the pre-benchmark fixed value): ~30m bring-up
+# + rank-0's test files + margin. Short groups keep at least this much.
 _ACTIVE_DEADLINE = 9000
+# DNS-1035 label budget for the run name (children append suffixes).
+_RUN_NAME_MAX = 40
 
 
 def load_config(path):
@@ -70,7 +76,13 @@ def load_config(path):
 
 def dns_safe(name):
     s = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
-    return (s[:40].strip("-")) or "run"
+    s = (s[:_RUN_NAME_MAX].strip("-")) or "run"
+    # The JobSet webhook enforces DNS-1035 on the derived child Job names,
+    # which must START WITH A LETTER -- and the compact run_name is a sha256
+    # prefix that can start with a digit (bit us with '24afde9fbae2...').
+    if not s[0].isalpha():
+        s = "g" + s[: _RUN_NAME_MAX - 1]
+    return s
 
 
 def list_groups(cfg, root, nightly_only):
@@ -92,7 +104,9 @@ def list_groups(cfg, root, nightly_only):
                 file=sys.stderr,
             )
             continue
-        groups.setdefault((suite, ls, weights), []).append(path)
+        groups.setdefault((suite, ls, weights), []).append(
+            (path, int(spec.get("timeout_per_file", 3600)))
+        )
 
     # 3. Round-robin each suite's groups across its slices and BUCKET by slice, so the matrix
     #    is one job PER SLICE. Deterministic (sorted keys). The i-th group of a suite -> slice
@@ -100,7 +114,7 @@ def list_groups(cfg, root, nightly_only):
     #    while different slices run in parallel.
     slices = {}
     per_suite_i = {}
-    for (suite, ls, weights), files in sorted(groups.items()):
+    for (suite, ls, weights), entries in sorted(groups.items()):
         sl = suites[suite]
         pool = sl["nodepool_vars"]
         i = per_suite_i.get(suite, 0)
@@ -117,14 +131,17 @@ def list_groups(cfg, root, nightly_only):
                 "groups": [],
             },
         )
+        files = sorted(path for path, _ in entries)
         bucket["groups"].append(
             {
-                **names_from_path(
-                    sorted(files)[0]
-                ),  # #552: path-derived name + compact run_name
+                **names_from_path(files[0]),  # #552: path-derived name + run_name
                 "launch_script": ls,
                 "weights": weights,
-                "files": " ".join(sorted(files)),
+                "files": " ".join(files),
+                # The group's per-file budget is the largest any of its files
+                # declares; the workflow passes it back to render so the
+                # JobSet deadline is sized from what actually runs.
+                "timeout_per_file": max(tpf for _, tpf in entries),
             }
         )
     return [slices[k] for k in sorted(slices)]
@@ -151,6 +168,15 @@ def render(cfg, a):
     tp = hosts * int(cl["devices_per_host"])
     model_path = f"{w['mount_path']}/{w['prefix']}/{a.weights}"
     extra_args = a.extra_args or w.get("default_extra_args", "")
+    # Size the JobSet deadline from what actually runs: ~1h of bring-up
+    # (gcsfuse weight load + compile warmup) plus every file's own budget,
+    # floored at the old fixed value so short groups keep their margin.
+    active_deadline = a.active_deadline
+    if active_deadline is None:
+        n_files = len(a.files.split())
+        active_deadline = max(
+            _ACTIVE_DEADLINE, _BRINGUP_ALLOWANCE + n_files * a.timeout_per_file
+        )
 
     vals = {
         "IMAGE": a.image,
@@ -161,7 +187,7 @@ def render(cfg, a):
         "TOPOLOGY": sl["topology"],
         "NODEPOOL": a.nodepool,
         "ACCELERATOR": cl["accelerator"],
-        "ACTIVE_DEADLINE": str(a.active_deadline),
+        "ACTIVE_DEADLINE": str(active_deadline),
         "LAUNCH_SCRIPT": a.launch_script,
         "TEST_FILES": a.files,
         "MODEL_PATH": model_path,
@@ -202,7 +228,14 @@ def main():
     )
     ap.add_argument("--name", default="")
     ap.add_argument("--extra-args", default="")
-    ap.add_argument("--active-deadline", type=int, default=_ACTIVE_DEADLINE)
+    ap.add_argument(
+        "--active-deadline",
+        type=int,
+        default=None,
+        help="JobSet activeDeadlineSeconds; default = %d bring-up + "
+        "--timeout-per-file x the file count (floor %d)."
+        % (_BRINGUP_ALLOWANCE, _ACTIVE_DEADLINE),
+    )
     ap.add_argument("--timeout-per-file", type=int, default=3600)
     a = ap.parse_args()
 
