@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -542,6 +543,41 @@ def _dp_gather_via_all_gather(
     is_partial: bool,
 ):
     use_world = world_dp_gather_enabled()
+
+    if _is_tpu:
+        # The TPU compile policy pads the local batch up to a compile bucket,
+        # while the global DP buffer is sized from the agreed max_len slots.
+        # Padding rows sit at the tail and carry no real tokens, so reconcile
+        # the local contribution to its slot (mirrors dp_scatter's slicing).
+        expected_rows = global_tokens.shape[0] // get_attention_dp_size()
+        if not torch.compiler.is_compiling() and (
+            os.environ.get("SGLANG_TPU_DEBUG_DP_GATHER") == "1"
+        ):
+            # Debug-only: the metadata arg is a ForwardBatch on the layer path
+            # but a LogitsMetadata on the logits path; log what both carry.
+            logger.info(
+                "dp_gather[%s]: meta=%s mode=%s local=%s global=%s",
+                get_attention_dp_rank(),
+                type(forward_batch).__name__,
+                getattr(forward_batch, "forward_mode", None),
+                tuple(local_tokens.shape),
+                tuple(global_tokens.shape),
+            )
+        if local_tokens.shape[0] > expected_rows:
+            local_tokens = local_tokens[:expected_rows]
+        if local_tokens.shape[0] < expected_rows:
+            # Short contribution (the eager logits gather prunes to real rows).
+            # torch_tpu's eager pad + all_gather lowering CHECK-fails on tiny
+            # row counts (windowing_util rank 0 vs 1), so place the rows into
+            # this rank's slot and all_reduce -- the attn_tp>1 branch's pattern.
+            if not is_partial:
+                local_tokens = local_tokens * attn_rank0_scale(local_tokens)
+            idx = _dp_rank_slot_rows(num_rows=expected_rows, device=local_tokens.device)
+            contrib = torch.zeros_like(global_tokens)
+            contrib[idx[: local_tokens.shape[0]]] = local_tokens
+            contrib = get_tp_group().all_reduce(contrib)
+            global_tokens.copy_(contrib)
+            return
 
     if get_attn_tensor_model_parallel_world_size() == 1:
         if use_world:
