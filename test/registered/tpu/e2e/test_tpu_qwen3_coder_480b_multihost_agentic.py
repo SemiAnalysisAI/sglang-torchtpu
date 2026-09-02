@@ -35,6 +35,7 @@ import requests
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase, dump_metric
+from sglang.test.tpu import emit_result_payload
 
 register_tpu_ci(est_time=1800, suite="nightly-tpu-multihost", nightly=True)
 
@@ -70,12 +71,6 @@ PROFILE = os.environ.get("PROFILE", "ci")
 # MIN_PREFIX_HIT_RATE to gate on an absolute rate instead.
 MIN_PREFIX_HIT_FRACTION = float(os.environ.get("MIN_PREFIX_HIT_FRACTION", "0.6"))
 MIN_PREFIX_HIT_RATE = os.environ.get("MIN_PREFIX_HIT_RATE")
-
-# The only egress from a TPU JobSet is the streamed pod log, so the results JSON is
-# printed between these markers; .github/workflows/_tpu-test.yml lifts it out into
-# a run artifact + the job summary.
-RESULT_BEGIN = "=== TPU_BENCH_RESULT_JSON BEGIN ==="
-RESULT_END = "=== TPU_BENCH_RESULT_JSON END ==="
 
 # Dashboard series key. The canonical HF id, not the mount path the recipe serves
 # from -- remounting the weights elsewhere must not split the trend in two.
@@ -140,7 +135,7 @@ def _print_workload_digest(summary) -> None:
 
     "workload" matches the metric labels; summary.json's schema still says legs.
 
-    The payload is the fragile half of the egress (see `_emit_result_json`), and
+    The payload is the fragile half of the egress (see `emit_result_payload`), and
     on 2026-08-26 and 08-28 the job log ended on the RESULT_BEGIN marker -- so the
     gsm8k-style verdict, the failing assertion and the TIMINGS record were all
     lost behind it and the red run said nothing about why. These lines are a few
@@ -156,32 +151,6 @@ def _print_workload_digest(summary) -> None:
             f"output_throughput={metrics.get('output_throughput')}",
             flush=True,
         )
-
-
-def _emit_result_json(summary) -> None:
-    """Print the summary between the markers, shaped to survive the log stream.
-
-    The only egress from a TPU JobSet is the streamed pod log, and containerd caps
-    a single log record at 16 KiB -- a summary emitted as one long line is split
-    into CRI partial records and has twice taken the rest of the job log with it.
-    `indent` keeps every line short without changing what the consumer sees:
-    _tpu-test.yml's awk rejoins the block with newlines, and pretty-printed JSON
-    only ever breaks BETWEEN tokens, so the rejoined text parses identically.
-    Chunking a single line at a fixed width would not -- it would drop a newline
-    inside a string literal and corrupt the payload.
-    """
-    try:
-        blob = json.dumps(summary, sort_keys=True, default=str, indent=1)
-    except (TypeError, ValueError) as exc:
-        # sort_keys raises on mixed-type keys. A lost payload is recoverable from
-        # the digest above; an exception here happens in setUpClass and would take
-        # down every gate in the file, reporting nothing about the sweep itself.
-        print(f"{RESULT_BEGIN}\n{RESULT_END}", flush=True)
-        print(f"[480b-agentic] summary not serializable, payload skipped: {exc!r}")
-        return
-    print(RESULT_BEGIN, flush=True)
-    print(blob, flush=True)
-    print(RESULT_END, flush=True)
 
 
 def _reachable_prefix_hit_rate(config, dp_size):
@@ -339,7 +308,7 @@ class TestTpuQwen3Coder480bMultihostAgentic(CustomTestCase):
         with open(summary_path) as f:
             summary = json.load(f)
         _print_workload_digest(summary)
-        _emit_result_json(summary)
+        emit_result_payload(summary)
         return summary
 
     def _legs(self):

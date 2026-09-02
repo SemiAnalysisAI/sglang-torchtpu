@@ -541,6 +541,42 @@ def read_bench_point(out_dir: str, point: Dict[str, Any]) -> Optional[Dict[str, 
     return record
 
 
+# The framed-payload egress every TPU perf test shares (the standard set by
+# test_tpu_qwen3_coder_480b_multihost_agentic.py): metrics are dumped per-number
+# via dump_metric when a leg is clean, and the WHOLE measurement summary is also
+# printed once, machine-readable, between these markers. Keel keys on the marker
+# text, so it never changes.
+RESULT_BEGIN = "=== TPU_BENCH_RESULT_JSON BEGIN ==="
+RESULT_END = "=== TPU_BENCH_RESULT_JSON END ==="
+
+
+def emit_result_payload(summary: Any) -> None:
+    """Print ``summary`` between the RESULT markers, shaped to survive the log.
+
+    The only egress from a TPU JobSet is the streamed pod log, and containerd
+    caps a single log record at 16 KiB -- a summary emitted as one long line is
+    split into CRI partial records and has twice (2026-08-26, 08-28) taken the
+    rest of the job log with it. ``indent`` keeps every line short without
+    changing what the consumer sees: _tpu-test.yml's awk rejoins the block with
+    newlines, and pretty-printed JSON only ever breaks BETWEEN tokens, so the
+    rejoined text parses identically. Chunking a single line at a fixed width
+    would not -- it would drop a newline inside a string literal and corrupt the
+    payload.
+    """
+    try:
+        blob = json.dumps(summary, sort_keys=True, default=str, indent=1)
+    except (TypeError, ValueError) as exc:
+        # sort_keys raises on mixed-type keys. A lost payload is recoverable from
+        # the digest lines printed before it; an exception here would take down
+        # the caller, reporting nothing about the measurement itself.
+        print(f"{RESULT_BEGIN}\n{RESULT_END}", flush=True)
+        print(f"[payload] summary not serializable, payload skipped: {exc!r}")
+        return
+    print(RESULT_BEGIN, flush=True)
+    print(blob, flush=True)
+    print(RESULT_END, flush=True)
+
+
 # Every numeric field bench_serving writes per sweep point, and how to read it.
 # Dumped in full because the JSONL never leaves the pod and the job log expires at
 # ~90 days: a field not recorded tonight cannot be back-filled later without
@@ -601,6 +637,9 @@ def bench_serving_runner(
     model: str = "",
     bench_env: Optional[Dict[str, str]] = None,
     prompts_per_concurrency: int = 10,
+    series_id: str = "",
+    display_name: str = "",
+    smoke_state: Optional[Dict[str, Any]] = None,
 ):
     """Build an ``AccuracyTestParams.runner`` that measures throughput.
 
@@ -614,9 +653,68 @@ def bench_serving_runner(
     either never fire or fire on noise. It gates that the measurement is COMPLETE --
     every point wrote its JSONL, no request errored, throughput positive -- which is
     what separates "slower" from "the server served nothing".
+
+    A point that fails -- a preceding smoke leg red (``smoke_state``, written by
+    the smoke gates model_config builds), the script exiting non-zero, or the
+    measurement incomplete -- dumps a ``smoke_failed`` record instead of numbers.
+    The dashboard renders it as a ✕ on that night's chart with ``reason`` on
+    hover, so a failed run is explained rather than hidden.
+
+    ``series_id``/``display_name`` come from MODEL_CONFIG's ``id``/``display_name``
+    and ride on every dashboard-bound record: ``id`` is the stable series join key
+    (never renamed; forced changes go through
+    .github/tpu-ci/dashboard_aliases.json), ``display_name`` is cosmetic.
     """
 
+    def dashboard_labels(point: Dict[str, Any]) -> Dict[str, Any]:
+        # kind/model/workload route the record to the right Performance chart;
+        # id joins the series across nights, display_name is what it is called.
+        labels = {
+            "kind": "performance",
+            "model": model or test_name,
+            "workload": point["workload"],
+        }
+        if series_id:
+            labels["id"] = series_id
+        if display_name:
+            labels["display_name"] = display_name
+        return labels
+
+    def dump_cross(point: Dict[str, Any], reason: str) -> None:
+        # The ✕ record: same routing labels as the numbers it replaces, so the
+        # server/bench config panels stay attached to the failed night too.
+        dump_metric(
+            "smoke_failed", 1, labels={**dashboard_labels(point), "reason": reason}
+        )
+
     def run(base_url: str) -> Dict[str, Any]:
+        smoke_failures = (smoke_state or {}).get("failures") or []
+        if smoke_failures:
+            # A smoke leg already failed: the measurement would be garbage, so no
+            # numbers are plotted -- each point gets a ✕ carrying the smoke reason.
+            reason = "; ".join(smoke_failures)
+            for point in sweep:
+                dump_cross(point, reason)
+            emit_result_payload(
+                {
+                    "test": test_name,
+                    "model": model or test_name,
+                    "legs": [
+                        {
+                            "workload": point["workload"],
+                            "concurrency": point["concurrency"],
+                            "status": "withheld",
+                            "reason": reason,
+                        }
+                        for point in sweep
+                    ],
+                }
+            )
+            return {
+                "score": 0.0,
+                "_passed": False,
+                "_failures": [f"sweep withheld: {reason}"],
+            }
         out_dir = bench_output_dir(test_name)
         env = os.environ.copy()
         # bench_serving.sh exits 2 without MODEL, and it is the tokenizer source, so
@@ -647,27 +745,51 @@ def bench_serving_runner(
             failures.append(f"bench_serving.sh exited {proc.returncode}")
 
         headline = None
+        legs = []
+
+        def fail_point(point, reason):
+            failures.append(reason)
+            dump_cross(point, reason)
+            legs.append(
+                {
+                    "workload": point["workload"],
+                    "concurrency": point["concurrency"],
+                    "status": "failed",
+                    "reason": reason,
+                }
+            )
+
         for point in sweep:
             label = f"{test_name} {point['workload']} c{point['concurrency']}"
             record = read_bench_point(search_dir, point)
             if record is None:
-                failures.append(f"{label}: no JSONL -- the point never ran")
+                fail_point(point, f"{label}: no JSONL -- the point never ran")
                 continue
             expected = point["concurrency"] * prompts_per_concurrency
             if record.get("completed") != expected:
-                failures.append(
+                # A partial point must not be published as a number: charted next
+                # to complete ones it poisons the trend (the 2026-08-24 gsm8k 0.0
+                # was exactly this shape of bug). The ✕ record explains the gap.
+                fail_point(
+                    point,
                     f"{label}: {record.get('completed')} of {expected} requests "
-                    "completed; the rest errored, so its throughput is not comparable"
+                    "completed; the rest errored, so its throughput is not "
+                    "comparable",
                 )
-                # And for the same reason it must not be published: a partial
-                # point charted next to complete ones poisons the trend (the
-                # 2026-08-24 gsm8k 0.0 was exactly this shape of bug).
                 continue
             total = record.get("total_throughput")
             if not total or total <= 0:
-                failures.append(f"{label}: total_throughput is {total}")
+                fail_point(point, f"{label}: total_throughput is {total}")
                 continue
             headline = headline or total
+            legs.append(
+                {
+                    "workload": point["workload"],
+                    "concurrency": point["concurrency"],
+                    "status": "clean",
+                    "metrics": record,
+                }
+            )
             print(
                 f"[perf] {label}: {total:.0f} tok/s total, "
                 f"ttft {record.get('median_ttft_ms', float('nan')):.0f} ms",
@@ -684,33 +806,36 @@ def bench_serving_runner(
                 value = record.get(field)
                 if not isinstance(value, (int, float)):
                     continue
-                # model keys the dashboard's series and ties the point back to the
-                # server/bench config captured for the same model. `direction` says
-                # which way is an improvement, because a regression check that
-                # assumes higher-is-better reads a TTFT drop as a win.
-                labels = {
-                    "model": model or test_name,
-                    "c": point["concurrency"],
-                    "direction": direction,
-                }
+                # `direction` says which way is an improvement, because a
+                # regression check that assumes higher-is-better reads a TTFT
+                # drop as a win.
+                labels = {"c": point["concurrency"], "direction": direction}
                 if field == _HEADLINE_METRIC:
-                    # `workload` is what routes a metric to the Performance tab, so
-                    # only the headline carries it. The other 40-odd land as
-                    # "unclassified": stored in the dashboard's archive forever, but
-                    # charted nowhere -- which is the point. Recording them costs a
-                    # few hundred bytes a night and cannot be done retroactively once
-                    # the job log expires; charting them all would bury the one
-                    # number anyone opens the page for under forty series.
-                    #
-                    # To chart one later: give it `workload` here, or teach the
-                    # dashboard to treat kind="bench_detail" as performance -- the
-                    # latter lights up every night already recorded, retroactively.
-                    labels["workload"] = point["workload"]
+                    # kind/model/workload route the headline to the Performance
+                    # tab. The other 40-odd land as kind=info: stored in the
+                    # dashboard's archive forever, shown in the point's details,
+                    # but charted nowhere -- which is the point. Recording them
+                    # costs a few hundred bytes a night and cannot be done
+                    # retroactively once the job log expires; charting them all
+                    # would bury the one number anyone opens the page for under
+                    # forty series. To chart one later, promote it on the keel
+                    # side -- the historical records already carry the data.
+                    labels.update(dashboard_labels(point))
                     labels["headline"] = "1"
                 else:
-                    labels["kind"] = "bench_detail"
+                    labels["kind"] = "info"
+                    labels["model"] = model or test_name
                     labels["workload_name"] = point["workload"]
+                    if series_id:
+                        labels["id"] = series_id
                 dump_metric(f"{stem}.{field}", value, labels=labels)
+
+        # The framed one-block summary, after the per-number dumps: clean legs
+        # carry their full record, failed ones their reason -- the same egress
+        # shape as the 480B agentic sweep.
+        emit_result_payload(
+            {"test": test_name, "model": model or test_name, "legs": legs}
+        )
 
         return {
             "score": headline or 0.0,

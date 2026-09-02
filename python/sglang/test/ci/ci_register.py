@@ -25,7 +25,7 @@ __all__ = [
 # `register_cpu_ci(5, "base-a-test-cpu")` style positional calls. New fields
 # (`stage`, `runner_config`) are kwarg-only.
 _PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
-_KWARG_ONLY = ("stage", "runner_config")
+_KWARG_ONLY = ("stage", "runner_config", "labels")
 _ALL_PARAMS = _PARAM_ORDER + _KWARG_ONLY
 _UNSET = object()
 
@@ -53,6 +53,9 @@ class CIRegistry:
     suite: Optional[str] = None
     nightly: bool = False
     disabled: Optional[str] = None
+    # Free-form dashboard tags ("multihost", "gpt-oss-120b", "pd", ...); consumed
+    # by CI dashboards, never by scheduling.
+    labels: Tuple[str, ...] = ()
 
     @property
     def effective_suite(self) -> Optional[str]:
@@ -147,6 +150,7 @@ def register_tpu_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
+    labels: Optional[List[str]] = None,
 ):
     """Marker for TPU CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -200,6 +204,11 @@ class RegistryVisitor(ast.NodeVisitor):
     def _constant_value(self, node: ast.AST) -> object:
         if isinstance(node, ast.Constant):
             return node.value
+        # A ["a", "b"] literal (labels). Anything non-constant inside stays _UNSET.
+        if isinstance(node, (ast.List, ast.Tuple)) and all(
+            isinstance(e, ast.Constant) for e in node.elts
+        ):
+            return tuple(e.value for e in node.elts)
         return _UNSET
 
     def _parse_call_args(self, func_call: ast.Call) -> dict:
@@ -293,6 +302,16 @@ class RegistryVisitor(ast.NodeVisitor):
                 f"{self.filename}: disabled must be a string in {func_call.func.id}()"
             )
 
+        labels = args["labels"] if args["labels"] is not _UNSET else ()
+        if not (
+            isinstance(labels, tuple)
+            and all(isinstance(l, str) and l.strip() for l in labels)
+        ):
+            raise ValueError(
+                f"{self.filename}: labels must be a list of non-empty strings "
+                f"in {func_call.func.id}()"
+            )
+
         return {
             "est_time": float(est_time),
             "stage": stage,
@@ -300,6 +319,7 @@ class RegistryVisitor(ast.NodeVisitor):
             "suite": suite,
             "nightly": nightly,
             "disabled": disabled,
+            "labels": labels,
         }
 
     def _collect_ci_registry(self, func_call: ast.Call):

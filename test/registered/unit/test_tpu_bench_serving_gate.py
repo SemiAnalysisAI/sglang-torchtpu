@@ -163,6 +163,51 @@ class TestOutputDir(CustomTestCase):
             self.assertEqual(eval_support.bench_output_dir("m"), "")
 
 
+class TestResultPayload(CustomTestCase):
+    """The framed-payload egress every perf test shares (emit_result_payload)."""
+
+    @staticmethod
+    def _emit(summary):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            eval_support.emit_result_payload(summary)
+        return buf.getvalue()
+
+    def test_payload_is_framed_and_reparses(self):
+        # Bug regression (2026-08-26/28): a summary emitted as ONE long line is
+        # split by containerd's 16 KiB CRI record cap and corrupted the rest of
+        # the job log. The contract is a marker-framed, pretty-printed block:
+        # line breaks only ever fall BETWEEN JSON tokens, so the rejoined text
+        # parses back to exactly what was emitted.
+        summary = {
+            "legs": [
+                {
+                    "workload": "8k1k",
+                    "status": "clean",
+                    "metrics": {"total_throughput": 12000.0},
+                }
+            ]
+        }
+        out = self._emit(summary).splitlines()
+        self.assertEqual(out[0], eval_support.RESULT_BEGIN)
+        self.assertEqual(out[-1], eval_support.RESULT_END)
+        body = "\n".join(out[1:-1])
+        self.assertGreater(len(out), 3, "payload must be multi-line, not one record")
+        self.assertEqual(json.loads(body), summary)
+
+    def test_unserializable_summary_skips_payload_without_raising(self):
+        # sort_keys raises on mixed-type keys. The payload is the fragile half
+        # of the egress; an exception here would take down the caller and every
+        # gate behind it, reporting nothing about the measurement itself.
+        out = self._emit({1: "a", "b": 2})
+        self.assertIn(eval_support.RESULT_BEGIN, out)
+        self.assertIn(eval_support.RESULT_END, out)
+        self.assertIn("payload skipped", out)
+
+
 def _run_gate(tmp, record, returncode=0, seen=None, **runner_kw):
     """Run the gate with bench_serving.sh stubbed and `record` already written.
 
@@ -211,18 +256,79 @@ class TestGate(CustomTestCase):
         self.assertFalse(result["_passed"])
         self.assertIn("159 of 160", " ".join(result["_failures"]))
 
-    def test_dropped_requests_do_not_publish(self):
+    def test_dropped_requests_publish_only_a_cross_record(self):
         """Bug regression (2026-08-24 gsm8k 0.0): the incomplete branch recorded
         its failure, then fell through and dumped the point anyway -- putting a
         number from a half-dead server on the chart, indistinguishable from a
-        measured one. An incomplete point must dump NO [METRIC] lines."""
+        measured one. An incomplete point must dump NO numbers; what it dumps
+        instead is one `smoke_failed` record, which the dashboard renders as a ✕
+        with the reason on hover -- a failed night is explained, not hidden."""
         dumped = []
         with patch.object(
-            eval_support, "dump_metric", side_effect=lambda *a, **k: dumped.append(a)
+            eval_support,
+            "dump_metric",
+            side_effect=lambda name, value, labels=None: dumped.append(
+                (name, value, labels)
+            ),
         ):
             result = _run_gate(self.tmp, {**COMPLETE, "completed": 159})
         self.assertFalse(result["_passed"])
-        self.assertEqual(dumped, [])
+        self.assertEqual([d[0] for d in dumped], ["smoke_failed"])
+        labels = dumped[0][2]
+        # kind/model/workload are what route the ✕ to the right chart; reason is
+        # free text from the actual failure.
+        self.assertEqual(labels["kind"], "performance")
+        self.assertEqual(labels["model"], "m")
+        self.assertEqual(labels["workload"], "8k1k")
+        self.assertIn("159 of 160", labels["reason"])
+
+    def test_failed_smoke_leg_withholds_the_sweep(self):
+        """A red smoke leg means the measurement would be garbage: the sweep must
+        not run at all (no bench subprocess), and every point must land as a ✕
+        carrying the smoke reason instead of a number."""
+        dumped, ran = [], []
+        runner = eval_support.bench_serving_runner(
+            sweep=[POINT],
+            test_name="m",
+            smoke_state={"failures": ["server health check timed out after 1800s"]},
+        )
+        with patch.object(
+            eval_support,
+            "dump_metric",
+            side_effect=lambda name, value, labels=None: dumped.append((name, labels)),
+        ), patch.object(
+            eval_support.subprocess, "run", side_effect=lambda *a, **k: ran.append(a)
+        ):
+            result = runner("http://127.0.0.1:30000")
+        self.assertFalse(result["_passed"])
+        self.assertEqual(ran, [])
+        self.assertEqual([d[0] for d in dumped], ["smoke_failed"])
+        self.assertIn("timed out", dumped[0][1]["reason"])
+
+    def test_headline_carries_the_series_identity(self):
+        # id joins the series across nights and display_name names it; without
+        # them on the headline record, a rename splits the trend in two.
+        dumped = []
+        with patch.object(
+            eval_support,
+            "dump_metric",
+            side_effect=lambda name, value, labels=None: dumped.append((name, labels)),
+        ):
+            _run_gate(
+                self.tmp,
+                COMPLETE,
+                series_id="perf-m",
+                display_name="M 1B",
+            )
+        headline = [l for n, l in dumped if n.endswith(".total_throughput")]
+        self.assertEqual(len(headline), 1)
+        self.assertEqual(headline[0]["kind"], "performance")
+        self.assertEqual(headline[0]["id"], "perf-m")
+        self.assertEqual(headline[0]["display_name"], "M 1B")
+        self.assertEqual(headline[0]["workload"], "8k1k")
+        # The non-headline detail records stay off every chart: kind=info.
+        details = {l["kind"] for n, l in dumped if "total_throughput" not in n}
+        self.assertEqual(details, {"info"})
 
     def test_zero_throughput_fails(self):
         result = _run_gate(self.tmp, {**COMPLETE, "total_throughput": 0.0})
@@ -321,6 +427,91 @@ class TestSweepGateTranslation(CustomTestCase):
                     "gates": [{"dataset": "mmlu", "baseline": 0.8, "bench_env": {}}],
                 }
             )
+
+
+class TestSmokeLegs(CustomTestCase):
+    """Smoke legs guard the sweep: ordering, shape, and the withhold wiring."""
+
+    @staticmethod
+    def _smoke(passed=True):
+        return {
+            "dataset": "health",
+            "smoke": True,
+            "runner": lambda base_url: {
+                "score": 1.0,
+                "_passed": passed,
+                "_failures": [] if passed else ["sanity request returned 500"],
+            },
+        }
+
+    def test_smoke_after_sweep_raises(self):
+        # Gates run in list order; a smoke leg after the sweep would validate a
+        # measurement that has already been published.
+        with self.assertRaises(ValueError):
+            model_config.build_gates(
+                {
+                    "model": "m",
+                    "gates": [
+                        {"dataset": "bench_serving", "sweep": [POINT]},
+                        self._smoke(),
+                    ],
+                }
+            )
+
+    def test_smoke_without_runner_raises(self):
+        # Only a self-gating runner reports a verdict this module can observe; a
+        # baseline-graded smoke leg would fail invisibly and never withhold.
+        with self.assertRaises(ValueError):
+            model_config.build_gates(
+                {"model": "m", "gates": [{"dataset": "health", "smoke": True}]}
+            )
+
+    def test_failed_smoke_leg_withholds_the_sweep(self):
+        # The wiring end to end: the smoke gate's failure text must reach the ✕
+        # record the sweep dumps in place of its numbers.
+        gates = model_config.build_gates(
+            {
+                "model": "m",
+                "gates": [
+                    self._smoke(passed=False),
+                    {"dataset": "bench_serving", "sweep": [POINT]},
+                ],
+            }
+        )
+        gates[0].runner("http://127.0.0.1:30000")
+
+        dumped, ran = [], []
+        with patch.object(
+            eval_support,
+            "dump_metric",
+            side_effect=lambda name, value, labels=None: dumped.append((name, labels)),
+        ), patch.object(
+            eval_support.subprocess, "run", side_effect=lambda *a, **k: ran.append(a)
+        ):
+            result = gates[1].runner("http://127.0.0.1:30000")
+        self.assertFalse(result["_passed"])
+        self.assertEqual(ran, [])
+        self.assertEqual([d[0] for d in dumped], ["smoke_failed"])
+        self.assertIn("sanity request returned 500", dumped[0][1]["reason"])
+
+
+class TestSeriesIdentity(CustomTestCase):
+    """id/display_name flow from MODEL_CONFIG onto every dashboard-bound record."""
+
+    def test_accuracy_gate_labels_carry_id_and_display_name(self):
+        gates = model_config.build_gates(
+            {
+                "model": "m",
+                "id": "accuracy-m",
+                "display_name": "M 1B",
+                "dashboard": "accuracy",
+                "gates": [{"dataset": "mmlu", "baseline": 0.8, "atol": 0.03}],
+            }
+        )
+        labels = gates[0].metric_labels
+        self.assertEqual(labels["kind"], "accuracy")
+        self.assertEqual(labels["id"], "accuracy-m")
+        self.assertEqual(labels["display_name"], "M 1B")
 
 
 class TestPerfConfigsAreValid(CustomTestCase):
