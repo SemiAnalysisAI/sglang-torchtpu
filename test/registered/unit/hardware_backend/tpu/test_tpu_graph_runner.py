@@ -166,6 +166,7 @@ class TestTpuGraphRunner(CustomTestCase):
             prefill_max_requests=None,
             chunked_prefill_size=None,
             max_prefill_tokens=2048,
+            max_prefill_buffer_tokens=lambda: 2048,
         )
 
         # Mirror ServerArgs.override: the _can_torch_compile=False path calls it
