@@ -53,8 +53,8 @@ PYTHON=${PYTHON:-python3}
 # chain, so a change to any link that breaks another fails CI instead of
 # silently truncating a benchmark.
 # ---------------------------------------------------------------------------
-# Deadline for one leg's bench client. Not a typical duration (healthy c64
-# legs measured 150-500s) -- the cap only bites hung legs, and it must leave
+# Deadline for one leg's bench client. Not a typical duration -- the cap only
+# bites hung legs, and it must leave
 # the ci profile's worst case (7 attempted legs) inside SWEEP_TIMEOUT. Sized
 # for 7-ramp-round long sessions (gpt-oss to ~122k, qwen to ~260k).
 MAX_LEG_SECONDS_CI=900
@@ -83,8 +83,7 @@ case "$PROFILE" in
         MAX_LEG_SECONDS=${MAX_LEG_SECONDS:-$MAX_LEG_SECONDS_CI}
         ;;
     e2e)
-        # The grid's heaviest cell (the 2026-09-01 4-host bring-up was
-        # validated at the previous grid's c64-long4).
+        # The grid's heaviest cell.
         SWEEP_BS=${SWEEP_BS:-"32"}
         SWEEP_LONG=${SWEEP_LONG:-"4"}
         MAX_LEG_SECONDS=${MAX_LEG_SECONDS:-$MAX_LEG_SECONDS_SINGLE_POINT}
@@ -188,16 +187,11 @@ case "$BENCH_MODEL" in
         PAGE_SIZE=${PAGE_SIZE:-64}
         CONTEXT_LEN=${CONTEXT_LEN:-131072}
         # ~15.2 KB KV/token/rank at tp=8 (fp8 + hybrid-SWA second pool).
-        # Sized for the 120k long target on the original c64/16k-context
-        # grid (60 x ~15.4k + 4 x ~122k ~= 1.41M tokens); the current grid's
-        # heaviest cell (c32-long4, 2-round ~10.3k normals) needs ~0.78M, so
-        # the pool carries ~2x headroom that the radix cache uses for prefix
-        # retention. Costs ~24 GB
-        # per rank and leaves ~41 GB for the EXTEND-graph capture -- above
-        # the measured OOM point (38.3 GB, 2026-09-01 iteration 5) but below
-        # the comfortable 45 GB line; if the capture OOMs, halve
-        # CHUNKED_PREFILL_SIZE rather than shrinking this (a retraction voids
-        # legs; a smaller chunk only slows cold prefills).
+        # ~2x the heaviest cell's worst case (c32-long4 ~0.78M tokens); the
+        # headroom feeds radix-cache prefix retention. Costs ~24 GB per rank,
+        # and the EXTEND-graph capture needs most of what remains: if capture
+        # OOMs, halve CHUNKED_PREFILL_SIZE rather than shrinking this (a
+        # retraction voids legs; a smaller chunk only slows cold prefills).
         # Scaled by TP below (per-rank bytes stay constant).
         MAX_TOTAL_TOKENS_TP8=1572864
         MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.6}
@@ -211,19 +205,16 @@ case "$BENCH_MODEL" in
         QUANTIZATION=fp8
         KV_CACHE_DTYPE=${KV_CACHE_DTYPE-fp8_e4m3}
         # rpa_v3 for KV-offload compatibility and because rpa_batched
-        # mis-computes non-first segments of packed EXTEND batches
-        # (/cache/share/tpu-batched-decode-corruption-fix.md).
+        # mis-computes non-first segments of packed EXTEND batches.
         ATTENTION_BACKEND=pallas_tpu_rpa_v3
         PAGE_SIZE=${PAGE_SIZE:-128}
         # The full native window (no YaRN at 262144); the agentic long
         # sessions ramp to ~260k of it.
         CONTEXT_LEN=${CONTEXT_LEN:-262144}
         # ~15.9 KB KV/token/rank at tp=8 (62 layers x 1 kv head x 128 x K+V).
-        # Sized for the 256k long target: c32-long4 worst case is
-        # 28 x ~10.3k + 4 x ~260k ~= 1.33M tokens -> 1.5M pool, ~25 GB/rank
-        # (the 64k-era pool was 1.18M/~19 GB). WARNING: bring-up at this size
-        # is not yet E2E-validated; if it OOMs, first halve
-        # CHUNKED_PREFILL_SIZE (the gpt-oss precedent), then revisit
+        # Sized for the 256k long target: the c32-long4 worst case is
+        # 28 x ~10.3k + 4 x ~260k ~= 1.33M tokens -> 1.5M pool, ~25 GB/rank.
+        # If bring-up OOMs, first halve CHUNKED_PREFILL_SIZE, then revisit
         # MEM_FRACTION_STATIC.
         # Scaled by TP below (per-rank bytes stay constant).
         MAX_TOTAL_TOKENS_TP8=1572864
@@ -277,28 +268,25 @@ esac
 PD_PREFILL_ENGINES=${PD_PREFILL_ENGINES:-1}
 
 # Spec verify/draft graph capture is expensive and host-RAM hungry when the
-# grid is unbounded; bound it to the sweep's shapes (incl. bs=64 -- the EAGLE3
-# bs-64 crash is fixed by #546) and allow spec recompiles for the tail.
+# grid is unbounded; bound it to the sweep's shapes and allow spec recompiles
+# for the tail.
 if [[ "$SPEC_DECODE" == "1" ]]; then
-    export TPU_COMPILE_BS=${TPU_COMPILE_BS:-"1 2 4 16 64"}
+    export TPU_COMPILE_BS=${TPU_COMPILE_BS:-"1 2 4 16 32"}
     export SGLANG_TPU_ALLOW_SPEC_RECOMPILE=${SGLANG_TPU_ALLOW_SPEC_RECOMPILE:-1}
 fi
 
-# KV pool, scaled with TP so the per-rank HBM cost stays what the tp=8 recipe
-# guidance was measured at (scaling a tp=8 engine's pool past that ate the
-# ~45 GB the 8k EXTEND-graph capture needs and OOM'd bring-up -- iteration 5).
+# KV pool, scaled with TP so the per-rank HBM cost stays constant (scaling a
+# tp=8 engine's pool further starves the EXTEND-graph capture and OOMs
+# bring-up).
 # In the P/D recipe each single-host decode engine holds ~half the running
 # batch (two decodes behind the LB), so the tp=8 pool covers the grid's
 # heaviest working set with ample headroom.
 MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS-$((MAX_TOTAL_TOKENS_TP8 * TP_SIZE / 8))}
 MAX_TOTAL_TOKENS_PREFILL=${MAX_TOTAL_TOKENS_PREFILL-$MAX_TOTAL_TOKENS_TP8}
 
-# P/D disaggregation timeouts: stock 300s. The 2026-09-01 external runs in
-# which every request failed exactly at the timeout boundary (216.5 tok/s at
-# 300s, 72.7 tok/s at 900s, empty response bodies) were the IPv6 ZMQ
-# rendezvous bug fixed in PR #606 -- the pods here are IPv6-only and the
-# raiden connector's PULL_REQ/BLOCKS were never delivered -- not slow
-# transfers, so the window is a safety net only. Overridable for experiments.
+# P/D disaggregation timeouts: stock 300s. A longer window never rescues a
+# stuck transfer -- it only delays the abort sweep that frees the batch -- so
+# the stock value stays. Overridable for experiments.
 #
 # Two separate knobs bound the two sides of a handoff: the decode's wait for
 # its KV (WAITING) and the prefill's wait for the decode to ask (BOOTSTRAP --

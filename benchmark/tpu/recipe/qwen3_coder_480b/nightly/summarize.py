@@ -359,8 +359,8 @@ def main() -> int:
     ap.add_argument("--md-out", required=True)
     ap.add_argument("--profile", default=os.environ.get("PROFILE", "unknown"))
     ap.add_argument("--mode", default=os.environ.get("MODE", "unknown"))
-    # Labels only -- so the external benchmark matrix (which reuses this
-    # summarizer for other models/recipes) does not report as the 480B run.
+    # Labels only -- so the benchmark matrix (which reuses this summarizer
+    # for other models/recipes) does not report as the 480B run.
     ap.add_argument(
         "--benchmark-label",
         default=os.environ.get("BENCH_SUMMARY_LABEL", "qwen3-coder-480b-tpu-agentic"),

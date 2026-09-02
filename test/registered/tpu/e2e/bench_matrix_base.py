@@ -118,11 +118,10 @@ def _direction(field: str) -> str:
 def _print_workload_digest(summary) -> None:
     """One short line per leg, printed BEFORE the fragile JSON payload.
 
-    The payload is the fragile half of the egress (see `_emit_result_json`),
-    and on 2026-08-26 and 08-28 the job log ended on the RESULT_BEGIN marker
-    -- the verdict, the failing assertion and the timings were all lost
-    behind it. These lines are a few dozen bytes each and carry exactly the
-    fields the gates read, so a triage never depends on the payload
+    The payload is the fragile half of the egress (see `_emit_result_json`)
+    and a truncated payload has taken the verdict and the failing assertion
+    with it before. These lines are a few dozen bytes each and carry exactly
+    the fields the gates read, so a triage never depends on the payload
     surviving the log stream."""
     for leg in summary.get("legs") or []:
         derived = leg.get("feature_derived") or {}
@@ -180,15 +179,13 @@ def _reachable_prefix_hit_rate(config, dp_size):
 
     the same (R-D)(R-D+1)/(R(R-1)) fraction of the single-cache ideal that
     the 480B nightly's config.sh derives when it picks COLOCATED_DP. It is
-    ZERO whenever R <= D -- the state PR #574 found at dp=4 against 3-round
-    sessions, where every c1 leg measured 0.0%. D=1 recovers the single-cache
-    ideal, (I+O)*R*(R-1)/2.
+    ZERO whenever R <= D; D=1 recovers the single-cache ideal,
+    (I+O)*R*(R-1)/2.
 
     Exact at concurrency 1, where a session's rounds strictly alternate
     ranks. At higher concurrency round_robin interleaves sessions and some
-    land consecutive rounds on one rank, so this is a LOWER bound there
-    (measured c16-long0 53.6% against 50.5% predicted) -- safe for a floor,
-    which is all it is used for.
+    land consecutive rounds on one rank, so this is a LOWER bound there --
+    safe for a floor, which is all it is used for.
 
     Summed over the leg's normal and long sessions (the long ones ramp at
     long_ramp_tokens). Returns None if the leg meta lacks the round counts.
@@ -229,10 +226,9 @@ def _matrix_spec_metrics_url(bench_recipe: str, base_url: str) -> str:
     """Where the spec gauges live: the engine that decodes.
 
     For P/D that is the decode leader (hosts[2] of the slice), never the
-    mini-LB -- the LB serves no /metrics, and its /generate path hangs against
-    this raiden P/D setup (prefill computes, decode never pulls; observed on a
-    fresh server, iteration 7), so a request-level probe through it cannot be
-    the oracle. For 1-host recipes the one server is the decode.
+    mini-LB -- the LB serves no /metrics, and a request-level probe through
+    it is not a reliable oracle on this P/D setup. For 1-host recipes the
+    one server is the decode.
     """
     if bench_recipe.startswith("pd_"):
         # Engine leaders follow PHYSICAL host order (serve_group.sh's
@@ -418,11 +414,9 @@ def build_bench_test(
             Gated against the REACHABLE rate, not the single-cache ideal:
             those differ by a third at dp=2, and a floor derived from the
             ideal can sit above what the deployment permits -- an assertion
-            no correct server can pass, which reddened the 480B file on
-            2026-08-30/31 (c1-long1 measured 30.2% against a 36.9% floor,
-            with 30.7% reachable). Green here means "the cache does what the
-            routing allows", NOT "prefix caching is fully exploited": only
-            cache-aware routing (sgl-model-gateway, not this repo) closes
+            no correct server can pass. Green here means "the cache does
+            what the routing allows", NOT "prefix caching is fully
+            exploited": only cache-aware routing (outside this repo) closes
             the rest.
             """
             for leg in self._legs():

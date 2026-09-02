@@ -238,9 +238,7 @@ class TestBenchMatrix(CustomTestCase):
         TIMEOUT_PER_FILE. Its links live in three files (test literals, the
         base's constants, config.sh's profile) that nothing else cross-checks;
         this is what turns "we changed one number" into a red test instead of
-        a silently truncated benchmark (the ci leg cap once sat at 900 with an
-        8-leg sweep against a 4500s budget -- a pathological run would have
-        breached the file timeout)."""
+        a silently truncated benchmark."""
         # Every cell's literal must equal the base's budget constant.
         for path in self._cell_files():
             _, launch, _ = _scan_file(path)

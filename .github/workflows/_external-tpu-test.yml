@@ -170,9 +170,8 @@ jobs:
             local running_deadline; running_deadline=$(( $(date +%s) + POD_RUNNING_DEADLINE ))
             until kubectl -n "$ns" get pods -l "$sel" -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q Running; do
               # Fail fast when the JobSet's Jobs are REJECTED (e.g. an admission
-              # policy): no pod will ever run, the JobSet never turns Failed, and
-              # waiting the full budget burns hours (2026-09-01: privileged
-              # containers denied by 'cf-disallow-privileged-controllers').
+              # policy denying the pod spec): no pod will ever run, the JobSet
+              # never turns Failed, and waiting the full budget burns hours.
               # "already exists" is EXCLUDED: the JobSet controller races its own
               # reconcile and logs that as JobCreationFailed although the child
               # Job is live and its pods start normally.
@@ -198,8 +197,8 @@ jobs:
             # the JobSet is still live: the pod log is the ONLY egress for the
             # benchmark results, so a dead stream silently discards them. The cap
             # is 64 because unprivileged pods carry sidecars (gke-gcsfuse), so a
-            # 4-host group already needs >10 streams (2026-09-01: "12 log streams
-            # ... maximum allowed concurrency is 10" left a whole run logless).
+            # 4-host group already needs more streams than kubectl's default
+            # concurrency cap of 10 allows.
             ( first=1
               while kubectl -n "$ns" get "$name" >/dev/null 2>&1; do
                 jok="$(kubectl -n "$ns" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"

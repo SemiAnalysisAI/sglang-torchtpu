@@ -118,13 +118,10 @@ echo "[serve_group] injected TPU env:"
 env | grep -E '^TPU_' | sed 's/^/[serve_group]   /' || true
 
 # FOUR single-host tp=8 engines: pods 0-1 prefill, pods 2-3 decode, paired at
-# request time by the mini-LB. This is the raiden P/D topology every existing
-# gate validates (single-host engines; task-10 multihost PD likewise). The
-# 2-host-tp=16-per-engine variant on a subdivided slice brings up cleanly with
-# a consistently re-scoped libtpu env; its 2026-09-01 "KV pulls never
-# complete" failures were the same IPv6 ZMQ rendezvous bug this topology hit
-# (PR #606), so it is untested since the fix rather than known-broken --
-# revisit if tp=16-per-engine P/D is wanted.
+# request time by the mini-LB -- the raiden P/D topology the existing gates
+# validate. (A 2-host tp=16-per-engine variant on a subdivided slice also
+# brings up with a consistently re-scoped libtpu env, but its KV-transfer
+# path is unvalidated; revisit if tp=16 engines are wanted.)
 if (( WORKER_ID < 2 )); then
     ROLE=prefill
     export PORT=$PD_PREFILL_PORT
@@ -163,10 +160,9 @@ else
 --disaggregation-transfer-backend raiden"
 fi
 
-# No bring-up retry here on purpose: the one nondeterministic death this
-# harness ever hit (duplicate replica ids at graph capture) was root-caused to
-# the partial libtpu env re-scope and fixed; a JobSet-level restart would also
-# rerun the TEST files on a legitimately red run. Fail once, loudly.
+# No bring-up retry on purpose: a relaunch loop can orphan scheduler
+# children (EADDRINUSE cascades), and a JobSet-level restart would rerun the
+# TEST files on a legitimately red run. Fail once, loudly.
 bash "$TPU_BENCH/launch_server.sh" &
 ENGINE_PID=$!
 CHILD_PIDS+=("$ENGINE_PID")

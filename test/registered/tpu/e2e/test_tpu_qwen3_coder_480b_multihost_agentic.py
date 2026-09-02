@@ -16,10 +16,8 @@ dashboard. The sweep harness stays this recipe's own run_nightly.sh; only the
 test machinery is shared. Metric names are bare leg tags (no namespace) --
 this file's dashboard trend predates the matrix and must not split.
 
-Watch items: the tp=16 dp=2 DP-attention decode precompile at attn_tp=8 (PR #279
-fixed the attn_tp=4 shape this ran at before COLOCATED_DP dropped to 2). The
-weights are already on the shared model-weights-rox PVC, so no hydration step is
-needed.
+The weights are already on the shared model-weights-rox PVC, so no hydration
+step is needed.
 """
 
 import os
@@ -69,8 +67,6 @@ TestTpuQwen3Coder480bMultihostAgentic = build_bench_test(
     # hence 600 + 2700 + 300 spare. It must also clear the `ci` profile's own
     # worst case -- 4 legs x MAX_LEG_SECONDS=420 = 1680s -- or the sweep is
     # killed mid-run and the whole file fails on a budget, not on a result.
-    # (1500 did not: that was sized when the template gave a file 1800s and
-    # the sweep was described as two legs.)
     sweep_timeout_default=2700,
     gate_prefix_hits=True,
     metric_namespace=None,

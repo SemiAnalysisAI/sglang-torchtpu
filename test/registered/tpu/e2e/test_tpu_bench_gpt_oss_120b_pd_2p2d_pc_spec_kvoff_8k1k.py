@@ -26,7 +26,7 @@ register_tpu_ci(
     est_time=7200,
     suite="external-nightly-2x2x4",
     nightly=True,
-    disabled="one failed raiden transfer parks its request forever: the decode withholds KVPoll.Failed while an unsettled read keeps room_has_active_io true, so the request never terminalizes and the mini-LB never answers (run 33548460767: 56/64 done in ~100s, then all engines idle for 28min). Not a 64k perf tail; see /cache/share/task13-raiden-pd-settle-stall.md step 10",
+    disabled="raiden P/D terminalization deadlock: one failed KV transfer parks its request forever (the decode withholds KVPoll.Failed while the room still counts active IO), so the leg hangs at the tail and the mini-LB never answers; re-enable once the deadlock is fixed",
 )
 
 MULTIHOST_LAUNCH = {
