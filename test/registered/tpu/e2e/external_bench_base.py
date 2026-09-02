@@ -55,7 +55,7 @@ BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
 # MULTIHOST_LAUNCH declares literally as timeout_per_file (the CI scanner
 # reads it via AST, so the files cannot compute it); the matrix ratchet
 # asserts the literals match this constant and that the chain holds.
-TIMEOUT_PER_FILE_BUDGET = 5400
+TIMEOUT_PER_FILE_BUDGET = 8100
 # Re-checking a server the JobSet already gated healthy.
 HEALTH_RECHECK_BUDGET = 600
 # Headroom after the sweep for summarize + digest + result-JSON printing.

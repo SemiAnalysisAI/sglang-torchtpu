@@ -58,7 +58,7 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 380   # > WAIT_SLACK + 2 files x 8100s (= 350 min) + job setup
     steps:
       - uses: actions/checkout@v4
         with:

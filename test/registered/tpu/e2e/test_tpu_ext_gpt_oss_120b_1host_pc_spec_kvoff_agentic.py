@@ -1,7 +1,7 @@
 """GPT-OSS-120B external-cluster serving benchmark: 1 host tp=8/ep=8, prefix caching + EAGLE3 spec + KV offload (raiden).
 
 Workload: multi-turn agentic (4k in + 1k out per round to 16k context; long
-sessions ramp to 64k) -- the 480B nightly's workload shape. Prefix-cache
+sessions ramp to the model's LONG_TARGET_CONTEXT (~120k gpt-oss / 64k qwen)) -- the 480B nightly's workload shape. Prefix-cache
 hit rate is gated against what the round count makes reachable.
 
 Sweep: concurrency {1,16,64} x long requests {0,1,4} (legs with more long
@@ -25,7 +25,7 @@ register_tpu_ci(est_time=5400, suite="external-nightly-2x2x2", nightly=True)
 MULTIHOST_LAUNCH = {
     "launch_script": "recipe/external_bench/gpt_oss_120b_1host_pc_spec_kvoff.sh",
     "weights": "gpt-oss-120b",
-    "timeout_per_file": 5400,
+    "timeout_per_file": 8100,
 }
 
 TestExtGptOss120b1hostPcSpecKvoffAgentic = build_matrix_test(

@@ -53,9 +53,10 @@ PYTHON=${PYTHON:-python3}
 # silently truncating a benchmark.
 # ---------------------------------------------------------------------------
 # Deadline for one leg's bench client. Not a typical duration (healthy c64
-# legs run 150-300s) -- the cap only bites hung legs, and it must leave the
-# ci profile's worst case (8 attempted legs) inside SWEEP_TIMEOUT.
-MAX_LEG_SECONDS_CI=480
+# legs measured 150-500s) -- the cap only bites hung legs, and it must leave
+# the ci profile's worst case (8 attempted legs) inside SWEEP_TIMEOUT. Sized
+# for the gpt-oss 120k long target (7 ramp-rounds per long session).
+MAX_LEG_SECONDS_CI=900
 # e2e runs a single leg, so it can afford a far larger cap for bring-up-time
 # experiments on that one point.
 MAX_LEG_SECONDS_SINGLE_POINT=1800
@@ -96,12 +97,26 @@ esac
 # ---------------------------------------------------------------------------
 # Workload shape. Both are expressed in the agentic generator's terms.
 # ---------------------------------------------------------------------------
-# LONG_TARGET_CONTEXT=65536 for both models keeps the c=64 working set at or
-# under ~1.25M tokens (60x16k normal + 4x65k long), which the per-model KV
-# pools below are sized to hold without retracting -- a retraction voids the
-# leg (see the retraction gate in the tests). GPT-OSS's native window is 128k,
-# so no rope override is needed for either model at this target.
-LONG_TARGET_CONTEXT=${LONG_TARGET_CONTEXT:-65536}
+# The long-context target is PER MODEL: it is capped by the native window
+# minus output/rounding/template headroom, and by what the model's KV pool
+# holds retraction-free at c64-long4 (a retraction voids the leg -- see the
+# retraction gate in the tests). Model validity itself is enforced by the
+# model-fragments case below.
+case "$BENCH_MODEL" in
+    gpt_oss_120b)
+        # 7 ramp-rounds -> final context ~122k, the largest the 131072 window
+        # fits with headroom (the asked-for "128k" is unreachable: the last
+        # round's output plus rounding must also fit). Requires the enlarged
+        # pool in the model fragment (~1.41M-token worst case at c64-long4).
+        LONG_TARGET_CONTEXT=${LONG_TARGET_CONTEXT:-120832}
+        ;;
+    *)
+        # qwen3_coder_480b stays at 64k: its tp8 pool already sits at the
+        # mem-fraction budget's edge (~21 GB), so a 120k target first needs a
+        # pool + mem-fraction re-measurement on cells not yet E2E-run.
+        LONG_TARGET_CONTEXT=${LONG_TARGET_CONTEXT:-65536}
+        ;;
+esac
 case "$WORKLOAD" in
     agentic)
         TURN_INPUT_TOKENS=${TURN_INPUT_TOKENS:-4096}
@@ -156,11 +171,16 @@ case "$BENCH_MODEL" in
         ATTENTION_BACKEND=pallas_tpu_rpa_v3
         PAGE_SIZE=${PAGE_SIZE:-64}
         CONTEXT_LEN=${CONTEXT_LEN:-131072}
-        # ~15.2 KB KV/token/rank at tp=8 (fp8 + hybrid-SWA second pool). 10x
-        # the context length, per the gpt_oss_120b recipe's HBM guidance:
-        # leaves the EXTEND-graph temporaries their headroom at mem 0.6.
+        # ~15.2 KB KV/token/rank at tp=8 (fp8 + hybrid-SWA second pool).
+        # Sized for the 120k long target: c64-long4 worst case is
+        # 60 x ~15.4k + 4 x ~122k ~= 1.41M tokens, plus margin. Costs ~24 GB
+        # per rank and leaves ~41 GB for the EXTEND-graph capture -- above
+        # the measured OOM point (38.3 GB, 2026-09-01 iteration 5) but below
+        # the comfortable 45 GB line; if the capture OOMs, halve
+        # CHUNKED_PREFILL_SIZE rather than shrinking this (a retraction voids
+        # legs; a smaller chunk only slows cold prefills).
         # Scaled by TP below (per-rank bytes stay constant).
-        MAX_TOTAL_TOKENS_TP8=1310720
+        MAX_TOTAL_TOKENS_TP8=1572864
         MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.6}
         # SparseCore ragged-gather MoE cannot lower for GPT-OSS's EXTEND graph.
         export SGLANG_TPU_FUSED_MOE_SC_GATHER=${SGLANG_TPU_FUSED_MOE_SC_GATHER:-0}
@@ -314,10 +334,19 @@ done
 for _l in $SWEEP_LONG; do
     case "$_l" in ''|*[!0-9]*) echo "ERROR: SWEEP_LONG has non-numeric '$_l'" >&2; exit 2;; esac
 done
-_round_headroom=$(( (LONG_RAMP_TOKENS + TURN_OUTPUT_TOKENS) / 2 ))
-if (( LONG_TARGET_CONTEXT + _round_headroom > CONTEXT_LEN )); then
-    echo "ERROR: LONG_TARGET_CONTEXT=$LONG_TARGET_CONTEXT (+$_round_headroom" \
-         "rounding headroom) exceeds CONTEXT_LEN=$CONTEXT_LEN" >&2
+# A long session's ACTUAL final context is rounds x (ramp + output) -- the
+# same nearest-round arithmetic as bench_leg.sh / gen_agentic_workload.py --
+# plus a small per-round chat-template overhead. Assert on that rather than a
+# fixed half-round headroom, which over-blocks single-shot (1-round) longs.
+_long_growth=$(( LONG_RAMP_TOKENS + TURN_OUTPUT_TOKENS ))
+_long_rounds=$(( (LONG_TARGET_CONTEXT + _long_growth / 2) / _long_growth ))
+(( _long_rounds < 1 )) && _long_rounds=1
+_TEMPLATE_OVERHEAD_PER_ROUND=32   # measured ~10 tok/round on the 480B shape; padded
+_long_final=$(( _long_rounds * (_long_growth + _TEMPLATE_OVERHEAD_PER_ROUND) ))
+if (( _long_final > CONTEXT_LEN )); then
+    echo "ERROR: a long session reaches ~$_long_final tokens" \
+         "($_long_rounds rounds x ($_long_growth+$_TEMPLATE_OVERHEAD_PER_ROUND))" \
+         "> CONTEXT_LEN=$CONTEXT_LEN; lower LONG_TARGET_CONTEXT or LONG_RAMP_TOKENS" >&2
     exit 2
 fi
 

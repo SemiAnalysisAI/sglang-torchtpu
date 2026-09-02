@@ -1,7 +1,7 @@
 """GPT-OSS-120B external-cluster serving benchmark: 1 host tp=8/ep=8, prefix caching on.
 
 Workload: single-turn 8k-input / 1k-output serving; 'long requests' are
-single-turn 64k-input requests mixed into the batch. Prefix-cache hit
+single-turn LONG_TARGET_CONTEXT-input requests (~120k gpt-oss / 64k qwen) mixed into the batch. Prefix-cache hit
 rate is recorded but not gated (a single-turn session cannot re-see a
 prefix).
 
@@ -26,7 +26,7 @@ register_tpu_ci(est_time=5400, suite="external-nightly-2x2x2", nightly=True)
 MULTIHOST_LAUNCH = {
     "launch_script": "recipe/external_bench/gpt_oss_120b_1host_pc.sh",
     "weights": "gpt-oss-120b",
-    "timeout_per_file": 5400,
+    "timeout_per_file": 8100,
 }
 
 TestExtGptOss120b1hostPc8k1k = build_matrix_test(

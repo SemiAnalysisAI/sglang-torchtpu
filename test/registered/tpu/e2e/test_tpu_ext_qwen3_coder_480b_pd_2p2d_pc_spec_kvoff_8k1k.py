@@ -3,7 +3,7 @@ decode engines (tp=8 each) over raiden behind a mini-LB, prefix caching +
 EAGLE3 spec + KV offload.
 
 Workload: single-turn 8k-input / 1k-output serving; 'long requests' are
-single-turn 64k-input requests mixed into the batch. Prefix-cache hit
+single-turn LONG_TARGET_CONTEXT-input requests (~120k gpt-oss / 64k qwen) mixed into the batch. Prefix-cache hit
 rate is recorded but not gated (a single-turn session cannot re-see a
 prefix).
 
@@ -34,7 +34,7 @@ register_tpu_ci(
 MULTIHOST_LAUNCH = {
     "launch_script": "recipe/external_bench/qwen3_coder_480b_pd_2p2d_pc_spec_kvoff.sh",
     "weights": "Qwen3-Coder-480B-A35B-Instruct-FP8",
-    "timeout_per_file": 5400,
+    "timeout_per_file": 8100,
 }
 
 TestExtQwen3Coder480bPd2p2dPcSpecKvoff8k1k = build_matrix_test(
