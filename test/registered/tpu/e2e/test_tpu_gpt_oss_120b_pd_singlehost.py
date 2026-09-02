@@ -17,6 +17,7 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.tpu import model_config_main
+    from sglang.test.tpu.pd_router import build_router_cmd
 except ModuleNotFoundError as exc:
     # Source-only checkout: the host-side configuration tests still run.
     SGLANG_IMPORT_ERROR = exc
@@ -26,6 +27,9 @@ except ModuleNotFoundError as exc:
 
     def model_config_main(*_args, **_kwargs):
         return None
+
+    def build_router_cmd(**_kwargs):
+        raise SGLANG_IMPORT_ERROR
 
 
 # Expected runtime: 45 minutes; CI uses this for scheduling and timeouts.
@@ -263,21 +267,23 @@ def execute_decode(log_path: str = DECODE_LOG) -> subprocess.Popen:
 def execute_router(
     *, prefill_host: str, decode_host: str, log_path: str = LB_LOG
 ) -> subprocess.Popen:
-    """Launch the mini-LB in front of the prefill and decode pods."""
-    cmd = (
-        PYTHON,
-        "-m",
-        "sglang_router.launch_router",
-        "--pd-disaggregation",
-        "--mini-lb",
-        "--prefill",
-        f"http://{prefill_host}:{PREFILL_PORT}",
-        "--decode",
-        f"http://{decode_host}:{DECODE_PORT}",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(LB_PORT),
+    """Launch the router in front of the prefill and decode pods.
+
+    ``SGLANG_TPU_PD_ROUTER`` selects between the legacy mini-LB (the default, and what
+    this test has always used) and the SGLang Model Gateway PD router; see
+    :mod:`sglang.test.tpu.pd_router` for the policy knobs.
+
+    ``prefill_host`` must be this pod's cluster-reachable name. The router
+    injects it as the bootstrap address that the decode pods dial for the KV
+    rendezvous, so loopback would strand every transfer.
+    """
+    cmd = build_router_cmd(
+        python=PYTHON,
+        prefill_url=f"http://{prefill_host}:{PREFILL_PORT}",
+        decode_url=f"http://{decode_host}:{DECODE_PORT}",
+        host="0.0.0.0",
+        port=LB_PORT,
+        bootstrap_port=BOOTSTRAP_PORT,
     )
     return _launch(cmd, log_path=log_path)
 
