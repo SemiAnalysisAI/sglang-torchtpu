@@ -71,22 +71,22 @@ normal_rounds=$(( (TARGET_CONTEXT + _normal_growth / 2) / _normal_growth ))
 (( long_rounds < 1 )) && long_rounds=1
 (( normal_rounds < 1 )) && normal_rounds=1
 
-# Normal sessions are replayed so the non-long slots stay busy for as long as
-# the long sessions run; see config.sh (NORMAL_REPLAYS). `replays` depends only on
-# the round counts, so it is the same for every concurrency.
-replays=$NORMAL_REPLAYS
-if [[ "$replays" == "auto" ]]; then
+# Extra fresh normal sessions keep the non-long slots busy for as long as the
+# long sessions run; see config.sh (SESSIONS_PER_SLOT). Depends only on the
+# round counts, so it is the same for every concurrency.
+sessions_per_slot=$SESSIONS_PER_SLOT
+if [[ "$sessions_per_slot" == "auto" ]]; then
     if (( NUM_LONG > 0 )); then
-        replays=$(( (long_rounds + normal_rounds - 1) / normal_rounds ))
-        (( replays > MAX_NORMAL_REPLAYS )) && replays=$MAX_NORMAL_REPLAYS
-        (( replays < 1 )) && replays=1
+        sessions_per_slot=$(( (long_rounds + normal_rounds - 1) / normal_rounds ))
+        (( sessions_per_slot > MAX_SESSIONS_PER_SLOT )) && sessions_per_slot=$MAX_SESSIONS_PER_SLOT
+        (( sessions_per_slot < 1 )) && sessions_per_slot=1
     else
-        replays=1
+        sessions_per_slot=1
     fi
 fi
 sessions_for() {   # sessions a leg of concurrency $1 sends
     local bs="$1" n
-    n=$(( NUM_LONG + (bs - NUM_LONG) * replays ))
+    n=$(( NUM_LONG + (bs - NUM_LONG) * sessions_per_slot ))
     (( n < bs )) && n=$bs
     echo "$n"
 }
@@ -209,7 +209,7 @@ bench_args=(
     echo "  base_url        = $BASE_URL"
     echo "  concurrency     = $BS"
     echo "  long sessions   = $NUM_LONG  (target ctx $LONG_TARGET_CONTEXT, ${long_rounds} rounds each)"
-    echo "  normal sessions = $(( num_sessions - NUM_LONG ))  (target ctx $TARGET_CONTEXT, ${normal_rounds} rounds each, ${replays} replay(s) per slot)"
+    echo "  normal sessions = $(( num_sessions - NUM_LONG ))  (target ctx $TARGET_CONTEXT, ${normal_rounds} rounds each, ${sessions_per_slot} session(s) per slot)"
     echo "  total sessions  = $num_sessions   total rounds = $(( NUM_LONG * long_rounds + (num_sessions - NUM_LONG) * normal_rounds ))"
     echo "  per round       = $TURN_INPUT_TOKENS in / $TURN_OUTPUT_TOKENS out"
     echo "  trace           = $TRACE (holds $trace_sessions sessions; first $num_sessions used)"
@@ -272,7 +272,8 @@ bench_argv_json=$("$PYTHON" -c 'import json,sys; print(json.dumps(sys.argv[1:]))
     --set num_long_sessions="$NUM_LONG" \
     --set num_sessions="$num_sessions" \
     --set trace_sessions="$trace_sessions" \
-    --set normal_replays="$replays" \
+    --set sessions_per_slot="$sessions_per_slot" \
+    --set normal_replays="$sessions_per_slot" \
     --set rounds_per_long_session="$long_rounds" \
     --set rounds_per_normal_session="$normal_rounds" \
     --set turn_input_tokens="$TURN_INPUT_TOKENS" \
