@@ -1531,12 +1531,10 @@ class Envs:
     # Serve pack-quantized int4 MoE checkpoints (Kimi-K2.x) as W4A8 instead of
     # W4A16. "fp8-requant": dequant the int4 groups at load and requantize to
     # channelwise fp8 (weights double to 8-bit, fused fp8 grouped-GEMM; measured
-    # 6.3x W4A16 decode, MMLU held). "a8-kernel" (EXPERIMENTAL, does not serve
-    # yet): weights stay 4-bit on the vendored kernel; numerics and load-time
-    # density verified, but the in-graph int32->int4 weight bitcast materializes
-    # per-layer copies under the fullgraph trace (XLA "HLO temporaries 160G"
-    # OOM). Needs packed-int32 rhs support in the vendored kernel or jax-side
-    # persistent int4 buffers in the bridge.
+    # 6.3x W4A16 decode, MMLU held). "a8-kernel": weights stay 4-bit on the
+    # vendored kernel's packed-int32 path (in-tile VMEM bitcast) -- 21.5 tok/s
+    # bs=1, 37 GB/core, full KV pool, 59 s load; the pool doubling beats
+    # fp8-requant under eval concurrency.
     SGLANG_TPU_USE_W4A8_MOE = EnvStr(None)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
