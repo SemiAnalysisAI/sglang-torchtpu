@@ -5,7 +5,7 @@ single-turn LONG_TARGET_CONTEXT-input requests (~120k gpt-oss / 64k qwen) mixed 
 rate is recorded but not gated (a single-turn session cannot re-see a
 prefix).
 
-Sweep: concurrency {1,16,64} x long requests {0,1,4} (legs with more long
+Sweep: concurrency {1,16,32} x long requests {1,2,4} (legs with more long
 requests than slots are skipped). One server serves every leg; the client's
 concurrency semaphore is what varies. Rank 0 of the 2-host slice serves single-host; the second host idles
 (2x2x2 is the registered suite's smallest slice).

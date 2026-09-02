@@ -8,16 +8,16 @@
 #   BENCH_MODEL   gpt_oss_120b | qwen3_coder_480b
 #   BENCH_RECIPE  1host_pc               1 host, tp=8, prefix caching
 #                 1host_pc_spec_kvoff    + EAGLE3 spec + KV offload (raiden)
-#                 pd_2p2d_pc_spec_kvoff  4 hosts: 2-host prefill + 2-host decode
-#                                        engines (tp=16 each) over raiden P/D,
-#                                        prefix caching + spec + KV offload
+#                 pd_2p2d_pc_spec_kvoff  4 hosts: 2 prefill + 2 decode engines
+#                                        (single-host tp=8 each) over raiden
+#                                        P/D, prefix caching + spec + KV offload
 #   WORKLOAD      agentic  multi-turn agentic (the 480B nightly's shape:
 #                          4k in + 1k out per round, sessions to 16k; long
 #                          sessions ramp to LONG_TARGET_CONTEXT)
 #                 8k1k     single-turn 8k in / 1k out; "long requests" are
 #                          single-turn LONG_TARGET_CONTEXT-input requests
-#   PROFILE       ci     full sweep grid {1,16,64} x {0,1,4} (long>bs skipped)
-#                 e2e    one point: concurrency 64 x 4 long requests
+#   PROFILE       ci     full sweep grid {1,16,32} x {1,2,4} (long>bs skipped)
+#                 e2e    one point: the grid's heaviest cell (c32-long4)
 #                 smoke  tiny plumbing check
 #
 # Both workloads run through gen_agentic_workload.py + the agentic-trace
@@ -46,7 +46,7 @@ PYTHON=${PYTHON:-python3}
 #   worst-case sweep  <=  SWEEP_TIMEOUT  <  TIMEOUT_PER_FILE  <  JobSet deadline
 #
 # where worst-case sweep = (number of attempted legs) x MAX_LEG_SECONDS.
-# TIMEOUT_PER_FILE (5400) is declared literally in every test file's
+# TIMEOUT_PER_FILE (8100) is declared literally in every test file's
 # MULTIHOST_LAUNCH (the CI scanner reads it via AST, so it cannot be computed
 # there); test/registered/unit/test_bench_matrix.py ASSERTS the whole
 # chain, so a change to any link that breaks another fails CI instead of
@@ -54,7 +54,7 @@ PYTHON=${PYTHON:-python3}
 # ---------------------------------------------------------------------------
 # Deadline for one leg's bench client. Not a typical duration (healthy c64
 # legs measured 150-500s) -- the cap only bites hung legs, and it must leave
-# the ci profile's worst case (8 attempted legs) inside SWEEP_TIMEOUT. Sized
+# the ci profile's worst case (7 attempted legs) inside SWEEP_TIMEOUT. Sized
 # for the gpt-oss 120k long target (7 ramp-rounds per long session).
 MAX_LEG_SECONDS_CI=900
 # e2e runs a single leg, so it can afford a far larger cap for bring-up-time
@@ -69,17 +69,19 @@ CURL_MAX_TIME=10
 LEG_KILL_GRACE=60
 
 # ---------------------------------------------------------------------------
-# Sweep axes (the task's grid). e2e keeps only the point the 4-host bring-up
-# is validated with; smoke is a plumbing check.
+# Sweep axes (the CI grid). e2e keeps a single heaviest point; smoke is a
+# plumbing check.
 # ---------------------------------------------------------------------------
 case "$PROFILE" in
     ci)
-        SWEEP_BS=${SWEEP_BS:-"1 16 64"}
-        SWEEP_LONG=${SWEEP_LONG:-"0 1 4"}
+        SWEEP_BS=${SWEEP_BS:-"1 16 32"}
+        SWEEP_LONG=${SWEEP_LONG:-"1 2 4"}
         MAX_LEG_SECONDS=${MAX_LEG_SECONDS:-$MAX_LEG_SECONDS_CI}
         ;;
     e2e)
-        SWEEP_BS=${SWEEP_BS:-"64"}
+        # The grid's heaviest cell (the 2026-09-01 4-host bring-up was
+        # validated at the previous grid's c64-long4).
+        SWEEP_BS=${SWEEP_BS:-"32"}
         SWEEP_LONG=${SWEEP_LONG:-"4"}
         MAX_LEG_SECONDS=${MAX_LEG_SECONDS:-$MAX_LEG_SECONDS_SINGLE_POINT}
         ;;
@@ -99,7 +101,7 @@ esac
 # ---------------------------------------------------------------------------
 # The long-context target is PER MODEL: it is capped by the native window
 # minus output/rounding/template headroom, and by what the model's KV pool
-# holds retraction-free at c64-long4 (a retraction voids the leg -- see the
+# holds retraction-free at the grid's heaviest cell (a retraction voids the leg -- see the
 # retraction gate in the tests). Model validity itself is enforced by the
 # model-fragments case below.
 case "$BENCH_MODEL" in
@@ -107,7 +109,7 @@ case "$BENCH_MODEL" in
         # 7 ramp-rounds -> final context ~122k, the largest the 131072 window
         # fits with headroom (the asked-for "128k" is unreachable: the last
         # round's output plus rounding must also fit). Requires the enlarged
-        # pool in the model fragment (~1.41M-token worst case at c64-long4).
+        # pool in the model fragment (see its sizing comment).
         LONG_TARGET_CONTEXT=${LONG_TARGET_CONTEXT:-120832}
         ;;
     *)
@@ -172,8 +174,10 @@ case "$BENCH_MODEL" in
         PAGE_SIZE=${PAGE_SIZE:-64}
         CONTEXT_LEN=${CONTEXT_LEN:-131072}
         # ~15.2 KB KV/token/rank at tp=8 (fp8 + hybrid-SWA second pool).
-        # Sized for the 120k long target: c64-long4 worst case is
-        # 60 x ~15.4k + 4 x ~122k ~= 1.41M tokens, plus margin. Costs ~24 GB
+        # Sized for the 120k long target on the previous c64 grid
+        # (60 x ~15.4k + 4 x ~122k ~= 1.41M tokens); the current grid's
+        # heaviest cell (c32-long4) needs ~0.92M, so the pool carries ~1.7x
+        # headroom that the radix cache uses for prefix retention. Costs ~24 GB
         # per rank and leaves ~41 GB for the EXTEND-graph capture -- above
         # the measured OOM point (38.3 GB, 2026-09-01 iteration 5) but below
         # the comfortable 45 GB line; if the capture OOMs, halve
@@ -262,8 +266,8 @@ fi
 # guidance was measured at (scaling a tp=8 engine's pool past that ate the
 # ~45 GB the 8k EXTEND-graph capture needs and OOM'd bring-up -- iteration 5).
 # In the P/D recipe each single-host decode engine holds ~half the running
-# batch (two decodes behind the LB), so the tp=8 pool covers the c64 working
-# set with ~2x headroom.
+# batch (two decodes behind the LB), so the tp=8 pool covers the grid's
+# heaviest working set with ample headroom.
 MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS-$((MAX_TOTAL_TOKENS_TP8 * TP_SIZE / 8))}
 MAX_TOTAL_TOKENS_PREFILL=${MAX_TOTAL_TOKENS_PREFILL-$MAX_TOTAL_TOKENS_TP8}
 

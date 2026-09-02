@@ -4,7 +4,7 @@ Workload: multi-turn agentic (4k in + 1k out per round to 16k context; long
 sessions ramp to the model's LONG_TARGET_CONTEXT (~120k gpt-oss / 64k qwen)) -- the 480B nightly's workload shape. Prefix-cache
 hit rate is gated against what the round count makes reachable.
 
-Sweep: concurrency {1,16,64} x long requests {0,1,4} (legs with more long
+Sweep: concurrency {1,16,32} x long requests {1,2,4} (legs with more long
 requests than slots are skipped). One server serves every leg; the client's
 concurrency semaphore is what varies. Rank 0 of the 2-host slice serves single-host; the second host idles
 (2x2x2 is the registered suite's smallest slice).

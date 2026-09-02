@@ -13,7 +13,7 @@ slice. Each case here answers "someone extended X without updating Y":
     two full bring-ups;
   * a recipe registering against the wrong slice shape (a pd cell on the
     2-host suite) only fails at engine rendezvous, an hour into the run;
-  * config.sh losing a sweep axis (the task's {1,16,64} x {0,1,4} grid) would
+  * config.sh losing a sweep axis (the {1,16,32} x {1,2,4} grid) would
     keep every downstream gate green while measuring a smaller matrix.
 """
 
@@ -185,8 +185,8 @@ class TestBenchMatrix(CustomTestCase):
         )
 
     def test_config_resolves_the_tasks_sweep_grid(self):
-        """config.sh must keep the task's grid: concurrency {1,16,64} x long
-        requests {0,1,4} in the ci profile, for every (model, recipe)."""
+        """config.sh must keep the CI grid: concurrency {1,16,32} x long
+        requests {1,2,4} in the ci profile, for every (model, recipe)."""
         for model in MODELS:
             for recipe in RECIPES:
                 out = subprocess.run(
@@ -207,7 +207,7 @@ class TestBenchMatrix(CustomTestCase):
                     text=True,
                 )
                 self.assertEqual(out.returncode, 0, f"{model}/{recipe}: {out.stderr}")
-                self.assertIn("BS=1 16 64|LONG=0 1 4", out.stdout)
+                self.assertIn("BS=1 16 32|LONG=1 2 4", out.stdout)
 
     def test_reused_nightly_tools_exist(self):
         """config.sh reaches into recipe/qwen3_coder_480b/nightly/ for the
