@@ -1619,6 +1619,11 @@ class Envs:
     # structural, so the VL wrappers undo the slice in _restore_full_rope_cache
     # (the config cannot tell -- the text checkpoint carries mrope_section too).
     SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE = EnvBool(False)
+    # INT4 MoE execution mode. "fp8-requant" converts weights to channelwise
+    # FP8 at load time (doubling weight bytes). "a8-kernel" keeps packed INT4
+    # weights and dequantizes groups in VMEM before BF16 matmul in gmm_v2;
+    # despite its historical name, this mode does not quantize activations.
+    SGLANG_TPU_USE_W4A8_MOE = EnvStr(None)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)

@@ -256,6 +256,7 @@ class InputConfigs:
     # dtype of the per-block scale tensor (fp32/bf16/fp8); drives the scale's
     # share of the cost-model byte estimate. None when the rhs is unscaled.
     scale_dtype: jnp.dtype | None = None
+    dequantize_in_vmem: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -463,6 +464,41 @@ def inner_kernel(
         # axis. This expands the K dimension back to tile_k.
         tiled_rhs = tiled_rhs_ref.get_weight(cfgs.rhs_cfgs.quant_dtype)
 
+        if cfgs.rhs_cfgs.dequantize_in_vmem:
+            # Apply short-group scales before a larger BF16 dot. A zero-stride
+            # VMEM load broadcasts each scale over its K group without an
+            # intermediate broadcast of the entire unpacked weight tile.
+            group_k = cfgs.rhs_cfgs.quant_block_size
+
+            def load_group_scales(ref):
+                # Mosaic only supports strided loads for 32-bit elements.
+                # The production INT4 loader stores scales in float32; retain
+                # support for callers supplying checkpoint BF16 scales.
+                if ref.dtype == jnp.float32:
+                    return ref[:, pl.ds(0, group_k, 0), :]
+                return jnp.broadcast_to(
+                    ref[...], (ref.shape[0], group_k, ref.shape[-1])
+                )
+
+            if isinstance(tiled_rhs_ref, FusedWeightsRef):
+                scales = jnp.concatenate(
+                    [
+                        load_group_scales(tiled_rhs_ref.gate.scale),
+                        load_group_scales(tiled_rhs_ref.up.scale),
+                    ],
+                    axis=-1,
+                )
+            else:
+                scales = load_group_scales(tiled_rhs_ref.scale)
+            rhs_shape = tiled_rhs.shape
+            tiled_rhs = (
+                tiled_rhs.astype(tiled_lhs.dtype).reshape(
+                    num_quant_blocks_per_tile_k, group_k, rhs_shape[-1]
+                )
+                * scales.astype(tiled_lhs.dtype)
+            ).reshape(rhs_shape)
+            num_quant_blocks_per_tile_k = 1
+
         valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
         if is_last_k_step and valid_k != 0:
             mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
@@ -475,7 +511,11 @@ def inner_kernel(
                 tiled_rhs = tiled_rhs.astype(tiled_lhs.dtype)
             acc_list = []
             mxu_size = pltpu.get_tpu_info().mxu_column_size
-            rhs_qbs = cfgs.rhs_cfgs.quant_block_size
+            rhs_qbs = (
+                cfgs.tiles.tile_k
+                if cfgs.rhs_cfgs.dequantize_in_vmem
+                else cfgs.rhs_cfgs.quant_block_size
+            )
             rhs_cols = tiled_rhs.shape[1]
             for start_n in range(0, rhs_cols, mxu_size):
                 end_n = min(rhs_cols, start_n + mxu_size)
@@ -490,7 +530,7 @@ def inner_kernel(
                         tiled_rhs[k_start:k_end, start_n:end_n],
                         preferred_element_type=jnp.float32,
                     )
-                    if cfgs.rhs_cfgs.has_scale:
+                    if cfgs.rhs_cfgs.has_scale and not cfgs.rhs_cfgs.dequantize_in_vmem:
                         tiled_rhs_scale = tiled_rhs_ref.get_scale(
                             b_id, cfgs.rhs_cfgs.scale_block_n
                         )
@@ -982,6 +1022,9 @@ def calculate_tiling(
     rhs_dtype = rhs_cfgs.dtype
     lhs_bits = jax.dtypes.itemsize_bits(lhs_dtype)
     rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
+    if rhs_cfgs.dequantize_in_vmem:
+        # Reserve room for the unpacked compute tile as well as packed DMA.
+        rhs_bits = max(rhs_bits, jax.dtypes.itemsize_bits(lhs_cfgs.dtype))
     base_rhs_bytes_multiplier = 2 if fuse_act else 1
 
     # When using bf16 for lhs and rhs, 128 is the largest tile_m value that is
@@ -1217,6 +1260,7 @@ def make_gmm_configs(
     fuse_act: str | None = None,
     packed_fp4: bool = False,
     rhs_quant_dtype: jnp.dtype | None = None,
+    dequantize_rhs: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
@@ -1277,7 +1321,15 @@ def make_gmm_configs(
         scale_size_n=scale_size_n,
         scale_block_n=scale_block_n,
         scale_dtype=rhs_scale.dtype if has_scale else None,
+        dequantize_in_vmem=dequantize_rhs,
     )
+
+    if dequantize_rhs:
+        if rhs_quant_dtype != jnp.int4.dtype or not has_scale or scale_block_n != 1:
+            raise ValueError(
+                "VMEM dequantization requires per-channel group-scaled INT4 weights"
+            )
+        maybe_quantize_lhs = False
 
     lhs_quant_block_size = 512
     if packed_fp4 and block_size != lhs_quant_block_size:
@@ -1368,6 +1420,11 @@ def make_gmm_configs(
         if compact_tile_n != tiles.tile_n:
             tiles = dataclasses.replace(tiles, tile_n=compact_tile_n)
 
+    if dequantize_rhs and tiles.tile_k % block_size != 0:
+        raise ValueError(
+            "VMEM dequantization requires tile_k to be a multiple of the INT4 group size"
+        )
+
     return GmmConfigs(
         dims=dims,
         tiles=tiles,
@@ -1412,6 +1469,7 @@ def get_metadata(cfgs: GmmConfigs):
         "fuse_act",
         "packed_fp4",
         "rhs_quant_dtype",
+        "dequantize_rhs",
     ]
 )
 def gmm_v2(
@@ -1432,6 +1490,7 @@ def gmm_v2(
     fuse_act: str | None = None,
     packed_fp4: bool = False,
     rhs_quant_dtype: jnp.dtype | None = None,  # set when rhs is pre-packed
+    dequantize_rhs: bool = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1452,6 +1511,8 @@ def gmm_v2(
         preferred_element_type: Optional jnp.dtype for the output matrix.
         acc_dtype: Optional jnp.dtype for the accumulator.
         maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
+        dequantize_rhs: Dequantize INT4 groups in VMEM before BF16 matmul;
+            keeps activations unquantized and avoids short-K group products.
         zero_initialize: Whether to initialize unvisited output elements to zero.
         fuse_act: Activation function to fuse with GMM, None if no fusion.
 
@@ -1486,6 +1547,7 @@ def gmm_v2(
         fuse_act=fuse_act,
         packed_fp4=packed_fp4,
         rhs_quant_dtype=rhs_quant_dtype,
+        dequantize_rhs=dequantize_rhs,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles

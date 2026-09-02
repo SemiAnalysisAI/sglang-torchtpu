@@ -407,9 +407,15 @@ def _fused_moe_jax(
 
     rhs_quant_dtype = None
     maybe_quantize_lhs = True
+    dequantize_int4_in_vmem = False
     if w_quant_bits:
         assert w_quant_bits == 4, f"unsupported w_quant_bits={w_quant_bits}"
-        # W4A16: checkpoint-packed int4 rhs (8 per int32), bf16 activations.
+        # Both INT4 modes use the existing GMM and keep packed HBM weights.
+        # a8-kernel dequantizes groups in VMEM before a larger BF16 dot;
+        # the default applies each scale after its short-K group product.
+        from sglang.srt.environ import envs
+
+        dequantize_int4_in_vmem = envs.SGLANG_TPU_USE_W4A8_MOE.get() == "a8-kernel"
         rhs_quant_dtype = jnp.int4
         maybe_quantize_lhs = False
 
@@ -568,6 +574,7 @@ def _fused_moe_jax(
         packed_fp4=w1_packed,
         maybe_quantize_lhs=maybe_quantize_lhs,
         rhs_quant_dtype=rhs_quant_dtype,
+        dequantize_rhs=dequantize_int4_in_vmem,
     )
     if unfused_gmm1:
         gmm1_out = apply_act_fn(
@@ -602,6 +609,7 @@ def _fused_moe_jax(
         packed_fp4=w2_packed,
         maybe_quantize_lhs=maybe_quantize_lhs,
         rhs_quant_dtype=rhs_quant_dtype,
+        dequantize_rhs=dequantize_int4_in_vmem,
     )[
         :,
         :hidden_size,
