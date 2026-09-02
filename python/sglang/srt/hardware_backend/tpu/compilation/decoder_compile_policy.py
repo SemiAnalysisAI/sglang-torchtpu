@@ -1217,11 +1217,21 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         outer = getattr(self.model_runner, "model", None)
         is_multimodal = hasattr(outer, "get_image_feature")
         if is_multimodal and is_dp_attention_enabled():
-            raise NotImplementedError(
-                "Qwen3-VL TPU decoder compilation does not support DP attention; "
-                "disable --enable-torch-compile for this configuration."
-            )
+            # --no-enable-multimodal rejects image inputs upstream, so only the
+            # text calling convention (which the plain policy's DP support
+            # covers) can reach the decoder; the VL input_embeds path stays
+            # unreachable and unwarmed (see _uses_input_embeds).
+            if not self._mm_serving_disabled():
+                raise NotImplementedError(
+                    "Qwen3-VL TPU decoder compilation does not support DP "
+                    "attention with multimodal serving enabled; relaunch with "
+                    "--no-enable-multimodal for text-only DP serving, or "
+                    "disable --enable-torch-compile."
+                )
         return super().install()
+
+    def _mm_serving_disabled(self) -> bool:
+        return self.model_runner.server_args.enable_multimodal is False
 
     @property
     def _num_deepstack(self) -> int:
