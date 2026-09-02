@@ -355,6 +355,7 @@ class TestInstallExtendCap(CustomTestCase):
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 chunked_prefill_size=None,
+                max_prefill_buffer_tokens=lambda: 0,
                 max_prefill_tokens=2048,
                 torch_compile_max_bs=64,
                 prefill_max_requests=prefill_max_requests,
@@ -461,6 +462,7 @@ class TestInstallExtendCap(CustomTestCase):
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 chunked_prefill_size=None,
+                max_prefill_buffer_tokens=lambda: 0,
                 max_prefill_tokens=2048,
                 torch_compile_max_bs=64,
                 prefill_max_requests=16,
@@ -518,6 +520,7 @@ class TestInstallExtendCap(CustomTestCase):
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 chunked_prefill_size=None,
+                max_prefill_buffer_tokens=lambda: 0,
                 max_prefill_tokens=2048,
                 torch_compile_max_bs=64,
                 prefill_max_requests=16,
@@ -572,6 +575,7 @@ class TestInstallExtendCap(CustomTestCase):
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 chunked_prefill_size=None,
+                max_prefill_buffer_tokens=lambda: 0,
                 max_prefill_tokens=2048,
                 torch_compile_max_bs=64,
                 prefill_max_requests=16,

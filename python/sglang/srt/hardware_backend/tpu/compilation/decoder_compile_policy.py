@@ -424,22 +424,16 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
             compiled_logits.__signature__ = inspect.signature(logits_fn)
             self.owner.logits_processor.forward = compiled_logits
-        # EXTEND's token dimension is the aggregate number of tokens in the
-        # scheduled batch, so it can exceed any one request's context length.
-        # Bound it by the scheduler's aggregate prefill limits and use the
-        # context length only when neither aggregate limit is configured.
-        prefill_t_candidates = [
-            c
-            for c in (
-                server_args.chunked_prefill_size,
-                server_args.max_prefill_tokens,
+        # EXTEND's token dimension is aggregate across the scheduled batch,
+        # not bounded by any one request's context length.
+        max_t = server_args.max_prefill_buffer_tokens()
+        if max_t <= 0:
+            # Without chunking, one forward may contain a full context or the
+            # scheduler's aggregate prefill budget, whichever is larger.
+            max_t = max(
+                server_args.max_prefill_tokens or 0,
+                self.model_runner.model_config.context_len or 0,
             )
-            if c and c > 0
-        ]
-        if prefill_t_candidates:
-            max_t = min(prefill_t_candidates)
-        else:
-            max_t = self.model_runner.model_config.context_len
         if not max_t or max_t <= 0:
             raise ValueError(
                 "Cannot determine max_t for TPU compile bucketing: "
