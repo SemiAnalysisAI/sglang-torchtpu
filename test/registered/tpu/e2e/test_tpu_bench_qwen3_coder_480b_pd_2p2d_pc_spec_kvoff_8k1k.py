@@ -2,13 +2,11 @@
 decode engines (tp=8 each) over raiden behind a mini-LB, prefix caching +
 EAGLE3 spec + KV offload.
 
-Workload: single-turn 8k-input / 1k-output serving; 'long requests' are
-single-turn LONG_TARGET_CONTEXT-input requests (~120k gpt-oss / 64k qwen) mixed into the batch. Prefix-cache hit
-rate is recorded but not gated (a single-turn session cannot re-see a
-prefix).
+Workload: single-turn 8k-input / 1k-output serving; no long requests (the
+sweep's long axis is 0 for this workload). Prefix-cache hit rate is recorded
+but not gated (a single-turn session cannot re-see a prefix).
 
-Sweep: concurrency {1,16,32} x long requests {1,2,4} (legs with more long
-requests than slots are skipped). One server serves every leg; the client's
+Sweep: concurrency {1,16,32}. One server serves every leg; the client's
 concurrency semaphore is what varies. Pods 0-1 serve prefill, pods 2-3 decode, each a single-host engine
 (the raiden-validated P/D topology); pod 0 fronts all four with the mini-LB
 on :30000 (the benched endpoint).

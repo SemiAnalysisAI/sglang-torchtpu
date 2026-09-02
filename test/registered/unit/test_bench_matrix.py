@@ -13,8 +13,9 @@ slice. Each case here answers "someone extended X without updating Y":
     two full bring-ups;
   * a recipe registering against the wrong slice shape (a pd cell on the
     2-host suite) only fails at engine rendezvous, an hour into the run;
-  * config.sh losing a sweep axis (the {1,16,32} x {1,2,4} grid) would
-    keep every downstream gate green while measuring a smaller matrix.
+  * config.sh losing a sweep axis (concurrency {1,16,32}; long requests
+    {1,2,4} for agentic, none for 8k1k) would keep every downstream gate
+    green while measuring a smaller matrix.
 """
 
 import ast
@@ -184,30 +185,37 @@ class TestBenchMatrix(CustomTestCase):
             len(expected.get("external-nightly-2x2x4", ())),
         )
 
-    def test_config_resolves_the_tasks_sweep_grid(self):
-        """config.sh must keep the CI grid: concurrency {1,16,32} x long
-        requests {1,2,4} in the ci profile, for every (model, recipe)."""
+    def test_config_resolves_the_sweep_grid(self):
+        """config.sh must keep the CI grid: concurrency {1,16,32}, long
+        requests {1,2,4} for agentic and none for 8k1k, for every
+        (model, recipe)."""
+        expected_long = {"agentic": "1 2 4", "8k1k": "0"}
         for model in MODELS:
             for recipe in RECIPES:
-                out = subprocess.run(
-                    [
-                        "bash",
-                        "-c",
-                        'source ./config.sh && echo "BS=$SWEEP_BS|LONG=$SWEEP_LONG"',
-                    ],
-                    cwd=BENCH_MATRIX,
-                    env={
-                        **os.environ,
-                        "BENCH_MODEL": model,
-                        "BENCH_RECIPE": recipe,
-                        "WORKLOAD": "agentic",
-                        "PROFILE": "ci",
-                    },
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertEqual(out.returncode, 0, f"{model}/{recipe}: {out.stderr}")
-                self.assertIn("BS=1 16 32|LONG=1 2 4", out.stdout)
+                for workload in WORKLOADS:
+                    out = subprocess.run(
+                        [
+                            "bash",
+                            "-c",
+                            'source ./config.sh && echo "BS=$SWEEP_BS|LONG=$SWEEP_LONG"',
+                        ],
+                        cwd=BENCH_MATRIX,
+                        env={
+                            **os.environ,
+                            "BENCH_MODEL": model,
+                            "BENCH_RECIPE": recipe,
+                            "WORKLOAD": workload,
+                            "PROFILE": "ci",
+                        },
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(
+                        out.returncode, 0, f"{model}/{recipe}/{workload}: {out.stderr}"
+                    )
+                    self.assertIn(
+                        f"BS=1 16 32|LONG={expected_long[workload]}", out.stdout
+                    )
 
     def test_reused_nightly_tools_exist(self):
         """config.sh reaches into recipe/qwen3_coder_480b/nightly/ for the

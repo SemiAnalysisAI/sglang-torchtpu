@@ -12,12 +12,13 @@
 #                                        (single-host tp=8 each) over raiden
 #                                        P/D, prefix caching + spec + KV offload
 #   WORKLOAD      agentic  multi-turn agentic (the 480B nightly's shape:
-#                          4k in + 1k out per round, sessions to 16k; long
-#                          sessions ramp to LONG_TARGET_CONTEXT)
-#                 8k1k     single-turn 8k in / 1k out; "long requests" are
-#                          single-turn LONG_TARGET_CONTEXT-input requests
-#   PROFILE       ci     full sweep grid {1,16,32} x {1,2,4} (long>bs skipped)
-#                 e2e    one point: the grid's heaviest cell (c32-long4)
+#                          4k in + 1k out per round, 2 rounds = 8k of input;
+#                          long sessions ramp to LONG_TARGET_CONTEXT)
+#                 8k1k     single-turn 8k in / 1k out; NO long requests
+#                          (the long axis collapses to 0)
+#   PROFILE       ci     grid {1,16,32} x {1,2,4} (long>bs skipped; the
+#                        long axis is {0} for 8k1k)
+#                 e2e    one point: the heaviest cell (c32-long4 / c32-long0)
 #                 smoke  tiny plumbing check
 #
 # Both workloads run through gen_agentic_workload.py + the agentic-trace
@@ -55,7 +56,7 @@ PYTHON=${PYTHON:-python3}
 # Deadline for one leg's bench client. Not a typical duration (healthy c64
 # legs measured 150-500s) -- the cap only bites hung legs, and it must leave
 # the ci profile's worst case (7 attempted legs) inside SWEEP_TIMEOUT. Sized
-# for the gpt-oss 120k long target (7 ramp-rounds per long session).
+# for 7-ramp-round long sessions (gpt-oss to ~122k, qwen to ~260k).
 MAX_LEG_SECONDS_CI=900
 # e2e runs a single leg, so it can afford a far larger cap for bring-up-time
 # experiments on that one point.
@@ -72,6 +73,9 @@ LEG_KILL_GRACE=60
 # Sweep axes (the CI grid). e2e keeps a single heaviest point; smoke is a
 # plumbing check.
 # ---------------------------------------------------------------------------
+# An explicit SWEEP_LONG from the caller must survive the 8k1k long-axis
+# collapse below, so remember it before the profile defaults consume it.
+SWEEP_LONG_FROM_ENV=${SWEEP_LONG:-}
 case "$PROFILE" in
     ci)
         SWEEP_BS=${SWEEP_BS:-"1 16 32"}
@@ -107,26 +111,34 @@ esac
 case "$BENCH_MODEL" in
     gpt_oss_120b)
         # 7 ramp-rounds -> final context ~122k, the largest the 131072 window
-        # fits with headroom (the asked-for "128k" is unreachable: the last
+        # fits with headroom (a "128k" target is unreachable: the last
         # round's output plus rounding must also fit). Requires the enlarged
         # pool in the model fragment (see its sizing comment).
         LONG_TARGET_CONTEXT=${LONG_TARGET_CONTEXT:-120832}
+        LONG_RAMP_DEFAULT=16384
         ;;
     *)
-        # qwen3_coder_480b stays at 64k: its tp8 pool already sits at the
-        # mem-fraction budget's edge (~21 GB), so a 120k target first needs a
-        # pool + mem-fraction re-measurement on cells not yet E2E-run.
-        LONG_TARGET_CONTEXT=${LONG_TARGET_CONTEXT:-65536}
+        # qwen3_coder_480b: 256k-total long context (the native 262144
+        # window). Ramped at ~36k/round so the generator lands on 7 rounds
+        # like gpt-oss, final ~260k with ~2k window margin -- at the old
+        # 16k/round it would take 15 rounds and the extra sequential decode
+        # (15 x 1k tokens) blows the 900s leg cap. Needs the enlarged pool
+        # in the model fragment; NOT yet E2E-validated at this length.
+        LONG_TARGET_CONTEXT=${LONG_TARGET_CONTEXT:-262144}
+        LONG_RAMP_DEFAULT=36096
         ;;
 esac
 case "$WORKLOAD" in
     agentic)
         TURN_INPUT_TOKENS=${TURN_INPUT_TOKENS:-4096}
         TURN_OUTPUT_TOKENS=${TURN_OUTPUT_TOKENS:-1024}
-        TARGET_CONTEXT=${TARGET_CONTEXT:-16384}          # 3 rounds
-        # ci ramps long sessions at 16k/round (~4 rounds to 64k) to bound wall
-        # clock, same trade the 480B nightly's ci profile makes.
-        LONG_RAMP_TOKENS=${LONG_RAMP_TOKENS:-16384}
+        # Regular sessions total 8k of input: 2 rounds of 4k (final context
+        # ~10.3k with the 1k outputs).
+        TARGET_CONTEXT=${TARGET_CONTEXT:-8192}
+        # Long sessions ramp at a per-model rate chosen so they stay at
+        # ~7 rounds (see LONG_RAMP_DEFAULT above; wall clock scales with
+        # rounds x sequential decode, not with the ramp size).
+        LONG_RAMP_TOKENS=${LONG_RAMP_TOKENS:-$LONG_RAMP_DEFAULT}
         ;;
     8k1k)
         TURN_INPUT_TOKENS=${TURN_INPUT_TOKENS:-8192}
@@ -134,8 +146,10 @@ case "$WORKLOAD" in
         # target == per-round input -> every session is exactly one round, so
         # the leg is a plain 8k-in/1k-out serving benchmark.
         TARGET_CONTEXT=${TARGET_CONTEXT:-8192}
-        # long requests are likewise SINGLE-turn: one request with the whole
-        # long context as input.
+        # This workload has NO long requests: collapse the sweep's long axis
+        # (an explicit SWEEP_LONG env still wins). LONG_* stay defined for
+        # the generator's interface but no long session is produced.
+        SWEEP_LONG=${SWEEP_LONG_FROM_ENV:-0}
         LONG_RAMP_TOKENS=${LONG_RAMP_TOKENS:-$LONG_TARGET_CONTEXT}
         ;;
     *)
@@ -174,10 +188,11 @@ case "$BENCH_MODEL" in
         PAGE_SIZE=${PAGE_SIZE:-64}
         CONTEXT_LEN=${CONTEXT_LEN:-131072}
         # ~15.2 KB KV/token/rank at tp=8 (fp8 + hybrid-SWA second pool).
-        # Sized for the 120k long target on the previous c64 grid
-        # (60 x ~15.4k + 4 x ~122k ~= 1.41M tokens); the current grid's
-        # heaviest cell (c32-long4) needs ~0.92M, so the pool carries ~1.7x
-        # headroom that the radix cache uses for prefix retention. Costs ~24 GB
+        # Sized for the 120k long target on the original c64/16k-context
+        # grid (60 x ~15.4k + 4 x ~122k ~= 1.41M tokens); the current grid's
+        # heaviest cell (c32-long4, 2-round ~10.3k normals) needs ~0.78M, so
+        # the pool carries ~2x headroom that the radix cache uses for prefix
+        # retention. Costs ~24 GB
         # per rank and leaves ~41 GB for the EXTEND-graph capture -- above
         # the measured OOM point (38.3 GB, 2026-09-01 iteration 5) but below
         # the comfortable 45 GB line; if the capture OOMs, halve
@@ -200,11 +215,18 @@ case "$BENCH_MODEL" in
         # (/cache/share/tpu-batched-decode-corruption-fix.md).
         ATTENTION_BACKEND=pallas_tpu_rpa_v3
         PAGE_SIZE=${PAGE_SIZE:-128}
-        # Native window is 262144; 131072 needs no YaRN and matches GPT-OSS.
-        CONTEXT_LEN=${CONTEXT_LEN:-131072}
+        # The full native window (no YaRN at 262144); the agentic long
+        # sessions ramp to ~260k of it.
+        CONTEXT_LEN=${CONTEXT_LEN:-262144}
         # ~15.9 KB KV/token/rank at tp=8 (62 layers x 1 kv head x 128 x K+V).
+        # Sized for the 256k long target: c32-long4 worst case is
+        # 28 x ~10.3k + 4 x ~260k ~= 1.33M tokens -> 1.5M pool, ~25 GB/rank
+        # (the 64k-era pool was 1.18M/~19 GB). WARNING: bring-up at this size
+        # is not yet E2E-validated; if it OOMs, first halve
+        # CHUNKED_PREFILL_SIZE (the gpt-oss precedent), then revisit
+        # MEM_FRACTION_STATIC.
         # Scaled by TP below (per-rank bytes stay constant).
-        MAX_TOTAL_TOKENS_TP8=1179648
+        MAX_TOTAL_TOKENS_TP8=1572864
         MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.8}
         MODEL_EXTRA_ARGS="--tpu-fp8-runtime channelwise"
         ;;
@@ -337,16 +359,23 @@ done
 # same nearest-round arithmetic as bench_leg.sh / gen_agentic_workload.py --
 # plus a small per-round chat-template overhead. Assert on that rather than a
 # fixed half-round headroom, which over-blocks single-shot (1-round) longs.
-_long_growth=$(( LONG_RAMP_TOKENS + TURN_OUTPUT_TOKENS ))
-_long_rounds=$(( (LONG_TARGET_CONTEXT + _long_growth / 2) / _long_growth ))
-(( _long_rounds < 1 )) && _long_rounds=1
-_TEMPLATE_OVERHEAD_PER_ROUND=32   # measured ~10 tok/round on the 480B shape; padded
-_long_final=$(( _long_rounds * (_long_growth + _TEMPLATE_OVERHEAD_PER_ROUND) ))
-if (( _long_final > CONTEXT_LEN )); then
-    echo "ERROR: a long session reaches ~$_long_final tokens" \
-         "($_long_rounds rounds x ($_long_growth+$_TEMPLATE_OVERHEAD_PER_ROUND))" \
-         "> CONTEXT_LEN=$CONTEXT_LEN; lower LONG_TARGET_CONTEXT or LONG_RAMP_TOKENS" >&2
-    exit 2
+# Only meaningful when the sweep can actually produce a long session (the
+# 8k1k workload collapses the long axis to 0, and its single-turn long shape
+# deliberately does not fit some models' windows).
+_max_long=0
+for _l in $SWEEP_LONG; do (( _l > _max_long )) && _max_long=$_l; done
+if (( _max_long > 0 )); then
+    _long_growth=$(( LONG_RAMP_TOKENS + TURN_OUTPUT_TOKENS ))
+    _long_rounds=$(( (LONG_TARGET_CONTEXT + _long_growth / 2) / _long_growth ))
+    (( _long_rounds < 1 )) && _long_rounds=1
+    _TEMPLATE_OVERHEAD_PER_ROUND=32   # measured ~10 tok/round on the 480B shape; padded
+    _long_final=$(( _long_rounds * (_long_growth + _TEMPLATE_OVERHEAD_PER_ROUND) ))
+    if (( _long_final > CONTEXT_LEN )); then
+        echo "ERROR: a long session reaches ~$_long_final tokens" \
+             "($_long_rounds rounds x ($_long_growth+$_TEMPLATE_OVERHEAD_PER_ROUND))" \
+             "> CONTEXT_LEN=$CONTEXT_LEN; lower LONG_TARGET_CONTEXT or LONG_RAMP_TOKENS" >&2
+        exit 2
+    fi
 fi
 
 MODEL_SLUG=$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_' | sed 's/__*/_/g; s/^_//; s/_$//')
