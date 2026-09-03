@@ -1273,6 +1273,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
+        if tensor.shape[0] >= size:
+            return tensor[:size]
         if value == 0:
             return torch.cat(
                 [tensor, tensor.new_zeros(size - tensor.shape[0], *tensor.shape[1:])],
@@ -1562,15 +1564,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         if self.mrope_positions is not None:
-            self.mrope_positions = torch.cat(
-                [
-                    self.mrope_positions,
-                    self.mrope_positions.new_zeros(
-                        3, num_tokens - self.mrope_positions.shape[1]
-                    ),
-                ],
-                dim=1,
-            )
+            if self.mrope_positions.shape[1] >= num_tokens:
+                self.mrope_positions = self.mrope_positions[:, :num_tokens]
+            else:
+                self.mrope_positions = torch.cat(
+                    [
+                        self.mrope_positions,
+                        self.mrope_positions.new_zeros(
+                            3, num_tokens - self.mrope_positions.shape[1]
+                        ),
+                    ],
+                    dim=1,
+                )
 
         # TODO: check if we need to pad other tensors
         if self.extend_seq_lens is not None:
