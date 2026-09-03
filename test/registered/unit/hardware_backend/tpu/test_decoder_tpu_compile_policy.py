@@ -37,6 +37,10 @@ from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagl
     SpecDecoderTpuCompilePolicy,
 )
 from sglang.srt.hardware_backend.tpu.sampler import select_logits_output_mode
+from sglang.srt.hardware_backend.tpu.top_k import (
+    PallasDistributedTopKConfig,
+    TpuVocabShard,
+)
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
@@ -108,15 +112,36 @@ def _make_policy(model_runner=None, token_buckets=(64, 256), bs_buckets=(1, 4)):
 
 
 def _enable_distributed_top_k(model_runner):
+    shard_width = 202_048 // 16
+    shard = TpuVocabShard(
+        width=shard_width,
+        global_vocab_size=202_048,
+        org_vocab_size=202_048,
+        org_vocab_start=0,
+        org_vocab_count=shard_width,
+        org_vocab_padded_count=shard_width,
+        added_vocab_start=202_048,
+        added_vocab_count=0,
+    )
     model_runner.model.logits_processor = SimpleNamespace(
         use_tpu_distributed_top_k=True,
         do_tensor_parallel_all_gather=True,
         do_tensor_parallel_all_gather_dp_attn=False,
+        _tpu_distributed_top_k_initialized=True,
+        _tpu_distributed_top_k_config=PallasDistributedTopKConfig(
+            shard=shard,
+            world_size=16,
+            model_rank=0,
+            candidate_width=64,
+            output_dtype=torch.bfloat16,
+        ),
     )
     model_runner.model.lm_head = SimpleNamespace(
         enable_tp=True,
         num_embeddings=202_048,
-        num_embeddings_per_partition=202_048 // 16,
+        org_vocab_size=202_048,
+        tp_size=16,
+        num_embeddings_per_partition=shard_width,
         shard_indices=object(),
     )
     return model_runner

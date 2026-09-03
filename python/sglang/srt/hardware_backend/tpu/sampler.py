@@ -4,6 +4,7 @@ Unsupported sampling features retain the full-vocabulary PyTorch path."""
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import torch
@@ -17,7 +18,9 @@ from sglang.srt.layers.sampler import (
 from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
-MAX_DISTRIBUTED_TOP_K = 64
+logger = logging.getLogger(__name__)
+
+_MAX_LOCAL_TOP_K = 64
 _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = max(
     1, envs.SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE.get()
 )
@@ -39,24 +42,16 @@ def distributed_top_k_candidate_width(logits_processor, lm_head) -> Optional[int
     ):
         return None
 
-    from sglang.srt.hardware_backend.tpu.top_k import (
-        supports_distributed_tpu_top_k,
-    )
-
-    candidate_width = min(
-        MAX_DISTRIBUTED_TOP_K,
-        int(getattr(lm_head, "num_embeddings", 0)),
-        int(getattr(lm_head, "num_embeddings_per_partition", 0)),
-    )
-    if candidate_width <= 1 or not supports_distributed_tpu_top_k(
-        lm_head, candidate_width
-    ):
+    if not getattr(logits_processor, "_tpu_distributed_top_k_initialized", False):
         return None
-    return candidate_width
+    config = getattr(logits_processor, "_tpu_distributed_top_k_config", None)
+    if config is None:
+        return None
+    return config.candidate_width
 
 
-def distributed_top_k_candidate_width_for_model(model) -> Optional[int]:
-    """Return the fixed candidate width supported by a model's output head."""
+def _distributed_top_k_output_head(model):
+    """Resolve the output head consumed by the model's logits processor."""
 
     get_output_embeddings = getattr(model, "get_output_embeddings", None)
     output_head = get_output_embeddings() if callable(get_output_embeddings) else None
@@ -66,6 +61,119 @@ def distributed_top_k_candidate_width_for_model(model) -> Optional[int]:
         getattr(model, "config", None), "tie_word_embeddings", False
     ):
         output_head = getattr(getattr(model, "model", None), "embed_tokens", None)
+    return output_head
+
+
+def initialize_distributed_top_k_for_model(model):
+    """Negotiate and freeze the target model's distributed TopK contract.
+
+    This runs after post-load model transformations and before TPU graph setup.
+    Capability getters remain pure and never launch collectives while selecting
+    a request's compile-static logits contract.
+    """
+
+    logits_processor = getattr(model, "logits_processor", None)
+    lm_head = _distributed_top_k_output_head(model)
+    if logits_processor is None or lm_head is None:
+        return None
+    if not getattr(logits_processor, "use_tpu_distributed_top_k", False):
+        return None
+
+    from sglang.srt.distributed import (
+        get_attn_tp_group,
+        get_tp_group,
+        model_parallel_is_initialized,
+    )
+    from sglang.srt.hardware_backend.tpu.top_k import (
+        negotiate_pallas_distributed_top_k_config,
+        register_tpu_top_k_ops,
+    )
+
+    if not model_parallel_is_initialized():
+        raise RuntimeError(
+            "distributed TPU TopK initialization requires model parallelism"
+        )
+
+    group = (
+        get_attn_tp_group()
+        if getattr(logits_processor, "use_attn_tp_group", False)
+        else get_tp_group()
+    )
+    dtype_resolver = getattr(
+        logits_processor,
+        "get_tpu_distributed_top_k_output_dtype",
+        None,
+    )
+    expected_dtype = (
+        dtype_resolver(lm_head)
+        if callable(dtype_resolver)
+        else getattr(getattr(lm_head, "weight", None), "dtype", None)
+    )
+    group_signature = (
+        int(getattr(group, "world_size", 0)),
+        getattr(group, "rank_in_group", None),
+        tuple(getattr(group, "ranks", ())),
+    )
+    init_key = (id(lm_head), group_signature, expected_dtype)
+    if getattr(logits_processor, "_tpu_distributed_top_k_initialized", False):
+        if (
+            getattr(logits_processor, "_tpu_distributed_top_k_init_key", None)
+            != init_key
+        ):
+            raise RuntimeError(
+                "distributed TPU TopK cannot be reinitialized for a different "
+                "LM head, group, or dtype"
+            )
+        return getattr(logits_processor, "_tpu_distributed_top_k_config", None)
+
+    local_fallback_reason = None
+    if not getattr(logits_processor, "do_tensor_parallel_all_gather", False) or getattr(
+        logits_processor, "do_tensor_parallel_all_gather_dp_attn", False
+    ):
+        local_fallback_reason = (
+            "the logits processor does not use a supported TP gather"
+        )
+    negotiation = negotiate_pallas_distributed_top_k_config(
+        lm_head,
+        group=group,
+        expected_dtype=expected_dtype,
+        local_fallback_reason=local_fallback_reason,
+    )
+    config = negotiation.config
+    fallback_reason = negotiation.fallback_reason
+    if config is not None:
+        register_tpu_top_k_ops(config.world_size)
+
+    # Commit the terminal state only after a successful consensus and schema
+    # registration. A collective/export failure therefore remains a startup
+    # failure instead of becoming an unsafe rank-local fallback.
+    logits_processor._tpu_distributed_top_k_config = config
+    logits_processor._tpu_distributed_top_k_init_key = init_key
+    logits_processor._tpu_distributed_top_k_initialized = True
+
+    if getattr(group, "rank_in_group", None) == 0:
+        if config is None:
+            logger.info(
+                "Pallas distributed TopK disabled; using full-vocabulary logits: %s",
+                fallback_reason,
+            )
+        else:
+            logger.info(
+                "Pallas distributed TopK enabled: TP%d dtype=%s vocab=%d "
+                "local_width=%d candidates=%d",
+                config.world_size,
+                config.output_dtype,
+                config.shard.global_vocab_size,
+                config.shard.width,
+                config.candidate_width,
+            )
+    return config
+
+
+def distributed_top_k_candidate_width_for_model(model) -> Optional[int]:
+    """Return the fixed candidate width supported by a model's output head."""
+
+    output_head = _distributed_top_k_output_head(model)
     if output_head is None:
         return None
     return distributed_top_k_candidate_width(
@@ -147,7 +255,7 @@ def distributed_top_k_for_batch(
     top_k = info.uniform_top_k
     if (
         top_k is None
-        or not 1 < top_k <= MAX_DISTRIBUTED_TOP_K
+        or top_k <= 1
         or info.is_any_greedy
         or info.sampling_seed is not None
         or not info.need_top_k_sampling
@@ -270,7 +378,7 @@ class TpuSampler(Sampler):
         )
         if (
             top_k is not None
-            and 1 < top_k <= MAX_DISTRIBUTED_TOP_K
+            and 1 < top_k <= _MAX_LOCAL_TOP_K
             and sampling_info.sampling_seed is None
             and sampling_info.need_top_k_sampling
             and (not needs_top_p_or_min_p or _use_bsearch_filtering(probs))
