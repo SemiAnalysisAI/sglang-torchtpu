@@ -66,9 +66,10 @@ LAUNCH_ENV = {
     "CONCUR": "4",
     "CONTEXT_LEN": "4096",
     "MAX_TOTAL_TOKENS": "8192",
-    "TPU_COMPILE_TOKENS": "512 1024 2048",
+    "TPU_COMPILE_TOKENS": "64 128 256 512 1024 2048",
     "TPU_COMPILE_BS": "1 2 4",
     "ENABLE_PROFILER_ENDPOINT": "0",
+    "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
     "EXTRA_ARGS": (
         "--reasoning-parser gpt-oss "
         f"--served-model-name {SERVED_MODEL_NAME} "
