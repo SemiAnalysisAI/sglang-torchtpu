@@ -92,6 +92,7 @@ LAUNCH_ENV = {
     "TPU_COMPILE_BS": "1 2 4",
     "ENABLE_PROFILER_ENDPOINT": "0",
     "DP_SIZE": str(DP_SIZE),
+    "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
     "EXTRA_ARGS": (
         "--reasoning-parser gpt-oss "
         f"--served-model-name {SERVED_MODEL_NAME} "
