@@ -19,19 +19,17 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ._epilogue import (
+from ._contract import (
+    COLUMNS_PER_DESTINATION,
     HEAD_DIM,
+    HIDDEN_SIZE,
     KEY_COLUMNS,
     QUERY_COLUMNS,
-    VALUE_COLUMNS,
-    gathered_interleaved_rope,
-)
-from ._schedule import (
-    COLUMNS_PER_DESTINATION,
-    HIDDEN_SIZE,
     TP_SIZE,
-    HybridGatherAllToAllPlan,
+    VALUE_COLUMNS,
 )
+from ._epilogue import gathered_interleaved_rope
+from ._schedule import HybridGatherAllToAllPlan
 
 
 def _kernel_hybrid_gather_a2a(

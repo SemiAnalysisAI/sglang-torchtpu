@@ -21,13 +21,11 @@ from jax import lax
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from ._epilogue import HEAD_DIM, qkvog_epilogue, split_epilogued_qkvog
+from ._contract import COLUMNS_PER_DESTINATION, HEAD_DIM, HIDDEN_SIZE, TP_SIZE
+from ._epilogue import qkvog_epilogue, split_epilogued_qkvog
 from ._kernel_a2a import run_a2a
 from ._kernel_hybrid_gather_a2a import run_hybrid_gather_a2a
 from ._schedule import (
-    COLUMNS_PER_DESTINATION,
-    HIDDEN_SIZE,
-    TP_SIZE,
     AllToAllPlan,
     HybridGatherAllToAllPlan,
     SchedulePlan,

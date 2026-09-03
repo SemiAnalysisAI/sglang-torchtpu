@@ -13,9 +13,8 @@ from __future__ import annotations
 import itertools
 from dataclasses import dataclass
 
-TP_SIZE = 16
-HIDDEN_SIZE = 8192
-COLUMNS_PER_DESTINATION = 1152
+from ._contract import TP_SIZE
+
 MIN_TUNED_TOKENS = 1024
 MAX_TUNED_TOKENS = 16384
 

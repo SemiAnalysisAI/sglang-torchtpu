@@ -11,20 +11,72 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.kernels.sequence_parallel.qkvog._schedule import (
+from sglang.srt.hardware_backend.tpu.kernels.sequence_parallel.qkvog._contract import (
     COLUMNS_PER_DESTINATION,
+    HEAD_DIM,
     HIDDEN_SIZE,
+    KV_HEADS_PER_DESTINATION,
+    OUTPUT_GATE_HEADS_PER_DESTINATION,
+    QUERY_HEADS_PER_DESTINATION,
     TP_SIZE,
+    TPU_DEVICE_KIND,
+)
+from sglang.srt.hardware_backend.tpu.kernels.sequence_parallel.qkvog._schedule import (
     supports_token_count,
 )
 
 if TYPE_CHECKING:
     import jax
 
-_HEAD_DIM = 64
 _RANK_METADATA_WIDTH = TP_SIZE + 2
 _FUSED_QKVOG_OP: Callable | None = None
 _FUSED_QKVOG_LOCK = Lock()
+
+
+def tpu_sp_qkvog_config_unsupported_reason(
+    *,
+    tp_size: int,
+    world_size: int | None = None,
+    hidden_size: int,
+    head_dim: int,
+    query_heads_per_rank: int,
+    kv_heads_per_rank: int,
+    output_gate_heads_per_rank: int,
+) -> str | None:
+    """Return why model metadata cannot use this shape-specialized kernel."""
+    if world_size is not None and world_size != TP_SIZE:
+        return (
+            f"the tuned QKVOG kernel requires DP1/TP{TP_SIZE} "
+            f"(WORLD_SIZE={TP_SIZE}), got WORLD_SIZE={world_size}"
+        )
+    actual = (
+        tp_size,
+        hidden_size,
+        head_dim,
+        query_heads_per_rank,
+        kv_heads_per_rank,
+        output_gate_heads_per_rank,
+    )
+    required = (
+        TP_SIZE,
+        HIDDEN_SIZE,
+        HEAD_DIM,
+        QUERY_HEADS_PER_DESTINATION,
+        KV_HEADS_PER_DESTINATION,
+        OUTPUT_GATE_HEADS_PER_DESTINATION,
+    )
+    if actual == required:
+        return None
+    return (
+        "the tuned QKVOG kernel requires "
+        f"TP{TP_SIZE}, hidden size {HIDDEN_SIZE}, head size {HEAD_DIM}, "
+        f"{QUERY_HEADS_PER_DESTINATION} query heads, "
+        f"{KV_HEADS_PER_DESTINATION} KV heads, and "
+        f"{OUTPUT_GATE_HEADS_PER_DESTINATION} output-gate heads per rank; got "
+        f"TP{tp_size}, hidden size {hidden_size}, head size {head_dim}, "
+        f"{query_heads_per_rank} query heads, {kv_heads_per_rank} KV heads, and "
+        f"{output_gate_heads_per_rank} output-gate heads per rank"
+    )
 
 
 def validate_physical_to_logical(
@@ -115,16 +167,29 @@ def pack_local_qkvog_weights_by_physical_destination(
 def prepare_tpu_sp_qkvog_weight(
     local_weight: torch.Tensor,
     tp_group=None,
+    *,
+    hidden_size: int,
+    head_dim: int,
+    query_heads_per_rank: int,
+    kv_heads_per_rank: int,
+    output_gate_heads_per_rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather and pack one layer's QKVOG weight once, after checkpoint load."""
     if tp_group is None:
         from sglang.srt.runtime_context import get_parallel
 
         tp_group = get_parallel().attn_tp_group
-    if tp_group.world_size != TP_SIZE:
-        raise ValueError(
-            f"the tuned QKVOG kernel requires TP{TP_SIZE}, got TP{tp_group.world_size}"
-        )
+    config_reason = tpu_sp_qkvog_config_unsupported_reason(
+        tp_size=tp_group.world_size,
+        world_size=int(os.environ.get("WORLD_SIZE", tp_group.world_size)),
+        hidden_size=hidden_size,
+        head_dim=head_dim,
+        query_heads_per_rank=query_heads_per_rank,
+        kv_heads_per_rank=kv_heads_per_rank,
+        output_gate_heads_per_rank=output_gate_heads_per_rank,
+    )
+    if config_reason is not None:
+        raise ValueError(config_reason)
     expected_local = (COLUMNS_PER_DESTINATION, HIDDEN_SIZE)
     if tuple(local_weight.shape) != expected_local:
         raise ValueError(
@@ -164,16 +229,27 @@ def prepare_tpu_sp_qkvog_weight(
     return packed, metadata
 
 
-def supports_tpu_sp_qkvog_device() -> bool:
-    """Whether this process is running on the topology the schedules target."""
+def tpu_sp_qkvog_device_unsupported_reason() -> str | None:
+    """Return why the current TPU generation cannot use the tuned schedules."""
     try:
         from sglang.srt.hardware_backend.tpu.pallas_export import (
             get_pallas_tpu_device_kind,
         )
 
-        return get_pallas_tpu_device_kind() == "TPU7x"
-    except (ImportError, RuntimeError):
-        return False
+        device_kind = get_pallas_tpu_device_kind()
+    except (ImportError, RuntimeError) as error:
+        return f"could not identify the TPU device kind: {error}"
+    if device_kind != TPU_DEVICE_KIND:
+        return (
+            f"the tuned QKVOG schedules require {TPU_DEVICE_KIND}, "
+            f"got {device_kind}"
+        )
+    return None
+
+
+def supports_tpu_sp_qkvog_device() -> bool:
+    """Whether this process is running on the topology the schedules target."""
+    return tpu_sp_qkvog_device_unsupported_reason() is None
 
 
 @functools.cache
@@ -190,8 +266,9 @@ def _get_mesh():
         raise RuntimeError(
             f"the tuned QKVOG kernel requires WORLD_SIZE={TP_SIZE}, got {world_size}"
         )
-    if not supports_tpu_sp_qkvog_device():
-        raise RuntimeError("the tuned QKVOG kernel requires TPU7x")
+    device_reason = tpu_sp_qkvog_device_unsupported_reason()
+    if device_reason is not None:
+        raise RuntimeError(device_reason)
     export_devices = np.asarray(get_torchtpu_export_devices(world_size)).reshape(1, -1)
     return Mesh(export_devices, ("data", "model"))
 
@@ -356,7 +433,7 @@ def tpu_sp_fused_qkvog(
         rank_metadata,
     ):
         raise ValueError("inputs do not satisfy the tuned TP16 QKVOG contract")
-    expected_rope = (hidden_states.shape[0], _HEAD_DIM)
+    expected_rope = (hidden_states.shape[0], HEAD_DIM)
     if tuple(cos.shape) != expected_rope or tuple(sin.shape) != expected_rope:
         raise ValueError(
             f"local cos/sin must have shape {expected_rope}, got "
@@ -385,6 +462,8 @@ __all__ = [
     "prepare_tpu_sp_qkvog_weight",
     "register_tpu_sp_fused_qkvog_op",
     "supports_tpu_sp_qkvog_device",
+    "tpu_sp_qkvog_config_unsupported_reason",
+    "tpu_sp_qkvog_device_unsupported_reason",
     "tpu_sp_fused_qkvog",
     "validate_physical_to_logical",
 ]

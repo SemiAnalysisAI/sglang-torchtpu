@@ -73,8 +73,38 @@ def test_device_gate_is_tpu7x_only():
     target = "sglang.srt.hardware_backend.tpu.pallas_export.get_pallas_tpu_device_kind"
     with patch(target, return_value="TPU7x"):
         assert qkvog.supports_tpu_sp_qkvog_device()
+        assert qkvog.tpu_sp_qkvog_device_unsupported_reason() is None
     with patch(target, return_value="TPU v6 lite"):
         assert not qkvog.supports_tpu_sp_qkvog_device()
+        reason = qkvog.tpu_sp_qkvog_device_unsupported_reason()
+        assert "require TPU7x" in reason
+        assert "TPU v6 lite" in reason
+
+
+def test_model_config_contract_is_owned_by_the_kernel_adapter():
+    config = dict(
+        tp_size=16,
+        hidden_size=8192,
+        head_dim=64,
+        query_heads_per_rank=8,
+        kv_heads_per_rank=1,
+        output_gate_heads_per_rank=8,
+    )
+    assert qkvog.tpu_sp_qkvog_config_unsupported_reason(**config) is None
+
+    reason = qkvog.tpu_sp_qkvog_config_unsupported_reason(
+        **config,
+        world_size=32,
+    )
+    assert reason is not None
+    assert "DP1/TP16" in reason
+    assert "WORLD_SIZE=32" in reason
+
+    config["head_dim"] = 128
+    reason = qkvog.tpu_sp_qkvog_config_unsupported_reason(**config)
+    assert reason is not None
+    assert "head size 64" in reason
+    assert "head size 128" in reason
 
 
 def test_weight_blocks_are_packed_in_physical_destination_order():

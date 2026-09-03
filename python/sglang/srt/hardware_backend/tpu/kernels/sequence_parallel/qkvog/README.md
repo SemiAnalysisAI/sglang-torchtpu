@@ -69,6 +69,8 @@ avoid activation movement and exchange only completed projection tiles.
 
 ## Source layout
 
+- `_contract.py` is the single source of truth for the tuned model shape and
+  destination-local QKVOG layout.
 - `fused_rmsnorm_qkvog_mm_a2a_entrypoint.py` validates the public contract,
   selects the static schedule, and defines the pure-JAX oracle.
 - `_schedule.py` contains host-side plans and routing tables.
