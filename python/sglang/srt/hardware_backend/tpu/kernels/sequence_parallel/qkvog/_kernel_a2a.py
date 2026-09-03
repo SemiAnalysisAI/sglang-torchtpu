@@ -29,7 +29,23 @@ from ._schedule import (
 )
 
 
+# Reading guide for the Pallas primitives used below:
+#
+# * ``*_hbm_ref`` names refer to large, off-chip HBM allocations. Buffers
+#   created by ``pl.with_scoped`` live in the smaller, faster on-chip VMEM.
+# * ``ref.at[...]`` describes a view into a memory reference; ``pl.ds(start,
+#   size)`` is a dynamic slice beginning at ``start`` with length ``size``.
+# * ``make_async_copy`` returns a DMA descriptor. ``start()`` launches the
+#   transfer and ``wait()`` prevents its buffer or result from being used too
+#   early.
+# * The MXU performs the large matrix multiplications, while the vector unit
+#   handles RMSNorm, Q/K normalization, scaling, and RoPE.
+
+
 def _signal_all_peers(axis_name: str) -> None:
+    # Every rank, including this one, contributes one signal to every rank's
+    # barrier. The matching wait for TP_SIZE signals is delayed until the first
+    # output send, so setup and projection work can overlap the rendezvous.
     barrier = pltpu.get_barrier_semaphore()
     for peer in range(TP_SIZE):
         pltpu.semaphore_signal(
@@ -59,6 +75,12 @@ def _kernel_a2a(
     plan: AllToAllPlan,
 ):
     """Project local rows and send final Q/K/V/OG tiles to each destination."""
+    # Each rank begins with only its token rows, but with projection weights for
+    # every destination rank. For each destination this kernel computes that
+    # rank's Q/K/V/OG columns, applies Q/K normalization, query scaling, and
+    # RoPE, then sends the finished rows. Each rank therefore ends with its own
+    # heads for every source rank's tokens; no standalone activation all-gather
+    # is needed.
     total_local_rows, hidden_size = x_hbm_ref.shape
     block_rows = plan.row_block_rows
     projection_widths = plan.projection_widths
@@ -66,6 +88,8 @@ def _kernel_a2a(
     max_projection_width = max(projection_widths)
     send_width = max(QUERY_COLUMNS, OUTPUT_GATE_COLUMNS)
     assert sum(projection_widths) == COLUMNS_PER_DESTINATION
+    # A task is one projection tile. The plan uses two adjacent tasks per
+    # destination: one for packed [Q | K | V], followed by one for OG.
     task_count = TP_SIZE * tiles_per_destination
 
     assert weight_hbm_ref.shape == (
@@ -79,29 +103,40 @@ def _kernel_a2a(
     assert kv_hbm_ref.shape == (output_rows, KEY_COLUMNS + VALUE_COLUMNS)
     assert og_hbm_ref.shape == (output_rows, OUTPUT_GATE_COLUMNS)
 
+    # ``with_scoped`` allocates this working set once per Pallas grid program
+    # and passes the resulting VMEM buffers and semaphores to ``_run``.
     @pl.with_scoped(
         # The serving residual stream is FP32. Normalize from that source
         # precision, then store BF16 for the MXU just like the unfused path's
         # branch-dtype boundary.
         normalized=pltpu.VMEM((block_rows, hidden_size), jnp.bfloat16),
+        # Stream one small row tile from HBM at a time for input RMSNorm.
         x_tile=pltpu.VMEM((plan.norm_block_rows, hidden_size), x_hbm_ref.dtype),
         gain=pltpu.VMEM((hidden_size,), gain_hbm_ref.dtype),
         cos=pltpu.VMEM((block_rows, HEAD_DIM), cos_hbm_ref.dtype),
         sin=pltpu.VMEM((block_rows, HEAD_DIM), sin_hbm_ref.dtype),
+        # Dedicated QKV and OG weight slots let HBM DMA for the next destination
+        # overlap MXU work for the current destination.
         weight_tiles=pltpu.VMEM(
             (plan.weight_buffers, hidden_size, max_projection_width),
             weight_hbm_ref.dtype,
         ),
+        # Raw BF16 projections are double-buffered: one buffer feeds the vector
+        # epilogue and output DMA while the MXU fills the other.
         projection_buffers=pltpu.VMEM(
             (plan.projection_buffers, block_rows, COLUMNS_PER_DESTINATION),
             jnp.bfloat16,
         ),
+        # Q and OG share a ring of same-width payload buffers. KV keeps one
+        # destination-specific buffer because all destination sends may overlap.
         send_buffers=pltpu.VMEM(
             (plan.send_slots, block_rows, send_width), q_hbm_ref.dtype
         ),
         kv_send_buffers=pltpu.VMEM(
             (TP_SIZE, block_rows, KEY_COLUMNS + VALUE_COLUMNS), kv_hbm_ref.dtype
         ),
+        # A separate semaphore tracks each independently reusable DMA buffer.
+        # Remote receives share ``recv_sem`` and are drained by byte count.
         x_sem=pltpu.SemaphoreType.DMA,
         gain_sem=pltpu.SemaphoreType.DMA,
         rope_sems=pltpu.SemaphoreType.DMA((2,)),
@@ -134,6 +169,9 @@ def _kernel_a2a(
         # token order.
         my_id = rank_metadata_ref[0]
         logical_id = rank_metadata_ref[1]
+        # Large inputs use several grid programs, each responsible for one
+        # contiguous row block. ``multiple_of`` is an alignment promise to the
+        # compiler; it does not round or otherwise change the row offset.
         row_start = (
             pl.multiple_of(
                 pl.program_id(0) * block_rows,
@@ -144,6 +182,10 @@ def _kernel_a2a(
         )
 
         def task_coordinates(task):
+            # Flatten [destination round, projection tile] into one task index.
+            # ``destination_orders`` contains XOR masks rather than absolute
+            # IDs. XORing every mask with ``my_id`` visits all physical ranks,
+            # while the parity-specific orders spread traffic across links.
             destination_round = task // tiles_per_destination
             column_index = task % tiles_per_destination
             destination_mask = lax.select(
@@ -158,6 +200,10 @@ def _kernel_a2a(
 
         def weight_copy(task, slot):
             destination, column_start, column_width = task_coordinates(task)
+            # The replicated matrix is destination-major:
+            # [destination 0's QKVOG | ... | destination 15's QKVOG].
+            # This expression selects the current destination and its QKV or
+            # OG sub-tile. ``multiple_of`` only records its known alignment.
             flat_column_start = pl.multiple_of(
                 destination * COLUMNS_PER_DESTINATION + column_start,
                 128,
@@ -179,6 +225,8 @@ def _kernel_a2a(
             ).wait()
 
         def wait_kv_send_slot(slot):
+            # As above, this reconstructs the descriptor of an earlier KV send
+            # and waits for it; it does not launch a VMEM-to-VMEM copy.
             pltpu.make_async_copy(
                 kv_send_buffers.at[slot],
                 kv_send_buffers.at[slot],
@@ -186,6 +234,9 @@ def _kernel_a2a(
             ).wait()
 
         def start_output_copy(source, target, send_sem, destination):
+            # ``pl.when`` emits device-side conditionals. A remote destination
+            # uses the TPU interconnect; this rank's own destination is a local
+            # VMEM-to-HBM DMA with the same output layout.
             @pl.when(destination != my_id)
             def _send_remote():
                 pltpu.make_async_remote_copy(
@@ -202,6 +253,9 @@ def _kernel_a2a(
                 pltpu.make_async_copy(source, target, send_sem).start()
 
         def qk_epilogue(value):
+            # ``value`` is [rows, query heads + one key head, HEAD_DIM]. The
+            # projection is stored in BF16, but normalization and RoPE use FP32
+            # intermediates before the final BF16 conversion.
             value = value.astype(jnp.bfloat16).astype(jnp.float32)
             if use_qk_norm:
                 inverse_rms = lax.rsqrt(
@@ -209,6 +263,9 @@ def _kernel_a2a(
                 )
                 head_scale = jnp.concatenate(
                     (
+                        # Query heads receive both RMS normalization and the
+                        # configured query scale; the key head receives only
+                        # RMS normalization.
                         jnp.full(
                             (QUERY_COLUMNS // HEAD_DIM,),
                             scale_query_by,
@@ -233,6 +290,8 @@ def _kernel_a2a(
 
         # Protect remote output buffers, but overlap the barrier round trip with
         # local normalization, RoPE-table loads, and the first weight loads.
+        # These independent ``start`` calls put several DMAs in flight; each is
+        # waited only at the point where its data or buffer is first needed.
         _signal_all_peers(axis_name)
         gain_copy = pltpu.make_async_copy(gain_hbm_ref, gain, gain_sem)
         gain_copy.start()
@@ -254,6 +313,9 @@ def _kernel_a2a(
             sin_copy.start()
         gain_copy.wait()
 
+        # Normalize a small row tile at a time to bound FP32 VMEM use. Here
+        # ``input_rows`` addresses the original HBM input, while ``local_rows``
+        # addresses the corresponding rows of the on-chip normalized buffer.
         for row_block in range(block_rows // plan.norm_block_rows):
             local_rows = pl.ds(
                 row_block * plan.norm_block_rows,
@@ -298,6 +360,9 @@ def _kernel_a2a(
             # with independent MXU work.
             weight_copy(qkv_task, 0).wait()
             with jax.named_scope("qkv_matmul"):
+                # [block_rows, hidden] @ [hidden, Q+K+V] -> [block_rows, Q+K+V].
+                # Contract dimension 1 of the activations with dimension 0 of
+                # the weights, and accumulate the MXU result in FP32.
                 projection_buffers.at[buffer_index, :, pl.ds(0, qkv_width)][...] = (
                     lax.dot_general(
                         normalized[...],
@@ -311,6 +376,7 @@ def _kernel_a2a(
 
             weight_copy(og_task, 1).wait()
             with jax.named_scope("og_matmul"):
+                # The second matmul projects the same normalized rows to OG.
                 projection_buffers.at[
                     buffer_index,
                     :,
@@ -343,9 +409,15 @@ def _kernel_a2a(
                 wait_send_slot(og_send_slot)
 
             projection = projection_buffers.at[buffer_index]
+            # One destination's raw projection is packed as [Q | K | V | OG].
+            # Q and K share normalization/RoPE; V bypasses that epilogue, and
+            # OG came from the second matmul.
             qkv_projected = projection.at[:, pl.ds(0, qkv_width)][...]
             og_projected = projection.at[:, pl.ds(qkv_width, og_width)][...]
             with jax.named_scope("qkv_epilogue"):
+                # Reinterpret the flat Q+K columns as eight query heads followed
+                # by one key head. The slices below flatten Q again and pack
+                # [K | V] into the KV payload expected by the destination.
                 qk = qk_epilogue(
                     qkv_projected[:, : QUERY_COLUMNS + KEY_COLUMNS].reshape(
                         block_rows,
@@ -381,6 +453,9 @@ def _kernel_a2a(
             if destination_round == 0:
                 pltpu.semaphore_wait(pltpu.get_barrier_semaphore(), TP_SIZE)
 
+            # This is the all-to-all itself: send this source rank's fixed row
+            # interval to the physical rank that owns these Q/K/V/OG columns.
+            # Q, packed KV, and OG use separate asynchronous transfers.
             start_output_copy(
                 send_buffers.at[q_send_slot],
                 q_hbm_ref.at[source_rows, :],
@@ -415,7 +490,8 @@ def _kernel_a2a(
             TP_SIZE - 1,
             (TP_SIZE - 1) % plan.projection_buffers,
         )
-        # Reset all send and aggregate receive semaphore counts before return.
+        # Drain every outgoing transfer before its VMEM payload disappears.
+        # Q/OG use the reusable slot ring; KV has one slot per destination.
         for slot in range(plan.send_slots):
             wait_send_slot(slot)
         for slot in range(TP_SIZE):
@@ -467,11 +543,15 @@ def run_a2a(
             f"got {local_rank_metadata.shape}"
         )
 
+    # A scalar grid runs one program for up to ``row_block_rows`` local rows.
+    # Larger inputs launch one independent program per contiguous row block.
     grid = (
         (plan.local_rows // plan.row_block_rows,)
         if plan.local_rows > plan.row_block_rows
         else ()
     )
+    # Rank metadata is scalar-prefetched; the five tensor inputs and all three
+    # outputs remain HBM references consumed by the kernel above.
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=1,
         in_specs=[
@@ -484,6 +564,8 @@ def run_a2a(
         out_specs=(pl.BlockSpec(memory_space=pltpu.HBM),) * 3,
         grid=grid,
     )
+    # Shapes, feature flags, loop counts, routing tables, and collective ID are
+    # compile-time properties of this specialized Pallas program.
     q, kv, og = pl.pallas_call(
         functools.partial(
             _kernel_a2a,
@@ -525,4 +607,6 @@ def run_a2a(
         local_cos,
         local_sin,
     )
+    # The kernel communicates K and V together, then this wrapper restores the
+    # public four-output interface by splitting the packed last dimension.
     return q, kv[:, :KEY_COLUMNS], kv[:, KEY_COLUMNS:], og
