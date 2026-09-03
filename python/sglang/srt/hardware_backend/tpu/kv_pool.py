@@ -258,6 +258,29 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
             self._raiden_backup_obj = maybe_build_backup(self)
         return self._raiden_backup_obj
 
+    def _gather_token_rows(
+        self, layer_kv: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        return layer_kv.flatten(0, 1).index_select(0, indices)
+
+    def _allocate_pages_for_rows(
+        self, num_pages: int, rows: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.empty(
+            (num_pages, self.page_size, *rows.shape[1:]),
+            dtype=rows.dtype,
+            device=rows.device,
+        )
+
+    def _put_rows_in_pages(
+        self,
+        pages: torch.Tensor,
+        page_positions: torch.Tensor,
+        offsets: torch.Tensor,
+        rows: torch.Tensor,
+    ) -> None:
+        pages[page_positions, offsets] = rows
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         """Copy the KV rows at ``indices`` out to host.
 
@@ -280,10 +303,10 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
-            layer_kv = self.kv_buffer[layer_id].flatten(0, 1)
+            layer_kv = self.kv_buffer[layer_id]
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
-                kv_cpu = layer_kv.index_select(0, chunk_indices).to(
+                kv_cpu = self._gather_token_rows(layer_kv, chunk_indices).to(
                     "cpu", non_blocking=True
                 )
                 kv_cache_cpu[-1].append(kv_cpu)
@@ -336,15 +359,18 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
             assert rows.shape[0] == indices.numel()
             dst = self.kv_buffer[layer_id]
             if full_blocks.numel():
-                pages = torch.empty(
-                    (full_blocks.numel(), page, *rows.shape[1:]), dtype=rows.dtype
+                pages = self._allocate_pages_for_rows(full_blocks.numel(), rows)
+                self._put_rows_in_pages(
+                    pages, full_page_pos, full_offsets, rows[full_rows]
                 )
-                pages[full_page_pos, full_offsets] = rows[full_rows]
                 write_pages_torch(full_blocks, pages.to(device, non_blocking=True), dst)
             if part_blocks.numel():
                 pages = dst[part_blocks]
-                pages[part_page_pos, part_offsets] = rows[~full_rows].to(
-                    device, non_blocking=True
+                self._put_rows_in_pages(
+                    pages,
+                    part_page_pos,
+                    part_offsets,
+                    rows[~full_rows].to(device, non_blocking=True),
                 )
                 write_pages_torch(part_blocks, pages, dst)
         self.device_module.synchronize()
@@ -472,9 +498,8 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     ``num_kv_heads * 2`` is a plain axis here rather than something packed into
     32-bit lanes, so it carries no padding. At one KV head per rank that makes
     an fp8 cache half the size of the fused layout's, which rounds two heads up
-    to ``kv_packing``. The flip side is that nothing written against the fused
-    5D row layout works on this buffer, so the host-offload paths below refuse
-    rather than reinterpret it.
+    to ``kv_packing``. Host copies retain this native packing while translating
+    between token indices and their page/lane coordinates.
     """
 
     def _head_dim_lanes(self) -> int:
@@ -545,17 +570,30 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
             n_blocks * page_size, kv_heads_x2, hd_words * packing
         )
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        raise NotImplementedError(
-            "CPU offloading is not supported for the SEQ_ALONG_LANE KV layout: "
-            "a token is a lane, not a row, so the fused pool's row gather does "
-            "not apply. Use --attention-backend pallas_tpu_rpa_batched or v3."
+    def _gather_token_rows(
+        self, layer_kv: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        blocks = indices // self.page_size
+        offsets = indices % self.page_size
+        return layer_kv[blocks, ..., offsets]
+
+    def _allocate_pages_for_rows(
+        self, num_pages: int, rows: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.empty(
+            (num_pages, *rows.shape[1:], self.page_size),
+            dtype=rows.dtype,
+            device=rows.device,
         )
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        raise NotImplementedError(
-            "CPU offloading is not supported for the SEQ_ALONG_LANE KV layout."
-        )
+    def _put_rows_in_pages(
+        self,
+        pages: torch.Tensor,
+        page_positions: torch.Tensor,
+        offsets: torch.Tensor,
+        rows: torch.Tensor,
+    ) -> None:
+        pages[page_positions, ..., offsets] = rows
 
 
 class TpuFusedMLATokenToKVPool(MLATokenToKVPool):

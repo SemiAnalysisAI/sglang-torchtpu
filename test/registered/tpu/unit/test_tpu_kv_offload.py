@@ -261,6 +261,45 @@ class TestTpuFusedHostPool(CustomTestCase):
 
 
 @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
+class TestTpuSeqAlongLaneCpuCopy(CustomTestCase):
+    def test_unordered_rows_round_trip_and_preserve_neighbours(self):
+        from sglang.srt.hardware_backend.tpu.kv_pool import TpuSeqAlongLaneKVPool
+
+        page_size = 128
+        pool = TpuSeqAlongLaneKVPool(
+            size=page_size * 3,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=128,
+            layer_num=2,
+            device=DEV,
+            enable_memory_saver=False,
+        )
+        pool.cpu_offloading_chunk_size = 3
+        for layer, buf in enumerate(pool.kv_buffer):
+            seed = torch.randn(buf.shape, dtype=torch.bfloat16).to(DEV)
+            buf.copy_(seed)
+
+        source = torch.tensor([3, 130, 5, 257])
+        payload = pool.get_cpu_copy(source)
+        expected = [torch.cat(layer_chunks, dim=0) for layer_chunks in payload]
+
+        for buf in pool.kv_buffer:
+            buf.fill_(-1)
+        destination = torch.tensor([260, 7, 129, 258])
+        pool.load_cpu_copy(payload, destination)
+
+        destination_device = destination.to(DEV)
+        for layer, buf in enumerate(pool.kv_buffer):
+            restored = pool._gather_token_rows(buf, destination_device).cpu()
+            self.assertTrue(torch.equal(restored, expected[layer]))
+            for index in (6, 8, 128, 130, 257, 259, 261):
+                block, offset = divmod(index, page_size)
+                self.assertTrue(bool(torch.all(buf[block, ..., offset].cpu() == -1)))
+
+
+@unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
 class TestTpuDraftKvOffload(CustomTestCase):
     """Draft (speculative) KV piggyback: the controller reuses the target's
     host/device index pair for a 1-layer draft pool on every round."""

@@ -12,6 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -22,7 +23,10 @@ try:
 except Exception:
     _HAS_JAX = False
 
-from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+from sglang.srt.hardware_backend.tpu.kv_pool import (
+    TpuFusedMHATokenToKVPool,
+    TpuSeqAlongLaneKVPool,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.test_utils import CustomTestCase
@@ -66,6 +70,22 @@ def _make_mha_pool(size, layer_num):
     return pool
 
 
+def _make_seq_pool(size, page_size, layer_num, dtype=torch.bfloat16):
+    with patch.object(TpuSeqAlongLaneKVPool, "_head_dim_lanes", return_value=HEAD_DIM):
+        pool = TpuSeqAlongLaneKVPool(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=HEAD_NUM,
+            head_dim=HEAD_DIM,
+            layer_num=layer_num,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+    pool.cpu_offloading_chunk_size = CHUNK_SIZE
+    return pool
+
+
 def _fill_rows(buffers, offset=0.0):
     """Write ``offset + layer * LAYER_STRIDE + row`` into every element of a row."""
     for layer, buf in enumerate(buffers):
@@ -78,15 +98,40 @@ def _fused_rows(pool):
     return [buf.flatten(0, 1) for buf in pool.kv_buffer]
 
 
+def _fill_seq_rows(pool, offset=0.0):
+    for layer, buf in enumerate(pool.kv_buffer):
+        num_rows = buf.shape[0] * buf.shape[-1]
+        values = (
+            torch.arange(num_rows, dtype=torch.float32) + layer * LAYER_STRIDE + offset
+        )
+        buf.copy_(values.view(buf.shape[0], 1, 1, 1, buf.shape[-1]).to(buf.dtype))
+
+
+def _seq_rows(pool):
+    return [
+        pool._logical_kv_view(pool.start_layer + layer)
+        for layer in range(pool.layer_num)
+    ]
+
+
 def _row_values(buf, rows):
     rows = torch.as_tensor(rows, dtype=torch.long)
     return buf[rows].flatten(1)[:, 0].float().tolist()
 
 
-class TestFusedPoolFilterCpuCopy(CustomTestCase):
-    def test_fused_pool_filter_round_trip(self):
-        pool = _make_fused_pool(size=32, page_size=4, layer_num=2)
-        _fill_rows(_fused_rows(pool))
+class _PoolCpuCopyContract:
+    def _make_pool(self, size, page_size, layer_num):
+        raise NotImplementedError
+
+    def _fill_pool(self, pool, offset=0.0):
+        raise NotImplementedError
+
+    def _rows(self, pool):
+        raise NotImplementedError
+
+    def test_filter_round_trip(self):
+        pool = self._make_pool(size=32, page_size=4, layer_num=2)
+        self._fill_pool(pool)
 
         indices = torch.arange(5, 15)
         row_mask = torch.tensor([1, 0, 1, 1, 0, 0, 1, 1, 1, 0], dtype=torch.bool)
@@ -105,15 +150,15 @@ class TestFusedPoolFilterCpuCopy(CustomTestCase):
 
         new_indices = torch.arange(20, 20 + len(kept))
         pool.load_cpu_copy(filtered, new_indices)
-        for layer, buf in enumerate(_fused_rows(pool)):
+        for layer, rows in enumerate(self._rows(pool)):
             self.assertEqual(
-                _row_values(buf, new_indices),
-                [layer * LAYER_STRIDE + r for r in kept.tolist()],
+                _row_values(rows, new_indices),
+                [layer * LAYER_STRIDE + row for row in kept.tolist()],
             )
 
-    def test_fused_pool_filter_keeps_single_chunk_layout(self):
-        pool = _make_fused_pool(size=8, page_size=4, layer_num=1)
-        _fill_rows(_fused_rows(pool))
+    def test_filter_keeps_single_chunk_layout(self):
+        pool = self._make_pool(size=8, page_size=4, layer_num=1)
+        self._fill_pool(pool)
 
         indices = torch.tensor([1, 2])
         kv_cpu = pool.get_cpu_copy(indices)
@@ -121,41 +166,96 @@ class TestFusedPoolFilterCpuCopy(CustomTestCase):
         self.assertEqual(len(filtered[0]), 1)
         self.assertEqual(_row_values(filtered[0][0], [0]), [2.0])
 
-    def test_fused_pool_load_partial_pages_keeps_neighbours(self):
-        pool = _make_fused_pool(size=32, page_size=4, layer_num=2)
-        _fill_rows(_fused_rows(pool))
+    def test_load_partial_pages_keeps_neighbours(self):
+        pool = self._make_pool(size=32, page_size=4, layer_num=2)
+        self._fill_pool(pool)
         # Rows 6..13 span a partial page (6, 7), a full page (8..11) and
         # another partial page (12, 13).
         src = torch.arange(6, 14)
         kv_cpu = pool.get_cpu_copy(src)
 
-        _fill_rows(_fused_rows(pool), offset=SWA_OFFSET)
+        self._fill_pool(pool, offset=SWA_OFFSET)
         dst = torch.arange(18, 26)
         pool.load_cpu_copy(kv_cpu, dst)
-        for layer, buf in enumerate(_fused_rows(pool)):
+        for layer, rows in enumerate(self._rows(pool)):
             self.assertEqual(
-                _row_values(buf, dst),
-                [layer * LAYER_STRIDE + r for r in src.tolist()],
+                _row_values(rows, dst),
+                [layer * LAYER_STRIDE + row for row in src.tolist()],
             )
             untouched = [16, 17, 26, 27]
             self.assertEqual(
-                _row_values(buf, untouched),
-                [SWA_OFFSET + layer * LAYER_STRIDE + r for r in untouched],
+                _row_values(rows, untouched),
+                [SWA_OFFSET + layer * LAYER_STRIDE + row for row in untouched],
             )
 
-    def test_fused_pool_load_unordered_indices(self):
-        pool = _make_fused_pool(size=16, page_size=4, layer_num=1)
-        _fill_rows(_fused_rows(pool))
+    def test_load_unordered_indices(self):
+        pool = self._make_pool(size=16, page_size=4, layer_num=1)
+        self._fill_pool(pool)
         src = torch.tensor([9, 2, 11, 3])
         kv_cpu = pool.get_cpu_copy(src)
-        _fill_rows(_fused_rows(pool), offset=SWA_OFFSET)
+        self._fill_pool(pool, offset=SWA_OFFSET)
         dst = torch.tensor([5, 13, 4, 12])
         pool.load_cpu_copy(kv_cpu, dst)
-        buf = _fused_rows(pool)[0]
-        self.assertEqual(_row_values(buf, dst), [9.0, 2.0, 11.0, 3.0])
+        rows = self._rows(pool)[0]
+        self.assertEqual(_row_values(rows, dst), [9.0, 2.0, 11.0, 3.0])
         self.assertEqual(
-            _row_values(buf, [6, 7, 14, 15]), [SWA_OFFSET + r for r in [6, 7, 14, 15]]
+            _row_values(rows, [6, 7, 14, 15]),
+            [SWA_OFFSET + row for row in [6, 7, 14, 15]],
         )
+
+
+class TestFusedPoolCpuCopy(_PoolCpuCopyContract, CustomTestCase):
+    def _make_pool(self, size, page_size, layer_num):
+        return _make_fused_pool(size, page_size, layer_num)
+
+    def _fill_pool(self, pool, offset=0.0):
+        _fill_rows(_fused_rows(pool), offset)
+
+    def _rows(self, pool):
+        return _fused_rows(pool)
+
+
+class TestSeqAlongLanePoolCpuCopy(_PoolCpuCopyContract, CustomTestCase):
+    def _make_pool(self, size, page_size, layer_num):
+        return _make_seq_pool(size, page_size, layer_num)
+
+    def _fill_pool(self, pool, offset=0.0):
+        _fill_seq_rows(pool, offset)
+
+    def _rows(self, pool):
+        return _seq_rows(pool)
+
+    def test_payload_retains_native_packing(self):
+        pool = self._make_pool(size=8, page_size=4, layer_num=1)
+        self._fill_pool(pool)
+        payload = pool.get_cpu_copy(torch.tensor([1, 2]))
+        self.assertEqual(
+            payload[0][0].shape,
+            (2, HEAD_NUM * 2, HEAD_DIM // 2, 2),
+        )
+
+    def test_fp8_round_trip_preserves_packed_bytes(self):
+        pool = _make_seq_pool(
+            size=16,
+            page_size=4,
+            layer_num=1,
+            dtype=torch.float8_e4m3fn,
+        )
+        raw = pool.kv_buffer[0].view(torch.uint8)
+        values = torch.arange(raw.numel(), dtype=torch.int64).remainder(128)
+        raw.copy_(values.to(torch.uint8).reshape(raw.shape))
+
+        source = torch.tensor([1, 6, 9, 11])
+        payload = pool.get_cpu_copy(source)
+        expected = torch.cat(payload[0], dim=0).view(torch.uint8).clone()
+
+        raw.zero_()
+        destination = torch.tensor([2, 4, 13, 15])
+        pool.load_cpu_copy(payload, destination)
+        restored = pool._gather_token_rows(pool.kv_buffer[0], destination).view(
+            torch.uint8
+        )
+        self.assertTrue(torch.equal(restored, expected))
 
 
 class TestKvPageWriteKernel(CustomTestCase):
@@ -277,6 +377,34 @@ class TestRaidenRetractionBackup(CustomTestCase):
             rows_now = _fused_rows(pool)[l].flatten(0, 1)[new_indices]
             self.assertTrue(torch.equal(rows_now, rows_before[l]))
         # The handle returned its host pages.
+        self.assertEqual(sorted(backup._free), list(range(16)))
+
+    def test_seq_layout_round_trip_into_new_pages(self):
+        from sglang.srt.hardware_backend.tpu import raiden_kv_backup
+        from sglang.srt.hardware_backend.tpu.raiden_kv_backup import (
+            RaidenKVBackupHandle,
+        )
+
+        pool = _make_seq_pool(size=64 * 8, page_size=8, layer_num=2)
+        backup = raiden_kv_backup.RaidenKVBackup.__new__(
+            raiden_kv_backup.RaidenKVBackup
+        )
+        backup._transfer = _FakeTransfer(pool, 16)
+        backup._page_size = pool.page_size
+        backup._free = list(range(16))
+        pool._raiden_backup_obj = backup
+        _fill_seq_rows(pool)
+
+        saved_indices = torch.arange(16, 16 + 21)
+        rows_before = [rows[saved_indices].clone() for rows in _seq_rows(pool)]
+        handle = pool.get_cpu_copy(saved_indices)
+        self.assertIsInstance(handle, RaidenKVBackupHandle)
+
+        _fill_seq_rows(pool, offset=SWA_OFFSET)
+        new_indices = torch.arange(40, 40 + 21)
+        pool.load_cpu_copy(handle, new_indices)
+        for layer, rows in enumerate(_seq_rows(pool)):
+            self.assertTrue(torch.equal(rows[new_indices], rows_before[layer]))
         self.assertEqual(sorted(backup._free), list(range(16)))
 
     def test_irregular_rows_fall_back_to_the_row_path(self):
@@ -410,6 +538,55 @@ class TestSwaPoolResumeWithFusedSubPool(CustomTestCase):
             self.assertEqual(
                 _row_values(buf, torch.arange(11, 16)),
                 [SWA_OFFSET + layer * LAYER_STRIDE + s for s in range(1, 6)],
+            )
+
+
+class TestSwaPoolResumeWithSeqAlongLaneSubPool(CustomTestCase):
+    def test_resume_drops_rows_without_swa_slot(self):
+        with patch.object(
+            TpuSeqAlongLaneKVPool, "_head_dim_lanes", return_value=HEAD_DIM
+        ):
+            pool = SWAKVPool(
+                size=64,
+                size_swa=32,
+                page_size=4,
+                dtype=torch.bfloat16,
+                head_num=HEAD_NUM,
+                head_dim=HEAD_DIM,
+                swa_attention_layer_ids=[0, 2],
+                full_attention_layer_ids=[1],
+                device="cpu",
+                token_to_kv_pool_class=TpuSeqAlongLaneKVPool,
+            )
+        pool.full_kv_pool.cpu_offloading_chunk_size = CHUNK_SIZE
+        pool.swa_kv_pool.cpu_offloading_chunk_size = CHUNK_SIZE
+        _fill_seq_rows(pool.full_kv_pool)
+        _fill_seq_rows(pool.swa_kv_pool, offset=SWA_OFFSET)
+
+        mapping = torch.zeros(pool.size + 1, dtype=torch.int64)
+        mapping[-1] = -1
+        pool.register_mapping(mapping)
+
+        old_indices = torch.arange(4, 14)
+        mapping[old_indices[2:]] = torch.arange(4, 12)
+        kv_cpu = pool.get_cpu_copy(old_indices)
+
+        new_indices = torch.arange(24, 34)
+        remapped_positions = [2, 3, 6, 7, 9]
+        new_swa_indices = torch.tensor([16, 17, 20, 21, 24])
+        mapping[new_indices[remapped_positions]] = new_swa_indices
+        pool.load_cpu_copy(kv_cpu, new_indices)
+
+        for layer, rows in enumerate(_seq_rows(pool.full_kv_pool)):
+            self.assertEqual(
+                _row_values(rows, new_indices),
+                [layer * LAYER_STRIDE + row for row in old_indices.tolist()],
+            )
+        old_swa_indices = [4, 5, 8, 9, 11]
+        for layer, rows in enumerate(_seq_rows(pool.swa_kv_pool)):
+            self.assertEqual(
+                _row_values(rows, new_swa_indices),
+                [SWA_OFFSET + layer * LAYER_STRIDE + row for row in old_swa_indices],
             )
 
 
