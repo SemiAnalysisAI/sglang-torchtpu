@@ -62,8 +62,7 @@ export TORCH_LOGS=${TORCH_LOGS:-+recompiles}
 # collective-matmul modes and the four SparseCore-offload=false flags are the
 # DP-attention hardening set (avoid TP correctness issues / SparseCore halts).
 # Overriding this string invalidates the compile cache.
-export LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"--xla_tpu_scoped_vmem_limit_kib=65536 \
---xla_tpu_enable_async_collective_fusion=true \
+export LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"--xla_tpu_enable_async_collective_fusion=true \
 --xla_tpu_overlap_compute_collective_tc=true \
 --xla_tpu_enable_async_collective_fusion_multiple_steps=true \
 --xla_tpu_enable_latency_hiding_scheduler=true \
