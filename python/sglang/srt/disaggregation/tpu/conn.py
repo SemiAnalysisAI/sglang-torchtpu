@@ -279,28 +279,29 @@ class TpuKVManager(TpuKVManagerBase):
         self, page_indices: np.ndarray, lane_slice: tuple[int, int] | None
     ) -> tuple[list[memoryview | bytes], list[StageBuf] | None, Any | None, int]:
         """Gathers lanes by lane slice and page indices, D2H."""
+        layer_buffers = tpu_transfer.get_layer_page_buffers(
+            self.kv_pool, lane_slice=lane_slice
+        )
         pool = getattr(self, "_stage_pool", None)
         use_stage = (
-            pool is not None
-            and self.layer_buffers
-            and self.layer_buffers[0].device.type != "cpu"
+            pool is not None and layer_buffers and layer_buffers[0].device.type != "cpu"
         )
         d2h_future = None
         if use_stage:
             if getattr(self, "_async_d2h", False):
                 d2h_future, stages = tpu_transfer.gather_pages_to_stage_async(
-                    self.layer_buffers, page_indices, pool, lane_slice=lane_slice
+                    layer_buffers, page_indices, pool, lane_slice=lane_slice
                 )
             else:
                 stages = tpu_transfer.gather_pages_to_stage(
-                    self.layer_buffers, page_indices, pool, lane_slice=lane_slice
+                    layer_buffers, page_indices, pool, lane_slice=lane_slice
                 )
             layer_frames = [st.mv() for st in stages]
             nbytes = sum(st.nbytes for st in stages)
         else:
             stages = None
             layer_frames = tpu_transfer.gather_pages_to_host(
-                self.layer_buffers, page_indices, lane_slice=lane_slice
+                layer_buffers, page_indices, lane_slice=lane_slice
             )
             nbytes = sum(len(b) for b in layer_frames)
         return layer_frames, stages, d2h_future, nbytes

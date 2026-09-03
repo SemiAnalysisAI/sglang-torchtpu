@@ -265,7 +265,7 @@ class TestTpuSeqAlongLaneCpuCopy(CustomTestCase):
     def test_unordered_rows_round_trip_and_preserve_neighbours(self):
         from sglang.srt.hardware_backend.tpu.kv_pool import TpuSeqAlongLaneKVPool
 
-        page_size = 128
+        page_size = 256
         pool = TpuSeqAlongLaneKVPool(
             size=page_size * 3,
             page_size=page_size,
@@ -281,22 +281,55 @@ class TestTpuSeqAlongLaneCpuCopy(CustomTestCase):
             seed = torch.randn(buf.shape, dtype=torch.bfloat16).to(DEV)
             buf.copy_(seed)
 
-        source = torch.tensor([3, 130, 5, 257])
+        source = torch.tensor([3, 258, 5, 513])
         payload = pool.get_cpu_copy(source)
         expected = [torch.cat(layer_chunks, dim=0) for layer_chunks in payload]
 
         for buf in pool.kv_buffer:
             buf.fill_(-1)
-        destination = torch.tensor([260, 7, 129, 258])
+        destination = torch.tensor([516, 7, 257, 514])
         pool.load_cpu_copy(payload, destination)
 
         destination_device = destination.to(DEV)
         for layer, buf in enumerate(pool.kv_buffer):
             restored = pool._gather_token_rows(buf, destination_device).cpu()
             self.assertTrue(torch.equal(restored, expected[layer]))
-            for index in (6, 8, 128, 130, 257, 259, 261):
+            for index in (6, 8, 256, 258, 513, 515, 517):
                 block, offset = divmod(index, page_size)
                 self.assertTrue(bool(torch.all(buf[block, ..., offset].cpu() == -1)))
+
+    def test_full_page_round_trip(self):
+        from sglang.srt.hardware_backend.tpu.kv_pool import TpuSeqAlongLaneKVPool
+
+        page_size = 256
+        pool = TpuSeqAlongLaneKVPool(
+            size=page_size * 4,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=128,
+            layer_num=2,
+            device=DEV,
+            enable_memory_saver=False,
+        )
+        for buf in pool.kv_buffer:
+            buf.copy_(torch.randn(buf.shape, dtype=torch.bfloat16).to(DEV))
+
+        source = torch.arange(page_size, page_size * 2)
+        payload = pool.get_cpu_copy(source)
+        expected = [torch.cat(layer_chunks, dim=0) for layer_chunks in payload]
+
+        for buf in pool.kv_buffer:
+            buf.fill_(-1)
+        destination = torch.arange(page_size * 2, page_size * 3)
+        pool.load_cpu_copy(payload, destination)
+
+        destination_device = destination.to(DEV)
+        for layer, buf in enumerate(pool.kv_buffer):
+            restored = pool._gather_token_rows(buf, destination_device).cpu()
+            self.assertTrue(torch.equal(restored, expected[layer]))
+            self.assertTrue(bool(torch.all(buf[1].cpu() == -1)))
+            self.assertTrue(bool(torch.all(buf[3].cpu() == -1)))
 
 
 @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)

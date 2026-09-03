@@ -618,15 +618,25 @@ def _batch_transfer():
     return _BATCH_TRANSFER or None
 
 
-def get_layer_page_buffers(kv_pool) -> list[torch.Tensor]:
+def get_layer_page_buffers(kv_pool, lane_slice: LaneSlice = None) -> list[torch.Tensor]:
     """Return the per-layer KV buffers whose dim 0 is block-indexed.
 
-    Supports the fused RPA v3 pool (``kv_pool.kv_buffer`` — a list of 5D
-    tensors shaped ``[num_blocks, page_size, ...]``). The token-indexed
+    Whole-page transfers support both fused and SEQ_ALONG_LANE layouts.
+    Resharding slices dim 2 of the fused layout, so reject SEQ_ALONG_LANE,
+    whose dim 2 is the head-dimension word axis. The token-indexed
     ``k_buffer``/``v_buffer`` layout used by the ``pallas_tpu_flash`` backend
-    is intentionally rejected: its dim 0 is per-token, not per-page, so the
-    block-id gather/scatter below would be wrong.
+    is also rejected because its dim 0 is per-token, not per-page.
     """
+    if lane_slice is not None:
+        from sglang.srt.hardware_backend.tpu.kv_pool import (
+            TpuSeqAlongLaneKVPool,
+        )
+
+        if isinstance(kv_pool, TpuSeqAlongLaneKVPool):
+            raise NotImplementedError(
+                "TPU P/D KV resharding does not support the SEQ_ALONG_LANE "
+                "KV layout because its packed KV-head axis is not dim 2."
+            )
     bufs = getattr(kv_pool, "kv_buffer", None)
     if isinstance(bufs, (list, tuple)) and len(bufs) > 0:
         return list(bufs)

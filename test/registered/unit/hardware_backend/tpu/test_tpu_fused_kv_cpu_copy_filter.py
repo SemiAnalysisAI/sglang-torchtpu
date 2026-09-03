@@ -23,6 +23,7 @@ try:
 except Exception:
     _HAS_JAX = False
 
+from sglang.srt.disaggregation.tpu.transfer import get_layer_page_buffers
 from sglang.srt.hardware_backend.tpu.kv_pool import (
     TpuFusedMHATokenToKVPool,
     TpuSeqAlongLaneKVPool,
@@ -233,6 +234,12 @@ class TestSeqAlongLanePoolCpuCopy(_PoolCpuCopyContract, CustomTestCase):
             payload[0][0].shape,
             (2, HEAD_NUM * 2, HEAD_DIM // 2, 2),
         )
+
+    def test_pd_resharding_is_rejected(self):
+        pool = self._make_pool(size=8, page_size=4, layer_num=1)
+        self.assertIs(get_layer_page_buffers(pool)[0], pool.kv_buffer[0])
+        with self.assertRaisesRegex(NotImplementedError, "SEQ_ALONG_LANE"):
+            get_layer_page_buffers(pool, lane_slice=(0, 1))
 
     def test_fp8_round_trip_preserves_packed_bytes(self):
         pool = _make_seq_pool(

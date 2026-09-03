@@ -445,14 +445,17 @@ class TpuKVManagerBase(CommonKVManager):
                 and info.n_lane_to_send == state.dst_lane_per_page_block
             )
             dst_lane_slice = None if full else (info.dst_lane_idx, info.n_lane_to_send)
+            layer_buffers = tpu_transfer.get_layer_page_buffers(
+                self.kv_pool, lane_slice=dst_lane_slice
+            )
 
             _nbytes = chunk.nbytes
 
             _t0 = time.perf_counter()
             pool = self._stage_pool
-            if self.layer_buffers and self.layer_buffers[0].device.type != "cpu":
+            if layer_buffers and layer_buffers[0].device.type != "cpu":
                 tpu_transfer.scatter_stage_from_host(
-                    self.layer_buffers,
+                    layer_buffers,
                     dst_pages,
                     chunk.layer_blobs,
                     pool,
@@ -460,7 +463,7 @@ class TpuKVManagerBase(CommonKVManager):
                 )
             else:
                 tpu_transfer.scatter_pages_from_host(
-                    self.layer_buffers,
+                    layer_buffers,
                     dst_pages,
                     chunk.layer_blobs,
                     dst_lane_slice,
