@@ -34,6 +34,11 @@ register_tpu_ci(est_time=300, suite="nightly-tpu-4-v7", nightly=True)
 
 MODEL = "Qwen/Qwen3-0.6B"
 PROMPT = "The capital of France is Paris, and the capital of Italy is"
+TOP_K = 5
+# Two arbitrary ids well inside Qwen3's 151936-token vocabulary. The point of
+# token_ids_logprob is that a named id is scored wherever it lands in the
+# distribution, so which ids these are does not matter.
+NAMED_TOKEN_IDS = [100, 200]
 
 
 def _skip_if_no_tpu():
@@ -114,6 +119,12 @@ class TestTpuQwen306bSinglehostPromptLogprob(CustomTestCase):
         """meta_info for a request that asks to score the prompt itself."""
         return self._generate(return_logprob=True, logprob_start_len=0)["meta_info"]
 
+    def _prompt_top_logprobs(self):
+        """meta_info for a prompt-scoring request that also asks for top-k."""
+        return self._generate(
+            return_logprob=True, logprob_start_len=0, top_logprobs_num=TOP_K
+        )["meta_info"]
+
     def test_prompt_logprobs_are_returned(self):
         info = self._prompt_logprobs()
         entries = info["input_token_logprobs"]
@@ -144,6 +155,71 @@ class TestTpuQwen306bSinglehostPromptLogprob(CustomTestCase):
         scored = [entry[0] for entry in info["input_token_logprobs"][1:]]
         self.assertEqual(len(scored), info["prompt_tokens"] - 1)
         self.assertGreater(len(set(scored)), 1)
+
+    def test_prompt_top_logprobs_are_returned(self):
+        # The eager gather computes top-k alongside the chosen-token logprobs,
+        # but the shim used to copy only the latter onto the output. The
+        # scheduler then indexed input_top_logprobs_val per request and the
+        # whole request died on a None index.
+        info = self._prompt_top_logprobs()
+        entries = info["input_top_logprobs"]
+        # Same length and same leading null as input_token_logprobs: both index
+        # by prompt position, and position 0 has nothing before it to score.
+        self.assertEqual(len(entries), info["prompt_tokens"])
+        self.assertIsNone(entries[0])
+        for row in entries[1:]:
+            self.assertEqual(len(row), TOP_K)
+            for logprob, token_id, _text in row:
+                self.assertLessEqual(logprob, 0.0)
+                self.assertEqual(logprob, logprob)  # not NaN
+                self.assertIsInstance(token_id, int)
+
+    def test_top_logprobs_bound_the_chosen_token(self):
+        # Both lists read the same vocabulary row at each position: the chosen
+        # token's logprob is one entry of that row, the top-k are its largest
+        # entries, so the best of the top-k cannot be smaller than the chosen
+        # one. Shift either list by a position and this goes red -- a count-only
+        # check would not, which is what makes this the case worth having.
+        info = self._prompt_top_logprobs()
+        chosen = info["input_token_logprobs"]
+        top = info["input_top_logprobs"]
+        self.assertEqual(len(chosen), len(top))
+        for pos, (chosen_entry, top_row) in enumerate(
+            zip(chosen[1:], top[1:]), start=1
+        ):
+            best = max(value for value, _token_id, _text in top_row)
+            self.assertLessEqual(
+                chosen_entry[0],
+                best + 1e-4,  # equal when the chosen token is itself the top-1
+                f"position {pos}: chosen logprob {chosen_entry[0]} is above the "
+                f"largest top-k value {best} from the same vocabulary row",
+            )
+
+    def test_top_logprobs_are_ranked_best_first(self):
+        # Callers read entry 0 as the model's pick, so descending order is part
+        # of the contract, not an accident of the implementation. torch.topk
+        # sorts by default but takes sorted=False, and dropping the sort is the
+        # kind of thing a throughput change does; every other case here uses
+        # max() and would stay green through it.
+        for row in self._prompt_top_logprobs()["input_top_logprobs"][1:]:
+            values = [value for value, _token_id, _text in row]
+            self.assertEqual(values, sorted(values, reverse=True))
+
+    def test_token_ids_logprobs_are_returned(self):
+        # The third read of the same row: score ids the caller names, wherever
+        # they rank. Top-k cannot stand in -- a named id outside the top k comes
+        # back empty. It was dropped by the same line as the top-k fields.
+        info = self._generate(
+            return_logprob=True,
+            logprob_start_len=0,
+            token_ids_logprob=NAMED_TOKEN_IDS,
+        )["meta_info"]
+        entries = info["input_token_ids_logprobs"]
+        self.assertEqual(len(entries), info["prompt_tokens"])
+        self.assertIsNone(entries[0])
+        for row in entries[1:]:
+            # Every scored position reports the same named ids, in order.
+            self.assertEqual([token_id for _v, token_id, _t in row], NAMED_TOKEN_IDS)
 
     def test_output_logprobs_still_work(self):
         # Output-only logprobs never entered the graph; guard the regression.

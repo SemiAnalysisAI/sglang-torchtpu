@@ -1339,7 +1339,9 @@ class TestAttachInputLogprobs(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "CaptureHiddenMode.FULL"):
             _attach_input_logprobs(
                 logits_output=out,
-                forward_batch=SimpleNamespace(input_ids=torch.zeros(2)),
+                forward_batch=SimpleNamespace(
+                    input_ids=torch.zeros(2), top_logprobs_nums=None
+                ),
                 model=_StubModel(),
             )
 
@@ -1350,7 +1352,9 @@ class TestAttachInputLogprobs(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "input_token_logprobs"):
             _attach_input_logprobs(
                 logits_output=out,
-                forward_batch=SimpleNamespace(input_ids=torch.zeros(2)),
+                forward_batch=SimpleNamespace(
+                    input_ids=torch.zeros(2), top_logprobs_nums=None
+                ),
                 model=_StubModel(input_token_logprobs=None),
             )
 
@@ -1362,7 +1366,9 @@ class TestAttachInputLogprobs(CustomTestCase):
         with self.assertRaises(RuntimeError):
             _attach_input_logprobs(
                 logits_output=out,
-                forward_batch=SimpleNamespace(input_ids=torch.zeros(2)),
+                forward_batch=SimpleNamespace(
+                    input_ids=torch.zeros(2), top_logprobs_nums=None
+                ),
                 model=model,
             )
         self.assertFalse(model.logits_processor.compute_input_logprobs)
@@ -1374,13 +1380,75 @@ class TestAttachInputLogprobs(CustomTestCase):
         )
         _attach_input_logprobs(
             logits_output=out,
-            forward_batch=SimpleNamespace(input_ids=torch.zeros(2)),
+            forward_batch=SimpleNamespace(
+                input_ids=torch.zeros(2), top_logprobs_nums=None
+            ),
             model=model,
         )
         # The reference gather only emits input logprobs when the flag is on,
         # so the model must observe it set.
         self.assertTrue(model.flag_during_call)
         self.assertFalse(model.logits_processor.compute_input_logprobs)
+
+    def test_all_input_logprob_fields_reach_the_output(self):
+        # The gather fills five input logprob fields. An earlier revision kept
+        # only input_token_logprobs, so a request asking for top-k (or for named
+        # token ids) reached the scheduler with the rest still None and died
+        # there indexing it -- see logprob_result_processor's
+        # `output.input_top_logprobs_val[i]`.
+        model = _StubModel(
+            input_top_logprobs_val=[[[-0.1, -0.2]]],
+            input_top_logprobs_idx=[[[11, 22]]],
+            input_token_ids_logprobs_val=[[[-0.3]]],
+            input_token_ids_logprobs_idx=[[[33]]],
+        )
+        out = LogitsProcessorOutput(
+            next_token_logits=torch.zeros(2, 4), hidden_states=torch.zeros(2, 4)
+        )
+        _attach_input_logprobs(
+            logits_output=out,
+            forward_batch=SimpleNamespace(
+                input_ids=torch.zeros(2), top_logprobs_nums=[2]
+            ),
+            model=model,
+        )
+        self.assertIsNotNone(out.input_token_logprobs)
+        self.assertEqual(out.input_top_logprobs_val, [[[-0.1, -0.2]]])
+        self.assertEqual(out.input_top_logprobs_idx, [[[11, 22]]])
+        self.assertEqual(out.input_token_ids_logprobs_val, [[[-0.3]]])
+        self.assertEqual(out.input_token_ids_logprobs_idx, [[[33]]])
+
+    def test_raises_when_top_logprobs_were_asked_for_but_not_gathered(self):
+        # top_logprobs_nums is pinned to None for the compiled forward and put
+        # back before the gather. This case guards that restore: an empty top-k
+        # here would otherwise reach the scheduler as a None index.
+        out = LogitsProcessorOutput(
+            next_token_logits=torch.zeros(2, 4), hidden_states=torch.zeros(2, 4)
+        )
+        with self.assertRaisesRegex(RuntimeError, "top_logprobs_nums"):
+            _attach_input_logprobs(
+                logits_output=out,
+                forward_batch=SimpleNamespace(
+                    input_ids=torch.zeros(2), top_logprobs_nums=[5]
+                ),
+                model=_StubModel(),  # gathers no top-k
+            )
+
+    def test_no_raise_when_top_logprobs_were_not_asked_for(self):
+        # The negative branch, and the reason the check reads top_logprobs_nums
+        # rather than just testing the field for None: a chosen-token-only
+        # request legitimately gathers no top-k and must pass through.
+        out = LogitsProcessorOutput(
+            next_token_logits=torch.zeros(2, 4), hidden_states=torch.zeros(2, 4)
+        )
+        _attach_input_logprobs(
+            logits_output=out,
+            forward_batch=SimpleNamespace(
+                input_ids=torch.zeros(2), top_logprobs_nums=[0]
+            ),
+            model=_StubModel(),
+        )
+        self.assertIsNone(out.input_top_logprobs_val)
 
 
 class TestGatherMatchesRealLogitsProcessor(CustomTestCase):
@@ -1417,6 +1485,23 @@ class TestGatherMatchesRealLogitsProcessor(CustomTestCase):
         source = inspect.getsource(LogitsProcessor.__init__)
         self.assertIn("self.compute_input_logprobs", source)
 
+    def test_shim_copies_every_input_field_the_output_defines(self):
+        # The gather's result is transferred field by field, so a new input_*
+        # field on LogitsProcessorOutput is dropped on the floor unless the copy
+        # is extended with it. That is exactly how top-k went missing: the
+        # request succeeded on GPU and died on TPU indexing a None.
+        copied = {
+            line.split("=")[0].strip().removeprefix("logits_output.")
+            for line in inspect.getsource(_attach_input_logprobs).splitlines()
+            if line.strip().startswith("logits_output.input_")
+        }
+        defined = {
+            name
+            for name in LogitsProcessorOutput.__annotations__
+            if name.startswith("input_")
+        }
+        self.assertEqual(copied, defined)
+
 
 class _StubLogitsProcessor:
     """Stands in for LogitsProcessor.
@@ -1428,9 +1513,12 @@ class _StubLogitsProcessor:
     that isn't there. Keep this in step with the real signature.
     """
 
-    def __init__(self, input_token_logprobs):
+    def __init__(self, input_token_logprobs, **input_logprob_fields):
         self.compute_input_logprobs = False
         self._input_token_logprobs = input_token_logprobs
+        # The real gather fills top-k and named-token-id rows alongside the
+        # chosen-token logprobs; tests that care pass them in.
+        self._input_logprob_fields = input_logprob_fields
         self.calls = 0
         self.flag_during_call = None
 
@@ -1440,6 +1528,7 @@ class _StubLogitsProcessor:
         return LogitsProcessorOutput(
             next_token_logits=torch.zeros(1, 4),
             input_token_logprobs=self._input_token_logprobs,
+            **self._input_logprob_fields,
         )
 
 
@@ -1448,8 +1537,10 @@ class _StubModel:
 
     LOGPROBS = torch.tensor([-0.5, -1.5, -2.5])
 
-    def __init__(self, input_token_logprobs=LOGPROBS):
-        self.logits_processor = _StubLogitsProcessor(input_token_logprobs)
+    def __init__(self, input_token_logprobs=LOGPROBS, **input_logprob_fields):
+        self.logits_processor = _StubLogitsProcessor(
+            input_token_logprobs, **input_logprob_fields
+        )
         self.lm_head = object()
 
     @property
