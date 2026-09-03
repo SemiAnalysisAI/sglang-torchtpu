@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Kimi-K2.6 (1.1T MoE, native INT4 compressed-tensors) + MoonViT multi-host
-# launch recipe -- TEXT PATH VALIDATED, VISION PATH NOT.
+# launch recipe -- text path validated; vision path smoke-validated with VISION=1.
 #
 # STATUS: run end-to-end against the K2.6 checkpoint on a 2-host v7x slice
 # (2026-08-26): weights load, the int4 MoE serves, and GPQA-Diamond scores under
-# the card protocol. The MoonViT tower is untested -- its precompile ladder is
-# disabled below and no vision gate exists yet, so treat only the text path as
-# covered.
+# the card protocol. Vision (2026-09-03, VISION=1): the MoonViT ladder compiles,
+# single- and two-image MMMU-Pro questions answer correctly through
+# /v1/chat/completions; a full MMMU-Pro pass is the remaining gate.
 #
 # Sizing rationale:
 #   1.1T total, int4 experts -> ~37GB/device at tp=16 over 2 hosts, confirmed on
@@ -87,9 +87,16 @@ export TPU_COMPILE_BS=${TPU_COMPILE_BS:-"48"}
 export TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$MAX_RUNNING}
 
 # MoonViT's precompile ladder is a second graph family on top of the text ones,
-# and text evals never reach it. Set-but-empty disables it; unset the variable
-# (not just blank it) for vision runs.
-export SGLANG_TPU_VIT_PRECOMPILE_SIZES=${SGLANG_TPU_VIT_PRECOMPILE_SIZES-""}
+# and text evals never reach it, so it stays off unless VISION=1. Buckets are
+# pre-merge patches per image (the TPU policy runs each image at its own
+# bucket); these 13 squares cover MMMU-Pro, whose largest image is 16,900 =
+# 130^2 patches at the checkpoint's in_patch_limit 16384, with ~1.3x padding.
+# An image past the top bucket runs eagerly rather than recompiling.
+if [[ "${VISION:-0}" == "1" ]]; then
+  export SGLANG_TPU_VIT_PRECOMPILE_SIZES=${SGLANG_TPU_VIT_PRECOMPILE_SIZES:-"256,400,576,784,1024,1600,2304,3136,4096,6400,9216,12544,16900"}
+else
+  export SGLANG_TPU_VIT_PRECOMPILE_SIZES=""
+fi
 
 # Custom config/tokenizer/processor code (configuration_kimi_k25.py,
 # kimi_k25_processor.py) ships in the checkpoint.

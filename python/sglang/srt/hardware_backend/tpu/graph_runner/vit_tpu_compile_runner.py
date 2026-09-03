@@ -130,6 +130,9 @@ class VisionTpuCompilePolicy(CompilePolicy):
             vit = getattr(owner, "vit", owner)
         self.vit = vit
         self.compiled_fn = None
+        # The bound eager method install() wraps; a shape outside the bucket
+        # ladder runs through this instead of forcing a recompile.
+        self.eager_fn = None
         self._patch_buckets: list[int] | None = None
         self._warned_oversize: set[int] = set()
         self._logged_shapes = False
@@ -157,6 +160,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
 
         _register_tpu_compile_backend()
         method = getattr(runner, self.method_name)
+        self.eager_fn = method
         server_args = self.model_runner.server_args
         use_bundle = (
             server_args.unsafe_save_torch_compile_bundle is not None
