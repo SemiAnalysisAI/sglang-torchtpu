@@ -26,6 +26,7 @@ cluster looks exactly like a symmetric one:
 """
 
 import argparse
+import concurrent.futures
 import enum
 import json
 import os
@@ -33,6 +34,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import unittest
 import urllib.error
@@ -125,6 +127,9 @@ CACHE_MAX_NEW_TOKENS = int(E("CACHE_PROBE_MAX_NEW_TOKENS", "64"))
 # here: probe 3.2 (64 tokens / 20 verify steps), GSM8K 2.80 mean over 200,
 # against 2.7786 standalone. 2.5 is ~78% of the probe figure.
 MIN_SPEC_ACCEPT_LENGTH = float(E("MIN_SPEC_ACCEPT_LENGTH", "2.5"))
+# Held under MAX_RUNNING_REQUESTS so the wave lands in one engine batch rather
+# than queueing into separate ones, which is what makes it a batching test.
+CONCURRENT_WAVE_SIZE = int(E("CONCURRENT_WAVE_SIZE", "8"))
 EXTRA_SERVER_ARGS: Tuple[str, ...] = ("--reasoning-parser", "gpt-oss")
 # Bound the compile grid + allow spec recompiles: the unbounded bs<=max_running
 # verify-graph capture spikes host RAM and OOM-kills the decode. RESHARD off:
@@ -150,9 +155,18 @@ SPEC_NUM_STEPS = 3
 SPEC_EAGLE_TOPK = 1
 SPEC_NUM_DRAFT_TOKENS = 4
 
-# The single-host GPT-OSS EAGLE3 gate measured about 0.785 over 200 examples.
-# A 0.75 baseline with the default 0.03 tolerance enforces a 0.72 score floor.
-GSM8K_BASELINE = float(E("GSM8K_THRESHOLD_GPT_OSS_120B_SPEC", "0.75"))
+# Measured on THIS topology over three runs: 0.950, 0.965, 0.970. The symmetric
+# gate lands in the same range, so gating here at the same level makes GSM8K a
+# comparison against the non-resharded reference rather than a floor any working
+# engine clears -- a subtle reshard numerical error would never move a 0.72
+# floor. 0.92 with the default tolerance enforces 0.89, about four standard
+# errors below the lowest observed score at n=200.
+#
+# The sibling files quote 0.785 from the single-host gate and set 0.75; that
+# figure matches nothing this topology produces, so this row uses its own
+# measurements, under its own env var -- tuning one row should not silently
+# retune the others sharing GSM8K_THRESHOLD_GPT_OSS_120B_SPEC.
+GSM8K_BASELINE = float(E("GSM8K_THRESHOLD_GPT_OSS_120B_SPEC_RESHARD", "0.92"))
 ATOL = float(E("GSM8K_ATOL", "0.03"))
 NUM_EXAMPLES = int(E("GSM8K_NUM_EXAMPLES", "200"))
 # Match client concurrency to MAX_RUNNING_REQUESTS and the largest
@@ -617,6 +631,8 @@ def run_cache_offload_spec_probe(base_url: str, flush_url: str) -> None:
     ):
         _assert_spec_active(record, label)
 
+    _assert_concurrent_wave_is_deterministic(base_url, target, device_hit["text"])
+
 
 def _serve_worker(topology: PodTopology, role: Role) -> int:
     """Serve prefill or decode worker shard until termination."""
@@ -670,6 +686,48 @@ def assert_decode_reshard_topology(decode_host: str) -> None:
         )
     if attn_tp <= 0 or tp_size % dp_size:
         raise AssertionError(f"decode tp={tp_size} is not divisible by dp={dp_size}")
+
+
+def _assert_concurrent_wave_is_deterministic(
+    base_url: str, prompt: str, expected_text: str
+) -> None:
+    """Same prompt, CONCURRENT_WAVE_SIZE at once: every reply must be identical.
+
+    The cache probe is strictly one request at a time, so it cannot see
+    nondeterminism that only appears when requests share a batch -- the class of
+    bug resharding is most exposed to, since a decode rank now assembles its KV
+    from two prefill sources and ordering between them, and between requests
+    interleaved in one batch, is newly load-bearing. Greedy decoding makes the
+    expected output exact; the sequential result is the reference.
+    """
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=CONCURRENT_WAVE_SIZE
+    ) as pool:
+        records = list(
+            pool.map(
+                lambda _: _generate_probe(base_url, prompt, CACHE_MAX_NEW_TOKENS),
+                range(CONCURRENT_WAVE_SIZE),
+            )
+        )
+    for index, record in enumerate(records):
+        _assert_spec_active(record, f"concurrent-wave[{index}]")
+        if record["text"] != expected_text:
+            matched = 0
+            for left, right in zip(expected_text, record["text"]):
+                if left != right:
+                    break
+                matched += 1
+            raise AssertionError(
+                f"concurrent request {index} of {CONCURRENT_WAVE_SIZE} diverged "
+                f"from the sequential greedy output after {matched} identical "
+                f"characters.\n  sequential: {expected_text[:200]!r}\n  "
+                f"concurrent: {record['text'][:200]!r}"
+            )
+    print(
+        f"concurrent wave: {CONCURRENT_WAVE_SIZE}/{CONCURRENT_WAVE_SIZE} replies "
+        "identical to the sequential greedy output",
+        flush=True,
+    )
 
 
 def _serve_prefill_leader(topology: PodTopology) -> int:
@@ -755,28 +813,53 @@ class TestPdGptOss120bReshardConfiguration(unittest.TestCase):
         for env in (prefill, decode):
             self.assertEqual(env["SGLANG_RAIDEN_RESHARD"], "1")
 
-    def test_accept_length_floor_can_actually_fail(self) -> None:
-        # accept_length >= 1 always, so the symmetric gate's 1.0 would pass even
-        # with every draft token rejected. This row exists partly to catch draft
-        # KV going missing through the reshard, which looks exactly like that.
+    def test_gates_are_stricter_than_the_symmetric_row(self) -> None:
+        # Both gates this row inherits are unfailable at their default values:
+        # accept_length >= 1 always, and a 0.72 GSM8K floor is cleared by any
+        # working engine. Neither could see a subtle reshard numerical error.
         self.assertGreater(MIN_SPEC_ACCEPT_LENGTH, 1.0)
+        self.assertGreaterEqual(GSM8K_BASELINE, 0.9)
+        # ...but not so strict the row is flaky by construction: the floor stays
+        # below the lowest score this topology has produced.
+        self.assertLess(GSM8K_BASELINE - ATOL, 0.95)
+        self.assertEqual(MODEL_CONFIG["gates"][0]["baseline"], GSM8K_BASELINE)
 
-    def test_oracle_rejects_a_symmetric_decode_engine(self) -> None:
-        # The failure mode this row is most exposed to: everything green, decode
-        # engine symmetric. The config assertions above cannot see it -- they
-        # check the dict this process builds, not the engine two hops
-        # downstream behind a launcher script.
+    def test_concurrent_wave_fits_one_engine_batch(self) -> None:
+        # Sized above MAX_RUNNING_REQUESTS the wave would queue into separate
+        # batches and stop exercising the interleaving it exists to check.
+        self.assertGreater(CONCURRENT_WAVE_SIZE, 1)
+        self.assertLessEqual(CONCURRENT_WAVE_SIZE, MAX_RUNNING_REQUESTS)
+
+    def test_runtime_oracles_reject_what_they_are_meant_to(self) -> None:
+        # Both runtime checks guard failure modes that look exactly like a pass
+        # from outside: a symmetric decode engine, and a wave whose replies
+        # disagree. Stub the engine and drive each one.
+        stub_url = "http://stub-host:30000"
         served: dict = {}
+        replies: list = []
+        lock = threading.Lock()
 
         class _Resp:
             def read(self):
-                return json.dumps(served).encode()
+                with lock:
+                    return json.dumps(replies.pop(0) if replies else served).encode()
 
             def __enter__(self):
                 return self
 
             def __exit__(self, *exc):
                 return False
+
+        def _reply(text):
+            return {
+                "text": text,
+                "meta_info": {
+                    "completion_tokens": 64,
+                    "spec_verify_ct": 20,
+                    "prompt_tokens": 4102,
+                    "cached_tokens_details": {"device": 0, "host": 0},
+                },
+            }
 
         real_urlopen = urllib.request.urlopen
         urllib.request.urlopen = lambda *a, **k: _Resp()
@@ -789,6 +872,13 @@ class TestPdGptOss120bReshardConfiguration(unittest.TestCase):
                 assert_decode_reshard_topology("decode-host")
             served.update(tp_size=16, dp_size=2, enable_dp_attention=True)
             assert_decode_reshard_topology("decode-host")  # must not raise
+
+            replies[:] = [_reply("same") for _ in range(CONCURRENT_WAVE_SIZE)]
+            _assert_concurrent_wave_is_deterministic(stub_url, "prompt", "same")
+            replies[:] = [_reply("same") for _ in range(CONCURRENT_WAVE_SIZE)]
+            replies[-1] = _reply("same but drifted")
+            with self.assertRaisesRegex(AssertionError, "diverged"):
+                _assert_concurrent_wave_is_deterministic(stub_url, "prompt", "same")
         finally:
             urllib.request.urlopen = real_urlopen
 
