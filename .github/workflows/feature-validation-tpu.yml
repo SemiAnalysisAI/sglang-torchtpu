@@ -119,11 +119,14 @@ jobs:
       fail-fast: false
       matrix:
         test: ${{ fromJSON(needs.discover-tests.outputs.single_host) }}
-    name: ${{ matrix.test.name }}
+    # Stage tag here, test file stem in display_name, so the check ends with the
+    # test (see README, "Two names per job").
+    name: single-host
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: ${{ matrix.test.name }}
       lane: nightly
       suite: ${{ matrix.test.suite }}
       test_file: ${{ matrix.test.file }}
@@ -152,11 +155,12 @@ jobs:
     if: >-
       ${{ !cancelled() && needs.discover-tests.result == 'success'
           && contains(fromJSON('["all","pd-mh-gpt-120b-pc-offload"]'), inputs.only || 'all') }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.pd_pc_offload)[0].name }}
+    name: pd-mh-gpt-120b-pc-offload
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: ${{ fromJSON(needs.discover-tests.outputs.pd_pc_offload)[0].name }}
       # hosts feeds only the slice concurrency group; the P/D topology below
       # sizes the JobSet (2-host prefill slice + 2-host decode slice).
       hosts: 2
@@ -179,11 +183,12 @@ jobs:
     if: >-
       ${{ !cancelled() && needs.discover-tests.result == 'success'
           && contains(fromJSON('["all","pd-mh-gpt-120b-tp-reshard"]'), inputs.only || 'all') }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.pd_tp_reshard)[0].name }}
+    name: pd-mh-gpt-120b-tp-reshard
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: ${{ fromJSON(needs.discover-tests.outputs.pd_tp_reshard)[0].name }}
       hosts: 2
       lane: nightly
       pd_prefill_hosts: 2
@@ -204,11 +209,12 @@ jobs:
     if: >-
       ${{ !cancelled() && needs.discover-tests.result == 'success'
           && contains(fromJSON('["all","pd-sh-gpt-120b"]'), inputs.only || 'all') }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost)[0].name }}
+    name: pd-sh-gpt-120b
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost)[0].name }}
       lane: nightly
       hosts: 1
       pd_prefill_hosts: 1
@@ -229,11 +235,12 @@ jobs:
     if: >-
       ${{ !cancelled() && needs.discover-tests.result == 'success'
           && contains(fromJSON('["all","pd-sh-gpt-120b-spec"]'), inputs.only || 'all') }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_spec)[0].name }}
+    name: pd-sh-gpt-120b-spec
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_spec)[0].name }}
       lane: nightly
       hosts: 1
       pd_prefill_hosts: 1
@@ -252,11 +259,12 @@ jobs:
     if: >-
       ${{ !cancelled() && needs.discover-tests.result == 'success'
           && contains(fromJSON('["all","pd-mh-gpt-120b"]'), inputs.only || 'all') }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.pd_multihost)[0].name }}
+    name: pd-mh-gpt-120b
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: ${{ fromJSON(needs.discover-tests.outputs.pd_multihost)[0].name }}
       lane: nightly
       hosts: 2
       pd_prefill_hosts: 2
@@ -281,6 +289,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k
       lane: nightly
       hosts: 2
       pd_prefill_hosts: 2
@@ -304,6 +313,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec
       lane: nightly
       hosts: 2
       pd_prefill_hosts: 2
@@ -370,11 +380,12 @@ jobs:
       fail-fast: false
       matrix:
         group: ${{ fromJSON(needs.discover.outputs.groups) }}
-    name: ${{ matrix.group.name }}
+    name: multi-host
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: ${{ matrix.group.name }}
       lane: nightly
       nightly: true
       launch_script: ${{ matrix.group.launch_script }}
