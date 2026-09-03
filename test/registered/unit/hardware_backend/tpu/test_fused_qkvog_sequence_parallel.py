@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from sglang.srt.hardware_backend.tpu import fused_qkvog_sequence_parallel as qkvog
-from sglang.srt.hardware_backend.tpu.kernels.sequence_parallel.qkvog._schedule import (
+from sglang.srt.hardware_backend.tpu.kernels.sequence_parallel.fused_rmsnorm_qkvog_mm_a2a._schedule import (
     AllToAllPlan,
     HybridGatherAllToAllPlan,
     make_schedule_plan,

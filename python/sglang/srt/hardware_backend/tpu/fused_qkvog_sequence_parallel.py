@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.kernels.sequence_parallel.qkvog._contract import (
+from sglang.srt.hardware_backend.tpu.kernels.sequence_parallel.fused_rmsnorm_qkvog_mm_a2a._contract import (
     COLUMNS_PER_DESTINATION,
     HEAD_DIM,
     HIDDEN_SIZE,
@@ -21,7 +21,7 @@ from sglang.srt.hardware_backend.tpu.kernels.sequence_parallel.qkvog._contract i
     TP_SIZE,
     TPU_DEVICE_KIND,
 )
-from sglang.srt.hardware_backend.tpu.kernels.sequence_parallel.qkvog._schedule import (
+from sglang.srt.hardware_backend.tpu.kernels.sequence_parallel.fused_rmsnorm_qkvog_mm_a2a._schedule import (
     supports_token_count,
 )
 
@@ -286,7 +286,7 @@ def _build_fused_qkvog_op() -> Callable:
         import jax.numpy as jnp
         from jax.sharding import PartitionSpec as P
 
-        from sglang.srt.hardware_backend.tpu.kernels.sequence_parallel.qkvog import (
+        from sglang.srt.hardware_backend.tpu.kernels.sequence_parallel.fused_rmsnorm_qkvog_mm_a2a import (
             fused_rmsnorm_qkvog_mm_a2a,
         )
         from sglang.srt.hardware_backend.tpu.pallas_jax_op import cpu_export_jax_op

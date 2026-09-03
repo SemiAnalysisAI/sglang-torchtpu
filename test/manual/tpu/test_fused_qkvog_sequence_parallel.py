@@ -13,7 +13,7 @@ import pytest
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sglang.srt.hardware_backend.tpu.kernels.sequence_parallel.qkvog import (
+from sglang.srt.hardware_backend.tpu.kernels.sequence_parallel.fused_rmsnorm_qkvog_mm_a2a import (
     fused_rmsnorm_qkvog_mm_a2a,
     jax_rmsnorm_qkvog_mm_a2a,
 )
