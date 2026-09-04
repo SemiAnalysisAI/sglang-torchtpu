@@ -581,6 +581,21 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             str(second), second, "127.0.0.1:31020", [2], [9]
         )
 
+    def test_dynamic_decode_admission_is_weighted_by_chunk_pages(self):
+        # Model one nominal 8-page slot with a four-transfer work ceiling.
+        # Four two-page chunks fit the native dynamic pool concurrently; the
+        # old count-based gate would have admitted only one.
+        mgr = self._decode_mgr(capacity=4, full_limit=8)
+        mgr._pulling = SlotAdmission(4, full_block_capacity=8)
+        for room in range(40, 44):
+            self._announce(mgr, room, full_pages=2)
+            self.assertTrue(mgr.maybe_start_pull(room))
+
+        blocked = 44
+        self._announce(mgr, blocked, full_pages=1)
+        self.assertFalse(mgr.maybe_start_pull(blocked))
+        self.assertEqual(mgr._engine.start_read.call_count, 4)
+
     @staticmethod
     def _decode_mgr(capacity, full_limit, swa_limit=None):
         mgr = object.__new__(RaidenKVManager)

@@ -95,9 +95,13 @@ speculative draft KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 | `SGLANG_RAIDEN_SWA_MAX_BLOCKS` | `0` (auto) | SWA max pages/request; auto includes one page for an unaligned window start |
 | `SGLANG_RAIDEN_MAX_MODEL_LEN` | `8192` | fallback when `--context-length` is unset |
 | `SGLANG_RAIDEN_TIMEOUT_S` | `120` | raiden transfer timeout |
-| `TPU_RAIDEN_DYNAMIC_HOST_STAGING` | `1` | raiden allocates host staging per transfer from the pool; resharding stages each plan in its own host blocks instead of shadowing the device KV pool. Setting `0` keeps fixed slots and rejects asymmetric resharding, which needs per-transfer staging |
+| `TPU_RAIDEN_DYNAMIC_HOST_STAGING` | `1` | raiden assigns each transfer its actual number of host blocks from the eagerly allocated pool; resharding stages each plan in its own host blocks instead of shadowing the device KV pool. Setting `0` keeps fixed slots and rejects asymmetric resharding, which needs per-transfer staging |
 
-A decode rank issues at most one pull per host staging slot; requests past that stay in the transfer queue and are retried as slots free, so the batch size does not have to fit the slot count.
+A decode rank admits pulls while their combined full-attention and sliding-window
+block counts fit the corresponding host pools. A separate ceiling of
+`max_running_requests + disaggregation_decode_extra_slots` bounds concurrent
+transfer work. Requests that do not fit stay queued and are retried as blocks
+return to the pools.
 
 ## Launch (one host each, equal TP)
 

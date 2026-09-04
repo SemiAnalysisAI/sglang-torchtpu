@@ -11,6 +11,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import unittest
 
 from sglang.srt.disaggregation.raiden.host_pool import (
+    SlotAdmission,
     node_worker_rank,
     ranks_per_node,
     slot_host_bytes,
@@ -53,6 +54,42 @@ class TestSlotHostBytes(unittest.TestCase):
         mixed = _pool(2) + [_Buffer((4096, 128, 2, 16, 128))]
         widest = 128 * 2 * 16 * 128 * 2
         self.assertEqual(slot_host_bytes(mixed, 8), widest * 3 * 8)
+
+
+class TestBlockWeightedAdmission(unittest.TestCase):
+    def test_small_transfers_share_the_pool_past_nominal_slot_count(self):
+        gate = SlotAdmission(64, full_block_capacity=128)
+        self.assertTrue(gate.admit("a", full_blocks=32))
+        self.assertTrue(gate.admit("b", full_blocks=32))
+        self.assertTrue(gate.admit("c", full_blocks=32))
+        self.assertTrue(gate.admit("d", full_blocks=32))
+        self.assertFalse(gate.admit("e", full_blocks=1))
+
+    def test_full_and_swa_capacity_are_reserved_atomically(self):
+        gate = SlotAdmission(
+            8,
+            full_block_capacity=128,
+            swa_block_capacity=8,
+        )
+        self.assertTrue(gate.admit("a", full_blocks=32, swa_blocks=6))
+        self.assertFalse(gate.admit("b", full_blocks=32, swa_blocks=3))
+        self.assertEqual(gate.rooms(), ["a"])
+
+    def test_release_returns_both_block_budgets(self):
+        gate = SlotAdmission(
+            8,
+            full_block_capacity=32,
+            swa_block_capacity=4,
+        )
+        self.assertTrue(gate.admit("a", full_blocks=32, swa_blocks=4))
+        gate.release("a")
+        self.assertTrue(gate.admit("b", full_blocks=32, swa_blocks=4))
+
+    def test_count_ceiling_still_bounds_tiny_transfers(self):
+        gate = SlotAdmission(2, full_block_capacity=128)
+        self.assertTrue(gate.admit("a", full_blocks=1))
+        self.assertTrue(gate.admit("b", full_blocks=1))
+        self.assertFalse(gate.admit("c", full_blocks=1))
 
 
 class TestRanksPerNode(unittest.TestCase):

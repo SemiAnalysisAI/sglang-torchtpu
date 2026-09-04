@@ -61,6 +61,51 @@ class TestSlotAdmission(unittest.TestCase):
             waves += 1
         self.assertEqual(waves, 4)
 
+    def test_dynamic_admission_accounts_actual_full_blocks(self):
+        gate = SlotAdmission(64, full_block_capacity=128)
+        self.assertTrue(gate.admit("a", full_blocks=32))
+        self.assertTrue(gate.admit("b", full_blocks=64))
+        self.assertFalse(gate.admit("c", full_blocks=33))
+        self.assertTrue(gate.admit("c", full_blocks=32))
+
+    def test_dynamic_admission_retains_a_count_ceiling(self):
+        gate = SlotAdmission(2, full_block_capacity=128)
+        self.assertTrue(gate.admit("a", full_blocks=1))
+        self.assertTrue(gate.admit("b", full_blocks=1))
+        self.assertFalse(gate.admit("c", full_blocks=1))
+
+    def test_dynamic_admission_reserves_full_and_swa_atomically(self):
+        gate = SlotAdmission(
+            8,
+            full_block_capacity=128,
+            swa_block_capacity=8,
+        )
+        self.assertTrue(gate.admit("a", full_blocks=32, swa_blocks=6))
+        self.assertFalse(gate.admit("b", full_blocks=32, swa_blocks=3))
+        self.assertEqual(gate.rooms(), ["a"])
+
+    def test_dynamic_release_returns_both_block_budgets(self):
+        gate = SlotAdmission(
+            8,
+            full_block_capacity=32,
+            swa_block_capacity=4,
+        )
+        self.assertTrue(gate.admit("a", full_blocks=32, swa_blocks=4))
+        self.assertFalse(gate.admit("b", full_blocks=1))
+        gate.release("a")
+        self.assertTrue(gate.admit("b", full_blocks=32, swa_blocks=4))
+
+    def test_dynamic_readmission_does_not_double_charge(self):
+        gate = SlotAdmission(8, full_block_capacity=32)
+        self.assertTrue(gate.admit("a", full_blocks=32))
+        self.assertTrue(gate.admit("a", full_blocks=32))
+        self.assertEqual(len(gate), 1)
+
+    def test_dynamic_admission_requires_a_block_count(self):
+        gate = SlotAdmission(8, full_block_capacity=32)
+        with self.assertRaises(ValueError):
+            gate.admit("a")
+
 
 if __name__ == "__main__":
     unittest.main()

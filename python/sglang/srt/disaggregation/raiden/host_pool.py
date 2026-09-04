@@ -1,29 +1,46 @@
 """Sizing and admission control for raiden's host staging pool.
 
 A raiden engine reserves ``num_slots * max_blocks`` pages of pinned host memory
-at startup and borrows one slot per in-flight transfer. Deriving the slot count
-from a memory budget keeps a large context length from turning into a host
-allocation that fails at startup; admission keeps a consumer from issuing more
-concurrent pulls than the pool holds.
+at startup. Fixed staging borrows one complete slot per transfer; dynamic
+staging borrows the transfer's actual block count from the same pool. Deriving
+the pool size from a memory budget prevents a large context length from causing
+an unbounded startup allocation, while admission prevents pool overcommit.
 """
 
 from __future__ import annotations
 
-from typing import Any, List, Set
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class SlotAdmission:
-    """Admission control over raiden's host staging slots.
+    """Admission control over raiden's host staging pool.
 
-    Raiden borrows one slot per in-flight transfer and rejects a read it cannot
-    seat, so a consumer must not issue more concurrent reads than the pool
-    holds. Reads that are not admitted stay pending and are retried. Keys are
-    whatever identifies one read -- a room, or a room's chunk.
+    With dynamic staging, Raiden borrows the actual number of full-attention
+    and SWA blocks a transfer needs from separate pools. ``capacity`` remains a
+    count ceiling so tiny transfers cannot create unbounded concurrent work.
+
+    When block capacities are omitted this retains the legacy count-only
+    behavior used with fixed native staging slots. Keys are whatever identifies
+    one read -- a room, or a room's chunk.
     """
 
-    def __init__(self, capacity: int):
+    def __init__(
+        self,
+        capacity: int,
+        *,
+        full_block_capacity: Optional[int] = None,
+        swa_block_capacity: Optional[int] = None,
+    ):
         self.capacity = max(1, int(capacity))
-        self._in_flight: Set[Any] = set()
+        self.full_block_capacity = (
+            None if full_block_capacity is None else max(0, int(full_block_capacity))
+        )
+        self.swa_block_capacity = (
+            None if swa_block_capacity is None else max(0, int(swa_block_capacity))
+        )
+        self._in_flight: Dict[Any, Tuple[int, int]] = {}
+        self._full_blocks_in_flight = 0
+        self._swa_blocks_in_flight = 0
 
     def __len__(self) -> int:
         return len(self._in_flight)
@@ -31,17 +48,53 @@ class SlotAdmission:
     def __contains__(self, key: Any) -> bool:
         return key in self._in_flight
 
-    def admit(self, key: Any) -> bool:
-        """Reserves a slot for ``key``. False means try again later."""
+    def admit(
+        self,
+        key: Any,
+        *,
+        full_blocks: Optional[int] = None,
+        swa_blocks: int = 0,
+    ) -> bool:
+        """Reserves pool capacity for ``key``. False means retry later."""
         if key in self._in_flight:
             return True
         if len(self._in_flight) >= self.capacity:
             return False
-        self._in_flight.add(key)
+
+        # No block budget means native Raiden is using fixed slots. Preserve
+        # the old one-transfer-per-slot admission behavior in that mode.
+        if self.full_block_capacity is None:
+            self._in_flight[key] = (0, 0)
+            return True
+
+        if full_blocks is None:
+            raise ValueError("full_blocks is required for block-weighted admission")
+        full_blocks = int(full_blocks)
+        swa_blocks = int(swa_blocks)
+        if full_blocks < 0 or swa_blocks < 0:
+            raise ValueError("staging block counts must be non-negative")
+        if self._full_blocks_in_flight + full_blocks > self.full_block_capacity:
+            return False
+        if swa_blocks and self.swa_block_capacity is None:
+            return False
+        if (
+            self.swa_block_capacity is not None
+            and self._swa_blocks_in_flight + swa_blocks > self.swa_block_capacity
+        ):
+            return False
+
+        self._in_flight[key] = (full_blocks, swa_blocks)
+        self._full_blocks_in_flight += full_blocks
+        self._swa_blocks_in_flight += swa_blocks
         return True
 
     def release(self, key: Any) -> None:
-        self._in_flight.discard(key)
+        held = self._in_flight.pop(key, None)
+        if held is None:
+            return
+        full_blocks, swa_blocks = held
+        self._full_blocks_in_flight -= full_blocks
+        self._swa_blocks_in_flight -= swa_blocks
 
     def rooms(self) -> List[Any]:
         return list(self._in_flight)

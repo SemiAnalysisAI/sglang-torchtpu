@@ -455,7 +455,6 @@ class RaidenKVManager(CommonKVManager):
             num_slots=num_slots,
             timeout_s=self._timeout_s,
         )
-        self._pulling = SlotAdmission(num_slots)
         self._full_engine_max_blocks = max_blocks
         logger.info(
             "RaidenKVManager rank%d engine up | endpoint=%s max_blocks=%d "
@@ -466,6 +465,8 @@ class RaidenKVManager(CommonKVManager):
             num_slots,
             int(self.chunked_transfer),
         )
+        swa_max_blocks = 0
+        swa_num_slots = 0
         if self._swa_kv_caches:
             self.swa_raiden_endpoint = NetworkAddress(
                 host=self.local_ip, port=self._control_port + 2
@@ -480,8 +481,6 @@ class RaidenKVManager(CommonKVManager):
                 num_slots=swa_num_slots,
                 timeout_s=self._timeout_s,
             )
-            # A room occupies a slot in both engines; the tighter pool binds.
-            self._pulling.capacity = min(self._pulling.capacity, swa_num_slots)
             self._swa_engine_max_blocks = swa_max_blocks
             logger.info(
                 "RaidenKVManager rank%d SWA engine up | endpoint=%s "
@@ -491,6 +490,21 @@ class RaidenKVManager(CommonKVManager):
                 swa_max_blocks,
                 swa_num_slots,
             )
+        if self._dynamic_host_staging:
+            # Native Raiden allocates actual pages per transfer from these
+            # eagerly-created block pools. Account in the same units instead
+            # of charging every chunk one full-context slot.
+            self._pulling = SlotAdmission(
+                self._slot_ceiling(),
+                full_block_capacity=num_slots * max_blocks,
+                swa_block_capacity=(
+                    swa_num_slots * swa_max_blocks if self._swa_engine else None
+                ),
+            )
+        else:
+            # Fixed native staging still consumes one whole slot per transfer.
+            capacity = min(num_slots, swa_num_slots) if self._swa_engine else num_slots
+            self._pulling = SlotAdmission(capacity)
 
     def _max_request_blocks(self) -> int:
         override = int(os.environ.get("SGLANG_RAIDEN_MAX_BLOCKS", "0"))
@@ -515,13 +529,12 @@ class RaidenKVManager(CommonKVManager):
         return max(1, math.ceil(max_tokens / self.kv_args.page_size))
 
     def _slot_ceiling(self) -> int:
-        """Slots that can ever be claimed at once.
+        """Transfers that can ever be active at once.
 
-        A transfer holds one slot from the moment it is issued until its H2D
-        lands. The decode admits a request into the transfer queue before it
-        joins the running batch, so the reach is the batch plus the extra
-        in-transfer slots reserved alongside it; past that, slots are
-        unclaimable.
+        The decode admits a request into the transfer queue before it joins the
+        running batch, so the reach is the batch plus the extra in-transfer
+        entries reserved alongside it. Dynamic staging applies this separately
+        from the block budget so tiny transfers cannot create unbounded work.
         """
         batch = int(self.server_args.max_running_requests or 64)
         in_transfer = int(
@@ -1488,9 +1501,10 @@ class RaidenKVManager(CommonKVManager):
                 if not pairs:
                     queue.pop(0)
                     continue
-                if len(pairs) > self._full_engine_max_blocks:
+                full_pages = len({local_block for _, local_block in pairs})
+                if full_pages > self._full_engine_max_blocks:
                     oversized = (
-                        len(pairs),
+                        full_pages,
                         self._full_engine_max_blocks,
                         "full-attention",
                         "SGLANG_RAIDEN_MAX_BLOCKS",
@@ -1499,6 +1513,7 @@ class RaidenKVManager(CommonKVManager):
                 # The closing read also carries the sliding-window pages, on
                 # the engine that stages them against its own limit.
                 closing = req_id == str(room) and self._swa_engine is not None
+                swa_pages = 0
                 if closing:
                     remote_swa, local_swa = self._pair_blocks(
                         list(self._remote_swa_blocks.get(room, [])),
@@ -1517,7 +1532,9 @@ class RaidenKVManager(CommonKVManager):
                 if room in self._aborted:
                     # The room failed; its pages are no longer this read's.
                     return started
-                if not self._pulling.admit(req_id):
+                if not self._pulling.admit(
+                    req_id, full_blocks=full_pages, swa_blocks=swa_pages
+                ):
                     return started
                 # Status moves with the admission, under the same lock an
                 # abort takes: a Transferring write can never follow the
@@ -1577,6 +1594,7 @@ class RaidenKVManager(CommonKVManager):
                 "SGLANG_RAIDEN_MAX_BLOCKS",
             )
             return False
+        swa_pages = 0
         if self._swa_engine is not None:
             remote_swa, local_swa = self._pair_blocks(remote_swa, local_swa)
             swa_pages = len(set(local_swa))
@@ -1599,7 +1617,9 @@ class RaidenKVManager(CommonKVManager):
             # own key; a chunked read's key is its chunk id.
             if str(room) in self._pulling:
                 return True
-            if room in self._aborted or not self._pulling.admit(str(room)):
+            if room in self._aborted or not self._pulling.admit(
+                str(room), full_blocks=full_pages, swa_blocks=swa_pages
+            ):
                 return False
             # Status moves with the admission, under the same lock an abort
             # takes: a Transferring write can never follow the abort's Failed.
