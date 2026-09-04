@@ -8,11 +8,11 @@ representing it as one target is the honest model. The cyclic imports resolve
 at import time; Bazel's job here is only to stage the sources and the external
 libraries they need.
 
-The ``deps`` block between BEGIN/END GENERATED DEPS is machine-generated from
-an AST scan of the TPU serving closure; the generator is a bootstrap script,
-not part of the repository. Regenerate after adding/removing a third-party
-import. First-party (sglang.*) imports intentionally produce no deps: this
-target already stages the whole package.
+The ``deps`` list of ``:sglang`` is machine-generated from an AST scan of the
+TPU serving closure; the generator is a bootstrap script, not part of the
+repository. Regenerate after adding/removing a third-party import. First-party
+(sglang.*) imports intentionally produce no deps: this target already stages
+the whole package.
 """
 
 load("@rules_python//python:defs.bzl", "py_library")
@@ -53,7 +53,6 @@ py_library(
         ":dist_info",
         "//python/sglang:data_files",
     ],
-# BEGIN GENERATED DEPS (gen_sglang_build.py)
     deps = [
         "@sglang_pypi//accelerate",
         "@sglang_pypi//aiohttp",
@@ -138,5 +137,4 @@ py_library(
         "@torch_tpu//shims/jax:pallas",
         "@torch_tpu//torch_tpu",
     ],
-# END GENERATED DEPS
 )
