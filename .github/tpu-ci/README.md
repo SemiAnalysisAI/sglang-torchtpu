@@ -189,12 +189,14 @@ The nightly single-host jobs are ONE JOB PER TEST FILE (`discover_tests.py` rend
 matrix), so a red job names its test directly — the dashboard contract. Kueue queues
 them against the nightly lane's single-host quota, and they all reuse one image build.
 
-**Two names per job.** GitHub renders a called job as `<caller> / <callee>`, so a stage
-job carries the compact stage tag (`single-host`, `accuracy`, `pd-sh-gpt-120b`, …) and
-passes its test to `_tpu-test.yml` as `display_name` — a check ENDS with the test:
-`feature-validation / single-host / test_diffusion_wan22_ti2v_5b`. `run_name` is a
-different name, for Kubernetes only (pods are `tpu-ci-<run_name>-<rand>-slice-<idx>`, 63
-chars max). Neither is a dashboard key: series identity is the metric `id`.
+**`run_name` has a budget.** It prefixes every Kubernetes object a leg creates, and JobSet
+validates the POD name — `tpu-ci-<run_name>-<5 rand>-<role>-<job idx>-<pod idx>-<5 rand>` —
+against the 63-char DNS-label cap at admission. That leaves `run_name` 34 chars on a slice
+and 32 on a P/D role; the discovery scripts hand every leg a 12-hex compact name for this,
+and a hand-written one (`accuracy-<model>-<eval>`, `pd-mh-gpt-120b-spec`) stays short. The
+suite name is NOT a safe default — `nightly-tpu-accuracy-gpt-oss-120b-mmlupro` (41) is
+rejected. Neither this nor the job name is a dashboard key: series identity is the metric
+`id`.
 
 **Adding a nightly test.** Single-host: `register_tpu_ci(est_time=…, suite=…, nightly=True)`
 plus the suite in `run_suite.py`. Multi-host: drop a file with a `MULTIHOST_LAUNCH` dict
