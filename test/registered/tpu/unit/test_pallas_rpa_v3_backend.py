@@ -159,6 +159,7 @@ class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
             soft_cap,
             k_scale,
             v_scale,
+            decode_query_size=1,
         ):
             captured["sliding_window"] = sliding_window
             return torch.zeros_like(q)

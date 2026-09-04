@@ -149,6 +149,14 @@ class TestBatchedRpaMetadataDecode(CustomTestCase):
         self.assertTrue(torch.equal(meta.distribution, expected))
         self.assertEqual(meta.distribution.dtype, torch.int32)
 
+    def test_verify_uses_decode_distribution_and_full_query_width(self):
+        self.fb.forward_mode = ForwardMode.TARGET_VERIFY
+        self.fb.spec_info = types.SimpleNamespace(num_tokens_per_req=4)
+        meta = self._build()
+        self.assertEqual(meta.distribution.tolist(), [self.bs] * 3)
+        self.assertEqual(meta.cu_q_lens.tolist(), [0, 4, 8, 12])
+        self.assertEqual(meta.kv_lens.tolist(), (self.seq_lens + 4).tolist())
+
     def test_no_swa_page_indices(self):
         self.assertIsNone(self._build().swa_page_indices)
 

@@ -79,6 +79,7 @@ class ServingConfigs:
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
     smem_fraction_limit_for_schedule_generation: float = 0.33
     max_schedule_size_multiplier: int = 16
+    decode_query_size: int = 1
 
     @property
     def pages_per_seq(self) -> int:
@@ -217,8 +218,13 @@ class RpaConfigs:
 
     @property
     def bkv_p_new(self) -> int:
-        if self.mode == RpaCase.DECODE or self.block.bq_sz == 1:
+        if self.block.bq_sz == 1:
             return 1
+        if self.mode == RpaCase.DECODE:
+            return min(
+                1 + pl.cdiv(self.serve.decode_query_size - 1, self.serve.page_size),
+                self.bkv_p,
+            )
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.bkv_p + 1
         return self.bkv_p

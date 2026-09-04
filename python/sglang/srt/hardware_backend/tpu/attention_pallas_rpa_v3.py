@@ -54,6 +54,7 @@ def _invoke_v3_kernel(
     soft_cap,
     k_scale,
     v_scale,
+    decode_query_size=1,
 ):
     return jax_rpa(
         queries,

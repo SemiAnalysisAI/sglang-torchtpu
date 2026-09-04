@@ -179,6 +179,7 @@ class RpaKernelSpec:
     extend_distribution_mask: tuple[int, int, int]
     # Minimum KV page size required by the backend.
     min_page_size: int | None = None
+    supports_verify_decode: bool = False
 
 
 # torch custom ops are process-global; cache one per op_name so repeated backend
@@ -240,6 +241,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         soft_cap: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
+        decode_query_size: int = 1,
     ) -> tuple[jax.Array, jax.Array]:
         if not spec.supports_attention_sink and attention_sink is not None:
             raise NotImplementedError(f"{op_name} does not support attention sinks")
@@ -264,14 +266,16 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
             soft_cap=soft_cap,
             k_scale=k_scale,
             v_scale=v_scale,
+            decode_query_size=decode_query_size,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
         # Static (non-traced) args by _wrapped position: 10=sm_scale,
-        # 11=sliding_window, 12=soft_cap, 13=k_scale, 14=v_scale.
-        static_argnums=(10, 11, 12, 13, 14),
+        # 11=sliding_window, 12=soft_cap, 13=k_scale, 14=v_scale,
+        # 15=decode_query_size.
+        static_argnums=(10, 11, 12, 13, 14, 15),
         donate_argnums=(3,),
         input_output_aliases={3: 1},
         warn_deprecated=False,
@@ -298,6 +302,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         soft_cap: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
+        decode_query_size: int = 1,
     ) -> torch.Tensor:
         with tpu_info_for_cpu_export():
             output, _updated_kv = jax_kernel(
@@ -316,6 +321,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
                 soft_cap,
                 k_scale,
                 v_scale,
+                decode_query_size,
             )
         return output
 
@@ -541,7 +547,13 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         page_size = self.page_size
         device = forward_batch.seq_lens.device
         distribution = self._get_cached_rpa_distribution(
-            forward_batch.forward_mode.is_decode(), non_empty_bs, device
+            forward_batch.forward_mode.is_decode()
+            or (
+                self.kernel_spec.supports_verify_decode
+                and forward_batch.forward_mode.is_target_verify()
+            ),
+            non_empty_bs,
+            device,
         )
         bs = int(forward_batch.seq_lens.shape[0])
         req_to_token = self.req_to_token_pool.req_to_token
@@ -910,6 +922,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             soft_cap,
             k_scale,
             v_scale,
+            (
+                forward_batch.spec_info.num_tokens_per_req
+                if self.kernel_spec.supports_verify_decode
+                and forward_batch.forward_mode.is_target_verify()
+                else 1
+            ),
         )
 
         capture_mode = getattr(forward_batch, "capture_hidden_mode", None)

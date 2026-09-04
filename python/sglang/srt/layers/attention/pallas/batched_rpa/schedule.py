@@ -640,11 +640,19 @@ def compute_metadata(
                 dma_entry.wb_hbm[...] = dst_hbm
                 dma_entry.set_flags(dma_sz, dma_sz)
 
-        if cfgs.block.bq_sz == 1:
-            # Decode path
-            assert cfgs.bkv_p_new == 1
-            slot_start = (bkv_sz_cache // cfgs.serve.page_size) * cfgs.serve.page_size
-            fill_dma_kv_new(0, bkv_sz_cache, new_sz, slot_start)
+        if cfgs.bkv_p_new < cfgs.bkv_p:
+            # A verification span may cross noncontiguous physical KV pages.
+            # Split writebacks at each page boundary, even in decode mode.
+            curr_vmem = bkv_sz_cache
+            curr_rem = new_sz
+            for i in range(cfgs.bkv_p_new):
+                slot_start = (curr_vmem // cfgs.serve.page_size) * cfgs.serve.page_size
+                dma_sz = jnp.minimum(
+                    curr_rem, slot_start + cfgs.serve.page_size - curr_vmem
+                )
+                fill_dma_kv_new(i, curr_vmem, dma_sz, slot_start)
+                curr_vmem += dma_sz
+                curr_rem -= dma_sz
         else:
             iters = max(cfgs.bkv_p, cfgs.bkv_p_new)
             for i in range(iters):

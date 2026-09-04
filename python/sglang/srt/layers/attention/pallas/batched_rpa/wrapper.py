@@ -389,7 +389,9 @@ def calculate_block_sizes(
     # cell's worth.
     prefill_batch_size = 1
 
-    decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
+    decode_block_sizes = find_best_block_sizes(
+        decode_batch_size, n_buffer, serve_cfgs.decode_query_size
+    )
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
 
     # Operator escape hatch. The search above works from a VMEM estimate that
@@ -424,6 +426,7 @@ def calculate_block_sizes(
         "use_causal_mask",
         "skip_kv_update",
         "kv_layout",
+        "decode_query_size",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -453,6 +456,7 @@ def ragged_paged_attention(
     use_causal_mask: bool = True,
     skip_kv_update: bool = False,
     kv_layout: configs.KVLayout | None = None,
+    decode_query_size: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -482,6 +486,8 @@ def ragged_paged_attention(
         k_scale: Quantization scale value of keys.
         v_scale: Quantization scale value of values.
         chunk_prefill_size: Not used.
+        decode_query_size: Maximum query width routed through decode, including
+            speculative verification tokens. Defaults to single-token decode.
         decode_block_sizes: Kernel block size to use during decode.
         prefill_block_sizes: Kernel block size to use during prefill.
         vmem_limit_bytes: VMEM size limit of the kernel. Defaults to maximum VMEM
@@ -504,6 +510,8 @@ def ragged_paged_attention(
     if kv_layout is None:
         kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
 
+    if decode_query_size < 1:
+        raise ValueError("decode_query_size must be positive")
     if not use_causal_mask:
         raise ValueError("Only causal attention is supported.")
     if chunk_prefill_size is not None:
@@ -550,6 +558,7 @@ def ragged_paged_attention(
         scale_k=k_scale,
         scale_v=v_scale,
         kv_layout=kv_layout,
+        decode_query_size=decode_query_size,
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(

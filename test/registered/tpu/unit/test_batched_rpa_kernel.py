@@ -46,6 +46,19 @@ class TestBatchedRpaKernel(unittest.TestCase):
     TOLERANCE = 0.05
 
     def test_idle_lane_multihead_decode_and_writeback_match_reference(self):
+        self._check_decode(query_size=1, prefix_len=2048)
+
+    def test_verify_cross_page_writeback_matches_reference(self):
+        # Distinct physical pages expose writes that incorrectly continue into
+        # the next physical page instead of following the request page table.
+        for seq_layout in (False, True):
+            for prefix_len in (2046, 2048):
+                with self.subTest(seq_layout=seq_layout, prefix_len=prefix_len):
+                    self._check_decode(
+                        query_size=4, prefix_len=prefix_len, seq_layout=seq_layout
+                    )
+
+    def _check_decode(self, *, query_size, prefix_len, seq_layout=False):
         import jax
         import jax.numpy as jnp
 
@@ -60,7 +73,7 @@ class TestBatchedRpaKernel(unittest.TestCase):
         )
 
         kv_dtype = jnp.bfloat16
-        kv_len = 2049
+        kv_len = prefix_len + query_size
         total_pages = self.PAGES_PER_SEQ
         padded_q_tokens = 8
 
@@ -92,12 +105,18 @@ class TestBatchedRpaKernel(unittest.TestCase):
             dtype=kv_dtype,
         )
 
-        page_indices_host = np.arange(total_pages, dtype=np.int32).reshape(1, -1)
-        new_token_pos = kv_len - 1
-        rel_page, slot = divmod(new_token_pos, self.PAGE_SIZE)
-        abs_page = int(page_indices_host[0, rel_page])
-        ref_k = cache_k.at[abs_page, slot].set(new_k[0])
-        ref_v = cache_v.at[abs_page, slot].set(new_v[0])
+        page_indices_host = (
+            np.random.default_rng(42)
+            .permutation(total_pages)
+            .astype(np.int32)
+            .reshape(1, -1)
+        )
+        ref_k, ref_v = cache_k, cache_v
+        for token in range(query_size):
+            rel_page, slot = divmod(prefix_len + token, self.PAGE_SIZE)
+            abs_page = int(page_indices_host[0, rel_page])
+            ref_k = ref_k.at[abs_page, slot].set(new_k[token])
+            ref_v = ref_v.at[abs_page, slot].set(new_v[token])
 
         packing = get_dtype_packing(kv_dtype)
         unpacked_kv_heads = self.NUM_KV_HEADS * 2
@@ -120,14 +139,25 @@ class TestBatchedRpaKernel(unittest.TestCase):
             self.HEAD_DIM,
         )
 
+        from sglang.srt.layers.attention.pallas.batched_rpa.configs import KVLayout
+
+        if seq_layout:
+            kv_cache = kv_cache_unpacked.reshape(
+                total_pages,
+                self.PAGE_SIZE,
+                unpacked_kv_heads,
+                self.HEAD_DIM // packing,
+                packing,
+            ).transpose(0, 2, 3, 4, 1)
+
         kv_lens = jnp.asarray([kv_len], dtype=jnp.int32)
-        cu_q_lens = jnp.asarray([0, 1], dtype=jnp.int32)
+        cu_q_lens = jnp.asarray([0, query_size], dtype=jnp.int32)
         page_indices = jnp.asarray(page_indices_host.reshape(-1))
         distribution = jnp.ones((3,), dtype=jnp.int32)
         sm_scale = 1.0 / math.sqrt(self.HEAD_DIM)
 
         expected = ref_ragged_paged_attention(
-            q[:1],
+            q[:query_size],
             ref_k,
             ref_v,
             kv_lens,
@@ -146,23 +176,38 @@ class TestBatchedRpaKernel(unittest.TestCase):
             cu_q_lens,
             distribution,
             sm_scale=sm_scale,
+            decode_query_size=query_size,
+            kv_layout=(
+                KVLayout.SEQ_ALONG_LANE if seq_layout else KVLayout.HEAD_ALONG_SUBLANE
+            ),
         )
 
         max_diff = jnp.max(
-            jnp.abs(actual[:1].astype(jnp.float32) - expected.astype(jnp.float32))
+            jnp.abs(
+                actual[:query_size].astype(jnp.float32) - expected.astype(jnp.float32)
+            )
         )
         self.assertLess(float(max_diff), self.TOLERANCE)
 
+        if seq_layout:
+            updated_cache = updated_cache.transpose(0, 4, 1, 2, 3)
         unpacked_cache = updated_cache.reshape(
             total_pages, self.PAGE_SIZE, aligned_kv_heads, self.HEAD_DIM
         )
+        checked_slots = np.ones((total_pages, self.PAGE_SIZE), dtype=bool)
+        if seq_layout:
+            # This layout writes whole owned pages. Unused slots after kv_len
+            # are unspecified; live prefixes and all other pages must survive.
+            last_page, end_slot = divmod(kv_len, self.PAGE_SIZE)
+            if end_slot:
+                checked_slots[page_indices_host[0, last_page], end_slot:] = False
         np.testing.assert_array_equal(
-            np.asarray(unpacked_cache[abs_page, slot, 0:unpacked_kv_heads:2]),
-            np.asarray(new_k[0]),
+            np.asarray(unpacked_cache[:, :, 0:unpacked_kv_heads:2])[checked_slots],
+            np.asarray(ref_k)[checked_slots],
         )
         np.testing.assert_array_equal(
-            np.asarray(unpacked_cache[abs_page, slot, 1:unpacked_kv_heads:2]),
-            np.asarray(new_v[0]),
+            np.asarray(unpacked_cache[:, :, 1:unpacked_kv_heads:2])[checked_slots],
+            np.asarray(ref_v)[checked_slots],
         )
 
 

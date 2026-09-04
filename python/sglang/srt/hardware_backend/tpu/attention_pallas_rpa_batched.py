@@ -82,6 +82,7 @@ def _invoke_batched_kernel(
     soft_cap,
     k_scale,
     v_scale,
+    decode_query_size=1,
 ):
     # cu_kv_lens and attention_sink are not consumed by the batched kernel.
     # It builds its schedule inline and has no per-mode dispatch to skip, so
@@ -106,6 +107,7 @@ def _invoke_batched_kernel(
         # The kernel owns the KV write; the backend never writes out of band.
         skip_kv_update=False,
         kv_layout=kv_layout(),
+        decode_query_size=decode_query_size,
     )
 
 
@@ -123,6 +125,7 @@ RPA_BATCHED_SPEC = RpaKernelSpec(
     uses_cu_kv_lens=False,
     extend_distribution_mask=(0, 0, 1),  # [0, 0, n] (MIXED-only)
     min_page_size=_MIN_PAGE_SIZE,
+    supports_verify_decode=True,
 )
 
 
