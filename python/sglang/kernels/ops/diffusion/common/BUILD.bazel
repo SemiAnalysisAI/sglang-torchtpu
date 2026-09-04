@@ -52,6 +52,5 @@ py_library(
     imports = ["../../../../.."],
     deps = [
         "//python:cycle_0",
-        "//python:cycle_1",
     ],
 )

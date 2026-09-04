@@ -72,7 +72,6 @@ py_library(
     srcs = ["tokenizer.py"],
     imports = ["../../../.."],
     deps = [
-        "//python/sglang/srt/tokenizer:tiktoken_tokenizer",
         "//python:cycle_0",
         "@sglang_pypi//tokenizers",
         "@sglang_pypi//transformers",

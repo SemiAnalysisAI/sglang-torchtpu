@@ -72,5 +72,14 @@ targets. Regenerate after adding/removing modules or changing imports:
 bazel run //bazel:gen_sglang_build
 ```
 
+Only the **TPU serving closure** gets BUILD files — directories statically
+reachable from the launch entry points plus the dynamic roots
+(`DYNAMIC_ROOTS` in `bazel/gen_sglang_build.py`: models, speculative,
+multimodal, attention/quantization layers, hardware backends, kernel ops).
+The rest of the tree (CUDA kernel zoos, `multimodal_gen`, ...) stays
+Bazel-free; a stale BUILD file outside the closure is removed on regen. A
+closure module that starts importing outside the closure fails the generator
+loudly — extend `DYNAMIC_ROOTS` or `NON_CLOSURE_DEPS` deliberately.
+
 `python/BUILD.bazel` is handwritten: it loads the generated cycles and defines
-the `:sglang` aggregator (the whole package) that tests depend on.
+the `:sglang` aggregator (the TPU serving closure) that tests depend on.

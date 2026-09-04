@@ -30,7 +30,104 @@ modules or changing their imports:
 It rewrites the per-directory BUILD files and ``python/cycles.bzl`` (the
 collapsed cycle targets plus the ``ALL_MODULE_DEPS`` list the handwritten
 ``python/BUILD.bazel`` builds its ``:sglang`` aggregator from).
+
+Only the TPU closure gets BUILD files: directories reachable from the launch
+entry points by static imports, plus DYNAMIC_ROOTS below. The rest of the
+tree (CUDA kernel zoos, multimodal generation, ...) stays Bazel-free, which
+keeps the change non-invasive.
 """
+
+# Directories whose modules are loaded dynamically (importlib/pkgutil) and
+# therefore invisible to the static import scan, but required on the TPU
+# serving path:
+# - srt/models: the model registry pkgutil-walks and imports EVERY module in
+#   the directory at startup (import failures are logged and skipped, so a
+#   missing BUILD file would not crash -- it would silently drop the model).
+#   Model files import their multimodal processors and attention backends,
+#   which pulls in the rest of srt/multimodal and srt/layers/attention.
+# - srt/speculative: spec-decoding algorithms are selected by name at launch.
+# - kernels/ops: model files and multimodal processors import kernel ops by
+#   name across the subtree (attention backends, mm processors).
+# - hardware_backend: layers/quantization unconditionally imports sibling
+#   backends' quantization helpers (upstream coupling, not TPU-specific), so
+#   the whole tree rides along.
+# - layers/quantization: quantization methods register their schemes by name
+#   at import time via dynamic loads.
+# Everything under these roots gets BUILD files; nothing else outside the
+# static closure does.
+DYNAMIC_ROOTS = (
+    "sglang/srt/models",
+    "sglang/srt/speculative",
+    "sglang/srt/multimodal",
+    "sglang/srt/layers/attention",
+    "sglang/srt/layers/quantization",
+    "sglang/srt/hardware_backend",
+    "sglang/kernels/ops",
+)
+
+# Static roots of the closure: the launch entry point, the bench entry, the
+# package root, and the test harness. The e2e test file imports
+# sglang.test.ci directly and the TPU harness uses sglang.test.kits, so the
+# whole sglang.test tree -- kits, fixtures, runners -- is in the closure.
+STATIC_ROOTS = ("sglang.launch_server", "sglang.bench_serving", "sglang")
+
+# Directory prefixes treated as static roots too (the static scan starts from
+# module names, which cannot express a package prefix).
+STATIC_DIR_ROOTS = ("sglang/test",)
+
+# Modules outside the closure that closure modules import anyway (diffusion
+# kernels pull multimodal_gen; the TPU harness pulls two test fixtures and the
+# tiktoken tokenizer). The TPU serving path never executes these imports --
+# they sit in GPU-only or eval-only code -- so the modules are simply absent
+# from the Bazel closure, and the import would fail loudly if ever reached.
+# The generator errors on any OTHER non-closure dep so a real leak is caught
+# at regen time, not at runtime. Values are module names; "pkg.*" allows the
+# whole subtree (multimodal_gen: diffusion serving, never on the TPU path).
+NON_CLOSURE_DEPS = {
+    "sglang.multimodal_gen.*",
+    "sglang.srt.tokenizer.tiktoken_tokenizer",
+    "sglang.test.server_fixtures.disaggregation_fixture",
+    "sglang.test.server_fixtures.streaming_session_fixture",
+}
+
+
+def _is_non_closure_allowed(mod: str) -> bool:
+    for pat in NON_CLOSURE_DEPS:
+        if pat.endswith(".*"):
+            if mod == pat[:-2] or mod.startswith(pat[:-1]):
+                return True
+        elif mod == pat:
+            return True
+    return False
+
+
+def closure_dirs(g: "Graph"):
+    """Directory set that gets BUILD files: static import reachability from
+    STATIC_ROOTS, plus DYNAMIC_ROOTS, plus the package ancestors of every
+    reachable module (importing sglang.a.b executes sglang/__init__ and
+    sglang/a/__init__, and those directories own pkg targets / resources)."""
+    reachable = set()
+    work = [m for m in STATIC_ROOTS if m in g.modules]
+    while work:
+        mod = work.pop()
+        if mod in reachable:
+            continue
+        reachable.add(mod)
+        work.extend(d for d in g.edges.get(mod, ()) if d not in reachable)
+    for root in DYNAMIC_ROOTS + STATIC_DIR_ROOTS:
+        root_dir = g.src_root / root
+        if root_dir.is_dir():
+            reachable.update(
+                m for m in g.modules
+                if g.pkg_dir(m) == Path(root) or Path(root) in g.pkg_dir(m).parents
+            )
+    dirs = set()
+    for m in reachable:
+        pkg = g.pkg_dir(m)
+        while pkg.parts:
+            dirs.add(pkg)
+            pkg = pkg.parent
+    return dirs
 
 import argparse
 import ast
@@ -197,6 +294,7 @@ class Graph:
         self.sccs = tarjan_scc(list(self.modules), self.edges)
         self.sccs.sort(key=lambda s: (-len(s), s[0]))
         self.scc_of = {m: i for i, s in enumerate(self.sccs) for m in s}
+        self.keep_dirs = None  # set by main() before rendering
 
         # Packages holding a direct resource tree (RESOURCE_SUBDIRS), plus the
         # module-name prefix a module must have to live in that package's
@@ -216,6 +314,13 @@ class Graph:
         its resource trees belong on that cycle target, not this package's."""
         prefix = self.pkg_module_prefix[pkg_dir]
         return any(m.startswith(prefix) for m in self.scc_of)
+
+    def droppable(self, mod: str) -> bool:
+        """True when `mod` is outside the emitted closure and may be dropped
+        from deps (allowlisted; never reached on the TPU serving path)."""
+        return (self.keep_dirs is not None
+                and self.pkg_dir(mod) not in self.keep_dirs
+                and _is_non_closure_allowed(mod))
 
     def resolve(self, name: str):
         m = name
@@ -282,7 +387,7 @@ def render_dir(g: Graph, pkg_dir: Path, mods_in_dir) -> str:
         member's own deps carry the rest of the package) -- unless the package
         has no pkg target of its own (its __init__ is itself a cycle member),
         in which case the package dep is a distinct cycle edge and stays."""
-        raw = set(g.edges.get(mod, ()))
+        raw = {d for d in g.edges.get(mod, ()) if not g.droppable(d)}
         keep = set(raw)
         for d in raw:
             parent = d.rpartition(".")[0]
@@ -360,7 +465,7 @@ def render_dir(g: Graph, pkg_dir: Path, mods_in_dir) -> str:
     return "\n".join(lines)
 
 
-def render_cycles(g: Graph) -> str:
+def render_cycles(g: Graph, keep_dirs=None) -> str:
     """//python:cycles.bzl -- one ``declare_cycles`` macro emitting one glob'd
     py_library per import cycle.
 
@@ -379,7 +484,10 @@ def render_cycles(g: Graph) -> str:
     # sglang closure, so python/BUILD.bazel builds the :sglang aggregator from
     # it instead of re-deriving (and getting wrong, e.g. when a package's
     # __init__ is itself a cycle member and has no pkg target).
-    all_deps = sorted({g.dep_label(m) for m in g.modules})
+    all_deps = sorted({g.dep_label(m) for m in g.modules
+                       if keep_dirs is None or g.pkg_dir(m) in keep_dirs})
+    # Cycle targets gather sources only from directories that got BUILD files;
+    # members outside the closure are absent from the Bazel graph entirely.
     lines = [GENERATED, "", '"""Generated import-cycle targets; loaded by python/BUILD.bazel."""', "",
              PY_LOAD, "",
              "# Labels of every collapsed import-cycle target, in stable order.",
@@ -394,10 +502,16 @@ def render_cycles(g: Graph) -> str:
         deps = set()
         srcs = set()
         data = set()
-        for m in sorted(members):
+        in_closure = [m for m in sorted(members)
+                      if keep_dirs is None or g.pkg_dir(m) in keep_dirs]
+        if not in_closure:
+            continue
+        for m in in_closure:
             pkg = g.pkg_dir(m)
             srcs.add(f"//{g.src_root}/{pkg}:cycle_{i}_files")
             for dep in g.edges.get(m, ()):
+                if g.droppable(dep):
+                    continue  # NON_CLOSURE_DEPS; never reached on the TPU path
                 if dep not in g.scc_of:
                     deps.add(g.dep_label(dep))
                 elif g.scc_of[dep] != i:
@@ -410,7 +524,9 @@ def render_cycles(g: Graph) -> str:
         # every resource tree directly under a package whose subtree this cycle
         # reaches into. Data, not deps: no PyInfo, no edge back into the cycle.
         for pkg in sorted(g.pkgs_with_resources):
-            if any(m.startswith(g.pkg_module_prefix[pkg]) for m in members):
+            if keep_dirs is not None and pkg not in keep_dirs:
+                continue
+            if any(m.startswith(g.pkg_module_prefix[pkg]) for m in in_closure):
                 for sub in g.pkgs_with_resources[pkg]:
                     data.add(f"//{g.src_root}/{pkg}:{sub}_data")
         lines += ["    py_library(", f'        name = "cycle_{i}",', "        srcs = ["]
@@ -462,19 +578,48 @@ def main():
     mods_by_dir = defaultdict(list)
     for mod in g.modules:
         mods_by_dir[g.pkg_dir(mod)].append(mod)
+    keep_dirs = closure_dirs(g)
+    g.keep_dirs = keep_dirs
+    leaks = {
+        (m, d)
+        for m in g.modules
+        if g.pkg_dir(m) in keep_dirs
+        for d in g.edges.get(m, ())
+        if g.pkg_dir(d) not in keep_dirs and not _is_non_closure_allowed(d)
+    }
+    if leaks:
+        detail = "\n".join(f"  {m} -> {d}" for m, d in sorted(leaks))
+        raise SystemExit(
+            "closure modules depend on directories outside the closure "
+            "(add the root to DYNAMIC_ROOTS or the module to NON_CLOSURE_DEPS):\n"
+            + detail
+        )
+    stale = 0
     for pkg_dir, mods in sorted(mods_by_dir.items()):
-        write_if_changed(src_root / pkg_dir / "BUILD.bazel",
-                         render_dir(g, pkg_dir, mods), args.check)
+        build = src_root / pkg_dir / "BUILD.bazel"
+        if pkg_dir not in keep_dirs:
+            # Outside the TPU closure: no Bazel footprint. Remove a BUILD file
+            # an earlier (less selective) generator run left behind.
+            if build.exists():
+                if args.check:
+                    raise SystemExit(f"{build} is stale; run bazel run //bazel:gen_sglang_build")
+                build.unlink()
+                stale += 1
+                print(f"removed {build} (outside TPU closure)")
+            continue
+        write_if_changed(build, render_dir(g, pkg_dir, mods), args.check)
 
     # One glob'd py_library per import cycle, living at the python/ root so it
     # may gather files from every directory the cycle spans. Emitted as a .bzl
     # macro that the handwritten python/BUILD.bazel loads, so that file can
     # also carry the handwritten :sglang aggregator without being clobbered.
-    write_if_changed(src_root / "cycles.bzl", render_cycles(g), args.check)
+    write_if_changed(src_root / "cycles.bzl", render_cycles(g, keep_dirs), args.check)
 
     report = {
         "modules": len(g.modules),
-        "dirs": len(mods_by_dir),
+        "dirs_emitted": len(keep_dirs),
+        "dirs_total": len(mods_by_dir),
+        "dirs_pruned": stale,
         "sccs": [{"size": len(s), "anchor": min(s, key=lambda m: (m.count("."), m))}
                  for s in g.sccs],
         "unknown_top_level_imports": {k: sorted(v) for k, v in sorted(g.unknown.items())},

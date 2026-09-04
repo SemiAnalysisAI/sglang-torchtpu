@@ -37,7 +37,6 @@ py_library(
     deps = [
         "//python/sglang/kernels/ops/diffusion/sites:quality_gate",
         "//python:cycle_0",
-        "//python:cycle_1",
         "@sglang_pypi//torch",
     ],
 )
