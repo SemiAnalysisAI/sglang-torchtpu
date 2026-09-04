@@ -112,10 +112,13 @@ spec:
                       spid=$!
                       if [ "$RANK" = "0" ]; then
                         ok=0
-                        for i in $(seq 1 300); do
-                          curl -sf --max-time 5 http://127.0.0.1:30000/health_generate >/dev/null 2>&1 && { ok=1; break; }
+                        # 90 min of health polling: a 450G checkpoint's first gcsfuse
+                        # read plus tp=16 compile warmup can exceed the old 50 min cap.
+                        HEALTH_TRIES=540; HEALTH_POLL=10; HEALTH_CURL_MAX=5
+                        for i in $(seq 1 "$HEALTH_TRIES"); do
+                          curl -sf --max-time "$HEALTH_CURL_MAX" http://127.0.0.1:30000/health_generate >/dev/null 2>&1 && { ok=1; break; }
                           kill -0 "$spid" 2>/dev/null || { echo "server exited early"; break; }
-                          sleep 10
+                          sleep "$HEALTH_POLL"
                         done
                         echo "== server.log tail =="; tail -n 60 /tmp/server.log
                         [ "$ok" = 1 ] || { echo "FAIL: server never healthy"; exit 1; }
@@ -163,5 +166,8 @@ spec:
                     - name: weights
                       mountPath: ${WEIGHTS_MOUNT_PATH}
                       readOnly: true
-                  securityContext:
-                    privileged: true
+                  # NO securityContext.privileged here: the external cluster's
+                  # ValidatingAdmissionPolicy 'cf-disallow-privileged-controllers'
+                  # rejects Job creation outright for privileged containers (the
+                  # in-project template runs privileged; GKE TPU access needs only
+                  # the google.com/tpu resource + device plugin).

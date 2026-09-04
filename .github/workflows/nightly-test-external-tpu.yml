@@ -53,7 +53,10 @@ jobs:
           slices="$(python3 .github/tpu-ci/external/render_external_jobset.py --list-groups)"
           echo "slices=$slices" >> "$GITHUB_OUTPUT"
           echo "discovered external-nightly slices: $slices"
-          [ "$slices" = "[]" ] && echo "No external-nightly-* tests registered yet; run will be skipped."
+          # `|| true`: under set -e a bare `[ ... ] &&` as the step's last command
+          # fails the step the moment tests ARE discovered (the scaffold-era bug
+          # never fired because slices was always []).
+          [ "$slices" = "[]" ] && echo "No external-nightly-* tests registered yet; run will be skipped." || true
 
   # One matrix job PER SLICE (parallel across slices). Each runs its bucketed groups serially.
   run:
