@@ -339,6 +339,10 @@ def _attach_input_logprobs(
     that is how logprobs end up silently attached to the wrong tokens. Every
     model reaches its logits through this same `logits_processor(input_ids,
     hidden_states, lm_head, forward_batch)` call, so this stays model-agnostic.
+
+    Copies every input_* field the gather produces -- chosen-token logprobs,
+    top-k, and logprobs for caller-named token ids. The scheduler indexes each
+    directly, so a field left behind is a None index downstream.
     """
     hidden_states = logits_output.hidden_states
     if hidden_states is None:
@@ -360,7 +364,24 @@ def _attach_input_logprobs(
             "the logits processor returned no input_token_logprobs despite "
             "compute_input_logprobs being set"
         )
+    # Exact, not an approximation of the gather's gate: from_forward_batch guards
+    # extend_return_top_logprob on is_extend / return_logprob / not target_verify,
+    # all of which needs_input_logprob already required to get here, leaving only
+    # the any(). Empty top-k past that means the pin was not restored.
+    if any(n > 0 for n in forward_batch.top_logprobs_nums or []) and (
+        eager.input_top_logprobs_val is None
+    ):
+        raise RuntimeError(
+            "the batch asked for input top logprobs but the logits processor "
+            "returned none; the pinned top_logprobs_nums was not restored before "
+            "the eager gather"
+        )
+    # Keep this in step with LogitsProcessorOutput's input_* fields.
     logits_output.input_token_logprobs = eager.input_token_logprobs
+    logits_output.input_top_logprobs_val = eager.input_top_logprobs_val
+    logits_output.input_top_logprobs_idx = eager.input_top_logprobs_idx
+    logits_output.input_token_ids_logprobs_val = eager.input_token_ids_logprobs_val
+    logits_output.input_token_ids_logprobs_idx = eager.input_token_ids_logprobs_idx
 
 
 def _pad_forward_batch_inputs(
