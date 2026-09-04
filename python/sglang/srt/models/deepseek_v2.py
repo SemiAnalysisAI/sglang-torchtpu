@@ -1984,6 +1984,12 @@ class DeepseekV2AttentionMLA(
             tuple(q_b_weight.shape) in q_b_proj_verified_shapes
         )
         self._use_min_latency_q_b_gemm: bool | None = None
+        if not _is_cuda:
+            # The fused-A GEMM is CUDA-only. Resolve both flags now: settling
+            # them lazily inside the first forward leaves the first compiled
+            # graph guarding on `is None`, which every later call fails.
+            self._use_min_latency_fused_a_gemm = False
+            self._use_min_latency_q_b_gemm = False
 
         self.init_mha_forward()
         self.init_mla_forward()
@@ -3161,8 +3167,17 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            # Keyword form: the TPU compiled-forward shim drops keywords equal
+            # to their defaults, so a text call reaches the compiled inner
+            # model as the same 3-positional shape its warm-up graphs were
+            # traced with. Passing the two Nones positionally is a distinct
+            # call shape and trips fail_on_recompile at serve time.
             hidden_states = self.model(
-                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds=input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
             )
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
