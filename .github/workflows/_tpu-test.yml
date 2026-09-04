@@ -151,6 +151,21 @@ jobs:
             ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml
           echo "== rendered (key fields) =="
           grep -nE 'completions:|gke-tpu-topology:|ci-tpu-pool:|claimName:|bash "benchmark|for f in|run_suite.py' /tmp/job.yaml | head
+          # Name the test files from HERE, before anything can fail. The pod prints
+          # the same line, but a leg the apiserver rejects at admission (an over-long
+          # name), or that Kueue never admits, has no pod -- and the dashboard then
+          # files the failure under the job's display name, which reads as a test that
+          # does not exist and changes with every workflow restructure. The ingester
+          # takes the first `== test files: ... ==` it sees, so this one wins.
+          files='${{ inputs.files }}'
+          if [ -z "$files" ] && [ -n '${{ inputs.test_file }}' ]; then
+            files='${{ inputs.test_file }}'
+          elif [ -z "$files" ] && [ -n "$suite" ]; then
+            files="$(python3 .github/tpu-ci/discover_tests.py --suite "$suite" \
+                       ${{ inputs.nightly && '--nightly' || '' }} \
+                     | python3 -c 'import json,sys; print(" ".join(t["file"] for t in json.load(sys.stdin)))')"
+          fi
+          [ -n "$files" ] && echo "== test files: ${files} =="
           # Quota tracks live capacity, checked here rather than on a timer: it only has to
           # be right at the moment admission is decided. Fails open -- a stale quota is
           # survivable (waitForPodsReady evicts and requeues), a blocked test is not.

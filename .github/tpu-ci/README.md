@@ -546,6 +546,14 @@ prints its exact boot env, the script echoes the settings it resolved, and the
 dashboard reassembles both into the two collapsed commands under each chart. A test
 that boots a server by hand gets a chart with no reproduce commands.
 
+**Every leg names its files before it can fail.** `_tpu-test.yml` prints
+`== test files: ... ==` from the runner, right after rendering and before `kubectl create`
+— so a leg the apiserver rejects at admission, or that Kueue never admits, is still filed
+under its test. Without it the ingester's only handle is the job's display name, which
+reads as a test that does not exist and changes with every workflow restructure (the
+`accuracy (...) / ...` rows of 2026-09-03). Suite legs resolve the list through
+`discover_tests.py`; `test_file` and `files` legs print what they were given.
+
 **Multi-host tests must let the job name its files.** `jobset-tpu.yaml` prints
 `== test files: ... ==` before the server boots. A job that dies during bring-up has
 no test to blame otherwise, and it would land on the dashboard as a row named after
