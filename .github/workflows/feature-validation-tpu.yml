@@ -36,6 +36,7 @@ on:
           - pd-mh-gpt-120b-pc-offload
           - pd-mh-gpt-120b-spec
           - pd-mh-gpt-120b-pc-offload-spec
+          - pd-mh-gpt-120b-pc-offload-spec-reshard
           - pd-mh-gpt-120b-tp-reshard
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
@@ -334,6 +335,36 @@ jobs:
       # Names the dashboard row and the TIMINGS record.
       files: test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py
       run_name: ${{ fromJSON(needs.discover-tests.outputs.diffusion_mh_collectives)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # Issue #379: the row above plus heterogeneous attention TP, so the KV crosses
+  # Raiden's strided push-reshard instead of landing rank-for-rank. Its own file,
+  # so the symmetric gate stays untouched and the two differ in exactly the
+  # feature under test. Needs #592 (hybrid SWA under push-resharding) and #583
+  # (draft KV over the P/D transfer).
+  #
+  # run_name feeds the pod names, which JobSet caps at 63 chars including its
+  # own suffixes -- hence the abbreviation rather than the full job name.
+  pd-mh-gpt-120b-pc-offload-spec-reshard:
+    needs: build
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","pd-mh-gpt-120b-pc-offload-spec-reshard"]'), inputs.only || 'all') }}
+    name: pd-mh-gpt-120b-pc-offload-spec-reshard
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 2
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py integration
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py
+      weights_pvc: model-weights-rox
+      run_name: pd-mh-gpt-120b-pcoff-spec-rs
     permissions:
       contents: read
       id-token: write
