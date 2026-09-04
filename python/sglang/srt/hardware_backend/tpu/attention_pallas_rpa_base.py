@@ -916,10 +916,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             v_scale,
         )
 
-        capture_mode = getattr(forward_batch, "capture_hidden_mode", None)
-        # FULL capture retains padded rows for later EAGLE steps.
-        if capture_mode is not None and capture_mode.is_full():
-            out = _zero_inactive_rpa_rows(out, self.forward_metadata.active_num_tokens)
+        # The kernel never writes rows past the active token count, so a padded
+        # batch would carry stale HBM into the norms and the MoE router (each
+        # pad row then routes to its own random experts). Zero them every
+        # forward; FULL capture (EAGLE) also depends on it.
+        out = _zero_inactive_rpa_rows(out, self.forward_metadata.active_num_tokens)
 
         # The kernel emits output at the (padded) qk head_dim. For asymmetric
         # K/V the trailing (qk - v) columns come from the zero-padded V slots and

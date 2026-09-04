@@ -45,6 +45,7 @@ import torch
 
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
     _quantize_kv_to_fp8,
+    _zero_inactive_rpa_rows,
 )
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
     TpuPallasRpaV3AttnBackend,
@@ -313,6 +314,11 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
             k_scale,
             v_scale,
         )
+
+        # Rows past the active token count are never written by the kernel
+        # (distribution stops at the real batch); zero them so padded rows do
+        # not feed stale HBM into the norms and the MoE router.
+        out = _zero_inactive_rpa_rows(out, self.forward_metadata.active_num_tokens)
 
         # o_latent [T, H, kv_lora_rank] -> [T, H * kv_lora_rank]; the model
         # views it back to 3D and folds W_UV.

@@ -2009,6 +2009,20 @@ def _post_process_topk_ids(
         # That final pass re-zeros after any shared-expert append/remap, so a
         # second zeroing here would be redundant (zeroing is idempotent).
 
+    elif _is_tpu and num_token_non_padded is not None:
+        # Compile-bucket padding leaves rows past the real token count with
+        # whatever the attention kernel left in them (it skips inactive rows), so
+        # the router scattered every pad row over a random set of experts and
+        # the grouped matmul streamed every local expert per layer (Kimi-K2.6
+        # bs=1 on the bs=128 graph: 8.7 ms/step of expert weights for one real
+        # token). Route pad rows to -1 with zero weight; both TPU MoE paths map
+        # -1 to a zero-weight local slot. Out-of-place: boolean-index assignment
+        # does not lower on torch_tpu.
+        row_ids = torch.arange(topk_ids.shape[0], device=topk_ids.device)
+        valid = (row_ids < num_token_non_padded).unsqueeze(1)
+        topk_ids = torch.where(valid, topk_ids, torch.full_like(topk_ids, -1))
+        topk_weights = torch.where(valid, topk_weights, torch.zeros_like(topk_weights))
+
     if recorder_topk_ids is None:
         recorder_topk_ids = topk_ids
 
