@@ -145,6 +145,11 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 512): (8, 128),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 1024): (8, 128),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 2048): (8, 128),
+        # 4096/8192-token chunks (tp=8 single-host serving): copies of the 2048
+        # entry, not tuned. The alternative is the (1, 16) fallback, measured at
+        # 14.8 ms/layer for a 4096-token chunk (bq=16 x 1 page grid).
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 4096): (8, 128),
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 8192): (8, 128),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 1): (32, 1, 8),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 2): (32, 1, 8),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 4): (32, 1, 8),
@@ -272,6 +277,15 @@ def get_tuned_block_sizes_mla(
     )
 
     hit = table.get(key)
+    if (
+        hit is None
+        and jnp.issubdtype(jnp.dtype(kv_dtype), jnp.floating)
+        and jnp.dtype(kv_dtype).itemsize == 1
+    ):
+        # fp8 KV: no fp8-tuned rows yet. The bf16 row for the same shape is a
+        # safe stand-in -- block sizes are bounded by VMEM, and fp8 halves the
+        # KV bytes per block -- and far better than the hardcoded fallback.
+        hit = table.get(key[:2] + ("bfloat16",) + key[3:])
     if hit is None and key not in _WARNED_MISSES:
         _WARNED_MISSES.add(key)
         logger.info(
