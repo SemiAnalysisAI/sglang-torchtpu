@@ -185,6 +185,35 @@ class TestViTTpuCompileRunner(unittest.TestCase):
             policy.precompile(patch_counts=[196, 324, 4900])
             self.assertEqual(vit_runner.precompiled_max_patch_count(), 4900)
 
+    def test_qwen3_vl_warmup_covers_the_whole_pass_not_just_the_compiled_region(self):
+        """Warmup must enter at the encoder, ahead of patch_embed.
+
+        patch_embed and the host-staged prologue sit outside the compiled
+        region but are still shape-static per bucket. Warming only compiled_fn
+        (the base class default) leaves them to compile on the first real
+        request of each bucket, which is exactly what this override prevents.
+        """
+        patch_embed = SimpleNamespace(
+            in_channels=3, temporal_patch_size=2, patch_size=16
+        )
+        vit = SimpleNamespace(
+            spatial_merge_size=2,
+            patch_embed=patch_embed,
+            dtype=torch.float32,
+            forward_with_tpu_graph=MagicMock(return_value=torch.zeros(1)),
+        )
+        policy = Qwen3VLVisionTpuCompilePolicy(vit)
+
+        policy.warmup_once(324)
+
+        (x, grid_thw), _ = vit.forward_with_tpu_graph.call_args
+        # 3 channels * 2 temporal * 16 * 16 == 1536 features per patch.
+        self.assertEqual(tuple(x.shape), (324, 1536))
+        self.assertEqual(x.device.type, "cpu")
+        self.assertEqual(grid_thw.device.type, "cpu")
+        # 324 == 18^2, so a square grid lands exactly on the bucket.
+        self.assertEqual(grid_thw.tolist(), [[1, 18, 18]])
+
     def test_precompile_publishes_nothing_when_warming_is_disabled(self):
         policy = _FakeVisionPolicy()
         policy.owner = SimpleNamespace()
@@ -225,6 +254,66 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         )
         self.assertEqual(selected.tolist(), [2.0, 0.0])
 
+    def test_qwen3_vl_unpad_moves_to_host_before_trimming(self):
+        """The D2H must happen while the shape is still the static bucket.
+
+        Everything downstream of unpad (per-image split, embedding cache, chunk
+        assembly) is variable-length; leaving it on device recompiles once per
+        length. Asserting the device of the result cannot catch a regression
+        here because unit-test tensors are already on CPU, so spy on the shape
+        at which .to() is called instead: it must be the bucket, not the trim.
+        """
+
+        class _HostMoveSpy:
+            """Stands in for the compiled ViT output; records .to() calls."""
+
+            def __init__(self, tensor):
+                self._tensor = tensor
+                self.to_calls = []
+
+            def to(self, device):
+                self.to_calls.append((device, tuple(self._tensor.shape)))
+                return self._tensor
+
+        policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
+        spy = _HostMoveSpy(torch.arange(8).float())
+        padding = VisionPaddingContext(
+            real_seq_len=12, bucket_len=16, padded=True, merge_sq=4
+        )
+
+        trimmed = policy.unpad_outputs(
+            spy, _Qwen3VLRunContext(padding=padding, output_indices=None)
+        )
+
+        self.assertEqual(spy.to_calls, [("cpu", (8,))])
+        self.assertEqual(trimmed.tolist(), [0.0, 1.0, 2.0])
+
+    def test_qwen3_vl_prepare_call_consumes_host_padded_inputs(self):
+        """prepare_call reads the real length off cu_seqlens, not off x_3d.
+
+        Padding moved to the host, so x_3d already spans the bucket. Deriving
+        real_seq_len from its leading dim would make unpad_outputs stop
+        trimming and leak padded merger rows downstream.
+        """
+        policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
+        bucket_len = 12
+        cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+        x_3d = torch.zeros(bucket_len, 1, 4)
+        cos = torch.zeros(bucket_len, 8)
+        sin = torch.zeros(bucket_len, 8)
+
+        args, ctx = policy.prepare_call(x_3d, cu_seqlens, cos, sin)
+        out_x, graph_cu_seqlens, out_cos, out_sin, segment_ids = args
+
+        self.assertIs(out_x, x_3d)
+        self.assertIs(out_cos, cos)
+        self.assertIs(out_sin, sin)
+        self.assertEqual(graph_cu_seqlens.tolist(), [0, bucket_len])
+        self.assertEqual(segment_ids.tolist(), [[0, 0, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2]])
+        self.assertEqual(ctx.padding.real_seq_len, 5)
+        self.assertEqual(ctx.padding.bucket_len, bucket_len)
+        self.assertTrue(ctx.padding.padded)
+
     def test_segment_ids_are_built_from_host_cumulative_lengths(self):
         cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
 
@@ -234,6 +323,21 @@ class TestViTTpuCompileRunner(unittest.TestCase):
 
         self.assertEqual(segment_ids.dtype, torch.int32)
         self.assertEqual(segment_ids.tolist(), [[0, 0, 1, 1, 1]])
+
+    def test_segment_ids_isolate_the_padded_tail(self):
+        """Padded patches must not share a segment with real ones.
+
+        Attention is masked by segment id, so reusing the last real id would
+        let bias-valued padding rows attend to real patches.
+        """
+        segment_ids = _cu_seqlens_to_segment_ids(
+            torch.tensor([0, 2, 5], dtype=torch.int32),
+            total_patches=5,
+            device=torch.device("cpu"),
+            pad_to=8,
+        )
+
+        self.assertEqual(segment_ids.tolist(), [[0, 0, 1, 1, 1, 2, 2, 2]])
 
     def test_shared_tpu_attention_builds_packed_segment_ids(self):
         segment_ids = _build_tpu_segment_ids(
@@ -412,6 +516,88 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         )
 
         self.assertIs(block.cu_seqlens, cu_seqlens)
+
+
+class TestRunnerHostState(unittest.TestCase):
+    """State the compile policy publishes onto the runner, and its readers."""
+
+    @staticmethod
+    def _runner(**vit_attrs):
+        """Bare ViTTpuCompileRunner: __init__ inspects a real ViT we do not need."""
+        runner = ViTTpuCompileRunner.__new__(ViTTpuCompileRunner)
+        runner.vit = SimpleNamespace(**vit_attrs)
+        runner.padded_patch_buckets = ()
+        runner._warned_oversize_patches = set()
+        runner._rotary_cos_sin_cache_cpu = None
+        return runner
+
+    def test_bucket_for_patches_is_identity_without_a_ladder(self):
+        """No published ladder means no padding.
+
+        The ladder only exists once the compile policy installs, so an
+        uninstalled runner must keep the exact patch count.
+        """
+        self.assertEqual(self._runner().bucket_for_patches(1234), 1234)
+
+    def test_bucket_for_patches_rounds_up_and_degrades_past_the_top(self):
+        """Oversize inputs fall back to their own length instead of raising."""
+        runner = self._runner()
+        runner.padded_patch_buckets = (196, 256, 324)
+        self.assertEqual(runner.bucket_for_patches(196), 196)
+        self.assertEqual(runner.bucket_for_patches(197), 256)
+        self.assertEqual(runner.bucket_for_patches(999), 999)
+
+    def test_host_rotary_cache_is_taken_once_and_detached(self):
+        """The mirror is lazy and must not alias the live device cache.
+
+        Loaders can build the ViT under a meta device, so the copy cannot be
+        taken at construction; aliasing it would let a later device-side write
+        change what the host prologue gathers.
+        """
+        cache = torch.randn(16, 8)
+        runner = self._runner(rotary_pos_emb=SimpleNamespace(cos_sin_cache=cache))
+
+        first = runner._host_rotary_cache()
+        self.assertIsNot(first, cache)
+        self.assertTrue(torch.equal(first, cache))
+
+        cache.zero_()
+        self.assertIs(runner._host_rotary_cache(), first)
+        self.assertFalse(torch.equal(runner._host_rotary_cache(), cache))
+
+    def test_rot_pos_emb_cpu_matches_eager_and_pads(self):
+        """Host rot_pos_emb must match the eager path and zero-pad the tail.
+
+        _rot_pos_emb_cpu mirrors rot_pos_emb against the host cache; a
+        mis-sized max_grid_size slice or a lost pad would feed the encoder
+        wrong rotary factors.
+        """
+        from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
+        from sglang.srt.models.utils import RotaryPosMixin
+
+        merge, rotary_dim = 2, 8
+        cache = torch.randn(256, 2 * rotary_dim)
+        vit = SimpleNamespace(
+            device=torch.device("cpu"),
+            spatial_merge_size=merge,
+            rot_pos_ids=RotaryPosMixin.rot_pos_ids,
+            rotary_pos_emb=SimpleNamespace(
+                cos_sin_cache=cache,
+                get_cos_sin=lambda seqlen: cache[:seqlen].chunk(2, dim=-1),
+            ),
+        )
+        runner = self._runner(**vars(vit))
+
+        for grid in ([[1, 16, 16]], [[4, 16, 20]], [[1, 16, 24], [1, 32, 12]]):
+            ref_cos, ref_sin = Qwen3VLMoeVisionModel.rot_pos_emb(vit, grid)
+            real_len = ref_cos.shape[0]
+            bucket_len = real_len + 3 * merge**2
+
+            cos, sin = runner._rot_pos_emb_cpu(grid, bucket_len=bucket_len)
+
+            self.assertEqual(cos.shape, (bucket_len, ref_cos.shape[1]), str(grid))
+            self.assertTrue(torch.equal(cos[:real_len], ref_cos), str(grid))
+            self.assertTrue(torch.equal(sin[:real_len], ref_sin), str(grid))
 
 
 if __name__ == "__main__":

@@ -43,9 +43,11 @@ from sglang.srt.runtime_context import (
     get_server_args,
     get_serving,
 )
-from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.srt.utils import flatten_nested_list, is_tpu, print_warning_once
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
+
+_is_tpu = is_tpu()
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
@@ -365,6 +367,18 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         return ret_input_ids
 
 
+def _pad_scatter_source(src: torch.Tensor, rows: int) -> torch.Tensor:
+    """Extend src to rows so the scatter sees one shape per token bucket.
+
+    masked_scatter_ consumes only the first mask.sum() rows, so the added tail
+    never reaches the destination. Worth doing only where src is still on the
+    host and the destination is already bucketed, i.e. the TPU path.
+    """
+    if src.shape[0] >= rows:
+        return src
+    return nn.functional.pad(src, (0, 0, 0, rows - src.shape[0]))
+
+
 def embed_mm_inputs(
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],
@@ -488,6 +502,8 @@ def embed_mm_inputs(
     # 4. scatter embeddings into input embedding
     # masked_scatter_ avoids the cudaStreamSynchronize that torch.where triggers.
     def _scatter(dest, mask, src):
+        if _is_tpu:
+            src = _pad_scatter_source(src, dest.shape[0])
         dest.masked_scatter_(mask.expand_as(dest), src.to(dest.device, dest.dtype))
 
     for i, modality, embedding, mask in zip(
