@@ -108,7 +108,30 @@ multitool.hub(lockfile = "//requirements:uv.lock.json")
 use_repo(multitool, "multitool")
 
 pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+
+# ONE pip hub for the whole module graph. The lock behind it is a single uv
+# resolution of sglang's python/pyproject_tpu.toml AND @torch_tpu's
+# pyproject.toml together (see //requirements:regenerate_lock), so every
+# package torch_tpu references -- including the TPU stack (torch 2.11.0,
+# torchvision 0.26.0, libtpu 0.0.44.1, jax/jaxlib 0.10.2) pinned in
+# pyproject_tpu.toml -- resolves here, not in torch_tpu's own hub. The
+# override_repo below then substitutes this hub for torch_tpu's: the root
+# module gets the final say over the whole PyPI stack.
 pip.parse(
+    # The split-libtorch cc_library aliases torch_tpu's native glue links
+    # against (mirrored from torch_tpu's MODULE.bazel; keep in sync).
+    extra_hub_aliases = {
+        "torch": [
+            "torch_headers",
+            "torch_libs",
+            "libc10",
+            "libtorch_cpu",
+            "libtorch_python",
+            "libtorch",
+            "libshm",
+            "libtorch_global_deps",
+        ],
+    },
     extra_pip_args = [
         "--index-url",
         "https://pypi.org/simple",
@@ -116,10 +139,15 @@ pip.parse(
         "https://download.pytorch.org/whl/cpu",
         "--timeout",
         "120",
+        "--retries",
+        "5",
     ],
     hub_name = "sglang_pypi",
     python_version = "3.12",
     requirements_lock = "//requirements:requirements_lock_3_12.txt",
+    # Injects the split libtorch cc_library targets into the torch spoke's
+    # BUILD (mirrored byte-for-byte from ../torch_tpu/bazel/torch_wheel.json).
+    whl_modifications = {"//bazel:torch_wheel.json": "torch"},
 )
 # xgrammar discovers its adjacent extension from wheel RECORD metadata. Point
 # its loader at the package directory because Bazel's wheel import omits RECORD.
@@ -131,4 +159,25 @@ pip.override(
         "//bazel/patches/xgrammar:record.patch",
     ],
 )
-use_repo(pip, "sglang_pypi")
+use_repo(
+    pip,
+    "sglang_pypi",
+    # The torch/libtpu spokes under their canonical names, so override_repo
+    # can map torch_tpu's spokes onto them.
+    "sglang_pypi_312_libtpu",
+    "sglang_pypi_312_torch",
+)
+
+# Replace the extension repos torch_tpu references with ours. Keys are the
+# apparent names torch_tpu's use_repo exports them under; values are repos
+# visible in this module's scope.
+override_repo(
+    pip,
+    # torch_tpu's hub -> our single hub (jax 0.10.2, torch 2.11.0, ...).
+    torch_tpu_pypi = "sglang_pypi",
+    # torch_tpu's 3.12 torch/libtpu spokes (consumed as @pypi_torch_312//...,
+    # @pypi_libtpu_312//... by its shims, and by canonical path in
+    # build_defs.bzl LD_LIBRARY_PATH) -> our hub's spokes.
+    torch_tpu_pypi_312_libtpu = "sglang_pypi_312_libtpu",
+    torch_tpu_pypi_312_torch = "sglang_pypi_312_torch",
+)

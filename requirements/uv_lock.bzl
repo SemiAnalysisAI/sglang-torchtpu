@@ -22,17 +22,20 @@ echo "wrote $BUILD_WORKSPACE_DIRECTORY/{out_workspace}"
 
 
 def _uv_lock_impl(ctx):
-    # `uv pip compile` insists the input is named exactly `pyproject.toml`,
-    # so stage a symlink under that name next to the outputs.
-    staged = ctx.actions.declare_file(ctx.label.name + ".scratch/pyproject.toml")
-    ctx.actions.symlink(output = staged, target_file = ctx.file.pyproject)
+    # `uv pip compile` insists each input is named exactly `pyproject.toml`,
+    # so stage symlinks under that name in per-input scratch dirs.
+    staged = []
+    for i, src in enumerate(ctx.files.pyprojects):
+        out = ctx.actions.declare_file("%s.scratch/%d/pyproject.toml" % (ctx.label.name, i))
+        ctx.actions.symlink(output = out, target_file = src)
+        staged.append(out)
 
     lock = ctx.actions.declare_file(ctx.label.name + ".lock")
     cache = ctx.actions.declare_directory(ctx.label.name + ".uv_cache")
     args = ctx.actions.args()
     args.add("pip")
     args.add("compile")
-    args.add(staged.path)
+    args.add_all([s.path for s in staged])
     for extra in ctx.attr.extras:
         args.add("--extra")
         args.add(extra)
@@ -55,7 +58,7 @@ def _uv_lock_impl(ctx):
     ctx.actions.run(
         executable = ctx.executable._uv,
         arguments = [args],
-        inputs = [staged, ctx.file.excludes, python],
+        inputs = staged + [ctx.file.excludes, python],
         outputs = [lock, cache],
         # HOME is not writable in the sandbox; keep uv's cache and managed
         # downloads inside it.
@@ -64,7 +67,7 @@ def _uv_lock_impl(ctx):
             "UV_PYTHON_INSTALL_DIR": cache.path + "/python",
         },
         mnemonic = "UvPipCompile",
-        progress_message = "uv pip compile %s" % ctx.file.pyproject.short_path,
+        progress_message = "uv pip compile %s" % ctx.files.pyprojects[0].short_path,
     )
 
     runner = ctx.actions.declare_file(ctx.label.name + ".sh")
@@ -88,10 +91,12 @@ def _uv_lock_impl(ctx):
 uv_lock = rule(
     implementation = _uv_lock_impl,
     attrs = {
-        "pyproject": attr.label(
-            allow_single_file = True,
+        "pyprojects": attr.label_list(
+            allow_files = True,
             mandatory = True,
-            doc = "The pyproject file to resolve (e.g. python/pyproject_tpu.toml).",
+            doc = """The pyproject files to resolve together. The first is the
+primary project; additional ones (e.g. @torch_tpu//:pyproject) add their
+dependency sets to the same resolution so the root gets one mediated lock.""",
         ),
         "excludes": attr.label(
             allow_single_file = True,

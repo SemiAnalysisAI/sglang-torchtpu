@@ -106,6 +106,7 @@ py_library(
         "@sglang_pypi//pydantic_core",
         "@sglang_pypi//pytest",
         "@sglang_pypi//python_dateutil",
+        "@sglang_pypi//python_multipart",
         "@sglang_pypi//pyyaml",
         "@sglang_pypi//pyzmq",
         "@sglang_pypi//regex",
@@ -138,5 +139,12 @@ py_library(
         "@sglang_pypi//xxhash",
         "@torch_tpu//shims/jax:pallas",
         "@torch_tpu//torch_tpu",
+        # Pure-Python pallas package (torch_tpu._internal.pallas: __init__.py +
+        # pallas.py, which defines jax_op). The //torch_tpu aggregator only
+        # re-exports torch.tpu/xla modules and the pywrap only bundles the C++
+        # extensions, so without this dep the pallas __init__/pallas.py never
+        # reach runfiles and `from torch_tpu._internal.pallas import jax_op`
+        # fails with "cannot import name 'jax_op' ... (unknown location)".
+        "@torch_tpu//torch_tpu/_internal/pallas",
     ],
 )

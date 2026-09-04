@@ -21,6 +21,11 @@ query --incompatible_disallow_empty_glob=false
 build --incompatible_default_to_explicit_init_py=true
 build --legacy_external_runfiles=false
 build --@rules_python//python/config_settings:precompile=force_disabled
+# Mute compiler warnings from external repos (XLA, LLVM, torch_tpu deps) so
+# their noise doesn't bury our own diagnostics. Same trick as openxla/xla's
+# warnings.bazelrc: -w for everything under external/. Warnings in our own
+# tree are unaffected.
+build --per_file_copt=external/.*@-w
 # Ship py_binary launchers as a self-contained bash script instead of the
 # default `#!/usr/bin/env python3` shebang. XNNPACK's codegen genrules (pulled
 # in via XLA for torch_tpu) run their py_binary generators as plain genrule

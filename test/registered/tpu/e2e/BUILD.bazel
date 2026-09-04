@@ -1,17 +1,9 @@
-load("@rules_python//python:defs.bzl", "py_test")
+load("//bazel:defs.bzl", "sglang_tpu_e2e_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# The test file is the entrypoint, exactly as outside Bazel: it calls
-# model_config_main, which boots the server through benchmark/tpu's shell
-# recipe. The recipe execs "$PYTHON" -m sglang.launch_server; the launcher
-# (eval_support.RecipeLauncher) defaults PYTHON to the test's own
-# sys.executable -- the py_test's runfiles-venv python, which carries the whole
-# sglang + torch_tpu closure -- so the server runs on the same interpreter the
-# test already runs on, with sys.path fed by Bazel. No PYTHONPATH, no override.
-py_test(
+sglang_tpu_e2e_test(
     name = "test_tpu_gpt_oss_120b_singlehost_spec",
-    timeout = "eternal",
     srcs = ["test_tpu_gpt_oss_120b_singlehost_spec.py"],
     data = [
         # Shell recipes, eval configs, and helpers the launcher resolves at
@@ -20,12 +12,24 @@ py_test(
     ],
     main = "test_tpu_gpt_oss_120b_singlehost_spec.py",
     tags = [
-        "manual",
-        # The server subprocess writes the torch_tpu compile cache under
-        # $HOME and needs real TPU devices; the sandbox walls both off.
-        "no-sandbox",
-        "requires-net:external",
-        "requires-tpu",
+        "requires-tpu-v7x",
+    ],
+    deps = [
+        "//python:sglang",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
+    ],
+)
+
+sglang_tpu_e2e_test(
+    name = "test_tpu_gpt_oss_120b_singlehost_dpa",
+    srcs = ["test_tpu_gpt_oss_120b_singlehost_dpa.py"],
+    data = [
+        # Shell recipes, eval configs, and helpers the launcher resolves at
+        # runtime (benchmark/tpu/**, reached via _TPU_BENCH_DIR).
+        "//benchmark/tpu:runtime",
+    ],
+    main = "test_tpu_gpt_oss_120b_singlehost_dpa.py",
+    tags = [
         "requires-tpu-v7x",
     ],
     deps = [
