@@ -4,7 +4,11 @@ package(default_visibility = ["//visibility:public"])
 
 # The test file is the entrypoint, exactly as outside Bazel: it calls
 # model_config_main, which boots the server through benchmark/tpu's shell
-# recipe.
+# recipe. The recipe execs "$PYTHON" -m sglang.launch_server; the launcher
+# (eval_support.RecipeLauncher) defaults PYTHON to the test's own
+# sys.executable -- the py_test's runfiles-venv python, which carries the whole
+# sglang + torch_tpu closure -- so the server runs on the same interpreter the
+# test already runs on, with sys.path fed by Bazel. No PYTHONPATH, no override.
 py_test(
     name = "test_tpu_gpt_oss_120b_singlehost_spec",
     timeout = "eternal",

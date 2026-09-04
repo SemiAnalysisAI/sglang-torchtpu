@@ -21,6 +21,27 @@ package(default_visibility = ["//visibility:public"])
 
 exports_files(["pyproject_tpu.toml"])
 
+# The dist metadata `pip install -e python` would register, generated from
+# pyproject_tpu.toml at build time so importlib.metadata (the sglang.srt.platforms
+# entry-point group and version("sglang")) works for the in-tree package under
+# runfiles. Nothing is checked in; it derives from the same [project] table the
+# wheel builds from.
+genrule(
+    name = "dist_info",
+    srcs = ["pyproject_tpu.toml"],
+    outs = [
+        "sglang-0.0.0.dev0.dist-info/METADATA",
+        "sglang-0.0.0.dev0.dist-info/entry_points.txt",
+    ],
+    cmd = "$(location :gen_dist_info) $(location pyproject_tpu.toml) $(@D)",
+    tools = [":gen_dist_info"],
+)
+
+py_binary(
+    name = "gen_dist_info",
+    srcs = ["gen_dist_info.py"],
+)
+
 # The whole sglang package. Sources come from //python/sglang:py_files and
 # resource trees from //python/sglang:data_files (filegroups own the globs
 # because the package lives in a subdirectory; a target's glob may not cross
@@ -30,7 +51,10 @@ py_library(
     name = "sglang",
     srcs = ["//python/sglang:py_files"],
     imports = ["."],
-    data = ["//python/sglang:data_files"],
+    data = [
+        ":dist_info",
+        "//python/sglang:data_files",
+    ],
     deps = [
         "@sglang_pypi//accelerate",
         "@sglang_pypi//aiohttp",
