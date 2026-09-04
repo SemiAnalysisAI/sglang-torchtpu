@@ -14,6 +14,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu import sampler as tpu_sampler_module
+from sglang.srt.hardware_backend.tpu import top_k as tpu_top_k_module
 from sglang.srt.hardware_backend.tpu.sampler import (
     TpuSampler,
     distributed_top_k_candidate_width,
@@ -22,8 +23,11 @@ from sglang.srt.hardware_backend.tpu.sampler import (
     select_logits_output_mode,
 )
 from sglang.srt.hardware_backend.tpu.top_k import (
+    PallasDistributedTopKConfig,
+    PallasDistributedTopKNegotiation,
     TpuVocabShard,
     distributed_tpu_top_k,
+    negotiate_pallas_distributed_top_k_config,
     supports_distributed_tpu_top_k,
     tpu_top_k,
 )
@@ -76,20 +80,53 @@ def _forward_batch(*, batch_size=1, **info_overrides):
     )
 
 
-def _distributed_top_k_model(shard_width=202_048 // 16):
-    return SimpleNamespace(
-        logits_processor=SimpleNamespace(
-            use_tpu_distributed_top_k=True,
-            do_tensor_parallel_all_gather=True,
-            do_tensor_parallel_all_gather_dp_attn=False,
-        ),
-        lm_head=SimpleNamespace(
-            enable_tp=True,
-            num_embeddings=202_048,
-            num_embeddings_per_partition=shard_width,
-            shard_indices=object(),
-        ),
+def _distributed_top_k_config(
+    *, shard_width=202_048 // 16, world_size=16
+) -> PallasDistributedTopKConfig:
+    global_vocab_size = shard_width * world_size
+    shard = TpuVocabShard(
+        width=shard_width,
+        global_vocab_size=global_vocab_size,
+        org_vocab_size=global_vocab_size,
+        org_vocab_start=0,
+        org_vocab_count=shard_width,
+        org_vocab_padded_count=shard_width,
+        added_vocab_start=global_vocab_size,
+        added_vocab_count=0,
     )
+    return PallasDistributedTopKConfig(
+        shard=shard,
+        world_size=world_size,
+        model_rank=0,
+        candidate_width=64,
+        output_dtype=torch.bfloat16,
+    )
+
+
+def _distributed_top_k_model(shard_width=202_048 // 16):
+    processor = SimpleNamespace(
+        use_tpu_distributed_top_k=True,
+        do_tensor_parallel_all_gather=True,
+        do_tensor_parallel_all_gather_dp_attn=False,
+    )
+    lm_head = SimpleNamespace(
+        enable_tp=True,
+        num_embeddings=202_048,
+        org_vocab_size=202_048,
+        num_embeddings_per_partition=shard_width,
+        weight=torch.empty(0, dtype=torch.bfloat16),
+        shard_indices=object(),
+    )
+    config = _distributed_top_k_config(shard_width=shard_width)
+    tpu_sampler_module._DISTRIBUTED_TOP_K_STATES[id(processor)] = (
+        tpu_sampler_module._DistributedTopKState(
+            logits_processor=processor,
+            lm_head=lm_head,
+            config=config,
+            fallback_reason=None,
+        )
+    )
+    return SimpleNamespace(logits_processor=processor, lm_head=lm_head)
 
 
 class TestDistributedTopKEligibility(CustomTestCase):
@@ -134,13 +171,124 @@ class TestDistributedTopKEligibility(CustomTestCase):
                     mode = select_logits_output_mode(batch, model)
                     self.assertIs(mode, LogitsOutputMode.DISTRIBUTED_TOP_K)
 
-            lm_head.num_embeddings_per_partition = 32
+            oversized_batch = _forward_batch(batch_size=1, uniform_top_k=65)
+            self.assertEqual(
+                distributed_top_k_for_batch(oversized_batch, sampling_backend="tpu"),
+                65,
+            )
             self.assertIs(
-                select_logits_output_mode(
-                    _forward_batch(batch_size=1, uniform_top_k=50), model
-                ),
+                select_logits_output_mode(oversized_batch, model),
                 LogitsOutputMode.FULL_VOCAB,
             )
+
+    def test_cached_candidate_width_is_fullgraph_safe(self):
+        model = _distributed_top_k_model()
+        processor, lm_head = model.logits_processor, model.lm_head
+
+        compiled = torch.compile(
+            lambda value: value + distributed_top_k_candidate_width(processor, lm_head),
+            backend="eager",
+            fullgraph=True,
+        )
+
+        torch.testing.assert_close(compiled(torch.tensor(1)), torch.tensor(65))
+
+    def test_candidate_contract_is_negotiated_lazily_once(self):
+        config = _distributed_top_k_config(shard_width=32, world_size=8)
+        processor = SimpleNamespace(
+            use_tpu_distributed_top_k=True,
+            do_tensor_parallel_all_gather=True,
+            do_tensor_parallel_all_gather_dp_attn=False,
+            use_attn_tp_group=False,
+        )
+        lm_head = SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16))
+        group = SimpleNamespace(world_size=8, rank_in_group=0, ranks=list(range(8)))
+
+        with (
+            patch(
+                "sglang.srt.distributed.model_parallel_is_initialized",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.distributed.get_tp_group", return_value=group
+            ) as get_group,
+            patch.object(
+                tpu_top_k_module,
+                "negotiate_pallas_distributed_top_k_config",
+                return_value=PallasDistributedTopKNegotiation(config, None),
+            ) as negotiate,
+            patch(
+                "sglang.srt.hardware_backend.tpu.distributed_topk_pallas."
+                "register_pallas_distributed_top_k_op"
+            ) as register,
+        ):
+            self.assertEqual(distributed_top_k_candidate_width(processor, lm_head), 64)
+            self.assertEqual(distributed_top_k_candidate_width(processor, lm_head), 64)
+
+        get_group.assert_called_once()
+        negotiate.assert_called_once_with(
+            lm_head,
+            group=group,
+            expected_dtype=torch.bfloat16,
+            local_fallback_reason=None,
+        )
+        register.assert_called_once_with(8)
+
+    def test_candidate_getter_waits_for_model_parallel_initialization(self):
+        processor = SimpleNamespace(
+            use_tpu_distributed_top_k=True,
+            do_tensor_parallel_all_gather=True,
+            do_tensor_parallel_all_gather_dp_attn=False,
+        )
+        lm_head = SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16))
+
+        with (
+            patch(
+                "sglang.srt.distributed.model_parallel_is_initialized",
+                return_value=False,
+            ),
+            patch.object(
+                tpu_top_k_module, "negotiate_pallas_distributed_top_k_config"
+            ) as negotiate,
+        ):
+            self.assertIsNone(distributed_top_k_candidate_width(processor, lm_head))
+
+        negotiate.assert_not_called()
+
+    def test_candidate_contract_rejects_reinitialization_for_a_new_head(self):
+        config = _distributed_top_k_config(shard_width=32, world_size=8)
+        processor = SimpleNamespace(
+            use_tpu_distributed_top_k=True,
+            do_tensor_parallel_all_gather=True,
+            do_tensor_parallel_all_gather_dp_attn=False,
+            use_attn_tp_group=False,
+        )
+        model = SimpleNamespace(
+            logits_processor=processor,
+            lm_head=SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16)),
+        )
+        group = SimpleNamespace(world_size=8, rank_in_group=0, ranks=list(range(8)))
+
+        with (
+            patch(
+                "sglang.srt.distributed.model_parallel_is_initialized",
+                return_value=True,
+            ),
+            patch("sglang.srt.distributed.get_tp_group", return_value=group),
+            patch.object(
+                tpu_top_k_module,
+                "negotiate_pallas_distributed_top_k_config",
+                return_value=PallasDistributedTopKNegotiation(config, None),
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.distributed_topk_pallas."
+                "register_pallas_distributed_top_k_op"
+            ),
+        ):
+            distributed_top_k_candidate_width(processor, model.lm_head)
+            model.lm_head = SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16))
+            with self.assertRaisesRegex(RuntimeError, "cannot be reinitialized"):
+                distributed_top_k_candidate_width(processor, model.lm_head)
 
     def test_measured_default_uses_distributed_top_k_from_batch_64(self):
         cutoff = envs.SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
@@ -168,6 +316,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
         sharded_lm_head = SimpleNamespace(
             enable_tp=True,
             num_embeddings=128,
+            org_vocab_size=128,
             num_embeddings_per_partition=16,
             shard_indices=object(),
         )
@@ -181,7 +330,6 @@ class TestDistributedTopKEligibility(CustomTestCase):
     def test_full_vocab_features_fall_back(self):
         cases = {
             "mixed top-k": {"uniform_top_k": None},
-            "large top-k": {"uniform_top_k": 65},
             "greedy row": {"is_any_greedy": True},
             "seeded sampling": {"sampling_seed": torch.tensor([17])},
             "top-p": {"need_top_p_sampling": True},
@@ -573,10 +721,207 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
 
 
 class TestTpuTopKLayout(CustomTestCase):
+    @staticmethod
+    def _canonical_shard(rank, *, world_size=8, org_vocab_size=1000):
+        org_padded_count = 128
+        added_width = 8
+        global_vocab_size = 1016
+        org_start = min(rank * org_padded_count, org_vocab_size)
+        org_end = min((rank + 1) * org_padded_count, org_vocab_size)
+        added_start = min(
+            org_vocab_size + rank * added_width,
+            global_vocab_size,
+        )
+        added_end = min(
+            org_vocab_size + (rank + 1) * added_width,
+            global_vocab_size,
+        )
+        return TpuVocabShard(
+            width=org_padded_count + added_width,
+            global_vocab_size=global_vocab_size,
+            org_vocab_size=org_vocab_size,
+            org_vocab_start=org_start,
+            org_vocab_count=org_end - org_start,
+            org_vocab_padded_count=org_padded_count,
+            added_vocab_start=added_start,
+            added_vocab_count=added_end - added_start,
+        )
+
+    def _capability_group(self, *, world_size=8, mutate=None, descriptor_mutate=None):
+        def all_gather(local):
+            descriptors = []
+            for rank in range(world_size):
+                shard = (
+                    local.shard
+                    if rank == 0
+                    else self._canonical_shard(rank, world_size=world_size)
+                )
+                if mutate is not None:
+                    shard = mutate(rank, shard)
+                descriptor = type(local)(
+                    rank=local.rank if rank == 0 else rank,
+                    shard=shard,
+                    output_dtype=local.output_dtype,
+                    candidate_width=local.candidate_width,
+                    head_tp_size=local.head_tp_size,
+                    fallback_reason=local.fallback_reason,
+                )
+                if descriptor_mutate is not None:
+                    descriptor = descriptor_mutate(rank, descriptor)
+                descriptors.append(descriptor)
+            return descriptors
+
+        return SimpleNamespace(
+            world_size=world_size,
+            rank_in_group=0,
+            ranks=list(range(world_size)),
+            all_gather_object=MagicMock(side_effect=all_gather),
+        )
+
+    def _capability_lm_head(self, *, world_size=8):
+        shard = self._canonical_shard(0, world_size=world_size)
+        indices = SimpleNamespace(
+            org_vocab_start_index=shard.org_vocab_start,
+            num_org_elements=shard.org_vocab_count,
+            num_org_elements_padded=shard.org_vocab_padded_count,
+            added_vocab_start_index=shard.added_vocab_start,
+            num_added_elements=shard.added_vocab_count,
+        )
+        return SimpleNamespace(
+            enable_tp=True,
+            num_embeddings=shard.global_vocab_size,
+            org_vocab_size=shard.org_vocab_size,
+            tp_size=world_size,
+            num_embeddings_per_partition=shard.width,
+            shard_indices=indices,
+        )
+
+    def test_capability_requires_rank_consensus(self):
+        group = self._capability_group()
+        with patch.object(tpu_top_k_module, "_group_spans_world", return_value=True):
+            config = negotiate_pallas_distributed_top_k_config(
+                self._capability_lm_head(),
+                group=group,
+                expected_dtype=torch.bfloat16,
+            ).config
+
+        self.assertIsNotNone(config)
+        self.assertEqual(config.candidate_width, 64)
+        self.assertEqual(config.world_size, 8)
+        group.all_gather_object.assert_called_once()
+
+    def test_tp16_capability_is_supported(self):
+        group = self._capability_group(world_size=16)
+        with patch.object(tpu_top_k_module, "_group_spans_world", return_value=True):
+            config = negotiate_pallas_distributed_top_k_config(
+                self._capability_lm_head(world_size=16),
+                group=group,
+                expected_dtype=torch.float32,
+            ).config
+
+        self.assertIsNotNone(config)
+        self.assertEqual(config.world_size, 16)
+        self.assertEqual(config.output_dtype, torch.float32)
+
+    def test_subgroup_is_rejected_before_negotiation(self):
+        group = self._capability_group()
+        with patch.object(tpu_top_k_module, "_group_spans_world", return_value=False):
+            config = negotiate_pallas_distributed_top_k_config(
+                self._capability_lm_head(),
+                group=group,
+                expected_dtype=torch.bfloat16,
+            ).config
+
+        self.assertIsNone(config)
+        group.all_gather_object.assert_not_called()
+
+    def test_malformed_local_rank_falls_back_after_consensus(self):
+        group = self._capability_group()
+        group.rank_in_group = None
+        with patch.object(tpu_top_k_module, "_group_spans_world", return_value=True):
+            config = negotiate_pallas_distributed_top_k_config(
+                self._capability_lm_head(),
+                group=group,
+                expected_dtype=torch.bfloat16,
+            ).config
+
+        self.assertIsNone(config)
+        group.all_gather_object.assert_called_once()
+
+    def test_duplicate_rank_falls_back_after_consensus(self):
+        group = self._capability_group(
+            descriptor_mutate=lambda rank, descriptor: (
+                descriptor._replace(rank=0) if rank == 7 else descriptor
+            )
+        )
+        with patch.object(tpu_top_k_module, "_group_spans_world", return_value=True):
+            config = negotiate_pallas_distributed_top_k_config(
+                self._capability_lm_head(),
+                group=group,
+                expected_dtype=torch.bfloat16,
+            ).config
+
+        self.assertIsNone(config)
+        group.all_gather_object.assert_called_once()
+
+    def test_one_rank_metadata_disagreement_falls_back_everywhere(self):
+        def mutate(rank, shard):
+            if rank != 3:
+                return shard
+            return shard._replace(global_vocab_size=shard.global_vocab_size + 1)
+
+        group = self._capability_group(mutate=mutate)
+        with patch.object(tpu_top_k_module, "_group_spans_world", return_value=True):
+            config = negotiate_pallas_distributed_top_k_config(
+                self._capability_lm_head(),
+                group=group,
+                expected_dtype=torch.bfloat16,
+            ).config
+        self.assertIsNone(config)
+
+    def test_consumer_ineligibility_participates_in_rank_consensus(self):
+        group = self._capability_group()
+        with patch.object(tpu_top_k_module, "_group_spans_world", return_value=True):
+            result = negotiate_pallas_distributed_top_k_config(
+                self._capability_lm_head(),
+                group=group,
+                expected_dtype=torch.bfloat16,
+                local_fallback_reason="unsupported logits gather",
+            )
+
+        self.assertIsNone(result.config)
+        self.assertEqual(result.fallback_reason, "rank 0: unsupported logits gather")
+        group.all_gather_object.assert_called_once()
+
+    def test_unsupported_dtype_falls_back_after_consensus(self):
+        group = self._capability_group()
+        with patch.object(tpu_top_k_module, "_group_spans_world", return_value=True):
+            config = negotiate_pallas_distributed_top_k_config(
+                self._capability_lm_head(),
+                group=group,
+                expected_dtype=torch.float16,
+            ).config
+        self.assertIsNone(config)
+        group.all_gather_object.assert_called_once()
+
+    def test_consensus_transport_failure_is_fatal(self):
+        group = self._capability_group()
+        group.all_gather_object.side_effect = RuntimeError("collective failed")
+        with (
+            patch.object(tpu_top_k_module, "_group_spans_world", return_value=True),
+            self.assertRaisesRegex(RuntimeError, "collective failed"),
+        ):
+            negotiate_pallas_distributed_top_k_config(
+                self._capability_lm_head(),
+                group=group,
+                expected_dtype=torch.bfloat16,
+            )
+
     def test_distributed_path_requires_a_sharded_lm_head(self):
         layout = SimpleNamespace(
             enable_tp=True,
             num_embeddings=128,
+            org_vocab_size=128,
             num_embeddings_per_partition=16,
             shard_indices=object(),
         )
@@ -602,6 +947,7 @@ class TestTpuTopKLayout(CustomTestCase):
             enable_tp=True,
             shard_indices=shard,
             num_embeddings=22,
+            org_vocab_size=20,
             num_embeddings_per_partition=12,
         )
 
@@ -610,6 +956,7 @@ class TestTpuTopKLayout(CustomTestCase):
             TpuVocabShard(
                 width=12,
                 global_vocab_size=22,
+                org_vocab_size=20,
                 org_vocab_start=8,
                 org_vocab_count=6,
                 org_vocab_padded_count=8,
@@ -622,82 +969,25 @@ class TestTpuTopKLayout(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "requires a TPU tensor"):
             tpu_top_k(torch.ones(1, 8), 4)
 
-    def test_distributed_merge_matches_full_top_k(self):
-        local_logits = torch.tensor([[9.0, 3.0, -2.0, 7.0]])
-        shard = TpuVocabShard(
-            width=4,
-            global_vocab_size=8,
-            org_vocab_start=0,
-            org_vocab_count=2,
-            org_vocab_padded_count=3,
-            added_vocab_start=3,
-            added_vocab_count=1,
-        )
-        peer_logits = torch.tensor([[8.0, 6.0, 1.0, 0.0]])
-        peer_ids = torch.tensor([4, 5, 6, 7], dtype=torch.int32)
-        k = 3
+    def test_empty_distributed_input_bypasses_the_pallas_grid(self):
+        shard = self._canonical_shard(0)
+        group = SimpleNamespace(world_size=8, rank_in_group=0)
 
-        local_ids = torch.tensor([0, 1, -1, 3], dtype=torch.int32)
-        masked_local = local_logits.masked_fill(
-            local_ids.lt(0).unsqueeze(0), -torch.inf
-        )
-        local_sharded_top_k_logits, local_sharded_top_k_positions = torch.topk(
-            masked_local, k, dim=-1
-        )
-        local_sharded_top_k_token_ids = local_ids[local_sharded_top_k_positions]
-        peer_sharded_top_k_logits, peer_sharded_top_k_positions = torch.topk(
-            peer_logits, k, dim=-1
-        )
-        peer_sharded_top_k_token_ids = peer_ids[peer_sharded_top_k_positions]
-        group = SimpleNamespace(
-            world_size=2,
-            all_gather=MagicMock(
-                return_value=torch.cat(
-                    (
-                        torch.stack(
-                            (
-                                local_sharded_top_k_logits.float(),
-                                local_sharded_top_k_token_ids.float(),
-                            ),
-                            dim=-1,
-                        ),
-                        torch.stack(
-                            (
-                                peer_sharded_top_k_logits.float(),
-                                peer_sharded_top_k_token_ids.float(),
-                            ),
-                            dim=-1,
-                        ),
-                    ),
-                    dim=1,
-                )
-            ),
-        )
+        class EmptyTpuTensor:
+            device = SimpleNamespace(type="tpu")
+            ndim = 2
+            shape = (0, shard.width)
+            dtype = torch.bfloat16
 
-        with (
-            patch(
-                "sglang.srt.hardware_backend.tpu.top_k.tpu_sharded_top_k",
-                return_value=(
-                    local_sharded_top_k_logits,
-                    local_sharded_top_k_token_ids,
-                ),
-            ),
-            patch(
-                "sglang.srt.hardware_backend.tpu.top_k.tpu_top_k",
-                side_effect=lambda values, count: torch.topk(values, count, dim=-1),
-            ),
-        ):
-            global_top_k_logits, global_top_k_token_ids = distributed_tpu_top_k(
-                local_logits.clone(),
-                shard,
-                k,
-                group=group,
-            )
+            @staticmethod
+            def new_empty(shape, *, dtype):
+                return torch.empty(shape, dtype=dtype)
 
-        torch.testing.assert_close(global_top_k_logits, torch.tensor([[9.0, 8.0, 7.0]]))
-        torch.testing.assert_close(
-            global_top_k_token_ids, torch.tensor([[0, 4, 3]], dtype=torch.int32)
-        )
+        values, ids = distributed_tpu_top_k(EmptyTpuTensor(), shard, 64, group=group)
+        self.assertEqual(values.shape, (0, 64))
+        self.assertEqual(values.dtype, torch.float32)
+        self.assertEqual(ids.shape, (0, 64))
+        self.assertEqual(ids.dtype, torch.int32)
 
 
 if __name__ == "__main__":

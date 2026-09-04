@@ -134,6 +134,8 @@ class TestTpuCompileCache(CustomTestCase):
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_base.py",
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_batched.py",
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_v3.py",
+                srt_root / "hardware_backend/tpu/distributed_topk_pallas.py",
+                srt_root / "hardware_backend/tpu/kernels/distributed_topk.py",
                 srt_root / "hardware_backend/tpu/kernels/kernel.py",
                 srt_root / "hardware_backend/tpu/pallas_export.py",
                 srt_root / "hardware_backend/tpu/pallas_jax_op.py",
@@ -151,7 +153,10 @@ class TestTpuCompileCache(CustomTestCase):
                 compile_cache.add_pallas_kernel_sources_to_compile_cache_key()
                 original_key = compiler_config.cache_key_tag
 
-                source_files[0].write_text("changed source\n")
+                distributed_top_k_source = (
+                    srt_root / "hardware_backend/tpu/kernels/distributed_topk.py"
+                )
+                distributed_top_k_source.write_text("changed source\n")
                 compile_cache.add_pallas_kernel_sources_to_compile_cache_key()
                 changed_key = compiler_config.cache_key_tag
 
