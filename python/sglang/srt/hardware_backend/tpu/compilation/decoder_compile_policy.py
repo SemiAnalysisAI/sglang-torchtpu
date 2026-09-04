@@ -1375,6 +1375,42 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                     f"in {elapsed:.1f}s{hbm_str}"
                 )
 
+        self._precompile_mm_embed_placement()
+
+    def _precompile_mm_embed_placement(self) -> None:
+        """Warm the device select that merges host-placed multimodal rows.
+
+        It runs eagerly outside the compiled graph, so it JITs on first use at
+        each token bucket unless warmed here. The deepstack grid needs no warm:
+        it is bound straight from its host matrix, which is a plain transfer.
+        """
+        from sglang.srt.hardware_backend.tpu.mm_embed_tpu import apply_host_mm_embeds
+
+        assert self.t_bucketer is not None
+
+        embed_tokens = self.owner.get_input_embeddings()
+        hidden = embed_tokens.embedding_dim
+        dtype = embed_tokens.weight.dtype
+        device = self.model_runner.device
+        buckets = list(self.t_bucketer.buckets)
+
+        start = time.perf_counter()
+        with torch.no_grad():
+            for num_tokens in buckets:
+                apply_host_mm_embeds(
+                    input_embeds=torch.zeros(
+                        (num_tokens, hidden), dtype=dtype, device=device
+                    ),
+                    host_src=torch.zeros((num_tokens, hidden), dtype=dtype),
+                    host_mask=torch.zeros((num_tokens, 1), dtype=torch.bool),
+                )
+        logger.info(
+            "[decoder compile policy] VL MM EMBED PLACEMENT: %d token buckets "
+            "in %.1fs",
+            len(buckets),
+            time.perf_counter() - start,
+        )
+
     def _precompile_decode(self) -> None:
         if not self._uses_input_embeds(self.owner):
             return super()._precompile_decode()

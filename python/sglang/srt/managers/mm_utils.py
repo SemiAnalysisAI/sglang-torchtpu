@@ -367,18 +367,6 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         return ret_input_ids
 
 
-def _pad_scatter_source(src: torch.Tensor, rows: int) -> torch.Tensor:
-    """Extend src to rows so the scatter sees one shape per token bucket.
-
-    masked_scatter_ consumes only the first mask.sum() rows, so the added tail
-    never reaches the destination. Worth doing only where src is still on the
-    host and the destination is already bucketed, i.e. the TPU path.
-    """
-    if src.shape[0] >= rows:
-        return src
-    return nn.functional.pad(src, (0, 0, 0, rows - src.shape[0]))
-
-
 def embed_mm_inputs(
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],
@@ -490,6 +478,25 @@ def embed_mm_inputs(
         deepstack_embedding_shape = input_embeds.shape[:-1] + (
             input_embeds.shape[-1] * num_deepstack_embeddings,
         )
+
+    # 4. scatter embeddings into input embedding
+    if _is_tpu:
+        from sglang.srt.hardware_backend.tpu.mm_embed_tpu import embed_mm_on_host
+
+        input_embeds, input_deepstack_embeds = embed_mm_on_host(
+            input_embeds=input_embeds,
+            deepstack_shape=deepstack_embedding_shape if use_deepstack else None,
+            modalities=modalities,
+            embeddings=embeddings,
+            masks=masks,
+            deepstack_embeddings=deepstack_embeddings,
+            use_deepstack=use_deepstack,
+        )
+        if use_deepstack:
+            other_info["input_deepstack_embeds"] = input_deepstack_embeds
+        return input_embeds, other_info
+
+    if use_deepstack:
         # a zero-filled embedding, with the same length of input_embeds, but different hidden_size
         input_deepstack_embeds = torch.zeros(
             deepstack_embedding_shape,
@@ -499,11 +506,8 @@ def embed_mm_inputs(
 
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
-    # 4. scatter embeddings into input embedding
     # masked_scatter_ avoids the cudaStreamSynchronize that torch.where triggers.
     def _scatter(dest, mask, src):
-        if _is_tpu:
-            src = _pad_scatter_source(src, dest.shape[0])
         dest.masked_scatter_(mask.expand_as(dest), src.to(dest.device, dest.dtype))
 
     for i, modality, embedding, mask in zip(

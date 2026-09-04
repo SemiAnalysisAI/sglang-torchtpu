@@ -434,9 +434,8 @@ class RotaryPosMixin:
     def merge_window_order(h: int, w: int, spatial_merge_size: int) -> np.ndarray:
         """Row order that groups a h*w patch grid into merger windows.
 
-        The same permutation the eager path expresses as
-        view(h/m, m, w/m, m).permute(0, 2, 1, 3).flatten(); folding it into a
-        gather index keeps it off the device.
+        Same permutation as view(h/m, m, w/m, m).permute(0, 2, 1, 3).flatten();
+        folding it into a gather index keeps it off the device.
         """
         order = (
             np.arange(h * w)

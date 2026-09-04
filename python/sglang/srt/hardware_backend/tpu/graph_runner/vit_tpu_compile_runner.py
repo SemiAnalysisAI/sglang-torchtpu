@@ -310,10 +310,8 @@ class VisionTpuCompilePolicy(CompilePolicy):
     def warmup_once(self, patch_count: int) -> None:
         """Warm one patch count, blocking until it lands.
 
-        Defaults to the compiled region alone. Override when the encoder also
-        has an eager prologue or epilogue that is shape-static per bucket --
-        warming only the compiled region leaves those to compile on the first
-        real request of every bucket.
+        Defaults to the compiled region. Override when the encoder has an
+        eager prologue or epilogue that is shape-static per bucket too.
         """
         result = self.compiled_fn(*self.make_warmup_inputs(patch_count))
         tpu_sync([result], wait=True)
@@ -420,9 +418,8 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
         )
 
     def warmup_once(self, patch_count: int) -> None:
-        # A square grid lands exactly on the bucket, so the whole pass -- host
-        # prologue, patch_embed, the compiled blocks, the D2H epilogue -- runs
-        # at the shapes a real image of this bucket will use.
+        # A square grid lands exactly on the bucket, so the eager prologue and
+        # epilogue warm at the shapes a real image of this bucket will use.
         vit = self.vit
         patch_embed = vit.patch_embed
         in_features = (
@@ -485,9 +482,8 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
         self, result: torch.Tensor, ctx: _Qwen3VLRunContext
     ) -> torch.Tensor:
         padding = ctx.padding
-        # Land on the host while the shape is still the static bucket. Every
-        # consumer from here on (unpad, per-image split, embedding cache, chunk
-        # assembly) is variable-length and would recompile once per length.
+        # Land on the host while the shape is still the bucket: every consumer
+        # from here on is variable-length and would recompile per length.
         result = result.to("cpu")
         if padding.padded:
             result = result[: padding.real_seq_len // padding.merge_sq]

@@ -1121,9 +1121,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Bilinear pos-embed gather indices and weights, padded to bucket_len.
 
-        Folds the merger-window reorder that _get_position_embedding applies on
-        device into the index array, so the device side is one flat gather.
-        Padded slots gather row 0 with weight 0.
+        Folds in the merger-window reorder so the device side is one flat
+        gather. Padded slots gather row 0 with weight 0.
         """
         indices_np = np.zeros((4, bucket_len), dtype=np.int64)
         weights_np = np.zeros((4, bucket_len), dtype=np.float32)
@@ -1154,9 +1153,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
     ) -> torch.Tensor:
         """ViT forward whose pre-encoder work stays on the host.
 
-        x arrives already padded to a patch bucket, so every tensor handed to
-        the device has a static shape and the encoder prologue stops
-        recompiling per image size. cu_seqlens keeps the real segmentation.
+        x arrives padded to a patch bucket, so every tensor reaching the
+        device is shape-static. cu_seqlens keeps the real segmentation.
         """
         if x.device.type != "cpu" or grid_thw.device.type != "cpu":
             raise ValueError("forward_with_tpu_graph expects CPU inputs")
