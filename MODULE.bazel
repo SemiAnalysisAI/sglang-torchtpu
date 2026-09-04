@@ -20,7 +20,7 @@ git_override(
 
 # Bzlmod applies overrides only from the root module AND only with patch files
 # from the main repository ("only patches in the main repository can be
-# applied"), so torch_tpu's source overrides are re-declared here with local
+# applied"), so torch_tpu's source overrides are redeclared here with local
 # copies of its patch files. The copies under bazel/patches/torch_tpu mirror
 # torch_tpu's bazel/patches/** at the pinned commit byte-for-byte (checked at
 # review time); re-sync them when the torch_tpu commit moves.

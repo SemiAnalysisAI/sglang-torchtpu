@@ -5,7 +5,7 @@ index 3299a9f1..ae900149 100644
 @@ -1272,20 +1272,13 @@ def get_release_info(platform, python_version, base_url = DEFAULT_RELEASE_BASE_U
      for u in url:
          p, _, _ = platform.partition(FREETHREADED)
- 
+
 -        # Assume an unknown release_id is a newer url format
 -        release_id = 99999999
 -        url_parts = u.split("/")
@@ -27,7 +27,7 @@ index 3299a9f1..ae900149 100644
 @@ -1298,9 +1291,6 @@ def get_release_info(platform, python_version, base_url = DEFAULT_RELEASE_BASE_U
          else:
              build = INSTALL_ONLY
- 
+
 -        if WINDOWS_NAME in platform and release_id < 20250317:
 -            build = "shared-" + build
 -
