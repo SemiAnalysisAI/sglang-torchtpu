@@ -1,5 +1,3 @@
-# GENERATED FILE -- do not edit.
-
 """Generated import-cycle targets; loaded by python/BUILD.bazel."""
 
 load("@rules_python//python:defs.bzl", "py_library")
