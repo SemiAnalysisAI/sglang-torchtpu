@@ -40,6 +40,7 @@ on:
           - pd-mh-gpt-120b-tp-reshard
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
+          - pd-sh-qwen-480b-pc-offload
           - sh
       update-dashboard:
         description: "Publish this run's results to the dashboard (main only)"
@@ -313,6 +314,36 @@ jobs:
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py
       weights_pvc: model-weights-rox
       run_name: pd-mh-gpt-120b-pc-offload-spec
+    permissions:
+      contents: read
+      id-token: write
+
+  # Issue #379: the uniform-attention half of the P/D + prefix cache + KV offload
+  # requirement. One host per engine, unlike the GPT-OSS row above: this model
+  # cannot run attention TP above 8 without replicating KV heads, so a tp=16
+  # engine needs --enable-dp-attention, which splits the radix cache per DP rank
+  # and makes the round-robin-routed cache probe a coin flip. tp=8 keeps one
+  # cache per engine -- and is the layout the 480B nightly recipe already gives
+  # its P/D roles.
+  pd-sh-qwen-480b-pc-offload:
+    needs: build
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","pd-sh-qwen-480b-pc-offload"]'), inputs.only || 'all') }}
+    name: pd-sh-qwen-480b-pc-offload
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_singlehost_prefix_cache_kv_offload.py
+      # Names the dashboard row and the TIMINGS record; required in P/D mode.
+      files: test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_singlehost_prefix_cache_kv_offload.py
+      weights_pvc: model-weights-rox
+      run_name: pd-sh-qwen-480b-pcoff
     permissions:
       contents: read
       id-token: write
