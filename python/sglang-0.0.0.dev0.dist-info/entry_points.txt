@@ -1,8 +1,0 @@
-# Mirrors the [project.entry-points.*] tables of python/pyproject_tpu.toml
-# exactly as `pip install -e` would register them, so importlib.metadata
-# discovery works for the in-tree sglang under Bazel runfiles.
-[sglang.srt.platforms]
-tpu = sglang.srt.hardware_backend.tpu:activate
-
-[console_scripts]
-sglang = sglang.cli.main:main
