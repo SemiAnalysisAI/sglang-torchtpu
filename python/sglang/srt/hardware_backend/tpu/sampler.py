@@ -205,6 +205,21 @@ def sample_from_global_top_k_logits(
     return sampling_from_probs_torch(global_top_k_probs)
 
 
+def sample_exponential_race(probs: torch.Tensor) -> torch.Tensor:
+    """Draw one index per row from ``probs`` with argmax(p_i / E_i), E_i ~ Exp(1).
+
+    Exact categorical sampling (the Gumbel-max trick in probability space):
+    P(argmax_i p_i/E_i = j) = p_j / sum(p). Elementwise ops plus one reduce, so
+    it lowers to a couple of small fused programs; eager ``torch.multinomial``
+    over the 160k-entry vocabulary took 1.3 ms per decode step at bs=1 and
+    7.9 ms at 48 running on Kimi-K2.6. Rows of all-zero probs return 0.
+    """
+    u = torch.rand_like(probs)
+    # -log(u) ~ Exp(1); clamp keeps u=0 from producing inf/nan.
+    e = torch.log(u.clamp_min(torch.finfo(probs.dtype).tiny)).neg_()
+    return torch.argmax(probs / e, dim=-1).to(torch.int32)
+
+
 class TpuSampler(Sampler):
     """Consume a pre-gather global TopK for eligible TPU sampling batches.
     Every other batch delegates to the full-vocabulary sampler implementation."""
@@ -259,6 +274,8 @@ class TpuSampler(Sampler):
         This avoids a full sort when pre-gather reduction is not selected."""
 
         if simple_sampling_case:
+            if sampling_info.sampling_seed is None:
+                return sample_exponential_race(probs)
             return sampling_from_probs_torch(
                 probs,
                 sampling_seed=sampling_info.sampling_seed,
