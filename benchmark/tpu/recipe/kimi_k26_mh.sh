@@ -38,7 +38,7 @@ export EP_SIZE=${EP_SIZE:-16}
 # --- precision ---
 # Native int4 (compressed-tensors pack-quantized). Both MUST be empty; see above.
 export QUANTIZATION=
-export KV_CACHE_DTYPE=
+export KV_CACHE_DTYPE=${KV_CACHE_DTYPE-""}   # bf16 default; fp8_e4m3 halves KV bytes (MLA fp8 KV supported)
 
 # --- attention ---
 # Kimi is an MLA model.

@@ -277,15 +277,31 @@ def get_tuned_block_sizes_mla(
     )
 
     hit = table.get(key)
-    if (
-        hit is None
-        and jnp.issubdtype(jnp.dtype(kv_dtype), jnp.floating)
-        and jnp.dtype(kv_dtype).itemsize == 1
-    ):
-        # fp8 KV: no fp8-tuned rows yet. The bf16 row for the same shape is a
-        # safe stand-in -- block sizes are bounded by VMEM, and fp8 halves the
-        # KV bytes per block -- and far better than the hardcoded fallback.
-        hit = table.get(key[:2] + ("bfloat16",) + key[3:])
+    if hit is None:
+        # Two safe stand-ins before the hardcoded fallback, both bounded by
+        # VMEM in the right direction: an fp8 KV key may use the bf16 row for
+        # the same shape (fp8 halves the KV bytes per block), and a shard with
+        # fewer q heads may use the row tuned for the next larger head count
+        # (fewer heads means smaller q / score blocks). Kimi-K2.6 at tp=16 has
+        # 4 heads and no rows of its own; R1 at tp=8 has 16 heads at page 128
+        # only. The hardcoded fallback was measured at 14.8 ms per layer on a
+        # 4096-token prefill chunk, ~10x a tuned row.
+        kv_dtype_names = [key[2]]
+        kv_jnp = jnp.dtype(kv_dtype)
+        if jnp.issubdtype(kv_jnp, jnp.floating) and kv_jnp.itemsize == 1:
+            kv_dtype_names.append("bfloat16")
+        heads = key[3]
+        head_counts = [heads]
+        while heads < 128:
+            heads *= 2
+            head_counts.append(heads)
+        for h in head_counts:
+            for kv_name in kv_dtype_names:
+                hit = table.get(key[:2] + (kv_name, h) + key[4:])
+                if hit is not None:
+                    break
+            if hit is not None:
+                break
     if hit is None and key not in _WARNED_MISSES:
         _WARNED_MISSES.add(key)
         logger.info(
