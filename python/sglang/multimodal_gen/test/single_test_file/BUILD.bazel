@@ -1,0 +1,188 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "cli_generate_common",
+    srcs = ["cli_generate_common.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test:test_utils",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pillow",
+    ],
+)
+
+py_library(
+    name = "test_ar_models",
+    srcs = ["test_ar_models.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test/single_test_file:test_disagg_server",
+        "//python/sglang/multimodal_gen/test:test_utils",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_diffusion_bcg_tp2_zimage_turbo",
+    srcs = ["test_diffusion_bcg_tp2_zimage_turbo.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test:test_utils",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_diffusion_bcg_zimage_turbo",
+    srcs = ["test_diffusion_bcg_zimage_turbo.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test/server:test_server_utils",
+        "//python/sglang/multimodal_gen/test:test_utils",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//openai",
+    ],
+)
+
+py_library(
+    name = "test_disagg_server",
+    srcs = ["test_disagg_server.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test:test_utils",
+        "//python/sglang/test:otel_collector",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//requests",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_dp_serving_2_gpu",
+    srcs = ["test_dp_serving_2_gpu.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_encoder_fold_srt_2_gpu",
+    srcs = ["test_encoder_fold_srt_2_gpu.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/loader/component_loaders:text_encoder_loader",
+        "//python/sglang/multimodal_gen/runtime/models/encoders:clip",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python/sglang/multimodal_gen/test/server:test_server_utils",
+        "//python/sglang/multimodal_gen/test/server:testcase_configs",
+        "//python/sglang/multimodal_gen/test:test_utils",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//openai",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_generate_i2i",
+    srcs = ["test_generate_i2i.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test/single_test_file:cli_generate_common",
+        "//python/sglang/multimodal_gen/test:test_utils",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pillow",
+    ],
+)
+
+py_library(
+    name = "test_generate_zimage_turbo_cli",
+    srcs = ["test_generate_zimage_turbo_cli.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test/single_test_file:cli_generate_common",
+        "//python/sglang/multimodal_gen/test:test_utils",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pillow",
+    ],
+)
+
+py_library(
+    name = "test_ipc_a2a_2_gpu",
+    srcs = ["test_ipc_a2a_2_gpu.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_pi05_e2e",
+    srcs = ["test_pi05_e2e.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pytest",
+    ],
+)
+
+py_library(
+    name = "test_pynccl_a2a_capture_2_gpu",
+    srcs = ["test_pynccl_a2a_capture_2_gpu.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_update_weights_from_disk",
+    srcs = ["test_update_weights_from_disk.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test/server:test_server_utils",
+        "//python/sglang/multimodal_gen/test:test_utils",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//requests",
+        "@sglang_pypi//safetensors",
+    ],
+)
+
+py_library(
+    name = "test_usp_replicated_parity_2_gpu",
+    srcs = ["test_usp_replicated_parity_2_gpu.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)

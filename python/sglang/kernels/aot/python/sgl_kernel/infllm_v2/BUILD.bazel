@@ -1,0 +1,34 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../../.."],
+)
+
+py_library(
+    name = "_loader",
+    srcs = ["_loader.py"],
+    imports = ["../../../../../.."],
+)
+
+py_library(
+    name = "attention",
+    srcs = ["attention.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "max_pooling",
+    srcs = ["max_pooling.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)

@@ -1,0 +1,36 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "bootstrap.py",
+        "naive_distributed.py",
+        "parallel_state.py",
+        "utils.py",
+    ]),
+)
+
+py_library(
+    name = "communication_op",
+    srcs = ["communication_op.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "communication_tags",
+    srcs = ["communication_tags.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "parallel_state_wrapper",
+    srcs = ["parallel_state_wrapper.py"],
+    imports = ["../../.."],
+)

@@ -1,0 +1,96 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_1_files",
+    srcs = glob([
+        "activation.py",
+        "custom_op.py",
+        "linear.py",
+        "parallel_conv.py",
+        "usp.py",
+        "utils.py",
+        "vocab_parallel_embedding.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "elementwise",
+    srcs = ["elementwise.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/diffusion:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "fused_scale_shift_gate",
+    srcs = ["fused_scale_shift_gate.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/diffusion:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "layernorm",
+    srcs = ["layernorm.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/diffusion:pkg",
+        "//python/sglang/multimodal_gen/runtime/layers/rotary_embedding:pkg",
+        "//python/sglang/multimodal_gen/runtime/platforms:aiter",
+        "//python/sglang/multimodal_gen/runtime/utils:common",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "mlp",
+    srcs = ["mlp.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "moe",
+    srcs = ["moe.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "visual_embedding",
+    srcs = ["visual_embedding.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/diffusion:pkg",
+        "//python/sglang/multimodal_gen/runtime/layers:mlp",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)

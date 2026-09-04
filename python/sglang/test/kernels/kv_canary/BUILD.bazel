@@ -1,0 +1,90 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "_canary_helpers",
+    srcs = ["_canary_helpers.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/kv_canary:consts",
+        "//python/sglang/test/kernels/kv_canary:_constants",
+        "//python/sglang/test/kernels/kv_canary:_fixtures",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "_constants",
+    srcs = ["_constants.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "_differential",
+    srcs = ["_differential.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/kv_canary:consts",
+        "//python/sglang/kernels/ops/kv_canary:plan_ref",
+        "//python/sglang/kernels/ops/kv_canary:verify_ref",
+        "//python/sglang/kernels/ops/kv_canary:write_ref",
+        "//python/sglang/test/kernels/kv_canary:_canary_helpers",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "_fixtures",
+    srcs = ["_fixtures.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/test/kernels/kv_canary:_constants",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "_fuzz_driver",
+    srcs = ["_fuzz_driver.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/test/kernels/kv_canary:_differential",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "_hand_oracle",
+    srcs = ["_hand_oracle.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/kv_canary:consts",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "_invariants",
+    srcs = ["_invariants.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/kv_canary:consts",
+        "//python/sglang/test/kernels/kv_canary:_canary_helpers",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)

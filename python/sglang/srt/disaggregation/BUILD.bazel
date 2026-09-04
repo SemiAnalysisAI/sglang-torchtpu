@@ -1,0 +1,67 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "decode.py",
+        "decode_hicache_mixin.py",
+        "decode_kvcache_offload_manager.py",
+        "decode_schedule_batch_mixin.py",
+        "encode_receiver.py",
+        "prefill.py",
+        "utils.py",
+    ]),
+)
+
+py_library(
+    name = "encode_grpc_server",
+    srcs = ["encode_grpc_server.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/srt/disaggregation:encode_server",
+        "//python:cycle_0",
+        "@sglang_pypi//grpcio",
+        "@sglang_pypi//grpcio_health_checking",
+        "@sglang_pypi//grpcio_reflection",
+        "@sglang_pypi//pyzmq",
+        "@sglang_pypi//smg_grpc_proto",
+    ],
+)
+
+py_library(
+    name = "encode_server",
+    srcs = ["encode_server.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/srt/mem_cache:embedding_cache_controller",
+        "//python/sglang/srt/mem_cache:embedding_store",
+        "//python/sglang/srt/multimodal/processors:qwen_vl",
+        "//python/sglang/srt/multimodal:encoder_preprocessing",
+        "//python/sglang/srt:constants",
+        "//python:cycle_0",
+        "@sglang_pypi//aiohttp",
+        "@sglang_pypi//fastapi",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//prometheus_client",
+        "@sglang_pypi//pyzmq",
+        "@sglang_pypi//requests",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//transformers",
+        "@sglang_pypi//uvicorn",
+    ],
+)
+
+py_library(
+    name = "kv_events",
+    srcs = ["kv_events.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//msgspec",
+        "@sglang_pypi//pydantic",
+        "@sglang_pypi//pyzmq",
+    ],
+)

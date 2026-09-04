@@ -1,0 +1,55 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "mhc.py",
+        "norm.py",
+        "rmsnorm_hf.py",
+    ]),
+)
+
+py_library(
+    name = "fused_eh_norm",
+    srcs = ["fused_eh_norm.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//apache_tvm_ffi",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "gemma4_fused_ops",
+    srcs = ["gemma4_fused_ops.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "mhc_head",
+    srcs = ["mhc_head.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "minimax_m3_rmsnorm",
+    srcs = ["minimax_m3_rmsnorm.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)

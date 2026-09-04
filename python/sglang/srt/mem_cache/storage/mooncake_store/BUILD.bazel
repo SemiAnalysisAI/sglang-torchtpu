@@ -1,0 +1,33 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "mooncake_store.py",
+    ]),
+)
+
+py_library(
+    name = "mooncake_embedding_store",
+    srcs = ["mooncake_embedding_store.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/srt/mem_cache/storage:pkg",
+        "//python/sglang/srt/mem_cache:embedding_store",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "test_mooncake_store",
+    srcs = ["test_mooncake_store.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/srt/mem_cache/storage:pkg",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)

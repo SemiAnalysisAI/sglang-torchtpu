@@ -1,0 +1,26 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "awq_kernels",
+    srcs = ["awq_kernels.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/srt/layers/quantization/awq:awq",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "gptq_kernels",
+    srcs = ["gptq_kernels.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/srt/layers/quantization/gptq:gptq",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)

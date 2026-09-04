@@ -1,0 +1,25 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "mla_ragged_paged_attention_v2.py",
+        "ragged_paged_attention_v3.py",
+        "tuned_block_sizes.py",
+        "tuned_block_sizes_mla.py",
+        "util.py",
+    ]),
+)
+
+py_library(
+    name = "mla_kv_utils",
+    srcs = ["mla_kv_utils.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@torch_tpu//shims/jax:pallas",
+    ],
+)

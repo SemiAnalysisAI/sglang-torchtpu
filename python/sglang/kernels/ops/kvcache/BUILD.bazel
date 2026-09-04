@@ -1,0 +1,88 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "cache_move.py",
+        "cache_ops.py",
+        "fused_fp8_qkv_kv_cache.py",
+        "hicache.py",
+        "hisparse.py",
+        "kvcache.py",
+        "minimax_store_kv_index.py",
+        "mla_buffer.py",
+        "set_mla_kv_buffer.py",
+    ]),
+)
+
+py_library(
+    name = "aiter_unified_attention",
+    srcs = ["aiter_unified_attention.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "kv_indices",
+    srcs = ["kv_indices.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "rope_cache",
+    srcs = ["rope_cache.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "triton_store_cache",
+    srcs = ["triton_store_cache.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "trtllm_mha_graph_metadata",
+    srcs = ["trtllm_mha_graph_metadata.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "trtllm_mha_page_table",
+    srcs = ["trtllm_mha_page_table.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "zero_pages",
+    srcs = ["zero_pages.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)

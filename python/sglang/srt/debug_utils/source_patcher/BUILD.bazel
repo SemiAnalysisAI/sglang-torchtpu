@@ -1,0 +1,22 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "code_patcher.py",
+        "source_editor.py",
+    ]),
+)
+
+py_library(
+    name = "types",
+    srcs = ["types.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//pydantic",
+    ],
+)

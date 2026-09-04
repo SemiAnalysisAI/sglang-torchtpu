@@ -1,0 +1,147 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "allocator_tpu.py",
+        "attention_gdn_pallas.py",
+        "attention_pallas.py",
+        "attention_pallas_mla.py",
+        "attention_pallas_rpa_base.py",
+        "attention_pallas_rpa_batched.py",
+        "attention_pallas_rpa_v3.py",
+        "env_override.py",
+        "fp4_moe.py",
+        "fp8_linear.py",
+        "fp8_moe.py",
+        "fp8_moe_fused_rs.py",
+        "fused_rs_sequence_parallel.py",
+        "kv_page_write.py",
+        "kv_pool.py",
+        "pallas_jax_op.py",
+        "patches.py",
+        "profiler.py",
+        "qk_norm_rope.py",
+        "raiden_cache_controller.py",
+        "raiden_hybrid_cache_controller.py",
+        "raiden_kv_backup.py",
+        "raiden_transfer.py",
+        "sampler.py",
+        "sampling_mask.py",
+        "spec_op_precompile.py",
+        "top_k.py",
+    ]),
+)
+
+py_library(
+    name = "_logging",
+    srcs = ["_logging.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "compile_cache",
+    srcs = ["compile_cache.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "kv_copy_worker",
+    srcs = ["kv_copy_worker.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "kv_pool_host",
+    srcs = ["kv_pool_host.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "mamba_pool",
+    srcs = ["mamba_pool.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/srt/utils:torch_memory_saver_adapter",
+        "//python:cycle_0",
+        "@sglang_pypi//msgspec",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "pallas_export",
+    srcs = ["pallas_export.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@torch_tpu//shims/jax:pallas",
+        "@torch_tpu//torch_tpu",
+    ],
+)
+
+py_library(
+    name = "quantized_matmul",
+    srcs = ["quantized_matmul.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@torch_tpu//shims/jax:pallas",
+        "@torch_tpu//torch_tpu",
+    ],
+)
+
+py_library(
+    name = "ray_utils",
+    srcs = ["ray_utils.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "spec_op_warmup",
+    srcs = ["spec_op_warmup.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "tpu_platform",
+    srcs = ["tpu_platform.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/srt/hardware_backend/tpu:_logging",
+        "//python/sglang/srt/hardware_backend/tpu:compile_cache",
+        "//python/sglang/srt/hardware_backend/tpu:kv_pool_host",
+        "//python/sglang/srt/hardware_backend/tpu:mamba_pool",
+        "//python/sglang/srt/model_executor:tpu_graph_runner",
+        "//python/sglang/srt/utils/hf_transformers:config",
+        "//python:cycle_0",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+        "@torch_tpu//torch_tpu",
+    ],
+)
+
+py_library(
+    name = "w4a16_moe",
+    srcs = ["w4a16_moe.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/srt/layers/moe:tpu_moe_utils",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)

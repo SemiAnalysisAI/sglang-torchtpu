@@ -1,0 +1,75 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "bench_offline_throughput",
+    srcs = ["bench_offline_throughput.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/benchmarks:datasets",
+        "//python/sglang/multimodal_gen/benchmarks:request_manifest",
+        "//python/sglang/multimodal_gen/test:test_utils",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//tqdm",
+    ],
+)
+
+py_library(
+    name = "bench_pi05_openpi",
+    srcs = ["bench_pi05_openpi.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/pipelines:pi05",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//requests",
+        "@sglang_pypi//torch",
+        "@torch_tpu//shims/jax:pallas",
+    ],
+)
+
+py_library(
+    name = "bench_serving",
+    srcs = ["bench_serving.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/benchmarks:datasets",
+        "//python/sglang/multimodal_gen/test:test_utils",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//aiohttp",
+        "@sglang_pypi//huggingface_hub",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//requests",
+        "@sglang_pypi//tqdm",
+    ],
+)
+
+py_library(
+    name = "compare_perf",
+    srcs = ["compare_perf.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "datasets",
+    srcs = ["datasets.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//requests",
+    ],
+)
+
+py_library(
+    name = "request_manifest",
+    srcs = ["request_manifest.py"],
+    imports = ["../../.."],
+)

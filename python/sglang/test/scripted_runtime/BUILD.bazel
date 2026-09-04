@@ -1,0 +1,66 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "req_handle.py",
+        "scheduler_hook.py",
+        "tokenizer_recv_proxy.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "background_http_poster",
+    srcs = ["background_http_poster.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//aiohttp",
+    ],
+)
+
+py_library(
+    name = "http_server",
+    srcs = ["http_server.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test/scripted_runtime:io_struct",
+        "//python/sglang/test/scripted_runtime:utils",
+        "//python:cycle_0",
+        "@sglang_pypi//pyzmq",
+        "@sglang_pypi//requests",
+    ],
+)
+
+py_library(
+    name = "io_struct",
+    srcs = ["io_struct.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "test_case",
+    srcs = ["test_case.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test/scripted_runtime:http_server",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "utils",
+    srcs = ["utils.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//pyzmq",
+    ],
+)

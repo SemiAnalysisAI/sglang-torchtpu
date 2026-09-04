@@ -1,0 +1,8 @@
+# The TPU stack is not resolved from PyPI: Bazel builds torch-tpu from source
+# (@torch_tpu) and torch_tpu's own pip hub pins libtpu/jax/jaxlib; torch comes
+# from the CPU index at the version pinned in pyproject_tpu.toml.
+torch-tpu==0.1.1.dev20260817010134
+tpu-raiden-torch==0.0.1.dev20260825123352
+libtpu==0.0.44.1
+jax==0.10.2
+jaxlib==0.10.2

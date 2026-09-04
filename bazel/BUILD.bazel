@@ -1,0 +1,12 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# Regenerates python/sglang/**/BUILD.bazel and python/cycles.bzl.
+# `bazel run //bazel:gen_sglang_build` executes it at the workspace root, so
+# its default --src/--external paths apply; --external falls back to
+# `bazel info output_base` either way.
+py_binary(
+    name = "gen_sglang_build",
+    srcs = ["gen_sglang_build.py"],
+)

@@ -1,0 +1,225 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "aiter.py",
+        "async_probe.py",
+        "common.py",
+        "cuda_ipc_transport_utils.py",
+        "cuda_vmm_transport_utils.py",
+        "custom_op.py",
+        "hf_transformers_patches.py",
+        "hf_transformers_utils.py",
+        "host_shared_memory.py",
+        "invariants.py",
+        "multi_stream_utils.py",
+        "network.py",
+        "numa_utils.py",
+        "nvtx_utils.py",
+        "offloader.py",
+        "patch_tokenizer.py",
+        "patch_torch.py",
+        "phase_checker.py",
+        "poll_based_barrier.py",
+        "profile_utils.py",
+        "request_logger.py",
+        "runai_utils.py",
+        "scheduler_status_logger.py",
+        "tensor_bridge.py",
+        "triton_load_watch.py",
+        "watchdog.py",
+        "weight_checker.py",
+        "weight_checker_comparator.py",
+    ]),
+)
+
+py_library(
+    name = "aio_rwlock",
+    srcs = ["aio_rwlock.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "auth",
+    srcs = ["auth.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//fastapi",
+        "@sglang_pypi//starlette",
+    ],
+)
+
+py_library(
+    name = "bench_utils",
+    srcs = ["bench_utils.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "cudacore_pyspy_dump_utils",
+    srcs = ["cudacore_pyspy_dump_utils.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//psutil",
+    ],
+)
+
+py_library(
+    name = "device_timer",
+    srcs = ["device_timer.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "field_validators",
+    srcs = ["field_validators.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "flatten",
+    srcs = ["flatten.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "gauge_histogram",
+    srcs = ["gauge_histogram.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//prometheus_client",
+    ],
+)
+
+py_library(
+    name = "http_middleware_patch",
+    srcs = ["http_middleware_patch.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//starlette",
+    ],
+)
+
+py_library(
+    name = "json_response",
+    srcs = ["json_response.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//fastapi",
+        "@sglang_pypi//orjson",
+    ],
+)
+
+py_library(
+    name = "log_utils",
+    srcs = ["log_utils.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "model_file_verifier",
+    srcs = ["model_file_verifier.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//huggingface_hub",
+        "@sglang_pypi//tqdm",
+    ],
+)
+
+py_library(
+    name = "msgspec_utils",
+    srcs = ["msgspec_utils.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//msgspec",
+        "@sglang_pypi//pydantic_core",
+    ],
+)
+
+py_library(
+    name = "nvjpeg_decoder",
+    srcs = ["nvjpeg_decoder.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "nvtx_pytorch_hooks",
+    srcs = ["nvtx_pytorch_hooks.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "profile_merger",
+    srcs = ["profile_merger.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "rpd_utils",
+    srcs = ["rpd_utils.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "slow_rank_detector",
+    srcs = ["slow_rank_detector.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "stale_shm_cleanup",
+    srcs = ["stale_shm_cleanup.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "token_sequence_matcher",
+    srcs = ["token_sequence_matcher.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "torch_memory_saver_adapter",
+    srcs = ["torch_memory_saver_adapter.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "torch_npu_patch_utils",
+    srcs = ["torch_npu_patch_utils.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "video_decoder",
+    srcs = ["video_decoder.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+    ],
+)

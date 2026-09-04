@@ -1,0 +1,41 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "activation.py",
+        "finalize_routing.py",
+        "fuseep.py",
+        "topk.py",
+    ]),
+)
+
+py_library(
+    name = "init_routing",
+    srcs = ["init_routing.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "matmul",
+    srcs = ["matmul.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "quant",
+    srcs = ["quant.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)

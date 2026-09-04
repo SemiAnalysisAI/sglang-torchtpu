@@ -1,0 +1,24 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "handler.py",
+        "session.py",
+    ]),
+)
+
+py_library(
+    name = "protocol",
+    srcs = ["protocol.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//openai",
+        "@sglang_pypi//pydantic",
+        "@sglang_pypi//typing_extensions",
+    ],
+)

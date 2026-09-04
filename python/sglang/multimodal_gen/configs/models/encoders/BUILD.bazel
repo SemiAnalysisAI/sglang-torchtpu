@@ -1,0 +1,25 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_1_files",
+    srcs = glob([
+        "__init__.py",
+        "base.py",
+        "clip.py",
+        "flux_2.py",
+        "gemma2.py",
+        "gemma_3.py",
+        "gemma_4_unified.py",
+        "ideogram.py",
+        "llama.py",
+        "minimax_h3_qwen3vl.py",
+        "mistral3.py",
+        "qwen3.py",
+        "qwen3vl.py",
+        "qwen_image.py",
+        "t5.py",
+    ]),
+)

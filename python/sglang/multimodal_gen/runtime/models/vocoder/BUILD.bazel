@@ -1,0 +1,17 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "ltx_2_vocoder",
+    srcs = ["ltx_2_vocoder.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "//python:cycle_8",
+        "@sglang_pypi//einops",
+        "@sglang_pypi//torch",
+    ],
+)

@@ -1,0 +1,24 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "flash_with_topk_idx",
+    srcs = ["flash_with_topk_idx.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "topk_sparse",
+    srcs = ["topk_sparse.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)

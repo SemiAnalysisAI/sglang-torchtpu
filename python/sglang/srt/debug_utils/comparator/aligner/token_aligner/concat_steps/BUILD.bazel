@@ -1,0 +1,39 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../../../.."],
+    deps = [
+        "//python/sglang/srt/debug_utils/comparator/aligner/token_aligner/concat_steps:executor",
+        "//python/sglang/srt/debug_utils/comparator/aligner/token_aligner:pkg",
+        "//python:cycle_0",
+        "//python:cycle_2",
+    ],
+)
+
+py_library(
+    name = "executor",
+    srcs = ["executor.py"],
+    imports = ["../../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_2",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "thd_seq_lens_loader",
+    srcs = ["thd_seq_lens_loader.py"],
+    imports = ["../../../../../../.."],
+    deps = [
+        "//python/sglang/srt/debug_utils/comparator/aligner/token_aligner/smart:aux_loader",
+        "//python/sglang/srt/debug_utils/comparator/aligner/token_aligner/smart:aux_plugins",
+        "//python:cycle_0",
+        "//python:cycle_2",
+    ],
+)

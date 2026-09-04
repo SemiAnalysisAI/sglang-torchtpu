@@ -1,0 +1,218 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_1_files",
+    srcs = glob([
+        "attention_backend.py",
+        "flash_attn.py",
+        "sparse_video_gen_2_attn.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../../.."],
+)
+
+py_library(
+    name = "aiter",
+    srcs = ["aiter.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/platforms:aiter",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "aiter_sage",
+    srcs = ["aiter_sage.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "ascend_fa",
+    srcs = ["ascend_fa.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "block_sparse_attn",
+    srcs = ["block_sparse_attn.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:laser_attn",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "flash_attn_2",
+    srcs = ["flash_attn_2.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "laser_attn",
+    srcs = ["laser_attn.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:sdpa",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "rain_fusion_attn",
+    srcs = ["rain_fusion_attn.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:laser_attn",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//einops",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "sage_attn",
+    srcs = ["sage_attn.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "sage_attn3",
+    srcs = ["sage_attn3.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "sdpa",
+    srcs = ["sdpa.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "sliding_tile_attn",
+    srcs = ["sliding_tile_attn.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//einops",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "sol_attn",
+    srcs = ["sol_attn.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention:flash_attention",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "sparse_linear_attn",
+    srcs = ["sparse_linear_attn.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/diffusion:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "subblock_sparse_attn",
+    srcs = ["subblock_sparse_attn.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends/subblock_sparse:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//msgspec",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "video_sparse_attn",
+    srcs = ["video_sparse_attn.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "vmoba",
+    srcs = ["vmoba.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//einops",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "xpu_backend",
+    srcs = ["xpu_backend.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)

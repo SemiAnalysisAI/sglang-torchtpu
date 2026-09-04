@@ -587,7 +587,11 @@ if [[ "$DUMP_META" == "1" ]]; then
         || echo "WARN: dump_meta failed; launching without launch_meta.json" >&2
 fi
 
-# PYTHON is exported by common_env.sh (default python3).
+# The recipe launcher (eval_support.RecipeLauncher) sets PYTHON to the
+# interpreter carrying the SGLang closure, so this is always the plain
+# `python -m` entrypoint -- under Bazel that interpreter is a venv python
+# whose site-packages picks up the test's runfiles closure via a .pth file
+# (model_config._bazel_interpreter_env).
 set -x
 exec "$PYTHON" "${args[@]}" 2>&1
 set +x

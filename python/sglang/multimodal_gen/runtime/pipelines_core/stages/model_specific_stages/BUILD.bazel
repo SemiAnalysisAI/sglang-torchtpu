@@ -1,0 +1,199 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_1_files",
+    srcs = glob([
+        "wan_ti2v.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../../.."],
+)
+
+py_library(
+    name = "cosmos3",
+    srcs = ["cosmos3.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages:cosmos3_action",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages:cosmos3_guardrails",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages:validators",
+        "//python/sglang/multimodal_gen/runtime/utils:vision",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "cosmos3_action",
+    srcs = ["cosmos3_action.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "cosmos3_guardrails",
+    srcs = ["cosmos3_guardrails.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "ernie_image_pe",
+    srcs = ["ernie_image_pe.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "glm_image",
+    srcs = ["glm_image.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/dits:glm_image",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python/sglang/multimodal_gen/runtime/utils:vision",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//requests",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "helios_decoding",
+    srcs = ["helios_decoding.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "helios_denoising",
+    srcs = ["helios_denoising.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/disaggregation:roles",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "ideogram",
+    srcs = ["ideogram.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/disaggregation:roles",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages:validators",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "krea2",
+    srcs = ["krea2.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//einops",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "longcat_image",
+    srcs = ["longcat_image.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "longlive2",
+    srcs = ["longlive2.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "mova",
+    srcs = ["mova.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/disaggregation:roles",
+        "//python/sglang/multimodal_gen/runtime/models/dits:mova_video_dit",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages:validators",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "pi05_preprocess",
+    srcs = ["pi05_preprocess.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/vla:observation",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "qwen_image_layered",
+    srcs = ["qwen_image_layered.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/utils:vision",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+    ],
+)

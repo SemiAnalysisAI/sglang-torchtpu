@@ -1,0 +1,86 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "mamba_ssm",
+    srcs = ["mamba_ssm.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//packaging",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "ssd_bmm",
+    srcs = ["ssd_bmm.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "ssd_chunk_scan",
+    srcs = ["ssd_chunk_scan.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//packaging",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "ssd_chunk_state",
+    srcs = ["ssd_chunk_state.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "ssd_combined",
+    srcs = ["ssd_combined.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//einops",
+        "@sglang_pypi//packaging",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "ssd_state_passing",
+    srcs = ["ssd_state_passing.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "ssu_dispatch",
+    srcs = ["ssu_dispatch.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/mamba/triton_ops:mamba_ssm",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)

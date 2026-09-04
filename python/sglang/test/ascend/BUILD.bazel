@@ -1,0 +1,135 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "disaggregation_utils",
+    srcs = ["disaggregation_utils.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//requests",
+    ],
+)
+
+py_library(
+    name = "gsm8k_ascend_mixin",
+    srcs = ["gsm8k_ascend_mixin.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test/ascend:npu_eval_accuracy_kit",
+        "//python/sglang/test/ascend:test_ascend_utils",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "npu_eval_accuracy_kit",
+    srcs = ["npu_eval_accuracy_kit.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test/kits:eval_accuracy_kit",
+        "//python/sglang/test:pkg",
+        "//python:cycle_0",
+        "@sglang_pypi//requests",
+    ],
+)
+
+py_library(
+    name = "output_capturer",
+    srcs = ["output_capturer.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "run_eval",
+    srcs = ["run_eval.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test/ascend:simple_eval_mmlu",
+        "//python/sglang/test:simple_eval_common",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "simple_eval_mmlu",
+    srcs = ["simple_eval_mmlu.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test:simple_eval_common",
+        "//python/sglang/test:simple_eval_mmlu",
+        "//python:cycle_0",
+        "@sglang_pypi//pandas",
+    ],
+)
+
+py_library(
+    name = "test_ascend_utils",
+    srcs = ["test_ascend_utils.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//requests",
+    ],
+)
+
+py_library(
+    name = "test_embedding_base",
+    srcs = ["test_embedding_base.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test:runners",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "test_mmlu",
+    srcs = ["test_mmlu.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test/ascend:test_ascend_utils",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "test_no_hf_reward_base",
+    srcs = ["test_no_hf_reward_base.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test:runners",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_npu_logging",
+    srcs = ["test_npu_logging.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test/ascend:test_ascend_utils",
+        "//python:cycle_0",
+        "@sglang_pypi//requests",
+    ],
+)
+
+py_library(
+    name = "vlm_utils",
+    srcs = ["vlm_utils.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python:cycle_0",
+    ],
+)

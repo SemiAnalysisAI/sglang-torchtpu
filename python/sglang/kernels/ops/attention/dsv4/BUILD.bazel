@@ -1,0 +1,146 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "compress_old.py",
+        "dequant_k_cache.py",
+        "fused_compress_triton.py",
+        "gemm.py",
+        "index_buf_accessor.py",
+        "online_c128_mtp.py",
+        "topk.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "attn",
+    srcs = ["attn.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/kvcache:triton_store_cache",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "c128_cleanup",
+    srcs = ["c128_cleanup.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "compress",
+    srcs = ["compress.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//apache_tvm_ffi",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "elementwise",
+    srcs = ["elementwise.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention:deepseek_v4_rope",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "fp4_indexer",
+    srcs = ["fp4_indexer.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "fp8_wo_a",
+    srcs = ["fp8_wo_a.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/kernels:kernel_api_logging",
+        "//python:cycle_0",
+        "@sglang_pypi//apache_tvm_ffi",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "metadata_kernel",
+    srcs = ["metadata_kernel.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "moe",
+    srcs = ["moe.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/moe:triton_hash_topk",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "quant_k_cache",
+    srcs = ["quant_k_cache.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "rms_normalize_hip",
+    srcs = ["rms_normalize_hip.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "sparse_prefill_kernels",
+    srcs = ["sparse_prefill_kernels.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "utils",
+    srcs = ["utils.py"],
+    imports = ["../../../../.."],
+)

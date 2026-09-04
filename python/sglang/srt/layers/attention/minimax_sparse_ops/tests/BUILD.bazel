@@ -1,0 +1,53 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "test_flash_with_topk_idx",
+    srcs = ["test_flash_with_topk_idx.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention/minimax_sparse:pkg",
+        "//python:cycle_0",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_fp8_attn_gemm",
+    srcs = ["test_fp8_attn_gemm.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention/minimax_sparse/common:utils",
+        "//python/sglang/kernels/ops/attention/minimax_sparse:pkg",
+        "//python:cycle_0",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_msa_fp8_parity",
+    srcs = ["test_msa_fp8_parity.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_sparse_gqa",
+    srcs = ["test_sparse_gqa.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention/minimax_sparse/decode:topk_sparse",
+        "//python/sglang/kernels/ops/attention/minimax_sparse:pkg",
+        "//python:cycle_0",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)

@@ -1,0 +1,57 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "fallback_mps",
+    srcs = ["fallback_mps.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "fallback_npu",
+    srcs = ["fallback_npu.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "fallback_torch",
+    srcs = ["fallback_torch.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "numerics",
+    srcs = ["numerics.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "platform",
+    srcs = ["platform.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)

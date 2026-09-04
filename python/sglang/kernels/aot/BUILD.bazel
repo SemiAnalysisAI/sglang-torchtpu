@@ -1,0 +1,49 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "include_data",
+    srcs = glob(["include/**"]),
+)
+
+filegroup(
+    name = "csrc_data",
+    srcs = glob(["csrc/**"]),
+)
+
+py_library(
+    name = "analyze_whl_kernel_sizes",
+    srcs = ["analyze_whl_kernel_sizes.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "setup_metal",
+    srcs = ["setup_metal.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//setuptools",
+    ],
+)
+
+py_library(
+    name = "setup_musa",
+    srcs = ["setup_musa.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//setuptools",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "setup_rocm",
+    srcs = ["setup_rocm.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//setuptools",
+        "@sglang_pypi//torch",
+    ],
+)

@@ -1,0 +1,44 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_1_files",
+    srcs = glob([
+        "__init__.py",
+        "base.py",
+        "dac.py",
+        "ernie_image.py",
+        "flux.py",
+        "glmimage.py",
+        "hunyuan3d.py",
+        "hunyuanvae.py",
+        "longcat_image.py",
+        "ltx_2_5_video.py",
+        "ltx_audio.py",
+        "ltx_video.py",
+        "minimax_h3_audio.py",
+        "minimax_h3_video.py",
+        "qwenimage.py",
+        "sana.py",
+        "stablediffusion3.py",
+        "wanvae.py",
+    ]),
+)
+
+py_library(
+    name = "minimax_h3_contract",
+    srcs = ["minimax_h3_contract.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "stable_diffusion",
+    srcs = ["stable_diffusion.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)

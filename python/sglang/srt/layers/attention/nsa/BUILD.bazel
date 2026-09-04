@@ -1,0 +1,88 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "nsa_indexer.py",
+    ]),
+)
+
+py_library(
+    name = "dequant_k_cache",
+    srcs = ["dequant_k_cache.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention/dsa:dequant_k_cache",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "index_buf_accessor",
+    srcs = ["index_buf_accessor.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "nsa_backend_mtp_precompute",
+    srcs = ["nsa_backend_mtp_precompute.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "quant_k_cache",
+    srcs = ["quant_k_cache.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention/dsa:quant_k_cache",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "tilelang_kernel",
+    srcs = ["tilelang_kernel.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "transform_index",
+    srcs = ["transform_index.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention/dsa:transform_index",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "triton_kernel",
+    srcs = ["triton_kernel.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention/dsa:triton_kernel",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "utils",
+    srcs = ["utils.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+    ],
+)

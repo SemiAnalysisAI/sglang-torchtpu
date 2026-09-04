@@ -1,0 +1,239 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "allreduce",
+    srcs = ["allreduce.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "attention",
+    srcs = ["attention.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "cutlass_moe",
+    srcs = ["cutlass_moe.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "debug_utils",
+    srcs = ["debug_utils.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/kernels:kernel_api_logging",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "elementwise",
+    srcs = ["elementwise.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "expert_specialization",
+    srcs = ["expert_specialization.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "flash_attn",
+    srcs = ["flash_attn.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "flash_mla",
+    srcs = ["flash_mla.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "gemm",
+    srcs = ["gemm.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "grammar",
+    srcs = ["grammar.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "kvcacheio",
+    srcs = ["kvcacheio.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "load_utils",
+    srcs = ["load_utils.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "mamba",
+    srcs = ["mamba.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "memory",
+    srcs = ["memory.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "metal",
+    srcs = ["metal.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "moe",
+    srcs = ["moe.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "musa",
+    srcs = ["musa.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "sampling",
+    srcs = ["sampling.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "scalar_type",
+    srcs = ["scalar_type.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "sparse_flash_attn",
+    srcs = ["sparse_flash_attn.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "spatial",
+    srcs = ["spatial.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "speculative",
+    srcs = ["speculative.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_utils",
+    srcs = ["test_utils.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "top_k",
+    srcs = ["top_k.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "utils",
+    srcs = ["utils.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "version",
+    srcs = ["version.py"],
+    imports = ["../../../../.."],
+)

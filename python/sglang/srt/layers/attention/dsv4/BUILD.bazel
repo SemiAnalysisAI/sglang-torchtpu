@@ -1,0 +1,33 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "compressor.py",
+        "compressor_v2.py",
+        "indexer.py",
+        "metadata.py",
+        "sparse_prefill_utils.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "compress_hip",
+    srcs = ["compress_hip.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention/dsv4:rms_normalize_hip",
+        "//python/sglang/kernels/ops/attention:deepseek_v4_rope",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)

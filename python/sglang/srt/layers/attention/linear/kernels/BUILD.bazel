@@ -1,0 +1,35 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "gdn_cutedsl.py",
+        "gdn_flashinfer.py",
+        "gdn_triton.py",
+        "kda_cutedsl.py",
+        "kda_flashinfer.py",
+        "kda_flashkda.py",
+        "kda_helion.py",
+        "kda_nvidia.py",
+        "kda_ptx.py",
+        "kda_triton.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../../.."],
+)
+
+py_library(
+    name = "kernel_backend",
+    srcs = ["kernel_backend.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)

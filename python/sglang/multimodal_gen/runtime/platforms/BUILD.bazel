@@ -1,0 +1,135 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_1_files",
+    srcs = glob([
+        "__init__.py",
+        "interface.py",
+    ]),
+)
+
+py_library(
+    name = "aiter",
+    srcs = ["aiter.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "cpu",
+    srcs = ["cpu.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//psutil",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "cuda",
+    srcs = ["cuda.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends/subblock_sparse:pkg",
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:flash_attn_2",
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:sage_attn",
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:sage_attn3",
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:sliding_tile_attn",
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:sol_attn",
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:subblock_sparse_attn",
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:video_sparse_attn",
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:vmoba",
+        "//python/sglang/multimodal_gen/runtime/models/vaes:flux2_vae_cuda_opt",
+        "//python/sglang/multimodal_gen/runtime/models/vaes:wan_vae_cuda_opt",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//psutil",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//typing_extensions",
+    ],
+)
+
+py_library(
+    name = "mps",
+    srcs = ["mps.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//psutil",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "musa",
+    srcs = ["musa.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:sage_attn",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//psutil",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//typing_extensions",
+    ],
+)
+
+py_library(
+    name = "npu",
+    srcs = ["npu.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:block_sparse_attn",
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:laser_attn",
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:rain_fusion_attn",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "rocm",
+    srcs = ["rocm.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention:flash_attention_v3",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "tpu",
+    srcs = ["tpu.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+        "@torch_tpu//torch_tpu",
+    ],
+)
+
+py_library(
+    name = "xpu",
+    srcs = ["xpu.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:xpu_backend",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)

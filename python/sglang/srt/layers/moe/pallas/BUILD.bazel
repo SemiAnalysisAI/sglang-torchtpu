@@ -1,0 +1,37 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "fused_moe_op.py",
+        "fused_moe_rs_op.py",
+    ]),
+)
+
+py_library(
+    name = "gmm_v2",
+    srcs = ["gmm_v2.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@torch_tpu//shims/jax:pallas",
+    ],
+)
+
+py_library(
+    name = "tuned_block_sizes",
+    srcs = ["tuned_block_sizes.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "utils",
+    srcs = ["utils.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@torch_tpu//shims/jax:pallas",
+    ],
+)

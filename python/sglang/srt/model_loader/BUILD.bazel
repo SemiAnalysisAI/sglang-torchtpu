@@ -1,0 +1,35 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "auto_loader.py",
+        "ci_weight_validation.py",
+        "loader.py",
+        "utils.py",
+        "weight_utils.py",
+    ]),
+)
+
+py_library(
+    name = "gguf_name_maps",
+    srcs = ["gguf_name_maps.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "remote_instance_weight_loader_utils",
+    srcs = ["remote_instance_weight_loader_utils.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//requests",
+        "@sglang_pypi//torch",
+    ],
+)

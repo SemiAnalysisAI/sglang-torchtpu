@@ -1,0 +1,25 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "eic_storage",
+    srcs = ["eic_storage.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//pyyaml",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_unit",
+    srcs = ["test_unit.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//pyyaml",
+        "@sglang_pypi//torch",
+    ],
+)

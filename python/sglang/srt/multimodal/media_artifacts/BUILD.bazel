@@ -1,0 +1,38 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/srt/multimodal/media_artifacts:base",
+        "//python/sglang/srt/multimodal:pkg",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "base",
+    srcs = ["base.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "kimi_k3",
+    srcs = ["kimi_k3.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/srt/multimodal:kimi_k3_image_processing",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)

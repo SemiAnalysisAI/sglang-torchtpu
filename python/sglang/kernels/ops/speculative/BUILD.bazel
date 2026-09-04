@@ -1,0 +1,85 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "cache_locs.py",
+        "eagle.py",
+        "multi_layer_eagle.py",
+        "ngram_corpus.py",
+        "ngram_embedding.py",
+    ]),
+)
+
+py_library(
+    name = "dflash",
+    srcs = ["dflash.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "fused_kv_materialize",
+    srcs = ["fused_kv_materialize.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "gather_spec_extras",
+    srcs = ["gather_spec_extras.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "ragged_verify_kernels",
+    srcs = ["ragged_verify_kernels.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//msgspec",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "reject_sampling",
+    srcs = ["reject_sampling.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "spec_tree",
+    srcs = ["spec_tree.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "topk1",
+    srcs = ["topk1.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)

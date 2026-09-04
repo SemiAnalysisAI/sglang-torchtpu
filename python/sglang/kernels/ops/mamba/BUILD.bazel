@@ -1,0 +1,45 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "causal_conv1d_triton.py",
+        "inkling_sconv.py",
+        "transfer_mamba.py",
+    ]),
+)
+
+py_library(
+    name = "causal_conv1d",
+    srcs = ["causal_conv1d.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//apache_tvm_ffi",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "mamba_state_indices_triton",
+    srcs = ["mamba_state_indices_triton.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "mamba_state_scatter_triton",
+    srcs = ["mamba_state_scatter_triton.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)

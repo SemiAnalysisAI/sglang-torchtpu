@@ -1,0 +1,58 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "test_flux_pipeline",
+    srcs = ["test_flux_pipeline.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_qwen_image_edit_pipeline",
+    srcs = ["test_qwen_image_edit_pipeline.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_qwen_image_pipeline",
+    srcs = ["test_qwen_image_pipeline.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_zimage_pipeline",
+    srcs = ["test_zimage_pipeline.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)

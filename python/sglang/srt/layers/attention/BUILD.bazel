@@ -1,0 +1,82 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "aiter_backend.py",
+        "aiter_utils.py",
+        "attention_registry.py",
+        "base_attn_backend.py",
+        "cutedsl_mla_backend.py",
+        "cutlass_mla_backend.py",
+        "deepseek_v4_backend.py",
+        "deepseek_v4_backend_hip_radix.py",
+        "dsa_backend.py",
+        "dual_chunk_flashattention_backend.py",
+        "flashattention_backend.py",
+        "flashinfer_backend.py",
+        "flashinfer_mla_backend.py",
+        "flashmla_backend.py",
+        "hip_flash_mla.py",
+        "hpc_ops_backend.py",
+        "hybrid_attn_backend.py",
+        "hybrid_linear_attn_backend.py",
+        "index_topk_share.py",
+        "intel_amx_backend.py",
+        "minimax_sparse_backend.py",
+        "tbo_backend.py",
+        "tokenspeed_mla_backend.py",
+        "torch_flex_backend.py",
+        "torch_native_backend.py",
+        "triton_backend.py",
+        "trtllm_mha_backend.py",
+        "trtllm_mla_backend.py",
+        "verify_mask.py",
+        "vision.py",
+        "wave_backend.py",
+        "xpu_backend.py",
+    ]),
+)
+
+py_library(
+    name = "merge_state",
+    srcs = ["merge_state.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention:merge_state",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "nsa_backend",
+    srcs = ["nsa_backend.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "unified_mem_hooks",
+    srcs = ["unified_mem_hooks.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//msgspec",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "vision_utils",
+    srcs = ["vision_utils.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)

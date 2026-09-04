@@ -1,0 +1,94 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_1_files",
+    srcs = glob([
+        "denoising.py",
+        "upsample.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../../.."],
+)
+
+py_library(
+    name = "flux",
+    srcs = ["flux.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "flux_2",
+    srcs = ["flux_2.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "ideogram",
+    srcs = ["ideogram.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages:ideogram",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "qwen_image",
+    srcs = ["qwen_image.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "spectral_ops",
+    srcs = ["spectral_ops.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "wan",
+    srcs = ["wan.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "zimage",
+    srcs = ["zimage.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)

@@ -1,0 +1,37 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "generator",
+    srcs = ["generator.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//psutil",
+    ],
+)
+
+py_library(
+    name = "model_patcher",
+    srcs = ["model_patcher.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "server_api",
+    srcs = ["server_api.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//requests",
+    ],
+)

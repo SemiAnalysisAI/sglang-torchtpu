@@ -1,0 +1,24 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "aiter.py",
+        "ascend.py",
+        "base.py",
+        "deep_gemm.py",
+        "flashinfer_cutedsl.py",
+        "flashinfer_cutlass.py",
+        "flashinfer_trtllm.py",
+        "hpc_ops.py",
+        "humming.py",
+        "marlin.py",
+        "runner.py",
+        "triton.py",
+        "triton_kernels.py",
+    ]),
+)

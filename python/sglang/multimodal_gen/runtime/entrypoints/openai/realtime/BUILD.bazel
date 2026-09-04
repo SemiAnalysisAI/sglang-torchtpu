@@ -1,0 +1,27 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_1_files",
+    srcs = glob([
+        "generate_session.py",
+        "realtime_adapter.py",
+        "realtime_output_adapter.py",
+        "realtime_video_api.py",
+        "registry.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../../.."],
+)
+
+py_library(
+    name = "timer",
+    srcs = ["timer.py"],
+    imports = ["../../../../../.."],
+)

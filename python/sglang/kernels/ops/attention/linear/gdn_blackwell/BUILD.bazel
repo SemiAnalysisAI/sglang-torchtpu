@@ -1,0 +1,50 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "kernel_h",
+    srcs = ["kernel_h.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention/cute_utils:_tcgen05",
+        "//python/sglang/kernels/ops/attention/cute_utils:cvt",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "kernel_kkt_inv_uw",
+    srcs = ["kernel_kkt_inv_uw.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention/cute_utils:_tcgen05",
+        "//python/sglang/kernels/ops/attention/cute_utils:cvt",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "kernel_o",
+    srcs = ["kernel_o.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention/cute_utils:_tcgen05",
+        "//python/sglang/kernels/ops/attention/cute_utils:cvt",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)

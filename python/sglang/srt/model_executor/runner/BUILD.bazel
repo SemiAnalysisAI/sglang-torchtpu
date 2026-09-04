@@ -1,0 +1,23 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "base_cuda_graph_runner.py",
+        "base_runner.py",
+        "decode_cuda_graph_runner.py",
+        "eager_runner.py",
+        "flashinfer_autotune.py",
+        "prefill_cuda_graph_runner.py",
+    ]),
+)
+
+py_library(
+    name = "shape_key",
+    srcs = ["shape_key.py"],
+    imports = ["../../../.."],
+)

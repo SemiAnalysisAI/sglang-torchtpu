@@ -1,0 +1,44 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "dspark_block_accept_estimator.py",
+        "dspark_config.py",
+        "dspark_draft.py",
+        "dspark_draft_sampler.py",
+        "dspark_kv_inject.py",
+        "dspark_observability.py",
+        "dspark_planner.py",
+        "dspark_verify.py",
+        "dspark_worker_v2.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "dspark_sps",
+    srcs = ["dspark_sps.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//msgspec",
+    ],
+)
+
+py_library(
+    name = "dspark_sts",
+    srcs = ["dspark_sts.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//msgspec",
+        "@sglang_pypi//torch",
+    ],
+)

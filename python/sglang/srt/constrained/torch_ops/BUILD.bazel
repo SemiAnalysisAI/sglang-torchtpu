@@ -1,0 +1,13 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "token_filter_torch_ops",
+    srcs = ["token_filter_torch_ops.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)

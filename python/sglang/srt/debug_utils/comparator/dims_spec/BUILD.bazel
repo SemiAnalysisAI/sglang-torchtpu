@@ -1,0 +1,17 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_2_files",
+    srcs = glob([
+        "__init__.py",
+        "comment_parser.py",
+        "dim_parser.py",
+        "dims_parser.py",
+        "modifier_parser.py",
+        "tensor_naming.py",
+        "types.py",
+    ]),
+)

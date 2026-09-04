@@ -1,0 +1,121 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "test_causal_denoising",
+    srcs = ["test_causal_denoising.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/kvcache:causal_attention_cache",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_lingbot_causal_denoising",
+    srcs = ["test_lingbot_causal_denoising.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/configs/quantization:qvg_kv",
+        "//python/sglang/multimodal_gen/runtime/layers/kvcache:causal_attention_cache",
+        "//python/sglang/multimodal_gen/runtime/models/dits:lingbot_world",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/lingbot_world:constants",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_output_materialization",
+    srcs = ["test_output_materialization.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_realtime_consistency_harness",
+    srcs = ["test_realtime_consistency_harness.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test/server:gpu_cases",
+        "//python/sglang/multimodal_gen/test/server:realtime_consistency",
+        "//python/sglang/multimodal_gen/test/server:test_server_utils",
+        "//python/sglang/multimodal_gen/test/server:testcase_configs",
+        "//python/sglang/multimodal_gen/test:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//msgspec",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pytest",
+    ],
+)
+
+py_library(
+    name = "test_realtime_control_signals",
+    srcs = ["test_realtime_control_signals.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/realtime:control_signals",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_realtime_output_transport",
+    srcs = ["test_realtime_output_transport.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/entrypoints:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//msgspec",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_realtime_runtime",
+    srcs = ["test_realtime_runtime.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/entrypoints/openai:protocol",
+        "//python/sglang/multimodal_gen/runtime/entrypoints:pkg",
+        "//python/sglang/multimodal_gen/runtime/realtime:control_signals",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//msgspec",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_realtime_vae",
+    srcs = ["test_realtime_vae.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_realtime_webui",
+    srcs = ["test_realtime_webui.py"],
+    imports = ["../../../../.."],
+)

@@ -1,0 +1,34 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "canary_manager.py",
+        "enable_warner.py",
+        "health_checker.py",
+        "kernel_launcher.py",
+        "stats_logger.py",
+        "swa_divergence.py",
+        "sweep.py",
+        "violation_manager.py",
+        "violation_reporter.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "future_tensor",
+    srcs = ["future_tensor.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)

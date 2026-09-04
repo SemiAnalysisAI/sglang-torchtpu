@@ -1,0 +1,67 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "cli_types",
+    srcs = ["cli_types.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "generate",
+    srcs = ["generate.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/entrypoints/cli:cli_types",
+        "//python/sglang/multimodal_gen/runtime/entrypoints/cli:utils",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "main",
+    srcs = ["main.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/entrypoints/cli:cli_types",
+        "//python/sglang/multimodal_gen/runtime/entrypoints/cli:generate",
+        "//python/sglang/multimodal_gen/runtime/entrypoints/cli:serve",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "serve",
+    srcs = ["serve.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/apps/webui:pkg",
+        "//python/sglang/multimodal_gen/runtime/entrypoints/cli:cli_types",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "utils",
+    srcs = ["utils.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)

@@ -1,0 +1,52 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "partitioning",
+    srcs = ["partitioning.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "run_suite",
+    srcs = ["run_suite.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test/runner:pytest_runner",
+        "//python/sglang/multimodal_gen/test/server/ascend:testcase_configs_npu",
+        "//python/sglang/multimodal_gen/test/server:gpu_cases",
+        "//python/sglang/multimodal_gen/test/server:testcase_configs",
+        "//python/sglang/multimodal_gen/test:partitioning",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//tabulate",
+    ],
+)
+
+py_library(
+    name = "test_utils",
+    srcs = ["test_utils.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/utils:common",
+        "//python/sglang/multimodal_gen/test/server:testcase_configs",
+        "//python/sglang/multimodal_gen/test:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//httpx",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//requests",
+        "@sglang_pypi//tokenizers",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//transformers",
+    ],
+)

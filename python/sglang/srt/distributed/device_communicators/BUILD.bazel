@@ -1,0 +1,51 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "cuda_wrapper.py",
+        "custom_all_reduce.py",
+        "custom_all_reduce_ops.py",
+        "custom_all_reduce_utils.py",
+        "hpu_communicator.py",
+        "mooncake_transfer_engine.py",
+        "npu_communicator.py",
+        "pymscclpp.py",
+        "pynccl.py",
+        "pynccl_allocator.py",
+        "quick_all_reduce.py",
+        "shm_broadcast.py",
+        "torch_symm_mem.py",
+        "triton_symm_mem_ag.py",
+        "xpu_communicator.py",
+    ]),
+)
+
+py_library(
+    name = "all_reduce_utils",
+    srcs = ["all_reduce_utils.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "custom_all_reduce_v2",
+    srcs = ["custom_all_reduce_v2.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/communication:all_reduce",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "pynccl_wrapper",
+    srcs = ["pynccl_wrapper.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)

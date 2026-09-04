@@ -1,0 +1,29 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "attention_backend_setup.py",
+        "cuda_graph_setup.py",
+        "kv_pool_runtime.py",
+        "layer_setup.py",
+        "load_model_utils.py",
+        "misc_utils.py",
+        "moe_ep_setup.py",
+        "ngram_embedding_manager.py",
+        "remote_instance_weight_transporter.py",
+        "spec_aux_hidden_state.py",
+        "startup_weight_load.py",
+        "weight_exporter.py",
+        "weight_updater.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../.."],
+)

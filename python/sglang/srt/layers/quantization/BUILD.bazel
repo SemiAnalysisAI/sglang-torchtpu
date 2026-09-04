@@ -1,0 +1,108 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "auto_round.py",
+        "base_config.py",
+        "bitsandbytes.py",
+        "blockwise_int8.py",
+        "fp4_kv_cache_quant_method.py",
+        "fp4_utils.py",
+        "fp8.py",
+        "fp8_utils.py",
+        "gguf.py",
+        "humming.py",
+        "humming_utils.py",
+        "int8_utils.py",
+        "kv_cache.py",
+        "kvfp4_tensor.py",
+        "marlin_utils.py",
+        "marlin_utils_fp4.py",
+        "marlin_utils_fp8.py",
+        "mlx.py",
+        "modelopt_quant.py",
+        "moe_wna16.py",
+        "mxfp4.py",
+        "mxfp4_flashinfer_cutlass_moe.py",
+        "mxfp4_flashinfer_trtllm_moe.py",
+        "mxfp4_humming_moe.py",
+        "mxfp4_marlin_moe.py",
+        "mxfp4_tpu_util.py",
+        "npu_mxfp4.py",
+        "npu_mxfp4_w4a4.py",
+        "nvfp4_online.py",
+        "petit.py",
+        "quark_int4fp8_moe.py",
+        "unquant.py",
+        "utils.py",
+        "w4afp8.py",
+        "w8a8_fp8.py",
+        "w8a8_int8.py",
+    ]),
+)
+
+py_library(
+    name = "base_scheme",
+    srcs = ["base_scheme.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "dequantization",
+    srcs = ["dequantization.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "mxfp4_tensor",
+    srcs = ["mxfp4_tensor.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "mxfp8_block_convert",
+    srcs = ["mxfp8_block_convert.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "online_quantization",
+    srcs = ["online_quantization.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "petit_utils",
+    srcs = ["petit_utils.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "rocm_mxfp4_utils",
+    srcs = ["rocm_mxfp4_utils.py"],
+    imports = ["../../../.."],
+)

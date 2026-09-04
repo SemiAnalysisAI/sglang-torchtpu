@@ -1,0 +1,33 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "fused_op.py",
+        "registry.py",
+        "selector.py",
+    ]),
+)
+
+py_library(
+    name = "kernel_api_logging",
+    srcs = ["kernel_api_logging.py"],
+    imports = ["../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "spec",
+    srcs = ["spec.py"],
+    imports = ["../.."],
+    deps = [
+        "@sglang_pypi//msgspec",
+        "@sglang_pypi//torch",
+    ],
+)

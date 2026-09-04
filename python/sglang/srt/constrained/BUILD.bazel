@@ -1,0 +1,23 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "base_grammar_backend.py",
+        "grammar_manager.py",
+        "llguidance_backend.py",
+        "outlines_backend.py",
+        "outlines_jump_forward.py",
+        "reasoner_grammar_backend.py",
+        "xgrammar_backend.py",
+    ]),
+)
+
+py_library(
+    name = "utils",
+    srcs = ["utils.py"],
+    imports = ["../../.."],
+)

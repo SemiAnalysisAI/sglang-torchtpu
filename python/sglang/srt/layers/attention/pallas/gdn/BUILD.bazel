@@ -1,0 +1,26 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "compute_conv1d.py",
+        "compute_gdn.py",
+        "memory_ref.py",
+        "metadata.py",
+        "vmem_ldst.py",
+        "wrapper.py",
+    ]),
+)
+
+py_library(
+    name = "config",
+    srcs = ["config.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "@torch_tpu//shims/jax:pallas",
+    ],
+)

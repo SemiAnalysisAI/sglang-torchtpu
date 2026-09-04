@@ -1,0 +1,20 @@
+exports_files([
+    "requirements_lock_3_12.txt",
+    "tpu_stack_excludes.txt",
+])
+
+# Regenerate requirements_lock_3_12.txt from python/pyproject_tpu.toml with
+# the hermetic uv pinned in MODULE.bazel (rules_uv) -- same binary on every
+# machine, nothing required on PATH:
+#
+#   bazel run //requirements:regenerate_lock
+sh_binary(
+    name = "regenerate_lock",
+    srcs = ["regenerate_lock.sh"],
+    data = [
+        "tpu_stack_excludes.txt",
+        "//python:pyproject_tpu.toml",
+        "@multitool//tools/uv",
+    ],
+    deps = ["@bazel_tools//tools/bash/runfiles"],
+)

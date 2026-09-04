@@ -1,0 +1,27 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_9_files",
+    srcs = glob([
+        "__init__.py",
+        "pi05_policy.py",
+    ]),
+)
+
+py_library(
+    name = "pi05_core",
+    srcs = ["pi05_core.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/rotary_embedding:pkg",
+        "//python/sglang/multimodal_gen/runtime/vla:prefix_cache",
+        "//python/sglang/srt/models:siglip",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//transformers",
+    ],
+)

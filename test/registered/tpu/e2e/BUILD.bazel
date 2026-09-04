@@ -1,0 +1,34 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# The test file is the entrypoint, exactly as outside Bazel: it calls
+# model_config_main, which boots the server through benchmark/tpu's shell
+# recipe. model_config._bazel_interpreter_env() hands the recipe a venv whose
+# site-packages picks up the test's runfiles closure via a .pth file, so the
+# recipe's plain `python -m sglang.launch_server` runs with the Bazel closure
+# -- no wrapper binary, no alternate entrypoint, no PYTHONPATH.
+py_test(
+    name = "test_tpu_gpt_oss_120b_singlehost_spec",
+    timeout = "eternal",
+    srcs = ["test_tpu_gpt_oss_120b_singlehost_spec.py"],
+    data = [
+        # Shell recipes, eval configs, and helpers the launcher resolves at
+        # runtime (benchmark/tpu/**, reached via _TPU_BENCH_DIR).
+        "//benchmark/tpu:runtime",
+    ],
+    main = "test_tpu_gpt_oss_120b_singlehost_spec.py",
+    tags = [
+        "manual",
+        # The server subprocess writes the torch_tpu compile cache under
+        # $HOME and needs real TPU devices; the sandbox walls both off.
+        "no-sandbox",
+        "requires-net:external",
+        "requires-tpu",
+        "requires-tpu-v7x",
+    ],
+    deps = [
+        "//python:sglang",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
+    ],
+)

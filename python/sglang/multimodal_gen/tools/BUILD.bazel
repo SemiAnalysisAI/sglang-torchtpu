@@ -1,0 +1,73 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "build_minimax_h3_adaln_cache",
+    srcs = ["build_minimax_h3_adaln_cache.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:denoise_loop",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:time_request",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//safetensors",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "build_modelopt_fp8_transformer",
+    srcs = ["build_modelopt_fp8_transformer.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//safetensors",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "build_modelopt_nvfp4_transformer",
+    srcs = ["build_modelopt_nvfp4_transformer.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//safetensors",
+    ],
+)
+
+py_library(
+    name = "compare_diffusion_trajectory_similarity",
+    srcs = ["compare_diffusion_trajectory_similarity.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "convert_hf_to_fp8",
+    srcs = ["convert_hf_to_fp8.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//safetensors",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//tqdm",
+    ],
+)
+
+py_library(
+    name = "wan_repack",
+    srcs = ["wan_repack.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//safetensors",
+    ],
+)

@@ -1,0 +1,51 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_15_files",
+    srcs = glob([
+        "__init__.py",
+        "processing_inkling.py",
+    ]),
+)
+
+py_library(
+    name = "feature_extraction",
+    srcs = ["feature_extraction.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//soundfile",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "image_processing",
+    srcs = ["image_processing.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "image_processing_rust",
+    srcs = ["image_processing_rust.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/srt/multimodal/inkling:image_processing",
+        "//python:cycle_0",
+        "//python:cycle_15",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//transformers",
+    ],
+)

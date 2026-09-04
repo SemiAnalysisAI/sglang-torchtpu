@@ -1,0 +1,54 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "audio_chunking.py",
+        "chat_encoding.py",
+        "protocol.py",
+        "serving_base.py",
+        "serving_chat.py",
+        "serving_classify.py",
+        "serving_completions.py",
+        "serving_embedding.py",
+        "serving_rerank.py",
+        "serving_responses.py",
+        "serving_score.py",
+        "serving_tokenize.py",
+        "serving_transcription.py",
+        "streaming_asr.py",
+        "tool_server.py",
+        "usage_processor.py",
+        "utils.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "encoding_dsv32",
+    srcs = ["encoding_dsv32.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "encoding_dsv4",
+    srcs = ["encoding_dsv4.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "sse_utils",
+    srcs = ["sse_utils.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//msgspec",
+    ],
+)

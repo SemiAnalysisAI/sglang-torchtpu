@@ -1,0 +1,60 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "compiled_forward_shim.py",
+        "decoder_compile_policy.py",
+        "direct_compile.py",
+        "spec_decode_compile_policy.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "bucketer",
+    srcs = ["bucketer.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "recompilation_checker",
+    srcs = ["recompilation_checker.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/srt/hardware_backend/tpu:_logging",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "spec_decode_compile_policy_dflash",
+    srcs = ["spec_decode_compile_policy_dflash.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/srt/hardware_backend/tpu:_logging",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "spec_decode_compile_policy_eagle3",
+    srcs = ["spec_decode_compile_policy_eagle3.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/srt/hardware_backend/tpu:_logging",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//tqdm",
+    ],
+)

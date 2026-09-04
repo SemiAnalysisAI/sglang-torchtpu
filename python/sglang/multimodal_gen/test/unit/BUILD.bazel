@@ -1,0 +1,1708 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "conftest",
+    srcs = ["conftest.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+    ],
+)
+
+py_library(
+    name = "test_adapter_loader_offload_target",
+    srcs = ["test_adapter_loader_offload_target.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/loader/component_loaders:adapter_loader",
+        "//python/sglang/multimodal_gen/runtime/loader/component_loaders:diffusion_decoder_loader",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_attention_backend_selector",
+    srcs = ["test_attention_backend_selector.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_cache_dit_integration",
+    srcs = ["test_cache_dit_integration.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "test_cfg_gating",
+    srcs = ["test_cfg_gating.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_cfg_parallel_warmup",
+    srcs = ["test_cfg_parallel_warmup.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_cfg_policy",
+    srcs = ["test_cfg_policy.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_cli_generate_common",
+    srcs = ["test_cli_generate_common.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test/single_test_file:cli_generate_common",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pillow",
+    ],
+)
+
+py_library(
+    name = "test_component_accuracy_inputs",
+    srcs = ["test_component_accuracy_inputs.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "//python:cycle_11",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_component_accuracy_parallel_runtime",
+    srcs = ["test_component_accuracy_parallel_runtime.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/distributed:parallel_groups",
+        "//python/sglang/multimodal_gen/test/single_test_file/component_accuracy:engine",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "//python:cycle_11",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_component_loading_order",
+    srcs = ["test_component_loading_order.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_component_residency",
+    srcs = ["test_component_residency.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/pipelines:qwen_image",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_consistency_metrics",
+    srcs = ["test_consistency_metrics.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test:test_utils",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pytest",
+    ],
+)
+
+py_library(
+    name = "test_cosmos3",
+    srcs = ["test_cosmos3.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/entrypoints/openai:protocol",
+        "//python/sglang/multimodal_gen/runtime/loader/component_loaders:scheduler_loader",
+        "//python/sglang/multimodal_gen/runtime/models/dits:cosmos3video",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages:cosmos3",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages:cosmos3_action",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages:cosmos3_guardrails",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_cosmos3_rollout",
+    srcs = ["test_cosmos3_rollout.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_cuda_attention_backend",
+    srcs = ["test_cuda_attention_backend.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/platforms:cuda",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_decoding_stage_parallelism",
+    srcs = ["test_decoding_stage_parallelism.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "//python:cycle_10",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_diffusion_bcg_padding",
+    srcs = ["test_diffusion_bcg_padding.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/dits:qwen_image",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_diffusion_bcg_tp_graph_capture",
+    srcs = ["test_diffusion_bcg_tp_graph_capture.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_diffusion_generator_shutdown",
+    srcs = ["test_diffusion_generator_shutdown.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_disagg_roles",
+    srcs = ["test_disagg_roles.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/disaggregation:roles",
+        "//python/sglang/multimodal_gen/runtime/pipelines:flux_2",
+        "//python/sglang/multimodal_gen/runtime/pipelines:glm_image",
+        "//python/sglang/multimodal_gen/runtime/pipelines:hunyuan3d_pipeline",
+        "//python/sglang/multimodal_gen/runtime/pipelines:ltx_2_pipeline",
+        "//python/sglang/multimodal_gen/runtime/pipelines:mova_pipeline",
+        "//python/sglang/multimodal_gen/runtime/pipelines:qwen_image",
+        "//python/sglang/multimodal_gen/runtime/pipelines:wan_i2v_dmd_pipeline",
+        "//python/sglang/multimodal_gen/runtime/pipelines:wan_i2v_pipeline",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/hunyuan3d:shape",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages:helios_denoising",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages:mova",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages:qwen_image_layered",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "//python:cycle_10",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_disagg_trace",
+    srcs = ["test_disagg_trace.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/disaggregation/transport:codec",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_dit_config_boundary",
+    srcs = ["test_dit_config_boundary.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/configs/models/bridges:mova_dual_tower",
+        "//python/sglang/multimodal_gen/runtime/models/bridges:mova_dual_tower",
+        "//python/sglang/multimodal_gen/runtime/models/dits:base",
+        "//python/sglang/multimodal_gen/test/server:test_server_utils",
+        "//python/sglang/multimodal_gen/test:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_dp_routing",
+    srcs = ["test_dp_routing.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_encoder_world_folding",
+    srcs = ["test_encoder_world_folding.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_ernie_image_pipeline_config",
+    srcs = ["test_ernie_image_pipeline_config.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_ernie_rope_geglu_fusion",
+    srcs = ["test_ernie_rope_geglu_fusion.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/dits:ernie_image",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_fp32_layernorm",
+    srcs = ["test_fp32_layernorm.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers:layernorm",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_fsdp_load",
+    srcs = ["test_fsdp_load.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/loader:weight_load_plan",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//safetensors",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_fused_lora_compose",
+    srcs = ["test_fused_lora_compose.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_glm_image_ar",
+    srcs = ["test_glm_image_ar.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/entrypoints:pkg",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages:glm_image",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_glm_image_multi_output",
+    srcs = ["test_glm_image_multi_output.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers:layernorm",
+        "//python/sglang/multimodal_gen/runtime/models/dits:glm_image",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages:glm_image",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_gpu_worker_cpu_threads",
+    srcs = ["test_gpu_worker_cpu_threads.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_health_warmup_gate",
+    srcs = ["test_health_warmup_gate.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test/server:test_server_utils",
+        "//python/sglang/multimodal_gen/test:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_helios_denoising_profiler",
+    srcs = ["test_helios_denoising_profiler.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages:helios_denoising",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_hf_diffusers_utils",
+    srcs = ["test_hf_diffusers_utils.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//huggingface_hub",
+        "@sglang_pypi//modelscope",
+        "@sglang_pypi//pytest",
+    ],
+)
+
+py_library(
+    name = "test_hunyuan3d_native_texture_models",
+    srcs = ["test_hunyuan3d_native_texture_models.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/configs/models/vaes:stable_diffusion",
+        "//python/sglang/multimodal_gen/runtime/models/dits:hunyuan3d_paint",
+        "//python/sglang/multimodal_gen/runtime/models/dits:stable_diffusion",
+        "//python/sglang/multimodal_gen/runtime/models/vaes:autoencoder",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python/sglang/multimodal_gen/runtime/pipelines:hunyuan3d_pipeline",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/hunyuan3d:paint",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/hunyuan3d:shape",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_ideogram4",
+    srcs = ["test_ideogram4.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/disaggregation:roles",
+        "//python/sglang/multimodal_gen/runtime/layers/quantization:weight_only_fp8",
+        "//python/sglang/multimodal_gen/runtime/layers/rotary_embedding:pkg",
+        "//python/sglang/multimodal_gen/runtime/models/dits:ideogram",
+        "//python/sglang/multimodal_gen/runtime/models/encoders:ideogram",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python/sglang/multimodal_gen/runtime/pipelines:ideogram",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages:ideogram",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "test_ideogram_rope_swiglu_fusion",
+    srcs = ["test_ideogram_rope_swiglu_fusion.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/rotary_embedding:pkg",
+        "//python/sglang/multimodal_gen/runtime/models/dits:ideogram",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_input_validation",
+    srcs = ["test_input_validation.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/pipelines:flux_2",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_ipc_a2a_lifecycle",
+    srcs = ["test_ipc_a2a_lifecycle.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_ipc_array",
+    srcs = ["test_ipc_array.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime:ipc_array",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pytest",
+    ],
+)
+
+py_library(
+    name = "test_krea2_fp8",
+    srcs = ["test_krea2_fp8.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/dits:krea2",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "//python:cycle_11",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_latent_upsampler_group_norm_silu",
+    srcs = ["test_latent_upsampler_group_norm_silu.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/diffusion/norm:group_norm_silu_triton",
+        "//python/sglang/multimodal_gen/runtime/models/upsampler:latent_upsampler",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//einops",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_launch_server_shutdown",
+    srcs = ["test_launch_server_shutdown.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/disaggregation:roles",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_layernorm_cutedsl_dispatch",
+    srcs = ["test_layernorm_cutedsl_dispatch.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers:layernorm",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_layerwise_offload",
+    srcs = ["test_layerwise_offload.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/disaggregation:roles",
+        "//python/sglang/multimodal_gen/runtime/managers/memory_managers:layerwise_offload_components",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_lingbot_video_moe",
+    srcs = ["test_lingbot_video_moe.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers:moe",
+        "//python/sglang/multimodal_gen/runtime/models/dits:lingbot_video_moe",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/lingbot_video_moe:text_encoding",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_logging_utils",
+    srcs = ["test_logging_utils.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_longlive2_pipeline_config",
+    srcs = ["test_longlive2_pipeline_config.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_lora_commit_as_base",
+    srcs = ["test_lora_commit_as_base.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_lora_format_adapter",
+    srcs = ["test_lora_format_adapter.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/pipelines_core:lora_format_adapter",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//huggingface_hub",
+        "@sglang_pypi//safetensors",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_lora_inference_mode",
+    srcs = ["test_lora_inference_mode.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_lora_pipeline",
+    srcs = ["test_lora_pipeline.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_ltx2_5_config",
+    srcs = ["test_ltx2_5_config.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/configs/models/adapter:ltx_2_connector",
+        "//python/sglang/multimodal_gen/configs/models/adapter:ltx_2_duration_head",
+        "//python/sglang/multimodal_gen/configs/models/decoders:ltx_2_5_diffusion_decoder",
+        "//python/sglang/multimodal_gen/runtime/loader/component_loaders:upsampler_loader",
+        "//python/sglang/multimodal_gen/runtime/models/adapter:ltx_2_duration_head",
+        "//python/sglang/multimodal_gen/runtime/models/decoders:ltx_2_5_diffusion_decoder",
+        "//python/sglang/multimodal_gen/runtime/models/upsampler:latent_upsampler",
+        "//python/sglang/multimodal_gen/runtime/pipelines:ltx_2_pipeline",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "//python:cycle_8",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_ltx2_bcg_coords",
+    srcs = ["test_ltx2_bcg_coords.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/ltx_2:denoising",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "//python:cycle_10",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_ltx2_modulate_mount",
+    srcs = ["test_ltx2_modulate_mount.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/dits:ltx_2",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_ltx2_vae_channels_last",
+    srcs = ["test_ltx2_vae_channels_last.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_minimax_h3_adaln_cache",
+    srcs = ["test_minimax_h3_adaln_cache.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/dits:minimax_h3",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//safetensors",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_minimax_h3_admission",
+    srcs = ["test_minimax_h3_admission.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/entrypoints/openai:protocol",
+        "//python/sglang/multimodal_gen/runtime/entrypoints:pkg",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/stages:denoising",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:release_metadata",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_minimax_h3_denoise_loop",
+    srcs = ["test_minimax_h3_denoise_loop.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/schedulers:scheduling_minimax_h3_euler_ancestral",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:denoise_loop",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:packed_sequence",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_minimax_h3_dit_contract",
+    srcs = ["test_minimax_h3_dit_contract.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/diffusion:pkg",
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:sdpa",
+        "//python/sglang/multimodal_gen/runtime/models/dits:minimax_h3",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "//python:cycle_11",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_minimax_h3_encoder_device",
+    srcs = ["test_minimax_h3_encoder_device.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/encoders:minimax_h3_qwen3vl",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_minimax_h3_media",
+    srcs = ["test_minimax_h3_media.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:material_io",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_minimax_h3_packed_sequence",
+    srcs = ["test_minimax_h3_packed_sequence.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:packed_sequence",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_minimax_h3_vae_parallel_modes",
+    srcs = ["test_minimax_h3_vae_parallel_modes.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/vaes/minimax_h3_audio_vae:audio_vae",
+        "//python/sglang/multimodal_gen/runtime/models/vaes/minimax_h3_video_vae:attention",
+        "//python/sglang/multimodal_gen/runtime/models/vaes:minimax_h3",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_ministral3_generation",
+    srcs = ["test_ministral3_generation.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:sdpa",
+        "//python/sglang/multimodal_gen/runtime/loader/component_loaders:pe_loader",
+        "//python/sglang/multimodal_gen/runtime/models/encoders:mistral_3",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "test_multi_output_grouping",
+    srcs = ["test_multi_output_grouping.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_nvtx_pytorch_hooks",
+    srcs = ["test_nvtx_pytorch_hooks.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_openai_image_api",
+    srcs = ["test_openai_image_api.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/entrypoints:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//fastapi",
+        "@sglang_pypi//pillow",
+    ],
+)
+
+py_library(
+    name = "test_openai_utils",
+    srcs = ["test_openai_utils.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/entrypoints:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//starlette",
+    ],
+)
+
+py_library(
+    name = "test_output_saving",
+    srcs = ["test_output_saving.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_parallel_linear_weight_loading",
+    srcs = ["test_parallel_linear_weight_loading.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_pi05_action_api",
+    srcs = ["test_pi05_action_api.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+    ],
+)
+
+py_library(
+    name = "test_pi05_prefix_cache",
+    srcs = ["test_pi05_prefix_cache.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/vla:prefix_cache",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_pi05_runtime_helpers",
+    srcs = ["test_pi05_runtime_helpers.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/vlas:pi05_core",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages:pi05_preprocess",
+        "//python/sglang/multimodal_gen/runtime/vla:cuda_graph",
+        "//python/sglang/multimodal_gen/runtime/vla:prefix_cache",
+        "//python/sglang/srt/models:siglip",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "//python:cycle_9",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_pipeline_executor",
+    srcs = ["test_pipeline_executor.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/platforms:npu",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_pipeline_stage_profiling",
+    srcs = ["test_pipeline_stage_profiling.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_platform_detection",
+    srcs = ["test_platform_detection.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_precision_consistency",
+    srcs = ["test_precision_consistency.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_qvg_packed_kv",
+    srcs = ["test_qvg_packed_kv.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/configs/quantization:qvg_kv",
+        "//python/sglang/multimodal_gen/configs:pkg",
+        "//python/sglang/multimodal_gen/runtime/layers/kvcache:causal_attention_cache",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_qwen2_5vl_generation",
+    srcs = ["test_qwen2_5vl_generation.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/encoders:qwen2_5vl",
+        "//python/sglang/multimodal_gen/runtime/models/encoders:qwen2_5vl_vision",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python/sglang/multimodal_gen/runtime/pipelines:longcat_image",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_qwen3_encoder",
+    srcs = ["test_qwen3_encoder.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/encoders:qwen3",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_qwen3vl_vision",
+    srcs = ["test_qwen3vl_vision.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/encoders:minimax_h3_qwen3vl",
+        "//python/sglang/multimodal_gen/runtime/models/encoders:qwen3vl",
+        "//python/sglang/multimodal_gen/runtime/models/encoders:qwen3vl_vision",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_qwen_image_layered",
+    srcs = ["test_qwen_image_layered.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_regional_torch_compile",
+    srcs = ["test_regional_torch_compile.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/dits:ltx_2",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_request_manifest",
+    srcs = ["test_request_manifest.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/benchmarks:bench_offline_throughput",
+        "//python/sglang/multimodal_gen/benchmarks:request_manifest",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+    ],
+)
+
+py_library(
+    name = "test_resolve_prompts",
+    srcs = ["test_resolve_prompts.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_ring_admission",
+    srcs = ["test_ring_admission.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:sdpa",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_rollout_api",
+    srcs = ["test_rollout_api.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/entrypoints/post_training:io_struct",
+        "//python/sglang/multimodal_gen/runtime/entrypoints/post_training:utils",
+        "//python/sglang/multimodal_gen/runtime/post_training:rl_dataclasses",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_sampling_params",
+    srcs = ["test_sampling_params.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_sana_video",
+    srcs = ["test_sana_video.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/dits:sana_video",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python/sglang/multimodal_gen/runtime/pipelines:sana_video",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_scheduler_client",
+    srcs = ["test_scheduler_client.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//pyzmq",
+    ],
+)
+
+py_library(
+    name = "test_scheduler_rollout_unit",
+    srcs = ["test_scheduler_rollout_unit.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_served_model_name",
+    srcs = ["test_served_model_name.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/entrypoints/openai:protocol",
+        "//python/sglang/multimodal_gen/runtime/entrypoints:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_server_args",
+    srcs = ["test_server_args.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/cli:utils",
+        "//python/sglang/multimodal_gen/configs/models:fsdp",
+        "//python/sglang/multimodal_gen/configs/pipeline_configs:model_deployment_config",
+        "//python/sglang/multimodal_gen/runtime/disaggregation:disagg_args",
+        "//python/sglang/multimodal_gen/runtime/disaggregation:roles",
+        "//python/sglang/multimodal_gen/runtime/entrypoints/cli:serve",
+        "//python/sglang/multimodal_gen/runtime/models/dits:qwen_image",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python/sglang/multimodal_gen/runtime/pipelines:minimax_h3_pipeline",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_server_warmup_progress",
+    srcs = ["test_server_warmup_progress.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_sol_attn_backend",
+    srcs = ["test_sol_attn_backend.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:sol_attn",
+        "//python/sglang/multimodal_gen/runtime/platforms:cuda",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_sp_shard",
+    srcs = ["test_sp_shard.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_spectrum",
+    srcs = ["test_spectrum.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_srt_clip_reuse",
+    srcs = ["test_srt_clip_reuse.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/encoders:clip",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python/sglang/srt/models:clip",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_srt_siglip_reuse",
+    srcs = ["test_srt_siglip_reuse.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/encoders:gemma_3",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python/sglang/srt/models:siglip",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_storage",
+    srcs = ["test_storage.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/entrypoints:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+    ],
+)
+
+py_library(
+    name = "test_subblock_sparse_attention",
+    srcs = ["test_subblock_sparse_attention.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends/subblock_sparse:router",
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:subblock_sparse_attn",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_suite_partitioning",
+    srcs = ["test_suite_partitioning.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test/server:gpu_cases",
+        "//python/sglang/multimodal_gen/test:partitioning",
+        "//python/sglang/multimodal_gen/test:run_suite",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//pytest",
+    ],
+)
+
+py_library(
+    name = "test_text_encode_dp_gate",
+    srcs = ["test_text_encode_dp_gate.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_text_encoder_loader",
+    srcs = ["test_text_encoder_loader.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/loader/component_loaders:text_encoder_loader",
+        "//python/sglang/multimodal_gen/runtime/models/encoders:minimax_h3_qwen3vl",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "test_text_encoding_cache",
+    srcs = ["test_text_encoding_cache.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_tpu_enablement",
+    srcs = ["test_tpu_enablement.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers:layernorm",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_tpu_platform",
+    srcs = ["test_tpu_platform.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/platforms:tpu",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_transformer_quant",
+    srcs = ["test_transformer_quant.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/loader:weight_load_plan",
+        "//python/sglang/multimodal_gen/runtime/models/dits:flux",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python/sglang/multimodal_gen/tools:build_modelopt_nvfp4_transformer",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//safetensors",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_turbo_wan_backend",
+    srcs = ["test_turbo_wan_backend.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_usp_attention_kv_gather",
+    srcs = ["test_usp_attention_kv_gather.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_usp_attention_replicated_prefix",
+    srcs = ["test_usp_attention_replicated_prefix.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_usp_ipc_a2a_guard",
+    srcs = ["test_usp_ipc_a2a_guard.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_usp_packed_qkv_a2a",
+    srcs = ["test_usp_packed_qkv_a2a.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_usp_ring_replicated",
+    srcs = ["test_usp_ring_replicated.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_usp_ring_tail_pad",
+    srcs = ["test_usp_ring_tail_pad.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_utils_parent_death",
+    srcs = ["test_utils_parent_death.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_vae_fast_path_gate",
+    srcs = ["test_vae_fast_path_gate.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/vaes:fast_path_gate",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_vae_loader",
+    srcs = ["test_vae_loader.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_vae_spatial_parallel_decode",
+    srcs = ["test_vae_spatial_parallel_decode.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/configs:utils",
+        "//python/sglang/multimodal_gen/runtime/models/vaes:autoencoder",
+        "//python/sglang/multimodal_gen/runtime/models/vaes:autoencoder_kl_qwenimage",
+        "//python/sglang/multimodal_gen/runtime/models/vaes:hunyuanvae",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_varlen_meta_host_build",
+    srcs = ["test_varlen_meta_host_build.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_video_api_profiling",
+    srcs = ["test_video_api_profiling.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/entrypoints/openai:protocol",
+        "//python/sglang/multimodal_gen/runtime/entrypoints:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_video_job_lifecycle",
+    srcs = ["test_video_job_lifecycle.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/entrypoints:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_video_sparse_attention",
+    srcs = ["test_video_sparse_attention.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/attention/backends:video_sparse_attn",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_wan_attention_backend",
+    srcs = ["test_wan_attention_backend.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/dits:wanvideo",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_wan_pipeline_config",
+    srcs = ["test_wan_pipeline_config.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_wan_temb_table_slices",
+    srcs = ["test_wan_temb_table_slices.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/dits:wanvideo",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_wan_ti2v_helpers",
+    srcs = ["test_wan_ti2v_helpers.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_weight_only_fp8_dequant_cache",
+    srcs = ["test_weight_only_fp8_dequant_cache.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/layers/quantization:weight_only_fp8",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_weight_utils",
+    srcs = ["test_weight_utils.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_zimage_pipeline_config",
+    srcs = ["test_zimage_pipeline_config.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/dits:zimage",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "test_zimage_qknorm_fusion",
+    srcs = ["test_zimage_qknorm_fusion.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/dits:zimage",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)

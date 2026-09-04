@@ -1,0 +1,4 @@
+Metadata-Version: 2.1
+Name: sglang
+Version: 0.0.0.dev0
+Summary: Bazel runfiles metadata mirroring what `pip install -e python` registers (see python/pyproject_tpu.toml).

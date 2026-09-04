@@ -1,0 +1,29 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "code_completion_parser.py",
+        "conversation.py",
+        "inkling_renderer.py",
+        "jinja_template_utils.py",
+        "reasoning_parser.py",
+        "template_detection.py",
+        "template_manager.py",
+    ]),
+)
+
+py_library(
+    name = "harmony_parser",
+    srcs = ["harmony_parser.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "inkling_tokenizer",
+    srcs = ["inkling_tokenizer.py"],
+    imports = ["../../.."],
+)

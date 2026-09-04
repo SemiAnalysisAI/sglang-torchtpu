@@ -1,0 +1,95 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "allocation.py",
+        "allocation_sizing.py",
+        "base_prefix_cache.py",
+        "base_swa_memory_pool.py",
+        "cache_init_params.py",
+        "chunk_cache.py",
+        "common.py",
+        "deepseek_v4_compress_state.py",
+        "deepseek_v4_memory_pool.py",
+        "dsa_cache_layer_split.py",
+        "events.py",
+        "evict_policy.py",
+        "hicache_storage.py",
+        "hiradix_cache.py",
+        "hisparse_memory_pool.py",
+        "index_key_cache.py",
+        "kv_cache_builder.py",
+        "kv_cache_configurator.py",
+        "kv_cache_dtype.py",
+        "kv_vmm_backing.py",
+        "l2_transfer.py",
+        "mamba_checkpoint_pool.py",
+        "memory_pool.py",
+        "memory_pool_host.py",
+        "multi_ended_allocator.py",
+        "multimodal_cache.py",
+        "pure_swa_radix_cache.py",
+        "radix_cache.py",
+        "radix_cache_cpp.py",
+        "registry.py",
+        "swa_memory_pool.py",
+        "swa_radix_cache.py",
+        "unified_memory_pool.py",
+        "unified_radix_cache.py",
+        "utils.py",
+    ]),
+)
+
+py_library(
+    name = "embedding_cache_controller",
+    srcs = ["embedding_cache_controller.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/srt/mem_cache:embedding_store",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "embedding_store",
+    srcs = ["embedding_store.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "flush_cache",
+    srcs = ["flush_cache.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//requests",
+    ],
+)
+
+py_library(
+    name = "mamba_radix_cache",
+    srcs = ["mamba_radix_cache.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "mamba_slot_fused",
+    srcs = ["mamba_slot_fused.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)

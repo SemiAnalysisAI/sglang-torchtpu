@@ -1,0 +1,140 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "ep_moe_kernels.py",
+        "fused_moe_lora_kernel.py",
+        "fused_moe_triton_kernels.py",
+        "inkling_moe.py",
+        "moe_align.py",
+        "moe_align_single_token.py",
+        "moe_align_small_numel.py",
+        "moe_finalize_fuse_shared.py",
+        "moe_fused_gate.py",
+        "moe_fused_mul_sum.py",
+        "moe_lora_align.py",
+        "moe_permute_prepare.py",
+        "moe_route_quant_fused.py",
+        "moe_route_radix.py",
+        "moe_topk_sigmoid.py",
+        "moe_topk_sum.py",
+        "moe_wna16_marlin.py",
+        "mxfp8_moe_amd_gfx95.py",
+        "pack_topk_ids.py",
+        "rocm_moe_utils.py",
+        "triton_sigmoid_gate_mul.py",
+        "virtual_experts.py",
+    ]),
+)
+
+py_library(
+    name = "deepep_waterfill_kernels",
+    srcs = ["deepep_waterfill_kernels.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "fill_padded_rows",
+    srcs = ["fill_padded_rows.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "gate_topk",
+    srcs = ["gate_topk.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "inkling_gate_topk_renorm",
+    srcs = ["inkling_gate_topk_renorm.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//apache_tvm_ffi",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "minimax_m3_swiglu",
+    srcs = ["minimax_m3_swiglu.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "moe_front",
+    srcs = ["moe_front.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//apache_tvm_ffi",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "moe_topk_softmax",
+    srcs = ["moe_topk_softmax.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//apache_tvm_ffi",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "router",
+    srcs = ["router.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "sigmoid_gate_topk_renorm",
+    srcs = ["sigmoid_gate_topk_renorm.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/moe:gate_topk",
+        "//python/sglang/kernels/ops/moe:inkling_gate_topk_renorm",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "triton_hash_topk",
+    srcs = ["triton_hash_topk.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)

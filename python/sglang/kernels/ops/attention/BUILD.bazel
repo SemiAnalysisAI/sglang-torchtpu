@@ -1,0 +1,307 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "clamp_position.py",
+        "concat_mla.py",
+        "decode_attention.py",
+        "extend_attention.py",
+        "fixup_zero_kv.py",
+        "flash_attention_v4.py",
+        "flash_attention_v4_sm120.py",
+        "flash_mla_sm120.py",
+        "fused_metadata_copy.py",
+        "fused_qk_norm_rope_store.py",
+        "fused_qknorm_rope.py",
+        "fused_store_index_cache.py",
+        "kda_fused_decode.py",
+        "kda_packed_decode.py",
+        "metadata.py",
+        "minimax_decode_topk.py",
+        "mla_kv_pack_quantize_fp8.py",
+        "prefill_attention.py",
+        "qprep_bf16_fp8_sm90.py",
+        "rope.py",
+        "set_mla_kv_concat_q.py",
+        "sparse_mla_q8kv8_prefill_sm90.py",
+        "triton_gdn_fused_proj.py",
+        "utils.py",
+        "verify_mla.py",
+        "verify_splitkv.py",
+    ]),
+)
+
+py_library(
+    name = "cutedsl_fp8_paged_mqa_logits",
+    srcs = ["cutedsl_fp8_paged_mqa_logits.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "cutedsl_gdn",
+    srcs = ["cutedsl_gdn.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "cutedsl_gdn_mtp_ring",
+    srcs = ["cutedsl_gdn_mtp_ring.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "cutedsl_kda",
+    srcs = ["cutedsl_kda.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "dcp_kernels",
+    srcs = ["dcp_kernels.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "deepseek_v4_rope",
+    srcs = ["deepseek_v4_rope.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "dsa_metadata",
+    srcs = ["dsa_metadata.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "dsv4_attn_metadata_kernels",
+    srcs = ["dsv4_attn_metadata_kernels.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//msgspec",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "flash_attention",
+    srcs = ["flash_attention.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "flash_attention_v3",
+    srcs = ["flash_attention_v3.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels:kernel_api_logging",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "flash_mla_sm120_triton",
+    srcs = ["flash_mla_sm120_triton.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "fused_qk_rmsnorm_rope_gate",
+    srcs = ["fused_qk_rmsnorm_rope_gate.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "inkling_attn_prologue",
+    srcs = ["inkling_attn_prologue.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//apache_tvm_ffi",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "inkling_rel_proj",
+    srcs = ["inkling_rel_proj.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//apache_tvm_ffi",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "inkling_row_scale",
+    srcs = ["inkling_row_scale.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//apache_tvm_ffi",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "log_scaling_tau",
+    srcs = ["log_scaling_tau.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention:inkling_row_scale",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "merge_state",
+    srcs = ["merge_state.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "minimax_m3_qk_norm_rope",
+    srcs = ["minimax_m3_qk_norm_rope.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "minimax_qknorm_rope",
+    srcs = ["minimax_qknorm_rope.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//apache_tvm_ffi",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "mrope",
+    srcs = ["mrope.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "pa_page_table",
+    srcs = ["pa_page_table.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "pad",
+    srcs = ["pad.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "position",
+    srcs = ["position.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "rocm_mla_decode_rope",
+    srcs = ["rocm_mla_decode_rope.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "rotary_triton",
+    srcs = ["rotary_triton.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "score_mod",
+    srcs = ["score_mod.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "vision_rope",
+    srcs = ["vision_rope.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)

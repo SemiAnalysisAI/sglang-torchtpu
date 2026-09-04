@@ -1,0 +1,36 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "base",
+    srcs = ["base.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "ltx_2_connector",
+    srcs = ["ltx_2_connector.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/configs/models/adapter:base",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "ltx_2_duration_head",
+    srcs = ["ltx_2_duration_head.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/configs/models/adapter:base",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)

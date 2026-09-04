@@ -1,0 +1,25 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "ascend_backend.py",
+        "ascend_dsv4_backend.py",
+        "ascend_gdn_backend.py",
+        "ascend_hybrid_linear_attn_backend.py",
+        "ascend_kda_backend.py",
+        "mla_preprocess.py",
+    ]),
+)
+
+py_library(
+    name = "ascend_torch_native_backend",
+    srcs = ["ascend_torch_native_backend.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)

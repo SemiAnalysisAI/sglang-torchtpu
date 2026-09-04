@@ -1,0 +1,102 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../../.."],
+)
+
+py_library(
+    name = "attention",
+    srcs = ["attention.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "base_module",
+    srcs = ["base_module.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/diffusion:pkg",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "conv",
+    srcs = ["conv.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "klvae",
+    srcs = ["klvae.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "norm",
+    srcs = ["norm.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "processor",
+    srcs = ["processor.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "@sglang_pypi//einops",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//torchvision",
+    ],
+)
+
+py_library(
+    name = "vae_cnn",
+    srcs = ["vae_cnn.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "vae_vit",
+    srcs = ["vae_vit.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "vit_utils",
+    srcs = ["vit_utils.py"],
+    imports = ["../../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)

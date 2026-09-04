@@ -1,0 +1,50 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "hicache_nixl",
+    srcs = ["hicache_nixl.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/srt/mem_cache/storage/mmap:pkg",
+        "//python/sglang/srt/mem_cache/storage/nixl:nixl_cleaner",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "nixl_cleaner",
+    srcs = ["nixl_cleaner.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/srt/mem_cache/storage/nixl:nixl_routing",
+        "//python/sglang/srt/mem_cache/storage:pkg",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "nixl_registry",
+    srcs = ["nixl_registry.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "nixl_routing",
+    srcs = ["nixl_routing.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "nixl_utils",
+    srcs = ["nixl_utils.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/srt/mem_cache/storage/nixl:nixl_routing",
+        "//python/sglang/srt/mem_cache/storage:pkg",
+        "//python:cycle_0",
+    ],
+)

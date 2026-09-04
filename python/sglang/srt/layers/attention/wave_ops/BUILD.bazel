@@ -1,0 +1,25 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "decode_attention",
+    srcs = ["decode_attention.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "extend_attention",
+    srcs = ["extend_attention.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "prefill_attention",
+    srcs = ["prefill_attention.py"],
+    imports = ["../../../../.."],
+)

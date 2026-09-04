@@ -1,0 +1,50 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_18_files",
+    srcs = glob([
+        "__init__.py",
+        "model_config.py",
+    ]),
+)
+
+py_library(
+    name = "eval_support",
+    srcs = ["eval_support.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test/kits:lm_eval_kit",
+        "//python:cycle_0",
+        "@sglang_pypi//pyyaml",
+        "@sglang_pypi//requests",
+    ],
+)
+
+py_library(
+    name = "gpt_oss_120b_eval_common",
+    srcs = ["gpt_oss_120b_eval_common.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "kv_offload_probe",
+    srcs = ["kv_offload_probe.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//msgspec",
+        "@sglang_pypi//requests",
+    ],
+)
+
+py_library(
+    name = "server_test_suite",
+    srcs = ["server_test_suite.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python:cycle_0",
+    ],
+)

@@ -1,0 +1,30 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "umbp_host_allocator.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "umbp_store",
+    srcs = ["umbp_store.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/srt/disaggregation:kv_events",
+        "//python:cycle_0",
+        "@sglang_pypi//msgspec",
+        "@sglang_pypi//pyzmq",
+        "@sglang_pypi//torch",
+    ],
+)

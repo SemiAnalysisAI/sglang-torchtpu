@@ -1,0 +1,35 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "ci_register",
+    srcs = ["ci_register.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "ci_stress_utils",
+    srcs = ["ci_stress_utils.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "ci_utils",
+    srcs = ["ci_utils.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test/ci:ci_register",
+        "//python:cycle_0",
+    ],
+)

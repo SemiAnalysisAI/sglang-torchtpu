@@ -1,0 +1,68 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "verify.py",
+        "write.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "consts",
+    srcs = ["consts.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "plan_ref",
+    srcs = ["plan_ref.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/kv_canary:consts",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "scatter_req_token_ids",
+    srcs = ["scatter_req_token_ids.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "verify_ref",
+    srcs = ["verify_ref.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/kv_canary:consts",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "write_ref",
+    srcs = ["write_ref.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/kv_canary:consts",
+        "//python/sglang/kernels/ops/kv_canary:verify_ref",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)

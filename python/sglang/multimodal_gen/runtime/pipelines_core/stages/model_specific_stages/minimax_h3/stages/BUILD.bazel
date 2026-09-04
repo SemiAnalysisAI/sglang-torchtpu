@@ -1,0 +1,123 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../../../../.."],
+)
+
+py_library(
+    name = "audio_encoding",
+    srcs = ["audio_encoding.py"],
+    imports = ["../../../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/disaggregation:roles",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:constants",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:material_io",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "decoding",
+    srcs = ["decoding.py"],
+    imports = ["../../../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/disaggregation:roles",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:constants",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages:validators",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "denoising",
+    srcs = ["denoising.py"],
+    imports = ["../../../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:condition_noise",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:constants",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:denoise_loop",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:packed_sequence",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:packed_tokens",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages:validators",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "latent_preparation",
+    srcs = ["latent_preparation.py"],
+    imports = ["../../../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:constants",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:packed_tokens",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages:validators",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "replica_broadcast",
+    srcs = ["replica_broadcast.py"],
+    imports = ["../../../../../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "text_encoding",
+    srcs = ["text_encoding.py"],
+    imports = ["../../../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/stages:replica_broadcast",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:canvas",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:constants",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:material_io",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:presentation",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "timestep_preparation",
+    srcs = ["timestep_preparation.py"],
+    imports = ["../../../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:time_request",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages:validators",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "visual_encoding",
+    srcs = ["visual_encoding.py"],
+    imports = ["../../../../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/disaggregation:roles",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:canvas",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:constants",
+        "//python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3:material_io",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//torch",
+    ],
+)

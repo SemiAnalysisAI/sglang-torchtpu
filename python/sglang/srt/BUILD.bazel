@@ -1,0 +1,29 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "cuda_vmm_utils.py",
+        "environ.py",
+        "runtime_context.py",
+        "server_args.py",
+    ]),
+)
+
+py_library(
+    name = "constants",
+    srcs = ["constants.py"],
+    imports = ["../.."],
+)
+
+py_library(
+    name = "server_args_config_parser",
+    srcs = ["server_args_config_parser.py"],
+    imports = ["../.."],
+    deps = [
+        "@sglang_pypi//pyyaml",
+    ],
+)

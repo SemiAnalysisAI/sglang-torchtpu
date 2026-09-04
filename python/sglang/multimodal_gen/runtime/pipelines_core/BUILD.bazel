@@ -1,0 +1,24 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_1_files",
+    srcs = glob([
+        "__init__.py",
+        "composed_pipeline_base.py",
+        "diffusion_scheduler_utils.py",
+        "lora_pipeline.py",
+        "schedule_batch.py",
+    ]),
+)
+
+py_library(
+    name = "lora_format_adapter",
+    srcs = ["lora_format_adapter.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)

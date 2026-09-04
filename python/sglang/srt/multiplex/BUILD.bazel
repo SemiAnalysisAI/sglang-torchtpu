@@ -1,0 +1,21 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "multiplexing_mixin.py",
+    ]),
+)
+
+py_library(
+    name = "pdmux_context",
+    srcs = ["pdmux_context.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//pyyaml",
+        "@sglang_pypi//torch",
+    ],
+)

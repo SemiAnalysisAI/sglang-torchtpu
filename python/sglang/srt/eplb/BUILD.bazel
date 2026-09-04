@@ -1,0 +1,22 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "eplb_manager.py",
+        "expert_distribution.py",
+        "expert_location.py",
+        "expert_location_dispatch.py",
+        "expert_location_updater.py",
+        "lplb_solver.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../.."],
+)

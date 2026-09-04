@@ -1,0 +1,123 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_1_files",
+    srcs = glob([
+        "component_load.py",
+        "distributed.py",
+        "hf_diffusers_utils.py",
+        "logging_utils.py",
+        "model_overlay.py",
+        "nvtx_pytorch_hooks.py",
+        "perf_logger.py",
+        "precision.py",
+        "profiler.py",
+        "quantization_utils.py",
+        "realtime_video.py",
+        "torch_compile.py",
+    ]),
+)
+
+py_library(
+    name = "camera_geometry",
+    srcs = ["camera_geometry.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "common",
+    srcs = ["common.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//psutil",
+        "@sglang_pypi//pyzmq",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "condition_expansion",
+    srcs = ["condition_expansion.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "image_io",
+    srcs = ["image_io.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "mesh3d_utils",
+    srcs = ["mesh3d_utils.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/diffusion:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//einops",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "precision_types",
+    srcs = ["precision_types.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "request_logger",
+    srcs = ["request_logger.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/srt/utils:log_utils",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "trace_wrapper",
+    srcs = ["trace_wrapper.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "vision",
+    srcs = ["vision.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//packaging",
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//requests",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "weight_attrs",
+    srcs = ["weight_attrs.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)

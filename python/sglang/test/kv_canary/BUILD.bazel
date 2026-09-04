@@ -1,0 +1,108 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "consts",
+    srcs = ["consts.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "e2e_base",
+    srcs = ["e2e_base.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test/kv_canary:mode_config",
+        "//python/sglang/test/kv_canary:utils",
+        "//python/sglang/test/kv_canary:violation_assert_mixin",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "fixtures",
+    srcs = ["fixtures.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/kv_canary:consts",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "mode_config",
+    srcs = ["mode_config.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "pd_fixture",
+    srcs = ["pd_fixture.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test/kv_canary:mode_config",
+        "//python/sglang/test/kv_canary:utils",
+        "//python/sglang/test/kv_canary:violation_assert_mixin",
+        "//python/sglang/test/server_fixtures:disaggregation_fixture",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "pp_fixture",
+    srcs = ["pp_fixture.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test/kv_canary:consts",
+        "//python/sglang/test/kv_canary:e2e_base",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "runner_test_base",
+    srcs = ["runner_test_base.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/kv_canary:consts",
+        "//python/sglang/test/kv_canary:fixtures",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "utils",
+    srcs = ["utils.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test/kv_canary:mode_config",
+        "//python:cycle_0",
+        "@sglang_pypi//requests",
+    ],
+)
+
+py_library(
+    name = "violation_assert_mixin",
+    srcs = ["violation_assert_mixin.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/test/kv_canary:violation_log_utils",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "violation_log_utils",
+    srcs = ["violation_log_utils.py"],
+    imports = ["../../.."],
+)

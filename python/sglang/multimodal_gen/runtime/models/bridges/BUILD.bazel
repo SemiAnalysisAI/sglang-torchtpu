@@ -1,0 +1,33 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/runtime/models/bridges:mova_dual_tower",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "mova_dual_tower",
+    srcs = ["mova_dual_tower.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/configs/models/bridges:mova_dual_tower",
+        "//python/sglang/multimodal_gen/runtime/layers/rotary_embedding:pkg",
+        "//python/sglang/multimodal_gen/runtime/layers:layernorm",
+        "//python/sglang/multimodal_gen/runtime/models/dits:base",
+        "//python/sglang/multimodal_gen/runtime/models:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+        "@sglang_pypi//einops",
+        "@sglang_pypi//torch",
+    ],
+)

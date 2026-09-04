@@ -1,0 +1,16 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "eagle_draft_extend_npu_graph_runner.py",
+        "eagle_draft_npu_graph_runner.py",
+        "multi_layer_eagle_draft_extend_npu_graph_runner.py",
+        "npu_cudagraph_backend.py",
+        "npu_graph_runner.py",
+        "vit_npu_graph_runner.py",
+    ]),
+)

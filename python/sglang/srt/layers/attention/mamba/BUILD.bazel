@@ -1,0 +1,14 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "causal_conv1d.py",
+        "mamba.py",
+        "mamba2_metadata.py",
+        "mixer2_rms_norm_gated.py",
+    ]),
+)

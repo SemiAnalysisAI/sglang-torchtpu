@@ -1,0 +1,262 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "bailing_hybrid.py",
+        "deepseek_ocr.py",
+        "deepseek_v4.py",
+        "device_config.py",
+        "dots_ocr.py",
+        "dots_vlm.py",
+        "falcon_h1.py",
+        "granitemoehybrid.py",
+        "hybrid_arch.py",
+        "inkling.py",
+        "interns2_mobius.py",
+        "interns2preview.py",
+        "janus_pro.py",
+        "jet_nemotron.py",
+        "jet_vlm.py",
+        "kimi_k3.py",
+        "kimi_linear.py",
+        "kimi_vl.py",
+        "laguna.py",
+        "lfm2.py",
+        "lfm2_moe.py",
+        "lfm2_vl.py",
+        "load_config.py",
+        "locate_anything.py",
+        "mamba_utils.py",
+        "minicpmv4_6.py",
+        "model_config.py",
+        "muse_glimmer.py",
+        "nano_nemotron_vl.py",
+        "nemotron_h.py",
+        "qwen3_5.py",
+        "qwen3_asr.py",
+        "qwen3_next.py",
+        "qwen3_omni.py",
+        "step3p7.py",
+        "unlimited_ocr.py",
+        "update_config.py",
+        "zaya.py",
+    ]),
+)
+
+py_library(
+    name = "afmoe",
+    srcs = ["afmoe.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "chatglm",
+    srcs = ["chatglm.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "cohere2_moe",
+    srcs = ["cohere2_moe.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "dbrx",
+    srcs = ["dbrx.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "deepseekvl2",
+    srcs = ["deepseekvl2.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//torchvision",
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "embedding_model_spec",
+    srcs = ["embedding_model_spec.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "exaone",
+    srcs = ["exaone.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "internvl",
+    srcs = ["internvl.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//sentencepiece",
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "kimi_k25",
+    srcs = ["kimi_k25.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "kimi_vl_moonvit",
+    srcs = ["kimi_vl_moonvit.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "linear_attn_model_registry",
+    srcs = ["linear_attn_model_registry.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "longcat_flash",
+    srcs = ["longcat_flash.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "minimax_vl",
+    srcs = ["minimax_vl.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "model_config_parser_registry",
+    srcs = ["model_config_parser_registry.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "modelopt_config",
+    srcs = ["modelopt_config.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "muse_glimmer_processing",
+    srcs = ["muse_glimmer_processing.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "olmo3",
+    srcs = ["olmo3.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "parakeet",
+    srcs = ["parakeet.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "points_v15_chat",
+    srcs = ["points_v15_chat.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "qwen3_vl",
+    srcs = ["qwen3_vl.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "radio",
+    srcs = ["radio.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "step3_vl",
+    srcs = ["step3_vl.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "step3p5",
+    srcs = ["step3p5.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "utils",
+    srcs = ["utils.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//transformers",
+    ],
+)

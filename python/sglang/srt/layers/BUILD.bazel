@@ -1,0 +1,163 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "activation.py",
+        "amx_utils.py",
+        "communicator.py",
+        "communicator_dsa_cp.py",
+        "conv.py",
+        "dp_attention.py",
+        "flashinfer_comm_fusion.py",
+        "layernorm.py",
+        "linear.py",
+        "logits_processor.py",
+        "logprob_processor.py",
+        "n_gram_embedding.py",
+        "parameter.py",
+        "pooler.py",
+        "radix_attention.py",
+        "radix_linear_attention.py",
+        "sampler.py",
+        "vocab_parallel_embedding.py",
+    ]),
+)
+
+py_library(
+    name = "attn_residual",
+    srcs = ["attn_residual.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/kimi_k3:attn_res",
+        "//python/sglang/kernels/ops/kimi_k3:attn_res_hip",
+        "//python/sglang/srt/layers:k3_sp_collective",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "aux_hidden_states",
+    srcs = ["aux_hidden_states.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "clippable_linear",
+    srcs = ["clippable_linear.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "int4fp8_utils",
+    srcs = ["int4fp8_utils.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "k3_ar_fusion",
+    srcs = ["k3_ar_fusion.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/kimi_k3:all_reduce",
+        "//python/sglang/kernels/ops/kimi_k3:gemm_ag",
+        "//python/sglang/srt/distributed/device_communicators:custom_all_reduce_v2",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "k3_gemm_ar",
+    srcs = ["k3_gemm_ar.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/kimi_k3:gemm_ar",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "k3_sp_collective",
+    srcs = ["k3_sp_collective.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/kimi_k3:attn_res",
+        "//python/sglang/kernels/ops/kimi_k3:sp_collective",
+        "//python/sglang/srt/distributed/device_communicators:custom_all_reduce_v2",
+        "//python/sglang/srt/layers:k3_ar_fusion",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "logsumexp",
+    srcs = ["logsumexp.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "model_parallel",
+    srcs = ["model_parallel.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "modelopt_utils",
+    srcs = ["modelopt_utils.py"],
+    imports = ["../../.."],
+)
+
+py_library(
+    name = "rocm_linear_utils",
+    srcs = ["rocm_linear_utils.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "sparse_pooler",
+    srcs = ["sparse_pooler.py"],
+    imports = ["../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "zero_copy_context",
+    srcs = ["zero_copy_context.py"],
+    imports = ["../../.."],
+    deps = [
+        "@sglang_pypi//msgspec",
+        "@sglang_pypi//torch",
+    ],
+)

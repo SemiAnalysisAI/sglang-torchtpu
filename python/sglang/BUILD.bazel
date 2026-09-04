@@ -1,0 +1,102 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "bench_one_batch_server.py",
+        "utils.py",
+        "version.py",
+    ]),
+)
+
+py_library(
+    name = "_platform_stubs",
+    srcs = ["_platform_stubs.py"],
+    imports = [".."],
+    deps = [
+        "@sglang_pypi//psutil",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "_version",
+    srcs = ["_version.py"],
+    imports = [".."],
+)
+
+py_library(
+    name = "bench_offline_throughput",
+    srcs = ["bench_offline_throughput.py"],
+    imports = [".."],
+    deps = [
+        "//python/sglang/benchmark:offline_throughput",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "bench_one_batch",
+    srcs = ["bench_one_batch.py"],
+    imports = [".."],
+    deps = [
+        "//python/sglang/benchmark:one_batch",
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "bench_serving",
+    srcs = ["bench_serving.py"],
+    imports = [".."],
+    deps = [
+        "//python:cycle_0",
+    ],
+)
+
+py_library(
+    name = "check_env",
+    srcs = ["check_env.py"],
+    imports = [".."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "compile_deep_gemm",
+    srcs = ["compile_deep_gemm.py"],
+    imports = [".."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//requests",
+    ],
+)
+
+py_library(
+    name = "launch_server",
+    srcs = ["launch_server.py"],
+    imports = [".."],
+    deps = [
+        "//python/sglang/srt/disaggregation:encode_grpc_server",
+        "//python/sglang/srt/disaggregation:encode_server",
+        "//python/sglang/srt/entrypoints:grpc_server",
+        "//python/sglang/srt/ray:http_server",
+        "//python:cycle_0",
+        "//python:cycle_6",
+    ],
+)
+
+py_library(
+    name = "profiler",
+    srcs = ["profiler.py"],
+    imports = [".."],
+    deps = [
+        "@sglang_pypi//requests",
+    ],
+)

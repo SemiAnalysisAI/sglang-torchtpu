@@ -1,0 +1,253 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "bench_activation",
+    srcs = ["bench_activation.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_amd_deterministic_allreduce",
+    srcs = ["bench_amd_deterministic_allreduce.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "bench_awq_dequant",
+    srcs = ["bench_awq_dequant.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_cutlass_mla",
+    srcs = ["bench_cutlass_mla.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_dsv4_norm_rope",
+    srcs = ["bench_dsv4_norm_rope.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_es_fp8_blockwise_grouped_gemm",
+    srcs = ["bench_es_fp8_blockwise_grouped_gemm.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "bench_fp4_gemm",
+    srcs = ["bench_fp4_gemm.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_fp8_blockwise_group_gemm",
+    srcs = ["bench_fp8_blockwise_group_gemm.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "bench_fp8_gemm",
+    srcs = ["bench_fp8_gemm.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_fp8_gemm_swap_ab",
+    srcs = ["bench_fp8_gemm_swap_ab.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_int8_gemm",
+    srcs = ["bench_int8_gemm.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_moe_align_block_size",
+    srcs = ["bench_moe_align_block_size.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_moe_ep_post_reorder",
+    srcs = ["bench_moe_ep_post_reorder.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_moe_topk_sigmoid",
+    srcs = ["bench_moe_topk_sigmoid.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/srt/hardware_backend/musa/kernels:topk",
+        "//python/sglang/srt/hardware_backend/musa:pkg",
+        "//python:cycle_0",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_moe_topk_softmax",
+    srcs = ["bench_moe_topk_softmax.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/srt/hardware_backend/musa/kernels:topk",
+        "//python/sglang/srt/hardware_backend/musa:pkg",
+        "//python:cycle_0",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_mrope",
+    srcs = ["bench_mrope.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//transformers",
+    ],
+)
+
+py_library(
+    name = "bench_per_tensor_quant_fp8",
+    srcs = ["bench_per_tensor_quant_fp8.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_per_token_group_quant_8bit",
+    srcs = ["bench_per_token_group_quant_8bit.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/srt/utils:bench_utils",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_rmsnorm",
+    srcs = ["bench_rmsnorm.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_rotary_embedding",
+    srcs = ["bench_rotary_embedding.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/srt/utils:bench_utils",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_sum_scale",
+    srcs = ["bench_sum_scale.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "bench_top_k_top_p_sampling",
+    srcs = ["bench_top_k_top_p_sampling.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)

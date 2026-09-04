@@ -1,0 +1,32 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "core.py",
+        "kimi_k2_moe_fused_gate.py",
+        "moe_lora_merged_align.py",
+        "topk_softmax_pack.py",
+        "virtual_experts.py",
+    ]),
+)
+
+py_library(
+    name = "jit",
+    srcs = ["jit.py"],
+    imports = ["../../../../.."],
+)
+
+py_library(
+    name = "topk_pack",
+    srcs = ["topk_pack.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)

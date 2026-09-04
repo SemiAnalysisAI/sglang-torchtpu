@@ -1,0 +1,44 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "test_server_1_npu",
+    srcs = ["test_server_1_npu.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test/server/ascend:testcase_configs_npu",
+        "//python/sglang/multimodal_gen/test/server/common:case_fixtures",
+        "//python/sglang/multimodal_gen/test/server:test_server_common",
+        "//python/sglang/multimodal_gen/test:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "test_server_2_npu",
+    srcs = ["test_server_2_npu.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test/server/ascend:testcase_configs_npu",
+        "//python/sglang/multimodal_gen/test/server/common:case_fixtures",
+        "//python/sglang/multimodal_gen/test/server:test_server_common",
+        "//python/sglang/multimodal_gen/test:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)
+
+py_library(
+    name = "testcase_configs_npu",
+    srcs = ["testcase_configs_npu.py"],
+    imports = ["../../../../.."],
+    deps = [
+        "//python/sglang/multimodal_gen/test/server:testcase_configs",
+        "//python/sglang/multimodal_gen/test:pkg",
+        "//python:cycle_0",
+        "//python:cycle_1",
+    ],
+)

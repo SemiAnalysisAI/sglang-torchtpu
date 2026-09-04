@@ -1,0 +1,87 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "dense_mlp.py",
+        "lora.py",
+        "util.py",
+    ]),
+)
+
+py_library(
+    name = "pkg",
+    srcs = ["__init__.py"],
+    imports = ["../../../.."],
+)
+
+py_library(
+    name = "attn",
+    srcs = ["attn.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/attention/flash_attn/cute:batch_invariance",
+        "//python/sglang/kernels/ops/attention/flash_attn/cute:seqlen_info",
+        "//python/sglang/kernels/ops/attention:inkling_attn_prologue",
+        "//python/sglang/kernels/ops/attention:inkling_rel_proj",
+        "//python/sglang/kernels/ops/attention:inkling_row_scale",
+        "//python/sglang/kernels/ops/attention:log_scaling_tau",
+        "//python/sglang/kernels/ops/attention:score_mod",
+        "//python/sglang/kernels/ops/quantization:mxfp8_quant",
+        "//python/sglang/srt/models/inkling_common:norm",
+        "//python/sglang/srt/models/inkling_common:sconv",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "hmlp",
+    srcs = ["hmlp.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/srt/models/inkling_common:norm",
+        "//python:cycle_0",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//scipy",
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "moe",
+    srcs = ["moe.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python/sglang/kernels/ops/moe:gate_topk",
+        "//python/sglang/kernels/ops/moe:inkling_gate_topk_renorm",
+        "//python/sglang/kernels/ops/moe:sigmoid_gate_topk_renorm",
+        "//python:cycle_0",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)
+
+py_library(
+    name = "norm",
+    srcs = ["norm.py"],
+    imports = ["../../../.."],
+    deps = [
+        "@sglang_pypi//torch",
+    ],
+)
+
+py_library(
+    name = "sconv",
+    srcs = ["sconv.py"],
+    imports = ["../../../.."],
+    deps = [
+        "//python:cycle_0",
+        "@sglang_pypi//einops",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//triton",
+    ],
+)

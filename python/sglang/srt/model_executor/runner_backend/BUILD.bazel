@@ -1,0 +1,17 @@
+# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "cycle_0_files",
+    srcs = glob([
+        "__init__.py",
+        "base_cuda_graph_backend.py",
+        "breakable_cuda_graph_backend.py",
+        "cuda_graph_dedup_mixin.py",
+        "full_cuda_graph_backend.py",
+        "tc_piecewise_cuda_graph_backend.py",
+        "utils.py",
+    ]),
+)
