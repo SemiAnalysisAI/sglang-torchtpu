@@ -104,7 +104,7 @@ jobs:
           discover_files='python3 .github/tpu-ci/discover_files.py'
           echo "single_host=$(python3 .github/tpu-ci/discover_tests.py --suite nightly-tpu-4-v7 --nightly)" >> "$GITHUB_OUTPUT"
           echo "pd_pc_offload=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py)" >> "$GITHUB_OUTPUT"
-          echo "pd_tp_reshard=$($discover_files --entry test/registered/tpu/integration/test_pd_tp_resharding.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_tp_reshard=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_tp_resharding.py)" >> "$GITHUB_OUTPUT"
           echo "pd_singlehost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py)" >> "$GITHUB_OUTPUT"
           echo "pd_singlehost_spec=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py)" >> "$GITHUB_OUTPUT"
           echo "pd_multihost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py)" >> "$GITHUB_OUTPUT"
@@ -189,9 +189,9 @@ jobs:
       lane: nightly
       pd_prefill_hosts: 2
       pd_decode_hosts: 2
-      exec_cmd: env MODEL_PROFILE=gpt_oss_120b python3 test/registered/tpu/integration/test_pd_tp_resharding.py
+      exec_cmd: env MODEL_PROFILE=gpt_oss_120b python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_tp_resharding.py
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
-      files: test/registered/tpu/integration/test_pd_tp_resharding.py
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_tp_resharding.py
       weights_pvc: model-weights-rox
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_tp_reshard)[0].run_name }}
     permissions:

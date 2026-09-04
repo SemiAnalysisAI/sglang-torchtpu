@@ -10,7 +10,7 @@ instead of a rank-for-rank landing.
 Its own file rather than a flag on that gate: the gate runs nightly and its
 GSM8K baseline is only meaningful for the shape it was measured on, so an edit
 there would need re-validating on hardware before it could be trusted. Same
-trade test_pd_tp_resharding.py already makes.
+trade test_tpu_gpt_oss_120b_pd_multihost_tp_resharding.py already makes.
 
 Needs #592 (push-resharding for hybrid SWA pools; before it an asymmetric
 GPT-OSS run could only raise) and #583 (draft KV over the P/D transfer).
