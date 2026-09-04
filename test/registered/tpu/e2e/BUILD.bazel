@@ -4,10 +4,7 @@ package(default_visibility = ["//visibility:public"])
 
 # The test file is the entrypoint, exactly as outside Bazel: it calls
 # model_config_main, which boots the server through benchmark/tpu's shell
-# recipe. model_config._bazel_interpreter_env() hands the recipe a venv whose
-# site-packages picks up the test's runfiles closure via a .pth file, so the
-# recipe's plain `python -m sglang.launch_server` runs with the Bazel closure
-# -- no wrapper binary, no alternate entrypoint, no PYTHONPATH.
+# recipe.
 py_test(
     name = "test_tpu_gpt_oss_120b_singlehost_spec",
     timeout = "eternal",

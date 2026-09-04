@@ -116,10 +116,7 @@ Unknown keys raise rather than being ignored -- a silently-dropped typo in a
 threshold is the failure mode this shape would otherwise invite.
 """
 
-import os
 import re
-import subprocess
-import sys
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -136,55 +133,6 @@ from sglang.test.tpu.eval_support import (
 )
 
 _TPU_BENCH_DIR = Path(__file__).resolve().parents[4] / "benchmark" / "tpu"
-
-
-def _runfiles_import_roots() -> List[str]:
-    """The test process's import roots that live inside the Bazel runfiles
-    tree: the pip hubs' site-packages dirs (sglang_pypi, torch_tpu_pypi incl.
-    libtpu/jax) and the ``_main/python`` source root."""
-    runfiles_dir = os.path.realpath(os.environ["RUNFILES_DIR"])
-    roots = []
-    for entry in sys.path:
-        real = os.path.realpath(entry) if entry else entry
-        if real.startswith(runfiles_dir + os.sep) and real not in roots:
-            roots.append(real)
-    return roots
-
-
-def _bazel_interpreter_env() -> Dict[str, str]:
-    """Env that lets a shell recipe spawn ``python -m sglang.launch_server``
-    with the test's own Bazel Python closure.
-
-    Under ``bazel test`` the recipe runs in a *separate* process from the test,
-    so it does not inherit the import setup rules_python built for the test's
-    interpreter. PYTHONPATH/LD_LIBRARY_PATH are not an option, so this builds
-    a real venv instead: ``python -m venv --without-pip`` under TEST_TMPDIR,
-    with a ``.pth`` file in its site-packages listing the runfiles import
-    roots. ``.pth`` files execute in genuine site dirs during interpreter
-    startup, so the venv python sees the exact same modules as the test with
-    no environment variables. Setting ``PYTHON`` to the venv interpreter makes
-    the recipe's original entrypoint just work.
-
-    Empty outside Bazel: there the recipe keeps its own ``PYTHON`` default.
-    """
-    if not os.environ.get("RUNFILES_DIR"):
-        return {}
-    roots = _runfiles_import_roots()
-    if not roots:
-        return {}
-    venv_dir = Path(os.environ["TEST_TMPDIR"]) / "sglang_test_venv"
-    python = venv_dir / "bin" / "python"
-    if not python.exists():
-        subprocess.run(
-            [sys.executable, "-m", "venv", "--without-pip", str(venv_dir)],
-            check=True,
-        )
-        site_packages = next((venv_dir / "lib").glob("python*/site-packages"))
-        (site_packages / "sglang_bazel_runfiles.pth").write_text(
-            "".join(f"{root}\n" for root in roots)
-        )
-    print(f"[bazel] interpreter env: PYTHON={python} ({len(roots)} roots)", flush=True)
-    return {"PYTHON": str(python)}
 
 _CONFIG_KEYS = {
     "model",
@@ -251,13 +199,9 @@ def _build_launcher(launch: Dict[str, Any]):
     script = Path(recipe)
     if not script.is_absolute():
         script = _TPU_BENCH_DIR / script
-    # Under Bazel the recipe's `python -m sglang.launch_server` needs the test's
-    # interpreter closure; outside Bazel this is empty and the recipe's own
-    # PYTHON default applies. The test's explicit env wins on a conflict.
-    env = {**_bazel_interpreter_env(), **(launch.get("env") or {})}
     return RecipeLauncher(
         str(script),
-        env=env,
+        env=launch.get("env"),
         cwd=str(_TPU_BENCH_DIR),
         health_timeout=timeout,
         tag=tag,
