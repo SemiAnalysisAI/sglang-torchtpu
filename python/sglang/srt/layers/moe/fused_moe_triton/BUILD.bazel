@@ -1,4 +1,4 @@
-# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+# GENERATED FILE -- do not edit.
 load("@rules_python//python:defs.bzl", "py_library")
 
 package(default_visibility = ["//visibility:public"])

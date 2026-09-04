@@ -1,4 +1,4 @@
-# GENERATED FILE -- do not edit. Regenerate: bazel run //bazel:gen_sglang_build
+# GENERATED FILE -- do not edit.
 
 """Generated import-cycle targets; loaded by python/BUILD.bazel."""
 

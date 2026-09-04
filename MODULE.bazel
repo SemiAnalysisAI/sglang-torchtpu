@@ -18,10 +18,12 @@ git_override(
     remote = "git@github.com:google-pytorch/torch_tpu.git",
 )
 
-# Bzlmod applies overrides only from the root module. Mirror torch_tpu's source
-# overrides here so consuming it as a dependency produces the same graph as a
-# build launched from the torch_tpu repository itself. Bazel permits override
-# patches only from the root module, so these files mirror the pinned source.
+# Bzlmod applies overrides only from the root module AND only with patch files
+# from the main repository ("only patches in the main repository can be
+# applied"), so torch_tpu's source overrides are re-declared here with local
+# copies of its patch files. The copies under bazel/patches/torch_tpu mirror
+# torch_tpu's bazel/patches/** at the pinned commit byte-for-byte (checked at
+# review time); re-sync them when the torch_tpu commit moves.
 single_version_override(
     module_name = "curl",
     patches = [
