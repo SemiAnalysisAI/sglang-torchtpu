@@ -97,10 +97,14 @@ python.toolchain(
 )
 use_repo(python, "python_3_12")
 
-# rules_uv vendors a pinned uv binary via rules_multitool (@multitool//tools/uv);
-# //requirements:regenerate_lock uses it so the lock file is produced by the
-# same uv on every machine instead of whatever happens to be on PATH.
+# //requirements:regenerate_lock resolves with the hermetic uv pinned in
+# requirements/uv.lock.json -- the same uv on every machine instead of whatever
+# happens to be on PATH. rules_uv also feeds rules_multitool its own vendored
+# (older) uv; our hub tag comes later, and rules_multitool merges lockfiles in
+# reverse module order with later entries winning, so this pin is the one that
+# @multitool//tools/uv serves to the main module.
 multitool = use_extension("@rules_multitool//multitool:extension.bzl", "multitool")
+multitool.hub(lockfile = "//requirements:uv.lock.json")
 use_repo(multitool, "multitool")
 
 pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
