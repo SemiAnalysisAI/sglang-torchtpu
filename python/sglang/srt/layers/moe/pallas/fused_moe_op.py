@@ -825,6 +825,12 @@ def fused_moe_call(
     when ``no_combine`` is True.
     """
     op = _build_fused_moe_op()
+    # Routed rows for this (bucket-padded) call; static per compiled graph.
+    routed_rows = int(hidden_states.shape[0]) * int(topk)
+    use_sc_gather = int(
+        envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()
+        and routed_rows >= envs.SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS.get()
+    )
     return op(
         hidden_states,
         w1,
@@ -840,7 +846,7 @@ def fused_moe_call(
         no_combine,
         global_num_experts,
         expert_group_offset,
-        int(envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()),
+        use_sc_gather,
         w_quant_bits,
         int(envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD.get()),
     )
