@@ -31,7 +31,6 @@ from torch.nn.parameter import Parameter
 from sglang.srt.hardware_backend.tpu.fp8_moe import _own_storage
 from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import get_parallel
 
@@ -155,9 +154,7 @@ def prepare_tpu_w4a16_moe_weights(layer: torch.nn.Module, group_size: int) -> No
         # Storing f32 makes that cast a no-op (+66 MB per layer per device);
         # the dtype conversion also gives the rank-4 layout its own storage,
         # which _own_storage guarantees for the no-conversion case.
-        new_scale = _own_storage(
-            old_scale.unsqueeze(2).contiguous().to(torch.float32)
-        )
+        new_scale = _own_storage(old_scale.unsqueeze(2).contiguous().to(torch.float32))
         assert packed.shape[1] * 8 == num_blocks * group_size, (
             f"{packed_name} packed K {packed.shape[1]}*8 inconsistent with "
             f"{scale_name} blocks {num_blocks}*group_size {group_size}"
@@ -201,12 +198,24 @@ def apply_tpu_w4a16_moe(
         raise NotImplementedError(
             "Fused shared experts are not supported on the TPU MoE path."
         )
-    topk_weights, topk_ids = mask_tpu_moe_non_local_experts(
-        topk_weights,
-        topk_ids,
-        layer.num_local_experts,
-        get_parallel().moe_ep_rank,
-    )
+    # Padded rows carry expert id -1: route them to expert 0 with zero weight.
+    valid = topk_ids >= 0
+    topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
+    topk_weights = topk_weights * valid.to(topk_weights.dtype)
+
+    # Hand the kernel GLOBAL expert ids plus this rank's group window, as the
+    # fp8 path does, instead of pre-masking to local ids. With the window the
+    # permute gathers only this rank's routed rows (~1/EP of them) and the
+    # combine takes ragged_gather_reduce, which runs on the TensorCore at
+    # decode sizes; without it every row was permuted and the combine went
+    # through dense_gather_reduce's mpmd_map lowering: 2 SparseCore calls of
+    # ~41 us per layer, 4.9 ms of a 20 ms bs=1 step on Kimi-K2.6.
+    global_num_experts = 0
+    expert_group_offset = 0
+    ep_size = get_parallel().moe_ep_size
+    if ep_size > 1:
+        global_num_experts = layer.num_local_experts * ep_size
+        expert_group_offset = get_parallel().moe_ep_rank * layer.num_local_experts
 
     output = fused_moe_call(
         hidden_states=x,
@@ -219,6 +228,8 @@ def apply_tpu_w4a16_moe(
         w1_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
         no_combine=no_combine,
+        global_num_experts=global_num_experts,
+        expert_group_offset=expert_group_offset,
         w_quant_bits=4,
     )
     return StandardCombineInput(hidden_states=output)
