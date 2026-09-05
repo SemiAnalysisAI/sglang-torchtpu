@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Optional, Type
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
@@ -152,6 +153,75 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
         )
 
 
+def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
+    """Reject configurations the TPU prefill context-parallel path cannot run.
+
+    The path shards extend batches by zigzag blocks over the attention
+    context-parallel group (= the TP group), all-gathers K/V per layer into
+    every rank's own RPA v3 pool and reduces the last-token rows before the
+    logits step; it exists only inside the compiled forward.
+    """
+    from sglang.srt.arg_groups.overrides import declare_late_resolution
+
+    attn_cp_size = server_args.attn_cp_size
+    if attn_cp_size <= 1:
+        return
+    feature = f"Prefill context parallelism on TPU (--attn-cp-size {attn_cp_size})"
+    if not server_args.enable_prefill_cp:
+        raise NotImplementedError(f"{feature} requires --enable-prefill-cp.")
+    if server_args.cp_strategy != "zigzag":
+        raise NotImplementedError(
+            f"{feature} requires --cp-strategy zigzag, got {server_args.cp_strategy!r}."
+        )
+    backend = server_args.attention_backend
+    if backend not in (None, "pallas_tpu_rpa_v3"):
+        raise NotImplementedError(
+            f"{feature} requires --attention-backend pallas_tpu_rpa_v3, got {backend!r}."
+        )
+    if server_args.pp_size != 1:
+        raise NotImplementedError(
+            f"{feature} does not support pipeline parallelism (pp_size={server_args.pp_size})."
+        )
+    if server_args.speculative_algorithm is not None:
+        raise NotImplementedError(f"{feature} does not support speculative decoding.")
+    if server_args.enable_dp_attention:
+        raise NotImplementedError(f"{feature} does not support DP attention.")
+    if server_args.moe_dp_size not in (1, attn_cp_size):
+        raise NotImplementedError(
+            f"{feature} requires --moe-dp-size 1 (expert-parallel MoE over the "
+            f"gathered tokens) or --moe-dp-size {attn_cp_size} (replicated experts "
+            f"on each rank's own tokens), got {server_args.moe_dp_size}."
+        )
+    if not server_args.enable_torch_compile:
+        raise NotImplementedError(f"{feature} requires --enable-torch-compile.")
+    if server_args.tpu_compile_tracer != "dynamo":
+        raise NotImplementedError(
+            f"{feature} requires --tpu-compile-tracer dynamo, got "
+            f"{server_args.tpu_compile_tracer!r}."
+        )
+    if server_args.sampling_backend is None:
+        declare_late_resolution(
+            server_args, "tpu.apply_server_args_defaults", sampling_backend="pytorch"
+        )
+    elif server_args.sampling_backend != "pytorch":
+        raise NotImplementedError(
+            f"{feature} requires --sampling-backend pytorch (the logits step runs on "
+            f"the reduced last-token rows), got {server_args.sampling_backend!r}."
+        )
+    if envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get():
+        raise NotImplementedError(
+            f"{feature} does not support input (prompt) logprobs; unset "
+            "SGLANG_TPU_ENABLE_PROMPT_LOGPROB."
+        )
+    # The layout and the KV slot table are built from the host req_to_token.
+    if os.environ.get("SGLANG_TPU_REQ_TO_TOKEN_ON_HOST") == "0":
+        logger.warning(
+            "Overriding SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=0 -> 1: prefill context "
+            "parallelism requires host-resident req_to_token."
+        )
+    os.environ["SGLANG_TPU_REQ_TO_TOKEN_ON_HOST"] = "1"
+
+
 def _apply_page_size_default(server_args) -> None:
     """Resolve ``page_size`` against the attention backend's declared floor.
 
@@ -286,6 +356,8 @@ class TpuSRTPlatform(SRTPlatform):
                 "tpu.apply_server_args_defaults",
                 attention_backend=self.get_default_attention_backend(),
             )
+
+        _validate_prefill_context_parallel(server_args)
 
         if cfg.sampling_backend is None:
             declare_late_resolution(
