@@ -22,7 +22,14 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.utils import cpu_has_amx_support, get_device, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_device,
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_tpu,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -31,6 +38,9 @@ _is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_npu:
     import torch_npu
+
+
+_is_tpu = is_tpu()
 
 
 class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
@@ -448,6 +458,67 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         sin = self.sin_cached.to(positions.device)
         return cos, sin
 
+    def _tpu_rope_tables(self, device, dtype):
+        """Interleave-expanded cos/sin cache and the rotation as a +-1 matrix.
+
+        Built once per (device, dtype). ``rotate_neox`` / ``rotate_gptj`` are
+        slices, negation, stack/cat and flatten -- five or six launches per
+        tensor at bs=1 on TPU, plus a ``repeat`` of cos/sin per call. As a
+        constant permutation matrix the rotation is one small dot (exact: each
+        output is a single +-input, accumulated in f32), and the cos/sin
+        expansion is done at build time so the per-step path is a gather, a
+        dot and one fusion per tensor.
+        """
+        key = (device, dtype)
+        cached = getattr(self, "_tpu_rope_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1], cached[2]
+        rd = self.rotary_dim
+        cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
+        if self.is_neox_style:
+            cos_e, sin_e = cos.repeat(1, 2), sin.repeat(1, 2)
+        else:
+            cos_e = cos.repeat_interleave(2, dim=-1)
+            sin_e = sin.repeat_interleave(2, dim=-1)
+        # Keep the cache dtype for cos/sin so the products round exactly as the
+        # native path's; only the rotation matrix takes the activation dtype.
+        cos_sin = torch.cat((cos_e, sin_e), dim=-1).to(device=device)
+        rot = torch.zeros(rd, rd, dtype=dtype, device=device)
+        idx = torch.arange(rd, device=device)
+        if self.is_neox_style:
+            half = rd // 2
+            rot[idx[half:], idx[:half]] = -1.0  # out[k] = -x[k + half], k < half
+            rot[idx[:half], idx[half:]] = 1.0  # out[k] = x[k - half], k >= half
+        else:
+            rot[idx[1::2], idx[0::2]] = -1.0  # out[2i] = -x[2i + 1]
+            rot[idx[0::2], idx[1::2]] = 1.0  # out[2i + 1] = x[2i]
+        self._tpu_rope_cache = (key, cos_sin, rot)
+        return cos_sin, rot
+
+    def _forward_tpu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        dtype = query.dtype
+        rd = self.rotary_dim
+        cos_sin, rot = self._tpu_rope_tables(query.device, dtype)
+        idx = torch.add(positions, offsets) if offsets is not None else positions
+        cs = cos_sin[idx].unsqueeze(-2)  # [T, 1, 2 * rotary_dim]
+        cos, sin = cs[..., :rd], cs[..., rd:]
+        query_rot = query[..., :rd]
+        key_rot = key[..., :rd]
+        query_rot = query_rot * cos + (query_rot @ rot) * sin
+        key_rot = key_rot * cos + (key_rot @ rot) * sin
+        if rd < self.head_size:
+            query = torch.cat((query_rot, query[..., rd:]), dim=-1)
+            key = torch.cat((key_rot, key[..., rd:]), dim=-1)
+        else:
+            query, key = query_rot, key_rot
+        return query.to(dtype), key.to(dtype)
+
     def forward_native(
         self,
         positions: torch.Tensor,
@@ -456,6 +527,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
+        if _is_tpu:
+            return self._forward_tpu(positions, query, key, offsets)
         dtype = query.dtype
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
