@@ -92,6 +92,26 @@ def _matches_default(value: Any, default: Any) -> bool:
     return type(value) is type(default) and value == default
 
 
+def _check_pp_proxy_rows(proxy: Any, input_ids: Any, forward_batch: Any) -> None:
+    """Reject a pipeline proxy whose token axis differs from the padded batch.
+
+    The previous stage transmits its proxy at its own token bucket; this stage
+    pads its ForwardBatch independently and consumes the proxy as-is, so the two
+    must agree row for row.
+    """
+    reference = input_ids if input_ids is not None else forward_batch.input_ids
+    if reference is None:
+        return
+    expected = int(reference.shape[0])
+    for name, tensor in proxy.tensors.items():
+        if isinstance(tensor, torch.Tensor) and int(tensor.shape[0]) != expected:
+            raise ValueError(
+                f"pp_proxy_tensors[{name!r}] has {int(tensor.shape[0])} rows but "
+                f"the padded batch has {expected} input tokens; the previous "
+                "pipeline stage and this one padded to different token buckets."
+            )
+
+
 def _zero_pad_dim0(t: torch.Tensor, target_size: int) -> torch.Tensor:
     """Zero-pad a tensor along dim 0 to target_size."""
     if t.shape[0] >= target_size:
@@ -677,6 +697,10 @@ class CompiledForwardShim:
         self._recompilation_checker = checker
         self._model_label = model_label
 
+    def _is_first_pp_stage(self) -> bool:
+        pp_group = getattr(self.policy.model_runner, "pp_group", None)
+        return pp_group is not None and bool(pp_group.is_first_rank)
+
     def wait_for_hicache_reload(self) -> None:
         """Wait for the current HiCache reload outside compiled regions."""
         model_runner = self.policy.model_runner
@@ -714,6 +738,13 @@ class CompiledForwardShim:
         input_embeds = getattr(forward_batch, "input_embeds", None)
         if input_embeds is not None:
             kwargs["input_embeds"] = input_embeds
+        pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
+        if pp_proxy_tensors is not None:
+            if self._is_first_pp_stage():
+                # The first stage embeds its own input; its graph takes no proxy.
+                kwargs.pop("pp_proxy_tensors")
+            else:
+                _check_pp_proxy_rows(pp_proxy_tensors, input_ids, forward_batch)
         # Pin is_prefill_only for the compiled forward. An idle batch computes
         # it as True (all() over zero requests) while real batches are False;
         # the compiled forward reads the value, so it must be identical across

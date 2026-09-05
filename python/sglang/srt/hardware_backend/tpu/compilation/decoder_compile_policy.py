@@ -79,6 +79,12 @@ def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None
         if isinstance(value, torch.Tensor):
             tensors.append(value)
 
+    if isinstance(out, PPProxyTensors):
+        # A non-final pipeline stage returns its hidden states and residual.
+        tensors.extend(
+            value for value in out.tensors.values() if isinstance(value, torch.Tensor)
+        )
+
     if getattr(attn_backend, "requires_kv_sync_after_compile", False):
         pool = token_to_kv_pool
         for layer_id in range(pool.start_layer, pool.start_layer + pool.layer_num):
@@ -621,9 +627,36 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def _compiles_logits_processor(self) -> bool:
         """Whether this compiled callable includes target-model logits processing."""
 
+        pp_group = getattr(self.model_runner, "pp_group", None)
+        if pp_group is not None and not pp_group.is_last_rank:
+            # Only the final pipeline stage runs the logits processor.
+            return False
         return self.owner is self.model_runner.model and not bool(
             getattr(self.model_runner, "is_draft_worker", False)
         )
+
+    def _pp_warmup_kwargs(self, num_tokens: int) -> dict[str, Any]:
+        """The ``pp_proxy_tensors`` kwarg a non-first pipeline stage warms up with.
+
+        The proxy carries the previous stage's hidden states and residual at the
+        padded token bucket, in the model dtype, on the device; the first stage
+        (and a non-pipelined model) gets no proxy.
+        """
+        pp_group = getattr(self.model_runner, "pp_group", None)
+        if pp_group is None or pp_group.is_first_rank:
+            return {}
+        hidden_size = self.model_runner.model_config.hidden_size
+        zeros = functools.partial(
+            torch.zeros,
+            (num_tokens, hidden_size),
+            dtype=self.model_runner.dtype,
+            device=self.model_runner.device,
+        )
+        return {
+            "pp_proxy_tensors": PPProxyTensors(
+                {"hidden_states": zeros(), "residual": zeros()}
+            )
+        }
 
     def _distributed_top_k_width(self) -> int | None:
         if not self._compiles_logits_processor():
@@ -925,7 +958,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             capture_hidden_mode=capture_hidden_mode,
             spec_info=spec_info,
         )
-        return (forward_batch.input_ids, forward_batch.positions, forward_batch), {}
+        return (
+            (forward_batch.input_ids, forward_batch.positions, forward_batch),
+            self._pp_warmup_kwargs(num_tokens),
+        )
 
     def _run_one(
         self,
@@ -1455,12 +1491,15 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
         if mode.is_decode() and self._decode_uses_input_ids():
             # Positions stay mrope-shaped; only the embedding moves into the graph.
-            return (forward_batch.input_ids, positions, forward_batch), {}
+            return (
+                (forward_batch.input_ids, positions, forward_batch),
+                self._pp_warmup_kwargs(num_tokens),
+            )
 
         embed_tokens = self.owner.get_input_embeddings()
         input_embeds = embed_tokens(forward_batch.input_ids)
 
-        call_kwargs: dict[str, Any] = {}
+        call_kwargs: dict[str, Any] = self._pp_warmup_kwargs(num_tokens)
         num_deepstack = self._num_deepstack
         if variant == "deepstack" and mode == ForwardMode.EXTEND and num_deepstack > 0:
             call_kwargs["input_deepstack_embeds"] = torch.zeros(

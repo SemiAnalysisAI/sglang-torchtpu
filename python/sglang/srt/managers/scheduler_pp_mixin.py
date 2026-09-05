@@ -39,9 +39,11 @@ from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_device_module, is_xpu
+from sglang.srt.utils.common import get_device_module, is_tpu, is_xpu
 
 logger = logging.getLogger(__name__)
+
+_is_tpu = is_tpu()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -1094,14 +1096,21 @@ class SchedulerPPMixin:
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
-            pp_proxy_tensors = PPProxyTensors(
-                self._pp_recv_typed_dict(
-                    expected_kind="proxy",
-                    all_gather_group=(
-                        self.attn_tp_group if self.require_attn_tp_allgather else None
-                    ),
-                )
+            tensor_dict = self._pp_recv_typed_dict(
+                expected_kind="proxy",
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                ),
             )
+            if _is_tpu:
+                # The compiled forward takes tensors only; the message-type
+                # tag stays out of the proxy.
+                tensor_dict = {
+                    key: value
+                    for key, value in tensor_dict.items()
+                    if isinstance(value, torch.Tensor)
+                }
+            pp_proxy_tensors = PPProxyTensors(tensor_dict)
         return pp_proxy_tensors
 
     def _pp_recv_dict_from_prev_stage(
@@ -1266,7 +1275,8 @@ class SchedulerPPMixin:
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
             with self.copy_stream_ctx:
-                self.copy_stream.wait_stream(self.schedule_stream)
+                if self.use_overlap_streams:
+                    self.copy_stream.wait_stream(self.schedule_stream)
                 batch_result = self._pp_prep_batch_result(
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
@@ -1292,7 +1302,8 @@ class SchedulerPPMixin:
     ):
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
-                self.forward_stream.wait_stream(self.schedule_stream)
+                if self.use_overlap_streams:
+                    self.forward_stream.wait_stream(self.schedule_stream)
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_start_time",

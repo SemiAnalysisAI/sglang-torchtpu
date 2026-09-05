@@ -96,6 +96,36 @@ def _uses_seq_along_lane_kv() -> bool:
     return uses_seq_along_lane_kv()
 
 
+def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
+    """Reject server configurations pipeline parallelism on TPU cannot run.
+
+    Every pipeline stage is one process on one device: the stage hand-off is a
+    host copy over the gloo cpu_group and the stages never take part in a
+    shared device collective, which is what tensor parallelism inside a stage
+    would require.
+    """
+    pp = server_args.pp_size
+    if server_args.tp_size > 1:
+        raise NotImplementedError(
+            "Pipeline parallelism on TPU requires --tp-size 1 "
+            f"(got --tp-size {server_args.tp_size} with --pp-size {pp}): "
+            "tensor parallelism inside a pipeline stage is not supported."
+        )
+    if server_args.speculative_algorithm is not None:
+        raise NotImplementedError(
+            "Speculative decoding "
+            f"(--speculative-algorithm {server_args.speculative_algorithm}) "
+            f"is not supported with pipeline parallelism on TPU (--pp-size {pp})."
+        )
+    if server_args.enable_dynamic_chunking:
+        raise NotImplementedError(
+            "--enable-dynamic-chunking is not supported with pipeline "
+            f"parallelism on TPU (--pp-size {pp}): its chunk-latency profiling "
+            "relies on a device synchronize that does not wait for TPU "
+            "execution."
+        )
+
+
 def _apply_page_size_default(server_args) -> None:
     """Resolve ``page_size`` against the attention backend's declared floor.
 
@@ -181,6 +211,9 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang.srt.arg_groups.overrides import declare_late_resolution
         from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
 
+        if server_args.pp_size > 1:
+            _validate_pipeline_parallel_args(server_args)
+
         # Under Ray the slicebuilder/topology env is built per-rank after the
         # cluster's real node IPs are discovered (multihost: per-actor from Ray
         # IPs in _prepare_tpu_env; single-host: seeded once in
@@ -189,8 +222,11 @@ class TpuSRTPlatform(SRTPlatform):
         # (localhost) env that never applies to the actual ranks. Still apply
         # the libtpu/env overrides now so actors inherit them before importing
         # torch_tpu.
+        # The PJRT slice holds one device per scheduler process: tp_size
+        # ranks per pipeline stage times pp_size stages.
         _prepare_tpu_env(
-            server_args.tp_size, setup_slicebuilder=not server_args.use_ray
+            server_args.tp_size * server_args.pp_size,
+            setup_slicebuilder=not server_args.use_ray,
         )
 
         from sglang.srt.hardware_backend.tpu.env_override import (
