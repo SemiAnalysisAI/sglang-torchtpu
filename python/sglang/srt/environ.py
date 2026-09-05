@@ -1649,6 +1649,13 @@ class Envs:
     SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES = EnvInt(4900)
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
+    # MoE: below this many routed rows (tokens x topk), gather on the
+    # TensorCore instead -- the SparseCore permute is mostly fixed cost there.
+    # Crossover measured on Kimi-K2.6, DeepSeek-R1 (EP8/EP16) and Qwen3-Coder
+    # -480B geometries (bench_sc_vs_tc_gather.py): TensorCore wins below 1024
+    # routed rows on all of them, the two tie at 1024, SparseCore wins from
+    # 2048 on.
+    SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS = EnvInt(1024)
     # MoE: use onehot dense matmul for small permute and unpermute/combine
     # paths instead of gather. When set to 0, this is disabled. When set
     # to a positive integer, this is the threshold for tokens per rank below
