@@ -1555,6 +1555,10 @@ class Envs:
     SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES = EnvInt(4900)
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
+    # MoE: below this many routed rows (tokens x topk) the SparseCore gather is
+    # all fixed cost (74 us per layer for 16 rows on Kimi-K2.6); gather on the
+    # TensorCore instead.
+    SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS = EnvInt(256)
     # MoE: use onehot dense matmul for small permute and unpermute/combine
     # paths instead of gather. When set to 0, this is disabled. When set
     # to a positive integer, this is the threshold for tokens per rank below
