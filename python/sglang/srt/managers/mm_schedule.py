@@ -9,12 +9,13 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.runtime_context import get_parallel, get_schedule
-from sglang.srt.utils import is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_hip, is_npu, is_tpu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang.utils import logger
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 _is_xpu = is_xpu()
 
 embedding_cache: Optional[MultiModalStaticCache] = None
@@ -282,6 +283,20 @@ class PerImageRequestInfo:
     )
 
 
+def _encode_vision_items(
+    data_embedding_func: DataEmbeddingFunc,
+    items: List[MultimodalDataItem],
+) -> torch.Tensor | List[torch.Tensor] | EVSEmbeddingResult:
+    """Encode a batch of vision items, one encoder call unless a backend caps it."""
+    if _is_tpu:
+        # Imported here, not at module scope: mm_schedule_tpu imports
+        # DataEmbeddingFunc back from this module.
+        from sglang.srt.hardware_backend.tpu.mm_schedule_tpu import encode_vision_items
+
+        return encode_vision_items(data_embedding_func, items)
+    return data_embedding_func(items)
+
+
 def _batch_encode_per_image_misses(
     data_embedding_func: DataEmbeddingFunc,
     per_image_requests: List[PerImageRequestInfo],
@@ -328,7 +343,7 @@ def _batch_encode_per_image_misses(
 
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(miss_items, device)
-        all_miss_embedding = data_embedding_func(miss_items)
+        all_miss_embedding = _encode_vision_items(data_embedding_func, miss_items)
 
         if isinstance(all_miss_embedding, list):
             # Per-item embeddings: no split needed, and each cache entry owns
@@ -397,7 +412,7 @@ def _get_chunked_embedding_by_item(
         miss_item_list = [item for _, item, _, _ in miss_items]
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(miss_item_list, device)
-        all_miss_embedding = data_embedding_func(miss_item_list)
+        all_miss_embedding = _encode_vision_items(data_embedding_func, miss_item_list)
 
         if isinstance(all_miss_embedding, list):
             # Per-item embeddings: no split needed, and each cache entry owns
