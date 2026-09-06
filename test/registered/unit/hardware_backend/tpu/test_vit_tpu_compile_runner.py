@@ -324,21 +324,6 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         self.assertEqual(segment_ids.dtype, torch.int32)
         self.assertEqual(segment_ids.tolist(), [[0, 0, 1, 1, 1]])
 
-    def test_segment_ids_isolate_the_padded_tail(self):
-        """Padded patches must not share a segment with real ones.
-
-        Attention is masked by segment id, so reusing the last real id would
-        let bias-valued padding rows attend to real patches.
-        """
-        segment_ids = _cu_seqlens_to_segment_ids(
-            torch.tensor([0, 2, 5], dtype=torch.int32),
-            total_patches=5,
-            device=torch.device("cpu"),
-            pad_to=8,
-        )
-
-        self.assertEqual(segment_ids.tolist(), [[0, 0, 1, 1, 1, 2, 2, 2]])
-
     def test_shared_tpu_attention_builds_packed_segment_ids(self):
         segment_ids = _build_tpu_segment_ids(
             torch.tensor([0, 2, 5], dtype=torch.int32),

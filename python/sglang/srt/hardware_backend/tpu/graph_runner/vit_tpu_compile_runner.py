@@ -78,15 +78,8 @@ def _cu_seqlens_to_segment_ids(
     cu_seqlens: torch.Tensor,
     total_patches: int,
     device: torch.device,
-    *,
-    pad_to: int | None = None,
 ) -> torch.Tensor:
-    """Build segment IDs on the host, then transfer them to the patch device.
-
-    Args:
-      pad_to: Bucket length to extend to; the tail becomes one extra segment so
-        padded patches cannot attend to real ones.
-    """
+    """Build segment IDs on the host, then transfer them to the patch device."""
     if cu_seqlens.device.type != "cpu":
         raise ValueError("TPU vision cu_seqlens must remain on CPU")
 
@@ -101,12 +94,6 @@ def _cu_seqlens_to_segment_ids(
     lengths = cu[1:] - cu[:-1]
     if bool(torch.any(lengths < 0)):
         raise ValueError("cu_seqlens must be nondecreasing")
-    if pad_to is not None:
-        if pad_to < total_patches:
-            raise ValueError(f"pad_to={pad_to} is below total_patches={total_patches}")
-        lengths = torch.cat(
-            [lengths, torch.tensor([pad_to - total_patches], dtype=lengths.dtype)]
-        )
     segment_ids = torch.repeat_interleave(
         torch.arange(lengths.numel(), dtype=torch.int32), lengths
     ).unsqueeze(0)
@@ -447,8 +434,11 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
         real_seq_len = int(cu_seqlens[-1])
         merge_sq = self.vit.spatial_merge_size**2
 
+        # Closing the tail with one more boundary gives the padded patches a
+        # segment of their own, so they cannot attend to real ones.
+        padded_cu_seqlens = torch.cat([cu_seqlens, cu_seqlens.new_tensor([bucket_len])])
         segment_ids = _cu_seqlens_to_segment_ids(
-            cu_seqlens, real_seq_len, x_3d.device, pad_to=bucket_len
+            padded_cu_seqlens, bucket_len, x_3d.device
         )
         ctx = _Qwen3VLRunContext(
             padding=VisionPaddingContext(
