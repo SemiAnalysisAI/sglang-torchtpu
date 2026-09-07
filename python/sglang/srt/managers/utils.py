@@ -34,6 +34,13 @@ def _async_d2h(t: torch.Tensor) -> torch.Tensor:
     the source alive until the copy stream drains, so the caching allocator can't
     recycle it early. Non-CUDA falls back to a plain copy."""
     if not t.is_cuda:
+        if t.device.type == "tpu":
+            # torch_tpu: a fresh ``.to("cpu")`` takes the blocking DtoH path; a
+            # same-dtype contiguous destination takes the non-blocking direct DMA
+            # whose completion ``copy_done.record()/synchronize()`` track.
+            cpu_t = torch.empty(t.shape, dtype=t.dtype)
+            cpu_t.copy_(t.contiguous(), non_blocking=True)
+            return cpu_t
         return t.to("cpu", non_blocking=True)
     cpu_t = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
     cpu_t.copy_(t, non_blocking=True)
