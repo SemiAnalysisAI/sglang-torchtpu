@@ -467,6 +467,10 @@ class MultimemAllGatherer:
         self._skip_entry_sync = skip_entry_sync
         # None => always NCCL; _UNINIT => build on first eager call.
         self._state = self._UNINIT if enabled else None
+        if self._state is self._UNINIT and not torch.cuda.is_available():
+            # Multimem is a CUDA symmetric-memory Triton kernel; on TPU/CPU
+            # every call takes the group all-gather fallback.
+            self._state = None
         if self._state is self._UNINIT:
             # Lazy import avoids a module-load dependency on the distributed facade.
             from sglang.srt.distributed import get_tp_group
