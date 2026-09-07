@@ -31,7 +31,7 @@ Roles (rank = slice-local TPU_WORKER_ID):
 Run one model profile per invocation on hardware:
 
   MODEL_PROFILE=gpt_oss_120b CI_PD_ROLE=prefill python3 \
-      test/registered/tpu/integration/test_pd_tp_resharding.py
+      test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_tp_resharding.py
 
 Without CI_PD_ROLE the file runs only its host-side configuration tests.
 """
