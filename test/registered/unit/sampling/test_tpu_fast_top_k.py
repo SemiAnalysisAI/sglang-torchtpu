@@ -145,9 +145,7 @@ class TestDistributedTopKRankOperand(CustomTestCase):
 
     def test_registration_publishes_the_rank_as_a_named_buffer(self):
         lm_head = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
-        register_distributed_top_k_rank(
-            lm_head, group=SimpleNamespace(rank_in_group=3)
-        )
+        register_distributed_top_k_rank(lm_head, group=SimpleNamespace(rank_in_group=3))
 
         buffers = dict(lm_head.named_buffers())
         self.assertIn(DISTRIBUTED_TOP_K_RANK_BUFFER, buffers)
@@ -173,9 +171,7 @@ class TestDistributedTopKRankOperand(CustomTestCase):
         # Negotiation test doubles are plain namespaces; only an nn.Module can
         # hold a buffer, and only an nn.Module can be part of a captured model.
         lm_head = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
-        register_distributed_top_k_rank(
-            lm_head, group=SimpleNamespace(rank_in_group=1)
-        )
+        register_distributed_top_k_rank(lm_head, group=SimpleNamespace(rank_in_group=1))
         self.assertFalse(hasattr(lm_head, DISTRIBUTED_TOP_K_RANK_BUFFER))
 
 
