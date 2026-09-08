@@ -50,7 +50,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     LogitsOutputMode,
     PPProxyTensors,
 )
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_disagg, get_parallel, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.eagle_info import (
@@ -75,6 +75,63 @@ class _FakeAttnBackend:
         )
 
 
+# Config the compile policies read from the namespace bags; it reaches production
+# only by being published (_PolicyTestCase below).
+_BASE_CONFIG = {
+    "page_size": 1,
+    "dp_size": 1,
+    "disaggregation_mode": "null",
+}
+
+# topk=1 EAGLE3 chain: the verify width is speculative_num_steps + 1.
+_SPEC_NUM_STEPS = 3
+_EAGLE3_CONFIG = {
+    **_BASE_CONFIG,
+    "speculative_algorithm": "EAGLE3",
+    "speculative_num_steps": _SPEC_NUM_STEPS,
+    "speculative_num_draft_tokens": _SPEC_NUM_STEPS + 1,
+    "speculative_eagle_topk": 1,
+}
+
+
+_DFLASH_CONFIG = {
+    **_BASE_CONFIG,
+    "speculative_algorithm": "DFLASH",
+    "speculative_num_steps": 0,
+    "speculative_num_draft_tokens": 4,
+    "speculative_draft_model_path": None,
+    "speculative_draft_model_revision": None,
+    "torch_compile_max_bs": 4,
+}
+
+
+class _PolicyTestCase(CustomTestCase):
+    """Publishes the config the TPU compile policies read from the bags; each
+    publish is undone in its own cleanup, so tests cannot leak config."""
+
+    #: Merged underneath whatever a ``publish_config`` call passes.
+    config_defaults = _BASE_CONFIG
+
+    def setUp(self):
+        super().setUp()
+        self.publish_config()
+
+    def publish_config(self, **fields):
+        """Publish ``config_defaults`` overlaid with ``fields`` for this test."""
+        override = get_context().override_server_args(
+            **{**self.config_defaults, **fields}
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        return override
+
+
+class _SpecPolicyTestCase(_PolicyTestCase):
+    """Adds the EAGLE3 spec config the spec policies read at construction."""
+
+    config_defaults = _EAGLE3_CONFIG
+
+
 def _model_runner(device="cpu"):
     """Minimal ModelRunner stand-in for unit tests.
 
@@ -96,7 +153,6 @@ def _model_runner(device="cpu"):
         model_config=SimpleNamespace(model_is_mrope=False),
         is_draft_worker=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
-        server_args=SimpleNamespace(page_size=1, dp_size=1, disaggregation_mode="null"),
     )
 
 
@@ -228,7 +284,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         )
 
 
-class TestLogitsOutputMode(CustomTestCase):
+class TestLogitsOutputMode(_PolicyTestCase):
     def test_specialization_key_uses_selected_logits_mode(self):
         policy = _make_policy()
         forward_batch = SimpleNamespace(
@@ -378,11 +434,17 @@ class TestDecoderOutputUnpadding(CustomTestCase):
         self.assertEqual(forward_batch.input_ids.shape[0], 3)
 
 
-class TestInstallExtendCap(CustomTestCase):
+class TestInstallExtendCap(_PolicyTestCase):
     def _install_policy(self, *, prefill_max_requests, dp_attention):
         model = SimpleNamespace(
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
+        )
+        # install() takes the compile grid from the bags; prefill_max_requests stays on the instance.
+        self.publish_config(
+            chunked_prefill_size=None,
+            max_prefill_tokens=2048,
+            torch_compile_max_bs=64,
         )
         model_runner = SimpleNamespace(
             model=model,
@@ -390,10 +452,6 @@ class TestInstallExtendCap(CustomTestCase):
             is_draft_worker=False,
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
-                chunked_prefill_size=None,
-                max_prefill_buffer_tokens=lambda: 0,
-                max_prefill_tokens=2048,
-                torch_compile_max_bs=64,
                 prefill_max_requests=prefill_max_requests,
                 unsafe_save_torch_compile_bundle=None,
                 unsafe_load_torch_compile_bundle=None,
@@ -451,16 +509,19 @@ class TestInstallExtendCap(CustomTestCase):
             # token dimension covers the aggregate prefill batch.
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
-                chunked_prefill_size=8192,
-                max_prefill_buffer_tokens=lambda: 8192,
-                max_prefill_tokens=16384,
-                torch_compile_max_bs=16,
                 prefill_max_requests=16,
                 tpu_compile_tokens=[1024, 4096, 8192],
                 tpu_compile_bs=[16],
                 unsafe_save_torch_compile_bundle=None,
                 unsafe_load_torch_compile_bundle=None,
             ),
+        )
+        # The 8192 ceiling derives from chunked_prefill_size via the bags;
+        # the explicit bucket lists stay on the instance.
+        self.publish_config(
+            chunked_prefill_size=8192,
+            max_prefill_tokens=16384,
+            torch_compile_max_bs=16,
         )
         policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
         policy.backend = "eager"
@@ -497,14 +558,16 @@ class TestInstallExtendCap(CustomTestCase):
             is_draft_worker=False,
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
-                chunked_prefill_size=None,
-                max_prefill_buffer_tokens=lambda: 0,
-                max_prefill_tokens=2048,
-                torch_compile_max_bs=64,
                 prefill_max_requests=16,
                 unsafe_save_torch_compile_bundle=None,
                 unsafe_load_torch_compile_bundle=None,
             ),
+        )
+        # install() reads the compile grid from the bags.
+        self.publish_config(
+            chunked_prefill_size=None,
+            max_prefill_tokens=2048,
+            torch_compile_max_bs=64,
         )
         policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
         policy.backend = "eager"
@@ -555,14 +618,16 @@ class TestInstallExtendCap(CustomTestCase):
             is_draft_worker=True,
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
-                chunked_prefill_size=None,
-                max_prefill_buffer_tokens=lambda: 0,
-                max_prefill_tokens=2048,
-                torch_compile_max_bs=64,
                 prefill_max_requests=16,
                 unsafe_save_torch_compile_bundle=None,
                 unsafe_load_torch_compile_bundle=None,
             ),
+        )
+        # install() reads the compile grid from the bags.
+        self.publish_config(
+            chunked_prefill_size=None,
+            max_prefill_tokens=2048,
+            torch_compile_max_bs=64,
         )
         policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
         policy.backend = "eager"
@@ -610,14 +675,16 @@ class TestInstallExtendCap(CustomTestCase):
             is_draft_worker=True,
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
-                chunked_prefill_size=None,
-                max_prefill_buffer_tokens=lambda: 0,
-                max_prefill_tokens=2048,
-                torch_compile_max_bs=64,
                 prefill_max_requests=16,
                 unsafe_save_torch_compile_bundle=None,
                 unsafe_load_torch_compile_bundle=None,
             ),
+        )
+        # install() reads the compile grid from the bags.
+        self.publish_config(
+            chunked_prefill_size=None,
+            max_prefill_tokens=2048,
+            torch_compile_max_bs=64,
         )
         policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
         policy.backend = "eager"
@@ -650,7 +717,7 @@ class TestInstallExtendCap(CustomTestCase):
         self.assertIs(policy.compiled_forward_shim.fn, compiled_model)
 
 
-class TestQwen3VLDecoderPolicy(CustomTestCase):
+class TestQwen3VLDecoderPolicy(_PolicyTestCase):
     def _forward_batch(self):
         return SimpleNamespace(
             _tpu_real_q=3,
@@ -861,7 +928,7 @@ class TestQwen3VLDecoderPolicy(CustomTestCase):
         self.assertEqual(forward_batch.batch_size, 2)
 
 
-class TestMakeDummyForwardBatch(CustomTestCase):
+class TestMakeDummyForwardBatch(_PolicyTestCase):
     """``_make_dummy_forward_batch`` shapes valid + ghost slots correctly."""
 
     def test_extend_shapes_and_ghost_tokens(self):
@@ -935,7 +1002,7 @@ class TestMakeDummyForwardBatch(CustomTestCase):
         self.assertIsNone(fb.sampling_info.penalizer_orchestrator)
 
 
-class TestDpIdleDecodeMaterializationScope(CustomTestCase):
+class TestDpIdleDecodeMaterializationScope(_SpecPolicyTestCase):
     def test_prepare_materializes_zero_row_spec_batch(self):
         policy = _make_spec_policy()
         spec_info = EagleDraftInput(
@@ -965,7 +1032,7 @@ class TestDpIdleDecodeMaterializationScope(CustomTestCase):
         self.assertEqual(forward_batch.input_ids.tolist(), [0])
 
 
-class TestPrecompileLoops(CustomTestCase):
+class TestPrecompileLoops(_PolicyTestCase):
     """``precompile`` fires one forward per TPU precompile variant:
     EXTEND covers token buckets at the fixed batch cap, and DECODE varies bs
     (tokens == bs)."""
@@ -1034,7 +1101,8 @@ class TestPrecompileLoops(CustomTestCase):
 
     def test_mixed_chunk_adds_fixed_decode_max_column(self):
         mr = _model_runner()
-        mr.server_args = SimpleNamespace(enable_mixed_chunk=True)
+        # _extend_compile_cases reads enable_mixed_chunk off the schedule bag.
+        self.publish_config(enable_mixed_chunk=True)
         policy = _make_policy(
             mr,
             token_buckets=(16, 64, 128),
@@ -1061,7 +1129,7 @@ class TestPrecompileLoops(CustomTestCase):
 
     def test_qwen3_vl_extend_uses_configured_prefill_cap(self):
         mr = _model_runner()
-        mr.server_args = SimpleNamespace(enable_mixed_chunk=False)
+        self.publish_config(enable_mixed_chunk=False)
         mr.model.get_image_feature = MagicMock()
         mr.model.get_input_embeddings = MagicMock(return_value=torch.nn.Embedding(2, 4))
         policy = Qwen3VLDecoderTpuCompilePolicy(
@@ -1180,7 +1248,7 @@ class TestPrecompileLoops(CustomTestCase):
         self.assertEqual(mr.model.forward.call_count, 4)
 
 
-class TestRunOneCallsCompiledForward(CustomTestCase):
+class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
     """``_run_one`` wires the synthesized batch through the same chain
     serving uses: ``prepare_forward_batch`` → ``init_forward_metadata``
     → compiled ``forward``."""
@@ -1271,8 +1339,8 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
         self.assertEqual(pool.get_fused_kv_buffer.call_args_list[1].args, (3,))
 
 
-def _spec_model_runner(device="cpu", is_draft_worker=False, num_steps=3):
-    """ModelRunner stand-in with the spec config SpecDecoderTpuCompilePolicy reads."""
+def _spec_model_runner(device="cpu", is_draft_worker=False):
+    """ModelRunner stand-in; the spec config comes from get_spec(), not from here."""
     return SimpleNamespace(
         device=device,
         model=SimpleNamespace(
@@ -1300,16 +1368,6 @@ def _spec_model_runner(device="cpu", is_draft_worker=False, num_steps=3):
         dtype=torch.bfloat16,
         is_draft_worker=is_draft_worker,
         spec_algorithm=SpeculativeAlgorithm.EAGLE3,
-        server_args=SimpleNamespace(
-            speculative_num_steps=num_steps,
-            # topk=1 chain: verify width == num_steps + 1.
-            speculative_num_draft_tokens=num_steps + 1,
-            speculative_algorithm="EAGLE3",
-            speculative_eagle_topk=1,
-            page_size=1,
-            dp_size=1,
-            disaggregation_mode="null",
-        ),
     )
 
 
@@ -1378,7 +1436,7 @@ def _dp_idle_batch(spec_info, *, peer_tokens, **overrides):
     return SimpleNamespace(**fields)
 
 
-class TestSpecPrecompileLoops(CustomTestCase):
+class TestSpecPrecompileLoops(_SpecPolicyTestCase):
     """Target spec precompile covers its serving forward families."""
 
     def test_draft_prefill_uses_configured_prefill_cap(self):
@@ -1413,7 +1471,7 @@ class TestSpecPrecompileLoops(CustomTestCase):
         self.assertEqual(policy.eagle_hidden_size, 24_576)
 
     def test_extend_full_uses_configured_prefill_cap(self):
-        mr = _spec_model_runner(num_steps=3)
+        mr = _spec_model_runner()
         policy = _make_spec_policy(
             mr,
             token_buckets=(1024, 4096),
@@ -1430,7 +1488,7 @@ class TestSpecPrecompileLoops(CustomTestCase):
         )
 
     def test_extend_full_precompiles_both_spec_info_states(self):
-        mr = _spec_model_runner(num_steps=3)
+        mr = _spec_model_runner()
         policy = _make_spec_policy(mr, token_buckets=(8,), bs_buckets=(4,))
 
         with get_parallel().override(tp_rank=1):
@@ -1450,7 +1508,7 @@ class TestSpecPrecompileLoops(CustomTestCase):
         )
 
     def test_target_precompiles_all_spec_modes(self):
-        mr = _spec_model_runner(num_steps=3)  # draft_token_num = 4
+        mr = _spec_model_runner()  # draft_token_num = 4
         policy = _make_spec_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
         # precompile() spans two modules: the base EXTEND/DECODE warmup lives in
         # decoder_compile_policy (via super()), the spec TARGET_VERIFY/EXTEND(FULL)
@@ -1473,8 +1531,9 @@ class TestSpecPrecompileLoops(CustomTestCase):
         self.assertEqual(mr.attn_backend.calls, [])
 
     def test_draft_precompiles_all_serving_forward_families(self):
-        mr = _spec_model_runner(is_draft_worker=True, num_steps=3)
-        mr.server_args.page_size = 8
+        mr = _spec_model_runner(is_draft_worker=True)
+        # The dummy draft-extend layout pages by get_schedule().page_size.
+        self.publish_config(page_size=8)
         policy = _make_spec_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
         decode_backends = [_FakeAttnBackend(), _FakeAttnBackend()]
         draft_backend = SimpleNamespace(attn_backends=decode_backends)
@@ -1503,7 +1562,7 @@ class TestSpecPrecompileLoops(CustomTestCase):
         )
 
     def test_draft_precompile_skips_shapes_larger_than_local_request_pool(self):
-        mr = _spec_model_runner(is_draft_worker=True, num_steps=3)
+        mr = _spec_model_runner(is_draft_worker=True)
         mr.req_to_token_pool.size = 4
         policy = _make_spec_policy(mr, bs_buckets=(1, 4, 8))
         policy._precompile_draft_prefill_extend = MagicMock()
@@ -1520,16 +1579,17 @@ class TestSpecPrecompileLoops(CustomTestCase):
         # EAGLE3 today); an unsupported algorithm fails loudly rather than
         # silently degrading to a non-spec policy.
         mr = _spec_model_runner()
-        mr.server_args.speculative_algorithm = "NGRAM"
+        # The algorithm is read from get_spec() as the policy is constructed.
+        self.publish_config(speculative_algorithm="NGRAM")
         with self.assertRaisesRegex(ValueError, "only supports EAGLE3"):
             _make_spec_policy(mr)
 
 
-class TestSpecDummyForwardBatch(CustomTestCase):
+class TestSpecDummyForwardBatch(_SpecPolicyTestCase):
     """Spec dummy batches carry spec_info and slot-1 KV seeding."""
 
     def test_target_verify_batch_shapes_and_capture_mode(self):
-        policy = _make_spec_policy(num_steps=3)  # draft_token_num = 4
+        policy = _make_spec_policy()  # draft_token_num = 4
         spec_info = policy.make_verify_spec_info()
         fb = policy._make_dummy_forward_batch(
             num_tokens=16,
@@ -1578,8 +1638,8 @@ class TestSpecDummyForwardBatch(CustomTestCase):
         self.assertEqual(fb.out_cache_loc.dtype, torch.int64)
 
     def test_draft_extend_uses_per_request_kv_pages(self):
-        mr = _spec_model_runner(is_draft_worker=True, num_steps=3)
-        mr.server_args.page_size = 8
+        mr = _spec_model_runner(is_draft_worker=True)
+        self.publish_config(page_size=8)
         policy = _make_spec_policy(mr, bs_buckets=(1, 4))
         fb = policy._make_dummy_forward_batch(
             num_tokens=16,
@@ -1611,8 +1671,8 @@ class TestSpecDummyForwardBatch(CustomTestCase):
             )
 
     def test_draft_extend_uses_multiple_pages_when_tokens_exceed_page(self):
-        mr = _spec_model_runner(is_draft_worker=True, num_steps=3)
-        mr.server_args.page_size = 2
+        mr = _spec_model_runner(is_draft_worker=True)
+        self.publish_config(page_size=2)
         policy = _make_spec_policy(mr, bs_buckets=(1, 2))
         fb = policy._make_dummy_forward_batch(
             num_tokens=8,
@@ -1635,8 +1695,10 @@ class TestSpecDummyForwardBatch(CustomTestCase):
         self.assertEqual(req_to_token[2, :4].tolist(), list(range(8, 12)))
 
 
-class TestDFlashCompilePolicy(CustomTestCase):
+class TestDFlashCompilePolicy(_PolicyTestCase):
     """Unit tests for DFlash compile policy KV append compilation, padding, and warmup."""
+
+    config_defaults = _DFLASH_CONFIG
 
     def _make_dflash_policy(
         self,
@@ -1669,20 +1731,9 @@ class TestDFlashCompilePolicy(CustomTestCase):
             model_config=SimpleNamespace(hidden_size=hidden_size, model_is_mrope=False),
             is_draft_worker=is_draft_worker,
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
-            server_args=SimpleNamespace(
-                speculative_num_draft_tokens=draft_token_num,
-                speculative_draft_model_path=None,
-                speculative_draft_model_revision=None,
-                speculative_num_steps=0,
-                speculative_algorithm="DFLASH",
-                page_size=1,
-                dp_size=1,
-                torch_compile_max_bs=4,
-                unsafe_save_torch_compile_bundle=None,
-                unsafe_load_torch_compile_bundle=None,
-                disaggregation_mode="null",
-            ),
         )
+        # _infer_dflash_block_size reads get_spec() at construction; publish the block size.
+        self.publish_config(speculative_num_draft_tokens=draft_token_num)
         t_bucketer = Bucketer(name="Token", buckets=list(token_buckets))
         b_bucketer = Bucketer(name="Bs", buckets=list(bs_buckets))
         policy = DFlashSpecDecoderTpuCompilePolicy(
@@ -1700,8 +1751,8 @@ class TestDFlashCompilePolicy(CustomTestCase):
         policy, mr = self._make_dflash_policy(draft_token_num=8)
         self.assertEqual(policy.draft_token_num, 8)
 
-        mr.server_args.speculative_num_draft_tokens = None
-        mr.server_args.speculative_draft_model_path = None
+        # Republish without block size or draft model: the fallback comes from the spec bag.
+        self.publish_config(speculative_num_draft_tokens=None)
         new_policy = DFlashSpecDecoderTpuCompilePolicy(
             model_runner=mr,
             t_bucketer=policy.t_bucketer,
@@ -2047,7 +2098,6 @@ class TestDFlashCompilePolicy(CustomTestCase):
         policy, mr = self._make_dflash_policy(
             token_buckets=(16, 64), bs_buckets=(1, 4), draft_token_num=4
         )
-        mr.server_args.disaggregation_mode = "prefill"
         mock_append_kernel = MagicMock()
         policy._compiled_kv_appender = mock_append_kernel
         worker = SimpleNamespace(
@@ -2056,7 +2106,11 @@ class TestDFlashCompilePolicy(CustomTestCase):
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
         )
 
-        with get_parallel().override(tp_rank=1):
+        # precompile_draft branches on get_disagg().disaggregation_mode.
+        with (
+            get_parallel().override(tp_rank=1),
+            get_disagg().override(disaggregation_mode="prefill"),
+        ):
             policy.precompile_draft(
                 draft_attn_backend=_FakeAttnBackend(), dflash_worker=worker
             )
@@ -2069,7 +2123,6 @@ class TestDFlashCompilePolicy(CustomTestCase):
         policy, mr = self._make_dflash_policy(
             token_buckets=(16, 64), bs_buckets=(1, 4), draft_token_num=4
         )
-        mr.server_args.disaggregation_mode = "decode"
         mock_append_kernel = MagicMock()
         policy._compiled_kv_appender = mock_append_kernel
         worker = SimpleNamespace(
@@ -2078,7 +2131,10 @@ class TestDFlashCompilePolicy(CustomTestCase):
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
         )
 
-        with get_parallel().override(tp_rank=1):
+        with (
+            get_parallel().override(tp_rank=1),
+            get_disagg().override(disaggregation_mode="decode"),
+        ):
             policy.precompile_draft(
                 draft_attn_backend=_FakeAttnBackend(), dflash_worker=worker
             )
@@ -2112,9 +2168,12 @@ class TestDFlashCompilePolicy(CustomTestCase):
             draft_token_num=4,
             is_draft_worker=False,
         )
-        mr.server_args.disaggregation_mode = "prefill"
 
-        with get_parallel().override(tp_rank=1):
+        # precompile() reads get_disagg().disaggregation_mode per call; scope each half.
+        with (
+            get_parallel().override(tp_rank=1),
+            get_disagg().override(disaggregation_mode="prefill"),
+        ):
             policy.precompile()
         # Prefill mode: EXTEND (2), EXTEND(FULL) (4) = 6 calls; DECODE and TARGET_VERIFY skipped.
         self.assertEqual(mr.model.forward.call_count, 6)
@@ -2125,17 +2184,19 @@ class TestDFlashCompilePolicy(CustomTestCase):
             draft_token_num=4,
             is_draft_worker=False,
         )
-        mr_dec.server_args.disaggregation_mode = "decode"
 
-        with get_parallel().override(tp_rank=1):
+        with (
+            get_parallel().override(tp_rank=1),
+            get_disagg().override(disaggregation_mode="decode"),
+        ):
             policy_dec.precompile()
         # Decode mode: DECODE (2), TARGET_VERIFY (2) = 4 calls; EXTEND and EXTEND(FULL) skipped.
         self.assertEqual(mr_dec.model.forward.call_count, 4)
 
 
-class TestSpecDraftDecodePadding(CustomTestCase):
+class TestSpecDraftDecodePadding(_SpecPolicyTestCase):
     def test_pads_mrope_and_cpu_seq_lens_from_three_to_four(self):
-        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
+        policy = _make_spec_policy(bs_buckets=(1, 4))
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             spec_info=EagleDraftInput(
@@ -2173,7 +2234,7 @@ class TestSpecDraftDecodePadding(CustomTestCase):
         self.assertTrue(forward_batch.spec_info.keep_outputs_padded)
 
     def test_dp_idle_draft_extend_normalizes_before_post_write_update(self):
-        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
+        policy = _make_spec_policy(bs_buckets=(1, 4))
         spec_info = EagleDraftExtendInput(
             hidden_states=torch.zeros((0, 16)),
             num_tokens_per_req=4,
@@ -2211,7 +2272,7 @@ class TestSpecDraftDecodePadding(CustomTestCase):
         self.assertEqual(forward_batch.req_pool_indices_cpu.tolist(), [0, 0])
 
     def test_dp_idle_verify_relabels_as_target_verify(self):
-        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
+        policy = _make_spec_policy(bs_buckets=(1, 4))
         seen = []
         policy.model_runner.forward = lambda forward_batch: seen.append(
             forward_batch.forward_mode
@@ -2236,7 +2297,7 @@ class TestSpecDraftDecodePadding(CustomTestCase):
         self.assertTrue(spec_info.keep_outputs_padded)
 
     def test_dp_idle_draft_prefill_relabels_as_extend(self):
-        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
+        policy = _make_spec_policy(bs_buckets=(1, 4))
         seen = []
         policy.model_runner.forward = lambda forward_batch: seen.append(
             forward_batch.forward_mode
@@ -2269,7 +2330,7 @@ class TestSpecDraftDecodePadding(CustomTestCase):
         self.assertEqual(forward_batch.extend_seq_lens.tolist(), [300])
 
 
-class TestDpSyncNumTokens(CustomTestCase):
+class TestDpSyncNumTokens(_SpecPolicyTestCase):
     """DP-agreed speculative widths use compiled shapes."""
 
     def test_default_policy_uses_generic_collective_alignment(self):
@@ -2300,7 +2361,7 @@ class TestDpSyncNumTokens(CustomTestCase):
         self.assertEqual(logprob_counts, [8, 0])
 
     def test_fixed_width_spec_skips_generic_alignment_and_uses_shared_bucket(self):
-        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4, 8, 16))
+        policy = _make_spec_policy(bs_buckets=(1, 4, 8, 16))
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
             spec_info=SimpleNamespace(num_tokens_per_req=4),
@@ -2321,7 +2382,7 @@ class TestDpSyncNumTokens(CustomTestCase):
         self.assertEqual(logprob_counts, [3, 0])
 
     def test_rounds_agreed_width_up_to_a_batch_bucket(self):
-        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4, 8, 16))
+        policy = _make_spec_policy(bs_buckets=(1, 4, 8, 16))
         forward_batch = SimpleNamespace(
             spec_info=SimpleNamespace(num_tokens_per_req=4),
             input_ids=torch.zeros(28),
@@ -2329,7 +2390,7 @@ class TestDpSyncNumTokens(CustomTestCase):
         self.assertEqual(policy._bucket_dp_sync_token_width(forward_batch, 28), 32)
 
     def test_keeps_an_already_materialized_wider_bucket(self):
-        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4, 8, 16))
+        policy = _make_spec_policy(bs_buckets=(1, 4, 8, 16))
         forward_batch = SimpleNamespace(
             spec_info=SimpleNamespace(num_tokens_per_req=1),
             input_ids=torch.zeros(16),
@@ -2338,7 +2399,7 @@ class TestDpSyncNumTokens(CustomTestCase):
         self.assertEqual(policy._bucket_dp_sync_token_width(forward_batch, 8), 16)
 
     def test_keeps_materialized_request_rows_for_draft_extend(self):
-        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4, 8, 16))
+        policy = _make_spec_policy(bs_buckets=(1, 4, 8, 16))
         forward_batch = SimpleNamespace(
             spec_info=SimpleNamespace(num_tokens_per_req=4),
             input_ids=torch.zeros(4),
@@ -2348,14 +2409,14 @@ class TestDpSyncNumTokens(CustomTestCase):
         self.assertEqual(policy._bucket_dp_sync_token_width(forward_batch, 4), 16)
 
 
-class TestSpecDraftExtendPadding(CustomTestCase):
+class TestSpecDraftExtendPadding(_SpecPolicyTestCase):
     def test_pads_extend_metadata_tensors_off_bucket(self):
         """Bug regression: at an off-bucket bs, `_pad_inputs_to_size` grows the
         core request-axis tensors but left `extend_seq_lens` /
         `extend_prefix_lens` / `extend_start_loc` at real_bs, so the compiled
         DRAFT_EXTEND_V2 graph (traced with them at the bucket length) was
         invoked with shapes the trace never saw."""
-        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
+        policy = _make_spec_policy(bs_buckets=(1, 4))
         forward_batch = SimpleNamespace(
             input_ids=torch.ones(12, dtype=torch.int32),
             seq_lens=torch.ones(3, dtype=torch.int32),
@@ -2378,7 +2439,7 @@ class TestSpecDraftExtendPadding(CustomTestCase):
         self.assertEqual(forward_batch.extend_start_loc.tolist(), [0, 4, 8, 0])
 
     def test_normalizes_stale_cpu_lists_at_exact_bucket(self):
-        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
+        policy = _make_spec_policy(bs_buckets=(1, 4))
         forward_batch = SimpleNamespace(
             input_ids=torch.ones(16, dtype=torch.int32),
             seq_lens=torch.ones(4, dtype=torch.int32),
@@ -2397,7 +2458,7 @@ class TestSpecDraftExtendPadding(CustomTestCase):
         self.assertEqual(forward_batch.mm_inputs, [None] * 4)
 
     def test_pads_to_dp_peer_request_width(self):
-        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
+        policy = _make_spec_policy(bs_buckets=(1, 4))
         forward_batch = SimpleNamespace(
             input_ids=torch.ones(4, dtype=torch.int32),
             seq_lens=torch.ones(1, dtype=torch.int32),
@@ -2423,7 +2484,7 @@ class TestSpecDraftExtendPadding(CustomTestCase):
         self.assertEqual(forward_batch.batch_size, 4)
 
 
-class TestSpecUnpadOutputs(CustomTestCase):
+class TestSpecUnpadOutputs(_SpecPolicyTestCase):
     """Spec output slicing: TARGET_VERIFY logits use real_q; capture-LAST hidden
     uses real_b; everything else matches the base decoder policy."""
 
@@ -2530,7 +2591,7 @@ class TestSpecUnpadOutputs(CustomTestCase):
         self.assertTrue(spec_info.keep_outputs_padded)
 
     def test_dp_idle_sentinel_row_pads_to_peer_draft_width(self):
-        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
+        policy = _make_spec_policy(bs_buckets=(1, 4))
         draft_input = EagleDraftInput(
             topk_p=torch.zeros((1, 1)),
             topk_index=torch.full((1, 1), 31999, dtype=torch.int64),
@@ -2584,7 +2645,7 @@ class TestSpecUnpadOutputs(CustomTestCase):
         self.assertTrue(fb.spec_info.keep_outputs_padded)
 
 
-class TestSpecForwardBatchPreparation(CustomTestCase):
+class TestSpecForwardBatchPreparation(_SpecPolicyTestCase):
     """``prepare_spec_forward_batch`` dispatches on the draft forward mode."""
 
     @staticmethod
@@ -2647,7 +2708,7 @@ class TestSpecForwardBatchPreparation(CustomTestCase):
         policy._pad_draft_extend.assert_not_called()
 
     def test_draft_decode_buckets_before_input_ids_are_built(self):
-        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
+        policy = _make_spec_policy(bs_buckets=(1, 4))
         draft_input = EagleDraftInput(
             topk_p=torch.zeros((2, 1)),
             topk_index=torch.zeros((2, 1), dtype=torch.int64),
@@ -2681,7 +2742,7 @@ class TestSpecForwardBatchPreparation(CustomTestCase):
         self.assertEqual(state.physical_num_tokens, 4)
 
     def test_fused_draft_refreshes_dp_metadata_after_inputs_are_consumed(self):
-        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 8))
+        policy = _make_spec_policy(bs_buckets=(1, 8))
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             input_ids=None,
@@ -2719,7 +2780,7 @@ class TestSpecForwardBatchPreparation(CustomTestCase):
         set_is_extend.assert_called_once_with(False)
 
     def test_draft_extend_buckets_to_the_full_tree_width(self):
-        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
+        policy = _make_spec_policy(bs_buckets=(1, 4))
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=torch.zeros((8, 8)),
             num_correct_drafts=torch.tensor([2, 1], dtype=torch.int32),
@@ -2758,11 +2819,11 @@ class TestSpecForwardBatchPreparation(CustomTestCase):
         self.assertEqual(state.physical_num_tokens, 16)
 
 
-class TestDraftPrecompile(CustomTestCase):
+class TestDraftPrecompile(_SpecPolicyTestCase):
     """``precompile_draft`` warms the three draft forward families."""
 
     def test_draft_worker_compiles_prefill_decode_and_extend(self):
-        mr = _spec_model_runner(is_draft_worker=True, num_steps=3)
+        mr = _spec_model_runner(is_draft_worker=True)
         policy = _make_spec_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
         step_backends = [_FakeAttnBackend() for _ in range(3)]
         draft_attn_backend = SimpleNamespace(attn_backends=step_backends)
@@ -2791,7 +2852,7 @@ class TestDraftPrecompile(CustomTestCase):
         self.assertEqual(mr.model.forward.call_count, 0)
 
     def test_fused_draft_warms_every_batch_bucket(self):
-        mr = _spec_model_runner(is_draft_worker=True, num_steps=3)
+        mr = _spec_model_runner(is_draft_worker=True)
         policy = _make_spec_policy(mr, token_buckets=(8,), bs_buckets=(1, 4))
         step_backends = [_FakeAttnBackend() for _ in range(3)]
 
@@ -2831,26 +2892,19 @@ class TestDraftPrecompile(CustomTestCase):
 # Speculative verification padding fixtures.
 BS = 2
 BUCKET_BS = 4
-DRAFT_TOKEN_NUM = 4
+# The published EAGLE3 chain (_EAGLE3_CONFIG) is what the policy reads.
+DRAFT_TOKEN_NUM = _SPEC_NUM_STEPS + 1
 VOCAB_SIZE = 10
 LOGICAL_TOKENS = BS * DRAFT_TOKEN_NUM
 PADDED_TOKENS = BUCKET_BS * DRAFT_TOKEN_NUM
 
 
 def _policy():
-    """A spec policy whose only job here is to own the verify padding."""
+    """A spec policy that only owns the verify padding; its chain comes from get_spec()."""
     model_runner = SimpleNamespace(
         model=SimpleNamespace(forward=None, prepare_forward_batch=None),
         is_draft_worker=False,
         model_config=SimpleNamespace(hidden_size=16, model_is_mrope=False),
-        server_args=SimpleNamespace(
-            speculative_num_steps=DRAFT_TOKEN_NUM - 1,
-            speculative_num_draft_tokens=DRAFT_TOKEN_NUM,
-            speculative_algorithm="EAGLE3",
-            speculative_eagle_topk=1,
-            page_size=1,
-            dp_size=1,
-        ),
     )
     return SpecDecoderTpuCompilePolicy(
         model_runner=model_runner,
@@ -2900,7 +2954,8 @@ def _serving_stubs():
             "torch._dynamo.config.disable",
             True,
         ),
-        get_context().override_server_args(
+        # Layered onto the published config: eagle_sample reads the rest of the spec bag.
+        get_spec().override(
             speculative_use_rejection_sampling=False,
             speculative_accept_threshold_single=1.0,
             speculative_accept_threshold_acc=1.0,
@@ -2975,7 +3030,7 @@ def _accepting_logits():
     return logits
 
 
-class TestSpecVerifyPaddingRecord(CustomTestCase):
+class TestSpecVerifyPaddingRecord(_SpecPolicyTestCase):
     """``prepare_spec_verify`` widens exactly the batch state verify samples from."""
 
     def test_deferral_decision_is_policy_owned(self):
@@ -3173,7 +3228,7 @@ class TestSpecVerifyPaddingRecord(CustomTestCase):
             _policy().prepare_spec_verify(batch, verify_input, logits)
 
 
-class TestSpecVerifyPaddingIsInert(CustomTestCase):
+class TestSpecVerifyPaddingIsInert(_SpecPolicyTestCase):
     """Whatever lands in the padded rows must not reach the real requests.
 
     Both runs use the same shapes, so they consume the random stream

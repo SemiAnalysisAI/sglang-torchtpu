@@ -73,17 +73,16 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_parallel,
+    get_platform,
 )
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
-    is_blackwell_supported,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
     is_hip,
     is_npu,
-    is_sm90_supported,
     is_tpu,
     make_layers,
 )
@@ -97,7 +96,7 @@ _is_tpu = is_tpu()
 _is_tinygemm_supported = (
     _is_cuda
     and is_flashinfer_available()
-    and (is_sm90_supported() or is_blackwell_supported())
+    and (get_platform().is_sm90 or get_platform().is_blackwell)
 )
 
 if _is_tinygemm_supported:

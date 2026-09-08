@@ -30,7 +30,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_bool_env_var, is_hip, is_tpu
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
@@ -51,7 +51,7 @@ strategy_to_parameter_type = {
 
 
 def _get_tpu_fp8_runtime() -> str:
-    return get_global_server_args().tpu_fp8_runtime
+    return get_exec().kernel.tpu_fp8_runtime
 
 
 def _requantize_tpu_block_fp8_to_channelwise(layer: torch.nn.Module) -> None:

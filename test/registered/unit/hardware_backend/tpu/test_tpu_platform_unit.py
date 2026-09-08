@@ -16,6 +16,7 @@ import torch.compiler.config as compiler_config
 
 from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 from sglang.srt.platforms.device_mixin import PlatformEnum
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -213,9 +214,8 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
     """apply_server_args_defaults sets correct values."""
 
     def _args(self, **overrides):
-        # Full set of fields apply_server_args_defaults reads, plus an
-        # override() shim mirroring ServerArgs.override (its audited mutation
-        # point, which the defaults now flow through).
+        # apply_server_args_defaults declares rather than writes, so the assertions read the
+        # decisions back with resolution_result, as the projection does.
         defaults = dict(
             dtype=None,
             attention_backend=None,
@@ -239,62 +239,61 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             speculative_use_rejection_sampling=False,
         )
         defaults.update(overrides)
-        args = SimpleNamespace(**defaults)
-
-        def _override(source, **fields):
-            for k, v in fields.items():
-                setattr(args, k, v)
-
-        args.override = _override
-        return args
+        return SimpleNamespace(**defaults)
 
     def _apply(self, args):
         platform = TpuSRTPlatform()
         with patch("sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"):
             platform.apply_server_args_defaults(args)
 
+    def _resolved(self, args, field):
+        """What resolution decided for ``field``, else what the caller supplied."""
+        from sglang.srt.arg_groups.overrides import resolution_result
+
+        return resolution_result(args, field)
+
     def test_defaults_applied(self):
         args = self._args(enable_torch_compile=False)
         self._apply(args)
 
-        self.assertEqual(args.dtype, "bfloat16")
-        self.assertEqual(args.attention_backend, "pallas_tpu_rpa_v3")
-        self.assertEqual(args.sampling_backend, "tpu")
-        self.assertTrue(args.disable_cuda_graph)
-        self.assertTrue(args.disable_piecewise_cuda_graph)
+        self.assertEqual(self._resolved(args, "dtype"), "bfloat16")
+        self.assertEqual(self._resolved(args, "attention_backend"), "pallas_tpu_rpa_v3")
+        self.assertEqual(self._resolved(args, "sampling_backend"), "tpu")
+        self.assertTrue(self._resolved(args, "disable_cuda_graph"))
+        self.assertTrue(self._resolved(args, "disable_piecewise_cuda_graph"))
         # enable_torch_compile is opt-in on TPU and must not be forced off.
-        self.assertFalse(args.enable_torch_compile)
+        self.assertFalse(self._resolved(args, "enable_torch_compile"))
         # Overlap is enabled on TPU via the thread-based path in
         # scheduler_overlap_mixin; the platform must NOT force-disable it.
-        self.assertFalse(args.disable_overlap_schedule)
-        self.assertEqual(args.mem_fraction_static, 0.40)
+        self.assertFalse(self._resolved(args, "disable_overlap_schedule"))
+        self.assertEqual(self._resolved(args, "mem_fraction_static"), 0.40)
 
     def test_rpa_backends_default_to_fp8_kv_cache(self):
         for backend in ("pallas_tpu_rpa_v3", "pallas_tpu_rpa_batched"):
             with self.subTest(backend=backend):
                 args = self._args(attention_backend=backend)
                 self._apply(args)
-                self.assertEqual(args.kv_cache_dtype, "fp8_e4m3")
+                self.assertEqual(self._resolved(args, "kv_cache_dtype"), "fp8_e4m3")
 
     def test_explicit_kv_cache_dtype_not_overridden(self):
         args = self._args(
             attention_backend="pallas_tpu_rpa_batched", kv_cache_dtype="bfloat16"
         )
         self._apply(args)
-        self.assertEqual(args.kv_cache_dtype, "bfloat16")
+        self.assertEqual(self._resolved(args, "kv_cache_dtype"), "bfloat16")
 
     def test_non_rpa_backend_keeps_auto_kv_cache_dtype(self):
         # pallas_tpu_mla rejects an fp8 KV cache, so the fp8 default is scoped
         # to the RPA backends and must not leak to it.
         args = self._args(attention_backend="pallas_tpu_mla")
         self._apply(args)
-        self.assertEqual(args.kv_cache_dtype, "auto")
-        self.assertEqual(args.page_size, 64)
+        self.assertEqual(self._resolved(args, "kv_cache_dtype"), "auto")
+        self.assertEqual(self._resolved(args, "page_size"), 64)
 
     def test_batched_rpa_page_size_default_meets_the_kernel_floor(self):
         args = self._args(attention_backend="pallas_tpu_rpa_batched")
         self._apply(args)
-        self.assertEqual(args.page_size, 256)
+        self.assertEqual(self._resolved(args, "page_size"), 256)
 
     def test_batched_rpa_rejects_a_page_size_below_the_floor(self):
         args = self._args(attention_backend="pallas_tpu_rpa_batched", page_size=64)
@@ -304,12 +303,12 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
     def test_explicit_page_size_above_the_floor_is_kept(self):
         args = self._args(attention_backend="pallas_tpu_rpa_batched", page_size=512)
         self._apply(args)
-        self.assertEqual(args.page_size, 512)
+        self.assertEqual(self._resolved(args, "page_size"), 512)
 
     def test_enable_torch_compile_preserved_when_opted_in(self):
         args = self._args(enable_torch_compile=True)
         self._apply(args)
-        self.assertTrue(args.enable_torch_compile)
+        self.assertTrue(self._resolved(args, "enable_torch_compile"))
 
     def test_registered_spec_algorithm_name_is_admitted(self):
         # Plugin registration may happen after platform defaults. Unknown names
@@ -393,17 +392,17 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
     def test_explicit_dtype_not_overridden(self):
         args = self._args(dtype="float32")
         self._apply(args)
-        self.assertEqual(args.dtype, "float32")
+        self.assertEqual(self._resolved(args, "dtype"), "float32")
 
     def test_explicit_mem_fraction_not_overridden(self):
         args = self._args(mem_fraction_static=0.60)
         self._apply(args)
-        self.assertEqual(args.mem_fraction_static, 0.60)
+        self.assertEqual(self._resolved(args, "mem_fraction_static"), 0.60)
 
     def test_explicit_sampling_backend_not_overridden(self):
         args = self._args(sampling_backend="pytorch")
         self._apply(args)
-        self.assertEqual(args.sampling_backend, "pytorch")
+        self.assertEqual(self._resolved(args, "sampling_backend"), "pytorch")
 
 
 class TestTpuPlatformFactoryMethods(CustomTestCase):
@@ -421,18 +420,12 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
         self.assertEqual(cls.__name__, "TpuPagedTokenToKVPoolAllocator")
 
     def test_mha_kv_pool_cls(self):
-        # get_mha_kv_pool_cls picks the pool by the resolved attention backend
-        with patch(
-            "sglang.srt.server_args.get_global_server_args",
-            return_value=SimpleNamespace(attention_backend="torch_native"),
-        ):
+        # get_mha_kv_pool_cls reads the exec bag; publish the backend.
+        with get_context().override_server_args(attention_backend="torch_native"):
             cls = self.platform.get_mha_kv_pool_cls()
         self.assertEqual(cls.__name__, "MHATokenToKVPool")
 
-        with patch(
-            "sglang.srt.server_args.get_global_server_args",
-            return_value=SimpleNamespace(attention_backend="pallas_tpu_rpa_v3"),
-        ):
+        with get_context().override_server_args(attention_backend="pallas_tpu_rpa_v3"):
             cls = self.platform.get_mha_kv_pool_cls()
         self.assertEqual(cls.__name__, "TpuFusedMHATokenToKVPool")
 

@@ -9,6 +9,7 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.runtime_context import attention_backends, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -47,12 +48,16 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
     resolved_attention_backend: str
 
 
-def _resolve_draft_attention_backend_fallback(
-    *, server_args: ServerArgs, algo_label: str
-) -> str:
-    draft_backend = server_args.speculative_draft_attention_backend
+def _resolve_draft_attention_backend_fallback(*, algo_label: str) -> str:
+    """The draft's attention backend, from the published leaves.
+
+    `spec.speculative_draft_attention_backend` when the operator named one,
+    otherwise the process's prefill backend. Both are resolution's answers, so
+    they come from the bags.
+    """
+    draft_backend = get_spec().speculative_draft_attention_backend
     if draft_backend is None:
-        draft_backend, _ = server_args.get_attention_backends()
+        draft_backend, _ = attention_backends()
     if draft_backend is None:
         return (
             "pallas_tpu_rpa_v3"
@@ -86,14 +91,13 @@ def build_draft_tp_worker(
     target_model_config: ModelConfig,
     algo_label: str,
     attention_backend_override: Optional[str] = None,
+    draft_worker_cls: type[TpModelWorker] = TpModelWorker,
 ) -> DraftWorkerBundle:
     # An override names a draft-specific backend the caller has already
     # validated (e.g. a self-drafting architecture); it skips the generic
     # supported-backend fallback below.
     draft_backend = attention_backend_override or (
-        _resolve_draft_attention_backend_fallback(
-            server_args=server_args, algo_label=algo_label
-        )
+        _resolve_draft_attention_backend_fallback(algo_label=algo_label)
     )
     from sglang.srt.layers.moe.utils import draft_model_build_scope
 
@@ -103,7 +107,7 @@ def build_draft_tp_worker(
     # workers run the draft outside speculative_moe_backend_context, so a
     # construction-only swap would build and execute under different backends.
     with draft_model_build_scope():
-        draft_worker = TpModelWorker(
+        draft_worker = draft_worker_cls(
             server_args=server_args,
             gpu_id=gpu_id,
             ps=ps,

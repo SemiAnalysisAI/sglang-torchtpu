@@ -9,30 +9,34 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 _SCHED_MOD = "sglang.srt.managers.scheduler"
 
 
-def _make_scheduler(*, speculative_algorithm, enable_dp_attention=False):
-    scheduler = Scheduler.__new__(Scheduler)
-    scheduler.tp_worker = SimpleNamespace(
-        model_runner=SimpleNamespace(
-            device="tpu",
-            server_args=SimpleNamespace(
-                enable_torch_compile=True,
-                speculative_algorithm=speculative_algorithm,
-                enable_dp_attention=enable_dp_attention,
-            ),
-        )
-    )
-    return scheduler
-
-
 class TestSchedulerRecompileStance(unittest.TestCase):
+    def _make_scheduler(self, *, speculative_algorithm, enable_dp_attention=False):
+        # _maybe_arm_fail_on_recompile reads the exec and spec bags; publish both.
+        override = get_context().override_server_args(
+            enable_torch_compile=True,
+            speculative_algorithm=speculative_algorithm,
+            enable_dp_attention=enable_dp_attention,
+        )
+        server_args = override.install()
+        self.addCleanup(override.restore)
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(device="tpu")
+        )
+        # Built with __new__: wire server_args to the published instance.
+        scheduler.server_args = server_args
+        return scheduler
+
     def test_spec_freezes_recompiles_by_default(self):
-        scheduler = _make_scheduler(speculative_algorithm="EAGLE3")
+        scheduler = self._make_scheduler(speculative_algorithm="EAGLE3")
 
         with envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(False), patch(
             f"{_SCHED_MOD}.torch.compiler.set_stance"
@@ -42,7 +46,7 @@ class TestSchedulerRecompileStance(unittest.TestCase):
         set_stance.assert_called_once_with("fail_on_recompile")
 
     def test_env_allows_spec_recompiles(self):
-        scheduler = _make_scheduler(speculative_algorithm="EAGLE3")
+        scheduler = self._make_scheduler(speculative_algorithm="EAGLE3")
 
         with envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(True), patch(
             f"{_SCHED_MOD}.torch.compiler.set_stance"
@@ -52,7 +56,7 @@ class TestSchedulerRecompileStance(unittest.TestCase):
         set_stance.assert_not_called()
 
     def test_hybrid_dp_attention_freezes_spec_recompiles(self):
-        scheduler = _make_scheduler(
+        scheduler = self._make_scheduler(
             speculative_algorithm="EAGLE3", enable_dp_attention=True
         )
 
@@ -64,7 +68,7 @@ class TestSchedulerRecompileStance(unittest.TestCase):
         set_stance.assert_called_once_with("fail_on_recompile")
 
     def test_env_does_not_affect_non_spec(self):
-        scheduler = _make_scheduler(speculative_algorithm=None)
+        scheduler = self._make_scheduler(speculative_algorithm=None)
 
         with envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(True), patch(
             f"{_SCHED_MOD}.torch.compiler.set_stance"

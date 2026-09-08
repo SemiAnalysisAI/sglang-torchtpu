@@ -21,6 +21,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -31,6 +32,7 @@ from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -169,6 +171,12 @@ def _create_dflash_worker_for_tpu(
     worker.device = dev
     worker.gpu_id = 0
     worker.ps = SimpleNamespace(tp_rank=0, world_size=1)
+    # world size 1: every sync is a pass-through.
+    worker._tp_sync = SpecTpSync(SimpleNamespace(world_size=1, rank_in_group=0))
+    # plain DFlash: no candidate selector.
+    worker.selector = None
+    worker._selector_sample = None
+    worker._draft_probs_buf = None
     worker.nccl_port = 0
     worker._need_mamba_verify_commit = False
     worker._warned_sampling_fallback = False
@@ -247,6 +255,16 @@ def _create_dflash_worker_for_tpu(
     req_to_token_table[2, :16] = torch.arange(200, 216, dtype=torch.int32, device=dev)
 
     target_model_runner = SimpleNamespace(
+        # Read by ForwardBatch.init_new: no LoRA, no KV index translation.
+        is_draft_worker=False,
+        kv_index_translator=KVIndexTranslator(
+            req_to_token=req_to_token_table,
+            token_to_kv_pool_allocator=None,
+            token_to_kv_pool=None,
+            page_size=16,
+            device=dev,
+        ),
+        lora_manager=None,
         model=target_model,
         model_config=SimpleNamespace(
             vocab_size=vocab_size,
@@ -312,6 +330,18 @@ def _create_dflash_worker_for_tpu(
     )
 
     draft_model_runner = SimpleNamespace(
+        is_draft_worker=True,
+        kv_index_translator=KVIndexTranslator(
+            req_to_token=draft_r2t_table,
+            token_to_kv_pool_allocator=None,
+            token_to_kv_pool=draft_token_to_kv_pool,
+            page_size=16,
+            device=dev,
+        ),
+        lora_manager=None,
+        ngram_embedding_manager=SimpleNamespace(enabled=False),
+        prefill_attention_backend_str="torch_native",
+        ps=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
         model=draft_model,
         model_config=SimpleNamespace(
             vocab_size=vocab_size,
@@ -411,6 +441,9 @@ def _make_schedule_batch(
         has_grammar=False,
         can_run_dp_cuda_graph=False,
         can_run_dp_breakable_cuda_graph=False,
+        can_run_decode_cuda_graph=False,
+        can_run_dp_prefill_cuda_graph=False,
+        return_hidden_states_mode=CaptureHiddenMode.NULL,
         global_forward_mode=forward_mode,
         is_prefill_only=False,
         spec_algorithm=None,

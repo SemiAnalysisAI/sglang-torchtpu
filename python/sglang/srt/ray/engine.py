@@ -35,13 +35,16 @@ from sglang.srt.entrypoints.engine import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.ray.scheduler_actor import SchedulerActor
-from sglang.srt.runtime_context import configured_pp_size, get_parallel
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.runtime_context import (
+    get_device,
+    get_parallel,
+)
+from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 
 logger = logging.getLogger(__name__)
 
 
-def _accelerator_resource_name(server_args: ServerArgs) -> str:
+def _accelerator_resource_name() -> str:
     """Ray resource name for the server's accelerator.
 
     Ray auto-detects NVIDIA GPUs as the built-in ``GPU`` resource, but a TPU
@@ -49,11 +52,14 @@ def _accelerator_resource_name(server_args: ServerArgs) -> str:
     and scheduler actors must request the resource that actually exists on the
     nodes -- otherwise the bundles are never schedulable and the Engine hangs
     forever at ``pg.ready()``.
+
+    The device is resolved config, so it comes from the ``device`` bag: the
+    driver lays the actors out after ``_launch_subprocesses`` published.
     """
-    return "TPU" if server_args.device == "tpu" else "GPU"
+    return "TPU" if get_device().device == "tpu" else "GPU"
 
 
-def _accelerator_actor_options(server_args: ServerArgs, count: int = 1) -> dict:
+def _accelerator_actor_options(count: int = 1) -> dict:
     """Ray ``.options()`` kwargs reserving ``count`` accelerators per actor.
 
     Ray only special-cases ``num_gpus`` (which also drives CUDA_VISIBLE_DEVICES);
@@ -61,7 +67,7 @@ def _accelerator_actor_options(server_args: ServerArgs, count: int = 1) -> dict:
     generic ``resources`` dict. This keeps one scheduler actor pinned per chip
     without touching the GPU machinery.
     """
-    if server_args.device == "tpu":
+    if get_device().device == "tpu":
         return {"num_gpus": 0, "resources": {"TPU": count}}
     return {"num_gpus": count}
 
@@ -80,8 +86,8 @@ def _actor_options(server_args: ServerArgs) -> dict:
     heavy/optional TPU imports; byte-identical GPU options either way).
     """
     options = {"num_cpus": 0}
-    options.update(_accelerator_actor_options(server_args))
-    if server_args.device == "tpu":
+    options.update(_accelerator_actor_options())
+    if get_device().device == "tpu":
         from sglang.srt.hardware_backend.tpu.ray_utils import tpu_actor_runtime_env
 
         options.update(tpu_actor_runtime_env(server_args))
@@ -153,14 +159,18 @@ def _get_bundle_node_ip(placement_group: PlacementGroup, bundle_idx: int) -> str
     )
 
 
-def _compute_world_size(server_args: ServerArgs) -> int:
+def _compute_world_size() -> int:
     """Compute world_size (total number of scheduler actors/GPUs needed).
 
-    Normal: dp_size * tp_size * pp_size; DP attention: tp_size * pp_size.
+    Reads the published parallel leaves: the driver is sizing the actors that
+    will hold the process groups, so there is nothing live to ask.
     """
-    if get_parallel().enable_dp_attention:
-        return server_args.tp_size * configured_pp_size()
-    return get_parallel().dp_size * server_args.tp_size * configured_pp_size()
+    return compute_world_size(
+        enable_dp_attention=get_parallel().enable_dp_attention,
+        dp_size=get_parallel().dp_size,
+        tp_size=get_parallel().tp_size,
+        pp_size=get_parallel().pp_size,
+    )
 
 
 def _resolve_bundle_indices(pg: PlacementGroup, world_size: int) -> list[int]:
@@ -312,7 +322,11 @@ class RayEngine(Engine):
             Tuple of (RaySchedulerInitResult, None).
             scheduler_procs is None since Ray uses actors instead of mp.Process.
         """
-        # TPU + Ray: honor server_args.nnodes, discovering the pre-ordered host
+        # nnodes can still move below (TPU auto-detect). The actors get the replaced
+        # record, the driver's bag does not, so read this local from here on.
+        nnodes = get_parallel().nnodes
+
+        # TPU + Ray: honor the configured nnodes, discovering the pre-ordered host
         # list from the live cluster. nnodes=0 opts into auto-detecting the count.
         # The computed TPU env is stashed on server_args (tpu_worker_hostnames /
         # torch_tpu_slicebuilder_addresses / torch_tpu_topology) and injected into
@@ -320,7 +334,7 @@ class RayEngine(Engine):
         # since it does NOT forward the driver's os.environ. runtime_env also carries
         # a curated allowlist of the driver's launcher-set config env that the actor
         # would otherwise lose (see ray_utils._forwarded_driver_env).
-        if server_args.use_ray and server_args.device == "tpu":
+        if get_device().use_ray and get_device().device == "tpu":
             # Lazy TPU import: keeps the GPU Ray path from importing the TPU
             # package (see _actor_options).
             from sglang.srt.hardware_backend.tpu.ray_utils import (
@@ -347,26 +361,28 @@ class RayEngine(Engine):
                 )
 
             # Detect nnodes if not specified. This is needed for TPU multihost.
-            if server_args.nnodes == 0:
+            if nnodes == 0:
                 detected = detect_tpu_nnodes()
-                resolved = max(detected, 1)
+                nnodes = max(detected, 1)
                 logger.info(
                     "Ray discovery: nnodes=0 (auto); detected %d TPU node(s), "
                     "using nnodes=%d",
                     detected,
-                    resolved,
+                    nnodes,
                 )
-                server_args = dataclasses.replace(server_args, nnodes=resolved)
+                server_args = server_args.replace_resolved(
+                    "ray.tpu_nnodes_autodetect", nnodes=nnodes
+                )
                 # Run the (tp_size * pp_size) % nnodes check that
                 # check_server_args deferred for nnodes=0. A non-divisor
                 # under-provisions the placement group and the launch hangs
                 # forever -- fail loud instead.
-                if (server_args.tp_size * server_args.pp_size) % resolved != 0:
+                ranks = get_parallel().tp_size * get_parallel().pp_size
+                if ranks % nnodes != 0:
                     raise ValueError(
-                        f"Auto-detected {resolved} TPU node(s), but "
-                        f"tp_size * pp_size = "
-                        f"{server_args.tp_size * server_args.pp_size} is not "
-                        f"divisible by {resolved}. The placement group would be "
+                        f"Auto-detected {nnodes} TPU node(s), but "
+                        f"tp_size * pp_size = {ranks} is not "
+                        f"divisible by {nnodes}. The placement group would be "
                         "under-provisioned and the launch would hang. Pass "
                         "--nnodes explicitly to match your TPU slice topology."
                     )
@@ -382,14 +398,14 @@ class RayEngine(Engine):
             # they share the node). Multi-host: endpoints are deterministic
             # (host:base_port+i), so the driver only stashes the physically-
             # ordered host list and each actor rebuilds them itself.
-            if server_args.nnodes <= 1:
+            if nnodes <= 1:
                 from sglang.srt.hardware_backend.tpu.patches import (
                     compute_single_host_tpu_env,
                 )
 
-                single_host_env = compute_single_host_tpu_env(server_args.tp_size)
-                server_args = dataclasses.replace(
-                    server_args,
+                single_host_env = compute_single_host_tpu_env(get_parallel().tp_size)
+                server_args = server_args.replace_resolved(
+                    "ray.tpu_single_host_env",
                     # Force TPU_WORKER_HOSTNAMES="" into every actor. On a
                     # multi-host GKE slice each pod inherits the slice-wide
                     # value from `ray start`; without overriding it, the actor's
@@ -403,28 +419,27 @@ class RayEngine(Engine):
                     torch_tpu_topology=single_host_env.get("TORCH_TPU_TOPOLOGY"),
                 )
             else:
-                tpu_worker_hostnames = discover_tpu_worker_hostnames(server_args.nnodes)
+                tpu_worker_hostnames = discover_tpu_worker_hostnames(nnodes)
                 if tpu_worker_hostnames:
                     # Multihost: stash the physically-ordered (TPU_WORKER_ID) host
                     # list. Actors rebuild the slicebuilder deterministically from it
                     # (see _prepare_tpu_env), so the port list is identical everywhere.
-                    server_args = dataclasses.replace(
-                        server_args, tpu_worker_hostnames=tpu_worker_hostnames
+                    server_args = server_args.replace_resolved(
+                        "ray.tpu_worker_hostnames",
+                        tpu_worker_hostnames=tpu_worker_hostnames,
                     )
 
         pg = placement_group or ray.util.get_current_placement_group()
         if pg is None:
-            if get_parallel().enable_dp_attention:
-                total_gpus = server_args.tp_size * configured_pp_size()
+            parallel = get_parallel()
+            if parallel.enable_dp_attention:
+                total_gpus = parallel.tp_size * parallel.pp_size
             else:
-                total_gpus = (
-                    get_parallel().dp_size * server_args.tp_size * configured_pp_size()
-                )
+                total_gpus = parallel.dp_size * parallel.tp_size * parallel.pp_size
 
-            nnodes = server_args.nnodes
             gpus_per_node = total_gpus // nnodes
             strategy = "STRICT_PACK" if nnodes == 1 else "SPREAD"
-            accel = _accelerator_resource_name(server_args)
+            accel = _accelerator_resource_name()
 
             logger.info(
                 "No placement group detected. Auto-creating one with "
@@ -439,9 +454,9 @@ class RayEngine(Engine):
             ray.get(pg.ready())
 
         is_custom_pg = placement_group is not None
-        nnodes = server_args.nnodes
+        world_size = _compute_world_size()
 
-        if server_args.use_ray and server_args.device == "tpu" and nnodes > 1:
+        if get_device().use_ray and get_device().device == "tpu" and nnodes > 1:
             # TPU multihost: the slicebuilder endpoint list and MASTER_ADDR are
             # ordered by physical TPU_WORKER_ID, so rank r must land on the host
             # whose TPU_WORKER_ID == r // devices_per_host. Ray bundle indices are
@@ -467,7 +482,6 @@ class RayEngine(Engine):
 
         if get_parallel().dp_size == 1:
             # Launch tensor parallel scheduler actors
-            world_size = _compute_world_size(server_args)
             dist_init_addr = f"{rank0_node_ip}:{port_args.nccl_port}"
             logger.info(f"dist_init_addr: {dist_init_addr}")
 
@@ -475,7 +489,7 @@ class RayEngine(Engine):
 
             if not is_custom_pg:
                 gpus_per_node = world_size // nnodes
-                accel = _accelerator_resource_name(server_args)
+                accel = _accelerator_resource_name()
                 logger.info(
                     f"Ray cluster (auto PG): {nnodes} nodes, "
                     f"{gpus_per_node} {accel}(s)/node, world_size={world_size}"
@@ -486,8 +500,8 @@ class RayEngine(Engine):
                     pp_range, tp_range, pp_per_node, tp_per_node = (
                         _calculate_rank_ranges(
                             nnodes,
-                            configured_pp_size(),
-                            server_args.tp_size,
+                            get_parallel().pp_size,
+                            get_parallel().tp_size,
                             node_rank=node_idx,
                         )
                     )
@@ -523,9 +537,10 @@ class RayEngine(Engine):
                     f"bundle_indices={bundle_indices}"
                 )
 
+                tp_size = get_parallel().tp_size
                 for rank in range(world_size):
-                    pp_rank = rank // server_args.tp_size
-                    tp_rank = rank % server_args.tp_size
+                    pp_rank = rank // tp_size
+                    tp_rank = rank % tp_size
                     bundle_idx = bundle_indices[rank]
 
                     actor = _create_scheduler_actor(
@@ -582,6 +597,7 @@ class RayEngine(Engine):
                     bundle_for_node,
                     rank0_node_ip,
                     is_custom_pg,
+                    nnodes=nnodes,
                 ),
                 None,
             )
@@ -595,32 +611,34 @@ class RayEngine(Engine):
         bundle_for_node: list,
         rank0_node_ip: str,
         is_custom_pg: bool = False,
+        *,
+        nnodes: int,
     ) -> RaySchedulerInitResult:
-        """Launch DP schedulers via RayDataParallelController."""
+        """Launch DP schedulers; ``nnodes`` comes from the caller (TPU auto-detect
+        decides it after publish, so the parallel leaf may still say 0)."""
         from sglang.srt.ray.data_parallel_controller import (
             RayDataParallelController,
         )
 
-        if get_parallel().enable_dp_attention:
+        parallel = get_parallel()
+        if parallel.enable_dp_attention:
             # DP attention folds DP into TP — total GPUs = tp_size * pp_size
-            total_gpus = server_args.tp_size * configured_pp_size()
+            total_gpus = parallel.tp_size * parallel.pp_size
         else:
-            total_gpus = (
-                get_parallel().dp_size * server_args.tp_size * configured_pp_size()
-            )
-        gpus_per_node = total_gpus // server_args.nnodes
+            total_gpus = parallel.dp_size * parallel.tp_size * parallel.pp_size
+        gpus_per_node = total_gpus // nnodes
         logger.info(
-            f"Ray DP cluster: {server_args.nnodes} nodes, "
-            f"{gpus_per_node} {_accelerator_resource_name(server_args)}/node, "
-            f"dp_size={get_parallel().dp_size}, "
-            f"tp_size={server_args.tp_size}, pp_size={configured_pp_size()}, "
-            f"enable_dp_attention={get_parallel().enable_dp_attention}"
+            f"Ray DP cluster: {nnodes} nodes, "
+            f"{gpus_per_node} {_accelerator_resource_name()}/node, "
+            f"dp_size={parallel.dp_size}, "
+            f"tp_size={parallel.tp_size}, pp_size={parallel.pp_size}, "
+            f"enable_dp_attention={parallel.enable_dp_attention}"
         )
 
         # Set dist_init_addr on server_args so PortArgs.init_new() can compute
         # TCP addresses correctly (required for DP attention path).
-        dp_server_args = dataclasses.replace(
-            server_args,
+        dp_server_args = server_args.replace_resolved(
+            "ray.dp_controller",
             dist_init_addr=f"{rank0_node_ip}:{port_args.nccl_port}",
         )
 
@@ -633,6 +651,7 @@ class RayEngine(Engine):
             bundle_for_node,
             rank0_node_ip,
             is_custom_pg,
+            nnodes=nnodes,
         )
 
         # Start the DP controller's event loop in a daemon thread.

@@ -95,7 +95,6 @@ def _make_controller() -> TpuRaidenHybridCacheController:
     swa = _FakeEntry(PoolName.SWA, swa_pool, device_pool=object())
     ctrl.mem_pool_host = _FakeGroup(anchor, [swa])
     ctrl.io_backend = "raiden"
-    ctrl.has_draft = False
     ctrl.write_queue = []
     ctrl.load_queue = []
     ctrl.ack_write_queue = []
@@ -249,10 +248,10 @@ class TestAssemblerPlatformHook(CustomTestCase):
         publish(args, role="scheduler")
         try:
             with patch("sglang.srt.platforms.current_platform", fake_platform):
+                # The assembler reads hicache sizing off the memory bag; the publish above configures it.
                 pool = hybrid_pool_assembler.build_kv_host_pool(
                     kv_pool=kv_pool,
                     page_size=64,
-                    server_args=args,
                     use_mla=False,
                     pool_label="swa",
                 )

@@ -51,7 +51,9 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
+    derive_parallel_widths,
     get_global_dwdp_manager,
+    get_parallel,
     set_global_dwdp_manager,
 )
 from sglang.srt.utils import (
@@ -849,6 +851,7 @@ class GroupCoordinator:
         eps: float,
         group_size: int = 128,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ) -> Optional[Tuple[torch.Tensor, ...]]:
         """Attempt fused all-reduce + RMSNorm + per-group FP8 quant.
 
@@ -862,6 +865,10 @@ class GroupCoordinator:
         ``(fp8, residual_out, scale, bf16)`` — used by GDN-style layers that
         need both an FP8 projection and a bf16 gating projection without
         launching a separate per-group quant kernel.
+
+        When ``transpose_scale=True`` the kernel writes the per-group scale in
+        the column-major layout the gfx95 bpreshuffle GEMM consumes, so the
+        caller can skip the post-kernel scale transpose.
         """
         if not (is_hip() and is_gfx95_supported()):
             return None
@@ -908,6 +915,7 @@ class GroupCoordinator:
                 group_size,
                 use_1stage_ar,
                 emit_bf16=emit_bf16,
+                transpose_scale=transpose_scale,
             )
         except Exception:
             return None
@@ -1088,7 +1096,8 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu:
+        if _is_npu or _is_cpu:
+            # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
             return
@@ -1270,7 +1279,8 @@ class GroupCoordinator:
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu:
+        if _is_npu or _is_cpu:
+            # TODO: add optimized all_gather_into_tensor kernel for cpu
             self._all_gather_into_tensor(output, input)
         else:
             # TPU routes through the custom op: the raw all_gather lowers to
@@ -2062,6 +2072,12 @@ def get_moe_tp_group() -> GroupCoordinator:
 get_tensor_model_parallel_group = get_tp_group
 
 _PP: Optional[GroupCoordinator] = None
+_SELF_PP: Optional[GroupCoordinator] = None
+
+
+def get_self_pp_group() -> GroupCoordinator:
+    assert _SELF_PP is not None, "self pipeline group is not initialized"
+    return _SELF_PP
 
 
 def get_pp_group() -> GroupCoordinator:
@@ -2392,12 +2408,16 @@ def initialize_model_parallel(
 
     Let's say we use 2 GPUs for attention context parallelism (attn_cp_size=2) and 4 GPUs for
     attention tensor parallelism (attn_tp_size=4). As for MoE part, we use 2 GPUs for moe data
-    parallelism (moe_dp_size=2) and 4 GPUs for moe expert parallelism (moe_ep_size=4). The present
+    parallelism (moe_dp_size=2) and 4 GPUs for moe expert parallelism (moe_ep_size=4). Note that
+    this implies tensor_model_parallel_size=8 (attn_tp_size = tp_size // attn_cp_size //
+    attn_dp_size), so all 8 GPUs form a single tensor model-parallel group. The present
     function will create the following groups:
-        2 tensor model-parallel groups:
-            [g0, g1, g2, g3], [g4, g5, g6, g7]
+        1 tensor model-parallel group:
+            [g0, g1, g2, g3, g4, g5, g6, g7]
         4 attention context-parallel groups:
             [g0, g4], [g1, g5], [g2, g6], [g3, g7]
+        2 attention tensor-parallel groups:
+            [g0, g1, g2, g3], [g4, g5, g6, g7]
         2 moe expert-parallel groups:
             [g0, g1, g2, g3], [g4, g5, g6, g7]
         4 moe data-parallel groups:
@@ -2512,7 +2532,18 @@ def initialize_model_parallel(
 
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
-    attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
+    # The groups below are built at these numbers, and the same dict is stamped
+    # once they exist.
+    derived_widths = derive_parallel_widths(
+        tp_size=tensor_model_parallel_size,
+        attn_cp_size=attn_cp_size,
+        attn_dp_size=attn_dp_size,
+        moe_ep_size=expert_model_parallel_size,
+        moe_dp_size=moe_data_model_parallel_size,
+        dcp_size=decode_context_parallel_size,
+        dcp_enabled=_DCP is not None,
+    )
+    attn_tp_size = derived_widths["attn_tp_size"]
 
     global _ATTN_CP
     assert (
@@ -2598,7 +2629,7 @@ def initialize_model_parallel(
 
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
-    moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_dp_size
+    moe_tp_size = derived_widths["moe_tp_size"]
 
     global _MOE_DP
     assert _MOE_DP is None, "moe data parallel group is already initialized"
@@ -2711,6 +2742,20 @@ def initialize_model_parallel(
         max_world_size=max_world_size,
     )
 
+    # The one-layer draft uses a singleton PP group; every rank creates all groups
+    # because new_group is collective.
+    global _SELF_PP
+    if _SELF_PP is None:
+        _SELF_PP = init_model_parallel_group(
+            [[r] for r in range(world_size)],
+            get_world_group().local_rank,
+            backend,
+            use_custom_allreduce=False,
+            group_name="self_pp",
+        )
+
+    get_parallel().stamp_derived_widths(**derived_widths)
+
 
 def create_custom_parallel_group(
     group_ranks: List[int], backend: str = "gloo"
@@ -2807,18 +2852,44 @@ def model_parallel_is_initialized():
 
 
 _TP_STATE_PATCHED = False
+_PP_STATE_PATCHED = False
+
+
+@contextmanager
+def patch_pipeline_parallel_group(pp_group: GroupCoordinator):
+    """Patch the pp group temporarily until this function ends.
+
+    This method is for draft workers of speculative decoding, whose model does not
+    span pipeline stages and must not read the target's pp topology.
+    """
+    global _PP_STATE_PATCHED
+    assert not _PP_STATE_PATCHED, "Should not call when it's already patched"
+
+    _PP_STATE_PATCHED = True
+    old_pp_group = get_pp_group()
+    global _PP
+    _PP = pp_group
+    try:
+        yield
+    finally:
+        _PP_STATE_PATCHED = False
+        _PP = old_pp_group
 
 
 @contextmanager
 def patch_tensor_parallel_group(tp_group: GroupCoordinator):
-    """Patch the tp group temporarily until this function ends.
+    """Run under a different tensor-parallel group until this scope ends.
 
-    This method is for draft workers of speculative decoding to run draft model
-    with different tp degree from that of target model workers.
+    This is for draft workers of speculative decoding, which run the draft model
+    at the target's attention-TP width rather than its global TP width.
+
+    The scope replaces both the module global that ``get_tp_group()`` reads and
+    the three members the runtime context answers with.
 
     Args:
         tp_group (GroupCoordinator): the tp group coordinator
     """
+
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
 
@@ -2827,9 +2898,13 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     global _TP
     _TP = tp_group
     try:
-        yield
+        with get_parallel().override(
+            tp_size=tp_group.world_size,
+            tp_rank=tp_group.rank_in_group,
+            tp_group=tp_group,
+        ):
+            yield
     finally:
-        # restore the original state
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
 
@@ -2929,6 +3004,7 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    get_parallel().clear_derived_widths()
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:
         dwdp_mgr.cleanup()

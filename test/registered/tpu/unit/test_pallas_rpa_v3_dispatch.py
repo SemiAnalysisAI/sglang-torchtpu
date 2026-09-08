@@ -24,9 +24,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
-import types
 import unittest
-from unittest.mock import patch
 
 from sglang.test.test_utils import CustomTestCase
 
@@ -56,11 +54,10 @@ class TestPallasBackendRegistration(CustomTestCase):
 class TestMHAKVPoolSelection(CustomTestCase):
     def _pool_cls_for(self, attention_backend):
         from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
+        from sglang.srt.runtime_context import get_context
 
-        with patch(
-            "sglang.srt.server_args.get_global_server_args",
-            return_value=types.SimpleNamespace(attention_backend=attention_backend),
-        ):
+        # get_mha_kv_pool_cls reads the exec bag; publish the backend.
+        with get_context().override_server_args(attention_backend=attention_backend):
             return TpuSRTPlatform().get_mha_kv_pool_cls()
 
     def test_fused_pool_for_rpa_backends(self):
