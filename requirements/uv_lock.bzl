@@ -23,11 +23,24 @@ echo "wrote $BUILD_WORKSPACE_DIRECTORY/{out_workspace}"
 
 def _uv_lock_impl(ctx):
     # `uv pip compile` insists each input is named exactly `pyproject.toml`,
-    # so stage symlinks under that name in per-input scratch dirs.
+    # so stage inputs under that name in per-input scratch dirs.
     staged = []
     for i, src in enumerate(ctx.files.pyprojects):
         out = ctx.actions.declare_file("%s.scratch/%d/pyproject.toml" % (ctx.label.name, i))
-        ctx.actions.symlink(output = out, target_file = src)
+        if i == 0:
+            ctx.actions.symlink(output = out, target_file = src)
+        else:
+            # --extra applies to every input pyproject. Only the primary
+            # project's test suite is under test here; dependency projects'
+            # optional suites can impose unrelated, conflicting version pins.
+            # Hide their optional-dependencies table from uv in the staged copy.
+            ctx.actions.run_shell(
+                inputs = [src],
+                outputs = [out],
+                arguments = [src.path, out.path],
+                command = "sed 's/^\\([[:space:]]*\\)\\[project\\.optional-dependencies\\]/\\1[tool.bazel.unused-optional-dependencies]/' \"$1\" > \"$2\"",
+                mnemonic = "StageRuntimePyproject",
+            )
         staged.append(out)
 
     lock = ctx.actions.declare_file(ctx.label.name + ".lock")
@@ -96,7 +109,7 @@ uv_lock = rule(
             mandatory = True,
             doc = """The pyproject files to resolve together. The first is the
 primary project; additional ones (e.g. @torch_tpu//:pyproject) add their
-dependency sets to the same resolution so the root gets one mediated lock.""",
+runtime dependency sets to the same resolution so the root gets one mediated lock.""",
         ),
         "excludes": attr.label(
             allow_single_file = True,
@@ -109,7 +122,7 @@ dependency sets to the same resolution so the root gets one mediated lock.""",
         ),
         "extras": attr.string_list(
             default = ["test"],
-            doc = "pyproject extras to resolve (`--extra`).",
+            doc = "Extras to resolve from the first pyproject only (`--extra`).",
         ),
         "python_version": attr.string(
             default = "3.12",

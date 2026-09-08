@@ -13,7 +13,8 @@ exports_files([
 #   bazel run //requirements:regenerate_lock
 #
 # Resolving both pyprojects together makes this single lock the mediated
-# resolution for the whole module graph: sglang's deps, torch_tpu's deps, and
+# resolution for the whole module graph: sglang's deps (including its test
+# extra), torch_tpu's runtime deps (without its own test extra), and
 # the TPU stack pins in pyproject_tpu.toml (which satisfy torch_tpu's looser
 # bounds). MODULE.bazel then points torch_tpu's pip hub at this one hub via
 # override_repo, so there is no second lock for the TPU stack.

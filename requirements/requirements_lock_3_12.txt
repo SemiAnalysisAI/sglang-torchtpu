@@ -643,10 +643,8 @@ tiktoken==0.14.0
     #   sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
     #   lm-eval
     #   mistral-common
-timm==1.0.26
-    # via
-    #   sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
-    #   torch-tpu (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/1/pyproject.toml)
+timm==1.0.16
+    # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
 tokenizers==0.22.2
     # via
     #   sentence-transformers
