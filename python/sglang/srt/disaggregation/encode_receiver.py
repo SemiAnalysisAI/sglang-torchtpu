@@ -21,7 +21,7 @@ import uvicorn
 import zmq
 import zmq.asyncio
 from aiohttp import ClientSession, ClientTimeout
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response
 from transformers import PretrainedConfig
 
@@ -1902,16 +1902,26 @@ class MMReceiverBase(ABC):
                 daemon=True,
             )
             encode_thread.start()
+        elif mm_data:
+            # Every encoder is unregistered or evicted. Do not fall back to
+            # encoding here: a language-only server precompiles no vision
+            # buckets, so the first local ViT call recompiles and takes down
+            # the scheduler under set_stance('fail_on_recompile').
+            logger.warning(
+                f"No encoder URLs available for request {obj.rid}; "
+                "rejecting instead of encoding locally."
+            )
+            raise HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                detail=(
+                    f"No encoder is registered to embed the {len(mm_data)} "
+                    "multimodal item(s) in this request. The request was not "
+                    "run locally in language-only mode."
+                ),
+            )
         else:
-            # No encoder URLs available (bootstrap may not have any registered yet);
-            # reset the flag so the scheduler does not wait for embeddings that will
-            # never arrive.  A warning is emitted so the user can diagnose why
-            # disaggregation is not happening for this request.
-            if mm_data:
-                logger.warning(
-                    f"No encoder URLs available for request {obj.rid}; "
-                    "processing without encoder disaggregation."
-                )
+            # Nothing to dispatch; clear the flag so the scheduler does not wait
+            # for embeddings that will never arrive.
             obj.need_wait_for_mm_inputs = False
 
     def _sync_fail_info_across_tp(self, waiting_req: WaitingImageRequest) -> None:
