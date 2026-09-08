@@ -54,6 +54,7 @@ class AccuracyTestParams:
     # feeds dashboards, so only declared gates are ever plotted; the backends' own
     # dump_metric calls stay as stored-but-unplotted detail.
     metric_labels: Optional[dict] = None
+    num_shots: Optional[int] = None  # few-shot count; None = run_eval's default
     # Report a completed score without comparing it to a quality floor.
     report_only: bool = False
 
@@ -192,6 +193,7 @@ def _run_simple_eval(
     dataset: str,
     num_examples: Optional[int] = None,
     num_threads: Optional[int] = None,
+    num_shots: Optional[int] = None,
     max_tokens: Optional[int] = None,
     return_latency: bool = False,
     thinking_mode: Optional[str] = None,
@@ -217,6 +219,9 @@ def _run_simple_eval(
             num_examples=num_examples,
             num_threads=num_threads or 1024,
         )
+
+        if num_shots is not None:
+            args.num_shots = num_shots
 
         if api is not None:
             args.api = api
@@ -586,6 +591,7 @@ def _dispatch_eval(
         dataset=params.dataset,
         num_examples=params.num_examples,
         num_threads=params.num_threads,
+        num_shots=params.num_shots,
         max_tokens=params.max_tokens,
         return_latency=params.return_latency,
         thinking_mode=params.thinking_mode,
