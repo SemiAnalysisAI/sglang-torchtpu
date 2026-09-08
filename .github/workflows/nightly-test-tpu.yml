@@ -51,6 +51,11 @@ on:
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
           - sh
+      test_filter:
+        description: "Substring of a single-host test file path; runs only matching tests"
+        required: false
+        default: ""
+        type: string
       update-dashboard:
         description: "Publish this run's results to the dashboard (main only)"
         required: false
@@ -81,6 +86,7 @@ jobs:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
       only: ${{ contains(fromJSON('["all","feature-validation"]'), inputs.only || 'all') && 'all' || inputs.only }}
+      test_filter: ${{ inputs.test_filter || '' }}
     permissions:
       contents: read
       id-token: write
