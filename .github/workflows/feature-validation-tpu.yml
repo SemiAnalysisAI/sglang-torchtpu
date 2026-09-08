@@ -41,6 +41,11 @@ on:
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
           - sh
+      test_filter:
+        description: "Substring of a single-host test file path; runs only matching tests"
+        required: false
+        default: ""
+        type: string
       update-dashboard:
         description: "Publish this run's results to the dashboard (main only)"
         required: false
@@ -57,6 +62,10 @@ on:
         default: all
         type: string
       image:
+        required: false
+        default: ""
+        type: string
+      test_filter:
         required: false
         default: ""
         type: string
@@ -99,10 +108,28 @@ jobs:
         with:
           ref: ${{ inputs.ref || 'main' }}
       - id: tests
+        env:
+          # Read through env rather than inline interpolation so a filter string
+          # cannot break out of the shell command.
+          TEST_FILTER: ${{ inputs.test_filter }}
+          UPDATE_DASHBOARD: ${{ inputs.update-dashboard }}
         run: |
           set -euo pipefail
+          # A filtered run is a partial nightly, and ingestion replaces the
+          # datapoints for a (run_id, attempt) -- publishing one would overwrite
+          # the trend with a subset. Mutually exclusive by construction.
+          if [ -n "$TEST_FILTER" ] && [ "$UPDATE_DASHBOARD" = "true" ]; then
+            echo "::error::test_filter cannot be combined with update-dashboard"
+            exit 1
+          fi
           discover_files='python3 .github/tpu-ci/discover_files.py'
-          echo "single_host=$(python3 .github/tpu-ci/discover_tests.py --suite nightly-tpu-4-v7 --nightly)" >> "$GITHUB_OUTPUT"
+          single_host=$(python3 .github/tpu-ci/discover_tests.py --suite nightly-tpu-4-v7 --nightly)
+          if [ -n "$TEST_FILTER" ]; then
+            single_host=$(printf '%s' "$single_host" \
+              | python3 .github/tpu-ci/filter_tests.py --filter "$TEST_FILTER")
+            echo "test_filter=$TEST_FILTER kept: $single_host"
+          fi
+          echo "single_host=$single_host" >> "$GITHUB_OUTPUT"
           echo "pd_pc_offload=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py)" >> "$GITHUB_OUTPUT"
           echo "pd_tp_reshard=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_tp_resharding.py)" >> "$GITHUB_OUTPUT"
           echo "pd_singlehost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py)" >> "$GITHUB_OUTPUT"
