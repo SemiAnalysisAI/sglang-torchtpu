@@ -133,11 +133,16 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
+                # Over the wave the last stage sends the previous outputs after
+                # it has queued this forward: the send copies them off the
+                # device, and the copy then overlaps the forward.
+                defer_send = self._pp_wave is not None and self.pp_group.is_last_rank
                 if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
+                            defer_send=defer_send,
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
@@ -149,6 +154,8 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                if defer_send and get_parallel().pp_async_batch_depth > 0:
+                    self._pp_send_deferred_output(next_first_rank_mb_id)
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -157,7 +164,10 @@ class SchedulerPPMixin:
                         )
                     )
                 if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
+                    # Over the wave the ring delivers host tensors, so there
+                    # is no copy of this batch's outputs to wait for.
+                    if self._pp_wave is None:
+                        d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
@@ -991,6 +1001,8 @@ class SchedulerPPMixin:
         self: Scheduler,
         next_first_rank_mb_id: int,
         next_mb_id: int,
+        *,
+        defer_send: bool = False,
     ) -> Tuple[
         Optional[PPProxyTensors],
         Optional[GenerationBatchResult],
@@ -1009,8 +1021,20 @@ class SchedulerPPMixin:
             self.mb_metadata,
             self.last_rank_comm_queue,
             self.pp_outputs,
+            defer_send=defer_send,
         )
         return next_pp_outputs, next_batch_result, d2h_event
+
+    def _pp_send_deferred_output(self: Scheduler, next_first_rank_mb_id: int) -> None:
+        """The ring send skipped by ``defer_send``, issued after the forward
+        launch so the copy of the previous outputs off the device overlaps
+        the forward just queued."""
+        self.send_output_work = self._pp_send_output_to_next_stage(
+            next_first_rank_mb_id,
+            self.mbs,
+            self.last_rank_comm_queue,
+            self.pp_outputs,
+        )
 
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
@@ -1271,6 +1295,7 @@ class SchedulerPPMixin:
         mb_metadata: List[PPBatchMetadata],
         last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]],
         pp_outputs: PPProxyTensors | None,
+        defer_send: bool = False,
     ) -> Tuple[
         Optional[PPProxyTensors],
         Optional[GenerationBatchResult],
@@ -1324,7 +1349,9 @@ class SchedulerPPMixin:
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
 
-        if send_first:
+        if defer_send:
+            _do_recv()
+        elif send_first:
             send_output_work = _do_send()
             _do_recv()
         else:

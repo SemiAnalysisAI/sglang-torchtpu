@@ -698,7 +698,15 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             # EXTEND and DRAFT_EXTEND use current lengths.
             assert forward_batch.extend_seq_lens is not None
             kv_lens = forward_batch.seq_lens.to(torch.int32)
-            extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
+            # The host copy exists whenever the batch was built from host
+            # lists; reading the device copy back would wait for every
+            # program queued before it (the previous forward included).
+            if forward_batch.extend_seq_lens_cpu is not None:
+                extend_seq_lens = torch.tensor(
+                    forward_batch.extend_seq_lens_cpu[:bs], dtype=torch.int32
+                )
+            else:
+                extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
         else:
             kv_lens = forward_batch.seq_lens.to(torch.int32)
             if (
