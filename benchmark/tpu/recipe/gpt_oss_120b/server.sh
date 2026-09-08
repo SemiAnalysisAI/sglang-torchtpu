@@ -16,12 +16,12 @@ OSL=${OSL:-1024}
 CONCUR=${CONCUR:-64}
 
 export MODEL=${MODEL:-openai/gpt-oss-120b}
-export TP_SIZE=8
+export TP_SIZE=${TP_SIZE-8}
 # 128 experts / 8 = 16 local experts per rank. EP (not TP) for the experts:
 # the TPU MXFP4 path dequantizes each expert to bf16 in gmm_v2's (E, K, N)
 # layout, and TP-sharding intermediate_size=2880 across 8 ranks (360/rank)
 # neither matches the MXFP4 32-element block nor the MXU's 128 lane tile.
-export EP_SIZE=8
+export EP_SIZE=${EP_SIZE-8}
 
 # The SparseCore ragged-gather MoE path (default ON) cannot be lowered for
 # GPT-OSS: ragged_gather_v2's pltpu.async_copy indexer needs a static row count,

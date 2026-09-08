@@ -87,7 +87,7 @@ MODEL_CONFIG = {
     # Cosmetic, free to change at will -- the split from `id` is what makes a
     # display rename a non-event for the trend.
     "display_name": "GPT-OSS 120B",
-    "variant": "TP8+EP8",
+    "variant": "PP8",
     "launch": {
         # server.sh's own sample usage is `ISL=8192 OSL=1024 CONCUR=N ./server.sh`
         # -- it derives context, prefill chunk, KV pool and compile buckets from
@@ -112,7 +112,11 @@ MODEL_CONFIG = {
         "recipe": "recipe/gpt_oss_120b/server.sh",
         "env": {
             "MODEL": WEIGHTS,
-            "EXTRA_ARGS": f"--served-model-name {MODEL}",
+            "EXTRA_ARGS": f"--served-model-name {MODEL} --tpu-compile-tracer dynamo",
+            "TP_SIZE": "1",
+            "EP_SIZE": "",
+            "PP_SIZE": "8",
+            "PP_MAX_MICRO_BATCH_SIZE": "4",
             "ISL": str(ISL),
             "OSL": str(OSL),
             "CONCUR": str(CONCUR),
