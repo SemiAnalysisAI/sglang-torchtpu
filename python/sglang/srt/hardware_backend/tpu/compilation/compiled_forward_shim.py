@@ -25,6 +25,7 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     PowerBucketer,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
@@ -644,10 +645,9 @@ class CompiledForwardShim:
                 "backend; only output (next-token) logprobs are served by "
                 "default."
             )
-        server_args = self.policy.model_runner.server_args
-        # Read off server_args rather than get_attention_dp_size(), which
-        # asserts on process-global state that only a live DP server sets.
-        attn_dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
+        parallel = get_parallel()
+        # get_attention_dp_size() asserts on live DP state; read the parallel leaves.
+        attn_dp_size = parallel.dp_size if parallel.enable_dp_attention else 1
         # _attach_input_logprobs re-runs the LogitsProcessor, whose logits path
         # enters the attention-TP/DP collectives. Wanting input logprobs is a
         # property of the local batch, so under DP attention a rank holding
@@ -663,7 +663,7 @@ class CompiledForwardShim:
             )
         # Non-final pipeline stages return PPProxyTensors, which carries no
         # hidden states for the gather to read.
-        if server_args.pp_size > 1:
+        if parallel.pp_size > 1:
             return (
                 "input/prompt logprobs are not supported with pipeline "
                 "parallelism (pp_size > 1): non-final stages return "
@@ -857,7 +857,8 @@ def build_bucketers(
             name="TokenBucketer", min_val=64, max_val=max_t, power=2
         )
 
-    bs_paddings = server_args.tpu_compile_bs
+    # tpu_compile_bs is reconciled in resolution; read the resolved leaf.
+    bs_paddings = get_exec().graph.tpu_compile_bs
     if bs_paddings:
         bs_bucketer: Bucketer = Bucketer(
             name="BatchSizeBucketer", buckets=list(bs_paddings)

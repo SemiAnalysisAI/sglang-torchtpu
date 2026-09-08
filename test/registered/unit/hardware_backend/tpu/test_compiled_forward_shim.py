@@ -42,6 +42,7 @@ from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagl
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.runtime_context import get_context, get_exec
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -253,14 +254,13 @@ class TestPadForwardBatchInputs(CustomTestCase):
         t_bucketer = _bucketer("Token", [16, 64, 128])
         b_bucketer = _bucketer("Bs", [16, 32, 64])
         policy = DecoderTpuCompilePolicy(
-            model_runner=SimpleNamespace(
-                server_args=SimpleNamespace(enable_mixed_chunk=True)
-            ),
             t_bucketer=t_bucketer,
             b_bucketer=b_bucketer,
         )
         policy.extend_bs = 16
-        precompiled_shapes = set(policy._extend_compile_shapes())
+        # _extend_compile_cases reads enable_mixed_chunk off the schedule bag.
+        with get_context().override_server_args(enable_mixed_chunk=True):
+            precompiled_shapes = set(policy._extend_compile_shapes())
 
         for real_q in (1, 16, 17, 64, 65, 128):
             for real_b in (1, 16, 17, 32, 33, 64):
@@ -690,20 +690,24 @@ class TestCompiledForwardShim(CustomTestCase):
 
 
 class TestBuildBucketers(CustomTestCase):
+    """tpu_compile_bs is read off exec.graph, so the case publishes its config."""
+
+    def setUp(self):
+        super().setUp()
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
     @staticmethod
-    def _server_args(tpu_compile_tokens=None, tpu_compile_bs=None):
-        return SimpleNamespace(
-            tpu_compile_tokens=tpu_compile_tokens,
-            tpu_compile_bs=tpu_compile_bs,
-        )
+    def _server_args(tpu_compile_tokens=None):
+        # Only what production still reads off the handed record.
+        return SimpleNamespace(tpu_compile_tokens=tpu_compile_tokens)
 
     def test_uses_user_buckets_as_plain_bucketer(self):
         # User list yields a plain Bucketer (not the PowerBucketer fallback).
-        sa = self._server_args(
-            tpu_compile_tokens=[64, 512, 2048],
-            tpu_compile_bs=[1, 4, 16],
-        )
-        t_b, b_b = build_bucketers(sa, max_t=2048, max_b=16)
+        sa = self._server_args(tpu_compile_tokens=[64, 512, 2048])
+        with get_exec().graph.override(tpu_compile_bs=[1, 4, 16]):
+            t_b, b_b = build_bucketers(sa, max_t=2048, max_b=16)
         self.assertEqual(t_b.buckets, [64, 512, 2048])
         self.assertEqual(b_b.buckets, [1, 4, 16])
         self.assertIsInstance(t_b, Bucketer)
@@ -711,11 +715,9 @@ class TestBuildBucketers(CustomTestCase):
 
     def test_explicit_buckets_used_verbatim(self):
         # Explicit lists are trusted as-is; out-of-range runtime shapes raise.
-        sa = self._server_args(
-            tpu_compile_tokens=[64, 512],
-            tpu_compile_bs=[1, 2],
-        )
-        t_b, b_b = build_bucketers(sa, max_t=2048, max_b=16)
+        sa = self._server_args(tpu_compile_tokens=[64, 512])
+        with get_exec().graph.override(tpu_compile_bs=[1, 2]):
+            t_b, b_b = build_bucketers(sa, max_t=2048, max_b=16)
         self.assertEqual(t_b.buckets, [64, 512])
         self.assertEqual(b_b.buckets, [1, 2])
 
@@ -1059,18 +1061,14 @@ class TestHiCacheReloadGate(CustomTestCase):
         counter.wait.assert_not_called()
 
 
-def _policy(model, *, pp_size=1, dp_size=1, enable_dp_attention=False):
-    """Policy whose model_runner exposes just what the shim reads."""
+def _policy(model):
+    """Policy whose model_runner exposes just what the shim reads; the topology
+    is published (``_publish_topology``), not injected."""
     policy = DecoderTpuCompilePolicy()
     policy.model_runner = SimpleNamespace(
         model=model,
         # Read by the HiCache reload gate on every eager call.
         token_to_kv_pool=SimpleNamespace(layer_transfer_counter=None),
-        server_args=SimpleNamespace(
-            pp_size=pp_size,
-            dp_size=dp_size,
-            enable_dp_attention=enable_dp_attention,
-        ),
     )
     return policy
 
@@ -1162,6 +1160,21 @@ class TestPinFields(CustomTestCase):
 class TestShimInputLogprobPath(CustomTestCase):
     """Presents FULL capture to the graph and gathers logprobs eagerly."""
 
+    def setUp(self):
+        super().setUp()
+        # The gate reads the parallel bag per forward; publish a single-rank server.
+        self._publish_topology()
+
+    def _publish_topology(self, *, pp_size=1, dp_size=1, enable_dp_attention=False):
+        """Publish the topology the prompt-logprob gate reads, for this test."""
+        override = get_context().override_server_args(
+            pp_size=pp_size,
+            dp_size=dp_size,
+            enable_dp_attention=enable_dp_attention,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
     @staticmethod
     def _fb(mode="extend", return_logprob=True, starts=(0, 0)):
         return SimpleNamespace(
@@ -1181,7 +1194,16 @@ class TestShimInputLogprobPath(CustomTestCase):
             _tpu_real_b=2,
         )
 
-    def _shim(self, seen, *, model=None, enabled=True, pp_size=1, **policy_kw):
+    def _shim(
+        self,
+        seen,
+        *,
+        model=None,
+        enabled=True,
+        pp_size=1,
+        dp_size=1,
+        enable_dp_attention=False,
+    ):
         def compiled(input_ids, positions, forward_batch, *a, **kw):
             # Snapshot what the graph actually sees.
             seen["capture_hidden_mode"] = forward_batch.capture_hidden_mode
@@ -1192,13 +1214,18 @@ class TestShimInputLogprobPath(CustomTestCase):
                 hidden_states=torch.zeros(8, 5),
             )
 
+        # The gate reads the topology when the shim is called, so this stays installed.
+        self._publish_topology(
+            pp_size=pp_size,
+            dp_size=dp_size,
+            enable_dp_attention=enable_dp_attention,
+        )
+
         # Constructed inside the override on purpose: the flag decides which
         # extend variant warmup compiled, so the shim reads it once and cannot
         # honour a later change.
         with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(enabled):
-            return CompiledForwardShim(
-                compiled, policy=_policy(model, pp_size=pp_size, **policy_kw)
-            )
+            return CompiledForwardShim(compiled, policy=_policy(model))
 
     def test_graph_sees_full_capture_and_no_logprob_request(self):
         seen, fb = {}, self._fb()

@@ -46,8 +46,9 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             1, self.num_pages + 1, dtype=torch.int32, device="cpu"
         )
         self.release_pages = torch.empty((0,), dtype=torch.int32, device="cpu")
-        self.is_not_in_free_group = True
-        self.free_group = []
+        # None outside a free_group_begin()/free_group_end() pair, as in the parent.
+        self.free_group = None
+        self.free_page_reps_group = []
 
     def alloc(self, need_size: int):
         # Page-aligned bulk allocation, returns contiguous device indices.

@@ -43,7 +43,9 @@ class TestSchedulerInternalStateEnvVars(unittest.TestCase):
         )
         scheduler.draft_worker = None
 
-        with get_context().override_server_args():
+        with get_context().override_server_args() as server_args:
+            # Built with __new__: wire server_args to the published instance so fields and bags agree.
+            scheduler.server_args = server_args
             output = scheduler.get_internal_state(recv_req=GetInternalStateReq())
 
         return output.internal_state

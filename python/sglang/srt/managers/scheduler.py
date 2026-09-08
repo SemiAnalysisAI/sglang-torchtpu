@@ -1051,7 +1051,7 @@ class Scheduler(
         # Independent DP groups repeat distributed ranks but run identical model
         # replicas. DP0 writes their shared bundles; DP-attention ranks are unique.
         if save_bundle_dir is not None and (
-            self.server_args.enable_dp_attention or self.ps.dp_rank in (None, 0)
+            self.enable_dp_attention or self.ps.dp_rank in (None, 0)
         ):
             torch_compile_bundle.save(bundle_path)
 
@@ -4471,10 +4471,10 @@ class Scheduler(
         if model_runner.device != "tpu":
             # Only enable this for tpu
             return
-        if not model_runner.server_args.enable_torch_compile:
+        if not get_exec().graph.enable_torch_compile:
             return
         if (
-            model_runner.server_args.speculative_algorithm is not None
+            get_spec().speculative_algorithm is not None
             and envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.get()
         ):
             logger.info(
@@ -4789,7 +4789,7 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
-        if self.server_args.enable_torch_compile:
+        if get_exec().graph.enable_torch_compile:
             counters = torch._dynamo.utils.counters
             ret["torch_compile_dynamo_frames"] = counters["frames"]["total"]
             ret["torch_compile_aot_autograd_graphs"] = counters["aot_autograd"]["total"]

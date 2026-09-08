@@ -39,10 +39,15 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_parallel,
+    get_schedule,
+    max_prefill_buffer_tokens,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = get_logger(__name__)
@@ -349,8 +354,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         assert self.b_bucketer is not None
 
         mode_caps = [(ForwardMode.EXTEND, self._extend_compile_cap())]
-        server_args = getattr(self.model_runner, "server_args", None)
-        if getattr(server_args, "enable_mixed_chunk", False):
+        if get_schedule().enable_mixed_chunk:
             mode_caps.append(
                 (
                     ForwardMode.MIXED,
@@ -431,15 +435,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # max_t is the largest flattened EXTEND token dimension compiled for one
         # scheduled batch. It sums tokens across requests, so a per-request
         # context length must not cap it.
-        max_t = server_args.max_prefill_buffer_tokens() or max(
-            server_args.max_prefill_tokens or 0,
+        max_t = max_prefill_buffer_tokens() or max(
+            get_schedule().max_prefill_tokens or 0,
             self.model_runner.model_config.context_len,
         )
         # max_b is the reconciled compile-batch ceiling, already grown to cover
         # scheduler concurrency in ServerArgs.__post_init__ via
         # reconcile_tpu_batch_limits, so the grid covers every decode batch the
         # scheduler can form (Task #40).
-        max_b = server_args.torch_compile_max_bs
+        max_b = get_exec().graph.torch_compile_max_bs
         t_bucketer, b_bucketer = build_bucketers(server_args, max_t=max_t, max_b=max_b)
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
@@ -791,8 +795,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def precompile(self) -> None:
         """Warm decoder graphs for this policy's bucket grid."""
         overall = time.perf_counter()
-        server_args: ServerArgs = self.model_runner.server_args
-        disagg_mode = server_args.disaggregation_mode
+        disagg_mode = get_disagg().disaggregation_mode
         if disagg_mode != "decode":
             self._precompile_extend()
         if disagg_mode != "prefill":
@@ -1011,7 +1014,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """
         from sglang.srt.layers.dp_attention import DpPaddingMode
 
-        dp_size = self.model_runner.server_args.dp_size
+        dp_size = get_parallel().dp_size
         device = self.model_runner.device
         global_num_tokens = [num_tokens] * dp_size
         forward_batch.dp_padding_mode = DpPaddingMode.MAX_LEN
@@ -1186,7 +1189,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 bs,
                 tokens_per_req,
                 device=device,
-                page_size=self.model_runner.server_args.page_size,
+                page_size=get_schedule().page_size,
                 out_cache_loc_dtype=self._dummy_out_cache_loc_dtype(mode),
             )
         return _DummyForwardBatchFields.default(

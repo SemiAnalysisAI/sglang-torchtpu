@@ -42,6 +42,7 @@ from sglang.srt.hardware_backend.tpu.ray_utils import (
     redact_env_for_log,
     tpu_actor_runtime_env,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -361,11 +362,24 @@ class TestActorOptions(CustomTestCase):
     into the actor's os.environ. Worker bootstrap then reads them while setting
     rank state, preparing the remaining TPU environment, and applying the
     process-local runtime patches.
+
+    The device is resolved config: the driver builds these options after
+    ``_launch_subprocesses`` published, so ``_actor_options`` reads the
+    ``device`` bag and the cases publish it rather than injecting it on the
+    stand-in (which production would never consult). The stand-in still carries
+    the launcher-stashed TPU env fields -- those travel to
+    ``tpu_actor_runtime_env`` as a whole object.
     """
+
+    def _publish_device(self, device):
+        override = get_context().override_server_args(device=device)
+        override.install()
+        self.addCleanup(override.restore)
 
     def test_gpu_options_byte_identical(self):
         from sglang.srt.ray.engine import _actor_options
 
+        self._publish_device("cuda")
         self.assertEqual(
             _actor_options(_server_args(device="cuda")),
             {"num_cpus": 0, "num_gpus": 1},
@@ -377,6 +391,7 @@ class TestActorOptions(CustomTestCase):
 
         # No TPU env stashed + empty driver env -> tpu_actor_runtime_env forwards
         # nothing and injects nothing, so no runtime_env key.
+        self._publish_device("tpu")
         self.assertEqual(
             _actor_options(_server_args(device="tpu")),
             {"num_cpus": 0, "num_gpus": 0, "resources": {"TPU": 1}},
@@ -386,6 +401,7 @@ class TestActorOptions(CustomTestCase):
     def test_tpu_options_merge_runtime_env(self):
         from sglang.srt.ray.engine import _actor_options
 
+        self._publish_device("tpu")
         opts = _actor_options(
             _server_args(device="tpu", tpu_worker_hostnames="ipA,ipB")
         )

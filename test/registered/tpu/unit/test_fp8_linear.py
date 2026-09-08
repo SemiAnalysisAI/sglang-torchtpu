@@ -5,7 +5,6 @@ from sglang.test.ci.ci_register import register_tpu_ci
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
 import unittest
-from types import SimpleNamespace
 
 import torch
 
@@ -18,7 +17,7 @@ from sglang.srt.hardware_backend.tpu.fp8_moe import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
-from sglang.srt.server_args import set_global_server_args_for_scheduler
+from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -30,9 +29,10 @@ class _FakeBlockFp8Config:
 
 class TestTpuFp8Linear(CustomTestCase):
     def setUp(self):
-        set_global_server_args_for_scheduler(
-            SimpleNamespace(tpu_fp8_runtime="blockwise")
-        )
+        # publish() resolves the record; seed the leaf through the context.
+        override = get_context().override_server_args(tpu_fp8_runtime="blockwise")
+        override.install()
+        self.addCleanup(override.restore)
 
     def test_fp8_linear_runs_eager_and_compiled(self):
         device = torch.device("tpu")

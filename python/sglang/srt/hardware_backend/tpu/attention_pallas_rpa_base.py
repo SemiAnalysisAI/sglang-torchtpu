@@ -44,6 +44,7 @@ from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_expor
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -374,7 +375,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 "RPA context capacity exceeds the request-to-token table width: "
                 f"required={self.max_context_len}, available={req_to_token_width}."
             )
-        max_bs = getattr(model_runner.server_args, "torch_compile_max_bs", None)
+        max_bs = get_exec().graph.torch_compile_max_bs
         if max_bs:
             pages_per_seq = _get_pages_per_seq(self.max_context_len, self.page_size)
             table_bytes = _page_table_smem_bytes(max_bs, pages_per_seq)

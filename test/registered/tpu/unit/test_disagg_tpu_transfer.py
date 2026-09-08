@@ -1548,7 +1548,8 @@ class TestPrepareForPrebuiltTpuPadding(CustomTestCase):
                 self.model_config = SimpleNamespace(vocab_size=32000)
 
                 req = SimpleNamespace()
-                req.req_pool_idx = 1
+                # prepare_for_prebuilt reads the pool row off the request's KV state.
+                req.kv = SimpleNamespace(req_pool_idx=1)
                 req.prefix_indices = list(range(10))
                 req.get_fill_ids = lambda: array("q", range(110))
                 req.extend_range = Range(10, 110)  # length = 100

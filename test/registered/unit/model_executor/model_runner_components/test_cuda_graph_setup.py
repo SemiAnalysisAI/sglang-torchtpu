@@ -3,6 +3,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     _align_pipeline_layers,
@@ -10,7 +15,7 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     has_standard_gqa_for_all_local_layers,
     index_attention_layers_by_global_id,
 )
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_context, get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -138,13 +143,7 @@ def test_pd_prefill_target_skip_is_cuda_only(monkeypatch, device, expect_runner)
         is_draft_worker=False,
         spec_algorithm=SimpleNamespace(is_speculative=lambda: True),
         decode_num_tokens_per_req=lambda: 2,
-        server_args=SimpleNamespace(
-            model_impl="auto",
-            disaggregation_mode="prefill",
-            cuda_graph_config=SimpleNamespace(
-                decode=SimpleNamespace(backend="disabled")
-            ),
-        ),
+        server_args=SimpleNamespace(model_impl="auto"),
     )
     monkeypatch.setattr(cuda_graph_setup, "get_available_gpu_memory", lambda *_: 10.0)
     monkeypatch.setattr(
@@ -157,8 +156,13 @@ def test_pd_prefill_target_skip_is_cuda_only(monkeypatch, device, expect_runner)
         lambda: StubGraphRunner,
     )
 
-    with get_flags().capture.override(enable_torch_compile=True):
-        capture = capture_decode_graph(model_runner=model_runner)
+    # capture_decode_graph reads disaggregation_mode off the disagg bag; publish it.
+    with get_context().override_server_args(
+        disaggregation_mode="prefill",
+        cuda_graph_config=CudaGraphConfig(decode=PhaseConfig(backend=Backend.DISABLED)),
+    ):
+        with get_flags().capture.override(enable_torch_compile=True):
+            capture = capture_decode_graph(model_runner=model_runner)
 
     assert isinstance(capture.runner, StubGraphRunner) is expect_runner
 

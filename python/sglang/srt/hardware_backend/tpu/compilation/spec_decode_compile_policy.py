@@ -26,8 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = get_logger(__name__)
@@ -56,13 +55,13 @@ class BaseSpecDecodeCompilePolicyMixin:
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        server_args: ServerArgs = self.model_runner.server_args
-        self.speculative_num_steps = server_args.speculative_num_steps or 0
-        self.speculative_algorithm = server_args.speculative_algorithm
+        spec = get_spec()
+        self.speculative_num_steps = spec.speculative_num_steps or 0
+        self.speculative_algorithm = spec.speculative_algorithm
         self.is_draft_worker = self.model_runner.is_draft_worker
 
         # Draft tokens verified per request = the TARGET_VERIFY width.
-        self.draft_token_num = server_args.speculative_num_draft_tokens or (
+        self.draft_token_num = spec.speculative_num_draft_tokens or (
             self.speculative_num_steps + 1 if self.speculative_num_steps else 0
         )
 
@@ -78,7 +77,7 @@ class BaseSpecDecodeCompilePolicyMixin:
         # A PD prefill pool has no SpeculativeState, so a TARGET_VERIFY dummy
         # forward would trip the backend's pool-type assert; a PD decode server
         # never runs prefill.
-        disagg_mode = self.model_runner.server_args.disaggregation_mode
+        disagg_mode = get_disagg().disaggregation_mode
         if disagg_mode != "prefill":
             self._precompile_target_verify()
         if disagg_mode != "decode":

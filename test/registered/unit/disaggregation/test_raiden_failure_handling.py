@@ -227,6 +227,9 @@ def _decode_manager_stub(**overrides):
         _failed=set(),
         _native_failed=set(),
         room_has_active_io=lambda room: False,
+        # _check_waiting_timeout takes the manager's connection lock.
+        connection_lock=threading.Lock(),
+        connection_pool={},
     )
     fields.update(overrides)
     mgr = SimpleNamespace(**fields)
@@ -253,6 +256,7 @@ def _receiver(mgr):
     recv.conclude_state = None
     recv.abort_notified = False
     recv.bootstrap_infos = [{"rank_ip": "10.0.0.1", "rank_port": 4444}]
+    recv._connection_pool_entries = {}
     recv._started = False
     recv.init_time = None
     return recv
@@ -714,7 +718,6 @@ class TestGroupFailureDrainGate(unittest.TestCase):
                 tp_group,
                 decode_reqs=[object()],
                 metadata_buffers=object(),
-                server_args=object(),
                 additional_groups=[cp_group],
             )
 

@@ -19,6 +19,7 @@ from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
     RPA_BATCHED_SPEC,
     kv_layout,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -43,12 +44,10 @@ class TestKvLayoutSelection(CustomTestCase):
         )
         from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 
-        sa = types.SimpleNamespace(attention_backend="pallas_tpu_rpa_batched")
-        import sglang.srt.server_args as server_args_mod
-
-        original = server_args_mod.get_global_server_args
-        server_args_mod.get_global_server_args = lambda: sa
-        try:
+        # get_mha_kv_pool_cls reads the exec bag; publish the backend.
+        with get_context().override_server_args(
+            attention_backend="pallas_tpu_rpa_batched"
+        ):
             self.assertIs(
                 TpuSRTPlatform().get_mha_kv_pool_cls(), TpuFusedMHATokenToKVPool
             )
@@ -56,19 +55,22 @@ class TestKvLayoutSelection(CustomTestCase):
                 self.assertIs(
                     TpuSRTPlatform().get_mha_kv_pool_cls(), TpuSeqAlongLaneKVPool
                 )
-        finally:
-            server_args_mod.get_global_server_args = original
 
 
 class TestPageSizeFloor(CustomTestCase):
     """SEQ_ALONG_LANE tiles pages onto lanes, so a page must be >= the floor."""
 
     def _server_args(self, page_size):
-        # declare_late_resolution writes the fields in place, so a plain
-        # namespace is enough -- it only refuses the *published* config.
+        # declare_late_resolution only refuses the published config; a namespace is enough.
         return types.SimpleNamespace(
             attention_backend="pallas_tpu_rpa_batched", page_size=page_size
         )
+
+    def _resolved(self, sa, field):
+        """What resolution decided, i.e. the declaration if one was made."""
+        from sglang.srt.arg_groups.overrides import resolution_result
+
+        return resolution_result(sa, field)
 
     def test_default_is_raised_to_the_floor(self):
         from sglang.srt.hardware_backend.tpu.tpu_platform import (
@@ -77,7 +79,9 @@ class TestPageSizeFloor(CustomTestCase):
 
         sa = self._server_args(None)
         _apply_page_size_default(sa)
-        self.assertEqual(sa.page_size, RPA_BATCHED_SPEC.min_page_size)
+        self.assertEqual(
+            self._resolved(sa, "page_size"), RPA_BATCHED_SPEC.min_page_size
+        )
 
     def test_explicit_below_floor_is_rejected(self):
         from sglang.srt.hardware_backend.tpu.tpu_platform import (
@@ -94,7 +98,7 @@ class TestPageSizeFloor(CustomTestCase):
 
         sa = self._server_args(512)
         _apply_page_size_default(sa)
-        self.assertEqual(sa.page_size, 512)
+        self.assertEqual(self._resolved(sa, "page_size"), 512)
 
 
 class TestKvCacheDtypeDefault(CustomTestCase):
@@ -105,6 +109,12 @@ class TestKvCacheDtypeDefault(CustomTestCase):
             kv_cache_dtype=kv_cache_dtype, attention_backend=backend
         )
 
+    def _resolved(self, sa, field):
+        """What resolution decided, i.e. the declaration if one was made."""
+        from sglang.srt.arg_groups.overrides import resolution_result
+
+        return resolution_result(sa, field)
+
     def test_auto_becomes_fp8_for_the_rpa_backends(self):
         from sglang.srt.hardware_backend.tpu.tpu_platform import (
             _apply_kv_cache_dtype_default,
@@ -113,7 +123,7 @@ class TestKvCacheDtypeDefault(CustomTestCase):
         for backend in ("pallas_tpu_rpa_batched", "pallas_tpu_rpa_v3"):
             sa = self._server_args("auto", backend)
             _apply_kv_cache_dtype_default(sa)
-            self.assertEqual(sa.kv_cache_dtype, "fp8_e4m3", backend)
+            self.assertEqual(self._resolved(sa, "kv_cache_dtype"), "fp8_e4m3", backend)
 
     def test_backends_that_reject_fp8_keep_auto(self):
         # pallas_tpu_mla raises on an fp8 KV cache and pallas_tpu_flash has no
@@ -126,7 +136,7 @@ class TestKvCacheDtypeDefault(CustomTestCase):
         for backend in ("pallas_tpu_mla", "pallas_tpu_flash"):
             sa = self._server_args("auto", backend)
             _apply_kv_cache_dtype_default(sa)
-            self.assertEqual(sa.kv_cache_dtype, "auto", backend)
+            self.assertEqual(self._resolved(sa, "kv_cache_dtype"), "auto", backend)
 
     def test_explicit_choice_is_left_alone(self):
         from sglang.srt.hardware_backend.tpu.tpu_platform import (
@@ -136,7 +146,7 @@ class TestKvCacheDtypeDefault(CustomTestCase):
         for given in ("bf16", "fp8_e5m2"):
             sa = self._server_args(given)
             _apply_kv_cache_dtype_default(sa)
-            self.assertEqual(sa.kv_cache_dtype, given)
+            self.assertEqual(self._resolved(sa, "kv_cache_dtype"), given)
 
 
 class TestPrefillBlockSizes(CustomTestCase):

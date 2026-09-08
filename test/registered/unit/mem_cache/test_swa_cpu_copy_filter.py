@@ -1,8 +1,8 @@
 import unittest
-from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -12,8 +12,12 @@ ROWS = 4
 
 
 def _pool(chunk_size: int = ROWS) -> SWAKVPool:
+    """A composite pool whose SWA half is a real KV pool: _filter_swa_cpu_copy
+    delegates the row trimming to it, so the stand-in must be the production class."""
     pool = object.__new__(SWAKVPool)
-    pool.swa_kv_pool = SimpleNamespace(cpu_offloading_chunk_size=chunk_size)
+    swa_kv_pool = object.__new__(MHATokenToKVPool)
+    swa_kv_pool.cpu_offloading_chunk_size = chunk_size
+    pool.swa_kv_pool = swa_kv_pool
     return pool
 
 

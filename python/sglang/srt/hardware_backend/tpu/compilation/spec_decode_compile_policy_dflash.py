@@ -22,6 +22,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_disagg, get_spec
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
@@ -57,16 +58,16 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         self._compiled_kv_appender: Callable[..., None] | None = None
 
     def _infer_dflash_block_size(self) -> int:
-        """Infer DFlash block size from server_args or draft config."""
-        server_args = self.model_runner.server_args
-        if server_args.speculative_num_draft_tokens is not None:
-            return int(server_args.speculative_num_draft_tokens)
-        if server_args.speculative_draft_model_path:
+        """Infer DFlash block size from the spec config or the draft config."""
+        spec = get_spec()
+        if spec.speculative_num_draft_tokens is not None:
+            return int(spec.speculative_num_draft_tokens)
+        if spec.speculative_draft_model_path:
             try:
                 draft_model_config = ModelConfig.from_server_args(
-                    server_args,
-                    model_path=server_args.speculative_draft_model_path,
-                    model_revision=server_args.speculative_draft_model_revision,
+                    self.model_runner.server_args,
+                    model_path=spec.speculative_draft_model_path,
+                    model_revision=spec.speculative_draft_model_revision,
                     is_draft_model=True,
                 )
                 dflash_cfg = parse_dflash_draft_config(
@@ -352,7 +353,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         if dflash_worker is None:
             raise ValueError("DFlash worker cannot be None")
         overall = time.perf_counter()
-        if self.model_runner.server_args.disaggregation_mode != "prefill":
+        if get_disagg().disaggregation_mode != "prefill":
             self._precompile_draft_verify(draft_attn_backend)
         self._precompile_append_target_hidden_to_draft_kv_by_loc_tpu(dflash_worker)
         logger.info(
@@ -368,7 +369,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
     ) -> None:
         """Warm up DFlash draft KV append across token buckets and batch size buckets."""
         self._ensure_kv_appender(dflash_worker)
-        disagg_mode = self.model_runner.server_args.disaggregation_mode
+        disagg_mode = get_disagg().disaggregation_mode
         if disagg_mode != "prefill":
             self._precompile_draft_append_kv_verify()
         if disagg_mode != "decode":

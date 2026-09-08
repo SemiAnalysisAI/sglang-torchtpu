@@ -72,8 +72,13 @@ class TestTpuGraphRunner(CustomTestCase):
     """TpuGraphRunner orchestrates annotated compile policies."""
 
     def setUp(self):
-        # Publish a dummy config: init warms the CP singleton (parallel leaf read).
-        override = get_context().override_server_args()
+        # Publish a dummy config: init warms the CP singleton and policy install() reads the
+        # compile grid off the bags (chunked_prefill_size sets max_prefill_buffer_tokens to 2048).
+        override = get_context().override_server_args(
+            torch_compile_max_bs=8,
+            chunked_prefill_size=2048,
+            max_prefill_tokens=2048,
+        )
         override.install()
         self.addCleanup(override.restore)
         # Flush init's lazy imports before the torch.compile patch: their
@@ -155,6 +160,7 @@ class TestTpuGraphRunner(CustomTestCase):
         enable_torch_compile: bool = True,
         tpu_compile_tracer: str = "dynamo",
     ) -> SimpleNamespace:
+        # Only what production still reads off the handed instance.
         server_args = SimpleNamespace(
             enable_torch_compile=enable_torch_compile,
             tpu_compile_tracer=tpu_compile_tracer,
@@ -162,11 +168,7 @@ class TestTpuGraphRunner(CustomTestCase):
             unsafe_load_torch_compile_bundle=None,
             tpu_compile_tokens=None,
             tpu_compile_bs=None,
-            torch_compile_max_bs=8,
             prefill_max_requests=None,
-            chunked_prefill_size=None,
-            max_prefill_tokens=2048,
-            max_prefill_buffer_tokens=lambda: 2048,
         )
 
         # Mirror ServerArgs.override: the _can_torch_compile=False path calls it
@@ -463,6 +465,14 @@ class TestDraftTorchCompileInstall(CustomTestCase):
 
     _SETUP_MOD = "sglang.srt.model_executor.model_runner_components.cuda_graph_setup"
 
+    def setUp(self):
+        # capture_cuda_graphs reads the draft MoE backends and the symmetric-memory switch
+        # off the bags, so the case runs against a published config.
+        super().setUp()
+        override = get_context().override_server_args(moe_runner_backend="triton")
+        override.install()
+        self.addCleanup(override.restore)
+
     @staticmethod
     def _runner(device):
         return SimpleNamespace(
@@ -470,14 +480,8 @@ class TestDraftTorchCompileInstall(CustomTestCase):
             is_draft_worker=True,
             model=object(),
             model_config=SimpleNamespace(quantization=None),
-            server_args=SimpleNamespace(
-                speculative_moe_runner_backend=None,
-                moe_runner_backend="triton",
-                speculative_moe_a2a_backend=None,
-                moe_a2a_backend="none",
-                forward_hooks=[],
-                enable_symm_mem=False,
-            ),
+            # Only what production still reads off the handed record.
+            server_args=SimpleNamespace(forward_hooks=[]),
             forward_stream=None,
             canary_manager=None,
         )

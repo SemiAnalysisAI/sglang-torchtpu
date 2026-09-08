@@ -708,10 +708,10 @@ class ModelRunner:
         # recording, the metadata is never read (see expert_location_dispatch.py
         # and fused_moe_triton/layer.py which handle None).
         needs_expert_location_metadata = (
-            self.server_args.enable_eplb
-            or self.server_args.ep_dispatch_algorithm is not None
-            or self.server_args.expert_distribution_recorder_mode is not None
-            or self.server_args.init_expert_location != "trivial"
+            get_exec().moe.enable_eplb
+            or get_exec().moe.ep_dispatch_algorithm is not None
+            or get_exec().moe.expert_distribution_recorder_mode is not None
+            or get_exec().moe.init_expert_location != "trivial"
         )
         set_global_expert_location_metadata(
             compute_initial_expert_location_metadata(

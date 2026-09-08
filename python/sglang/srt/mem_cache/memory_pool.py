@@ -2407,22 +2407,24 @@ class MHATokenToKVPool(KVCache):
     def filter_cpu_copy(self, kv_cache_cpu, row_mask: torch.Tensor):
         """Keep only the rows of a `get_cpu_copy` payload selected by ``row_mask``.
 
-        Each layer's chunks are ``[K, V]`` pairs sharing the token axis; K and
-        V are masked separately and re-split into ``cpu_offloading_chunk_size``
-        chunks, the format `load_cpu_copy` reads.
-        """
+        Every tensor a chunk carries is masked (``[K, V]`` here, ``[K, V, k_scale,
+        v_scale]`` for the MXFP8 subclass) and re-split into
+        ``cpu_offloading_chunk_size`` chunks, the format `load_cpu_copy` reads."""
         chunk_size = self.cpu_offloading_chunk_size
         filtered = []
         for layer_chunks in kv_cache_cpu:
             if len(layer_chunks) == 0:
                 filtered.append([])
                 continue
-            k_cpu = torch.cat([chunk[0] for chunk in layer_chunks], dim=0)[row_mask]
-            v_cpu = torch.cat([chunk[1] for chunk in layer_chunks], dim=0)[row_mask]
+            num_tensors = len(layer_chunks[0])
+            tensors = [
+                torch.cat([chunk[t] for chunk in layer_chunks], dim=0)[row_mask]
+                for t in range(num_tensors)
+            ]
             filtered.append(
                 [
-                    [k_cpu[i : i + chunk_size], v_cpu[i : i + chunk_size]]
-                    for i in range(0, len(k_cpu), chunk_size)
+                    [t[i : i + chunk_size] for t in tensors]
+                    for i in range(0, len(tensors[0]), chunk_size)
                 ]
             )
         return filtered

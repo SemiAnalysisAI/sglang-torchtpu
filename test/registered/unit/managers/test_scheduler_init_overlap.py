@@ -179,12 +179,13 @@ class TestLaunchBatchSampleStreamGating(CustomTestCase):
         s = self._make_self(use_overlap_streams=False)
         br = self._make_batch_result()
 
-        Scheduler.launch_batch_sample_if_needed(
-            s, br, self._make_cur_batch()
-        )  # must not raise
+        cur_batch = self._make_cur_batch()
+        Scheduler.launch_batch_sample_if_needed(s, br, cur_batch)  # must not raise
 
         br.copy_to_cpu.assert_called_once()
-        s._relay_forward_payload.assert_called_once_with(br.future_indices, br)
+        s._relay_forward_payload.assert_called_once_with(
+            cur_batch, br.future_indices, br
+        )
         self.assertIsNone(br.delay_sample_func)  # closure released
 
     def test_multi_stream_waits_on_schedule_stream(self):

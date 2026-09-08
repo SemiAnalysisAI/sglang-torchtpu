@@ -48,6 +48,7 @@ from sglang.srt.hardware_backend.tpu.raiden_transfer import (
     CombinedFutureEvent,
     RaidenFutureEvent,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -153,7 +154,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             enable_hisparse=False,
             sliding_window_size=4096,
             model_config=model_config,
-            server_args=SimpleNamespace(disaggregation_ib_device="mlx5_0"),
+            server_args=SimpleNamespace(),
         )
         queue.token_to_kv_pool = _KVPool()
         queue.draft_token_to_kv_pool = _DraftKVPool()
@@ -173,10 +174,13 @@ class TestRaidenHostPoolPaging(CustomTestCase):
                 side_effect=_get_kv_class,
             ),
             patch("sglang.srt.disaggregation.decode.setup_state_kv_args"),
+            # _init_kv_manager reads the IB device off the disagg bag; publish it.
+            get_context().override_server_args(disaggregation_ib_device="mlx5_0"),
         ):
             queue._init_kv_manager()
 
         kv_args = captured["kv_args"]
+        self.assertEqual(kv_args.ib_device, "mlx5_0")
         self.assertEqual(kv_args.page_size, 128)
         self.assertEqual(kv_args.sliding_window_size, 4096)
         self.assertEqual(kv_args.kv_head_num, 4)

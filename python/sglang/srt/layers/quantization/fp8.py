@@ -82,6 +82,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_platform,
 )
@@ -139,9 +140,7 @@ _use_aiter_a8w4 = get_bool_env_var("AITER_FORCE_A8W4", "false")
 
 
 def _get_tpu_fp8_runtime() -> str:
-    from sglang.srt.server_args import get_global_server_args
-
-    return get_global_server_args().tpu_fp8_runtime
+    return get_exec().kernel.tpu_fp8_runtime
 
 
 def _clear_replaced_param(module: Module, name: str) -> None:

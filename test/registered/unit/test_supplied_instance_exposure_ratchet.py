@@ -136,36 +136,15 @@ _PASSED = frozenset({"model_path", "device", "random_seed"})
 
 # Upstream migrated every launcher/reader in its own tree to read the resolved
 # declarations (`resolving_view`), so its supplied-instance surface is empty.
-# What remains is the fork's own surface: TPU platform code and a few
-# HiCache-offload readers still read `server_args.<field>` directly for a
-# resolution-written field, so those pairs stay pinned here.
+# What remains is the fork's own surface: readers that still take a resolution-written
+# field off server_args. apply_server_args_defaults reads resolving_view(server_args);
+# _resolve_num_hidden_layers still reads model_path off the record.
 _EXPOSED: frozenset = frozenset(
     {
         # TPU fork surface
-        ("hardware_backend/tpu/tpu_platform.py", "attention_backend"),
-        ("hardware_backend/tpu/tpu_platform.py", "dp_size"),
-        ("hardware_backend/tpu/tpu_platform.py", "dtype"),
-        ("hardware_backend/tpu/tpu_platform.py", "enable_dp_attention"),
-        ("hardware_backend/tpu/tpu_platform.py", "enable_dp_lm_head"),
-        ("hardware_backend/tpu/tpu_platform.py", "hicache_io_backend"),
-        ("hardware_backend/tpu/tpu_platform.py", "kv_cache_dtype"),
-        ("hardware_backend/tpu/tpu_platform.py", "mem_fraction_static"),
         ("hardware_backend/tpu/tpu_platform.py", "model_path"),
-        ("hardware_backend/tpu/tpu_platform.py", "page_size"),
-        ("hardware_backend/tpu/tpu_platform.py", "sampling_backend"),
-        ("hardware_backend/tpu/tpu_platform.py", "speculative_algorithm"),
-        ("hardware_backend/tpu/tpu_platform.py", "speculative_eagle_topk"),
         ("layers/dp_attention.py", "device"),
-        ("managers/scheduler.py", "enable_dp_attention"),
-        ("model_executor/model_runner.py", "ep_dispatch_algorithm"),
-        ("model_executor/model_runner.py", "expert_distribution_recorder_mode"),
-        (
-            "model_executor/model_runner_components/spec_aux_hidden_state.py",
-            "kv_cache_dtype",
-        ),
-        ("ray/engine.py", "device"),
-        ("ray/engine.py", "pp_size"),
-        ("speculative/eagle_worker_v2.py", "disable_cuda_graph"),
+        # The Ray driver rows are gone: test_ray_driver_reads_the_bags.py pins those at zero.
         ("utils/patch_torch.py", "device"),
     }
 )
@@ -185,11 +164,8 @@ _EXPOSED_CUDA_ONLY: frozenset = frozenset()
 # axis-two surface is empty too; only the fork's TPU/HiCache reads remain.
 _OVERRIDDEN_AND_READ: frozenset = frozenset(
     {
-        # TPU fork surface
-        ("hardware_backend/tpu/tpu_platform.py", "dp_size"),
-        ("hardware_backend/tpu/tpu_platform.py", "dtype"),
+        # TPU fork surface: dp_size/dtype moved to the declaration view; model_path stays.
         ("hardware_backend/tpu/tpu_platform.py", "model_path"),
-        ("speculative/eagle_worker_v2.py", "disable_cuda_graph"),
     }
 )
 

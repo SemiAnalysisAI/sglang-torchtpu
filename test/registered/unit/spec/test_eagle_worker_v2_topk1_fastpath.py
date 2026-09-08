@@ -183,6 +183,8 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             ),
         )
         forward_batch = SimpleNamespace(
+            # an idle draft decode batch routes to _draft_forward_idle before touching KV.
+            forward_mode=ForwardMode.DECODE,
             batch_size=1,
             input_ids=None,
             out_cache_loc=torch.arange(3, device=DEVICE),

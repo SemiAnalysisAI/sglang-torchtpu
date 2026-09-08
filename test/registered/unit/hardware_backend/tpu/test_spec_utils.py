@@ -367,15 +367,14 @@ def test_allocator_device_resident_uses_paged_device_result():
 
 
 def test_eagle_prepare_for_decode_uses_torch_native_allocator():
+    # Both lengths live on Req.kv (ReqKvInfo).
     reqs = [
         SimpleNamespace(
-            kv=SimpleNamespace(kv_allocated_len=2),
-            kv_committed_len=3,
+            kv=SimpleNamespace(kv_allocated_len=2, kv_committed_len=3),
             decode_batch_idx=0,
         ),
         SimpleNamespace(
-            kv=SimpleNamespace(kv_allocated_len=5),
-            kv_committed_len=1,
+            kv=SimpleNamespace(kv_allocated_len=5, kv_committed_len=1),
             decode_batch_idx=0,
         ),
     ]
@@ -422,16 +421,15 @@ def test_dflash_prepare_for_decode_uses_torch_native_allocator():
     import sglang.srt.speculative.dflash_info_v2 as dflash_info_v2
     from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
+    # Both lengths live on Req.kv (ReqKvInfo).
     reqs = [
         SimpleNamespace(
-            kv=SimpleNamespace(kv_allocated_len=2),
-            kv_committed_len=3,
+            kv=SimpleNamespace(kv_allocated_len=2, kv_committed_len=3),
             sampling_params=SimpleNamespace(top_k=1),
             decode_batch_idx=0,
         ),
         SimpleNamespace(
-            kv=SimpleNamespace(kv_allocated_len=5),
-            kv_committed_len=1,
+            kv=SimpleNamespace(kv_allocated_len=5, kv_committed_len=1),
             sampling_params=SimpleNamespace(top_k=1),
             decode_batch_idx=0,
         ),

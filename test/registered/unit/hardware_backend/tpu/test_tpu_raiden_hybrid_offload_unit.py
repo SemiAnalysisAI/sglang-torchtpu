@@ -248,10 +248,10 @@ class TestAssemblerPlatformHook(CustomTestCase):
         publish(args, role="scheduler")
         try:
             with patch("sglang.srt.platforms.current_platform", fake_platform):
+                # The assembler reads hicache sizing off the memory bag; the publish above configures it.
                 pool = hybrid_pool_assembler.build_kv_host_pool(
                     kv_pool=kv_pool,
                     page_size=64,
-                    server_args=args,
                     use_mla=False,
                     pool_label="swa",
                 )

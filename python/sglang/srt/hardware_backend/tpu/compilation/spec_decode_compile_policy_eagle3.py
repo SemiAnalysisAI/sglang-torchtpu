@@ -35,7 +35,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -154,10 +154,10 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        server_args = self.model_runner.server_args
-        self.speculative_num_steps = server_args.speculative_num_steps or 0
-        self.speculative_algorithm = server_args.speculative_algorithm
-        self.speculative_eagle_topk = server_args.speculative_eagle_topk or 1
+        spec = get_spec()
+        self.speculative_num_steps = spec.speculative_num_steps or 0
+        self.speculative_algorithm = spec.speculative_algorithm
+        self.speculative_eagle_topk = spec.speculative_eagle_topk or 1
         self.is_draft_worker = self.model_runner.is_draft_worker
 
         if self.speculative_algorithm and self.speculative_algorithm != "EAGLE3":
@@ -169,7 +169,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         # Draft tokens verified per request = the TARGET_VERIFY width. This
         # equals speculative_num_steps + 1 only for a topk=1 chain; use the
         # configured value so tree drafts (topk > 1) size correctly.
-        self.draft_token_num = server_args.speculative_num_draft_tokens or (
+        self.draft_token_num = spec.speculative_num_draft_tokens or (
             self.speculative_num_steps + 1 if self.speculative_num_steps else 0
         )
         # Width of spec_info.hidden_states the EAGLE3 draft model expects.

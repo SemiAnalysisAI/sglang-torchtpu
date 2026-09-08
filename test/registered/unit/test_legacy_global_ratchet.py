@@ -30,7 +30,7 @@ _RATCHETS = [
     # The remaining 8 are fork-side sites the sync kept: hardware_backend/tpu
     # (fp8_moe 1, tpu_platform 2), speculative/eagle_info 3, and
     # layers/quantization (fp8 1, compressed_tensors w8a8_fp8 1).
-    ("get_global_server_args", r"\bget_global_server_args\s*\(", 9),
+    ("get_global_server_args", r"\bget_global_server_args\s*\(", 4),
     (
         "set_global_server_args_for_*",
         r"\bset_global_server_args_for_(?:scheduler|tokenizer)\s*\(",

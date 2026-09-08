@@ -419,7 +419,9 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
 
 
 class TestDecodePrebuilt(unittest.TestCase):
-    def _new_scheduler(self, *, enable_overlap: bool) -> Scheduler:
+    def _new_scheduler(
+        self, *, enable_overlap: bool, use_overlap_streams: bool = True
+    ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.has_waiting_grammars.return_value = False
@@ -432,11 +434,14 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.tree_cache = MagicMock()
         scheduler.model_config = MagicMock()
         scheduler.enable_overlap = enable_overlap
+        # Single-stream overlap (TPU): init_overlap creates no schedule_stream.
+        scheduler.use_overlap_streams = use_overlap_streams
         scheduler.spec_algorithm = MagicMock()
         scheduler.max_running_requests = 1
         scheduler.future_map = MagicMock()
         scheduler.policy = MagicMock()
-        scheduler.schedule_stream = MagicMock()
+        if use_overlap_streams:
+            scheduler.schedule_stream = MagicMock()
         scheduler.forward_stream = MagicMock()
         return scheduler
 
@@ -501,6 +506,32 @@ class TestDecodePrebuilt(unittest.TestCase):
             scheduler.forward_stream
         )
         self.assertEqual(call_order, ["prepare", "wait", "process"])
+
+    def test_single_stream_overlap_has_no_schedule_stream_to_wait_on(self):
+        # TPU runs overlap on one stream and never creates schedule_stream.
+        scheduler = self._new_scheduler(enable_overlap=True, use_overlap_streams=False)
+        self.assertFalse(hasattr(scheduler, "schedule_stream"))
+        scheduler.waiting_queue = [MagicMock(rid="request")]
+
+        call_order = []
+        new_batch = MagicMock()
+        new_batch.prepare_for_prebuilt.side_effect = lambda: call_order.append(
+            "prepare"
+        )
+        new_batch.process_prebuilt.side_effect = lambda *_: call_order.append("process")
+
+        with patch(
+            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+            return_value=new_batch,
+        ), get_context().override_server_args(
+            disaggregation_decode_enable_radix_cache=False
+        ):
+            ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                scheduler, scheduler.running_batch
+            )
+
+        self.assertIs(ret, new_batch)
+        self.assertEqual(call_order, ["prepare", "process"])
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import print_warning_once
 
 
@@ -51,9 +51,7 @@ def _replace_tpu_param_from_cpu(param: Parameter, new_cpu: torch.Tensor) -> None
 
 
 def _get_tpu_fp8_runtime() -> str:
-    from sglang.srt.server_args import get_global_server_args
-
-    return get_global_server_args().tpu_fp8_runtime
+    return get_exec().kernel.tpu_fp8_runtime
 
 
 def _quantize_moe_weight_channelwise(

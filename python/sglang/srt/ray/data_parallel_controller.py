@@ -56,6 +56,8 @@ class RayDataParallelController(DataParallelController):
         bundle_for_node: List[int],
         rank0_node_ip: str,
         is_custom_pg: bool = False,
+        *,
+        nnodes: int,
     ):
         # Set Ray-specific attributes BEFORE super().__init__() because the
         # parent constructor calls launch_dp_schedulers / launch_dp_attention_schedulers
@@ -64,6 +66,8 @@ class RayDataParallelController(DataParallelController):
         self.is_custom_pg = is_custom_pg
         self.bundle_for_node = bundle_for_node
         self.rank0_node_ip = rank0_node_ip
+        # A constructor argument, not a leaf: the TPU driver auto-detects nnodes after publish.
+        self.nnodes = nnodes
         self.scheduler_actors: List = []
         self.event_loop_refs: List = []
         self.startup_time = None
@@ -139,7 +143,7 @@ class RayDataParallelController(DataParallelController):
 
         For regular DP, dp_rank is an integer and worker_ports is None.
         """
-        nnodes = get_parallel().nnodes
+        nnodes = self.nnodes
         batch_start_idx = len(self.scheduler_actors)
 
         if not self.is_custom_pg:

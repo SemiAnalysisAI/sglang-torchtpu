@@ -372,7 +372,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # TPU sets disable_cuda_graph after cuda_graph_config is parsed, so the
         # decode backend can remain Backend.FULL even though capture is disabled.
-        if self.server_args.disable_cuda_graph:
+        if get_exec().graph.disable_cuda_graph:
             return
 
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):

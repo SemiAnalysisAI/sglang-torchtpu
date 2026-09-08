@@ -885,7 +885,9 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
             ),
             mock.patch.object(modelopt_quant, "is_cuda", return_value=False),
             mock.patch.object(
-                modelopt_quant, "is_blackwell_supported", return_value=True
+                modelopt_quant,
+                "get_platform",
+                return_value=mock.MagicMock(is_blackwell=True),
             ),
         ):
             self.assertIsInstance(

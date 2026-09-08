@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils.common import Range
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -206,10 +207,15 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
             time_stats=SimpleNamespace(trace_ctx=MagicMock()),
             to_finish=object(),
             pending_bootstrap=True,
+            # A Req aborted mid chunked-prefill has no events and no output tokens yet.
+            weight_version_events=[],
+            output_ids=array("q"),
         )
         scheduler = self._scheduler(req)
 
-        scheduler.process_pending_chunked_abort()
+        # The same notice reads the live weight version off the serving bag.
+        with get_context().override_server_args():
+            scheduler.process_pending_chunked_abort()
 
         sender.abort.assert_called_once_with()
         release_kv.assert_not_called()

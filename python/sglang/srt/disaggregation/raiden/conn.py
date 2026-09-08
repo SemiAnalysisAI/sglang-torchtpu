@@ -60,6 +60,7 @@ from sglang.srt.disaggregation.raiden.serde import (
     write_aux_blob,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.runtime_context import get_disagg, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
@@ -542,10 +543,8 @@ class RaidenKVManager(CommonKVManager):
         the reach is the batch plus the extra in-transfer slots reserved
         alongside it; a larger pool could never be claimed.
         """
-        batch = int(self.server_args.max_running_requests or 64)
-        in_transfer = int(
-            getattr(self.server_args, "disaggregation_decode_extra_slots", 0) or 0
-        )
+        batch = int(get_schedule().max_running_requests or 64)
+        in_transfer = int(get_disagg().disaggregation_decode_extra_slots or 0)
         return max(1, batch + in_transfer)
 
     def _num_slots(
