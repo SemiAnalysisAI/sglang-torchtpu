@@ -71,7 +71,12 @@ LAUNCH_ENV = {
     # compiles the 1024 extend graph the green spec_dpa lane compiles.
     "CHUNK": "2048",
     "DP_SIZE": str(DP_SIZE),
-    "TPU_COMPILE_TOKENS": "512 1024 2048",
+    # Only the tiers the DP-divided chunk can actually reach. Eight ranks
+    # compile extend graphs concurrently and the host cannot hold three tiers
+    # worth at once: run 34258644286 died in _precompile_extend with "server
+    # exited with code -9" (host OOM) after clearing weight load, KV allocation
+    # and decode capture. The shipped dp=1 config compiled one tier; this is two.
+    "TPU_COMPILE_TOKENS": "512 1024",
     "TPU_COMPILE_BS": "1 2 4",
     # The recipe serves this model on pallas_tpu_rpa_batched, which raiden rejects:
     # RPA v3 is the only TPU backend carrying the HiCache reload-commit hook and the
