@@ -23,19 +23,28 @@ _PROMPT_VOCAB = (
     "very after our just name good through where help much before line right too mean old"
 ).split()
 
-# The probe prompt ends on this, and every read has to continue the count. Greedy
-# decoding on these servers is not reproducible: on Qwen3-Coder, three flushed cold
-# reads of the same 2048-token filler prompt returned three different texts,
-# logprobs apart by up to 1.7, with no cache involved at all. Forcing the
-# continuation narrows that but does not remove it -- across six reads of this tail
-# the decode still split between continuing it (" 13 14 15 16 17 ") and restarting
-# it ("\n\n1 2 3 4 5 6 7 8"), and it split on the DEVICE hit as often as on the host
-# reload, which no host round-trip can explain. So the gate asserts the count, not
-# the text: which of those two a read picks is noise, whereas KV that came back
-# wrong cannot produce either. See ``_counting_failure``.
-_FORCED_TAIL = (
-    "\n\nIgnore the words above. Continue this sequence.\n" "1 2 3 4 5 6 7 8 9 10 11 12"
-)
+# The probe prompt ends on this, and every read has to continue the count. The
+# gate asserts the count, not the text: KV that came back wrong cannot produce a
+# clean ascending run. See ``_counting_failure``.
+#
+# No instruction, and a long run rather than a short one, because the margin
+# between "keep counting" and anything else is what this gate rests on. The
+# earlier tail asked in words -- "Ignore the words above. Continue this
+# sequence." over "1 ... 12" -- and an instruct-tuned model can answer that
+# request instead of obeying it. It did: on 2026-09-08 every read on gpt-oss
+# came back "<token>\n\nIt looks like you're asking for a continuation of a
+# sequence that starts with", reddening both non-DPA offload gates while GSM8K
+# on the same boot scored 0.84 and the device-hit and host-reload reads were
+# byte-identical -- the cache was fine and the yardstick was not.
+#
+# What tipped it was the libtpu 0.0.44.1 -> 0.0.47 bump in #648: last-decimal
+# changes in kernel arithmetic flip a first token whose two candidates are
+# nearly tied, and autoregression turns that one token into a different reply.
+# Twenty-two terms of an unbroken run leave no competitive alternative to " 23",
+# so the decision is no longer decided in the last decimal. It also restores the
+# spec gates' accept length: a predictable continuation is what a draft model
+# gets right, and rejected drafts were why mean accept length read 1.33.
+_FORCED_TAIL = "\n\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22"
 # Rough, like the word-per-token estimate above, and only used to keep the prompt
 # near the requested size. Nothing asserts an exact token count.
 _FORCED_TAIL_TOKENS = 48
