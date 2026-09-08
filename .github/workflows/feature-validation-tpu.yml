@@ -102,7 +102,11 @@ jobs:
         run: |
           set -euo pipefail
           discover_files='python3 .github/tpu-ci/discover_files.py'
-          echo "single_host=$(python3 .github/tpu-ci/discover_tests.py --suite nightly-tpu-4-v7 --nightly)" >> "$GITHUB_OUTPUT"
+          # TEMPORARY CARRIER -- DO NOT MERGE. Narrows the single-host matrix
+          # to one test so a flakiness sample costs 1 job instead of 13. There
+          # is no per-test dispatch input; see the repo idiom at 2a0a5d043.
+          echo "single_host=$(python3 .github/tpu-ci/discover_tests.py --suite nightly-tpu-4-v7 --nightly \
+            | python3 -c 'import json,sys; rows=json.load(sys.stdin); sys.stdout.write(json.dumps([r for r in rows if "prefix_cache_kv_offload_spec.py" in r["file"]]))')" >> "$GITHUB_OUTPUT"
           echo "pd_pc_offload=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py)" >> "$GITHUB_OUTPUT"
           echo "pd_tp_reshard=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_tp_resharding.py)" >> "$GITHUB_OUTPUT"
           echo "pd_singlehost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py)" >> "$GITHUB_OUTPUT"
