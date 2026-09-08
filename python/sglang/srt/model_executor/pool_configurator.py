@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import (
+    configured_pp_size,
     get_disagg,
     get_memory,
     get_parallel,
@@ -643,6 +644,11 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             )
         else:
             chunks_in_flight = 1 if get_schedule().disable_overlap_schedule else 2
+            if configured_pp_size() > 1:
+                # A pipeline stage keeps one chunk per pipeline slot in flight.
+                chunks_in_flight *= (
+                    configured_pp_size() + get_parallel().pp_async_batch_depth
+                )
             self._swa_cap = (
                 per_request * num_reqs
                 + chunks_in_flight * get_schedule().chunked_prefill_size
