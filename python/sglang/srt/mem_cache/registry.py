@@ -113,6 +113,20 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
         return PureSWARadixCache(params=params)
 
+    if (
+        ctx.enable_hierarchical_cache
+        and get_memory().hicache_io_backend == "torch_tpu"
+        and not (ctx.is_hybrid_ssm or ctx.is_hybrid_swa or ctx.is_dsa)
+    ):
+        # torch_tpu's HiCache data plane (TpuHiCacheController) lives on HiRadixCache;
+        # the unified tree's HybridCacheController has a TPU variant for raiden only.
+        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+
+        cache = HiRadixCache(params=params, server_args=server_args)
+        ctx.tp_worker.register_hicache_layer_transfer_counter(
+            cache.cache_controller.layer_done_counter
+        )
+        return cache
     if get_memory().enable_lmcache:
         from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
             LMCRadixCache,

@@ -125,7 +125,7 @@ def _seed_pages(dev, dev_page_ids):
     return orig
 
 
-def _make_controller(target_dev, target_host, draft_dev=None, draft_host=None):
+def _make_controller(target_dev, target_host):
     """Minimal TpuHiCacheController carrying only the data-plane state the
     write/load rounds touch (the full __init__ wires storage/prefetch threads
     irrelevant to these tests)."""
@@ -140,9 +140,6 @@ def _make_controller(target_dev, target_host, draft_dev=None, draft_host=None):
     controller.device = target_dev.device  # move_indices re-pins onto this
     controller.mem_pool_device = target_dev
     controller.mem_pool_host = target_host
-    controller.has_draft = False
-    controller.mem_pool_device_draft = None
-    controller.mem_pool_host_draft = None
     controller.layer_done_counter = BatchDoneCounter()
     target_dev.register_layer_transfer_counter(controller.layer_done_counter)
     controller._load_worker = TpuKvCopyWorker("test-kv-offload-h2d")
@@ -159,8 +156,6 @@ def _make_controller(target_dev, target_host, draft_dev=None, draft_host=None):
     controller.storage_backend = None
     controller.storage_backend_type = None
     controller.enable_storage_metrics = False
-    if draft_dev is not None:
-        controller.set_draft_kv_pool(draft_dev, draft_host)
     return controller
 
 
@@ -326,76 +321,16 @@ class TestTpuSeqAlongLaneCpuCopy(CustomTestCase):
 
 
 @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
-class TestTpuDraftKvOffload(CustomTestCase):
-    """Draft (speculative) KV piggyback: the controller reuses the target's
-    host/device index pair for a 1-layer draft pool on every round."""
+class TestTpuHiCacheControllerRound(CustomTestCase):
+    """Write + load rounds through TpuHiCacheController on the target pool."""
 
-    def test_draft_single_layer_roundtrip(self):
-        # EAGLE3 draft = 1 layer; exercises the fused host pool at layer_num=1
-        # (sizing, pow2 bucketing, gather/scatter) independent of the controller.
+    def test_single_layer_pool_roundtrip(self):
+        # 1-layer pool (the EAGLE3 draft shape): host pool sizing, gather/scatter.
         dev, host = _make_pools(layer_num=1)
         _assert_backup_load_roundtrip(self, dev, host, [3, 0, 6])
 
-    def test_draft_pool_gates_on_shared_counter(self):
-        # set_draft_kv_pool must hand the whole-batch gate to the draft device pool: the draft forward waits via its OWN pool's counter.
-        target_dev, target_host = _make_pools(layer_num=2)
-        draft_dev, draft_host = _make_pools(layer_num=1)
-        controller = _make_controller(target_dev, target_host, draft_dev, draft_host)
-        self.assertTrue(controller.has_draft)
-        self.assertIs(draft_dev.layer_transfer_counter, controller.layer_done_counter)
-        self.assertIs(target_dev.layer_transfer_counter, controller.layer_done_counter)
-
-    def test_controller_round_piggybacks_draft(self):
-        # One write + one load round through the controller must round-trip
-        from sglang.srt.managers.cache_controller import CacheOperation
-
-        target_dev, target_host = _make_pools(layer_num=2)
-        draft_dev, draft_host = _make_pools(layer_num=1)
-        controller = _make_controller(target_dev, target_host, draft_dev, draft_host)
-
-        pages = [1, 4, 2]
-        orig_target = _seed_pages(target_dev, pages)
-        orig_draft = _seed_pages(draft_dev, pages)
-        device_indices = torch.cat(
-            [
-                torch.arange(pid * PAGE_SIZE, (pid + 1) * PAGE_SIZE, device=DEV)
-                for pid in pages
-            ]
-        )
-        host_indices = target_host.alloc(len(device_indices))
-        self.assertIsNotNone(host_indices)
-
-        controller.write_queue.append(
-            CacheOperation(host_indices, device_indices, node_id=0)
-        )
-        controller.start_writing()
-        controller._backup_inflight.synchronize()
-
-        for dev in (target_dev, draft_dev):  # evict
-            for layer in range(dev.layer_num):
-                dev.kv_buffer[layer][pages] = 0
-
-        controller.load_queue.append(
-            CacheOperation(host_indices, device_indices, node_id=0)
-        )
-        producer_id = controller.start_loading()
-        self.assertGreaterEqual(producer_id, 0)
-        # The forward's commit point (init_forward_metadata); wait() is only
-        # the consumer gate and does not drain.
-        target_dev.tpu_commit_pending_loads()
-        controller.layer_done_counter.set_consumer(producer_id)
-        controller.layer_done_counter.wait()
-
-        for layer in range(target_dev.layer_num):
-            self.assertTrue(
-                torch.equal(
-                    target_dev.kv_buffer[layer][pages].cpu(), orig_target[layer]
-                )
-            )
-        self.assertTrue(torch.equal(draft_dev.kv_buffer[0][pages].cpu(), orig_draft[0]))
-
-    def test_controller_round_without_draft_unchanged(self):
-        # No-draft config: the piggyback branches must stay dormant.
+    def test_controller_write_load_round(self):
+        # write to host, evict on device, load back.
         from sglang.srt.managers.cache_controller import CacheOperation
 
         target_dev, target_host = _make_pools(layer_num=2)

@@ -95,7 +95,6 @@ def _make_controller() -> TpuRaidenHybridCacheController:
     swa = _FakeEntry(PoolName.SWA, swa_pool, device_pool=object())
     ctrl.mem_pool_host = _FakeGroup(anchor, [swa])
     ctrl.io_backend = "raiden"
-    ctrl.has_draft = False
     ctrl.write_queue = []
     ctrl.load_queue = []
     ctrl.ack_write_queue = []
