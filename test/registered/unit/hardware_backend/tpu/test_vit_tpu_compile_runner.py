@@ -6,6 +6,10 @@ from unittest.mock import MagicMock, patch
 import torch
 from torch import nn
 
+from sglang.srt.compilation.support_torch_compile import (
+    CompilePolicy,
+    support_torch_compile,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.graph_runner import (
     vit_tpu_compile_runner as vit_runner,
@@ -583,6 +587,106 @@ class TestRunnerHostState(unittest.TestCase):
             self.assertEqual(cos.shape, (bucket_len, ref_cos.shape[1]), str(grid))
             self.assertTrue(torch.equal(cos[:real_len], ref_cos), str(grid))
             self.assertTrue(torch.equal(sin[:real_len], ref_sin), str(grid))
+
+
+class _AnnotatedVision(nn.Module):
+    def forward(self):
+        return None
+
+
+class _AnnotatedDecoder(nn.Module):
+    def forward(self):
+        return None
+
+
+class _Unannotated(nn.Module):
+    def forward(self):
+        return None
+
+
+class _RecordingVisionPolicy(VisionTpuCompilePolicy):
+    """Records the lifecycle without touching torch.compile."""
+
+    installs = True
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.precompiled = False
+
+    def install(self):
+        return self.installs
+
+    def precompile(self, patch_counts=None):
+        self.precompiled = True
+
+    def compute_patch_buckets(self):
+        return [4]
+
+    def prepare_call(self, x):
+        return (x,), None
+
+    def unpad_outputs(self, result, ctx):
+        return result
+
+
+class _RefusingVisionPolicy(_RecordingVisionPolicy):
+    installs = False
+
+
+class _DecoderShapedPolicy(CompilePolicy):
+    """Not a vision policy: the installer must leave it alone."""
+
+    platform = "tpu"
+
+    def install(self):
+        raise AssertionError("the vision installer must not install this policy")
+
+    def precompile(self):
+        raise AssertionError("the vision installer must not warm this policy")
+
+
+class _Model(nn.Module):
+    def __init__(self, vision_policy=_RecordingVisionPolicy):
+        super().__init__()
+        self.vision_a = support_torch_compile(_AnnotatedVision(), policy=vision_policy)
+        self.vision_b = support_torch_compile(_AnnotatedVision(), policy=vision_policy)
+        self.decoder = support_torch_compile(
+            _AnnotatedDecoder(), policy=_DecoderShapedPolicy
+        )
+        self.plain = _Unannotated()
+
+
+class TestInstallVisionCompilePolicies(unittest.TestCase):
+    def test_installs_every_vision_policy_and_skips_the_others(self):
+        model = _Model()
+
+        installed = vit_runner.install_vision_compile_policies(model)
+
+        self.assertEqual(len(installed), 2)
+        self.assertEqual(
+            {policy.owner for policy in installed}, {model.vision_a, model.vision_b}
+        )
+        self.assertTrue(all(policy.precompiled for policy in installed))
+
+    def test_installs_without_a_model_runner(self):
+        # The encode server owns a vision encoder but builds no ModelRunner, so
+        # nothing on the policy may reach through it.
+        installed = vit_runner.install_vision_compile_policies(_Model())
+
+        self.assertTrue(all(policy.model_runner is None for policy in installed))
+
+    def test_raises_when_no_policy_installs(self):
+        # Returning an empty list would leave precompiled_max_patch_count
+        # reporting the env ceiling while the runner pads nothing, so every
+        # image would silently recompile.
+        model = _Model(vision_policy=_RefusingVisionPolicy)
+
+        with self.assertRaisesRegex(RuntimeError, "no TPU vision compile policy"):
+            vit_runner.install_vision_compile_policies(model)
+
+    def test_raises_when_nothing_is_annotated(self):
+        with self.assertRaisesRegex(RuntimeError, "0 annotated"):
+            vit_runner.install_vision_compile_policies(_Unannotated())
 
 
 if __name__ == "__main__":

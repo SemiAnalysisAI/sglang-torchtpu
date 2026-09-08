@@ -14,7 +14,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Annotated, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Annotated, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -44,6 +44,10 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
+from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -99,7 +103,7 @@ from sglang.srt.utils import (
     random_uuid,
     set_prometheus_multiproc_dir,
 )
-from sglang.srt.utils.common import configure_logger, maybe_reindex_device_id
+from sglang.srt.utils.common import configure_logger, is_tpu, maybe_reindex_device_id
 from sglang.srt.utils.hf_transformers_utils import resolve_image_processor_backend
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -108,8 +112,11 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket,
 )
+from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
 
 logger = logging.getLogger(__name__)
+
+_is_tpu = is_tpu()
 
 HEALTH_CHECK_TIMEOUT = 30
 
@@ -317,6 +324,11 @@ class MMEncoder:
         # The DP and TP encoder workers are spawned, so this constructor is
         # the first publish in those processes.
         publish(server_args, role="encoder")
+        # Sets the torchrun-style env torch_tpu's PJRT slicebuilder reads, then
+        # initializes the backend. No-op off TPU. Must precede set_device and
+        # the distributed init below; this is the encoder's counterpart of the
+        # scheduler-worker bootstrap.
+        initialize_torch_tpu_worker(server_args, rank)
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
         configure_media_url_security(
@@ -355,10 +367,26 @@ class MMEncoder:
 
         torch.get_device_module(self.device).set_device(self.gpu_id)
 
+        if _is_tpu:
+            # ModelRunner.load_model does this for the serving path, and this
+            # process has no ModelRunner: torch sized its intra-op pool from
+            # nproc rather than the cgroup quota, so every TP rank spun a full
+            # pool and held the container in CFS throttling -- 3.1s per image
+            # for 22ms of ViT.
+            torch.set_num_threads(1)
+
         self.use_image_processor_gpu = (
             use_image_processor_gpu
             and resolve_image_processor_backend(server_args) != "pil"
         )
+        if self.use_image_processor_gpu and _is_tpu:
+            # The backend would receive device="tpu", which no HF fast image
+            # processor understands.
+            logger.warning(
+                "SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU is not supported on TPU; "
+                "preprocessing images on the host instead."
+            )
+            self.use_image_processor_gpu = False
         self._build_vision_config(get_mm().mm_process_config)
         self.model_audio_sr = self._resolve_audio_sr()
         logger.info(f"Resolved model audio sample rate: {self.model_audio_sr} Hz")
@@ -372,6 +400,7 @@ class MMEncoder:
         )
         initialize_model_parallel(tensor_model_parallel_size=server_args.tp_size)
         initialize_dp_attention(server_args, self.model_config)
+        self._init_moe_gemm_config(server_args)
 
         self.model = load_model(
             model_config=self.model_config,
@@ -382,6 +411,7 @@ class MMEncoder:
             self.model
         )
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
+        self._maybe_install_tpu_vision_compile()
 
         self.context = zmq.asyncio.Context(2)
         self.sync_context = zmq.Context()  # Reuse sync context for thread pool
@@ -495,6 +525,52 @@ class MMEncoder:
                 self._encode_fn = self.encode
 
         logger.info(f"rank {rank} init finish ")
+
+    def _init_moe_gemm_config(self, server_args: ServerArgs) -> None:
+        """Resolve the MoE and GEMM backend globals, as Scheduler does.
+
+        They are assigned on first use, and this process has no Scheduler; a
+        first assignment inside a torch.compile trace builds a sourceless object
+        Dynamo cannot wrap.
+
+        Args:
+            server_args: Startup record the backend choices resolve from.
+        """
+        config_to_check = getattr(
+            self.model_config.hf_config, "text_config", self.model_config.hf_config
+        )
+        moe_topk_attrs = (
+            "num_experts_per_tok",
+            "num_experts_per_token",
+            "top_k_experts",
+            "moe_top_k",
+            "moe_topk",
+        )
+        if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
+            initialize_moe_config(server_args)
+
+        initialize_fp8_gemm_config(server_args)
+        initialize_fp4_gemm_config(server_args)
+        initialize_bf16_gemm_config(server_args)
+
+    def _maybe_install_tpu_vision_compile(self) -> None:
+        """Compile and warm the TPU vision encoder over its patch buckets.
+
+        Serving installs compile policies from TpuGraphRunner, which only a
+        ModelRunner builds; this process has none, so it drives the vision
+        policies itself. Warming the whole bucket ladder takes minutes -- narrow
+        it with SGLANG_TPU_VIT_PRECOMPILE_SIZES.
+        """
+        if not _is_tpu or not get_exec().graph.enable_torch_compile:
+            return
+
+        # Imported here, not at module scope: the module imports torch_tpu,
+        # which does not exist on the CUDA hosts that also run this server.
+        from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+            install_vision_compile_policies,
+        )
+
+        install_vision_compile_policies(self.model)
 
     def _infer_embedding_dims(self) -> dict:
         """Infer per-modality embedding dimensions from hf_config at init time."""
@@ -1053,6 +1129,117 @@ class MMEncoder:
                     mm_item.set(key, value)
         return mm_items
 
+    def _split_indices_by_patch_budget(
+        self, indices: List[int], modality: Modality, grid_thw: torch.Tensor
+    ) -> List[List[int]]:
+        """Group grid rows so each encoder call fits a precompiled patch bucket.
+
+        Args:
+            indices: Rows of grid_thw this call covers.
+            modality: Modality of every index. Audio has no patch grid, so it
+                stays one group.
+            grid_thw: Per-item grid of shape [num_items, 3]; [num_items, 2] for
+                Kimi-VL and [num_items] for audio.
+
+        Returns:
+            Index groups in input order, each within the patch budget. An item
+            above the budget on its own gets a group of its own.
+        """
+        if modality == Modality.AUDIO:
+            return [list(indices)]
+
+        # Imported here, not at module scope: the module imports torch_tpu,
+        # which does not exist on the CUDA hosts that also run this server.
+        from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+            precompiled_max_patch_count,
+        )
+
+        budget = precompiled_max_patch_count()
+        groups: List[List[int]] = []
+        current: List[int] = []
+        current_patches = 0
+        for index in indices:
+            patches = self.get_num_patches(grid_thw[index], modality)
+            if current and current_patches + patches > budget:
+                groups.append(current)
+                current, current_patches = [], 0
+            current.append(index)
+            current_patches += patches
+        if current:
+            groups.append(current)
+        return groups
+
+    def _encode_missing_tpu(
+        self,
+        mm_feature: torch.Tensor,
+        mm_inputs: Dict[str, Any],
+        indices: List[int],
+        modality: Modality,
+        get_feature_fn: Callable[[List[MultimodalDataItem]], torch.Tensor],
+        grid_thw: torch.Tensor,
+        log_metrics: bool = True,
+    ) -> List[torch.Tensor]:
+        """TPU counterpart of _encode_missing.
+
+        TPU precompiles the encoder for a bounded ladder of patch counts, so a
+        batch above the largest one falls off the ladder and recompiles. The
+        split regroups grid rows rather than items: the aggregate processor path
+        collapses every image of a request into one item whose grid is
+        [num_items, 3], which an item-level split can never break up.
+
+        Runs under no_grad rather than inference_mode: that is how the compiled
+        boundary is built and warmed.
+
+        Args:
+            mm_feature: Per-item features concatenated along the patch dim, of
+                shape [total_patches, feature_dim].
+            mm_inputs: Processor output the items carry alongside mm_feature.
+            indices: Rows of grid_thw to encode.
+            modality: Modality of every index.
+            get_feature_fn: The model's per-modality feature entry point.
+            grid_thw: Per-item grid of shape [num_items, 3].
+            log_metrics: Whether to observe the forward. False for health
+                checks, and for a caller that observes it itself.
+
+        Returns:
+            One host embedding per index, each of shape
+            [num_tokens, hidden_size], where num_tokens is the item's patch
+            count after the merge window.
+        """
+        groups = self._split_indices_by_patch_budget(indices, modality, grid_thw)
+        if len(groups) > 1:
+            logger.info(
+                "Splitting the vision batch: %d grids / %d patches exceed the "
+                "encoder patch budget, so it runs as %d calls of %s patches.",
+                len(indices),
+                sum(self.get_num_patches(grid_thw[i], modality) for i in indices),
+                len(groups),
+                [
+                    sum(self.get_num_patches(grid_thw[i], modality) for i in group)
+                    for group in groups
+                ],
+            )
+        forward_start = time.perf_counter()
+        with torch.no_grad():
+            outputs = [
+                get_feature_fn(
+                    self._build_mm_data_items(
+                        mm_feature, mm_inputs, group, modality, grid_thw
+                    )
+                )
+                for group in groups
+            ]
+            new_embeddings = torch.cat(
+                [output.reshape(-1, output.shape[-1]) for output in outputs], dim=0
+            ).cpu()
+        if encoder_metrics_collector is not None and log_metrics:
+            encoder_metrics_collector.observe_model_forward(
+                time.perf_counter() - forward_start, modality=modality.name.lower()
+            )
+
+        sub_grids = [grid_thw[i] for i in indices]
+        return self.slice_embedding(new_embeddings, sub_grids, modality)
+
     def _encode_missing(
         self,
         mm_feature,
@@ -1068,6 +1255,17 @@ class MMEncoder:
         """
         if grid_thw is None:
             grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+        if _is_tpu:
+            if keep_on_gpu is True:
+                raise ValueError("TPU require saving embeddings on host.")
+            return self._encode_missing_tpu(
+                mm_feature,
+                mm_inputs,
+                indices,
+                modality,
+                get_feature_fn,
+                grid_thw,
+            )
         mm_items = self._build_mm_data_items(
             mm_feature, mm_inputs, indices, modality, grid_thw
         )
@@ -1929,9 +2127,25 @@ class MMEncoder:
 
             if mm_embedding is None:
                 forward_start = time.perf_counter()
-                with torch.inference_mode():
-                    mm_embedding: torch.Tensor = get_feature_fn(model_mm_items)
-                    mm_embedding = mm_embedding.cpu()
+                if _is_tpu:
+                    # Slices concatenate back to the flat grid this path wants;
+                    # the split is what the encoder needs, not the slicing.
+                    mm_embedding = torch.cat(
+                        self._encode_missing_tpu(
+                            mm_feature,
+                            mm_inputs,
+                            list(range(len(grid_thw))),
+                            modality,
+                            get_feature_fn,
+                            grid_thw,
+                            log_metrics=False,
+                        ),
+                        dim=0,
+                    )
+                else:
+                    with torch.inference_mode():
+                        mm_embedding: torch.Tensor = get_feature_fn(model_mm_items)
+                        mm_embedding = mm_embedding.cpu()
                 if len(mm_embedding.shape) != 2:
                     mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
                 if encoder_metrics_collector is not None and log_metrics:
@@ -4027,6 +4241,13 @@ def _launch_server_dp(server_args: ServerArgs):
         raise ValueError(
             "Encoder DP mode requires --dp-size > 1 and --tp-size 1; got "
             f"dp_size={get_parallel().dp_size}, tp_size={server_args.tp_size}."
+        )
+    if _is_tpu:
+        # Each DP worker would bootstrap as RANK 0 of a world of 1 and no
+        # TPU_VISIBLE_DEVICES tells them apart, so they all bind one chip.
+        raise ValueError(
+            "Encoder DP mode is not supported on TPU; scale the encoder with "
+            "--tp-size instead."
         )
     dp_size = get_parallel().dp_size
     logger.info(f"Launching encoder in DP mode: dp_size={dp_size}")

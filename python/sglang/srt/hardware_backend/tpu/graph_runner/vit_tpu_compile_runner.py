@@ -14,9 +14,13 @@ import torch._dynamo
 from torch_tpu._internal.sync.sync import synchronize as tpu_sync
 
 from sglang.srt.compilation import torch_compile_bundle
-from sglang.srt.compilation.support_torch_compile import CompilePolicy
+from sglang.srt.compilation.support_torch_compile import (
+    CompilePolicy,
+    get_torch_compile_policy,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.patches import _register_tpu_compile_backend
+from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +160,12 @@ class VisionTpuCompilePolicy(CompilePolicy):
         return getattr(self.owner, "graph_runners", self.owner)
 
     def install(self) -> bool:
+        """Compile the runner's boundary and wire the serve entry point.
+
+        Returns:
+            Whether the boundary was compiled. False leaves the encoder eager,
+            which the caller must treat as a failure on TPU.
+        """
         runner = self._resolve_runner()
         if runner is None:
             logger.warning("VisionTpuCompilePolicy: missing owner; cannot install.")
@@ -173,10 +183,12 @@ class VisionTpuCompilePolicy(CompilePolicy):
 
         _register_tpu_compile_backend()
         method = getattr(runner, self.method_name)
-        server_args = self.model_runner.server_args
+        # Read the bundle flags off the resolved config bag, not model_runner:
+        # the encode server owns a vision encoder without a ModelRunner.
+        graph_config = get_exec().graph
         use_bundle = (
-            server_args.unsafe_save_torch_compile_bundle is not None
-            or server_args.unsafe_load_torch_compile_bundle is not None
+            graph_config.unsafe_save_torch_compile_bundle is not None
+            or graph_config.unsafe_load_torch_compile_bundle is not None
         )
         compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
         self.compiled_fn = compiler(
@@ -675,3 +687,52 @@ class ViTTpuCompileRunner:
         if output_indices is not None:
             result = result.index_select(0, output_indices.to("cpu"))
         return result
+
+
+def install_vision_compile_policies(
+    model: torch.nn.Module,
+) -> list[VisionTpuCompilePolicy]:
+    """Install and warm every TPU vision compile policy attached to model.
+
+    The ModelRunner-free counterpart of TpuGraphRunner's policy loop, for a
+    process that owns a vision encoder but no ModelRunner -- the EPD encode
+    server. Decoder policies are left alone: that process has no language model.
+
+    Args:
+        model: Module tree to scan for support_torch_compile annotations.
+
+    Returns:
+        The installed policies, in module-traversal order.
+
+    Raises:
+        RuntimeError: No vision policy installed. Silently falling back to eager
+            would leave precompiled_max_patch_count reporting the env ceiling
+            while the runner pads nothing, so every image recompiles.
+    """
+    installed: list[VisionTpuCompilePolicy] = []
+    annotated = 0
+    for module in model.modules():
+        policy_cls = get_torch_compile_policy(module)
+        if policy_cls is None or not issubclass(policy_cls, VisionTpuCompilePolicy):
+            continue
+        annotated += 1
+        policy = policy_cls(
+            owner=module,
+            method_name="forward",
+            method=module.forward,
+            label=type(module).__name__,
+        )
+        if not policy.install():
+            continue
+        installed.append(policy)
+        policy.precompile()
+
+    if not installed:
+        raise RuntimeError(
+            f"{type(model).__name__} installed no TPU vision compile policy "
+            f"({annotated} annotated module(s) found). The encoder would run "
+            "eager and recompile per image shape. Check that the ViT attention "
+            "backend supports segment IDs, and that the weights are on TPU "
+            "(the runner is selected from the patch-embedding device)."
+        )
+    return installed

@@ -1,10 +1,12 @@
 import pickle
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation import encode_server
 from sglang.srt.disaggregation.encode_receiver import EmbeddingData
 from sglang.srt.disaggregation.encode_server import MMEncoder, _get_mm_grid_dim
 from sglang.srt.managers.schedule_batch import Modality
@@ -102,6 +104,46 @@ class TestKimiVLEPDGrid(unittest.TestCase):
         )
 
         torch.testing.assert_close(restored.grid_dim, torch.tensor([[40, 60]]))
+
+
+class _Bootstrapped(Exception):
+    pass
+
+
+class TestEncoderTpuBootstrap(unittest.TestCase):
+    def test_tpu_worker_bootstrap_runs_before_anything_touches_the_device(self):
+        # It must precede set_device and the distributed init, so it has to be
+        # the first thing after publish -- an init step that sneaks in ahead of
+        # it would reach the device before torch_tpu is configured.
+        server_args = SimpleNamespace(tp_size=1)
+        calls = []
+
+        def _record(args, rank):
+            calls.append((args, rank))
+            raise _Bootstrapped
+
+        with (
+            patch.object(encode_server, "publish"),
+            patch.object(encode_server, "initialize_torch_tpu_worker", _record),
+        ):
+            with self.assertRaises(_Bootstrapped):
+                MMEncoder(server_args, rank=3)
+
+        self.assertEqual(calls, [(server_args, 3)])
+
+    def test_encoder_dp_is_rejected_on_tpu(self):
+        # Every DP worker would bootstrap as rank 0 of a world of 1 and bind the
+        # same chip, so this must fail at launch rather than at first forward.
+        with (
+            patch.object(
+                encode_server, "get_parallel", return_value=SimpleNamespace(dp_size=2)
+            ),
+            patch.object(
+                encode_server, "get_device", return_value=SimpleNamespace(device="tpu")
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "not supported on TPU"):
+                encode_server._launch_server_dp(SimpleNamespace(tp_size=1))
 
 
 if __name__ == "__main__":
