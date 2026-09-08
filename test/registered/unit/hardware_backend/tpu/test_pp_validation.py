@@ -39,6 +39,7 @@ def _args(**overrides):
         speculative_algorithm=None,
         speculative_eagle_topk=None,
         speculative_use_rejection_sampling=False,
+        pp_async_batch_depth=0,
     )
     defaults.update(overrides)
     args = SimpleNamespace(**defaults)
@@ -66,6 +67,21 @@ class TestPipelineParallelValidation(CustomTestCase):
         prepare_tpu_env.assert_called_once_with(8, setup_slicebuilder=True)
         self.assertEqual(args.attention_backend, "pallas_tpu_rpa_v3")
         self.assertTrue(args.enable_torch_compile)
+
+    def test_pipeline_runs_at_async_batch_depth_one(self):
+        """The ICI hand-off needs the last stage's outputs received before
+        each forward; depth 0 exchanges them after the forward and deadlocks."""
+        args = _args(pp_size=8, tp_size=1, enable_torch_compile=True)
+        _apply(args)
+        self.assertEqual(args.pp_async_batch_depth, 1)
+        args = _args(
+            pp_size=8, tp_size=1, enable_torch_compile=True, pp_async_batch_depth=2
+        )
+        _apply(args)
+        self.assertEqual(args.pp_async_batch_depth, 2)
+        args = _args(tp_size=8)
+        _apply(args)
+        self.assertEqual(args.pp_async_batch_depth, 0)
 
     def test_tp_only_slice_size_is_unchanged(self):
         prepare_tpu_env = _apply(_args(tp_size=8))

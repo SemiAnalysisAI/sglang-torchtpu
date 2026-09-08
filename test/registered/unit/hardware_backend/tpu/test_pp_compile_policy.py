@@ -19,7 +19,7 @@ from sglang.srt.hardware_backend.tpu.compilation import decoder_compile_policy
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     CompiledForwardShim,
-    _check_pp_proxy_rows,
+    _fit_pp_proxy_rows,
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
@@ -309,11 +309,11 @@ def _shim(pp_group=None):
 
 
 class TestShimProxyCheck(CustomTestCase):
-    def test_row_mismatch_names_the_tensor_and_both_row_counts(self):
+    def test_short_proxy_names_the_tensor_and_both_row_counts(self):
         with self.assertRaisesRegex(
             ValueError, r"'residual'.*32 rows.*64 input tokens"
         ):
-            _check_pp_proxy_rows(
+            _fit_pp_proxy_rows(
                 PPProxyTensors(
                     {
                         "hidden_states": torch.zeros(64, 2),
@@ -325,9 +325,23 @@ class TestShimProxyCheck(CustomTestCase):
             )
 
     def test_matching_rows_pass_and_none_input_ids_fall_back_to_the_batch(self):
-        _check_pp_proxy_rows(_proxy(8), None, _forward_batch(8))
+        fitted = _fit_pp_proxy_rows(_proxy(8), None, _forward_batch(8))
+        self.assertEqual(fitted.tensors["hidden_states"].shape[0], 8)
         with self.assertRaises(ValueError):
-            _check_pp_proxy_rows(_proxy(8), None, _forward_batch(16))
+            _fit_pp_proxy_rows(_proxy(8), None, _forward_batch(16))
+
+    def test_longer_proxy_is_trimmed_to_the_padded_batch(self):
+        """The ICI wave delivers activations at the largest token bucket; a
+        stage running a smaller bucket keeps the leading rows."""
+        proxy = PPProxyTensors(
+            {
+                "hidden_states": torch.arange(64.0).reshape(64, 1),
+                "residual": torch.arange(64.0).reshape(64, 1) + 100,
+            }
+        )
+        fitted = _fit_pp_proxy_rows(proxy, torch.zeros(16), None)
+        self.assertEqual(fitted.tensors["hidden_states"].shape, (16, 1))
+        self.assertEqual(float(fitted.tensors["residual"][15, 0]), 115.0)
 
     def test_shim_passes_a_matching_proxy_to_the_compiled_forward(self):
         shim, compiled = _shim(_pp_group(first=False, last=False))

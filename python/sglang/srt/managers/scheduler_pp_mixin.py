@@ -14,7 +14,10 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -119,9 +122,14 @@ class SchedulerPPMixin:
                 self.running_mbs[mb_id] = self.running_batch
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
+                if self._pp_wave is not None:
+                    self._pp_wave.begin_iteration(cur_batch is not None)
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    if self._pp_wave is not None:
+                        pp_proxy_tensors = self._pp_wave_receive()
+                    else:
+                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -156,25 +164,55 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
-                if not self.pp_group.is_last_rank:
-                    if cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
+                if self._pp_wave is not None:
+                    with torch.profiler.record_function("pp_wave_send"):
+                        self._pp_wave.end_iteration(
+                            result.pp_hidden_states_proxy_tensors.tensors
+                            if cur_batch and not self.pp_group.is_last_rank
+                            else None
                         )
-                        with torch.profiler.record_function(
-                            "send_proxy_dict_to_next_stage"
-                        ):
-                            self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                                result.pp_hidden_states_proxy_tensors.tensors,
-                                async_send=True,
-                                msg_type="proxy",
-                            )
+                elif cur_batch and not self.pp_group.is_last_rank:
+                    self.device_module.current_stream().wait_event(self.launch_event)
+                    with torch.profiler.record_function(
+                        "send_proxy_dict_to_next_stage"
+                    ):
+                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                            result.pp_hidden_states_proxy_tensors.tensors,
+                            async_send=True,
+                            msg_type="proxy",
+                        )
 
                 self.pp_outputs = next_pp_outputs
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self.on_idle()
+
+    def _pp_wave_receive(self: Scheduler) -> Optional[PPProxyTensors]:
+        """This iteration's incoming activations over the ICI wave (None on
+        the first stage). They arrive at the wave's row count; the compiled
+        forward shim trims them to the batch's token bucket."""
+        tensors = self._pp_wave.receive()
+        return None if tensors is None else PPProxyTensors(tensors)
+
+    def _pp_init_wave(self: Scheduler):
+        """Hand activations between stages over ICI (TPU, no disaggregation)."""
+        from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+            max_extend_tokens,
+        )
+        from sglang.srt.hardware_backend.tpu.pp_wave import build_pp_wave
+
+        model_runner = self.tp_worker.model_runner
+        return build_pp_wave(
+            self.pp_group,
+            # The buffer holds the largest batch a forward can hand on.
+            rows=max_extend_tokens(
+                self.server_args, context_len=model_runner.model_config.context_len
+            ),
+            hidden=int(model_runner.model_config.hidden_size),
+            dtype=model_runner.dtype,
+            device=torch.device(model_runner.device),
+        )
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
@@ -588,6 +626,9 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
+        self._pp_wave = None
+        if _is_tpu and self.disaggregation_mode == DisaggregationMode.NULL:
+            self._pp_wave = self._pp_init_wave()
 
     def profile_and_init_predictor(self: Scheduler):
         """

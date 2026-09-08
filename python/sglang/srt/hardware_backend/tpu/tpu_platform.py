@@ -97,14 +97,27 @@ def _uses_seq_along_lane_kv() -> bool:
 
 
 def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
-    """Reject server configurations pipeline parallelism on TPU cannot run.
+    """Reject server configurations pipeline parallelism on TPU cannot run,
+    and pin the scheduler order the stage hand-off needs.
 
-    Every pipeline stage is one process on one device: the stage hand-off is a
-    host copy over the gloo cpu_group and the stages never take part in a
-    shared device collective, which is what tensor parallelism inside a stage
-    would require.
+    Every pipeline stage is one process on one device. Activations move over
+    ICI as one collective-permute launched by every stage in lockstep, so a
+    stage's forward waits on launches the other stages issue at the top of
+    their next iteration. The scheduler must therefore receive and forward
+    the last stage's outputs before it launches a forward, not after: that is
+    the async-batch-depth 1 order (depth 0 does the ring exchange after the
+    forward and the two waits form a cycle). Tensor parallelism inside a stage
+    would need the stages to share a second device collective and is rejected.
     """
     pp = server_args.pp_size
+    if server_args.pp_async_batch_depth < 1:
+        logger.info(
+            "Pipeline parallelism on TPU runs with --pp-async-batch-depth 1 "
+            "(got %d): the ICI hand-off needs the last stage's outputs "
+            "received before each forward.",
+            server_args.pp_async_batch_depth,
+        )
+        server_args.pp_async_batch_depth = 1
     if server_args.tp_size > 1:
         raise NotImplementedError(
             "Pipeline parallelism on TPU requires --tp-size 1 "

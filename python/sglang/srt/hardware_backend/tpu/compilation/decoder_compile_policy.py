@@ -59,6 +59,16 @@ _COMPILE_BAR_FORMAT = (
 _DISTRIBUTED_TOP_K_WARMUP_K = 50
 
 
+def max_extend_tokens(server_args: ServerArgs, *, context_len: int) -> int:
+    """The largest flattened EXTEND token dimension one scheduled batch can
+    reach: the prefill-buffer ceiling, else the larger of max_prefill_tokens
+    and the context length (tokens sum across requests, so a per-request
+    context length must not cap it)."""
+    return server_args.max_prefill_buffer_tokens() or max(
+        server_args.max_prefill_tokens or 0, context_len
+    )
+
+
 def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None:
     """Sync returned tensors and backend-marked KV side effects.
 
@@ -434,12 +444,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
             compiled_logits.__signature__ = inspect.signature(logits_fn)
             self.owner.logits_processor.forward = compiled_logits
-        # max_t is the largest flattened EXTEND token dimension compiled for one
-        # scheduled batch. It sums tokens across requests, so a per-request
-        # context length must not cap it.
-        max_t = server_args.max_prefill_buffer_tokens() or max(
-            server_args.max_prefill_tokens or 0,
-            self.model_runner.model_config.context_len,
+        max_t = max_extend_tokens(
+            server_args, context_len=self.model_runner.model_config.context_len
         )
         # max_b is the reconciled compile-batch ceiling, already grown to cover
         # scheduler concurrency in ServerArgs.__post_init__ via
