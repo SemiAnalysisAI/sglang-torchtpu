@@ -123,16 +123,25 @@ def register_pallas_distributed_top_k_op(world_size: int) -> None:
 def pallas_distributed_top_k(
     local_logits: torch.Tensor,
     *,
+    rank_input: torch.Tensor,
     org_vocab_size: int,
     global_vocab_size: int,
     org_vocab_padded_count: int,
     k: int,
     world_size: int,
-    model_rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return replicated exact global TopK values and unpadded token IDs."""
+    """Return replicated exact global TopK values and unpadded token IDs.
 
-    rank_input = local_logits.new_tensor((model_rank,), dtype=torch.int32)
+    ``rank_input`` carries this rank's vocabulary index into the kernel, which
+    cannot read it from ``lax.axis_index`` because the mesh order need not match
+    torch.distributed rank order. It must be a tensor direct_compile already
+    lifted into the graph (the lm_head buffer registered by
+    ``register_distributed_top_k_rank``) -- building it here with ``new_tensor``
+    materializes a device buffer inside the traced region that is reachable from
+    the outputs but is not a graph input, and TraverseAndCompile aborts the
+    process with "identified an argument that was not provided: ... int32[1]".
+    """
+
     values, token_ids = get_pallas_distributed_top_k_op(world_size)(
         local_logits,
         rank_input,
