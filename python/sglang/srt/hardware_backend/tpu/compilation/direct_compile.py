@@ -6,6 +6,7 @@ import functools
 import inspect
 import logging
 from collections.abc import Callable, Hashable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields
@@ -23,6 +24,7 @@ from torch_tpu._internal.compile import tpu_torch_compile
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
     PallasForwardMetadata,
 )
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -79,6 +81,7 @@ def insert_callback(
 
 SpecializationKey = Callable[..., Hashable]
 _STATIC_INPUT_TYPES = (bool, int, float, str, Enum)
+_ASYNC_COMPILE_EXECUTOR = ThreadPoolExecutor(thread_name_prefix="direct_compile")
 
 
 def _resolve_dotted_attr(root: object, path: str) -> tuple[object, str, object]:
@@ -142,6 +145,9 @@ def direct_compile(
     Any non-Tensor values are baked directly into the graph; all Tensor
     values are graph inputs.
     Then, it lowers it to MLIR and then compiles it with XLA/PJRT.
+
+    ``CompiledFunction.warmup_async`` queues compilation and returns a
+    ``PendingCall``. Waiting on it executes the compiled call.
 
     This API is specialized for SGLang inference. A more general API adds
     complexity and can be added when needed.
@@ -245,6 +251,20 @@ class CompiledFunction:
         self._ignored_argnames = ignored_argnames
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        artifact = self._get_artifact(args, kwargs)
+        return artifact((args, kwargs))
+
+    def warmup_async(self, *args: Any, **kwargs: Any) -> PendingCall:
+        """Queue compilation and execute this call when ``wait`` is called."""
+        artifact = self._get_artifact(args, kwargs, _ASYNC_COMPILE_EXECUTOR)
+        return PendingCall(lambda: artifact((args, kwargs)))
+
+    def _get_artifact(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        executor: ThreadPoolExecutor | None = None,
+    ) -> _CompiledArtifact:
         key = self.specialization_key(*args, **kwargs)
         artifact = self.cache.get(key)
         if artifact is None:
@@ -255,12 +275,15 @@ class CompiledFunction:
                     "'fail_on_recompile'. direct_compile specialization key: "
                     f"{key!r}"
                 )
-            artifact = self._compile(args, kwargs)
+            artifact = self._compile(args, kwargs, executor)
             self.cache[key] = artifact
-        return artifact((args, kwargs))
+        return artifact
 
     def _compile(
-        self, args: tuple[Any, ...], kwargs: dict[str, Any]
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        executor: ThreadPoolExecutor | None,
     ) -> _CompiledArtifact:
         """Compile one specialization into a PJRT executable."""
 
@@ -432,13 +455,16 @@ class CompiledFunction:
             len(kv_pool_inputs),
             len(inserted_callbacks),
         )
-        with dynamo_timed("direct_compile_traverse_and_compile"):
-            compile_result = tpu_torch_compile.traverse_and_compile(
-                result_tensors, graph_inputs
+        if executor is None:
+            executable = _compile_executable(result_tensors, graph_inputs)
+            logger.info("[direct_compile] compilation finished")
+        else:
+            executable = executor.submit(
+                _compile_executable, result_tensors, graph_inputs
             )
-        logger.info("[direct_compile] compilation finished")
+            logger.info("[direct_compile] compilation submitted")
         return _CompiledArtifact(
-            executable=compile_result.executable,
+            executable=executable,
             model_inputs=tuple(model_inputs),
             kv_pool=self._kv_pool,
             tensor_inputs_key_paths=tuple(tensor_inputs_key_paths),
@@ -453,7 +479,7 @@ class CompiledFunction:
 
 @dataclass(frozen=True)
 class _CompiledArtifact:
-    """Wrap a TorchTPU PJRT executable with input/output/mutation handling."""
+    """Wrap a PJRT executable, or its warmup future, with runtime handling."""
 
     executable: Any
     model_inputs: tuple[torch.Tensor, ...]
@@ -465,6 +491,11 @@ class _CompiledArtifact:
     callbacks: tuple[Callable[[torch.Tensor], None], ...] = ()
 
     def __call__(self, call: tuple[tuple[Any, ...], dict[str, Any]]) -> Any:
+        executable = (
+            self.executable.result()
+            if isinstance(self.executable, Future)
+            else self.executable
+        )
         kv_pool_inputs = self.kv_pool.get_state() if self.kv_pool is not None else []
         inputs = [*self.model_inputs, *kv_pool_inputs]
         # Resolve explicit inputs by path, similar to Dynamo sources.
@@ -489,7 +520,7 @@ class _CompiledArtifact:
                 )
             inputs.append(value)
 
-        outputs = tpu_torch_compile.execute(self.executable, inputs)
+        outputs = tpu_torch_compile.execute(executable, inputs)
 
         # Copy updated KV state back into the live pool tensors.
         with torch.no_grad():
@@ -510,6 +541,15 @@ class _CompiledArtifact:
         return tree_util.tree_unflatten(
             self.output_treespec, outputs[: self.output_count]
         )
+
+
+def _compile_executable(
+    result_tensors: list[torch.Tensor], graph_inputs: list[Any]
+) -> Any:
+    """Return an executable through TorchTPU's cache-aware compile path."""
+    with dynamo_timed("direct_compile_traverse_and_compile"):
+        result = tpu_torch_compile.traverse_and_compile(result_tensors, graph_inputs)
+    return result.executable
 
 
 def _get_path(value: Any, path: tree_util.KeyPath) -> Any:

@@ -23,6 +23,7 @@ policy or driver. It should not know decoder- or ViT-specific padding rules.
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -204,8 +205,10 @@ class TpuGraphRunner:
             if callable(getattr(self.model, "modules", None))
             else (self.model,)
         )
+        warmup_start = time.perf_counter()
         installed_any = False
         installed_policies: list[Any] = []
+        pending_warmups = []
         for module in modules:
             policy_cls = get_torch_compile_policy(module)
             if policy_cls is None:
@@ -253,7 +256,7 @@ class TpuGraphRunner:
             if installed:
                 installed_any = True
                 installed_policies.append(policy)
-                policy.precompile()
+                pending_warmups.extend(policy.precompile() or ())
 
         if not installed_any:
             server_args = model_runner.server_args
@@ -275,10 +278,19 @@ class TpuGraphRunner:
             if fallback_policy.install():
                 installed_any = True
                 installed_policies.append(fallback_policy)
-                fallback_policy.precompile()
+                pending_warmups.extend(fallback_policy.precompile() or ())
 
         if not installed_any:
             return
+
+        if pending_warmups:
+            logger.info("[direct_compile] waiting for %d warmups", len(pending_warmups))
+            for warmup in pending_warmups:
+                warmup.wait()
+            logger.info(
+                "TpuGraphRunner warmups finished in %.1fs",
+                time.perf_counter() - warmup_start,
+            )
 
         # Wire serving-time recompilation detection into installed shims
         # after warmup establishes the expected compile baseline.

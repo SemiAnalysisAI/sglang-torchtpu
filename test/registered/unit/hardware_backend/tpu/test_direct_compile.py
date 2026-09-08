@@ -125,26 +125,35 @@ class TestDirectCompile(CustomTestCase):
                 specialization_key=lambda value: tuple(value.shape),
             )
 
-        value = torch.ones(2, device="tpu")
-        expected = torch.full((2,), 2.0)
-        torch.tpu._clear_cache()
-        requests_before = torch.tpu._get_cache_requests()
-        hits_before = torch.tpu._get_cache_hits()
-        misses_before = torch.tpu._get_cache_misses()
+        def run(compiled_fn, value, async_compile):
+            if async_compile:
+                return compiled_fn.warmup_async(value).wait()
+            return compiled_fn(value)
 
-        torch.testing.assert_close(new_compiled_fn()(value).cpu(), expected)
-        self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
-        self.assertEqual(torch.tpu._get_cache_hits(), hits_before)
-        self.assertEqual(torch.tpu._get_cache_misses(), misses_before + 1)
+        for async_compile in (False, True):
+            with self.subTest(async_compile=async_compile):
+                value = torch.ones(2, device="tpu")
+                expected = torch.full((2,), 2.0)
+                torch.tpu._clear_cache()
+                requests_before = torch.tpu._get_cache_requests()
+                hits_before = torch.tpu._get_cache_hits()
+                misses_before = torch.tpu._get_cache_misses()
 
-        requests_before = torch.tpu._get_cache_requests()
-        hits_before = torch.tpu._get_cache_hits()
-        misses_before = torch.tpu._get_cache_misses()
+                result = run(new_compiled_fn(), value, async_compile)
+                torch.testing.assert_close(result.cpu(), expected)
+                self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
+                self.assertEqual(torch.tpu._get_cache_hits(), hits_before)
+                self.assertEqual(torch.tpu._get_cache_misses(), misses_before + 1)
 
-        torch.testing.assert_close(new_compiled_fn()(value).cpu(), expected)
-        self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
-        self.assertEqual(torch.tpu._get_cache_hits(), hits_before + 1)
-        self.assertEqual(torch.tpu._get_cache_misses(), misses_before)
+                requests_before = torch.tpu._get_cache_requests()
+                hits_before = torch.tpu._get_cache_hits()
+                misses_before = torch.tpu._get_cache_misses()
+
+                result = run(new_compiled_fn(), value, async_compile)
+                torch.testing.assert_close(result.cpu(), expected)
+                self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
+                self.assertEqual(torch.tpu._get_cache_hits(), hits_before + 1)
+                self.assertEqual(torch.tpu._get_cache_misses(), misses_before)
 
     def test_model_extra_tensor_attrs_trace_user_object_state_and_aliases(self):
         model = _ModelWithObjectTensorState()

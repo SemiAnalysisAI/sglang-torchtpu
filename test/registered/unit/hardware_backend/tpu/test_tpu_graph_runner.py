@@ -115,7 +115,10 @@ class TestTpuGraphRunner(CustomTestCase):
         direct_patcher = patch(
             "sglang.srt.hardware_backend.tpu.compilation."
             "decoder_compile_policy.DecoderTpuCompilePolicy._direct_compile",
-            return_value=MagicMock(name="direct_compiled"),
+            return_value=(
+                MagicMock(name="direct_compiled"),
+                MagicMock(name="direct_warmup_async"),
+            ),
         )
         self.mock_direct_compile = direct_patcher.start()
         self.addCleanup(direct_patcher.stop)
