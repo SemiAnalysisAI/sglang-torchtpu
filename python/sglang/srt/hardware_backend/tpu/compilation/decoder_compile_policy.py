@@ -283,6 +283,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     platform = "tpu"
     fullgraph = True
     dynamic = False
+    # The Pallas GDN backend runs a 1-token extend with a cached prefix, so a
+    # hybrid rank holding decode work can join a peer's prefill step.
+    dp_hybrid_decode_joins_extend = True
     model_extra_tensor_attrs: ClassVar[tuple[str, ...]] = ()
 
     def get_dp_padded_token_counts(
@@ -1213,9 +1216,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         # input_embeds path, so the DP restriction -- which is a property of that
         # path -- must be gated the same way. Raising unconditionally blocked DP
         # attention for text-only serving, where none of the VL machinery runs.
-        outer = getattr(self.model_runner, "model", None)
-        is_multimodal = hasattr(outer, "get_image_feature")
-        if is_multimodal and is_dp_attention_enabled():
+        if self._serves_multimodal and is_dp_attention_enabled():
             raise NotImplementedError(
                 "Qwen3-VL TPU decoder compilation does not support DP attention; "
                 "disable --enable-torch-compile for this configuration."
@@ -1227,11 +1228,25 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         model = getattr(self.model_runner, "model", None)
         return int(getattr(model, "num_deepstack_embeddings", 0) or 0)
 
+    @property
+    def _serves_multimodal(self) -> bool:
+        """A VL owner that still has its vision tower.
+
+        --language-model-only drops the tower and forwards like a text model;
+        --language-only (encoder disaggregation) keeps the input_embeds path.
+        """
+        outer = getattr(self.model_runner, "model", None)
+        # Kimi and MiniCPM-V owners install this policy too and carry no
+        # language_model_only attribute; only the Qwen3-VL wrappers set it.
+        return hasattr(outer, "get_image_feature") and not getattr(
+            outer, "language_model_only", False
+        )
+
     def _uses_input_embeds(self, target: Any) -> bool:
         """Whether to warm ``target`` via the Qwen3-VL input_embeds path."""
-        outer = getattr(self.model_runner, "model", None)
-        is_multimodal = hasattr(outer, "get_image_feature")
-        return is_multimodal and callable(getattr(target, "get_input_embeddings", None))
+        return self._serves_multimodal and callable(
+            getattr(target, "get_input_embeddings", None)
+        )
 
     def _direct_compile_specialization_key(
         self,
