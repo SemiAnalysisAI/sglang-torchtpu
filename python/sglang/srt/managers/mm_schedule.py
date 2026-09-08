@@ -587,6 +587,16 @@ def _get_chunked_prefill_embedding(
 def _get_multimodal_mask(
     input_ids: torch.Tensor, placeholder_tensor: torch.Tensor
 ) -> torch.Tensor:
+    """Mask of multimodal placeholder positions, on the consumer's device.
+
+    TPU assembles the embeddings on the host, so the mask lands there too: isin
+    would otherwise recompile per (token bucket, placeholder count), and the
+    device copy is a few KB of token ids.
+    """
+    if _is_tpu:
+        return torch.isin(input_ids.to("cpu"), placeholder_tensor.to("cpu")).unsqueeze(
+            -1
+        )
     return torch.isin(input_ids, placeholder_tensor).unsqueeze(-1)
 
 

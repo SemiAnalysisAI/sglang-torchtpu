@@ -11,7 +11,6 @@ from typing import Any
 
 import torch
 import torch._dynamo
-import torch.nn.functional as F
 from torch_tpu._internal.sync.sync import synchronize as tpu_sync
 
 from sglang.srt.compilation import torch_compile_bundle
@@ -148,7 +147,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
         self.vit = vit
         self.compiled_fn = None
         self._patch_buckets: list[int] | None = None
-        self._warned_oversize: set[int] = set()
+        self._graph_cu_seqlens_cache: dict[int, torch.Tensor] = {}
         self._logged_shapes = False
 
     def _resolve_runner(self) -> Any | None:
@@ -259,9 +258,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
                         len(patch_counts),
                         patch_count,
                     )
-                    inputs = self.make_warmup_inputs(patch_count)
-                    result = self.compiled_fn(*inputs)
-                    tpu_sync([result], wait=True)
+                    self.warmup_once(patch_count)
         finally:
             torch.set_default_dtype(init_dtype)
 
@@ -297,13 +294,23 @@ class VisionTpuCompilePolicy(CompilePolicy):
         precompile.
         """
 
-    @abstractmethod
+    def warmup_once(self, patch_count: int) -> None:
+        """Warm one patch count, blocking until it lands.
+
+        Defaults to the compiled region. Override when the encoder has an
+        eager prologue or epilogue that is shape-static per bucket too.
+        """
+        result = self.compiled_fn(*self.make_warmup_inputs(patch_count))
+        tpu_sync([result], wait=True)
+
     def make_warmup_inputs(self, patch_count: int) -> tuple[Any, ...]:
-        """Build the compiled-fn argument tuple for a warmup patch count.
+        """Compiled-fn argument tuple, for the default warmup_once.
 
         Reads whatever encoder state it needs (device, dtype, embedding dim)
         directly; the base holds no opinion about the encoder's module tree.
+        Unneeded when a subclass overrides warmup_once.
         """
+        raise NotImplementedError
 
     @abstractmethod
     def prepare_call(self, *raw: Any) -> tuple[tuple[Any, ...], Any]:
@@ -379,9 +386,12 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
             )
 
         runner.run = _run
+        # Padding moved upstream to the encoder, which needs the ladder to size
+        # its host-side buffers. Only reached once install succeeds.
+        runner.padded_patch_buckets = tuple(self.resolve_patch_buckets())
 
     def compute_patch_buckets(self) -> list[int]:
-        merge_size = getattr(self.vit, "spatial_merge_size", 2)
+        merge_size = self.vit.spatial_merge_size
         # Set but empty disables precompile: EnvTuple drops empty entries, so the
         # override is (), which validates trivially and warms nothing.
         if envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.is_set():
@@ -394,25 +404,21 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
             max_patches=envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.get(),
         )
 
-    def make_warmup_inputs(
-        self, patch_count: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def warmup_once(self, patch_count: int) -> None:
+        # A square grid lands exactly on the bucket, so the eager prologue and
+        # epilogue warm at the shapes a real image of this bucket will use.
         vit = self.vit
-        weight = vit.patch_embed.proj.weight
-        device, dtype = weight.device, weight.dtype
-        embed_dim = vit.blocks[0].norm1.normalized_shape[0]
-        x = torch.zeros(patch_count, 1, embed_dim, device=device, dtype=dtype)
+        patch_embed = vit.patch_embed
+        in_features = (
+            patch_embed.in_channels
+            * patch_embed.temporal_patch_size
+            * patch_embed.patch_size**2
+        )
         grid = int(math.isqrt(patch_count))
-        cos, sin = vit.rot_pos_emb([[1, grid, grid]])
-        cu_seqlens = torch.tensor([0, patch_count], device=device, dtype=torch.int32)
-        segment_ids = torch.zeros(1, patch_count, device=device, dtype=torch.int32)
-
-        merge_sq = getattr(vit, "spatial_merge_size", 2) ** 2
-        real = max(merge_sq, patch_count - merge_sq)
-        if patch_count > real:
-            segment_ids[0, real:] = 1
-
-        return x, cu_seqlens, cos, sin, segment_ids
+        vit.forward_with_tpu_graph(
+            torch.zeros(patch_count, in_features, dtype=vit.dtype),
+            torch.tensor([[1, grid, grid]], dtype=torch.int32),
+        )
 
     def prepare_call(
         self,
@@ -422,61 +428,58 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
         rotary_pos_emb_sin: torch.Tensor,
         output_indices: torch.Tensor | None = None,
     ) -> tuple[tuple[torch.Tensor, ...], _Qwen3VLRunContext]:
-        seq_len = x_3d.shape[0]
-        merge_sq = getattr(self.vit, "spatial_merge_size", 2) ** 2
-        bucket_len = self._bucket_for(seq_len)
-        padded = bucket_len is not None and bucket_len > seq_len
-        cos = rotary_pos_emb_cos
-        sin = rotary_pos_emb_sin
+        # The caller pads to a bucket on the host, so x_3d is already bucket
+        # sized; cu_seqlens still carries the real segmentation.
+        bucket_len = x_3d.shape[0]
+        real_seq_len = int(cu_seqlens[-1])
+        merge_sq = self.vit.spatial_merge_size**2
 
-        if padded:
-            pad = bucket_len - seq_len
-            x_3d = F.pad(x_3d, (0, 0, 0, 0, 0, pad))
-            cos = F.pad(cos, (0, 0, 0, pad))
-            sin = F.pad(sin, (0, 0, 0, pad))
-            segment_ids = _cu_seqlens_to_segment_ids(cu_seqlens, seq_len, x_3d.device)
-            num_real_segments = int(cu_seqlens.shape[0]) - 1
-            pad_segment = torch.full(
-                (1, pad), num_real_segments, dtype=torch.int32, device=x_3d.device
-            )
-            segment_ids = torch.cat([segment_ids, pad_segment], dim=1)
-        else:
-            if bucket_len is None and seq_len not in self._warned_oversize:
-                self._warned_oversize.add(seq_len)
-                buckets = self.resolve_patch_buckets()
-                logger.warning(
-                    "ViTTpuCompileRunner: patch count %d exceeds the largest "
-                    "precompiled bucket %s; this image triggers a one-time ViT "
-                    "recompile. Raise SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES, or "
-                    "lower max_pixels via --mm-process-config.",
-                    seq_len,
-                    buckets[-1] if buckets else None,
-                )
-            segment_ids = _cu_seqlens_to_segment_ids(cu_seqlens, seq_len, x_3d.device)
-
-        graph_cu_seqlens = torch.tensor(
-            [0, x_3d.shape[0]], device=x_3d.device, dtype=torch.int32
+        # Closing the tail with one more boundary gives the padded patches a
+        # segment of their own, so they cannot attend to real ones.
+        padded_cu_seqlens = torch.cat([cu_seqlens, cu_seqlens.new_tensor([bucket_len])])
+        segment_ids = _cu_seqlens_to_segment_ids(
+            padded_cu_seqlens, bucket_len, x_3d.device
         )
         ctx = _Qwen3VLRunContext(
             padding=VisionPaddingContext(
-                real_seq_len=seq_len,
+                real_seq_len=real_seq_len,
                 bucket_len=bucket_len,
-                padded=padded,
+                padded=bucket_len > real_seq_len,
                 merge_sq=merge_sq,
             ),
             output_indices=output_indices,
         )
-        return (x_3d, graph_cu_seqlens, cos, sin, segment_ids), ctx
+        return (
+            (
+                x_3d,
+                self._graph_cu_seqlens(bucket_len, x_3d.device),
+                rotary_pos_emb_cos,
+                rotary_pos_emb_sin,
+                segment_ids,
+            ),
+            ctx,
+        )
+
+    def _graph_cu_seqlens(self, bucket_len: int, device: torch.device) -> torch.Tensor:
+        """Single-segment indptr for the compiled boundary, cached per bucket."""
+        cached = self._graph_cu_seqlens_cache.get(bucket_len)
+        if cached is None:
+            cached = torch.tensor([0, bucket_len], device=device, dtype=torch.int32)
+            self._graph_cu_seqlens_cache[bucket_len] = cached
+        return cached
 
     def unpad_outputs(
         self, result: torch.Tensor, ctx: _Qwen3VLRunContext
     ) -> torch.Tensor:
         padding = ctx.padding
+        # Land on the host while the shape is still the bucket: every consumer
+        # from here on is variable-length and would recompile per length.
+        result = result.to("cpu")
         if padding.padded:
             result = result[: padding.real_seq_len // padding.merge_sq]
         # Qwen3-VL's caller asks for a subset of the merged output rows.
         if ctx.output_indices is not None:
-            result = result.index_select(0, ctx.output_indices)
+            result = result.index_select(0, ctx.output_indices.to("cpu"))
         return result
 
 
@@ -486,6 +489,14 @@ class ViTTpuCompileRunner:
     def __init__(self, vit: Any) -> None:
         self.vit = vit
         self._compiled_fn = None
+
+        # Published by the TPU compile policy on install; empty until then,
+        # which makes bucket_for_patches the identity.
+        self.padded_patch_buckets: tuple[int, ...] = ()
+        self._warned_oversize_patches: set[int] = set()
+        # Host mirror of the rotary cache, taken on first use: some loaders
+        # build the model under a meta device, where it holds no values yet.
+        self._rotary_cos_sin_cache_cpu: torch.Tensor | None = None
 
         self._deepstack_visual_indexes = set(
             getattr(vit, "deepstack_visual_indexes", []) or []
@@ -507,6 +518,50 @@ class ViTTpuCompileRunner:
                 "segment_ids; "
                 "falling back to eager ViT execution."
             )
+
+    def bucket_for_patches(self, total_patches: int) -> int:
+        """Padded patch count for total_patches, or itself when unbucketed."""
+        for bucket in self.padded_patch_buckets:
+            if bucket >= total_patches:
+                return bucket
+        if (
+            self.padded_patch_buckets
+            and total_patches not in self._warned_oversize_patches
+        ):
+            self._warned_oversize_patches.add(total_patches)
+            logger.warning(
+                "ViTTpuCompileRunner: patch count %d exceeds the largest "
+                "precompiled bucket %d; this image triggers a one-time ViT "
+                "recompile. Raise SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES, or "
+                "lower max_pixels via --mm-process-config.",
+                total_patches,
+                self.padded_patch_buckets[-1],
+            )
+        return total_patches
+
+    def _host_rotary_cache(self) -> torch.Tensor:
+        if self._rotary_cos_sin_cache_cpu is None:
+            self._rotary_cos_sin_cache_cpu = (
+                self.vit.rotary_pos_emb.cos_sin_cache.detach().to("cpu", copy=True)
+            )
+        return self._rotary_cos_sin_cache_cpu
+
+    def _rot_pos_emb_cpu(
+        self, grid_thw: list[list[int]], *, bucket_len: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Host-side rot_pos_emb; cos/sin come back padded to bucket_len."""
+        pos_ids_per_image = []
+        for t, h, w in grid_thw:
+            base = self.vit.rot_pos_ids(h, w, self.vit.spatial_merge_size)
+            pos_ids_per_image.append(base if t == 1 else base.repeat(t, 1))
+        pos_ids = torch.cat(pos_ids_per_image, dim=0)
+
+        padded_pos_ids = pos_ids.new_zeros((bucket_len, pos_ids.shape[1]))
+        padded_pos_ids[: pos_ids.shape[0]] = pos_ids
+
+        max_grid_size = max(max(h, w) for _, h, w in grid_thw)
+        cos, sin = self._host_rotary_cache()[:max_grid_size].chunk(2, dim=-1)
+        return cos[padded_pos_ids].flatten(1), sin[padded_pos_ids].flatten(1)
 
     def _all_blocks_use_segment_id_attention(self) -> bool:
         for block in self.vit.blocks:
@@ -614,6 +669,9 @@ class ViTTpuCompileRunner:
             result = self._blocks_and_merger_fallback(
                 x_3d, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin
             )
+        # Same host contract as the installed policy's unpad_outputs, so the
+        # embedding cache never mixes devices across the two modes.
+        result = result.to("cpu")
         if output_indices is not None:
-            result = result.index_select(0, output_indices)
+            result = result.index_select(0, output_indices.to("cpu"))
         return result

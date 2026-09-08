@@ -1063,7 +1063,7 @@ class TestPrecompileLoops(CustomTestCase):
         mr = _model_runner()
         mr.server_args = SimpleNamespace(enable_mixed_chunk=False)
         mr.model.get_image_feature = MagicMock()
-        mr.model.get_input_embeddings = MagicMock()
+        mr.model.get_input_embeddings = MagicMock(return_value=torch.nn.Embedding(2, 4))
         policy = Qwen3VLDecoderTpuCompilePolicy(
             model_runner=mr,
             t_bucketer=Bucketer(name="Token", buckets=[64, 256]),
@@ -1085,7 +1085,7 @@ class TestPrecompileLoops(CustomTestCase):
     def test_qwen3_vl_warmup_crosses_logits_modes(self):
         mr = _model_runner()
         mr.model.get_image_feature = MagicMock()
-        mr.model.get_input_embeddings = MagicMock()
+        mr.model.get_input_embeddings = MagicMock(return_value=torch.nn.Embedding(2, 4))
         _enable_distributed_top_k(mr)
         policy = Qwen3VLDecoderTpuCompilePolicy(
             model_runner=mr,
@@ -1110,6 +1110,39 @@ class TestPrecompileLoops(CustomTestCase):
                 LogitsOutputMode.DISTRIBUTED_TOP_K,
                 LogitsOutputMode.FULL_VOCAB,
             ],
+        )
+
+    def test_qwen3_vl_warms_mm_embed_placement_for_every_token_bucket(self):
+        """A skipped bucket JITs its select on the first real prefill.
+
+        The multimodal merge runs eagerly outside the compiled graph, so it is
+        not covered by the graph warmup above; only this loop reaches it. A
+        bucket missing here reappears as a mid-serving compile stall.
+        """
+        mr = _model_runner()
+        mr.server_args = SimpleNamespace(enable_mixed_chunk=False)
+        mr.model.get_image_feature = MagicMock()
+        mr.model.get_input_embeddings = MagicMock(return_value=torch.nn.Embedding(2, 4))
+        policy = Qwen3VLDecoderTpuCompilePolicy(
+            model_runner=mr,
+            t_bucketer=Bucketer(name="Token", buckets=[64, 256]),
+            b_bucketer=Bucketer(name="Bs", buckets=[16]),
+            owner=mr.model,
+        )
+        policy.extend_bs = 16
+        policy._run_one = MagicMock()
+
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.mm_embed_tpu.apply_host_mm_embeds"
+            ) as warmed,
+            get_parallel().override(tp_rank=1),
+        ):
+            policy._precompile_extend()
+
+        self.assertEqual(
+            [call.kwargs["input_embeds"].shape for call in warmed.call_args_list],
+            [torch.Size((64, 4)), torch.Size((256, 4))],
         )
 
     def test_extend_skips_token_bucket_below_bs(self):

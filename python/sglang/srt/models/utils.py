@@ -429,6 +429,25 @@ class RotaryPosMixin:
 
         return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
 
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def merge_window_order(h: int, w: int, spatial_merge_size: int) -> np.ndarray:
+        """Row order that groups a h*w patch grid into merger windows.
+
+        Same permutation as view(h/m, m, w/m, m).permute(0, 2, 1, 3).flatten();
+        folding it into a gather index keeps it off the device.
+        """
+        order = (
+            np.arange(h * w)
+            .reshape(
+                h // spatial_merge_size, spatial_merge_size, -1, spatial_merge_size
+            )
+            .transpose(0, 2, 1, 3)
+            .reshape(-1)
+        )
+        order.flags.writeable = False
+        return order
+
 
 def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
     """Reshape a (..., H*D) tensor into (..., H, D) ahead of QK RMSNorm.

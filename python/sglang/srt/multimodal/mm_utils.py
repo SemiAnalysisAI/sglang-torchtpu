@@ -63,6 +63,7 @@ def materialize_multimodal_features(
     *,
     device: torch.device,
     dtype: torch.dtype,
+    pad_to: int | None = None,
 ) -> torch.Tensor:
     """Concatenate variable-length feature tensors into one destination buffer.
 
@@ -76,6 +77,10 @@ def materialize_multimodal_features(
     All tensors must agree on dimensions after the leading token dimension.
     The leading dimension may differ because images commonly have different
     numbers of vision patches.
+
+    Args:
+      pad_to: Leading length to allocate instead of the packed token count,
+        with the tail zeroed. Lets a caller hand the encoder a bucket shape.
     """
 
     if not features:
@@ -98,8 +103,11 @@ def materialize_multimodal_features(
             )
         total_tokens += feature.shape[0]
 
+    if pad_to is not None and pad_to < total_tokens:
+        raise ValueError(f"pad_to={pad_to} is smaller than {total_tokens} tokens")
+
     output = torch.empty(
-        (total_tokens, *trailing_shape),
+        (total_tokens if pad_to is None else pad_to, *trailing_shape),
         device=device,
         dtype=dtype,
     )
@@ -108,6 +116,8 @@ def materialize_multimodal_features(
         length = feature.shape[0]
         output[offset : offset + length].copy_(feature, non_blocking=True)
         offset += length
+    if pad_to is not None:
+        output[offset:].zero_()
     return output
 
 

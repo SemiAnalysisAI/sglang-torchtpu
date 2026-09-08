@@ -899,11 +899,11 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        if _is_tpu:
+            return self.forward_with_tpu_graph(x, grid_thw)
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if _is_npu:
                 return self.forward_with_npu_graph(x, grid_thw)
-            return self.forward_with_cuda_graph(x, grid_thw)
-        if _is_tpu:
             return self.forward_with_cuda_graph(x, grid_thw)
 
         x = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
@@ -1040,11 +1040,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_cos,
             rotary_pos_emb_sin,
         ) = self._prepare_graph_inputs(x, grid_thw)
-        if _is_tpu:
-            # Segment IDs are built on the host by ViTTpuCompileRunner. Keep the
-            # cumulative lengths on CPU to avoid a per-request TPU-to-host sync.
-            cu_seqlens = torch.as_tensor(cu_seqlens, dtype=torch.int32, device="cpu")
-        elif not isinstance(cu_seqlens, torch.Tensor):
+        if not isinstance(cu_seqlens, torch.Tensor):
             cu_seqlens = torch.tensor(cu_seqlens, device=x.device, dtype=torch.int32)
         else:
             cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
@@ -1119,6 +1115,78 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
         return x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin
+
+    def _pos_embed_indices_cpu(
+        self, grid_thw: list[list[int]], *, bucket_len: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Bilinear pos-embed gather indices and weights, padded to bucket_len.
+
+        Folds in the merger-window reorder so the device side is one flat
+        gather. Padded slots gather row 0 with weight 0.
+        """
+        indices_np = np.zeros((4, bucket_len), dtype=np.int64)
+        weights_np = np.zeros((4, bucket_len), dtype=np.float32)
+
+        offset = 0
+        for t, h, w in grid_thw:
+            corner_indices, corner_weights = self._calculate_indices_and_weights(
+                self._get_interpolation_indices(h), self._get_interpolation_indices(w)
+            )
+            order = self.merge_window_order(h, w, self.spatial_merge_size)
+            end = offset + t * h * w
+            for corner in range(4):
+                indices_np[corner, offset:end] = np.tile(
+                    corner_indices[corner][order], t
+                )
+                weights_np[corner, offset:end] = np.tile(
+                    corner_weights[corner][order], t
+                )
+            offset = end
+
+        return (
+            torch.from_numpy(indices_np),
+            torch.from_numpy(weights_np).to(dtype=self.dtype),
+        )
+
+    def forward_with_tpu_graph(
+        self, x: torch.Tensor, grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        """ViT forward whose pre-encoder work stays on the host.
+
+        x arrives padded to a patch bucket, so every tensor reaching the
+        device is shape-static. cu_seqlens keeps the real segmentation.
+        """
+        if x.device.type != "cpu" or grid_thw.device.type != "cpu":
+            raise ValueError("forward_with_tpu_graph expects CPU inputs")
+        bucket_len = x.shape[0]
+        grid_thw_list = grid_thw.tolist()
+
+        idx, weights = self._pos_embed_indices_cpu(grid_thw_list, bucket_len=bucket_len)
+        cos, sin = self.graph_runners._rot_pos_emb_cpu(
+            grid_thw_list, bucket_len=bucket_len
+        )
+        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
+
+        device = self.device
+        x = x.to(device=device, dtype=self.dtype, non_blocking=True)
+        idx = idx.to(device=device, non_blocking=True)
+        weights = weights.to(device=device, non_blocking=True)
+        cos = cos.to(device=device, non_blocking=True)
+        sin = sin.to(device=device, non_blocking=True)
+
+        x = self.patch_embed(x)
+        pos_embeds = self.pos_embed(idx.view(-1)).view(4, bucket_len, -1)
+        x += (pos_embeds * weights.unsqueeze(-1)).sum(dim=0)
+
+        return self.graph_runners.run(
+            x=x,
+            position_embeddings=None,
+            rotary_pos_emb_cos=cos,
+            rotary_pos_emb_sin=sin,
+            cu_seqlens=cu_seqlens,
+            cu_window_seqlens=None,
+            output_indices=None,
+        )
 
 
 if _is_tpu:
@@ -1409,6 +1477,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> torch.Tensor:
         assert grid_thw.dim() == 2, grid_thw.dim()
         if self.use_data_parallel:
+            if _is_tpu:
+                # The DP runner shards and all-gathers on device, which is
+                # incompatible with the host-staged TPU encoder path.
+                raise NotImplementedError(
+                    "TPU vision encoding does not support --mm-enable-dp-encoder"
+                )
             return run_dp_sharded_mrope_vision_model(
                 self.visual,
                 None,
@@ -1418,29 +1492,48 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 pixel_values_device=self.visual.device,
                 pixel_values_dtype=self.visual.dtype,
             )
-        pixel_values = self._materialize_visual_items(items, range(len(items)))
+        if _is_tpu:
+            # Assemble on the host at bucket length so the encoder prologue sees
+            # a static shape; forward_with_tpu_graph does the single transfer.
+            total_patches = int(grid_thw.prod(dim=1).sum())
+            pixel_values = self._materialize_visual_items(
+                items,
+                range(len(items)),
+                device=torch.device("cpu"),
+                pad_to=self.visual.graph_runners.bucket_for_patches(total_patches),
+            )
+        else:
+            pixel_values = self._materialize_visual_items(items, range(len(items)))
         assert pixel_values.dim() == 2, pixel_values.dim()
         return self.visual(pixel_values, grid_thw=grid_thw)
 
     def _materialize_visual_items(
-        self, items: List[MultimodalDataItem], indices: Iterable[int]
+        self,
+        items: List[MultimodalDataItem],
+        indices: Iterable[int],
+        *,
+        device: torch.device | None = None,
+        pad_to: int | None = None,
     ) -> torch.Tensor:
-        device = self.visual.device
-        device_index = device.index
-        if device.type == "cuda" and device_index is None:
+        visual_device = self.visual.device
+        device_index = visual_device.index
+        if visual_device.type == "cuda" and device_index is None:
             device_index = torch.cuda.current_device()
-        if device.type == "cuda":
+        if visual_device.type == "cuda":
             parallel = get_parallel()
             consumer_count = max(parallel.tp_size, 1)
 
         features = []
         for index in indices:
             item = items[index]
-            if device.type == "cuda":
+            if visual_device.type == "cuda":
                 item.reconstruct(device_index, ipc_consumer_count=consumer_count)
             features.append(item.feature)
         return materialize_multimodal_features(
-            features, device=device, dtype=self.visual.dtype
+            features,
+            device=visual_device if device is None else device,
+            dtype=self.visual.dtype,
+            pad_to=pad_to,
         )
 
     def get_input_embeddings(self):

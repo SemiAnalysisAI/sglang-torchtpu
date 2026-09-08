@@ -43,9 +43,11 @@ from sglang.srt.runtime_context import (
     get_server_args,
     get_serving,
 )
-from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.srt.utils import flatten_nested_list, is_tpu, print_warning_once
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
+
+_is_tpu = is_tpu()
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
@@ -476,6 +478,25 @@ def embed_mm_inputs(
         deepstack_embedding_shape = input_embeds.shape[:-1] + (
             input_embeds.shape[-1] * num_deepstack_embeddings,
         )
+
+    # 4. scatter embeddings into input embedding
+    if _is_tpu:
+        from sglang.srt.hardware_backend.tpu.mm_embed_tpu import embed_mm_on_host
+
+        input_embeds, input_deepstack_embeds = embed_mm_on_host(
+            input_embeds=input_embeds,
+            deepstack_shape=deepstack_embedding_shape if use_deepstack else None,
+            modalities=modalities,
+            embeddings=embeddings,
+            masks=masks,
+            deepstack_embeddings=deepstack_embeddings,
+            use_deepstack=use_deepstack,
+        )
+        if use_deepstack:
+            other_info["input_deepstack_embeds"] = input_deepstack_embeds
+        return input_embeds, other_info
+
+    if use_deepstack:
         # a zero-filled embedding, with the same length of input_embeds, but different hidden_size
         input_deepstack_embeds = torch.zeros(
             deepstack_embedding_shape,
@@ -485,7 +506,6 @@ def embed_mm_inputs(
 
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
-    # 4. scatter embeddings into input embedding
     # masked_scatter_ avoids the cudaStreamSynchronize that torch.where triggers.
     def _scatter(dest, mask, src):
         dest.masked_scatter_(mask.expand_as(dest), src.to(dest.device, dest.dtype))

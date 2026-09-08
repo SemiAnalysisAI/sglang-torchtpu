@@ -22,9 +22,13 @@ class _RecordingVisual:
     device = torch.device("meta")
     dtype = torch.bfloat16
 
-    def __init__(self):
+    def __init__(self, bucket=None):
         self.pixel_values = None
         self.grid_thw = None
+        # The ladder lives on the runner now, so the fake answers from there.
+        self.graph_runners = SimpleNamespace(
+            bucket_for_patches=lambda total: total if bucket is None else bucket
+        )
 
     def __call__(self, pixel_values, *, grid_thw):
         self.pixel_values = pixel_values
@@ -98,12 +102,40 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
                 image_grid_thw=torch.tensor([[1, 1, 1]]),
             ),
         ]
-        output = model.get_image_feature(items)
+        with patch("sglang.srt.models.qwen3_vl._is_tpu", False):
+            output = model.get_image_feature(items)
 
         self.assertIs(visual.pixel_values, output)
         self.assertEqual(output.shape, (3, 3))
         self.assertEqual(output.device, visual.device)
         self.assertEqual(output.dtype, visual.dtype)
+
+    def test_tpu_packs_image_features_on_host_at_bucket_length(self):
+        """TPU assembles on CPU and pads to a bucket.
+
+        The encoder prologue runs outside any compile boundary, so a
+        non-bucket leading dim there costs a fresh XLA compile per image size.
+        """
+        visual = _RecordingVisual(bucket=8)
+        model = self._model(visual, use_data_parallel=False)
+        items = [
+            SimpleNamespace(
+                feature=torch.ones(2, 3),
+                image_grid_thw=torch.tensor([[1, 1, 2]]),
+            ),
+            SimpleNamespace(
+                feature=torch.ones(1, 3),
+                image_grid_thw=torch.tensor([[1, 1, 1]]),
+            ),
+        ]
+
+        with patch("sglang.srt.models.qwen3_vl._is_tpu", True):
+            output = model.get_image_feature(items)
+
+        self.assertEqual(output.shape, (8, 3))
+        self.assertEqual(output.device.type, "cpu")
+        self.assertTrue(torch.equal(output[:3], torch.ones(3, 3, dtype=visual.dtype)))
+        self.assertTrue(torch.equal(output[3:], torch.zeros(5, 3, dtype=visual.dtype)))
 
     def test_video_features_are_packed_on_the_visual_device(self):
         visual = _RecordingVisual()
@@ -118,7 +150,8 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
                 video_grid_thw=torch.tensor([[1, 1, 2]]),
             ),
         ]
-        output = model.get_video_feature(items)
+        with patch("sglang.srt.models.qwen3_vl._is_tpu", False):
+            output = model.get_video_feature(items)
 
         self.assertIs(visual.pixel_values, output)
         self.assertEqual(output.shape, (5, 4))
@@ -127,6 +160,27 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
         self.assertTrue(
             torch.equal(visual.grid_thw, torch.tensor([[1, 1, 3], [1, 1, 2]]))
         )
+
+    def test_tpu_rejects_encoder_dp_instead_of_failing_deep(self):
+        """TPU + DP encoder must fail with a clear message at the entry.
+
+        The DP runner shards and all-gathers on device, but the TPU encoder
+        path hands it host-staged pixel values. Without this guard the
+        mismatch surfaces as a CPU-device assertion inside
+        forward_with_tpu_graph, far from the actual misconfiguration.
+        """
+        visual = _RecordingVisual()
+        model = self._model(visual, use_data_parallel=True)
+        items = [
+            SimpleNamespace(
+                feature=torch.ones(2, 3),
+                image_grid_thw=torch.tensor([[1, 1, 2]]),
+            )
+        ]
+
+        with patch("sglang.srt.models.qwen3_vl._is_tpu", True):
+            with self.assertRaisesRegex(NotImplementedError, "mm-enable-dp-encoder"):
+                model.get_image_feature(items)
 
     def test_encoder_dp_materializes_only_locally_assigned_visual_items(self):
         visual = SimpleNamespace(device=torch.device("cuda:0"), dtype=torch.bfloat16)
@@ -169,6 +223,8 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
                 ) as materialize, patch(
                     "sglang.srt.models.qwen3_vl.get_parallel",
                     return_value=SimpleNamespace(tp_size=8),
+                ), patch(
+                    "sglang.srt.models.qwen3_vl._is_tpu", False
                 ):
                     output = feature_method(items)
 
@@ -176,7 +232,10 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
                 items[0].reconstruct.assert_not_called()
                 items[1].reconstruct.assert_called_once_with(0, ipc_consumer_count=8)
                 materialize.assert_called_once_with(
-                    [items[1].feature], device=visual.device, dtype=visual.dtype
+                    [items[1].feature],
+                    device=visual.device,
+                    dtype=visual.dtype,
+                    pad_to=None,
                 )
 
 
