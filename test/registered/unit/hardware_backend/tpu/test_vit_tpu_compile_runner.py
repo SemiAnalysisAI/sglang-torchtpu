@@ -11,6 +11,9 @@ from sglang.srt.compilation.support_torch_compile import (
     support_torch_compile,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.compilation.encoder_compile_policy import (
+    install_vision_compile_policies,
+)
 from sglang.srt.hardware_backend.tpu.graph_runner import (
     vit_tpu_compile_runner as vit_runner,
 )
@@ -660,7 +663,7 @@ class TestInstallVisionCompilePolicies(unittest.TestCase):
     def test_installs_every_vision_policy_and_skips_the_others(self):
         model = _Model()
 
-        installed = vit_runner.install_vision_compile_policies(model)
+        installed = install_vision_compile_policies(model)
 
         self.assertEqual(len(installed), 2)
         self.assertEqual(
@@ -671,7 +674,7 @@ class TestInstallVisionCompilePolicies(unittest.TestCase):
     def test_installs_without_a_model_runner(self):
         # The encode server owns a vision encoder but builds no ModelRunner, so
         # nothing on the policy may reach through it.
-        installed = vit_runner.install_vision_compile_policies(_Model())
+        installed = install_vision_compile_policies(_Model())
 
         self.assertTrue(all(policy.model_runner is None for policy in installed))
 
@@ -682,11 +685,11 @@ class TestInstallVisionCompilePolicies(unittest.TestCase):
         model = _Model(vision_policy=_RefusingVisionPolicy)
 
         with self.assertRaisesRegex(RuntimeError, "no TPU vision compile policy"):
-            vit_runner.install_vision_compile_policies(model)
+            install_vision_compile_policies(model)
 
     def test_raises_when_nothing_is_annotated(self):
         with self.assertRaisesRegex(RuntimeError, "0 annotated"):
-            vit_runner.install_vision_compile_policies(_Unannotated())
+            install_vision_compile_policies(_Unannotated())
 
 
 if __name__ == "__main__":

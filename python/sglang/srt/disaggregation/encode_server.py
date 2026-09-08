@@ -566,7 +566,7 @@ class MMEncoder:
 
         # Imported here, not at module scope: the module imports torch_tpu,
         # which does not exist on the CUDA hosts that also run this server.
-        from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+        from sglang.srt.hardware_backend.tpu.compilation.encoder_compile_policy import (
             install_vision_compile_policies,
         )
 
