@@ -37,16 +37,28 @@ HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "3600"))
 # the model computes, so a drop here is a corrupted host round-trip.
 GSM8K_ACCURACY = 0.65
 
-# The device pool has to be small enough that a handful of filler prefills evict the
-# probe to host, and large enough that GSM8K at CONCUR=8 still fits (short prompts
-# plus 512 output tokens each). Both hold at 16k.
-DEVICE_POOL_TOKENS = 16384
+# Per DP worker. Small enough that a handful of filler prefills evict the probe to
+# host, large enough that GSM8K's share of CONCUR=8 still fits on a worker (short
+# prompts plus 512 output tokens each). Both hold at 8k once dp splits the traffic.
+DEVICE_POOL_TOKENS = 8192
 HICACHE_RATIO = 3.0
 PROBE_TOKENS = 2048
 # recipe/qwen3_coder_480b/server.sh exports PAGE_SIZE unconditionally, so this is
 # not overridable from `env` -- it is restated because the gate's "at least one
 # page" checks are in terms of it, and a prefix match is floored to a page multiple.
 PAGE_SIZE = 256
+# Matching the one 480B lane that is green, singlehost_spec_dpa_gsm8k. dp=1 has
+# no working setting on this model: 512 boots but decodes garbage (GSM8K 0.0,
+# measured with HiCache OFF too, so the cache is not involved), and 1024 and
+# 4096 both abort every rank in the extend precompile on
+# absl::raw_hash_map<>::at. Under DP attention the same model serves correctly.
+#
+# dp=2, not the 4 the spec_dpa lane uses: HiCache allocates a host pool PER DP
+# GROUP, so at ratio 3.0 dp=4 asks for 4 x 3 x 8192 = 98304 host tokens, double
+# the dp=1 total, and the OS killed a scheduler mid weight-load (run 34252903494,
+# server exited with code -9). spec_dpa gets away with dp=4 because it runs no
+# HiCache at all. dp=2 puts the host total back at the dp=1 level.
+DP_SIZE = 2
 
 LAUNCH_ENV = {
     "MODEL": "/weights/Qwen3-Coder-480B-A35B-Instruct-FP8",
@@ -55,21 +67,12 @@ LAUNCH_ENV = {
     "CONCUR": "8",
     "CONTEXT_LEN": "8192",
     "MAX_TOTAL_TOKENS": str(DEVICE_POOL_TOKENS),
-    # CHUNK caps --chunked-prefill-size and --max-prefill-tokens, and it defaults to
-    # ISL. Pinned to 512 because a larger EXTEND is not served correctly at this
-    # config, tracked on issue #372: at 2048 the model emits nothing but token 0
-    # (`!!!!...`) for any prompt over 512 tokens, and at 4096 the TPU compiler wedges
-    # for ~10 minutes and then aborts every rank on `raw_hash_map<>::at`. A prompt
-    # length sweep on a TPU7x-8 host puts the cliff exactly at the tier boundary --
-    # 512 tokens is clean, 520 is garbage -- and it moves with the tier rather than
-    # with the prompt, so it is the size of one prefill graph. Ruled out on that same
-    # sweep, each changed alone: page size (64 fails identically to 256) and
-    # xla_tpu_use_dynamic_smem_negotiation. Capping here keeps every EXTEND on the
-    # 512 graph, and costs nothing the gate needs -- the probe is 2048 tokens and
-    # GSM8K prompts are shorter, so both just chunk.
-    "CHUNK": "512",
-    "TPU_COMPILE_TOKENS": "512",
-    "TPU_COMPILE_BS": "1 2 4 8",
+    # DP attention divides --chunked-prefill-size by dp_size, so 2048 at dp=2
+    # compiles the 1024 extend graph the green spec_dpa lane compiles.
+    "CHUNK": "2048",
+    "DP_SIZE": str(DP_SIZE),
+    "TPU_COMPILE_TOKENS": "512 1024 2048",
+    "TPU_COMPILE_BS": "1 2 4",
     # The recipe serves this model on pallas_tpu_rpa_batched, which raiden rejects:
     # RPA v3 is the only TPU backend carrying the HiCache reload-commit hook and the
     # fused KV pool. Overridden here, together with the layout it forces.
@@ -94,7 +97,7 @@ LAUNCH_ENV = {
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "qwen3-coder-480b-prefix-cache-kv-offload",
-    "variant": "TP8+EP8+HiCache-raiden",
+    "variant": "TP8+EP8+DP2+HiCache-raiden",
     "launch": {
         "recipe": "recipe/qwen3_coder_480b/server.sh",
         "env": LAUNCH_ENV,
@@ -116,6 +119,9 @@ MODEL_CONFIG = {
                 page_size=PAGE_SIZE,
                 probe_tokens=PROBE_TOKENS,
                 hicache_ratio=HICACHE_RATIO,
+                # The probe pins each read to one DP rank and checks the
+                # response came back from it, so it runs once per rank.
+                dp_size=DP_SIZE,
             ),
         },
         {
