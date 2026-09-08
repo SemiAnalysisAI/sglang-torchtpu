@@ -716,6 +716,7 @@ class DFlashDraftModel(nn.Module):
                 TpuVocabShard.from_lm_head(self.lm_head),
                 k=1,
                 group=get_tp_group(),
+                lm_head=self.lm_head,
             )
             tokens = global_token_ids.squeeze(-1).to(torch.long)
             return tokens.view(bs, self.block_size - 1)
