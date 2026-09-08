@@ -123,6 +123,15 @@ logger = logging.getLogger(__name__)
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
 # SGLang assumes exclusive
+_LAYER_ID_RE = re.compile(r"\.layers\.(\d+)\.")
+
+
+def _checkpoint_layer_id(name: str) -> Optional[int]:
+    """Decoder layer index named by a checkpoint weight, or None."""
+    match = _LAYER_ID_RE.search(name)
+    return int(match.group(1)) if match else None
+
+
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
@@ -1023,6 +1032,12 @@ class GptOssForCausalLM(nn.Module):
         target_device = next(self.parameters()).device
 
         for name, weight in weights:
+            layer_id = _checkpoint_layer_id(name)
+            if layer_id is not None and not (
+                self.start_layer <= layer_id < self.end_layer
+            ):
+                # Another pipeline stage holds this layer.
+                continue
             weight = weight.to(target_device)
 
             if "gate_up_proj_blocks" in name:
