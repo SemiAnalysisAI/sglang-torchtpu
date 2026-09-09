@@ -382,13 +382,16 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
 
     def _split_logits_processor(self) -> bool:
-        # GPT-OSS target verification produced rank-divergent logits when the
-        # backbone and logits processor shared one compiled graph. Reuse the
-        # EAGLE3 draft boundary to keep target verification outputs consistent.
-        return (
+        # Keep speculative backbones and logits processors in separate regions.
+        # Combining them produced rank-divergent target verification outputs;
+        # use the existing draft boundary for speculative targets as well.
+        return hasattr(self.owner, "logits_processor") and (
             self.model_runner.is_draft_worker
-            or type(self.owner).__name__ == "GptOssForCausalLM"
-        ) and hasattr(self.owner, "logits_processor")
+            or (
+                hasattr(self.owner, "model")
+                and not self.model_runner.spec_algorithm.is_none()
+            )
+        )
 
     def install(self) -> bool:
         """Install runtime compile wrappers for the annotated decoder target."""
@@ -496,9 +499,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     ) -> None:
         """Wrap and install the compiled forward shim on owner.
 
-        EAGLE3 drafts and GPT-OSS targets compile the backbone and logits processor
-        separately, leaving the outer forward eager as a coordinator. DFlash samples
-        via the target lm_head without logits_processor, so its forward stays compiled.
+        Speculative targets and drafts with a logits processor compile it separately
+        from the backbone, leaving the outer forward eager as a coordinator.
+        DFlash samples via the target lm_head without logits_processor, so its
+        forward stays compiled.
 
         Args:
           fn: Original uncompiled forward function.
