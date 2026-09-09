@@ -634,6 +634,7 @@ class TestInstallExtendCap(_PolicyTestCase):
             model=model,
             forward=MagicMock(),
             is_draft_worker=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 prefill_max_requests=16,
