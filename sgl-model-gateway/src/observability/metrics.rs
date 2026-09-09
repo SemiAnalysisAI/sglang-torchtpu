@@ -245,6 +245,15 @@ pub(crate) fn init_metrics() {
         "smg_manual_policy_cache_entries",
         "Number of routing entries in manual policy cache"
     );
+    describe_counter!(
+        "smg_cache_aware_policy_branch_total",
+        "cache_aware routing decisions by branch \
+         (imbalanced, affinity_hit, below_threshold, stale_tenant, no_tree)"
+    );
+    describe_histogram!(
+        "smg_cache_aware_match_rate",
+        "Prefix match rate (matched chars / input chars) per cache_aware decision"
+    );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
     describe_gauge!(
@@ -907,6 +916,20 @@ impl Metrics {
             "branch" => branch
         )
         .increment(1);
+    }
+
+    /// Record cache aware policy execution branch for routing decisions
+    pub fn record_worker_cache_aware_policy_branch(branch: &'static str) {
+        counter!(
+            "smg_cache_aware_policy_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
+    /// Record the prefix match rate cache_aware computed for one routing decision
+    pub fn record_cache_aware_match_rate(match_rate: f32) {
+        histogram!("smg_cache_aware_match_rate").record(match_rate as f64);
     }
 
     /// Set running requests per worker
