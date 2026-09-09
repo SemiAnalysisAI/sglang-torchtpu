@@ -53,6 +53,23 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 
 
+def _select_verify_bookkeeping_seq_lens(
+    batch: Any, verify_padding: Any
+) -> torch.Tensor:
+    """Use the scheduler-logical empty tensor for a padded idle DP rank.
+
+    TPU hybrid-DP verification temporarily widens an idle rank to its peer's
+    physical request width so sampling sees the padded target logits. Sampling
+    itself intentionally returns empty tensors on that logical idle rank. Keep
+    bookkeeping on the original empty ``seq_lens`` tensor; otherwise the fused
+    bookkeeping op sees a padded sequence row paired with an empty prediction
+    tensor and attempts an un-warmed zero-width recompile.
+    """
+    if verify_padding is not None and verify_padding.state.logical_batch_size == 0:
+        return verify_padding.seq_lens
+    return batch.seq_lens
+
+
 def duplicate_prefix_tail_to_draft_branches(
     token_to_kv_pool,
     rows: torch.Tensor,
@@ -333,6 +350,7 @@ def build_eagle_verify_input(
     num_draft_tokens: int,
     tree_mask_mode: TreeMaskMode,
     device: str,
+    prebuilt_tree: Optional[tuple[torch.Tensor, ...]] = None,
 ) -> EagleVerifyInput:
     """Shared draft() tail: idle input, tree-mask build, EagleVerifyInput assembly.
 
@@ -348,48 +366,59 @@ def build_eagle_verify_input(
             device,
         )
 
-    # Write straight into the backend's buffer when it owns one and this batch
-    # fits; an eager batch past the captured max_bs falls back to allocating.
-    bs = batch.seq_lens.shape[0]
-    target_attn_backend = target_worker.model_runner.attn_backend
-    verify_mask = target_attn_backend.verify_mask
-    if verify_mask is None:
-        tree_mask_buf, mask_mode, fill_mask = None, tree_mask_mode, True
+    if prebuilt_tree is not None:
+        (
+            tree_mask,
+            position,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            draft_tokens,
+        ) = prebuilt_tree
+        position = position.flatten()
+        draft_tokens = draft_tokens.flatten()
     else:
-        mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
-        tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
-
-    # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
-    # FULL_MASK tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
-    seq_lens_sum = batch.seq_lens_sum
-    if seq_lens_sum is None:
-        if tree_mask_buf is not None or mask_mode == TreeMaskMode.QLEN_ONLY:
-            # Preallocated, or a QLEN_ONLY allocation sized off bs alone.
-            seq_lens_sum = 0
+        # Write straight into the backend's buffer when it owns one and this batch
+        # fits; an eager batch past the captured max_bs falls back to allocating.
+        bs = batch.seq_lens.shape[0]
+        target_attn_backend = target_worker.model_runner.attn_backend
+        verify_mask = target_attn_backend.verify_mask
+        if verify_mask is None:
+            tree_mask_buf, mask_mode, fill_mask = None, tree_mask_mode, True
         else:
-            seq_lens_sum = bs * target_attn_backend.max_context_len
+            mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
+            tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
 
-    (
-        tree_mask,
-        position,
-        retrieve_index,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        draft_tokens,
-    ) = build_tree_kernel_efficient(
-        draft_input.bonus_tokens,
-        parent_list,
-        top_scores_index,
-        draft_tokens,
-        batch.seq_lens,
-        seq_lens_sum,
-        topk,
-        num_steps,
-        num_draft_tokens,
-        mask_mode,
-        tree_mask_buf,
-        fill_prefix_mask=fill_mask,
-    )
+        # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
+        # FULL_MASK tree mask; over-size is safe. Skip .sum().item() D2H via UB.
+        seq_lens_sum = batch.seq_lens_sum
+        if seq_lens_sum is None:
+            if tree_mask_buf is not None or mask_mode == TreeMaskMode.QLEN_ONLY:
+                seq_lens_sum = 0
+            else:
+                seq_lens_sum = bs * target_attn_backend.max_context_len
+
+        (
+            tree_mask,
+            position,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            draft_tokens,
+        ) = build_tree_kernel_efficient(
+            draft_input.bonus_tokens,
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            batch.seq_lens,
+            seq_lens_sum,
+            topk,
+            num_steps,
+            num_draft_tokens,
+            mask_mode,
+            tree_mask_buf,
+            fill_prefix_mask=fill_mask,
+        )
 
     return EagleVerifyInput(
         draft_token=draft_tokens,
@@ -603,7 +632,7 @@ def run_eagle_verify(
         verify_result = eagle_sample(verify_input, batch, logits_output, grammar_mask)
         post_predict, post_accept_lens, post_accept_index = verify_result
         verify_bookkeeping_result = verify_bookkeeping_func(
-            batch.seq_lens,
+            _select_verify_bookkeeping_seq_lens(batch, verify_padding),
             post_accept_lens,
             post_predict,
             post_accept_index,
