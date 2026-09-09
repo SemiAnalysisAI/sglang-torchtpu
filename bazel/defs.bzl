@@ -52,6 +52,7 @@ def sglang_tpu_e2e_test(name, env = None, tags = None, **kwargs):
     Wraps py_test with everything such a target always needs:
       * env_inherit for HOME / HF cache / TPU topology variables from the host
       * PYTHONUNBUFFERED=1 so server logs stream unbuffered
+      * the Python 3.12 bootstrap exports its venv interpreter as PYTHON
       * manual + no-sandbox + requires-* execution tags
       * eternal timeout (model load + torch.compile alone can take 30+ min;
         HEALTH_TIMEOUT in the test file is the real bound)
@@ -62,7 +63,9 @@ def sglang_tpu_e2e_test(name, env = None, tags = None, **kwargs):
     """
     merged_env = dict(env or {})
     merged_env.setdefault("PYTHONUNBUFFERED", "1")
+    merged_env.setdefault("SGLANG_EXPORT_PYTHON", "1")
 
+    kwargs.setdefault("python_version", "3.12")
     kwargs.setdefault("timeout", "eternal")
 
     py_test(

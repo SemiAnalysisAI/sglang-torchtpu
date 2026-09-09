@@ -68,9 +68,6 @@ sglang_tpu_e2e_test(
     ],
 )
 
-# This legacy test uses its own shell launcher and defaults PYTHON to python3.
-# Supply --test_env=PYTHON=<interpreter-with-dependencies> when running it.
-
 sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_0_6b_singlehost_eval_accuracy_large",
     srcs = ["test_tpu_qwen3_0_6b_singlehost_eval_accuracy_large.py"],
