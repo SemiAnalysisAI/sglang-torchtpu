@@ -18,13 +18,16 @@ WORKDIR /build
 COPY sgl-model-gateway /build/sgl-model-gateway
 
 # The TPU base carries only git/curl/build-essential. smg-grpc-client's build
-# script compiles .proto files, so it needs protoc, and --features
-# vendored-openssl builds OpenSSL from source, which needs perl and pkg-config.
-# docker/gateway.Dockerfile installs the same set.
+# script compiles .proto files, so it needs protoc; those protos import the
+# well-known types (google/protobuf/timestamp.proto, struct.proto), which ship
+# in libprotobuf-dev rather than protobuf-compiler. --features vendored-openssl
+# additionally builds OpenSSL from source, which needs perl and pkg-config.
+# docker/rocm.Dockerfile installs the same protobuf pair.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config protobuf-compiler perl libssl-dev \
+        pkg-config protobuf-compiler libprotobuf-dev perl libssl-dev \
     && rm -rf /var/lib/apt/lists/* \
-    && protoc --version
+    && protoc --version \
+    && test -f /usr/include/google/protobuf/timestamp.proto
 
 # Install Rust, build the Python bindings wheel, then drop the toolchain so none
 # of it reaches the final image.
