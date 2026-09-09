@@ -76,7 +76,6 @@ MODEL_CONFIG = {
                 page_size=PAGE_SIZE,
                 probe_tokens=PROBE_TOKENS,
                 hicache_ratio=HICACHE_RATIO,
-                require_counting=False,
             ),
         },
         {

@@ -83,9 +83,6 @@ MODEL_CONFIG = {
                 probe_tokens=PROBE_TOKENS,
                 hicache_ratio=HICACHE_RATIO,
                 min_accept_length=MIN_ACCEPT_LENGTH,
-                # Full DPA exposed occasional instruction-following variance on a
-                # cold read; compare the device-hit and host-reload text directly.
-                require_counting=False,
                 dp_size=DP_SIZE,
             ),
         },
