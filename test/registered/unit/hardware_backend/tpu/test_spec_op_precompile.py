@@ -1,12 +1,17 @@
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from sglang.srt.hardware_backend.tpu import spec_op_precompile
 from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
     SpecOpWarmupContext,
     make_dflash_verify_bookkeeping_args,
+    make_draft_extend_prepare_args,
     make_draft_extend_select_args,
+    make_future_map_store_args,
+    make_future_map_store_hidden_args,
     make_verify_bookkeeping_args,
     make_verify_tree_greedy_args,
 )
@@ -14,6 +19,32 @@ from sglang.srt.speculative.dflash_utils import dflash_verify_bookkeeping_torch
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def test_precompile_visits_only_physical_batch_buckets(monkeypatch):
+    seen_batch_sizes = []
+
+    def make_warmup_args(context):
+        seen_batch_sizes.append(context.physical_bs)
+        return ()
+
+    registered_op = SimpleNamespace(make_warmup_args=make_warmup_args, op=lambda: None)
+    monkeypatch.setattr(
+        spec_op_precompile, "get_compiled_ops", lambda: (registered_op,)
+    )
+
+    spec_op_precompile.precompile_spec_v2_ops(
+        device=torch.device("cpu"),
+        physical_batch_buckets=(1, 2, 4, 8, 16),
+        num_verify_tokens=4,
+        vocab_size=8,
+        draft_vocab_size=8,
+        hidden_size=8,
+        hidden_dtype=torch.bfloat16,
+        req_pool_size=16,
+    )
+
+    assert seen_batch_sizes == [1, 2, 4, 8, 16]
 
 
 def test_warmup_inputs_match_physical_helper_shapes():
@@ -25,6 +56,7 @@ def test_warmup_inputs_match_physical_helper_shapes():
         draft_vocab_size=5,
         hidden_size=6,
         hidden_dtype=torch.bfloat16,
+        req_pool_size=16,
     )
 
     verify_logits, candidates, retrieve_index = make_verify_tree_greedy_args(context)
@@ -50,6 +82,29 @@ def test_warmup_inputs_match_physical_helper_shapes():
     assert dflash_cands.shape == (4, 3)
     assert dflash_target_top1.shape == (4, 3)
     assert dflash_prefix_lens.shape == (4,)
+
+    seq_lens, accept_lens, next_token_ids, width = make_draft_extend_prepare_args(
+        context
+    )
+    assert seq_lens.shape == accept_lens.shape == (4,)
+    assert next_token_ids.shape == (12,)
+    assert seq_lens.dtype == torch.int64
+    assert accept_lens.dtype == torch.int32
+    assert next_token_ids.dtype == torch.int64
+    assert width == 3
+
+    store_args = make_future_map_store_args(context)
+    assert store_args[0].shape == store_args[4].shape == (4,)
+    assert store_args[1].shape == (17,)
+    assert store_args[2].shape == store_args[3].shape == (17, 1)
+    assert store_args[5].shape == store_args[6].shape == (4, 1)
+    assert store_args[4].dtype == torch.int64
+
+    store_hidden_args = make_future_map_store_hidden_args(context)
+    assert store_args[-2:] == (None, None)
+    assert store_hidden_args[-2].shape == (17, 6)
+    assert store_hidden_args[4].dtype == torch.int64
+    assert store_hidden_args[-1].shape == (4, 6)
 
 
 def test_dflash_verify_bookkeeping_torch_correctness():

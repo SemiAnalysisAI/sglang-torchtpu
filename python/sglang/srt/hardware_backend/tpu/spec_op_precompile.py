@@ -9,6 +9,12 @@ from collections.abc import Sequence
 import torch
 
 from sglang.srt.compilation.compiled_op import get_compiled_ops
+from sglang.srt.hardware_backend.tpu import (  # noqa: F401
+    eagle_utils_tpu as _eagle_utils_tpu,
+)
+from sglang.srt.hardware_backend.tpu import (  # noqa: F401
+    overlap_utils_tpu as _overlap_utils_tpu,
+)
 from sglang.srt.hardware_backend.tpu.spec_op_warmup import SpecOpWarmupContext
 from sglang.srt.speculative import dflash_utils as _dflash_utils  # noqa: F401
 from sglang.srt.speculative import eagle_utils as _eagle_utils  # noqa: F401
@@ -25,6 +31,7 @@ def precompile_spec_v2_ops(
     draft_vocab_size: int,
     hidden_size: int,
     hidden_dtype: torch.dtype,
+    req_pool_size: int,
 ) -> None:
     """Warm up Spec V2 helper graphs for every physical batch bucket."""
     shapes = tuple(
@@ -43,6 +50,7 @@ def precompile_spec_v2_ops(
             draft_vocab_size=draft_vocab_size,
             hidden_size=hidden_size,
             hidden_dtype=hidden_dtype,
+            req_pool_size=req_pool_size,
         )
         for physical_bs, _ in shapes
     ]

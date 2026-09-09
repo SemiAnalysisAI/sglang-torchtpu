@@ -31,12 +31,12 @@ def get_compiled_ops() -> tuple[RegisteredCompiledOp, ...]:
     return tuple(_compiled_ops.values())
 
 
-def compiled_op(*, warmup: WarmupArgsFactory):
+def compiled_op(*, warmup: WarmupArgsFactory | tuple[WarmupArgsFactory, ...]):
     """Lazily ``torch.compile`` a pure tensor helper into one fused dispatch.
 
     Active only on TPU with ``--enable-torch-compile``. The caller must pass
     TPU tensors and ``fn`` must be compile-safe. Every helper must provide a
-    callable that builds representative arguments for ahead-of-time warm-up.
+    callable (or tuple of callables) building arguments for ahead-of-time warm-up.
     """
 
     def decorator(fn):
@@ -54,10 +54,13 @@ def compiled_op(*, warmup: WarmupArgsFactory):
             return compiled_fn(*args, **kwargs)
 
         op_name = f"{fn.__module__}.{fn.__qualname__}"
-        _compiled_ops[op_name] = RegisteredCompiledOp(
-            op=wrapper,
-            make_warmup_args=warmup,
-        )
+        factories = warmup if isinstance(warmup, tuple) else (warmup,)
+        for i, factory in enumerate(factories):
+            key = op_name if len(factories) == 1 else f"{op_name}:{i}"
+            _compiled_ops[key] = RegisteredCompiledOp(
+                op=wrapper,
+                make_warmup_args=factory,
+            )
         return wrapper
 
     return decorator

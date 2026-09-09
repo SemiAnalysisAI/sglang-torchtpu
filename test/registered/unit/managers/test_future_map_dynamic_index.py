@@ -20,6 +20,7 @@ dynamic-index ``_store`` seam (fork PR #78) is preserved and is what we test.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -28,6 +29,9 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
+    store_future_map_tpu,
+)
 from sglang.srt.managers.overlap_utils import (
     _DYNAMIC_INDEX_DEVICE_TYPES,
     FutureMap,
@@ -87,6 +91,28 @@ class TestFutureMapInit(CustomTestCase):
         self.assertEqual(fm.output_tokens_buf.shape[0], 8)
         self.assertEqual(fm.new_seq_lens_buf.shape[0], 8)
 
+    def test_tpu_reserves_scratch_row_without_growing_request_pool(self):
+        with patch("sglang.srt.managers.overlap_utils._is_tpu", True):
+            fm = _make_future_map(req_pool_size=8)
+        fm.spec_algo = SimpleNamespace(is_some=lambda: True, need_topk=lambda: True)
+        payload = SimpleNamespace(
+            topk_p=torch.ones((2, 1)),
+            topk_index=torch.zeros((2, 1), dtype=torch.int64),
+            hidden_states=torch.zeros((2, 3)),
+            draft_probs=None,
+        )
+        with patch(
+            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+            return_value=True,
+        ):
+            fm._maybe_init_forward_bufs(payload)
+        self.assertEqual(fm.req_pool_size, 8)
+        self.assertEqual(fm.new_seq_lens_buf.shape, (8,))
+        self.assertEqual(fm.output_tokens_buf.shape, (9,))
+        self.assertEqual(fm.topk_p_buf.shape, (9, 1))
+        self.assertEqual(fm.topk_index_buf.shape, (9, 1))
+        self.assertEqual(fm.hidden_states_buf.shape, (9, 3))
+
 
 class TestDynamicIndexEquivalence(CustomTestCase):
     """``_store``'s dynamic (index_copy_) path must equal the static setitem path."""
@@ -129,6 +155,69 @@ class TestDynamicIndexEquivalence(CustomTestCase):
         fm._store(buf, torch.tensor([1, 2]), torch.tensor([5, 6], dtype=torch.int32))
         self.assertEqual(buf[1].item(), 5)
         self.assertEqual(buf[2].item(), 6)
+
+
+class TestFusedFutureMapStore(CustomTestCase):
+    def test_store_updates_all_relay_buffers(self):
+        indices = torch.tensor([1, 3], dtype=torch.int64)
+        output, topk_p, topk_index, hidden = store_future_map_tpu(
+            indices=indices,
+            future_map=SimpleNamespace(
+                output_tokens_buf=torch.zeros(5, dtype=torch.int64),
+                topk_p_buf=torch.zeros((5, 1), dtype=torch.float32),
+                topk_index_buf=torch.zeros((5, 1), dtype=torch.int64),
+                need_hidden_states=False,
+                req_pool_size=4,
+                _tpu_precompiled_batch_sizes=(1, 2, 4, 8),
+                hidden_states_buf=None,
+            ),
+            payload=SimpleNamespace(
+                bonus_tokens=torch.tensor([7, 9], dtype=torch.int32),
+                topk_p=torch.tensor([[0.25], [0.75]], dtype=torch.float32),
+                topk_index=torch.tensor([[4], [6]], dtype=torch.int32),
+            ),
+        )
+        self.assertIsNone(hidden)
+        self.assertEqual(output.tolist(), [0, 7, 0, 9, 0])
+        self.assertTrue(
+            torch.equal(topk_p[:, 0], torch.tensor([0.0, 0.25, 0.0, 0.75, 0.0]))
+        )
+        self.assertEqual(topk_index[:, 0].tolist(), [0, 4, 0, 6, 0])
+
+    def test_hidden_store_updates_hidden_buffer(self):
+        indices = torch.tensor([0, 2], dtype=torch.int64)
+        output, topk_p, topk_index, hidden = store_future_map_tpu(
+            indices=indices,
+            future_map=SimpleNamespace(
+                output_tokens_buf=torch.zeros(4, dtype=torch.int64),
+                topk_p_buf=torch.zeros((4, 1), dtype=torch.float32),
+                topk_index_buf=torch.zeros((4, 1), dtype=torch.int64),
+                hidden_states_buf=torch.zeros((4, 3), dtype=torch.bfloat16),
+                need_hidden_states=True,
+                req_pool_size=3,
+                _tpu_precompiled_batch_sizes=(1, 2, 4, 8),
+            ),
+            payload=SimpleNamespace(
+                bonus_tokens=torch.tensor([5, 8], dtype=torch.int64),
+                topk_p=torch.tensor([[0.4], [0.6]], dtype=torch.float32),
+                topk_index=torch.tensor([[2], [3]], dtype=torch.int64),
+                hidden_states=torch.tensor(
+                    [[1, 2, 3], [4, 5, 6]], dtype=torch.bfloat16
+                ),
+            ),
+        )
+        self.assertEqual(output.tolist(), [5, 0, 8, 0])
+        self.assertTrue(torch.equal(topk_p[:, 0], torch.tensor([0.4, 0.0, 0.6, 0.0])))
+        self.assertEqual(topk_index[:, 0].tolist(), [2, 0, 3, 0])
+        self.assertTrue(
+            torch.equal(
+                hidden,
+                torch.tensor(
+                    [[1, 2, 3], [0, 0, 0], [4, 5, 6], [0, 0, 0]],
+                    dtype=torch.bfloat16,
+                ),
+            )
+        )
 
 
 if __name__ == "__main__":

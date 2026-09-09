@@ -876,6 +876,9 @@ class EagleDraftExtendInput(SpecInput):
     #   - bonus_tokens: shape `[bs]`; read post-extend to populate next iter's
     #     `EagleDraftInput.bonus_tokens`.
     positions: Optional[torch.Tensor] = None
+    # Fixed-width draft-extend query offsets. When supplied with positions,
+    # ForwardBatch.init_new can bypass the generic CPU-staged position builder.
+    extend_start_loc: Optional[torch.Tensor] = None
     bonus_tokens: Optional[torch.Tensor] = None
 
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST

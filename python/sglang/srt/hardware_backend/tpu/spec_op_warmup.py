@@ -18,6 +18,52 @@ class SpecOpWarmupContext:
     draft_vocab_size: int
     hidden_size: int
     hidden_dtype: torch.dtype
+    req_pool_size: int
+
+
+def make_future_map_store_args(
+    context: SpecOpWarmupContext,
+) -> tuple[torch.Tensor | None, ...]:
+    return (
+        torch.arange(context.physical_bs, dtype=torch.int64, device=context.device),
+        torch.zeros(
+            (context.req_pool_size + 1,), dtype=torch.int64, device=context.device
+        ),
+        torch.zeros(
+            (context.req_pool_size + 1, 1), dtype=torch.float32, device=context.device
+        ),
+        torch.zeros(
+            (context.req_pool_size + 1, 1), dtype=torch.int64, device=context.device
+        ),
+        # EAGLE and DFlash normalize relayed token IDs to the int64 FutureMap
+        # buffer dtype before this helper is called.
+        torch.zeros((context.physical_bs,), dtype=torch.int64, device=context.device),
+        torch.zeros(
+            (context.physical_bs, 1), dtype=torch.float32, device=context.device
+        ),
+        torch.zeros((context.physical_bs, 1), dtype=torch.int64, device=context.device),
+        None,
+        None,
+    )
+
+
+def make_future_map_store_hidden_args(
+    context: SpecOpWarmupContext,
+) -> tuple[torch.Tensor | None, ...]:
+    common = make_future_map_store_args(context)
+    return (
+        *common[:7],
+        torch.zeros(
+            (context.req_pool_size + 1, context.hidden_size),
+            dtype=context.hidden_dtype,
+            device=context.device,
+        ),
+        torch.zeros(
+            (context.physical_bs, context.hidden_size),
+            dtype=context.hidden_dtype,
+            device=context.device,
+        ),
+    )
 
 
 def make_verify_tree_greedy_args(
@@ -99,4 +145,17 @@ def make_dflash_verify_bookkeeping_args(
             dtype=torch.int64,
             device=context.device,
         ),
+    )
+
+
+def make_draft_extend_prepare_args(
+    context: SpecOpWarmupContext,
+) -> tuple[torch.Tensor, ...]:
+    """Inputs for the fixed-width draft-extend layout helper."""
+    num_draft_rows = context.physical_bs * context.num_verify_tokens
+    return (
+        torch.zeros((context.physical_bs,), dtype=torch.int64, device=context.device),
+        torch.ones((context.physical_bs,), dtype=torch.int32, device=context.device),
+        torch.zeros((num_draft_rows,), dtype=torch.int64, device=context.device),
+        context.num_verify_tokens,
     )

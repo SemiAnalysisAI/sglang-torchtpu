@@ -6,6 +6,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -519,7 +520,7 @@ class TestDraftExtendSelectFused(unittest.TestCase):
     """Fused draft-extend select must match the eager gather + argmax."""
 
     def test_matches_eager_select_and_argmax(self):
-        from sglang.srt.speculative.eagle_utils import (
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
             fused_draft_extend_select_argmax_func,
         )
 
@@ -547,7 +548,7 @@ class TestDraftExtendSelectFused(unittest.TestCase):
                 self.assertEqual(tp.shape, want_ti.shape)
 
     def test_none_hidden_states_passes_through(self):
-        from sglang.srt.speculative.eagle_utils import (
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
             fused_draft_extend_select_argmax_func,
         )
 
@@ -571,6 +572,123 @@ class TestDraftExtendSelectFused(unittest.TestCase):
         self.assertEqual(
             draft_extend_input.last_accepted_indices().tolist(), [1, 6, 9, 12]
         )
+
+
+class TestDraftExtendPrepareFused(unittest.TestCase):
+    """The fused layout must match the former staged TPU preparation."""
+
+    def test_matches_fixed_width_layout(self):
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+            fused_draft_extend_prepare_func,
+        )
+
+        seq_lens = torch.tensor([17, 31, 9], dtype=torch.int64)
+        accept_lens = torch.tensor([1, 4, 2], dtype=torch.int32)
+        next_token_ids = torch.arange(12, dtype=torch.int32)
+
+        correct, token_ids, positions, starts, select = fused_draft_extend_prepare_func(
+            seq_lens, accept_lens, next_token_ids, num_draft_tokens=4
+        )
+
+        self.assertTrue(
+            torch.equal(correct, torch.tensor([0, 3, 1], dtype=torch.int32))
+        )
+        self.assertEqual(token_ids.dtype, torch.int64)
+        self.assertTrue(torch.equal(token_ids, next_token_ids.to(torch.int64)))
+        self.assertTrue(
+            torch.equal(
+                positions,
+                torch.tensor(
+                    [17, 18, 19, 20, 31, 32, 33, 34, 9, 10, 11, 12],
+                    dtype=torch.int64,
+                ),
+            )
+        )
+        self.assertTrue(torch.equal(starts, torch.tensor([0, 4, 8], dtype=torch.int32)))
+        self.assertTrue(torch.equal(select, torch.tensor([0, 7, 9], dtype=torch.int64)))
+
+    def test_compiled_prepare_handles_empty_and_non_bucket_batches(self):
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+            fused_draft_extend_prepare_func,
+        )
+
+        prepare = torch.compile(
+            fused_draft_extend_prepare_func.__wrapped__,
+            backend="eager",
+            fullgraph=True,
+            dynamic=False,
+        )
+        for batch_size in (0, 3):
+            with self.subTest(batch_size=batch_size):
+                seq_lens = torch.arange(batch_size, dtype=torch.int64) + 10
+                accept_lens = torch.ones(batch_size, dtype=torch.int32)
+                token_ids = torch.arange(batch_size * 4, dtype=torch.int32)
+                correct, tokens, positions, starts, select = prepare(
+                    seq_lens, accept_lens, token_ids, 4
+                )
+                self.assertEqual(correct.tolist(), [0] * batch_size)
+                self.assertEqual(tokens.tolist(), token_ids.tolist())
+                self.assertEqual(tokens.dtype, torch.int64)
+                self.assertEqual(
+                    positions.tolist(),
+                    [10 + row + col for row in range(batch_size) for col in range(4)],
+                )
+                self.assertEqual(starts.tolist(), list(range(0, batch_size * 4, 4)))
+                self.assertEqual(select.tolist(), starts.tolist())
+
+
+class TestDraftExtendSelectTpuWrapper(unittest.TestCase):
+    def test_tpu_wrapper_preserves_physical_bucket_shape(self):
+        from sglang.srt.hardware_backend.tpu import eagle_utils_tpu as eagle_utils
+
+        logits = torch.randn(32, 16)
+        hidden_states = torch.randn(32, 8)
+        select_index = torch.arange(3, 32, 4)
+
+        with patch.object(
+            eagle_utils,
+            "fused_draft_extend_select_argmax_func",
+            wraps=eagle_utils._draft_extend_select_argmax_impl,
+        ) as fused:
+            eagle_utils.draft_extend_select_argmax_func(
+                logits,
+                hidden_states,
+                select_index,
+                physical_batch_buckets=(1, 2, 4, 8),
+                num_draft_tokens=4,
+            )
+
+        call_args = fused.call_args.args
+        self.assertEqual(call_args[0].shape, (32, 16))
+        self.assertEqual(call_args[1].shape, (32, 8))
+        self.assertIs(call_args[2], select_index)
+
+    def test_idle_dp_batch_bypasses_compiled_zero_selector(self):
+        from sglang.srt.hardware_backend.tpu import eagle_utils_tpu as eagle_utils
+
+        logits = torch.zeros((4, 16), dtype=torch.float32)
+        hidden_states = torch.zeros((4, 8), dtype=torch.bfloat16)
+        select_index = torch.empty(0, dtype=torch.int64)
+
+        with patch.object(
+            eagle_utils,
+            "fused_draft_extend_select_argmax_func",
+            side_effect=AssertionError("zero-sized DP idle selector must stay eager"),
+        ):
+            selected_logits, selected_hidden, topk_p, topk_index = (
+                eagle_utils.draft_extend_select_argmax_func(
+                    logits,
+                    hidden_states,
+                    select_index,
+                    physical_batch_buckets=(1, 2, 4, 8),
+                    num_draft_tokens=4,
+                )
+            )
+
+        self.assertEqual(selected_logits.shape, (0, 16))
+        self.assertEqual(selected_hidden.shape, (0, 8))
+        self.assertEqual(topk_p.shape, (0, 1))
+        self.assertEqual(topk_index.shape, (0, 1))
 
 
 if __name__ == "__main__":

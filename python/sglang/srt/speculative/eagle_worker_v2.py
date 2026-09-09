@@ -77,7 +77,6 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     default_tree_mask_mode,
-    fused_draft_extend_select_argmax_func,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
@@ -132,6 +131,8 @@ _is_xpu = is_xpu()
 if _is_tpu:
     from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
         build_topk1_verify_chain_torch,
+        draft_extend_prepare_func,
+        draft_extend_select_argmax_func,
     )
 
 
@@ -1109,30 +1110,51 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
+        if current_platform.is_tpu():
+            bucketer = self.draft_runner.compile_policy.b_bucketer
+            (
+                num_correct_drafts,
+                next_token_ids,
+                draft_extend_positions,
+                draft_extend_start_loc,
+                select_index,
+            ) = draft_extend_prepare_func(
+                batch.seq_lens,
+                batch_result.accept_lens,
+                batch_result.next_token_ids,
+                self.speculative_num_draft_tokens,
+                physical_batch_buckets=(
+                    tuple(bucketer.buckets) if bucketer is not None else ()
+                ),
+            )
+        else:
+            num_correct_drafts = batch_result.accept_lens - 1
+            select_index = (
+                torch.arange(
+                    0,
+                    len(batch.seq_lens) * self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens,
+                    device=self.device,
+                )
+                + batch_result.accept_lens
+                - 1
+            )
+            next_token_ids = batch_result.next_token_ids.to(torch.int64)
+            draft_extend_positions = None
+            draft_extend_start_loc = None
+
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
-            num_correct_drafts=batch_result.accept_lens - 1,
+            num_correct_drafts=num_correct_drafts,
             num_accept_tokens=batch_result.accept_lens,
             # Draft-extend fills the whole tree width (num_draft_tokens) per req,
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
+            positions=draft_extend_positions,
+            extend_start_loc=draft_extend_start_loc,
         )
-        select_index = (
-            torch.arange(
-                0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
-                device=self.device,
-            )
-            + batch_result.accept_lens
-            - 1
-        )
-
-        # Cast to int64 before entering plan stream to avoid cross-stream
-        # synchronization issues with .to() inside the plan stream context.
-        next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
@@ -1194,6 +1216,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             f"draft_extend_for_decode (cuda_graph={can_run_decode_cuda_graph})",
         )
 
+        if current_platform.is_tpu():
+            assert isinstance(forward_batch.spec_info, EagleDraftExtendInput)
+            execution_select_index = forward_batch.spec_info.last_accepted_indices()
+
         # Gather the per-request last-position indexer top-k as the next loop's
         # seed (select_index already picks the last accepted position per req).
         dsa_seed_topk_indices = None
@@ -1208,17 +1234,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         if current_platform.is_tpu():
-            execution_select_index = forward_batch.spec_info.last_accepted_indices()
             (
                 draft_logits_output.next_token_logits,
                 draft_logits_output.hidden_states,
                 ret_topk_p,
                 ret_topk_index,
             ) = self.draft_runner.compile_policy.finalize_spec_forward_batch(
-                outputs=fused_draft_extend_select_argmax_func(
+                outputs=draft_extend_select_argmax_func(
                     draft_logits_output.next_token_logits,
                     draft_logits_output.hidden_states,
                     execution_select_index,
+                    physical_batch_buckets=(
+                        tuple(bucketer.buckets) if bucketer is not None else ()
+                    ),
+                    num_draft_tokens=self.speculative_num_draft_tokens,
                 ),
                 forward_batch=forward_batch,
             )

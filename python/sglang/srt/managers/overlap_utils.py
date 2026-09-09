@@ -16,6 +16,11 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
 
 _is_tpu = is_tpu()
 
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
+        store_future_map_tpu,
+    )
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -288,6 +293,10 @@ class FutureMap:
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
         self.needs_confidence_relay = needs_confidence_relay
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
+        # TPU padded stores use one permanent scratch row outside the request pool.
+        self._forward_buf_size = self.req_pool_size + int(_is_tpu)
+        # Physical shapes admitted to the TPU EAGLE relay helpers.
+        self._tpu_precompiled_batch_sizes: frozenset[int] = frozenset()
 
         # On backends that bake a buffer WRITE offset as an HLO constant-shaped
         # scatter (e.g. TPU/XLA), route future-buffer writes through `_store`
@@ -300,14 +309,14 @@ class FutureMap:
         if _DEBUG_ASSERT:
             # Poisoned init: every row must be written before its first gather.
             self.output_tokens_buf = torch.full(
-                (self.req_pool_size,), -1, dtype=torch.int64, device=self.device
+                (self._forward_buf_size,), -1, dtype=torch.int64, device=self.device
             )
             self.new_seq_lens_buf = torch.full(
                 (self.req_pool_size,), -1, dtype=torch.int64, device=self.device
             )
         else:
             self.output_tokens_buf = torch.empty(
-                (self.req_pool_size,), dtype=torch.int64, device=self.device
+                (self._forward_buf_size,), dtype=torch.int64, device=self.device
             )
             self.new_seq_lens_buf = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
@@ -347,6 +356,9 @@ class FutureMap:
             pool=req_to_token_pool,
         )
 
+    def set_tpu_precompiled_batch_sizes(self, batch_sizes: Sequence[int]) -> None:
+        self._tpu_precompiled_batch_sizes = frozenset(batch_sizes)
+
     def _maybe_init_forward_bufs(self, payload: RelayPayload) -> None:
         # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.
         from sglang.srt.speculative.spec_utils import spec_need_hidden_states
@@ -362,12 +374,12 @@ class FutureMap:
             topk_p0 = payload.topk_p[0]
             topk_index0 = payload.topk_index[0]
             self.topk_p_buf = torch.empty(
-                (self.req_pool_size, *topk_p0.shape),
+                (self._forward_buf_size, *topk_p0.shape),
                 dtype=topk_p0.dtype,
                 device=self.device,
             )
             self.topk_index_buf = torch.empty(
-                (self.req_pool_size, *topk_index0.shape),
+                (self._forward_buf_size, *topk_index0.shape),
                 dtype=topk_index0.dtype,
                 device=self.device,
             )
@@ -380,7 +392,7 @@ class FutureMap:
             self.need_hidden_states = True
             hidden_states0 = payload.hidden_states[0]
             self.hidden_states_buf = torch.empty(
-                (self.req_pool_size, *hidden_states0.shape),
+                (self._forward_buf_size, *hidden_states0.shape),
                 dtype=hidden_states0.dtype,
                 device=self.device,
             )
@@ -606,27 +618,34 @@ class FutureMap:
             return
         self._maybe_init_forward_bufs(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
-        self._store(
-            self.output_tokens_buf,
-            indices,
-            payload.bonus_tokens.to(self.output_tokens_buf.dtype),
-        )
-
-        if self.need_topk:
-            self._store(
-                self.topk_p_buf, indices, payload.topk_p.to(self.topk_p_buf.dtype)
-            )
-            self._store(
+        if _is_tpu and self.need_topk:
+            (
+                self.output_tokens_buf,
+                self.topk_p_buf,
                 self.topk_index_buf,
-                indices,
-                payload.topk_index.to(self.topk_index_buf.dtype),
-            )
-        if self.need_hidden_states:
-            self._store(
                 self.hidden_states_buf,
+            ) = store_future_map_tpu(future_map=self, indices=indices, payload=payload)
+        else:
+            self._store(
+                self.output_tokens_buf,
                 indices,
-                payload.hidden_states.to(self.hidden_states_buf.dtype),
+                payload.bonus_tokens.to(self.output_tokens_buf.dtype),
             )
+            if self.need_topk:
+                self._store(
+                    self.topk_p_buf, indices, payload.topk_p.to(self.topk_p_buf.dtype)
+                )
+                self._store(
+                    self.topk_index_buf,
+                    indices,
+                    payload.topk_index.to(self.topk_index_buf.dtype),
+                )
+            if self.need_hidden_states:
+                self._store(
+                    self.hidden_states_buf,
+                    indices,
+                    payload.hidden_states.to(self.hidden_states_buf.dtype),
+                )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self._store(self.draft_probs_buf, indices, payload.draft_probs)
         if (

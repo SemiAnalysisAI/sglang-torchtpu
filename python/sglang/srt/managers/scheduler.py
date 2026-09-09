@@ -1635,6 +1635,8 @@ class Scheduler(
         if not isinstance(compile_policy, BaseSpecDecodeCompilePolicyMixin):
             return
         assert compile_policy.b_bucketer is not None
+        physical_batch_buckets = tuple(compile_policy.b_bucketer.buckets)
+        assert physical_batch_buckets
 
         draft_runner = self.draft_worker.draft_worker.draft_runner
         hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(draft_runner)
@@ -1647,13 +1649,15 @@ class Scheduler(
 
         precompile_spec_v2_ops(
             device=torch.device(self.device),
-            physical_batch_buckets=compile_policy.b_bucketer.buckets,
+            physical_batch_buckets=physical_batch_buckets,
             num_verify_tokens=compile_policy.draft_token_num,
             vocab_size=self.model_config.vocab_size,
             draft_vocab_size=draft_vocab_size,
             hidden_size=hidden_size,
             hidden_dtype=hidden_dtype,
+            req_pool_size=self.future_map.req_pool_size,
         )
+        self.future_map.set_tpu_precompiled_batch_sizes(physical_batch_buckets)
 
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (
