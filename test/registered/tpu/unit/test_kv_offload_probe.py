@@ -82,33 +82,30 @@ class TestKvOffloadOutputOracle(unittest.TestCase):
             reload=CacheObservation(reload_text, 0, 960, 8, 0),
         )
 
-    def test_equivalent_cache_reads_pass_without_counting(self) -> None:
+    def test_equivalent_cache_reads_pass(self) -> None:
         failures = validate_probe(
             probe=self._tiered_probe(
                 warm_text="not a count", reload_text="not a count"
             ),
             page_size=64,
-            require_counting=False,
         )
         self.assertEqual(failures, [])
 
-    def test_changed_host_reload_fails_without_counting(self) -> None:
+    def test_changed_host_reload_fails(self) -> None:
         failures = validate_probe(
             probe=self._tiered_probe(warm_text="device", reload_text="host"),
             page_size=64,
-            require_counting=False,
         )
         self.assertEqual(len(failures), 1)
         self.assertIn("host reload changed", failures[0])
 
-    def test_counting_remains_the_default(self) -> None:
+    def test_two_empty_reads_are_not_a_match(self) -> None:
         failures = validate_probe(
-            probe=self._tiered_probe(
-                warm_text="not a count", reload_text="not a count"
-            ),
+            probe=self._tiered_probe(warm_text="", reload_text=""),
             page_size=64,
         )
-        self.assertEqual(len(failures), 2)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("must be non-empty", failures[0])
 
 
 class TestDpRouting(unittest.TestCase):
