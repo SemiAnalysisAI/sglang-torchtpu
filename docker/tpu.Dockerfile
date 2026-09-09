@@ -17,6 +17,15 @@ WORKDIR /build
 # Copy ONLY the gateway source (not the full repo)
 COPY sgl-model-gateway /build/sgl-model-gateway
 
+# The TPU base carries only git/curl/build-essential. smg-grpc-client's build
+# script compiles .proto files, so it needs protoc, and --features
+# vendored-openssl builds OpenSSL from source, which needs perl and pkg-config.
+# docker/gateway.Dockerfile installs the same set.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config protobuf-compiler perl libssl-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && protoc --version
+
 # Install Rust, build the Python bindings wheel, then drop the toolchain so none
 # of it reaches the final image.
 RUN --mount=type=cache,target=/root/.cache/pip \
