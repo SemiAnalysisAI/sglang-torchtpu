@@ -9,6 +9,9 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+    build_topk1_verify_chain_torch,
+)
 from sglang.srt.speculative.eagle_utils import (
     _top_k_renorm_prob_torch,
     _top_p_renorm_prob_torch,
@@ -98,6 +101,41 @@ def _run_sampler(
         topk=1,
     )
     return predicts, accept_index, accept_token_num, draft_probs
+
+
+class TestBuildTreeTopk1Tpu(unittest.TestCase):
+    def test_builds_chain_in_one_pure_tensor_helper(self):
+        outputs = build_topk1_verify_chain_torch(
+            torch.tensor([101, 102], dtype=torch.int32),
+            torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int64),
+            torch.tensor([5, 10], dtype=torch.int64),
+        )
+        (
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            verify_tokens,
+        ) = outputs
+
+        self.assertEqual(tree_mask.numel(), 0)
+        self.assertEqual(positions.tolist(), [[5, 6, 7, 8], [10, 11, 12, 13]])
+        self.assertEqual(retrieve_index.tolist(), [[0, 1, 2, 3], [4, 5, 6, 7]])
+        self.assertEqual(retrieve_next_token.tolist(), [[1, 2, 3, -1], [1, 2, 3, -1]])
+        self.assertEqual(retrieve_next_sibling.tolist(), [[-1, -1, -1, -1]] * 2)
+        self.assertEqual(verify_tokens.tolist(), [[101, 11, 12, 13], [102, 21, 22, 23]])
+
+    def test_empty_batch_preserves_verify_width(self):
+        """An idle batch must not infer a dimension from zero elements."""
+        outputs = build_topk1_verify_chain_torch(
+            torch.empty(0, dtype=torch.int64),
+            torch.empty((0, 3), dtype=torch.int64),
+            torch.empty(0, dtype=torch.int64),
+        )
+        self.assertEqual(outputs[0].shape, (0,))
+        for tensor in outputs[1:]:
+            self.assertEqual(tensor.shape, (0, 4))
 
 
 class TestEagleSamplingTorchFallbacks(unittest.TestCase):

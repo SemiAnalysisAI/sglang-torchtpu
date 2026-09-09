@@ -557,18 +557,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             model=model,
             model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
             kv_pool=self.model_runner.token_to_kv_pool,
-            ignored_argnames=(
-                "forward_batch.sampling_info",
-                "forward_batch.orig_seq_lens",
-                # Prompt-logprob inputs are rejected on compiled TPU. Ignore
-                # this request-only tensor before direct compile flattens the
-                # ForwardBatch leaves, matching LogitsProcessor's static view.
-                "forward_batch.extend_input_logprob_token_ids_gpu",
-                # Pallas consumes these host mirrors before the compiled model.
-                "forward_batch.req_pool_indices_cpu",
-                "forward_batch.seq_lens_cpu",
-                *self._extra_ignored_argnames(),
-            ),
+            ignored_argnames=self._ignored_argnames(),
         )
 
         @functools.wraps(fn)
@@ -582,10 +571,21 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         return call
 
+    def _ignored_argnames(self) -> tuple[str, ...]:
+        return (
+            "forward_batch.sampling_info",
+            "forward_batch.orig_seq_lens",
+            # Prompt-logprob inputs are rejected on compiled TPU. Ignore this
+            # request-only tensor before direct compile flattens ForwardBatch.
+            "forward_batch.extend_input_logprob_token_ids_gpu",
+            # Pallas consumes these host mirrors before the compiled model.
+            "forward_batch.req_pool_indices_cpu",
+            "forward_batch.seq_lens_cpu",
+            *self._extra_ignored_argnames(),
+        )
+
     def _extra_ignored_argnames(self) -> tuple[str, ...]:
-        if self.model_runner.is_draft_worker:
-            return ()
-        return ("forward_batch.spec_info",)
+        return ()
 
     def get_model_extra_tensor_attrs(self) -> tuple[str, ...]:
         """Returns paths to non-param non-buffer Tensor attrs on the model.

@@ -275,14 +275,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             model=self.model_runner.model,
             model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
             kv_pool=self.model_runner.token_to_kv_pool,
-            ignored_argnames=(
-                "forward_batch.sampling_info",
-                "forward_batch.orig_seq_lens",
-                "forward_batch.extend_input_logprob_token_ids_gpu",
-                "forward_batch.req_pool_indices_cpu",
-                "forward_batch.seq_lens_cpu",
-                *self._extra_ignored_argnames(),
-            ),
+            ignored_argnames=self._ignored_argnames(),
         )
 
         @functools.wraps(fn)
@@ -970,6 +963,9 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         spec_info.topk_index = torch.zeros(
             (bs, self.speculative_eagle_topk), device=device, dtype=torch.int64
         )
+        # FutureMap stores serving tokens in its int64 relay buffer. The fused
+        # draft graph also builds the verify chain from these seeds.
+        spec_info.bonus_tokens = torch.zeros(bs, device=device, dtype=torch.int64)
         spec_info.hidden_states = torch.zeros(
             (bs, spec_info.hidden_states.shape[1]),
             device=device,

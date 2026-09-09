@@ -129,6 +129,11 @@ _is_hip = is_hip()
 _is_tpu = is_tpu()
 _is_xpu = is_xpu()
 
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+        build_topk1_verify_chain_torch,
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -558,6 +563,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
+        use_fused_draft = False
         with canary_outside_ctx:
             # Run draft
             if can_run_decode_cuda_graph:
@@ -573,16 +579,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self._prepare_draft_forward_batch(
                         forward_batch, refresh_dp_metadata=use_fused_draft
                     )
-                if use_fused_draft:
-                    draft_outputs = self._fused_draft_forward(forward_batch)
-                else:
-                    draft_outputs = self.draft_forward(forward_batch)
-                parent_list, top_scores_index, draft_tokens, draft_probs = (
+                draft_outputs = (
+                    self._fused_draft_forward(forward_batch)
+                    if use_fused_draft
+                    else self.draft_forward(forward_batch)
+                )
+                draft_outputs = (
                     self.draft_runner.compile_policy.finalize_spec_forward_batch(
-                        outputs=draft_outputs,
-                        forward_batch=forward_batch,
+                        outputs=draft_outputs, forward_batch=forward_batch
                     )
                 )
+
+        prebuilt_tree = draft_outputs if use_fused_draft else None
+        if use_fused_draft:
+            parent_list = top_scores_index = draft_tokens = draft_probs = None
+        elif not can_run_decode_cuda_graph:
+            parent_list, top_scores_index, draft_tokens, draft_probs = draft_outputs
 
         # Tree construction consumes scheduler-logical rows.
         padding = draft_input.padding_state
@@ -597,11 +609,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     return tensor[:real_bs]
                 return tensor
 
-            parent_list = _unpad_rows(parent_list)
-            top_scores_index = _unpad_rows(top_scores_index)
-            draft_tokens = _unpad_rows(draft_tokens)
-            draft_probs = _unpad_rows(draft_probs)
-            draft_input.bonus_tokens = _unpad_rows(draft_input.bonus_tokens)
+            if prebuilt_tree is not None:
+                # Trim rows before flattening so verify pads each request once.
+                prebuilt_tree = (
+                    prebuilt_tree[0],
+                    *(tensor[:real_bs] for tensor in prebuilt_tree[1:]),
+                )
+            else:
+                parent_list = _unpad_rows(parent_list)
+                top_scores_index = _unpad_rows(top_scores_index)
+                draft_tokens = _unpad_rows(draft_tokens)
+                draft_probs = _unpad_rows(draft_probs)
+                draft_input.bonus_tokens = _unpad_rows(draft_input.bonus_tokens)
 
         return build_eagle_verify_input(
             batch,
@@ -616,6 +635,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_draft_tokens=self.speculative_num_draft_tokens,
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
+            prebuilt_tree=prebuilt_tree,
         )
 
     def _prepare_draft_forward_batch(
@@ -678,7 +698,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         forward_batch.is_prefill_only = False
         try:
             with forward_context(ForwardContext(attn_backend=attn_backends[0])):
-                token_list = steps_fn(
+                tree_outputs = steps_fn(
                     forward_batch,
                     topk_p,
                     topk_index,
@@ -686,18 +706,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     kv_lens_stack,
                     out_cache_loc,
                     self.hot_token_id,
+                    spec_info.bonus_tokens,
+                    forward_batch.seq_lens,
                 )
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
         spec_info.rpa_draft_kv_lens = None
 
-        bs = token_list[0].shape[0]
-        return (
-            self._topk1_parents_prealloc[:bs],
-            self._topk1_score_indices_prealloc[:bs],
-            torch.cat(token_list, dim=1),
-            None,
-        )
+        return tree_outputs
 
     def _should_fuse_draft_steps(self) -> bool:
         return _is_tpu and self.speculative_num_steps > 1
@@ -711,6 +727,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         kv_lens_stack: torch.Tensor,
         out_cache_loc: torch.Tensor,
         hot_token_id: torch.Tensor | None,
+        bonus_tokens: torch.Tensor,
+        seq_lens: torch.Tensor,
     ):
         """Run the compiled draft loop."""
         num_steps = self.speculative_num_steps
@@ -742,7 +760,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if hot_token_id is not None:
                 topk_index = hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
-        return tokens
+        return build_topk1_verify_chain_torch(
+            bonus_tokens,
+            torch.cat(tokens, dim=1),
+            seq_lens,
+        )
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args

@@ -65,6 +65,11 @@ class BaseSpecDecodeCompilePolicyMixin:
             self.speculative_num_steps + 1 if self.speculative_num_steps else 0
         )
 
+    def _extra_ignored_argnames(self) -> tuple[str, ...]:
+        if self.is_draft_worker:
+            return ()
+        return ("forward_batch.spec_info",)
+
     def precompile(self) -> None:
         """Warm target graphs during graph-runner initialization."""
         if self.is_draft_worker:
