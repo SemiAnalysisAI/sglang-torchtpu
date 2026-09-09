@@ -381,6 +381,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
         )
 
+    def _split_logits_processor(self) -> bool:
+        # GPT-OSS target verification produced rank-divergent logits when the
+        # backbone and logits processor shared one compiled graph. Reuse the
+        # EAGLE3 draft boundary to keep target verification outputs consistent.
+        return (
+            self.model_runner.is_draft_worker
+            or type(self.owner).__name__ == "GptOssForCausalLM"
+        ) and hasattr(self.owner, "logits_processor")
+
     def install(self) -> bool:
         """Install runtime compile wrappers for the annotated decoder target."""
         if self.model_runner is None or self.owner is None or self.method_name is None:
@@ -401,11 +410,12 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             return False
 
         server_args = self.model_runner.server_args
-        is_draft_worker = self.model_runner.is_draft_worker
+        split_logits = self._split_logits_processor()
+        compile_backbone = self.model_runner.is_draft_worker or split_logits
         compile_owner = (
-            getattr(self.owner, "model", self.owner) if is_draft_worker else self.owner
+            getattr(self.owner, "model", self.owner) if compile_backbone else self.owner
         )
-        compile_fn = compile_owner.forward if is_draft_worker else fn
+        compile_fn = compile_owner.forward if compile_backbone else fn
 
         if self._compiles_logits_processor():
             logits_processor = getattr(
@@ -419,10 +429,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         compiled.__signature__ = inspect.signature(compile_fn)
         setattr(
             compile_owner,
-            "forward" if is_draft_worker else self.method_name,
+            "forward" if compile_backbone else self.method_name,
             compiled,
         )
-        if is_draft_worker and hasattr(self.owner, "logits_processor"):
+        if split_logits:
             logits_fn = self.owner.logits_processor.forward
             compiled_logits = torch.compile(
                 torch.no_grad()(logits_fn),
@@ -486,23 +496,21 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     ) -> None:
         """Wrap and install the compiled forward shim on owner.
 
-        EAGLE3 splits backbone and logits_processor into separate compiled regions,
-        leaving outer forward eager as a coordinator. DFlash samples via target lm_head
-        without logits_processor, so its entire forward is compiled.
+        EAGLE3 drafts and GPT-OSS targets compile the backbone and logits processor
+        separately, leaving the outer forward eager as a coordinator. DFlash samples
+        via the target lm_head without logits_processor, so its forward stays compiled.
 
         Args:
           fn: Original uncompiled forward function.
           compiled: Compiled forward function.
         """
-        is_eagle3_draft = self.model_runner.is_draft_worker and hasattr(
-            self.owner, "logits_processor"
-        )
-        shim_target = fn if is_eagle3_draft else compiled
+        split_logits = self._split_logits_processor()
+        shim_target = fn if split_logits else compiled
         logger.info(
-            "[decoder compile policy] _install_forward_shim for %s (is_draft=%s, is_eagle3_draft=%s, shim_target=%s)",
+            "[decoder compile policy] _install_forward_shim for %s (is_draft=%s, split_logits=%s, shim_target=%s)",
             type(self.owner).__name__,
             self.model_runner.is_draft_worker,
-            is_eagle3_draft,
+            split_logits,
             getattr(shim_target, "__name__", type(shim_target).__name__),
         )
         self.compiled_forward_shim = CompiledForwardShim(shim_target, policy=self)
