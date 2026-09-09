@@ -198,8 +198,8 @@ def mean_accept_length(*, probe: KvOffloadProbe) -> float:
     return sum(read.completion_tokens for _, read in _labelled_reads(probe)) / verifies
 
 
-def spec_failures(*, probe: KvOffloadProbe, min_accept_length: float) -> List[str]:
-    """Require verify forwards on every read and sufficient mean accept length."""
+def spec_failures(*, probe: KvOffloadProbe) -> List[str]:
+    """Require verify forwards on every read and equal cost for the two cached reads."""
     failures = [
         f"speculative decoding did not run on the {label} read: spec_verify_ct=0 "
         f"over {read.completion_tokens} completion tokens"
@@ -209,12 +209,17 @@ def spec_failures(*, probe: KvOffloadProbe, min_accept_length: float) -> List[st
     if failures:
         return failures
 
-    accept_length = mean_accept_length(probe=probe)
-    if accept_length <= min_accept_length:
+    # The two cached reads decode identical text over the same stored prefix, so
+    # they must cost the same verify forwards; a difference is the reloaded KV
+    # perturbing the draft or verify path. The cold read is excluded for the same
+    # reason the text comparison excludes it. How many forwards the pair takes is
+    # a property of the decoded text, not of offloading -- the acceptance rate is
+    # guarded on the GSM8K sample instead.
+    if probe.reload.spec_verify_ct != probe.warm.spec_verify_ct:
         failures.append(
-            f"mean accept length {accept_length:.2f} over the three probe reads is "
-            f"not above {min_accept_length:.2f}, so accepted draft tokens were not "
-            "demonstrated"
+            f"the host reload changed speculative decoding: "
+            f"{probe.reload.spec_verify_ct} verify forwards against the device "
+            f"hit's {probe.warm.spec_verify_ct} for the same decoded text"
         )
     return failures
 
@@ -365,13 +370,13 @@ def kv_offload_runner(
     page_size: int,
     probe_tokens: int,
     hicache_ratio: float,
-    min_accept_length: Optional[float] = None,
+    spec_decoding: bool = False,
     dp_size: int = 1,
 ):
     """Build a runner that validates device hits and complete host reloads.
 
     ``hicache_ratio`` must leave enough host capacity for the probe and fillers.
-    ``min_accept_length`` additionally enables speculative-decoding checks.
+    ``spec_decoding`` additionally enables the speculative-decoding checks.
     """
     plan = plan_eviction(
         device_pool_tokens=device_pool_tokens,
@@ -426,7 +431,7 @@ def kv_offload_runner(
                 labels=labels,
             )
 
-            if min_accept_length is not None:
+            if spec_decoding:
                 accept_length = mean_accept_length(probe=probe)
                 verifies = ", ".join(
                     f"{label}={read.spec_verify_ct}"
@@ -434,8 +439,7 @@ def kv_offload_runner(
                 )
                 print(
                     f"[kv-offload] {test_name}/dp{dp_rank}: spec verify forwards "
-                    f"{verifies}, mean accept length {accept_length:.2f} against "
-                    f"floor {min_accept_length}",
+                    f"{verifies}, mean accept length {accept_length:.2f}",
                     flush=True,
                 )
                 dump_metric(
@@ -443,9 +447,7 @@ def kv_offload_runner(
                 )
                 failures += [
                     f"dp_rank={dp_rank}: {failure}"
-                    for failure in spec_failures(
-                        probe=probe, min_accept_length=min_accept_length
-                    )
+                    for failure in spec_failures(probe=probe)
                 ]
 
         return {

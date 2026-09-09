@@ -24,9 +24,6 @@ DEVICE_POOL_TOKENS = 8192
 HICACHE_RATIO = 3.0
 PROBE_TOKENS = 2048
 PAGE_SIZE = 64
-# A value above 1.0 proves that the verifier accepted draft tokens. Keep this a
-# functional gate; three short probe reads are too noisy for a performance floor.
-MIN_ACCEPT_LENGTH = 1.0
 
 LAUNCH_ENV = {
     "MODEL": "/weights/gpt-oss-120b",
@@ -82,7 +79,7 @@ MODEL_CONFIG = {
                 page_size=PAGE_SIZE,
                 probe_tokens=PROBE_TOKENS,
                 hicache_ratio=HICACHE_RATIO,
-                min_accept_length=MIN_ACCEPT_LENGTH,
+                spec_decoding=True,
                 dp_size=DP_SIZE,
             ),
         },

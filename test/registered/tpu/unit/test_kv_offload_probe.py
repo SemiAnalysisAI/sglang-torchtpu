@@ -52,26 +52,30 @@ class TestSpeculativeKvOffloadProbe(unittest.TestCase):
         self.assertEqual(mean_accept_length(probe=probe), 0.0)
 
     def test_each_read_must_run_speculative_decoding(self) -> None:
-        failures = spec_failures(
-            probe=_probe(reload=_read(spec_verify_ct=0)), min_accept_length=1.0
-        )
+        failures = spec_failures(probe=_probe(reload=_read(spec_verify_ct=0)))
         self.assertEqual(len(failures), 1)
         self.assertIn("host-reload", failures[0])
 
-    def test_accept_length_must_be_strictly_above_floor(self) -> None:
+    def test_host_reload_must_cost_the_same_verify_forwards(self) -> None:
         failures = spec_failures(
             probe=_probe(
-                cold=_read(completion_tokens=4, spec_verify_ct=4),
-                warm=_read(completion_tokens=4, spec_verify_ct=4),
-                reload=_read(completion_tokens=4, spec_verify_ct=4),
-            ),
-            min_accept_length=1.0,
+                warm=_read(spec_verify_ct=5),
+                reload=_read(spec_verify_ct=13),
+            )
         )
         self.assertEqual(len(failures), 1)
-        self.assertIn("not above 1.00", failures[0])
+        self.assertIn("the host reload changed speculative decoding", failures[0])
 
-    def test_productive_drafts_pass(self) -> None:
-        self.assertEqual(spec_failures(probe=_probe(), min_accept_length=1.0), [])
+    def test_cold_read_may_cost_a_different_number_of_forwards(self) -> None:
+        probe = _probe(
+            cold=_read(spec_verify_ct=12),
+            warm=_read(spec_verify_ct=5),
+            reload=_read(spec_verify_ct=5),
+        )
+        self.assertEqual(spec_failures(probe=probe), [])
+
+    def test_matching_cached_reads_pass(self) -> None:
+        self.assertEqual(spec_failures(probe=_probe()), [])
 
 
 class TestKvOffloadOutputOracle(unittest.TestCase):
