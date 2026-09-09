@@ -89,6 +89,7 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.test_utils import dump_metric
+    from sglang.test.tpu.pd_router import build_router_cmd
 except ModuleNotFoundError as exc:
     # Keep the configuration tests runnable in a source-only checkout; the
     # integration cases need the full SGLang TPU environment anyway.
@@ -99,6 +100,9 @@ except ModuleNotFoundError as exc:
 
     def dump_metric(*_args, **_kwargs):
         return None
+
+    def build_router_cmd(**_kwargs):
+        raise SGLANG_IMPORT_ERROR
 
 
 # One invocation runs ONE model profile: two engines (weight load + compile),
@@ -749,28 +753,20 @@ class TestPdTpResharding(unittest.TestCase):
                 tuple(cls.procs),
             )
 
-            # The mini-LB injects the --prefill hostname into requests as the KV
+            # The router injects the --prefill hostname into requests as the KV
             # bootstrap address the decode pods dial -- it must be this pod's
             # cluster-reachable name, never 127.0.0.1.
             cls.procs.append(
                 subprocess.Popen(
                     _tee_command(
-                        (
-                            PYTHON,
-                            "-m",
-                            "sglang_router.launch_router",
-                            "--pd-disaggregation",
-                            "--mini-lb",
-                            "--prefill",
-                            f"http://{self_host}:{PREFILL_PORT}",
-                            "--decode",
-                            f"http://{decode_host}:{DECODE_PORT}",
-                            "--host",
-                            "0.0.0.0",
-                            "--port",
-                            str(LB_PORT),
-                            "--request-timeout-secs",
-                            "3600",
+                        build_router_cmd(
+                            python=PYTHON,
+                            prefill_url=f"http://{self_host}:{PREFILL_PORT}",
+                            decode_url=f"http://{decode_host}:{DECODE_PORT}",
+                            host="0.0.0.0",
+                            port=LB_PORT,
+                            request_timeout_secs=3600,
+                            bootstrap_port=BOOTSTRAP_PORT,
                         ),
                         log_path=LB_LOG,
                     ),
