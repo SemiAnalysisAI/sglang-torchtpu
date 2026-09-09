@@ -382,14 +382,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
 
     def _split_logits_processor(self) -> bool:
-        # Keep speculative backbones and logits processors in separate regions.
+        # Keep EAGLE3 target backbones and logits processors in separate regions.
         # Combining them produced rank-divergent target verification outputs;
-        # use the existing draft boundary for speculative targets as well.
+        # use the existing draft boundary for EAGLE3 targets as well.
         return hasattr(self.owner, "logits_processor") and (
             self.model_runner.is_draft_worker
             or (
                 hasattr(self.owner, "model")
-                and not self.model_runner.spec_algorithm.is_none()
+                and self.model_runner.spec_algorithm.is_eagle3()
             )
         )
 
@@ -499,7 +499,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     ) -> None:
         """Wrap and install the compiled forward shim on owner.
 
-        Speculative targets and drafts with a logits processor compile it separately
+        EAGLE3 targets and drafts with a logits processor compile it separately
         from the backbone, leaving the outer forward eager as a coordinator.
         DFlash samples via the target lm_head without logits_processor, so its
         forward stays compiled.

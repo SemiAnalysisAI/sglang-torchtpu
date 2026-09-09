@@ -622,6 +622,15 @@ class TestInstallExtendCap(_PolicyTestCase):
         self.assertEqual(policy.t_bucketer.next_bucket(8192), 8192)
 
     def test_target_model_keeps_outer_compile_boundary(self):
+        for algorithm in (
+            SpeculativeAlgorithm.NONE,
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.DFLASH,
+        ):
+            with self.subTest(algorithm=algorithm):
+                self._assert_target_keeps_outer_compile_boundary(algorithm)
+
+    def _assert_target_keeps_outer_compile_boundary(self, algorithm):
         original_outer = MagicMock(name="outer_forward")
         original_backbone = MagicMock(name="backbone_forward")
         model = SimpleNamespace(
@@ -634,7 +643,7 @@ class TestInstallExtendCap(_PolicyTestCase):
             model=model,
             forward=MagicMock(),
             is_draft_worker=False,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
+            spec_algorithm=algorithm,
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 prefill_max_requests=16,
@@ -680,7 +689,12 @@ class TestInstallExtendCap(_PolicyTestCase):
         compile_mock.assert_called_once()
         self.assertIs(compile_mock.call_args.args[0].__wrapped__, original_outer)
 
-    def test_draft_compiles_backbone_and_logits_as_separate_regions(self):
+    def test_eagle3_compiles_backbone_and_logits_as_separate_regions(self):
+        for is_draft_worker in (False, True):
+            with self.subTest(is_draft_worker=is_draft_worker):
+                self._assert_separate_backbone_and_logits(is_draft_worker)
+
+    def _assert_separate_backbone_and_logits(self, is_draft_worker):
         original_outer = MagicMock(name="outer_forward")
         original_backbone = MagicMock(name="backbone_forward")
         original_logits = MagicMock(name="logits_forward")
@@ -694,7 +708,8 @@ class TestInstallExtendCap(_PolicyTestCase):
         model_runner = SimpleNamespace(
             model=model,
             forward=MagicMock(),
-            is_draft_worker=True,
+            is_draft_worker=is_draft_worker,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 prefill_max_requests=16,
