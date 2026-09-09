@@ -49,6 +49,20 @@ if TYPE_CHECKING:
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
 
+def _select_active_tp_replica_info(tp_info: torch.Tensor) -> torch.Tensor:
+    """Choose the busiest scheduler replica for each attention-DP rank.
+
+    TPU schedulers can cross an overlap result boundary a few milliseconds
+    apart. During that window TP0 may already be idle while another TP replica
+    still owns the optimistic next decode batch. Prefer the replica reporting
+    the most tokens. Ties select the first maximal replica, which is TP0 only
+    when TP0 is one of the tied replicas.
+    """
+    replica = tp_info[:, :, 0].argmax(dim=1)
+    dp_rank = torch.arange(tp_info.shape[0], device=tp_info.device)
+    return tp_info[dp_rank, replica]
+
+
 def _resolve_elastic_world_dp_size(
     dp_size: int,
     *,
@@ -101,7 +115,7 @@ class MLPSyncBatchInfo:
     local_forward_mode: int
 
     # some gathered elements
-    tp0_info_cpu: torch.Tensor = None
+    selected_info_cpu: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
@@ -140,12 +154,12 @@ class MLPSyncBatchInfo:
 
     def finalize_local(self):
         """Populate gather-derived metadata from the sole attention-DP rank."""
-        self.tp0_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
+        self.selected_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
-                self.tp0_info_cpu[:, 5].tolist()
+                self.selected_info_cpu[:, 5].tolist()
             )
 
     def all_gather(
@@ -207,16 +221,29 @@ class MLPSyncBatchInfo:
         # tensor is its own stream sync. Copy the whole tensor, not the
         # `[:, 0, :]` slice -- that slice is non-contiguous once
         # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
-        tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
-        self.tp0_info_cpu = tp0_info_cpu
-        self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
-        self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
-        self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
-        self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
-        self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
+        global_info_cpu = global_info_tensor.cpu()
+        if _is_tpu:
+            # TorchTPU's single-queue overlap can expose the next scheduler
+            # iteration on one attention-TP replica before its peers. Other
+            # platforms retain TP0 as the canonical scheduler replica.
+            selected_info_cpu = _select_active_tp_replica_info(global_info_cpu)
+            # An equal-token EXTEND/DECODE disagreement is invisible to the
+            # busiest-replica selector. EXTEND is the conservative vote: the
+            # forward-batch padding path converts decode/idle peers to EXTEND.
+            is_extend_in_batch = bool(global_info_cpu[:, :, 3].max())
+        else:
+            selected_info_cpu = global_info_cpu[:, 0, :]
+            is_extend_in_batch = bool(selected_info_cpu[:, 3].max())
+
+        self.selected_info_cpu = selected_info_cpu
+        self.global_num_tokens = selected_info_cpu[:, 0].tolist()
+        self.global_num_tokens_for_logprob = selected_info_cpu[:, 1].tolist()
+        self.can_run_decode_cuda_graph = bool(selected_info_cpu[:, 2].min())
+        self.is_extend_in_batch = is_extend_in_batch
+        self.can_run_prefill_cuda_graph = bool(selected_info_cpu[:, 6].min())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
-                tp0_info_cpu[:, 5].tolist()
+                selected_info_cpu[:, 5].tolist()
             )
 
 
@@ -228,8 +255,19 @@ def _update_gather_batch(
 ):
     # TODO: handle the case when moe_dense_tp_size != 1
     if not require_mlp_tp_gather:
-        batch.global_num_tokens = [mlp_sync_info.num_tokens]
-        batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
+        if _is_tpu and mlp_sync_info.global_num_tokens is not None:
+            # No MLP all-gather is required, so expose only this attention-DP
+            # rank's count. It must still come from the selected scheduler
+            # replica; using the stale local count recreates asymmetric TPU
+            # compile shapes inside one attention-TP group.
+            dp_rank = get_parallel().attn_dp_rank
+            batch.global_num_tokens = [mlp_sync_info.global_num_tokens[dp_rank]]
+            batch.global_num_tokens_for_logprob = [
+                mlp_sync_info.global_num_tokens_for_logprob[dp_rank]
+            ]
+        else:
+            batch.global_num_tokens = [mlp_sync_info.num_tokens]
+            batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
     else:
         batch.global_num_tokens = mlp_sync_info.global_num_tokens
         batch.global_num_tokens_for_logprob = (
@@ -461,11 +499,11 @@ def prepare_mlp_sync_batch_raw(
             use_all_reduce=use_world_group,
         )
 
-    metadata_ready = mlp_sync_info.tp0_info_cpu is not None
+    metadata_ready = mlp_sync_info.selected_info_cpu is not None
     if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
-                mlp_sync_info.tp0_info_cpu[:, 4:6],
+                mlp_sync_info.selected_info_cpu[:, 4:6],
             )
         )
 
@@ -497,7 +535,7 @@ def prepare_mlp_sync_batch_raw(
     if local_batch is not None and metadata_ready:
         local_batch.recv_skipper_forward_mode = (
             SchedulerRecvSkipper.derive_forward_mode(
-                mlp_sync_info.tp0_info_cpu[:, 5].tolist()
+                mlp_sync_info.selected_info_cpu[:, 5].tolist()
             )
         )
 
