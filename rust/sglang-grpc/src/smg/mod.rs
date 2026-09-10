@@ -27,6 +27,8 @@ use tonic::{Request, Response, Status};
 use crate::bridge::PyBridge;
 use crate::smg_proto;
 
+pub mod model_info;
+
 type StreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
 pub struct SmgSchedulerServiceImpl {
@@ -56,7 +58,18 @@ impl smg_proto::sglang_scheduler_server::SglangScheduler for SmgSchedulerService
         &self,
         _request: Request<smg_proto::HealthCheckRequest>,
     ) -> Result<Response<smg_proto::HealthCheckResponse>, Status> {
-        Err(Status::unimplemented("HealthCheck is not implemented yet"))
+        let healthy = tokio::task::spawn_blocking({
+            let bridge = self.bridge.clone();
+            move || bridge.health_check()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Status::internal(format!("Health check failed: {}", e)))?;
+
+        Ok(Response::new(smg_proto::HealthCheckResponse {
+            healthy,
+            message: String::new(),
+        }))
     }
 
     async fn abort(
@@ -70,7 +83,18 @@ impl smg_proto::sglang_scheduler_server::SglangScheduler for SmgSchedulerService
         &self,
         _request: Request<smg_proto::GetModelInfoRequest>,
     ) -> Result<Response<smg_proto::GetModelInfoResponse>, Status> {
-        Err(Status::unimplemented("GetModelInfo is not implemented yet"))
+        let json_info = tokio::task::spawn_blocking({
+            let bridge = self.bridge.clone();
+            move || bridge.get_model_info()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Status::internal(format!("Failed to get model info: {}", e)))?;
+
+        Ok(Response::new(model_info::build_model_info(
+            &json_info,
+            self.bridge.context_len(),
+        )))
     }
 
     /// Never called by SMG: `/server_info` goes to the worker's HTTP endpoint
