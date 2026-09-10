@@ -862,7 +862,11 @@ class DeepseekV2MoE(nn.Module):
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
-        self._moe_quant_once: Optional[bool] = None
+        # The optimization is CUDA-only; settle the TPU value before graph
+        # capture so one warmup variant cannot invalidate another's None guard.
+        self._moe_quant_once: Optional[bool] = (
+            False if get_device().device == "tpu" else None
+        )
 
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
