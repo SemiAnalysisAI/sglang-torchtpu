@@ -19,6 +19,10 @@ HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
 
 DRAFT_MODEL_PATH = "lmsys/EAGLE3-gpt-oss-120b-bf16"
 GSM8K_ACCURACY = 0.70
+# Measured 2.7971 over 200 examples; same floor as the non-offload DP8 spec row.
+SPEC_ACCEPT_LENGTH_THRESHOLD = float(
+    os.environ.get("SPEC_ACCEPT_LENGTH_THRESHOLD", "1.90")
+)
 DP_SIZE = 8
 DEVICE_POOL_TOKENS = 8192
 HICACHE_RATIO = 3.0
@@ -87,6 +91,7 @@ MODEL_CONFIG = {
             "dataset": "gsm8k",
             "label": "gsm8k",
             "baseline": GSM8K_ACCURACY,
+            "spec_accept_length_threshold": SPEC_ACCEPT_LENGTH_THRESHOLD,
             "num_examples": 200,
             "num_threads": 16,
             "max_tokens": 512,
