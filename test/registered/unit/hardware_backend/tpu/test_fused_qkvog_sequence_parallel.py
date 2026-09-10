@@ -222,7 +222,8 @@ def test_torch_adapter_drops_legacy_collective_id_before_export(monkeypatch):
     }
     parameter = inspect.signature(qkvog.tpu_sp_fused_qkvog).parameters["collective_id"]
     assert parameter.default is None
-    for collective_id in (None, 100, 161):
+    legacy_collective_ids = (None, *range(100, 162))
+    for collective_id in legacy_collective_ids:
         assert (
             qkvog.tpu_sp_fused_qkvog(
                 hidden,
@@ -237,7 +238,7 @@ def test_torch_adapter_drops_legacy_collective_id_before_export(monkeypatch):
             is sentinel
         )
 
-    assert len(calls) == 3
+    assert len(calls) == len(legacy_collective_ids)
     for args in calls:
         assert len(args) == 11
         assert all(
