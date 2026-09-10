@@ -60,6 +60,7 @@ _is_cpu = is_cpu()
 if _use_torch_native:
     from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
         build_topk1_verify_tree_tpu,
+        prepare_device_accept_tpu,
     )
 
 logger = logging.getLogger(__name__)
@@ -757,18 +758,29 @@ def eagle_prepare_for_verify(
         )
         device = batch.device
         if _use_torch_native:
-            # TPU: torch-native gather routed through the host mirrors.
-            batch.out_cache_loc = assign_extend_cache_locs_func(
-                req_pool_indices=batch.req_pool_indices,
-                req_to_token=req_to_token_pool.req_to_token,
-                start_offset=batch.seq_lens,
-                end_offset=batch.seq_lens + verify_input.draft_token_num,
-                batch_size=bs,
-                draft_token_num=verify_input.draft_token_num,
-                device=device,
-                host_req_pool_indices=batch.req_pool_indices_cpu,
-                host_seq_lens=batch.seq_lens_cpu,
-            )
+            precomputed_cache_locs = verify_input.device_accept_cache_locs
+            if precomputed_cache_locs is not None:
+                assert precomputed_cache_locs.shape == (
+                    bs * verify_input.draft_token_num,
+                ), "precomputed cache locations must match verify tokens"
+                # The overlap FutureMap selected the accepted-length-dependent
+                # window on device. Reuse it for verify instead of consulting
+                # a deliberately stale host seq-len mirror.
+                batch.out_cache_loc = precomputed_cache_locs
+                verify_input.device_accept_cache_locs = None
+            else:
+                # TPU: torch-native gather routed through the host mirrors.
+                batch.out_cache_loc = assign_extend_cache_locs_func(
+                    req_pool_indices=batch.req_pool_indices,
+                    req_to_token=req_to_token_pool.req_to_token,
+                    start_offset=batch.seq_lens,
+                    end_offset=batch.seq_lens + verify_input.draft_token_num,
+                    batch_size=bs,
+                    draft_token_num=verify_input.draft_token_num,
+                    device=device,
+                    host_req_pool_indices=batch.req_pool_indices_cpu,
+                    host_seq_lens=batch.seq_lens_cpu,
+                )
         else:
             # Uniform variant: end offsets (= start + draft_token_num) are computed
             # inside the kernel, keeping the eager `seq_lens + N` add off the host
@@ -1187,10 +1199,15 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
 
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
+    # In overlap mode req.seqlen is one pending accepted bonus ahead of honest
+    # kv_committed_len while the following batch is prepared. Include that slot
+    # in the page-aligned allocation used by device-resident accept routing.
+    tpu_overlap = _use_torch_native and batch.enable_overlap
+    allocation_reserve = double_alloc + int(tpu_overlap)
 
     cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
         batch.reqs,
-        reserve=double_alloc,
+        reserve=allocation_reserve,
         page_size=page_size,
     )
     for r in batch.reqs:
@@ -1249,6 +1266,9 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             num_needed_tokens=num_needed_tokens,
             batch=batch,
         )
+
+    if _use_torch_native:
+        prepare_device_accept_tpu(batch, bs=bs, double_alloc=double_alloc)
 
 
 def _top_k_renorm_prob_torch(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:
