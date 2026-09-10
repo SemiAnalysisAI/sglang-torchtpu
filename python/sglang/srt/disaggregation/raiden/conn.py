@@ -181,6 +181,11 @@ class RaidenKVManager(CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        from sglang.srt.runtime_verification.instrumentation import (
+            install_runtime_verification,
+        )
+
+        install_runtime_verification()
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
 
         self._message_handlers = {
