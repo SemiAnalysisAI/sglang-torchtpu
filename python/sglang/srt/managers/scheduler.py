@@ -1653,6 +1653,10 @@ class Scheduler(
             draft_vocab_size=draft_vocab_size,
             hidden_size=hidden_size,
             hidden_dtype=hidden_dtype,
+            req_pool_size=self.future_map.req_pool_size,
+        )
+        self.future_map.set_tpu_precompiled_batch_sizes(
+            compile_policy.b_bucketer.buckets
         )
 
     def maybe_init_ngram_embedding(self):
