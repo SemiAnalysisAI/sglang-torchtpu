@@ -52,7 +52,7 @@ on:
           - pd-sh-gpt-120b-spec
           - sh
       test_filter:
-        description: "Substring of a single-host test file path; runs only matching tests"
+        description: "Substring of a test file path; runs only matching tests"
         required: false
         default: ""
         type: string

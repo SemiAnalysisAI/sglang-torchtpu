@@ -59,8 +59,42 @@ class TestFilterRows(CustomTestCase):
 
     def test_no_match_is_empty_not_an_error(self):
         # A filter naming a single-host test legitimately matches no group, so
-        # the helper cannot decide fatality; the workflow checks across both.
+        # the helper cannot decide fatality; --verify checks across families.
         self.assertEqual(self.mod._filter_rows(GROUPS, "alpha_spec"), [])
+
+
+class TestStageTestFiles(CustomTestCase):
+    """--verify's universe, which is what makes a typo'd filter red.
+
+    It spans three sources with different shapes, and the static one is read
+    by regex out of the workflow. A reshape that broke any of them would leave
+    --verify passing a filter that selects no job -- the silent green again.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.files = _load()._stage_test_files()
+
+    def test_covers_the_single_host_matrix(self):
+        self.assertTrue(
+            any("singlehost_prefix_cache_kv_offload" in f for f in self.files)
+        )
+
+    def test_covers_the_multihost_launch_groups(self):
+        self.assertTrue(any("multihost" in f for f in self.files))
+
+    def test_covers_the_hand_wired_static_jobs(self):
+        # Static P/D and diffusion jobs are not discovered; they are parsed out
+        # of feature-validation-tpu.yml's literal `files:` values.
+        self.assertIn(
+            "test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py",
+            self.files,
+        )
+
+    def test_every_file_exists(self):
+        repo = Path(__file__).resolve().parents[3]
+        for path in self.files:
+            self.assertTrue((repo / path).is_file(), f"missing: {path}")
 
 
 if __name__ == "__main__":
