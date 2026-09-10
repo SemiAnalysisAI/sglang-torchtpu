@@ -72,9 +72,6 @@ MODEL_CONFIG = {
                 page_size=PAGE_SIZE,
                 probe_tokens=PROBE_TOKENS,
                 hicache_ratio=HICACHE_RATIO,
-                # Full DPA exposed occasional instruction-following variance on a
-                # cold read; compare the device-hit and host-reload text directly.
-                require_counting=False,
                 dp_size=DP_SIZE,
             ),
         },

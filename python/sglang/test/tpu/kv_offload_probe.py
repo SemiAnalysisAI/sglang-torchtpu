@@ -5,7 +5,6 @@ speculation checks use counters returned by the same three requests.
 """
 
 import math
-import re
 from typing import Any, Dict, List, Optional
 
 import msgspec
@@ -23,16 +22,12 @@ _PROMPT_VOCAB = (
     "very after our just name good through where help much before line right too mean old"
 ).split()
 
-# The probe prompt ends on this, and every read has to continue the count. Greedy
-# decoding on these servers is not reproducible: on Qwen3-Coder, three flushed cold
-# reads of the same 2048-token filler prompt returned three different texts,
-# logprobs apart by up to 1.7, with no cache involved at all. Forcing the
-# continuation narrows that but does not remove it -- across six reads of this tail
-# the decode still split between continuing it (" 13 14 15 16 17 ") and restarting
-# it ("\n\n1 2 3 4 5 6 7 8"), and it split on the DEVICE hit as often as on the host
-# reload, which no host round-trip can explain. So the gate asserts the count, not
-# the text: which of those two a read picks is noise, whereas KV that came back
-# wrong cannot produce either. See ``_counting_failure``.
+# The probe prompt ends on this so a read has something short and definite to
+# decode. Its exact text is never asserted -- the gate compares the device hit
+# against the host reload (``validate_probe``), which holds whatever the model
+# happens to say. Greedy decoding here sits on near-ties, and that is what makes
+# the comparison sharp: a reloaded page that came back even slightly wrong flips
+# a token and the two reads stop matching.
 _FORCED_TAIL = (
     "\n\nIgnore the words above. Continue this sequence.\n" "1 2 3 4 5 6 7 8 9 10 11 12"
 )
@@ -43,14 +38,9 @@ _FORCED_TAIL_TOKENS = 48
 # Filler KV as a multiple of the device pool. Above 1 so the probe is provably the
 # LRU victim rather than merely likely to be.
 _EVICTION_MARGIN = 1.5
-# Enough decode steps to land a countable run whichever way the tail is picked up,
-# few enough that the probe stays cheap next to the accuracy gate sharing the boot.
+# Enough decode steps that the two cached reads have real text to differ in, few
+# enough that the probe stays cheap next to the accuracy gate sharing the boot.
 _MAX_NEW_TOKENS = 16
-_INTEGER = re.compile(r"\d+")
-# Integers a read must land, past the first. Only a floor against a degenerate
-# decode -- the ascending property in ``_counting_failure`` is what actually
-# catches bad KV, and it catches it at any length.
-_MIN_COUNT_RUN = 3
 # Generous: the first probe is a cold prefill on a freshly compiled server.
 _REQUEST_TIMEOUT = 900
 
@@ -123,34 +113,11 @@ def _labelled_reads(probe: KvOffloadProbe):
     )
 
 
-def _counting_failure(*, label: str, text: str) -> Optional[str]:
-    """Reject a decode that did not come back as a readable ascending count.
-
-    The first integer is dropped: it is routinely a fragment of a number the
-    prompt already opened, so a read can legitimately start on "0 11 12 13 ...".
-    Everything after it has to step by one, which is the part corrupted KV cannot
-    fake -- a single bad token breaks the run (" 13 1<garbage> 15 16 17 ") even
-    though the model recovers right after it, and KV that is wholly wrong decodes
-    to no integers at all.
-    """
-    numbers = [int(match) for match in _INTEGER.findall(text)][1:]
-    counted = len(numbers) >= _MIN_COUNT_RUN and all(
-        later == earlier + 1 for earlier, later in zip(numbers, numbers[1:])
-    )
-    if counted:
-        return None
-    return (
-        f"the {label} read did not continue the forced count, so the KV it "
-        f"attended over is wrong: {text!r}"
-    )
-
-
 def validate_probe(
     *,
     probe: KvOffloadProbe,
     page_size: int,
     plan: Optional[EvictionPlan] = None,
-    require_counting: bool = True,
 ) -> List[str]:
     """Every judgement the gate makes. Empty list means the feature is working.
 
@@ -208,20 +175,17 @@ def validate_probe(
             f"the offloaded copy did not survive intact.{hint}"
         )
 
-    if require_counting:
-        # Check every tier so a host-reload failure can be attributed to the host.
-        for label, observation in _labelled_reads(probe):
-            counting_failure = _counting_failure(label=label, text=observation.text)
-            if counting_failure is not None:
-                failures.append(counting_failure)
-    else:
-        if not probe.warm.text or not probe.reload.text:
-            failures.append("the device-hit and host-reload reads must be non-empty")
-        elif probe.warm.text != probe.reload.text:
-            failures.append(
-                "the host reload changed the device-cached output: "
-                f"device={probe.warm.text!r}, host={probe.reload.text!r}"
-            )
+    # The two cached reads run the same extend shape over the same stored prefix,
+    # so they must decode identically; a difference is the reloaded KV itself. The
+    # cold read is excluded on purpose -- it consumes the prefix at compute dtype
+    # rather than KV-cache dtype, so it differs from both at epsilon scale.
+    if not probe.warm.text or not probe.reload.text:
+        failures.append("the device-hit and host-reload reads must be non-empty")
+    elif probe.warm.text != probe.reload.text:
+        failures.append(
+            "the host reload changed the device-cached output: "
+            f"device={probe.warm.text!r}, host={probe.reload.text!r}"
+        )
 
     return failures
 
@@ -234,8 +198,8 @@ def mean_accept_length(*, probe: KvOffloadProbe) -> float:
     return sum(read.completion_tokens for _, read in _labelled_reads(probe)) / verifies
 
 
-def spec_failures(*, probe: KvOffloadProbe, min_accept_length: float) -> List[str]:
-    """Require verify forwards on every read and sufficient mean accept length."""
+def spec_failures(*, probe: KvOffloadProbe) -> List[str]:
+    """Require verify forwards on every read and equal cost for the two cached reads."""
     failures = [
         f"speculative decoding did not run on the {label} read: spec_verify_ct=0 "
         f"over {read.completion_tokens} completion tokens"
@@ -245,12 +209,17 @@ def spec_failures(*, probe: KvOffloadProbe, min_accept_length: float) -> List[st
     if failures:
         return failures
 
-    accept_length = mean_accept_length(probe=probe)
-    if accept_length <= min_accept_length:
+    # The two cached reads decode identical text over the same stored prefix, so
+    # they must cost the same verify forwards; a difference is the reloaded KV
+    # perturbing the draft or verify path. The cold read is excluded for the same
+    # reason the text comparison excludes it. How many forwards the pair takes is
+    # a property of the decoded text, not of offloading -- the acceptance rate is
+    # guarded on the GSM8K sample instead.
+    if probe.reload.spec_verify_ct != probe.warm.spec_verify_ct:
         failures.append(
-            f"mean accept length {accept_length:.2f} over the three probe reads is "
-            f"not above {min_accept_length:.2f}, so accepted draft tokens were not "
-            "demonstrated"
+            f"the host reload changed speculative decoding: "
+            f"{probe.reload.spec_verify_ct} verify forwards against the device "
+            f"hit's {probe.warm.spec_verify_ct} for the same decoded text"
         )
     return failures
 
@@ -401,16 +370,13 @@ def kv_offload_runner(
     page_size: int,
     probe_tokens: int,
     hicache_ratio: float,
-    min_accept_length: Optional[float] = None,
-    require_counting: bool = True,
+    spec_decoding: bool = False,
     dp_size: int = 1,
 ):
     """Build a runner that validates device hits and complete host reloads.
 
     ``hicache_ratio`` must leave enough host capacity for the probe and fillers.
-    ``min_accept_length`` additionally enables speculative-decoding checks.
-    ``require_counting=False`` compares the device-hit and host-reload outputs for
-    models that do not reliably follow the probe's forced counting instruction.
+    ``spec_decoding`` additionally enables the speculative-decoding checks.
     """
     plan = plan_eviction(
         device_pool_tokens=device_pool_tokens,
@@ -443,7 +409,6 @@ def kv_offload_runner(
                     probe=probe,
                     page_size=page_size,
                     plan=plan,
-                    require_counting=require_counting,
                 )
             ]
 
@@ -466,7 +431,7 @@ def kv_offload_runner(
                 labels=labels,
             )
 
-            if min_accept_length is not None:
+            if spec_decoding:
                 accept_length = mean_accept_length(probe=probe)
                 verifies = ", ".join(
                     f"{label}={read.spec_verify_ct}"
@@ -474,8 +439,7 @@ def kv_offload_runner(
                 )
                 print(
                     f"[kv-offload] {test_name}/dp{dp_rank}: spec verify forwards "
-                    f"{verifies}, mean accept length {accept_length:.2f} against "
-                    f"floor {min_accept_length}",
+                    f"{verifies}, mean accept length {accept_length:.2f}",
                     flush=True,
                 )
                 dump_metric(
@@ -483,9 +447,7 @@ def kv_offload_runner(
                 )
                 failures += [
                     f"dp_rank={dp_rank}: {failure}"
-                    for failure in spec_failures(
-                        probe=probe, min_accept_length=min_accept_length
-                    )
+                    for failure in spec_failures(probe=probe)
                 ]
 
         return {

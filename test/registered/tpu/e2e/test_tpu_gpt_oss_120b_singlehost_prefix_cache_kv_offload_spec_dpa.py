@@ -19,14 +19,15 @@ HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
 
 DRAFT_MODEL_PATH = "lmsys/EAGLE3-gpt-oss-120b-bf16"
 GSM8K_ACCURACY = 0.70
+# Measured 2.7971 over 200 examples; same floor as the non-offload DP8 spec row.
+SPEC_ACCEPT_LENGTH_THRESHOLD = float(
+    os.environ.get("SPEC_ACCEPT_LENGTH_THRESHOLD", "1.90")
+)
 DP_SIZE = 8
 DEVICE_POOL_TOKENS = 8192
 HICACHE_RATIO = 3.0
 PROBE_TOKENS = 2048
 PAGE_SIZE = 64
-# A value above 1.0 proves that the verifier accepted draft tokens. Keep this a
-# functional gate; three short probe reads are too noisy for a performance floor.
-MIN_ACCEPT_LENGTH = 1.0
 
 LAUNCH_ENV = {
     "MODEL": "/weights/gpt-oss-120b",
@@ -82,10 +83,7 @@ MODEL_CONFIG = {
                 page_size=PAGE_SIZE,
                 probe_tokens=PROBE_TOKENS,
                 hicache_ratio=HICACHE_RATIO,
-                min_accept_length=MIN_ACCEPT_LENGTH,
-                # Full DPA exposed occasional instruction-following variance on a
-                # cold read; compare the device-hit and host-reload text directly.
-                require_counting=False,
+                spec_decoding=True,
                 dp_size=DP_SIZE,
             ),
         },
@@ -93,6 +91,7 @@ MODEL_CONFIG = {
             "dataset": "gsm8k",
             "label": "gsm8k",
             "baseline": GSM8K_ACCURACY,
+            "spec_accept_length_threshold": SPEC_ACCEPT_LENGTH_THRESHOLD,
             "num_examples": 200,
             "num_threads": 16,
             "max_tokens": 512,

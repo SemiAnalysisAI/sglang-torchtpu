@@ -52,26 +52,30 @@ class TestSpeculativeKvOffloadProbe(unittest.TestCase):
         self.assertEqual(mean_accept_length(probe=probe), 0.0)
 
     def test_each_read_must_run_speculative_decoding(self) -> None:
-        failures = spec_failures(
-            probe=_probe(reload=_read(spec_verify_ct=0)), min_accept_length=1.0
-        )
+        failures = spec_failures(probe=_probe(reload=_read(spec_verify_ct=0)))
         self.assertEqual(len(failures), 1)
         self.assertIn("host-reload", failures[0])
 
-    def test_accept_length_must_be_strictly_above_floor(self) -> None:
+    def test_host_reload_must_cost_the_same_verify_forwards(self) -> None:
         failures = spec_failures(
             probe=_probe(
-                cold=_read(completion_tokens=4, spec_verify_ct=4),
-                warm=_read(completion_tokens=4, spec_verify_ct=4),
-                reload=_read(completion_tokens=4, spec_verify_ct=4),
-            ),
-            min_accept_length=1.0,
+                warm=_read(spec_verify_ct=5),
+                reload=_read(spec_verify_ct=13),
+            )
         )
         self.assertEqual(len(failures), 1)
-        self.assertIn("not above 1.00", failures[0])
+        self.assertIn("the host reload changed speculative decoding", failures[0])
 
-    def test_productive_drafts_pass(self) -> None:
-        self.assertEqual(spec_failures(probe=_probe(), min_accept_length=1.0), [])
+    def test_cold_read_may_cost_a_different_number_of_forwards(self) -> None:
+        probe = _probe(
+            cold=_read(spec_verify_ct=12),
+            warm=_read(spec_verify_ct=5),
+            reload=_read(spec_verify_ct=5),
+        )
+        self.assertEqual(spec_failures(probe=probe), [])
+
+    def test_matching_cached_reads_pass(self) -> None:
+        self.assertEqual(spec_failures(probe=_probe()), [])
 
 
 class TestKvOffloadOutputOracle(unittest.TestCase):
@@ -82,33 +86,30 @@ class TestKvOffloadOutputOracle(unittest.TestCase):
             reload=CacheObservation(reload_text, 0, 960, 8, 0),
         )
 
-    def test_equivalent_cache_reads_pass_without_counting(self) -> None:
+    def test_equivalent_cache_reads_pass(self) -> None:
         failures = validate_probe(
             probe=self._tiered_probe(
                 warm_text="not a count", reload_text="not a count"
             ),
             page_size=64,
-            require_counting=False,
         )
         self.assertEqual(failures, [])
 
-    def test_changed_host_reload_fails_without_counting(self) -> None:
+    def test_changed_host_reload_fails(self) -> None:
         failures = validate_probe(
             probe=self._tiered_probe(warm_text="device", reload_text="host"),
             page_size=64,
-            require_counting=False,
         )
         self.assertEqual(len(failures), 1)
         self.assertIn("host reload changed", failures[0])
 
-    def test_counting_remains_the_default(self) -> None:
+    def test_two_empty_reads_are_not_a_match(self) -> None:
         failures = validate_probe(
-            probe=self._tiered_probe(
-                warm_text="not a count", reload_text="not a count"
-            ),
+            probe=self._tiered_probe(warm_text="", reload_text=""),
             page_size=64,
         )
-        self.assertEqual(len(failures), 2)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("must be non-empty", failures[0])
 
 
 class TestDpRouting(unittest.TestCase):
