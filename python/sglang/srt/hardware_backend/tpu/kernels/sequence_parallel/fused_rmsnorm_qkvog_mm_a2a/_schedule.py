@@ -17,6 +17,7 @@ from ._contract import TP_SIZE
 
 MIN_TUNED_TOKENS = 1024
 MAX_TUNED_TOKENS = 16384
+_SUPPORTED_LOCAL_ROWS = (64, 128, 256, 320, 384, 448, 512, 1024)
 
 
 def _build_ici_schedule() -> tuple[tuple[tuple[int, int], ...], ...]:
@@ -111,7 +112,7 @@ def supports_token_count(global_tokens: int) -> bool:
     if global_tokens % TP_SIZE:
         return False
     local_rows = global_tokens // TP_SIZE
-    return local_rows in (64, 128) or (local_rows >= 256 and local_rows % 64 == 0)
+    return local_rows in _SUPPORTED_LOCAL_ROWS
 
 
 def _eight_source_gather_steps() -> tuple[tuple[tuple[int, int], ...], ...]:
@@ -167,10 +168,8 @@ def make_schedule_plan(local_rows: int) -> SchedulePlan:
             output_orders=_TWO_SOURCE_OUTPUT_ORDERS,
             vmem_limit_bytes=62 * 1024 * 1024,
         )
-    if local_rows < 256 or local_rows > 1024 or local_rows % 64:
-        raise ValueError(
-            "supported local rows are 64, 128, or 256--1024 in multiples of 64"
-        )
+    if local_rows not in _SUPPORTED_LOCAL_ROWS:
+        raise ValueError("supported local rows: 64, 128, 256--512 by 64, or 1024")
     return AllToAllPlan(
         name="all-to-all-grid" if local_rows > 512 else "all-to-all",
         collective_id=(

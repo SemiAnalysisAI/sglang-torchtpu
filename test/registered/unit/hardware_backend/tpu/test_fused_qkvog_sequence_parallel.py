@@ -150,7 +150,7 @@ def test_tuned_token_schedule(tokens, plan_type, name, collective_id):
 def test_schedule_owned_collective_ids_have_finite_cardinality():
     ids = {
         make_schedule_plan(tokens // 16).collective_id
-        for tokens in range(4096, 16385, 1024)
+        for tokens in (4096, 5120, 6144, 7168, 8192, 16384)
     }
     ids.update(
         {
@@ -174,6 +174,13 @@ def test_inlined_ici_schedule_keeps_the_tuned_hypercube_routes():
 @pytest.mark.parametrize("tokens", (0, 512, 1000, 17408))
 def test_unsupported_token_schedule_falls_back(tokens):
     assert not supports_token_count(tokens)
+
+
+@pytest.mark.parametrize("local_rows", range(576, 1024, 64))
+def test_partial_a2a_row_blocks_are_rejected(local_rows):
+    assert not supports_token_count(local_rows * 16)
+    with pytest.raises(ValueError, match="supported local rows"):
+        make_schedule_plan(local_rows)
 
 
 def test_runtime_contract_accepts_only_tuned_bf16_shapes():

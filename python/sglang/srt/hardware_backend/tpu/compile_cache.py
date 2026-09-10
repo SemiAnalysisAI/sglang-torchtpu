@@ -28,6 +28,7 @@ def get_pallas_kernel_sources() -> tuple[str, ...]:
         "hardware_backend/tpu/attention_pallas_rpa_batched.py",
         "hardware_backend/tpu/attention_pallas_rpa_v3.py",
         "hardware_backend/tpu/distributed_topk_pallas.py",
+        "hardware_backend/tpu/fused_qkvog_sequence_parallel.py",
         "hardware_backend/tpu/kernels",
         "hardware_backend/tpu/pallas_export.py",
         "hardware_backend/tpu/pallas_jax_op.py",

@@ -559,12 +559,15 @@ def run_a2a(
         )
 
     # A scalar grid runs one program for up to ``row_block_rows`` local rows.
-    # Larger inputs launch one independent program per contiguous row block.
-    grid = (
-        (plan.local_rows // plan.row_block_rows,)
-        if plan.local_rows > plan.row_block_rows
-        else ()
-    )
+    # The kernel has no masked tail path, so every accepted plan must divide
+    # the local rows into complete blocks.
+    program_count, tail_rows = divmod(plan.local_rows, plan.row_block_rows)
+    if tail_rows:
+        raise ValueError(
+            f"local rows ({plan.local_rows}) must be divisible by row block rows "
+            f"({plan.row_block_rows})"
+        )
+    grid = (program_count,) if program_count > 1 else ()
     # Rank metadata is scalar-prefetched; the five tensor inputs and all three
     # outputs remain HBM references consumed by the kernel above.
     grid_spec = pltpu.PrefetchScalarGridSpec(
