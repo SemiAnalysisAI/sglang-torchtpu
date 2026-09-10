@@ -17,6 +17,11 @@
 //! `--incremental-streaming-output` defaults false, so our `output_ids` are
 //! cumulative while SMG's chunk contract is incremental (see `response_map`).
 
+// Every fallible function in this module reports through `tonic::Status`,
+// which is 176 bytes, because that is what the service trait returns. Boxing it
+// would only move the unboxing to each tonic boundary.
+#![allow(clippy::result_large_err)]
+
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -72,11 +77,35 @@ impl smg_proto::sglang_scheduler_server::SglangScheduler for SmgSchedulerService
         }))
     }
 
+    /// SMG never calls this explicitly; `AbortOnDropStream::Drop` fires it on
+    /// every client disconnect, every `GenerateError`, every tonic stream error
+    /// and every cancellation, because SMG calls `mark_completed()` only on
+    /// clean success. Leaving it `unimplemented` would leave each of those
+    /// requests generating to `max_new_tokens` and, in PD, strand the
+    /// bootstrap room.
+    ///
+    /// An abort for an already-finished request is the normal case — Drop races
+    /// the terminal frame — so `PyBridge::abort` treats an unknown rid as a
+    /// no-op success and we must not turn that into an error.
     async fn abort(
         &self,
-        _request: Request<smg_proto::AbortRequest>,
+        request: Request<smg_proto::AbortRequest>,
     ) -> Result<Response<smg_proto::AbortResponse>, Status> {
-        Err(Status::unimplemented("Abort is not implemented yet"))
+        let req = request.into_inner();
+        let rid = abort_rid(&req)?;
+        tracing::debug!(rid, reason = %req.reason, "SMG abort");
+
+        // `abort_all` is hard-coded false: AbortRequest has no such field, and
+        // this listener is unauthenticated (see run_grpc_server's TODO), so the
+        // blast radius stays at one request.
+        self.bridge
+            .abort(rid, false)
+            .map_err(|e| Status::internal(format!("Failed to abort: {}", e)))?;
+
+        Ok(Response::new(smg_proto::AbortResponse {
+            success: true,
+            message: String::new(),
+        }))
     }
 
     async fn get_model_info(
@@ -119,6 +148,18 @@ impl smg_proto::sglang_scheduler_server::SglangScheduler for SmgSchedulerService
             "GetLoads is not served over sglang.grpc.scheduler; SMG reports -1 for gRPC workers",
         ))
     }
+}
+
+/// The rid an `AbortRequest` targets, which must be the verbatim
+/// `GenerateRequest.request_id` or the abort matches nothing.
+fn abort_rid(req: &smg_proto::AbortRequest) -> Result<&str, Status> {
+    let rid = req.request_id.trim();
+    if rid.is_empty() {
+        return Err(Status::invalid_argument(
+            "Abort requires a non-empty request_id",
+        ));
+    }
+    Ok(rid)
 }
 
 #[cfg(test)]

@@ -3,8 +3,11 @@
 //! The mapping tests live next to the code they cover
 //! (`request_map`, `response_map`, `model_info`, `rooms`).
 
+use super::abort_rid;
+use crate::smg_proto;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use tonic::Code;
 
 fn repo_path(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -53,4 +56,38 @@ fn vendored_proto_digest_is_unchanged() {
         "the vendored sglang_scheduler.proto changed. If that was deliberate, \
          update EXPECTED and re-read src/smg/ for the fields you moved."
     );
+}
+
+/// T38, request half. The recorded abort is
+/// `AbortRequest { request_id: "chatcmpl-...", reason: "Stream dropped" }`, so
+/// the id SMG aborts with is byte-identical to the one it generated with; see
+/// `request_map`'s `request_id_is_used_verbatim_as_rid`.
+#[test]
+fn abort_uses_the_request_id_verbatim() {
+    let req = smg_proto::AbortRequest {
+        request_id: "chatcmpl-bbd2aa96-d42d-4870-b9b5-36e10adfc71f".to_string(),
+        reason: "Stream dropped".to_string(),
+    };
+
+    assert_eq!(
+        abort_rid(&req).unwrap(),
+        "chatcmpl-bbd2aa96-d42d-4870-b9b5-36e10adfc71f"
+    );
+}
+
+#[test]
+fn abort_without_a_request_id_is_rejected() {
+    for request_id in ["", "   "] {
+        let req = smg_proto::AbortRequest {
+            request_id: request_id.to_string(),
+            reason: String::new(),
+        };
+
+        assert_eq!(
+            abort_rid(&req).unwrap_err().code(),
+            Code::InvalidArgument,
+            "an empty request_id cannot identify anything; aborting nothing \
+             silently would leave the request generating"
+        );
+    }
 }
