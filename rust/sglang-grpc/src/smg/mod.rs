@@ -29,11 +29,16 @@ use tokio::time::Duration;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
-use crate::bridge::PyBridge;
+use crate::bridge::{PyBridge, ResponseChunk};
+use crate::server::{
+    RequestAbortGuard, closed_stream_status, pyerr_to_status, recv_chunk_with_timeout,
+};
+use crate::smg::response_map::{StreamMode, StreamTranslator};
 use crate::smg_proto;
 
 pub mod model_info;
 pub mod request_map;
+pub mod response_map;
 pub mod rooms;
 
 type StreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -41,6 +46,9 @@ type StreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'st
 pub struct SmgSchedulerServiceImpl {
     pub bridge: Arc<PyBridge>,
     pub response_timeout: Duration,
+    /// Whether the engine emits cumulative or incremental `output_ids`; read
+    /// once at startup because it is a server argument, not a per-request one.
+    pub stream_mode: StreamMode,
 }
 
 #[tonic::async_trait]
@@ -49,9 +57,77 @@ impl smg_proto::sglang_scheduler_server::SglangScheduler for SmgSchedulerService
 
     async fn generate(
         &self,
-        _request: Request<smg_proto::GenerateRequest>,
+        request: Request<smg_proto::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        Err(Status::unimplemented("Generate is not implemented yet"))
+        let mapped = request_map::generate_to_dict(&request.into_inner())?;
+        let rid = mapped.rid;
+
+        let mut receiver = self
+            .bridge
+            .submit_request(&rid, "generate", mapped.dict)
+            .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
+
+        let bridge = self.bridge.clone();
+        let response_timeout = self.response_timeout;
+        let mut translator = StreamTranslator::new(self.stream_mode);
+
+        let stream = async_stream::stream! {
+            let mut abort_guard = RequestAbortGuard::new(bridge.clone(), rid.clone());
+            loop {
+                match recv_chunk_with_timeout(&mut receiver, response_timeout, || "Stream chunk timed out".to_string()).await {
+                    Ok(Some(ResponseChunk::Data(data))) => {
+                        match translator.on_data(&data) {
+                            Ok(Some(message)) => yield Ok(response_map::with_request_id(message, &rid)),
+                            // An empty delta is not an error; it just has
+                            // nothing SMG can use, and a zero-token chunk
+                            // inflates Harmony's per-chunk token count.
+                            Ok(None) => {}
+                            Err(status) => {
+                                abort_guard.abort_now();
+                                yield Err(status);
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Some(ResponseChunk::Finished(data))) => {
+                        abort_guard.disarm();
+                        match translator.on_finished(&data) {
+                            Ok(messages) => {
+                                for message in messages {
+                                    yield Ok(response_map::with_request_id(message, &rid));
+                                }
+                            }
+                            Err(status) => yield Err(status),
+                        }
+                        break;
+                    }
+                    Ok(Some(ResponseChunk::Error(msg))) => {
+                        abort_guard.disarm();
+                        let (message, status) = response_map::error_messages(msg);
+                        yield Ok(response_map::with_request_id(message, &rid));
+                        yield Err(status);
+                        break;
+                    }
+                    Ok(None) => {
+                        let (status, should_abort) = closed_stream_status(&bridge, &rid);
+                        if should_abort {
+                            abort_guard.abort_now();
+                        } else {
+                            abort_guard.disarm();
+                        }
+                        yield Err(status);
+                        break;
+                    }
+                    Err(status) => {
+                        abort_guard.abort_now();
+                        yield Err(status);
+                        break;
+                    }
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn embed(
