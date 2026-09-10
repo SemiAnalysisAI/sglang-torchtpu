@@ -83,9 +83,9 @@ entering the next invocation and contributing a signal to a slower rank's
 previous invocation. Both the hybrid and direct schedules use this protocol.
 
 The lower-level JAX entrypoint accepts an explicit collective-ID override for
-specialized callers. The Torch adapter intentionally uses the schedule-owned
-default; its legacy `collective_id` keyword remains source-compatible but does
-not enter the exported custom-op signature or compilation key.
+specialized callers. The Torch adapter intentionally exposes no collective-ID
+argument and always uses the schedule-owned default, so a model caller cannot
+accidentally turn layer identity into export-cache identity.
 
 ## Source layout
 

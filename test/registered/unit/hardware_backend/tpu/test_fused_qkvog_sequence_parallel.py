@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import inspect
 import sys
 from unittest.mock import patch
 
@@ -197,7 +198,7 @@ def test_runtime_contract_accepts_only_tuned_bf16_shapes():
     )
 
 
-def test_layer_collective_id_is_not_forwarded_to_exported_op(monkeypatch):
+def test_torch_adapter_has_no_caller_owned_collective_id(monkeypatch):
     hidden = torch.empty((64, 8192), dtype=torch.bfloat16, device="meta")
     weight = torch.empty((8192, 16 * 1152), dtype=torch.bfloat16, device="meta")
     gain = torch.empty((8192,), dtype=torch.bfloat16, device="meta")
@@ -219,22 +220,21 @@ def test_layer_collective_id_is_not_forwarded_to_exported_op(monkeypatch):
         "use_qk_norm": True,
         "use_rope": True,
     }
-    for layer_collective_id in (100, 161):
-        assert (
-            qkvog.tpu_sp_fused_qkvog(
-                hidden,
-                weight,
-                gain,
-                cos,
-                sin,
-                metadata,
-                collective_id=layer_collective_id,
-                **kwargs,
-            )
-            is sentinel
+    assert "collective_id" not in inspect.signature(qkvog.tpu_sp_fused_qkvog).parameters
+    assert (
+        qkvog.tpu_sp_fused_qkvog(
+            hidden,
+            weight,
+            gain,
+            cos,
+            sin,
+            metadata,
+            **kwargs,
         )
+        is sentinel
+    )
 
-    assert len(calls) == 2
+    assert len(calls) == 1
     for args in calls:
         assert len(args) == 11
         assert all(

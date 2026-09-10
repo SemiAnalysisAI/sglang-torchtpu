@@ -264,7 +264,7 @@ def test_matches_jax_reference_and_is_deterministic(
         _assert_addressable_shards_close(actual_part, expected_part)
 
 
-@pytest.mark.parametrize("tokens", (1024, 4096))
+@pytest.mark.parametrize("tokens", (1024, 2048, 4096, 16384))
 def test_schedule_owned_collective_channel_is_reuse_safe(
     tp16_mesh,
     weight_and_gain,

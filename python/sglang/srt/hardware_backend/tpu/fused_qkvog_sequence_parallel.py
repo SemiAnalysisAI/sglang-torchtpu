@@ -419,15 +419,8 @@ def tpu_sp_fused_qkvog(
     scale_query_by: float,
     use_qk_norm: bool,
     use_rope: bool,
-    collective_id: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run fused RMSNorm, QKVOG projection, Q/K epilogue, and token/head A2A.
-
-    ``collective_id`` remains accepted for compatibility with serving callers,
-    but is intentionally not forwarded to the exported custom op. The Pallas
-    implementation owns a finite channel namespace by schedule so layer IDs do
-    not create otherwise-identical compiler specializations.
-    """
+    """Run fused RMSNorm, QKVOG projection, Q/K epilogue, and token/head A2A."""
     if not can_use_tpu_sp_fused_qkvog(
         hidden_states,
         packed_weight,
