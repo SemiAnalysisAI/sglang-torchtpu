@@ -937,6 +937,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_prefix_lens,
                 ret.extend_seq_lens,
                 ret.extend_num_tokens,
+                ret.extend_prefix_lens_cpu,
+                ret.extend_seq_lens_cpu,
             )
             if ret.positions is None:
                 ret.positions = positions
@@ -1858,6 +1860,8 @@ def compute_position(
     extend_prefix_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     extend_seq_lens_sum: int,
+    extend_prefix_lens_cpu: Optional[List[int]] = None,
+    extend_seq_lens_cpu: Optional[List[int]] = None,
 ):
     if support_triton(attn_backend):
         positions, extend_start_loc = compute_position_triton(
@@ -1866,14 +1870,22 @@ def compute_position(
             extend_seq_lens_sum,
         )
     else:
+        # The host lists, when the caller has them, let a CPU-staged
+        # implementation skip reading the device tensors back.
         positions, extend_start_loc = compute_position_torch(
-            extend_prefix_lens, extend_seq_lens
+            extend_prefix_lens,
+            extend_seq_lens,
+            extend_prefix_lens_cpu,
+            extend_seq_lens_cpu,
         )
     return positions, extend_start_loc
 
 
 def compute_position_torch(
-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_prefix_lens_cpu: Optional[List[int]] = None,
+    extend_seq_lens_cpu: Optional[List[int]] = None,
 ):
     positions = torch.cat(
         [

@@ -415,10 +415,10 @@ def _patch_compute_position_torch() -> None:
     warmup completes, then all schedulers hang at this line on the next
     request.
 
-    Fix: `.tolist()` both length tensors once (single explicit sync), build
-    positions on CPU, transfer to device once. Behavior identical on CUDA/CPU
-    (which doesn't use this path anyway — CUDA goes through the triton
-    variant).
+    Fix: build positions on CPU and transfer to device once. When the caller
+    has the lengths as host lists (init_new does), use them instead of reading
+    the device tensors back. Behavior identical on CUDA/CPU (which doesn't use
+    this path anyway — CUDA goes through the triton variant).
     """
     global _compute_position_torch_patched
     if _compute_position_torch_patched:
@@ -430,15 +430,36 @@ def _patch_compute_position_torch() -> None:
     from sglang.srt.model_executor import forward_batch_info
 
     def compute_position_torch_cpu_staged(
-        extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
+        extend_prefix_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        extend_prefix_lens_cpu=None,
+        extend_seq_lens_cpu=None,
     ):
         device = extend_prefix_lens.device
-        prefix_lens = extend_prefix_lens.tolist()
-        seq_lens = extend_seq_lens.tolist()
-        positions_cpu = torch.cat(
-            [torch.arange(p, p + s) for p, s in zip(prefix_lens, seq_lens)],
-            axis=0,
-        ).to(torch.int64)
+        # init_new hands over the host lists it built the device tensors from;
+        # other callers (spec workers, two-batch overlap) pass tensors only.
+        prefix_lens = (
+            list(extend_prefix_lens_cpu)
+            if extend_prefix_lens_cpu is not None
+            else extend_prefix_lens.tolist()
+        )
+        seq_lens = (
+            list(extend_seq_lens_cpu)
+            if extend_seq_lens_cpu is not None
+            else extend_seq_lens.tolist()
+        )
+        total = int(sum(seq_lens))
+        if total == 0:
+            positions_cpu = torch.empty((0,), dtype=torch.int64)
+        else:
+            # One arange + repeat_interleave instead of one arange per request:
+            # position = prefix_len + offset within the request.
+            seq_t = torch.tensor(seq_lens, dtype=torch.int64)
+            starts = torch.cumsum(seq_t, 0) - seq_t
+            prefix_t = torch.tensor(prefix_lens, dtype=torch.int64)
+            positions_cpu = torch.arange(total, dtype=torch.int64) + (
+                torch.repeat_interleave(prefix_t - starts, seq_t)
+            )
         extend_start_loc = torch.zeros_like(extend_seq_lens)
         if extend_seq_lens.numel() > 1:
             # Set dtype to int32 rather than cumsum's default int64.
