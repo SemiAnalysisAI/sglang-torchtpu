@@ -86,8 +86,13 @@ def _env(values: Optional[Dict[str, str]]) -> Dict[str, str]:
 
 
 def resolve_mode(*, env: Optional[Dict[str, str]] = None) -> str:
-    """Router selected by ``SGLANG_TPU_PD_ROUTER``, defaulting to the legacy mini-LB."""
-    mode = _env(env).get("SGLANG_TPU_PD_ROUTER", MINI_LB).strip().lower()
+    """Router selected by ``SGLANG_TPU_PD_ROUTER``, defaulting to the legacy mini-LB.
+
+    NOT FOR MERGE: this branch defaults to SMG so a full nightly exercises the
+    router migration end to end before any of the PRs land. The shipped default
+    is MINI_LB; see shriharim/tpu-pd-router-seam.
+    """
+    mode = _env(env).get("SGLANG_TPU_PD_ROUTER", SMG).strip().lower()
     if mode not in ROUTER_MODES:
         raise ValueError(
             f"SGLANG_TPU_PD_ROUTER={mode!r} is not one of {ROUTER_MODES}. "
