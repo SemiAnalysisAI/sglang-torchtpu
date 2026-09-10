@@ -47,8 +47,8 @@ on:
           - pd-mh-gpt-120b-spec
           - pd-mh-gpt-120b-pc-offload-spec
           - pd-mh-gpt-120b-pc-offload-spec-reshard
-          - pd-mh-gpt-120b-tp-reshard
-          - pd-mh-qwen3-480b-tp-reshard
+          - pd-mh-gpt-120b-kvoff-reshard
+          - pd-mh-qwen3-480b-kvoff-reshard
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
           - sh

@@ -11,8 +11,8 @@ dispatch, probes and gsm8k. The dashboard contract is one job to one test file,
 so each model gets a thin sibling that carries the registration and calls
 main():
 
-  test_tpu_gpt_oss_120b_pd_multihost_tp_resharding.py     -> main("gpt_oss_120b")
-  test_tpu_qwen3_coder_480b_pd_multihost_tp_resharding.py -> main("qwen3_coder_480b")
+  test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py     -> main("gpt_oss_120b")
+  test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py -> main("qwen3_coder_480b")
 
 Keeping both profiles here rather than in those files keeps the model matrix in
 one place; a file selects one by key. This module registers itself as a disabled
@@ -390,6 +390,31 @@ def validate_model_source(profile: ModelProfile, model_path: str) -> None:
         )
 
 
+def hicache_server_args(
+    profile: ModelProfile, env: Optional[Mapping[str, str]] = None
+) -> str:
+    """Prefill-side KV offload, matching the standalone kv-offload tests.
+
+    Offload runs on the prefill engine only: it is where the pages are produced
+    and where eviction pressure is, and the decode engine receives KV through
+    the reshard rather than reloading it from host. build_decode_env therefore
+    carries no hicache flag, and a test below pins that.
+    """
+    values = os.environ if env is None else env
+    return " ".join(
+        (
+            "--enable-hierarchical-cache",
+            "--hicache-ratio",
+            values.get("HICACHE_RATIO", "2"),
+            "--hicache-io-backend",
+            "raiden",
+            "--hicache-mem-layout",
+            "page_first_fused",
+            "--enable-cache-report",
+        )
+    )
+
+
 def _common_launch_env(
     profile: ModelProfile, group_hosts: int, env: Optional[Mapping[str, str]] = None
 ) -> Dict[str, str]:
@@ -466,6 +491,7 @@ def build_prefill_env(
         "EXTRA_ARGS": " ".join(
             (
                 *prefill_args,
+                hicache_server_args(profile, values),
                 *profile.extra_server_args,
                 values.get("EXTRA_PREFILL_ARGS", ""),
             )
@@ -963,6 +989,28 @@ class TestPdTpResharding(unittest.TestCase):
         print(f"gsm8k score={score:.4f} floor={self.gsm8k_config.threshold:.4f}")
         self.assertGreaterEqual(score, self.gsm8k_config.threshold)
 
+    def test_02b_kv_offload_engaged(self) -> None:
+        """The prefill engine's host offload tier actually initialized.
+
+        Enabling --enable-hierarchical-cache is not evidence that offload ran.
+        If the raiden HiCache backend fails to come up, the engine serves
+        happily from the device pool alone and every other assertion here still
+        passes -- the combo silently degrades to the one it was meant to extend.
+        This marker is emitted by hardware_backend/tpu/raiden_transfer.py once
+        the host pool and DMA engine are up, so its absence is the direct
+        evidence of that silent skip.
+        """
+        with open(PREFILL_LOG, "r", errors="replace") as f:
+            log = f.read()
+        self.assertIn(
+            RAIDEN_READY_MARKER,
+            log,
+            "KV offload never engaged on the prefill engine: no "
+            f"{RAIDEN_READY_MARKER!r} in {PREFILL_LOG}. The run would still "
+            "pass every other check while serving entirely from the device "
+            "pool, so the offload half of this combo was not exercised.",
+        )
+
     def test_03_sliding_window_crossed_the_reshard(self) -> None:
         """A hybrid model's window must actually be resharded, not just its
         full-attention pool.
@@ -1100,6 +1148,10 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
             self.assertIn("--enable-dp-attention", d_env["EXTRA_ARGS"])
             self.assertIn("--enable-dp-lm-head", d_env["EXTRA_ARGS"])
             self.assertNotIn("hicache", d_env["EXTRA_ARGS"])
+            # Offload is prefill-side; decode receives KV through the reshard.
+            self.assertIn("--enable-hierarchical-cache", p_env["EXTRA_ARGS"])
+            self.assertIn("--hicache-io-backend raiden", p_env["EXTRA_ARGS"])
+            self.assertIn("--hicache-mem-layout page_first_fused", p_env["EXTRA_ARGS"])
 
     def test_heterogeneous_attention_tp_resharding_ratio(self) -> None:
         for profile in MODEL_PROFILES.values():
