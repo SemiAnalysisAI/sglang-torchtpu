@@ -1006,6 +1006,7 @@ pub async fn run_grpc_server(
             bridge: smg_bridge,
             response_timeout,
             stream_mode,
+            rooms: Arc::new(crate::smg::rooms::RoomRegistry::new()),
         })
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size);

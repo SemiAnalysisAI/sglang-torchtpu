@@ -1,4 +1,8 @@
-use super::widen_room;
+use std::sync::Arc;
+
+use tonic::Code;
+
+use super::{RoomRegistry, widen_room};
 
 /// T11.
 #[test]
@@ -37,4 +41,54 @@ fn widening_is_deterministic_across_legs() {
     for room in [0, 1, 7, 507_686_309, i32::MAX, -1, i32::MIN] {
         assert_eq!(widen_room(room), widen_room(room));
     }
+}
+
+/// T13. Without the registry a concurrent collision means one request's decode
+/// consumes another's KV, with no error anywhere.
+#[test]
+fn concurrent_room_reuse_is_rejected() {
+    let registry = Arc::new(RoomRegistry::new());
+
+    let first = registry.claim(507_686_309, "chatcmpl-a").unwrap();
+
+    let status = registry.claim(507_686_309, "chatcmpl-b").unwrap_err();
+    assert_eq!(status.code(), Code::AlreadyExists);
+    assert!(
+        status.message().contains("chatcmpl-a"),
+        "the rejection must name the holder: {}",
+        status.message()
+    );
+
+    // A different room is unaffected.
+    let _other = registry.claim(507_686_310, "chatcmpl-c").unwrap();
+
+    drop(first);
+    registry
+        .claim(507_686_309, "chatcmpl-b")
+        .expect("reuse after completion is the normal case, not a collision");
+}
+
+/// R5: a missed release poisons the room for the process lifetime, so the guard
+/// must free it on every exit path, not just the happy one.
+#[test]
+fn the_guard_releases_the_room_on_every_path() {
+    let registry = Arc::new(RoomRegistry::new());
+
+    // Normal scope exit.
+    {
+        let _guard = registry.claim(1, "a").unwrap();
+        assert_eq!(registry.len(), 1);
+    }
+    assert_eq!(registry.len(), 0);
+
+    // Unwind.
+    let unwound = std::panic::catch_unwind({
+        let registry = Arc::clone(&registry);
+        move || {
+            let _guard = registry.claim(2, "b").unwrap();
+            panic!("simulated stream failure");
+        }
+    });
+    assert!(unwound.is_err());
+    assert_eq!(registry.len(), 0);
 }

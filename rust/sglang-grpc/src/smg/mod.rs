@@ -50,6 +50,7 @@ pub struct SmgSchedulerServiceImpl {
     /// Whether the engine emits cumulative or incremental `output_ids`; read
     /// once at startup because it is a server argument, not a per-request one.
     pub stream_mode: StreamMode,
+    pub rooms: Arc<rooms::RoomRegistry>,
 }
 
 #[tonic::async_trait]
@@ -63,6 +64,14 @@ impl smg_proto::sglang_scheduler_server::SglangScheduler for SmgSchedulerService
         let mapped = request_map::generate_to_dict(&request.into_inner())?;
         let rid = mapped.rid;
 
+        // Claimed before submitting, released by the guard when the response
+        // stream drops. A concurrent room collision becomes ALREADY_EXISTS
+        // instead of this request's decode consuming another's KV.
+        let room_guard = match mapped.bootstrap_room {
+            Some(room) => Some(self.rooms.claim(room, &rid)?),
+            None => None,
+        };
+
         let mut receiver = self
             .bridge
             .submit_request(&rid, "generate", mapped.dict)
@@ -73,6 +82,7 @@ impl smg_proto::sglang_scheduler_server::SglangScheduler for SmgSchedulerService
         let mut translator = StreamTranslator::new(self.stream_mode);
 
         let stream = async_stream::stream! {
+            let _room_guard = room_guard;
             let mut abort_guard = RequestAbortGuard::new(bridge.clone(), rid.clone());
             loop {
                 match recv_chunk_with_timeout(&mut receiver, response_timeout, || "Stream chunk timed out".to_string()).await {
