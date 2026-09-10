@@ -121,7 +121,7 @@ def prepare_tpu_w4a16_moe_weights(layer: torch.nn.Module, group_size: int) -> No
 
     Keeps the packed int32 weights exactly as loaded (their [E, K//8, N]
     orientation is already gmm_v2's (g, k, n) convention) and converts the
-    group scales to the kernel's [E, num_blocks, 1, out] fp32 layout.
+    group scales to the kernel's [E, num_blocks, 1, out] fp32 layout, in f32.
     """
     if getattr(layer, "is_tpu_w4a16_converted", False):
         return
@@ -148,11 +148,16 @@ def prepare_tpu_w4a16_moe_weights(layer: torch.nn.Module, group_size: int) -> No
         old_scale = getattr(layer, scale_name).data
         packed = getattr(layer, packed_name).data
         num_blocks = old_scale.shape[1]
-        # [E, num_blocks, out] -> [E, num_blocks, 1, out]; keep the
-        # checkpoint dtype — gmm_v2 casts scales to f32 per call. Since the
-        # unsqueezed contiguous tensor can remain a view, explicitly give the
-        # rank-4 layout independent storage.
-        new_scale = _own_storage(old_scale.unsqueeze(2).contiguous())
+        # [E, num_blocks, out] -> [E, num_blocks, 1, out] in f32. gmm_v2 casts
+        # the scales to f32 inside the traced call, so a bf16 parameter costs a
+        # full HBM pass over both scale tensors of every MoE layer on EVERY
+        # forward step: 8.4 ms of a 47 ms bs=1 decode step on Kimi-K2.6.
+        # Storing f32 makes that cast a no-op (+66 MB per layer per device);
+        # the dtype conversion also gives the rank-4 layout its own storage,
+        # which _own_storage guarantees for the no-conversion case.
+        new_scale = _own_storage(
+            old_scale.unsqueeze(2).contiguous().to(torch.float32)
+        )
         assert packed.shape[1] * 8 == num_blocks * group_size, (
             f"{packed_name} packed K {packed.shape[1]}*8 inconsistent with "
             f"{scale_name} blocks {num_blocks}*group_size {group_size}"
