@@ -38,8 +38,11 @@ _TPU_TEST_ENV_INHERIT = [
 # Tags every TPU e2e target needs. The server subprocess writes the torch_tpu
 # compile cache under $HOME and needs real TPU devices and the network, so the
 # sandbox must be off; `manual` keeps these out of `bazel test //...` wildcard
-# builds (TPU tests are scheduled by CI on TPU-equipped runners).
+# builds (TPU tests are scheduled by CI on TPU-equipped runners). `exclusive`
+# serializes tests within a Bazel invocation until the runner can assign
+# separate TPU devices to concurrent tests.
 _TPU_TEST_TAGS = [
+    "exclusive",
     "manual",
     "no-sandbox",
     "requires-net:external",
@@ -53,13 +56,19 @@ def sglang_tpu_e2e_test(name, env = None, tags = None, **kwargs):
       * env_inherit for HOME / HF cache / TPU topology variables from the host
       * PYTHONUNBUFFERED=1 so server logs stream unbuffered
       * the Python 3.12 bootstrap exports its venv interpreter as PYTHON
-      * manual + no-sandbox + requires-* execution tags
-      * eternal timeout (model load + torch.compile alone can take 30+ min;
-        HEALTH_TIMEOUT in the test file is the real bound)
+      * exclusive + manual + no-sandbox + requires-* execution tags
+      * eternal timeout (24 hours via the repository .bazelrc) for model load,
+        torch.compile, and long evaluations; HEALTH_TIMEOUT only bounds startup
 
     Callers add the test-specific pieces: srcs/main, deps, data (typically
     //benchmark/tpu:runtime), hardware-specific tags (e.g. requires-tpu-v7x),
     and any extra env.
+
+    Bazel's eternal timeout defaults to one hour without the repository's
+    .bazelrc. Override the timeout for an invocation with
+    `bazel test <target> --test_timeout=86400` (seconds); test_timeout is a
+    command-line flag, not a py_test attribute. Callers can still select a
+    shorter timeout category with timeout = "short", "moderate", or "long".
     """
     merged_env = dict(env or {})
     merged_env.setdefault("PYTHONUNBUFFERED", "1")

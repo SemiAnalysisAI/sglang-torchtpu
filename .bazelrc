@@ -34,6 +34,12 @@ build --per_file_copt=external/.*@-w
 # MODULE.bazel itself, no PATH hacks anywhere.
 build --@rules_python//python/config_settings:bootstrap_impl=script
 
+# TPU e2e tests use the eternal timeout category. Model compilation plus long
+# evaluations (e.g. Kimi MMMU-pro at 6-7 hours) can exceed its one-hour default.
+# Allow 24 hours while preserving Bazel's short, moderate, and long defaults.
+# Override per invocation with --test_timeout=<seconds>.
+test --test_timeout=-1,-1,-1,86400
+
 # The integration target launches a long-lived server subprocess and needs
 # direct access to TPU devices and the network. The target carries the
 # `no-sandbox` execution tag, which disables sandboxing; this just runs it
