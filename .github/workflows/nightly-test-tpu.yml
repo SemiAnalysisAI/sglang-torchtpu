@@ -87,6 +87,9 @@ jobs:
       image: ${{ needs.build.outputs.digest }}
       only: ${{ contains(fromJSON('["all","feature-validation"]'), inputs.only || 'all') && 'all' || inputs.only }}
       test_filter: ${{ inputs.test_filter || '' }}
+      # Without this the test_filter/update-dashboard guard inside the called
+      # workflow never sees the flag, so a filtered run could publish.
+      update-dashboard: ${{ inputs.update-dashboard || false }}
     permissions:
       contents: read
       id-token: write

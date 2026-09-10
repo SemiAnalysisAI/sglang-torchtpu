@@ -69,6 +69,12 @@ on:
         required: false
         default: ""
         type: string
+      # Forwarded so the test_filter guard below sees it on the nightly path
+      # too; a called workflow does not inherit the caller's inputs.
+      update-dashboard:
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   # Only governs standalone dispatches (a called workflow rides the caller's
@@ -412,11 +418,42 @@ jobs:
         with:
           ref: ${{ inputs.ref || 'main' }}
       - id: d
+        env:
+          TEST_FILTER: ${{ inputs.test_filter }}
         run: |
           set -euo pipefail
           groups="$(python3 .github/tpu-ci/discover_multihost.py --suite nightly-tpu-multihost)"
+          if [ -n "$TEST_FILTER" ]; then
+            groups=$(printf '%s' "$groups" \
+              | python3 .github/tpu-ci/filter_tests.py --filter "$TEST_FILTER")
+          fi
           echo "groups=$groups" >> "$GITHUB_OUTPUT"
           echo "discovered groups: $groups"
+
+  # An empty matrix makes GitHub skip its jobs, and a skipped job reads as a
+  # pass, so a typo'd filter would otherwise produce a green run that tested
+  # nothing. Checked across both filtered matrices rather than inside either
+  # one: a filter naming a single-host test matches no launch group, and only
+  # this job sees both results.
+  filter-matched:
+    needs: [discover-tests, discover]
+    # `discover` may be skipped (only=sh), so only discover-tests is required.
+    if: >-
+      ${{ !cancelled() && inputs.test_filter != ''
+          && needs.discover-tests.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          TEST_FILTER: ${{ inputs.test_filter }}
+          SINGLE_HOST: ${{ needs.discover-tests.outputs.single_host }}
+          GROUPS: ${{ needs.discover.outputs.groups }}
+        run: |
+          set -euo pipefail
+          # `discover` is skipped for only=sh, leaving GROUPS empty rather than [].
+          if [ "${SINGLE_HOST:-[]}" = "[]" ] && [ "${GROUPS:-[]}" = "[]" ]; then
+            echo "::error::test_filter '$TEST_FILTER' matched no test"
+            exit 1
+          fi
 
   # One JobSet per launch group. matrix.group is a discovered object.
   multi-host:
