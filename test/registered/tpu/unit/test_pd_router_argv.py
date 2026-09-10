@@ -39,6 +39,9 @@ def _cmd(**overrides):
         decode_url=DECODE_URL,
         host="0.0.0.0",
         port=LB_PORT,
+        # NOT FOR MERGE: this validation branch defaults resolve_mode to SMG, so
+        # the mini-LB cases name their mode. On the PR branch this is the default.
+        mode=MINI_LB,
         env={},
     )
     kwargs.update(overrides)
@@ -130,7 +133,9 @@ class TestSmgArgv(CustomTestCase):
 
 class TestEnvResolution(CustomTestCase):
     def test_default_mode_is_the_legacy_router(self):
-        self.assertEqual(resolve_mode(env={}), MINI_LB)
+        # NOT FOR MERGE: this validation branch defaults to SMG so a full
+        # nightly exercises the migration. On the PR branch this asserts MINI_LB.
+        self.assertEqual(resolve_mode(env={}), SMG)
 
     def test_mode_from_env(self):
         self.assertEqual(resolve_mode(env={"SGLANG_TPU_PD_ROUTER": "smg"}), SMG)
@@ -143,6 +148,7 @@ class TestEnvResolution(CustomTestCase):
     def test_policies_and_knobs_from_env(self):
         cmd = _cmd(
             bootstrap_port=BOOTSTRAP_PORT,
+            mode=None,  # NOT FOR MERGE: let env resolution run; _cmd pins MINI_LB here
             env={
                 "SGLANG_TPU_PD_ROUTER": "smg",
                 "TPU_PD_PREFILL_POLICY": "random",
@@ -171,7 +177,12 @@ class TestEnvResolution(CustomTestCase):
             router_metrics_url(host="127.0.0.1", env={"SGLANG_TPU_PD_ROUTER": "smg"}),
             "http://127.0.0.1:29000/metrics",
         )
-        self.assertIsNone(router_metrics_url(host="127.0.0.1", env={}))
+        self.assertIsNone(
+            # NOT FOR MERGE: env={} resolves to SMG on this branch.
+            router_metrics_url(
+                host="127.0.0.1", env={"SGLANG_TPU_PD_ROUTER": "mini_lb"}
+            )
+        )
         self.assertIsNone(
             router_metrics_url(
                 host="127.0.0.1",
