@@ -33,6 +33,8 @@ use crate::bridge::PyBridge;
 use crate::smg_proto;
 
 pub mod model_info;
+pub mod request_map;
+pub mod rooms;
 
 type StreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
