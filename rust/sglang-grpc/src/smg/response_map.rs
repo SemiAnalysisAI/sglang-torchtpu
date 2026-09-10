@@ -283,20 +283,10 @@ pub fn embed_response(
     request_id: &str,
     data: &ResponseData,
 ) -> Result<smg_proto::EmbedResponse, Status> {
-    // `extract::<Vec<f32>>()` in the bridge yields None for sparse
-    // (Dict[int, float]) and multi-vector poolers, which would otherwise become
-    // a zero-length embedding with no error and a cosine similarity of 0
-    // everywhere downstream.
-    let embedding = data
-        .embedding
-        .clone()
-        .filter(|values| !values.is_empty())
-        .ok_or_else(|| {
-            Status::internal(
-                "embedding is empty; the model's pooler is probably not dense, which \
-             the bridge cannot extract",
-            )
-        })?;
+    // Empty when the bridge's `extract::<Vec<f32>>()` met a sparse or
+    // multi-vector pooler; forwarded as empty because the native Embed does the
+    // same `unwrap_or_default()`, and this transport does not diverge from it.
+    let embedding = data.embedding.clone().unwrap_or_default();
     let prompt_tokens = meta_count(&data.meta_info, "prompt_tokens")?;
     let embedding_dim = embedding.len() as i32;
 

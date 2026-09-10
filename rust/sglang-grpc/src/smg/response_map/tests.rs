@@ -576,14 +576,18 @@ fn embed_response_carries_both_wire_layouts() {
     assert_eq!(response.request_id, "embed-0");
 }
 
-/// T37. A sparse or multi-vector pooler yields None from the bridge's
-/// `extract::<Vec<f32>>()`, which would otherwise ship a zero-length embedding
-/// and make every cosine similarity downstream 0.
+/// An absent embedding is forwarded as empty, matching the native Embed's
+/// `unwrap_or_default()` rather than erroring where it would not.
 #[test]
-fn embed_empty_embedding_is_an_error() {
-    for embedding in [None, Some(Vec::new())] {
-        let status = super::embed_response("embed-0", &embed_data(embedding)).unwrap_err();
-        assert_eq!(status.code(), Code::Internal);
-        assert!(status.message().contains("pooler"), "{}", status.message());
+fn embed_absent_embedding_matches_the_native_path() {
+    let response = super::embed_response("embed-0", &embed_data(None)).unwrap();
+
+    match response.response.as_ref() {
+        Some(smg_proto::embed_response::Response::Complete(complete)) => {
+            assert!(complete.embedding.is_empty());
+            assert_eq!(complete.embedding_dim, 0);
+        }
+        other => panic!("expected the 1.0.0 layout, got {:?}", other),
     }
+    assert!(response.embedding_v112.is_empty());
 }

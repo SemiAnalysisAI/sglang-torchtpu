@@ -28,8 +28,8 @@ fn bootstrap_room_zero_is_remapped() {
     assert_ne!(
         widen_room(0),
         0,
-        "a zero room reads as 'metadata has not landed' and aborts the request \
-         with a message that points nowhere near the router"
+        "0 is the engine's 'metadata buffer not yet written' sentinel; a request \
+         carrying it fails on the decode side every time, not occasionally"
     );
 }
 
