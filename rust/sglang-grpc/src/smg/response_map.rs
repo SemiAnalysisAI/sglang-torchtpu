@@ -34,10 +34,10 @@ pub enum StreamMode {
 
 /// One generation stream's worth of state.
 ///
-/// One translator per `index`. There is exactly one today because `n > 1` is
-/// rejected in `request_map`; the index is carried as state rather than
-/// hard-coded at each construction site so that lifting the restriction is a
-/// change to the service's bookkeeping and not to this file.
+/// One translator per `index`, and `index` is always 0: `runtime.v1` has no
+/// per-sample discriminator, so `request_map` rejects `n > 1`. Held as state
+/// rather than written at each construction site so the two files disagree
+/// loudly rather than drifting.
 pub struct StreamTranslator {
     mode: StreamMode,
     index: u32,

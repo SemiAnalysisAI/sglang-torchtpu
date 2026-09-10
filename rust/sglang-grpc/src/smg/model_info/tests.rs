@@ -7,7 +7,9 @@ fn json_info() -> String {
         "served_model_name": "qwen3",
         "tokenizer_path": "/models/qwen3-0.6b",
         "is_generation": true,
-        "weight_version": null,
+        // ServerArgs.weight_version is a non-Optional str defaulting to
+        // "default", so the CLI cannot produce a null here.
+        "weight_version": "default",
         "load_format": "auto",
         "reasoning_parser": null,
         "tool_call_parser": null,
@@ -34,6 +36,7 @@ fn model_info_required_labels_are_non_empty() {
     assert_eq!(info.max_context_length, 32768);
     assert_eq!(info.architectures, vec!["Qwen3ForCausalLM".to_string()]);
     assert!(info.is_generation);
+    assert_eq!(info.weight_version, "default");
 }
 
 /// T34, the fallback arm: `get_serving().tokenizer_path` is None whenever the
@@ -53,17 +56,25 @@ fn null_tokenizer_path_falls_back_to_model_path() {
     );
 }
 
-/// T35.
+/// T35, on the two keys that can genuinely be null: `model_type` is
+/// `getattr(hf_config, "model_type", None)` and `tokenizer_path` is Optional.
+/// `weight_version` is not among them -- see the fixture.
 #[test]
 fn model_info_json_null_does_not_become_the_string_null() {
-    let info = build_model_info(&json_info(), 4096);
+    let json = serde_json::json!({
+        "model_path": "/models/m",
+        "served_model_name": "m",
+        "model_type": null,
+    })
+    .to_string();
 
+    let info = build_model_info(&json, 4096);
     assert_eq!(
-        info.weight_version, "",
+        info.model_type, "",
         "a literal \"null\" is non-empty, so to_labels() would keep it and SMG \
-         would dispatch against a weight version that does not exist"
+         would build a ModelCard around a model type that does not exist"
     );
-    assert_eq!(info.model_type, "qwen3");
+    assert_eq!(build_model_info(&json_info(), 4096).model_type, "qwen3");
 }
 
 /// T36. Named individually so a future `..Default::default()` cannot make the

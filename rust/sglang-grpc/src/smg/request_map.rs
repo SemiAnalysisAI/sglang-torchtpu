@@ -18,18 +18,16 @@ use crate::smg::rooms::widen_room;
 use crate::smg_proto;
 use crate::utils::now_timestamp;
 
-/// SMG demultiplexes parallel samples purely on `GenerateStreamChunk.index` /
-/// `GenerateComplete.index`, and `index` never reaches Rust: Python sets
-/// `out_dict["index"]` but `ChunkCallback::__call__` reads only `text`,
-/// `output_ids`, `embedding` and `meta_info`. With `n > 1` the samples would
-/// arrive interleaved on one stream with no discriminator and all land in
-/// SMG's bucket 0, concatenated into a single fluent-but-wrong completion.
+/// `sglang.runtime.v1.GenerateResponse` carries `output_ids`, `meta_info` and
+/// `finished` and no `index`, so the native response protocol cannot say which
+/// of N sample streams a message belongs to; one stream is the limit the
+/// service already has. This rejects rather than returning that one stream as
+/// if it were N, which reads as a single fluent wrong completion.
 ///
-/// `n: 2` does reach the wire from ordinary chat traffic, so this rejection is
-/// a real functional loss. Enabling it is scoped work outside this crate: add
-/// `index` to `meta_info` in `tokenizer_manager._handle_batch_output`, read it
-/// in `bridge.rs`, then key `response_map::StreamTranslator` by index (it
-/// already carries the index it stamps on every message) and delete this gate.
+/// Carrying `index` would mean adding a field upstream does not define, so the
+/// limit is matched, not worked around. If upstream ever adds one, honouring it
+/// is reading it in `bridge.rs` and keying `response_map::StreamTranslator` by
+/// it; the translator already stamps the index it holds on every message.
 const MAX_SUPPORTED_PARALLEL_SAMPLES: i32 = 1;
 
 /// A mapped `GenerateRequest`, ready for `PyBridge::submit_request`.
@@ -231,20 +229,6 @@ fn reject_unsupported_inputs(req: &smg_proto::GenerateRequest) -> Result<(), Sta
 }
 
 fn sampling_params_to_json(params: &smg_proto::SamplingParams) -> Result<Value, Status> {
-    // The whole message left at SamplingParams::default(). No SMG builder
-    // produces it — both seed temperature=1.0, top_p=1.0, top_k=-1,
-    // repetition_penalty=1.0, n=1 — but the fields are not `optional`, so this
-    // layer cannot tell "unset" from "explicitly zero". Without this check the
-    // first upstream path that uses `..Default::default()` turns every request
-    // greedy with no error anywhere.
-    if params.top_k == 0 && params.top_p == 0.0 && params.repetition_penalty == 0.0 && params.n == 0
-    {
-        return Err(Status::invalid_argument(
-            "SamplingParams is entirely proto3 defaults, which means greedy \
-             decoding rather than the semantic defaults; send explicit values",
-        ));
-    }
-
     if params.n > MAX_SUPPORTED_PARALLEL_SAMPLES {
         return Err(Status::unimplemented(format!(
             "n > {} is not supported on sglang.grpc.scheduler: the per-sample \

@@ -149,9 +149,9 @@ fn recorded_logprob_fields_are_forwarded_verbatim() {
     assert_eq!(on.dict["top_logprobs_num"], json!(3));
 }
 
-/// T15. `n: 2` reaches the wire from ordinary chat traffic, so this is a real
-/// functional loss, taken deliberately: the alternative is returning one
-/// stream's tokens as if they were two samples.
+/// T15. `n: 2` reaches the wire from ordinary chat traffic, and `runtime.v1`
+/// has no way to label which sample a response belongs to, so the alternative
+/// to rejecting is returning one stream's tokens as if they were two samples.
 #[test]
 fn recorded_n_greater_than_one_is_rejected() {
     let req = recorded_generate("05_chat_n2.generate_request.hex");
@@ -419,21 +419,19 @@ fn ignore_eos_true_maps_to_ignore_eos() {
     );
 }
 
-/// T7. Dormant today because SMG's builders seed semantic defaults; it wakes
-/// the first time an upstream path uses `..Default::default()`, and then
-/// temperature 0 means greedy decoding for every request with no complaint.
+/// A `SamplingParams::default()` from a future SMG path is left to the engine:
+/// `verify()` raises on `top_p == 0.0`, on `top_k == 0` and on
+/// `repetition_penalty == 0.0`, so the case is already loud and naming it here
+/// would only relabel the error. The zeros must therefore reach the dict.
 #[test]
-fn default_sampling_params_are_rejected() {
+fn proto3_default_sampling_params_are_forwarded_for_the_engine_to_reject() {
     let mut req = smg_generate_request();
     req.sampling_params = Some(smg_proto::SamplingParams::default());
 
-    let status = generate_to_dict(&req).unwrap_err();
-    assert_eq!(status.code(), Code::InvalidArgument);
-    assert!(
-        status.message().contains("proto3 defaults"),
-        "{}",
-        status.message()
-    );
+    let mapped = map_ok(&req);
+    assert_eq!(sampling(&mapped)["top_p"], json!(0.0f32));
+    assert_eq!(sampling(&mapped)["top_k"], json!(0));
+    assert_eq!(sampling(&mapped)["repetition_penalty"], json!(0.0f32));
 }
 
 /// T8. Guards against an `unwrap_or_default()` slipping in later, which would
