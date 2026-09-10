@@ -419,8 +419,15 @@ def tpu_sp_fused_qkvog(
     scale_query_by: float,
     use_qk_norm: bool,
     use_rope: bool,
+    collective_id: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run fused RMSNorm, QKVOG projection, Q/K epilogue, and token/head A2A."""
+    """Run fused RMSNorm, QKVOG projection, Q/K epilogue, and token/head A2A.
+
+    ``collective_id`` is a compatibility-only argument for downstream callers
+    that predate schedule-owned channels. It is intentionally not forwarded
+    through the Torch-to-JAX export boundary; the kernel derives its actual
+    channel from the bounded token schedule.
+    """
     if not can_use_tpu_sp_fused_qkvog(
         hidden_states,
         packed_weight,

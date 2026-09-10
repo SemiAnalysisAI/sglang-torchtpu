@@ -198,7 +198,7 @@ def test_runtime_contract_accepts_only_tuned_bf16_shapes():
     )
 
 
-def test_torch_adapter_has_no_caller_owned_collective_id(monkeypatch):
+def test_torch_adapter_drops_legacy_collective_id_before_export(monkeypatch):
     hidden = torch.empty((64, 8192), dtype=torch.bfloat16, device="meta")
     weight = torch.empty((8192, 16 * 1152), dtype=torch.bfloat16, device="meta")
     gain = torch.empty((8192,), dtype=torch.bfloat16, device="meta")
@@ -220,21 +220,24 @@ def test_torch_adapter_has_no_caller_owned_collective_id(monkeypatch):
         "use_qk_norm": True,
         "use_rope": True,
     }
-    assert "collective_id" not in inspect.signature(qkvog.tpu_sp_fused_qkvog).parameters
-    assert (
-        qkvog.tpu_sp_fused_qkvog(
-            hidden,
-            weight,
-            gain,
-            cos,
-            sin,
-            metadata,
-            **kwargs,
+    parameter = inspect.signature(qkvog.tpu_sp_fused_qkvog).parameters["collective_id"]
+    assert parameter.default is None
+    for collective_id in (None, 100, 161):
+        assert (
+            qkvog.tpu_sp_fused_qkvog(
+                hidden,
+                weight,
+                gain,
+                cos,
+                sin,
+                metadata,
+                collective_id=collective_id,
+                **kwargs,
+            )
+            is sentinel
         )
-        is sentinel
-    )
 
-    assert len(calls) == 1
+    assert len(calls) == 3
     for args in calls:
         assert len(args) == 11
         assert all(
