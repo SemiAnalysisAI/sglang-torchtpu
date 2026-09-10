@@ -1082,7 +1082,7 @@ def _split_model_data_for_item(
             and len(v.shape) > 0
             and v.shape[0] == num_items
         ):
-            new_data[k] = v[index : index + 1]
+            new_data[k] = _slice_value(v, index, index + 1)
         else:
             new_data[k] = v
     return new_data
@@ -1115,12 +1115,14 @@ def _try_simple_split(item, num_items, expanded_mm_items):
             if isinstance(item.feature, (list, tuple)):
                 new_item.feature = [item.feature[i]]
             else:
-                new_item.feature = item.feature[i : i + 1]
+                new_item.feature = _slice_value(item.feature, i, i + 1)
         if item.precomputed_embeddings is not None:
             if isinstance(item.precomputed_embeddings, (list, tuple)):
                 new_item.precomputed_embeddings = [item.precomputed_embeddings[i]]
             else:
-                new_item.precomputed_embeddings = item.precomputed_embeddings[i : i + 1]
+                new_item.precomputed_embeddings = _slice_value(
+                    item.precomputed_embeddings, i, i + 1
+                )
         new_item.offsets = [item.offsets[i]]
         new_item.model_specific_data = _split_model_data_for_item(
             item.model_specific_data, i, num_items, patch_slices, total_num_patches

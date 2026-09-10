@@ -185,6 +185,49 @@ class TestGetNewExpandedMMItems(CustomTestCase):
                                 tensor.numel() * tensor.element_size(),
                             )
 
+    @patch("sglang.srt.managers.mm_utils._is_tpu", True)
+    def test_simple_split_tensors_own_storage(self):
+        count = 8
+        hidden_size = 1536
+
+        for field in ("feature", "precomputed_embeddings"):
+            parent = torch.arange(count * hidden_size, dtype=torch.float32).reshape(
+                count, hidden_size
+            )
+            metadata_parent = parent + 1
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                offsets=[(i, i + 1) for i in range(count)],
+                model_specific_data={"item_data": metadata_parent},
+                **{field: parent},
+            )
+            items = get_new_expanded_mm_items([item])
+            logical_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in (parent, metadata_parent)
+            )
+
+            self.assertEqual(len(items), count)
+            for split_item, expected, expected_metadata in zip(
+                items, parent.split(1), metadata_parent.split(1)
+            ):
+                tensor = getattr(split_item, field)
+                self.assertTrue(torch.equal(tensor, expected))
+                self.assertEqual(
+                    tensor.untyped_storage().nbytes(),
+                    tensor.numel() * tensor.element_size(),
+                )
+                metadata = split_item.model_specific_data["item_data"]
+                self.assertTrue(torch.equal(metadata, expected_metadata))
+                self.assertEqual(
+                    metadata.untyped_storage().nbytes(),
+                    metadata.numel() * metadata.element_size(),
+                )
+
+            for protocol in (pickle.DEFAULT_PROTOCOL, pickle.HIGHEST_PROTOCOL):
+                payload = pickle.dumps(items, protocol=protocol)
+                self.assertLess(len(payload), logical_bytes * 1.2)
+
 
 if __name__ == "__main__":
     unittest.main()
