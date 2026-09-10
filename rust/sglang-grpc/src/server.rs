@@ -13,6 +13,8 @@ use tonic::{Request, Response, Status};
 
 use crate::bridge::{PyBridge, ResponseChunk, TerminalError};
 use crate::proto;
+use crate::smg::SmgSchedulerServiceImpl;
+use crate::smg_proto;
 use crate::utils::{
     build_classify_dict, build_embed_dict, build_generate_dict, build_text_embed_dict,
     build_text_generate_dict, extract_model_path,
@@ -984,6 +986,7 @@ pub async fn run_grpc_server(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = listener.local_addr()?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
+    let smg_bridge = bridge.clone();
     let service = SglangServiceImpl {
         bridge,
         response_timeout,
@@ -994,10 +997,21 @@ pub async fn run_grpc_server(
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size);
 
+    // Second service on the same listener. `/<package>.<service>/<Method>`
+    // dispatch keys are disjoint, so the two never interact.
+    let smg_svc =
+        smg_proto::sglang_scheduler_server::SglangSchedulerServer::new(SmgSchedulerServiceImpl {
+            bridge: smg_bridge,
+            response_timeout,
+        })
+        .max_decoding_message_size(max_message_size)
+        .max_encoding_message_size(max_message_size);
+
     tracing::info!("gRPC server listening on {}", addr);
 
     tonic::transport::Server::builder()
         .add_service(svc)
+        .add_service(smg_svc)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.notified().await;
             tracing::info!("gRPC server shutting down");

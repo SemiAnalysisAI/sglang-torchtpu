@@ -1,10 +1,19 @@
 pub mod bridge;
 pub mod server;
+pub mod smg;
 pub mod tokenizers;
 pub(crate) mod utils;
 
 pub mod proto {
     tonic::include_proto!("sglang.runtime.v1");
+}
+
+/// The sgl-model-gateway contract, vendored at smg-grpc-client 1.0.0.
+///
+/// Shares message names with `proto` on disagreeing field numbers; the two
+/// modules must never be mixed. See `proto/sglang/grpc/scheduler/`.
+pub mod smg_proto {
+    tonic::include_proto!("sglang.grpc.scheduler");
 }
 
 use pyo3::prelude::*;

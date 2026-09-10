@@ -31,8 +31,14 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 prost = "0.13"
+# google.protobuf.{Struct,Timestamp} in the vendored sgl-model-gateway proto.
+prost-types = "0.13"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 tonic = { version = "0.12", features = ["gzip", "transport"] }
+
+[dev-dependencies]
+# Only for the vendored-proto digest pin in src/smg/tests.rs.
+sha2 = "0.10"
 
 [build-dependencies]
 tonic-build = "0.12"
