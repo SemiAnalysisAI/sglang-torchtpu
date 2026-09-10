@@ -536,3 +536,54 @@ fn chunk_leaves_the_fields_smg_never_reads_empty() {
     assert!(chunk.input_logprobs.is_none());
     assert_eq!(chunk.index, 0, "n > 1 is rejected, so there is one stream");
 }
+
+// ---------- Embed ----------
+
+fn embed_data(embedding: Option<Vec<f32>>) -> ResponseData {
+    ResponseData {
+        text: None,
+        output_ids: None,
+        embedding,
+        json_bytes: None,
+        meta_info: meta(&[("id", "\"embed-0\""), ("prompt_tokens", "2")]),
+    }
+}
+
+/// A8. Confirmed safe: a 1.0.0 client skips the higher field numbers as
+/// unknown. Emitting only the 1.12.0 layout produced a loud
+/// `HTTP 500 embedding_no_response`; emitting only the 1.0.0 layout would give
+/// a 1.12.0 client an empty embedding and no error at all.
+#[test]
+fn embed_response_carries_both_wire_layouts() {
+    let response = super::embed_response("embed-0", &embed_data(Some(vec![0.25, -0.5]))).unwrap();
+
+    match response.response.as_ref() {
+        Some(smg_proto::embed_response::Response::Complete(complete)) => {
+            assert_eq!(complete.embedding, vec![0.25, -0.5]);
+            assert_eq!(complete.embedding_dim, 2, "derived from the vector length");
+            assert_eq!(complete.prompt_tokens, 2);
+            assert_eq!(
+                complete.cached_tokens, 0,
+                "unknown, not zero: not emitted for embeddings"
+            );
+        }
+        other => panic!("expected the 1.0.0 layout, got {:?}", other),
+    }
+
+    assert_eq!(response.embedding_v112, vec![0.25, -0.5]);
+    assert_eq!(response.embedding_dim_v112, 2);
+    assert_eq!(response.prompt_tokens_v112, 2);
+    assert_eq!(response.request_id, "embed-0");
+}
+
+/// T37. A sparse or multi-vector pooler yields None from the bridge's
+/// `extract::<Vec<f32>>()`, which would otherwise ship a zero-length embedding
+/// and make every cosine similarity downstream 0.
+#[test]
+fn embed_empty_embedding_is_an_error() {
+    for embedding in [None, Some(Vec::new())] {
+        let status = super::embed_response("embed-0", &embed_data(embedding)).unwrap_err();
+        assert_eq!(status.code(), Code::Internal);
+        assert!(status.message().contains("pooler"), "{}", status.message());
+    }
+}

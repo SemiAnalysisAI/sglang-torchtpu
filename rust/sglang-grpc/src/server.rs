@@ -142,7 +142,7 @@ fn spawn_abort(bridge: Arc<PyBridge>, rid: String) {
     }
 }
 
-async fn recv_terminal_chunk_for_request(
+pub(crate) async fn recv_terminal_chunk_for_request(
     bridge: &Arc<PyBridge>,
     rid: &str,
     receiver: &mut Receiver<ResponseChunk>,

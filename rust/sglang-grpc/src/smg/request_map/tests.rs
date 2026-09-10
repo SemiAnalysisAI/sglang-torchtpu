@@ -301,6 +301,104 @@ fn every_recorded_generate_request_maps_or_rejects_deliberately() {
     }
 }
 
+/// The dict is splatted into `GenerateReqInput(**req_dict)` /
+/// `EmbeddingReqInput(**req_dict)`, both dataclasses, so an unknown key is a
+/// TypeError at request time rather than a mapping bug found in review. These
+/// two lists are the fields this layer claims exist on the Python side; adding
+/// a key without adding it here is what the test is for.
+///
+/// `EmbeddingReqInput` in particular has neither `routed_dp_rank` nor
+/// `data_parallel_rank`, which is why `embed_to_dict` rejects a non-zero rank
+/// instead of forwarding it the way `generate_to_dict` does.
+#[test]
+fn the_dict_only_uses_keys_the_python_dataclasses_declare() {
+    const GENERATE_REQ_INPUT_FIELDS: &[&str] = &[
+        "rid",
+        "input_ids",
+        "sampling_params",
+        "return_logprob",
+        "logprob_start_len",
+        "top_logprobs_num",
+        "token_ids_logprob",
+        "return_hidden_states",
+        "bootstrap_host",
+        "bootstrap_port",
+        "bootstrap_room",
+        "custom_logit_processor",
+        "lora_path",
+        "routed_dp_rank",
+        "stream",
+        "received_time",
+    ];
+    const EMBEDDING_REQ_INPUT_FIELDS: &[&str] = &["rid", "input_ids", "received_time"];
+    const SAMPLING_PARAMS_FIELDS: &[&str] = &[
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "repetition_penalty",
+        "max_new_tokens",
+        "stop",
+        "stop_token_ids",
+        "skip_special_tokens",
+        "spaces_between_special_tokens",
+        "min_new_tokens",
+        "ignore_eos",
+        "no_stop_trim",
+        "stream_interval",
+        "logit_bias",
+        "custom_params",
+        "regex",
+        "json_schema",
+        "ebnf",
+        "structural_tag",
+    ];
+
+    let mut maximal = recorded_generate("09_maximal_sampling_params.generate_request.hex");
+    maximal.data_parallel_rank = 2;
+    maximal.lora_id = "adapter".to_string();
+    maximal.custom_logit_processor = "{}".to_string();
+    maximal.disaggregated_params = Some(smg_proto::DisaggregatedParams {
+        bootstrap_host: "127.0.0.1".to_string(),
+        bootstrap_port: 9001,
+        bootstrap_room: 7,
+    });
+    maximal.sampling_params = Some(smg_proto::SamplingParams {
+        stop_token_ids: vec![13],
+        stream_interval: Some(1),
+        logit_bias: [("13".to_string(), -1.0f32)].into_iter().collect(),
+        custom_params: Some(prost_types::Struct::default()),
+        ..maximal.sampling_params.clone().unwrap()
+    });
+
+    let mapped = map_ok(&maximal);
+    for key in mapped.dict.keys() {
+        assert!(
+            GENERATE_REQ_INPUT_FIELDS.contains(&key.as_str()),
+            "{} is not a GenerateReqInput field",
+            key
+        );
+    }
+    for key in sampling(&mapped).as_object().unwrap().keys() {
+        assert!(
+            SAMPLING_PARAMS_FIELDS.contains(&key.as_str()),
+            "{} is not a SamplingParams field",
+            key
+        );
+    }
+
+    let embed = super::embed_to_dict(&recorded_embed("07_embeddings.embed_request.hex")).unwrap();
+    for key in embed.dict.keys() {
+        assert!(
+            EMBEDDING_REQ_INPUT_FIELDS.contains(&key.as_str()),
+            "{} is not an EmbeddingReqInput field",
+            key
+        );
+    }
+}
+
 // ---------- constructed cases the recordings do not reach ----------
 
 /// T3, the converse of the field-12 collision.
@@ -520,4 +618,78 @@ fn logit_bias_and_stream_interval_are_mapped_when_present() {
     assert_eq!(sampling(&mapped)["logit_bias"], json!({"13": -100.0f32}));
     assert_eq!(sampling(&mapped)["stream_interval"], json!(4));
     assert_eq!(sampling(&mapped)["stop_token_ids"], json!([13, 14]));
+}
+
+// ---------- Embed ----------
+
+fn recorded_embed(name: &str) -> smg_proto::EmbedRequest {
+    smg_proto::EmbedRequest::decode(recorded_bytes(name).as_slice())
+        .unwrap_or_else(|err| panic!("{} is not an EmbedRequest: {}", name, err))
+}
+
+#[test]
+fn recorded_embed_requests_map() {
+    for name in [
+        "07_embeddings.embed_request.hex",
+        "10_v1_classify.embed_request.hex",
+    ] {
+        let req = recorded_embed(name);
+        let mapped = super::embed_to_dict(&req).unwrap_or_else(|s| panic!("{}: {}", name, s));
+
+        assert_eq!(mapped.dict["rid"], json!(req.request_id), "{}", name);
+        assert!(mapped.dict["input_ids"].as_array().is_some(), "{}", name);
+        assert!(
+            !mapped.dict.contains_key("sampling_params"),
+            "{}: the proto calls these dummy params for compatibility",
+            name
+        );
+        assert!(!mapped.dict.contains_key("routed_dp_rank"), "{}", name);
+    }
+}
+
+/// T16. Each of these silently changes the question being answered: a relevance
+/// score computed without segment ids is a plausible wrong number.
+#[test]
+fn cross_encoder_embed_is_rejected() {
+    let base = recorded_embed("07_embeddings.embed_request.hex");
+
+    let mut with_token_types = base.clone();
+    with_token_types.token_type_ids = vec![0, 1];
+
+    let mut cross_encoder = base.clone();
+    cross_encoder.is_cross_encoder = true;
+
+    let mut with_texts = base.clone();
+    with_texts.texts = vec!["query".to_string()];
+
+    let mut with_mm = base.clone();
+    with_mm.mm_inputs = Some(smg_proto::MultimodalInputs::default());
+
+    for req in [with_token_types, cross_encoder, with_texts, with_mm] {
+        assert_eq!(
+            super::embed_to_dict(&req).unwrap_err().code(),
+            Code::Unimplemented
+        );
+    }
+}
+
+#[test]
+fn embed_data_parallel_rank_is_rejected_because_the_dict_has_no_key() {
+    let mut req = recorded_embed("07_embeddings.embed_request.hex");
+    assert_eq!(req.data_parallel_rank, 0, "every recording has it unset");
+    assert!(
+        !super::embed_to_dict(&req)
+            .unwrap()
+            .dict
+            .contains_key("routed_dp_rank")
+    );
+
+    // EmbeddingReqInput has no routed_dp_rank and no data_parallel_rank, so
+    // forwarding it raises a TypeError from the dataclass and dropping it
+    // silently discards SMG's routing decision.
+    req.data_parallel_rank = 3;
+    assert_eq!(
+        super::embed_to_dict(&req).unwrap_err().code(),
+        Code::Unimplemented
+    );
 }

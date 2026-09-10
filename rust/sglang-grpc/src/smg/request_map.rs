@@ -139,6 +139,77 @@ pub fn generate_to_dict(req: &smg_proto::GenerateRequest) -> Result<MappedGenera
     })
 }
 
+/// A mapped `EmbedRequest`. Also serves `/v1/classify`, which reuses this RPC
+/// and reinterprets the embedding as logits.
+#[derive(Debug)]
+pub struct MappedEmbed {
+    pub rid: String,
+    pub dict: HashMap<String, Value>,
+}
+
+pub fn embed_to_dict(req: &smg_proto::EmbedRequest) -> Result<MappedEmbed, Status> {
+    let rid = req.request_id.trim();
+    if rid.is_empty() {
+        return Err(Status::invalid_argument(
+            "EmbedRequest.request_id is required",
+        ));
+    }
+
+    if req.mm_inputs.is_some() {
+        return Err(Status::unimplemented(
+            "Multimodal embedding inputs are not supported on sglang.grpc.scheduler",
+        ));
+    }
+    // A cross-encoder scored without segment ids returns a plausible wrong
+    // number, so all three of these reject rather than ignore.
+    if !req.token_type_ids.is_empty() {
+        return Err(Status::unimplemented(
+            "token_type_ids has no request-dict key; a cross-encoder scored \
+             without segment ids returns a plausible wrong number",
+        ));
+    }
+    if req.is_cross_encoder {
+        return Err(Status::unimplemented(
+            "Cross-encoder embedding is not supported on sglang.grpc.scheduler",
+        ));
+    }
+    if !req.texts.is_empty() {
+        return Err(Status::unimplemented(
+            "EmbedRequest.texts is the cross-encoder batch input and is not supported",
+        ));
+    }
+    // Unlike GenerateReqInput, EmbeddingReqInput has neither `routed_dp_rank`
+    // nor `data_parallel_rank`, so there is nowhere to put this. Passing it
+    // would raise a TypeError from the dataclass constructor, and dropping it
+    // would silently ignore SMG's DP-aware routing decision.
+    if req.data_parallel_rank > 0 {
+        return Err(Status::unimplemented(
+            "data_parallel_rank has no EmbeddingReqInput field; DP-aware routing \
+             is not supported for embeddings on sglang.grpc.scheduler",
+        ));
+    }
+
+    let tokenized = req
+        .tokenized
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("EmbedRequest.tokenized is required"))?;
+
+    let mut dict = HashMap::new();
+    dict.insert("rid".into(), Value::from(rid));
+    dict.insert(
+        "input_ids".into(),
+        Value::from(to_token_ids(&tokenized.input_ids)?),
+    );
+    dict.insert("received_time".into(), Value::from(now_timestamp()));
+    // `sampling_params` is dropped: the proto itself calls it "dummy sampling
+    // params for compatibility". `log_metrics` is dropped as for Generate.
+
+    Ok(MappedEmbed {
+        rid: rid.to_string(),
+        dict,
+    })
+}
+
 /// The inputs this layer cannot carry. Each would otherwise produce a fluent
 /// answer to a different question than the one asked.
 fn reject_unsupported_inputs(req: &smg_proto::GenerateRequest) -> Result<(), Status> {

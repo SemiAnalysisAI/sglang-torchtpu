@@ -272,6 +272,71 @@ pub fn with_request_id(
     response
 }
 
+/// Build an `EmbedResponse` in **both** wire layouts.
+///
+/// smg-grpc-client 1.0.0 reads `complete.embedding` off the oneof at field 2;
+/// 1.12.0 reserves 1-3 and reads flat fields 4-6. The numbers are disjoint, so
+/// each client skips the other's as unknown. Emitting only one layout hands the
+/// other client an empty embedding and no error at all — confirmed as an
+/// `HTTP 500 embedding_no_response` when only the 1.12.0 layout was sent.
+pub fn embed_response(
+    request_id: &str,
+    data: &ResponseData,
+) -> Result<smg_proto::EmbedResponse, Status> {
+    // `extract::<Vec<f32>>()` in the bridge yields None for sparse
+    // (Dict[int, float]) and multi-vector poolers, which would otherwise become
+    // a zero-length embedding with no error and a cosine similarity of 0
+    // everywhere downstream.
+    let embedding = data
+        .embedding
+        .clone()
+        .filter(|values| !values.is_empty())
+        .ok_or_else(|| {
+            Status::internal(
+                "embedding is empty; the model's pooler is probably not dense, which \
+             the bridge cannot extract",
+            )
+        })?;
+    let prompt_tokens = meta_count(&data.meta_info, "prompt_tokens")?;
+    let embedding_dim = embedding.len() as i32;
+
+    Ok(smg_proto::EmbedResponse {
+        request_id: request_id.to_string(),
+        response: Some(smg_proto::embed_response::Response::Complete(
+            smg_proto::EmbedComplete {
+                embedding: embedding.clone(),
+                prompt_tokens,
+                // Not emitted for embeddings: tokenizer_manager guards the
+                // meta_info update behind `not isinstance(BatchEmbeddingOutput)`.
+                // 0 here means unknown, not "no cache hits". SMG never reads it.
+                cached_tokens: 0,
+                embedding_dim,
+                // Our embed path returns one vector and SMG emits exactly one
+                // EmbeddingObject regardless.
+                batch_embeddings: Vec::new(),
+            },
+        )),
+        embedding_dim_v112: embedding_dim as u32,
+        embedding_v112: embedding,
+        prompt_tokens_v112: prompt_tokens.max(0) as u32,
+    })
+}
+
+pub fn embed_error(request_id: &str, message: String) -> smg_proto::EmbedResponse {
+    smg_proto::EmbedResponse {
+        request_id: request_id.to_string(),
+        response: Some(smg_proto::embed_response::Response::Error(
+            smg_proto::EmbedError {
+                message,
+                // SMG reads neither.
+                code: String::new(),
+                details: String::new(),
+            },
+        )),
+        ..Default::default()
+    }
+}
+
 fn to_output_ids(ids: &[i32]) -> Result<Vec<u32>, Status> {
     ids.iter()
         .map(|&id| {

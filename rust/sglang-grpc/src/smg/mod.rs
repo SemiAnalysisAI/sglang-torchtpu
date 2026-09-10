@@ -32,6 +32,7 @@ use tonic::{Request, Response, Status};
 use crate::bridge::{PyBridge, ResponseChunk};
 use crate::server::{
     RequestAbortGuard, closed_stream_status, pyerr_to_status, recv_chunk_with_timeout,
+    recv_terminal_chunk_for_request,
 };
 use crate::smg::response_map::{StreamMode, StreamTranslator};
 use crate::smg_proto;
@@ -130,11 +131,37 @@ impl smg_proto::sglang_scheduler_server::SglangScheduler for SmgSchedulerService
         Ok(Response::new(Box::pin(stream)))
     }
 
+    /// Serves both `/v1/embeddings` and `/v1/classify`; the latter reuses this
+    /// RPC and reinterprets the embedding as logits.
     async fn embed(
         &self,
-        _request: Request<smg_proto::EmbedRequest>,
+        request: Request<smg_proto::EmbedRequest>,
     ) -> Result<Response<smg_proto::EmbedResponse>, Status> {
-        Err(Status::unimplemented("Embed is not implemented yet"))
+        let mapped = request_map::embed_to_dict(&request.into_inner())?;
+        let rid = mapped.rid;
+
+        let mut receiver = self
+            .bridge
+            .submit_request(&rid, "embed", mapped.dict)
+            .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
+
+        // Same unary receive as the native Embed: a non-terminal Data chunk is a
+        // protocol violation that must abort the request rather than answer from
+        // whatever arrived first.
+        let chunk = recv_terminal_chunk_for_request(
+            &self.bridge,
+            &rid,
+            &mut receiver,
+            self.response_timeout,
+        )
+        .await?;
+
+        match chunk {
+            ResponseChunk::Data(data) | ResponseChunk::Finished(data) => {
+                Ok(Response::new(response_map::embed_response(&rid, &data)?))
+            }
+            ResponseChunk::Error(msg) => Ok(Response::new(response_map::embed_error(&rid, msg))),
+        }
     }
 
     async fn health_check(
