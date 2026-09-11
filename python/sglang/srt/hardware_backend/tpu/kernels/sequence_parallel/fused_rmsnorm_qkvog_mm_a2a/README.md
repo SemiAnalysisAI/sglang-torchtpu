@@ -91,10 +91,15 @@ accidentally turn layer identity into export-cache identity.
 
 - `_contract.py` is the single source of truth for the tuned model shape and
   destination-local QKVOG layout.
-- `fused_rmsnorm_qkvog_mm_a2a_entrypoint.py` validates the public contract,
-  selects the static schedule, and defines the pure-JAX oracle.
+- `fused_rmsnorm_qkvog_mm_a2a_entrypoint.py` owns the TorchTPU adapter, weight
+  preparation, and custom-op registration and dispatch.
+- `_jax_entrypoint.py` validates the JAX contract, selects the static schedule,
+  and defines the pure-JAX oracle.
 - `_schedule.py` contains host-side plans and routing tables.
 - `_kernel_hybrid_gather_a2a.py` implements the 1K/2K pipelines.
 - `_kernel_a2a.py` implements the 4K--16K direct-output pipeline.
 - `_epilogue.py` centralizes QKVOG splitting, Q/K normalization, scaling,
   RoPE, and output dtype semantics.
+
+The legacy `hardware_backend/tpu/fused_qkvog_sequence_parallel.py` module
+re-exports the TorchTPU entrypoint for downstream compatibility.

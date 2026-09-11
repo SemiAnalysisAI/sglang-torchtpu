@@ -1,369 +1,467 @@
 # SPDX-License-Identifier: Apache-2.0
-
-"""Public entrypoint for fused SP QKVOG projection and attention epilogue.
-
-The public contract is deliberately independent of the internal TPU schedule:
-the activation is token-sharded, the weight and RMSNorm gain are replicated,
-and the result is sharded by QKVOG destination.  The static input shape selects
-a schedule before Pallas tracing, so callers see one operation while each token
-range still gets the measured-fastest TPU program.
-"""
+"""TorchTPU entrypoint for the tuned TP16 sequence-parallel QKVOG entry."""
 
 from __future__ import annotations
 
 import functools
-from typing import Any
+import os
+from collections.abc import Callable, Sequence
+from threading import Lock
+from typing import TYPE_CHECKING
 
-import jax
-import jax.numpy as jnp
-import numpy as np
-from jax import lax
-from jax.sharding import Mesh, NamedSharding
-from jax.sharding import PartitionSpec as P
+import torch
 
-from ._contract import COLUMNS_PER_DESTINATION, HEAD_DIM, HIDDEN_SIZE, TP_SIZE
-from ._epilogue import qkvog_epilogue, split_epilogued_qkvog
-from ._kernel_a2a import run_a2a
-from ._kernel_hybrid_gather_a2a import run_hybrid_gather_a2a
-from ._schedule import (
-    AllToAllPlan,
-    HybridGatherAllToAllPlan,
-    SchedulePlan,
-    make_schedule_plan,
+from ._contract import (
+    COLUMNS_PER_DESTINATION,
+    HEAD_DIM,
+    HIDDEN_SIZE,
+    KV_HEADS_PER_DESTINATION,
+    OUTPUT_GATE_HEADS_PER_DESTINATION,
+    QUERY_HEADS_PER_DESTINATION,
+    TP_SIZE,
+    TPU_DEVICE_KIND,
 )
+from ._schedule import supports_token_count
+
+if TYPE_CHECKING:
+    import jax
+
+_RANK_METADATA_WIDTH = TP_SIZE + 2
+_FUSED_QKVOG_OP: Callable | None = None
+_FUSED_QKVOG_LOCK = Lock()
 
 
-def pack_qkvog_weight_by_destination(
-    q_weight: jax.Array,
-    k_weight: jax.Array,
-    v_weight: jax.Array,
-    og_weight: jax.Array,
+def tpu_sp_qkvog_config_unsupported_reason(
     *,
     tp_size: int,
-) -> jax.Array:
-    """Pack canonical 3-D Q/K/V/OG weights into destination-major blocks.
-
-    Canonical weights group all query heads, then all key heads, and so on.
-    The distributed projection instead needs one contiguous
-    ``[Q_local | K_local | V_local | OG_local]`` block per TP destination so
-    each completed block can be sent directly to its owner.
-    """
-    weights = (q_weight, k_weight, v_weight, og_weight)
-    if tp_size <= 0:
-        raise ValueError(f"tp_size must be positive, got {tp_size}")
-    if any(weight.ndim != 3 for weight in weights):
-        raise ValueError("Q/K/V/OG weights must all have shape [hidden, heads, dim]")
-    hidden_size, _, head_dim = q_weight.shape
-    if any(
-        weight.shape[0] != hidden_size or weight.shape[2] != head_dim
-        for weight in weights
-    ):
-        raise ValueError("Q/K/V/OG weights must share hidden and head dimensions")
-    if any(weight.shape[1] % tp_size for weight in weights):
-        raise ValueError(f"every head count must be divisible by TP{tp_size}")
-
-    grouped = tuple(
-        weight.reshape(hidden_size, tp_size, weight.shape[1] // tp_size, head_dim)
-        for weight in weights
+    world_size: int | None = None,
+    hidden_size: int,
+    head_dim: int,
+    query_heads_per_rank: int,
+    kv_heads_per_rank: int,
+    output_gate_heads_per_rank: int,
+) -> str | None:
+    """Return why model metadata cannot use this shape-specialized kernel."""
+    if world_size is not None and world_size != TP_SIZE:
+        return (
+            f"the tuned QKVOG kernel requires DP1/TP{TP_SIZE} "
+            f"(WORLD_SIZE={TP_SIZE}), got WORLD_SIZE={world_size}"
+        )
+    actual = (
+        tp_size,
+        hidden_size,
+        head_dim,
+        query_heads_per_rank,
+        kv_heads_per_rank,
+        output_gate_heads_per_rank,
     )
-    return jnp.concatenate(grouped, axis=2).reshape(hidden_size, -1)
+    required = (
+        TP_SIZE,
+        HIDDEN_SIZE,
+        HEAD_DIM,
+        QUERY_HEADS_PER_DESTINATION,
+        KV_HEADS_PER_DESTINATION,
+        OUTPUT_GATE_HEADS_PER_DESTINATION,
+    )
+    if actual == required:
+        return None
+    return (
+        "the tuned QKVOG kernel requires "
+        f"TP{TP_SIZE}, hidden size {HIDDEN_SIZE}, head size {HEAD_DIM}, "
+        f"{QUERY_HEADS_PER_DESTINATION} query heads, "
+        f"{KV_HEADS_PER_DESTINATION} KV heads, and "
+        f"{OUTPUT_GATE_HEADS_PER_DESTINATION} output-gate heads per rank; got "
+        f"TP{tp_size}, hidden size {hidden_size}, head size {head_dim}, "
+        f"{query_heads_per_rank} query heads, {kv_heads_per_rank} KV heads, and "
+        f"{output_gate_heads_per_rank} output-gate heads per rank"
+    )
 
 
-def _run_local_schedule(
-    local_x: jax.Array,
-    replicated_weight: jax.Array,
-    replicated_gain: jax.Array,
-    local_cos: jax.Array,
-    local_sin: jax.Array,
-    local_rank_metadata: jax.Array,
+def validate_physical_to_logical(
+    physical_to_logical: Sequence[int],
+) -> tuple[int, ...]:
+    """Validate the TP16 permutation required by physical-DMA scheduling."""
+    mapping = tuple(int(rank) for rank in physical_to_logical)
+    if len(mapping) != TP_SIZE or sorted(mapping) != list(range(TP_SIZE)):
+        raise ValueError(
+            f"physical_to_logical must be a TP{TP_SIZE} permutation, got {mapping}"
+        )
+    # The 1K hybrid schedule transfers its final two same-chip source shards
+    # as one contiguous block. Reject a topology that would make the block land
+    # in non-contiguous or reversed logical rows.
+    for physical_id in range(0, TP_SIZE, 2):
+        if (
+            mapping[physical_id] % 2
+            or mapping[physical_id + 1] != mapping[physical_id] + 1
+        ):
+            raise ValueError(
+                "physical_to_logical must preserve ordered two-core pairs for "
+                f"the 1K schedule, got {mapping}"
+            )
+    return mapping
+
+
+def make_local_rank_metadata(
     *,
-    axis_name: str,
+    physical_id: int,
+    logical_id: int,
+    physical_to_logical: Sequence[int],
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Build this rank's scalar-prefetch row for the Pallas kernel."""
+    mapping = validate_physical_to_logical(physical_to_logical)
+    if not 0 <= physical_id < TP_SIZE:
+        raise ValueError(f"physical_id must be in [0, {TP_SIZE}), got {physical_id}")
+    if not 0 <= logical_id < TP_SIZE:
+        raise ValueError(f"logical_id must be in [0, {TP_SIZE}), got {logical_id}")
+    if mapping[physical_id] != logical_id:
+        raise ValueError(
+            f"physical rank {physical_id} owns logical rank {mapping[physical_id]}, "
+            f"not {logical_id}"
+        )
+    return torch.tensor(
+        [physical_id, logical_id, *mapping],
+        dtype=torch.int32,
+        device=device,
+    )
+
+
+def pack_local_qkvog_weights_by_physical_destination(
+    gathered_logical_weights: torch.Tensor,
+    physical_to_logical: Sequence[int],
+) -> torch.Tensor:
+    """Convert gathered local ``[Q|K|V|OG]`` blocks to kernel layout.
+
+    ``gathered_logical_weights`` is the result of a dim-0 TP all-gather and has
+    shape ``[16 * 1152, 8192]`` in logical-rank order. The returned replicated
+    matrix is ``[8192, 16 * 1152]`` with destination blocks in physical order,
+    matching the Pallas DMA schedule.
+    """
+    mapping = validate_physical_to_logical(physical_to_logical)
+    expected = (TP_SIZE * COLUMNS_PER_DESTINATION, HIDDEN_SIZE)
+    if tuple(gathered_logical_weights.shape) != expected:
+        raise ValueError(
+            f"gathered QKVOG weight must have shape {expected}, got "
+            f"{tuple(gathered_logical_weights.shape)}"
+        )
+    if gathered_logical_weights.dtype != torch.bfloat16:
+        raise ValueError(
+            "the fused QKVOG kernel requires BF16 weights, got "
+            f"{gathered_logical_weights.dtype}"
+        )
+    physical_order = torch.tensor(
+        mapping,
+        dtype=torch.long,
+        device=gathered_logical_weights.device,
+    )
+    blocks = gathered_logical_weights.reshape(
+        TP_SIZE,
+        COLUMNS_PER_DESTINATION,
+        HIDDEN_SIZE,
+    )
+    return blocks.index_select(0, physical_order).reshape(expected).t().contiguous()
+
+
+def prepare_tpu_sp_qkvog_weight(
+    local_weight: torch.Tensor,
+    tp_group=None,
+    *,
+    hidden_size: int,
+    head_dim: int,
+    query_heads_per_rank: int,
+    kv_heads_per_rank: int,
+    output_gate_heads_per_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather and pack one layer's QKVOG weight once, after checkpoint load."""
+    if tp_group is None:
+        from sglang.srt.runtime_context import get_parallel
+
+        tp_group = get_parallel().attn_tp_group
+    config_reason = tpu_sp_qkvog_config_unsupported_reason(
+        tp_size=tp_group.world_size,
+        world_size=int(os.environ.get("WORLD_SIZE", tp_group.world_size)),
+        hidden_size=hidden_size,
+        head_dim=head_dim,
+        query_heads_per_rank=query_heads_per_rank,
+        kv_heads_per_rank=kv_heads_per_rank,
+        output_gate_heads_per_rank=output_gate_heads_per_rank,
+    )
+    if config_reason is not None:
+        raise ValueError(config_reason)
+    expected_local = (COLUMNS_PER_DESTINATION, HIDDEN_SIZE)
+    if tuple(local_weight.shape) != expected_local:
+        raise ValueError(
+            f"local QKVOG weight must have shape {expected_local}, got "
+            f"{tuple(local_weight.shape)}"
+        )
+    if local_weight.dtype != torch.bfloat16:
+        raise ValueError(
+            f"the fused QKVOG kernel requires BF16 weights, got {local_weight.dtype}"
+        )
+
+    from sglang.srt.hardware_backend.tpu.rank_topology import (
+        get_tpu_physical_rank_metadata,
+    )
+
+    physical_id, physical_to_logical, logical_to_physical = (
+        get_tpu_physical_rank_metadata()
+    )
+    physical_to_logical = validate_physical_to_logical(physical_to_logical)
+    logical_id = physical_to_logical[physical_id]
+    if (
+        logical_to_physical[logical_id] != physical_id
+        or logical_id != tp_group.rank_in_group
+    ):
+        raise RuntimeError("inconsistent TPU logical/physical rank metadata")
+    gathered = tp_group.all_gather(local_weight, dim=0).contiguous()
+    packed = pack_local_qkvog_weights_by_physical_destination(
+        gathered,
+        physical_to_logical,
+    )
+    metadata = make_local_rank_metadata(
+        physical_id=physical_id,
+        logical_id=logical_id,
+        physical_to_logical=physical_to_logical,
+        device=local_weight.device,
+    )
+    return packed, metadata
+
+
+def tpu_sp_qkvog_device_unsupported_reason() -> str | None:
+    """Return why the current TPU generation cannot use the tuned schedules."""
+    try:
+        from sglang.srt.hardware_backend.tpu.pallas_export import (
+            get_pallas_tpu_device_kind,
+        )
+
+        device_kind = get_pallas_tpu_device_kind()
+    except (ImportError, RuntimeError) as error:
+        return f"could not identify the TPU device kind: {error}"
+    if device_kind != TPU_DEVICE_KIND:
+        return (
+            f"the tuned QKVOG schedules require {TPU_DEVICE_KIND}, "
+            f"got {device_kind}"
+        )
+    return None
+
+
+def supports_tpu_sp_qkvog_device() -> bool:
+    """Whether this process is running on the topology the schedules target."""
+    return tpu_sp_qkvog_device_unsupported_reason() is None
+
+
+@functools.cache
+def _get_mesh():
+    import numpy as np
+    from jax.sharding import Mesh
+
+    from sglang.srt.hardware_backend.tpu.pallas_export import (
+        get_torchtpu_export_devices,
+    )
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size != TP_SIZE:
+        raise RuntimeError(
+            f"the tuned QKVOG kernel requires WORLD_SIZE={TP_SIZE}, got {world_size}"
+        )
+    device_reason = tpu_sp_qkvog_device_unsupported_reason()
+    if device_reason is not None:
+        raise RuntimeError(device_reason)
+    export_devices = np.asarray(get_torchtpu_export_devices(world_size)).reshape(1, -1)
+    return Mesh(export_devices, ("data", "model"))
+
+
+def _build_fused_qkvog_op() -> Callable:
+    global _FUSED_QKVOG_OP
+    if _FUSED_QKVOG_OP is not None:
+        return _FUSED_QKVOG_OP
+
+    with _FUSED_QKVOG_LOCK:
+        if _FUSED_QKVOG_OP is not None:
+            return _FUSED_QKVOG_OP
+
+        import jax
+        import jax.numpy as jnp
+        from jax.sharding import PartitionSpec as P
+
+        from sglang.srt.hardware_backend.tpu.pallas_jax_op import cpu_export_jax_op
+
+        from ._jax_entrypoint import fused_rmsnorm_qkvog_mm_a2a
+
+        mesh = _get_mesh()
+
+        def _wrapped(
+            hidden_states: jax.Array,
+            packed_weight: jax.Array,
+            gain: jax.Array,
+            cos: jax.Array,
+            sin: jax.Array,
+            rank_metadata: jax.Array,
+            eps: float,
+            eps_qk: float,
+            scale_query_by: float,
+            use_qk_norm: bool,
+            use_rope: bool,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return fused_rmsnorm_qkvog_mm_a2a(
+                hidden_states,
+                packed_weight,
+                gain,
+                cos,
+                sin,
+                mesh,
+                "model",
+                rank_metadata=rank_metadata,
+                eps=eps,
+                eps_qk=eps_qk,
+                scale_query_by=scale_query_by,
+                use_qk_norm=use_qk_norm,
+                use_rope=use_rope,
+                kv_dtype=jnp.bfloat16,
+            )
+
+        # ``from __future__ import annotations`` stringizes the inline types,
+        # while TorchTPU's JAX bridge deliberately requires the concrete JAX
+        # and POD classes to determine tensor versus static arguments.
+        _wrapped.__annotations__ = {
+            "hidden_states": jax.Array,
+            "packed_weight": jax.Array,
+            "gain": jax.Array,
+            "cos": jax.Array,
+            "sin": jax.Array,
+            "rank_metadata": jax.Array,
+            "eps": float,
+            "eps_qk": float,
+            "scale_query_by": float,
+            "use_qk_norm": bool,
+            "use_rope": bool,
+            "return": tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        }
+
+        op = cpu_export_jax_op(
+            "sglang_tpu_pallas::fused_sp_rmsnorm_qkvog",
+            _wrapped,
+            mesh=mesh,
+            input_partition_specs=(
+                P("model", None),
+                P(),
+                P(),
+                P("model", None),
+                P("model", None),
+                P("model"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            output_partition_specs=(
+                P(None, "model", None),
+                P(None, "model", None),
+                P(None, "model", None),
+                P(None, "model", None),
+            ),
+        )
+
+        # cpu_export_jax_op installs the fake implementation from the exported
+        # output shardings; registering another fake here would conflict with
+        # that bridge-owned registration.
+        _FUSED_QKVOG_OP = op
+        return op
+
+
+def register_tpu_sp_fused_qkvog_op() -> None:
+    """Register the custom op before torch.compile captures a model."""
+    _build_fused_qkvog_op()
+
+
+def can_use_tpu_sp_fused_qkvog(
+    hidden_states: torch.Tensor,
+    packed_weight: torch.Tensor | None,
+    gain: torch.Tensor | None,
+    rank_metadata: torch.Tensor | None,
+) -> bool:
+    """Return whether tensors satisfy the tuned kernel contract."""
+    if hidden_states.ndim != 2:
+        return False
+
+    global_tokens = hidden_states.shape[0] * TP_SIZE
+    return bool(
+        hidden_states.shape[1] == HIDDEN_SIZE
+        and hidden_states.dtype in (torch.float32, torch.bfloat16)
+        and supports_token_count(global_tokens)
+        and packed_weight is not None
+        and tuple(packed_weight.shape)
+        == (HIDDEN_SIZE, TP_SIZE * COLUMNS_PER_DESTINATION)
+        and packed_weight.dtype == torch.bfloat16
+        and gain is not None
+        and tuple(gain.shape) == (HIDDEN_SIZE,)
+        and gain.dtype == torch.bfloat16
+        and rank_metadata is not None
+        and tuple(rank_metadata.shape) == (_RANK_METADATA_WIDTH,)
+        and rank_metadata.dtype == torch.int32
+    )
+
+
+def tpu_sp_fused_qkvog(
+    hidden_states: torch.Tensor,
+    packed_weight: torch.Tensor,
+    gain: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rank_metadata: torch.Tensor,
+    *,
     eps: float,
     eps_qk: float,
     scale_query_by: float,
     use_qk_norm: bool,
     use_rope: bool,
-    kv_dtype: Any,
-    plan: SchedulePlan,
-    collective_id: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Trace the selected projection schedule and return final components."""
-    if isinstance(plan, HybridGatherAllToAllPlan):
-        projected = run_hybrid_gather_a2a(
-            local_x,
-            replicated_weight,
-            replicated_gain,
-            local_cos,
-            local_sin,
-            local_rank_metadata,
-            axis_name=axis_name,
-            eps=eps,
-            eps_qk=eps_qk,
-            scale_query_by=scale_query_by,
-            use_qk_norm=use_qk_norm,
-            use_rope=use_rope,
-            plan=plan,
-            collective_id=collective_id,
-        )
-        return split_epilogued_qkvog(projected, kv_dtype=kv_dtype)
-    elif isinstance(plan, AllToAllPlan):
-        outputs = run_a2a(
-            local_x,
-            replicated_weight,
-            replicated_gain,
-            local_cos,
-            local_sin,
-            local_rank_metadata,
-            axis_name=axis_name,
-            eps=eps,
-            eps_qk=eps_qk,
-            scale_query_by=scale_query_by,
-            use_qk_norm=use_qk_norm,
-            use_rope=use_rope,
-            kv_dtype=kv_dtype,
-            plan=plan,
-            collective_id=collective_id,
-        )
-        return tuple(
-            output.reshape(output.shape[0], output.shape[1] // HEAD_DIM, HEAD_DIM)
-            for output in outputs
-        )
-    else:
-        raise TypeError(f"unsupported schedule plan: {type(plan).__name__}")
-
-
-def _validate_rope_inputs(
-    x: jax.Array,
-    cos: jax.Array | None,
-    sin: jax.Array | None,
-    *,
-    use_rope: bool,
-) -> tuple[jax.Array, jax.Array]:
-    if not use_rope and cos is None and sin is None:
-        zeros = jnp.zeros((x.shape[0], HEAD_DIM), dtype=jnp.float32)
-        return zeros, zeros
-    if cos is None or sin is None:
-        raise ValueError("cos and sin are both required when RoPE is enabled")
-    expected = (x.shape[0], HEAD_DIM)
-    if cos.shape != expected or sin.shape != expected:
-        raise ValueError(
-            f"cos and sin must both have global shape {expected}, "
-            f"got {cos.shape} and {sin.shape}"
-        )
-    return cos, sin
-
-
-def fused_rmsnorm_qkvog_mm_a2a(
-    x: jax.Array,
-    weight: jax.Array,
-    gain: jax.Array,
-    cos: jax.Array | None,
-    sin: jax.Array | None,
-    mesh: Mesh,
-    axis_name: str,
-    *,
-    rank_metadata: jax.Array | None = None,
-    eps: float = 1e-5,
-    eps_qk: float = 1e-5,
-    scale_query_by: float = 1.0,
-    use_qk_norm: bool = True,
-    use_rope: bool = True,
-    kv_dtype: Any = jnp.bfloat16,
     collective_id: int | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Run the tuned TP16 fused SP attention-entry operation.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run fused RMSNorm, QKVOG projection, Q/K epilogue, and token/head A2A.
 
-    Args:
-        x: Token-sharded ``[tokens, 8192]`` activation.
-        weight: Replicated ``[8192, 16 * 1152]`` packed QKVOG weight.
-        gain: Replicated ``[8192]`` RMSNorm gain.
-        cos: Token-sharded global ``[tokens, 64]`` pair-repeated RoPE cosines.
-        sin: Token-sharded global ``[tokens, 64]`` pair-repeated RoPE sines.
-        mesh: Device mesh containing a size-16 tensor-parallel axis.
-        axis_name: Name of the tensor-parallel mesh axis.
-        eps: RMSNorm epsilon.
-        rank_metadata: Token-sharded ``[16 * 18]`` int32 metadata. Each local
-            row is ``[physical_id, logical_id, *physical_to_logical]``. ``None``
-            selects identity placement for native JAX callers.
-        collective_id: Optional Pallas collective channel override. The default
-            uses the schedule's stable channel so equivalent layer invocations
-            share one compiled kernel safely.
-
-    Returns:
-        Attention-ready ``(q, k, v, og)`` with global shapes
-        ``[tokens,128,64]``, ``[tokens,16,64]``, ``[tokens,16,64]``, and
-        ``[tokens,128,64]``. Heads are sharded over ``axis_name``. Q/OG use
-        BF16 and K/V use ``kv_dtype``.
-
-    The local token count selects a static schedule: 64 rows gathers eight
-    source shards before projecting two destinations; 128 rows gathers two
-    on-chip source shards before projecting eight destinations; larger inputs
-    project local rows and push completed attention-ready outputs directly.
+    ``collective_id`` is a compatibility-only argument for downstream callers
+    that predate schedule-owned channels. It is intentionally not forwarded
+    through the Torch-to-JAX export boundary; the kernel derives its actual
+    channel from the bounded token schedule.
     """
-    if axis_name not in mesh.axis_names:
-        raise ValueError(f"mesh has no axis named {axis_name!r}")
-    axis_size = mesh.shape[axis_name]
-    if axis_size != TP_SIZE:
-        raise ValueError(f"the tuned kernel requires TP{TP_SIZE}, got TP{axis_size}")
-    if x.ndim != 2 or x.shape[0] % TP_SIZE:
+    if not can_use_tpu_sp_fused_qkvog(
+        hidden_states,
+        packed_weight,
+        gain,
+        rank_metadata,
+    ):
+        raise ValueError("inputs do not satisfy the tuned TP16 QKVOG contract")
+    expected_rope = (hidden_states.shape[0], HEAD_DIM)
+    if tuple(cos.shape) != expected_rope or tuple(sin.shape) != expected_rope:
         raise ValueError(
-            f"x must be [tokens, hidden] with tokens divisible by TP{TP_SIZE}"
+            f"local cos/sin must have shape {expected_rope}, got "
+            f"{tuple(cos.shape)} and {tuple(sin.shape)}"
         )
-    if x.shape[1] != HIDDEN_SIZE:
-        raise ValueError(f"the tuned kernel requires hidden size {HIDDEN_SIZE}")
-    expected_weight_shape = (
-        HIDDEN_SIZE,
-        TP_SIZE * COLUMNS_PER_DESTINATION,
+    return _build_fused_qkvog_op()(
+        hidden_states,
+        packed_weight,
+        gain,
+        cos,
+        sin,
+        rank_metadata,
+        eps,
+        eps_qk,
+        scale_query_by,
+        use_qk_norm,
+        use_rope,
     )
-    if weight.shape != expected_weight_shape:
-        raise ValueError(
-            f"weight must be the replicated packed {expected_weight_shape} QKVOG matrix"
-        )
-    if gain.shape != (HIDDEN_SIZE,):
-        raise ValueError(f"gain must have shape ({HIDDEN_SIZE},)")
-    if x.dtype not in (jnp.float32, jnp.bfloat16):
-        raise ValueError("x must use float32 or bfloat16")
-    if any(value.dtype != jnp.bfloat16 for value in (weight, gain)):
-        raise ValueError("weight and gain must use bfloat16")
-    cos, sin = _validate_rope_inputs(x, cos, sin, use_rope=use_rope)
-    if rank_metadata is None:
-        logical_ranks = np.arange(TP_SIZE, dtype=np.int32)
-        rank_metadata = jax.device_put(
-            np.concatenate(
-                (
-                    logical_ranks[:, None],
-                    logical_ranks[:, None],
-                    np.broadcast_to(logical_ranks, (TP_SIZE, TP_SIZE)),
-                ),
-                axis=1,
-            ).reshape(-1),
-            NamedSharding(mesh, P(axis_name)),
-        )
-    if rank_metadata.shape != (TP_SIZE * (TP_SIZE + 2),):
-        raise ValueError(
-            f"rank_metadata must have shape ({TP_SIZE * (TP_SIZE + 2)},), "
-            f"got {rank_metadata.shape}"
-        )
-    if rank_metadata.dtype != jnp.int32:
-        raise ValueError("rank_metadata must use int32")
-
-    local_rows = x.shape[0] // TP_SIZE
-    plan = make_schedule_plan(local_rows)
-    if collective_id is None:
-        collective_id = plan.collective_id
-    local_operation = functools.partial(
-        _run_local_schedule,
-        axis_name=axis_name,
-        eps=eps,
-        eps_qk=eps_qk,
-        scale_query_by=scale_query_by,
-        use_qk_norm=use_qk_norm,
-        use_rope=use_rope,
-        kv_dtype=kv_dtype,
-        plan=plan,
-        collective_id=collective_id,
-    )
-    return jax.shard_map(
-        local_operation,
-        mesh=mesh,
-        in_specs=(
-            P(axis_name, None),
-            P(None, None),
-            P(None),
-            P(axis_name, None),
-            P(axis_name, None),
-            P(axis_name),
-        ),
-        out_specs=(
-            P(None, axis_name, None),
-            P(None, axis_name, None),
-            P(None, axis_name, None),
-            P(None, axis_name, None),
-        ),
-        check_vma=False,
-    )(x, weight, gain, cos, sin, rank_metadata)
 
 
-def jax_rmsnorm_qkvog_mm_a2a(
-    x: jax.Array,
-    weight: jax.Array,
-    gain: jax.Array,
-    cos: jax.Array | None,
-    sin: jax.Array | None,
-    mesh: Mesh,
-    axis_name: str,
-    *,
-    eps: float = 1e-5,
-    eps_qk: float = 1e-5,
-    scale_query_by: float = 1.0,
-    use_qk_norm: bool = True,
-    use_rope: bool = True,
-    kv_dtype: Any = jnp.bfloat16,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Pure-JAX same-contract numerical oracle and performance baseline."""
-
-    cos, sin = _validate_rope_inputs(x, cos, sin, use_rope=use_rope)
-
-    def _local(local_x, replicated_weight, replicated_gain, local_cos, local_sin):
-        if (
-            replicated_weight.ndim != 2
-            or replicated_weight.shape[1] % mesh.shape[axis_name]
-        ):
-            raise ValueError("flat weight output width must divide the collective size")
-        grouped_weight = replicated_weight.reshape(
-            replicated_weight.shape[0],
-            mesh.shape[axis_name],
-            replicated_weight.shape[1] // mesh.shape[axis_name],
-        )
-        x_f32 = local_x.astype(jnp.float32)
-        inverse_rms = lax.rsqrt(jnp.mean(x_f32 * x_f32, axis=-1, keepdims=True) + eps)
-        normalized = (
-            x_f32 * inverse_rms * replicated_gain.astype(jnp.float32)[jnp.newaxis, :]
-        ).astype(jnp.bfloat16)
-        projected = lax.dot_general(
-            normalized,
-            grouped_weight,
-            (((1,), (0,)), ((), ())),
-            preferred_element_type=jnp.float32,
-        ).astype(jnp.bfloat16)
-        exchanged = lax.all_to_all(
-            projected,
-            axis_name,
-            split_axis=1,
-            concat_axis=0,
-            tiled=True,
-        )
-        if use_rope:
-            full_cos = lax.all_gather(local_cos, axis_name, axis=0, tiled=True)
-            full_sin = lax.all_gather(local_sin, axis_name, axis=0, tiled=True)
-        else:
-            full_cos, full_sin = local_cos, local_sin
-        return qkvog_epilogue(
-            exchanged[:, 0, :],
-            full_cos,
-            full_sin,
-            eps_qk=eps_qk,
-            scale_query_by=scale_query_by,
-            use_qk_norm=use_qk_norm,
-            use_rope=use_rope,
-            kv_dtype=kv_dtype,
-        )
-
-    return jax.shard_map(
-        _local,
-        mesh=mesh,
-        in_specs=(
-            P(axis_name, None),
-            P(None, None),
-            P(None),
-            P(axis_name, None),
-            P(axis_name, None),
-        ),
-        out_specs=(
-            P(None, axis_name, None),
-            P(None, axis_name, None),
-            P(None, axis_name, None),
-            P(None, axis_name, None),
-        ),
-        check_vma=False,
-    )(x, weight, gain, cos, sin)
+__all__ = [
+    "can_use_tpu_sp_fused_qkvog",
+    "make_local_rank_metadata",
+    "pack_local_qkvog_weights_by_physical_destination",
+    "prepare_tpu_sp_qkvog_weight",
+    "register_tpu_sp_fused_qkvog_op",
+    "supports_tpu_sp_qkvog_device",
+    "tpu_sp_qkvog_config_unsupported_reason",
+    "tpu_sp_qkvog_device_unsupported_reason",
+    "tpu_sp_fused_qkvog",
+    "validate_physical_to_logical",
+]

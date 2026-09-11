@@ -15,7 +15,7 @@ def __getattr__(name: str):
     """Import JAX only when a kernel entrypoint is actually requested."""
     if name not in _ENTRYPOINT_EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    from .fused_rmsnorm_qkvog_mm_a2a_entrypoint import (
+    from ._jax_entrypoint import (
         fused_rmsnorm_qkvog_mm_a2a,
         jax_rmsnorm_qkvog_mm_a2a,
         pack_qkvog_weight_by_destination,
