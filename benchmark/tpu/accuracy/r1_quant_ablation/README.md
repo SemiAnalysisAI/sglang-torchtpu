@@ -42,3 +42,17 @@ The MLA test executes the actual post-loader method and compares its TPU
 BF16 treatment against both direct checkpoint reconstruction and the CUDA
 BF16 branch. Kernel smoke covers partial output blocks and matched block/
 channel scale representations.
+
+## Weight-only matched comparison (supersedes the initial queue)
+
+`SGLANG_R1_TEST_ACTIVATIONS=block128` decouples activation grouping from
+`SGLANG_R1_TEST_MATH`. Both native and channelwise candidates use this setting
+with `MATH=production`, FP8 KV, and MLA BF16. Dense matmuls use the same
+blockwise implementation with BF16 intermediate accumulation on both sides;
+MoE uses K=128 activation groups and BF16 scales/accumulation on both sides.
+The variable being tested is checkpoint block weights versus channelwise
+requantized weights. This is a matched diagnostic, not production-versus-native
+with all other production kernels unchanged. `ACTIVATIONS=auto` (default)
+retains the historical math-dependent behavior for reproducibility.
+
+FP32 arithmetic is deferred until this weight comparison is trustworthy.

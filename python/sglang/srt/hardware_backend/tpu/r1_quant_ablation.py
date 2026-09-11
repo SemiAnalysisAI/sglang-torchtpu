@@ -21,13 +21,18 @@ KV = _choice("SGLANG_R1_TEST_KV", ("production", "bf16"))
 NATIVE_WEIGHTS = WEIGHTS == "native"
 MLA_BF16 = WEIGHTS in ("mla_bf16", "native")
 PRECISE_MATH = MATH == "fp32"
-ACTIVATION_BLOCK = 128 if PRECISE_MATH else 512
+ACTIVATIONS = _choice("SGLANG_R1_TEST_ACTIVATIONS", ("auto", "production", "block128"))
+# Preserve earlier experiments when unset, but allow activation grouping to be
+# held fixed while testing weights without the FP32 arithmetic bundle.
+DENSE_ACT128 = ACTIVATIONS == "block128" or (ACTIVATIONS == "auto" and PRECISE_MATH)
+ACTIVATION_BLOCK = 128 if DENSE_ACT128 else 512
 
 
 def settings() -> dict:
     return dict(
         weights=WEIGHTS,
         math=MATH,
+        activations=ACTIVATIONS,
         kv=KV,
         mla_bf16=MLA_BF16,
         native_weights=NATIVE_WEIGHTS,

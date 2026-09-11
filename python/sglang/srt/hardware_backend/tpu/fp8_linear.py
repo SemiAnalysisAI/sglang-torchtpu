@@ -6,7 +6,7 @@
 import torch
 
 from sglang.srt.hardware_backend.tpu.r1_quant_ablation import (
-    PRECISE_MATH as _R1_DENSE_ACT128,
+    DENSE_ACT128 as _R1_DENSE_ACT128,
 )
 
 
