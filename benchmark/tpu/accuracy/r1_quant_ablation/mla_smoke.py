@@ -94,8 +94,8 @@ k, v = ref.reshape(4, 256, 512).split([128, 128], dim=1)
 treatment = results["mla_bf16"]
 assert treatment.w_kc.dtype == torch.bfloat16 and treatment.w_vc.dtype == torch.bfloat16
 assert treatment.w_scale is None
-assert torch.equal(treatment.w_kc, k.transpose(1, 2))
-assert torch.equal(treatment.w_vc, v)
+assert torch.equal(treatment.w_kc, k)
+assert torch.equal(treatment.w_vc, v.transpose(1, 2))
 assert torch.equal(treatment.w_kc, results["cuda_reference"].w_kc)
 assert torch.equal(treatment.w_vc, results["cuda_reference"].w_vc)
 legacy = results["production"]
