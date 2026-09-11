@@ -107,7 +107,19 @@ def _measure(swa_ratio: float) -> dict:
             Patch the current hook instead, for the same purpose -- force
             ``pin_memory=False`` so the host pool allocates without a device.
             """
+            from sglang.srt.mem_cache.pool_host import base as pool_host_base
             from sglang.srt.platforms import current_platform
+
+            # The host pool refuses to build unless psutil reports headroom, minus
+            # a fixed reserve, divided across the ranks on the host. A CPU CI
+            # runner can compute that as negative, which rejects even the ~0.01 GB
+            # pools here. The budget is a production sizing guard and is not what
+            # this test exercises, so give it a fixed generous answer.
+            budget = mock.patch.object(
+                pool_host_base, "host_memory_budget_bytes", return_value=1 << 30
+            )
+            budget.start()
+            self.addCleanup(budget.stop)
 
             orig = current_platform.get_mha_kv_pool_host_cls
 
