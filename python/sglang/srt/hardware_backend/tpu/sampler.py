@@ -322,6 +322,18 @@ def sample_from_global_top_k_logits(
     return sampling_from_probs_torch(global_top_k_probs)
 
 
+def sample_exponential_race(probs: torch.Tensor) -> torch.Tensor:
+    """Exact categorical draw per row as argmax(p_i / E_i), E_i ~ Exp(1).
+
+    Elementwise ops plus one reduce, so it stays inside the compiled graph;
+    ``torch.multinomial`` runs eagerly on TPU. All-zero rows return 0.
+    """
+    u = torch.rand_like(probs)
+    # -log(u) ~ Exp(1); clamp keeps u=0 from producing inf/nan.
+    e = torch.log(u.clamp_min(torch.finfo(probs.dtype).tiny)).neg_()
+    return torch.argmax(probs / e, dim=-1).to(torch.int32)
+
+
 class TpuSampler(Sampler):
     """Consume a pre-gather global TopK for eligible TPU sampling batches.
     Every other batch delegates to the full-vocabulary sampler implementation."""
@@ -376,6 +388,8 @@ class TpuSampler(Sampler):
         This avoids a full sort when pre-gather reduction is not selected."""
 
         if simple_sampling_case:
+            if sampling_info.sampling_seed is None:
+                return sample_exponential_race(probs)
             return sampling_from_probs_torch(
                 probs,
                 sampling_seed=sampling_info.sampling_seed,
@@ -411,8 +425,7 @@ class TpuSampler(Sampler):
         if sampling_info.sampling_seed is None and _use_bsearch_filtering(probs):
             # Sort-free path: the torch fallback below needs a full-vocab sort
             # plus boolean-mask scatters, which run eagerly on TPU at ~415 ms
-            # per decode step. The binary-search mask is one compiled program;
-            # the remaining multinomial is the cheap tier-2 op.
+            # per decode step. The binary-search mask is one compiled program.
             from sglang.srt.hardware_backend.tpu.sampling_mask import tpu_filter_probs
 
             filtered_probs = tpu_filter_probs(
@@ -424,7 +437,7 @@ class TpuSampler(Sampler):
                 need_top_p=sampling_info.need_top_p_sampling,
                 need_min_p=sampling_info.need_min_p_sampling,
             )
-            return sampling_from_probs_torch(filtered_probs)
+            return sample_exponential_race(filtered_probs)
 
         # Seeded (deterministic) sampling keeps the sort-based reference path.
         return top_k_top_p_min_p_sampling_from_probs_torch(
