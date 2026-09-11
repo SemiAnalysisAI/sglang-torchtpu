@@ -66,6 +66,8 @@ class _BackendUnderTest(TpuPallasRpaV3AttnBackend):
         self.forward_metadata = None
         self._op = None
         self._distribution_cache = {}
+        self._fixed_offsets_cache = {}
+        self._active_num_tokens_cache = {}
         # Non-SWA: skips the hybrid-SWA page remap in _build_metadata(_host).
         self._is_hybrid_swa = False
 
