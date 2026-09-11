@@ -366,10 +366,24 @@ class KVCacheConfigurator:
         # decode read of the SWA pool returns wrong K/V. Round the SWA pool
         # down to an 8-page-aligned size (costs at most 7 pages and keeps the
         # window-ring HBM savings).
+        # Below 8 pages there is no aligned size to round down to, so the pool
+        # cannot satisfy the constraint at all. Falling through would leave it
+        # unaligned -- the exact state this block exists to prevent -- and the
+        # miscompile surfaces as a permanent serving hang rather than an error,
+        # so refuse at startup instead.
         if self.device == "tpu" and swa_max_total_num_tokens is not None:
             align_tokens = self.pool_page_size * 8
             aligned = (swa_max_total_num_tokens // align_tokens) * align_tokens
-            if aligned != swa_max_total_num_tokens and aligned > 0:
+            if aligned == 0:
+                raise ValueError(
+                    "[hybrid-SWA] SWA pool is "
+                    f"{swa_max_total_num_tokens // self.pool_page_size} pages "
+                    f"({swa_max_total_num_tokens} tokens), below the 8-page "
+                    "minimum required for correct torch.compile decode on TPU. "
+                    "Raise --swa-full-tokens-ratio or --max-total-tokens so "
+                    f"their product is at least {align_tokens} tokens."
+                )
+            if aligned != swa_max_total_num_tokens:
                 logger.info(
                     "[hybrid-SWA] aligning swa_max_total_num_tokens "
                     f"{swa_max_total_num_tokens} -> {aligned} "
