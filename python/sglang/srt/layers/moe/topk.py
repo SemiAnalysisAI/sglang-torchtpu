@@ -1441,6 +1441,41 @@ def biased_topk_xpu(
     return output, indices
 
 
+def _tpu_grouped_topk_group_mask(
+    scores_for_choice: torch.Tensor, num_expert_group: int, topk_group: int
+) -> torch.Tensor:
+    """Expert-group selection without ``scatter_`` or a per-group sort.
+
+    XLA on TPU lowers ``topk(2)`` over [n, groups, experts/group] to a sort and
+    ``scatter_`` to a serialized update. Group score = max + max after masking
+    the argmax lane (a tie at the max counts twice, like ``topk(2)``); a group
+    is kept when fewer than ``topk_group`` groups outrank it, by score then by
+    lower index, so exactly ``topk_group`` groups survive. All elementwise and
+    small reductions, so it fuses.
+    """
+    n = scores_for_choice.shape[0]
+    if topk_group == num_expert_group:
+        # Every group survives (Kimi routes 1 of 1); skip the ranking.
+        return torch.ones(
+            (n, num_expert_group),
+            dtype=scores_for_choice.dtype,
+            device=scores_for_choice.device,
+        )
+    g = scores_for_choice.view(n, num_expert_group, -1)
+    m1, i1 = g.max(dim=-1)
+    lane = torch.arange(g.shape[-1], device=g.device)
+    neg_inf = torch.tensor(float("-inf"), dtype=g.dtype, device=g.device)
+    m2 = torch.where(lane == i1.unsqueeze(-1), neg_inf, g).amax(dim=-1)
+    group_scores = m1 + m2  # [n, n_group]
+    gs_i = group_scores.unsqueeze(-1)  # [n, G, 1] the group being ranked
+    gs_j = group_scores.unsqueeze(-2)  # [n, 1, G] the competitors
+    gi = torch.arange(num_expert_group, device=g.device)
+    j_before_i = gi.unsqueeze(0) < gi.unsqueeze(1)  # [G(i), G(j)]
+    outranked_by = (gs_j > gs_i) | ((gs_j == gs_i) & j_before_i)
+    keep = outranked_by.sum(dim=-1) < topk_group  # [n, n_group]
+    return keep.to(scores_for_choice.dtype)
+
+
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu or _is_tpu)
 def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
@@ -1460,16 +1495,21 @@ def biased_grouped_topk_impl(
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
     scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
-    group_scores = (
-        scores_for_choice.view(num_token, num_expert_group, -1)
-        .topk(2, dim=-1)[0]
-        .sum(dim=-1)
-    )  # [n, n_group]
-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
-        1
-    ]  # [n, top_k_group]
-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+    if _is_tpu:
+        group_mask = _tpu_grouped_topk_group_mask(
+            scores_for_choice, num_expert_group, topk_group
+        )
+    else:
+        group_scores = (
+            scores_for_choice.view(num_token, num_expert_group, -1)
+            .topk(2, dim=-1)[0]
+            .sum(dim=-1)
+        )  # [n, n_group]
+        group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+            1
+        ]  # [n, top_k_group]
+        group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+        group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
     score_mask = (
         group_mask.unsqueeze(-1)
         .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
