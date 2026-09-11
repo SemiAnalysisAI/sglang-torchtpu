@@ -230,11 +230,17 @@ impl WorkerSelectionStage {
             return None;
         }
 
-        // Select using policies
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
+        // Select using policies.
+        //
+        // PD applies TWO independent policies -- the prefill and decode pools
+        // have different characteristics, so `--prefill-policy cache_aware
+        // --decode-policy round_robin` is the normal configuration. The HTTP PD
+        // router already does this (routers/http/pd_router.rs), but this path
+        // previously resolved a single policy and applied it to both pools, so
+        // both flags were silently ignored on gRPC: they are populated in the
+        // registry by routers/factory.rs, and only the HTTP path read them.
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
 
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self
@@ -247,29 +253,152 @@ impl WorkerSelectionStage {
             headers,
             hash_ring,
         };
-        let prefill_idx = policy.select_worker(&available_prefill, &info).await?;
-        let decode_idx = policy.select_worker(&available_decode, &info).await?;
+        let prefill_idx = prefill_policy
+            .select_worker(&available_prefill, &info)
+            .await?;
+        let decode_idx = decode_policy
+            .select_worker(&available_decode, &info)
+            .await?;
 
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
-        let policy_name = policy.name();
 
-        // Record worker selection metrics for both prefill and decode
+        // Record worker selection metrics for both prefill and decode. Each pool
+        // reports the policy that actually chose its worker; labelling both with
+        // one name would hide the split that was just fixed above.
         Metrics::record_worker_selection(
             metrics_labels::WORKER_PREFILL,
             metrics_labels::CONNECTION_GRPC,
             model,
-            policy_name,
+            prefill_policy.name(),
         );
         Metrics::record_worker_selection(
             metrics_labels::WORKER_DECODE,
             metrics_labels::CONNECTION_GRPC,
             model,
-            policy_name,
+            decode_policy.name(),
         );
 
         Some((
             available_prefill[prefill_idx].clone(),
             available_decode[decode_idx].clone(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PolicyConfig;
+    use crate::core::BasicWorkerBuilder;
+    use crate::policies::RoundRobinPolicy;
+
+    fn add_workers(reg: &WorkerRegistry, kind: WorkerType, n: usize, base_port: u16) {
+        for i in 0..n {
+            let w = BasicWorkerBuilder::new(format!("http://127.0.0.1:{}", base_port + i as u16))
+                .worker_type(kind.clone())
+                .connection_mode(ConnectionMode::Grpc { port: None })
+                .build();
+            reg.register(Arc::new(w) as Arc<dyn Worker>);
+        }
+    }
+
+    /// 2 prefill + 2 decode gRPC workers, with an INDEPENDENT round-robin
+    /// policy configured for each pool.
+    fn pd_stage() -> WorkerSelectionStage {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        add_workers(
+            &worker_registry,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            2,
+            9000,
+        );
+        add_workers(&worker_registry, WorkerType::Decode, 2, 9100);
+
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::Random));
+        policy_registry.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
+        policy_registry.set_decode_policy(Arc::new(RoundRobinPolicy::new()));
+
+        WorkerSelectionStage::new(
+            worker_registry,
+            policy_registry,
+            WorkerSelectionMode::PrefillDecode,
+        )
+    }
+
+    /// gRPC PD must apply the prefill and decode policies INDEPENDENTLY.
+    ///
+    /// Regression test for a real bug: this path used to resolve a single
+    /// policy and hand it to both pools, so `--prefill-policy` and
+    /// `--decode-policy` were silently ignored on gRPC. They are populated in
+    /// the registry by routers/factory.rs, but only the HTTP PD router read
+    /// them. Every pre-existing test still passed, because none configured
+    /// differing policies and checked they were honoured separately.
+    ///
+    /// The discriminator is deliberately order-independent, so it does not
+    /// depend on the order WorkerRegistry happens to return workers in.
+    /// RoundRobin does `count = counter.fetch_add(1); idx = count % len`.
+    ///
+    /// With TWO independent policies each pool advances its own counter, so
+    /// two successive requests land on two different workers:
+    ///     prefill: req1 -> idx 0, req2 -> idx 1
+    ///     decode:  req1 -> idx 0, req2 -> idx 1
+    ///
+    /// With ONE shared policy the counter advances twice per request (once per
+    /// pool), so prefill always sees an even count and decode an odd one, and
+    /// both pools stay pinned to a single worker:
+    ///     prefill: req1 -> idx 0, req2 -> idx 0   (counts 0, 2)
+    ///     decode:  req1 -> idx 1, req2 -> idx 1   (counts 1, 3)
+    ///
+    /// "Both pools moved between requests" is exactly what the bug destroyed.
+    #[tokio::test]
+    async fn grpc_pd_applies_prefill_and_decode_policies_independently() {
+        let stage = pd_stage();
+
+        let (p1, d1) = stage
+            .select_pd_pair(None, Some("hello"), None, None)
+            .await
+            .expect("first request should select a prefill/decode pair");
+        let (p2, d2) = stage
+            .select_pd_pair(None, Some("hello"), None, None)
+            .await
+            .expect("second request should select a prefill/decode pair");
+
+        assert_ne!(
+            p1.url(),
+            p2.url(),
+            "prefill pool did not advance: both requests chose {}. The prefill \
+             policy is not being applied independently (shared-policy bug).",
+            p1.url()
+        );
+        assert_ne!(
+            d1.url(),
+            d2.url(),
+            "decode pool did not advance: both requests chose {}. The decode \
+             policy is not being applied independently (shared-policy bug).",
+            d1.url()
+        );
+    }
+
+    /// Setting one pool's policy must not set the other's.
+    ///
+    /// The two accessors read separate slots, and an unset slot falls back to
+    /// the global default -- the same contract the HTTP PD router relies on
+    /// (`routers/http/pd_router.rs`). If they ever shared a slot, the bug above
+    /// would come back through the registry instead of through the stage.
+    #[test]
+    fn setting_one_pool_policy_does_not_set_the_other() {
+        let registry = PolicyRegistry::new(PolicyConfig::Random);
+        assert_eq!(registry.get_prefill_policy().name(), "random");
+        assert_eq!(registry.get_decode_policy().name(), "random");
+
+        registry.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
+        assert_eq!(registry.get_prefill_policy().name(), "round_robin");
+        assert_eq!(
+            registry.get_decode_policy().name(),
+            "random",
+            "setting the prefill policy must not implicitly set the decode policy"
+        );
     }
 }
