@@ -115,6 +115,44 @@ def prepare_tpu_w4a8_moe_weights(layer: torch.nn.Module, group_size: int) -> Non
     layer.is_tpu_w4a8_converted = True
 
 
+def prepare_tpu_vmem_fp8_scales(layer: torch.nn.Module, group_size: int) -> None:
+    """Keep INT4 words; prepare normalized group and FP8 channel scales once."""
+    if getattr(layer, "is_tpu_vmem_fp8", False):
+        return
+    if group_size != 32:
+        raise ValueError("vmem-fp8 requires INT4 group size 32")
+    for packed_name, scale_name, channel_name in (
+        ("w13_weight_packed", "w13_weight_scale", "w13_vmem_channel_scale"),
+        ("w2_weight_packed", "w2_weight_scale", "w2_vmem_channel_scale"),
+    ):
+        packed = getattr(layer, packed_name).data
+        old_scale = getattr(layer, scale_name).data
+        normalized = torch.empty(old_scale.shape, dtype=torch.float32, device="cpu")
+        channels = torch.empty(
+            (packed.shape[0], 1, packed.shape[-1]), dtype=torch.float32
+        )
+        for e in range(packed.shape[0]):
+            scale = old_scale[e].detach().cpu().to(torch.bfloat16)
+            q = _unpack_int4_offset_binary(packed[e].detach().cpu())
+            # BF16 rounding is monotonic: the largest absolute product within
+            # a group is max(abs(q)) * abs(scale). Avoid expanding the group
+            # scales and the full dequantized BF16 weight just to reduce K.
+            group_max = q.reshape(-1, group_size, q.shape[-1]).abs().amax(dim=1)
+            group_max = group_max.to(torch.bfloat16) * scale.abs()
+            c = (group_max.float().amax(dim=0, keepdim=True) / 448.0).clamp_min(1e-12)
+            normalized[e] = scale.float() / c
+            channels[e] = c
+        new = normalized.to(old_scale.device)
+        copy_or_rebind_param(layer, scale_name, new)
+        setattr(
+            layer,
+            channel_name,
+            Parameter(channels.to(old_scale.device), requires_grad=False),
+        )
+        _free_replaced_storage(old_scale, getattr(layer, scale_name).data)
+    layer.is_tpu_vmem_fp8 = True
+
+
 def prepare_tpu_w4a16_moe_weights(layer: torch.nn.Module, group_size: int) -> None:
     """One-time post-load formatting for the Pallas W4A16 MoE path.
 
@@ -124,6 +162,12 @@ def prepare_tpu_w4a16_moe_weights(layer: torch.nn.Module, group_size: int) -> No
     """
     if getattr(layer, "is_tpu_w4a16_converted", False):
         return
+
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_TPU_USE_W4A8_MOE.get() == "vmem-fp8":
+        # Normalize before converting checkpoint offset-binary nibbles.
+        prepare_tpu_vmem_fp8_scales(layer, group_size)
 
     # Offset-binary -> two's complement nibbles for pltpu's signed int4
     # unpack: flip each nibble's top bit ((q+8) ^ 0x8 == int4(q)).
@@ -231,5 +275,7 @@ def apply_tpu_w4a16_moe(
         global_num_experts=global_num_experts,
         expert_group_offset=expert_group_offset,
         w_quant_bits=4,
+        w1_channel_scale=getattr(layer, "w13_vmem_channel_scale", None),
+        w2_channel_scale=getattr(layer, "w2_vmem_channel_scale", None),
     )
     return StandardCombineInput(hidden_states=output)

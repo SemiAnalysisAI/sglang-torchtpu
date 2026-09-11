@@ -1623,7 +1623,12 @@ class Envs:
     # FP8 at load time (doubling weight bytes). "a8-kernel" keeps packed INT4
     # weights and dequantizes groups in VMEM before BF16 matmul in gmm_v2;
     # despite its historical name, this mode does not quantize activations.
+    # "vmem-fp8": packed INT4 HBM weights, FP8 weight tiles and activations
+    # inside gmm_v2, with load-time normalized group/channel scales.
     SGLANG_TPU_USE_W4A8_MOE = EnvStr(None)
+    # Shape-guarded fast path and fused gate/up for Kimi BS1 in vmem-fp8 mode.
+    SGLANG_TPU_KIMI_BS1_OPT = EnvBool(True)
+    SGLANG_TPU_KIMI_FP8_GATE_UP_FUSION = EnvBool(True)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
