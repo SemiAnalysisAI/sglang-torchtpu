@@ -11,6 +11,13 @@ cd "$(dirname "$0")/.."   # recipe/ -> benchmark/tpu
 
 PROFILE=${PROFILE:-ci}
 
+# Simulate mean accept length 2.5, including the bonus, on synthetic prompts.
+# Real draft tokens preserve token-dependent MoE routing; outputs are synthetic.
+export SGLANG_SIMULATE_ACC_LEN=2.5
+export SGLANG_SIMULATE_ACC_METHOD=match-expected
+export SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token
+echo "[480b-agentic-spec] simulated accept_length=2.5 (includes bonus), method=$SGLANG_SIMULATE_ACC_METHOD, token_mode=$SGLANG_SIMULATE_ACC_TOKEN_MODE"
+
 # The target checkpoint otherwise remains in the host page cache after loading.
 # Together with the pinned HiCache pool and compiler state, that can exhaust host
 # memory while TPU HBM still has headroom.

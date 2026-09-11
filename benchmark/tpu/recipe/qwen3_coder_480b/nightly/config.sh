@@ -237,6 +237,9 @@ HICACHE_IO_BACKEND=${HICACHE_IO_BACKEND:-raiden}
 # time, hence the cap. Formerly named NORMAL_REPLAYS, which wrongly suggested
 # re-sending the same session (each is distinct -- no artificial prefix-cache
 # hits); the old env names still work.
+# In CI, auto also supplies at least three sessions per normal slot when
+# concurrency > 1 (subject to the cap), to replace sessions that finish early.
+# This increases measured work; c1 legs still use the round-count calculation.
 SESSIONS_PER_SLOT=${SESSIONS_PER_SLOT:-${NORMAL_REPLAYS:-auto}}
 MAX_SESSIONS_PER_SLOT=${MAX_SESSIONS_PER_SLOT:-${MAX_NORMAL_REPLAYS:-8}}
 
