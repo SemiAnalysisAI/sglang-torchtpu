@@ -58,63 +58,6 @@ def _unpack_int4_offset_binary(packed: torch.Tensor) -> torch.Tensor:
     return values.reshape(*packed.shape[:-2], packed.shape[-2] * 8, packed.shape[-1])
 
 
-def prepare_tpu_w4a8_moe_weights(layer: torch.nn.Module, group_size: int) -> None:
-    """Requantize pack-quantized int4 group weights to channelwise fp8.
-
-    The SGLANG_TPU_USE_W4A8_MOE=fp8-requant mode: dequant the int4 groups to
-    f32 on the host, take one fp8 scale per (expert, out-channel), and hand the
-    result to the fused fp8 grouped-GEMM path (``apply_tpu_fp8_moe``, dynamic
-    fp8 activation quant). Weight bytes double relative to packed INT4.
-    """
-    if getattr(layer, "is_tpu_w4a8_converted", False):
-        return
-    fp8_dtype = torch.float8_e4m3fn
-    fp8_max = torch.finfo(fp8_dtype).max
-    for packed_name, scale_name, out_name in (
-        ("w13_weight_packed", "w13_weight_scale", "w13_weight"),
-        ("w2_weight_packed", "w2_weight_scale", "w2_weight"),
-    ):
-        packed_param = getattr(layer, packed_name)
-        scale_param = getattr(layer, scale_name)
-        packed_cpu = packed_param.data.cpu()
-        gscale_cpu = scale_param.data.float().cpu()
-        # Whole layer on host: [E, K, N] f32 is ~3 GB at EP16 -- fine per rank.
-        w = _unpack_int4_offset_binary(packed_cpu).float()
-        w *= gscale_cpu.repeat_interleave(group_size, dim=1)
-        ch_scale = torch.clamp(w.abs().amax(dim=1, keepdim=True) / fp8_max, min=1e-12)
-        w = torch.clamp(w / ch_scale, min=-fp8_max, max=fp8_max).to(fp8_dtype)
-        setattr(
-            layer,
-            out_name,
-            Parameter(w.to(packed_param.data.device), requires_grad=False),
-        )
-        # gmm_v2 RHS scale layout [E, 1, 1, N]; frees the group scales' storage.
-        from sglang.srt.hardware_backend.tpu.fp8_moe import (
-            _to_tpu_fp8_moe_scale_layout,
-        )
-
-        old_scale = scale_param.data
-        new_scale = _to_tpu_fp8_moe_scale_layout(ch_scale.squeeze(1), w.shape[-1]).to(
-            old_scale.device
-        )
-        copy_or_rebind_param(layer, scale_name, new_scale)
-        _free_replaced_storage(old_scale, getattr(layer, scale_name).data)
-        _drop_param(layer, packed_name)
-
-    for name in (
-        "w13_weight_g_idx",
-        "w2_weight_g_idx",
-        "w13_g_idx_sort_indices",
-        "w2_g_idx_sort_indices",
-        "w13_weight_shape",
-        "w2_weight_shape",
-    ):
-        _drop_param(layer, name)
-
-    layer.weight_block_size = None
-    layer.is_tpu_w4a8_converted = True
-
-
 def prepare_tpu_vmem_fp8_scales(layer: torch.nn.Module, group_size: int) -> None:
     """Keep INT4 words; prepare normalized group and FP8 channel scales once."""
     if getattr(layer, "is_tpu_vmem_fp8", False):
