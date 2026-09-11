@@ -202,5 +202,4 @@ gate/up SiLU, and combines sorted expert outputs directly. For ablations, set
 `SGLANG_TPU_KIMI_FP8_GATE_UP_FUSION=0` to disable just activation fusion.
 
 The other modes retain their behavior: unset uses W4A16 group products;
-`a8-kernel` is the historical name for INT4-to-BF16 VMEM dequantization;
-`fp8-requant` creates FP8 expert weights in HBM at load time.
+`a8-kernel` is the historical name for INT4-to-BF16 VMEM dequantization.
