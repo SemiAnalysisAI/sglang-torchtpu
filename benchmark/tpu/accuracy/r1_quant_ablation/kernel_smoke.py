@@ -80,7 +80,7 @@ for m, n, k in [(1, 2112, 7168), (32, 448, 2048), (1, 128, 256)]:
 # against identical per-channel scales while retaining the same K=128 act groups.
 x = jnp.asarray(rng.normal(0, 0.3, (16, 512)), jnp.bfloat16)
 w = jnp.asarray(rng.normal(0, 30, (2, 512, 256)), jnp.float8_e4m3fn)
-s = jnp.asarray(rng.uniform(0.001, 0.03, (2, 1, 1, 256)), jnp.bfloat16)
+s = jnp.asarray(rng.uniform(0.001, 0.03, (2, 1, 1, 256)), jnp.float32)
 g = jnp.array([5, 11], jnp.int32)
 a = gmm_v2(
     x, w, g, rhs_scale=jnp.repeat(s, 4, axis=1), tile_info=TileSizes(16, 256, 128)
@@ -88,5 +88,23 @@ a = gmm_v2(
 b = gmm_v2(x, w, g, rhs_scale=s, tile_info=TileSizes(16, 256, 128))
 np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 results.append(dict(test="FP32_MoE_block_vs_channel_representations", passed=True))
+from sglang.srt.layers.moe.pallas.fused_moe_op import _fused_moe_jax
+
+x = jnp.asarray(rng.normal(0, 0.2, (8, 512)), jnp.bfloat16)
+w1 = jnp.asarray(rng.normal(0, 15, (2, 512, 1024)), jnp.float8_e4m3fn)
+w2 = jnp.asarray(rng.normal(0, 15, (2, 512, 512)), jnp.float8_e4m3fn)
+s1 = jnp.full((2, 1, 1, 1024), 0.01, jnp.float32)
+s2 = jnp.full((2, 1, 1, 512), 0.01, jnp.float32)
+weights = jnp.asarray(rng.uniform(0.01, 0.99, (8, 2)), jnp.float32)
+ids = jnp.tile(jnp.asarray([[0, 1]], jnp.int32), (8, 1))
+args = (x, w1, w2, weights, ids, s1, s2, None, None, 2, "silu")
+slots = _fused_moe_jax(*args, no_combine=True)
+ref = (slots.astype(jnp.float32) * weights[..., None]).sum(axis=1).astype(jnp.bfloat16)
+for sc in (0, 1):
+    combined = _fused_moe_jax(*args, use_sc_gather=sc)
+    np.testing.assert_array_equal(np.asarray(combined), np.asarray(ref))
+    results.append(dict(test="FP32_fused_expert_combine", sparse_core=sc, passed=True))
+    print(results[-1], flush=True)
+
 (r / "startup-smoke.json").write_text(json.dumps(results, indent=2))
 print("PASSED", flush=True)
