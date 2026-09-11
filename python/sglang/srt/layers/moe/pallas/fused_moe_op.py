@@ -319,6 +319,13 @@ def _dividing_tile_k(base_tile_info):
         else:
             tiles = base_tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
         quant_block_size = rhs_cfgs.quant_block_size if rhs_cfgs.has_scale else None
+        if getattr(rhs_cfgs, "requantize_in_vmem", False):
+            quant_block_size = min(lhs_cfgs.quant_block_size, dims.size_k)
+            # Activation amax must cover the whole K=512 group. Unlike
+            # stored RHS scales, it cannot be split into smaller tiles.
+            tiles = dataclasses.replace(
+                tiles, tile_k=max(tiles.tile_k, quant_block_size)
+            )
         if dims.size_k % tiles.tile_k != 0 or not _quant_block_compatible(
             tiles.tile_k, quant_block_size
         ):
@@ -374,6 +381,8 @@ def _fused_moe_jax(
     use_sc_gather=0,
     w_quant_bits=0,  # 4 => w1/w2 are checkpoint-packed int4 words (W4A16)
     permute_dense_threshold=0,
+    w1_channel_scale=None,
+    w2_channel_scale=None,
 ):
     """Production fused-MoE kernel body. Exported by ``_build_fused_moe_op``.
 
@@ -408,30 +417,55 @@ def _fused_moe_jax(
     rhs_quant_dtype = None
     maybe_quantize_lhs = True
     dequantize_int4_in_vmem = False
+    use_vmem_fp8 = w1_channel_scale is not None or w2_channel_scale is not None
+    if use_vmem_fp8 and (
+        w_quant_bits != 4
+        or w1_channel_scale is None
+        or w2_channel_scale is None
+        or w1_bias is not None
+        or w2_bias is not None
+    ):
+        raise ValueError(
+            "VMEM FP8 requires two channel-scale tensors, INT4 weights and no biases"
+        )
+    kimi_bs1_opt = False
     if w_quant_bits:
         assert w_quant_bits == 4, f"unsupported w_quant_bits={w_quant_bits}"
-        # Both INT4 modes use the existing GMM and keep packed HBM weights.
+        # Packed INT4 modes share the existing GMM and keep packed HBM weights.
         # a8-kernel dequantizes groups in VMEM before a larger BF16 dot;
         # the default applies each scale after its short-K group product.
         from sglang.srt.environ import envs
 
-        dequantize_int4_in_vmem = envs.SGLANG_TPU_USE_W4A8_MOE.get() == "a8-kernel"
+        dequantize_int4_in_vmem = (
+            not use_vmem_fp8 and envs.SGLANG_TPU_USE_W4A8_MOE.get() == "a8-kernel"
+        )
         rhs_quant_dtype = jnp.int4
-        maybe_quantize_lhs = False
+        maybe_quantize_lhs = use_vmem_fp8
+        kimi_bs1_opt = (
+            use_vmem_fp8
+            and envs.SGLANG_TPU_KIMI_BS1_OPT.get()
+            and m == 1
+            and topk == 8
+            and w1.shape[1:] == (896, 4096)
+            and w2.shape[1:] == (256, 7168)
+        )
 
     # gmm_v2 needs the routed-row count ``m*topk`` to be a multiple of its LHS
     # sublane tiling (16 for the bf16 activations this path runs on). Padding
     # the *input* tokens here keeps the permute/gather operating on an
     # already-aligned, fixed-bucket shape and removes the post-gather
     # ``jnp.pad`` + ``group_sizes`` scatter that XLA was offloading to the
-    # SparseCore (and crashing on). Pad tokens route to expert 0 with zero
-    # weight, so they contribute nothing to any real token and are sliced off
-    # at the very end.
+    # SparseCore (and crashing on). Padding has zero weight. The Kimi BS1
+    # path assigns padding an out-of-range sentinel to avoid dummy expert work.
     m_orig = m
     m_pad = _padded_token_count(m, topk, lhs_sublane_tiling(hidden_states.dtype))
     if m_pad != m:
         hidden_states = jnp.pad(hidden_states, ((0, m_pad - m), (0, 0)))
-        topk_ids = jnp.pad(topk_ids, ((0, m_pad - m), (0, 0)))  # pad -> expert 0
+        topk_ids = jnp.pad(
+            topk_ids,
+            ((0, m_pad - m), (0, 0)),
+            constant_values=(global_num_experts or num_experts) if kimi_bs1_opt else 0,
+        )
         topk_weights = jnp.pad(
             topk_weights, ((0, m_pad - m), (0, 0))
         )  # pad -> weight 0
@@ -463,7 +497,11 @@ def _fused_moe_jax(
     use_dense_permute = m < permute_dense_threshold
     use_dense_unpermute = (m * topk) < permute_dense_threshold and not no_combine
 
-    if use_dense_permute:
+    direct_bs1_dispatch = kimi_bs1_opt and not no_combine and not use_sc_gather
+    if direct_bs1_dispatch:
+        # All real routes refer to one token; sentinel padding owns no expert.
+        x_sorted = jnp.broadcast_to(hidden_states[:1], (m * topk, hidden_size))
+    elif use_dense_permute:
         permute_matrix = jax.nn.one_hot(sorted_token_ids, m, dtype=hidden_states.dtype)
         x_sorted = jax.lax.dot_general(
             permute_matrix,
@@ -507,7 +545,15 @@ def _fused_moe_jax(
     compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
     # W4A16 runs GMM1 unfused: the fused gate/up split mis-applies multi-block
     # rhs scales, so the activation is applied in JAX below.
-    unfused_gmm1 = compact_block_scales or bool(w_quant_bits)
+    fuse_vmem_fp8_gate_up = (
+        use_vmem_fp8
+        and kimi_bs1_opt
+        and activation_name == "silu"
+        and envs.SGLANG_TPU_KIMI_FP8_GATE_UP_FUSION.get()
+    )
+    unfused_gmm1 = (
+        compact_block_scales or bool(w_quant_bits)
+    ) and not fuse_vmem_fp8_gate_up
     gmm1_fuse_act = None if unfused_gmm1 else _fuse_act_name(activation_name)
 
     gmm1_tile_info = None
@@ -558,12 +604,16 @@ def _fused_moe_jax(
     else:
         zero_init = True
 
+    if kimi_bs1_opt:
+        gmm1_tiling = TileSizes(16, 7168, 1024)
+
     gmm1_out = gmm_v2(
         lhs=x_sorted,
         rhs=w1,
         group_sizes=group_sizes,
         rhs_scale=w1_scale,
         rhs_bias=w1_bias,
+        rhs_channel_scale=w1_channel_scale,
         group_offset=group_offset,
         zero_initialize=zero_init,
         preferred_element_type=out_dtype,
@@ -596,12 +646,16 @@ def _fused_moe_jax(
             _gmm2_tile_source(gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed)
         )
     )
+    if kimi_bs1_opt:
+        gmm2_tiling = TileSizes(16, 2048, 3584)
+
     gmm2_out = gmm_v2(
         lhs=gmm1_out,
         rhs=w2,
         group_sizes=group_sizes,
         rhs_scale=w2_scale,
         rhs_bias=w2_bias,
+        rhs_channel_scale=w2_channel_scale,
         group_offset=group_offset,
         zero_initialize=zero_init,
         preferred_element_type=out_dtype,
@@ -618,6 +672,13 @@ def _fused_moe_jax(
     # Un-permute back to token-major order. Models that apply a post-expert
     # norm ask the runner for no_combine output so they can RMSNorm each top-k
     # slot before the weighted reduction.
+    if direct_bs1_dispatch:
+        sorted_weights = topk_weights.reshape(-1)[argsort_idx].astype(out_dtype)
+        return (
+            (gmm2_out.astype(out_dtype) * sorted_weights[:, None])
+            .sum(axis=0, keepdims=True)
+            .astype(out_dtype)
+        )
     if use_dense_unpermute:
         # Unpermute using dense matmul.
         w_sorted = topk_weights.reshape(-1)[argsort_idx].astype(jnp.float32)
@@ -736,6 +797,8 @@ def _build_fused_moe_op():
         use_sc_gather: int = 0,
         w_quant_bits: int = 0,
         permute_dense_threshold: int = 0,
+        w1_channel_scale: Optional[jax.Array] = None,
+        w2_channel_scale: Optional[jax.Array] = None,
     ) -> jax.Array:
         return _fused_moe_jax(
             hidden_states,
@@ -755,6 +818,8 @@ def _build_fused_moe_op():
             use_sc_gather,
             w_quant_bits,
             permute_dense_threshold,
+            w1_channel_scale,
+            w2_channel_scale,
         )
 
     custom_op = jax_op(op_name, _wrapped)
@@ -777,6 +842,8 @@ def _build_fused_moe_op():
         use_sc_gather: int = 0,
         w_quant_bits: int = 0,
         permute_dense_threshold: int = 0,
+        w1_channel_scale: Optional[torch.Tensor] = None,
+        w2_channel_scale: Optional[torch.Tensor] = None,
     ):
         if no_combine:
             return hidden_states.new_empty(
@@ -810,6 +877,8 @@ def fused_moe_call(
     global_num_experts: int = 0,
     expert_group_offset: int = 0,
     w_quant_bits: int = 0,
+    w1_channel_scale: Optional[torch.Tensor] = None,
+    w2_channel_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Invoke the Pallas fused-MoE op.
 
@@ -849,4 +918,6 @@ def fused_moe_call(
         use_sc_gather,
         w_quant_bits,
         int(envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD.get()),
+        w1_channel_scale,
+        w2_channel_scale,
     )

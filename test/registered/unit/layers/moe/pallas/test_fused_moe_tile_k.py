@@ -96,6 +96,20 @@ class TestDividingTileK(CustomTestCase):
             vmem_limit_bytes=128 * 1024 * 1024,
         )
 
+    def test_int4_to_fp8_preserves_activation_quantization_groups(self):
+        import dataclasses
+
+        rhs = dataclasses.replace(self._rhs_cfgs(7168, 32), requantize_in_vmem=True)
+        for requested_k in (256, 1280, 1792):
+            tiles = _dividing_tile_k(gmm_v2.TileSizes(16, requested_k, 128))(
+                self._dims(7168),
+                SimpleNamespace(quant_block_size=512),
+                rhs,
+                128 * 1024 * 1024,
+            )
+            self.assertEqual(tiles.tile_k % 512, 0)
+            self.assertEqual(7168 % tiles.tile_k, 0)
+
     # ---- the predicate itself -------------------------------------------
 
     def test_predicate_matches_calculate_tiling(self):

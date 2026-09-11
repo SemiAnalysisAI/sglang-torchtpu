@@ -95,5 +95,61 @@ class TestPrepareTpuW4A8MoeWeights(CustomTestCase):
         )
 
 
+class TestVmemFp8Preparation(CustomTestCase):
+    def test_packed_storage_scales_and_idempotence(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.hardware_backend.tpu.w4a16_moe import (
+            prepare_tpu_w4a16_moe_weights,
+        )
+
+        torch.manual_seed(4)
+        q = torch.randint(-8, 8, (2, 64, 16))
+        q[:, :, 0] = 0
+        scales = (torch.rand(2, 2, 16) * 0.1).bfloat16()
+        packed = _pack_offset_binary(q)
+        layer = _FakeMoELayer(
+            packed.clone(), scales.clone(), packed.clone(), scales.clone()
+        )
+        dequant = q.bfloat16() * scales.repeat_interleave(32, dim=1)
+        channel = (dequant.float().abs().amax(dim=1, keepdim=True) / 448).clamp_min(
+            1e-12
+        )
+        normalized = scales.float() / channel
+        with envs.SGLANG_TPU_USE_W4A8_MOE.override("vmem-fp8"):
+            prepare_tpu_w4a16_moe_weights(layer, 32)
+            for prefix in ("w13", "w2"):
+                weight = getattr(layer, prefix + "_weight_packed")
+                group_scale = getattr(layer, prefix + "_weight_scale")
+                channel_scale = getattr(layer, prefix + "_vmem_channel_scale")
+                self.assertEqual(weight.dtype, torch.int32)
+                self.assertEqual(weight.numel(), packed.numel())
+                torch.testing.assert_close(weight, packed ^ -2004318072, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    group_scale, normalized.unsqueeze(2), rtol=0, atol=0
+                )
+                torch.testing.assert_close(channel_scale, channel, rtol=0, atol=0)
+                self.assertIsNone(group_scale.data._base)
+                self.assertTrue(torch.isfinite(group_scale).all())
+            before = layer.w13_weight_packed.clone()
+            prepare_tpu_w4a16_moe_weights(layer, 32)
+            torch.testing.assert_close(layer.w13_weight_packed, before, rtol=0, atol=0)
+
+    def test_unsupported_groups_fail_before_mutation(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.hardware_backend.tpu.w4a16_moe import (
+            prepare_tpu_w4a16_moe_weights,
+        )
+
+        packed = torch.zeros(2, 8, 16, dtype=torch.int32)
+        scales = torch.ones(2, 4, 16, dtype=torch.bfloat16)
+        layer = _FakeMoELayer(
+            packed.clone(), scales.clone(), packed.clone(), scales.clone()
+        )
+        with envs.SGLANG_TPU_USE_W4A8_MOE.override("vmem-fp8"):
+            with self.assertRaisesRegex(ValueError, "group size 32"):
+                prepare_tpu_w4a16_moe_weights(layer, 16)
+        torch.testing.assert_close(layer.w13_weight_packed, packed, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     unittest.main()
