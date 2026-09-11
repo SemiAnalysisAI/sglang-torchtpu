@@ -616,7 +616,7 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
 
     def test_filtered_sampling_uses_bsearch_mask_on_tpu(self):
         """On TPU tensors, filtered sampling routes through the sort-free
-        binary-search mask + plain multinomial instead of the torch sort path.
+        binary-search mask + exponential-race draw instead of the torch sort path.
         The device gate is patched because CPU CI cannot allocate TPU tensors."""
         sampler = SimpleNamespace()
         probs = torch.rand(1, 128)
@@ -635,7 +635,7 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
             ) as filter_probs,
             patch.object(
                 tpu_sampler_module,
-                "sampling_from_probs_torch",
+                "sample_exponential_race",
                 return_value=expected,
             ) as sample,
             patch.object(
