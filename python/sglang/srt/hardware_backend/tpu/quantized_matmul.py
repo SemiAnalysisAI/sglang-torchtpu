@@ -13,6 +13,10 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from torch_tpu._internal import pallas
 
+from sglang.srt.hardware_backend.tpu.r1_quant_ablation import (
+    PRECISE_MATH as _R1_DENSE_FP32_ACC,
+)
+
 MXU_SIZE = 256
 
 
@@ -197,7 +201,7 @@ def _blockwise_quantized_matmul_kernel(
 
     save_acc = n_in > 1
     save_x_q = n_in == 1 and n_out > 1
-    acc_dtype = jnp.bfloat16
+    acc_dtype = jnp.float32 if _R1_DENSE_FP32_ACC else jnp.bfloat16
     steps_k = in_block_size // block_size
     compute_tile_n = MXU_SIZE * n_lane_multiplier
     if out_block_size % compute_tile_n != 0:
@@ -292,9 +296,7 @@ def _blockwise_quantized_matmul_kernel(
             out_specs=pl.BlockSpec(
                 (batch_block_size, out_block_size), lambda b, o, i: (b, o)
             ),
-            scratch_shapes=[
-                pltpu.VMEM((batch_block_size, out_block_size), jnp.bfloat16)
-            ],
+            scratch_shapes=[pltpu.VMEM((batch_block_size, out_block_size), acc_dtype)],
             grid=(n_batch, n_out, n_in),
         ),
         out_shape=jax.ShapeDtypeStruct((padded_m, padded_n), x.dtype),

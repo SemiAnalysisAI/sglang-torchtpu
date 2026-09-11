@@ -32,5 +32,12 @@ export TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$MAX_RUNNING}
 export EXTRA_ARGS="--reasoning-parser deepseek-r1 --weight-loader-drop-cache-after-load${EXTRA_ARGS:+ $EXTRA_ARGS}"
 export ENABLE_PROFILER_ENDPOINT=${ENABLE_PROFILER_ENDPOINT:-0}
 
+# Temporary R1 experiment control; launch metadata records the resolved dtype.
+case "${SGLANG_R1_TEST_KV:-production}" in
+    production) ;;
+    bf16) export KV_CACHE_DTYPE=bfloat16 ;;
+    *) echo "Invalid SGLANG_R1_TEST_KV" >&2; exit 2 ;;
+esac
+
 cd "$(dirname "$0")/.."
 exec ./launch_server.sh "$@"

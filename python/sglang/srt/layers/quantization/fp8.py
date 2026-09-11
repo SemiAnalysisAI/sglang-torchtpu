@@ -140,7 +140,9 @@ _use_aiter_a8w4 = get_bool_env_var("AITER_FORCE_A8W4", "false")
 
 
 def _get_tpu_fp8_runtime() -> str:
-    return get_exec().kernel.tpu_fp8_runtime
+    from sglang.srt.hardware_backend.tpu.r1_quant_ablation import NATIVE_WEIGHTS
+
+    return "blockwise" if NATIVE_WEIGHTS else get_exec().kernel.tpu_fp8_runtime
 
 
 def _clear_replaced_param(module: Module, name: str) -> None:

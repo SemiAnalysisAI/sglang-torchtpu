@@ -57,6 +57,7 @@ import torch
 from torch_tpu._internal.pallas import jax_op
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.r1_quant_ablation import PRECISE_MATH
 
 logger = logging.getLogger(__name__)
 
@@ -696,7 +697,7 @@ def _fused_moe_jax(
     # TODO (Qinghan): check performance against scatter
     unsort_idx = jnp.argsort(argsort_idx)
     if use_sc_gather:
-        if not no_combine:
+        if not no_combine and not PRECISE_MATH:
             # Fused gather + weighted top-k sum.
             from sglang.srt.layers.moe.pallas.sparse_core.dense_gather_reduce import (
                 dense_gather_reduce,
@@ -752,6 +753,8 @@ def _fused_moe_jax(
             valid_rows_mask = topk_weights[:m_orig].reshape(m_orig, topk, 1) != 0
         return jnp.where(valid_rows_mask, unsorted, jnp.zeros_like(unsorted))
 
+    if PRECISE_MATH:
+        unsorted = unsorted.astype(jnp.float32)
     weights = topk_weights[:m_orig].reshape(m_orig, topk, 1).astype(unsorted.dtype)
     out = (unsorted * weights).sum(axis=1).astype(out_dtype)
     return out

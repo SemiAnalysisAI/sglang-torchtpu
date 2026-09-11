@@ -189,6 +189,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _is_tpu,
     _is_xpu,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
@@ -552,7 +553,14 @@ class MoEGate(nn.Module):
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             elif not _is_cuda:
-                logits = F.linear(hidden_states, self.weight, None)
+                from sglang.srt.hardware_backend.tpu.r1_quant_ablation import (
+                    PRECISE_MATH,
+                )
+
+                if _is_tpu and PRECISE_MATH:
+                    logits = F.linear(hidden_states.float(), self.weight.float(), None)
+                else:
+                    logits = F.linear(hidden_states, self.weight, None)
             else:
                 # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
                 from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32

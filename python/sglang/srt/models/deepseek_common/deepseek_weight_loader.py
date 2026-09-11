@@ -562,6 +562,8 @@ class DeepseekV2WeightLoaderMixin:
             else:
                 w = self_attn.kv_b_proj.weight
 
+            from sglang.srt.hardware_backend.tpu.r1_quant_ablation import MLA_BF16
+
             # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
             # This may affect the accuracy of fp8 model.
             # Fix deepseek v3 blockwise bmm by using deep_gemm
@@ -616,7 +618,7 @@ class DeepseekV2WeightLoaderMixin:
                         )
 
                     if (
-                        (_is_cuda or _is_musa or _is_xpu)
+                        (_is_cuda or _is_musa or _is_xpu or (_is_tpu and MLA_BF16))
                         and weight_block_size[0] == 128
                         and weight_block_size[1] == 128
                     ):
@@ -634,6 +636,8 @@ class DeepseekV2WeightLoaderMixin:
                                 weight_block_size,
                                 torch.bfloat16,
                             )
+                            if _is_tpu and MLA_BF16:
+                                self_attn.w_scale = None
                     else:
                         w, scale = block_quant_to_tensor_quant(
                             weight, weight_scale, weight_block_size

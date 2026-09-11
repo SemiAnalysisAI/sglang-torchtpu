@@ -5,6 +5,10 @@
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.r1_quant_ablation import (
+    PRECISE_MATH as _R1_DENSE_ACT128,
+)
+
 
 def _pad_rows_to_scaled_mm_alignment(x: torch.Tensor) -> tuple[torch.Tensor, int]:
     pad = (16 - (x.shape[0] % 16)) % 16
@@ -64,6 +68,22 @@ def apply_tpu_fp8_linear(
     out_shape = (*x.shape[:-1], weight.shape[1])
     x_2d = x.reshape(-1, x.shape[-1])
     num_tokens = x_2d.shape[0]
+    if _R1_DENSE_ACT128:
+        # Preserve the channelwise FP8 weight codes and scales, but reuse
+        # the native blockwise kernel to quantize activations in K=128 groups.
+        from sglang.srt.hardware_backend.tpu.quantized_matmul import (
+            blockwise_quantized_matmul,
+        )
+
+        k, n = weight.shape
+        assert k % 128 == 0
+        kernel_scale = (
+            weight_scale.reshape(1, 1, -1).expand(k // 128, 1, n).contiguous().float()
+        )
+        out = blockwise_quantized_matmul(
+            x, weight.t().contiguous(), kernel_scale
+        ).reshape(out_shape)
+        return out if bias is None else out + bias
     x_2d, pad = _pad_rows_to_scaled_mm_alignment(x_2d)
     x_q, x_scale = _quantize_activation_per_row(x_2d, weight.dtype)
 
@@ -110,12 +130,12 @@ def tpu_w8a8_block_fp8_linear(
         raise ValueError(
             f"Input hidden dim {input.shape[-1]} must match weight hidden dim {k}."
         )
-    if k % block_k != 0 or n % block_n != 0:
+    if k % block_k != 0:
         raise ValueError(
             "TPU block FP8 linear currently requires local weight dimensions to "
             f"be divisible by block_size={block_size}; got weight shape {tuple(weight.shape)}."
         )
-    expected_scale_shape = (n // block_n, k // block_k)
+    expected_scale_shape = ((n + block_n - 1) // block_n, k // block_k)
     if tuple(weight_scale.shape) != expected_scale_shape:
         raise ValueError(
             "TPU block FP8 weight_scale shape mismatch: "
@@ -138,7 +158,7 @@ def tpu_w8a8_block_fp8_linear(
     kernel_scale = (
         weight_scale.t()
         .contiguous()
-        .repeat_interleave(block_n, dim=1)
+        .repeat_interleave(block_n, dim=1)[:, :n]
         .unsqueeze(1)
         .to(torch.float32)
     )

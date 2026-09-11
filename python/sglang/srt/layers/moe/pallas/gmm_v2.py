@@ -30,6 +30,13 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang.srt.hardware_backend.tpu.r1_quant_ablation import (
+    ACTIVATION_BLOCK as _R1_ACT_BLOCK,
+)
+from sglang.srt.hardware_backend.tpu.r1_quant_ablation import (
+    PRECISE_MATH as _R1_FP32_ACC,
+)
+
 # Util.
 
 
@@ -576,6 +583,8 @@ def inner_kernel(
                 for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
                     end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
                     block_lhs = tiled_lhs[:, start_k:end_k]
+                    if _R1_FP32_ACC:
+                        block_lhs = block_lhs.astype(jnp.float32)
                     block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
 
                     # Perform lhs quantization. Note that for every block_lhs,
@@ -1366,7 +1375,7 @@ def make_gmm_configs(
             )
         maybe_quantize_lhs = False
 
-    lhs_quant_block_size = 512
+    lhs_quant_block_size = _R1_ACT_BLOCK
     if packed_fp4 and block_size != lhs_quant_block_size:
         raise NotImplementedError(
             "Packed FP4 GMM requires quantization block size 512, " f"got {block_size}."
@@ -1429,7 +1438,7 @@ def make_gmm_configs(
             # Input quantization requires elementwise ops which can put pressure on
             # VPUs. Using faster bf16 hardware during accumulation can help offset the
             # pressure.
-            acc_dtype = jnp.bfloat16.dtype
+            acc_dtype = jnp.float32.dtype if _R1_FP32_ACC else jnp.bfloat16.dtype
 
     if isinstance(tile_info, TileSizes):
         tiles = tile_info

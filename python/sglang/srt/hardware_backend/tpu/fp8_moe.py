@@ -16,6 +16,9 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.r1_quant_ablation import (
+    PRECISE_MATH as _R1_FP32_SCALES,
+)
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.utils import copy_or_rebind_param
@@ -51,7 +54,9 @@ def _replace_tpu_param_from_cpu(param: Parameter, new_cpu: torch.Tensor) -> None
 
 
 def _get_tpu_fp8_runtime() -> str:
-    return get_exec().kernel.tpu_fp8_runtime
+    from sglang.srt.hardware_backend.tpu.r1_quant_ablation import NATIVE_WEIGHTS
+
+    return "blockwise" if NATIVE_WEIGHTS else get_exec().kernel.tpu_fp8_runtime
 
 
 def _quantize_moe_weight_channelwise(
@@ -141,7 +146,7 @@ def _to_tpu_fp8_moe_scale_layout(
     """Convert per-expert FP8 MoE scales to gmm_v2's RHS scale layout."""
     # TODO(torch_tpu): gmm_v2 has historically stored TPU MoE scales in bf16.
     # Check fp32 scale storage/compute for accuracy before changing this layout.
-    scale = scale.to(torch.bfloat16)
+    scale = scale.to(torch.float32 if _R1_FP32_SCALES else torch.bfloat16)
     if scale.dim() == 1:
         scale = scale[:, None].expand(-1, out_size)
     elif scale.dim() == 2:
@@ -179,7 +184,7 @@ def _to_tpu_fp8_moe_block_scale_layout(
     scale_tile_stride = 128
     # TODO(torch_tpu): gmm_v2 has historically stored TPU MoE scales in bf16.
     # Check fp32 scale storage/compute for accuracy before changing this layout.
-    scale = scale.to(torch.bfloat16)
+    scale = scale.to(torch.float32 if _R1_FP32_SCALES else torch.bfloat16)
     if scale.dim() == 4:
         if scale.shape[2] != 1:
             raise ValueError(
@@ -340,7 +345,7 @@ def apply_tpu_fp8_moe(
 
     x = dispatch_output.hidden_states
     topk_weights, topk_ids, _ = dispatch_output.topk_output
-    topk_weights = topk_weights.to(x.dtype)
+    topk_weights = topk_weights.to(torch.float32 if _R1_FP32_SCALES else x.dtype)
     topk_ids = topk_ids.to(torch.int32)
     # Padded tokens might have expert index of -1, override the expert
     # selection to expert 0.
