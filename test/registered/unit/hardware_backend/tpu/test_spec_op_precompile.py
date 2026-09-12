@@ -7,6 +7,8 @@ from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
     SpecOpWarmupContext,
     make_dflash_verify_bookkeeping_args,
     make_draft_extend_select_args,
+    make_future_map_device_accept_args,
+    make_future_map_device_accept_hidden_args,
     make_verify_bookkeeping_args,
     make_verify_tree_greedy_args,
 )
@@ -25,6 +27,7 @@ def test_warmup_inputs_match_physical_helper_shapes():
         draft_vocab_size=5,
         hidden_size=6,
         hidden_dtype=torch.bfloat16,
+        req_pool_size=16,
     )
 
     verify_logits, candidates, retrieve_index = make_verify_tree_greedy_args(context)
@@ -50,6 +53,18 @@ def test_warmup_inputs_match_physical_helper_shapes():
     assert dflash_cands.shape == (4, 3)
     assert dflash_target_top1.shape == (4, 3)
     assert dflash_prefix_lens.shape == (4,)
+
+    accept_args = make_future_map_device_accept_args(context)
+    assert accept_args[0].shape == (4,)
+    assert accept_args[1].shape == accept_args[2].shape == (16, 1)
+    assert accept_args[3].shape == (16,)
+    assert accept_args[4].shape == (4, 5)
+    assert accept_args[-1] == 3
+
+    accept_hidden_args = make_future_map_device_accept_hidden_args(context)
+    assert accept_hidden_args[4].shape == (16, 6)
+    assert accept_hidden_args[5].shape == (4, 5)
+    assert accept_hidden_args[-1] == 3
 
 
 def test_dflash_verify_bookkeeping_torch_correctness():
