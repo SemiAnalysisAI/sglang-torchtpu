@@ -416,10 +416,10 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
                 lengths = inputs["kv_lens"].at[active:].set(0)
                 cu_q = jnp.minimum(jnp.arange(3), active).astype(jnp.int32) * 4
                 output, cache = ragged_paged_attention(
-                    inputs["q"],
-                    inputs["new_k"],
-                    inputs["new_v"],
-                    inputs["kv_fused"],
+                    inputs["q"].copy(),
+                    inputs["new_k"].copy(),
+                    inputs["new_v"].copy(),
+                    inputs["kv_fused"].copy(),
                     lengths,
                     inputs["page_indices_flat"],
                     cu_q,
