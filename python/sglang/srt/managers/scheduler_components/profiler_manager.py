@@ -215,10 +215,13 @@ class SchedulerProfilerManager:
         if "TPU" in activities:
             # TorchTPU xprof: capture TPU device activity (and host CPU only if
             # "CPU" was also requested).
-            if _is_tpu and self._is_global_primary_rank():
+            if _is_tpu:
                 from sglang.srt.hardware_backend.tpu.profiler import start_tpu_profile
 
-                subdir_parts = [self.profile_prefix or "profile"]
+                subdir_parts = [
+                    self.profile_prefix or "profile",
+                    f"TP-{self.ps.tp_rank}-DP-{self.ps.dp_rank}-PP-{self.ps.pp_rank}",
+                ]
                 if self.profile_id:
                     subdir_parts.append(str(self.profile_id))
                 if stage is not None:
