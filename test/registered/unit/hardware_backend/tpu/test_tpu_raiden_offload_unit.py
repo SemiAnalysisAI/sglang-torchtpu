@@ -1033,6 +1033,12 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr.attn_tp_rank = 0
         mgr.record_failure = Mock()
         mgr._local_blocks = {room: local}
+        mgr._local_swa_blocks = {}
+        mgr._remote_blocks = {}
+        mgr._remote_endpoint = {}
+        mgr._remote_swa_blocks = {}
+        mgr._remote_swa_endpoint = {}
+        mgr._decode_aux_index = {}
         mgr._remote_total = {room: 64}
         mgr._chunk_queue = {}
         mgr._chunk_reads = {}
@@ -1049,6 +1055,53 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._reshard_slot_of = {}
         mgr._reshard_slot_rooms = [None]
         return mgr
+
+    def test_announced_and_closing_frames_preserve_page_pairs_across_prefix_hits(self):
+        for prefix_pages in (0, 8, 24, 48):
+            for offer_before_pull in (False, True):
+                with self.subTest(prefix=prefix_pages, offer_first=offer_before_pull):
+                    room = 61
+                    # Raiden does not publish decode_prefix_len to the sender:
+                    # announcements span the prompt, but decode owns its suffix.
+                    remote = list(range(100, 164))
+                    local = list(range(200, 264 - prefix_pages))
+                    prefill = self._prefill()
+                    decode = self._decode(room, local, pool_pages=64)
+                    pull = self._pull_req(room, len(local))
+                    if not offer_before_pull:
+                        prefill._on_pull_req(pull)
+                    for start in range(0, len(remote) - 16, 16):
+                        prefill.offer_chunk(
+                            room, start, remote[start : start + 16], len(remote)
+                        )
+                    if offer_before_pull:
+                        prefill._on_pull_req(pull)
+                    for call in prefill._socket.send_multipart.call_args_list:
+                        self.assertGreaterEqual(
+                            Chunk.from_frames(call.args[0]).start, prefix_pages
+                        )
+                        decode._on_chunk(call.args[0])
+                    decode._on_blocks(
+                        Blocks(
+                            room, remote, prefill.raiden_endpoint, [], "", b""
+                        ).to_frames()
+                    )
+                    self.assertFalse(decode.is_recv_done(room))
+                    # Complete each native read explicitly; no sleeps or timing races.
+                    for _ in range(4):
+                        decode.maybe_start_pull(room)
+                        for req_id in decode._chunk_reads.get(room, []):
+                            decode._completed_recv.add(req_id)
+                        with decode._state_lock:
+                            decode._release_pull_slots_locked()
+                    pairs = [
+                        pair
+                        for call in decode._engine.start_read.call_args_list
+                        for pair in zip(call.args[3], call.args[4])
+                    ]
+                    self.assertEqual(pairs, list(zip(remote[prefix_pages:], local)))
+                    self.assertTrue(decode.is_recv_done(room))
+                    self.assertEqual(len(decode._pulling), 0)
 
     def test_closing_read_carries_the_sliding_window_pages(self):
         room = 35
