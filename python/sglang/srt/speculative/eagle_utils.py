@@ -652,14 +652,25 @@ def verify_bookkeeping_func(seq_lens, accept_lens, predict, accept_index):
 def fused_draft_extend_select_argmax_func(
     next_token_logits: torch.Tensor,
     hidden_states: Optional[torch.Tensor],
-    select_index: torch.Tensor,
+    num_accept_tokens: torch.Tensor,
+    num_tokens_per_req: int,
 ):
-    """Select draft-extend rows and compute their greedy next-draft tokens."""
+    """Build next-draft state without materializing selectors or selected logits."""
+    row_starts = (
+        torch.arange(
+            num_accept_tokens.shape[0],
+            dtype=torch.int64,
+            device=num_accept_tokens.device,
+        )
+        * num_tokens_per_req
+    )
+    # Zero-count compile-padding rows select their own first window row.
+    select_index = row_starts + num_accept_tokens.to(torch.int64).clamp_min(1) - 1
     selected_logits = next_token_logits[select_index]
     selected_hidden = hidden_states[select_index] if hidden_states is not None else None
     topk_index = torch.argmax(selected_logits, dim=-1, keepdim=True)
     topk_p = torch.ones_like(topk_index, dtype=torch.float32)
-    return selected_logits, selected_hidden, topk_p, topk_index
+    return selected_hidden, topk_p, topk_index
 
 
 def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
