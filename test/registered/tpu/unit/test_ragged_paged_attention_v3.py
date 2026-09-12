@@ -398,6 +398,73 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         inputs = self._build_inputs([(19, 3), (37, 5)], noncontiguous_pages=True)
         self._run_and_compare(inputs, distribution=(0, 2, 2), chunk_prefill_size=4)
 
+    def test_static_verification_active_count_transitions(self):
+        """A padded bucket may become idle and active without stale cache writes."""
+        import jax.numpy as jnp
+
+        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+            ragged_paged_attention,
+            ref_ragged_paged_attention,
+        )
+
+        # Keep all operand shapes fixed while the active prefix changes.
+        for active in (2, 0, 1, 2):
+            with self.subTest(active=active):
+                inputs = self._build_inputs(
+                    [(19, 4), (36, 4)], noncontiguous_pages=True
+                )
+                lengths = inputs["kv_lens"].at[active:].set(0)
+                cu_q = jnp.minimum(jnp.arange(3), active).astype(jnp.int32) * 4
+                output, cache = ragged_paged_attention(
+                    inputs["q"],
+                    inputs["new_k"],
+                    inputs["new_v"],
+                    inputs["kv_fused"],
+                    lengths,
+                    inputs["page_indices_flat"],
+                    cu_q,
+                    inputs["cu_kv_lens"],
+                    jnp.array([0, active, active], jnp.int32),
+                    None,
+                    None,
+                    sm_scale=1.0 / np.sqrt(self.HEAD_DIM),
+                    chunk_prefill_size=4,
+                )
+                if active:
+                    reference = ref_ragged_paged_attention(
+                        inputs["q"][: active * 4],
+                        inputs["ref_kpages"],
+                        inputs["ref_vpages"],
+                        lengths[:active],
+                        inputs["ref_page_indices"][:active],
+                        cu_q[: active + 1],
+                        jnp.array([active], jnp.int32),
+                        sm_scale=1.0 / np.sqrt(self.HEAD_DIM),
+                    )
+                    np.testing.assert_allclose(
+                        np.asarray(output[: active * 4]).astype(np.float32),
+                        np.asarray(reference).astype(np.float32),
+                        atol=self.TOLERANCE,
+                        rtol=0,
+                    )
+                # Inactive metadata deliberately retains real page addresses.
+                # An erroneous static grid must not write those cache pages.
+                live_pages = set(
+                    np.asarray(inputs["ref_page_indices"][:active]).ravel()
+                )
+                untouched = sorted(set(range(self.TOTAL_NUM_PAGES)) - live_pages)
+                np.testing.assert_array_equal(
+                    np.asarray(cache)[untouched],
+                    np.asarray(inputs["kv_fused"])[untouched],
+                )
+
+    def test_static_verification_mixed_distribution(self):
+        """A fixed-width middle segment must preserve decode and ragged tails."""
+        inputs = self._build_inputs(
+            [(17, 1), (35, 4), (54, 7)], noncontiguous_pages=True
+        )
+        self._run_and_compare(inputs, distribution=(1, 2, 3), chunk_prefill_size=4)
+
     def test_static_verification_features_and_causality(self):
         """Static scheduling preserves masks, live cache, and inactive rows."""
         import jax.numpy as jnp
