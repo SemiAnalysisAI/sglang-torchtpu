@@ -385,6 +385,8 @@ def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module) -> None:
         layer.w2_weight_scale.data,
         layer.w2_weight_bias.data,
         w13_interleaved=w13_interleaved,
+        # 2944 = 23 * 128 forces narrow N tiles; 3072 admits wider divisors.
+        align_to=256 if layer.w13_weight.shape[1] // 2 == 2880 else 128,
     )
     layer.w13_weight = Parameter(w13, requires_grad=False)
     layer.w13_weight_scale = None
