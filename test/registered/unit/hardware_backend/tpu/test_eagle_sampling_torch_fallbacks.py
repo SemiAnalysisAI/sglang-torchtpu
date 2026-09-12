@@ -532,15 +532,14 @@ class TestDraftExtendSelectFused(unittest.TestCase):
                 torch.arange(0, bs * ndt, ndt, dtype=torch.int32) + accept_lens - 1
             ).long()
 
-            sel_l, sel_h, tp, ti = fused_draft_extend_select_argmax_func(
-                logits, hidden, select_index
+            sel_h, tp, ti = fused_draft_extend_select_argmax_func(
+                logits, hidden, accept_lens, ndt
             )
 
             want_l = logits[select_index]
             want_h = hidden[select_index]
             want_ti = torch.argmax(want_l, dim=-1, keepdim=True)
             with self.subTest(bs=bs, ndt=ndt):
-                self.assertTrue(torch.equal(sel_l, want_l))
                 self.assertTrue(torch.equal(sel_h, want_h))
                 self.assertTrue(torch.equal(ti, want_ti))
                 self.assertTrue(torch.all(tp == 1.0))
@@ -552,11 +551,31 @@ class TestDraftExtendSelectFused(unittest.TestCase):
         )
 
         logits = torch.randn(8, 16)
-        sel_l, sel_h, _, _ = fused_draft_extend_select_argmax_func(
-            logits, None, torch.tensor([1, 5])
+        sel_h, tp, ti = fused_draft_extend_select_argmax_func(
+            logits, None, torch.tensor([2, 2], dtype=torch.int32), 4
         )
         self.assertIsNone(sel_h)
-        self.assertEqual(sel_l.shape, (2, 16))
+        self.assertTrue(torch.equal(ti, logits[[1, 5]].argmax(-1, keepdim=True)))
+
+    def test_fused_finalize_preserves_padding_rows_and_argmax_ties(self):
+        from sglang.srt.speculative.eagle_utils import (
+            fused_draft_extend_select_argmax_func,
+        )
+
+        # Mixed acceptance selects rows 1, 7 and 8; padded row 8 must not
+        # alias the preceding request's final row 7. Equal maxima choose first.
+        logits = torch.zeros(12, 7)
+        logits[1, 2:4] = 5
+        logits[7, 4] = 6
+        logits[8, 1] = 7
+        hidden = torch.arange(36, dtype=torch.bfloat16).reshape(12, 3)
+        selected_hidden, probs, tokens = fused_draft_extend_select_argmax_func(
+            logits, hidden, torch.tensor([2, 4, 0], dtype=torch.int32), 4
+        )
+        self.assertTrue(torch.equal(tokens, torch.tensor([[2], [4], [1]])))
+        self.assertTrue(torch.equal(selected_hidden, hidden[[1, 7, 8]]))
+        self.assertEqual(probs.dtype, torch.float32)
+        self.assertEqual(tokens.dtype, torch.int64)
 
     def test_draft_extend_input_builds_a_safe_bucketed_selector(self):
         from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
