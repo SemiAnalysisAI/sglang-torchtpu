@@ -31,6 +31,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     logs_expert_balancedness_to_server_log,
 )
+from sglang.srt.utils.async_stats_logger import AsyncStatsLogger
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -135,6 +136,8 @@ class SchedulerMetricsReporter:
         self.is_stats_logging_rank = (
             self.metrics_collector_context.is_stats_logging_rank
         )
+        if self.is_stats_logging_rank:
+            self.stats_logger = AsyncStatsLogger(logger)
         self.current_scheduler_metrics_enabled = (
             self.metrics_collector_context.current_scheduler_metrics_enabled
         )
@@ -658,7 +661,7 @@ class SchedulerMetricsReporter:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
 
         if self.is_stats_logging_rank:
-            logger.info(msg)
+            self.stats_logger.info(msg)
         if self.current_scheduler_metrics_enabled:
             self.metrics_collector.increment_prefill_cuda_graph_pass(
                 value=can_run_cuda_graph
@@ -920,7 +923,7 @@ class SchedulerMetricsReporter:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
 
         if self.is_stats_logging_rank:
-            logger.info(msg)
+            self.stats_logger.info(msg)
         if self.current_scheduler_metrics_enabled:
             priority_enabled = self.scheduler.enable_priority_scheduling
 
