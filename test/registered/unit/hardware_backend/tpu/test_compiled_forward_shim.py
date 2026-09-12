@@ -757,6 +757,21 @@ class TestBuildBucketers(CustomTestCase):
         # Only what production still reads off the handed record.
         return SimpleNamespace(tpu_compile_tokens=tpu_compile_tokens)
 
+    def test_clipping_a_covering_token_ladder_preserves_scheduler_capacity(self):
+        # Both ladders cover 256: the dropped 512 bucket is a live pad target.
+        # Clipping must preserve a padding target at the scheduler limit.
+        for buckets in ([512], [128, 512]):
+            with self.subTest(buckets=buckets):
+                args = self._server_args(tpu_compile_tokens=buckets)
+                with get_context().override_server_args(tpu_compile_bs=[1, 4]):
+                    token_buckets, batch_buckets = build_bucketers(
+                        args, max_t=256, max_b=4
+                    )
+                self.assertEqual(token_buckets.buckets, buckets[:-1] + [256])
+                fb = _forward_batch(real_t=256, real_b=1)
+                _pad_forward_batch_inputs(fb, token_buckets, batch_buckets)
+                self.assertGreaterEqual(fb.input_ids.shape[0], 256)
+
     def test_uses_user_buckets_as_plain_bucketer(self):
         # User list yields a plain Bucketer (not the PowerBucketer fallback).
         sa = self._server_args(tpu_compile_tokens=[64, 512, 2048])
@@ -776,9 +791,7 @@ class TestBuildBucketers(CustomTestCase):
         self.assertEqual(b_b.buckets, [1, 2])
 
     def test_token_buckets_above_max_t_dropped(self):
-        # Token buckets feed only the EXTEND path, which never exceeds max_t
-        # (chunked-prefill / context cap), so buckets above it are dropped --
-        # they would compile dead shapes serving can't reach.
+        # A terminal bucket already at max_t is retained without duplication.
         sa = self._server_args(tpu_compile_tokens=[64, 512, 2048, 4096])
         t_b, _ = build_bucketers(sa, max_t=2048, max_b=8)
         self.assertEqual(t_b.buckets, [64, 512, 2048])  # 4096 dropped

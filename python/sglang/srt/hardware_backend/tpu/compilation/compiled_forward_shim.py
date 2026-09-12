@@ -858,17 +858,16 @@ def build_bucketers(
     """Build token and batch size bucketers."""
     token_paddings = server_args.tpu_compile_tokens
     if token_paddings:
-        # Token buckets are consumed only by the EXTEND path, and extend never
-        # runs longer than max_t (= min(chunked_prefill_size, max_prefill_tokens,
-        # context_len)). Drop any user buckets above it -- they'd compile dead
-        # shapes that serving can never reach.
+        # Replace buckets above the extend limit with the limit itself so a
+        # covering list still has a padding target for every reachable batch.
         capped = [t for t in token_paddings if t <= max_t]
         dropped = [t for t in token_paddings if t > max_t]
         if dropped:
+            if max_t not in capped:
+                capped.append(max_t)
             logger.warning(
-                "[compiled forward shim] Dropping --tpu-compile-tokens %s above the "
-                "max extend length %d; extend is capped there (chunked prefill / "
-                "context), so those buckets would never be used.",
+                "[compiled forward shim] Capping --tpu-compile-tokens %s at the "
+                "max extend length %d to preserve token coverage.",
                 dropped,
                 max_t,
             )
