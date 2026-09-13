@@ -17,6 +17,23 @@ class VerifyContinuation(msgspec.Struct, frozen=True):
     bonus_tokens: torch.Tensor
 
 
+class PaddedResultCopy(msgspec.Struct, frozen=True):
+    logical_batch_size: int
+    tokens_per_request: int
+    predict: torch.Tensor
+    accept_lens: torch.Tensor
+
+    def copy_to_cpu(self, copy_tensor):
+        # Copy producer tensors directly; materializing a TPU slice here can
+        # block submission behind the already queued draft extension.
+        predict = copy_tensor(self.predict)
+        accept_lens = copy_tensor(self.accept_lens)
+        return (
+            predict[: self.logical_batch_size * self.tokens_per_request],
+            accept_lens[: self.logical_batch_size],
+        )
+
+
 @compiled_op(warmup=make_extend_continuation_args)
 def prepare_extend_continuation_tpu(
     predict, accept_lens, seq_lens, width, hidden_states

@@ -47,6 +47,7 @@ if _is_tpu:
         prepare_draft_cache_locs_tpu,
     )
     from sglang.srt.hardware_backend.tpu.padded_spec_state import (
+        PaddedResultCopy,
         VerifyContinuation,
         can_continue_padded_spec_tpu,
         install_verify_continuation_tpu,
@@ -741,6 +742,16 @@ def run_eagle_verify(
     return GenerationBatchResult(
         logits_output=logits_output,
         next_token_ids=predict,
+        tpu_padded_result=(
+            PaddedResultCopy(
+                logical_batch_size=tpu_verify_continuation.logical_batch_size,
+                tokens_per_request=num_draft_tokens,
+                predict=tpu_verify_continuation.predict,
+                accept_lens=tpu_verify_continuation.accept_lens,
+            )
+            if tpu_verify_continuation is not None
+            else None
+        ),
         can_run_cuda_graph=can_run_cuda_graph,
         speculative_num_draft_tokens=num_draft_tokens,
         next_draft_input=next_draft_input,

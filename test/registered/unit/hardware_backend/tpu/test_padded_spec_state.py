@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.hardware_backend.tpu.padded_spec_state import (
+    PaddedResultCopy,
     VerifyContinuation,
     install_verify_continuation_tpu,
     prepare_extend_continuation_tpu,
@@ -18,6 +19,57 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestPaddedSpecState(CustomTestCase):
+    def test_result_copy_slices_host_storage_after_completion(self):
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang.srt.managers.utils import GenerationBatchResult
+
+        for logical_bs, physical_bs in ((3, 4), (12, 16), (24, 32)):
+            with self.subTest(logical_bs=logical_bs):
+                tokens = torch.arange(physical_bs * 4, dtype=torch.int32)
+                counts = torch.arange(physical_bs, dtype=torch.int32) % 4 + 1
+                transfers = []
+
+                def copy_tensor(source):
+                    # A pending D2H destination must only be viewed, not read or
+                    # cloned, before the existing completion event is waited.
+                    host = torch.full_like(source, -1)
+                    transfers.append((source, host))
+                    return host
+
+                class Completion:
+                    recorded = False
+
+                    def record(self):
+                        self.recorded = True
+
+                    def synchronize(self):
+                        assert self.recorded
+                        for source, host in transfers:
+                            host.copy_(source)
+
+                result = GenerationBatchResult(
+                    logits_output=LogitsProcessorOutput(next_token_logits=None),
+                    next_token_ids=tokens[: logical_bs * 4],
+                    accept_lens=counts[:logical_bs],
+                    copy_done=Completion(),
+                    tpu_padded_result=PaddedResultCopy(logical_bs, 4, tokens, counts),
+                )
+                with patch(
+                    "sglang.srt.managers.utils._async_d2h", side_effect=copy_tensor
+                ):
+                    result.copy_to_cpu(return_logprob=False, return_hidden_states=False)
+                self.assertEqual(len(transfers), 2)
+                self.assertIs(transfers[0][0], tokens)
+                self.assertIs(transfers[1][0], counts)
+                self.assertIsNone(result.tpu_padded_result)
+                result.copy_done.synchronize()
+                torch.testing.assert_close(
+                    result.next_token_ids, tokens[: logical_bs * 4]
+                )
+                torch.testing.assert_close(result.accept_lens, counts[:logical_bs])
+                self.assertEqual(result.next_token_ids.shape, (logical_bs * 4,))
+                self.assertEqual(result.accept_lens.shape, (logical_bs,))
+
     def test_tpu_equal_size_padding_preserves_owned_storage(self):
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
