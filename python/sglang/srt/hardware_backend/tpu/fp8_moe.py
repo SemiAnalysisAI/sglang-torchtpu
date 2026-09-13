@@ -391,6 +391,11 @@ def apply_tpu_fp8_moe(
     # scales and torch._scaled_grouped_mm_v2 for block scales once torch_tpu
     # registers those ops. Until then, keep MoE on the same backend-dispatched
     # fused grouped-GEMM model used by upstream CUDA paths and torchtpu-vllm.
+    swiglu_limit = getattr(layer.moe_runner_config, "swiglu_limit", None)
+    if swiglu_limit is not None:
+        if activation != "silu":
+            raise ValueError("TPU clamped MoE requires silu activation")
+        activation = f"silu_clamped:{float(swiglu_limit)}"
     output = fused_moe_call(
         hidden_states=x,
         w1=layer.w13_weight,

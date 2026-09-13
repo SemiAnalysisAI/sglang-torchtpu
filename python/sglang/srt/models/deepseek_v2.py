@@ -176,6 +176,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _is_tpu,
     _is_xpu,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
@@ -442,6 +443,13 @@ class DeepseekV2MLP(nn.Module):
                     bias=0,
                     interleaved=False,
                 )
+            elif _is_tpu:
+                _g, _u = gate_up.chunk(2, dim=-1)
+                _lim = float(self.swiglu_limit)
+                gate_up = torch.cat(
+                    [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
+                )
+                x = self.act_fn(gate_up)
             else:
                 M, N = gate_up.shape
                 x = gate_up.new_empty((M, N // 2))
@@ -463,14 +471,15 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_deepseek_v4 = is_deepseek_v4
+        self.router_dtype = (
+            torch.float32
+            if getattr(config, "router_fp32", False)
+            or (_is_tpu and getattr(config, "moe_router_dtype", None) == "float32")
+            else torch.get_default_dtype()
+        )
         self.weight = nn.Parameter(
             torch.empty(
-                (config.n_routed_experts, config.hidden_size),
-                dtype=(
-                    torch.float32
-                    if getattr(config, "router_fp32", False)
-                    else torch.get_default_dtype()
-                ),
+                (config.n_routed_experts, config.hidden_size), dtype=self.router_dtype
             )
         )
         if config.topk_method == "noaux_tc" and not is_hash_moe:

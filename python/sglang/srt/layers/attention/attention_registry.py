@@ -23,7 +23,7 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
-from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
+from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu, is_tpu
 
 _is_musa = is_musa()
 _is_npu = is_npu()
@@ -393,7 +393,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.utils import (
             is_blackwell,
             is_npu,
-            is_tpu,
             is_xpu,
         )
 
@@ -525,7 +524,13 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             else:
                 linear_attn_backend = KDAAttnBackend(runner)
         elif glm5_next_config(runner.model_config) is not None:
-            linear_attn_backend = KDAAttnBackend(runner)
+            if is_tpu():
+                backend_cls = import_backend_class(
+                    "sglang.srt.hardware_backend.tpu.attention_kda.TpuKDAAttnBackend"
+                )
+                linear_attn_backend = backend_cls(runner)
+            else:
+                linear_attn_backend = KDAAttnBackend(runner)
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:
