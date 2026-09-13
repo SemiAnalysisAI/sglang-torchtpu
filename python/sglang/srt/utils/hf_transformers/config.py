@@ -198,6 +198,17 @@ class HfModelConfigParser(ModelConfigParserBase):
         if config.model_type == "longcat_flash":
             _set_architectures(config, "LongcatFlashForCausalLM")
 
+        if config.model_type == "glm_moe_dsa":
+            # Transformers aliases head_dim to qk_rope_head_dim. GLM-5.3
+            # checkpoints also store a generic head_dim (the NoPE width),
+            # which can overwrite the explicit rotary width during parsing.
+            raw_config, _ = PretrainedConfig.get_config_dict(
+                model, revision=revision, **kwargs
+            )
+            if "qk_rope_head_dim" in raw_config:
+                config.qk_rope_head_dim = raw_config["qk_rope_head_dim"]
+                config.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+
         return config
 
 

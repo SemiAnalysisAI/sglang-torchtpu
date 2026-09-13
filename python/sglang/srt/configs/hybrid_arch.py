@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
+    Glm5NextTextConfig,
     GraniteMoeHybridConfig,
     InklingMMConfig,
     InklingModelConfig,
@@ -108,7 +109,7 @@ def kimi_linear_config(model_config: ModelConfig):
     if isinstance(config, BailingHybridConfig) and config.use_kda:
         return config
     text_config = getattr(config, "text_config", None)
-    if isinstance(text_config, KimiLinearConfig):
+    if isinstance(text_config, (KimiLinearConfig, Glm5NextTextConfig)):
         return text_config
     return None
 

@@ -22,7 +22,7 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
-from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
+from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu, is_tpu
 
 _is_musa = is_musa()
 _is_npu = is_npu()
@@ -397,7 +397,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.utils import (
             is_blackwell,
             is_npu,
-            is_tpu,
             is_xpu,
         )
 
@@ -507,7 +506,12 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             else:
                 linear_attn_backend = Mamba2AttnBackend(runner)
         elif kimi_linear_config(runner.model_config) is not None:
-            if _is_npu:
+            if is_tpu():
+                backend_cls = import_backend_class(
+                    "sglang.srt.hardware_backend.tpu.attention_kda.TpuKDAAttnBackend"
+                )
+                linear_attn_backend = backend_cls(runner)
+            elif _is_npu:
                 from sglang.srt.hardware_backend.npu.attention.ascend_kda_backend import (
                     AscendKDAAttnBackend,
                     AscendKDAHybridLinearAttnBackend,

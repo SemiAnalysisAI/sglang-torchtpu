@@ -189,6 +189,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _is_tpu,
     _is_xpu,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
@@ -448,7 +449,7 @@ class DeepseekV2MLP(nn.Module):
 
         # Fallback: fused silu+clamp kernel (still faster than unfused)
         elif self.swiglu_limit is not None:
-            if _is_npu:
+            if _is_npu or _is_tpu:
                 _g, _u = gate_up.chunk(2, dim=-1)
                 _lim = float(self.swiglu_limit)
                 gate_up = torch.cat(
@@ -480,8 +481,15 @@ class MoEGate(nn.Module):
         super().__init__()
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
+        self.router_dtype = (
+            torch.float32
+            if _is_tpu and getattr(config, "moe_router_dtype", None) == "float32"
+            else torch.get_default_dtype()
+        )
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size), dtype=self.router_dtype
+            )
         )
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
@@ -513,6 +521,8 @@ class MoEGate(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         forward_batch: ForwardBatch = None,
     ):
+        if _is_tpu and self.router_dtype == torch.float32:
+            return F.linear(hidden_states.float(), self.weight, None)
         if use_intel_amx_backend(self):
             return torch.ops.sgl_kernel.weight_packed_linear(
                 hidden_states,

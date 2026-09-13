@@ -279,11 +279,11 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
     is irrelevant here (state is always updated).
     """
 
-    def __init__(self, model_runner: "ModelRunner"):
+    def __init__(self, model_runner: "ModelRunner", *, op_builder=None):
         super().__init__(model_runner)
         # Build (and JAX-export) the custom op eagerly at construction time so
         # the heavyweight export does not happen inside a torch.compile trace.
-        self._op = build_gdn_pallas_op()
+        self._op = (op_builder or build_gdn_pallas_op)()
         # Per-forward GDN metadata (int32, TPU-native), computed once in
         # init_forward_metadata and read by every GDN layer's forward — not
         # carried by the shared ForwardMetadata dataclass.

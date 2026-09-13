@@ -29,7 +29,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
+from sglang.srt.utils import is_tpu
 from sglang.srt.utils.custom_op import register_custom_op
+
+_is_tpu = is_tpu()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -84,6 +87,16 @@ class RadixLinearAttention(nn.Module):
         a: torch.Tensor,
         b: torch.Tensor,
     ) -> torch.Tensor:
+        if _is_tpu:
+            # TPU kernels mask padding from query_start_loc/state indices.
+            # Preserve the static bucket without host trimming or pointer tests.
+            return get_attn_backend().forward(
+                layer=self,
+                forward_batch=forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+            )
         is_extend = forward_batch.forward_mode.is_extend()
         if is_extend and get_tc_piecewise_forward_context() is not None:
             # Output shape from linear attention: (1, seq_len, num_v_heads, head_v_dim)

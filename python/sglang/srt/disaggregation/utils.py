@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs.model_config import get_dsa_index_topk
+from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
@@ -69,6 +69,10 @@ def poll_and_all_reduce_pp(
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
     """Return the model-defined PD seed width, independent of local spec mode."""
+    # A checkpoint may retain indexer settings while using a dense attention
+    # path (e.g. the bounded-context GLM TPU recipes), which produces no seeds.
+    if not is_deepseek_dsa(hf_config):
+        return 0
     if not getattr(hf_config, "index_share_for_mtp_iteration", False):
         return 0
     return get_dsa_index_topk(hf_config)

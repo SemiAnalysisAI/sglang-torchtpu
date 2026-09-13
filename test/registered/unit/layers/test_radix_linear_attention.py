@@ -1,5 +1,6 @@
 """CPU regression coverage for padded linear-attention inputs and outputs."""
 
+import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -66,6 +67,33 @@ class _PhysicalAttentionBackend:
 
 
 class TestRadixLinearAttentionPadding(CustomTestCase):
+    def test_tpu_extend_keeps_physical_rows_for_kernel_padding_mask(self):
+        layer = radix_linear_attention.RadixLinearAttention(
+            layer_id=0,
+            num_q_heads=1,
+            num_k_heads=1,
+            num_v_heads=2,
+            head_q_dim=4,
+            head_k_dim=4,
+            head_v_dim=4,
+        )
+        cache_loc = torch.arange(5)
+        batch = SimpleNamespace(
+            forward_mode=_ExtendMode(),
+            num_token_non_padded_cpu=3,
+            out_cache_loc=cache_loc,
+        )
+        with patch.object(radix_linear_attention, "_is_tpu", True), patch.object(
+            radix_linear_attention,
+            "get_attn_backend",
+            return_value=_PhysicalAttentionBackend(),
+        ):
+            output = layer(
+                batch, torch.zeros(5, 8), torch.zeros(5, 2), torch.zeros(5, 2)
+            )
+        torch.testing.assert_close(output, torch.full((1, 5, 2, 4), 9.0))
+        self.assertIs(batch.out_cache_loc, cache_loc)
+
     def test_eager_padded_input_is_sliced_and_output_shape_is_restored(self):
         layer = radix_linear_attention.RadixLinearAttention(
             layer_id=0,
@@ -227,6 +255,4 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-
     unittest.main()

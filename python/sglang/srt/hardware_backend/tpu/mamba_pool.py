@@ -33,7 +33,7 @@ from typing import List, Optional
 import msgspec
 import torch
 
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+from sglang.srt.configs.mamba_utils import BaseLinearStateParams, KimiLinearStateShape
 from sglang.srt.mem_cache.memory_pool import MambaPool, get_tensor_size_bytes
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -113,6 +113,10 @@ class TpuMambaPool(MambaPool):
             )
 
         conv_state_shapes = cache_params.shape.conv  # list of (conv_dim, K-1)
+        if isinstance(cache_params.shape, KimiLinearStateShape):
+            conv_state_shapes = [
+                (channels, width) for width, channels in conv_state_shapes
+            ]
         # temporal (GPU layout): (num_v_heads, head_dim=d_v, state_size=d_k)
         n_v, d_v, d_k = cache_params.shape.temporal
 
