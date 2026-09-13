@@ -161,7 +161,14 @@ sglang = "sglang.cli.main:main"
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",
-  "jit_kernel/**/*"
+  "kernels/**/*",
+  "multimodal_gen/apps/realtime_webui/**/*"
+]
+
+[tool.setuptools.exclude-package-data]
+"sglang" = [
+  "kernels/aot/*",
+  "kernels/aot/**/*",
 ]
 
 [tool.setuptools.packages.find]
@@ -172,6 +179,7 @@ exclude = [
   "dist*",
   "playground*",
   "scripts*",
+  "sglang.kernels.aot*",
   "tests*",
 ]
 
