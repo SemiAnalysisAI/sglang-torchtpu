@@ -299,3 +299,6 @@ internal-docs/
 /bazel-*
 /MODULE.bazel.lock
 /user.bazelrc
+
+# Candidate wheel override files
+wheel_override/*.whl
