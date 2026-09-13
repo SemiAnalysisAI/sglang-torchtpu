@@ -519,11 +519,12 @@ class TestInstallExtendCap(_PolicyTestCase):
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
         )
-        # install() takes the compile grid from the bags; prefill_max_requests stays on the instance.
+        # install() reads the compile grid and prefill cap from the published config.
         self.publish_config(
             chunked_prefill_size=None,
             max_prefill_tokens=2048,
             torch_compile_max_bs=64,
+            prefill_max_requests=prefill_max_requests,
         )
         model_runner = SimpleNamespace(
             model=model,

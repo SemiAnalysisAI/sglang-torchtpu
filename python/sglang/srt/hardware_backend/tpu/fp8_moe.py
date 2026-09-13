@@ -77,50 +77,66 @@ def _quantize_moe_weight_channelwise(
     return weight_q, weight_scale.squeeze(-1)
 
 
+_REQUANT_CHUNK_BYTES = 1 << 30
+
+
 def _requantize_tpu_fp8_moe_block_to_channelwise(
     layer: torch.nn.Module,
     block_size: list[int] | tuple[int, int],
+    *,
+    transpose: bool = False,
 ) -> None:
-    # Convert block-FP8 MoE weights to channelwise-FP8 one expert-chunk at a
-    # time, overwriting the weight in place. Chunking (with a drain between
-    # chunks) keeps the float32 dequant transient small -- the whole [E, N, K]
-    # stack is ~2GB at tp8/ep8 and OOMs the thin post-load HBM headroom. It's
-    # exact because the channelwise scale is per-(expert, out-channel), so each
-    # expert converts independently of the rest.
-    #
-    # Size the per-chunk scratch to a fraction of free HBM: headroom-rich setups
-    # get bigger chunks (fewer syncs -> faster load), tight ones stay small.
-    # Clamp to [256 MiB, 2 GiB] -- below 256 MiB the per-chunk sync overhead
-    # dominates; above 2 GiB risks the thin post-load headroom.
+    """Convert a few experts at a time and concatenate their runtime weights."""
     free_bytes = current_platform.get_available_memory()[0]
-    target_transient_bytes = int(min(2 * 1024**3, max(256 * 1024**2, free_bytes // 4)))
+    target_transient_bytes = int(
+        min(_REQUANT_CHUNK_BYTES, max(256 << 20, free_bytes // 4))
+    )
     for w_name, scale_inv_name in (
         ("w13_weight", "w13_weight_scale_inv"),
         ("w2_weight", "w2_weight_scale_inv"),
     ):
         w_param = getattr(layer, w_name)
         scale_inv = getattr(layer, scale_inv_name).data
-        fp8_dtype = w_param.data.dtype  # capture FP8 target before any dequant
+        fp8_dtype = w_param.dtype
         num_experts, n, k = w_param.shape
         chunk = max(1, target_transient_bytes // max(1, n * k * 4))
-        scales = []
+        weights, scales = [], []
         for c0 in range(0, num_experts, chunk):
             c1 = min(c0 + chunk, num_experts)
-            # Dequant only this expert-chunk's blocks (its K axis is complete,
-            # so its channelwise amax is exact); the rest stay FP8 on device.
             w_chunk = block_quant_dequant(
                 w_param.data[c0:c1], scale_inv[c0:c1], block_size, torch.float32
             )
             q_chunk, s_chunk = _quantize_moe_weight_channelwise(w_chunk, fp8_dtype)
             del w_chunk
-            w_param.data[c0:c1].copy_(q_chunk)
-            del q_chunk
+            if transpose:
+                q_chunk = q_chunk.transpose(1, 2).contiguous()
+            weights.append(q_chunk)
             scales.append(s_chunk)
-            # Drain so this chunk's float32 transient frees before the next.
-            torch.tpu.synchronize()
+            if q_chunk.device.type == "tpu":
+                from torch_tpu._internal.sync.sync import synchronize
+
+                synchronize([q_chunk, s_chunk], wait=True)
+        w_param.data = torch.cat(weights, dim=0) if len(weights) > 1 else weights[0]
         copy_or_rebind_param(layer, f"{w_name}_scale", torch.cat(scales, dim=0))
         _clear_replaced_param(layer, scale_inv_name)
     layer.weight_block_size = None
+
+
+_TRANSPOSE_CHUNK_ELEMENTS = 1 << 28
+
+
+def _transpose_expert_chunks(weight: torch.Tensor) -> torch.Tensor:
+    """Transpose each expert's matrix with bounded device intermediates."""
+    step = max(1, _TRANSPOSE_CHUNK_ELEMENTS // max(1, weight[0].numel()))
+    chunks = []
+    for start in range(0, weight.shape[0], step):
+        chunk = weight[start : start + step].transpose(1, 2).contiguous()
+        if weight.device.type == "tpu":
+            from torch_tpu._internal.sync.sync import synchronize
+
+            synchronize([chunk], wait=True)
+        chunks.append(chunk)
+    return torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
 
 
 def _own_storage(t: torch.Tensor) -> torch.Tensor:
@@ -271,6 +287,7 @@ def prepare_tpu_fp8_moe_weights(
     if block_quant and weight_block_size is None:
         raise ValueError("TPU block-FP8 MoE requires weight_block_size.")
 
+    transposed = False
     if block_quant and _get_tpu_fp8_runtime() == "channelwise":
         print_warning_once(
             "TPU FP8 MoE is converting block-FP8 checkpoint weights to "
@@ -278,14 +295,18 @@ def prepare_tpu_fp8_moe_weights(
             "--tpu-fp8-runtime=channelwise to make this explicit, or "
             "--tpu-fp8-runtime=blockwise to preserve blockwise runtime scales."
         )
-        _requantize_tpu_fp8_moe_block_to_channelwise(layer, weight_block_size)
+        _requantize_tpu_fp8_moe_block_to_channelwise(
+            layer, weight_block_size, transpose=True
+        )
+        transposed = True
         block_quant = False
 
     # gmm_v2 consumes RHS weights as [expert, K, N]. SGLang loads MoE weights
     # as [expert, N, K], so make the TPU runtime layout explicit at load time.
-    for name in ("w13_weight", "w2_weight"):
-        param = getattr(layer, name)
-        param.data = param.data.transpose(1, 2).contiguous()
+    if not transposed:
+        for name in ("w13_weight", "w2_weight"):
+            param = getattr(layer, name)
+            param.data = _transpose_expert_chunks(param.data)
 
     if block_quant:
         old_w13_scale = layer.w13_weight_scale_inv.data

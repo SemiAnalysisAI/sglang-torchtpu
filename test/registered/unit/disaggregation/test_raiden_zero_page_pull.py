@@ -48,6 +48,8 @@ def _decode_manager(hybrid):
     mgr._announced_spans = {}
     mgr._chunk_queue = {}
     mgr._chunk_reads = {}
+    mgr._announced_at = {}
+    mgr._timeout_s = 120.0
     mgr._final_seen = set()
     mgr._decode_aux_index = {}
     return mgr

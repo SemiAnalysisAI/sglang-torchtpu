@@ -202,15 +202,12 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         # ``memory_saver_adapter`` / ``enable_custom_mem_pool`` as no-ops so
         # inherited methods that touch them keep working.
         #
-        # ``torch.zeros`` cannot materialize an fp8 tensor on TPU
-        # ("unsupported at::Scalar type"), so for fp8 storage we allocate a
-        # zeroed uint8 buffer (all-zero bytes == +0.0 in both e4m3 and e5m2)
-        # and reinterpret it as the fp8 dtype via ``view``. The buffer the
-        # kernel sees is genuinely fp8-typed (required: it validates the cache
-        # dtype is floating). For bf16 this is a plain ``torch.zeros``.
+        # TPU fp8 zero initialization uses a uint8-to-fp8 conversion. Native
+        # fp8 storage lets compiled attention consume and donate each cache
+        # directly, without materializing a full-cache dtype-view copy.
         if self.store_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             self.kv_buffer = [
-                torch.zeros(shape, dtype=torch.uint8, device=self.device).view(
+                torch.zeros(shape, dtype=torch.uint8, device=self.device).to(
                     self.store_dtype
                 )
                 for _ in range(self.layer_num)

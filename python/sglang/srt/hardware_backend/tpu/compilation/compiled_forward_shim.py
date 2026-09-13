@@ -101,6 +101,36 @@ def _matches_default(value: Any, default: Any) -> bool:
     return type(value) is type(default) and value == default
 
 
+def _fit_pp_proxy_rows(proxy: Any, input_ids: Any, forward_batch: Any) -> Any:
+    """Bring a pipeline proxy to the padded batch's token axis.
+
+    The ICI wave delivers the previous stage's activations at its fixed buffer
+    size (the largest token bucket), so a longer proxy is trimmed to this
+    stage's padded token count; a shorter one means the two stages padded to
+    different buckets and is rejected.
+    """
+    reference = input_ids if input_ids is not None else forward_batch.input_ids
+    if reference is None:
+        return proxy
+    expected = int(reference.shape[0])
+    tensors = {}
+    trimmed = False
+    for name, tensor in proxy.tensors.items():
+        if isinstance(tensor, torch.Tensor):
+            rows = int(tensor.shape[0])
+            if rows < expected:
+                raise ValueError(
+                    f"pp_proxy_tensors[{name!r}] has {rows} rows but the padded "
+                    f"batch has {expected} input tokens; the previous pipeline "
+                    "stage and this one padded to different token buckets."
+                )
+            if rows > expected:
+                tensor = tensor[:expected]
+                trimmed = True
+        tensors[name] = tensor
+    return type(proxy)(tensors) if trimmed else proxy
+
+
 def _zero_pad_dim0(t: torch.Tensor, target_size: int) -> torch.Tensor:
     """Zero-pad a tensor along dim 0 to target_size."""
     if t.shape[0] >= target_size:
@@ -685,6 +715,10 @@ class CompiledForwardShim:
         self._recompilation_checker = checker
         self._model_label = model_label
 
+    def _is_first_pp_stage(self) -> bool:
+        pp_group = getattr(self.policy.model_runner, "pp_group", None)
+        return pp_group is not None and bool(pp_group.is_first_rank)
+
     def wait_for_hicache_reload(self) -> None:
         """Wait for the current HiCache reload outside compiled regions."""
         model_runner = self.policy.model_runner
@@ -737,6 +771,15 @@ class CompiledForwardShim:
             )
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds
+        pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
+        if pp_proxy_tensors is not None:
+            if self._is_first_pp_stage():
+                # The first stage embeds its own input; its graph takes no proxy.
+                kwargs.pop("pp_proxy_tensors")
+            else:
+                kwargs["pp_proxy_tensors"] = _fit_pp_proxy_rows(
+                    pp_proxy_tensors, input_ids, forward_batch
+                )
         # Pin is_prefill_only for the compiled forward. An idle batch computes
         # it as True (all() over zero requests) while real batches are False;
         # the compiled forward reads the value, so it must be identical across

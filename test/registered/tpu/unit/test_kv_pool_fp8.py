@@ -4,12 +4,12 @@
 CUDA pools, which remap fp8 -> uint8 for ``index_put``): the Pallas RPA kernel
 validates that the cache dtype is floating and TPU supports fp8 storage
 natively, and the kernel performs the cache writes itself. ``torch.zeros``
-cannot materialize fp8 on TPU, so the pool allocates a zeroed uint8 buffer and
-reinterprets it as fp8 via ``view``.
+cannot materialize fp8 on TPU, so the pool converts zeroed uint8 tensors to
+native fp8 storage for compiled attention input/output aliasing.
 
 These tests assert:
 
-* fp8 (e4m3 / e5m2) buffers are genuinely fp8-typed (not uint8) and zeroed,
+* fp8 (e4m3 / e5m2) buffers have materialized fp8 storage and are zeroed,
 * the packing / fused shape is computed from the fp8 dtype (4 elems per lane),
 * bf16 is unchanged (``store_dtype == dtype``, packing 2).
 
@@ -70,13 +70,20 @@ class TestTpuFusedKVPoolFp8(CustomTestCase):
 
     def _check_fp8(self, dtype):
         import torch
+        from torch_tpu._internal.compile import tpu_torch_compile
+        from torch_tpu._internal.sync.sync import synchronize
 
         pool = self._make_pool(dtype)
+        synchronize(pool.kv_buffer, wait=True)
         # Storage dtype stays fp8, NOT uint8.
         self.assertEqual(pool.store_dtype, dtype)
         self.assertEqual(pool.kv_packing, 4)
         for layer_id in range(self.LAYER_NUM):
             buf = pool.get_fused_kv_buffer(layer_id)
+            self.assertIsNotNone(
+                tpu_torch_compile.get_device_layout_if_materialized(buf),
+                "Compiled attention requires materialized fp8 cache storage",
+            )
             self.assertEqual(buf.dtype, dtype)
             # num_kv_heads_x2 = 2*2 = 4; packed by 4 -> 1 along the packed axis.
             self.assertEqual(buf.shape[2], 4 // 4)

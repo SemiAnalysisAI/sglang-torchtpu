@@ -359,6 +359,9 @@ def process_mxfp4_moe_weights_native(
     return w13_w, w13_s, w13_b, w2_w, w2_s, w2_b
 
 
+_EXPERTS_PER_CHUNK = 16
+
+
 def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module) -> None:
     """Format GPT-OSS MXFP4 MoE weights for the TPU Pallas gmm_v2 backend.
 
@@ -377,14 +380,24 @@ def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module) -> None:
     # ``w13_interleave = layer.activation == MoEActivation.SWIGLUOAI`` — sglang
     # carries the activation as a string on the MoE runner config.
     w13_interleaved = layer.moe_runner_config.activation == "swigluoai"
-    w13, w13_bias, w2, w2_bias = process_mxfp4_moe_weights_bf16(
-        layer.w13_weight.data,
-        layer.w13_weight_scale.data,
-        layer.w13_weight_bias.data,
-        layer.w2_weight.data,
-        layer.w2_weight_scale.data,
-        layer.w2_weight_bias.data,
-        w13_interleaved=w13_interleaved,
+    # Experts are processed a few at a time: 128 experts of gpt-oss-120b on
+    # one device make a padded w13 of 2.2e9 elements, and processed as one
+    # tensor its contents came out wrong (see the commit that added this).
+    num_experts = layer.w13_weight.data.shape[0]
+    parts = [
+        process_mxfp4_moe_weights_bf16(
+            layer.w13_weight.data[i : i + _EXPERTS_PER_CHUNK],
+            layer.w13_weight_scale.data[i : i + _EXPERTS_PER_CHUNK],
+            layer.w13_weight_bias.data[i : i + _EXPERTS_PER_CHUNK],
+            layer.w2_weight.data[i : i + _EXPERTS_PER_CHUNK],
+            layer.w2_weight_scale.data[i : i + _EXPERTS_PER_CHUNK],
+            layer.w2_weight_bias.data[i : i + _EXPERTS_PER_CHUNK],
+            w13_interleaved=w13_interleaved,
+        )
+        for i in range(0, num_experts, _EXPERTS_PER_CHUNK)
+    ]
+    w13, w13_bias, w2, w2_bias = (
+        torch.cat([part[k] for part in parts], dim=0) for k in range(4)
     )
     layer.w13_weight = Parameter(w13, requires_grad=False)
     layer.w13_weight_scale = None
