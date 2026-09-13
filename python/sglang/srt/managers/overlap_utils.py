@@ -295,6 +295,7 @@ class FutureMap:
         self.needs_confidence_relay = needs_confidence_relay
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
         self._tpu_precompiled_batch_sizes: frozenset[int] = frozenset()
+        self.tpu_direct_handoff = None
 
         # On backends that bake a buffer WRITE offset as an HLO constant-shaped
         # scatter (e.g. TPU/XLA), route future-buffer writes through `_store`
@@ -609,6 +610,12 @@ class FutureMap:
             )
 
     def stash(self, future_indices: torch.Tensor, payload: RelayPayload) -> None:
+        if _is_tpu:
+            from sglang.srt.hardware_backend.tpu.direct_handoff import (
+                flush_direct_handoff_tpu,
+            )
+
+            flush_direct_handoff_tpu(self)
         indices = future_indices
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.

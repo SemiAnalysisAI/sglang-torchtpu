@@ -44,6 +44,18 @@ def make_future_map_device_accept_args(
     )
 
 
+def make_direct_accept_cache_args(context: SpecOpWarmupContext) -> tuple:
+    return (
+        torch.zeros(
+            (context.physical_bs, 2 * context.num_verify_tokens - 1),
+            dtype=torch.int64,
+            device=context.device,
+        ),
+        torch.ones(context.physical_bs, dtype=torch.int32, device=context.device),
+        context.num_verify_tokens,
+    )
+
+
 def make_future_map_device_accept_hidden_args(
     context: SpecOpWarmupContext,
 ) -> tuple[torch.Tensor, ...]:

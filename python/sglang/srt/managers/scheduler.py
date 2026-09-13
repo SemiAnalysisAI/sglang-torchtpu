@@ -4290,6 +4290,15 @@ class Scheduler(
             # The worker sliced the tail off before sampling, so sampled tokens
             # cover only the reqs-aligned rows; the coordinator relays the rest.
             future_indices = future_indices[: batch.beam_tail.num_base_rows]
+        if current_platform.is_tpu() and batch.beam_tail is None:
+            from sglang.srt.hardware_backend.tpu.direct_handoff import (
+                stash_direct_handoff_tpu,
+            )
+
+            if stash_direct_handoff_tpu(
+                self.future_map, batch, future_indices, payload, batch_result
+            ):
+                return
         self.future_map.stash(future_indices, payload)
         self.beam_coordinator.maybe_select_and_relay(
             batch, batch_result, chunked_req=self.chunked_req

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
+    make_direct_accept_cache_args,
     make_future_map_device_accept_args,
     make_future_map_device_accept_hidden_args,
 )
@@ -29,6 +30,11 @@ def _select_device_accept_cache_locs(
     cols = accept_lens.to(torch.int64)[:, None] - 1 + offsets[None, :]
     rows = torch.arange(bs, device=candidate_locs.device, dtype=torch.int64)[:, None]
     return candidate_locs[rows, cols]
+
+
+@compiled_op(warmup=make_direct_accept_cache_args)
+def select_direct_accept_cache_tpu(candidate_locs, accept_lens, width):
+    return _select_device_accept_cache_locs(candidate_locs, accept_lens, width)
 
 
 @compiled_op(warmup=make_future_map_device_accept_args)
@@ -163,6 +169,12 @@ def resolve_spec_extras_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool
 def resolve_device_accept_seq_lens_tpu(
     future_map: FutureMap, batch: ScheduleBatch
 ) -> bool:
+    from sglang.srt.hardware_backend.tpu.direct_handoff import (
+        resolve_direct_handoff_tpu,
+    )
+
+    if resolve_direct_handoff_tpu(future_map, batch):
+        return True
     # Candidate locations gate device routing; selected locations let the
     # subsequent relay resolution reuse the tensors resolved here.
     if not resolve_spec_extras_tpu(future_map, batch):
