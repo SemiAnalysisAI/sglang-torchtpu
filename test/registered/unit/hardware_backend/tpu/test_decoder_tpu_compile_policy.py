@@ -2984,7 +2984,8 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
         class FakeDraftBackend:
             attn_backends = step_backends
 
-            def init_forward_metadata(self, forward_batch):
+            def init_forward_metadata(self, forward_batch, *, fused_draft):
+                assert fused_draft
                 for backend in self.attn_backends:
                     backend.init_forward_metadata(forward_batch)
 

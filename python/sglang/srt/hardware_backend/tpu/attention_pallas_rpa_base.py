@@ -35,7 +35,7 @@ Design notes
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import torch
@@ -462,7 +462,13 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             return forward_mode.is_extend(include_draft_extend_v2=True)
         return forward_mode.is_extend()
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        shared_metadata: PallasForwardMetadata | None = None,
+        fused_draft: bool = False,
+    ):
         # Land deferred HiCache reload commits into the KV buffers before any
         # layer reads KV; this hook runs per forward in eager AND compiled.
         # Use the backend's cached pool: upstream moved token_to_kv_pool off
@@ -471,7 +477,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
         # Build metadata and its cached distribution from the same active width.
         non_empty_bs = self._non_empty_batch_size(forward_batch)
-        self.forward_metadata = self._build_metadata(forward_batch, non_empty_bs)
+        self.forward_metadata = self._build_metadata(
+            forward_batch,
+            non_empty_bs,
+            shared_metadata=shared_metadata,
+            fused_draft=fused_draft,
+        )
 
     @staticmethod
     def _pre_bucket_padded_batch_size(forward_batch: ForwardBatch) -> int:
@@ -539,6 +550,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         self,
         forward_batch: ForwardBatch,
         non_empty_bs: int,
+        *,
+        shared_metadata: PallasForwardMetadata | None = None,
+        fused_draft: bool = False,
     ) -> PallasForwardMetadata:
         """Build per-forward-pass metadata for the Pallas kernel.
 
@@ -578,6 +592,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 pages_per_seq,
                 distribution,
                 non_empty_bs,
+                shared_metadata=shared_metadata,
+                fused_draft=fused_draft,
             )
 
         # -------------------------------------------------------------- #
@@ -721,6 +737,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         pages_per_seq,
         distribution: torch.Tensor,
         non_empty_bs: int,
+        *,
+        shared_metadata: PallasForwardMetadata | None = None,
+        fused_draft: bool = False,
     ) -> PallasForwardMetadata:
         """Host-resident metadata build (gated in ``_build_metadata``).
 
@@ -748,16 +767,19 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 host_lens = host_lens.tolist()
             query_lens = tuple(host_lens)
         else:
-            kv_lens = forward_batch.seq_lens.to(torch.int32)
             if (
                 forward_batch.forward_mode.is_decode()
                 and forward_batch.spec_info is not None
             ):
-                # Multi-step draft decode: each step's backend has a different
-                # speculative_step_id.  Bump seq_lens so the kernel sees KV
-                # entries from prior draft steps.
                 kv_len_bump = self.speculative_step_id + 1
-                kv_lens = kv_lens + kv_len_bump
+            if fused_draft:
+                # The fused loop derives int32 lengths inside its graph; keep
+                # capacity validation here without submitting cast/add helpers.
+                kv_lens = forward_batch.seq_lens
+            else:
+                kv_lens = forward_batch.seq_lens.to(torch.int32)
+                if kv_len_bump:
+                    kv_lens = kv_lens + kv_len_bump
             query_width = 1
 
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
@@ -776,6 +798,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 # Empty seq_lens_cpu (e.g. idle rank forced into decode for DP
                 # collectives) or unhandled type.
                 pass
+
+        if shared_metadata is not None:
+            # Step backends share one forward's owned page snapshot; KV lengths
+            # and their capacity checks remain specific to each draft step.
+            return replace(shared_metadata, kv_lens=kv_lens)
 
         req_pool_indices = forward_batch.req_pool_indices_cpu
         assert req_pool_indices is not None
@@ -1053,10 +1080,18 @@ class BaseTpuPallasRpaMultiStepDraftBackend:
             for i in range(self.speculative_num_steps - 1)
         ]
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_metadata(
+        self, forward_batch: ForwardBatch, *, fused_draft: bool = False
+    ):
         assert forward_batch.spec_info is not None
+        shared_metadata = None
         for attn_backend in self.attn_backends:
-            attn_backend.init_forward_metadata(forward_batch)
+            attn_backend.init_forward_metadata(
+                forward_batch,
+                shared_metadata=shared_metadata,
+                fused_draft=fused_draft,
+            )
+            shared_metadata = attn_backend.forward_metadata
 
     def init_cuda_graph_state(self, max_bs, max_num_tokens):
         pass
