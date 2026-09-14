@@ -417,6 +417,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         self._distribution_cache: dict[tuple[bool, int, torch.device], torch.Tensor] = (
             {}
         )
+        self._fixed_offsets_cache: dict[
+            tuple[int, int, int, int, torch.device], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._active_num_tokens_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
         # Register the custom op eagerly so the (Python-introspection-heavy)
         # ``jax_op`` registration does not happen inside a ``torch.compile``
         # traced region — dynamo can't handle ``inspect.signature`` on the
@@ -671,6 +675,33 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             swa_page_indices=swa_page_indices,
         )
 
+    def _get_fixed_query_metadata(
+        self, *, bs, query_width, non_empty_bs, pages_per_seq, page_size, device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Offsets depend on the physical layout, not the number of live rows.
+        # Keep all cached tensors read-only; the active-token scalar needs its
+        # own storage for the direct-compile input-layout contract.
+        device = torch.device(device)
+        offsets_key = (bs, query_width, pages_per_seq, page_size, device)
+        cached_offsets = self._fixed_offsets_cache.get(offsets_key)
+        if cached_offsets is None:
+            offsets = torch.arange(bs + 1, dtype=torch.int32)
+            cached_offsets = (
+                (offsets * query_width).to(device, non_blocking=True),
+                (offsets * (pages_per_seq * page_size)).to(device, non_blocking=True),
+            )
+            self._fixed_offsets_cache[offsets_key] = cached_offsets
+
+        active_tokens = non_empty_bs * query_width
+        active_key = (active_tokens, device)
+        active_num_tokens = self._active_num_tokens_cache.get(active_key)
+        if active_num_tokens is None:
+            active_num_tokens = torch.tensor(active_tokens, dtype=torch.int32).to(
+                device, non_blocking=True
+            )
+            self._active_num_tokens_cache[active_key] = active_num_tokens
+        return cached_offsets[0], cached_offsets[1], active_num_tokens
+
     def _build_metadata_host(
         self,
         forward_batch,
@@ -689,17 +720,26 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         kv_lens stays on device; ``distribution`` is the caller's cached buffer.
         """
         kv_len_bump = 0
+        query_width = None
         if forward_batch.forward_mode.is_target_verify():
             assert forward_batch.spec_info is not None
             verify_width = forward_batch.spec_info.num_tokens_per_req
             kv_len_bump = verify_width
             kv_lens = (forward_batch.seq_lens + verify_width).to(torch.int32)
-            extend_seq_lens = torch.full((bs,), verify_width, dtype=torch.int32)
+            query_width = verify_width
         elif self._is_extend_including_draft(forward_batch.forward_mode):
             # EXTEND and DRAFT_EXTEND use current lengths.
             assert forward_batch.extend_seq_lens is not None
             kv_lens = forward_batch.seq_lens.to(torch.int32)
-            extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
+            # The draft worker and compile policy already maintain the padded
+            # host lengths. Reading the device copy here synchronizes every
+            # speculative cycle before the next forward can be submitted.
+            host_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+            if host_lens is None or len(host_lens) != bs:
+                host_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
+            if isinstance(host_lens, torch.Tensor):
+                host_lens = host_lens.tolist()
+            query_lens = tuple(host_lens)
         else:
             kv_lens = forward_batch.seq_lens.to(torch.int32)
             if (
@@ -711,7 +751,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 # entries from prior draft steps.
                 kv_len_bump = self.speculative_step_id + 1
                 kv_lens = kv_lens + kv_len_bump
-            extend_seq_lens = torch.ones(bs, dtype=torch.int32)
+            query_width = 1
 
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is not None and bs > 0:
@@ -736,11 +776,19 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         assert req_pool_indices.shape[0] == bs
         req_pool_indices = req_pool_indices.to(torch.int64)
 
-        cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32)
-        cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
-        cu_kv_lens = torch.arange(bs + 1, dtype=torch.int32) * (
-            pages_per_seq * page_size
-        )
+        if query_width is None:
+            cu_q_lens, cu_kv_lens, active_num_tokens = self._get_host_cu_lens(
+                query_lens, pages_per_seq * page_size, non_empty_bs, device
+            )
+        else:
+            cu_q_lens, cu_kv_lens, active_num_tokens = self._get_fixed_query_metadata(
+                bs=bs,
+                query_width=query_width,
+                non_empty_bs=non_empty_bs,
+                pages_per_seq=pages_per_seq,
+                page_size=page_size,
+                device=device,
+            )
 
         # Gather only the strided page-slot columns [bs, pages_per_seq] (one
         # slot per page), not the full [bs, max_ctx] row. page_cols is constant,
@@ -780,16 +828,42 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
         # H2D for host-built cu-lens / page_indices; kv_lens already on device,
         # distribution is the caller's cached buffer.
-        cu_q_lens = cu_q_lens.to(device, non_blocking=True)
         return PallasForwardMetadata(
             kv_lens=kv_lens,
             cu_q_lens=cu_q_lens,
-            cu_kv_lens=cu_kv_lens.to(device, non_blocking=True),
+            cu_kv_lens=cu_kv_lens,
             page_indices=page_indices.to(device, non_blocking=True),
             distribution=distribution,
-            active_num_tokens=_make_active_num_tokens(cu_q_lens, non_empty_bs),
+            active_num_tokens=active_num_tokens,
             swa_page_indices=swa_page_indices,
         )
+
+    def _get_host_cu_lens(
+        self, query_lens: tuple[int, ...], kv_stride: int, non_empty_bs: int, device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reuse immutable prefix sums for repeated extend layouts.
+
+        Keep one layout per backend so variable prefills cannot grow a cache.
+        Page indices and KV lengths remain per-forward data. Build the owned
+        active-token scalar on CPU too, avoiding a TPU slice/clone submission
+        while preserving its batch-independent backing storage (issue #565).
+        """
+        key = (query_lens, kv_stride, non_empty_bs, torch.device(device))
+        cached = getattr(self, "_host_cu_lens_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        cu_q_lens = torch.zeros(len(query_lens) + 1, dtype=torch.int32)
+        cu_q_lens[1:] = torch.cumsum(
+            torch.tensor(query_lens, dtype=torch.int32), dim=0, dtype=torch.int32
+        )
+        cu_kv_lens = torch.arange(len(query_lens) + 1, dtype=torch.int32) * kv_stride
+        active_num_tokens = _make_active_num_tokens(cu_q_lens, non_empty_bs)
+        result = tuple(
+            value.to(device, non_blocking=True)
+            for value in (cu_q_lens, cu_kv_lens, active_num_tokens)
+        )
+        self._host_cu_lens_cache = (key, result)
+        return result
 
     # ------------------------------------------------------------------ #
     # Forward
