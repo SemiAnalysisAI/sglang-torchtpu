@@ -9,6 +9,7 @@ from collections.abc import Sequence
 import torch
 
 from sglang.srt.compilation.compiled_op import get_compiled_ops
+from sglang.srt.hardware_backend.tpu import eagle_verify as _eagle_verify  # noqa: F401
 from sglang.srt.hardware_backend.tpu.spec_op_warmup import SpecOpWarmupContext
 from sglang.srt.speculative import dflash_utils as _dflash_utils  # noqa: F401
 from sglang.srt.speculative import eagle_utils as _eagle_utils  # noqa: F401

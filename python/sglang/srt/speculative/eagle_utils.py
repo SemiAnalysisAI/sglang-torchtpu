@@ -63,6 +63,11 @@ if _is_tpu:
         prepare_device_accept_tpu,
         prepare_verify_cache_locs_tpu,
     )
+    from sglang.srt.hardware_backend.tpu.eagle_verify import (
+        stash_fused_bookkeeping_tpu,
+        take_fused_bookkeeping_tpu,
+        try_verify_and_bookkeep_tpu,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -644,6 +649,9 @@ def verify_bookkeeping_func(seq_lens, accept_lens, predict, accept_index):
             (0,), device=seq_lens.device, dtype=torch.int64
         )
     if _is_tpu:
+        fused = take_fused_bookkeeping_tpu(accept_lens)
+        if fused is not None:
+            return fused
         return fused_verify_bookkeeping(seq_lens, accept_lens, predict, accept_index)
     new_seq_lens = seq_lens + accept_lens
     accept_tokens = predict[accept_index]
@@ -965,6 +973,14 @@ def eagle_sample(
         grammar_mask.apply(next_token_logits)
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
+    if _is_tpu and sampling_info.is_all_greedy:
+        fused = try_verify_and_bookkeep_tpu(
+            next_token_logits, candidates, verify_input, batch.seq_lens
+        )
+        if fused is not None:
+            predict, accept_lens, accept_index, new_seq_lens, bonus = fused
+            stash_fused_bookkeeping_tpu(accept_lens, new_seq_lens, bonus)
+            return predict, accept_lens, accept_index
     predict_shape = list(next_token_logits.shape)[:-1]
     predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
     accept_index = torch.full(
