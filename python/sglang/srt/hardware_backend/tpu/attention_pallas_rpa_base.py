@@ -40,6 +40,8 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.host_metadata_cache import HostMetadataCache
 from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
@@ -363,6 +365,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             )
         super().__init__()
         self.device = model_runner.device
+        self._host_metadata_cache = (
+            HostMetadataCache() if envs.SGLANG_TPU_EAGLE_CACHE_METADATA.get() else None
+        )
         self.speculative_step_id = speculative_step_id
         self.page_size = model_runner.page_size
         self.max_context_len = (
@@ -699,7 +704,22 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             # EXTEND and DRAFT_EXTEND use current lengths.
             assert forward_batch.extend_seq_lens is not None
             kv_lens = forward_batch.seq_lens.to(torch.int32)
-            extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
+            host_extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+            if (
+                envs.SGLANG_TPU_EAGLE_HOST_QUERY_LENS.get()
+                and host_extend_lens is not None
+            ):
+                # These query lengths were constructed on CPU and normalized
+                # with the same padding as the device tensor. Reuse them to
+                # avoid waiting for a round trip through the TPU queue.
+                if isinstance(host_extend_lens, torch.Tensor):
+                    assert host_extend_lens.device.type == "cpu"
+                extend_seq_lens = torch.as_tensor(
+                    host_extend_lens, dtype=torch.int32, device="cpu"
+                )
+                assert extend_seq_lens.shape == (bs,)
+            else:
+                extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
         else:
             kv_lens = forward_batch.seq_lens.to(torch.int32)
             if (
@@ -772,24 +792,37 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             # page_indices and full_to_swa are both CPU here, so gather on CPU and
             # H2D the small int32 result once.
             full_token_starts = page_indices.to(torch.int64) * page_size
-            swa_page_indices = (
-                (full_to_swa[full_token_starts] // page_size)
-                .to(torch.int32)
-                .to(device, non_blocking=True)
+            swa_page_indices = self._metadata_to_device(
+                "swa_page_indices",
+                (full_to_swa[full_token_starts] // page_size).to(torch.int32),
+                device,
             )
 
         # H2D for host-built cu-lens / page_indices; kv_lens already on device,
         # distribution is the caller's cached buffer.
-        cu_q_lens = cu_q_lens.to(device, non_blocking=True)
+        # Query lengths were built on CPU. Keep the scalar independently
+        # owned and value-checked there, avoiding a TPU slice/clone program.
+        active_num_tokens = self._metadata_to_device(
+            "active_num_tokens",
+            _make_active_num_tokens(cu_q_lens, non_empty_bs),
+            device,
+        )
+        cu_q_lens = self._metadata_to_device("cu_q_lens", cu_q_lens, device)
         return PallasForwardMetadata(
             kv_lens=kv_lens,
             cu_q_lens=cu_q_lens,
-            cu_kv_lens=cu_kv_lens.to(device, non_blocking=True),
-            page_indices=page_indices.to(device, non_blocking=True),
+            cu_kv_lens=self._metadata_to_device("cu_kv_lens", cu_kv_lens, device),
+            page_indices=self._metadata_to_device("page_indices", page_indices, device),
             distribution=distribution,
-            active_num_tokens=_make_active_num_tokens(cu_q_lens, non_empty_bs),
+            active_num_tokens=active_num_tokens,
             swa_page_indices=swa_page_indices,
         )
+
+    def _metadata_to_device(self, name, value, device):
+        cache = getattr(self, "_host_metadata_cache", None)
+        if cache is None:
+            return value.to(device, non_blocking=True)
+        return cache.get(name, value, device)
 
     # ------------------------------------------------------------------ #
     # Forward
