@@ -34,9 +34,28 @@ cd "$(dirname "$0")/.."   # recipe/ -> benchmark/tpu
 # Same flag and same reason as the EAGLE3 sibling recipe and deepseek_r1_0528_mh.
 EXTRA_ARGS="--weight-loader-drop-cache-after-load${EXTRA_ARGS:+ $EXTRA_ARGS}"
 
+PROFILE=${PROFILE:-ci}
+
+# Compile only the buckets the ci sweep can reach. config.sh derives MAX_RUNNING
+# and TORCH_COMPILE_MAX_BS from max(SWEEP_BS)=16, but that is the *client's
+# global* concurrency while both knobs are *per DP rank* -- at dp=2 no rank ever
+# sees more than ~8 in flight, so half the decode ladder is compiled for batches
+# that cannot occur. config.sh:347 already warns that sizing above the sweep
+# "only buys extra torch.compile buckets, which is the most expensive thing in a
+# CI bring-up"; since libtpu 0.0.47 (#727) that surplus no longer fits in host
+# RAM beside the pinned HiCache pool, and the pod is OOM-killed during warmup.
+# Takes the ladder from 5 decode + 7 extend variants to 2 + 1, matching the
+# EAGLE3 sibling, which runs the same sweep on the same topology and is green.
+if [[ "$PROFILE" == "ci" ]]; then
+  export MAX_RUNNING="${MAX_RUNNING:-8}"
+  export TORCH_COMPILE_MAX_BS="${TORCH_COMPILE_MAX_BS:-8}"
+  export TPU_COMPILE_TOKENS="${TPU_COMPILE_TOKENS:-4096}"
+  export TPU_COMPILE_BS="${TPU_COMPILE_BS:-1 8}"
+fi
+
 exec env \
   MODEL="${MODEL:-/weights/Qwen3-Coder-480B-A35B-Instruct-FP8}" \
-  PROFILE="${PROFILE:-ci}" \
+  PROFILE="$PROFILE" \
   EXTRA_ARGS="$EXTRA_ARGS" \
   ROLE=colocated \
   bash recipe/qwen3_coder_480b/nightly/serve.sh
