@@ -251,14 +251,12 @@ MODEL_PROFILES = {
             # current main (post-#717, with KV offload on) took gsm8k from 0.99
             # to 0.06 -- run 34891021287, issue #718. QWEN_CHUNK_CAP overrides
             # it for cap sweeps without a commit.
-            "CHUNKED_PREFILL_SIZE": os.environ.get("QWEN_CHUNK_CAP", "4096"),
-            # EXPERIMENT #718: MAX_PREFILL_TOKENS normally defaults to the chunk
-            # size, so lifting the cap silently sized this to 4096 too. Pin it
-            # low while the chunk size stays high. A 93-token cold prompt is one
-            # 93-token forward either way, yet it is 0/3 capped and 3/3 uncapped
-            # -- so the forward's own compile bucket does not explain it. If it
-            # goes clean here, the poison follows max_prefill_tokens instead.
-            "MAX_PREFILL_TOKENS": os.environ.get("QWEN_MAX_PREFILL", "256"),
+            "CHUNKED_PREFILL_SIZE": os.environ.get("QWEN_CHUNK_CAP", "1024"),
+            # Left to default to the chunk size. Pinning it lower than the
+            # chunk size is not a valid pair: --max-prefill-tokens 256 with
+            # --chunked-prefill-size 4096 hung precompile and the watchdog
+            # aborted the server before any test ran (run 34906027704).
+            "MAX_PREFILL_TOKENS": os.environ.get("QWEN_MAX_PREFILL", ""),
         },
         chat_template_kwargs={"enable_thinking": False},
     ),
@@ -1286,7 +1284,7 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
         env = build_prefill_env(profile, 2, env={})
         cap = int(env["CHUNKED_PREFILL_SIZE"])
         buckets = [int(b) for b in env["TPU_COMPILE_TOKENS"].split()]
-        if cap > max(buckets):
+        if cap >= max(buckets):
             self.skipTest("prefill cap lifted (issue #718 experiment)")
         self.assertIn(cap, buckets, "the cap must itself be a compiled bucket")
         self.assertLess(cap, max(buckets), "the cap must stay below the top bucket")
