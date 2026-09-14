@@ -429,6 +429,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             tuple[int, int, int, int, torch.device], tuple[torch.Tensor, torch.Tensor]
         ] = {}
         self._active_num_tokens_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
+        self._host_cu_lens_cache = None
         # Register the custom op eagerly so the (Python-introspection-heavy)
         # ``jax_op`` registration does not happen inside a ``torch.compile``
         # traced region — dynamo can't handle ``inspect.signature`` on the
@@ -739,7 +740,13 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             # EXTEND and DRAFT_EXTEND use current lengths.
             assert forward_batch.extend_seq_lens is not None
             kv_lens = forward_batch.seq_lens.to(torch.int32)
-            extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
+            # The host mirror avoids synchronizing device lengths during setup.
+            host_lens = forward_batch.extend_seq_lens_cpu
+            if host_lens is None or len(host_lens) != bs:
+                host_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
+            if isinstance(host_lens, torch.Tensor):
+                host_lens = host_lens.tolist()
+            query_lens = tuple(host_lens)
         else:
             kv_lens = forward_batch.seq_lens.to(torch.int32)
             if (
@@ -777,13 +784,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         req_pool_indices = req_pool_indices.to(torch.int64)
 
         if query_width is None:
-            cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32)
-            cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
-            cu_q_lens = cu_q_lens.to(device, non_blocking=True)
-            cu_kv_lens = (
-                torch.arange(bs + 1, dtype=torch.int32) * (pages_per_seq * page_size)
-            ).to(device, non_blocking=True)
-            active_num_tokens = _make_active_num_tokens(cu_q_lens, non_empty_bs)
+            cu_q_lens, cu_kv_lens, active_num_tokens = self._get_host_cu_lens(
+                query_lens=query_lens,
+                kv_stride=pages_per_seq * page_size,
+                non_empty_bs=non_empty_bs,
+                device=device,
+            )
         else:
             cu_q_lens, cu_kv_lens, active_num_tokens = self._get_fixed_query_metadata(
                 bs=bs,
@@ -830,7 +836,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 .to(device, non_blocking=True)
             )
 
-        # Page ownership and KV lengths remain fresh on every forward.
+        # H2D for host-built cu-lens / page_indices; kv_lens already on device,
+        # distribution is the caller's cached buffer.
         return PallasForwardMetadata(
             kv_lens=kv_lens,
             cu_q_lens=cu_q_lens,
@@ -840,6 +847,27 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             active_num_tokens=active_num_tokens,
             swa_page_indices=swa_page_indices,
         )
+
+    def _get_host_cu_lens(
+        self, query_lens: tuple[int, ...], kv_stride: int, non_empty_bs: int, device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = (query_lens, kv_stride, non_empty_bs, torch.device(device))
+        cached = self._host_cu_lens_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        cu_q_lens = torch.zeros(len(query_lens) + 1, dtype=torch.int32)
+        cu_q_lens[1:] = torch.cumsum(
+            torch.tensor(query_lens, dtype=torch.int32), dim=0, dtype=torch.int32
+        )
+        cu_kv_lens = torch.arange(len(query_lens) + 1, dtype=torch.int32) * kv_stride
+        active_num_tokens = _make_active_num_tokens(cu_q_lens, non_empty_bs)
+        result = tuple(
+            value.to(device, non_blocking=True)
+            for value in (cu_q_lens, cu_kv_lens, active_num_tokens)
+        )
+        # Retain one immutable layout so varying prefills cannot grow the cache.
+        self._host_cu_lens_cache = (key, result)
+        return result
 
     # ------------------------------------------------------------------ #
     # Forward
