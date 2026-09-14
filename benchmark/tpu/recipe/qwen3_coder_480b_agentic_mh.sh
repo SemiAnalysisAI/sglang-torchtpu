@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Multi-host CI recipe: Qwen3-Coder-480B-A35B-Instruct-FP8 colocated agentic
-# benchmark server -- tp=16, ep=16, dp=4 -> attention_tp = 16/4 = 4, across 2 hosts.
+# benchmark server -- tp=16, ep=16, dp=2 -> attention_tp = 16/2 = 8, across 2 hosts.
+# (dp is config.sh's COLOCATED_DP, which #574 moved 4 -> 2.)
 #
 # Declared by test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_multihost_agentic.py via
 # MULTIHOST_LAUNCH; the TPU CI JobSet runs this on EVERY host (one global TP group)
@@ -25,8 +26,17 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."   # recipe/ -> benchmark/tpu
 
+# The 449 GiB target checkpoint otherwise stays in the host page cache after
+# loading. Together with the pinned HiCache host pool -- one per DP group -- and
+# compiler state, that exhausts host memory while HBM still has headroom, and
+# the kernel OOM-kills the pod mid-startup (the container requests 32Gi and sets
+# no memory limit, so this lands as node-level pressure, not a cgroup cap).
+# Same flag and same reason as the EAGLE3 sibling recipe and deepseek_r1_0528_mh.
+EXTRA_ARGS="--weight-loader-drop-cache-after-load${EXTRA_ARGS:+ $EXTRA_ARGS}"
+
 exec env \
   MODEL="${MODEL:-/weights/Qwen3-Coder-480B-A35B-Instruct-FP8}" \
   PROFILE="${PROFILE:-ci}" \
+  EXTRA_ARGS="$EXTRA_ARGS" \
   ROLE=colocated \
   bash recipe/qwen3_coder_480b/nightly/serve.sh
