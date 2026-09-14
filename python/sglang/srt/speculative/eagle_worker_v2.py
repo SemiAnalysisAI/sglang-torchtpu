@@ -596,6 +596,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         elif not can_run_decode_cuda_graph:
             parent_list, top_scores_index, draft_tokens, draft_probs = draft_outputs
 
+        physical_tree = None
+        if (
+            use_fused_draft
+            and current_platform.is_tpu()
+            and not self.seed_dsa_topk_from_draft_extend
+        ):
+            from sglang.srt.hardware_backend.tpu.padded_spec_state import (
+                can_continue_padded_spec_tpu,
+            )
+
+            if can_continue_padded_spec_tpu(batch):
+                physical_tree = prebuilt_tree
         # Tree construction consumes scheduler-logical rows.
         padding = draft_input.padding_state
         if (
@@ -622,7 +634,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_probs = _unpad_rows(draft_probs)
                 draft_input.bonus_tokens = _unpad_rows(draft_input.bonus_tokens)
 
-        return build_eagle_verify_input(
+        verify_input = build_eagle_verify_input(
             batch,
             draft_input,
             parent_list,
@@ -637,6 +649,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             device=self.device,
             prebuilt_tree=prebuilt_tree,
         )
+        verify_input.tpu_verify_tree = physical_tree
+        return verify_input
 
     def _prepare_draft_forward_batch(
         self, forward_batch: ForwardBatch, *, refresh_dp_metadata: bool
@@ -760,10 +774,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if hot_token_id is not None:
                 topk_index = hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
-        return build_topk1_verify_chain_torch(
+        tree = build_topk1_verify_chain_torch(
             bonus_tokens,
             torch.cat(tokens, dim=1),
             seq_lens,
+        )
+        # Physical continuation exposes dummy rows to target execution. Keep
+        # its former zero-filled inputs without a separate padding program.
+        valid = seq_lens[:, None] > 0
+        return (
+            tree[0],
+            torch.where(valid, tree[1], 0),
+            *tree[2:5],
+            torch.where(valid, tree[5], 0),
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -1109,6 +1132,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
+        continuation = batch_result.next_draft_input.tpu_verify_continuation
+        batch_result.next_draft_input.tpu_verify_continuation = None
+        if self.seed_dsa_topk_from_draft_extend:
+            continuation = None
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
@@ -1147,6 +1174,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
+                tpu_verify_continuation=continuation,
             )
 
         if self.plan_stream:
@@ -1211,17 +1239,34 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         if current_platform.is_tpu():
+            physical_outputs = fused_draft_extend_select_argmax_func(
+                next_token_logits=draft_logits_output.next_token_logits,
+                hidden_states=draft_logits_output.hidden_states,
+                num_accept_tokens=forward_batch.spec_info.num_accept_tokens,
+                num_tokens_per_req=forward_batch.spec_info.num_tokens_per_req,
+            )
+            if continuation is not None:
+                from sglang.srt.hardware_backend.tpu.padded_spec_state import (
+                    DraftContinuation,
+                )
+
+                batch_result.next_draft_input.tpu_draft_continuation = (
+                    DraftContinuation(
+                        logical_batch_size=continuation.logical_batch_size,
+                        physical_batch_size=continuation.physical_batch_size,
+                        hidden_states=physical_outputs[0],
+                        topk_p=physical_outputs[1],
+                        topk_index=physical_outputs[2],
+                        bonus_tokens=continuation.bonus_tokens,
+                        accept_lens=continuation.accept_lens,
+                    )
+                )
             (
                 draft_logits_output.hidden_states,
                 ret_topk_p,
                 ret_topk_index,
             ) = self.draft_runner.compile_policy.finalize_spec_forward_batch(
-                outputs=fused_draft_extend_select_argmax_func(
-                    next_token_logits=draft_logits_output.next_token_logits,
-                    hidden_states=draft_logits_output.hidden_states,
-                    num_accept_tokens=forward_batch.spec_info.num_accept_tokens,
-                    num_tokens_per_req=forward_batch.spec_info.num_tokens_per_req,
-                ),
+                outputs=physical_outputs,
                 forward_batch=forward_batch,
             )
             ret_draft_probs = None

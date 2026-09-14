@@ -1657,6 +1657,10 @@ class Scheduler(
             or draft_runner.model.config.vocab_size
         )
 
+        from sglang.srt.speculative.eagle_utils import (
+            get_draft_input_from_target_hidden_dim,
+        )
+
         precompile_spec_v2_ops(
             device=torch.device(self.device),
             physical_batch_buckets=compile_policy.b_bucketer.buckets,
@@ -1666,6 +1670,7 @@ class Scheduler(
             hidden_size=hidden_size,
             hidden_dtype=hidden_dtype,
             req_pool_size=self.future_map.req_pool_size,
+            verify_hidden_size=get_draft_input_from_target_hidden_dim(draft_runner),
         )
         self.future_map.set_tpu_precompiled_batch_sizes(
             compile_policy.b_bucketer.buckets

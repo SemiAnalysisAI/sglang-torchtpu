@@ -4,6 +4,7 @@ from typing import Any
 
 import msgspec
 import torch
+import torch.nn.functional as F
 
 
 class DirectHandoff(msgspec.Struct, frozen=True):
@@ -11,6 +12,7 @@ class DirectHandoff(msgspec.Struct, frozen=True):
     indices: torch.Tensor
     payload: Any
     seq_lens: torch.Tensor
+    physical: Any = None
 
 
 def flush_direct_handoff_tpu(future_map) -> None:
@@ -31,7 +33,6 @@ def stash_direct_handoff_tpu(future_map, batch, indices, payload, result) -> boo
         or not future_map.spec_algo.is_eagle3()
         or draft is None
         or draft.accept_lens_device is None
-        or indices.shape[0] not in future_map._tpu_precompiled_batch_sizes
         or indices.shape[0] == 0
         or payload.topk_p is None
         or payload.topk_index is None
@@ -44,6 +45,18 @@ def stash_direct_handoff_tpu(future_map, batch, indices, payload, result) -> boo
         or any(req.lora_id is not None for req in batch.reqs)
     ):
         return False
+    physical = draft.tpu_draft_continuation if draft is not None else None
+    padded_bucket = (
+        physical is not None
+        and physical.logical_batch_size == indices.shape[0]
+        and physical.physical_batch_size in future_map._tpu_precompiled_batch_sizes
+        and physical.physical_batch_size > indices.shape[0]
+    )
+    if (
+        indices.shape[0] not in future_map._tpu_precompiled_batch_sizes
+        and not padded_bucket
+    ):
+        return False
     # A different batch may still need rows from the previous pending result.
     flush_direct_handoff_tpu(future_map)
     future_map._maybe_init_forward_bufs(payload)
@@ -52,7 +65,9 @@ def stash_direct_handoff_tpu(future_map, batch, indices, payload, result) -> boo
         indices=indices,
         payload=payload,
         seq_lens=result.new_seq_lens,
+        physical=physical,
     )
+    draft.tpu_draft_continuation = None
     return True
 
 
@@ -78,10 +93,21 @@ def resolve_direct_handoff_tpu(future_map, batch) -> bool:
     )
 
     candidates = draft.device_accept_candidate_locs
+    physical = pending.physical
+    accept_lens = draft.accept_lens_device
+    if physical is not None:
+        candidates = F.pad(
+            candidates, (0, 0, 0, physical.physical_batch_size - candidates.shape[0])
+        )
+        accept_lens = physical.accept_lens
     assert candidates.shape[1] >= 3 and candidates.shape[1] % 2 == 1
     draft.device_accept_selected_cache_locs = select_direct_accept_cache_tpu(
-        candidates, draft.accept_lens_device, (candidates.shape[1] + 1) // 2
+        candidates, accept_lens, (candidates.shape[1] + 1) // 2
     )
+    if physical is not None:
+        draft.device_accept_selected_cache_locs = (
+            draft.device_accept_selected_cache_locs[: physical.logical_batch_size]
+        )
     draft.bonus_tokens = pending.payload.bonus_tokens.to(
         future_map.output_tokens_buf.dtype
     )
@@ -91,6 +117,7 @@ def resolve_direct_handoff_tpu(future_map, batch) -> bool:
         future_map.hidden_states_buf.dtype
     )
     batch.seq_lens = pending.seq_lens.to(future_map.new_seq_lens_buf.dtype)
+    draft.tpu_draft_continuation = physical
     # All rows were consumed in order. The batch now owns these references;
     # subsequent filtered/merged generations use their own pending payload.
     future_map.tpu_direct_handoff = None

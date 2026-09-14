@@ -46,6 +46,11 @@ if _is_tpu:
         device_accept_verify_cache_locs_tpu,
         prepare_draft_cache_locs_tpu,
     )
+    from sglang.srt.hardware_backend.tpu.padded_spec_state import (
+        VerifyContinuation,
+        can_continue_padded_spec_tpu,
+        install_verify_continuation_tpu,
+    )
 
 if _is_cpu:
     from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
@@ -119,6 +124,7 @@ def prepare_for_draft_extend(
     return_hidden_states_before_norm: bool,
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
+    tpu_verify_continuation=None,
 ):
     bs = len(batch.seq_lens)
     # Optional window widening (num_front_tokens=0 -> off): prepend that many
@@ -199,6 +205,10 @@ def prepare_for_draft_extend(
         # Supply CPU mirror (extend_seq_lens are all num_window_tokens) so
         # backend max() reads from list without a per-iter D2H sync.
         forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
+    if tpu_verify_continuation is not None:
+        install_verify_continuation_tpu(
+            forward_batch, tpu_verify_continuation, num_draft_tokens
+        )
     draft_model_runner.compile_policy.prepare_spec_forward_batch(forward_batch)
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
@@ -635,6 +645,7 @@ def run_eagle_verify(
     verify_padding = target_compile_policy.prepare_spec_verify(
         batch, verify_input, logits_output.next_token_logits
     )
+    tpu_verify_continuation = None
     verify_result = (None, None, None)
     verify_bookkeeping_result = (None, None)
     try:
@@ -648,6 +659,22 @@ def run_eagle_verify(
             post_predict,
             post_accept_index,
         )
+        if (
+            _is_tpu
+            and verify_padding is not None
+            and logits_output.hidden_states is not None
+            and can_continue_padded_spec_tpu(batch)
+        ):
+            state = verify_padding.state
+            tpu_verify_continuation = VerifyContinuation(
+                logical_batch_size=state.logical_batch_size,
+                physical_batch_size=state.physical_batch_size,
+                hidden_states=logits_output.hidden_states,
+                predict=post_predict,
+                accept_lens=post_accept_lens,
+                seq_lens=batch.seq_lens,
+                bonus_tokens=verify_bookkeeping_result[1],
+            )
     finally:
         # Restore logical tensors and finalize target outputs.
         verify_result, verify_bookkeeping_result = (
@@ -701,7 +728,9 @@ def run_eagle_verify(
             num_draft_tokens=num_draft_tokens,
         )
 
-    next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
+    next_draft_input = EagleDraftInput(
+        bonus_tokens=bonus_tokens, tpu_verify_continuation=tpu_verify_continuation
+    )
     if _is_tpu:
         next_draft_input.accept_lens_device = accept_lens
 

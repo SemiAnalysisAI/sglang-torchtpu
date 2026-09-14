@@ -1,7 +1,13 @@
 import copy
 import logging
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
+
+if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.tpu.padded_spec_state import (
+        DraftContinuation,
+        VerifyContinuation,
+    )
 
 import torch
 import torch.nn.functional as F
@@ -86,6 +92,7 @@ class EagleVerifyInput(SpecInput):
 
     # TPU-selected KV locations for this verification.
     device_accept_cache_locs: Optional[torch.Tensor] = None
+    tpu_verify_tree: Optional[tuple] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
@@ -729,6 +736,10 @@ class EagleDraftInput(SpecInput):
 
     # TPU RPA KV lengths for the current fused draft step.
     rpa_draft_kv_lens: Optional[torch.Tensor] = None
+
+    # One-cycle TPU producer state; consumed before the result is published.
+    tpu_verify_continuation: Optional["VerifyContinuation"] = None
+    tpu_draft_continuation: Optional["DraftContinuation"] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)

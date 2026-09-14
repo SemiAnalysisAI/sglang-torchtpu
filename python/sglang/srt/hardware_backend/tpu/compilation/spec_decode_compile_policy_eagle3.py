@@ -1246,6 +1246,11 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         # EagleDraftInput seeds consumed by select_top_k_tokens.
         spec_info = forward_batch.spec_info
         if isinstance(spec_info, EagleDraftInput):
+            from sglang.srt.hardware_backend.tpu.padded_spec_state import (
+                install_draft_continuation_tpu,
+            )
+
+            install_draft_continuation_tpu(spec_info, pad_b)
             _pad_eagle_draft_input(spec_info, pad_b)
             logical_bs, logical_tokens = self._logical_spec_shape(
                 forward_batch,
@@ -1389,12 +1394,26 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         # Build every replacement before publishing any of them, so an error
         # cannot leave the caller with a partially padded batch.
         seq_lens = _pad_rows(padding.seq_lens, pad_bs, 0)
-        draft_token = _pad_rows(
-            padding.draft_token,
-            pad_bs * verify_input.draft_token_num,
-            _DRAFT_TOKEN_FILL,
+        tree = (
+            verify_input.tpu_verify_tree
+            if isinstance(verify_input, EagleVerifyInput)
+            else None
         )
-        retrieve_index = _pad_rows(padding.retrieve_index, pad_bs, _RETRIEVE_INDEX_FILL)
+        if tree is not None and tree[-1].shape == (
+            state.physical_batch_size,
+            verify_input.draft_token_num,
+        ):
+            draft_token = tree[-1].flatten()
+            retrieve_index = tree[2]
+        else:
+            draft_token = _pad_rows(
+                padding.draft_token,
+                pad_bs * verify_input.draft_token_num,
+                _DRAFT_TOKEN_FILL,
+            )
+            retrieve_index = _pad_rows(
+                padding.retrieve_index, pad_bs, _RETRIEVE_INDEX_FILL
+            )
         temperatures = (
             _pad_rows(padding.temperatures, pad_bs, _TEMPERATURE_FILL)
             if padding.temperatures is not None

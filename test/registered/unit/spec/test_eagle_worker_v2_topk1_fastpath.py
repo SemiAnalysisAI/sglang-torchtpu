@@ -203,6 +203,40 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
 
 
 class TestEagleWorkerV2FusedDraft(CustomTestCase):
+    def test_fused_tree_keeps_target_dummy_inputs_zero(self):
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+            build_topk1_verify_chain_torch,
+        )
+
+        worker = _make_worker(num_steps=1, num_draft_tokens=2)
+        worker.draft_runner = SimpleNamespace(model=None)
+        tokens = torch.tensor([[11], [22]], device=DEVICE)
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.select_top_k_tokens",
+                return_value=(tokens, None, None, (None, tokens, None)),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.build_topk1_verify_chain_torch",
+                new=build_topk1_verify_chain_torch,
+                create=True,
+            ),
+        ):
+            tree = worker._fused_draft_steps(
+                SimpleNamespace(positions=None),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                torch.tensor([101, 202], device=DEVICE),
+                torch.tensor([5, 0], device=DEVICE),
+            )
+        self.assertEqual(tree[1].tolist(), [[5, 6], [0, 0]])
+        self.assertEqual(tree[-1].tolist(), [[101, 11], [0, 0]])
+        self.assertEqual(tree[2].tolist(), [[0, 1], [2, 3]])
+
     def test_fused_steps_support_both_compile_tracers(self):
         worker = _make_worker(num_steps=3, num_draft_tokens=4)
 

@@ -3485,6 +3485,43 @@ class TestSpecVerifyPaddingIsInert(_SpecPolicyTestCase):
         for a, b in zip(first, second):
             self.assertEqual(a.tolist(), b.tolist())
 
+    def test_physical_tree_retrieval_does_not_leak_dummy_acceptance(self):
+        reference = self._run(temperature=0.0, pad_seed=1)
+        batch = _make_batch(0.0)
+        verify_input = _make_verify_input()
+        original_tokens = verify_input.draft_token
+        original_retrieve = verify_input.retrieve_index
+        tokens = torch.cat((original_tokens, torch.zeros_like(original_tokens)))
+        rows = torch.arange(PADDED_TOKENS, dtype=original_retrieve.dtype).reshape(
+            BUCKET_BS, DRAFT_TOKEN_NUM
+        )
+        # Dummy rows retrieve their own positions, rather than the old -1
+        # filler. Their acceptance must never enter the scheduler prefix.
+        verify_input.tpu_verify_tree = (
+            None,
+            None,
+            rows,
+            None,
+            None,
+            tokens.reshape(BUCKET_BS, DRAFT_TOKEN_NUM),
+        )
+        logits = torch.cat(
+            (_accepting_logits(), torch.randn(LOGICAL_TOKENS, VOCAB_SIZE))
+        )
+        policy = _policy()
+        padding = policy.prepare_spec_verify(batch, verify_input, logits)
+        self.assertIs(verify_input.retrieve_index, rows)
+        self.assertEqual(verify_input.draft_token.data_ptr(), tokens.data_ptr())
+        with _serving_stubs():
+            result = eagle_sample(
+                verify_input, batch, SimpleNamespace(next_token_logits=logits), None
+            )
+        logical, _ = policy.finalize_spec_verify(padding, result, (None, None))
+        for got, expected in zip(logical, reference):
+            torch.testing.assert_close(got, expected)
+        self.assertIs(verify_input.draft_token, original_tokens)
+        self.assertIs(verify_input.retrieve_index, original_retrieve)
+
     def test_greedy_verify_ignores_the_padded_rows(self):
         # accept_lens counts accepted drafts plus the bonus token.
         self._assert_inert(temperature=0.0, expected_accept_lens=[2, DRAFT_TOKEN_NUM])

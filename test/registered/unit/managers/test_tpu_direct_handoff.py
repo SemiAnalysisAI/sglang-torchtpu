@@ -53,6 +53,7 @@ def make_case():
     )
     draft = SimpleNamespace(
         future_indices=indices,
+        tpu_draft_continuation=None,
         accept_lens_device=torch.tensor([1, 3]),
         device_accept_candidate_locs=torch.arange(14).reshape(2, 7),
         device_accept_selected_cache_locs=None,
@@ -167,6 +168,62 @@ class TestDirectHandoff(CustomTestCase):
         torch.testing.assert_close(
             fm.hidden_states_buf[indices[:1]], newer.hidden_states[:1]
         )
+
+    def test_padded_handoff_reuses_physical_rows_but_flushes_only_real_rows(self):
+        from sglang.srt.hardware_backend.tpu.padded_spec_state import (
+            DraftContinuation,
+            install_draft_continuation_tpu,
+        )
+
+        for consume in (False, True):
+            with self.subTest(consume=consume):
+                fm, batch, indices, payload, result = make_case()
+                fm.set_tpu_precompiled_batch_sizes([4])
+                physical = DraftContinuation(
+                    logical_batch_size=2,
+                    physical_batch_size=4,
+                    hidden_states=torch.cat(
+                        (payload.hidden_states, torch.full((2, 3), 999.0))
+                    ),
+                    topk_p=torch.ones(4, 1),
+                    topk_index=torch.cat((payload.topk_index, torch.full((2, 1), 999))),
+                    bonus_tokens=torch.tensor([11, 12, 999, 999], dtype=torch.int32),
+                    accept_lens=torch.tensor([1, 3, 4, 4]),
+                )
+                result.next_draft_input.tpu_draft_continuation = physical
+                self.assertTrue(
+                    stash_direct_handoff_tpu(fm, batch, indices, payload, result)
+                )
+                if consume:
+                    with patch(
+                        "sglang.srt.hardware_backend.tpu.overlap_utils_tpu.select_direct_accept_cache_tpu",
+                        side_effect=_select_device_accept_cache_locs,
+                    ):
+                        self.assertTrue(resolve_direct_handoff_tpu(fm, batch))
+                    self.assertEqual(
+                        batch.spec_info.device_accept_selected_cache_locs.shape, (2, 4)
+                    )
+                    self.assertEqual(batch.seq_lens.shape, (2,))
+                    install_draft_continuation_tpu(batch.spec_info, 4)
+                    self.assertIs(batch.spec_info.hidden_states, physical.hidden_states)
+                    self.assertIsNone(batch.spec_info.tpu_draft_continuation)
+                    self.assertEqual(
+                        batch.spec_info.bonus_tokens.dtype, fm.output_tokens_buf.dtype
+                    )
+                else:
+                    batch.spec_info.future_indices = indices[:1]
+                    self.assertFalse(resolve_direct_handoff_tpu(fm, batch))
+                    torch.testing.assert_close(
+                        fm.hidden_states_buf[indices], payload.hidden_states
+                    )
+                    self.assertEqual(fm.hidden_states_buf[0].count_nonzero().item(), 0)
+                    self.assertEqual(fm.output_tokens_buf[0].item(), 0)
+
+    def test_other_algorithms_do_not_require_eagle_continuation_fields(self):
+        fm, batch, indices, payload, result = make_case()
+        fm.spec_algo.is_eagle3 = lambda: False
+        result.next_draft_input = SimpleNamespace()
+        self.assertFalse(stash_direct_handoff_tpu(fm, batch, indices, payload, result))
 
     def test_unsupported_paths_do_not_defer(self):
         for change in [

@@ -19,6 +19,7 @@ class SpecOpWarmupContext:
     hidden_size: int
     hidden_dtype: torch.dtype
     req_pool_size: int
+    verify_hidden_size: int = 0
 
 
 def make_future_map_device_accept_args(
@@ -148,6 +149,27 @@ def make_dflash_verify_bookkeeping_args(
         torch.zeros(
             (context.physical_bs,),
             dtype=torch.int64,
+            device=context.device,
+        ),
+    )
+
+
+def make_extend_continuation_args(context: SpecOpWarmupContext) -> tuple:
+    return (
+        torch.zeros(
+            context.physical_bs * context.num_verify_tokens,
+            dtype=torch.int32,
+            device=context.device,
+        ),
+        torch.ones(context.physical_bs, dtype=torch.int32, device=context.device),
+        torch.ones(context.physical_bs, dtype=torch.int64, device=context.device),
+        context.num_verify_tokens,
+        torch.zeros(
+            (
+                context.physical_bs * context.num_verify_tokens,
+                context.verify_hidden_size or context.hidden_size,
+            ),
+            dtype=context.hidden_dtype,
             device=context.device,
         ),
     )
