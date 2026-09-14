@@ -12,7 +12,7 @@ export EP_SIZE=${EP_SIZE:-16}
 
 # --- attention / precision ---
 export ATTENTION_BACKEND=pallas_tpu_mla   # required; the default rpa_v3 is not MLA
-export KV_CACHE_DTYPE=""                  # required; pallas_tpu_mla raises on fp8 KV
+export KV_CACHE_DTYPE=${KV_CACHE_DTYPE-""}  # Preserve explicit FP8/BF16 experiment settings.
 export QUANTIZATION=${QUANTIZATION:-fp8}
 
 # --- memory / shapes ---
