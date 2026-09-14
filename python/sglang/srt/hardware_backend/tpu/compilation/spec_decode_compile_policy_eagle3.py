@@ -17,6 +17,7 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
     _REAL_Q_KEY,
     _dp_attn_apply_bucket_metadata,
+    _ensure_host_query_lens,
     _restore_forward_batch_inputs,
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
@@ -1285,6 +1286,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         """Bucket V2 draft-extend before attention metadata is constructed."""
         if self.b_bucketer is None:
             return
+        _ensure_host_query_lens(forward_batch)
         draft_extend_input = forward_batch.spec_info
         real_bs = int(forward_batch.seq_lens.shape[0])
         real_tokens = int(forward_batch.input_ids.shape[0])
