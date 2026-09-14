@@ -21,6 +21,8 @@ KV = _choice("SGLANG_R1_TEST_KV", ("production", "bf16"))
 NATIVE_WEIGHTS = WEIGHTS == "native"
 MLA_BF16 = WEIGHTS in ("mla_bf16", "native")
 PRECISE_MATH = MATH == "fp32"
+MOE_SCALES = _choice("SGLANG_R1_TEST_MOE_SCALES", ("auto", "production", "fp32"))
+FP32_MOE_SCALES = MOE_SCALES == "fp32" or (MOE_SCALES == "auto" and PRECISE_MATH)
 ACTIVATIONS = _choice("SGLANG_R1_TEST_ACTIVATIONS", ("auto", "production", "block128"))
 # Preserve earlier experiments when unset, but allow activation grouping to be
 # held fixed while testing weights without the FP32 arithmetic bundle.
@@ -32,6 +34,8 @@ def settings() -> dict:
     return dict(
         weights=WEIGHTS,
         math=MATH,
+        moe_scales=MOE_SCALES,
+        fp32_moe_scales=FP32_MOE_SCALES,
         activations=ACTIVATIONS,
         kv=KV,
         mla_bf16=MLA_BF16,

@@ -34,6 +34,9 @@ from sglang.srt.hardware_backend.tpu.r1_quant_ablation import (
     ACTIVATION_BLOCK as _R1_ACT_BLOCK,
 )
 from sglang.srt.hardware_backend.tpu.r1_quant_ablation import (
+    FP32_MOE_SCALES as _R1_FP32_SCALES,
+)
+from sglang.srt.hardware_backend.tpu.r1_quant_ablation import (
     PRECISE_MATH as _R1_FP32_ACC,
 )
 
@@ -606,7 +609,10 @@ def inner_kernel(
                         preferred_element_type=preferred_element_type,
                     ).astype(acc_ref.dtype)
 
-                    block_acc *= block_scale.astype(acc_ref.dtype)
+                    # Keep dot rounding and accumulation unchanged in scale-only runs.
+                    scale_math_dtype = jnp.float32 if _R1_FP32_SCALES else acc_ref.dtype
+                    block_acc = block_acc.astype(scale_math_dtype)
+                    block_acc *= block_scale.astype(scale_math_dtype)
 
                     # Apply rhs subchannel scale per quant block.
                     if cfgs.rhs_cfgs.has_scale and not cfgs.rhs_cfgs.requantize_in_vmem:
@@ -615,10 +621,10 @@ def inner_kernel(
                             b_id, cfgs.rhs_cfgs.scale_block_n
                         )
                         block_acc *= rhs_scale_slice[..., start_n:end_n].astype(
-                            acc_ref.dtype
+                            scale_math_dtype
                         )
 
-                    acc_n += block_acc
+                    acc_n += block_acc.astype(acc_ref.dtype)
                 acc_list.append(acc_n)
             acc = jnp.concatenate(acc_list, axis=1)
 

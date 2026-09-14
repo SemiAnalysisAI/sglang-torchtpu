@@ -17,7 +17,10 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.r1_quant_ablation import (
-    PRECISE_MATH as _R1_FP32_SCALES,
+    FP32_MOE_SCALES as _R1_FP32_SCALES,
+)
+from sglang.srt.hardware_backend.tpu.r1_quant_ablation import (
+    PRECISE_MATH as _R1_PRECISE_MATH,
 )
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
@@ -345,7 +348,7 @@ def apply_tpu_fp8_moe(
 
     x = dispatch_output.hidden_states
     topk_weights, topk_ids, _ = dispatch_output.topk_output
-    topk_weights = topk_weights.to(torch.float32 if _R1_FP32_SCALES else x.dtype)
+    topk_weights = topk_weights.to(torch.float32 if _R1_PRECISE_MATH else x.dtype)
     topk_ids = topk_ids.to(torch.int32)
     # Padded tokens might have expert index of -1, override the expert
     # selection to expert 0.

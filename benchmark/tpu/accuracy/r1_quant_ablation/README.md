@@ -74,3 +74,12 @@ Use separate TP8/EP8/DP1 instances with 15 disjoint AIME25 questions each,
 concurrency 2 per instance, temperature 0.6, top-p 0.95, and 65,536 maximum
 generated tokens. Keep the experiment source frozen for the entire run.
 Future integrated runs must record their new source revision separately.
+
+## Independent MoE scale precision
+
+`SGLANG_R1_TEST_MOE_SCALES=fp32` retains expert weight scales in FP32
+and applies activation and weight scales to each GMM partial in FP32.
+With `MATH=production`, dot-result rounding, accumulation, activation-scale
+computation, router arithmetic, and expert combination remain production.
+The scaled partial is cast back to the production accumulator dtype before
+addition. `auto` preserves the historical math-dependent scale behavior.
