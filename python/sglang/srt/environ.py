@@ -1392,6 +1392,7 @@ class Envs:
     # TPU metadata transfer optimizations, also used by ordinary prefill.
     SGLANG_TPU_SPEC_DECODE_CACHE_METADATA = EnvBool(True)
     SGLANG_TPU_SPEC_DECODE_HOST_QUERY_LENS = EnvBool(True)
+    SGLANG_TPU_EAGLE_DEVICE_EXECUTION = EnvBool(False)
     # Draft sampler uses the Gumbel-max trick (argmax(probs / Exp(1))) instead of
     # torch.multinomial, whose device-side validity assert breaks draft-graph replay.
     SGLANG_OPT_USE_GUMBEL_SAMPLE = EnvBool(True)

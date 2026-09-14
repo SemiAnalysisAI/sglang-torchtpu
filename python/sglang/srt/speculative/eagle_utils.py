@@ -12,6 +12,7 @@ from sglang.kernels.ops.speculative.spec_tree import (
     verify_tree_greedy_kernel_triton,
 )
 from sglang.srt.compilation.compiled_op import compiled_op
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
@@ -756,7 +757,19 @@ def eagle_prepare_for_verify(
             "v2 prepare_for_verify input_ids",
         )
         device = batch.device
-        if _use_torch_native:
+        if (
+            _use_torch_native
+            and envs.SGLANG_TPU_EAGLE_DEVICE_EXECUTION.get()
+            and batch.seq_lens_cpu is None
+        ):
+            from sglang.srt.hardware_backend.tpu.eagle_device_execution import (
+                slot_locations,
+            )
+
+            batch.out_cache_loc = slot_locations(
+                batch, req_to_token_pool.req_to_token, verify_input.draft_token_num
+            )
+        elif _use_torch_native:
             # TPU: torch-native gather routed through the host mirrors.
             batch.out_cache_loc = assign_extend_cache_locs_func(
                 req_pool_indices=batch.req_pool_indices,

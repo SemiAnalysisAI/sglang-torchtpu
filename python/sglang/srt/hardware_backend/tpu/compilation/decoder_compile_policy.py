@@ -581,6 +581,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             # Pallas consumes these host mirrors before the compiled model.
             "forward_batch.req_pool_indices_cpu",
             "forward_batch.seq_lens_cpu",
+            "forward_batch._tpu_allocated_kv_upper_bound",
             *self._extra_ignored_argnames(),
         )
 

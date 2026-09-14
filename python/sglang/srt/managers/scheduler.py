@@ -1654,6 +1654,22 @@ class Scheduler(
             hidden_size=hidden_size,
             hidden_dtype=hidden_dtype,
         )
+        if (
+            self.spec_algorithm.is_eagle3()
+            and envs.SGLANG_TPU_EAGLE_DEVICE_EXECUTION.get()
+        ):
+            from sglang.srt.hardware_backend.tpu.eagle_device_execution import (
+                precompile,
+            )
+
+            precompile(
+                torch.device(self.device),
+                max(compile_policy.b_bucketer.buckets),
+                self.model_config.context_len,
+                self.page_size,
+                get_spec().speculative_num_steps,
+                compile_policy.draft_token_num,
+            )
 
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (

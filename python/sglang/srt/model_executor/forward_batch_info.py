@@ -482,6 +482,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
+    # CPU allocation bound for device-only EAGLE execution. A dataclass field
+    # survives the eager runner's replace() copy; metadata validates it before
+    # the compiled model runs. It is not a model tensor input.
+    _tpu_allocated_kv_upper_bound: Optional[int] = None
     # CPU mirror of req_pool_indices. With SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1,
     # the RPA metadata builder uses it to construct page_indices without a
     # device-to-host copy.
@@ -845,6 +849,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
+        if (
+            _is_tpu
+            and envs.SGLANG_TPU_EAGLE_DEVICE_EXECUTION.get()
+            and seq_lens_cpu is None
+        ):
+            from sglang.srt.hardware_backend.tpu.eagle_device_execution import (
+                allocation_upper_bound,
+            )
+
+            ret._tpu_allocated_kv_upper_bound = allocation_upper_bound(batch)
+
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
@@ -935,12 +950,28 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_seq_lens_cpu = None
                 ret.extend_prefix_lens = extend_prefix_lens
             ret.extend_num_tokens = batch.extend_num_tokens
-            positions, ret.extend_start_loc = compute_position(
-                model_runner.prefill_attention_backend_str,
-                ret.extend_prefix_lens,
-                ret.extend_seq_lens,
-                ret.extend_num_tokens,
-            )
+            if (
+                _is_tpu
+                and envs.SGLANG_TPU_EAGLE_DEVICE_EXECUTION.get()
+                and ret.forward_mode.is_draft_extend_v2()
+            ):
+                from sglang.srt.hardware_backend.tpu.eagle_device_execution import (
+                    uniform_positions,
+                )
+
+                width = ret.spec_info.num_tokens_per_req
+                assert getattr(ret.spec_info, "num_front_tokens", 0) == 0
+                assert ret.extend_num_tokens == ret.extend_prefix_lens.shape[0] * width
+                positions, ret.extend_start_loc = uniform_positions(
+                    ret.extend_prefix_lens, width
+                )
+            else:
+                positions, ret.extend_start_loc = compute_position(
+                    model_runner.prefill_attention_backend_str,
+                    ret.extend_prefix_lens,
+                    ret.extend_seq_lens,
+                    ret.extend_num_tokens,
+                )
             if ret.positions is None:
                 ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens

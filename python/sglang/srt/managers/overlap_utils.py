@@ -533,7 +533,18 @@ class FutureMap:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
-        if not self.needs_cpu_seq_lens:
+        capacity_mirror = False
+        if (
+            _is_tpu
+            and not self.needs_cpu_seq_lens
+            and envs.SGLANG_TPU_EAGLE_DEVICE_EXECUTION.get()
+        ):
+            from sglang.srt.hardware_backend.tpu.eagle_device_execution import (
+                requires_cpu_capacity_mirror,
+            )
+
+            capacity_mirror = requires_cpu_capacity_mirror(batch)
+        if not self.needs_cpu_seq_lens and not capacity_mirror:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
             # skip the .cpu() D2H. Downstream takes the GPU-only path.
             batch.seq_lens_cpu = None

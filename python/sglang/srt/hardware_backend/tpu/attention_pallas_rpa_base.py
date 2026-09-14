@@ -366,6 +366,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             )
         super().__init__()
         self.device = model_runner.device
+        from sglang.srt.hardware_backend.tpu.eagle_device_execution import (
+            validate_configuration,
+        )
+
+        self.needs_cpu_seq_lens = not validate_configuration(model_runner)
         self._host_metadata_cache = (
             HostMetadataCache()
             if envs.SGLANG_TPU_SPEC_DECODE_CACHE_METADATA.get()
@@ -487,6 +492,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         if bs == 0:
             return bs
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is None and not self.needs_cpu_seq_lens:
+            # This prototype requires DP=1: real request rows are all active;
+            # compile-bucket padding is represented by _tpu_real_b.
+            return bs
         seq_lens = seq_lens_cpu if seq_lens_cpu is not None else forward_batch.seq_lens
         live = int(torch.count_nonzero(seq_lens[:bs]).item())
         if live == bs:
@@ -759,6 +768,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 # collectives) or unhandled type.
                 pass
 
+        if seq_lens_cpu is None and not self.needs_cpu_seq_lens and bs:
+            upper = getattr(forward_batch, "_tpu_allocated_kv_upper_bound", None)
+            if upper is None or upper <= 0:
+                raise ValueError(
+                    "Device EAGLE metadata requires a CPU allocation bound"
+                )
+            _validate_kv_len_capacity(upper, pages_per_seq * page_size)
+
         req_pool_indices = forward_batch.req_pool_indices_cpu
         assert req_pool_indices is not None
         assert req_pool_indices.device.type == "cpu"
@@ -1010,6 +1027,9 @@ class BaseTpuPallasRpaMultiStepDraftBackend:
             self.attn_backend_cls(model_runner, speculative_step_id=i)
             for i in range(self.speculative_num_steps - 1)
         ]
+        self.needs_cpu_seq_lens = any(
+            backend.needs_cpu_seq_lens for backend in self.attn_backends
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         assert forward_batch.spec_info is not None

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -28,7 +29,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_tpu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -37,6 +38,7 @@ from sglang.srt.utils.async_probe import (
 from sglang.srt.utils.common import is_npu
 
 _is_cpu = is_cpu()
+_is_tpu = is_tpu()
 _is_npu = is_npu()
 
 if _is_cpu:
@@ -227,33 +229,46 @@ def prepare_for_draft(
         # Assign cache locations (draft-write targets).
         page_size = batch.token_to_kv_pool_allocator.page_size
         if page_size == 1 or topk == 1:
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * num_steps,),
-                dtype=torch.int64,
-                device=batch.device,
-            )
-            if _is_cpu:
-                assign_draft_cache_locs_contiguous_cpu(
-                    batch.req_pool_indices,
-                    req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    req_to_token_pool.req_to_token.shape[1],
-                    topk,
-                    num_steps,
+            if (
+                _is_tpu
+                and envs.SGLANG_TPU_EAGLE_DEVICE_EXECUTION.get()
+                and batch.seq_lens_cpu is None
+            ):
+                from sglang.srt.hardware_backend.tpu.eagle_device_execution import (
+                    slot_locations,
+                )
+
+                batch.out_cache_loc = slot_locations(
+                    batch, req_to_token_pool.req_to_token, topk * num_steps
                 )
             else:
-                # FIXME(lsyin): align with the default code path
-                assign_draft_cache_locs_contiguous_func(
-                    batch.req_pool_indices,
-                    req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    topk,
-                    num_steps,
-                    host_req_pool_indices=batch.req_pool_indices_cpu,
-                    host_seq_lens=batch.seq_lens_cpu,
+                batch.out_cache_loc = torch.empty(
+                    (bs * topk * num_steps,),
+                    dtype=torch.int64,
+                    device=batch.device,
                 )
+                if _is_cpu:
+                    assign_draft_cache_locs_contiguous_cpu(
+                        batch.req_pool_indices,
+                        req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.out_cache_loc,
+                        req_to_token_pool.req_to_token.shape[1],
+                        topk,
+                        num_steps,
+                    )
+                else:
+                    # FIXME(lsyin): align with the default code path
+                    assign_draft_cache_locs_contiguous_func(
+                        batch.req_pool_indices,
+                        req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.out_cache_loc,
+                        topk,
+                        num_steps,
+                        host_req_pool_indices=batch.req_pool_indices_cpu,
+                        host_seq_lens=batch.seq_lens_cpu,
+                    )
         else:
             # page_size > 1 + topk > 1: per-branch page-aligned draft pages.
             # Reduce out_cache_loc from the page-aligned tree region down to the
