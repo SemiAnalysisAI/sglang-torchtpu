@@ -682,8 +682,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             spec_info.hidden_states,
         )
         maybe_detect_nan(topk_p, "fused_draft: NaN in initial topk_p")
-        if self.hot_token_id is not None:
-            topk_index = self.hot_token_id[topk_index]
 
         attn_backends = self.draft_attn_backend.attn_backends
 
@@ -758,6 +756,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         tokens: tuple = ()
         scores = None
+        if hot_token_id is not None:
+            topk_index = hot_token_id[topk_index]
         for i in range(num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
