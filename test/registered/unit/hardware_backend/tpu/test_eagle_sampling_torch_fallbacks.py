@@ -6,6 +6,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -441,7 +442,7 @@ class TestGreedyVerifyTorchEquivalence(unittest.TestCase):
                     logits, candidates, retrieve_index
                 )
                 got_p, got_ai, got_lens = _verify_tree_greedy_torch(
-                    logits, candidates, retrieve_index
+                    logits, candidates.flatten(), retrieve_index
                 )
 
                 with self.subTest(bs=bs, ntv=ntv, trial=trial):
@@ -449,6 +450,36 @@ class TestGreedyVerifyTorchEquivalence(unittest.TestCase):
                     self.assertTrue(torch.equal(got_ai, want_ai))
                     # fused returns accept_len (incl. bonus); reference counts drafts
                     self.assertTrue(torch.equal(got_lens - 1, want_n))
+
+    def test_native_dispatch_keeps_flat_candidate_storage(self):
+        from sglang.srt.speculative import eagle_utils
+
+        flat_tokens = torch.arange(8, dtype=torch.int64)
+        retrieve_index = torch.arange(8).reshape(2, 4)
+        with (
+            patch.object(eagle_utils, "_is_cpu", False),
+            patch.object(eagle_utils, "_is_tpu", True),
+            patch.object(
+                eagle_utils,
+                "_verify_tree_greedy_torch",
+                wraps=eagle_utils._verify_tree_greedy_torch,
+            ) as compiled_verify,
+        ):
+            eagle_utils.verify_tree_greedy_func(
+                torch.zeros(8, dtype=torch.int32),
+                torch.full((2, 4), -1, dtype=torch.int32),
+                torch.empty(2, dtype=torch.int32),
+                flat_tokens.view(2, 4),
+                retrieve_index,
+                None,
+                None,
+                None,
+                topk=1,
+                next_token_logits=torch.zeros((8, 8)),
+            )
+        dispatched_tokens = compiled_verify.call_args.args[1]
+        self.assertEqual(dispatched_tokens.shape, (8,))
+        self.assertEqual(dispatched_tokens.data_ptr(), flat_tokens.data_ptr())
 
     def test_handles_single_verify_token(self):
         from sglang.srt.speculative.eagle_utils import _verify_tree_greedy_torch

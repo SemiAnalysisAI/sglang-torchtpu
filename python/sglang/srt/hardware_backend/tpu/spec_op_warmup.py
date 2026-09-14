@@ -31,7 +31,7 @@ def make_verify_tree_greedy_args(
             device=context.device,
         ),
         torch.zeros(
-            (context.physical_bs, context.num_verify_tokens),
+            (num_verify_rows,),
             dtype=torch.int64,
             device=context.device,
         ),

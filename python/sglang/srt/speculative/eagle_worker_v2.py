@@ -713,7 +713,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             forward_batch.is_prefill_only = orig_prefill_only
         spec_info.rpa_draft_kv_lens = None
 
-        return tree_outputs
+        # Keep scheduler-facing rows while target flattening resolves directly
+        # to the compiled producer's flat buffers without TPU view programs.
+        tree_shape = tree_outputs[2].shape
+        return (
+            tree_outputs[0],
+            tree_outputs[1].view(tree_shape),
+            *tree_outputs[2:5],
+            tree_outputs[5].view(tree_shape),
+        )
 
     def _should_fuse_draft_steps(self) -> bool:
         return _is_tpu and self.speculative_num_steps > 1
@@ -760,11 +768,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if hot_token_id is not None:
                 topk_index = hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
-        return build_topk1_verify_chain_torch(
+        tree = build_topk1_verify_chain_torch(
             bonus_tokens,
             torch.cat(tokens, dim=1),
             seq_lens,
         )
+        # Positions and verify tokens leave the graph flat; the target consumes
+        # them flat, so no separate TPU view program runs per step.
+        return (tree[0], tree[1].flatten(), *tree[2:5], tree[5].flatten())
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
