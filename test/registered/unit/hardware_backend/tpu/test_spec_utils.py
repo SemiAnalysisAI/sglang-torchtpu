@@ -7,6 +7,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 import sglang.srt.speculative.eagle_utils as eagle_utils
@@ -21,6 +22,56 @@ class _ForceTpu:
 
     def __exit__(self, *_):
         kernels._is_tpu, kernels._use_torch_native = self.previous
+
+
+@pytest.mark.parametrize("num_active", [0, 1, 8])
+@pytest.mark.parametrize("num_accept_tokens", [2, 3])
+def test_simulated_acceptance_preserves_padded_rows(num_active, num_accept_tokens):
+    """Padding must neither overwrite real predictions nor count as output."""
+    candidates = torch.arange(32).reshape(8, 4) + 100
+    target_predict = candidates + 100
+    predict = torch.arange(32) + 300
+    expected_predict = predict.clone()
+    accept_indices = torch.full((8, 4), -1, dtype=torch.int32)
+    expected_indices = accept_indices.clone()
+    num_correct_drafts = torch.zeros(8, dtype=torch.int32)
+    expected_counts = torch.full((8,), -1, dtype=torch.int32)
+    for row in range(num_active):
+        start = row * 4
+        accept_indices[row, 0] = start
+        expected_indices[row, :num_accept_tokens] = torch.arange(
+            start, start + num_accept_tokens
+        )
+        expected_predict[start : start + num_accept_tokens - 1] = candidates[
+            row, 1:num_accept_tokens
+        ]
+        expected_predict[start + num_accept_tokens - 1] = target_predict[
+            row, num_accept_tokens - 1
+        ]
+        expected_counts[row] = num_accept_tokens - 1
+
+    with (
+        _ForceTpu(),
+        patch.object(
+            kernels, "sample_simulated_acc_len", return_value=num_accept_tokens
+        ),
+    ):
+        result = kernels.generate_simulated_accept_index(
+            accept_indices,
+            predict,
+            num_correct_drafts,
+            candidates,
+            target_predict,
+            bs=8,
+            spec_steps=3,
+            simulate_acc_len=2.5,
+            simulate_acc_method="match-expected",
+            simulate_acc_token_mode="real-draft-token",
+        )
+
+    assert torch.equal(predict, expected_predict)
+    assert torch.equal(result, expected_indices)
+    assert torch.equal(num_correct_drafts, expected_counts)
 
 
 def test_gather_spec_extras_matches_row_indexing():
@@ -481,7 +532,5 @@ def test_dflash_prepare_for_decode_uses_torch_native_allocator():
 
 if __name__ == "__main__":
     import sys
-
-    import pytest
 
     sys.exit(pytest.main([__file__, "-v"]))
