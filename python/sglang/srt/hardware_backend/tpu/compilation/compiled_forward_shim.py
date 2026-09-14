@@ -395,8 +395,6 @@ def _attach_input_logprobs(
 
 def _ensure_host_query_lens(forward_batch: Any) -> None:
     """Recover absent query counts before padding can disguise them as zeros."""
-    if not envs.SGLANG_TPU_EAGLE_HOST_QUERY_LENS.get():
-        return
     device_lens = getattr(forward_batch, "extend_seq_lens", None)
     if not isinstance(device_lens, torch.Tensor):
         return
@@ -405,8 +403,9 @@ def _ensure_host_query_lens(forward_batch: Any) -> None:
         assert host_lens.device.type == "cpu"
         host_lens = forward_batch.extend_seq_lens_cpu = host_lens.tolist()
     if host_lens is None or len(host_lens) < device_lens.shape[0]:
-        # Keep the compiler's list representation. Existing complete mirrors
-        # avoid readback; missing/partial mirrors require exact device values.
+        # Padding must not turn unknown active rows into authoritative zeros,
+        # even when the consumer's reuse optimization is disabled. Complete
+        # mirrors avoid readback; missing/partial mirrors need exact values.
         forward_batch.extend_seq_lens_cpu = device_lens.to("cpu").tolist()
 
 

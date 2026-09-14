@@ -179,6 +179,10 @@ def prepare_for_draft_extend(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=return_hidden_states_before_norm,
     )
+    if gpu_only and not forward_batch.forward_mode.is_idle():
+        # The producer knows these query counts without reading device lengths.
+        # Install them before normalization, which may replace idle-rank rows.
+        forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
     # Normalize idle DP ranks before the shared sequence-length update.
     draft_model_runner.compile_policy.normalize_spec_forward_batch(forward_batch)
     # Forward sees post-write length (draft extend writes num_draft_tokens
@@ -187,10 +191,6 @@ def prepare_for_draft_extend(
     if not gpu_only:
         forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
         forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
-    else:
-        # Supply CPU mirror (extend_seq_lens are all num_window_tokens) so
-        # backend max() reads from list without a per-iter D2H sync.
-        forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
     draft_model_runner.compile_policy.prepare_spec_forward_batch(forward_batch)
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch

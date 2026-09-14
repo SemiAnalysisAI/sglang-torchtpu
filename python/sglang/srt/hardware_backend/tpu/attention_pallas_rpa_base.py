@@ -366,7 +366,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         super().__init__()
         self.device = model_runner.device
         self._host_metadata_cache = (
-            HostMetadataCache() if envs.SGLANG_TPU_EAGLE_CACHE_METADATA.get() else None
+            HostMetadataCache()
+            if envs.SGLANG_TPU_SPEC_DECODE_CACHE_METADATA.get()
+            else None
         )
         self.speculative_step_id = speculative_step_id
         self.page_size = model_runner.page_size
@@ -706,7 +708,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             kv_lens = forward_batch.seq_lens.to(torch.int32)
             host_extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
             if (
-                envs.SGLANG_TPU_EAGLE_HOST_QUERY_LENS.get()
+                envs.SGLANG_TPU_SPEC_DECODE_HOST_QUERY_LENS.get()
                 and host_extend_lens is not None
             ):
                 # These query lengths were constructed on CPU and normalized

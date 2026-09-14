@@ -49,7 +49,9 @@ def test_host_query_lengths_match_padded_device_lengths_without_readback(
             is_decode=lambda: False, is_target_verify=lambda: False
         ),
     )
-    with patch.object(envs.SGLANG_TPU_EAGLE_HOST_QUERY_LENS, "get", return_value=True):
+    with patch.object(
+        envs.SGLANG_TPU_SPEC_DECODE_HOST_QUERY_LENS, "get", return_value=True
+    ):
         metadata = backend._build_metadata(batch, non_empty_bs=2)
     expected = torch.cat(
         (torch.zeros(1, dtype=torch.int32), torch.tensor(lengths).cumsum(0).int())
@@ -107,7 +109,7 @@ def test_query_mirror_survives_padding_before_metadata(
     backend._is_hybrid_swa = False
     backend._host_metadata_cache = None
     with patch.object(
-        envs.SGLANG_TPU_EAGLE_HOST_QUERY_LENS, "get", return_value=enabled
+        envs.SGLANG_TPU_SPEC_DECODE_HOST_QUERY_LENS, "get", return_value=enabled
     ), patch(
         "sglang.srt.layers.dp_attention.is_dp_attention_enabled", return_value=False
     ):
@@ -119,9 +121,6 @@ def test_query_mirror_survives_padding_before_metadata(
                 extend_bs=physical_bs,
             )
         else:
-            # The legacy path expects list mirrors before its .extend() call.
-            if not enabled and isinstance(batch.extend_seq_lens_cpu, torch.Tensor):
-                batch.extend_seq_lens_cpu = batch.extend_seq_lens_cpu.tolist()
             policy = object.__new__(Eagle3SpecDecodeCompilePolicyMixin)
             policy.b_bucketer = Bucketer(name="Batch", buckets=[physical_bs])
             policy.draft_token_num = 4
@@ -148,11 +147,10 @@ def test_query_mirror_survives_padding_before_metadata(
     )
     torch.testing.assert_close(metadata.cu_q_lens, expected)
     assert metadata.active_num_tokens.item() == 8
-    if enabled:
-        assert batch.extend_seq_lens_cpu == batch.extend_seq_lens.tolist()
-        _restore_forward_batch_inputs(batch, 8, 2)
-        assert batch.extend_seq_lens_cpu == [4, 4]
-        assert batch.extend_seq_lens.tolist() == [4, 4]
+    assert batch.extend_seq_lens_cpu == batch.extend_seq_lens.tolist()
+    _restore_forward_batch_inputs(batch, 8, 2)
+    assert batch.extend_seq_lens_cpu == [4, 4]
+    assert batch.extend_seq_lens.tolist() == [4, 4]
 
 
 def test_complete_query_mirror_does_not_read_device_during_padding():
@@ -163,6 +161,93 @@ def test_complete_query_mirror_does_not_read_device_during_padding():
     batch = SimpleNamespace(
         extend_seq_lens=torch.empty(2, device="meta"), extend_seq_lens_cpu=[4, 4]
     )
-    with patch.object(envs.SGLANG_TPU_EAGLE_HOST_QUERY_LENS, "get", return_value=True):
+    with patch.object(
+        envs.SGLANG_TPU_SPEC_DECODE_HOST_QUERY_LENS, "get", return_value=True
+    ):
         _ensure_host_query_lens(batch)
     assert batch.extend_seq_lens_cpu == [4, 4]
+
+
+@pytest.mark.parametrize("idle", [False, True])
+def test_eagle_query_producer_precedes_idle_normalization(idle):
+    from unittest.mock import Mock
+
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.speculative import eagle_worker_common as common
+
+    bs = 0 if idle else 2
+    batch = SimpleNamespace(
+        seq_lens=torch.full((bs,), 64),
+        seq_lens_cpu=None,
+        forward_mode=ForwardMode.IDLE if idle else ForwardMode.DECODE,
+        model_config=SimpleNamespace(vocab_size=100),
+    )
+    forward = SimpleNamespace(
+        seq_lens=batch.seq_lens,
+        seq_lens_cpu=None,
+        extend_seq_lens_cpu=None,
+        forward_mode=ForwardMode.IDLE if idle else ForwardMode.DRAFT_EXTEND_V2,
+        mark_forward_metadata_ready=lambda: None,
+    )
+
+    def normalize(fb):
+        if idle:
+            assert fb.extend_seq_lens_cpu is None
+            # An idle DP rank acquires the peer's physical request layout.
+            fb.seq_lens = torch.full((4,), 64)
+            fb.extend_seq_lens = torch.full((4,), 4)
+            fb.extend_seq_lens_cpu = [4] * 4
+            fb.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+        else:
+            assert fb.extend_seq_lens_cpu == [4, 4]
+            fb.extend_seq_lens = torch.full((2,), 4)
+
+    runner = SimpleNamespace(
+        spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
+        compile_policy=SimpleNamespace(
+            normalize_spec_forward_batch=normalize,
+            prepare_spec_forward_batch=lambda fb: None,
+        ),
+        attn_backend=SimpleNamespace(init_forward_metadata=Mock()),
+    )
+    with patch.object(
+        common.ForwardBatch, "init_new", return_value=forward
+    ), patch.object(common, "maybe_detect_oob"):
+        result = common.prepare_for_draft_extend(
+            SimpleNamespace(num_front_tokens=0),
+            batch,
+            torch.zeros(bs * 4, dtype=torch.int64),
+            4,
+            runner,
+            None,
+            return_hidden_states_before_norm=False,
+        )
+    assert result.extend_seq_lens_cpu == result.extend_seq_lens.tolist()
+
+
+def test_padding_does_not_mutate_a_borrowed_cpu_query_list():
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+
+    original = [4, 4]
+    batch = ForwardBatch(
+        forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+        batch_size=2,
+        input_ids=torch.arange(8),
+        positions=torch.arange(8),
+        req_pool_indices=torch.tensor([0, 1]),
+        seq_lens=torch.tensor([68, 73]),
+        seq_lens_sum=141,
+        out_cache_loc=torch.arange(8),
+        extend_seq_lens=torch.tensor(original),
+        extend_seq_lens_cpu=original,
+        spec_info=SimpleNamespace(num_tokens_per_req=4, is_draft_input=lambda: False),
+    )
+    runner = SimpleNamespace(
+        attn_backend=SimpleNamespace(
+            get_cpu_graph_seq_len_fill_value=lambda: 0,
+            get_cuda_graph_seq_len_fill_value=lambda: 0,
+        )
+    )
+    batch._pad_inputs_to_size(runner, 16, 4)
+    assert original == [4, 4]
+    assert batch.extend_seq_lens_cpu == batch.extend_seq_lens.tolist() == [4, 4, 4, 4]

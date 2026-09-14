@@ -1389,9 +1389,9 @@ class Envs:
     # Capture all multi-layer EAGLE draft-extend steps and the in-graph chain
     # rotation into ONE CUDA graph instead of one captured graph per step.
     SGLANG_ENABLE_SINGLE_CG_DRAFT = EnvBool(True)
-    # Optional TPU execution optimizations.
-    SGLANG_TPU_EAGLE_CACHE_METADATA = EnvBool(False)
-    SGLANG_TPU_EAGLE_HOST_QUERY_LENS = EnvBool(False)
+    # TPU metadata transfer optimizations, also used by ordinary prefill.
+    SGLANG_TPU_SPEC_DECODE_CACHE_METADATA = EnvBool(True)
+    SGLANG_TPU_SPEC_DECODE_HOST_QUERY_LENS = EnvBool(True)
     # Draft sampler uses the Gumbel-max trick (argmax(probs / Exp(1))) instead of
     # torch.multinomial, whose device-side validity assert breaks draft-graph replay.
     SGLANG_OPT_USE_GUMBEL_SAMPLE = EnvBool(True)
