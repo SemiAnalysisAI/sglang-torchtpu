@@ -44,12 +44,21 @@ PROFILE=${PROFILE:-ci}
 # "only buys extra torch.compile buckets, which is the most expensive thing in a
 # CI bring-up"; since libtpu 0.0.47 (#727) that surplus no longer fits in host
 # RAM beside the pinned HiCache pool, and the pod is OOM-killed during warmup.
-# Takes the ladder from 5 decode + 7 extend variants to 2 + 1, matching the
-# EAGLE3 sibling, which runs the same sweep on the same topology and is green.
+# Takes the decode ladder from 5 variants to 2, matching the EAGLE3 sibling,
+# which runs the same sweep on the same topology and is green.
+#
+# The extend ladder is deliberately left derived. Pinning it to the sibling's
+# single 4096 bucket looked like the larger saving and broke the run: under DP
+# attention prepare_mlp_sync_batch pads every rank up to the global token count,
+# and with 4096 as the only bucket a batch that lands above it has nothing to
+# round up to, so the pad goes negative --
+#   forward_batch_info.py:1302 _pad_tensor_to_size
+#   RuntimeError: empty(): expected dimension sizes to be >= 0, got [-123]
+# observed on a `#new-token: 4096, #pending-token: 163` prefill in run
+# 34903370712. The derived ladder keeps the smaller buckets that absorb it.
 if [[ "$PROFILE" == "ci" ]]; then
   export MAX_RUNNING="${MAX_RUNNING:-8}"
   export TORCH_COMPILE_MAX_BS="${TORCH_COMPILE_MAX_BS:-8}"
-  export TPU_COMPILE_TOKENS="${TPU_COMPILE_TOKENS:-4096}"
   export TPU_COMPILE_BS="${TPU_COMPILE_BS:-1 8}"
 fi
 
