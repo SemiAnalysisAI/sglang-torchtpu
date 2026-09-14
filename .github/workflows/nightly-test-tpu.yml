@@ -51,6 +51,7 @@ on:
           - pd-mh-qwen3-480b-kvoff-reshard
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
+          - pd-sh-gpt-120b-decode-radix
           - sh
       test_filter:
         description: "Substring of a test file path; runs only matching tests"
