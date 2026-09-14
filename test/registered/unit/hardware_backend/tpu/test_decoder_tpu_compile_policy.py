@@ -2557,6 +2557,9 @@ class TestSpecDraftExtendPadding(_SpecPolicyTestCase):
 
         self.assertEqual(forward_batch.batch_size, 4)
         self.assertEqual(forward_batch.extend_seq_lens.tolist(), [4, 4, 4, 0])
+        self.assertEqual(
+            forward_batch.extend_seq_lens_cpu, forward_batch.extend_seq_lens.tolist()
+        )
         self.assertEqual(forward_batch.extend_prefix_lens.tolist(), [8, 7, 6, 0])
         self.assertEqual(forward_batch.extend_start_loc.tolist(), [0, 4, 8, 0])
 

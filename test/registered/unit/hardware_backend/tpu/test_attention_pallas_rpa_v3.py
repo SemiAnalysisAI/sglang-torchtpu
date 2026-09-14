@@ -105,6 +105,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
             forward_mode=forward_mode,
             extend_seq_lens=None,
+            extend_seq_lens_cpu=None,
             spec_info=spec_info,
         )
         return backend._build_metadata(forward_batch, non_empty_bs=1)
@@ -227,6 +228,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             req_pool_indices_cpu=torch.tensor([0, 0]),
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens=torch.tensor([2, 3]),
+            extend_seq_lens_cpu=None,
             spec_info=None,
         )
         first = backend._build_metadata(batch, non_empty_bs=2)
