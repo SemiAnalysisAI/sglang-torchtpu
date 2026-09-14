@@ -22,11 +22,19 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.utils import cpu_has_amx_support, get_device, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_device,
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_tpu,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_npu:
@@ -375,6 +383,10 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         )
         if _is_hip:
             self._forward_method = self.forward_native
+        if _is_tpu:
+            cos_sin, rot = self._build_tpu_rope_tables()
+            self.register_buffer("_tpu_cos_sin", cos_sin, persistent=False)
+            self.register_buffer("_tpu_rot", rot, persistent=False)
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
         pos_freqs = self.base ** (
@@ -448,6 +460,59 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         sin = self.sin_cached.to(positions.device)
         return cos, sin
 
+    def _build_tpu_rope_tables(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Interleave-expanded cos/sin table and the rotation as a +-1 matrix.
+
+        rotate_neox/rotate_gptj (slices, negate, stack/cat, flatten) plus the
+        per-call cos/sin repeat are five or six sub-5us launches per tensor on
+        TPU. Done once here, the per-step path is a gather, one [rd, rd] dot and
+        one elementwise fusion per tensor. The dot is exact: each output is a
+        single +-input. cos/sin keep the cache dtype so products round as in
+        forward_native.
+        """
+        rd = self.rotary_dim
+        cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
+        if self.is_neox_style:
+            cos_e, sin_e = cos.repeat(1, 2), sin.repeat(1, 2)
+        else:
+            cos_e = cos.repeat_interleave(2, dim=-1)
+            sin_e = sin.repeat_interleave(2, dim=-1)
+        cos_sin = torch.cat((cos_e, sin_e), dim=-1)
+        rot = torch.zeros(rd, rd, dtype=self.dtype, device=cos_sin.device)
+        idx = torch.arange(rd, device=cos_sin.device)
+        if self.is_neox_style:
+            half = rd // 2
+            rot[idx[half:], idx[:half]] = -1.0  # out[k] = -x[k + half], k < half
+            rot[idx[:half], idx[half:]] = 1.0  # out[k] = x[k - half], k >= half
+        else:
+            rot[idx[1::2], idx[0::2]] = -1.0  # out[2i] = -x[2i + 1]
+            rot[idx[0::2], idx[1::2]] = 1.0  # out[2i + 1] = x[2i]
+        return cos_sin, rot
+
+    def _forward_tpu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        dtype = query.dtype
+        rd = self.rotary_dim
+        rot = self._tpu_rot.to(dtype)
+        idx = torch.add(positions, offsets) if offsets is not None else positions
+        cs = self._tpu_cos_sin[idx].unsqueeze(-2)  # [T, 1, 2 * rotary_dim]
+        cos, sin = cs[..., :rd], cs[..., rd:]
+        query_rot = query[..., :rd]
+        key_rot = key[..., :rd]
+        query_rot = query_rot * cos + (query_rot @ rot) * sin
+        key_rot = key_rot * cos + (key_rot @ rot) * sin
+        if rd < self.head_size:
+            query = torch.cat((query_rot, query[..., rd:]), dim=-1)
+            key = torch.cat((key_rot, key[..., rd:]), dim=-1)
+        else:
+            query, key = query_rot, key_rot
+        return query.to(dtype), key.to(dtype)
+
     def forward_native(
         self,
         positions: torch.Tensor,
@@ -456,6 +521,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
+        if _is_tpu:
+            return self._forward_tpu(positions, query, key, offsets)
         dtype = query.dtype
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
