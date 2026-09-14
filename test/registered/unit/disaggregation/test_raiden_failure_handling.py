@@ -1250,3 +1250,79 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Append to test/registered/unit/disaggregation/test_raiden_failure_handling.py
+# It reuses that file's _prefill_manager fixture, KVPoll and Mock imports.
+# That file does NOT import zmq, so this block brings it in.
+import zmq
+
+ANNOUNCE_ROOM = 21
+ANNOUNCE_ADDR = ("10.0.0.9", 5555)
+ANNOUNCE_PAGES = 64
+
+
+def _armed_for_announce(mgr, room):
+    """Top up the shared fixture with what _announce_chunk needs to reach its send."""
+    mgr.chunked_transfer = True
+    mgr._uuid_seq = 0
+    mgr._local_rank = 0
+    mgr.attn_tp_rank = 0
+    mgr.raiden_endpoint = "tcp://10.0.0.1:40000"
+    mgr._announce_pages = ANNOUNCE_PAGES
+    mgr._engine = Mock()
+    mgr._engine.register_read = Mock(return_value=True)
+    mgr._decode_addr[room] = ANNOUNCE_ADDR
+    mgr._decode_pages[room] = ANNOUNCE_PAGES
+    mgr._send_blocks[room] = list(range(ANNOUNCE_PAGES))
+    # A room being announced always has a live status; update_status refuses
+    # to create one for Failed (common/conn.py:366-372).
+    mgr.request_status[room] = KVPoll.WaitingForInput
+
+
+class TestAnnounceSendFailureIsContained(unittest.TestCase):
+    """H1: an undeliverable CHUNK announce must fail its own room.
+
+    Unguarded, the zmq error propagates out of _announce_chunk -> offer_chunk
+    -> RaidenKVSender.send -> prefill.py:1343 -> the scheduler event loop, and
+    lands on scheduler.py:5624's `except Exception:` which SIGQUITs the parent
+    -- turning one room's transport failure into an engine-wide kill.
+    """
+
+    @staticmethod
+    def _dead_send(endpoint, parts, is_ipv6=False):
+        raise zmq.Again("Resource temporarily unavailable")
+
+    def test_undeliverable_chunk_fails_room_not_engine(self):
+        mgr = _prefill_manager()
+        _armed_for_announce(mgr, ANNOUNCE_ROOM)
+        mgr._send_multipart_locked = self._dead_send
+
+        try:
+            mgr._announce_chunk(
+                ANNOUNCE_ROOM, 0, list(range(1000, 1000 + ANNOUNCE_PAGES)), ANNOUNCE_PAGES
+            )
+        except zmq.ZMQError as exc:
+            self.fail(
+                "zmq error escaped _announce_chunk; it would reach the scheduler "
+                "top level and SIGQUIT the engine: %r" % exc
+            )
+
+        self.assertEqual(mgr.check_status(ANNOUNCE_ROOM), KVPoll.Failed)
+        self.assertIn(ANNOUNCE_ROOM, mgr.failure_records)
+        self.assertIn(ANNOUNCE_ROOM, mgr._aborted)
+
+    def test_failed_announce_leaves_other_rooms_alone(self):
+        mgr = _prefill_manager()
+        other = ANNOUNCE_ROOM + 1
+        for room in (ANNOUNCE_ROOM, other):
+            _armed_for_announce(mgr, room)
+        mgr.request_status[other] = KVPoll.Transferring
+        mgr._send_multipart_locked = self._dead_send
+
+        mgr._announce_chunk(
+            ANNOUNCE_ROOM, 0, list(range(1000, 1000 + ANNOUNCE_PAGES)), ANNOUNCE_PAGES
+        )
+
+        self.assertEqual(mgr.check_status(other), KVPoll.Transferring)
+        self.assertNotIn(other, mgr._aborted)

@@ -1111,7 +1111,21 @@ class RaidenKVManager(CommonKVManager):
                 endpoint=self.raiden_endpoint or "",
             ).to_frames()
             endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
-            self._send_multipart_locked(endpoint, payload)
+            try:
+                self._send_multipart_locked(endpoint, payload)
+            except zmq.ZMQError as exc:
+                # Same contract as the closing reply in _maybe_reply: a
+                # rendezvous frame this rank cannot deliver fails its own
+                # room. Without this the error reaches the scheduler's
+                # top-level handler, which SIGQUITs the whole engine for
+                # what is a single room's transport failure.
+                with self._state_lock:
+                    if room not in self._aborted:
+                        self._mark_aborted_locked(room)
+                        self._fail_room_locked(
+                            room, f"CHUNK announce to {endpoint} failed: {exc}"
+                        )
+                        self.update_status(room, KVPoll.Failed)
 
     def finalize_send(self, room: int, aux_index: Optional[int]) -> bool:
         """Announce the room's blocks to the decode. False if the room was aborted.
