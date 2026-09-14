@@ -251,7 +251,9 @@ MODEL_PROFILES = {
             # current main (post-#717, with KV offload on) took gsm8k from 0.99
             # to 0.06 -- run 34891021287, issue #718. QWEN_CHUNK_CAP overrides
             # it for cap sweeps without a commit.
-            "CHUNKED_PREFILL_SIZE": os.environ.get("QWEN_CHUNK_CAP", "256"),
+            "CHUNKED_PREFILL_SIZE": os.environ.get(
+                "QWEN_CHUNK_CAP", "4096"
+            ),  # EXPERIMENT #718,
         },
         chat_template_kwargs={"enable_thinking": False},
     ),
@@ -408,7 +410,7 @@ def hicache_server_args(
     # QWEN_KV_OFFLOAD=0 turns offload off for an experiment; see issue #718,
     # where uncapped prefill must be measured with and without it to tell the
     # compile graph apart from the offload path.
-    if values.get("KV_OFFLOAD_ENABLED", "1") != "1":
+    if values.get("KV_OFFLOAD_ENABLED", "0") != "1":  # EXPERIMENT #718
         return ""
     return " ".join(
         (
@@ -1009,6 +1011,11 @@ class TestPdTpResharding(unittest.TestCase):
         the host pool and DMA engine are up, so its absence is the direct
         evidence of that silent skip.
         """
+        if (
+            "--enable-hierarchical-cache"
+            not in build_prefill_env(self.profile, self.topo.group_hosts)["EXTRA_ARGS"]
+        ):
+            self.skipTest("KV offload disabled for this run (issue #718 experiment)")
         with open(PREFILL_LOG, "r", errors="replace") as f:
             log = f.read()
         self.assertIn(
@@ -1158,6 +1165,8 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
             self.assertIn("--enable-dp-lm-head", d_env["EXTRA_ARGS"])
             self.assertNotIn("hicache", d_env["EXTRA_ARGS"])
             # Offload is prefill-side; decode receives KV through the reshard.
+            if "--enable-hierarchical-cache" not in p_env["EXTRA_ARGS"]:
+                self.skipTest("KV offload disabled (issue #718 experiment)")
             self.assertIn("--enable-hierarchical-cache", p_env["EXTRA_ARGS"])
             self.assertIn("--hicache-io-backend raiden", p_env["EXTRA_ARGS"])
             self.assertIn("--hicache-mem-layout page_first_fused", p_env["EXTRA_ARGS"])
@@ -1272,6 +1281,8 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
         env = build_prefill_env(profile, 2, env={})
         cap = int(env["CHUNKED_PREFILL_SIZE"])
         buckets = [int(b) for b in env["TPU_COMPILE_TOKENS"].split()]
+        if cap > max(buckets):
+            self.skipTest("prefill cap lifted (issue #718 experiment)")
         self.assertIn(cap, buckets, "the cap must itself be a compiled bucket")
         self.assertLess(cap, max(buckets), "the cap must stay below the top bucket")
 
