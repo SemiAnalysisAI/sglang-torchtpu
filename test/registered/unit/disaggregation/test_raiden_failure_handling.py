@@ -1,5 +1,6 @@
 """Unit tests for the raiden transport's failure handling between prefill and decode."""
 
+import errno
 import threading
 import time
 import types
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -1251,15 +1253,6 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         self.assertNotIn(ROOM, mgr.request_status)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-# Append to test/registered/unit/disaggregation/test_raiden_failure_handling.py
-# It reuses that file's _prefill_manager fixture, KVPoll and Mock imports.
-# That file does NOT import zmq, so this block brings it in.
-import zmq
-
 ANNOUNCE_ROOM = 21
 ANNOUNCE_ADDR = ("10.0.0.9", 5555)
 ANNOUNCE_PAGES = 64
@@ -1329,3 +1322,68 @@ class TestAnnounceSendFailureIsContained(unittest.TestCase):
 
         self.assertEqual(mgr.check_status(other), KVPoll.Transferring)
         self.assertNotIn(other, mgr._aborted)
+
+    def test_engine_wide_zmq_errors_still_reach_the_scheduler(self):
+        """Only peer-attributable errnos are absorbed.
+
+        ETERM means the context is gone and every later send fails too;
+        ENOMEM means the process is dying. Neither belongs to one room, so
+        both must still propagate and kill the engine loudly.
+        """
+        for bad in (zmq.ETERM, errno.ENOMEM, errno.ENOTSOCK):
+            with self.subTest(errno=bad):
+                mgr = _prefill_manager()
+                _armed_for_announce(mgr, ANNOUNCE_ROOM)
+
+                def engine_wide(endpoint, parts, is_ipv6=False, _e=bad):
+                    raise zmq.ZMQError(_e)
+
+                mgr._send_multipart_locked = engine_wide
+                with self.assertRaises(zmq.ZMQError):
+                    mgr._announce_chunk(
+                        ANNOUNCE_ROOM,
+                        0,
+                        list(range(1000, 1000 + ANNOUNCE_PAGES)),
+                        ANNOUNCE_PAGES,
+                    )
+                # The room is not quietly buried on the way out.
+                self.assertNotEqual(mgr.check_status(ANNOUNCE_ROOM), KVPoll.Failed)
+
+    def test_peer_scoped_errnos_are_absorbed(self):
+        for ok in (zmq.EAGAIN, errno.EHOSTUNREACH, errno.EINVAL, errno.EINTR):
+            with self.subTest(errno=ok):
+                mgr = _prefill_manager()
+                _armed_for_announce(mgr, ANNOUNCE_ROOM)
+
+                def peer_scoped(endpoint, parts, is_ipv6=False, _e=ok):
+                    raise zmq.ZMQError(_e)
+
+                mgr._send_multipart_locked = peer_scoped
+                mgr._announce_chunk(
+                    ANNOUNCE_ROOM,
+                    0,
+                    list(range(1000, 1000 + ANNOUNCE_PAGES)),
+                    ANNOUNCE_PAGES,
+                )
+                self.assertEqual(mgr.check_status(ANNOUNCE_ROOM), KVPoll.Failed)
+
+    def test_absorbed_failure_is_logged(self):
+        """An absorbed error must not be silent: record_failure only stores the
+        reason, so without a log line an operator sees failures with no cause."""
+        mgr = _prefill_manager()
+        _armed_for_announce(mgr, ANNOUNCE_ROOM)
+        mgr._send_multipart_locked = self._dead_send
+
+        with patch("sglang.srt.disaggregation.raiden.conn.logger.error") as log_error:
+            mgr._announce_chunk(
+                ANNOUNCE_ROOM,
+                0,
+                list(range(1000, 1000 + ANNOUNCE_PAGES)),
+                ANNOUNCE_PAGES,
+            )
+        self.assertEqual(log_error.call_count, 1)
+        self.assertIn("CHUNK announce", log_error.call_args[0][0])
+
+
+if __name__ == "__main__":
+    unittest.main()
