@@ -105,6 +105,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
             forward_mode=forward_mode,
             extend_seq_lens=None,
+            extend_seq_lens_cpu=None,
             spec_info=spec_info,
         )
         return backend._build_metadata(forward_batch, non_empty_bs=1)
@@ -133,6 +134,110 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             2050,
         )
         self.assertLess(backend.max_context_len, self.POOL_WIDTH)
+
+    def test_fixed_offsets_do_not_cache_request_state(self):
+        """A reused layout must still observe a new KV length and page owner."""
+        backend = self._make_backend()
+        first = self._build_metadata(backend, ForwardMode.DECODE, None, seq_len=63)
+        backend.req_to_token_pool.req_to_token[0, 0] = 2 * self.PAGE_SIZE
+        second = self._build_metadata(backend, ForwardMode.DECODE, None, seq_len=65)
+        self.assertIs(first.cu_q_lens, second.cu_q_lens)
+        self.assertIs(first.cu_kv_lens, second.cu_kv_lens)
+        self.assertIs(first.active_num_tokens, second.active_num_tokens)
+        self.assertEqual(first.kv_lens.tolist(), [63])
+        self.assertEqual(second.kv_lens.tolist(), [65])
+        self.assertEqual(first.page_indices[0].item(), 0)
+        self.assertEqual(second.page_indices[0].item(), 2)
+
+    def test_fixed_metadata_tracks_physical_and_live_widths(self):
+        """Bucket reuse must not bake the preceding batch's live rows or width."""
+        backend = self._make_backend()
+        for bs, live, width in ((4, 4, 1), (4, 2, 1), (4, 2, 4), (8, 4, 4), (4, 0, 1)):
+            with self.subTest(bs=bs, live=live, width=width):
+                q, kv, active = backend._get_fixed_query_metadata(
+                    bs=bs,
+                    query_width=width,
+                    non_empty_bs=live,
+                    pages_per_seq=3,
+                    page_size=64,
+                    device="cpu",
+                )
+                self.assertEqual(q.tolist(), [i * width for i in range(bs + 1)])
+                self.assertEqual(kv.tolist(), [i * 192 for i in range(bs + 1)])
+                self.assertEqual(active.shape, ())
+                self.assertEqual(active.item(), live * width)
+                self.assertNotEqual(
+                    active.untyped_storage().data_ptr(), q.untyped_storage().data_ptr()
+                )
+
+    def test_fixed_offsets_reused_across_live_batch_sizes(self):
+        """Changing only the live prefix must not duplicate bucket offsets."""
+        backend = self._make_backend()
+        first = backend._get_fixed_query_metadata(
+            bs=256,
+            query_width=4,
+            non_empty_bs=0,
+            pages_per_seq=3,
+            page_size=64,
+            device="cpu",
+        )
+        for live in range(257):
+            q, kv, active = backend._get_fixed_query_metadata(
+                bs=256,
+                query_width=4,
+                non_empty_bs=live,
+                pages_per_seq=3,
+                page_size=64,
+                device="cpu",
+            )
+            self.assertIs(q, first[0])
+            self.assertIs(kv, first[1])
+            self.assertEqual(active.item(), 4 * live)
+        self.assertEqual(first[2].item(), 0)
+
+    def test_active_scalar_reused_across_query_layouts(self):
+        """Equal active-token counts can share storage across different layouts."""
+        backend = self._make_backend()
+        decode = backend._get_fixed_query_metadata(
+            bs=256,
+            query_width=1,
+            non_empty_bs=256,
+            pages_per_seq=3,
+            page_size=64,
+            device="cpu",
+        )
+        verify = backend._get_fixed_query_metadata(
+            bs=128,
+            query_width=4,
+            non_empty_bs=64,
+            pages_per_seq=3,
+            page_size=64,
+            device="cpu",
+        )
+        self.assertIs(decode[2], verify[2])
+        self.assertEqual(verify[2].item(), 256)
+        self.assertEqual(decode[0][-1].item(), 256)
+        self.assertEqual(verify[0][-1].item(), 512)
+
+    def test_extend_offsets_remain_request_dependent(self):
+        """Same-bucket prefills with different query lengths cannot share offsets."""
+        backend = self._make_backend()
+        batch = SimpleNamespace(
+            seq_lens=torch.tensor([10, 20]),
+            seq_lens_cpu=torch.tensor([10, 20]),
+            req_pool_indices_cpu=torch.tensor([0, 0]),
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens=torch.tensor([2, 3]),
+            extend_seq_lens_cpu=None,
+            spec_info=None,
+        )
+        first = backend._build_metadata(batch, non_empty_bs=2)
+        batch.extend_seq_lens = torch.tensor([3, 1])
+        second = backend._build_metadata(batch, non_empty_bs=2)
+        self.assertEqual(first.cu_q_lens.tolist(), [0, 2, 5])
+        self.assertEqual(second.cu_q_lens.tolist(), [0, 3, 4])
+        self.assertEqual(first.active_num_tokens.item(), 5)
+        self.assertEqual(second.active_num_tokens.item(), 4)
 
     def test_rejects_context_capacity_larger_than_request_table(self):
         with self.assertRaisesRegex(
