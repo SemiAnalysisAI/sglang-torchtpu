@@ -600,7 +600,14 @@ def _fused_moe_jax(
     # zero-initializes on both paths. The dense un-permute multiplies every
     # row (unwritten ones by weight 0), so unwritten rows must be zeros,
     # not garbage — 0 * NaN would poison the sum.
-    if use_sc_gather and not no_combine and not use_dense_unpermute:
+    # PRECISE_MATH bypasses the masked SparseCore reduction and gathers all
+    # routed rows for an FP32 sum. Other EP ranks' unwritten rows must be zero.
+    if (
+        use_sc_gather
+        and not no_combine
+        and not use_dense_unpermute
+        and not PRECISE_MATH
+    ):
         zero_init = False
     else:
         zero_init = True
