@@ -57,14 +57,8 @@ def make_verify_bookkeeping_args(
 
 def make_draft_extend_select_args(
     context: SpecOpWarmupContext,
-) -> tuple[torch.Tensor, ...]:
+) -> tuple[torch.Tensor | int, ...]:
     num_verify_rows = context.physical_bs * context.num_verify_tokens
-    select_index = (
-        torch.arange(context.physical_bs, dtype=torch.int64, device=context.device)
-        * context.num_verify_tokens
-        + context.num_verify_tokens
-        - 1
-    )
     return (
         torch.zeros(
             (num_verify_rows, context.draft_vocab_size),
@@ -76,7 +70,13 @@ def make_draft_extend_select_args(
             dtype=context.hidden_dtype,
             device=context.device,
         ),
-        select_index,
+        torch.full(
+            (context.physical_bs,),
+            context.num_verify_tokens,
+            dtype=torch.int32,
+            device=context.device,
+        ),
+        context.num_verify_tokens,
     )
 
 
