@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.layers.quantization.mxfp4_tpu_util import (
     prepare_tpu_mxfp4_moe_weights,
+    process_mxfp4_moe_weights_bf16,
 )
 from sglang.test.ci.ci_register import register_tpu_ci
 
@@ -14,6 +15,21 @@ register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
 
 
 class TestMxfp4Padding(unittest.TestCase):
+    def test_gate_bias_has_final_shape_storage(self):
+        """Static expert biases must not retain a view requiring each-call materialization."""
+        bias = torch.arange(256, dtype=torch.float32).reshape(1, 256)
+        _, prepared_bias, _, _ = process_mxfp4_moe_weights_bf16(
+            w13_packed=torch.zeros((1, 256, 16), dtype=torch.uint8),
+            w13_scale=torch.full((1, 256, 1), 127, dtype=torch.uint8),
+            w13_bias=bias,
+            w2_packed=torch.zeros((1, 32, 64), dtype=torch.uint8),
+            w2_scale=torch.full((1, 32, 4), 127, dtype=torch.uint8),
+            w2_bias=torch.zeros((1, 32)),
+            w13_interleaved=False,
+        )
+        torch.testing.assert_close(prepared_bias, bias.unsqueeze(1), rtol=0, atol=0)
+        self.assertIsNone(prepared_bias._base)
+
     def test_live_weights_and_biases_survive_symmetric_padding(self):
         """Moving the gate/up midpoint must not move or alter live channels."""
         torch.manual_seed(7)

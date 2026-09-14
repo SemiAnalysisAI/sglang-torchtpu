@@ -198,7 +198,9 @@ def process_mxfp4_moe_weights_bf16(
     if w13_interleaved:
         w13_b = _deinterleave_axis1(w13_b.unsqueeze(-1)).squeeze(-1)
     w13_b = _pad_gate_up_halves_axis1(w13_b.unsqueeze(-1), N_int, pad_n).squeeze(-1)
-    w13_b = w13_b.to(torch.float32).unsqueeze(1).contiguous()  # (E, 1, 2*N_padded)
+    # A contiguous view still has a 2D TPU backing buffer; own the final shape
+    # so compiled calls do not repeatedly materialize this static bias view.
+    w13_b = w13_b.to(torch.float32).unsqueeze(1).clone()  # (E, 1, 2*N_padded)
 
     # w2: dequant (along K=intermediate) → pad K to match N_padded → transpose.
     w2 = MXFP4QuantizeUtil.dequantize(
