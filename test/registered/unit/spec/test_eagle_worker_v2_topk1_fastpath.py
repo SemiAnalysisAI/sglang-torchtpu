@@ -233,8 +233,8 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
                 torch.tensor([101, 202], device=DEVICE),
                 torch.tensor([5, 0], device=DEVICE),
             )
-        self.assertEqual(tree[1].tolist(), [[5, 6], [0, 0]])
-        self.assertEqual(tree[-1].tolist(), [[101, 11], [0, 0]])
+        self.assertEqual(tree[1].tolist(), [5, 6, 0, 0])
+        self.assertEqual(tree[-1].tolist(), [101, 11, 0, 0])
         self.assertEqual(tree[2].tolist(), [[0, 1], [2, 3]])
 
     def test_fused_steps_support_both_compile_tracers(self):
@@ -317,7 +317,7 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
                 torch.tensor([5], dtype=torch.long, device=DEVICE),
             )
 
-        self.assertEqual(tree[-1].tolist(), [[99, 100, 101, 102]])
+        self.assertEqual(tree[-1].tolist(), [99, 100, 101, 102])
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][0].tolist(), calls[0][1].tolist())
         self.assertEqual(calls[1][0].tolist(), calls[1][1].tolist())
@@ -351,11 +351,13 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             observed_prefill_only.append(args[0].is_prefill_only)
             return (
                 torch.empty((0,), dtype=torch.bool, device=DEVICE),
-                torch.tensor([[5, 6, 7, 8], [10, 11, 12, 13]], device=DEVICE),
+                torch.tensor([5, 6, 7, 8, 10, 11, 12, 13], device=DEVICE),
                 torch.arange(8, device=DEVICE).view(2, 4),
                 torch.tensor([[1, 2, 3, -1]] * 2, device=DEVICE),
                 torch.full((2, 4), -1, device=DEVICE),
-                torch.cat((torch.tensor([[7], [8]], device=DEVICE), tokens), dim=1),
+                torch.cat(
+                    (torch.tensor([[7], [8]], device=DEVICE), tokens), dim=1
+                ).flatten(),
             )
 
         reload_gate = MagicMock()

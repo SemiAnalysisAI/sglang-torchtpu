@@ -727,7 +727,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             forward_batch.is_prefill_only = orig_prefill_only
         spec_info.rpa_draft_kv_lens = None
 
-        return tree_outputs
+        # Keep scheduler-facing rows while target flattening resolves directly
+        # to the compiled producer's flat buffers without TPU view programs.
+        tree_shape = tree_outputs[2].shape
+        return (
+            tree_outputs[0],
+            tree_outputs[1].view(tree_shape),
+            *tree_outputs[2:5],
+            tree_outputs[5].view(tree_shape),
+        )
 
     def _should_fuse_draft_steps(self) -> bool:
         return _is_tpu and self.speculative_num_steps > 1
@@ -784,9 +792,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         valid = seq_lens[:, None] > 0
         return (
             tree[0],
-            torch.where(valid, tree[1], 0),
+            torch.where(valid, tree[1], 0).flatten(),
             *tree[2:5],
-            torch.where(valid, tree[5], 0),
+            torch.where(valid, tree[5], 0).flatten(),
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):

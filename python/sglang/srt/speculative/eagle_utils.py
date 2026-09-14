@@ -429,7 +429,8 @@ def _verify_tree_greedy_torch(
     candidates: torch.Tensor,
     retrieve_index: torch.Tensor,
 ):
-    bs, num_verify_tokens = candidates.shape
+    bs, num_verify_tokens = retrieve_index.shape
+    candidates = candidates.reshape(bs, num_verify_tokens)
     target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
         bs, num_verify_tokens
     )
@@ -595,7 +596,11 @@ def verify_tree_greedy_func(
     elif _use_torch_native:
         assert next_token_logits is not None
         out_predicts, out_accept_index, out_accept_token_num = (
-            _verify_tree_greedy_torch(next_token_logits, candidates, retrieve_index)
+            # The draft producer owns flat token storage; reshape within the
+            # compiled sampler to avoid materializing another TPU input view.
+            _verify_tree_greedy_torch(
+                next_token_logits, candidates.flatten(), retrieve_index
+            )
         )
         bs, num_verify_tokens = candidates.shape
         predicts[: bs * num_verify_tokens] = out_predicts.to(predicts.dtype)
