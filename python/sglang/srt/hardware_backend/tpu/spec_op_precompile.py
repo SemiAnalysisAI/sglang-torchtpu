@@ -9,6 +9,7 @@ from collections.abc import Sequence
 import torch
 
 from sglang.srt.compilation.compiled_op import get_compiled_ops
+from sglang.srt.hardware_backend.tpu import eagle_verify as _eagle_verify  # noqa: F401
 from sglang.srt.hardware_backend.tpu import (  # noqa: F401
     overlap_utils_tpu as _overlap_utils_tpu,
 )

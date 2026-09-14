@@ -47,6 +47,7 @@ if _is_tpu:
         device_accept_verify_cache_locs_tpu,
         prepare_draft_cache_locs_tpu,
     )
+    from sglang.srt.hardware_backend.tpu.eagle_verify import try_verify_and_bookkeep_tpu
     from sglang.srt.hardware_backend.tpu.padded_spec_state import (
         PaddedResultCopy,
         VerifyContinuation,
@@ -666,16 +667,28 @@ def run_eagle_verify(
     verify_result = (None, None, None)
     verify_bookkeeping_result = (None, None)
     try:
-        verify_result = eagle_sample(verify_input, batch, logits_output, grammar_mask)
-        post_predict, post_accept_lens, post_accept_index = verify_result
-        # Sampling and bookkeeping must use the same physical rows, including
-        # padded idle DP peers. finalize_spec_verify restores the logical batch.
-        verify_bookkeeping_result = verify_bookkeeping_func(
-            batch.seq_lens,
-            post_accept_lens,
-            post_predict,
-            post_accept_index,
+        fused_result = (
+            try_verify_and_bookkeep_tpu(
+                batch=batch,
+                verify_input=verify_input,
+                logits_output=logits_output,
+                grammar_mask=grammar_mask,
+            )
+            if _is_tpu
+            else None
         )
+        if fused_result is not None:
+            verify_result = fused_result[:3]
+            verify_bookkeeping_result = fused_result[3:]
+        else:
+            verify_result = eagle_sample(
+                verify_input, batch, logits_output, grammar_mask
+            )
+            verify_bookkeeping_result = verify_bookkeeping_func(
+                batch.seq_lens, verify_result[1], verify_result[0], verify_result[2]
+            )
+        # Both results retain physical rows until finalize_spec_verify.
+        post_predict, post_accept_lens, post_accept_index = verify_result
         if (
             _is_tpu
             and verify_padding is not None
