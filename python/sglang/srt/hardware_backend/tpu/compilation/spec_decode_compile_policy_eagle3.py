@@ -220,7 +220,22 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             self._draft_eager_backbone_forward = self.owner.model.forward
             self._draft_eager_model_forward = self.owner.forward
             self._draft_eager_logits_forward = self.owner.logits_processor.forward
-        return super().install()
+        installed = super().install()
+        if (
+            installed
+            and self.is_draft_worker
+            and self.tracer == "direct"
+            and self.speculative_eagle_topk == 1
+            and not is_dp_attention_enabled()
+            and not self.target_is_multimodal
+            and not get_spec().speculative_use_rejection_sampling
+        ):
+            from sglang.srt.hardware_backend.tpu.eagle_draft_extend import (
+                install_fused_draft_extend,
+            )
+
+            install_fused_draft_extend(self)
+        return installed
 
     def compile_fused_draft_steps(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         """Compile the multi-step EAGLE draft loop with the selected tracer."""
@@ -965,7 +980,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 bs=bs,
                 mode=ForwardMode.DRAFT_EXTEND_V2,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
-                spec_info=self._make_draft_extend_spec_info(),
+                spec_info=self._make_draft_extend_spec_info(bs),
                 attn_backend=attn_backend,
             )
             return f"bs={bs}, tokens={num_tokens}"
@@ -1018,8 +1033,8 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         )
         return spec_info
 
-    def _make_draft_extend_spec_info(self) -> EagleDraftExtendInput:
-        """EagleDraftExtendInput stub for DRAFT_EXTEND_V2 precompilation."""
+    def _make_draft_extend_spec_info(self, bs: int) -> EagleDraftExtendInput:
+        """Build batch-shaped acceptance for DRAFT_EXTEND_V2 precompilation."""
         spec_info = EagleDraftExtendInput.create_idle_input(
             device=self.model_runner.device,
             hidden_size=self.eagle_hidden_size or 1,
@@ -1028,6 +1043,16 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         )
         spec_info.num_tokens_per_req = self.draft_token_num
         spec_info.num_tokens_for_logprob_per_req = self.draft_token_num
+        # The fused extension selects one LM-head row per acceptance count.
+        # Exact-bucket warmups bypass padding, so an idle (empty) vector would
+        # produce zero logits rows and an invalid distributed all-gather.
+        spec_info.num_accept_tokens = torch.full(
+            (bs,),
+            self.draft_token_num,
+            device=self.model_runner.device,
+            dtype=torch.int32,
+        )
+        spec_info.num_correct_drafts = spec_info.num_accept_tokens - 1
         return spec_info
 
     def make_null_spec_info(self) -> EagleDraftInput:

@@ -1252,12 +1252,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         if current_platform.is_tpu():
-            physical_outputs = fused_draft_extend_select_argmax_func(
-                next_token_logits=draft_logits_output.next_token_logits,
-                hidden_states=draft_logits_output.hidden_states,
-                num_accept_tokens=forward_batch.spec_info.num_accept_tokens,
-                num_tokens_per_req=forward_batch.spec_info.num_tokens_per_req,
-            )
+            physical_outputs = draft_logits_output.tpu_draft_extend_outputs
+            if physical_outputs is None:
+                physical_outputs = fused_draft_extend_select_argmax_func(
+                    next_token_logits=draft_logits_output.next_token_logits,
+                    hidden_states=draft_logits_output.hidden_states,
+                    num_accept_tokens=forward_batch.spec_info.num_accept_tokens,
+                    num_tokens_per_req=forward_batch.spec_info.num_tokens_per_req,
+                )
             if continuation is not None:
                 from sglang.srt.hardware_backend.tpu.padded_spec_state import (
                     DraftContinuation,

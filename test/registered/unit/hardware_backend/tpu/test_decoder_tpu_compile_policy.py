@@ -1682,6 +1682,18 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
             capture_modes,
             [CaptureHiddenMode.LAST] * 6 + [CaptureHiddenMode.FULL] * 2,
         )
+        for call in mr.model.forward.call_args_list[-2:]:
+            batch = call.args[2]
+            # The selected-row LM head needs one acceptance count per request,
+            # including exact-bucket warmups that never enter the padding path.
+            self.assertEqual(
+                batch.spec_info.num_accept_tokens.tolist(),
+                [policy.draft_token_num] * batch.batch_size,
+            )
+            self.assertEqual(
+                batch.spec_info.num_correct_drafts.tolist(),
+                [policy.draft_token_num - 1] * batch.batch_size,
+            )
 
     def test_draft_precompile_skips_shapes_larger_than_local_request_pool(self):
         mr = _spec_model_runner(is_draft_worker=True)
@@ -1768,7 +1780,7 @@ class TestSpecDummyForwardBatch(_SpecPolicyTestCase):
             bs=4,
             mode=ForwardMode.DRAFT_EXTEND_V2,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            spec_info=policy._make_draft_extend_spec_info(),
+            spec_info=policy._make_draft_extend_spec_info(4),
         )
 
         self.assertEqual(fb.capture_hidden_mode, CaptureHiddenMode.FULL)
@@ -1801,7 +1813,7 @@ class TestSpecDummyForwardBatch(_SpecPolicyTestCase):
             bs=2,
             mode=ForwardMode.DRAFT_EXTEND_V2,
             capture_hidden_mode=CaptureHiddenMode.LAST,
-            spec_info=policy._make_draft_extend_spec_info(),
+            spec_info=policy._make_draft_extend_spec_info(2),
         )
 
         self.assertEqual(fb.positions.tolist(), [0, 1, 2, 3] * 2)
