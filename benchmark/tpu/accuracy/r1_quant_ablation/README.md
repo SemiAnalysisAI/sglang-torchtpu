@@ -1,12 +1,15 @@
 # Temporary DeepSeek R1-0528 accuracy isolation
 
-This worktree starts from the frozen production serving snapshot. Unset controls
+These changes are based on `integration/kimi-all-20260914`. Unset controls
 preserve production behavior. These are diagnostic controls, not new defaults.
+The earlier AIME runs used a frozen source snapshot from before this rebase;
+their scores do not validate the integrated source.
 
 | Environment variable | Values | Scope |
 |---|---|---|
 | `SGLANG_R1_TEST_WEIGHTS` | `production` (default), `mla_bf16`, `native` | MLA-only direct checkpoint-to-BF16 weights, or that plus native generic dense/MoE block weights |
 | `SGLANG_R1_TEST_MATH` | `production` (default), `fp32` | K=128 dense/MoE activation groups; FP32 dense block accumulator, MoE scales/activation quantization/partial sums, router logits and expert combination |
+| `SGLANG_R1_TEST_ACTIVATIONS` | `auto` (default), `production`, `block128` | Explicit activation grouping independent of math: block128 selects K=128 for dense/MoE; production retains dense per-token and MoE K=512 |
 | `SGLANG_R1_TEST_KV` | `production` (default), `bf16` | R1 recipe selects BF16 KV instead of the baseline FP8 KV |
 
 `native` changes generic matmul implementations, not just stored weight codes.
@@ -56,3 +59,18 @@ with all other production kernels unchanged. `ACTIVATIONS=auto` (default)
 retains the historical math-dependent behavior for reproducibility.
 
 FP32 arithmetic is deferred until this weight comparison is trustworthy.
+
+## Current full-set configuration
+
+```bash
+export SGLANG_R1_TEST_WEIGHTS=mla_bf16
+export SGLANG_R1_TEST_MATH=production
+export SGLANG_R1_TEST_ACTIVATIONS=block128
+export SGLANG_R1_TEST_KV=production
+export KV_CACHE_DTYPE=fp8_e4m3
+```
+
+Use separate TP8/EP8/DP1 instances with 15 disjoint AIME25 questions each,
+concurrency 2 per instance, temperature 0.6, top-p 0.95, and 65,536 maximum
+generated tokens. Keep the experiment source frozen for the entire run.
+Future integrated runs must record their new source revision separately.
