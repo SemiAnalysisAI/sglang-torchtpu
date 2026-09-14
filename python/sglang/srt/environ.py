@@ -1622,6 +1622,15 @@ class Envs:
     # structural, so the VL wrappers undo the slice in _restore_full_rope_cache
     # (the config cannot tell -- the text checkpoint carries mrope_section too).
     SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE = EnvBool(False)
+    # INT4 MoE execution mode; packed INT4 stays in HBM in every mode. Unset:
+    # W4A16 group products. "a8-kernel": dequantize groups in VMEM before a BF16
+    # matmul in gmm_v2 (historical name; activations stay BF16). "vmem-fp8":
+    # FP8 weight tiles and activations inside gmm_v2, with load-time normalized
+    # group/channel scales.
+    SGLANG_TPU_USE_W4A8_MOE = EnvStr(None)
+    # Shape-guarded fast path and fused gate/up for Kimi BS1 in vmem-fp8 mode.
+    SGLANG_TPU_KIMI_BS1_OPT = EnvBool(True)
+    SGLANG_TPU_KIMI_FP8_GATE_UP_FUSION = EnvBool(True)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
@@ -1641,6 +1650,10 @@ class Envs:
     SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES = EnvInt(4900)
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
+    # MoE: below this many routed rows (tokens x topk) the SparseCore gather is
+    # all fixed cost (74 us per layer for 16 rows on Kimi-K2.6); gather on the
+    # TensorCore instead.
+    SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS = EnvInt(256)
     # MoE: use onehot dense matmul for small permute and unpermute/combine
     # paths instead of gather. When set to 0, this is disabled. When set
     # to a positive integer, this is the threshold for tokens per rank below

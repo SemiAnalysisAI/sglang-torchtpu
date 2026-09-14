@@ -741,6 +741,12 @@ class TpuCompressedTensorsWNA16MoE(CompressedTensorsWNA16MoE):
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.environ import envs
+
+        mode = envs.SGLANG_TPU_USE_W4A8_MOE.get()
+        if mode not in (None, "", "a8-kernel", "vmem-fp8"):
+            raise ValueError(f"Unsupported TPU INT4 MoE mode: {mode!r}")
+
         from sglang.srt.hardware_backend.tpu.w4a16_moe import (
             prepare_tpu_w4a16_moe_weights,
         )
@@ -760,9 +766,9 @@ class TpuCompressedTensorsWNA16MoE(CompressedTensorsWNA16MoE):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        cfg = self.moe_runner_config
         from sglang.srt.hardware_backend.tpu.w4a16_moe import apply_tpu_w4a16_moe
 
-        cfg = self.moe_runner_config
         return apply_tpu_w4a16_moe(
             layer=layer,
             dispatch_output=dispatch_output,

@@ -19,9 +19,8 @@ reads them as SIGNED two's complement, so each nibble's top bit is flipped
 once at load time (XOR 0x88888888): (q+8) ^ 0x8 is exactly the two's
 complement encoding of q. Same conversion torchtpu-vllm uses for Kimi-K2.6
 INT4 (commit 62b04dea). After that, the packed int32 words are handed to
-gmm_v2 as-is — its uint32 bitcast is a same-width reinterpret. Scales keep
-their checkpoint dtype (the kernel casts per-call) and only gain the
-``[E, num_blocks, 1, out]`` layout.
+gmm_v2 as-is — its uint32 bitcast is a same-width reinterpret. Scales are stored in float32 with the ``[E, num_blocks, 1, out]`` layout;
+checkpoint BF16 values convert exactly, and the kernel casts them as needed.
 """
 
 from __future__ import annotations
@@ -32,7 +31,6 @@ from torch.nn.parameter import Parameter
 from sglang.srt.hardware_backend.tpu.fp8_moe import _own_storage
 from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import get_parallel
 
@@ -52,15 +50,67 @@ def _drop_param(layer: torch.nn.Module, name: str) -> None:
     setattr(layer, name, None)
 
 
+def _unpack_int4_offset_binary(packed: torch.Tensor) -> torch.Tensor:
+    """[.., K//8, N] int32 of LSB-first offset-binary nibbles -> [.., K, N] int8."""
+    shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=packed.device)
+    nibbles = (packed.unsqueeze(-2) >> shifts.view(1, -1, 1)) & 0xF
+    values = (nibbles - 8).to(torch.int8)
+    return values.reshape(*packed.shape[:-2], packed.shape[-2] * 8, packed.shape[-1])
+
+
+def prepare_tpu_vmem_fp8_scales(layer: torch.nn.Module, group_size: int) -> None:
+    """Keep INT4 words; prepare normalized group and FP8 channel scales once."""
+    if getattr(layer, "is_tpu_vmem_fp8", False):
+        return
+    if group_size != 32:
+        raise ValueError("vmem-fp8 requires INT4 group size 32")
+    for packed_name, scale_name, channel_name in (
+        ("w13_weight_packed", "w13_weight_scale", "w13_vmem_channel_scale"),
+        ("w2_weight_packed", "w2_weight_scale", "w2_vmem_channel_scale"),
+    ):
+        packed = getattr(layer, packed_name).data
+        old_scale = getattr(layer, scale_name).data
+        normalized = torch.empty(old_scale.shape, dtype=torch.float32, device="cpu")
+        channels = torch.empty(
+            (packed.shape[0], 1, packed.shape[-1]), dtype=torch.float32
+        )
+        for e in range(packed.shape[0]):
+            scale = old_scale[e].detach().cpu().to(torch.bfloat16)
+            q = _unpack_int4_offset_binary(packed[e].detach().cpu())
+            # BF16 rounding is monotonic: the largest absolute product within
+            # a group is max(abs(q)) * abs(scale). Avoid expanding the group
+            # scales and the full dequantized BF16 weight just to reduce K.
+            group_max = q.reshape(-1, group_size, q.shape[-1]).abs().amax(dim=1)
+            group_max = group_max.to(torch.bfloat16) * scale.abs()
+            c = (group_max.float().amax(dim=0, keepdim=True) / 448.0).clamp_min(1e-12)
+            normalized[e] = scale.float() / c
+            channels[e] = c
+        new = normalized.to(old_scale.device)
+        copy_or_rebind_param(layer, scale_name, new)
+        setattr(
+            layer,
+            channel_name,
+            Parameter(channels.to(old_scale.device), requires_grad=False),
+        )
+        _free_replaced_storage(old_scale, getattr(layer, scale_name).data)
+    layer.is_tpu_vmem_fp8 = True
+
+
 def prepare_tpu_w4a16_moe_weights(layer: torch.nn.Module, group_size: int) -> None:
     """One-time post-load formatting for the Pallas W4A16 MoE path.
 
     Keeps the packed int32 weights exactly as loaded (their [E, K//8, N]
     orientation is already gmm_v2's (g, k, n) convention) and converts the
-    group scales to the kernel's [E, num_blocks, 1, out] fp32 layout.
+    group scales to the kernel's [E, num_blocks, 1, out] fp32 layout, in f32.
     """
     if getattr(layer, "is_tpu_w4a16_converted", False):
         return
+
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_TPU_USE_W4A8_MOE.get() == "vmem-fp8":
+        # Normalize before converting checkpoint offset-binary nibbles.
+        prepare_tpu_vmem_fp8_scales(layer, group_size)
 
     # Offset-binary -> two's complement nibbles for pltpu's signed int4
     # unpack: flip each nibble's top bit ((q+8) ^ 0x8 == int4(q)).
@@ -84,11 +134,14 @@ def prepare_tpu_w4a16_moe_weights(layer: torch.nn.Module, group_size: int) -> No
         old_scale = getattr(layer, scale_name).data
         packed = getattr(layer, packed_name).data
         num_blocks = old_scale.shape[1]
-        # [E, num_blocks, out] -> [E, num_blocks, 1, out]; keep the
-        # checkpoint dtype — gmm_v2 casts scales to f32 per call. Since the
-        # unsqueezed contiguous tensor can remain a view, explicitly give the
-        # rank-4 layout independent storage.
-        new_scale = _own_storage(old_scale.unsqueeze(2).contiguous())
+        # [E, num_blocks, out] -> [E, num_blocks, 1, out] in f32. gmm_v2 casts
+        # the scales to f32 inside the traced call, so a bf16 parameter costs a
+        # full HBM pass over both scale tensors of every MoE layer on EVERY
+        # forward step: 8.4 ms of a 47 ms bs=1 decode step on Kimi-K2.6.
+        # Storing f32 makes that cast a no-op (+66 MB per layer per device);
+        # the dtype conversion also gives the rank-4 layout its own storage,
+        # which _own_storage guarantees for the no-conversion case.
+        new_scale = _own_storage(old_scale.unsqueeze(2).contiguous().to(torch.float32))
         assert packed.shape[1] * 8 == num_blocks * group_size, (
             f"{packed_name} packed K {packed.shape[1]}*8 inconsistent with "
             f"{scale_name} blocks {num_blocks}*group_size {group_size}"
@@ -132,12 +185,24 @@ def apply_tpu_w4a16_moe(
         raise NotImplementedError(
             "Fused shared experts are not supported on the TPU MoE path."
         )
-    topk_weights, topk_ids = mask_tpu_moe_non_local_experts(
-        topk_weights,
-        topk_ids,
-        layer.num_local_experts,
-        get_parallel().moe_ep_rank,
-    )
+    # Padded rows carry expert id -1: route them to expert 0 with zero weight.
+    valid = topk_ids >= 0
+    topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
+    topk_weights = topk_weights * valid.to(topk_weights.dtype)
+
+    # Hand the kernel GLOBAL expert ids plus this rank's group window, as the
+    # fp8 path does, instead of pre-masking to local ids. With the window the
+    # permute gathers only this rank's routed rows (~1/EP of them) and the
+    # combine takes ragged_gather_reduce, which runs on the TensorCore at
+    # decode sizes; without it every row was permuted and the combine went
+    # through dense_gather_reduce's mpmd_map lowering: 2 SparseCore calls of
+    # ~41 us per layer, 4.9 ms of a 20 ms bs=1 step on Kimi-K2.6.
+    global_num_experts = 0
+    expert_group_offset = 0
+    ep_size = get_parallel().moe_ep_size
+    if ep_size > 1:
+        global_num_experts = layer.num_local_experts * ep_size
+        expert_group_offset = get_parallel().moe_ep_rank * layer.num_local_experts
 
     output = fused_moe_call(
         hidden_states=x,
@@ -150,6 +215,10 @@ def apply_tpu_w4a16_moe(
         w1_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
         no_combine=no_combine,
+        global_num_experts=global_num_experts,
+        expert_group_offset=expert_group_offset,
         w_quant_bits=4,
+        w1_channel_scale=getattr(layer, "w13_vmem_channel_scale", None),
+        w2_channel_scale=getattr(layer, "w2_vmem_channel_scale", None),
     )
     return StandardCombineInput(hidden_states=output)
