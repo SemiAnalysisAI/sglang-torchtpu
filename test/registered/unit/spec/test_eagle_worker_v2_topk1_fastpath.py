@@ -223,12 +223,11 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             ),
         ):
             tree = worker._fused_draft_steps(
-                SimpleNamespace(positions=None),
+                SimpleNamespace(positions=None, batch_size=2),
                 None,
                 None,
                 None,
-                None,
-                None,
+                torch.zeros(2, dtype=torch.long, device=DEVICE),
                 None,
                 torch.tensor([101, 202], device=DEVICE),
                 torch.tensor([5, 0], device=DEVICE),
@@ -278,6 +277,7 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             model=SimpleNamespace(forward=model_forward)
         )
         forward_batch = SimpleNamespace(
+            batch_size=1,
             input_ids=None,
             positions=torch.tensor([5], device=DEVICE),
             out_cache_loc=None,
@@ -286,8 +286,7 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
                 rpa_draft_kv_lens=None,
             ),
         )
-        kv_lens = torch.tensor([[10], [11]], device=DEVICE)
-        out_cache_loc = torch.tensor([[20], [21]], device=DEVICE)
+        out_cache_loc = torch.tensor([20, 21, 22], device=DEVICE)
 
         def select_step(i, topk_p, topk_index, hidden_states, scores, topk):
             del topk_p, topk_index, scores, topk
@@ -310,7 +309,6 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
                 torch.ones((1, 1), device=DEVICE),
                 torch.zeros((1, 1), dtype=torch.long, device=DEVICE),
                 torch.zeros((1, 2), device=DEVICE),
-                kv_lens,
                 out_cache_loc,
                 None,
                 torch.tensor([99], dtype=torch.long, device=DEVICE),
@@ -321,8 +319,8 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][0].tolist(), calls[0][1].tolist())
         self.assertEqual(calls[1][0].tolist(), calls[1][1].tolist())
-        self.assertEqual(calls[0][2].item(), 10)
-        self.assertEqual(calls[1][2].item(), 11)
+        self.assertEqual(calls[0][2].item(), 6)
+        self.assertEqual(calls[1][2].item(), 7)
         self.assertEqual(calls[0][3].tolist(), [[1.0, 1.0]])
         self.assertEqual(calls[1][3].tolist(), [[12.0, 12.0]])
         self.assertEqual(calls[0][4].item(), 20)

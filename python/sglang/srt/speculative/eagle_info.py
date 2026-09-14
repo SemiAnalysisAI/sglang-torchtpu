@@ -50,6 +50,9 @@ from sglang.srt.utils import is_tpu, next_power_of_2
 
 _is_tpu = is_tpu()
 
+if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.tpu.eagle_step_inputs import EagleRelayInputs
+
 if _is_tpu:
     from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
         filter_device_accept_tpu,
@@ -733,6 +736,7 @@ class EagleDraftInput(SpecInput):
     accept_lens_device: Optional[torch.Tensor] = None
     device_accept_candidate_locs: Optional[torch.Tensor] = None
     device_accept_selected_cache_locs: Optional[torch.Tensor] = None
+    tpu_relay_inputs: Optional["EagleRelayInputs"] = None
 
     # TPU RPA KV lengths for the current fused draft step.
     rpa_draft_kv_lens: Optional[torch.Tensor] = None
@@ -825,6 +829,7 @@ class EagleDraftInput(SpecInput):
             self.dsa_topk_indices = self.dsa_topk_indices[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
+        self.tpu_relay_inputs = None
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
             self.future_indices = torch.cat(

@@ -18,6 +18,7 @@ from sglang.srt.hardware_backend.tpu.direct_handoff import (
 )
 from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
     _select_device_accept_cache_locs,
+    resolve_device_accept_seq_lens_tpu,
 )
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 
@@ -85,7 +86,13 @@ class TestDirectHandoff(CustomTestCase):
                 "sglang.srt.hardware_backend.tpu.overlap_utils_tpu.select_direct_accept_cache_tpu",
                 side_effect=_select_device_accept_cache_locs,
             ):
-                self.assertTrue(resolve_direct_handoff_tpu(fm, batch))
+                self.assertTrue(resolve_device_accept_seq_lens_tpu(fm, batch))
+            relay = batch.spec_info.tpu_relay_inputs
+            self.assertIs(relay.logical_seq_lens, batch.seq_lens)
+            self.assertIs(relay.hidden_states, expected)
+            self.assertIs(
+                relay.cache_locs, batch.spec_info.device_accept_selected_cache_locs
+            )
             self.assertIs(batch.spec_info.hidden_states, expected)
             torch.testing.assert_close(
                 batch.spec_info.device_accept_selected_cache_locs,
@@ -199,7 +206,8 @@ class TestDirectHandoff(CustomTestCase):
                         "sglang.srt.hardware_backend.tpu.overlap_utils_tpu.select_direct_accept_cache_tpu",
                         side_effect=_select_device_accept_cache_locs,
                     ):
-                        self.assertTrue(resolve_direct_handoff_tpu(fm, batch))
+                        self.assertTrue(resolve_device_accept_seq_lens_tpu(fm, batch))
+                    self.assertIsNone(batch.spec_info.tpu_relay_inputs)
                     self.assertEqual(
                         batch.spec_info.device_accept_selected_cache_locs.shape, (2, 4)
                     )

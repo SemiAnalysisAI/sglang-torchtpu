@@ -531,7 +531,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
-    def draft(self, batch: ScheduleBatch):
+    def draft(self, batch: ScheduleBatch, *, prepared_inputs=None):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
             draft_input,
@@ -541,6 +541,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
+            prepared_inputs=prepared_inputs,
         )
         self.draft_runner.compile_policy.prepare_spec_draft_input(
             forward_batch, draft_input
@@ -1136,7 +1137,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         return buf[:num_tokens]
 
     def _draft_extend_for_decode(
-        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+        *,
+        prepared_extend_metadata=None,
     ):
         # Batch 2: Draft extend
         continuation = batch_result.next_draft_input.tpu_verify_continuation
@@ -1182,6 +1187,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
                 tpu_verify_continuation=continuation,
+                prepared_extend_metadata=prepared_extend_metadata,
             )
 
         if self.plan_stream:
@@ -1368,6 +1374,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if self._hosts_draft
             else None
         )
+        self.tpu_step_preparer = None
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
@@ -1404,6 +1411,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
+        if (
+            _is_tpu
+            and self.speculative_algorithm.is_eagle3()
+            and self._draft_worker is not None
+        ):
+            from sglang.srt.hardware_backend.tpu.eagle_step_preparation import (
+                EagleStepPreparer,
+            )
+
+            self.tpu_step_preparer = EagleStepPreparer.create(
+                target_runner=self.target_worker.model_runner,
+                draft_runner=self._draft_worker.draft_runner,
+                draft_attn_backend=self._draft_worker.draft_attn_backend,
+                server_args=self.server_args,
+            )
+
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (
@@ -1503,43 +1526,74 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
-            if self.speculative_num_steps == 0:
-                # Drafting disabled (high batch size). _draft_extend below still
-                # runs, keeping draft KV warm for when the batch shrinks.
-                verify_input = self._build_trivial_verify_input(batch)
-            else:
-                with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft"),
-                ):
-                    verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
-            assert verify_input.is_verify_input()
-            batch.spec_info = verify_input
-            batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
-            # Publish before draft_extend so the fence is at verify-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
-            if (
-                self.speculative_num_steps == 0
-                and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
+            prepared_step = (
+                self.tpu_step_preparer.prepare(batch)
+                if self.tpu_step_preparer is not None
+                else None
+            )
+            with (
+                prepared_step if prepared_step is not None else contextlib.nullcontext()
             ):
-                self._stub_skipped_draft_extend(batch, batch_output)
-            else:
-                with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft_extend"),
-                ):
-                    self.draft_worker._draft_extend_for_decode(batch, batch_output)
+                return self._forward_spec_decode(
+                    batch,
+                    on_publish=on_publish,
+                    grammar_barrier=grammar_barrier,
+                    prepared_step=prepared_step,
+                )
 
-            return batch_output
+    def _forward_spec_decode(
+        self, batch, *, on_publish, grammar_barrier, prepared_step
+    ):
+        if self.speculative_num_steps == 0:
+            # Drafting disabled (high batch size). _draft_extend below still
+            # runs, keeping draft KV warm for when the batch shrinks.
+            verify_input = self._build_trivial_verify_input(batch)
+        else:
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft"),
+            ):
+                verify_input: EagleVerifyInput = self.draft_worker.draft(
+                    batch,
+                    prepared_inputs=(
+                        prepared_step.inputs if prepared_step is not None else None
+                    ),
+                )
+        assert verify_input.is_verify_input()
+        batch.spec_info = verify_input
+        batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
+        # Publish before draft_extend so the fence is at verify-end.
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+        if (
+            self.speculative_num_steps == 0
+            and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
+        ):
+            self._stub_skipped_draft_extend(batch, batch_output)
+        else:
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend"),
+            ):
+                self.draft_worker._draft_extend_for_decode(
+                    batch,
+                    batch_output,
+                    prepared_extend_metadata=(
+                        prepared_step.extend_metadata
+                        if prepared_step is not None
+                        else None
+                    ),
+                )
+
+        return batch_output
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.

@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.eagle_step_inputs import EagleRelayInputs
 from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
     make_direct_accept_cache_args,
     make_future_map_device_accept_args,
@@ -174,10 +175,33 @@ def resolve_device_accept_seq_lens_tpu(
     )
 
     if resolve_direct_handoff_tpu(future_map, batch):
+        _record_eagle_step_relay(future_map, batch)
         return True
     # Candidate locations gate device routing; selected locations let the
     # subsequent relay resolution reuse the tensors resolved here.
     if not resolve_spec_extras_tpu(future_map, batch):
         return False
     batch.seq_lens = future_map.new_seq_lens_buf[batch.spec_info.future_indices]
+    _record_eagle_step_relay(future_map, batch)
     return True
+
+
+def _record_eagle_step_relay(future_map: FutureMap, batch: ScheduleBatch) -> None:
+    draft = batch.spec_info
+    draft.tpu_relay_inputs = None
+    if (
+        batch.seq_lens.shape[0] not in future_map._tpu_precompiled_batch_sizes
+        or draft.tpu_draft_continuation is not None
+        or draft.hidden_states is None
+    ):
+        return
+    # Padded continuations retain their existing producer-owned physical buffers.
+    draft.tpu_relay_inputs = EagleRelayInputs(
+        seq_lens=batch.seq_lens,
+        topk_p=draft.topk_p,
+        topk_index=draft.topk_index,
+        bonus_tokens=draft.bonus_tokens,
+        hidden_states=draft.hidden_states,
+        cache_locs=draft.device_accept_selected_cache_locs,
+        logical_seq_lens=batch.seq_lens,
+    )

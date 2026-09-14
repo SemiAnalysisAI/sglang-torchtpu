@@ -91,6 +91,7 @@ def prepare_device_accept_tpu(
     if draft_input is not None:
         draft_input.device_accept_candidate_locs = None
         draft_input.device_accept_selected_cache_locs = None
+        draft_input.tpu_relay_inputs = None
 
     accept_lens = draft_input.accept_lens_device if draft_input is not None else None
     if accept_lens is not None:
@@ -175,6 +176,7 @@ def filter_device_accept_tpu(
     draft_input: EagleDraftInput, new_indices: torch.Tensor
 ) -> None:
     draft_input.tpu_draft_continuation = None
+    draft_input.tpu_relay_inputs = None
     if draft_input.accept_lens_device is not None:
         draft_input.accept_lens_device = draft_input.accept_lens_device[new_indices]
     if draft_input.device_accept_candidate_locs is not None:
@@ -191,6 +193,7 @@ def merge_device_accept_tpu(
     draft_input: EagleDraftInput, spec_info: EagleDraftInput
 ) -> None:
     draft_input.tpu_draft_continuation = None
+    draft_input.tpu_relay_inputs = None
     if (
         draft_input.accept_lens_device is not None
         and spec_info.accept_lens_device is not None

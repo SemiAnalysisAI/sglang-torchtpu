@@ -747,6 +747,8 @@ def test_device_accept_gather_uses_covering_bucket(
         device_accept_selected_cache_locs=None,
         accept_lens_device=accept_lens,
         future_dsa_topk_indices_available=False,
+        tpu_draft_continuation=None,
+        hidden_states=None,
     )
     future_map = SimpleNamespace(
         publish_ready=None,

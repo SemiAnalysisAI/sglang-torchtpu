@@ -10,6 +10,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    PreparedExtendMetadata,
 )
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -126,6 +127,7 @@ def prepare_for_draft_extend(
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
     tpu_verify_continuation=None,
+    prepared_extend_metadata: Optional[PreparedExtendMetadata] = None,
 ):
     bs = len(batch.seq_lens)
     # Optional window widening (num_front_tokens=0 -> off): prepend that many
@@ -167,7 +169,10 @@ def prepare_for_draft_extend(
     )
     # init_new requires both list or both Tensor;
     # gpu_only emits device tensors to skip H2D.
-    if gpu_only:
+    if prepared_extend_metadata is not None:
+        batch.prefix_lens = prepared_extend_metadata.prefix_lens_cpu[:bs]
+        batch.extend_lens = prepared_extend_metadata.seq_lens_cpu[:bs]
+    elif gpu_only:
         batch.prefix_lens = (batch.seq_lens - front_offset).clamp(min=0).to(torch.int32)
         batch.extend_lens = torch.full(
             (bs,), num_window_tokens, dtype=torch.int32, device=batch.seq_lens.device
@@ -193,20 +198,23 @@ def prepare_for_draft_extend(
         draft_model_runner,
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=return_hidden_states_before_norm,
+        prepared_extend_metadata=prepared_extend_metadata,
     )
     # Normalize idle DP ranks before the shared sequence-length update.
     draft_model_runner.compile_policy.normalize_spec_forward_batch(forward_batch)
     # Forward sees post-write length (draft extend writes num_draft_tokens
     # slots); mutation stays on forward_batch to preserve SB.seq_lens.
-    forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
-    if not gpu_only:
-        forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
-        forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
-    else:
-        # Supply CPU mirror (extend_seq_lens are all num_window_tokens) so
-        # backend max() reads from list without a per-iter D2H sync.
-        forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
-    if tpu_verify_continuation is not None:
+    if prepared_extend_metadata is None:
+        forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
+        if not gpu_only:
+            forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
+            forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
+        else:
+            # Supply CPU mirror (extend_seq_lens are all num_window_tokens) so
+            # backend max() reads from list without a per-iter D2H sync.
+            forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
+    # The prepared TPU policy binds its post-write lengths along with padding.
+    if tpu_verify_continuation is not None and prepared_extend_metadata is None:
         install_verify_continuation_tpu(
             forward_batch, tpu_verify_continuation, num_draft_tokens
         )
@@ -238,6 +246,8 @@ def prepare_for_draft(
     draft_model_runner: ModelRunner,
     topk: int,
     num_steps: int,
+    *,
+    prepared_inputs=None,
 ):
 
     if not batch.forward_mode.is_idle():
@@ -245,7 +255,9 @@ def prepare_for_draft(
 
         # Assign cache locations (draft-write targets).
         page_size = batch.token_to_kv_pool_allocator.page_size
-        if _is_tpu and prepare_draft_cache_locs_tpu(
+        if prepared_inputs is not None:
+            batch.out_cache_loc = prepared_inputs.draft_cache_locs[: bs * num_steps]
+        elif _is_tpu and prepare_draft_cache_locs_tpu(
             batch,
             draft_input,
             bs=bs,
@@ -332,7 +344,11 @@ def prepare_for_draft(
         if draft_model_runner.spec_algorithm.is_standalone()
         else CaptureHiddenMode.LAST
     )
-    draft_input.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
+    draft_input.positions = (
+        prepared_inputs.seq_lens[:bs]
+        if prepared_inputs is not None
+        else batch.seq_lens.repeat_interleave(topk, dim=0)
+    )
     forward_batch = ForwardBatch.init_new(
         batch,
         draft_model_runner,

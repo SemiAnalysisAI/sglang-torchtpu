@@ -430,6 +430,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         ] = {}
         self._active_num_tokens_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
         self._host_cu_lens_cache = None
+        self.prepared_eagle_step = None
         # Register the custom op eagerly so the (Python-introspection-heavy)
         # ``jax_op`` registration does not happen inside a ``torch.compile``
         # traced region — dynamo can't handle ``inspect.signature`` on the
@@ -474,6 +475,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # Use the backend's cached pool: upstream moved token_to_kv_pool off
         # ForwardBatch onto the attn backend (see self.token_to_kv_pool above).
         self.token_to_kv_pool.tpu_commit_pending_loads()
+
+        if self.prepared_eagle_step is not None:
+            self.forward_metadata = self.prepared_eagle_step.metadata_for(
+                self, forward_batch, fused_draft=fused_draft
+            )
+            return
 
         # Build metadata and its cached distribution from the same active width.
         non_empty_bs = self._non_empty_batch_size(forward_batch)
