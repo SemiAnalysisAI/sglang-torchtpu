@@ -251,9 +251,14 @@ MODEL_PROFILES = {
             # current main (post-#717, with KV offload on) took gsm8k from 0.99
             # to 0.06 -- run 34891021287, issue #718. QWEN_CHUNK_CAP overrides
             # it for cap sweeps without a commit.
-            "CHUNKED_PREFILL_SIZE": os.environ.get(
-                "QWEN_CHUNK_CAP", "4096"
-            ),  # EXPERIMENT #718,
+            "CHUNKED_PREFILL_SIZE": os.environ.get("QWEN_CHUNK_CAP", "4096"),
+            # EXPERIMENT #718: MAX_PREFILL_TOKENS normally defaults to the chunk
+            # size, so lifting the cap silently sized this to 4096 too. Pin it
+            # low while the chunk size stays high. A 93-token cold prompt is one
+            # 93-token forward either way, yet it is 0/3 capped and 3/3 uncapped
+            # -- so the forward's own compile bucket does not explain it. If it
+            # goes clean here, the poison follows max_prefill_tokens instead.
+            "MAX_PREFILL_TOKENS": os.environ.get("QWEN_MAX_PREFILL", "256"),
         },
         chat_template_kwargs={"enable_thinking": False},
     ),
