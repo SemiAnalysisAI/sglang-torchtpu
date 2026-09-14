@@ -77,7 +77,6 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     default_tree_mask_mode,
-    fused_draft_extend_select_argmax_func,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
@@ -132,6 +131,7 @@ _is_xpu = is_xpu()
 if _is_tpu:
     from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
         build_topk1_verify_chain_torch,
+        fused_draft_extend_select_argmax_func,
     )
 
 
@@ -1208,17 +1208,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         if current_platform.is_tpu():
-            execution_select_index = forward_batch.spec_info.last_accepted_indices()
             (
-                draft_logits_output.next_token_logits,
                 draft_logits_output.hidden_states,
                 ret_topk_p,
                 ret_topk_index,
             ) = self.draft_runner.compile_policy.finalize_spec_forward_batch(
                 outputs=fused_draft_extend_select_argmax_func(
-                    draft_logits_output.next_token_logits,
-                    draft_logits_output.hidden_states,
-                    execution_select_index,
+                    next_token_logits=draft_logits_output.next_token_logits,
+                    hidden_states=draft_logits_output.hidden_states,
+                    num_accept_tokens=forward_batch.spec_info.num_accept_tokens,
+                    num_tokens_per_req=forward_batch.spec_info.num_tokens_per_req,
                 ),
                 forward_batch=forward_batch,
             )

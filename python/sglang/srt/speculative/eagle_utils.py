@@ -16,7 +16,6 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
 from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
-    make_draft_extend_select_args,
     make_verify_bookkeeping_args,
     make_verify_tree_greedy_args,
 )
@@ -645,20 +644,6 @@ def verify_bookkeeping_func(seq_lens, accept_lens, predict, accept_index):
         accept_tokens, accept_lens, bonus_tokens, accept_index.shape[1]
     )
     return new_seq_lens, bonus_tokens
-
-
-@compiled_op(warmup=make_draft_extend_select_args)
-def fused_draft_extend_select_argmax_func(
-    next_token_logits: torch.Tensor,
-    hidden_states: Optional[torch.Tensor],
-    select_index: torch.Tensor,
-):
-    """Select draft-extend rows and compute their greedy next-draft tokens."""
-    selected_logits = next_token_logits[select_index]
-    selected_hidden = hidden_states[select_index] if hidden_states is not None else None
-    topk_index = torch.argmax(selected_logits, dim=-1, keepdim=True)
-    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
-    return selected_logits, selected_hidden, topk_p, topk_index
 
 
 def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:

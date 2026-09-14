@@ -1,6 +1,9 @@
-"""TPU helpers for EAGLE verify trees."""
+"""TPU helpers for EAGLE verify trees and draft extension."""
 
 import torch
+
+from sglang.srt.compilation.compiled_op import compiled_op
+from sglang.srt.hardware_backend.tpu.spec_op_warmup import make_draft_extend_select_args
 
 
 def build_topk1_verify_chain_torch(
@@ -69,3 +72,27 @@ def build_topk1_verify_tree_tpu(
         next_sibling,
         verify_tokens.flatten(),
     )
+
+
+@compiled_op(warmup=make_draft_extend_select_args)
+def fused_draft_extend_select_argmax_func(
+    next_token_logits: torch.Tensor,
+    hidden_states: torch.Tensor | None,
+    num_accept_tokens: torch.Tensor,
+    num_tokens_per_req: int,
+):
+    row_starts = (
+        torch.arange(
+            num_accept_tokens.shape[0],
+            dtype=torch.int64,
+            device=num_accept_tokens.device,
+        )
+        * num_tokens_per_req
+    )
+    # Zero-count compile-padding rows select their own first window row.
+    select_index = row_starts + num_accept_tokens.to(torch.int64).clamp_min(1) - 1
+    selected_logits = next_token_logits[select_index]
+    selected_hidden = hidden_states[select_index] if hidden_states is not None else None
+    topk_index = torch.argmax(selected_logits, dim=-1, keepdim=True)
+    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+    return selected_hidden, topk_p, topk_index
