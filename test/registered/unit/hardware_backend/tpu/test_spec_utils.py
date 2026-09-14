@@ -489,12 +489,13 @@ def test_dflash_prepare_for_decode_uses_torch_native_allocator():
     assert reqs[1].kv.kv_allocated_len == 9
 
 
+@pytest.mark.parametrize("preallocated", [False, True])
 @pytest.mark.parametrize(
     "page_size,num_steps,num_draft_tokens,candidate_width",
     [(1, 1, 2, 3), (16, 2, 3, 5), (64, 3, 4, 7), (64, 0, 1, None)],
 )
 def test_eagle_prepare_for_decode_builds_device_accept_window_for_paged_tpu(
-    page_size, num_steps, num_draft_tokens, candidate_width
+    page_size, num_steps, num_draft_tokens, candidate_width, preallocated
 ):
     spec = SimpleNamespace(
         speculative_num_steps=num_steps,
@@ -503,8 +504,11 @@ def test_eagle_prepare_for_decode_builds_device_accept_window_for_paged_tpu(
         speculative_use_rejection_sampling=False,
     )
     host_base = max(1, page_size - 2)
+    initial_alloc_len = 128 if preallocated else 0
     req = SimpleNamespace(
-        kv=SimpleNamespace(kv_allocated_len=0, kv_committed_len=host_base - 1),
+        kv=SimpleNamespace(
+            kv_allocated_len=initial_alloc_len, kv_committed_len=host_base - 1
+        ),
         decode_batch_idx=0,
         seqlen=host_base,
         lora_id=None,
@@ -549,9 +553,21 @@ def test_eagle_prepare_for_decode_builds_device_accept_window_for_paged_tpu(
         ),
         patch.object(eagle_utils, "get_spec", return_value=spec),
         patch.object(eagle_utils_tpu, "get_spec", return_value=spec),
-        patch.object(kernels, "allocate_and_assign_decode_cache"),
+        patch.object(kernels, "allocate_and_assign_decode_cache") as allocate,
     ):
         eagle_utils.eagle_prepare_for_decode(batch)
+
+    if preallocated:
+        allocate.assert_not_called()
+    else:
+        allocate.assert_called_once()
+    assert req.decode_batch_idx == 1
+    batch.maybe_evict_swa.assert_called_once()
+    expected_alloc = max(
+        initial_alloc_len,
+        (host_base + 2 * num_draft_tokens + page_size - 1) // page_size * page_size,
+    )
+    assert req.kv.kv_allocated_len == expected_alloc
 
     if candidate_width is None:
         assert draft_input.device_accept_candidate_locs is None
@@ -568,10 +584,6 @@ def test_eagle_prepare_for_decode_builds_device_accept_window_for_paged_tpu(
         .to(torch.int64)
         .reshape(1, candidate_width),
     )
-    expected_alloc = (
-        (host_base + 2 * num_draft_tokens + page_size - 1) // page_size * page_size
-    )
-    assert req.kv.kv_allocated_len == expected_alloc
 
 
 def test_device_accept_state_tracks_filtered_and_merged_future_rows():

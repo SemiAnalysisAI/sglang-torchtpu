@@ -1249,17 +1249,20 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     if _use_torch_native and batch.req_to_token_pool.host_resident:
         # TPU: req_to_token lives on the host, so allocate and write the page
         # table through the host mirrors instead of the device alloc path.
-        allocate_and_assign_decode_cache(
-            tree_cache=batch.tree_cache,
-            req_to_token_pool=batch.req_to_token_pool,
-            req_pool_indices=batch.req_pool_indices,
-            cur_kv_lens_cpu=cur_kv_lens_cpu,
-            nxt_kv_lens_cpu=nxt_kv_lens_cpu,
-            num_needed_tokens=num_needed_tokens,
-            batch_size=bs,
-            device=batch.device,
-            host_req_pool_indices=batch.req_pool_indices_cpu,
-        )
+        # Most paged decode steps fit in the existing reservation. Avoid the
+        # per-request allocator walk and empty H2D copies until a page is needed.
+        if num_needed_tokens > 0:
+            allocate_and_assign_decode_cache(
+                tree_cache=batch.tree_cache,
+                req_to_token_pool=batch.req_to_token_pool,
+                req_pool_indices=batch.req_pool_indices,
+                cur_kv_lens_cpu=cur_kv_lens_cpu,
+                nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+                num_needed_tokens=num_needed_tokens,
+                batch_size=bs,
+                device=batch.device,
+                host_req_pool_indices=batch.req_pool_indices_cpu,
+            )
         # Bookkeeping that alloc_for_spec_decode does for the device path.
         for i, req in enumerate(batch.reqs):
             req.kv.kv_allocated_len = max(
