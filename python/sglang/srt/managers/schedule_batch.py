@@ -2470,6 +2470,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reqs = self.reqs
         input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
+        # DIAGNOSTIC (remove before merge): input_ids is sliced with the
+        # CURRENT prefix_indices, while extend_range was fixed at admission.
+        # If the matched prefix moved in between, the count this batch reports
+        # to the DP all-gather no longer describes the tensor it will pad.
+        for _i, _r in enumerate(reqs):
+            _admitted = _r.extend_range.length
+            _actual = len(input_ids[_i])
+            if _admitted != _actual:
+                logger.error(
+                    "prefix moved since admission: rid=%s admitted_extend=%d "
+                    "actual_extend=%d delta=%d prefix_indices=%d "
+                    "cache_protected_len=%s fill_ids=%d",
+                    _r.rid,
+                    _admitted,
+                    _actual,
+                    _actual - _admitted,
+                    len(_r.prefix_indices),
+                    _r.kv.cache_protected_len,
+                    len(_r.get_fill_ids()),
+                )
         seq_lens = [r.extend_range.end for r in reqs]
         orig_seq_lens = [max(r.extend_range.end, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
