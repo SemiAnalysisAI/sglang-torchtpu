@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
+import logging
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
@@ -48,6 +49,9 @@ if TYPE_CHECKING:
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
+
+
+logger = logging.getLogger(__name__)
 
 def _resolve_elastic_world_dp_size(
     dp_size: int,
@@ -371,6 +375,20 @@ def prepare_mlp_sync_batch_raw(
         num_tokens_for_logprob = num_tokens
     else:
         num_tokens = local_batch.extend_num_tokens
+        # DIAGNOSTIC (remove before merge): this is the value the all-gather
+        # publishes for this rank. The pad error downstream shows it arriving
+        # short of the batch's real input_ids. Stamp the batch identity so the
+        # two can be correlated -- same object mutated later, or a different
+        # object reaching the forward.
+        logger.error(
+            "MLPSYNC extend: batch=%x reqs=%d extend_num_tokens=%s "
+            "sum_extend_lens=%s mode=%s",
+            id(local_batch),
+            len(local_batch.reqs),
+            num_tokens,
+            sum(local_batch.extend_lens) if local_batch.extend_lens else None,
+            local_batch.forward_mode,
+        )
         num_tokens_for_logprob = sum(
             # We should have at least 1 token for sample in every case.
             max(extend_len - logprob_start_len, 1)
