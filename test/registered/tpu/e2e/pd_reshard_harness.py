@@ -703,8 +703,15 @@ def run_cold_length_sweep(base_url: str, profile: ModelProfile) -> None:
     shares a prefix with another and length is the only variable.
     """
     attempts = int(E("COLD_SWEEP_ATTEMPTS", "3"))
+    # EXPERIMENT #718: with the 1024 bucket dropped, prompts above the largest
+    # compiled bucket do not fail fast -- _generate waits out its 900s timeout,
+    # so 33 long requests outlast the JobSet deadline and the run reports
+    # nothing (34917480959 was cancelled at ~2h for exactly this). Cap the sweep
+    # at the lengths that carry the measurement.
+    limit = int(E("COLD_SWEEP_MAX_PARAGRAPHS", "6"))  # ~216 tokens
+    entries = [p for p in _COLD_SWEEP_PARAGRAPHS if not limit or p <= limit]
     results = []
-    for step, paragraphs in enumerate(_COLD_SWEEP_PARAGRAPHS):
+    for step, paragraphs in enumerate(entries):
         prompt = sweep_question(
             paragraphs, rotate=step + 1, tag=f"Memo {step:02d}-{step * 7 + 3}. "
         )
@@ -1029,6 +1036,18 @@ class TestPdTpResharding(unittest.TestCase):
         the host pool and DMA engine are up, so its absence is the direct
         evidence of that silent skip.
         """
+
+        # EXPERIMENT #718: when the compiled buckets cannot cover a full-length
+        # prompt, gsm8k's ~900-token questions do not fail fast -- each waits
+        # out the 900s client timeout and the run outlives the JobSet deadline
+        # (34917480959). The cold sweep carries the measurement in that mode.
+        env = build_prefill_env(self.profile, self.topo.group_hosts)
+        buckets = [int(b) for b in env["TPU_COMPILE_TOKENS"].split()]
+        if max(buckets) < int(env["CHUNKED_PREFILL_SIZE"]):
+            self.skipTest(
+                f"largest compiled bucket {max(buckets)} < chunk "
+                f"{env['CHUNKED_PREFILL_SIZE']}; long prompts cannot be served"
+            )
         if (
             "--enable-hierarchical-cache"
             not in build_prefill_env(self.profile, self.topo.group_hosts)["EXTRA_ARGS"]
