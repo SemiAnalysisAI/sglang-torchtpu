@@ -1555,41 +1555,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
-        # DIAGNOSTIC (remove before merge): every pad below grows a tensor to a
-        # size agreed across DP ranks. That size is derived from the
-        # extend_num_tokens each rank reported to the all-gather, and the
-        # derivation only ever rounds up -- so it cannot come out below this
-        # rank's own reported count. When it does, the count and the tensor were
-        # read from different batch states, and torch reports it four frames
-        # later as an opaque "expected dimension sizes to be >= 0". Dump both
-        # sides so the divergence is attributable.
+        # Every pad below grows a tensor to a size agreed across DP ranks.
+        # That size derives from the extend_num_tokens each rank reported to the
+        # all-gather, and the derivation only rounds up, so it cannot land below
+        # this rank's own contribution -- unless the batch changed after the
+        # report. Observed on a 16-session agentic sweep: a request lost one
+        # cached prefix page between the all-gather and prepare_for_extend, so
+        # it needed 128 more tokens of recompute than it had announced
+        # (input_ids=1523 against a 1400 target, prefix 54 pages -> 53).
+        #
+        # Fail here with both sides rather than four frames down inside torch as
+        # "empty(): expected dimension sizes to be >= 0, got [-123]", which says
+        # nothing about which rank disagreed or by how much.
         if num_tokens < self.input_ids.shape[0] or bs < self.req_pool_indices.shape[0]:
-            logger.error(
-                "DP pad would shrink: rank=%s mode=%s dp_padding_mode=%s "
-                "input_ids=%d -> num_tokens=%d (delta=%d) | "
-                "req_pool_indices=%d -> bs=%d (delta=%d) | "
-                "fb.extend_num_tokens=%s fb.batch_size=%s orig_batch_size=%s | "
-                "gathered=%s padded=%s | seq_lens=%s extend_seq_lens=%s",
-                get_parallel().attn_dp_rank,
-                self.forward_mode,
-                self.dp_padding_mode,
-                self.input_ids.shape[0],
-                num_tokens,
-                num_tokens - self.input_ids.shape[0],
-                self.req_pool_indices.shape[0],
-                bs,
-                bs - self.req_pool_indices.shape[0],
-                self.extend_num_tokens,
-                self.batch_size,
-                getattr(self, "_original_batch_size", None),
-                self.original_global_num_tokens_cpu,
-                self.global_num_tokens_cpu,
-                self.seq_lens_cpu.tolist() if self.seq_lens_cpu is not None else None,
-                (
-                    self.extend_seq_lens.tolist()
-                    if self.extend_seq_lens is not None
-                    else None
-                ),
+            raise RuntimeError(
+                "DP sync shape is smaller than this rank's batch: "
+                f"rank={get_parallel().attn_dp_rank} mode={self.forward_mode} "
+                f"dp_padding_mode={self.dp_padding_mode} "
+                f"input_ids={self.input_ids.shape[0]} -> num_tokens={num_tokens} "
+                f"req_pool_indices={self.req_pool_indices.shape[0]} -> bs={bs} | "
+                f"gathered={self.original_global_num_tokens_cpu} "
+                f"padded={self.global_num_tokens_cpu} | "
+                f"extend_seq_lens={self.extend_seq_lens.tolist() if self.extend_seq_lens is not None else None} "
+                f"seq_lens={self.seq_lens_cpu.tolist() if self.seq_lens_cpu is not None else None} "
+                "-- the batch grew after its token count was all-gathered"
             )
         # padding
         self._original_num_tokens = self.positions.shape[0]
