@@ -210,6 +210,11 @@ def _measure(swa_ratio: float, churn_tokens: int = CHURN_TOKENS) -> dict:
                     "before": before,
                     "churn": churn,
                     "after": self._match(cache, target).host_hit_length,
+                    # handed back so a test can inspect or alter the surviving
+                    # tree; the suppression arm needs to drop one component's
+                    # host half without disturbing the other.
+                    "rematch": lambda: self._match(cache, target).host_hit_length,
+                    "core": cache.tree_core,
                 }
             )
 
@@ -284,6 +289,51 @@ class TestHiCacheSwaHostPoolSizing(unittest.TestCase):
             0,
             f"a ratio of {mid} is not immune: churn past its SWA pool still "
             f"zeroes the host hit for the full half too: {over}",
+        )
+
+    def test_losing_only_the_swa_host_half_also_zeroes_the_hit(self):
+        """The other route to a zero hit: the node survives and the match stops.
+
+        The three arms above are all ratio-driven, and a low ratio takes one
+        specific route -- the SWA host allocation is refused at backup time, the
+        node never gains a host presence, and the tombstone reaper deletes it
+        along with its full half. The validators never run.
+
+        There is a second route, reached when an SWA half leaves host *after* a
+        successful backup: the node survives (the reaper keeps anything whose
+        Full half is on host), the conjunctive component match rejects it, and
+        the walk halts before the full half -- still resident -- is counted.
+        This arm constructs that state directly from a healthy parity tree, and
+        it is the one that leaves usable KV stranded rather than freed.
+
+        Unlike the reaping arms, this one *is* sensitive to the combinator:
+        the same state returns the full hit under ``any()``.
+        """
+        r = _measure(SWA_RATIO_PARITY)
+        self.assertEqual(r["after"], TARGET_TOKENS, r)
+
+        core, rematch = r["core"], r["rematch"]
+        _, _, ComponentType = _fixtures()
+
+        dropped = 0
+        stack = [core.root_node]
+        while stack:
+            node = stack.pop()
+            try:
+                data = node.component(ComponentType.SWA)
+            except Exception:  # noqa: BLE001 - node carries no SWA component
+                data = None
+            if data is not None and getattr(data, "host_value", None) is not None:
+                data.host_value = None
+                dropped += 1
+            stack.extend(node.children.values())
+
+        self.assertGreater(dropped, 0, "no SWA host halves to drop; fixture changed")
+        self.assertEqual(
+            rematch(),
+            0,
+            "an absent SWA host half should suppress the hit on the full half, "
+            f"which is still resident (dropped {dropped} SWA halves)",
         )
 
     def test_small_swa_pool_bounds_the_full_host_hit(self):
