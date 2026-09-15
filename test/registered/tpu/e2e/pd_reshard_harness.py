@@ -157,7 +157,7 @@ LB_LOG = "/tmp/pd_lb.log"
 # "the 1024 graph is compiled" from "the chunk size is large". Prompts longer
 # than 256 will fail the bucketer in that configuration; the short lengths are
 # the measurement.
-QWEN_COMPILE_TOKENS = os.environ.get("QWEN_COMPILE_TOKENS", "64 256")
+QWEN_COMPILE_TOKENS = os.environ.get("QWEN_COMPILE_TOKENS", "64 256 1024")
 
 
 class ModelProfile(msgspec.Struct, frozen=True, kw_only=True):
@@ -266,7 +266,7 @@ MODEL_PROFILES = {
             # current main (post-#717, with KV offload on) took gsm8k from 0.99
             # to 0.06 -- run 34891021287, issue #718. QWEN_CHUNK_CAP overrides
             # it for cap sweeps without a commit.
-            "CHUNKED_PREFILL_SIZE": os.environ.get("QWEN_CHUNK_CAP", "1024"),
+            "CHUNKED_PREFILL_SIZE": os.environ.get("QWEN_CHUNK_CAP", "256"),
             # Left to default to the chunk size. Pinning it lower than the
             # chunk size is not a valid pair: --max-prefill-tokens 256 with
             # --chunked-prefill-size 4096 hung precompile and the watchdog
@@ -708,7 +708,9 @@ def run_cold_length_sweep(base_url: str, profile: ModelProfile) -> None:
     # so 33 long requests outlast the JobSet deadline and the run reports
     # nothing (34917480959 was cancelled at ~2h for exactly this). Cap the sweep
     # at the lengths that carry the measurement.
-    limit = int(E("COLD_SWEEP_MAX_PARAGRAPHS", "6"))  # ~216 tokens
+    limit = int(
+        E("COLD_SWEEP_MAX_PARAGRAPHS", "6")
+    )  # ~216 tokens, both configs comparable
     entries = [p for p in _COLD_SWEEP_PARAGRAPHS if not limit or p <= limit]
     results = []
     for step, paragraphs in enumerate(entries):
@@ -995,6 +997,52 @@ class TestPdTpResharding(unittest.TestCase):
             return
         for p in cls.procs:
             _kill(p)
+
+    def test_00_report_prefill_config(self) -> None:
+        """Echo the prefill engine's resolved config through the leader.
+
+        Issue #718 comes down to one scalar: chunked_prefill_size 256 is clean
+        and 1024 is corrupt, with identical compiled buckets and identical
+        per-request forwards. Whatever it changes is set at bring-up, and the
+        resolved ServerArgs banner is the only place that is visible. It lives
+        in the tee'd prefill log, which a long job truncates out of the job log,
+        so reprint the relevant fields here -- the leader's own stdout is low
+        volume and survives. Diff two runs that differ only in the chunk size.
+        """
+        with open(PREFILL_LOG, "r", errors="replace") as f:
+            log = f.read()
+        banner = next(
+            (l for l in log.splitlines() if "server_args=ServerArgs(" in l), ""
+        )
+        if not banner:
+            self.skipTest(f"no ServerArgs banner in {PREFILL_LOG}")
+        keys = (
+            "chunked_prefill_size",
+            "max_prefill_tokens",
+            "max_running_requests",
+            "prefill_max_requests",
+            "page_size",
+            "context_length",
+            "max_total_tokens",
+            "torch_compile_max_bs",
+            "enable_mixed_chunk",
+            "disable_radix_cache",
+            "schedule_conservativeness",
+            "enable_dynamic_chunking",
+            "prefill_only_disable_kv_cache",
+        )
+        fields = dict(
+            kv.split("=", 1)
+            for kv in (p.strip() for p in banner.split(","))
+            if "=" in kv
+        )
+        for k in keys:
+            if k in fields:
+                print(f"[leader] prefill {k}={fields[k]}", flush=True)
+        for line in log.splitlines():
+            if "TokenBucketer" in line or "buckets=[" in line:
+                print(f"[leader] prefill {line.strip()[:160]}", flush=True)
+                break
 
     def test_01_tp_resharding_generation(self) -> None:
         run_tp_resharding_probe(
