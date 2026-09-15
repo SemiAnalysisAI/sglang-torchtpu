@@ -8,7 +8,7 @@ py_test(
     env = {"TORCH_DEVICE_BACKEND_AUTOLOAD": "0"},
     python_version = "3.12",
     deps = [
-        "//benchmark/tpu:python_launcher",
+        "//benchmark/tpu:python_configs",
         "//python:sglang",
     ],
 )

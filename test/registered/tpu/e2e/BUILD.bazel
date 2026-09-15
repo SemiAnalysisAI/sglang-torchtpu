@@ -63,7 +63,7 @@ sglang_tpu_e2e_test(
     main = "test_tpu_qwen3_0_6b_singlehost_compile_tracer.py",
     tags = ["requires-tpu-v7x"],
     deps = [
-        "//benchmark/tpu:python_launcher",
+        "//benchmark/tpu:python_configs",
         "//python:sglang",
         "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],

@@ -49,7 +49,6 @@ class TestTpuQwen306bSinglehostCompileTracer(CustomTestCase):
             other_args=server_args_to_cli(config["server_args"]),
             env=config["runtime_env"],
             device="tpu",
-            server_module="benchmark.tpu.launch_server_2",
         )
         try:
             request_path = "/v1/completions"
