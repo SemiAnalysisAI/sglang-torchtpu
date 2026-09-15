@@ -36,36 +36,33 @@ EXTRA_ARGS="--weight-loader-drop-cache-after-load${EXTRA_ARGS:+ $EXTRA_ARGS}"
 
 PROFILE=${PROFILE:-ci}
 
-# Compile only the buckets the ci sweep can reach. config.sh derives MAX_RUNNING
-# and TORCH_COMPILE_MAX_BS from max(SWEEP_BS)=16, but that is the *client's
-# global* concurrency while both knobs are *per DP rank* -- at dp=2 no rank ever
-# sees more than ~8 in flight, so half the decode ladder is compiled for batches
-# that cannot occur. config.sh:347 already warns that sizing above the sweep
-# "only buys extra torch.compile buckets, which is the most expensive thing in a
-# CI bring-up"; since libtpu 0.0.47 (#727) that surplus no longer fits in host
-# RAM beside the pinned HiCache pool, and the pod is OOM-killed during warmup.
-# Drops the intermediate decode rungs only. The ladder's MAXIMUM stays at
-# max(SWEEP_BS)=16 so it still covers max_running_requests, and MAX_RUNNING is
-# left derived -- both of those matter:
+# Since libtpu 0.0.47 (#727) the resident compiled executables no longer fit in
+# host RAM beside the pinned HiCache pool, and the pod is OOM-killed during
+# warmup with HBM still ~39 GB free. config.sh:347 already warns that extra
+# torch.compile buckets are "the most expensive thing in a CI bring-up"; 12
+# graph variants now OOM-kill the pod and 9 do not, so the ladder has to lose a
+# few. Which few is the whole question.
 #
-#   * Lowering MAX_RUNNING to 8 is what config.sh:337 warns about (a leg gets
-#     admission-capped below the concurrency it reports). It also breaks DP
-#     attention outright: prepare_mlp_sync_batch pads every rank up to the
-#     global token count, and with the cap in place a rank's own batch can
-#     exceed it, so the pad goes negative --
-#       forward_batch_info.py:1302 _pad_tensor_to_size
-#       RuntimeError: empty(): expected dimension sizes to be >= 0, got [-1017]
-#     seen in run 34908974337; the 09-11 green run, identical but for
-#     max_running_requests=16, has none.
-#   * Pinning the extend ladder to a single 4096 bucket fails the same way
-#     (run 34903370712, got [-123]), so it stays derived.
+# Thin the EXTEND ladder, and leave the decode ladder and MAX_RUNNING exactly
+# as the last green run had them. Every negative pad seen while fixing this has
+# coincided with a decode-side change, never with the extend side alone:
 #
-# bs 2..7 and 9..15 now round up, which the ci sweep barely visits: SWEEP_BS is
-# "1 16", so per rank at dp=2 the live sizes are ~1 and ~8, both exact rungs.
-# 12 graph variants -> 10. Run 34908974337 showed 9 clears the OOM and 12 does
-# not, so this should sit inside the margin.
+#   bs=[1,8]    + tokens=[4096] + MAX_RUNNING=8   -> pad -123  at c1  (34903370712)
+#   bs=[1,8]    + derived       + MAX_RUNNING=8   -> pad -1017 at c1  (34908974337)
+#   bs=[1,8,16] + derived       + MAX_RUNNING=16  -> pad -1352 at c16 (34914967096)
+#
+# The mechanism is DP attention: prepare_mlp_sync_batch sizes every rank from
+# the all-gathered global_num_tokens, and a decode ladder missing rungs lets a
+# rank's own padded batch exceed that target, so the pad goes negative
+# (forward_batch_info.py:1302). The last run got both c1 legs green and matched
+# the 09-11 baseline on hit rate and throughput, so only the c16 legs, where
+# per-rank batch size varies most, still trip it.
+#
+# Cutting extends instead keeps 4096 as the maximum -- nothing can overflow the
+# ladder that could not before -- and only costs padding on chunks under 1024.
+# 5 decode + 3 extend = 8 variants, below the 9 that ran OOM-free.
 if [[ "$PROFILE" == "ci" ]]; then
-  export TPU_COMPILE_BS="${TPU_COMPILE_BS:-1 8 16}"
+  export TPU_COMPILE_TOKENS="${TPU_COMPILE_TOKENS:-1024 2048 4096}"
 fi
 
 exec env \
