@@ -1,6 +1,9 @@
 """End-to-end tests for the TPU compilation tracers."""
 
+import sys
 import unittest
+from copy import deepcopy
+from pathlib import Path
 
 import requests
 
@@ -12,6 +15,12 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+# Support the CI runner's `python path/to/test.py` invocation as well as Bazel.
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu.recipe.configs.config_eval import server_args_to_cli
+from benchmark.tpu.recipe.configs.qwen3_0_6b import CONFIG
 
 register_tpu_ci(
     est_time=600,
@@ -30,47 +39,23 @@ class TestTpuQwen306bSinglehostCompileTracer(CustomTestCase):
         tracer,
         *,
         model=MODEL,
-        extra_args=(),
+        overrides=None,
         expect_speculative_decoding=False,
     ):
-        args = [
-            "--dtype",
-            "bfloat16",
-            "--device",
-            "tpu",
-            "--grammar-backend",
-            "none",
-            "--enable-torch-compile",
-            "--tp-size",
-            "1",
-            "--page-size",
-            "64",
-            "--chunked-prefill-size",
-            "64",
-            "--context-length",
-            "128",
-            "--max-prefill-tokens",
-            "64",
-            "--max-total-tokens",
-            "128",
-            "--max-running-requests",
-            "1",
-            "--torch-compile-max-bs",
-            "1",
-            "--tpu-compile-tokens",
-            "16",
-            "--tpu-compile-bs",
-            "1",
-        ]
+        config = deepcopy(CONFIG)
         if tracer == "direct":
-            args.extend(("--tpu-compile-tracer", "direct"))
-        args.extend(extra_args)
+            config["server_args"]["tpu_compile_tracer"] = "direct"
+        config["server_args"].update(overrides or {})
+        # The helper supplies the model and URL-derived connection flags.
+        for name in ("model_path", "host", "port"):
+            config["server_args"].pop(name, None)
 
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=args,
+            other_args=server_args_to_cli(config["server_args"]),
+            env=config["runtime_env"],
             device="tpu",
         )
         try:
@@ -118,32 +103,21 @@ class TestTpuQwen306bSinglehostCompileTracer(CustomTestCase):
         state = self._run_server(
             "direct",
             model=EAGLE3_MODEL,
-            extra_args=(
-                "--attention-backend",
-                "pallas_tpu_rpa_v3",
-                "--speculative-algorithm",
-                "EAGLE3",
-                "--speculative-draft-model-path",
-                EAGLE3_DRAFT_MODEL,
-                "--speculative-num-steps",
-                "3",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "4",
-                "--disable-overlap-schedule",
-                "--disable-radix-cache",
-                "--context-length",
-                "512",
-                "--max-total-tokens",
-                "512",
-                "--max-prefill-tokens",
-                "64",
-                "--chunked-prefill-size",
-                "64",
-                "--tpu-compile-tokens",
-                "64",
-            ),
+            overrides={
+                "attention_backend": "pallas_tpu_rpa_v3",
+                "speculative_algorithm": "EAGLE3",
+                "speculative_draft_model_path": EAGLE3_DRAFT_MODEL,
+                "speculative_num_steps": 3,
+                "speculative_eagle_topk": 1,
+                "speculative_num_draft_tokens": 4,
+                "disable_overlap_schedule": True,
+                "disable_radix_cache": True,
+                "context_length": 512,
+                "max_total_tokens": 512,
+                "max_prefill_tokens": 64,
+                "chunked_prefill_size": 64,
+                "tpu_compile_tokens": [64],
+            },
             expect_speculative_decoding=True,
         )
         self.assertEqual(state["torch_compile_dynamo_frames"], 0)
