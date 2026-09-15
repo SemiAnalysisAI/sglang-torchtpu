@@ -160,6 +160,7 @@ class TpuPlatform(Platform):
         from sglang.srt.hardware_backend.tpu.patches import (
             _patch_set_device_tolerate_mismatch,
             _prepare_tpu_env,
+            _register_aten_fallbacks,
         )
 
         # srt's activate() selects CPU-only JAX for TorchTPU processes; the
@@ -179,6 +180,11 @@ class TpuPlatform(Platform):
 
         # PJRT owns the chiplet binding; local_rank is only a label.
         _patch_set_device_tolerate_mismatch()
+
+        # Ops torch_tpu cannot lower abort the process rather than raising, so
+        # the whole srt fallback set is installed, not just the ones diffusion
+        # is known to reach today.
+        _register_aten_fallbacks()
 
         _install_device_module_shims()
         torch.zeros(1, device="tpu")

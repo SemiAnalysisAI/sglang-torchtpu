@@ -334,6 +334,25 @@ def _register_aten_fallbacks() -> None:
         self.copy_(out)
         return self
 
+    # s64 cumsum hits the same buggy lowering as masked_scatter_'s scan
+    # ("Unsupported conversion from vmreg/vreg to U64"), aborting the process;
+    # int32 is TPU native. Callers that can reach 2**31 must pass an explicit
+    # dtype. Only the functional overload is replaced, so redispatching through
+    # aten::cumsum.out reaches torch_tpu's kernel instead of recursing.
+    @torch.library.register_kernel("aten::cumsum", "PrivateUse1")
+    def _cumsum(self, dim, dtype=None):
+        if dtype is None:
+            # cumsum promotes every integral input, bool included, to int64.
+            dtype = (
+                self.dtype
+                if self.is_floating_point() or self.is_complex()
+                else torch.int64
+            )
+        compute_dtype = torch.int32 if dtype == torch.int64 else dtype
+        out = torch.empty(self.shape, dtype=compute_dtype, device=self.device)
+        torch.ops.aten.cumsum.out(self, dim, dtype=compute_dtype, out=out)
+        return out.to(dtype)
+
     # aten::upsample_bicubic2d -- no TPU kernel; run the CPU kernel and copy
     # back. Vision towers use it to resize position embeddings per image grid
     # (MoonViT's Learnable2DInterpPosEmb in Kimi-VL), so inputs are small (tens
@@ -350,7 +369,7 @@ def _register_aten_fallbacks() -> None:
 
     logger.info(
         "Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, "
-        "masked_scatter_, upsample_bicubic2d"
+        "masked_scatter_, cumsum, upsample_bicubic2d"
     )
 
 
