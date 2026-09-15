@@ -266,7 +266,7 @@ MODEL_PROFILES = {
             # current main (post-#717, with KV offload on) took gsm8k from 0.99
             # to 0.06 -- run 34891021287, issue #718. QWEN_CHUNK_CAP overrides
             # it for cap sweeps without a commit.
-            "CHUNKED_PREFILL_SIZE": os.environ.get("QWEN_CHUNK_CAP", "256"),
+            "CHUNKED_PREFILL_SIZE": os.environ.get("QWEN_CHUNK_CAP", "1024"),
             # Left to default to the chunk size. Pinning it lower than the
             # chunk size is not a valid pair: --max-prefill-tokens 256 with
             # --chunked-prefill-size 4096 hung precompile and the watchdog
@@ -428,7 +428,7 @@ def hicache_server_args(
     # QWEN_KV_OFFLOAD=0 turns offload off for an experiment; see issue #718,
     # where uncapped prefill must be measured with and without it to tell the
     # compile graph apart from the offload path.
-    if values.get("KV_OFFLOAD_ENABLED", "0") != "1":  # EXPERIMENT #718
+    if values.get("KV_OFFLOAD_ENABLED", "1") != "1":  # EXPERIMENT #718
         return ""
     return " ".join(
         (
@@ -1011,9 +1011,7 @@ class TestPdTpResharding(unittest.TestCase):
         """
         with open(PREFILL_LOG, "r", errors="replace") as f:
             log = f.read()
-        banner = next(
-            (l for l in log.splitlines() if "server_args=ServerArgs(" in l), ""
-        )
+        banner = next((l for l in log.splitlines() if "chunked_prefill_size=" in l), "")
         if not banner:
             self.skipTest(f"no ServerArgs banner in {PREFILL_LOG}")
         keys = (
