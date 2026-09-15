@@ -1,10 +1,10 @@
 """Load Python recipes that export a CONFIG dictionary."""
 
+import json
 import runpy
 from pathlib import Path
 
-ENV_SECTIONS = ("sglang_env", "torch_tpu_env", "runtime_env")
-SECTIONS = ("server_args", *ENV_SECTIONS)
+SECTIONS = ("server_args", "runtime_env")
 
 
 def validate_config(config):
@@ -28,3 +28,21 @@ def eval_config(path):
     if "CONFIG" not in namespace:
         raise ValueError(f"Python recipe must define CONFIG: {path}")
     return validate_config(namespace["CONFIG"])
+
+
+def server_args_to_cli(settings):
+    """Convert final recipe settings to CLI flags; False and None omit a flag."""
+    args = []
+    for name, value in settings.items():
+        flag = "--" + name.replace("_", "-")
+        if value is None or value is False:
+            continue
+        if value is True:
+            args.append(flag)
+        elif isinstance(value, list):
+            args.extend([flag, *map(str, value)])
+        elif isinstance(value, dict):
+            args.append(f"{flag}={json.dumps(value, allow_nan=False)}")
+        else:
+            args.append(f"{flag}={value}")
+    return args

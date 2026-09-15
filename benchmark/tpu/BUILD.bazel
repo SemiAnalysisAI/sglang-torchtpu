@@ -1,4 +1,17 @@
+load("@rules_python//python:defs.bzl", "py_library")
+
 package(default_visibility = ["//visibility:public"])
+
+# Expose the benchmark.tpu modules to Bazel's hermetic Python interpreter,
+# including the server-launch subprocess (which inherits PYTHONSAFEPATH).
+py_library(
+    name = "python_launcher",
+    srcs = [
+        "dump_meta.py",
+        "launch_server_2.py",
+    ] + glob(["recipe/configs/*.py"]),
+    imports = ["../.."],
+)
 
 # Shell recipes, evaluation configs, and helper programs resolved at runtime by
 # sglang.test.tpu. Executable bits are preserved in Bazel runfiles.

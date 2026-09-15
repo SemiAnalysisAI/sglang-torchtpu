@@ -1,11 +1,10 @@
-"""Config evaluation and launcher process contract; no accelerator required."""
+"""Unit tests for Python recipe loading, overrides, and CLI flag conversion."""
 
 import json
-import os
-import subprocess
 import sys
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -14,36 +13,35 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 ROOT = Path(__file__).resolve().parents[3]
 BENCH = ROOT / "benchmark" / "tpu"
-sys.path.insert(0, str(BENCH))
+sys.path.insert(0, str(ROOT))
 
-from launch_server_2 import build_launch, cli_args
-from recipe.configs import config_eval
+from benchmark.tpu.recipe.configs import config_eval
 
 
 class TestTpuConfigEval(unittest.TestCase):
     def test_only_python_recipes_are_accepted(self):
         for suffix in (".json", ".jsonnet", ".txt"):
-            with self.subTest(suffix=suffix), self.assertRaisesRegex(
-                ValueError, "must end in .py"
+            with (
+                self.subTest(suffix=suffix),
+                self.assertRaisesRegex(ValueError, "must end in .py"),
             ):
                 config_eval.eval_config("config" + suffix)
 
-    def test_example_builds(self):
+    def test_example_config(self):
         config = config_eval.eval_config(BENCH / "recipe/configs/qwen3_0_6b.py")
-        command, env = build_launch(config, inherited={})
-        self.assertIn("--context-length=1300", command)
-        self.assertIn("--max-running-requests=4", command)
-        self.assertEqual(env["TPU_VISIBLE_CHIPS"], "0")
+        self.assertEqual(config["server_args"]["context_length"], 128)
+        self.assertEqual(config["server_args"]["max_running_requests"], 1)
+        self.assertEqual(config["runtime_env"]["TPU_VISIBLE_CHIPS"], "0")
 
     def test_python_overrides_do_not_modify_base_or_later_loads(self):
         recipe = BENCH / "recipe/configs/qwen3_0_6b.py"
         first = config_eval.eval_config(recipe)
         first["server_args"]["port"] = 9999
         second = config_eval.eval_config(recipe)
-        base = sys.modules["recipe.configs.base"].CONFIG
+        base = sys.modules["benchmark.tpu.recipe.configs.base"].CONFIG
         self.assertEqual(second["server_args"]["port"], 30000)
-        self.assertNotIn("model-path", base["server_args"])
-        self.assertEqual(base["runtime_env"], {})
+        self.assertNotIn("model_path", base["server_args"])
+        self.assertEqual(base["runtime_env"], {"SGLANG_PLATFORM": "tpu"})
 
     def test_python_recipe_requires_config_object(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -52,6 +50,7 @@ class TestTpuConfigEval(unittest.TestCase):
                 "value = 1",
                 "CONFIG = []",
                 'CONFIG = {"server_args": []}',
+                'CONFIG = {"runtime_env": []}',
                 'CONFIG = {"unknown": {}}',
             ):
                 with self.subTest(source=source):
@@ -59,111 +58,50 @@ class TestTpuConfigEval(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         config_eval.eval_config(recipe)
 
-    def test_cli_types_and_overrides(self):
+    def test_cli_value_types(self):
         settings = {
-            "model-path": "a b; $(not-a-command)",
+            "model_path": "a b; $(not-a-command)",
             "port": 30000,
-            "enable-torch-compile": True,
-            "disable-radix-cache": False,
+            "enable_torch_compile": True,
+            "disable_radix_cache": False,
             "quantization": None,
-            "tpu-compile-bs": [1, 4, 8],
-            "json-model-override-args": {"value": "a b"},
+            "cuda_graph_bs": [1, 4, 8],
+            "json_model_override_args": {"rope_scaling": {"factor": 2}},
         }
-        command, _ = build_launch({"server_args": settings}, ["--port", "30001"], {})
-        self.assertIn("--model-path=a b; $(not-a-command)", command)
-        self.assertNotIn("--port=30000", command)
-        self.assertEqual(command[-2:], ["--port", "30001"])
-        self.assertIn("--enable-torch-compile", command)
-        self.assertNotIn("--disable-radix-cache", command)
-        self.assertNotIn("--quantization", command)
-        self.assertIn('--json-model-override-args={"value":"a b"}', command)
-        start = command.index("--tpu-compile-bs")
+        original = deepcopy(settings)
+        args = config_eval.server_args_to_cli(settings)
         self.assertEqual(
-            command[start : start + 4], ["--tpu-compile-bs", "1", "4", "8"]
+            args[:-1],
+            [
+                "--model-path=a b; $(not-a-command)",
+                "--port=30000",
+                "--enable-torch-compile",
+                "--cuda-graph-bs",
+                "1",
+                "4",
+                "8",
+            ],
         )
-        for settings in (
-            {"bad_key": 1},
-            {"config": "x"},
-            {"port": float("inf")},
-            {"list": []},
-            {"list": [True]},
-            {"model-path": "x\0y"},
-        ):
-            with self.subTest(settings=settings), self.assertRaises(ValueError):
-                cli_args(settings)
+        flag, value = args[-1].split("=", 1)
+        self.assertEqual(flag, "--json-model-override-args")
+        self.assertEqual(json.loads(value), settings["json_model_override_args"])
+        self.assertEqual(settings, original)
 
-    def test_environment_sections_and_inherited_values(self):
-        inherited = {"PATH": "/bin", "SGLANG_PLATFORM": "old", "TPU_VISIBLE_CHIPS": "3"}
-        config = {
-            "sglang_env": {"SGLANG_PLATFORM": "tpu"},
-            "torch_tpu_env": {"TORCH_TPU_EXAMPLE": "1"},
-            "runtime_env": {"TPU_VISIBLE_CHIPS": None},
-        }
-        _, env = build_launch(config, inherited=inherited)
-        self.assertEqual(
-            env, {"PATH": "/bin", "SGLANG_PLATFORM": "tpu", "TORCH_TPU_EXAMPLE": "1"}
-        )
-        self.assertEqual(inherited["SGLANG_PLATFORM"], "old")
-        self.assertEqual(inherited["TPU_VISIBLE_CHIPS"], "3")
-        for config in (
-            {"runtime_env": {"SGLANG_PLATFORM": "tpu"}},
-            {"sglang_env": {"SGLANG_PLATFORM": 1}},
-            {"runtime_env": {"BAD=NAME": "1"}},
-        ):
-            with self.assertRaises(ValueError):
-                build_launch(config, inherited={})
-
-    def test_child_receives_environment_before_import_and_exit_code(self):
+    def test_config_overrides_before_flag_conversion(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            package = root / "sglang"
-            package.mkdir()
-            (package / "__init__.py").write_text(
-                'import os\nassert os.environ["SGLANG_PLATFORM"] == "tpu"\n'
-                'assert os.environ["TORCH_TPU_EXAMPLE"] == "before-import"\n'
-                'assert "TPU_VISIBLE_CHIPS" not in os.environ\n'
-            )
-            (package / "launch_server.py").write_text(
-                "import json, sys\nprint(json.dumps(sys.argv[1:]))\nsys.exit(37)\n"
-            )
-            config = {
-                "server_args": {
-                    "model-path": "space ; $(literal)",
-                    "api-key": "private",
-                },
-                "sglang_env": {"SGLANG_PLATFORM": "tpu"},
-                "torch_tpu_env": {"TORCH_TPU_EXAMPLE": "before-import"},
-                "runtime_env": {
-                    "PYTHONPATH": str(root),
-                    "TPU_VISIBLE_CHIPS": None,
-                },
-            }
-            recipe = root / "config.py"
+            recipe = Path(tmp) / "config.py"
             recipe.write_text(
-                f"CONFIG = {config!r}\n" 'CONFIG["server_args"]["port"] = 30001\n'
+                'CONFIG = {"server_args": {"port": 30000, "context_length": 128}, '
+                '"runtime_env": {"EXAMPLE_SETTING": "original"}}\n'
+                'CONFIG["server_args"].update(port=30001, context_length=256)\n'
+                'CONFIG["runtime_env"]["EXAMPLE_SETTING"] = "overridden"\n'
             )
-            command = [
-                sys.executable,
-                str(BENCH / "launch_server_2.py"),
-                "--config",
-                str(recipe),
-            ]
-            env = {**os.environ, "TPU_VISIBLE_CHIPS": "7"}
-            dry = subprocess.run(
-                [*command, "--dry-run"], env=env, capture_output=True, text=True
-            )
-            self.assertEqual(dry.returncode, 0, dry.stderr)
-            self.assertNotIn("private", dry.stdout)
-            actual = subprocess.run(command, env=env, capture_output=True, text=True)
-            self.assertEqual(actual.returncode, 37, actual.stderr)
-            self.assertEqual(
-                json.loads(actual.stdout),
-                [
-                    "--model-path=space ; $(literal)",
-                    "--api-key=private",
-                    "--port=30001",
-                ],
-            )
+            config = config_eval.eval_config(recipe)
+        self.assertEqual(
+            config_eval.server_args_to_cli(config["server_args"]),
+            ["--port=30001", "--context-length=256"],
+        )
+        self.assertEqual(config["runtime_env"], {"EXAMPLE_SETTING": "overridden"})
 
 
 if __name__ == "__main__":
