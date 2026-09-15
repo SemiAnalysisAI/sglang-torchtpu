@@ -266,7 +266,13 @@ MODEL_PROFILES = {
             # current main (post-#717, with KV offload on) took gsm8k from 0.99
             # to 0.06 -- run 34891021287, issue #718. QWEN_CHUNK_CAP overrides
             # it for cap sweeps without a commit.
-            "CHUNKED_PREFILL_SIZE": os.environ.get("QWEN_CHUNK_CAP", "1024"),
+            # EXPERIMENT #718: extra_launch_env is merged by _common_launch_env
+            # into BOTH engines, so every earlier run moved the chunk size on
+            # prefill and decode together and the two were never separated.
+            # build_decode_env now pins decode explicitly, and its key wins
+            # because it is spread after this one -- so this value reaches the
+            # PREFILL engine only.
+            "CHUNKED_PREFILL_SIZE": os.environ.get("QWEN_CHUNK_PREFILL", "1024"),
             # Left to default to the chunk size. Pinning it lower than the
             # chunk size is not a valid pair: --max-prefill-tokens 256 with
             # --chunked-prefill-size 4096 hung precompile and the watchdog
@@ -562,6 +568,14 @@ def build_decode_env(
         "MAX_RUNNING": values.get("MAX_RUNNING", "8"),
         "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1 2 4 8"),
         "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", QWEN_COMPILE_TOKENS),
+        # EXPERIMENT #718: pin the DECODE side at the known-good 256 while the
+        # prefill side is varied, so the two can finally be told apart. Spread
+        # after _common_launch_env, so it wins over the profile's value. Empty
+        # for any other model, which leaves the launcher default untouched.
+        "CHUNKED_PREFILL_SIZE": values.get(
+            "QWEN_CHUNK_DECODE",
+            "256" if profile.key == "qwen3_coder_480b" else "",
+        ),
         "MEM_FRACTION_STATIC": values.get(
             "MEM_FRACTION_STATIC", profile.mem_fraction_decode
         ),
