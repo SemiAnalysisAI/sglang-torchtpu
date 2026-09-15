@@ -47,6 +47,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.speculative.spec_info import SpecInputType
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -709,11 +710,17 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             host_extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
             if (
                 envs.SGLANG_TPU_SPEC_DECODE_HOST_QUERY_LENS.get()
-                and host_extend_lens is not None
+                and forward_batch.forward_mode.is_draft_extend_v2()
+                and forward_batch.spec_info is not None
+                and forward_batch.spec_info.spec_input_type
+                == SpecInputType.EAGLE_DRAFT_EXTEND
+                and forward_batch.spec_info.num_tokens_per_req > 0
             ):
-                # These query lengths were constructed on CPU and normalized
-                # with the same padding as the device tensor. Reuse them to
-                # avoid waiting for a round trip through the TPU queue.
+                # Fixed-width EAGLE refresh creates these counts on the host.
+                # Padding must keep the CPU and device request axes aligned.
+                assert host_extend_lens is not None
+                assert forward_batch.extend_seq_lens.shape == (bs,)
+                assert len(host_extend_lens) == bs
                 if isinstance(host_extend_lens, torch.Tensor):
                     assert host_extend_lens.device.type == "cpu"
                 extend_seq_lens = torch.as_tensor(

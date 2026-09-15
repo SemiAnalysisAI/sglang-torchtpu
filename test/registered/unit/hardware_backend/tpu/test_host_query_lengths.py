@@ -8,14 +8,18 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-@pytest.mark.parametrize("lengths", [[4, 4, 0, 0], [5, 9, 0, 0]])
-@pytest.mark.parametrize("mirror_kind", ["list", "tensor", "missing"])
-def test_host_query_lengths_match_padded_device_lengths_without_readback(
+@pytest.mark.parametrize("lengths", [[4, 4, 0, 0], [4, 4, 4, 4]])
+@pytest.mark.parametrize(
+    "mirror_kind", ["list", "tensor", "missing", "partial", "rank2", "device_rank2"]
+)
+def test_eagle_refresh_requires_complete_host_query_shape_without_readback(
     lengths, mirror_kind
 ):
     backend = object.__new__(BaseTpuPallasRpaAttnBackend)
@@ -29,15 +33,17 @@ def test_host_query_lengths_match_padded_device_lengths_without_readback(
     backend.req_to_token_pool = SimpleNamespace(
         req_to_token=torch.arange(8 * 128, dtype=torch.int32).view(8, 128)
     )
-    mirror = (
-        lengths
-        if mirror_kind == "list"
-        else torch.tensor(lengths) if mirror_kind == "tensor" else None
-    )
-    # The meta tensor cannot be copied to CPU. A present host mirror must be
-    # sufficient; the missing-mirror case exercises the existing fallback.
-    device_lengths = (
-        torch.empty(4, device="meta") if mirror is not None else torch.tensor(lengths)
+    mirror = {
+        "list": lengths,
+        "tensor": torch.tensor(lengths),
+        "missing": None,
+        "partial": lengths[:2],
+        "rank2": torch.tensor(lengths).reshape(4, 1),
+        "device_rank2": lengths,
+    }[mirror_kind]
+    # The meta tensor cannot be copied to CPU, including on invalid input.
+    device_lengths = torch.empty(
+        (4, 1) if mirror_kind == "device_rank2" else (4,), device="meta"
     )
     batch = SimpleNamespace(
         seq_lens=torch.tensor([68, 73, 0, 0]),
@@ -45,24 +51,30 @@ def test_host_query_lengths_match_padded_device_lengths_without_readback(
         req_pool_indices_cpu=torch.tensor([4, 1, 0, 0]),
         extend_seq_lens=device_lengths,
         extend_seq_lens_cpu=mirror,
-        forward_mode=SimpleNamespace(
-            is_decode=lambda: False, is_target_verify=lambda: False
+        forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+        spec_info=SimpleNamespace(
+            spec_input_type=SpecInputType.EAGLE_DRAFT_EXTEND,
+            num_tokens_per_req=4,
         ),
     )
     with patch.object(
         envs.SGLANG_TPU_SPEC_DECODE_HOST_QUERY_LENS, "get", return_value=True
     ):
+        if mirror_kind in ("missing", "partial", "rank2", "device_rank2"):
+            with pytest.raises(AssertionError):
+                backend._build_metadata(batch, non_empty_bs=2)
+            return
         metadata = backend._build_metadata(batch, non_empty_bs=2)
     expected = torch.cat(
         (torch.zeros(1, dtype=torch.int32), torch.tensor(lengths).cumsum(0).int())
     )
     torch.testing.assert_close(metadata.cu_q_lens, expected)
-    assert metadata.active_num_tokens.item() == sum(lengths)
+    assert metadata.active_num_tokens.item() == sum(lengths[:2])
 
 
 @pytest.mark.parametrize("padding", ["general", "eagle"])
 @pytest.mark.parametrize("physical_bs", [2, 4])
-@pytest.mark.parametrize("mirror_kind", ["missing", "partial", "list", "tensor"])
+@pytest.mark.parametrize("mirror_kind", ["missing", "partial", "list"])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_query_mirror_survives_padding_before_metadata(
     padding, physical_bs, mirror_kind, enabled
@@ -81,12 +93,9 @@ def test_query_mirror_survives_padding_before_metadata(
         "missing": None,
         "partial": [4],
         "list": [4, 4],
-        "tensor": torch.tensor([4, 4]),
     }[mirror_kind]
     batch = ForwardBatch(
-        forward_mode=(
-            ForwardMode.EXTEND if padding == "general" else ForwardMode.DRAFT_EXTEND_V2
-        ),
+        forward_mode=ForwardMode.DRAFT_EXTEND_V2,
         batch_size=2,
         input_ids=torch.arange(8),
         positions=torch.arange(8),
@@ -102,7 +111,11 @@ def test_query_mirror_survives_padding_before_metadata(
         extend_prefix_lens_cpu=[64, 69],
         extend_start_loc=torch.tensor([0, 4]),
         extend_num_tokens=8,
-        spec_info=SimpleNamespace(num_tokens_per_req=4, is_draft_input=lambda: False),
+        spec_info=SimpleNamespace(
+            num_tokens_per_req=4,
+            spec_input_type=SpecInputType.EAGLE_DRAFT_EXTEND,
+            is_draft_input=lambda: False,
+        ),
     )
     backend = object.__new__(BaseTpuPallasRpaAttnBackend)
     backend.kernel_spec = SimpleNamespace(uses_draft_extend_v2=True)
@@ -132,40 +145,81 @@ def test_query_mirror_survives_padding_before_metadata(
                 )
             )
             policy._pad_draft_extend(batch)
-        metadata = backend._build_metadata_host(
-            batch,
-            64,
-            torch.device("cpu"),
-            physical_bs,
-            torch.arange(4 * 128, dtype=torch.int32).reshape(4, 128),
-            2,
-            torch.zeros(3, dtype=torch.int32),
-            non_empty_bs=2,
-        )
+
+        def build_metadata():
+            return backend._build_metadata_host(
+                batch,
+                64,
+                torch.device("cpu"),
+                physical_bs,
+                torch.arange(4 * 128, dtype=torch.int32).reshape(4, 128),
+                2,
+                torch.zeros(3, dtype=torch.int32),
+                non_empty_bs=2,
+            )
+
+        if enabled and mirror_kind in ("missing", "partial"):
+            assert batch.extend_seq_lens_cpu is None
+            with pytest.raises(AssertionError):
+                build_metadata()
+            return
+        metadata = build_metadata()
     expected = torch.cat(
         (torch.zeros(1, dtype=torch.int32), batch.extend_seq_lens.cumsum(0).int())
     )
     torch.testing.assert_close(metadata.cu_q_lens, expected)
     assert metadata.active_num_tokens.item() == 8
-    assert batch.extend_seq_lens_cpu == batch.extend_seq_lens.tolist()
+    if mirror_kind in ("missing", "partial"):
+        assert batch.extend_seq_lens_cpu is None
+    else:
+        assert batch.extend_seq_lens_cpu == batch.extend_seq_lens.tolist()
     _restore_forward_batch_inputs(batch, 8, 2)
-    assert batch.extend_seq_lens_cpu == [4, 4]
+    assert batch.extend_seq_lens_cpu == (
+        None if mirror_kind in ("missing", "partial") else [4, 4]
+    )
     assert batch.extend_seq_lens.tolist() == [4, 4]
 
 
-def test_complete_query_mirror_does_not_read_device_during_padding():
-    from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
-        _ensure_host_query_lens,
-    )
-
+@pytest.mark.parametrize(
+    "mode,spec_type,width,enabled",
+    [
+        (ForwardMode.EXTEND, SpecInputType.EAGLE_DRAFT_EXTEND, 4, True),
+        (ForwardMode.DRAFT_EXTEND_V2, SpecInputType.DFLASH_DRAFT, 4, True),
+        (ForwardMode.DRAFT_EXTEND_V2, SpecInputType.EAGLE_DRAFT_EXTEND, -1, True),
+        (ForwardMode.DRAFT_EXTEND_V2, SpecInputType.EAGLE_DRAFT_EXTEND, 4, False),
+    ],
+)
+def test_other_extend_paths_read_device_query_lengths(mode, spec_type, width, enabled):
+    backend = object.__new__(BaseTpuPallasRpaAttnBackend)
+    backend.kernel_spec = SimpleNamespace(uses_draft_extend_v2=True)
+    backend._is_hybrid_swa = False
+    backend._host_metadata_cache = None
     batch = SimpleNamespace(
-        extend_seq_lens=torch.empty(2, device="meta"), extend_seq_lens_cpu=[4, 4]
+        forward_mode=mode,
+        spec_info=SimpleNamespace(spec_input_type=spec_type, num_tokens_per_req=width),
+        seq_lens=torch.tensor([68, 73]),
+        seq_lens_cpu=torch.tensor([68, 73]),
+        req_pool_indices_cpu=torch.tensor([0, 1]),
+        extend_seq_lens=torch.tensor([5, 9]),
+        # Deliberately stale: this mirror must not be consumed on these paths.
+        extend_seq_lens_cpu=[4, 4],
     )
     with patch.object(
-        envs.SGLANG_TPU_SPEC_DECODE_HOST_QUERY_LENS, "get", return_value=True
+        envs.SGLANG_TPU_SPEC_DECODE_HOST_QUERY_LENS, "get", return_value=enabled
     ):
-        _ensure_host_query_lens(batch)
-    assert batch.extend_seq_lens_cpu == [4, 4]
+        metadata = backend._build_metadata_host(
+            batch,
+            64,
+            torch.device("cpu"),
+            2,
+            torch.arange(2 * 128, dtype=torch.int32).reshape(2, 128),
+            2,
+            torch.zeros(3, dtype=torch.int32),
+            non_empty_bs=2,
+        )
+    torch.testing.assert_close(
+        metadata.cu_q_lens, torch.tensor([0, 5, 14], dtype=torch.int32)
+    )
 
 
 @pytest.mark.parametrize("idle", [False, True])

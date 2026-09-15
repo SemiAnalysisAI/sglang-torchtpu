@@ -17,7 +17,6 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
     _REAL_Q_KEY,
     _dp_attn_apply_bucket_metadata,
-    _ensure_host_query_lens,
     _restore_forward_batch_inputs,
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
@@ -1286,7 +1285,6 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         """Bucket V2 draft-extend before attention metadata is constructed."""
         if self.b_bucketer is None:
             return
-        _ensure_host_query_lens(forward_batch)
         draft_extend_input = forward_batch.spec_info
         real_bs = int(forward_batch.seq_lens.shape[0])
         real_tokens = int(forward_batch.input_ids.shape[0])
@@ -1294,6 +1292,10 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             max(real_bs, self._dp_peer_draft_extend_rows(forward_batch))
         )
         pad_tokens = pad_b * self.draft_token_num
+        # Padding must not disguise missing active-row query counts.
+        query_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if query_lens_cpu is None or len(query_lens_cpu) < real_bs:
+            forward_batch.extend_seq_lens_cpu = None
         if pad_b != real_bs:
             # Draft extend has a fixed width, so it needs no token bucket.
             # This also grows its owned token- and request-axis tensors.
@@ -1328,6 +1330,8 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         ):
             value = getattr(forward_batch, field, None)
             if value is None:
+                if field == "extend_seq_lens_cpu":
+                    continue
                 value = []
             elif isinstance(value, torch.Tensor):
                 value = value.tolist()

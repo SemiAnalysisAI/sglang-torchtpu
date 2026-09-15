@@ -393,22 +393,6 @@ def _attach_input_logprobs(
     logits_output.input_token_ids_logprobs_idx = eager.input_token_ids_logprobs_idx
 
 
-def _ensure_host_query_lens(forward_batch: Any) -> None:
-    """Recover absent query counts before padding can disguise them as zeros."""
-    device_lens = getattr(forward_batch, "extend_seq_lens", None)
-    if not isinstance(device_lens, torch.Tensor):
-        return
-    host_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-    if isinstance(host_lens, torch.Tensor):
-        assert host_lens.device.type == "cpu"
-        host_lens = forward_batch.extend_seq_lens_cpu = host_lens.tolist()
-    if host_lens is None or len(host_lens) < device_lens.shape[0]:
-        # Padding must not turn unknown active rows into authoritative zeros,
-        # even when the consumer's reuse optimization is disabled. Complete
-        # mirrors avoid readback; missing/partial mirrors need exact values.
-        forward_batch.extend_seq_lens_cpu = device_lens.to("cpu").tolist()
-
-
 def _pad_forward_batch_inputs(
     forward_batch: Any,
     t_bucketer: Bucketer,
@@ -416,7 +400,6 @@ def _pad_forward_batch_inputs(
     extend_bs: int | None = None,
 ) -> tuple[int, int]:
     """Pad ForwardBatch tensors to next bucket shape and return original sizes."""
-    _ensure_host_query_lens(forward_batch)
     is_decode = forward_batch.forward_mode.is_decode()
     is_draft_extend_v2 = forward_batch.forward_mode.is_draft_extend_v2()
     real_q = forward_batch.input_ids.shape[0]
@@ -495,12 +478,17 @@ def _pad_forward_batch_inputs(
         if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
             setattr(forward_batch, field, _zero_pad_dim0(val, pad_b))
 
-    # Normalize tensor/None values to padded lists so every extend batch
+    # Query counts must cover the active rows before padding. An absent or
+    # partial mirror stays unavailable; padding cannot invent missing counts.
+    # Normalize other tensor/None values to padded lists so every extend batch
     # presents the same type to the compiled graph (the precompile dummy uses
     # lists, and DP attention derives tensors when converting decode batches
     # to extend). Non-extend batches keep the upstream None.
     for field in _BS_CPU_LIST_FIELDS:
         val = getattr(forward_batch, field, None)
+        if field == "extend_seq_lens_cpu" and (val is None or len(val) < real_b):
+            forward_batch.extend_seq_lens_cpu = None
+            continue
         if val is None:
             if not (forward_batch.forward_mode.is_extend() or is_draft_extend_v2):
                 continue

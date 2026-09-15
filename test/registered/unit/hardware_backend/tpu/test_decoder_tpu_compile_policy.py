@@ -2924,6 +2924,7 @@ class TestSpecForwardBatchPreparation(_SpecPolicyTestCase):
             spec_info=draft_extend_input,
             input_ids=draft_extend_input.input_ids,
             seq_lens=draft_extend_input.seq_lens,
+            extend_seq_lens_cpu=None,
             batch_size=2,
             _pad_inputs_to_size=fake_pad_inputs_to_size,
         )
