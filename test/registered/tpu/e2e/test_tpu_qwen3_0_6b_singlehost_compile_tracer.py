@@ -1,12 +1,12 @@
 """End-to-end tests for the TPU compilation tracers."""
 
+import sys
 import unittest
 from copy import deepcopy
+from pathlib import Path
 
 import requests
 
-from benchmark.tpu.recipe.configs.config_eval import server_args_to_cli
-from benchmark.tpu.recipe.configs.qwen3_0_6b import CONFIG
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import (
@@ -15,6 +15,12 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+# Support the CI runner's `python path/to/test.py` invocation as well as Bazel.
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu.recipe.configs.config_eval import server_args_to_cli
+from benchmark.tpu.recipe.configs.qwen3_0_6b import CONFIG
 
 register_tpu_ci(
     est_time=600,
@@ -40,7 +46,9 @@ class TestTpuQwen306bSinglehostCompileTracer(CustomTestCase):
         if tracer == "direct":
             config["server_args"]["tpu_compile_tracer"] = "direct"
         config["server_args"].update(overrides or {})
-        config["server_args"]["model_path"] = model
+        # The helper supplies the model and URL-derived connection flags.
+        for name in ("model_path", "host", "port"):
+            config["server_args"].pop(name, None)
 
         process = popen_launch_server(
             model,
