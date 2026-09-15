@@ -6,12 +6,19 @@ the smaller pool, while the sizing knobs and the exposed gauge both describe the
 larger one -- so a prefix whose full half is comfortably host-resident still
 returns ``host_hit_length`` 0 once its SWA half has churned out.
 
-What these tests pin is that *behaviour*, which is what recipe sizing has to
-avoid. They do **not** identify the mechanism: flipping the component combinator
-in ``unified_tree_core`` from ``all()`` to ``any()`` leaves every result here
-unchanged, so the conjunctive prefix match is not what produces the collapse in
-this fixture, whatever its role in the full engine. Treat a failure here as "the
-sizing relationship changed", not as "the validators were decoupled".
+The mechanism, measured rather than assumed. An undersized SWA pool **refuses
+the host allocation** -- 31 refusals at ratio 0.2 here, none at parity. A node
+that cannot be backed then holds neither device nor host data, and
+``_iteratively_delete_tombstone_ancestors`` reaps it, cascading to childless
+ancestors: 31 refusals delete 62 nodes, leaving 41 in the tree against 103 at
+parity. The re-match then returns 0 because the prefix is **gone**, not because
+it is unreachable -- and its full half was freed with it.
+
+Note this is *not* the conjunctive component match. Flipping ``_all_valid`` in
+``unified_tree_core`` from ``all()`` to ``any()`` leaves every result in this
+file unchanged, because by then there is no node left to validate. A failure
+here means the sizing relationship changed, not that the validators were
+decoupled.
 
 The TPU e2e offload tests cover hybrid-SWA end to end, but none varies the ratio;
 the tests that set a low ratio enable no HiCache. This crosses the two.
