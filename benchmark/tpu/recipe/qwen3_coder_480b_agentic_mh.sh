@@ -44,22 +44,28 @@ PROFILE=${PROFILE:-ci}
 # "only buys extra torch.compile buckets, which is the most expensive thing in a
 # CI bring-up"; since libtpu 0.0.47 (#727) that surplus no longer fits in host
 # RAM beside the pinned HiCache pool, and the pod is OOM-killed during warmup.
-# Takes the decode ladder from 5 variants to 2, matching the EAGLE3 sibling,
-# which runs the same sweep on the same topology and is green.
+# Drops the intermediate decode rungs only. The ladder's MAXIMUM stays at
+# max(SWEEP_BS)=16 so it still covers max_running_requests, and MAX_RUNNING is
+# left derived -- both of those matter:
 #
-# The extend ladder is deliberately left derived. Pinning it to the sibling's
-# single 4096 bucket looked like the larger saving and broke the run: under DP
-# attention prepare_mlp_sync_batch pads every rank up to the global token count,
-# and with 4096 as the only bucket a batch that lands above it has nothing to
-# round up to, so the pad goes negative --
-#   forward_batch_info.py:1302 _pad_tensor_to_size
-#   RuntimeError: empty(): expected dimension sizes to be >= 0, got [-123]
-# observed on a `#new-token: 4096, #pending-token: 163` prefill in run
-# 34903370712. The derived ladder keeps the smaller buckets that absorb it.
+#   * Lowering MAX_RUNNING to 8 is what config.sh:337 warns about (a leg gets
+#     admission-capped below the concurrency it reports). It also breaks DP
+#     attention outright: prepare_mlp_sync_batch pads every rank up to the
+#     global token count, and with the cap in place a rank's own batch can
+#     exceed it, so the pad goes negative --
+#       forward_batch_info.py:1302 _pad_tensor_to_size
+#       RuntimeError: empty(): expected dimension sizes to be >= 0, got [-1017]
+#     seen in run 34908974337; the 09-11 green run, identical but for
+#     max_running_requests=16, has none.
+#   * Pinning the extend ladder to a single 4096 bucket fails the same way
+#     (run 34903370712, got [-123]), so it stays derived.
+#
+# bs 2..7 and 9..15 now round up, which the ci sweep barely visits: SWEEP_BS is
+# "1 16", so per rank at dp=2 the live sizes are ~1 and ~8, both exact rungs.
+# 12 graph variants -> 10. Run 34908974337 showed 9 clears the OOM and 12 does
+# not, so this should sit inside the margin.
 if [[ "$PROFILE" == "ci" ]]; then
-  export MAX_RUNNING="${MAX_RUNNING:-8}"
-  export TORCH_COMPILE_MAX_BS="${TORCH_COMPILE_MAX_BS:-8}"
-  export TPU_COMPILE_BS="${TPU_COMPILE_BS:-1 8}"
+  export TPU_COMPILE_BS="${TPU_COMPILE_BS:-1 8 16}"
 fi
 
 exec env \
