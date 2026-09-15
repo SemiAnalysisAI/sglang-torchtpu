@@ -1,12 +1,17 @@
 """HiCache L2 on a hybrid-SWA model: the SWA host pool bounds the full pool too.
 
-Prefix matching combines the per-component validators with ``all()``, so the SWA
-validator rejects a node whose SWA half has left both device and host and the walk
-stops there -- before the full-KV half, which may still be host-resident, can
-contribute to ``host_hit_length``. Both host pools take the same token inflow, so
-an SWA pool at ``swa_full_tokens_ratio`` R turns over 1/R times as fast, and
-retention follows the smaller pool while the sizing knobs and the exposed gauge
-both describe the larger one.
+Both host pools take the same token inflow, so an SWA pool at
+``swa_full_tokens_ratio`` R turns over 1/R times as fast. Retention then follows
+the smaller pool, while the sizing knobs and the exposed gauge both describe the
+larger one -- so a prefix whose full half is comfortably host-resident still
+returns ``host_hit_length`` 0 once its SWA half has churned out.
+
+What these tests pin is that *behaviour*, which is what recipe sizing has to
+avoid. They do **not** identify the mechanism: flipping the component combinator
+in ``unified_tree_core`` from ``all()`` to ``any()`` leaves every result here
+unchanged, so the conjunctive prefix match is not what produces the collapse in
+this fixture, whatever its role in the full engine. Treat a failure here as "the
+sizing relationship changed", not as "the validators were decoupled".
 
 The TPU e2e offload tests cover hybrid-SWA end to end, but none varies the ratio;
 the tests that set a low ratio enable no HiCache. This crosses the two.
@@ -69,8 +74,13 @@ def _on_cpu(T):
         yield
 
 
-def _measure(swa_ratio: float) -> dict:
-    """Back a prefix to host, drop it from device, churn, then re-match."""
+def _measure(swa_ratio: float, churn_tokens: int = CHURN_TOKENS) -> dict:
+    """Back a prefix to host, drop it from device, churn, then re-match.
+
+    ``churn_tokens`` is the working set pushed through after the target is
+    backed up. It is a parameter because the collapse is set by the working set
+    relative to the SWA pool, not by the ratio alone -- see the band test.
+    """
     T, _mha, ComponentType = _fixtures()
     measured: dict = {}
 
@@ -178,7 +188,7 @@ def _measure(swa_ratio: float) -> dict:
             before = self._match(cache, target).host_hit_length
 
             churn = 0
-            while churn < CHURN_TOKENS:
+            while churn < churn_tokens:
                 base = 10_000 + churn * 10
                 seq = list(range(base, base + TARGET_TOKENS))
                 self._insert(cache, allocator, rtp, seq)
@@ -223,13 +233,60 @@ class TestHiCacheSwaHostPoolSizing(unittest.TestCase):
             f"host-backed prefix lost to churn the full pool absorbs: {r}",
         )
 
+    def test_a_higher_ratio_narrows_the_band_but_does_not_close_it(self):
+        """The two arms above invite "low ratios are bad, so 0.5 is fine". Wrong.
+
+        Read together, parity-survives and low-collapses suggest a cutoff
+        somewhere between, and that a comfortable ratio is therefore safe. It is
+        not a cutoff. Retention follows the SWA pool, so the collapse begins
+        wherever the working set outgrows it -- and the SWA pool is
+        ``ratio x full pool``. Every ratio below 1.0 therefore leaves a band
+
+            ratio x full_host  <  working set  <  full_host
+
+        in which the SWA half is gone from host, the full half is still there,
+        and the conjunctive match discards both. Raising the ratio narrows that
+        band by (1 - ratio); only 1.0 closes it.
+
+        So this asserts the rule rather than a threshold: for a mid ratio, a
+        churn under its SWA pool retains the prefix and a churn over it does
+        not. A fixed-churn sweep across ratios would show an apparent cutoff and
+        reproduce the very misreading this guards against.
+        """
+        mid = 0.5
+        probe = _measure(mid, churn_tokens=1)
+        swa_host, full_host = probe["swa_host"], probe["full_host"]
+        self.assertLess(swa_host, full_host, probe)
+
+        # Under the SWA pool: the prefix is still there.
+        under = _measure(mid, churn_tokens=max(TARGET_TOKENS * 2, swa_host // 3))
+        self.assertEqual(
+            under["after"],
+            TARGET_TOKENS,
+            f"churn inside the SWA pool should retain the prefix: {under}",
+        )
+
+        # Over it, but still inside the full pool, so the SWA half is the only
+        # possible reason -- the same isolation the two arms above rely on.
+        # Midpoint of the band rather than a multiple of swa_host: at ratio 0.5
+        # doubling it lands past full_host and the arm would no longer isolate.
+        over = _measure(mid, churn_tokens=(swa_host + full_host) // 2)
+        self.assertLess(over["churn"], full_host, over)
+        self.assertEqual(
+            over["after"],
+            0,
+            f"a ratio of {mid} is not immune: churn past its SWA pool still "
+            f"zeroes the host hit for the full half too: {over}",
+        )
+
     def test_small_swa_pool_bounds_the_full_host_hit(self):
         """A smaller SWA pool zeroes the host hit for the full half as well.
 
         Same target, same churn, same full pool as the parity case -- only the
         SWA pool differs. Documents today's behaviour: if this starts failing,
-        the components were decoupled and retention no longer follows the SWA
-        pool, so delete this test and revisit swa_full_tokens_ratio guidance.
+        retention no longer follows the SWA pool, so delete this test and
+        revisit swa_full_tokens_ratio guidance. (It will not catch the
+        components being decoupled -- see the module docstring.)
         """
         r = _measure(SWA_RATIO_LOW)
         self.assertLess(r["swa_host"], r["full_host"], r)
