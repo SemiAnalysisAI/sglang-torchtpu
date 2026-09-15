@@ -36,38 +36,46 @@ EXTRA_ARGS="--weight-loader-drop-cache-after-load${EXTRA_ARGS:+ $EXTRA_ARGS}"
 
 PROFILE=${PROFILE:-ci}
 
-# HOST-RAM REGRESSION, UNFIXED HERE. Since the libtpu 0.0.44.1 -> 0.0.47 pin
-# bump (#727, merged 09-11 18:32 UTC) this server is OOM-killed during
-# _execute_server_warmup, with HBM still ~39 GB free. The 09-11 green run (job
-# 103217467337) was configuration-identical, so nothing in this recipe caused
-# it. The node has 963 GB allocatable; the consumers are raiden's eagerly
-# pinned host pool (~208 GB) and the resident compiled executables.
+# Right-size the KV pool. Since the libtpu 0.0.44.1 -> 0.0.47 bump (#727) the
+# resident compiled executables no longer fit in host RAM beside raiden's
+# eagerly pinned host pool, and the pod is OOM-killed during warmup with HBM
+# still ~39 GB free. The 09-11 green run (job 103217467337) was
+# configuration-identical, so nothing here caused it; this buys the headroom
+# back from the one consumer that is demonstrably oversized.
 #
-# Every lever below this recipe owns has been tried and is closed. Do not
-# retry them:
+# config.sh pins 877440 tokens, a number inherited from an old dp=4 derivation
+# rather than from this workload. The ci sweep is 16 sessions of 30720-token
+# context; at dp=2 that is 8 per rank, so the live-plus-retained working set is
+# ~246k tokens -- and the pool peaks at 0.27 in every run. 524288 keeps it at
+# ~0.47, and raiden's host pool, sized from the device pool, drops 208 GB ->
+# ~124 GB per host.
 #
-#   * Compile ladder. Any reduction pads negative under DP attention --
-#     prepare_mlp_sync_batch sizes each rank from the all-gathered
-#     global_num_tokens and a non-default ladder lets a rank's own padded batch
-#     exceed it, so _pad_tensor_to_size is asked to shrink
-#     (forward_batch_info.py:1302). Four shapes, four failures:
-#       decode [1,8]    extend [4096]           -> -123  at c1  (34903370712)
-#       decode [1,8]    extend derived          -> -1017 at c1  (34908974337)
-#       decode [1,8,16] extend derived          -> -1352 at c16 (34914967096)
-#       decode derived  extend [1024,2048,4096] -> -253  at c16 (34919948429)
-#     Worth its own bug: a pad must never be negative.
-#   * HICACHE_RATIO below 1. Structurally illegal --
-#     kv_pool_host.py:97 asserts the host pool strictly exceeds the device
-#     pool, so 0.5 dies at bring-up with
-#     "Host KV pool must be larger than the device pool (host=438784 <=
-#     device=877440)" (34924965546). Ratio 1 only clears it on page rounding.
-#   * Shrinking max_total_num_tokens would shrink the host pool with it, but it
-#     is what sizes the sweep's reachable prefix cache, so it changes the
-#     number this benchmark exists to report.
+# 524288 specifically, not lower. Issue #363 deadlocks the extend precompile
+# (silently -- no crash, no watchdog) when a large program meets a small pool,
+# and #395's automatic mitigation triggers on tokens alone
+# (env_override.py: max_total_tokens < 4096*64) while the measured boundary was
+# 4096 PAGES. At this recipe's page_size=128 those disagree: 438720 tokens is
+# 3427 pages, inside the danger zone, yet above the token trigger so the
+# mitigation would not fire. 524288 = 4096 pages AND >= 262144 tokens, so it is
+# safe whichever unit the threshold really is. Qwen3-Coder-480B has 62 layers,
+# well above #395's 35-layer floor, so it is in the affected class.
 #
-# What remains is the libtpu pin itself. The page-cache flag above is kept
-# because it is correct hygiene and matches both sibling recipes, but on its
-# own it is not enough (34895558228 still OOM-killed with it applied).
+# Keeping KV offload is the point: --enable-hierarchical-cache, raiden and
+# ratio 1 are untouched. A smaller pool should also make the feature engage for
+# the first time -- kv_offload_written is 0.0 and #host-hit-token is 0 on every
+# prefill of every run, green included, because nothing is ever evicted.
+#
+# Not lowering the pool further, and not touching these, all proven broken:
+#   * Compile ladder. Any reduction pads negative under DP attention
+#     (forward_batch_info.py:1302): decode [1,8] + extend [4096] -> -123 c1
+#     (34903370712); decode [1,8] + derived -> -1017 c1 (34908974337);
+#     decode [1,8,16] + derived -> -1352 c16 (34914967096); decode derived +
+#     extend [1024,2048,4096] -> -253 c16 (34919948429). Worth its own bug.
+#   * HICACHE_RATIO below 1. kv_pool_host.py:97 asserts the host pool strictly
+#     exceeds the device pool; 0.5 dies at bring-up (34924965546).
+if [[ "$PROFILE" == "ci" ]]; then
+  export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-524288}"
+fi
 
 exec env \
   MODEL="${MODEL:-/weights/Qwen3-Coder-480B-A35B-Instruct-FP8}" \
