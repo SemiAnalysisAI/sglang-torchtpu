@@ -18,7 +18,7 @@ use crate::smg::response_map::StreamMode;
 use crate::smg_proto;
 use crate::utils::{
     build_classify_dict, build_embed_dict, build_generate_dict, build_text_embed_dict,
-    build_text_generate_dict, extract_model_path,
+    build_text_generate_dict, extract_model_path, merge_metadata_trace_context,
 };
 
 pub struct SglangServiceImpl {
@@ -227,12 +227,14 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         request: Request<proto::TextGenerateRequest>,
     ) -> Result<Response<Self::TextGenerateStream>, Status> {
-        let req = request.into_inner();
+        let (metadata, _extensions, req) = request.into_parts();
         let rid = req
             .rid
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let req_dict = build_text_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
+        let mut req_dict =
+            build_text_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
+        merge_metadata_trace_context(&metadata, &mut req_dict);
 
         let mut receiver = self
             .bridge
@@ -296,12 +298,13 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         request: Request<proto::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        let req = request.into_inner();
+        let (metadata, _extensions, req) = request.into_parts();
         let rid = req
             .rid
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let req_dict = build_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
+        let mut req_dict = build_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
+        merge_metadata_trace_context(&metadata, &mut req_dict);
 
         let mut receiver = self
             .bridge

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use tonic::metadata::MetadataMap;
+
 use crate::proto;
 
 fn regex_escape_literal(value: &str) -> String {
@@ -155,6 +157,39 @@ fn trace_headers_to_json(headers: &HashMap<String, String>) -> Option<serde_json
         None
     } else {
         Some(serde_json::json!(headers))
+    }
+}
+
+/// W3C names the Python side accepts; must match TRACE_HEADERS in
+/// python/sglang/srt/observability/trace.py.
+const W3C_TRACE_KEYS: [&str; 2] = ["traceparent", "tracestate"];
+
+/// Fold W3C trace context carried in gRPC metadata into an already-built request dict.
+///
+/// sgl-model-gateway 0.3.2 injects traceparent into gRPC metadata only
+/// (src/observability/otel_trace.rs:239) and never populates the proto
+/// `trace_headers` field, so without this the engine sees no parent and roots a
+/// fresh trace per request.
+pub(crate) fn merge_metadata_trace_context(
+    metadata: &MetadataMap,
+    d: &mut HashMap<String, serde_json::Value>,
+) {
+    // An explicit proto field is more specific than transport metadata, so it wins.
+    if d.contains_key("external_trace_header") {
+        return;
+    }
+    let mut headers = serde_json::Map::new();
+    for key in W3C_TRACE_KEYS {
+        if let Some(value) = metadata.get(key).and_then(|v| v.to_str().ok()) {
+            headers.insert(key.to_string(), serde_json::json!(value));
+        }
+    }
+    // Absent on non-SMG callers; leaving the key unset keeps today's root-span behaviour.
+    if !headers.is_empty() {
+        d.insert(
+            "external_trace_header".into(),
+            serde_json::Value::Object(headers),
+        );
     }
 }
 
@@ -374,6 +409,50 @@ pub(crate) fn build_classify_dict(
 #[allow(deprecated)]
 mod tests {
     use super::*;
+
+    const TRACEPARENT: &str = "00-be4d81048511af5dd6372e676fbd8ddc-7apYO5h6FuY0-01";
+
+    fn metadata_with(pairs: &[(&'static str, &str)]) -> MetadataMap {
+        let mut m = MetadataMap::new();
+        for (k, v) in pairs {
+            m.insert(*k, v.parse().unwrap());
+        }
+        m
+    }
+
+    #[test]
+    fn metadata_trace_context_is_adopted() {
+        let mut d = HashMap::new();
+        merge_metadata_trace_context(
+            &metadata_with(&[("traceparent", TRACEPARENT), ("tracestate", "a=1")]),
+            &mut d,
+        );
+        assert_eq!(
+            d.get("external_trace_header"),
+            Some(&serde_json::json!({"traceparent": TRACEPARENT, "tracestate": "a=1"}))
+        );
+    }
+
+    #[test]
+    fn proto_trace_headers_win_over_metadata() {
+        let mut d = HashMap::new();
+        d.insert(
+            "external_trace_header".into(),
+            serde_json::json!({"traceparent": "from-proto"}),
+        );
+        merge_metadata_trace_context(&metadata_with(&[("traceparent", TRACEPARENT)]), &mut d);
+        assert_eq!(
+            d.get("external_trace_header"),
+            Some(&serde_json::json!({"traceparent": "from-proto"}))
+        );
+    }
+
+    #[test]
+    fn absent_metadata_leaves_the_request_untraced() {
+        let mut d = HashMap::new();
+        merge_metadata_trace_context(&metadata_with(&[("user-agent", "grpc-go/1.0")]), &mut d);
+        assert!(!d.contains_key("external_trace_header"));
+    }
 
     #[test]
     fn generate_dicts_include_session_id() {

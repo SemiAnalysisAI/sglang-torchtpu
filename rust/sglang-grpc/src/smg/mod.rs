@@ -36,6 +36,7 @@ use crate::server::{
 };
 use crate::smg::response_map::{StreamMode, StreamTranslator};
 use crate::smg_proto;
+use crate::utils::merge_metadata_trace_context;
 
 pub mod model_info;
 pub mod request_map;
@@ -61,7 +62,9 @@ impl smg_proto::sglang_scheduler_server::SglangScheduler for SmgSchedulerService
         &self,
         request: Request<smg_proto::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        let mapped = request_map::generate_to_dict(&request.into_inner())?;
+        let (metadata, _extensions, request) = request.into_parts();
+        let mut mapped = request_map::generate_to_dict(&request)?;
+        merge_metadata_trace_context(&metadata, &mut mapped.dict);
         let rid = mapped.rid;
 
         // Claimed before submitting, released by the guard when the response
