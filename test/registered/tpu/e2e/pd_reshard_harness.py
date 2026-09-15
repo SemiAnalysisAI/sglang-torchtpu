@@ -157,7 +157,7 @@ LB_LOG = "/tmp/pd_lb.log"
 # "the 1024 graph is compiled" from "the chunk size is large". Prompts longer
 # than 256 will fail the bucketer in that configuration; the short lengths are
 # the measurement.
-QWEN_COMPILE_TOKENS = os.environ.get("QWEN_COMPILE_TOKENS", "64 256 1024")
+QWEN_COMPILE_TOKENS = os.environ.get("QWEN_COMPILE_TOKENS", "64 256")
 
 
 class ModelProfile(msgspec.Struct, frozen=True, kw_only=True):
