@@ -308,7 +308,39 @@ def get_kv_cache_shape(
     )
 
 
+# Refs pallas passes positionally: 9 scalar prefetches, 6 inputs (q, kv,
+# kv_cache, custom_mask, zero_mask, attention_sink), 2 outputs (out,
+# updated_kv_cache), then the scratch buffers.
+_NUM_SCALAR_PREFETCH = 9
+_NUM_KERNEL_INPUTS = 6
+_NUM_KERNEL_OUTPUTS = 2
+
+
+def _split_optional_refs(args, *, cp_group_size, return_lse):
+    """Take the optional CP/LSE refs out of the flat pallas argument list.
+
+    cp_rank and kv_lens_global are appended to the scalar prefetches, the LSE
+    buffer is the last input and the last output. They are passed only when the
+    matching flag is set, so every other ref keeps its position.
+    """
+    args = list(args)
+    optional_refs = {}
+    if cp_group_size is not None:
+        optional_refs["cp_rank_ref"] = args.pop(_NUM_SCALAR_PREFETCH)
+        optional_refs["kv_lens_global_ref"] = args.pop(_NUM_SCALAR_PREFETCH)
+    if return_lse:
+        lse_idx = _NUM_SCALAR_PREFETCH + _NUM_KERNEL_INPUTS
+        optional_refs["lse_hbm_in_ref"] = args.pop(lse_idx)
+        optional_refs["lse_hbm_ref"] = args.pop(lse_idx + _NUM_KERNEL_OUTPUTS)
+    return tuple(args), optional_refs
+
+
 def _ragged_paged_attention_kernel(*args, **kwargs):
+    args, optional_refs = _split_optional_refs(
+        args,
+        cp_group_size=kwargs["cp_group_size"],
+        return_lse=kwargs["return_lse"],
+    )
     # distribution_ref is at index 5 (after kv_lens, page_indices, cu_q_lens,
     # cu_kv_lens, cu_seq_mask_lens).
     distribution_ref = args[5]
@@ -319,6 +351,7 @@ def _ragged_paged_attention_kernel(*args, **kwargs):
         return _ragged_paged_attention_kernel_loop(
             seq_idx,
             *args,
+            **optional_refs,
             **kwargs,
         )
 
@@ -355,6 +388,11 @@ def _ragged_paged_attention_kernel_loop(
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128]
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim]
     *,
+    # Optional refs (see _split_optional_refs)
+    cp_rank_ref=None,  # i32[1]
+    kv_lens_global_ref=None,  # i32[max_num_seqs]
+    lse_hbm_in_ref=None,  # aliased with lse_hbm_ref
+    lse_hbm_ref=None,  # f32[actual_num_kv_heads, max_num_tokens * num_q_heads_per_kv_head, 128]
     causal: bool = True,
     sm_scale: float,
     sliding_window: int | None = None,
@@ -371,6 +409,10 @@ def _ragged_paged_attention_kernel_loop(
     bkv_csz,  # bkv compute size
     case: RpaCase = RpaCase.MIXED,
     skip_kv_mask: bool = False,
+    cache_only: bool = False,
+    skip_kv_write: bool = False,
+    return_lse: bool = False,
+    cp_group_size: int | None = None,
     debug_mode: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
@@ -381,6 +423,7 @@ def _ragged_paged_attention_kernel_loop(
         use_causal_mask = False
 
     out_dtype = acc_ref.dtype
+    lm_dtype = l_ref.dtype
     (
         actual_num_kv_heads,
         max_num_tokens,
@@ -413,20 +456,46 @@ def _ragged_paged_attention_kernel_loop(
     q_end = cu_q_lens_ref[seq_idx + 1]
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
-    kv_q_gap = kv_len - q_len
+    # With cache_only every one of the kv_len keys is cached and precedes every
+    # query, so the queries sit right after the whole kv range.
+    kv_q_gap = kv_len if cache_only else kv_len - q_len
     cur_seq_start_bkv_idx = 0
     next_seq_start_bkv_idx = 0
 
+    cp_rank = cp_rank_ref[0] if cp_group_size is not None else None
+    # Global position of this sequence's first query.
+    q_global_base = (
+        kv_lens_global_ref[seq_idx] - q_len if cp_group_size is not None else None
+    )
+
+    def start_bkv_idx_for(local_q_pos, global_q_pos):
+        """First bkv block with a key inside the window of query position."""
+        if cp_group_size is None:
+            first_kv_idx = jnp.maximum(local_q_pos - sliding_window, 0)
+        else:
+            # Local key j holds global position j * cp_group_size + cp_rank and
+            # is kept while that position is > global_q_pos - sliding_window.
+            first_kv_idx = (
+                jnp.maximum(global_q_pos - sliding_window - cp_rank + cp_group_size, 0)
+                // cp_group_size
+            )
+        return first_kv_idx // bkv_sz
+
     if sliding_window is not None:
-        cur_seq_start_bkv_idx = jnp.maximum(kv_q_gap - sliding_window, 0) // bkv_sz
+        cur_seq_start_bkv_idx = start_bkv_idx_for(kv_q_gap, q_global_base)
         next_seq_idx = jnp.minimum(seq_idx + 1, end_seq_idx - 1)
         next_q_start = cu_q_lens_ref[next_seq_idx]
         next_q_end = cu_q_lens_ref[next_seq_idx + 1]
         next_q_len = next_q_end - next_q_start
         next_kv_len = kv_lens_ref[next_seq_idx]
-        next_kv_q_gap = next_kv_len - next_q_len
-        next_seq_start_bkv_idx = (
-            jnp.maximum(next_kv_q_gap - sliding_window, 0) // bkv_sz
+        next_kv_q_gap = next_kv_len if cache_only else next_kv_len - next_q_len
+        next_seq_start_bkv_idx = start_bkv_idx_for(
+            next_kv_q_gap,
+            (
+                kv_lens_global_ref[next_seq_idx] - next_q_len
+                if cp_group_size is not None
+                else None
+            ),
         )
 
     def debug_print(msg, *args):
@@ -443,6 +512,7 @@ def _ragged_paged_attention_kernel_loop(
         processed_q_len,
         processed_kv_len,
         effective_kv_len,
+        processed_q_global=None,
         xai_temperature_reg=None,
         custom_mask_data=None,
     ):
@@ -512,7 +582,17 @@ def _ragged_paged_attention_kernel_loop(
             v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
 
         if sliding_window is not None:
-            mask = mask_and(mask, q_span < k_span + sliding_window)
+            if cp_group_size is None:
+                mask = mask_and(mask, q_span < k_span + sliding_window)
+            else:
+                q_span_global = processed_q_global.astype(int_ty) + (
+                    lax.broadcasted_iota(jnp.int32, s.shape, 0)
+                    // num_q_heads_per_kv_head
+                ).astype(int_ty)
+                mask = mask_and(
+                    mask,
+                    q_span_global < k_span * cp_group_size + cp_rank + sliding_window,
+                )
 
         if mask is not None:
             s = jnp.where(mask, s, mask_value)
@@ -520,13 +600,13 @@ def _ragged_paged_attention_kernel_loop(
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
         m_prev = m_ref[...].astype(jnp.float32)
         m_curr = jnp.maximum(m_prev, s_rowmax)
-        m_ref[...] = m_curr.astype(out_dtype)
+        m_ref[...] = m_curr.astype(lm_dtype)
         p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
 
         p_rowsum = jnp.sum(p, axis=1, keepdims=True)
         exp_m_diff = jnp.exp(m_prev - m_curr)
         l_prev = l_ref[...].astype(jnp.float32)
-        l_ref[...] = (exp_m_diff * l_prev + p_rowsum).astype(out_dtype)
+        l_ref[...] = (exp_m_diff * l_prev + p_rowsum).astype(lm_dtype)
 
         return p, v, exp_m_diff
 
@@ -612,7 +692,13 @@ def _ragged_paged_attention_kernel_loop(
         q_len = q_end - q_start
 
         kv_left = kv_len - kv_len_start
-        kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+        if cp_group_size is not None:
+            # The window skip can start past the end of a short local shard.
+            kv_left = jnp.maximum(kv_left, 0)
+        if cache_only:
+            kv_left_frm_cache = kv_left
+        else:
+            kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
         kv_left_frm_new = kv_left - kv_left_frm_cache
 
         bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, bkv_sz)
@@ -623,7 +709,8 @@ def _ragged_paged_attention_kernel_loop(
 
         if not wait:
             # Make sure the current bkv buffer is safe to overwrite.
-            wait_update_kv_cache(bkv_sem_idx)
+            if not skip_kv_write:
+                wait_update_kv_cache(bkv_sem_idx)
 
             for i in range(bkv_p):
                 sz = jnp.clip(kv_left_frm_cache - i * page_size, 0, page_size)
@@ -635,13 +722,14 @@ def _ragged_paged_attention_kernel_loop(
                     wait=False,
                 )
 
-            new_kv_len_start = q_end - kv_left_frm_new
-            _async_copy(
-                kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
-                vmem_ref.at[pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)],
-                sem,
-                wait,
-            )
+            if not cache_only:
+                new_kv_len_start = q_end - kv_left_frm_new
+                _async_copy(
+                    kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
+                    vmem_ref.at[pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)],
+                    sem,
+                    wait,
+                )
         else:
             dst = vmem_ref.at[pl.ds(0, bkv_sz_frm_cache + bkv_sz_frm_new)]
             _async_copy(
@@ -896,11 +984,13 @@ def _ragged_paged_attention_kernel_loop(
 
             next_bq_start_bkv_idx = 0
             if sliding_window is not None:
-                next_bq_start_bkv_idx = (
-                    jnp.maximum(
-                        kv_q_gap + (bq_idx + 1) * actual_bq_sz - sliding_window, 0
-                    )
-                    // bkv_sz
+                next_bq_start_bkv_idx = start_bkv_idx_for(
+                    kv_q_gap + (bq_idx + 1) * actual_bq_sz,
+                    (
+                        None
+                        if q_global_base is None
+                        else q_global_base + (bq_idx + 1) * actual_bq_sz
+                    ),
                 )
             next_bkv_idx = lax.select(is_last_bkv, next_bq_start_bkv_idx, next_bkv_idx)
             next_bkv_idx = lax.select(is_last_bq, next_seq_start_bkv_idx, next_bkv_idx)
@@ -924,7 +1014,7 @@ def _ragged_paged_attention_kernel_loop(
                     lm_size = actual_bq_sz * num_q_heads_per_kv_head
                     sink_tiled = jnp.tile(sinks, (actual_bq_sz, 1))
                     m_ref.at[kv_head_idx, pl.ds(lm_start, lm_size)][...] = (
-                        sink_tiled.astype(out_dtype)
+                        sink_tiled.astype(lm_dtype)
                     )
             else:
                 l_ref[...] = jnp.full_like(l_ref, 0.0)
@@ -936,16 +1026,21 @@ def _ragged_paged_attention_kernel_loop(
             )
 
             processed_q_len = kv_q_gap + bq_idx * actual_bq_sz
+            processed_q_global = (
+                None if q_global_base is None else q_global_base + bq_idx * actual_bq_sz
+            )
             start_bkv_idx = 0
             if sliding_window is not None:
-                start_bkv_idx = (
-                    jnp.maximum(processed_q_len - sliding_window, 0) // bkv_sz
-                )
+                start_bkv_idx = start_bkv_idx_for(processed_q_len, processed_q_global)
             if use_causal_mask:
                 effective_kv_len = jnp.minimum(kv_len, processed_q_len + actual_bq_sz)
             else:
                 effective_kv_len = kv_len
             end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
+            if cache_only:
+                # Run at least one bkv block: the next sequence's bkv prefetch is
+                # issued inside this loop, and a shard can hold no key at all.
+                end_bkv_idx = jnp.maximum(end_bkv_idx, start_bkv_idx + 1)
 
             # xai temperature computation
             xai_temperature_reg = None
@@ -1009,9 +1104,11 @@ def _ragged_paged_attention_kernel_loop(
 
                 # Start updating bkv to kv cache if applicable.
                 # Only needed in last bq loop.
-                @pl.when(jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
-                def update_cur_bkv_to_cache():
-                    start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
+                if not skip_kv_write:
+
+                    @pl.when(jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
+                    def update_cur_bkv_to_cache():
+                        start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
 
                 if debug_mode:
                     return
@@ -1085,6 +1182,11 @@ def _ragged_paged_attention_kernel_loop(
                                         processed_q_len=processed_q_len + bq_start,
                                         processed_kv_len=processed_kv_len + bkv_start,
                                         effective_kv_len=effective_kv_len,
+                                        processed_q_global=(
+                                            None
+                                            if processed_q_global is None
+                                            else processed_q_global + bq_start
+                                        ),
                                         xai_temperature_reg=cur_xai_temp,
                                         custom_mask_data=cur_mask_data,
                                     )
@@ -1099,11 +1201,30 @@ def _ragged_paged_attention_kernel_loop(
             # Load acc and calculate final output.
             acc = acc_ref[...]
             l = broadcast_minor(l_ref[...], acc.shape)  # noqa
+            if return_lse or cache_only:
+                # A row that attended no key keeps l == 0 and outputs 0.
+                l = jnp.where(l == 0.0, 1.0, l)
             out = (
                 acc * pl.reciprocal(l, approx=True)
                 if (l.dtype == jnp.float32 and out_dtype != jnp.float32)
                 else lax.div(acc, l)
             ).astype(out_dtype)
+
+            if return_lse:
+                bq_q_start = q_start + bq_idx * actual_bq_sz
+                bq_sz_actual = jnp.minimum(actual_bq_sz, q_end - bq_q_start)
+                # lse = m + log(l) in natural log, replicated over the 128 lanes;
+                # -inf for a row that attended no key.
+                l_ref[...] = m_ref[...] + jnp.log(l_ref[...])
+                lse_start = bq_q_start * num_q_heads_per_kv_head
+                lse_sz = bq_sz_actual * num_q_heads_per_kv_head
+                if num_q_heads_per_kv_head % 8 == 0:
+                    lse_start = pl.multiple_of(lse_start, 8)
+                    lse_sz = pl.multiple_of(lse_sz, 8)
+                lse_src = l_ref.at[:, pl.ds(0, lse_sz), :]
+                lse_dst = lse_hbm_ref.at[:, pl.ds(lse_start, lse_sz), :]
+                _async_copy(lse_src, lse_dst, sems.at[5, 0], wait=False)
+                _async_copy(lse_src, lse_dst, sems.at[5, 0], wait=True)
 
             # Wait for previous bo to be fully sent before storing new bo.
             bo_sem_idx = sem_ids_ref[2]
@@ -1150,7 +1271,8 @@ def _ragged_paged_attention_kernel_loop(
     def epilogue():
         for i in range(2):
             wait_send_bo(bo_sem_idx=i)
-            wait_update_kv_cache(bkv_sem_idx=i)
+            if not skip_kv_write:
+                wait_update_kv_cache(bkv_sem_idx=i)
 
     ### ------- Kernel end ------- ###
 
@@ -1350,6 +1472,13 @@ def static_validate_inputs(
     vmem_limit_bytes: int | None = None,
     skip_kv_mask: bool = False,
     attention_sink=None,
+    custom_mask=None,
+    cache_only: bool = False,
+    skip_kv_write: bool = False,
+    return_lse: bool = False,
+    cp_group_size: int | None = None,
+    cp_rank=None,
+    kv_lens_global=None,
 ):
     """Validate inputs to the RPA kernel statically."""
     q, k, v = queries, keys, values
@@ -1422,6 +1551,31 @@ def static_validate_inputs(
     if skip_kv_mask and use_causal_mask:
         raise ValueError("Cannot skip kv mask when using causal mask.")
 
+    if cp_group_size is not None:
+        if cp_group_size <= 0:
+            raise ValueError(f"{cp_group_size=} must be positive.")
+        if not cache_only:
+            raise ValueError("cp_group_size requires cache_only.")
+        if custom_mask is not None:
+            raise ValueError("cp_group_size does not support custom_mask.")
+        if xai_temperature_len is not None:
+            raise ValueError("cp_group_size does not support xai_temperature_len.")
+        if cp_rank is None or kv_lens_global is None:
+            raise ValueError("cp_group_size requires cp_rank and kv_lens_global.")
+        if cp_rank.shape != (1,) or cp_rank.dtype != jnp.int32:
+            raise ValueError(
+                f"Expected {cp_rank.shape=} to be (1,) and {cp_rank.dtype=} int32."
+            )
+        if kv_lens_global.shape != (max_num_seqs,) or (
+            kv_lens_global.dtype != jnp.int32
+        ):
+            raise ValueError(
+                f"Expected {kv_lens_global.shape=} to be ({max_num_seqs},) and"
+                f" {kv_lens_global.dtype=} int32."
+            )
+    elif cp_rank is not None or kv_lens_global is not None:
+        raise ValueError("cp_rank and kv_lens_global require cp_group_size.")
+
     def _validate_block_sizes(block_sizes, prefix):
         if block_sizes is None:
             return
@@ -1461,6 +1615,8 @@ def static_validate_inputs(
     del xai_temperature_len
     del skip_kv_mask
     del attention_sink
+    del skip_kv_write
+    del return_lse
 
 
 def dynamic_validate_inputs(
@@ -1473,6 +1629,8 @@ def dynamic_validate_inputs(
     cu_q_lens,
     cu_kv_lens,
     distribution,
+    *,
+    cache_only: bool = False,
     **kwargs,
 ):
     """Runtime validation of dynamic tensor values."""
@@ -1496,7 +1654,7 @@ def dynamic_validate_inputs(
         kv_len = int(kv_lens[seq_idx])
         if q_len <= 0:
             raise ValueError(f"Sequence {seq_idx}: q_len={q_len} must be > 0")
-        if q_len > kv_len:
+        if q_len > kv_len and not cache_only:
             raise ValueError(f"Sequence {seq_idx}: q_len={q_len} > kv_len={kv_len}")
         page_cnt = cdiv(kv_len, page_size)
         if page_cnt > pages_per_seq:
@@ -1686,6 +1844,10 @@ def get_vmem_limit():
         "vmem_limit_bytes",
         "out_dtype",
         "skip_kv_mask",
+        "cache_only",
+        "skip_kv_write",
+        "return_lse",
+        "cp_group_size",
         "disable_semaphore_checks",
         "debug_mode",
     ),
@@ -1704,6 +1866,8 @@ def ragged_paged_attention(
     custom_mask: jax.Array | None,
     attention_sink: jax.Array | None = None,
     *,
+    cp_rank: jax.Array | None = None,  # i32[1]
+    kv_lens_global: jax.Array | None = None,  # i32[max_num_seqs]
     causal: int = 1,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -1720,6 +1884,10 @@ def ragged_paged_attention(
     vmem_limit_bytes: int | None = None,
     out_dtype=None,
     skip_kv_mask: bool = False,
+    cache_only: bool = False,
+    skip_kv_write: bool = False,
+    return_lse: bool = False,
+    cp_group_size: int | None = None,
     disable_semaphore_checks: bool = True,
     debug_mode: bool = False,
 ):
@@ -1737,6 +1905,10 @@ def ragged_paged_attention(
       distribution: (i, j, k) decode/prefill/mixed sequence ranges.
       custom_mask: custom attention mask for speculative decoding.
       attention_sink: per-head sink logits for streaming inference.
+      cp_rank: this rank's index in the context-parallel group.
+      kv_lens_global: kv length of every sequence over the whole context-parallel
+        group; the query positions of sequence s start at kv_lens_global[s] -
+        q_len.
       causal: 1 for causal mask, 0 for custom mask.
       sm_scale: softmax scale applied to Q@K^T.
       sliding_window: sliding window size.
@@ -1751,10 +1923,21 @@ def ragged_paged_attention(
       p_block_sizes: block sizes for prefill.
       m_block_sizes: block sizes for mixed.
       vmem_limit_bytes: vmem limit for the pallas kernel.
+      cache_only: read all kv_lens keys of every sequence from the cache and
+        write nothing; keys/values are ignored and the queries follow the whole
+        kv range. Accepts q_len > kv_len and kv_len == 0.
+      skip_kv_write: keep the fetch semantics (the last q_len keys come from
+        keys/values) but never write the cache.
+      return_lse: also return lse[token, q head] = m + log(l) in natural log,
+        -inf where the row attended no key.
+      cp_group_size: size of the context-parallel group; the sliding window then
+        runs in global coordinates, where local key j of a sequence holds global
+        position j * cp_group_size + cp_rank. Requires cache_only, cp_rank and
+        kv_lens_global.
       debug_mode: if true, skip DMAs and flash attention.
 
     Returns:
-      (output, updated_kv_cache_fused)
+      (output, updated_kv_cache_fused), plus lse when return_lse.
     """
     q, k, v = queries, keys, values
 
@@ -1787,6 +1970,13 @@ def ragged_paged_attention(
         vmem_limit_bytes=vmem_limit_bytes,
         skip_kv_mask=skip_kv_mask,
         attention_sink=attention_sink,
+        custom_mask=custom_mask,
+        cache_only=cache_only,
+        skip_kv_write=skip_kv_write,
+        return_lse=return_lse,
+        cp_group_size=cp_group_size,
+        cp_rank=cp_rank,
+        kv_lens_global=kv_lens_global,
     )
 
     actual_num_q_heads = q.shape[1]
@@ -1830,6 +2020,17 @@ def ragged_paged_attention(
     else:
         cu_seq_mask_lens = jnp.array([0])
 
+    # LSE staging buffer, flattened over (token, q head) for DMA alignment.
+    lse_hbm = (
+        jnp.full(
+            (actual_num_kv_heads, max_num_tokens * num_q_heads_per_kv_head, 128),
+            -jnp.inf,
+            dtype=jnp.float32,
+        )
+        if return_lse
+        else None
+    )
+
     # Scalar prefetch init values.
     init_sem_ids = jnp.zeros((3,), jnp.int32)
     init_bo_ids = jnp.full((4,), -1, jnp.int32)
@@ -1841,6 +2042,7 @@ def ragged_paged_attention(
     def run_rpa_kernel(
         q,
         kv_cache,
+        lse_hbm,
         *,
         bq_sz,
         bkv_sz,
@@ -1871,6 +2073,10 @@ def ragged_paged_attention(
             pl.BlockSpec(memory_space=pltpu.HBM),
         ]
 
+        if return_lse:
+            in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # lse
+            out_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # lse
+
         bkv_stride = num_kv_heads_x2_per_kv_packing
         if has_bank_conflicts(bkv_stride):
             bkv_stride += 1
@@ -1895,9 +2101,11 @@ def ragged_paged_attention(
                 jnp.int32,
             )
 
+        # bf16 accumulators lose the exponent of m + log(l), so the LSE needs
+        # f32 l/m.
         l_scratch = pltpu.VMEM(
             (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
-            out_dtype,
+            jnp.float32 if return_lse else out_dtype,
         )
         m_scratch = l_scratch
 
@@ -1911,7 +2119,7 @@ def ragged_paged_attention(
             bkv_double_buf,
             bq_double_buf,
             bo_double_buf,
-            pltpu.SemaphoreType.DMA((5, 2)),
+            pltpu.SemaphoreType.DMA((6, 2) if return_lse else (5, 2)),
             l_scratch,
             m_scratch,
             acc_scratch,
@@ -1928,6 +2136,40 @@ def ragged_paged_attention(
             init_bo_ids,
             init_bkv_update_ids,
         )
+        if cp_group_size is not None:
+            scalar_prefetches += (cp_rank, kv_lens_global)
+
+        num_scalar_prefetch = len(scalar_prefetches)
+        input_output_aliases = {
+            num_scalar_prefetch: 0,  # q -> output
+            num_scalar_prefetch + 2: 1,  # kv_cache -> updated_kv_cache
+        }
+        out_shape = (
+            [
+                pltpu.HBM(shape=q.shape, dtype=q.dtype),
+                pltpu.HBM(shape=kv_cache.shape, dtype=kv_cache.dtype),
+            ]
+            if tpu_version >= 7
+            else [
+                jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
+                jax.ShapeDtypeStruct(shape=kv_cache.shape, dtype=kv_cache.dtype),
+            ]
+        )
+        if return_lse:
+            # q, kv, kv_cache, the optional custom_mask, zero_mask and the
+            # optional attention_sink precede the lse buffer.
+            lse_operand_idx = (
+                num_scalar_prefetch
+                + 4
+                + int(custom_mask is not None)
+                + int(attention_sink is not None)
+            )
+            input_output_aliases[lse_operand_idx] = 2  # lse -> updated lse
+            out_shape.append(
+                pltpu.HBM(shape=lse_hbm.shape, dtype=lse_hbm.dtype)
+                if tpu_version >= 7
+                else jax.ShapeDtypeStruct(shape=lse_hbm.shape, dtype=lse_hbm.dtype)
+            )
 
         scope_name = (
             f"RPA{case.symbol}-p_{page_size}-bq_{bq_sz}_{bq_csz}-bkv_{bkv_sz}_{bkv_csz}"
@@ -1954,6 +2196,10 @@ def ragged_paged_attention(
                 bkv_csz=bkv_csz,
                 case=case,
                 skip_kv_mask=skip_kv_mask,
+                cache_only=cache_only,
+                skip_kv_write=skip_kv_write,
+                return_lse=return_lse,
+                cp_group_size=cp_group_size,
                 debug_mode=debug_mode,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1969,21 +2215,8 @@ def ragged_paged_attention(
                 disable_bounds_checks=True,
                 **(_semaphore_kwargs(disable_semaphore_checks)),
             ),
-            out_shape=(
-                [
-                    pltpu.HBM(shape=q.shape, dtype=q.dtype),
-                    pltpu.HBM(shape=kv_cache.shape, dtype=kv_cache.dtype),
-                ]
-                if tpu_version >= 7
-                else [
-                    jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-                    jax.ShapeDtypeStruct(shape=kv_cache.shape, dtype=kv_cache.dtype),
-                ]
-            ),
-            input_output_aliases={
-                9: 0,  # q -> output
-                11: 1,  # kv_cache -> updated_kv_cache
-            },
+            out_shape=out_shape,
+            input_output_aliases=input_output_aliases,
             name=scope_name,
         )
 
@@ -1992,7 +2225,7 @@ def ragged_paged_attention(
         if tpu_version >= 7:
 
             @jax.jit
-            def run(scalar_prefetches, q, kv, kv_cache):
+            def run(scalar_prefetches, q, kv, kv_cache, lse_hbm):
                 return kernel(
                     *scalar_prefetches,
                     pltpu.with_memory_space_constraint(q, pltpu.HBM),
@@ -2005,11 +2238,16 @@ def ragged_paged_attention(
                     ),
                     zero_mask,
                     attention_sink,
+                    *(
+                        (pltpu.with_memory_space_constraint(lse_hbm, pltpu.HBM),)
+                        if return_lse
+                        else ()
+                    ),
                 )
 
         else:
 
-            def run(scalar_prefetches, q, kv, kv_cache):
+            def run(scalar_prefetches, q, kv, kv_cache, lse_hbm):
                 return kernel(
                     *scalar_prefetches,
                     q,
@@ -2018,9 +2256,13 @@ def ragged_paged_attention(
                     custom_mask,
                     zero_mask,
                     attention_sink,
+                    *((lse_hbm,) if return_lse else ()),
                 )
 
-        return run(scalar_prefetches, q, kv, kv_cache)
+        outputs = run(scalar_prefetches, q, kv, kv_cache, lse_hbm)
+        if return_lse:
+            return outputs
+        return outputs[0], outputs[1], None
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
@@ -2053,9 +2295,10 @@ def ragged_paged_attention(
         distribution = distribution.at[1].set(distribution[0])
 
     # Decode-only
-    q, kv_cache_fused_processed = run_rpa_kernel(
+    q, kv_cache_fused_processed, lse_hbm = run_rpa_kernel(
         q,
         kv_cache_fused_processed,
+        lse_hbm,
         **_prepare_block_sizes(d_block_sizes, RpaCase.DECODE),
         static_q_len=1,
         case=RpaCase.DECODE,
@@ -2063,25 +2306,34 @@ def ragged_paged_attention(
 
     if chunk_prefill_size is not None:
         # Prefill-only
-        q, kv_cache_fused_processed = run_rpa_kernel(
+        q, kv_cache_fused_processed, lse_hbm = run_rpa_kernel(
             q,
             kv_cache_fused_processed,
+            lse_hbm,
             **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
             static_q_len=chunk_prefill_size,
             case=RpaCase.PREFILL,
         )
     # Mixed
-    q, kv_cache_fused_processed = run_rpa_kernel(
+    q, kv_cache_fused_processed, lse_hbm = run_rpa_kernel(
         q,
         kv_cache_fused_processed,
+        lse_hbm,
         **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
         static_q_len=None,
         case=RpaCase.MIXED,
     )
 
-    return (
-        prepare_outputs(q, actual_num_q_heads_per_kv_head, actual_head_dim),
-        prepare_updated_kv_cache_fused(
-            kv_cache_fused_processed, actual_num_kv_heads, actual_head_dim
-        ),
+    out = prepare_outputs(q, actual_num_q_heads_per_kv_head, actual_head_dim)
+    updated_kv_cache_fused = prepare_updated_kv_cache_fused(
+        kv_cache_fused_processed, actual_num_kv_heads, actual_head_dim
     )
+    if not return_lse:
+        return out, updated_kv_cache_fused
+
+    # Unflatten (token, q head) and read the lane the LSE is replicated over.
+    lse = lse_hbm.reshape(
+        actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head, 128
+    )[:, :, :actual_num_q_heads_per_kv_head, 0]
+    lse = lse.swapaxes(0, 1).reshape(max_num_tokens, actual_num_q_heads)
+    return out, updated_kv_cache_fused, lse
