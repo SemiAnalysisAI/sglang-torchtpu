@@ -380,15 +380,18 @@ def prepare_mlp_sync_batch_raw(
         # short of the batch's real input_ids. Stamp the batch identity so the
         # two can be correlated -- same object mutated later, or a different
         # object reaching the forward.
-        logger.error(
-            "MLPSYNC extend: batch=%x reqs=%d extend_num_tokens=%s "
-            "sum_extend_lens=%s mode=%s",
-            id(local_batch),
-            len(local_batch.reqs),
-            num_tokens,
-            sum(local_batch.extend_lens) if local_batch.extend_lens else None,
-            local_batch.forward_mode,
-        )
+        # Gated to small batches: every observed pad failure had batch_size=1,
+        # and logging every extend sync across 16 ranks overran the job.
+        if len(local_batch.reqs) <= 2:
+            logger.error(
+                "MLPSYNC extend: batch=%x reqs=%d extend_num_tokens=%s "
+                "sum_extend_lens=%s mode=%s",
+                id(local_batch),
+                len(local_batch.reqs),
+                num_tokens,
+                sum(local_batch.extend_lens) if local_batch.extend_lens else None,
+                local_batch.forward_mode,
+            )
         num_tokens_for_logprob = sum(
             # We should have at least 1 token for sample in every case.
             max(extend_len - logprob_start_len, 1)
