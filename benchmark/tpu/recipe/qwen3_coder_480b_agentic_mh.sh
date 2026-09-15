@@ -37,32 +37,29 @@ EXTRA_ARGS="--weight-loader-drop-cache-after-load${EXTRA_ARGS:+ $EXTRA_ARGS}"
 PROFILE=${PROFILE:-ci}
 
 # Since libtpu 0.0.47 (#727) the resident compiled executables no longer fit in
-# host RAM beside the pinned HiCache pool, and the pod is OOM-killed during
-# warmup with HBM still ~39 GB free. config.sh:347 already warns that extra
-# torch.compile buckets are "the most expensive thing in a CI bring-up"; 12
-# graph variants now OOM-kill the pod and 9 do not, so the ladder has to lose a
-# few. Which few is the whole question.
+# host RAM beside raiden's host KV pool, and the pod is OOM-killed during warmup
+# with HBM still ~39 GB free. The node has 963 GB allocatable (config.sh:220).
 #
-# Thin the EXTEND ladder, and leave the decode ladder and MAX_RUNNING exactly
-# as the last green run had them. Every negative pad seen while fixing this has
-# coincided with a decode-side change, never with the extend side alone:
+# The compile ladder is NOT the lever. Every reduction of it pads negative under
+# DP attention -- prepare_mlp_sync_batch sizes each rank from the all-gathered
+# global_num_tokens and a non-default ladder lets a rank's own padded batch
+# exceed that target, so _pad_tensor_to_size is asked to shrink
+# (forward_batch_info.py:1302). Four shapes, four failures:
 #
-#   bs=[1,8]    + tokens=[4096] + MAX_RUNNING=8   -> pad -123  at c1  (34903370712)
-#   bs=[1,8]    + derived       + MAX_RUNNING=8   -> pad -1017 at c1  (34908974337)
-#   bs=[1,8,16] + derived       + MAX_RUNNING=16  -> pad -1352 at c16 (34914967096)
+#   decode [1,8]    extend [4096]            -> -123  at c1  (34903370712)
+#   decode [1,8]    extend derived           -> -1017 at c1  (34908974337)
+#   decode [1,8,16] extend derived           -> -1352 at c16 (34914967096)
+#   decode derived  extend [1024,2048,4096]  -> -253  at c16 (34919948429)
 #
-# The mechanism is DP attention: prepare_mlp_sync_batch sizes every rank from
-# the all-gathered global_num_tokens, and a decode ladder missing rungs lets a
-# rank's own padded batch exceed that target, so the pad goes negative
-# (forward_batch_info.py:1302). The last run got both c1 legs green and matched
-# the 09-11 baseline on hit rate and throughput, so only the c16 legs, where
-# per-rank batch size varies most, still trip it.
-#
-# Cutting extends instead keeps 4096 as the maximum -- nothing can overflow the
-# ladder that could not before -- and only costs padding on chunks under 1024.
-# 5 decode + 3 extend = 8 variants, below the 9 that ran OOM-free.
+# So both ladders stay derived, exactly as the last green run had them, and the
+# host RAM comes from raiden instead. Its host pool is pinned eagerly at
+# HICACHE_RATIO x the ~26 GB device pool x 8 ranks -- 208 GB at ratio 1 -- and
+# this benchmark never touches it: kv_offload_written and kv_offload_reloaded
+# are 0.0 on all four legs of every run observed, the 09-11 green one included
+# (the known gap in the recipe README). Halving it frees ~104 GB of pinned host
+# memory and cannot change a measurement that is identically zero.
 if [[ "$PROFILE" == "ci" ]]; then
-  export TPU_COMPILE_TOKENS="${TPU_COMPILE_TOKENS:-1024 2048 4096}"
+  export HICACHE_RATIO="${HICACHE_RATIO:-0.5}"
 fi
 
 exec env \
