@@ -145,6 +145,21 @@ DECODE_LOG = "/tmp/pd_decode.log"
 LB_LOG = "/tmp/pd_lb.log"
 
 
+# EXPERIMENT #718. build_bucketers (compiled_forward_shim.py:855) keeps only
+# buckets <= min(chunked_prefill_size, max_prefill_tokens, context_len), so the
+# chunk size decides which graphs get compiled, not just how long a forward is:
+#   chunk 256  -> [64, 256]        clean, gsm8k 0.95-0.99
+#   chunk 1024 -> [64, 256, 1024]  corrupt, gsm8k 0.06 (34910554721)
+#   chunk 4096 -> [64, 256, 1024]  corrupt, gsm8k 0.04-0.06 (34899115582)
+# A 93-token forward uses the 256 graph in all three and is corrupt in exactly
+# the two where a 1024 graph also exists. Setting "64 256" with the chunk left
+# high keeps forwards unchunked while dropping the 1024 graph, which separates
+# "the 1024 graph is compiled" from "the chunk size is large". Prompts longer
+# than 256 will fail the bucketer in that configuration; the short lengths are
+# the measurement.
+QWEN_COMPILE_TOKENS = os.environ.get("QWEN_COMPILE_TOKENS", "64 256")
+
+
 class ModelProfile(msgspec.Struct, frozen=True, kw_only=True):
     key: str
     display_name: str
@@ -496,7 +511,7 @@ def build_prefill_env(
         "ENABLE_DP_ATTENTION": "0",
         "MAX_RUNNING": values.get("MAX_RUNNING", "8"),
         "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1"),
-        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024"),
+        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", QWEN_COMPILE_TOKENS),
         "MEM_FRACTION_STATIC": values.get(
             "MEM_FRACTION_STATIC", profile.mem_fraction_prefill
         ),
@@ -546,7 +561,7 @@ def build_decode_env(
         "ENABLE_DP_ATTENTION": "1",
         "MAX_RUNNING": values.get("MAX_RUNNING", "8"),
         "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1 2 4 8"),
-        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024"),
+        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", QWEN_COMPILE_TOKENS),
         "MEM_FRACTION_STATIC": values.get(
             "MEM_FRACTION_STATIC", profile.mem_fraction_decode
         ),
