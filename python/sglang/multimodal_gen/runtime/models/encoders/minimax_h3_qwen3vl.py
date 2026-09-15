@@ -344,40 +344,29 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                 "pixel_values_videos and video_grid_thw must be given together"
             )
 
-        host_ids = input_ids.to(device="cpu", dtype=torch.long)[None]
-        host_image_grid_thw = (
-            image_grid_thw.to(device="cpu", dtype=torch.long)
-            if image_grid_thw is not None
-            else None
-        )
-        host_video_grid_thw = (
-            video_grid_thw.to(device="cpu", dtype=torch.long)
-            if video_grid_thw is not None
-            else None
-        )
+        ids = input_ids.to(device=self.device, dtype=torch.long)[None]
         position_ids = None
-        if host_image_grid_thw is not None or host_video_grid_thw is not None:
+        if image_grid_thw is not None or video_grid_thw is not None:
             position_ids, _ = self.model.get_rope_index(
-                host_ids,
-                host_image_grid_thw,
-                host_video_grid_thw,
-                attention_mask=torch.ones_like(host_ids),
+                ids,
+                image_grid_thw,
+                video_grid_thw,
+                attention_mask=torch.ones_like(ids),
             )
-        ids = host_ids.to(self.device)
         call_kwargs: dict[str, Any] = {
             "input_ids": ids,
             "attention_mask": torch.ones_like(ids),
         }
         if position_ids is not None:
-            call_kwargs["position_ids"] = position_ids.to(self.device)
+            call_kwargs["position_ids"] = position_ids
         if pixel_values is not None:
             call_kwargs["pixel_values"] = pixel_values.to(self.device, torch.bfloat16)
-            call_kwargs["image_grid_thw"] = host_image_grid_thw
+            call_kwargs["image_grid_thw"] = image_grid_thw
         if pixel_values_videos is not None:
             call_kwargs["pixel_values_videos"] = pixel_values_videos.to(
                 self.device, torch.bfloat16
             )
-            call_kwargs["video_grid_thw"] = host_video_grid_thw
+            call_kwargs["video_grid_thw"] = video_grid_thw
 
         hidden = self(**call_kwargs).last_hidden_state[0]
         if self.conditioning_projection is not None:
