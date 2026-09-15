@@ -288,9 +288,7 @@ impl WorkerSelectionStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PolicyConfig;
-    use crate::core::BasicWorkerBuilder;
-    use crate::policies::RoundRobinPolicy;
+    use crate::{config::PolicyConfig, core::BasicWorkerBuilder, policies::RoundRobinPolicy};
 
     fn add_workers(reg: &WorkerRegistry, kind: WorkerType, n: usize, base_port: u16) {
         for i in 0..n {
