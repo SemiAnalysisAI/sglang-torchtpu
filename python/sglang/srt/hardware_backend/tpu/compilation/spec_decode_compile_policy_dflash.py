@@ -469,7 +469,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
 
         def run(shape: tuple[int, int]) -> str:
             bs, num_tokens = shape
-            self._run_one(
+            warmup = self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=ForwardMode.TARGET_VERIFY,
@@ -477,6 +477,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 spec_info=self.make_null_spec_info(),
                 attn_backend=draft_attn_backend,
             )
+            assert warmup is None, "Draft warmups must execute synchronously"
             return f"bs={bs}, tokens={num_tokens}"
 
         self._precompile_shapes("DFLASH DRAFT VERIFY", shapes, run)

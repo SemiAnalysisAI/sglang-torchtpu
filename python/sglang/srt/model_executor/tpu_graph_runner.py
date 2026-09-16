@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from sglang.srt.compilation.support_torch_compile import (
+    CompilePolicy,
     DecoderCompilePolicy,
     get_torch_compile_policy,
 )
@@ -64,28 +65,51 @@ def _spec_enabled(model_runner: ModelRunner) -> bool:
     )
 
 
+def _uses_async_direct_compile(policy: CompilePolicy) -> bool:
+    return (
+        envs.SGLANG_TPU_ENABLE_DIRECT_COMPILE_ASYNC.get()
+        and isinstance(policy, DecoderTpuCompilePolicy)
+        and policy.tracer == "direct"
+    )
+
+
 def _complete_pending_warmups(
     pending_warmups: list[PendingCall], local_errors: tuple[str, ...] = ()
 ) -> None:
     """Compile prepared MLIR on every TP rank before executing any warmup."""
     compile_errors = list(local_errors)
-    logger.info("[direct_compile] starting %d compilations", len(pending_warmups))
-    for index, warmup in enumerate(pending_warmups):
-        try:
-            warmup.start_compiling()
-        except Exception as error:
-            compile_errors.append(
-                f"warmup {index} start: {type(error).__name__}: {error}"
-            )
-
-    logger.info("[direct_compile] waiting for %d compilations", len(pending_warmups))
-    for index, warmup in enumerate(pending_warmups):
-        try:
-            warmup.wait_compiled()
-        except Exception as error:
-            compile_errors.append(f"warmup {index}: {type(error).__name__}: {error}")
-
     parallel = get_parallel()
+    if pending_warmups:
+        logger.info("[direct_compile] starting %d compilations", len(pending_warmups))
+        for index, warmup in enumerate(pending_warmups):
+            try:
+                warmup.start_compiling()
+            except Exception as error:
+                compile_errors.append(
+                    f"warmup {index} start: {type(error).__name__}: {error}"
+                )
+
+        logger.info(
+            "[direct_compile] waiting for %d compilations", len(pending_warmups)
+        )
+        progress_interval = max(1, (len(pending_warmups) + 19) // 20)
+        for index, warmup in enumerate(pending_warmups):
+            try:
+                warmup.wait_compiled()
+            except Exception as error:
+                compile_errors.append(
+                    f"warmup {index}: {type(error).__name__}: {error}"
+                )
+            completed = index + 1
+            if parallel.tp_rank == 0 and (
+                completed % progress_interval == 0 or completed == len(pending_warmups)
+            ):
+                logger.info(
+                    "[direct_compile] finished %d/%d compilation tasks",
+                    completed,
+                    len(pending_warmups),
+                )
+
     if parallel.tp_size > 1:
         rank_states = parallel.tp_group.all_gather_object(
             (len(pending_warmups), tuple(compile_errors))
@@ -308,12 +332,9 @@ class TpuGraphRunner:
                 installed_any = True
                 installed_policies.append(policy)
                 try:
-                    pending_warmups.extend(policy.precompile() or ())
+                    pending_warmups.extend(policy.precompile())
                 except Exception as error:
-                    if not (
-                        envs.SGLANG_DIRECT_COMPILE_ASYNC.get()
-                        and getattr(policy, "tracer", None) == "direct"
-                    ):
+                    if not _uses_async_direct_compile(policy):
                         raise
                     precompile_errors.append(
                         f"{type(policy).__name__}: {type(error).__name__}: {error}"
@@ -341,9 +362,9 @@ class TpuGraphRunner:
                 installed_any = True
                 installed_policies.append(fallback_policy)
                 try:
-                    pending_warmups.extend(fallback_policy.precompile() or ())
+                    pending_warmups.extend(fallback_policy.precompile())
                 except Exception as error:
-                    if not envs.SGLANG_DIRECT_COMPILE_ASYNC.get():
+                    if not _uses_async_direct_compile(fallback_policy):
                         raise
                     precompile_errors.append(
                         f"{type(fallback_policy).__name__}: "
@@ -353,9 +374,11 @@ class TpuGraphRunner:
         if not installed_any:
             return
 
-        has_async_direct_policy = envs.SGLANG_DIRECT_COMPILE_ASYNC.get() and any(
-            getattr(policy, "tracer", None) == "direct" for policy in installed_policies
+        has_async_direct_policy = any(
+            _uses_async_direct_compile(policy) for policy in installed_policies
         )
+        # Every async-direct rank must enter the error/count exchange even when
+        # it has no local work, or a peer's trace failure can strand collectives.
         if pending_warmups or has_async_direct_policy:
             _complete_pending_warmups(
                 pending_warmups, local_errors=tuple(precompile_errors)

@@ -1411,6 +1411,19 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
     serving uses: ``prepare_forward_batch`` → ``init_forward_metadata``
     → compiled ``forward``."""
 
+    def test_draft_forward_shim_disables_async_warmup(self):
+        model_runner = _model_runner()
+        model_runner.is_draft_worker = True
+        policy = _make_policy(model_runner)
+
+        policy._install_forward_shim(
+            model_runner.model.forward,
+            MagicMock(name="compiled_forward"),
+            MagicMock(name="warmup_async"),
+        )
+
+        self.assertIsNone(policy.compiled_forward_shim.warmup_async_fn)
+
     def test_run_one_calls_prepare_then_metadata_then_forward(self):
         mr = _model_runner()
         policy = _make_policy(mr)
@@ -3022,6 +3035,18 @@ class TestSpecForwardBatchPreparation(_SpecPolicyTestCase):
 
 class TestDraftPrecompile(_SpecPolicyTestCase):
     """``precompile_draft`` warms the three draft forward families."""
+
+    def test_draft_precompile_rejects_deferred_warmup(self):
+        model_runner = _spec_model_runner(is_draft_worker=True)
+        policy = _make_spec_policy(model_runner, token_buckets=(8,), bs_buckets=(1,))
+        policy.extend_bs = 1
+        policy._run_one = MagicMock(return_value=MagicMock())
+
+        with (
+            get_parallel().override(tp_rank=1),
+            self.assertRaisesRegex(AssertionError, "must execute synchronously"),
+        ):
+            policy._precompile_draft_prefill_extend()
 
     def test_draft_worker_compiles_prefill_decode_and_extend(self):
         mr = _spec_model_runner(is_draft_worker=True)

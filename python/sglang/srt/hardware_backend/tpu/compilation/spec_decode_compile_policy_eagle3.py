@@ -834,7 +834,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
 
         def run(shape: tuple[int, int, str]) -> str:
             num_tokens, bs, variant = shape
-            self._run_one(
+            warmup = self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=ForwardMode.EXTEND,
@@ -842,6 +842,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 capture_hidden_mode=CaptureHiddenMode.LAST,
                 spec_info=self._make_draft_prefill_spec_info(),
             )
+            assert warmup is None, "Draft warmups must execute synchronously"
             return f"tokens={num_tokens}, bs={bs}, variant={variant}"
 
         self._precompile_shapes("DRAFT EXTEND(LAST)", valid_shapes, run)
@@ -864,7 +865,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
 
         def run(shape: tuple[int, int]) -> str:
             bs, step = shape
-            self._run_one(
+            warmup = self._run_one(
                 num_tokens=bs * self.speculative_eagle_topk,
                 bs=bs,
                 mode=ForwardMode.DECODE,
@@ -872,6 +873,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 spec_info=self._make_draft_decode_spec_info(),
                 attn_backend=step_backends[step],
             )
+            assert warmup is None, "Draft warmups must execute synchronously"
             return f"bs={bs}, step={step}"
 
         self._precompile_shapes("DRAFT DECODE", shapes, run)
@@ -953,7 +955,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
 
         def run(bs: int) -> str:
             num_tokens = bs * tokens_per_req
-            self._run_one(
+            warmup = self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=ForwardMode.DRAFT_EXTEND_V2,
@@ -961,6 +963,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 spec_info=self._make_draft_extend_spec_info(),
                 attn_backend=attn_backend,
             )
+            assert warmup is None, "Draft warmups must execute synchronously"
             return f"bs={bs}, tokens={num_tokens}"
 
         self._precompile_shapes("DRAFT_EXTEND_V2(FULL)", bs_buckets, run)

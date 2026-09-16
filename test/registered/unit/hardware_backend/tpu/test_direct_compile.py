@@ -4,7 +4,6 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
-from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -99,37 +98,6 @@ class _KVPool:
 
 
 class TestDirectCompile(CustomTestCase):
-    def test_async_compile_executor_bounds_in_flight_work(self):
-        executor = direct_compile._BoundedCompileExecutor(max_workers=1)
-        first_started = Event()
-        release_first = Event()
-        second_submitted = Event()
-
-        def first():
-            first_started.set()
-            release_first.wait()
-
-        try:
-            first_future = executor.submit(first)
-            self.assertTrue(first_started.wait(timeout=5))
-
-            def submit_second():
-                second_future = executor.submit(lambda: None)
-                second_submitted.set()
-                second_future.result()
-
-            with ThreadPoolExecutor(max_workers=1) as submitter:
-                submit_future = submitter.submit(submit_second)
-                self.assertFalse(second_submitted.wait(timeout=0.05))
-                release_first.set()
-                submit_future.result(timeout=5)
-
-            first_future.result(timeout=5)
-            self.assertTrue(second_submitted.is_set())
-        finally:
-            release_first.set()
-            executor.shutdown()
-
     def test_fail_on_recompile_stance(self):
         compiled = direct_compile.direct_compile(
             lambda value: value,
@@ -156,7 +124,7 @@ class TestDirectCompile(CustomTestCase):
         compiler = direct_compile.tpu_torch_compile
         value = torch.ones(2)
         result = torch.full((2,), 2.0)
-        executor = direct_compile._BoundedCompileExecutor(max_workers=1)
+        executor = ThreadPoolExecutor(max_workers=1)
 
         try:
             with (
@@ -199,6 +167,20 @@ class TestDirectCompile(CustomTestCase):
                 )
         finally:
             executor.shutdown()
+
+    def test_deferred_executable_memoizes_compiled_result(self):
+        executable = object()
+        future = MagicMock()
+        future.result.return_value = executable
+        executor = MagicMock()
+        executor.submit.return_value = future
+        deferred = direct_compile._DeferredExecutable("module", executor, [[]])
+
+        self.assertIs(deferred.result(), executable)
+        self.assertIs(deferred.result(), executable)
+
+        executor.submit.assert_called_once()
+        future.result.assert_called_once_with()
 
     @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
     def test_torch_tpu_cache_hit_for_equivalent_compilations(self):

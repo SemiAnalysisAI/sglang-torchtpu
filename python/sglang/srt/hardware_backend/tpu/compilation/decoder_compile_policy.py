@@ -1042,13 +1042,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             async_warmup = getattr(self.owner.forward, "warmup_async_fn", None)
             if (
                 self.tracer == "direct"
-                and envs.SGLANG_DIRECT_COMPILE_ASYNC.get()
+                and envs.SGLANG_TPU_ENABLE_DIRECT_COMPILE_ASYNC.get()
                 and async_warmup is not None
             ):
                 out = self.owner.forward.warmup_async(*args, **kwargs)
             else:
                 out = self.owner.forward(*args, **kwargs)
             if isinstance(out, PendingCall):
+                # Execution happens after these contexts exit; the artifact and
+                # callback retain the backend and KV pool they need explicitly.
                 return out.then(
                     lambda result: _materialize_out(
                         result,

@@ -207,19 +207,19 @@ class VisionTpuCompilePolicy(CompilePolicy):
                 return bucket
         return None
 
-    def precompile(self, patch_counts: list[int] | None = None) -> None:
+    def precompile(self, patch_counts: list[int] | None = None) -> list[Any]:
         """Warm the torch.compile cache for common patch counts."""
         owner = self.owner
         runner = self._resolve_runner()
         if owner is None or runner is None:
             logger.warning("VisionTpuCompilePolicy.precompile: missing owner.")
-            return
+            return []
         if not self._runner_ready_for_compile(runner):
             logger.info(
                 "VisionTpuCompilePolicy.precompile: skipped because the runner "
                 "does not support the compiled boundary."
             )
-            return
+            return []
 
         if patch_counts is None:
             patch_counts = self.resolve_patch_buckets()
@@ -228,14 +228,14 @@ class VisionTpuCompilePolicy(CompilePolicy):
                 "VisionTpuCompilePolicy.precompile: no patch counts to warm "
                 "(disabled via SGLANG_TPU_VIT_PRECOMPILE_SIZES='')."
             )
-            return
+            return []
 
         if self.compiled_fn is None:
             logger.info(
                 "VisionTpuCompilePolicy.precompile: skipped because policy is "
                 "not installed."
             )
-            return
+            return []
 
         global _precompiled_max_patch_count
         _precompiled_max_patch_count = max(patch_counts)
@@ -263,6 +263,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
             torch.set_default_dtype(init_dtype)
 
         logger.info("VisionTpuCompilePolicy.precompile: done.")
+        return []
 
     def run(self, *raw: Any) -> torch.Tensor:
         if self.compiled_fn is None:

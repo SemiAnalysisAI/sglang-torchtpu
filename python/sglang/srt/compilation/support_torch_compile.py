@@ -59,8 +59,8 @@ class CompilePolicy(ABC):
         """Install runtime compile wrappers for this policy."""
 
     @abstractmethod
-    def precompile(self) -> None:
-        """Warm compile artifacts for this policy."""
+    def precompile(self) -> list[Any]:
+        """Warm compile artifacts and return deferred calls to join."""
 
 
 class DecoderCompilePolicy(CompilePolicy):
@@ -157,8 +157,8 @@ class NoopCompilePolicy(DecoderCompilePolicy):
     def install(self) -> bool:
         return False
 
-    def precompile(self) -> None:
-        pass
+    def precompile(self) -> list[Any]:
+        return []
 
     def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
         pass

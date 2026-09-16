@@ -144,7 +144,7 @@ class TestTpuGraphRunner(CustomTestCase):
         self.addCleanup(platform_patcher.stop)
         parallel_patcher = patch(
             "sglang.srt.model_executor.tpu_graph_runner.get_parallel",
-            return_value=SimpleNamespace(tp_size=1),
+            return_value=SimpleNamespace(tp_size=1, tp_rank=0),
         )
         parallel_patcher.start()
         self.addCleanup(parallel_patcher.stop)
@@ -395,7 +395,7 @@ class TestTpuGraphRunner(CustomTestCase):
             def barrier(self):
                 events.append("barrier")
 
-        parallel = SimpleNamespace(tp_size=2, tp_group=_Group())
+        parallel = SimpleNamespace(tp_size=2, tp_rank=0, tp_group=_Group())
         with patch(
             "sglang.srt.model_executor.tpu_graph_runner.get_parallel",
             return_value=parallel,
@@ -438,7 +438,7 @@ class TestTpuGraphRunner(CustomTestCase):
             def barrier(self):
                 events.append("barrier")
 
-        parallel = SimpleNamespace(tp_size=2, tp_group=_Group())
+        parallel = SimpleNamespace(tp_size=2, tp_rank=0, tp_group=_Group())
         with (
             patch(
                 "sglang.srt.model_executor.tpu_graph_runner.get_parallel",
@@ -460,7 +460,7 @@ class TestTpuGraphRunner(CustomTestCase):
             def barrier(self):
                 raise AssertionError("barrier must not run")
 
-        parallel = SimpleNamespace(tp_size=2, tp_group=_Group())
+        parallel = SimpleNamespace(tp_size=2, tp_rank=0, tp_group=_Group())
         with (
             patch(
                 "sglang.srt.model_executor.tpu_graph_runner.get_parallel",
@@ -480,7 +480,7 @@ class TestTpuGraphRunner(CustomTestCase):
         self.mock_precompile.side_effect = ValueError("bad trace")
 
         with (
-            patch.object(envs.SGLANG_DIRECT_COMPILE_ASYNC, "get", return_value=True),
+            envs.SGLANG_TPU_ENABLE_DIRECT_COMPILE_ASYNC.override(True),
             self.assertRaisesRegex(RuntimeError, "bad trace"),
         ):
             TpuGraphRunner(runner)
@@ -496,8 +496,9 @@ class TestTpuGraphRunner(CustomTestCase):
                 self.owner.installed = True
                 return True
 
-            def precompile(self) -> None:
+            def precompile(self) -> list[Any]:
                 self.owner.precompiled = True
+                return []
 
         class _VisionModule:
             def forward(self):
@@ -517,6 +518,24 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertTrue(vision_module.precompiled)
         self.mock_compile.assert_not_called()
 
+    def test_policy_returning_none_fails_loudly(self):
+        class _BadPolicy(CompilePolicy):
+            platform = "tpu"
+
+            def install(self) -> bool:
+                return True
+
+            def precompile(self) -> Any:
+                return None
+
+        module = _model_with(forward=MagicMock())
+        support_torch_compile(module, policy=_BadPolicy)
+        model = _model_with()
+        model.modules = lambda: (model, module)
+
+        with self.assertRaisesRegex(TypeError, "NoneType"):
+            TpuGraphRunner(self._runner_for(model))
+
     def test_ignores_policy_for_another_platform(self):
         class _CudaPolicy(CompilePolicy):
             platform = "cuda"
@@ -525,8 +544,9 @@ class TestTpuGraphRunner(CustomTestCase):
                 self.owner.installed = True
                 return True
 
-            def precompile(self) -> None:
+            def precompile(self) -> list[Any]:
                 self.owner.precompiled = True
+                return []
 
         foreign_module = _model_with(forward=MagicMock())
         support_torch_compile(foreign_module, policy=_CudaPolicy)

@@ -85,46 +85,28 @@ SpecializationKey = Callable[..., Hashable]
 _STATIC_INPUT_TYPES = (bool, int, float, str, Enum)
 
 
-class _BoundedCompileExecutor:
-    """Bound submitted compile jobs as well as compiler worker threads."""
-
-    def __init__(self, max_workers: int) -> None:
-        if max_workers < 1:
-            raise ValueError(
-                "SGLANG_DIRECT_COMPILE_ASYNC_WORKERS must be at least 1, "
-                f"got {max_workers}."
-            )
-        self.max_workers = max_workers
-        self._executor = ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="direct_compile",
-        )
-        self._slots = threading.BoundedSemaphore(max_workers)
-
-    def submit(self, fn: Callable[..., Any], *args: Any) -> Future[Any]:
-        self._slots.acquire()
-        try:
-            future = self._executor.submit(fn, *args)
-        except BaseException:
-            self._slots.release()
-            raise
-        future.add_done_callback(lambda _future: self._slots.release())
-        return future
-
-    def shutdown(self) -> None:
-        self._executor.shutdown(wait=True)
-
-
-_ASYNC_COMPILE_EXECUTOR: _BoundedCompileExecutor | None = None
+_ASYNC_COMPILE_EXECUTOR: ThreadPoolExecutor | None = None
 _ASYNC_COMPILE_EXECUTOR_LOCK = threading.Lock()
 
 
-def _get_async_compile_executor() -> _BoundedCompileExecutor:
+def _get_async_compile_executor() -> ThreadPoolExecutor:
     global _ASYNC_COMPILE_EXECUTOR
     with _ASYNC_COMPILE_EXECUTOR_LOCK:
         if _ASYNC_COMPILE_EXECUTOR is None:
-            _ASYNC_COMPILE_EXECUTOR = _BoundedCompileExecutor(
-                envs.SGLANG_DIRECT_COMPILE_ASYNC_WORKERS.get()
+            max_workers = envs.SGLANG_TPU_DIRECT_COMPILE_ASYNC_WORKERS.get()
+            if max_workers < 1:
+                raise ValueError(
+                    "SGLANG_TPU_DIRECT_COMPILE_ASYNC_WORKERS must be at least 1, "
+                    f"got {max_workers}."
+                )
+            logger.warning(
+                "[direct_compile] async compilation bypasses TorchTPU's "
+                "persistent compile cache; use it only to optimize cold-cache "
+                "startup"
+            )
+            _ASYNC_COMPILE_EXECUTOR = ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="direct_compile",
             )
         return _ASYNC_COMPILE_EXECUTOR
 
@@ -313,7 +295,7 @@ class CompiledFunction:
         self,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-        executor: _BoundedCompileExecutor | None = None,
+        executor: ThreadPoolExecutor | None = None,
     ) -> _CompiledArtifact:
         key = self.specialization_key(*args, **kwargs)
         artifact = self.cache.get(key)
@@ -333,7 +315,7 @@ class CompiledFunction:
         self,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-        executor: _BoundedCompileExecutor | None,
+        executor: ThreadPoolExecutor | None,
     ) -> _CompiledArtifact:
         """Compile one specialization into a PJRT executable."""
 
@@ -624,13 +606,14 @@ class _DeferredExecutable:
     def __init__(
         self,
         module: Any,
-        executor: _BoundedCompileExecutor,
+        executor: ThreadPoolExecutor,
         argument_layouts: list[list[int]],
     ) -> None:
         self._module = module
         self._executor = executor
         self._argument_layouts = tuple(tuple(layout) for layout in argument_layouts)
         self._future: Future[Any] | None = None
+        self._executable: Any | None = None
         self._lock = threading.Lock()
 
     def start(self) -> None:
@@ -646,9 +629,12 @@ class _DeferredExecutable:
             self._module = None
 
     def result(self) -> Any:
+        if self._executable is not None:
+            return self._executable
         self.start()
         assert self._future is not None
-        return self._future.result()
+        self._executable = self._future.result()
+        return self._executable
 
 
 def _compile_executable(
@@ -670,7 +656,7 @@ def _compile_mlir(
     module: Any,
     argument_layouts: Sequence[Sequence[int]],
 ) -> Any:
-    """Compile an already-built MLIR module without touching trace state."""
+    """Compile built MLIR without trace state or TorchTPU's wrapper cache."""
     with dynamo_timed("direct_compile_compile_mlir"):
         executable = tpu_torch_compile.compile_mlir(
             module,

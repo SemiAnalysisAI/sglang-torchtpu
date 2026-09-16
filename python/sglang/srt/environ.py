@@ -1013,12 +1013,6 @@ class Envs:
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
-    # Opt in to compiling independent direct warmups concurrently.
-    SGLANG_DIRECT_COMPILE_ASYNC = EnvBool(False)
-    # XLA compilation is internally parallel and memory-intensive. Keep only a
-    # small number of whole-model compilations in flight per TPU worker.
-    SGLANG_DIRECT_COMPILE_ASYNC_WORKERS = EnvInt(2)
-
     # ===================================================================
     # Expert parallel load balancing
     # ===================================================================
@@ -1608,6 +1602,13 @@ class Envs:
 
     # TPU
     SGLANG_TPU_ASYNC_COPY_WORKER = EnvBool(True)
+    # Compile independent direct warmups concurrently. This cold-cache startup
+    # optimization bypasses TorchTPU's persistent compile cache because its
+    # split build_mlir/compile_mlir API does not expose a cache-aware path.
+    SGLANG_TPU_ENABLE_DIRECT_COMPILE_ASYNC = EnvBool(False)
+    # XLA compilation is internally parallel and memory-intensive. Keep only a
+    # small number of whole-model compilations in flight per TPU worker.
+    SGLANG_TPU_DIRECT_COMPILE_ASYNC_WORKERS = EnvInt(2)
     # Restore device MM scatter instead of host placement.
     # https://github.com/sgl-project/sglang-torchtpu/issues/741
     SGLANG_TPU_MM_EMBED_ON_DEVICE = EnvBool(False)

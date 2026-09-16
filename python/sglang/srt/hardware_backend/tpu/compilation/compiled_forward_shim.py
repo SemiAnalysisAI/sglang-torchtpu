@@ -796,6 +796,8 @@ class CompiledForwardShim:
         try:
             out = fn(input_ids, positions, forward_batch, *args, **kwargs)
         finally:
+            # These fields affect tracing but are not deferred runtime inputs,
+            # so restoring them before a PendingCall executes is intentional.
             forward_batch.is_prefill_only = orig_prefill_only
             _restore_fields(forward_batch, saved)
         if isinstance(out, PendingCall):
