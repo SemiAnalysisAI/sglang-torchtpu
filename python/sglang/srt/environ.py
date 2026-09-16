@@ -1625,12 +1625,9 @@ class Envs:
     SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE = EnvBool(False)
     # Preserve FP32 expert scales and apply GMM partial scales in FP32.
     SGLANG_TPU_FP8_MOE_FP32_SCALES = EnvBool(False)
-    # INT4 MoE execution mode; packed INT4 stays in HBM in every mode. Unset:
-    # W4A16 group products (scale each 32-K group's partial dot). "vmem-bf16":
-    # dequantize each group in VMEM to BF16, then one dot per tile; activations
-    # stay BF16. "vmem-fp8": FP8 weight tiles and FP8 activations inside
-    # gmm_v2, with load-time normalized group/channel scales. Values are
-    # validated by tpu_moe_utils.resolve_int4_moe_mode.
+    # INT4 MoE mode (packed INT4 stays in HBM in all of them). Unset: W4A16,
+    # scale after each 32-K group dot. "vmem-bf16": dequantize in VMEM, one
+    # bf16 dot per tile. "vmem-fp8": fp8 weight tiles and fp8 activations.
     SGLANG_TPU_INT4_MOE_MODE = EnvStr(None)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
@@ -1651,12 +1648,8 @@ class Envs:
     SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES = EnvInt(4900)
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
-    # MoE: below this many routed rows (tokens x topk), gather on the
-    # TensorCore instead -- the SparseCore permute is mostly fixed cost there.
-    # 0 keeps the SparseCore at every row count. Crossover measured on
-    # Kimi-K2.6, DeepSeek-R1 (EP8/EP16) and Qwen3-Coder-480B geometries
-    # (bench_sc_vs_tc_gather.py): TensorCore wins below 1024 routed rows on
-    # all of them, tie at 1024, SparseCore from 2048; their recipes set 1024.
+    # MoE: gather on the TensorCore below this many routed rows (tokens x topk);
+    # 0 = SparseCore always. Measured crossover is 1024 (Kimi, R1, Qwen3-480B).
     SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS = EnvInt(0)
     # MoE: use onehot dense matmul for small permute and unpermute/combine
     # paths instead of gather. When set to 0, this is disabled. When set

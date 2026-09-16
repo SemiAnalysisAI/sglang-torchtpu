@@ -235,27 +235,16 @@ def _gmm2_tile_source(lhs, w2, w2_scale, num_experts, *, w2_packed):
     return _lookup_tile_info(lhs, w2, w2_scale, num_experts, packed_fp4=True)
 
 
-# 3 pipelined rhs buffers + the unpack staging tile, leaving room for the
-# per-block scales, lhs, accumulator and output.
+# 3 pipelined rhs buffers + unpack staging tile + scales/lhs/acc/out.
 _PACKED_RHS_VMEM_DIVISOR = 5
 
 
 def _vmem_safe_packed_tile_n(base_tile_info):
-    """Wrap a gmm_v2 ``tile_info`` so a pre-packed sub-byte rhs tile leaves room
-    for the staging copy the kernel's own VMEM estimate does not model.
+    """Shrink ``tile_n`` for a packed sub-byte rhs so the unpack staging tile fits.
 
-    ``calculate_tiling`` sizes the rhs tile from the *stored* bit width and
-    budgets three pipelined buffers. A W4A16 rhs is additionally unpacked into a
-    staging tile before the matmul, so the real demand is about a buffer higher
-    than the estimate. At Kimi-K2.6's GMM1 (k=7168, n=4096, int4 packed 8-per
-    int32, 32-element quant blocks) that gap is what pushes the kernel over its
-    own limit -- measured 62.77 MB against 57.60 MB, which Mosaic reports as
-    ``CompileTimeScopedVmemOom``.
-
-    Only pre-packed quantized weights carry ``packing > 1``, so this is a no-op
-    for bf16 and FP8 MoE, and for packed FP4, which resolves its tiles through
-    ``_lookup_tile_info`` instead. Kimi's GMM2 (k=2048, n=7168) already fits and
-    keeps its tile.
+    ``calculate_tiling`` budgets the rhs from its stored bit width; the W4A16
+    unpack needs about one more buffer, which overflowed VMEM at Kimi's GMM1
+    (62.77 MB vs a 57.60 MB limit). No-op for bf16, FP8 and packed FP4.
     """
     import dataclasses
 
@@ -281,8 +270,7 @@ def _vmem_safe_packed_tile_n(base_tile_info):
             try:
                 tile_n = _largest_aligned_divisor_at_most(dims.size_n, tile_n // 2, 128)
             except ValueError:
-                # Nothing smaller divides size_n; keep the kernel's own choice
-                # rather than turning a tile search into a hard failure.
+                # Nothing smaller divides size_n; keep the kernel's choice.
                 return tiles
         if tile_n == tiles.tile_n:
             return tiles
@@ -321,8 +309,7 @@ def _dividing_tile_k(base_tile_info):
         quant_block_size = rhs_cfgs.quant_block_size if rhs_cfgs.has_scale else None
         if getattr(rhs_cfgs, "requantize_in_vmem", False):
             quant_block_size = min(lhs_cfgs.quant_block_size, dims.size_k)
-            # Activation amax must cover the whole K=512 group. Unlike
-            # stored RHS scales, it cannot be split into smaller tiles.
+            # Activation amax spans the whole K=512 group; tile_k cannot split it.
             tiles = dataclasses.replace(
                 tiles, tile_k=max(tiles.tile_k, quant_block_size)
             )
@@ -430,9 +417,8 @@ def _fused_moe_jax(
         )
     if w_quant_bits:
         assert w_quant_bits == 4, f"unsupported w_quant_bits={w_quant_bits}"
-        # Packed INT4 modes share the existing GMM and keep packed HBM weights.
-        # vmem-bf16 dequantizes groups in VMEM before a larger BF16 dot;
-        # the default applies each scale after its short-K group product.
+        # vmem-bf16: dequantize groups in VMEM, one dot per tile; default:
+        # scale after each 32-K group product.
         from sglang.srt.layers.moe.tpu_moe_utils import (
             INT4_MOE_MODE_VMEM_BF16,
             resolve_int4_moe_mode,
@@ -529,8 +515,7 @@ def _fused_moe_jax(
     # correctness.
     compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
     # W4A16 runs GMM1 unfused: the fused gate/up split mis-applies multi-block
-    # rhs scales, so the activation is applied in JAX below. (vmem-fp8 folds the
-    # scales first and could fuse; measured equal at one token, so it does not.)
+    # rhs scales, so the activation is applied in JAX below.
     unfused_gmm1 = compact_block_scales or bool(w_quant_bits)
     gmm1_fuse_act = None if unfused_gmm1 else _fuse_act_name(activation_name)
 

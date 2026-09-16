@@ -6,9 +6,7 @@ from typing import Optional
 
 import torch
 
-# INT4 MoE execution modes (SGLANG_TPU_INT4_MOE_MODE). None keeps the default
-# W4A16 group products; both named modes keep packed INT4 weights in HBM and
-# differ only in the dtype the dequantized weight tile lands in.
+# SGLANG_TPU_INT4_MOE_MODE values; None = default W4A16 group products.
 INT4_MOE_MODE_VMEM_BF16 = "vmem-bf16"
 INT4_MOE_MODE_VMEM_FP8 = "vmem-fp8"
 

@@ -479,15 +479,11 @@ def inner_kernel(
         tiled_rhs = tiled_rhs_ref.get_weight(cfgs.rhs_cfgs.quant_dtype)
 
         if cfgs.rhs_cfgs.dequantize_in_vmem or cfgs.rhs_cfgs.requantize_in_vmem:
-            # Apply short-group scales before BF16/FP8 compute. A zero-stride
-            # VMEM load broadcasts each scale over its K group without an
-            # intermediate broadcast of the entire unpacked weight tile.
+            # Zero-stride load broadcasts each group scale over its K rows.
             group_k = cfgs.rhs_cfgs.quant_block_size
 
             def load_group_scales(ref):
-                # Mosaic only supports strided loads for 32-bit elements.
-                # The production INT4 loader stores scales in float32; retain
-                # support for callers supplying checkpoint BF16 scales.
+                # Mosaic strided loads need 32-bit elements; bf16 scales fall back.
                 if ref.dtype == jnp.float32:
                     return ref[:, pl.ds(0, group_k, 0), :]
                 return jnp.broadcast_to(
@@ -512,8 +508,7 @@ def inner_kernel(
                 * scales.astype(tiled_lhs.dtype)
             ).reshape(rhs_shape)
             if cfgs.rhs_cfgs.requantize_in_vmem:
-                # Group scales were divided by the output-channel scale at
-                # load time. Materialize only this FP8 tile, never FP8 HBM weights.
+                # Group scales are pre-divided by the channel scale; fp8 lives only in VMEM.
                 tiled_rhs = jnp.clip(tiled_rhs, -448, 448).astype(jnp.float8_e4m3fn)
             else:
                 num_quant_blocks_per_tile_k = 1
@@ -637,8 +632,7 @@ def inner_kernel(
             if cfgs.rhs_cfgs.has_bias:
                 tiled_rhs_bias = tiled_rhs_ref.get_bias()
                 if cfgs.rhs_cfgs.requantize_in_vmem:
-                    # This buffer carries rhs_channel_scale in the FP8 mode.
-                    # Restore gate/up independently before any fused activation.
+                    # FP8 mode: this buffer is rhs_channel_scale, applied per column.
                     acc *= tiled_rhs_bias.astype(acc.dtype)
                 else:
                     acc += tiled_rhs_bias.astype(acc.dtype)
@@ -1593,8 +1587,7 @@ def gmm_v2(
     if requantize_rhs:
         if rhs_bias is not None:
             raise ValueError("rhs_bias and rhs_channel_scale are mutually exclusive")
-        # Reuse the existing per-channel pipeline buffer. Its meaning is explicit
-        # in rhs_cfgs.requantize_in_vmem; ordinary additive bias is unchanged.
+        # Channel scale rides the bias buffer; requantize_in_vmem says which it is.
         rhs_bias = rhs_channel_scale
 
     if group_offset is None:
