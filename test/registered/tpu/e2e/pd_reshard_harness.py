@@ -277,7 +277,7 @@ MODEL_PROFILES = {
             # build_decode_env now pins decode explicitly, and its key wins
             # because it is spread after this one -- so this value reaches the
             # PREFILL engine only.
-            "CHUNKED_PREFILL_SIZE": os.environ.get("QWEN_CHUNK_PREFILL", "1024"),
+            "CHUNKED_PREFILL_SIZE": os.environ.get("QWEN_CHUNK_PREFILL", "256"),
             # Left to default to the chunk size. Pinning it lower than the
             # chunk size is not a valid pair: --max-prefill-tokens 256 with
             # --chunked-prefill-size 4096 hung precompile and the watchdog
@@ -573,15 +573,17 @@ def build_decode_env(
         "MAX_RUNNING": values.get("MAX_RUNNING", "8"),
         "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1 2 4 8"),
         "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", QWEN_COMPILE_TOKENS),
-        # EXPERIMENT #718: every clean cell so far had prefill chunk == decode
-        # chunk == 256, and every corrupt one had prefill != 256 while decode
-        # stayed 256. "Prefill must be <= 256" and "the two engines must agree"
-        # fit the whole matrix equally well. Run both at 1024 to separate them.
-        # Spread after _common_launch_env, so it wins over the profile's value.
-        # Empty for any other model, which leaves the launcher default alone.
+        # EXPERIMENT #718: back to the shipped 256 on both engines. The whole
+        # chunk-size bisect was measured against a clean cell from before
+        # 2026-09-14 18:14 UTC, and main's first nightly carrying this test
+        # (34951373948) runs exactly that shipped configuration and is corrupt
+        # -- 62 tok clean, 93/156/216/271 all 3/3, gsm8k 0.0. So this run
+        # re-measures the control on today's tree. Spread after
+        # _common_launch_env, so it wins over the profile's value. Empty for any
+        # other model, which leaves the launcher default alone.
         "CHUNKED_PREFILL_SIZE": values.get(
             "QWEN_CHUNK_DECODE",
-            "1024" if profile.key == "qwen3_coder_480b" else "",
+            "256" if profile.key == "qwen3_coder_480b" else "",
         ),
         "MEM_FRACTION_STATIC": values.get(
             "MEM_FRACTION_STATIC", profile.mem_fraction_decode
