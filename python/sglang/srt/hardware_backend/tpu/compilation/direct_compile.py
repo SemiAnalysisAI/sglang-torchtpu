@@ -100,9 +100,9 @@ def _get_async_compile_executor() -> ThreadPoolExecutor:
                     f"got {max_workers}."
                 )
             logger.warning(
-                "[direct_compile] async compilation bypasses TorchTPU's "
-                "persistent compile cache; use it only to optimize cold-cache "
-                "startup"
+                "[direct_compile] async compilation uses TorchTPU's raw "
+                "compile_mlir path instead of its cache-aware wrapper; intended "
+                "for cold-start cluster pods"
             )
             _ASYNC_COMPILE_EXECUTOR = ThreadPoolExecutor(
                 max_workers=max_workers,
@@ -656,7 +656,7 @@ def _compile_mlir(
     module: Any,
     argument_layouts: Sequence[Sequence[int]],
 ) -> Any:
-    """Compile built MLIR without trace state or TorchTPU's wrapper cache."""
+    """Compile built MLIR through TorchTPU's raw, cache-unaware split API."""
     with dynamo_timed("direct_compile_compile_mlir"):
         executable = tpu_torch_compile.compile_mlir(
             module,

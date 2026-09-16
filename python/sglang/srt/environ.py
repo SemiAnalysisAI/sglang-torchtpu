@@ -1602,9 +1602,9 @@ class Envs:
 
     # TPU
     SGLANG_TPU_ASYNC_COPY_WORKER = EnvBool(True)
-    # Compile independent direct warmups concurrently. This cold-cache startup
-    # optimization bypasses TorchTPU's persistent compile cache because its
-    # split build_mlir/compile_mlir API does not expose a cache-aware path.
+    # Compile independent direct warmups concurrently. This uses TorchTPU's raw
+    # split API instead of its cache-aware wrapper. It is intended for ephemeral
+    # cluster pods that do not reuse compile artifacts across starts.
     SGLANG_TPU_ENABLE_DIRECT_COMPILE_ASYNC = EnvBool(False)
     # XLA compilation is internally parallel and memory-intensive. Keep only a
     # small number of whole-model compilations in flight per TPU worker.
