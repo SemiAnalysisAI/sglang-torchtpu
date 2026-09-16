@@ -2,7 +2,9 @@
 
 from copy import deepcopy
 
-from benchmark.tpu.recipe.configs.qwen3_coder_480b.nightly.serve import CONFIG as BASE_CONFIG
+from benchmark.tpu.recipe.configs.qwen3_coder_480b.nightly.serve import (
+    CONFIG as BASE_CONFIG,
+)
 
 CONFIG = deepcopy(BASE_CONFIG)
 CONFIG["server_args"].update(

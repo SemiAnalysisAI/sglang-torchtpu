@@ -363,9 +363,9 @@ def run_leg(config, settings, env, *, nightly=False):
         "kv_offload": int(args.get("enable_hierarchical_cache", False)),
         "spec_decode": int(bool(args.get("speculative_algorithm"))),
         "pd_disagg": int(settings.get("bench_recipe", "").startswith("pd_")),
-        "pd_prefill_engines": 2
-        if settings.get("bench_recipe", "").startswith("pd_")
-        else 1,
+        "pd_prefill_engines": (
+            2 if settings.get("bench_recipe", "").startswith("pd_") else 1
+        ),
         "hicache_ratio": args.get("hicache_ratio", 1),
         "seed": seed,
         "status": status,

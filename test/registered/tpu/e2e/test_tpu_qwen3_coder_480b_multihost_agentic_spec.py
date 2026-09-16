@@ -21,6 +21,7 @@ import os
 import unittest
 
 from bench_matrix_base import build_bench_test
+
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(
