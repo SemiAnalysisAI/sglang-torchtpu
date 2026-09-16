@@ -4,6 +4,7 @@ import os
 import unittest
 
 import requests
+
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase
 
