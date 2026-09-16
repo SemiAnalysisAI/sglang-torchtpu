@@ -291,29 +291,6 @@ def _vmem_safe_packed_tile_n(base_tile_info):
     return wrapped
 
 
-# VMEM budget (elements of one weight tile) for the single-token int4 tiles
-# below: 7168 x 1024, the largest tile measured on tpu7x for the vmem-fp8 path.
-_SINGLE_TOKEN_TILE_ELEMS = 7168 * 1024
-
-
-def _single_token_tiles(w_packed, tile_m):
-    """Tiles for a ``gmm_v2`` call whose LHS is one token's routed rows.
-
-    ``m * topk`` rows fit one sublane tile, so ``tile_m`` is that tile; the whole
-    contraction goes in one ``tile_k`` (no K loop over a handful of rows); and
-    ``tile_n`` is the largest divisor of N that keeps the weight tile inside the
-    VMEM budget. Derived from the weight shape, not pinned to a model.
-    """
-    from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes
-
-    k = int(w_packed.shape[1]) * 8  # int4: 8 codes per packed int32 along K
-    n = int(w_packed.shape[2])
-    tile_n = n
-    while tile_n > 128 and (k * tile_n > _SINGLE_TOKEN_TILE_ELEMS or n % tile_n):
-        tile_n //= 2
-    return TileSizes(tile_m=tile_m, tile_k=k, tile_n=tile_n)
-
-
 def _dividing_tile_k(base_tile_info):
     """Wrap a gmm_v2 ``tile_info`` so the resolved ``tile_k`` always divides
     ``size_k`` (mirrors the kernel's N-gate, which has no K equivalent) and
@@ -451,7 +428,6 @@ def _fused_moe_jax(
         raise ValueError(
             "VMEM FP8 requires two channel-scale tensors, INT4 weights and no biases"
         )
-    single_token_vmem_fp8 = False
     if w_quant_bits:
         assert w_quant_bits == 4, f"unsupported w_quant_bits={w_quant_bits}"
         # Packed INT4 modes share the existing GMM and keep packed HBM weights.
@@ -467,29 +443,18 @@ def _fused_moe_jax(
         )
         rhs_quant_dtype = jnp.int4
         maybe_quantize_lhs = use_vmem_fp8
-        # One token in vmem-fp8: every routed row is the same hidden row, so
-        # dispatch by broadcast, keep the pad rows out of expert work and use
-        # full-K tiles sized from the weight shape.
-        single_token_vmem_fp8 = use_vmem_fp8 and m == 1
 
     # gmm_v2 needs the routed-row count ``m*topk`` to be a multiple of its LHS
     # sublane tiling (16 for the bf16 activations this path runs on). Padding
     # the *input* tokens here keeps the permute/gather operating on an
     # already-aligned, fixed-bucket shape and removes the post-gather
     # ``jnp.pad`` + ``group_sizes`` scatter that XLA was offloading to the
-    # SparseCore (and crashing on). Padding has zero weight. The single-token
-    # path assigns padding an out-of-range sentinel to avoid dummy expert work.
+    # SparseCore (and crashing on). Padding has zero weight.
     m_orig = m
     m_pad = _padded_token_count(m, topk, lhs_sublane_tiling(hidden_states.dtype))
     if m_pad != m:
         hidden_states = jnp.pad(hidden_states, ((0, m_pad - m), (0, 0)))
-        topk_ids = jnp.pad(
-            topk_ids,
-            ((0, m_pad - m), (0, 0)),
-            constant_values=(
-                (global_num_experts or num_experts) if single_token_vmem_fp8 else 0
-            ),
-        )
+        topk_ids = jnp.pad(topk_ids, ((0, m_pad - m), (0, 0)))  # pad -> expert 0
         topk_weights = jnp.pad(
             topk_weights, ((0, m_pad - m), (0, 0))
         )  # pad -> weight 0
@@ -521,11 +486,7 @@ def _fused_moe_jax(
     use_dense_permute = m < permute_dense_threshold
     use_dense_unpermute = (m * topk) < permute_dense_threshold and not no_combine
 
-    direct_bs1_dispatch = single_token_vmem_fp8 and not no_combine and not use_sc_gather
-    if direct_bs1_dispatch:
-        # All real routes refer to one token; sentinel padding owns no expert.
-        x_sorted = jnp.broadcast_to(hidden_states[:1], (m * topk, hidden_size))
-    elif use_dense_permute:
+    if use_dense_permute:
         permute_matrix = jax.nn.one_hot(sorted_token_ids, m, dtype=hidden_states.dtype)
         x_sorted = jax.lax.dot_general(
             permute_matrix,
@@ -568,13 +529,9 @@ def _fused_moe_jax(
     # correctness.
     compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
     # W4A16 runs GMM1 unfused: the fused gate/up split mis-applies multi-block
-    # rhs scales, so the activation is applied in JAX below. vmem-fp8 folds the
-    # scales before the dot, so its single-token path fuses (measured at m=1;
-    # wider batches keep the unfused GMM1 until measured).
-    fuse_vmem_fp8_gate_up = single_token_vmem_fp8 and activation_name == "silu"
-    unfused_gmm1 = (
-        compact_block_scales or bool(w_quant_bits)
-    ) and not fuse_vmem_fp8_gate_up
+    # rhs scales, so the activation is applied in JAX below. (vmem-fp8 folds the
+    # scales first and could fuse; measured equal at one token, so it does not.)
+    unfused_gmm1 = compact_block_scales or bool(w_quant_bits)
     gmm1_fuse_act = None if unfused_gmm1 else _fuse_act_name(activation_name)
 
     gmm1_tile_info = None
@@ -625,9 +582,6 @@ def _fused_moe_jax(
     else:
         zero_init = True
 
-    if single_token_vmem_fp8:
-        gmm1_tiling = _single_token_tiles(w1, tile_m=int(x_sorted.shape[0]))
-
     gmm1_out = gmm_v2(
         lhs=x_sorted,
         rhs=w1,
@@ -667,9 +621,6 @@ def _fused_moe_jax(
             _gmm2_tile_source(gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed)
         )
     )
-    if single_token_vmem_fp8:
-        gmm2_tiling = _single_token_tiles(w2, tile_m=int(gmm1_out.shape[0]))
-
     gmm2_out = gmm_v2(
         lhs=gmm1_out,
         rhs=w2,
@@ -693,13 +644,6 @@ def _fused_moe_jax(
     # Un-permute back to token-major order. Models that apply a post-expert
     # norm ask the runner for no_combine output so they can RMSNorm each top-k
     # slot before the weighted reduction.
-    if direct_bs1_dispatch:
-        sorted_weights = topk_weights.reshape(-1)[argsort_idx].astype(out_dtype)
-        return (
-            (gmm2_out.astype(out_dtype) * sorted_weights[:, None])
-            .sum(axis=0, keepdims=True)
-            .astype(out_dtype)
-        )
     if use_dense_unpermute:
         # Unpermute using dense matmul.
         w_sorted = topk_weights.reshape(-1)[argsort_idx].astype(jnp.float32)

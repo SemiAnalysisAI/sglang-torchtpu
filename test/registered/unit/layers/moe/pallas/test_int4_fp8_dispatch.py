@@ -1,4 +1,4 @@
-"""Validate the BS1 wrapper's EP routing and explicit channel-scale arguments."""
+"""Validate one-token vmem-fp8 EP routing and the explicit channel-scale arguments."""
 
 import unittest
 from unittest import mock
@@ -39,8 +39,9 @@ class TestInt4Fp8Dispatch(CustomTestCase):
             def fake_gmm(lhs, rhs, group_sizes, **kwargs):
                 calls.append(kwargs)
                 sizes = np.asarray(group_sizes)
-                # The eight padded routes must not be assigned to expert zero.
-                self.assertEqual(int(sizes.sum()), 8)
+                # 8 real routes + 8 sublane-pad rows (expert 0, weight 0).
+                self.assertEqual(int(sizes.sum()), 16)
+                self.assertEqual(int(sizes[0]), 8 + ids.count(0))
                 width = rhs.shape[-1] // (2 if kwargs.get("fuse_act") else 1)
                 out = jnp.zeros((lhs.shape[0], width), jnp.bfloat16)
                 start = int(sizes[:48].sum())
@@ -76,7 +77,7 @@ class TestInt4Fp8Dispatch(CustomTestCase):
                     np.asarray(out, np.float32),
                     np.full((1, 7168), expected, np.float32),
                 )
-                self.assertEqual(calls[0]["fuse_act"], "silu")
+                self.assertIsNone(calls[0]["fuse_act"])  # W4A8 runs GMM1 unfused
                 self.assertIs(calls[0]["rhs_channel_scale"], c1)
                 self.assertIs(calls[1]["rhs_channel_scale"], c2)
                 self.assertIsNone(calls[0]["rhs_bias"])
