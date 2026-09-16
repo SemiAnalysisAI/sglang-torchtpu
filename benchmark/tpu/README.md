@@ -197,9 +197,7 @@ or full FP8 copy of the expert weights is required.
 
 For Kimi's single-token, top-8 decode shapes, the mode also enables direct token
 dispatch, excludes padding from expert work, uses fixed projection tiles, fuses
-gate/up SiLU, and combines sorted expert outputs directly. For ablations, set
-`SGLANG_TPU_KIMI_BS1_OPT=0` to disable these BS1 specializations, or
-`SGLANG_TPU_KIMI_FP8_GATE_UP_FUSION=0` to disable just activation fusion.
+gate/up SiLU, and combines sorted expert outputs directly.
 
 The other modes retain their behavior: unset uses W4A16 group products;
 `vmem-bf16` dequantizes each INT4 group in VMEM to BF16 and leaves activations

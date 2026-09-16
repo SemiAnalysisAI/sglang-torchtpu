@@ -434,7 +434,6 @@ def _fused_moe_jax(
         # Packed INT4 modes share the existing GMM and keep packed HBM weights.
         # vmem-bf16 dequantizes groups in VMEM before a larger BF16 dot;
         # the default applies each scale after its short-K group product.
-        from sglang.srt.environ import envs
         from sglang.srt.layers.moe.tpu_moe_utils import (
             INT4_MOE_MODE_VMEM_BF16,
             resolve_int4_moe_mode,
@@ -445,9 +444,11 @@ def _fused_moe_jax(
         )
         rhs_quant_dtype = jnp.int4
         maybe_quantize_lhs = use_vmem_fp8
+        # Kimi single-token top-8 decode: dispatch tokens directly, keep
+        # padding out of expert work and use fixed projection tiles. Guarded
+        # by the exact expert shapes, so no other model can take this path.
         kimi_bs1_opt = (
             use_vmem_fp8
-            and envs.SGLANG_TPU_KIMI_BS1_OPT.get()
             and m == 1
             and topk == 8
             and w1.shape[1:] == (896, 4096)
@@ -549,12 +550,7 @@ def _fused_moe_jax(
     compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
     # W4A16 runs GMM1 unfused: the fused gate/up split mis-applies multi-block
     # rhs scales, so the activation is applied in JAX below.
-    fuse_vmem_fp8_gate_up = (
-        use_vmem_fp8
-        and kimi_bs1_opt
-        and activation_name == "silu"
-        and envs.SGLANG_TPU_KIMI_FP8_GATE_UP_FUSION.get()
-    )
+    fuse_vmem_fp8_gate_up = use_vmem_fp8 and kimi_bs1_opt and activation_name == "silu"
     unfused_gmm1 = (
         compact_block_scales or bool(w_quant_bits)
     ) and not fuse_vmem_fp8_gate_up

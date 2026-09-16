@@ -1632,9 +1632,6 @@ class Envs:
     # gmm_v2, with load-time normalized group/channel scales. Values are
     # validated by tpu_moe_utils.resolve_int4_moe_mode.
     SGLANG_TPU_INT4_MOE_MODE = EnvStr(None)
-    # Shape-guarded fast path and fused gate/up for Kimi BS1 in vmem-fp8 mode.
-    SGLANG_TPU_KIMI_BS1_OPT = EnvBool(True)
-    SGLANG_TPU_KIMI_FP8_GATE_UP_FUSION = EnvBool(True)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)

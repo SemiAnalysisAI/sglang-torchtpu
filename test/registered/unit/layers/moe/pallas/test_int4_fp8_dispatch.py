@@ -21,7 +21,6 @@ except ImportError:
 @unittest.skipUnless(_HAS_JAX, "requires JAX")
 class TestInt4Fp8Dispatch(CustomTestCase):
     def test_bs1_ep_window_and_padding(self):
-        from sglang.srt.environ import envs
         from sglang.srt.layers.moe.pallas.fused_moe_op import _fused_moe_jax
 
         w1 = jax.ShapeDtypeStruct((48, 896, 4096), jnp.int32)
@@ -51,9 +50,7 @@ class TestInt4Fp8Dispatch(CustomTestCase):
                     start += count
                 return out
 
-            with self.subTest(ids=ids), envs.SGLANG_TPU_KIMI_BS1_OPT.override(
-                True
-            ), envs.SGLANG_TPU_KIMI_FP8_GATE_UP_FUSION.override(True), mock.patch(
+            with self.subTest(ids=ids), mock.patch(
                 "sglang.srt.layers.moe.pallas.gmm_v2.gmm_v2", side_effect=fake_gmm
             ):
                 out = _fused_moe_jax(
