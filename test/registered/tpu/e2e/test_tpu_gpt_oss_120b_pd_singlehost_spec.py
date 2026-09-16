@@ -25,6 +25,7 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.tpu import model_config_main
+    from sglang.test.tpu.pd_router import build_router_cmd
 except ModuleNotFoundError as exc:
     # Source-only checkouts can still run the launch-configuration tests.
     SGLANG_IMPORT_ERROR = exc
@@ -34,6 +35,9 @@ except ModuleNotFoundError as exc:
 
     def model_config_main(*_args, **_kwargs):
         return None
+
+    def build_router_cmd(**_kwargs):
+        raise SGLANG_IMPORT_ERROR
 
 
 register_tpu_ci(
@@ -322,20 +326,13 @@ def execute_router(
     *, prefill_host: str, decode_host: str, log_path: str = LB_LOG
 ) -> subprocess.Popen:
     return _launch(
-        (
-            PYTHON,
-            "-m",
-            "sglang_router.launch_router",
-            "--pd-disaggregation",
-            "--mini-lb",
-            "--prefill",
-            f"http://{prefill_host}:{PREFILL_PORT}",
-            "--decode",
-            f"http://{decode_host}:{DECODE_PORT}",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            str(LB_PORT),
+        build_router_cmd(
+            python=PYTHON,
+            prefill_url=f"http://{prefill_host}:{PREFILL_PORT}",
+            decode_url=f"http://{decode_host}:{DECODE_PORT}",
+            host="0.0.0.0",
+            port=LB_PORT,
+            bootstrap_port=BOOTSTRAP_PORT,
         ),
         log_path=log_path,
     )
