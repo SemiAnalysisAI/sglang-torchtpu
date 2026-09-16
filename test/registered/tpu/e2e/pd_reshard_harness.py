@@ -482,7 +482,15 @@ def build_prefill_env(
         "ENABLE_DP_ATTENTION": "0",
         "MAX_RUNNING": values.get("MAX_RUNNING", "8"),
         "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1"),
-        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024"),
+        # EXPERIMENT (#718): drop the 64 bucket on the PREFILL engine so the
+        # 62-token prompt -- the only one that still answers, and also the only
+        # one small enough for the 64 bucket -- is forced into the 256 graph.
+        # Same prompt, same tokens, same KV pages; only the padding changes.
+        # Set here rather than in the profile because build_prefill_env spreads
+        # _common_launch_env (and so extra_launch_env) FIRST and then overwrites
+        # TPU_COMPILE_TOKENS, which made the previous attempt inert -- run
+        # 35142653739 logged token_buckets=[64, 256] and measured nothing.
+        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "256"),
         "MEM_FRACTION_STATIC": values.get(
             "MEM_FRACTION_STATIC", profile.mem_fraction_prefill
         ),
