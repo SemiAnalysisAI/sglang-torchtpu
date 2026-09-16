@@ -81,6 +81,7 @@ ${WEIGHTS_VOLUME}
                     #   --from-literal=token=hf_...   (fine-grained, read-only)
                     # optional: pods must still start when the secret is absent --
                     # only the gated-dataset eval needs it.
+${PROFILE_ENV}
                     - name: HF_TOKEN
                       valueFrom:
                         secretKeyRef:
@@ -103,6 +104,42 @@ ${WEIGHTS_VOLUME}
                       # The numbers themselves leave via dump_metric's [METRIC] stdout
                       # lines, which the dashboard scrapes from this job's log.
                       export TPU_CI_BENCH_OUTPUT_ROOT=/tmp/tpu-perf-bench
+                      # Drive the capture from inside the pod: nothing else calls
+                      # /start_profile, so a provisioned directory alone stays empty. Bounded and
+                      # started after the server is up, to keep warmup and graph compilation out of
+                      # the trace -- an unbounded capture runs to gigabytes of mostly compile.
+                      # .xprof-done tells the runner the flush is complete and the file is safe to
+                      # copy, which it must do before the pod exits.
+                      if [ -n "${SGLANG_TORCH_PROFILER_DIR:-}" ]; then
+                        (
+                          set +e
+                          port=""
+                          for _ in $(seq 1 240); do
+                            for p in 30000 30001 30002; do
+                              curl -sf -m 2 "http://127.0.0.1:$p/health" >/dev/null 2>&1 && { port=$p; break; }
+                            done
+                            [ -n "$port" ] && break
+                            sleep 15
+                          done
+                          mkdir -p "${SGLANG_TORCH_PROFILER_DIR}"
+                          if [ -z "$port" ]; then
+                            echo "[xprof] no local server answered /health; skipping capture"
+                            touch "${SGLANG_TORCH_PROFILER_DIR}/.xprof-done"
+                            exit 0
+                          fi
+                          sleep "${PROFILE_AFTER_S:-180}"
+                          echo "[xprof] start on :$port"
+                          curl -sS -m 120 -X POST "http://127.0.0.1:$port/start_profile" \
+                            -H 'Content-Type: application/json' \
+                            -d '{"activities":["CPU","TPU"]}' || echo "[xprof] start failed"
+                          sleep "${PROFILE_SECONDS:-45}"
+                          # The flush is slow; a short timeout truncates the file to zero bytes.
+                          echo "[xprof] stop on :$port"
+                          curl -sS -m 900 -X POST "http://127.0.0.1:$port/stop_profile" || echo "[xprof] stop failed"
+                          touch "${SGLANG_TORCH_PROFILER_DIR}/.xprof-done"
+                          echo "[xprof] capture done: $(du -sh "${SGLANG_TORCH_PROFILER_DIR}" 2>/dev/null | cut -f1)"
+                        ) &
+                      fi
                       mkdir -p "$TPU_CI_BENCH_OUTPUT_ROOT"
 
                       # Exec mode (render_jobset.py --exec): every host runs the same

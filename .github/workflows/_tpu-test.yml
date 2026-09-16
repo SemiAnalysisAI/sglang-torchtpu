@@ -49,6 +49,16 @@ on:
         required: false
         type: string
         default: ""
+      # Non-empty turns on xprof capture: the engines get
+      # SGLANG_TORCH_PROFILER_DIR pointing here, and whatever lands in it is
+      # pulled off every pod and uploaded. Provisioning only -- triggering a
+      # capture (/start_profile, or bench_serving --profile) is the workload's
+      # business. Off by default; a capture costs real overhead and hundreds of
+      # MB per engine.
+      profile_dir:
+        required: false
+        type: string
+        default: ""
       timeout_per_file:
         required: false
         type: number
@@ -128,6 +138,7 @@ jobs:
         run: |
           set -euo pipefail
           label='${{ inputs.run_name || inputs.test_file || inputs.files || inputs.suite }}'
+          PROFILE_DIR='${{ inputs.profile_dir }}'
           JOB_CEILING_S=21600        # 360m, the GitHub cap
           suite='${{ inputs.suite }}'
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
@@ -151,6 +162,7 @@ jobs:
             --pd-prefill-hosts '${{ inputs.pd_prefill_hosts }}' \
             --pd-decode-hosts '${{ inputs.pd_decode_hosts }}' \
             --weights-pvc '${{ inputs.weights_pvc }}' \
+            --profile-dir '${{ inputs.profile_dir }}' \
             --timeout-per-file '${{ inputs.timeout_per_file }}' \
             --partition-id '${{ inputs.partition_id }}' \
             --partition-size '${{ inputs.partition_size }}' \
@@ -169,9 +181,60 @@ jobs:
             python3 .github/tpu-ci/reconcile_quota.py --pool="$p"
           done
 
+          # Pull xprof output off every pod while the JobSet still exists. The
+          # pod log is the only other egress and cannot carry a trace, so this
+          # has to happen in the trap -- the run step exits from several places
+          # (pass, fail, timeout) and the trap covers all of them.
+          # Copy one pod's capture. kubectl cp needs tar in the container, so
+          # fall back to streaming the tar ourselves.
+          copy_profile_from() {
+            pod="$1"; dest="$RUNNER_TEMP/xprof/${pod}"
+            [ -d "$dest" ] && return 0     # already collected
+            mkdir -p "$dest"
+            kubectl -n tpu-ci cp "${pod}:${PROFILE_DIR}" "$dest" -c test 2>/dev/null \
+              || kubectl -n tpu-ci exec "${pod}" -c test -- tar cf - -C "${PROFILE_DIR}" . 2>/dev/null \
+                   | tar xf - -C "$dest" 2>/dev/null \
+              || { rmdir "$dest" 2>/dev/null; return 1; }
+            # An empty directory is not a capture; do not let it mask a failure.
+            [ -n "$(find "$dest" -name '*.xplane.pb' -print -quit 2>/dev/null)" ] || {
+              rm -rf "$dest"; return 1; }
+            echo "  collected $(du -sh "$dest" | cut -f1) from ${pod}"
+          }
+
+          # Poll for the pod-side sentinel and copy as soon as it lands. Waiting
+          # for teardown loses pods that exit early -- decode finishes before
+          # prefill in a P/D run, and its trace went missing that way.
+          watch_profiles() {
+            [ -n "${PROFILE_DIR:-}" ] || return 0
+            deadline=$(( $(date +%s) + wait_s ))
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+              live=0
+              for ref in $(kubectl -n tpu-ci get pods -l "$sel" -o name 2>/dev/null); do
+                pod="${ref##*/}"
+                live=1
+                if kubectl -n tpu-ci exec "${pod}" -c test -- \
+                     test -f "${PROFILE_DIR}/.xprof-done" >/dev/null 2>&1; then
+                  copy_profile_from "${pod}" || true
+                fi
+              done
+              [ "$live" = 0 ] && break
+              sleep 20
+            done
+          }
+
+          # Last chance for anything the watcher missed, before the JobSet goes.
+          collect_profile() {
+            [ -n "${PROFILE_DIR:-}" ] || return 0
+            for ref in $(kubectl -n tpu-ci get pods -l "$sel" -o name 2>/dev/null); do
+              copy_profile_from "${ref##*/}" || true
+            done
+            echo "== xprof collected =="
+            du -sh "$RUNNER_TEMP/xprof"/* 2>/dev/null || echo "  (nothing)"
+          }
+
           name="$(kubectl -n tpu-ci create -f /tmp/job.yaml -o name)"
           echo "Created ${name}"
-          trap 'kubectl -n tpu-ci delete '"${name}"' --ignore-not-found --wait=false' EXIT
+          trap 'collect_profile; kubectl -n tpu-ci delete '"${name}"' --ignore-not-found --wait=false' EXIT
           short="${name##*/}"
           sel="jobset.sigs.k8s.io/jobset-name=${short}"
 
@@ -271,7 +334,7 @@ jobs:
             # instead of reporting NOT ADMITTED with an expired kubeconfig.
             if pods="$(kubectl -n tpu-ci get pods -l "$sel" -o name 2>&1)"; then
               auth_fails=0
-              [ -n "$pods" ] && break
+              [ -n "$pods" ] && { watch_profiles & echo "xprof watcher started"; break; }
             else
               auth_fails=$((auth_fails + 1))
               if [ "$auth_fails" -ge 3 ]; then
@@ -432,6 +495,16 @@ jobs:
                     f"| {f(m.get('median_ttft_ms'), '.0f')} | {f(m.get('median_itl_ms'))} "
                     f"| {(format(hit, '.1%') if isinstance(hit, float) else '-')} |")
           PY
+
+      - name: Upload xprof traces
+        if: always() && inputs.profile_dir != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: tpu-xprof-${{ inputs.run_name || inputs.suite || 'test' }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/xprof
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Upload benchmark results
         if: always()

@@ -89,6 +89,18 @@ WEIGHTS_MOUNT_TMPL = (
 # --service-account is given, so the pod keeps using the namespace default.
 SERVICE_ACCOUNT_TMPL = "              serviceAccountName: {sa}"
 
+# xprof writes into SGLANG_TORCH_PROFILER_DIR when /start_profile is called with
+# no output_dir. Only the directory is provisioned here; what triggers a capture
+# is the workload's business.
+PROFILE_ENV_TMPL = (
+    "                    - name: SGLANG_TORCH_PROFILER_DIR\n"
+    "                      value: {d}\n"
+    "                    - name: PROFILE_AFTER_S\n"
+    '                      value: "{after}"\n'
+    "                    - name: PROFILE_SECONDS\n"
+    '                      value: "{secs}"'
+)
+
 
 def dns_safe(name):
     s = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
@@ -161,6 +173,11 @@ def main():
     ap.add_argument("--pd-prefill-hosts", type=int, default=0)
     ap.add_argument("--pd-decode-hosts", type=int, default=0)
     ap.add_argument("--weights-pvc", default="")
+    ap.add_argument("--profile-dir", default="")
+    # Skip warmup and compile, then capture a bounded window. An unbounded
+    # capture runs to gigabytes and is mostly graph compilation.
+    ap.add_argument("--profile-after-s", type=int, default=180)
+    ap.add_argument("--profile-seconds", type=int, default=45)
     ap.add_argument("--timeout-per-file", type=int, default=3600)
     ap.add_argument(
         "--service-account",
@@ -289,6 +306,15 @@ def main():
             "POOL_LIST": " ".join(pd_pools),
             "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",
             "WEIGHTS_MOUNT": WEIGHTS_MOUNT_TMPL if pvc else "",
+            "PROFILE_ENV": (
+                PROFILE_ENV_TMPL.format(
+                    d=a.profile_dir,
+                    after=a.profile_after_s,
+                    secs=a.profile_seconds,
+                )
+                if a.profile_dir
+                else ""
+            ),
             "SERVICE_ACCOUNT": (
                 SERVICE_ACCOUNT_TMPL.format(sa=a.service_account)
                 if a.service_account
@@ -387,6 +413,15 @@ def main():
         "TEST_FILES": a.files,
         "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",
         "WEIGHTS_MOUNT": WEIGHTS_MOUNT_TMPL if pvc else "",
+        "PROFILE_ENV": (
+            PROFILE_ENV_TMPL.format(
+                d=a.profile_dir,
+                after=a.profile_after_s,
+                secs=a.profile_seconds,
+            )
+            if a.profile_dir
+            else ""
+        ),
         "TIMEOUT_PER_FILE": str(a.timeout_per_file),
         "SERVICE_ACCOUNT": (
             SERVICE_ACCOUNT_TMPL.format(sa=a.service_account)

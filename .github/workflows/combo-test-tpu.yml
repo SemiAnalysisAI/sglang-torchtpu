@@ -1,6 +1,6 @@
 # Isolated trigger for the registered GPT-OSS-120B 2P+2D feature test.
 # The same test also runs from nightly-test-tpu.yml.
-#   gh workflow run combo-test-tpu.yml [-f ref=<branch>]
+#   gh workflow run combo-test-tpu.yml [-f ref=<branch>] [-f profile=true]
 name: Combo Test (TPU)
 
 on:
@@ -10,6 +10,11 @@ on:
         description: "Git ref to test"
         required: false
         default: main
+      profile:
+        description: "Capture xprof traces and upload them as an artifact"
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   # Different refs can use separate nightly slices. Runs for one ref serialize.
@@ -41,6 +46,7 @@ jobs:
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py
       weights_pvc: model-weights-rox
       run_name: pd-mh-gpt-120b-pc-offload-spec
+      profile_dir: ${{ inputs.profile && '/tmp/xprof' || '' }}
     permissions:
       contents: read
       id-token: write
