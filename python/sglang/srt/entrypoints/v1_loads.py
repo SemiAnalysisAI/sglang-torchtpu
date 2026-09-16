@@ -26,10 +26,10 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
+from sglang.srt.managers.load_snapshot import LoadAggregate
 from sglang.srt.runtime_context import (
     get_parallel,
 )
-from sglang.srt.managers.load_snapshot import LoadAggregate
 from sglang.srt.utils import get_device_name
 from sglang.version import __version__
 

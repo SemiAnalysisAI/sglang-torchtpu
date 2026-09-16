@@ -62,7 +62,7 @@ class RouterArgs:
     eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
     prefix_token_count: int = 256  # prefix_hash: tokens hashed onto the ring
-    prefix_hash_load_factor: float = 1.25  # prefix_hash: multiple of mean load a worker may carry
+    prefix_hash_load_factor: float = 1.25  # prefix_hash: mean-load multiplier
     max_idle_secs: int = 4 * 3600
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches

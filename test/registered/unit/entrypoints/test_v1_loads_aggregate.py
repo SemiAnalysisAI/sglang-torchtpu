@@ -156,9 +156,7 @@ class TestLoadsResponse(CustomTestCase):
         manager = self._two_ranks()
         self.addCleanup(manager.restore)
 
-        response = asyncio.run(
-            get_loads(tokenizer_manager=manager, include="core")
-        )
+        response = asyncio.run(get_loads(tokenizer_manager=manager, include="core"))
 
         self.assertEqual(response["aggregate"]["total_tokens"], 356)
 

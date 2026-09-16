@@ -272,7 +272,7 @@ class LoadAggregate(msgspec.Struct):
     avg_utilization: float = 0.0
 
     @classmethod
-    def from_snapshots(cls, snapshots: "list[LoadSnapshot]") -> "LoadAggregate":
+    def from_snapshots(cls, snapshots: list[LoadSnapshot]) -> LoadAggregate:
         """Sum the totals, mean the averages.
 
         Sum rather than max because a gateway treats one endpoint as one worker
