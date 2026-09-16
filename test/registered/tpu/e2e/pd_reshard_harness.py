@@ -227,6 +227,30 @@ MODEL_PROFILES = {
         extra_server_args=("--tpu-fp8-runtime", "channelwise"),
         extra_launch_env={
             "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
+            # EXPERIMENT (#718): the compiler-optimization half of
+            # common_env.sh's LIBTPU_INIT_ARGS, turned off. Async collective
+            # fusion, compute/collective overlap and the latency-hiding
+            # scheduler are what reorder collectives off the matmul critical
+            # path, and a miscompile there produces exactly this shape of
+            # failure -- right model, right transport, wrong numbers, only on
+            # the multihost TP16 prefill. The DP-attention hardening flags (the
+            # post-SPMD collective-matmul modes and the four SparseCore
+            # offload=false) stay as they are; they already exist to avoid TP
+            # correctness issues. Clean here names the area and is shippable as
+            # a flag change; corrupt clears the whole optimization class.
+            "LIBTPU_INIT_ARGS": (
+                "--xla_tpu_scoped_vmem_limit_kib=65536 "
+                "--xla_tpu_enable_async_collective_fusion=false "
+                "--xla_tpu_overlap_compute_collective_tc=false "
+                "--xla_tpu_enable_async_collective_fusion_multiple_steps=false "
+                "--xla_tpu_enable_latency_hiding_scheduler=false "
+                "--xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative "
+                "--xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative "
+                "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false "
+                "--xla_tpu_offload_gather_to_sparsecore=false "
+                "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false "
+                "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false"
+            ),
             # Keep every prefill forward inside the 256-token compile graph.
             #
             # Extends compiled at the 1024-token bucket corrupt this model's
