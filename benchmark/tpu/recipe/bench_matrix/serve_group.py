@@ -209,9 +209,11 @@ def serve(module, inherited=None, dry_run=False):
     config = deepcopy(
         module.CONFIG
         if not pd
-        else module.PREFILL_CONFIG
-        if rank < group["prefill_engines"]
-        else module.DECODE_CONFIG
+        else (
+            module.PREFILL_CONFIG
+            if rank < group["prefill_engines"]
+            else module.DECODE_CONFIG
+        )
     )
     if pd:
         inherited.pop("HOST", None)

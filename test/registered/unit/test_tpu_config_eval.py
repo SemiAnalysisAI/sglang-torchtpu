@@ -15,13 +15,15 @@ sys.path.insert(0, str(ROOT))
 
 from benchmark.tpu.recipe.configs import config_eval
 from benchmark.tpu.recipe.configs.base import _BASE_CONFIG
-from benchmark.tpu.recipe.configs.qwen3_0_6b import CONFIG
 from benchmark.tpu.recipe.configs.gpt_oss_120b.server import CONFIG as GPT_OSS_CONFIG
 from benchmark.tpu.recipe.configs.kimi_k26_mh import CONFIG as KIMI_CONFIG
 from benchmark.tpu.recipe.configs.mimo.launch_mimo_25_pro_multihost import (
     CONFIG as MIMO_PRO_CONFIG,
 )
-from benchmark.tpu.recipe.configs.qwen3_coder_480b.server import CONFIG as QWEN_CODER_CONFIG
+from benchmark.tpu.recipe.configs.qwen3_0_6b import CONFIG
+from benchmark.tpu.recipe.configs.qwen3_coder_480b.server import (
+    CONFIG as QWEN_CODER_CONFIG,
+)
 
 
 class TestTpuConfigEval(unittest.TestCase):

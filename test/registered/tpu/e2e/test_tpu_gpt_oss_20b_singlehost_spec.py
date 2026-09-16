@@ -6,6 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import requests
+
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 from sglang.test.tpu.server_test_suite import resolve_tpu_model_path
