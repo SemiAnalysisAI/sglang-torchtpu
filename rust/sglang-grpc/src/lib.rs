@@ -1,10 +1,19 @@
 pub mod bridge;
 pub mod server;
+pub mod smg;
 pub mod tokenizers;
 pub(crate) mod utils;
 
 pub mod proto {
     tonic::include_proto!("sglang.runtime.v1");
+}
+
+/// The sgl-model-gateway contract, vendored at smg-grpc-client 1.0.0.
+///
+/// Shares message names with `proto` on disagreeing field numbers; the two
+/// modules must never be mixed. See `proto/sglang/grpc/scheduler/`.
+pub mod smg_proto {
+    tonic::include_proto!("sglang.grpc.scheduler");
 }
 
 use pyo3::prelude::*;
@@ -15,6 +24,7 @@ use tokio::time::Duration;
 use tracing_subscriber::EnvFilter;
 
 use bridge::{ChunkSendStatus, DEFAULT_RESPONSE_CHANNEL_CAPACITY, PyBridge};
+use smg::response_map::StreamMode;
 use tokenizers::RustTokenizer;
 
 /// Handle returned to Python that controls the running gRPC server.
@@ -44,6 +54,7 @@ struct TokenizerInfo {
     tokenizer_path: Option<String>,
     tokenizer_mode: Option<String>,
     context_len: i32,
+    stream_mode: StreamMode,
 }
 
 /// Extract tokenizer path/mode and context_len from the Python RuntimeHandle (one-time GIL).
@@ -72,6 +83,20 @@ fn try_get_attr_str(
     try_get_attr(py, obj, attr, context).and_then(|value| {
         value.extract(py).map(Some).unwrap_or_else(|err| {
             tracing::debug!("Could not extract {}.{} as string: {}", context, attr, err);
+            None
+        })
+    })
+}
+
+fn try_get_attr_bool(
+    py: Python<'_>,
+    obj: &Py<PyAny>,
+    attr: &'static str,
+    context: &'static str,
+) -> Option<bool> {
+    try_get_attr(py, obj, attr, context).and_then(|value| {
+        value.extract(py).map(Some).unwrap_or_else(|err| {
+            tracing::debug!("Could not extract {}.{} as bool: {}", context, attr, err);
             None
         })
     })
@@ -130,10 +155,32 @@ fn extract_tokenizer_info(runtime_handle: &Py<PyAny>) -> PyResult<TokenizerInfo>
                 0
             });
 
+        // Decides whether the SMG translation layer must difference
+        // `output_ids` before shipping them. Defaulting to Cumulative matches
+        // `--incremental-streaming-output`'s own default, and a wrong guess is
+        // caught at runtime by StreamTranslator's prefix invariant rather than
+        // silently duplicating output.
+        let stream_mode =
+            try_get_attr_bool(py, &tm, "incremental_streaming_output", "tokenizer_manager")
+                .or_else(|| {
+                    server_args.as_ref().and_then(|args| {
+                        try_get_attr_bool(py, args, "incremental_streaming_output", "server_args")
+                    })
+                })
+                .map(|incremental| {
+                    if incremental {
+                        StreamMode::Incremental
+                    } else {
+                        StreamMode::Cumulative
+                    }
+                })
+                .unwrap_or(StreamMode::Cumulative);
+
         Ok(TokenizerInfo {
             tokenizer_path,
             tokenizer_mode,
             context_len,
+            stream_mode,
         })
     })
 }
@@ -201,6 +248,7 @@ fn start_server(
     })?;
 
     let tokenizer_info = extract_tokenizer_info(&runtime_handle)?;
+    let stream_mode = tokenizer_info.stream_mode;
 
     let rust_tokenizer = tokenizer_info.tokenizer_path.as_deref().and_then(|p| {
         RustTokenizer::from_tokenizer_path(
@@ -242,6 +290,7 @@ fn start_server(
                 bridge_clone,
                 shutdown_clone,
                 response_timeout,
+                stream_mode,
             )) {
                 tracing::error!("gRPC server exited with error: {}", e);
             }
