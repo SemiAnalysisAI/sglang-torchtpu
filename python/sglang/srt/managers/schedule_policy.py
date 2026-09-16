@@ -192,6 +192,21 @@ def match_prefix_for_req(
     req.num_matched_prefix_tokens = min(
         len(req.prefix_indices) + req.host_hit_length, max_len
     )
+    # DIAGNOSTIC (remove before merge): TP ranks inside one attention-DP group
+    # must match the same prefix, or they build different-sized extends and the
+    # DP shape agreement breaks. Observed: TP0-5 matched 128 tokens more than
+    # TP6/TP7 for the same request. Log the match so the diverging rank and the
+    # tree state behind it are visible.
+    logger.error(
+        "MATCH rid=%s tokens=%d prefix=%d host_hit=%d node=%x evictable=%s protected=%s",
+        req.rid,
+        len(token_ids),
+        len(req.prefix_indices),
+        req.host_hit_length,
+        id(req.last_node),
+        getattr(tree_cache, "evictable_size", lambda: None)(),
+        getattr(tree_cache, "protected_size", lambda: None)(),
+    )
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
