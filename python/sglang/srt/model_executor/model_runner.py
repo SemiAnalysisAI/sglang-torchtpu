@@ -610,6 +610,8 @@ class ModelRunner:
             server_args=self.server_args,
             kv_cache_dtype=self.kv_cache_dtype,
             kv_cache_dtype_str=self.kv_cache_dtype_str,
+            kv_group_size=getattr(self, "kv_group_size", None),
+            speculative_draft_attention_backend=self.draft_attention_backend,
             model_dtype=self.dtype,
             page_size=self.page_size,
             sliding_window_size=self.sliding_window_size,
@@ -1419,6 +1421,13 @@ class ModelRunner:
             resolved_kv_cache_dtype
             if resolved_kv_cache_dtype is not None
             else get_model().kv_cache_dtype
+        )
+        # The TPU subclass owns this request; drafts inherit it without
+        # publishing over the target's process-global configuration.
+        self.kv_group_size = (
+            getattr(self.server_args, "tpu_mxint8_group_size", 32)
+            if self.kv_cache_dtype_str == "mxint8"
+            else None
         )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):

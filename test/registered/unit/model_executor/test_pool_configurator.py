@@ -10,6 +10,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.runtime_context import (
@@ -17,6 +19,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_server_args,
+    get_spec,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -129,6 +132,8 @@ def _make_model_runner(
     mc.context_len = 8192
     mr.model_config = mc
     mr.kv_cache_dtype = "fake_bf16"
+    mr.kv_cache_dtype_str = "auto"
+    mr.speculative_draft_attention_backend = None
 
     # The configurator reads the published bags, so the fixture publishes the
     # configuration it describes. The instance stays for the whole-object
@@ -1004,6 +1009,187 @@ class TestDflashDraftKvBudget(CustomTestCase):
             return config.full_max_total_num_tokens
 
         self.assertLess(_tokens(10240), _tokens(None))
+
+
+class TestMixedKVFormats(CustomTestCase):
+    def test_ordinary_formats_do_not_import_private_backend(self):
+        for dtype_str, dtype, per_token in (
+            ("auto", torch.bfloat16, 1024),
+            ("bf16", torch.bfloat16, 1024),
+            ("fp8_e4m3", torch.float8_e4m3fn, 512),
+            ("mxfp8", torch.float8_e4m3fn, 528),
+        ):
+            with self.subTest(dtype=dtype_str):
+                mr = _make_model_runner(self, num_layers=2, page_size=4)
+                mr.kv_cache_dtype_str = dtype_str
+                mr.kv_cache_dtype = dtype
+                with patch.dict(
+                    "sys.modules",
+                    {
+                        "sglang_torchtpu_meta": None,
+                        "sglang_torchtpu_meta.srt.backends.attention.kv_mxint8": None,
+                    },
+                ):
+                    from sglang.srt.model_executor.pool_configurator import (
+                        create_memory_pool_configurator,
+                    )
+
+                    cfg = create_memory_pool_configurator(mr)
+                    config = cfg.calculate_pool_sizes(1_000_000, 4)
+                self.assertEqual(
+                    config.max_total_num_tokens, (1_000_000 // (2 * per_token)) // 4 * 4
+                )
+
+    def test_mixed_formats_reserve_dummy_pages_and_align_capacity(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        available, page_size = 2_000_000, 4
+        for layout in ("default", "hybrid", "all_swa", "chunk_cap"):
+            for target_format, draft_format, target_cost, draft_cost in (
+                ("mxint8", "bf16", 640, 1024),
+                ("mxint8", "auto", 640, 1024),
+                ("bf16", "mxint8", 1024, 640),
+            ):
+                with self.subTest(
+                    layout=layout, target=target_format, draft=draft_format
+                ):
+                    hybrid = layout != "default"
+                    chunk_cap = layout == "chunk_cap"
+                    mr = _make_model_runner(
+                        self,
+                        num_layers=2,
+                        page_size=page_size,
+                        is_hybrid_swa=hybrid,
+                        full_attention_layer_ids=[] if layout == "all_swa" else [0],
+                        swa_attention_layer_ids=[0, 1] if layout == "all_swa" else [1],
+                        disable_radix_cache=chunk_cap,
+                        chunked_prefill_size=4 if chunk_cap else None,
+                        sliding_window_size=8 if chunk_cap else None,
+                        max_running_requests=2 if chunk_cap else None,
+                    )
+                    mr.kv_cache_dtype_str = target_format
+                    mr.kv_cache_dtype = (
+                        torch.int8 if target_format == "mxint8" else torch.bfloat16
+                    )
+                    mr.pool_page_size = page_size
+                    mr.kv_group_size = 32
+                    mr.spec_algorithm.is_eagle.return_value = True
+                    mr.spec_aux_config.eagle_draft_num_layers = 1
+                    mr.spec_aux_config.eagle_draft_swa_num_layers = int(hybrid)
+                    # Test budgeting against a fixed external layout cost, not the
+                    # private packing implementation (which has its own tests).
+                    backend = SimpleNamespace(
+                        cache_bytes_per_token=MagicMock(return_value=640)
+                    )
+                    with (
+                        mock_cpu_env(),
+                        get_spec().override(
+                            speculative_draft_kv_cache_dtype=draft_format
+                        ),
+                        patch.dict(
+                            "sys.modules",
+                            {
+                                "sglang_torchtpu_meta.srt.backends.attention.kv_mxint8": backend,
+                            },
+                        ),
+                    ):
+                        cfg = create_memory_pool_configurator(mr)
+                        config = cfg.calculate_pool_sizes(available, page_size)
+                        constrained = cfg.calculate_pool_sizes_from_max_tokens(
+                            101, page_size
+                        )
+
+                    dummy_bytes = page_size * (2 * target_cost + draft_cost)
+                    budget = available - dummy_bytes
+                    if layout in ("default", "all_swa"):
+                        expected = (
+                            budget
+                            // (2 * target_cost + draft_cost)
+                            // page_size
+                            * page_size
+                        )
+                        used = (config.max_total_num_tokens + page_size) * (
+                            2 * target_cost + draft_cost
+                        )
+                    else:
+                        if chunk_cap:
+                            # Per request: window 8 + eviction 4 + page 4 + decode 4.
+                            # Two requests plus two prefill chunks and one page: 52.
+                            self.assertEqual(config.swa_max_total_num_tokens, 52)
+                            expected = (
+                                (budget - 52 * (target_cost + draft_cost))
+                                // target_cost
+                                // page_size
+                                * page_size
+                            )
+                        else:
+                            expected = (
+                                int(
+                                    budget
+                                    // (target_cost + 0.5 * (target_cost + draft_cost))
+                                )
+                                // page_size
+                                * page_size
+                            )
+                        used = (
+                            config.full_max_total_num_tokens * target_cost
+                            + config.swa_max_total_num_tokens
+                            * (target_cost + draft_cost)
+                            + dummy_bytes
+                        )
+                        self.assertEqual(config.swa_max_total_num_tokens % page_size, 0)
+                    self.assertEqual(config.max_total_num_tokens, expected)
+                    self.assertEqual(constrained.max_total_num_tokens, 100)
+                    self.assertLessEqual(used, available)
+                    self.assertGreater(
+                        used, available - page_size * (2 * target_cost + draft_cost)
+                    )
+                    backend.cache_bytes_per_token.assert_called_with(
+                        4, 64, page_size, group_size=32
+                    )
+
+    def test_dflash_budget_uses_runner_local_backend(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        for local_backend, global_backend, draft_cost, dummy_tokens in (
+            ("fa4", "tpu", 1024, 0),
+            ("tpu", "fa4", 1152, 4),
+            (None, "fa4", 1024, 0),
+            (None, "tpu", 1152, 4),
+        ):
+            with self.subTest(local_backend=local_backend):
+                mr = _make_model_runner(self, num_layers=2, page_size=4)
+                mr.kv_cache_dtype = torch.bfloat16
+                mr.kv_cache_dtype_str = "bf16"
+                mr.speculative_draft_attention_backend = local_backend
+                mr.spec_algorithm.is_dflash_family.return_value = True
+                mr.spec_aux_config.dflash_draft_num_layers = 1
+                mr.spec_aux_config.dflash_draft_cell_size_per_token = 1024
+                with (
+                    mock_cpu_env(),
+                    get_spec().override(
+                        speculative_draft_kv_cache_dtype="mxint8",
+                        speculative_draft_attention_backend=global_backend,
+                    ),
+                    patch.dict(
+                        "sys.modules",
+                        {
+                            "sglang_torchtpu_meta.srt.backends.attention.kv_mxint8": SimpleNamespace(
+                                ROW_ALIGNMENT=128
+                            ),
+                        },
+                    ),
+                ):
+                    cfg = create_memory_pool_configurator(mr)
+                    config = cfg.calculate_pool_sizes(1_000_000, 4)
+                self.assertEqual(
+                    config.max_total_num_tokens,
+                    (1_000_000 // (2048 + draft_cost) - dummy_tokens) // 4 * 4,
+                )
 
 
 if __name__ == "__main__":
