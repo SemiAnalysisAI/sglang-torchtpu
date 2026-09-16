@@ -1040,6 +1040,23 @@ class UnifiedRadixCache(BasePrefixCache):
             req.prefix_indices = new_indices
         req.kv.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
+        # DIAGNOSTIC (remove before merge): chunked requests never re-enter
+        # match_prefix_for_req -- this rematch is what carries their prefix to
+        # the next chunk. TP ranks in one attention-DP group must land the same
+        # length here or they build different-sized extends and the DP shape
+        # agreement breaks (observed: TP0-5 1011 tokens, TP6/TP7 1139).
+        logger.error(
+            "REMATCH rid=%s new=%d orig=%d prefix=%d protected=%d node=%x "
+            "evictable=%s protected_sz=%s",
+            req.rid,
+            len(new_indices),
+            len(kv_indices_orig),
+            len(req.prefix_indices),
+            req.kv.cache_protected_len,
+            id(new_last_node),
+            self.evictable_size(),
+            self.protected_size(),
+        )
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
         # carry the skip set so this node's dec releases only what we locked
         req.skip_lock_node_ids = lock_result.skip_lock_node_ids
