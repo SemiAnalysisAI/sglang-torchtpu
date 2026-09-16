@@ -346,7 +346,7 @@ class TestCpMetadata(unittest.TestCase):
     PAGE_SIZE = 64
     DRAFT_TOKENS = 8
 
-    def _make_backend(self, req_to_token):
+    def _make_backend(self, req_to_token, full_to_swa=None):
         override = get_context().override_server_args(
             speculative_num_draft_tokens=self.DRAFT_TOKENS,
             speculative_algorithm="EAGLE3",
@@ -369,8 +369,8 @@ class TestCpMetadata(unittest.TestCase):
             model_config=SimpleNamespace(context_len=self.CONTEXT_LEN),
             server_args=server_args,
             req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
-            token_to_kv_pool=SimpleNamespace(),
-            is_hybrid_swa=False,
+            token_to_kv_pool=SimpleNamespace(full_to_swa_index_mapping=full_to_swa),
+            is_hybrid_swa=full_to_swa is not None,
             kv_cache_dtype=torch.bfloat16,
         )
         with patch(
@@ -426,6 +426,8 @@ class TestCpMetadata(unittest.TestCase):
                     int(req_to_token[req, host.prefix_lens[req] + pos])
                 )
         self.assertEqual(metadata.cp_dest_slots.tolist(), expected_slots)
+        self.assertIsNone(metadata.swa_page_indices)
+        self.assertIsNone(metadata.cp_swa_dest_slots)
         self.assertEqual(metadata.cp_last_rows.tolist(), host.last_rows.tolist())
         self.assertEqual(
             metadata.cp_last_owner_mask.tolist(), host.last_owner_mask.tolist()
@@ -438,6 +440,71 @@ class TestCpMetadata(unittest.TestCase):
         self.assertEqual(
             backend.forward_metadata.cp_dest_slots.tolist(), expected_slots
         )
+
+    def test_hybrid_swa_rows_and_slots_are_translated(self):
+        req_to_token = torch.zeros(2, self.POOL_WIDTH, dtype=torch.int32)
+        req_to_token[0] = 1000 + torch.arange(self.POOL_WIDTH)
+        req_to_token[1] = 5000 + torch.arange(self.POOL_WIDTH)
+        # Full-pool slot s lives at SWA slot s // 2 (page 64 -> SWA page 32).
+        full_to_swa = torch.arange(8192, dtype=torch.int64) // 2
+        backend = self._make_backend(req_to_token, full_to_swa=full_to_swa)
+        layout = _layout(
+            cp_size=4, cp_rank=1, extend=(40, 24), prefix=(0, 100), pad_b=4
+        )
+        batch = SimpleNamespace(
+            seq_lens=torch.tensor([40, 124, 0, 0], dtype=torch.int32),
+            req_pool_indices_cpu=torch.tensor([0, 1, 0, 0]),
+        )
+        metadata = backend._build_cp_metadata(batch, layout)
+
+        pages_per_seq = (backend.max_context_len + self.PAGE_SIZE - 1) // self.PAGE_SIZE
+        full_pages = metadata.page_indices.reshape(8, pages_per_seq)
+        swa_pages = metadata.swa_page_indices.reshape(8, pages_per_seq)
+        self.assertTrue(
+            torch.equal(
+                swa_pages,
+                (
+                    full_to_swa[full_pages.to(torch.int64) * self.PAGE_SIZE]
+                    // self.PAGE_SIZE
+                ).to(torch.int32),
+            )
+        )
+        expected = torch.where(
+            metadata.cp_dest_slots > 0,
+            full_to_swa[metadata.cp_dest_slots],
+            torch.zeros_like(metadata.cp_dest_slots),
+        )
+        self.assertEqual(metadata.cp_swa_dest_slots.tolist(), expected.tolist())
+
+    def test_hybrid_swa_rejects_unmapped_extend_rows(self):
+        req_to_token = torch.zeros(2, self.POOL_WIDTH, dtype=torch.int32)
+        req_to_token[0] = 1000 + torch.arange(self.POOL_WIDTH)
+        req_to_token[1] = 5000 + torch.arange(self.POOL_WIDTH)
+        full_to_swa = torch.zeros(8192, dtype=torch.int64)  # nothing mapped
+        backend = self._make_backend(req_to_token, full_to_swa=full_to_swa)
+        layout = _layout(
+            cp_size=4, cp_rank=1, extend=(40, 24), prefix=(0, 100), pad_b=4
+        )
+        batch = SimpleNamespace(
+            seq_lens=torch.tensor([40, 124, 0, 0], dtype=torch.int32),
+            req_pool_indices_cpu=torch.tensor([0, 1, 0, 0]),
+        )
+        with self.assertRaisesRegex(RuntimeError, "without an SWA slot"):
+            backend._build_cp_metadata(batch, layout)
+
+    def test_hybrid_swa_accepts_warmup_rows_on_the_padding_slot(self):
+        req_to_token = torch.zeros(2, self.POOL_WIDTH, dtype=torch.int32)
+        full_to_swa = torch.zeros(8192, dtype=torch.int64)  # nothing mapped
+        backend = self._make_backend(req_to_token, full_to_swa=full_to_swa)
+        layout = _layout(
+            cp_size=4, cp_rank=1, extend=(40, 24), prefix=(0, 100), pad_b=4
+        )
+        batch = SimpleNamespace(
+            seq_lens=torch.tensor([40, 124, 0, 0], dtype=torch.int32),
+            req_pool_indices_cpu=torch.tensor([0, 1, 0, 0]),
+        )
+        metadata = backend._build_cp_metadata(batch, layout)
+        self.assertEqual(int(metadata.cp_swa_dest_slots.max()), 0)
 
 
 if __name__ == "__main__":

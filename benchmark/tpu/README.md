@@ -162,12 +162,24 @@ EXTRA_ARGS="--sampling-backend pytorch --watchdog-timeout 3600" \
 Supported: `--enable-torch-compile` and eager, chunked prefill,
 `--kv-cache-dtype fp8_e4m3`, `--max-total-tokens` (every stage sizes its pool
 to the smallest stage). Rejected at launch with `--pp-size > 1` on TPU:
-`--tp-size > 1` (a pipeline stage is one device), speculative decoding, and
-`--enable-dynamic-chunking`. Input (prompt) logprobs are rejected per request.
-`--ep-size` and `--dp-size` have not been run with pipeline parallelism on
+`--tp-size > 1` (a stage is one device, or one context-parallel group as
+below), speculative decoding, and `--enable-dynamic-chunking`. Input (prompt)
+logprobs are rejected per request.
+`--dp-size` has not been run with pipeline parallelism on
 TPU. Overlap scheduling is switched off by pipeline parallelism itself. A
 stage waiting for the previous stage looks idle to the watchdog, so pass
 `--watchdog-timeout` at least `pp_size` times the longest microbatch.
+
+### Context-parallel stages (PP4 x PCP2)
+
+`--pp-size 4 --tp-size 2 --attn-cp-size 2 --enable-prefill-cp --cp-strategy
+zigzag --moe-dp-size 2` runs four stages of two chiplets: each stage splits
+its prefill tokens over its pair by zigzag blocks (each chiplet runs the
+attention of its own blocks and all-gathers the layer's K/V so both hold the
+whole KV of the stage's layers) and replicates the experts on both chiplets
+(`--ep-size 2` splits them instead). `--tp-size` must equal `--attn-cp-size`,
+and the torch_tpu build must compile a stage's collectives for the stage's
+devices only.
 
 Optional warmup — run between launch and bench *only* while the in-server
 torch.compile warmup doesn't yet cover all compile-shape buckets:

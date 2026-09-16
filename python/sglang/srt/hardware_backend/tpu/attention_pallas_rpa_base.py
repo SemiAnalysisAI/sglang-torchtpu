@@ -108,6 +108,9 @@ class PallasForwardMetadata:
     # i64[cp_size * local_tokens]  KV slot of every row of the rank-major
     # all-gathered K/V (slot 0 for padding rows)
     cp_dest_slots: torch.Tensor | None = None
+    # Same rows as ``cp_dest_slots`` translated to the SWA sub-pool (hybrid
+    # sliding-window models only).
+    cp_swa_dest_slots: torch.Tensor | None = None
     # i64[max_num_seqs]  local row of each request's last token (0 when this
     # rank does not own it)
     cp_last_rows: torch.Tensor | None = None
@@ -837,11 +840,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         the tail, outside ``distribution``. Built on the host from the CPU
         lengths and the host-resident req_to_token, then uploaded once.
         """
-        if self._is_hybrid_swa:
-            raise NotImplementedError(
-                "Prefill context parallelism on TPU does not support hybrid "
-                "sliding-window models."
-            )
         req_to_token = self.req_to_token_pool.req_to_token
         if req_to_token.device.type != "cpu":
             raise RuntimeError(
@@ -898,6 +896,32 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         slots = req_to_token[req_pool_indices[req], prefix + gathered_pos.clamp(min=0)]
         dest_slots = torch.where(valid, slots.to(torch.int64), torch.zeros_like(req))
 
+        # Hybrid-SWA: sliding-window layers read and write the SWA sub-pool, so page
+        # rows and write slots go through the host-resident full-to-SWA mapping.
+        swa_page_indices: torch.Tensor | None = None
+        swa_dest_slots: torch.Tensor | None = None
+        if self._is_hybrid_swa:
+            full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping
+            assert full_to_swa is not None, (
+                "Hybrid-SWA model is configured but full_to_swa_index_mapping "
+                "has not been registered yet; did the allocator finish init?"
+            )
+            full_token_starts = page_indices.to(torch.int64) * page_size
+            swa_page_indices = (
+                (full_to_swa[full_token_starts] // page_size)
+                .to(torch.int32)
+                .to(device, non_blocking=True)
+            )
+            translated = full_to_swa[dest_slots].to(torch.int64)
+            # An unmapped entry reads 0, the reserved padding slot; warmup batches
+            # point every row at full slot 0 and have nothing mapped.
+            if bool((translated[valid & (dest_slots > 0)] <= 0).any()):
+                raise RuntimeError(
+                    "context-parallel extend rows without an SWA slot: the "
+                    "sliding-window allocator did not map every token of the chunk."
+                )
+            swa_dest_slots = torch.where(valid, translated, torch.zeros_like(req))
+
         distribution = self._get_cached_rpa_distribution(
             False, 2 * host.num_reqs, device
         )
@@ -909,7 +933,13 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             page_indices=page_indices.to(device, non_blocking=True),
             distribution=distribution,
             active_num_tokens=_make_active_num_tokens(cu_q_lens, 2 * host.num_reqs),
+            swa_page_indices=swa_page_indices,
             cp_dest_slots=dest_slots.to(device, non_blocking=True),
+            cp_swa_dest_slots=(
+                None
+                if swa_dest_slots is None
+                else swa_dest_slots.to(device, non_blocking=True)
+            ),
             cp_last_rows=torch.from_numpy(host.last_rows).to(device, non_blocking=True),
             cp_last_owner_mask=torch.from_numpy(host.last_owner_mask)
             .to(torch.int32)
@@ -1022,6 +1052,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # K/V for this layer into its own pool before the kernel reads the
         # earlier blocks through the page table.
         cp_dest_slots = self.forward_metadata.cp_dest_slots
+        if is_swa_layer and self.forward_metadata.cp_swa_dest_slots is not None:
+            cp_dest_slots = self.forward_metadata.cp_swa_dest_slots
         if cp_dest_slots is not None:
             all_gather_and_write_kv(
                 kv_cache=kv_cache,
