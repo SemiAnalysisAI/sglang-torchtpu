@@ -247,7 +247,16 @@ MODEL_PROFILES = {
             # wrong only for this model -- gpt-oss runs the same bucket set and
             # scores 0.98 at 885 cold tokens, so fp8 weights are the suspect,
             # gpt-oss being MXFP4-native. Remove this once that is fixed.
-            "CHUNKED_PREFILL_SIZE": "256",
+            "CHUNKED_PREFILL_SIZE": "128",
+            # EXPERIMENT (#718): find the largest extend bucket that is still
+            # correct on the current libtpu.
+            #
+            # Compiling only the 64 bucket is clean end to end -- run
+            # 35137271950, cold sweep 0/3 at every length 62..900 and gsm8k 0.96
+            # -- but it turns a ~900-token prompt into fifteen extends. 128
+            # would halve that. On libtpu 0.0.44.1 the 128 bucket was correct
+            # (34344878767); this asks whether it still is.
+            "TPU_COMPILE_TOKENS": "128",
         },
         chat_template_kwargs={"enable_thinking": False},
     ),
