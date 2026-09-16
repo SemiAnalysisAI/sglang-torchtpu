@@ -227,6 +227,30 @@ MODEL_PROFILES = {
         extra_server_args=("--tpu-fp8-runtime", "channelwise"),
         extra_launch_env={
             "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
+            # EXPERIMENT (#718): same LIBTPU_INIT_ARGS as common_env.sh except
+            # the scoped VMEM limit, 65536 -> 131072 KiB.
+            #
+            # The corruption tracks the compiled extend graph's token bucket,
+            # not the request: on libtpu 0.0.44.1/0.0.45 the 1024 bucket was
+            # wrong and 64/256 were fine; on 0.0.46 the 256 bucket went wrong
+            # too and only 64 survives. A threshold that moves with graph size,
+            # in the biggest model we run, is what a VMEM-pressure-dependent
+            # miscompile looks like. If the extra VMEM makes bucket 256 correct
+            # again, the mechanism is named and the fix is one flag.
+            "LIBTPU_INIT_ARGS": (
+                "--xla_tpu_scoped_vmem_limit_kib=131072 "
+                "--xla_tpu_enable_async_collective_fusion=true "
+                "--xla_tpu_overlap_compute_collective_tc=true "
+                "--xla_tpu_enable_async_collective_fusion_multiple_steps=true "
+                "--xla_tpu_enable_latency_hiding_scheduler=true "
+                "--xla_latency_hiding_scheduler_rerun=10 "
+                "--xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative "
+                "--xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative "
+                "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false "
+                "--xla_tpu_offload_gather_to_sparsecore=false "
+                "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false "
+                "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false"
+            ),
             # Keep every prefill forward inside the 256-token compile graph.
             #
             # Extends compiled at the 1024-token bucket corrupt this model's
