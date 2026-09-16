@@ -259,12 +259,19 @@ class KVCacheConfigurator:
     memory_pool_config: Optional[MemoryPoolConfig]
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
+    kv_group_size: int | None = None
+    speculative_draft_attention_backend: str | None = None
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
     is_hybrid_swa_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
 
     def __post_init__(self) -> None:
+        if self.kv_cache_dtype_str != "mxint8":
+            self.kv_group_size = None
+        elif getattr(self, "kv_group_size", None) is None:
+            self.kv_group_size = getattr(self.server_args, "tpu_mxint8_group_size", 32)
+        self._validate_mxint8()
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
         self.is_hybrid_swa_mtp_draft = (
@@ -276,6 +283,122 @@ class KVCacheConfigurator:
         )
         self.draft_swa_full_capacity = self.is_hybrid_swa_mtp_draft and (
             self.draft_model_idx in self.model_config.swa_attention_layer_ids
+        )
+
+    def _validate_mxint8(self) -> None:
+        shared_mxint8_draft = False
+        if self.kv_cache_dtype_str != "mxint8":
+            if self.kv_cache_dtype == torch.int8:
+                raise ValueError("INT8 KV storage requires explicit mxint8 format")
+            shared_mxint8_draft = (
+                not self.is_draft_worker
+                and getattr(
+                    resolving_view(self.server_args),
+                    "speculative_draft_kv_cache_dtype",
+                    None,
+                )
+                == "mxint8"
+                and (
+                    self.spec_algorithm.is_eagle()
+                    or self.spec_algorithm.is_standalone()
+                )
+            )
+            if not shared_mxint8_draft:
+                return
+            # EAGLE shares target geometry. Validate that geometry/backend before
+            # target profiling can price a draft that cannot use the MXINT8 pool.
+            if self.kv_cache_dtype not in (
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            ):
+                raise ValueError(
+                    "MXINT8 EAGLE draft requires BF16/FP8 target KV storage"
+                )
+        from sglang_torchtpu_meta.srt.backends.attention.kv_mxint8 import (
+            validate_mxint8_config,
+            validate_mxint8_features,
+        )
+
+        cfg = resolving_view(self.server_args)
+        group_size = (
+            getattr(self.server_args, "tpu_mxint8_group_size", 32)
+            if shared_mxint8_draft
+            else self.kv_group_size
+        )
+        draft_backend = (
+            self.speculative_draft_attention_backend
+            or cfg.speculative_draft_attention_backend
+            if self.is_draft_worker or shared_mxint8_draft
+            else None
+        )
+        validate_mxint8_config(
+            kv_cache_dtype_str=(
+                "mxint8" if shared_mxint8_draft else self.kv_cache_dtype_str
+            ),
+            kv_cache_dtype=torch.int8 if shared_mxint8_draft else self.kv_cache_dtype,
+            model_dtype=self.model_dtype,
+            device=self.device,
+            prefill_backend=draft_backend
+            or cfg.prefill_attention_backend
+            or cfg.attention_backend,
+            decode_backend=draft_backend
+            or cfg.decode_attention_backend
+            or cfg.attention_backend,
+            head_num=self.model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            ),
+            head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
+            page_size=self.pool_page_size,
+            use_mla=self.use_mla_backend,
+            group_size=group_size,
+        )
+        if self.is_hybrid_swa:
+            validate_mxint8_config(
+                kv_cache_dtype_str="mxint8",
+                kv_cache_dtype=torch.int8,
+                model_dtype=self.model_dtype,
+                device=self.device,
+                prefill_backend=draft_backend
+                or cfg.prefill_attention_backend
+                or cfg.attention_backend,
+                decode_backend=draft_backend
+                or cfg.decode_attention_backend
+                or cfg.attention_backend,
+                head_num=self.model_config.get_swa_num_kv_heads(
+                    get_parallel().attn_tp_size
+                ),
+                head_dim=self.model_config.swa_head_dim,
+                v_head_dim=self.model_config.swa_v_head_dim,
+                page_size=self.pool_page_size,
+                use_mla=self.use_mla_backend,
+                group_size=group_size,
+            )
+        validate_mxint8_features(cfg)
+        if self.post_capture_kv_active or self.is_hybrid_swa_compress:
+            raise ValueError(
+                "MXINT8 does not support post-capture or compressed KV pools"
+            )
+        if is_minimax_sparse(self.model_config.hf_config) or is_deepseek_v4(
+            self.model_config.hf_config
+        ):
+            raise ValueError("MXINT8 requires the native rank-4 MHA pool")
+
+    def _tpu_mha_pool_class(self):
+        if self.kv_cache_dtype_str == "mxint8":
+            from sglang_torchtpu_meta.srt.backends.attention.kv_pool import (
+                TpuRpaSeqKVPool,
+            )
+
+            return TpuRpaSeqKVPool
+        return current_platform.get_mha_kv_pool_cls()
+
+    def _mxint8_pool_kwargs(self) -> dict:
+        return (
+            {"kv_cache_dtype_str": "mxint8", "kv_group_size": self.kv_group_size}
+            if self.kv_cache_dtype_str == "mxint8"
+            else {}
         )
 
     def _build_fp4_quant_method(self, *, num_layers: int):
@@ -1007,7 +1130,12 @@ class KVCacheConfigurator:
             PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
         )
 
-        if is_dsv4_model:
+        if self.kv_cache_dtype_str == "mxint8" and self.is_hybrid_swa:
+            token_to_kv_pool = self._build_tpu_swa_kv_pool(
+                full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+            )
+        elif is_dsv4_model:
             token_to_kv_pool = self._build_dsv4_kv_pool(
                 max_running_requests=sizes.max_running_requests,
                 swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
@@ -1239,9 +1367,10 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_oot_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        PoolCls = current_platform.get_mha_kv_pool_cls()
+        PoolCls = self._tpu_mha_pool_class()
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
+            **self._mxint8_pool_kwargs(),
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(
@@ -1376,7 +1505,19 @@ class KVCacheConfigurator:
         full_max_total_num_tokens: Optional[int],
         swa_max_total_num_tokens: Optional[int],
     ) -> KVCache:
-        PoolCls = current_platform.get_mha_kv_pool_cls()
+        PoolCls = self._tpu_mha_pool_class()
+        swa_attention_layer_ids = self.model_config.swa_attention_layer_ids
+        full_attention_layer_ids = self.model_config.full_attention_layer_ids
+        size_swa = swa_max_total_num_tokens
+        if self.kv_cache_dtype_str == "mxint8" and self.is_hybrid_swa_mtp_draft:
+            # Local MTP depths use the allocator's full-capacity identity map.
+            if self.draft_swa_full_capacity:
+                swa_attention_layer_ids = [self.draft_model_idx]
+                full_attention_layer_ids = []
+                size_swa = full_max_total_num_tokens
+            else:
+                swa_attention_layer_ids = []
+                full_attention_layer_ids = [self.draft_model_idx]
         # ``head_num`` sizes the FULL-attention sub-pool. When the SWA layers
         # have a different KV-head count (e.g. MiMo: num_key_value_heads=4 full
         # vs swa_num_key_value_heads=8), the SWA sub-pool must be sized to the
@@ -1395,9 +1536,35 @@ class KVCacheConfigurator:
             )
             // get_parallel().attn_tp_size,
         )
+        mxint8_subpool_kwargs = {}
+        if self.kv_cache_dtype_str == "mxint8":
+            common = {
+                "page_size": self.pool_page_size,
+                "device": self.device,
+                "enable_memory_saver": False,
+                **self._mxint8_pool_kwargs(),
+            }
+            mxint8_subpool_kwargs = {
+                "full_kv_pool_kwargs": {
+                    **common,
+                    "head_num": self.model_config.get_num_kv_heads(
+                        get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                    ),
+                    "head_dim": self.model_config.head_dim,
+                    "v_head_dim": self.model_config.v_head_dim,
+                    "allocation_label": "Full",
+                },
+                "swa_kv_pool_kwargs": {
+                    **common,
+                    "head_num": swa_head_num,
+                    "head_dim": self.model_config.swa_head_dim,
+                    "v_head_dim": self.model_config.swa_v_head_dim,
+                    "allocation_label": "SWA",
+                },
+            }
         return SWAKVPool(
             size=full_max_total_num_tokens,
-            size_swa=swa_max_total_num_tokens,
+            size_swa=size_swa,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(
@@ -1405,10 +1572,11 @@ class KVCacheConfigurator:
             ),
             head_dim=self.model_config.head_dim,
             swa_head_num=swa_head_num,
-            swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
-            full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
             device=self.device,
             token_to_kv_pool_class=PoolCls,
+            **mxint8_subpool_kwargs,
         )
 
     def _build_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
@@ -1682,7 +1850,25 @@ class KVCacheConfigurator:
             if self.kv_cache_dtype_str == "mxfp8" and not self.use_mla_backend
             else mha_pool_class
         )
+        full_kv_pool = None
+        if self.kv_cache_dtype_str == "mxint8":
+            # Supply the already-selected pool: HybridLinear's platform override
+            # otherwise discards full_kv_pool_class and loses runner-local format.
+            full_kv_pool = self._tpu_mha_pool_class()(
+                size=max_total_num_tokens,
+                page_size=self.pool_page_size,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(
+                    get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                ),
+                head_dim=self.model_config.head_dim,
+                layer_num=len(full_attention_layer_ids),
+                device=self.device,
+                enable_memory_saver=get_exec().features.enable_memory_saver,
+                **self._mxint8_pool_kwargs(),
+            )
         token_to_kv_pool = HybridLinearKVPool(
+            full_kv_pool=full_kv_pool,
             page_size=self.pool_page_size,
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
