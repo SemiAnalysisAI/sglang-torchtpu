@@ -1,5 +1,7 @@
 """Tests for the deferred TPU compilation call primitive."""
 
+import pytest
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -18,3 +20,7 @@ def test_pending_call_separates_compile_wait_from_execution() -> None:
     assert events == ["compiled"]
     assert pending.wait() == "final"
     assert events == ["compiled", "executed", "callback:result"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
