@@ -1,10 +1,6 @@
-"""DeepSeek-R1-0528 DPA serving regression on one two-host TPU instance.
+"""Original DeepSeek-R1-0528 TP16/EP16 FP8-KV evaluation, no DP attention.
 
-TP16/EP16/DP2 gives attention TP8 per group and a shared distributed MoE.
-This is not two independent TP8 servers. Use concurrent GPQA, AIME25, and MMLU requests to
-exercise DPA prefill, decode, and the shrinking-batch tail. The protocol and
-broad accuracy floors match the existing non-DPA regression; this is
-not the eight-repeat accuracy qualification or a DPA-vs-TP parity measurement.
+One pass each of GPQA, AIME25 and 250 MMLU questions at concurrency 128.
 """
 
 import os
@@ -17,12 +13,12 @@ register_tpu_ci(
     est_time=7200,
     suite="nightly-tpu-multihost-ondemand",
     nightly=True,
-    labels=["multihost", "deepseek-r1", "dpa", "accuracy"],
+    labels=["multihost", "deepseek-r1", "accuracy"],
 )
 
 MULTIHOST_LAUNCH = {
     "hosts": 2,
-    "launch_script": "recipe/deepseek_r1_0528_dpa_mh.sh",
+    "launch_script": "recipe/deepseek_r1_0528_fp8kv_mh.sh",
     "weights_pvc": "model-weights-rox",
     "timeout_per_file": 10800,
 }
@@ -30,12 +26,12 @@ MULTIHOST_LAUNCH = {
 BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
 MODEL_CONFIG = {
     "model": os.environ.get("MODEL", "/weights/DeepSeek-R1-0528"),
-    "test_name": "DeepSeek-R1-0528-multihost-dpa",
-    "variant": "2host-TP16+EP16+DP2(attn-tp8)",
+    "test_name": "DeepSeek-R1-0528-multihost-fp8kv",
+    "variant": "2host-TP16+EP16+DP1-FP8KV",
     "launch": {
         "external": True,
         "health_timeout": float(os.environ.get("HEALTH_TIMEOUT", "3000")),
-        "tag": "r1-dpa-e2e",
+        "tag": "r1-fp8kv-e2e",
     },
     "skip_unless": (
         os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
