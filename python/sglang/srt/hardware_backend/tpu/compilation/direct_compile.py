@@ -347,7 +347,8 @@ class CompiledFunction:
         # Clone mutated KV inputs; XLA will optimize these away.
         # The strategy for these is that during runtime, we will copy_ the
         # updated values back into the original Tensors. copy_ doesn't launch a
-        # kernel, it just swizzles some metadata around.
+        # kernel, it just swizzles some metadata around (the KV pool buffers
+        # are base tensors of their storage dtype; see kv_pool._zeros_kv_buffer).
         for input_index in range(kv_pool_input_start, kv_pool_input_stop):
             trace_inputs[input_index] = graph_inputs[input_index].clone()
         kv_pool_trace_inputs = trace_inputs[kv_pool_input_start:kv_pool_input_stop]

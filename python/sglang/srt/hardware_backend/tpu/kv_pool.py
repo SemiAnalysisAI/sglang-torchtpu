@@ -49,6 +49,21 @@ def _torch_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
     return packing_bits // bits
 
 
+def _zeros_kv_buffer(shape, dtype: torch.dtype, device) -> torch.Tensor:
+    """Preallocate one layer's KV buffer as a genuine ``dtype`` base tensor.
+
+    Called once per layer at pool construction; nothing allocates later. The
+    buffer must not be a dtype view (``uint8`` storage ``.view(fp8)``):
+    torch_tpu passes a compiled graph the real device buffer only when the
+    tensor dtype equals the storage dtype, otherwise the attention kernel's
+    KV donation is dropped and every extend materializes a second copy of the
+    pool (+6.6 GB for a 6.4 GB fp8 pool, OOM at tp=16).
+    """
+    buf = torch.zeros(shape, dtype=dtype, device=device)
+    assert buf._base is None and buf.dtype == dtype
+    return buf
+
+
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
@@ -201,25 +216,13 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         # allocate. The parent ``KVCache.__init__`` still populates
         # ``memory_saver_adapter`` / ``enable_custom_mem_pool`` as no-ops so
         # inherited methods that touch them keep working.
-        #
-        # ``torch.zeros`` cannot materialize an fp8 tensor on TPU
-        # ("unsupported at::Scalar type"), so for fp8 storage we allocate a
-        # zeroed uint8 buffer (all-zero bytes == +0.0 in both e4m3 and e5m2)
-        # and reinterpret it as the fp8 dtype via ``view``. The buffer the
-        # kernel sees is genuinely fp8-typed (required: it validates the cache
-        # dtype is floating). For bf16 this is a plain ``torch.zeros``.
-        if self.store_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            self.kv_buffer = [
-                torch.zeros(shape, dtype=torch.uint8, device=self.device).view(
-                    self.store_dtype
-                )
-                for _ in range(self.layer_num)
-            ]
-        else:
-            self.kv_buffer = [
-                torch.zeros(shape, dtype=self.store_dtype, device=self.device)
-                for _ in range(self.layer_num)
-            ]
+        # Each layer's buffer must be a genuine ``store_dtype`` base tensor
+        # (no dtype view), or the kernel's donation is lost -- see
+        # ``_zeros_kv_buffer``.
+        self.kv_buffer = [
+            _zeros_kv_buffer(shape, self.store_dtype, self.device)
+            for _ in range(self.layer_num)
+        ]
 
         # Mirrors used by the rest of SGLang. These are recomputed lazily; the
         # fused buffer is the source of truth.
@@ -506,21 +509,11 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
             shape,
             self.store_dtype,
         )
-        # torch.zeros cannot materialize fp8 on TPU; allocate zeroed uint8 and
-        # reinterpret (all-zero bytes are +0.0 in e4m3 and e5m2), as the fused
-        # pool above does.
-        if self.store_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            self.kv_buffer = [
-                torch.zeros(shape, dtype=torch.uint8, device=self.device).view(
-                    self.store_dtype
-                )
-                for _ in range(self.layer_num)
-            ]
-        else:
-            self.kv_buffer = [
-                torch.zeros(shape, dtype=self.store_dtype, device=self.device)
-                for _ in range(self.layer_num)
-            ]
+        # Genuine ``store_dtype`` bases, as in the fused pool above.
+        self.kv_buffer = [
+            _zeros_kv_buffer(shape, self.store_dtype, self.device)
+            for _ in range(self.layer_num)
+        ]
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.kv_buffer],
             dtype=torch.uint64,
@@ -770,19 +763,13 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
             self.nope_dim,
             self.rope_dim,
         )
-        # fp8: allocate as zeroed uint8 and reinterpret (see the MHA twin).
-        if self.store_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            self.kv_buffer = [
-                torch.zeros(shape, dtype=torch.uint8, device=self.device).view(
-                    self.store_dtype
-                )
-                for _ in range(self.layer_num)
-            ]
-        else:
-            self.kv_buffer = [
-                torch.zeros(shape, dtype=self.store_dtype, device=self.device)
-                for _ in range(self.layer_num)
-            ]
+        # Genuine ``store_dtype`` bases (no uint8 dtype view), or the MLA
+        # kernel's KV donation is dropped and the extend graph materializes a
+        # second pool -- see ``_zeros_kv_buffer``.
+        self.kv_buffer = [
+            _zeros_kv_buffer(shape, self.store_dtype, self.device)
+            for _ in range(self.layer_num)
+        ]
 
     def _clear_buffers(self):
         del self.kv_buffer
