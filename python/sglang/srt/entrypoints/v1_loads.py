@@ -29,6 +29,7 @@ from fastapi.responses import Response
 from sglang.srt.runtime_context import (
     get_parallel,
 )
+from sglang.srt.managers.load_snapshot import LoadAggregate
 from sglang.srt.utils import get_device_name
 from sglang.version import __version__
 
@@ -152,4 +153,7 @@ async def get_loads(
             get_parallel().enable_dp_attention,
         ),
         "loads": loads,
+        # Computed from load_results, not from `loads`: the latter is filtered by
+        # `include`, and the gateway polls with ?include=core.
+        "aggregate": LoadAggregate.from_snapshots(load_results).to_dict(),
     }

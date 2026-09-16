@@ -95,6 +95,7 @@ impl MockWorker {
                 post(responses_cancel_handler),
             )
             .route("/flush_cache", post(flush_cache_handler))
+            .route("/v1/loads", get(v1_loads_handler))
             .route("/v1/models", get(v1_models_handler))
             .with_state(config);
 
@@ -165,6 +166,40 @@ fn fail_status_code(port: u16) -> StatusCode {
     get_fail_status_code_for_port(port)
         .and_then(|s| StatusCode::from_u16(s).ok())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Mirrors the engine's /v1/loads body, including the `aggregate` rollup the
+/// gateway's LoadMonitor reads (src/core/worker_manager.rs:220). `total_tokens`
+/// is derived from the port so each worker reports a distinct, predictable
+/// load without adding a field to MockWorkerConfig.
+async fn v1_loads_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
+    let config = config.read().await;
+    let total_tokens = config.port as i64;
+
+    Json(json!({
+        "timestamp": "2026-01-01T00:00:00+00:00",
+        "version": "test",
+        "accelerator": "mock",
+        "num_accelerators": 1,
+        "loads": [{
+            "dp_rank": 0,
+            "num_running_reqs": 1,
+            "num_waiting_reqs": 0,
+            "num_used_tokens": total_tokens,
+            "num_total_tokens": total_tokens,
+        }],
+        "aggregate": {
+            "total_running_reqs": 1,
+            "total_waiting_reqs": 0,
+            "total_reqs": 1,
+            "total_used_tokens": total_tokens,
+            "total_tokens": total_tokens,
+            "avg_token_usage": 0.0,
+            "avg_throughput": 0.0,
+            "avg_utilization": 0.0,
+        },
+    }))
+    .into_response()
 }
 
 async fn health_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
