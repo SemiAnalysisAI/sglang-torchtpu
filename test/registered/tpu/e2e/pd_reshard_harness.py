@@ -272,7 +272,7 @@ MODEL_PROFILES = {
             # build_decode_env now pins decode explicitly, and its key wins
             # because it is spread after this one -- so this value reaches the
             # PREFILL engine only.
-            "CHUNKED_PREFILL_SIZE": os.environ.get("QWEN_CHUNK_PREFILL", "384"),
+            "CHUNKED_PREFILL_SIZE": os.environ.get("QWEN_CHUNK_PREFILL", "320"),
             # Left to default to the chunk size. Pinning it lower than the
             # chunk size is not a valid pair: --max-prefill-tokens 256 with
             # --chunked-prefill-size 4096 hung precompile and the watchdog
