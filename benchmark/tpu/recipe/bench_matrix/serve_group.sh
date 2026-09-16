@@ -178,13 +178,27 @@ if [[ "$WORKER_ID" == "0" ]]; then
     wait_url "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "prefill engine 1" "$HEALTH_TIMEOUT" || exit 1
     wait_url "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" "decode engine 0" "$HEALTH_TIMEOUT" || exit 1
     wait_url "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" "decode engine 1" "$HEALTH_TIMEOUT" || exit 1
+    # mini-LB force-overrides any policy to random; the SGLang Model Gateway is
+    # the same wheel without --mini-lb. Affinity is prefill-only: a P/D decode
+    # engine runs with disable_radix_cache, so a decode-side match could never
+    # correspond to a cache hit. round_robin rather than power_of_two on decode
+    # because the load monitor reads aggregate.total_tokens from /v1/loads, which
+    # the server does not emit, and scores every worker -1.
+    ROUTER_ARGS=(--pd-disaggregation)
+    if [[ "$PD_ROUTER" == "smg" ]]; then
+        ROUTER_ARGS+=(--prefill-policy cache_aware --decode-policy round_robin)
+        ROUTER_LABEL="smg"
+    else
+        ROUTER_ARGS+=(--mini-lb)
+        ROUTER_LABEL="mini-lb"
+    fi
     "$PYTHON" -m sglang_router.launch_router \
-        --pd-disaggregation --mini-lb \
+        "${ROUTER_ARGS[@]}" \
         --prefill "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
         --prefill "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
         --decode "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" \
         --decode "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" \
-        --host 0.0.0.0 --port "$LB_PORT" > >(sed 's/^/[mini-lb] /') 2>&1 &
+        --host 0.0.0.0 --port "$LB_PORT" > >(sed "s/^/[$ROUTER_LABEL] /") 2>&1 &
     CHILD_PIDS+=("$!")
 fi
 
