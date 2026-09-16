@@ -95,6 +95,11 @@ SERVICE_ACCOUNT_TMPL = "              serviceAccountName: {sa}"
 PROFILE_ENV_TMPL = (
     "                    - name: SGLANG_TORCH_PROFILER_DIR\n"
     "                      value: {d}\n"
+    # benchmark/tpu/launch_server.sh re-exports SGLANG_TORCH_PROFILER_DIR from
+    # its own PROFILER_DIR when ENABLE_PROFILER_ENDPOINT=1, overriding the value
+    # above and writing the trace somewhere the collector never looks. Pin both.
+    "                    - name: PROFILER_DIR\n"
+    "                      value: {d}\n"
     "                    - name: PROFILE_AFTER_S\n"
     '                      value: "{after}"\n'
     "                    - name: PROFILE_SECONDS\n"
