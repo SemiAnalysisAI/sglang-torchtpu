@@ -476,6 +476,36 @@ class TestRouterFromArgsKitchenSink:
         assert router._router.tcp_keepalive_secs == 15
         assert router._router.enable_wasm is True
 
+    def test_prefix_hash_tunables_reach_rust(self):
+        args = RouterArgs(
+            worker_urls=["http://w1:8000"],
+            policy="prefix_hash",
+            prefix_token_count=7,
+            prefix_hash_load_factor=2.5,
+        )
+        router = Router.from_args(args)
+
+        assert router._router.prefix_token_count == 7
+        assert router._router.prefix_hash_load_factor == 2.5
+
+    def test_prefix_hash_tunables_reach_the_policy_config(self):
+        """The getters above stop at the struct; this covers the next hop.
+
+        `to_router_config` built PolicyConfig::PrefixHash from hardcoded
+        256/1.25 and ignored the struct entirely, which no getter can detect.
+        """
+        args = RouterArgs(
+            worker_urls=["http://w1:8000"],
+            policy="prefix_hash",
+            prefix_token_count=7,
+            prefix_hash_load_factor=2.5,
+        )
+        router = Router.from_args(args)
+
+        policy = router._router.policy_config_debug()
+        assert "prefix_token_count: 7" in policy, policy
+        assert "load_factor: 2.5" in policy, policy
+
     def test_oracle_history_backend(self):
         args = RouterArgs(
             worker_urls=["http://w1:8000"],

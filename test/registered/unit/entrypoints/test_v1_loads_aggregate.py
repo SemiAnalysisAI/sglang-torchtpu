@@ -95,27 +95,80 @@ class _FakeHttpTokenizerManager:
 
 
 class TestLoadsResponse(CustomTestCase):
-    def test_response_omits_server_side_aggregate_and_redundant_fields(self):
-        manager = _FakeHttpTokenizerManager(
+    @staticmethod
+    def _two_ranks():
+        return _FakeHttpTokenizerManager(
             [
                 LoadSnapshot(
                     dp_rank=0,
                     num_running_reqs=3,
                     num_waiting_reqs=2,
+                    num_used_tokens=100,
                     num_total_tokens=256,
-                )
+                ),
+                LoadSnapshot(
+                    dp_rank=1,
+                    num_running_reqs=3,
+                    num_waiting_reqs=2,
+                    num_used_tokens=40,
+                    num_total_tokens=100,
+                ),
             ]
         )
+
+    def test_response_carries_aggregate_but_not_the_redundant_fields(self):
+        manager = self._two_ranks()
         self.addCleanup(manager.restore)
 
         response = asyncio.run(get_loads(tokenizer_manager=manager))
 
+        self.assertEqual(response["aggregate"]["total_tokens"], 356)
+        self.assertEqual(response["aggregate"]["total_used_tokens"], 140)
+        self.assertEqual(response["aggregate"]["total_running_reqs"], 6)
+        self.assertEqual(response["aggregate"]["total_reqs"], 10)
+
+        # Still omitted -- restoring the aggregate does not bring these back.
         self.assertNotIn("dp_rank_count", response)
-        self.assertNotIn("aggregate", response)
-        self.assertEqual(len(response["loads"]), 1)
+        self.assertEqual(len(response["loads"]), 2)
         self.assertNotIn("num_total_reqs", response["loads"][0])
         self.assertEqual(response["loads"][0]["num_running_reqs"], 3)
         self.assertEqual(response["loads"][0]["num_waiting_reqs"], 2)
+
+    def test_aggregate_key_path_the_gateway_reads(self):
+        """Pins the two literal key names an external consumer depends on.
+
+        sgl-model-gateway reads json["aggregate"]["total_tokens"] at
+        src/core/worker_manager.rs:220 and falls back to -1 on any miss, which
+        makes power_of_two silently degenerate to random. Renaming either key
+        here would break it with no failure visible on this side.
+        """
+        manager = self._two_ranks()
+        self.addCleanup(manager.restore)
+
+        response = asyncio.run(get_loads(tokenizer_manager=manager))
+
+        self.assertIn("aggregate", response)
+        self.assertIn("total_tokens", response["aggregate"])
+        self.assertIsInstance(response["aggregate"]["total_tokens"], int)
+
+    def test_aggregate_survives_include_core(self):
+        """The gateway polls with ?include=core, which strips nested sections."""
+        manager = self._two_ranks()
+        self.addCleanup(manager.restore)
+
+        response = asyncio.run(get_loads(tokenizer_manager=manager, include="core"))
+
+        self.assertEqual(response["aggregate"]["total_tokens"], 356)
+
+    def test_aggregate_of_no_snapshots_is_zero(self):
+        """Startup window: read_all() skips ranks that have never published."""
+        manager = _FakeHttpTokenizerManager([])
+        self.addCleanup(manager.restore)
+
+        response = asyncio.run(get_loads(tokenizer_manager=manager))
+
+        self.assertEqual(response["aggregate"]["total_tokens"], 0)
+        self.assertEqual(response["aggregate"]["avg_token_usage"], 0.0)
 
 
 class TestLoadsAcceleratorField(CustomTestCase):

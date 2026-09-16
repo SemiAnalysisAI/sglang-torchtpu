@@ -253,6 +253,51 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
         return load
 
 
+class LoadAggregate(msgspec.Struct):
+    """Fleet-wide rollup of the per-DP-rank snapshots, for the /v1/loads body.
+
+    Derived at response time rather than stored, so nothing here touches the
+    SHM/zmq wire format. Deliberately not `array_like`: the gateway reads
+    `aggregate.total_tokens` by key (sgl-model-gateway
+    src/core/worker_manager.rs:220), and positional encoding would break it.
+    """
+
+    total_running_reqs: int = 0
+    total_waiting_reqs: int = 0
+    total_reqs: int = 0
+    total_used_tokens: int = 0
+    total_tokens: int = 0
+    avg_token_usage: float = 0.0
+    avg_throughput: float = 0.0
+    avg_utilization: float = 0.0
+
+    @classmethod
+    def from_snapshots(cls, snapshots: list[LoadSnapshot]) -> LoadAggregate:
+        """Sum the totals, mean the averages.
+
+        Sum rather than max because a gateway treats one endpoint as one worker
+        and compares absolute values: a DP-8 rank holding 8x the tokens really
+        is carrying 8x the work.
+        """
+        if not snapshots:
+            return cls()
+
+        n = len(snapshots)
+        return cls(
+            total_running_reqs=sum(s.num_running_reqs for s in snapshots),
+            total_waiting_reqs=sum(s.num_waiting_reqs for s in snapshots),
+            total_reqs=sum(s.num_running_reqs + s.num_waiting_reqs for s in snapshots),
+            total_used_tokens=sum(s.num_used_tokens for s in snapshots),
+            total_tokens=sum(s.num_total_tokens for s in snapshots),
+            avg_token_usage=round(sum(s.token_usage for s in snapshots) / n, 4),
+            avg_throughput=round(sum(s.gen_throughput for s in snapshots) / n, 2),
+            avg_utilization=round(sum(s.utilization for s in snapshots) / n, 4),
+        )
+
+    def to_dict(self) -> dict:
+        return msgspec.structs.asdict(self)
+
+
 # Flat scalar fields returned under "core": every struct field but the sections.
 _CORE_KEYS = tuple(
     f for f in LoadSnapshot.__struct_fields__ if f not in _SECTION_FIELDS

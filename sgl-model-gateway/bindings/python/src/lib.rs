@@ -362,6 +362,13 @@ struct Router {
     balance_rel_threshold: f32,
     eviction_interval_secs: u64,
     max_tree_size: usize,
+    // Getters for the same reason as the five fields below: without them a
+    // typo'd struct literal that pins the old hardcoded 256/1.25 is
+    // undetectable from Python.
+    #[pyo3(get)]
+    prefix_token_count: usize,
+    #[pyo3(get)]
+    prefix_hash_load_factor: f64,
     max_idle_secs: u64,
     assignment_mode: String,
     max_payload_size: usize,
@@ -498,8 +505,8 @@ impl Router {
                 },
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
-                    prefix_token_count: 256,
-                    load_factor: 1.25,
+                    prefix_token_count: self.prefix_token_count,
+                    load_factor: self.prefix_hash_load_factor,
                 },
             }
         };
@@ -683,6 +690,8 @@ impl Router {
         balance_rel_threshold = 1.5,
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
+        prefix_token_count = 256,
+        prefix_hash_load_factor = 1.25,
         max_idle_secs = 14400,
         assignment_mode = String::from("random"),
         max_payload_size = 512 * 1024 * 1024,
@@ -775,6 +784,8 @@ impl Router {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        prefix_token_count: usize,
+        prefix_hash_load_factor: f64,
         max_idle_secs: u64,
         assignment_mode: String,
         max_payload_size: usize,
@@ -880,6 +891,8 @@ impl Router {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
+            prefix_token_count,
+            prefix_hash_load_factor,
             max_idle_secs,
             assignment_mode,
             max_payload_size,
@@ -960,6 +973,20 @@ impl Router {
             tcp_keepalive_secs,
             enable_wasm,
         })
+    }
+
+    /// The resolved policy config, debug-formatted, for tests.
+    ///
+    /// The field getters prove a kwarg reached the struct; they cannot prove
+    /// `to_router_config` then forwards it, which is a separate hop and the one
+    /// that regressed here — `PrefixHash` pinned 256/1.25 and ignored the
+    /// struct entirely. Debug rather than JSON to avoid pulling serde_json into
+    /// this crate's dependency list for a test accessor.
+    fn policy_config_debug(&self) -> PyResult<String> {
+        let router_config = self.to_router_config().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {}", e))
+        })?;
+        Ok(format!("{:?}", router_config.policy))
     }
 
     fn start(&self) -> PyResult<()> {
