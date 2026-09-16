@@ -61,6 +61,8 @@ class RouterArgs:
     balance_rel_threshold: float = 1.5
     eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
+    prefix_token_count: int = 256  # prefix_hash: tokens hashed onto the ring
+    prefix_hash_load_factor: float = 1.25  # prefix_hash: multiple of mean load a worker may carry
     max_idle_secs: int = 4 * 3600
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
@@ -336,6 +338,18 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_tree_size,
             help="Maximum size of the approximation tree for cache-aware routing",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefix-token-count",
+            type=int,
+            default=RouterArgs.prefix_token_count,
+            help="Number of leading tokens prefix_hash hashes onto the ring. Requests sharing a longer prefix than this are indistinguishable to the policy",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefix-hash-load-factor",
+            type=float,
+            default=RouterArgs.prefix_hash_load_factor,
+            help="Multiple of the mean worker load above which prefix_hash treats a worker as overloaded and picks the least-loaded one instead",
         )
         routing_group.add_argument(
             f"--{prefix}max-idle-secs",
