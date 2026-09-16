@@ -54,6 +54,7 @@ class TestHiSparsePoolConfigurator(CustomTestCase):
 
         with get_parallel().override(attn_tp_size=1):
             configurator = object.__new__(DefaultPoolConfigurator)
+            configurator.kv_cache_dtype_str = "auto"
             return configurator._compute_cell_size(kvc, num_layers=num_layers)
 
     def test_mla_layout_without_hisparse(self):

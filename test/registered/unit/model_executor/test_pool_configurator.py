@@ -1023,7 +1023,7 @@ class TestMixedKVFormats(CustomTestCase):
                 mr = _make_model_runner(self, num_layers=2, page_size=4)
                 mr.kv_cache_dtype_str = dtype_str
                 mr.kv_cache_dtype = dtype
-                with patch.dict(
+                with get_parallel().override(attn_tp_size=1), patch.dict(
                     "sys.modules",
                     {
                         "sglang_torchtpu_meta": None,
