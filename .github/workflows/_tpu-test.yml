@@ -191,13 +191,22 @@ jobs:
             pod="$1"; dest="$RUNNER_TEMP/xprof/${pod}"
             [ -d "$dest" ] && return 0     # already collected
             mkdir -p "$dest"
-            kubectl -n tpu-ci cp "${pod}:${PROFILE_DIR}" "$dest" -c test 2>/dev/null \
-              || kubectl -n tpu-ci exec "${pod}" -c test -- tar cf - -C "${PROFILE_DIR}" . 2>/dev/null \
-                   | tar xf - -C "$dest" 2>/dev/null \
-              || { rmdir "$dest" 2>/dev/null; return 1; }
+            # Stream the tar ourselves rather than use `kubectl cp`: cp shells out
+            # to tar in the container and swallows the reason when it is missing.
+            # stderr is kept -- a silent failure here looks identical to "no trace
+            # was produced", which cost a full run to tell apart.
+            if kubectl -n tpu-ci exec "${pod}" -c test -- \
+                 sh -c "cd '${PROFILE_DIR}' && tar cf - ." > "${dest}/x.tar" 2>"${dest}/err.txt"; then
+              tar xf "${dest}/x.tar" -C "$dest" && rm -f "${dest}/x.tar"
+            else
+              echo "  copy from ${pod} failed: $(tr -d '\r' < "${dest}/err.txt" | tail -1)"
+              rm -rf "$dest"; return 1
+            fi
+            rm -f "${dest}/err.txt"
             # An empty directory is not a capture; do not let it mask a failure.
-            [ -n "$(find "$dest" -name '*.xplane.pb' -print -quit 2>/dev/null)" ] || {
-              rm -rf "$dest"; return 1; }
+            if [ -z "$(find "$dest" -name '*.xplane.pb' -print -quit 2>/dev/null)" ]; then
+              rm -rf "$dest"; return 1
+            fi
             echo "  collected $(du -sh "$dest" | cut -f1) from ${pod}"
           }
 
@@ -207,7 +216,7 @@ jobs:
           watch_profiles() {
             [ -n "${PROFILE_DIR:-}" ] || return 0
             deadline=$(( $(date +%s) + wait_s ))
-            while [ "$(date +%s)" -lt "$deadline" ]; do
+            while [ "$(date +%s)" -lt "$deadline" ] && [ -z "${stop_watch:-}" ]; do
               live=0
               for ref in $(kubectl -n tpu-ci get pods -l "$sel" -o name 2>/dev/null); do
                 pod="${ref##*/}"
@@ -218,7 +227,8 @@ jobs:
                 fi
               done
               [ "$live" = 0 ] && break
-              sleep 20
+              # Short naps so the trap is not left waiting on a long sleep.
+              for _ in 1 2 3 4; do [ -n "${stop_watch:-}" ] && break; sleep 5; done
             done
           }
 
@@ -234,7 +244,7 @@ jobs:
 
           name="$(kubectl -n tpu-ci create -f /tmp/job.yaml -o name)"
           echo "Created ${name}"
-          trap 'collect_profile; kubectl -n tpu-ci delete '"${name}"' --ignore-not-found --wait=false' EXIT
+          trap 'stop_watch=1; collect_profile; kubectl -n tpu-ci delete '"${name}"' --ignore-not-found --wait=false' EXIT
           short="${name##*/}"
           sel="jobset.sigs.k8s.io/jobset-name=${short}"
 
