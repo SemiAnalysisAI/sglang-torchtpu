@@ -9,6 +9,12 @@ filegroup(
     srcs = glob(["**"]),
 )
 
+# Export sources across the recipe package boundary for python_configs.
+filegroup(
+    name = "py_files",
+    srcs = glob(["**/*.py"]),
+)
+
 # One py_binary per single-host serve config: `bazel run //benchmark/tpu/recipe:<model>`
 # boots that model's server. The binary is serve_group.py with the config fixed;
 # extra serve_group args (e.g. --dry-run) pass through after `--`.
@@ -17,24 +23,35 @@ filegroup(
 # hermetic interpreter must carry sglang on its path (//python:sglang). The
 # recipe configs are read as runfiles, not installed packages (see the sys.path
 # bootstrap in serve_group.py), so the benchmark/tpu tree rides along in data.
-[py_binary(
-    name = name,
-    srcs = ["bench_matrix/serve_group.py"],
-    args = ["--config", "recipe/configs/%s" % config],
-    data = [":pkg"],
-    main = "bench_matrix/serve_group.py",
-    python_version = "3.12",
-    deps = [
-        "//benchmark/tpu:python_configs",
-        "//python:sglang",
-    ],
-) for name, config in {
+_SINGLE_HOST_CONFIGS = {
     "gpt_oss_120b": "gpt_oss_120b/server.py",
     "mimo_25": "mimo/launch_mimo_25.py",
     "qwen3_coder_480b": "qwen3_coder_480b/server.py",
     "qwen3_coder_30b": "qwen3_coder_30b_a3b_fp8.py",
     "qwen3_0_6b": "qwen3_0_6b.py",
-}.items()]
+}
+
+# pywrap_torch_tpu supplies the native extensions needed by the server;
+# //python:sglang supplies its Python modules but not the extension bundle.
+# Keep executable paths distinct from recipe directories in runfiles.
+[py_binary(
+    name = name + "_server",
+    srcs = ["bench_matrix/serve_group.py"],
+    args = ["--config", "recipe/configs/%s" % config],
+    data = ["//benchmark/tpu:runtime"],
+    main = "bench_matrix/serve_group.py",
+    python_version = "3.12",
+    deps = [
+        "//benchmark/tpu:python_configs",
+        "//python:sglang",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
+    ],
+) for name, config in _SINGLE_HOST_CONFIGS.items()]
+
+[alias(
+    name = name,
+    actual = ":" + name + "_server",
+) for name in _SINGLE_HOST_CONFIGS]
 
 # Same launcher for the multihost recipes: each host runs the binary and
 # serve_group.py derives its node rank from TPU_WORKER_ID.
@@ -48,6 +65,7 @@ filegroup(
     deps = [
         "//benchmark/tpu:python_configs",
         "//python:sglang",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],
 ) for name, config in {
     "deepseek_r1_0528_mh": "deepseek_r1_0528_mh.py",
@@ -73,6 +91,7 @@ filegroup(
     deps = [
         "//benchmark/tpu:python_configs",
         "//python:sglang",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],
 ) for name in [
     "gpt_oss_120b_1host_pc",
@@ -94,6 +113,7 @@ py_binary(
     deps = [
         "//benchmark/tpu:python_configs",
         "//python:sglang",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],
 )
 
@@ -107,5 +127,6 @@ py_binary(
     deps = [
         "//benchmark/tpu:python_configs",
         "//python:sglang",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],
 )

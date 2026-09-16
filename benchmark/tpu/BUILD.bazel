@@ -5,7 +5,7 @@ package(default_visibility = ["//visibility:public"])
 # Expose Python recipe configs to Bazel's hermetic Python interpreter.
 py_library(
     name = "python_configs",
-    srcs = glob(["recipe/**/*.py"]),
+    srcs = ["//benchmark/tpu/recipe:py_files"],
     imports = ["../.."],
 )
 
@@ -17,8 +17,17 @@ filegroup(
     srcs = glob(["*"]),
 )
 
-# The whole benchmark/tpu tree, recipe subtree included, for callers that
-# resolve files under either half at runtime.
+# The whole benchmark/tpu tree, including helpers such as dump_meta.py and
+# the recipe configs used by the server launchers.
+filegroup(
+    name = "runtime",
+    srcs = [
+        ":pkg",
+        "//benchmark/tpu/recipe:pkg",
+    ],
+)
+
+# Compatibility label for callers that need the recipe subtree.
 alias(
     name = "recipe",
     actual = "//benchmark/tpu/recipe:pkg",
