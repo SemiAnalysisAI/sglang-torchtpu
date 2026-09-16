@@ -360,8 +360,11 @@ class CompiledFunction:
         # placeholders. The goal is to get a flat list of output Tensors.
         with (
             dynamo_timed("direct_compile_trace"),
+            # EXPERIMENT (#718): revert to the pre-#673 tracing mode. The torch-tpu
+            # bump and this line landed together (05cf57362b, 2026-09-14 18:25 UTC),
+            # 11 minutes after the last clean Qwen3-Coder-480B P/D reshard run.
             execution_mode.set_eager_mode(
-                execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
+                execution_mode.EagerMode.INTERNAL_DEFER_ALL
             ),
             ExitStack() as stack,
         ):
