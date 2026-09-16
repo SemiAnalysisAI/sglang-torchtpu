@@ -7,9 +7,10 @@ export TP_SIZE=16
 export EP_SIZE=16
 export DP_SIZE=2
 export MAX_RUNNING=4
-export TORCH_COMPILE_MAX_BS=4
-# Cover the single-request tail as well as concurrent decode.
-export TPU_COMPILE_BS="1 2 4"
+export TORCH_COMPILE_MAX_BS=8
+# DPA pads decode rows to attention TP (16 / 2 = 8), even at concurrency 4.
+# Include that physical shape as well as the smaller warmup buckets.
+export TPU_COMPILE_BS="1 2 4 8"
 # The server divides the global prefill budget by DP_SIZE: 4096 per group.
 export CHUNKED_PREFILL_SIZE=8192
 export MAX_PREFILL_TOKENS=8192
