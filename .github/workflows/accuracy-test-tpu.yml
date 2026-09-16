@@ -1,175 +1,33 @@
-# TPU accuracy evals -- test/registered/tpu/nightly-accuracy/ via run_suite, ONE
-# JOB PER BENCHMARK so each eval takes its own slice, runs in parallel, and gets
-# its own runtime budget (a slow AIME cannot cost GPQA its score). Scores are
-# emitted for longitudinal tracking without quality thresholds (report_only).
-# Stage [2] of the nightly (nightly-test-tpu.yml calls this workflow with a
-# prebuilt image); this action is also the isolated trigger, for collecting a
-# datapoint on demand without waiting for a nightly:
-#   gh workflow run accuracy-test-tpu.yml [-f model=gpt-oss-120b] [-f ref=<branch>]
-#
-# Single-host models go through run_suite (`accuracy`); the multihost ones parked out
-# of the nightly lane (DeepSeek-R1-0528, Kimi-K2.6) take the JobSet launch path
-# (`accuracy-multihost`).
-name: Accuracy Test (TPU)
-run-name: "Accuracy Test (TPU)${{ inputs.update-dashboard && ' [publish]' || '' }}"
-
+name: TPU Base Cache Diagnostic
 on:
   workflow_dispatch:
-    inputs:
-      ref:
-        description: "Git ref to test"
-        required: false
-        default: main
-      model:
-        # `nightly` is what nightly-test-tpu.yml passes: every single-host
-        # accuracy suite, but NOT the ondemand multihost models parked out of
-        # the nightly lane (their slices are dispatch-only on purpose).
-        description: "Which model to evaluate"
-        required: false
-        default: all
-        type: choice
-        options: [all, nightly, gpt-oss-120b, deepseek-r1-0528, kimi-k26]
-      update-dashboard:
-        description: "Publish this run's results to the dashboard (main only)"
-        required: false
-        default: false
-        type: boolean
-  workflow_call:
-    inputs:
-      ref:
-        required: false
-        default: main
-        type: string
-      model:
-        required: false
-        default: all
-        type: string
-      image:
-        required: false
-        default: ""
-        type: string
-
-concurrency:
-  # Only governs standalone dispatches (a called workflow rides the caller's
-  # group). Keyed on ref so runs for different branches proceed in parallel; same
-  # ref still serializes, so a re-dispatch cannot race the previous run's scores.
-  group: tpu-accuracy-${{ inputs.ref || github.ref }}
-  cancel-in-progress: false
-
+permissions:
+  contents: read
+  id-token: write
 jobs:
-  # Standalone runs build their own image; the nightly passes one in so every
-  # stage of the run tests a single build.
-  build:
-    if: ${{ (inputs.image || '') == '' }}
-    uses: ./.github/workflows/_tpu-build.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-    permissions:
-      contents: read
-      id-token: write
-
-  accuracy:
-    needs: build
-    # `build` may be skipped (image passed in); !cancelled() keeps this alive then.
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","nightly","gpt-oss-120b"]'), inputs.model || 'all') }}
-    strategy:
-      # A broken benchmark must not cancel the others' scores.
-      fail-fast: false
-      matrix:
-        # One suite (= one file, one job, one slice) per benchmark, each paired
-        # with the name its Kubernetes objects get. JobSet validates the POD name,
-        # tpu-ci-<run_name>-<5 rand>-slice-0-0-<5 rand>, against 63 chars, which
-        # leaves run_name 34; the suite itself (38-41) is rejected at admission.
-        # Suites stay spelled out: the pr-gate lint greps this file for each
-        # nightly-accuracy registration's literal suite. The next model adds its
-        # legs here and a choice above; selection stays in the job-level `if`
-        # while a single model is the only single-host entrant.
-        include:
-          - suite: nightly-tpu-accuracy-gpt-oss-120b-aime
-            run_name: accuracy-gpt-oss-120b-aime
-          - suite: nightly-tpu-accuracy-gpt-oss-120b-gpqa
-            run_name: accuracy-gpt-oss-120b-gpqa
-          - suite: nightly-tpu-accuracy-gpt-oss-120b-gsm8k
-            run_name: accuracy-gpt-oss-120b-gsm8k
-          - suite: nightly-tpu-accuracy-gpt-oss-120b-mmlupro
-            run_name: accuracy-gpt-oss-120b-mmlupro
-    name: ${{ matrix.suite }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      suite: ${{ matrix.suite }}
-      run_name: ${{ matrix.run_name }}
-      nightly: true
-      # gpt-oss-120b serves from the shared ROX disk at /weights.
-      weights_pvc: model-weights-rox
-      # Admission is separate; each eval file gets a 90-minute runtime budget.
-      timeout_per_file: 5400
-    permissions:
-      contents: read
-      id-token: write
-
-  # Discovers suite nightly-tpu-multihost-ondemand, which the nightly lane does not
-  # scan, so each test file keeps owning its launch spec. `model` filters the
-  # discovered groups by name.
-  discover-multihost:
-    needs: build
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","deepseek-r1-0528","kimi-k26"]'), inputs.model || 'all') }}
+  probe:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      groups: ${{ steps.d.outputs.groups }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        id: auth
         with:
-          ref: ${{ inputs.ref || 'main' }}
-      - id: d
+          workload_identity_provider: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc-v2
+          service_account: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
+          token_format: access_token
+          create_credentials_file: false
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Read cached base image without suppressing errors
         env:
-          MODEL: ${{ inputs.model || 'all' }}
+          CI_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
         run: |
-          set -euo pipefail
-          groups="$(python3 .github/tpu-ci/discover_multihost.py \
-                      --suite nightly-tpu-multihost-ondemand)"
-          if [ "$MODEL" != "all" ]; then
-            groups="$(jq -c --arg m "$MODEL" \
-                        '[.[] | select(.name | contains($m))]' <<< "$groups")"
-          fi
-          echo "groups=$groups" >> "$GITHUB_OUTPUT"
-          echo "discovered groups: $groups"
-
-  accuracy-multihost:
-    needs: [build, discover-multihost]
-    if: >-
-      ${{ !cancelled() && needs.discover-multihost.result == 'success'
-          && needs.discover-multihost.outputs.groups != '[]' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        group: ${{ fromJSON(needs.discover-multihost.outputs.groups) }}
-    name: ${{ matrix.group.name }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: ${{ matrix.group.name }}
-      lane: nightly
-      nightly: true
-      launch_script: ${{ matrix.group.launch_script }}
-      files: ${{ matrix.group.files }}
-      hosts: ${{ matrix.group.hosts }}
-      weights_pvc: ${{ matrix.group.weights_pvc }}
-      timeout_per_file: ${{ matrix.group.timeout_per_file }}
-      # The group's COMPACT name (discovery hashes the path): the file stem would
-      # push the pod name past 63 chars for deepseek-r1-0528. The test stays
-      # legible in the job name and in the job's own "== test files: ==" line.
-      run_name: ${{ matrix.group.run_name }}
-    permissions:
-      contents: read
-      id-token: write
+          set -uo pipefail
+          tokfile="${RUNNER_TEMP}/tpu-ci.token"
+          printf '%s' "$CI_ACCESS_TOKEN" > "$tokfile"
+          trap 'rm -f "$tokfile"' EXIT
+          image="us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu-base:base-873bb68496b6c24c"
+          gcloud artifacts docker images describe "$image" --project sglang-torchtpu --access-token-file="$tokfile"
+          echo "describe_rc=$?"
+          gcloud artifacts docker tags list us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu-base \
+            --filter='tag:base-873bb68496b6c24c' --format=json \
+            --project sglang-torchtpu --access-token-file="$tokfile"
+          echo "tags_rc=$?"
