@@ -242,6 +242,12 @@ MODEL_PROFILES = {
         extra_server_args=("--tpu-fp8-runtime", "channelwise"),
         extra_launch_env={
             "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
+            # EXPERIMENT (#718): cap the RPA v3 mixed-case query block at 128.
+            # bq_sz = min(2048 // 8, next_power_of_2(chunk) // 2) reaches 256
+            # exactly when the chunk exceeds 256, which is the measured
+            # corruption boundary. If capping it makes chunk 1024 clean, the
+            # attention kernel at bq_sz=256 is the fault, not the chunk size.
+            "SGLANG_TPU_RPA_BQ_CAP": os.environ.get("QWEN_RPA_BQ_CAP", "128"),
             # Keep every prefill forward inside the 256-token compile graph.
             #
             # Extends compiled at the 1024-token bucket corrupt this model's

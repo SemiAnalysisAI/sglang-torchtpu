@@ -26,6 +26,7 @@ sglang-jax specific features:
 import functools
 import inspect as _inspect
 import logging
+import os
 from enum import Enum
 
 import jax
@@ -1576,6 +1577,19 @@ def get_default_block_sizes(
                 bkv_csz = bkv_sz
             else:
                 bq_sz = min(2048 // num_q_heads_per_kv_head, max_q // 2)
+                # EXPERIMENT (issue #718): cap the mixed/prefill query block.
+                #
+                # On Qwen3-Coder-480B under multihost P/D, output is correct
+                # whenever this lands at <=128 and is repeated-token garbage
+                # whenever it reaches 256. bq_sz = min(2048 // 8, max_q // 2)
+                # here, and max_q = next_power_of_2(chunked_prefill_size), so it
+                # saturates at 256 exactly when the chunk exceeds 256 -- which is
+                # precisely the measured boundary (256 clean, 384/512/1024
+                # corrupt). Independent of the compiled bucket set and of the
+                # length of the request being served.
+                bq_cap = int(os.environ.get("SGLANG_TPU_RPA_BQ_CAP", "0"))
+                if bq_cap > 0:
+                    bq_sz = min(bq_sz, bq_cap)
                 bkv_sz = min(2048, max_kv // 2)
                 bq_csz = min(1024 // num_q_heads_per_kv_head, max_q // 2)
                 bkv_csz = (
