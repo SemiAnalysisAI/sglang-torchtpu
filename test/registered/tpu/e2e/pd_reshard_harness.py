@@ -242,12 +242,11 @@ MODEL_PROFILES = {
         extra_server_args=("--tpu-fp8-runtime", "channelwise"),
         extra_launch_env={
             "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
-            # EXPERIMENT (#718): cap the RPA v3 mixed-case query block at 128.
-            # bq_sz = min(2048 // 8, next_power_of_2(chunk) // 2) reaches 256
-            # exactly when the chunk exceeds 256, which is the measured
-            # corruption boundary. If capping it makes chunk 1024 clean, the
-            # attention kernel at bq_sz=256 is the fault, not the chunk size.
-            "SGLANG_TPU_RPA_BQ_CAP": os.environ.get("QWEN_RPA_BQ_CAP", "128"),
+            # EXPERIMENT (#718): FALSIFIED by run 35048436119. Capping the RPA
+            # v3 mixed-case query block at 128 (log confirms no bq>128 anywhere)
+            # left chunk 1024 just as corrupt: 93/156/216-token prompts 3/3,
+            # 2/3, 3/3. bq_sz=256 is not the fault. Knob kept, default off.
+            "SGLANG_TPU_RPA_BQ_CAP": os.environ.get("QWEN_RPA_BQ_CAP", "0"),
             # Keep every prefill forward inside the 256-token compile graph.
             #
             # Extends compiled at the 1024-token bucket corrupt this model's
@@ -574,13 +573,15 @@ def build_decode_env(
         "MAX_RUNNING": values.get("MAX_RUNNING", "8"),
         "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1 2 4 8"),
         "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", QWEN_COMPILE_TOKENS),
-        # EXPERIMENT #718: pin the DECODE side at the known-good 256 while the
-        # prefill side is varied, so the two can finally be told apart. Spread
-        # after _common_launch_env, so it wins over the profile's value. Empty
-        # for any other model, which leaves the launcher default untouched.
+        # EXPERIMENT #718: every clean cell so far had prefill chunk == decode
+        # chunk == 256, and every corrupt one had prefill != 256 while decode
+        # stayed 256. "Prefill must be <= 256" and "the two engines must agree"
+        # fit the whole matrix equally well. Run both at 1024 to separate them.
+        # Spread after _common_launch_env, so it wins over the profile's value.
+        # Empty for any other model, which leaves the launcher default alone.
         "CHUNKED_PREFILL_SIZE": values.get(
             "QWEN_CHUNK_DECODE",
-            "256" if profile.key == "qwen3_coder_480b" else "",
+            "1024" if profile.key == "qwen3_coder_480b" else "",
         ),
         "MEM_FRACTION_STATIC": values.get(
             "MEM_FRACTION_STATIC", profile.mem_fraction_decode
