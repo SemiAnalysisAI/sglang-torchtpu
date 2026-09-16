@@ -24,16 +24,27 @@ python3 -m benchmark.tpu.recipe.bench_matrix.serve_group \
     --config recipe/configs/gpt_oss_120b/server.py --dry-run
 ```
 
+### With Bazel
+
+Each single-host serve config also has a `py_binary` that pins it, so a model
+can be launched without naming the config path. `bazel run` serves the model;
+extra `serve_group` args (e.g. `--dry-run`) go after `--`:
+
+```bash
+bazel run //benchmark/tpu/recipe:gpt_oss_120b -- --dry-run
+```
+
 ## Single-host serve configs
 
-The per-model examples most people want. Each has a `Sample usage` docstring.
+The per-model examples most people want. Each has a `Sample usage` docstring
+and a matching `//benchmark/tpu/recipe:<target>` binary.
 
-| config | model | shape |
-|---|---|---|
-| `configs/gpt_oss_120b/server.py` | GPT-OSS-120B (MXFP4 MoE) | 1 host, tp8 / ep8 |
-| `configs/qwen3_coder_480b/server.py` | Qwen3-Coder-480B (FP8 MoE) | 1 host, tp8 / ep8 |
-| `configs/qwen3_coder_30b_a3b_fp8.py` | Qwen3-Coder-30B (FP8 MoE) | 1 host, tp8 / ep8 |
-| `configs/qwen3_0_6b.py` | Qwen3-0.6B (tracer e2e) | single chip |
+| config | bazel target | model | shape |
+|---|---|---|---|
+| `configs/gpt_oss_120b/server.py` | `//benchmark/tpu/recipe:gpt_oss_120b` | GPT-OSS-120B (MXFP4 MoE) | 1 host, tp8 / ep8 |
+| `configs/qwen3_coder_480b/server.py` | `//benchmark/tpu/recipe:qwen3_coder_480b` | Qwen3-Coder-480B (FP8 MoE) | 1 host, tp8 / ep8 |
+| `configs/qwen3_coder_30b_a3b_fp8.py` | `//benchmark/tpu/recipe:qwen3_coder_30b` | Qwen3-Coder-30B (FP8 MoE) | 1 host, tp8 / ep8 |
+| `configs/qwen3_0_6b.py` | `//benchmark/tpu/recipe:qwen3_0_6b` | Qwen3-0.6B (tracer e2e) | single chip |
 
 ## Layout
 
