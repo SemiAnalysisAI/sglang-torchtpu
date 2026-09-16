@@ -432,12 +432,16 @@ def _fused_moe_jax(
     if w_quant_bits:
         assert w_quant_bits == 4, f"unsupported w_quant_bits={w_quant_bits}"
         # Packed INT4 modes share the existing GMM and keep packed HBM weights.
-        # a8-kernel dequantizes groups in VMEM before a larger BF16 dot;
+        # vmem-bf16 dequantizes groups in VMEM before a larger BF16 dot;
         # the default applies each scale after its short-K group product.
         from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.tpu_moe_utils import (
+            INT4_MOE_MODE_VMEM_BF16,
+            resolve_int4_moe_mode,
+        )
 
         dequantize_int4_in_vmem = (
-            not use_vmem_fp8 and envs.SGLANG_TPU_USE_W4A8_MOE.get() == "a8-kernel"
+            not use_vmem_fp8 and resolve_int4_moe_mode() == INT4_MOE_MODE_VMEM_BF16
         )
         rhs_quant_dtype = jnp.int4
         maybe_quantize_lhs = use_vmem_fp8

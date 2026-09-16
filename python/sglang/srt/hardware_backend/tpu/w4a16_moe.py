@@ -106,9 +106,12 @@ def prepare_tpu_w4a16_moe_weights(layer: torch.nn.Module, group_size: int) -> No
     if getattr(layer, "is_tpu_w4a16_converted", False):
         return
 
-    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.tpu_moe_utils import (
+        INT4_MOE_MODE_VMEM_FP8,
+        resolve_int4_moe_mode,
+    )
 
-    if envs.SGLANG_TPU_USE_W4A8_MOE.get() == "vmem-fp8":
+    if resolve_int4_moe_mode() == INT4_MOE_MODE_VMEM_FP8:
         # Normalize before converting checkpoint offset-binary nibbles.
         prepare_tpu_vmem_fp8_scales(layer, group_size)
 

@@ -741,11 +741,10 @@ class TpuCompressedTensorsWNA16MoE(CompressedTensorsWNA16MoE):
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.tpu_moe_utils import resolve_int4_moe_mode
 
-        mode = envs.SGLANG_TPU_USE_W4A8_MOE.get()
-        if mode not in (None, "", "a8-kernel", "vmem-fp8"):
-            raise ValueError(f"Unsupported TPU INT4 MoE mode: {mode!r}")
+        # Raises on an unknown mode before any weight is touched.
+        resolve_int4_moe_mode()
 
         from sglang.srt.hardware_backend.tpu.w4a16_moe import (
             prepare_tpu_w4a16_moe_weights,

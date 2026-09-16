@@ -1626,11 +1626,12 @@ class Envs:
     # Preserve FP32 expert scales and apply GMM partial scales in FP32.
     SGLANG_TPU_FP8_MOE_FP32_SCALES = EnvBool(False)
     # INT4 MoE execution mode; packed INT4 stays in HBM in every mode. Unset:
-    # W4A16 group products. "a8-kernel": dequantize groups in VMEM before a BF16
-    # matmul in gmm_v2 (historical name; activations stay BF16). "vmem-fp8":
-    # FP8 weight tiles and activations inside gmm_v2, with load-time normalized
-    # group/channel scales.
-    SGLANG_TPU_USE_W4A8_MOE = EnvStr(None)
+    # W4A16 group products (scale each 32-K group's partial dot). "vmem-bf16":
+    # dequantize each group in VMEM to BF16, then one dot per tile; activations
+    # stay BF16. "vmem-fp8": FP8 weight tiles and FP8 activations inside
+    # gmm_v2, with load-time normalized group/channel scales. Values are
+    # validated by tpu_moe_utils.resolve_int4_moe_mode.
+    SGLANG_TPU_INT4_MOE_MODE = EnvStr(None)
     # Shape-guarded fast path and fused gate/up for Kimi BS1 in vmem-fp8 mode.
     SGLANG_TPU_KIMI_BS1_OPT = EnvBool(True)
     SGLANG_TPU_KIMI_FP8_GATE_UP_FUSION = EnvBool(True)

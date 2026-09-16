@@ -72,7 +72,7 @@ class TestVmemFp8Preparation(CustomTestCase):
             1e-12
         )
         normalized = scales.float() / channel
-        with envs.SGLANG_TPU_USE_W4A8_MOE.override("vmem-fp8"):
+        with envs.SGLANG_TPU_INT4_MOE_MODE.override("vmem-fp8"):
             prepare_tpu_w4a16_moe_weights(layer, 32)
             for prefix in ("w13", "w2"):
                 weight = getattr(layer, prefix + "_weight_packed")
@@ -102,7 +102,7 @@ class TestVmemFp8Preparation(CustomTestCase):
         layer = _FakeMoELayer(
             packed.clone(), scales.clone(), packed.clone(), scales.clone()
         )
-        with envs.SGLANG_TPU_USE_W4A8_MOE.override("vmem-fp8"):
+        with envs.SGLANG_TPU_INT4_MOE_MODE.override("vmem-fp8"):
             with self.assertRaisesRegex(ValueError, "group size 32"):
                 prepare_tpu_w4a16_moe_weights(layer, 16)
         torch.testing.assert_close(layer.w13_weight_packed, packed, rtol=0, atol=0)
@@ -110,3 +110,31 @@ class TestVmemFp8Preparation(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestResolveInt4MoeMode(CustomTestCase):
+    def test_unset_and_empty_mean_the_default_w4a16_path(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.tpu_moe_utils import resolve_int4_moe_mode
+
+        with envs.SGLANG_TPU_INT4_MOE_MODE.override(None):
+            self.assertIsNone(resolve_int4_moe_mode())
+        with envs.SGLANG_TPU_INT4_MOE_MODE.override(""):
+            self.assertIsNone(resolve_int4_moe_mode())
+
+    def test_named_modes_pass_through(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.tpu_moe_utils import resolve_int4_moe_mode
+
+        for mode in ("vmem-bf16", "vmem-fp8"):
+            with self.subTest(mode=mode):
+                with envs.SGLANG_TPU_INT4_MOE_MODE.override(mode):
+                    self.assertEqual(resolve_int4_moe_mode(), mode)
+
+    def test_unknown_mode_raises(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.tpu_moe_utils import resolve_int4_moe_mode
+
+        with envs.SGLANG_TPU_INT4_MOE_MODE.override("w4a8"):
+            with self.assertRaisesRegex(ValueError, "Unsupported TPU INT4 MoE mode"):
+                resolve_int4_moe_mode()
