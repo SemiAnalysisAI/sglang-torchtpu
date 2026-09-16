@@ -286,11 +286,11 @@ class KVCacheConfigurator:
         )
 
     def _validate_mxint8(self) -> None:
-        shared_mxint8_draft = False
+        """Backend extensions must override this before configurator construction."""
         if self.kv_cache_dtype_str != "mxint8":
             if self.kv_cache_dtype == torch.int8:
                 raise ValueError("INT8 KV storage requires explicit mxint8 format")
-            shared_mxint8_draft = (
+            mxint8_draft = (
                 not self.is_draft_worker
                 and getattr(
                     resolving_view(self.server_args),
@@ -303,95 +303,14 @@ class KVCacheConfigurator:
                     or self.spec_algorithm.is_standalone()
                 )
             )
-            if not shared_mxint8_draft:
+            if not mxint8_draft:
                 return
-            # EAGLE shares target geometry. Validate that geometry/backend before
-            # target profiling can price a draft that cannot use the MXINT8 pool.
-            if self.kv_cache_dtype not in (
-                torch.bfloat16,
-                torch.float8_e4m3fn,
-                torch.float8_e5m2,
-            ):
-                raise ValueError(
-                    "MXINT8 EAGLE draft requires BF16/FP8 target KV storage"
-                )
-        from sglang_torchtpu_meta.srt.backends.attention.kv_mxint8 import (
-            validate_mxint8_config,
-            validate_mxint8_features,
+        raise ValueError(
+            "MXINT8 KV cache is unsupported without a compatible backend extension; "
+            "configure support before constructing the KV cache configurator."
         )
-
-        cfg = resolving_view(self.server_args)
-        group_size = (
-            getattr(self.server_args, "tpu_mxint8_group_size", 32)
-            if shared_mxint8_draft
-            else self.kv_group_size
-        )
-        draft_backend = (
-            self.speculative_draft_attention_backend
-            or cfg.speculative_draft_attention_backend
-            if self.is_draft_worker or shared_mxint8_draft
-            else None
-        )
-        validate_mxint8_config(
-            kv_cache_dtype_str=(
-                "mxint8" if shared_mxint8_draft else self.kv_cache_dtype_str
-            ),
-            kv_cache_dtype=torch.int8 if shared_mxint8_draft else self.kv_cache_dtype,
-            model_dtype=self.model_dtype,
-            device=self.device,
-            prefill_backend=draft_backend
-            or cfg.prefill_attention_backend
-            or cfg.attention_backend,
-            decode_backend=draft_backend
-            or cfg.decode_attention_backend
-            or cfg.attention_backend,
-            head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-            ),
-            head_dim=self.model_config.head_dim,
-            v_head_dim=self.model_config.v_head_dim,
-            page_size=self.pool_page_size,
-            use_mla=self.use_mla_backend,
-            group_size=group_size,
-        )
-        if self.is_hybrid_swa:
-            validate_mxint8_config(
-                kv_cache_dtype_str="mxint8",
-                kv_cache_dtype=torch.int8,
-                model_dtype=self.model_dtype,
-                device=self.device,
-                prefill_backend=draft_backend
-                or cfg.prefill_attention_backend
-                or cfg.attention_backend,
-                decode_backend=draft_backend
-                or cfg.decode_attention_backend
-                or cfg.attention_backend,
-                head_num=self.model_config.get_swa_num_kv_heads(
-                    get_parallel().attn_tp_size
-                ),
-                head_dim=self.model_config.swa_head_dim,
-                v_head_dim=self.model_config.swa_v_head_dim,
-                page_size=self.pool_page_size,
-                use_mla=self.use_mla_backend,
-                group_size=group_size,
-            )
-        validate_mxint8_features(cfg)
-        if self.post_capture_kv_active or self.is_hybrid_swa_compress:
-            raise ValueError(
-                "MXINT8 does not support post-capture or compressed KV pools"
-            )
-        if is_minimax_sparse(self.model_config.hf_config) or is_deepseek_v4(
-            self.model_config.hf_config
-        ):
-            raise ValueError("MXINT8 requires the native rank-4 MHA pool")
 
     def _tpu_mha_pool_class(self):
-        if self.kv_cache_dtype_str == "mxint8":
-            from sglang_torchtpu_meta.srt.backends.attention.kv_pool import (
-                TpuRpaSeqKVPool,
-            )
-
-            return TpuRpaSeqKVPool
         return current_platform.get_mha_kv_pool_cls()
 
     def _mxint8_pool_kwargs(self) -> dict:
