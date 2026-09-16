@@ -248,6 +248,21 @@ MODEL_PROFILES = {
             # scores 0.98 at 885 cold tokens, so fp8 weights are the suspect,
             # gpt-oss being MXFP4-native. Remove this once that is fixed.
             "CHUNKED_PREFILL_SIZE": "256",
+            # EXPERIMENT (#718): drop the 64 bucket so the SAME 62-token prompt
+            # that is always clean today is forced into the 256 graph instead.
+            #
+            # Prompt, tokens, KV pages and page contents are all unchanged; the
+            # only difference is how far the extend is padded. Corrupt here
+            # proves the fault depends on the compiled shape and its padding
+            # rather than on anything in the request, which points at padded
+            # rows reaching attention unmasked -- our code, not the compiler.
+            # Clean here breaks the bucket law, since 93 tokens in this same
+            # 256 graph are corrupt.
+            #
+            # The mirror of this experiment on libtpu 0.0.44.1 already behaved
+            # this way one bucket up: a single 1024 bucket corrupted even a
+            # 62-token prompt (34360046804).
+            "TPU_COMPILE_TOKENS": "256",
         },
         chat_template_kwargs={"enable_thinking": False},
     ),
