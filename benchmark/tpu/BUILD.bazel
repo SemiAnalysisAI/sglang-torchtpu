@@ -9,9 +9,17 @@ py_library(
     imports = ["../.."],
 )
 
-# Shell recipes, evaluation configs, and helper programs resolved at runtime by
-# sglang.test.tpu. Executable bits are preserved in Bazel runfiles.
+# Shell launchers, evaluation configs, and helper programs in this directory,
+# resolved at runtime by sglang.test.tpu. Executable bits are preserved in
+# Bazel runfiles.
 filegroup(
-    name = "runtime",
-    srcs = glob(["**"], exclude = ["BUILD.bazel"]),
+    name = "pkg",
+    srcs = glob(["*"]),
+)
+
+# The whole benchmark/tpu tree, recipe subtree included, for callers that
+# resolve files under either half at runtime.
+alias(
+    name = "recipe",
+    actual = "//benchmark/tpu/recipe:pkg",
 )

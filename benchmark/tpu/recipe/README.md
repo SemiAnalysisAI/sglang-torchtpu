@@ -26,9 +26,10 @@ python3 -m benchmark.tpu.recipe.bench_matrix.serve_group \
 
 ### With Bazel
 
-Each single-host serve config also has a `py_binary` that pins it, so a model
-can be launched without naming the config path. `bazel run` serves the model;
-extra `serve_group` args (e.g. `--dry-run`) go after `--`:
+Each serve config — single-host and multihost alike — also has a `py_binary`
+that pins it, so a model can be launched without naming the config path.
+`bazel run` serves the model; extra `serve_group` args (e.g. `--dry-run`) go
+after `--`:
 
 ```bash
 bazel run //benchmark/tpu/recipe:gpt_oss_120b -- --dry-run
@@ -45,6 +46,7 @@ and a matching `//benchmark/tpu/recipe:<target>` binary.
 | `configs/qwen3_coder_480b/server.py` | `//benchmark/tpu/recipe:qwen3_coder_480b` | Qwen3-Coder-480B (FP8 MoE) | 1 host, tp8 / ep8 |
 | `configs/qwen3_coder_30b_a3b_fp8.py` | `//benchmark/tpu/recipe:qwen3_coder_30b` | Qwen3-Coder-30B (FP8 MoE) | 1 host, tp8 / ep8 |
 | `configs/qwen3_0_6b.py` | `//benchmark/tpu/recipe:qwen3_0_6b` | Qwen3-0.6B (tracer e2e) | single chip |
+| `configs/mimo/launch_mimo_25.py` | `//benchmark/tpu/recipe:mimo_25` | MiMo-V2.5 (FP8 MoE) | 1 host, tp8 / ep8 / dp2 |
 
 ## Layout
 
@@ -55,7 +57,9 @@ and a matching `//benchmark/tpu/recipe:<target>` binary.
   plus the two-host `multihost_base` for the spec variants), `qwen3_coder_480b/`
   (serve, bench, and the `nightly/` agentic P/D sweep), `mimo/`, `bench_matrix/`.
 - `configs/*_mh.py` — multi-host variants, launched by the CI JobSet across
-  hosts rather than by hand.
+  hosts rather than by hand. Each has a matching `//benchmark/tpu/recipe:<name>`
+  binary; every host runs it, and `serve_group.py` derives its node rank from
+  `TPU_WORKER_ID`.
 - `bench_matrix/` — the concurrency/prefix-cache sweep machinery
   (`serve_group.py` is the launcher above; `bench_leg.py`, `run_sweep.py` drive
   the matrix legs).
