@@ -2924,7 +2924,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
         """Tight estimate matching eagle_utils.eagle_prepare_for_decode allocation."""
-        reserve = get_alloc_reserve_per_decode()
+        # EAGLE device accept routing (host-resident req_to_token + overlap)
+        # reserves one slot beyond the double buffer; see the matching
+        # comment in eagle_prepare_for_decode. DFlash/DSpark never route on
+        # device.
+        reserve = get_alloc_reserve_per_decode() + int(
+            self.req_to_token_pool.host_resident
+            and self.enable_overlap
+            and not self.spec_algorithm.is_dflash_family()
+        )
         total = 0
         for r in requests:
             x = max(0, r.kv.kv_committed_len + reserve - r.kv.kv_allocated_len)
