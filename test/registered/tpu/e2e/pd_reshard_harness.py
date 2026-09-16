@@ -157,7 +157,7 @@ LB_LOG = "/tmp/pd_lb.log"
 # "the 1024 graph is compiled" from "the chunk size is large". Prompts longer
 # than 256 will fail the bucketer in that configuration; the short lengths are
 # the measurement.
-QWEN_COMPILE_TOKENS = os.environ.get("QWEN_COMPILE_TOKENS", "64 256")
+QWEN_COMPILE_TOKENS = os.environ.get("QWEN_COMPILE_TOKENS", "64 256 1024")
 
 
 class ModelProfile(msgspec.Struct, frozen=True, kw_only=True):
@@ -272,7 +272,7 @@ MODEL_PROFILES = {
             # build_decode_env now pins decode explicitly, and its key wins
             # because it is spread after this one -- so this value reaches the
             # PREFILL engine only.
-            "CHUNKED_PREFILL_SIZE": os.environ.get("QWEN_CHUNK_PREFILL", "320"),
+            "CHUNKED_PREFILL_SIZE": os.environ.get("QWEN_CHUNK_PREFILL", "1024"),
             # Left to default to the chunk size. Pinning it lower than the
             # chunk size is not a valid pair: --max-prefill-tokens 256 with
             # --chunked-prefill-size 4096 hung precompile and the watchdog
