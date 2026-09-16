@@ -20,15 +20,20 @@ jobs:
         env:
           CI_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
         run: |
-          set +e
-          set -uo pipefail
+          set -euo pipefail
           tokfile="${RUNNER_TEMP}/tpu-ci.token"
           printf '%s' "$CI_ACCESS_TOKEN" > "$tokfile"
           trap 'rm -f "$tokfile"' EXIT
-          image="us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu-base:base-873bb68496b6c24c"
-          gcloud artifacts docker images describe "$image" --project sglang-torchtpu --access-token-file="$tokfile"
-          echo "describe_rc=$?"
-          gcloud artifacts docker tags list us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu-base \
-            --filter='tag:base-873bb68496b6c24c' --format=json \
-            --project sglang-torchtpu --access-token-file="$tokfile"
-          echo "tags_rc=$?"
+          image="us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu-base"
+          for tag in base-873bb68496b6c24c diagnostic-nonexistent-${{ github.run_id }}; do
+            cached_tag=$(gcloud artifacts docker tags list "$image" \
+              --filter="tag~'/tags/${tag}$'" --format='value(tag)' \
+              --project sglang-torchtpu --access-token-file="$tokfile")
+            if [[ "$tag" == base-* ]]; then
+              test "${cached_tag##*/}" = "$tag"
+              echo "PASS: existing base image reused: $cached_tag"
+            else
+              test -z "$cached_tag"
+              echo "PASS: absent tag correctly returns a cache miss"
+            fi
+          done
