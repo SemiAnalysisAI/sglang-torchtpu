@@ -18,6 +18,7 @@ from sglang.srt.compilation.support_torch_compile import (
     CompilePolicy,
     support_torch_compile,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
@@ -33,6 +34,7 @@ from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagl
 from sglang.srt.model_executor.tpu_graph_runner import (
     TpuGraphRunner,
     _augment_spec_policy,
+    _complete_pending_warmups,
 )
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -115,7 +117,10 @@ class TestTpuGraphRunner(CustomTestCase):
         direct_patcher = patch(
             "sglang.srt.hardware_backend.tpu.compilation."
             "decoder_compile_policy.DecoderTpuCompilePolicy._direct_compile",
-            return_value=MagicMock(name="direct_compiled"),
+            return_value=(
+                MagicMock(name="direct_compiled"),
+                MagicMock(name="direct_warmup_async"),
+            ),
         )
         self.mock_direct_compile = direct_patcher.start()
         self.addCleanup(direct_patcher.stop)
@@ -137,6 +142,12 @@ class TestTpuGraphRunner(CustomTestCase):
         )
         platform_patcher.start()
         self.addCleanup(platform_patcher.stop)
+        parallel_patcher = patch(
+            "sglang.srt.model_executor.tpu_graph_runner.get_parallel",
+            return_value=SimpleNamespace(tp_size=1),
+        )
+        parallel_patcher.start()
+        self.addCleanup(parallel_patcher.stop)
         backend_patcher = patch(
             "sglang.srt.hardware_backend.tpu.compilation."
             "decoder_compile_policy.current_platform",
@@ -360,6 +371,120 @@ class TestTpuGraphRunner(CustomTestCase):
         TpuGraphRunner(self._runner_for(model))
         self.mock_precompile.assert_called_once()
 
+    def test_pending_warmups_compile_before_barrier_and_execution(self):
+        events = []
+
+        class _Pending:
+            def __init__(self, index):
+                self.index = index
+
+            def start_compiling(self):
+                events.append(f"start:{self.index}")
+
+            def wait_compiled(self):
+                events.append(f"compile:{self.index}")
+
+            def wait(self):
+                events.append(f"execute:{self.index}")
+
+        class _Group:
+            def all_gather_object(self, value):
+                events.append("gather")
+                return [value, value]
+
+            def barrier(self):
+                events.append("barrier")
+
+        parallel = SimpleNamespace(tp_size=2, tp_group=_Group())
+        with patch(
+            "sglang.srt.model_executor.tpu_graph_runner.get_parallel",
+            return_value=parallel,
+        ):
+            _complete_pending_warmups([_Pending(0), _Pending(1)])
+
+        self.assertEqual(
+            events,
+            [
+                "start:0",
+                "start:1",
+                "compile:0",
+                "compile:1",
+                "gather",
+                "barrier",
+                "execute:0",
+                "execute:1",
+            ],
+        )
+
+    def test_pending_warmup_compile_error_is_shared_before_execution(self):
+        events = []
+
+        class _Pending:
+            def start_compiling(self):
+                events.append("start")
+
+            def wait_compiled(self):
+                events.append("compile")
+                raise ValueError("bad graph")
+
+            def wait(self):
+                events.append("execute")
+
+        class _Group:
+            def all_gather_object(self, value):
+                events.append("gather")
+                return [value, value]
+
+            def barrier(self):
+                events.append("barrier")
+
+        parallel = SimpleNamespace(tp_size=2, tp_group=_Group())
+        with (
+            patch(
+                "sglang.srt.model_executor.tpu_graph_runner.get_parallel",
+                return_value=parallel,
+            ),
+            self.assertRaisesRegex(RuntimeError, "bad graph"),
+        ):
+            _complete_pending_warmups([_Pending()])
+
+        self.assertEqual(events, ["start", "compile", "gather"])
+
+    def test_pending_warmup_count_mismatch_fails_before_execution(self):
+        pending = MagicMock()
+
+        class _Group:
+            def all_gather_object(self, value):
+                return [value, (0, ())]
+
+            def barrier(self):
+                raise AssertionError("barrier must not run")
+
+        parallel = SimpleNamespace(tp_size=2, tp_group=_Group())
+        with (
+            patch(
+                "sglang.srt.model_executor.tpu_graph_runner.get_parallel",
+                return_value=parallel,
+            ),
+            self.assertRaisesRegex(RuntimeError, "counts differ"),
+        ):
+            _complete_pending_warmups([pending])
+
+        pending.wait_compiled.assert_called_once_with()
+        pending.start_compiling.assert_called_once_with()
+        pending.wait.assert_not_called()
+
+    def test_async_precompile_error_is_reported_through_rank_join(self):
+        model = _model_with(forward=MagicMock())
+        runner = self._runner_for(model, tpu_compile_tracer="direct")
+        self.mock_precompile.side_effect = ValueError("bad trace")
+
+        with (
+            patch.object(envs.SGLANG_DIRECT_COMPILE_ASYNC, "get", return_value=True),
+            self.assertRaisesRegex(RuntimeError, "bad trace"),
+        ):
+            TpuGraphRunner(runner)
+
     def test_discovers_annotated_module(self):
         class _VisionPolicy(CompilePolicy):
             platform = "tpu"
@@ -436,9 +561,12 @@ class TestTpuGraphRunner(CustomTestCase):
         def import_module(path):
             return modules.get(path, SimpleNamespace())
 
-        with patch.object(
-            tpu_patches.importlib, "import_module", side_effect=import_module
-        ), patch.object(tpu_patches, "_dynamic_compile_unwrapped", False):
+        with (
+            patch.object(
+                tpu_patches.importlib, "import_module", side_effect=import_module
+            ),
+            patch.object(tpu_patches, "_dynamic_compile_unwrapped", False),
+        ):
             tpu_patches._unwrap_dynamic_compile_fns()
 
         self.assertIs(getattr(modules[repetition_path], target), eager)
@@ -493,16 +621,13 @@ class TestDraftTorchCompileInstall(CustomTestCase):
         from sglang.srt.runtime_context import get_flags
 
         runner = self._runner(device)
-        with patch(
-            f"{self._SETUP_MOD}.GraphSharedOutput.create_for_model_runner"
-        ), patch(f"{self._SETUP_MOD}.EagerRunner"), patch(
-            f"{self._SETUP_MOD}.capture_prefill_graph"
-        ), patch(
-            f"{self._SETUP_MOD}.prealloc_symmetric_memory_pool"
-        ), patch(
-            f"{self._SETUP_MOD}.capture_decode_graph"
-        ) as decode_capture, get_flags().capture.override(
-            enable_torch_compile=enable_torch_compile
+        with (
+            patch(f"{self._SETUP_MOD}.GraphSharedOutput.create_for_model_runner"),
+            patch(f"{self._SETUP_MOD}.EagerRunner"),
+            patch(f"{self._SETUP_MOD}.capture_prefill_graph"),
+            patch(f"{self._SETUP_MOD}.prealloc_symmetric_memory_pool"),
+            patch(f"{self._SETUP_MOD}.capture_decode_graph") as decode_capture,
+            get_flags().capture.override(enable_torch_compile=enable_torch_compile),
         ):
             capture_cuda_graphs(model_runner=runner, capture_decode_cuda_graph=False)
         return decode_capture
@@ -529,21 +654,23 @@ class TestDraftTorchCompileInstall(CustomTestCase):
         runner.server_args.forward_hooks = [{"name": "capture"}]
         events = []
 
-        with patch(
-            f"{self._SETUP_MOD}.GraphSharedOutput.create_for_model_runner"
-        ), patch(f"{self._SETUP_MOD}.EagerRunner"), patch(
-            f"{self._SETUP_MOD}.register_forward_hooks",
-            side_effect=lambda *_: events.append("hooks"),
-        ), patch(
-            f"{self._SETUP_MOD}.capture_prefill_graph",
-            side_effect=lambda **_: events.append("prefill") or MagicMock(),
-        ), patch(
-            f"{self._SETUP_MOD}.prealloc_symmetric_memory_pool"
-        ), patch(
-            f"{self._SETUP_MOD}.capture_decode_graph",
-            side_effect=lambda **_: events.append("decode") or MagicMock(),
-        ), get_flags().capture.override(
-            enable_torch_compile=True
+        with (
+            patch(f"{self._SETUP_MOD}.GraphSharedOutput.create_for_model_runner"),
+            patch(f"{self._SETUP_MOD}.EagerRunner"),
+            patch(
+                f"{self._SETUP_MOD}.register_forward_hooks",
+                side_effect=lambda *_: events.append("hooks"),
+            ),
+            patch(
+                f"{self._SETUP_MOD}.capture_prefill_graph",
+                side_effect=lambda **_: events.append("prefill") or MagicMock(),
+            ),
+            patch(f"{self._SETUP_MOD}.prealloc_symmetric_memory_pool"),
+            patch(
+                f"{self._SETUP_MOD}.capture_decode_graph",
+                side_effect=lambda **_: events.append("decode") or MagicMock(),
+            ),
+            get_flags().capture.override(enable_torch_compile=True),
         ):
             capture_cuda_graphs(model_runner=runner)
 
@@ -590,19 +717,25 @@ class TestDraftPrecompileOrdering(CustomTestCase):
             side_effect=lambda: events.append("capture")
         )
 
-        with patch(
-            "sglang.srt.speculative.eagle_worker_v2." "speculative_moe_backend_context",
-            side_effect=contextlib.nullcontext,
-        ), patch(
-            "sglang.srt.speculative.eagle_worker_v2."
-            "speculative_moe_a2a_backend_context",
-            side_effect=contextlib.nullcontext,
-        ), patch(
-            "sglang.srt.speculative.eagle_worker_v2.check_cuda_graph_backend",
-            return_value=False,
-        ), patch(
-            "sglang.srt.speculative.eagle_worker_v2._is_tpu",
-            True,
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2."
+                "speculative_moe_backend_context",
+                side_effect=contextlib.nullcontext,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2."
+                "speculative_moe_a2a_backend_context",
+                side_effect=contextlib.nullcontext,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.check_cuda_graph_backend",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2._is_tpu",
+                True,
+            ),
         ):
             worker.init_cuda_graphs()
 

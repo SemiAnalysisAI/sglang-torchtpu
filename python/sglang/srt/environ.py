@@ -1013,6 +1013,11 @@ class Envs:
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
+    # Opt in to compiling independent direct warmups concurrently.
+    SGLANG_DIRECT_COMPILE_ASYNC = EnvBool(False)
+    # XLA compilation is internally parallel and memory-intensive. Keep only a
+    # small number of whole-model compilations in flight per TPU worker.
+    SGLANG_DIRECT_COMPILE_ASYNC_WORKERS = EnvInt(2)
 
     # ===================================================================
     # Expert parallel load balancing

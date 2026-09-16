@@ -5,7 +5,9 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import threading
 from collections.abc import Callable, Hashable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields
@@ -20,9 +22,11 @@ from torch.nn.utils.stateless import _reparametrize_module
 from torch_tpu._internal import execution_mode
 from torch_tpu._internal.compile import tpu_torch_compile
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
     PallasForwardMetadata,
 )
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -79,6 +83,50 @@ def insert_callback(
 
 SpecializationKey = Callable[..., Hashable]
 _STATIC_INPUT_TYPES = (bool, int, float, str, Enum)
+
+
+class _BoundedCompileExecutor:
+    """Bound submitted compile jobs as well as compiler worker threads."""
+
+    def __init__(self, max_workers: int) -> None:
+        if max_workers < 1:
+            raise ValueError(
+                "SGLANG_DIRECT_COMPILE_ASYNC_WORKERS must be at least 1, "
+                f"got {max_workers}."
+            )
+        self.max_workers = max_workers
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="direct_compile",
+        )
+        self._slots = threading.BoundedSemaphore(max_workers)
+
+    def submit(self, fn: Callable[..., Any], *args: Any) -> Future[Any]:
+        self._slots.acquire()
+        try:
+            future = self._executor.submit(fn, *args)
+        except BaseException:
+            self._slots.release()
+            raise
+        future.add_done_callback(lambda _future: self._slots.release())
+        return future
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=True)
+
+
+_ASYNC_COMPILE_EXECUTOR: _BoundedCompileExecutor | None = None
+_ASYNC_COMPILE_EXECUTOR_LOCK = threading.Lock()
+
+
+def _get_async_compile_executor() -> _BoundedCompileExecutor:
+    global _ASYNC_COMPILE_EXECUTOR
+    with _ASYNC_COMPILE_EXECUTOR_LOCK:
+        if _ASYNC_COMPILE_EXECUTOR is None:
+            _ASYNC_COMPILE_EXECUTOR = _BoundedCompileExecutor(
+                envs.SGLANG_DIRECT_COMPILE_ASYNC_WORKERS.get()
+            )
+        return _ASYNC_COMPILE_EXECUTOR
 
 
 def _resolve_dotted_attr(root: object, path: str) -> tuple[object, str, object]:
@@ -142,6 +190,10 @@ def direct_compile(
     Any non-Tensor values are baked directly into the graph; all Tensor
     values are graph inputs.
     Then, it lowers it to MLIR and then compiles it with XLA/PJRT.
+
+    ``CompiledFunction.warmup_async`` traces and builds MLIR, then returns a
+    ``PendingCall``. The graph runner starts compilation only after every MLIR
+    module is prepared, and waiting on the call executes the compiled graph.
 
     This API is specialized for SGLang inference. A more general API adds
     complexity and can be added when needed.
@@ -245,6 +297,24 @@ class CompiledFunction:
         self._ignored_argnames = ignored_argnames
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        artifact = self._get_artifact(args, kwargs)
+        return artifact((args, kwargs))
+
+    def warmup_async(self, *args: Any, **kwargs: Any) -> PendingCall:
+        """Prepare compilation and execute this call when ``wait`` is called."""
+        artifact = self._get_artifact(args, kwargs, _get_async_compile_executor())
+        return PendingCall(
+            artifact.wait_compiled,
+            lambda: artifact((args, kwargs)),
+            artifact.start_compiling,
+        )
+
+    def _get_artifact(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        executor: _BoundedCompileExecutor | None = None,
+    ) -> _CompiledArtifact:
         key = self.specialization_key(*args, **kwargs)
         artifact = self.cache.get(key)
         if artifact is None:
@@ -255,12 +325,15 @@ class CompiledFunction:
                     "'fail_on_recompile'. direct_compile specialization key: "
                     f"{key!r}"
                 )
-            artifact = self._compile(args, kwargs)
+            artifact = self._compile(args, kwargs, executor)
             self.cache[key] = artifact
-        return artifact((args, kwargs))
+        return artifact
 
     def _compile(
-        self, args: tuple[Any, ...], kwargs: dict[str, Any]
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        executor: _BoundedCompileExecutor | None,
     ) -> _CompiledArtifact:
         """Compile one specialization into a PJRT executable."""
 
@@ -433,20 +506,32 @@ class CompiledFunction:
             len(kv_pool_inputs),
             len(inserted_callbacks),
         )
-        with dynamo_timed("direct_compile_traverse_and_compile"):
-            # Placeholders do not retain the physical layout of their buffers.
-            argument_layouts = []
-            for tensor in flat_inputs:
-                layout = None
-                if tensor.device.type == "tpu":
-                    layout = tpu_torch_compile.get_device_layout_if_materialized(tensor)
-                argument_layouts.append(layout[0] if layout is not None else [])
-            compile_result = tpu_torch_compile.traverse_and_compile(
-                result_tensors, graph_inputs, argument_layouts=argument_layouts
+        # Placeholders do not retain the physical layout of their buffers.
+        argument_layouts = []
+        for tensor in flat_inputs:
+            layout = None
+            if tensor.device.type == "tpu":
+                layout = tpu_torch_compile.get_device_layout_if_materialized(tensor)
+            argument_layouts.append(layout[0] if layout is not None else [])
+        if executor is None:
+            executable = _compile_executable(
+                result_tensors, graph_inputs, argument_layouts
             )
-        logger.info("[direct_compile] compilation finished")
+            logger.info("[direct_compile] compilation finished")
+        else:
+            with dynamo_timed("direct_compile_build_mlir"):
+                module = tpu_torch_compile.build_mlir(
+                    result_tensors,
+                    graph_inputs,
+                    argument_layouts=argument_layouts,
+                )
+            executable = _DeferredExecutable(
+                module=module,
+                executor=executor,
+            )
+            logger.info("[direct_compile] MLIR prepared")
         return _CompiledArtifact(
-            executable=compile_result.executable,
+            executable=executable,
             model_inputs=tuple(model_inputs),
             kv_pool=self._kv_pool,
             tensor_inputs_key_paths=tuple(tensor_inputs_key_paths),
@@ -461,7 +546,7 @@ class CompiledFunction:
 
 @dataclass(frozen=True)
 class _CompiledArtifact:
-    """Wrap a TorchTPU PJRT executable with input/output/mutation handling."""
+    """Wrap a PJRT executable, or its deferred compile, with runtime handling."""
 
     executable: Any
     model_inputs: tuple[torch.Tensor, ...]
@@ -472,7 +557,20 @@ class _CompiledArtifact:
     output_count: int
     callbacks: tuple[Callable[[torch.Tensor], None], ...] = ()
 
+    def start_compiling(self) -> None:
+        if isinstance(self.executable, _DeferredExecutable):
+            self.executable.start()
+
+    def wait_compiled(self) -> None:
+        if isinstance(self.executable, _DeferredExecutable):
+            self.executable.result()
+
     def __call__(self, call: tuple[tuple[Any, ...], dict[str, Any]]) -> Any:
+        executable = (
+            self.executable.result()
+            if isinstance(self.executable, _DeferredExecutable)
+            else self.executable
+        )
         kv_pool_inputs = self.kv_pool.get_state() if self.kv_pool is not None else []
         inputs = [*self.model_inputs, *kv_pool_inputs]
         # Resolve explicit inputs by path, similar to Dynamo sources.
@@ -497,7 +595,7 @@ class _CompiledArtifact:
                 )
             inputs.append(value)
 
-        outputs = tpu_torch_compile.execute(self.executable, inputs)
+        outputs = tpu_torch_compile.execute(executable, inputs)
 
         # Copy updated KV state back into the live pool tensors.
         with torch.no_grad():
@@ -518,6 +616,52 @@ class _CompiledArtifact:
         return tree_util.tree_unflatten(
             self.output_treespec, outputs[: self.output_count]
         )
+
+
+class _DeferredExecutable:
+    """Compile a fully built MLIR module after all direct traces are complete."""
+
+    def __init__(self, module: Any, executor: _BoundedCompileExecutor) -> None:
+        self._module = module
+        self._executor = executor
+        self._future: Future[Any] | None = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._lock:
+            if self._future is not None:
+                return
+            module = self._module
+            self._future = self._executor.submit(_compile_mlir, module)
+            self._module = None
+
+    def result(self) -> Any:
+        self.start()
+        assert self._future is not None
+        return self._future.result()
+
+
+def _compile_executable(
+    result_tensors: list[torch.Tensor],
+    graph_inputs: list[Any],
+    argument_layouts: list[list[int]],
+) -> Any:
+    """Return an executable through TorchTPU's cache-aware compile path."""
+    with dynamo_timed("direct_compile_traverse_and_compile"):
+        result = tpu_torch_compile.traverse_and_compile(
+            result_tensors,
+            graph_inputs,
+            argument_layouts=argument_layouts,
+        )
+    return result.executable
+
+
+def _compile_mlir(module: Any) -> Any:
+    """Compile an already-built MLIR module without touching trace state."""
+    with dynamo_timed("direct_compile_compile_mlir"):
+        executable = tpu_torch_compile.compile_mlir(module)
+    logger.info("[direct_compile] compilation finished")
+    return executable
 
 
 def _get_path(value: Any, path: tree_util.KeyPath) -> Any:

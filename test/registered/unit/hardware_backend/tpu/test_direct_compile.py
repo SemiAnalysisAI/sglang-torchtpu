@@ -1,8 +1,10 @@
 """Tests for direct TPU compilation and artifact dispatch."""
 
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -97,6 +99,37 @@ class _KVPool:
 
 
 class TestDirectCompile(CustomTestCase):
+    def test_async_compile_executor_bounds_in_flight_work(self):
+        executor = direct_compile._BoundedCompileExecutor(max_workers=1)
+        first_started = Event()
+        release_first = Event()
+        second_submitted = Event()
+
+        def first():
+            first_started.set()
+            release_first.wait()
+
+        try:
+            first_future = executor.submit(first)
+            self.assertTrue(first_started.wait(timeout=5))
+
+            def submit_second():
+                second_future = executor.submit(lambda: None)
+                second_submitted.set()
+                second_future.result()
+
+            with ThreadPoolExecutor(max_workers=1) as submitter:
+                submit_future = submitter.submit(submit_second)
+                self.assertFalse(second_submitted.wait(timeout=0.05))
+                release_first.set()
+                submit_future.result(timeout=5)
+
+            first_future.result(timeout=5)
+            self.assertTrue(second_submitted.is_set())
+        finally:
+            release_first.set()
+            executor.shutdown()
+
     def test_fail_on_recompile_stance(self):
         compiled = direct_compile.direct_compile(
             lambda value: value,
@@ -115,6 +148,55 @@ class TestDirectCompile(CustomTestCase):
 
         compile_fn.assert_called_once()
 
+    def test_async_compile_starts_after_mlir_is_prepared(self):
+        compiled = direct_compile.direct_compile(
+            lambda value: value + value,
+            specialization_key=lambda value: tuple(value.shape),
+        )
+        compiler = direct_compile.tpu_torch_compile
+        value = torch.ones(2)
+        result = torch.full((2,), 2.0)
+        executor = direct_compile._BoundedCompileExecutor(max_workers=1)
+
+        try:
+            with (
+                patch.object(
+                    direct_compile,
+                    "_is_tpu_tensor",
+                    side_effect=lambda item: isinstance(item, torch.Tensor),
+                ),
+                patch.object(
+                    direct_compile.execution_mode,
+                    "set_eager_mode",
+                    return_value=nullcontext(),
+                ),
+                patch.object(
+                    compiler,
+                    "placeholder_like",
+                    side_effect=lambda tensor: tensor.clone(),
+                ),
+                patch.object(compiler, "build_mlir", return_value="module") as build,
+                patch.object(
+                    compiler, "compile_mlir", return_value="executable"
+                ) as compile_mlir,
+                patch.object(compiler, "execute", return_value=[result]),
+                patch.object(
+                    direct_compile,
+                    "_get_async_compile_executor",
+                    return_value=executor,
+                ),
+            ):
+                pending = compiled.warmup_async(value)
+                build.assert_called_once()
+                self.assertEqual(build.call_args.kwargs["argument_layouts"], [[]])
+                compile_mlir.assert_not_called()
+
+                pending.start_compiling()
+                self.assertTrue(torch.equal(pending.wait(), result))
+                compile_mlir.assert_called_once_with("module")
+        finally:
+            executor.shutdown()
+
     @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
     def test_torch_tpu_cache_hit_for_equivalent_compilations(self):
         def fn(value):
@@ -126,26 +208,35 @@ class TestDirectCompile(CustomTestCase):
                 specialization_key=lambda value: tuple(value.shape),
             )
 
-        value = torch.ones(2, device="tpu")
-        expected = torch.full((2,), 2.0)
-        torch.tpu._clear_cache()
-        requests_before = torch.tpu._get_cache_requests()
-        hits_before = torch.tpu._get_cache_hits()
-        misses_before = torch.tpu._get_cache_misses()
+        def run(compiled_fn, value, async_compile):
+            if async_compile:
+                return compiled_fn.warmup_async(value).wait()
+            return compiled_fn(value)
 
-        torch.testing.assert_close(new_compiled_fn()(value).cpu(), expected)
-        self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
-        self.assertEqual(torch.tpu._get_cache_hits(), hits_before)
-        self.assertEqual(torch.tpu._get_cache_misses(), misses_before + 1)
+        for async_compile in (False, True):
+            with self.subTest(async_compile=async_compile):
+                value = torch.ones(2, device="tpu")
+                expected = torch.full((2,), 2.0)
+                torch.tpu._clear_cache()
+                requests_before = torch.tpu._get_cache_requests()
+                hits_before = torch.tpu._get_cache_hits()
+                misses_before = torch.tpu._get_cache_misses()
 
-        requests_before = torch.tpu._get_cache_requests()
-        hits_before = torch.tpu._get_cache_hits()
-        misses_before = torch.tpu._get_cache_misses()
+                result = run(new_compiled_fn(), value, async_compile)
+                torch.testing.assert_close(result.cpu(), expected)
+                self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
+                self.assertEqual(torch.tpu._get_cache_hits(), hits_before)
+                self.assertEqual(torch.tpu._get_cache_misses(), misses_before + 1)
 
-        torch.testing.assert_close(new_compiled_fn()(value).cpu(), expected)
-        self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
-        self.assertEqual(torch.tpu._get_cache_hits(), hits_before + 1)
-        self.assertEqual(torch.tpu._get_cache_misses(), misses_before)
+                requests_before = torch.tpu._get_cache_requests()
+                hits_before = torch.tpu._get_cache_hits()
+                misses_before = torch.tpu._get_cache_misses()
+
+                result = run(new_compiled_fn(), value, async_compile)
+                torch.testing.assert_close(result.cpu(), expected)
+                self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
+                self.assertEqual(torch.tpu._get_cache_hits(), hits_before + 1)
+                self.assertEqual(torch.tpu._get_cache_misses(), misses_before)
 
     @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
     def test_preserves_model_and_argument_layouts(self):

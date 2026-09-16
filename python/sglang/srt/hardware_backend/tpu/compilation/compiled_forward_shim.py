@@ -24,6 +24,7 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
@@ -625,8 +626,10 @@ class CompiledForwardShim:
         self,
         compiled_fn: Callable[..., Any],
         policy: DecoderCompilePolicy,
+        warmup_async_fn: Callable[..., Any] | None = None,
     ) -> None:
         self.fn = compiled_fn
+        self.warmup_async_fn = warmup_async_fn
         self.policy = policy
         self._recompilation_checker = None
         self._model_label = ""
@@ -695,6 +698,21 @@ class CompiledForwardShim:
 
     def __call__(
         self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        forward_batch: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        return self._call(self.fn, input_ids, positions, forward_batch, *args, **kwargs)
+
+    def warmup_async(self, *args: Any, **kwargs: Any) -> Any:
+        """Queue direct compilation and defer execution until ``wait``."""
+        return self._call(self.warmup_async_fn, *args, **kwargs)
+
+    def _call(
+        self,
+        fn: Callable[..., Any],
         input_ids: torch.Tensor | None,
         positions: torch.Tensor | None,
         forward_batch: Any,
@@ -776,13 +794,24 @@ class CompiledForwardShim:
             )
         saved.update(_pin_fields(forward_batch, _PINNED_LOGPROB_FIELDS))
         try:
-            out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
-            spec_info = forward_batch.spec_info
-            if spec_info is None or not spec_info.keep_outputs_padded:
-                out = self.policy.finalize_forward_batch(out, forward_batch)
+            out = fn(input_ids, positions, forward_batch, *args, **kwargs)
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
             _restore_fields(forward_batch, saved)
+        if isinstance(out, PendingCall):
+            return out.then(
+                lambda result: self._finish_forward(
+                    result, forward_batch, wants_input_logprob
+                )
+            )
+        return self._finish_forward(out, forward_batch, wants_input_logprob)
+
+    def _finish_forward(
+        self, out: Any, forward_batch: Any, wants_input_logprob: bool = False
+    ) -> Any:
+        spec_info = forward_batch.spec_info
+        if spec_info is None or not spec_info.keep_outputs_padded:
+            out = self.policy.finalize_forward_batch(out, forward_batch)
 
         # After the restore: LogitsMetadata.from_forward_batch branches on
         # capture_hidden_mode, so the gather must see the caller's value.
