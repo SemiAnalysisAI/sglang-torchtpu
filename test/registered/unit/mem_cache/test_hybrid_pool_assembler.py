@@ -4,12 +4,17 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.managers.cache_controller import BatchDoneCounter
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
     _split_hicache_size,
     build_full_draft_pools,
+    build_kv_only_stack,
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -128,6 +133,88 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertEqual(build_host_pool.call_args.kwargs["host_to_device_ratio"], 1.0)
         self.assertEqual(len(specs), 1)
         self.assertIs(entries[0].host_pool, draft_host_pool)
+
+
+class TestKvOnlyStackBackendDispatch(CustomTestCase):
+    """A hybrid model run with ``--disable-hybrid-swa-memory`` falls back to the
+    plain-KV stack, which built the base controller directly instead of
+    dispatching on ``io_backend``. Under raiden that installed a per-layer
+    ``LayerDoneCounter`` -- whose device streams do not exist on TPU -- and the
+    first forward's whole-batch reload gate died with AttributeError.
+    """
+
+    def _build(self, io_backend):
+        params = MagicMock()
+        with (
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
+                "build_kv_only_group"
+            ),
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.get_memory",
+                return_value=SimpleNamespace(
+                    hicache_write_policy="write_through",
+                    hicache_io_backend=io_backend,
+                    hicache_host_memory_mode="pinned",
+                ),
+            ),
+            patch.object(HybridCacheController, "create_for_backend") as dispatch,
+        ):
+            _, controller = build_kv_only_stack(
+                params=params,
+                kv_pool=MagicMock(),
+                full_layer_mapping={i: i for i in range(4)},
+                load_cache_event=MagicMock(),
+                storage_backend=None,
+                use_mla=False,
+            )
+        return dispatch, controller
+
+    def test_kv_only_stack_dispatches_on_io_backend(self):
+        dispatch, controller = self._build("raiden")
+
+        dispatch.assert_called_once()
+        self.assertEqual(dispatch.call_args.kwargs["io_backend"], "raiden")
+        self.assertIs(controller, dispatch.return_value)
+
+    def test_kv_only_stack_dispatch_is_backend_agnostic(self):
+        dispatch, controller = self._build("kernel")
+
+        dispatch.assert_called_once()
+        self.assertEqual(dispatch.call_args.kwargs["io_backend"], "kernel")
+        self.assertIs(controller, dispatch.return_value)
+
+
+class TestBatchDoneCounterGate(CustomTestCase):
+    """``CompiledForwardShim`` gates each forward on the counter's whole-batch
+    ``wait()``. A ``wait()`` that returns without blocking on the consuming
+    slot's reload event lets the model read KV the H2D scatter has not landed
+    yet -- wrong output instead of a crash.
+    """
+
+    def test_wait_blocks_on_the_consumer_slot_event(self):
+        counter = BatchDoneCounter()
+        event = MagicMock()
+        producer = counter.update_producer()
+        counter.set_event(producer, event)
+        counter.set_consumer(producer)
+
+        counter.wait()
+
+        event.synchronize.assert_called_once_with()
+
+    def test_wait_blocks_on_the_consuming_batch_not_the_newest_reload(self):
+        counter = BatchDoneCounter()
+        consumed, newest = MagicMock(), MagicMock()
+        consuming_slot = counter.update_producer()
+        counter.set_event(consuming_slot, consumed)
+        counter.set_consumer(consuming_slot)
+        counter.set_event(counter.update_producer(), newest)
+
+        counter.wait()
+
+        consumed.synchronize.assert_called_once_with()
+        newest.synchronize.assert_not_called()
 
 
 if __name__ == "__main__":
