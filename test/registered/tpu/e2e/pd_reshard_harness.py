@@ -224,7 +224,7 @@ MODEL_PROFILES = {
         max_total_tokens=262144,
         device_pool_tokens_hint=262144,
         gsm8k_threshold=0.80,
-        extra_server_args=("--tpu-fp8-runtime", "channelwise"),
+        extra_server_args=("--tpu-fp8-runtime", "blockwise"),
         extra_launch_env={
             "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
             # Keep every prefill forward inside the 256-token compile graph.
