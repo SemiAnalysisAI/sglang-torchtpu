@@ -29,6 +29,11 @@ on:
         default: all
         type: choice
         options: [all, nightly, gpt-oss-120b, deepseek-r1-0528, kimi-k26]
+      test_filter:
+        description: "Substring of a multihost test file path; runs only matching tests"
+        required: false
+        default: ""
+        type: string
       update-dashboard:
         description: "Publish this run's results to the dashboard (main only)"
         required: false
@@ -43,6 +48,10 @@ on:
       model:
         required: false
         default: all
+        type: string
+      test_filter:
+        required: false
+        default: ""
         type: string
       image:
         required: false
@@ -133,13 +142,27 @@ jobs:
       - id: d
         env:
           MODEL: ${{ inputs.model || 'all' }}
+          TEST_FILTER: ${{ inputs.test_filter }}
+          UPDATE_DASHBOARD: ${{ inputs.update-dashboard }}
         run: |
           set -euo pipefail
+          if [ -n "$TEST_FILTER" ] && [ "$UPDATE_DASHBOARD" = "true" ]; then
+            echo "::error::test_filter cannot be combined with update-dashboard"
+            exit 1
+          fi
           groups="$(python3 .github/tpu-ci/discover_multihost.py \
                       --suite nightly-tpu-multihost-ondemand)"
           if [ "$MODEL" != "all" ]; then
             groups="$(jq -c --arg m "$MODEL" \
-                        '[.[] | select(.name | contains($m))]' <<< "$groups")"
+                        '[.[] | select(.name | contains($m | gsub("-"; "_")))]' <<< "$groups")"
+          fi
+          if [ -n "$TEST_FILTER" ]; then
+            groups="$(jq -c --arg f "$TEST_FILTER" \
+                        '[.[] | select(.files | contains($f))]' <<< "$groups")"
+            if [ "$groups" = "[]" ]; then
+              echo "::error::test_filter matched no multihost tests"
+              exit 1
+            fi
           fi
           echo "groups=$groups" >> "$GITHUB_OUTPUT"
           echo "discovered groups: $groups"

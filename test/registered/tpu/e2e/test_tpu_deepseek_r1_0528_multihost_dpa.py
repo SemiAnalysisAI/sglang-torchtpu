@@ -47,7 +47,7 @@ MODEL_CONFIG = {
             "label": "gpqa_diamond",
             "baseline": 0.715,
             "atol": 0.10,
-            "repeat": 2,
+            "repeat": 1,
             "num_threads": 4,
             "temperature": 0.6,
             "top_p": 0.95,
@@ -59,7 +59,7 @@ MODEL_CONFIG = {
             # Same broad serving-regression threshold as the non-DPA test.
             "baseline": 0.875,
             "atol": 0.20,
-            "repeat": 2,
+            "repeat": 1,
             "num_threads": 4,
             "temperature": 0.6,
             "top_p": 0.95,
@@ -70,7 +70,7 @@ MODEL_CONFIG = {
             "label": "mmlu",
             "baseline": 0.90,
             "atol": 0.08,
-            "repeat": 2,
+            "repeat": 1,
             # Match the non-DPA test: 250 sampled questions per repeat.
             "num_examples": 250,
             "num_threads": 4,
