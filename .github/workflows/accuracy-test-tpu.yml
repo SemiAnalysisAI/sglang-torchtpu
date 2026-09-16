@@ -1,56 +1,11 @@
-name: TPU Base Cache Diagnostic
+name: TPU Base Cache Build Validation
 on:
   workflow_dispatch:
 permissions:
   contents: read
   id-token: write
 jobs:
-  probe:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: google-github-actions/auth@v2
-        id: auth
-        with:
-          workload_identity_provider: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc-v2
-          service_account: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
-          token_format: access_token
-          create_credentials_file: false
-      - uses: google-github-actions/setup-gcloud@v2
-      - name: Read cached base image without suppressing errors
-        env:
-          CI_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
-        run: |
-          set -euo pipefail
-          tokfile="${RUNNER_TEMP}/tpu-ci.token"
-          printf '%s' "$CI_ACCESS_TOKEN" > "$tokfile"
-          trap 'rm -f "$tokfile"' EXIT
-          image="us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu-base"
-          for tag in base-873bb68496b6c24c diagnostic-nonexistent-${{ github.run_id }}; do
-            cached_tag=$(gcloud artifacts docker tags list "$image" \
-              --filter="tag~'/tags/${tag}$'" --format='value(tag)' \
-              --project sglang-torchtpu --access-token-file="$tokfile")
-            if [[ "$tag" == base-* ]]; then
-              test "${cached_tag##*/}" = "$tag"
-              echo "PASS: existing base image reused: $cached_tag"
-            else
-              test -z "$cached_tag"
-              echo "PASS: absent tag correctly returns a cache miss"
-            fi
-          done
-      - name: Inspect cache regression history
-        env:
-          CI_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
-        run: |
-          set +e
-          tokfile="${RUNNER_TEMP}/tpu-ci-history.token"
-          printf '%s' "$CI_ACCESS_TOKEN" > "$tokfile"
-          trap 'rm -f "$tokfile"' EXIT
-          gcloud version
-          gcloud logging read 'timestamp>="2026-08-27T00:00:00Z" AND timestamp<="2026-09-03T00:00:00Z" AND (protoPayload.methodName:SetIamPolicy OR protoPayload.methodName:EnableService OR protoPayload.methodName:BatchEnableServices)' \
-            --project=sglang-torchtpu --access-token-file="$tokfile" --limit=200 \
-            --format='json(timestamp,protoPayload.methodName,protoPayload.resourceName,protoPayload.serviceData.policyDelta,protoPayload.metadata,protoPayload.request.serviceIds)'
-          echo "audit_read_rc=$?"
-          gcloud projects get-iam-policy sglang-torchtpu --access-token-file="$tokfile" \
-            --flatten='bindings[].members' --filter='bindings.members:serviceAccount:tpu-ci@sglang-torchtpu.iam.gserviceaccount.com' \
-            --format='table(bindings.role)'
-          echo "policy_read_rc=$?"
+  build:
+    uses: sgl-project/sglang-torchtpu/.github/workflows/_tpu-build.yml@5bc287ec7d1cc9b9e8dc8e977afaf2a0aa876b82
+    with:
+      ref: 5bc287ec7d1cc9b9e8dc8e977afaf2a0aa876b82
