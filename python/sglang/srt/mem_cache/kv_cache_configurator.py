@@ -371,6 +371,10 @@ class KVCacheConfigurator:
         # unaligned -- the exact state this block exists to prevent -- and the
         # miscompile surfaces as a permanent serving hang rather than an error,
         # so refuse at startup instead.
+        # Deliberately not gated on the attention backend: the hang was observed
+        # on the RPA decode path, but nothing establishes that the other TPU
+        # backends are exempt, and the cost of refusing a working config is a
+        # startup error while the cost of missing one is a silent hang.
         if self.device == "tpu" and swa_max_total_num_tokens is not None:
             align_tokens = self.pool_page_size * 8
             aligned = (swa_max_total_num_tokens // align_tokens) * align_tokens
@@ -380,8 +384,13 @@ class KVCacheConfigurator:
                     f"{swa_max_total_num_tokens // self.pool_page_size} pages "
                     f"({swa_max_total_num_tokens} tokens), below the 8-page "
                     "minimum required for correct torch.compile decode on TPU. "
-                    "Raise --swa-full-tokens-ratio or --max-total-tokens so "
-                    f"their product is at least {align_tokens} tokens."
+                    "Increase the effective SWA capacity to at least "
+                    f"{align_tokens} tokens. Which knob depends on how the pool "
+                    "was sized: ratio-sized pools follow --swa-full-tokens-ratio, "
+                    "while chunk-cap sizing ignores the ratio and follows "
+                    "--max-running-requests and --chunked-prefill-size. "
+                    "--max-total-tokens is only an upper bound, so raising it "
+                    "helps only when the pool is capped by it rather than by HBM."
                 )
             if aligned != swa_max_total_num_tokens:
                 logger.info(

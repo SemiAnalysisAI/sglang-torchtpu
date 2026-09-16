@@ -15,8 +15,8 @@ the TPU recipes' `--swa-full-tokens-ratio 0.10` and page_size 512 gives a
 request large enough to touch the upper pages.
 
 These tests pin the three regimes: above the floor the alignment fires, at an
-exact multiple it is a no-op, and below the floor the pool must not be silently
-left unaligned.
+exact multiple it is a no-op, and below the floor startup is refused with a
+message naming the 8-page minimum.
 """
 
 import unittest
@@ -27,7 +27,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 PAGE_SIZE = 512
-ALIGN_PAGES = 8
 
 
 def _swa_pool_tokens(swa_tokens, *, device="tpu", page_size=PAGE_SIZE):
@@ -35,12 +34,10 @@ def _swa_pool_tokens(swa_tokens, *, device="tpu", page_size=PAGE_SIZE):
     from sglang.srt import runtime_context as rc
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
-    # A draft worker zeroes the compression pools instead of reading them off
-    # config, which keeps the fake to the fields the alignment path touches.
     fake = SimpleNamespace(
         device=device,
         is_hybrid_swa=True,
-        is_draft_worker=True,
+        is_draft_worker=False,
         loc_space_scale=1,
         pool_page_size=page_size,
         model_config=SimpleNamespace(hf_config=SimpleNamespace()),
@@ -50,6 +47,10 @@ def _swa_pool_tokens(swa_tokens, *, device="tpu", page_size=PAGE_SIZE):
         max_running_requests=64,
         full_max_total_num_tokens=32768,
         swa_max_total_num_tokens=swa_tokens,
+        c4_max_total_num_tokens=0,
+        c128_max_total_num_tokens=0,
+        c4_state_pool_size=0,
+        c128_state_pool_size=0,
     )
     with rc.get_context().override_server_args(page_size=page_size):
         sizes = KVCacheConfigurator._derive_pool_sizes(fake, config=config)
@@ -72,28 +73,20 @@ class TestSWAPageAlignment(unittest.TestCase):
             _swa_pool_tokens(34 * PAGE_SIZE, device="cuda"), 34 * PAGE_SIZE
         )
 
-    def test_pool_below_the_floor_is_not_left_unaligned(self):
-        """A sub-8-page pool cannot satisfy the invariant and must not pass through.
+    def test_pool_below_the_floor_is_refused_at_startup(self):
+        """A sub-8-page pool cannot satisfy the invariant, so refuse rather than serve.
 
         6 pages is what `--max-total-tokens 32768 --swa-full-tokens-ratio 0.10`
-        produces at page_size 512. Rounding down yields 0, so the `aligned > 0`
-        guard declines to act and the pool is allocated at 6 pages. Any resolution
-        is acceptable here -- raise at startup, or round up to 8 -- except
-        returning an unaligned size, which is the one outcome the alignment code
-        exists to rule out.
-        """
-        try:
-            result = _swa_pool_tokens(6 * PAGE_SIZE)
-        except ValueError:
-            return  # raising at startup is a valid resolution
+        produces at page_size 512. Rounding down yields 0, so before this change
+        the `aligned > 0` guard declined to act and the pool was allocated at 6
+        pages, and the miscompile surfaced as a permanent serving hang.
 
-        pages = result // PAGE_SIZE
-        self.assertEqual(
-            pages % ALIGN_PAGES,
-            0,
-            f"SWA pool left at {pages} pages, which is not a multiple of "
-            f"{ALIGN_PAGES}; compiled decode reads wrong K/V from this pool",
-        )
+        Match on the message, not just the type: returning 0 pages would satisfy
+        both `ValueError`-or-nothing and `pages % 8 == 0`, so a weaker assertion
+        passes for a pool that cannot hold a single token.
+        """
+        with self.assertRaisesRegex(ValueError, "below the 8-page minimum"):
+            _swa_pool_tokens(6 * PAGE_SIZE)
 
 
 if __name__ == "__main__":
