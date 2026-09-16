@@ -1474,18 +1474,26 @@ class TestPrefillAnnouncesRoomFailure(unittest.TestCase):
         self.assertEqual(endpoint, "tcp://10.0.0.3:6666")
         self.assertEqual(notice.room, ROOM)
 
-    def test_a_peer_ranks_group_failure_is_announced(self):
+    def test_a_peer_ranks_group_failure_is_announced_without_a_later_poll(self):
         """One rank's failure group-fails the room on all 16; the decode is
-        owed the notice from whichever rank it is talking to."""
+        owed the notice from whichever rank it is talking to.
+
+        This path cannot leave the send to the next poll. The drain gate calls
+        quiesce *after* this pass's poll has already flushed, and a room that
+        settles Failed leaves the inflight queue -- so when it was the last one
+        inflight, nothing polls this manager again and the notice would sit
+        queued until some unrelated later request happened to flush it. No poll
+        runs below: it has to be on the wire by the time quiesce returns.
+        """
         mgr = self._prefill()
         _populate_send_state(mgr, ROOM)
         sender = self._sender(mgr)
         sender.conclude_state = KVPoll.Success
 
         sender.quiesce_group_failure()
-        mgr._flush_room_failures()
 
         self.assertEqual(len(self._notices(mgr)), 1)
+        self.assertEqual(mgr._pending_room_failures, [])
 
     def test_an_undeliverable_notice_never_reaches_the_scheduler_thread(self):
         """Best-effort by construction: a send that raises here would land on

@@ -3124,6 +3124,12 @@ class RaidenKVSender(CommonKVSender):
         # State that could admit new work is discarded, while the leases added
         # for already accepted reads/stages/pushes intentionally survive.
         self.kv_mgr._drop_room_state(self.bootstrap_room)
+        # Publish here rather than leaving it to the next poll. The gate runs
+        # quiesce after this pass's poll already flushed, and a room that ends
+        # up Failed leaves the inflight queue -- so if it was the last one,
+        # nothing polls this manager again and the notice would sit in the
+        # queue until some later request happened to flush it.
+        self.kv_mgr._flush_room_failures()
 
     def abort(self) -> None:
         """Seal a local abort, but do not conclude it over retained source KV.
