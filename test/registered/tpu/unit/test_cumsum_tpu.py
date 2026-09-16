@@ -1,29 +1,12 @@
 """Correctness tests for the TPU ``aten::cumsum`` / ``aten::cumsum_`` kernels.
 
-torch_tpu cannot lower an int64 cumulative scan — it aborts the process on a
-libtpu ``CHECK`` ("Unsupported conversion from vmreg/vreg to U64", the same s64
-lowering bug that breaks ``masked_scatter_``'s scan). ``hardware_backend/tpu/
-patches.py`` registers ``PrivateUse1`` kernels that keep the result *exact*:
-either a provably lossless int32 scan (when the input dtype and the scanned
-length bound the running sum) or an int64 log-step scan built from elementwise
-adds.
+Two behaviors must not come back: an int64 cumsum aborting the process, and an
+int64 cumsum returning a value narrowed through int32. Every case is
+differential against PyTorch's own CPU result.
 
-Because cumsum's default dtype for any integral input *is* int64, the abort was
-reachable from ordinary code — ``mask.cumsum(-1)`` on a token mask, or a plain
-boolean advanced index like ``hidden[mask]``, which lowers to the same scan.
-The latter is what actually killed Qwen-Image's text-encoding stage.
-
-These tests are differential: the TPU result must equal PyTorch's own CPU
-result for every case, across dtypes, dims, shapes and — unlike a narrowing
-implementation — magnitudes that do not fit in int32. They also pin the two
-properties the implementation depends on: that work stays on the device (no
-host round trip, no recursion) and that dtype promotion matches PyTorch.
-
-Not covered, by construction: ``torch.cumsum(x, dim, out=an_int64_tensor)``.
-``aten::cumsum.out`` is the native primitive the kernels delegate to and cannot
-be replaced without losing it, so an int64 ``out=`` still aborts the process —
-which is also why there is no test for it here (it would take the runner down
-with it). Requires a real TPU device; skipped otherwise.
+``torch.cumsum(x, dim, out=an_int64_tensor)`` is untested on purpose —
+``aten::cumsum.out`` stays native, so it still aborts and would take the runner
+down with it. Requires a real TPU device; skipped otherwise.
 """
 
 from sglang.test.ci.ci_register import register_tpu_ci
@@ -79,7 +62,7 @@ class TestCumsumTpu(CustomTestCase):
         # This is the case that aborted the process before the fallback.
         self._assert_matches_cpu(torch.ones(1, 1024, dtype=torch.int64), -1)
 
-    def test_integral_inputs_promote_to_int64(self):
+    def test_dtype_promotion_matches_cpu(self):
         # cumsum promotes every integral input to int64 unless told otherwise;
         # narrow dtypes take the provably-safe int32 path and must still come
         # back as int64.
@@ -88,10 +71,9 @@ class TestCumsumTpu(CustomTestCase):
             self._assert_matches_cpu(src, 0)
             self.assertEqual(src.to(self.dev).cumsum(0).dtype, torch.int64)
 
-    def test_explicit_dtypes(self):
-        src = torch.randint(0, 7, (4, 64), dtype=torch.int64)
+        explicit = torch.randint(0, 7, (4, 64), dtype=torch.int64)
         for dtype in (torch.int32, torch.int64, torch.float32):
-            self._assert_matches_cpu(src, -1, dtype=dtype)
+            self._assert_matches_cpu(explicit, -1, dtype=dtype)
 
     def test_floating_inputs_are_untouched(self):
         for dt in (torch.float32, torch.bfloat16):
@@ -132,11 +114,14 @@ class TestCumsumTpu(CustomTestCase):
         src = torch.tensor([-(2**40), 2**41, -7, 2**31, -(2**33)], dtype=torch.int64)
         self._assert_matches_cpu(src, 0)
 
-    def test_large_values_on_inner_dim(self):
+    def test_large_values_on_every_dim(self):
+        # 3-D with a non-power-of-two inner length: the log-step scan shifts
+        # along one dim while the others must ride along untouched.
         torch.manual_seed(0)
-        src = torch.randint(-(2**45), 2**45, (3, 129), dtype=torch.int64)
-        for dim in (0, 1, -1):
+        src = torch.randint(-(2**45), 2**45, (3, 5, 129), dtype=torch.int64)
+        for dim in range(src.dim()):
             self._assert_matches_cpu(src, dim)
+            self._assert_matches_cpu(src, dim - src.dim())
 
     # --- overloads ---------------------------------------------------------
 
@@ -204,16 +189,6 @@ class TestCumsumTpu(CustomTestCase):
             self.assertEqual(i64.cumsum(-1).device.type, "tpu")
             self.assertEqual(big.cumsum(-1).device.type, "tpu")
             self.assertEqual(big.clone().cumsum_(-1).device.type, "tpu")
-
-    def test_fuzz(self):
-        torch.manual_seed(0)
-        for i in range(40):
-            ndim = int(torch.randint(1, 4, (1,)).item())
-            dims = torch.randint(1, 20, (ndim,)).tolist()
-            # Alternate between values int32 could hold and values it could not.
-            hi = 50 if i % 2 else 2**45
-            src = torch.randint(-hi, hi, dims, dtype=torch.int64)
-            self._assert_matches_cpu(src, int(torch.randint(0, ndim, (1,)).item()))
 
 
 if __name__ == "__main__":

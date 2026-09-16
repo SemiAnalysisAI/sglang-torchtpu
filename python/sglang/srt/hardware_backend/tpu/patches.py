@@ -337,38 +337,24 @@ def _register_aten_fallbacks() -> None:
     # torch_tpu cannot lower an int64 (s64) cumulative scan. It does not raise:
     # libtpu dies on a CHECK ("Unsupported conversion from vmreg/vreg to U64"),
     # the same lowering bug that already forces masked_scatter_'s scan to int32
-    # (google-pytorch/torch_tpu#2491). cumsum promotes every integral input to
-    # int64 by default, so an ordinary `mask.cumsum(-1)` -- or a boolean
-    # advanced index such as `hidden[mask]`, which lowers to one -- is enough to
-    # kill the process.
+    # (google-pytorch/torch_tpu#2491).
     #
-    # What these kernels return is always bit-exact against PyTorch. int64 is
-    # never produced by quietly computing in int32 and hoping the values stayed
-    # small; there are exactly two paths:
-    #
-    #   1. the input dtype and the scanned length *prove* the running sum
-    #      cannot leave int32 range -> torch_tpu's native int32 scan, then cast;
-    #   2. otherwise -> an int64 log-step scan built from elementwise adds,
-    #      which torch_tpu lowers fine. O(log n) kernels instead of one, so it
-    #      is reserved for the cases path 1 cannot prove.
-    #
-    # aten::cumsum.out is deliberately left native: it is the primitive these
-    # kernels delegate to for path 1, and a Python kernel cannot recover the
-    # kernel it replaced. `torch.cumsum(x, dim, out=an_int64_tensor)` therefore
-    # still aborts. Tensor.cumsum and Tensor.cumsum_ -- how model code spells
-    # it -- are covered.
+    # aten::cumsum.out is deliberately left native: it is the primitive the
+    # bounded path delegates to, and a Python kernel cannot recover the kernel
+    # it replaced. `torch.cumsum(x, dim, out=an_int64_tensor)` therefore still
+    # aborts; Tensor.cumsum and Tensor.cumsum_ are covered.
     #
     # TODO: delete all of this once torch_tpu#2491 gives s64 a real scan.
 
-    # Largest *absolute* value a element of this dtype can hold (int8 reaches
-    # -128, int16 -32768). Multiplied by the scanned length that bounds the
-    # running sum, which is what makes the int32 path provably lossless.
-    _CUMSUM_INT32_SAFE_ABS_MAX = {
-        torch.bool: 1,
-        torch.uint8: 255,
-        torch.int8: 128,
-        torch.int16: 32768,
-    }
+    def _cumsum_int32_abs_bound(dtype):
+        # Largest absolute element value, or None when the dtype has none.
+        # int8 reaches -128 and int16 -32768, so the bound is |min|, not max.
+        if dtype is torch.bool:
+            return 1
+        if dtype.is_floating_point or dtype.is_complex:
+            return None
+        info = torch.iinfo(dtype)
+        return max(abs(info.min), info.max)
 
     def _cumsum_scanned_length(src, dim):
         return src.shape[dim] if src.dim() else 1
@@ -376,7 +362,8 @@ def _register_aten_fallbacks() -> None:
     def _cumsum_int64_logstep(src, dim):
         # Hillis-Steele: after ceil(log2(n)) rounds of "add yourself shifted
         # right by 2**k", element i holds the sum of src[..:i+1]. Only
-        # elementwise int64 adds and copies, no scan lowering involved.
+        # elementwise int64 adds and copies, so no scan lowering is involved.
+        # O(log n) kernels, so it is reserved for what the bound cannot prove.
         out = src.to(torch.int64)
         length = _cumsum_scanned_length(out, dim)
         step = 1
@@ -400,7 +387,9 @@ def _register_aten_fallbacks() -> None:
             out = torch.empty(src.shape, dtype=dtype, device=src.device)
             torch.ops.aten.cumsum.out(src, dim, dtype=dtype, out=out)
             return out
-        bound = _CUMSUM_INT32_SAFE_ABS_MAX.get(src.dtype)
+        # Only when the dtype and scanned length prove the running sum cannot
+        # leave int32 range is the narrow scan lossless.
+        bound = _cumsum_int32_abs_bound(src.dtype)
         if bound is not None and bound * _cumsum_scanned_length(src, dim) <= 0x7FFFFFFF:
             out = torch.empty(src.shape, dtype=torch.int32, device=src.device)
             torch.ops.aten.cumsum.out(src, dim, dtype=torch.int32, out=out)
