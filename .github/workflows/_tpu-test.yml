@@ -216,6 +216,7 @@ jobs:
           watch_profiles() {
             [ -n "${PROFILE_DIR:-}" ] || return 0
             deadline=$(( $(date +%s) + wait_s ))
+            empty=0
             while [ "$(date +%s)" -lt "$deadline" ] && [ -z "${stop_watch:-}" ]; do
               live=0
               for ref in $(kubectl -n tpu-ci get pods -l "$sel" -o name 2>/dev/null); do
@@ -223,10 +224,24 @@ jobs:
                 live=1
                 if kubectl -n tpu-ci exec "${pod}" -c test -- \
                      test -f "${PROFILE_DIR}/.xprof-done" >/dev/null 2>&1; then
-                  copy_profile_from "${pod}" || true
+                  if copy_profile_from "${pod}"; then
+                    # Release the pod: it blocks on this marker so it cannot
+                    # reach Succeeded before the copy, and exec into a completed
+                    # pod is refused outright.
+                    kubectl -n tpu-ci exec "${pod}" -c test -- \
+                      touch "${PROFILE_DIR}/.xprof-taken" >/dev/null 2>&1 || true
+                  fi
                 fi
               done
-              [ "$live" = 0 ] && break
+              # One empty listing is a blip, not the end of the run; quitting on
+              # it left the collection to the trap, by which time every pod had
+              # Succeeded and could no longer be exec'd into.
+              if [ "$live" = 0 ]; then
+                empty=$(( empty + 1 ))
+                [ "$empty" -ge 5 ] && break
+              else
+                empty=0
+              fi
               # Short naps so the trap is not left waiting on a long sleep.
               for _ in 1 2 3 4; do [ -n "${stop_watch:-}" ] && break; sleep 5; done
             done

@@ -145,6 +145,16 @@ ${PROFILE_ENV}
                       t0=$SECONDS
                       ${EXEC_CMD}
                       rc=$?
+                      # Hold the pod open until the runner has taken the trace. kubectl exec is
+                      # refused once a pod reaches Succeeded, so finishing first loses the file.
+                      # Bounded, and skipped entirely when no capture was produced.
+                      if [ -n "${SGLANG_TORCH_PROFILER_DIR:-}" ]; then
+                        for _ in $(seq 1 180); do
+                          [ -f "${SGLANG_TORCH_PROFILER_DIR}/.xprof-taken" ] && break
+                          ls "${SGLANG_TORCH_PROFILER_DIR}"/*/plugins/profile/*/*.xplane.pb >/dev/null 2>&1 || break
+                          sleep 5
+                        done
+                      fi
                       # Only the prefill leader's verdict gates. On a non-leader
                       # host teardown is expected in two shapes: SIGTERM (143), or
                       # -- when the leader finishes the eval and exits first -- the
@@ -285,6 +295,16 @@ ${PROFILE_ENV}
                       echo "== test files: ${TEST_FILES} =="
                       ${EXEC_CMD}
                       rc=$?
+                      # Hold the pod open until the runner has taken the trace. kubectl exec is
+                      # refused once a pod reaches Succeeded, so finishing first loses the file.
+                      # Bounded, and skipped entirely when no capture was produced.
+                      if [ -n "${SGLANG_TORCH_PROFILER_DIR:-}" ]; then
+                        for _ in $(seq 1 180); do
+                          [ -f "${SGLANG_TORCH_PROFILER_DIR}/.xprof-taken" ] && break
+                          ls "${SGLANG_TORCH_PROFILER_DIR}"/*/plugins/profile/*/*.xplane.pb >/dev/null 2>&1 || break
+                          sleep 5
+                        done
+                      fi
                       # Decode pods never gate the verdict, so a teardown exit is
                       # success: SIGTERM (143), or a 137 whose log shows the peer
                       # disconnect (leader closed the socket, sglang SIGKILLs its
