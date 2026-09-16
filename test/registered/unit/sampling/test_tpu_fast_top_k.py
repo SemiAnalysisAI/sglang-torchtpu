@@ -616,7 +616,7 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
 
     def test_filtered_sampling_uses_bsearch_mask_on_tpu(self):
         """On TPU tensors, filtered sampling routes through the sort-free
-        binary-search mask + plain multinomial instead of the torch sort path.
+        binary-search mask + exponential-race draw instead of the torch sort path.
         The device gate is patched because CPU CI cannot allocate TPU tensors."""
         sampler = SimpleNamespace()
         probs = torch.rand(1, 128)
@@ -635,7 +635,7 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
             ) as filter_probs,
             patch.object(
                 tpu_sampler_module,
-                "sampling_from_probs_torch",
+                "sample_exponential_race",
                 return_value=expected,
             ) as sample,
             patch.object(
@@ -706,7 +706,10 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
             need_top_p=True,
             need_min_p=False,
         )
-        sample.assert_called_once_with(filtered_block)
+        sample.assert_called_once_with(
+            filtered_block,
+            unseeded_sampling_fn=tpu_sampler_module.sample_exponential_race,
+        )
 
     def test_kill_switch_restores_the_torch_reference_path(self):
         """With bsearch filtering disabled, uniform top-k plus top-p must NOT
@@ -763,7 +766,10 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
 
         torch.testing.assert_close(actual, torch.tensor([17], dtype=torch.int32))
         top_k.assert_called_once_with(probs, 50)
-        sample.assert_called_once_with(global_top_k_probs)
+        sample.assert_called_once_with(
+            global_top_k_probs,
+            unseeded_sampling_fn=tpu_sampler_module.sample_exponential_race,
+        )
 
 
 class TestTpuTopKLayout(CustomTestCase):
