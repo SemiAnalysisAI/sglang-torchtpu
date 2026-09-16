@@ -2522,6 +2522,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = seq_lens_tensor
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
+        # DIAGNOSTIC (remove before merge): pair with the MLPSYNC line so the
+        # published count and this one can be matched by batch identity.
+        if len(reqs) <= 2:
+            logger.error(
+                "PREPEXT: batch=%x reqs=%d extend_num_tokens=%d ranges=%s",
+                id(self),
+                len(reqs),
+                extend_num_tokens,
+                [r.extend_range.length for r in reqs],
+            )
 
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
