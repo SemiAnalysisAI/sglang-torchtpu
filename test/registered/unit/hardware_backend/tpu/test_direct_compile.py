@@ -211,35 +211,26 @@ class TestDirectCompile(CustomTestCase):
                 specialization_key=lambda value: tuple(value.shape),
             )
 
-        def run(compiled_fn, value, async_compile):
-            if async_compile:
-                return compiled_fn.warmup_async(value).wait()
-            return compiled_fn(value)
+        value = torch.ones(2, device="tpu")
+        expected = torch.full((2,), 2.0)
+        torch.tpu._clear_cache()
+        requests_before = torch.tpu._get_cache_requests()
+        hits_before = torch.tpu._get_cache_hits()
+        misses_before = torch.tpu._get_cache_misses()
 
-        for async_compile in (False, True):
-            with self.subTest(async_compile=async_compile):
-                value = torch.ones(2, device="tpu")
-                expected = torch.full((2,), 2.0)
-                torch.tpu._clear_cache()
-                requests_before = torch.tpu._get_cache_requests()
-                hits_before = torch.tpu._get_cache_hits()
-                misses_before = torch.tpu._get_cache_misses()
+        torch.testing.assert_close(new_compiled_fn()(value).cpu(), expected)
+        self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
+        self.assertEqual(torch.tpu._get_cache_hits(), hits_before)
+        self.assertEqual(torch.tpu._get_cache_misses(), misses_before + 1)
 
-                result = run(new_compiled_fn(), value, async_compile)
-                torch.testing.assert_close(result.cpu(), expected)
-                self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
-                self.assertEqual(torch.tpu._get_cache_hits(), hits_before)
-                self.assertEqual(torch.tpu._get_cache_misses(), misses_before + 1)
+        requests_before = torch.tpu._get_cache_requests()
+        hits_before = torch.tpu._get_cache_hits()
+        misses_before = torch.tpu._get_cache_misses()
 
-                requests_before = torch.tpu._get_cache_requests()
-                hits_before = torch.tpu._get_cache_hits()
-                misses_before = torch.tpu._get_cache_misses()
-
-                result = run(new_compiled_fn(), value, async_compile)
-                torch.testing.assert_close(result.cpu(), expected)
-                self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
-                self.assertEqual(torch.tpu._get_cache_hits(), hits_before + 1)
-                self.assertEqual(torch.tpu._get_cache_misses(), misses_before)
+        torch.testing.assert_close(new_compiled_fn()(value).cpu(), expected)
+        self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
+        self.assertEqual(torch.tpu._get_cache_hits(), hits_before + 1)
+        self.assertEqual(torch.tpu._get_cache_misses(), misses_before)
 
     @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
     def test_preserves_model_and_argument_layouts(self):
@@ -281,20 +272,32 @@ class TestDirectCompile(CustomTestCase):
                     cache_rows = model.cache.index_select(0, positions)
                     return cache_rows + values.index_select(0, positions)
 
-                compiled = direct_compile.direct_compile(
-                    fn, model=model, specialization_key=lambda positions, values: ()
-                )
-                with patch.object(
-                    compiler, "execute", side_effect=execute_with_layout_check
-                ):
-                    for indices in ([0, 127, 128, 255], [255, 128, 0, 255]):
-                        positions = torch.tensor(indices)
-                        expected = (cache_cpu + values_cpu).index_select(0, positions)
-                        actual = compiled(positions.to("tpu"), values)
-                        torch.testing.assert_close(
-                            actual.cpu(), expected, rtol=0, atol=0
+                for async_compile in (False, True):
+                    with self.subTest(async_compile=async_compile):
+                        compiled = direct_compile.direct_compile(
+                            fn,
+                            model=model,
+                            specialization_key=lambda positions, values: (),
                         )
-                self.assertEqual(len(compiled.cache), 1)
+                        with patch.object(
+                            compiler,
+                            "execute",
+                            side_effect=execute_with_layout_check,
+                        ):
+                            for indices in ([0, 127, 128, 255], [255, 128, 0, 255]):
+                                positions = torch.tensor(indices).to("tpu")
+                                expected = (cache_cpu + values_cpu).index_select(
+                                    0, positions.cpu()
+                                )
+                                actual = (
+                                    compiled.warmup_async(positions, values).wait()
+                                    if async_compile
+                                    else compiled(positions, values)
+                                )
+                                torch.testing.assert_close(
+                                    actual.cpu(), expected, rtol=0, atol=0
+                                )
+                        self.assertEqual(len(compiled.cache), 1)
 
     def test_model_extra_tensor_attrs_trace_user_object_state_and_aliases(self):
         model = _ModelWithObjectTensorState()
