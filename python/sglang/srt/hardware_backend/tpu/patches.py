@@ -360,13 +360,14 @@ def _register_aten_fallbacks() -> None:
     #
     # TODO: delete all of this once torch_tpu#2491 gives s64 a real scan.
 
-    # Largest magnitude a value of this dtype can hold. With the scanned length
-    # that bounds the running sum, which is what makes int32 provably lossless.
-    _CUMSUM_INT32_SAFE_MAX = {
+    # Largest *absolute* value a element of this dtype can hold (int8 reaches
+    # -128, int16 -32768). Multiplied by the scanned length that bounds the
+    # running sum, which is what makes the int32 path provably lossless.
+    _CUMSUM_INT32_SAFE_ABS_MAX = {
         torch.bool: 1,
         torch.uint8: 255,
-        torch.int8: 127,
-        torch.int16: 32767,
+        torch.int8: 128,
+        torch.int16: 32768,
     }
 
     def _cumsum_scanned_length(src, dim):
@@ -399,7 +400,7 @@ def _register_aten_fallbacks() -> None:
             out = torch.empty(src.shape, dtype=dtype, device=src.device)
             torch.ops.aten.cumsum.out(src, dim, dtype=dtype, out=out)
             return out
-        bound = _CUMSUM_INT32_SAFE_MAX.get(src.dtype)
+        bound = _CUMSUM_INT32_SAFE_ABS_MAX.get(src.dtype)
         if bound is not None and bound * _cumsum_scanned_length(src, dim) <= 0x7FFFFFFF:
             out = torch.empty(src.shape, dtype=torch.int32, device=src.device)
             torch.ops.aten.cumsum.out(src, dim, dtype=torch.int32, out=out)
@@ -421,7 +422,6 @@ def _register_aten_fallbacks() -> None:
         # In place, so the result lands in self whatever dtype was asked for.
         self.copy_(_cumsum_exact(self, dim, _cumsum_result_dtype(self, dtype)))
         return self
-
 
     # aten::upsample_bicubic2d -- no TPU kernel; run the CPU kernel and copy
     # back. Vision towers use it to resize position embeddings per image grid
