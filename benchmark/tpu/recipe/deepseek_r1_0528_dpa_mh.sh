@@ -6,15 +6,15 @@ export NNODES=2
 export TP_SIZE=16
 export EP_SIZE=16
 export DP_SIZE=2
-export MAX_RUNNING=4
-export TORCH_COMPILE_MAX_BS=8
-# DPA pads decode rows to attention TP (16 / 2 = 8), even at concurrency 4.
-# Include that physical shape as well as the smaller warmup buckets.
-export TPU_COMPILE_BS="1 2 4 8"
+export KV_CACHE_DTYPE=fp8_e4m3
+export MAX_RUNNING=128
+export TORCH_COMPILE_MAX_BS=128
+# Match the established FP8-KV launch; both buckets cover attention-TP8 padding.
+export TPU_COMPILE_BS="64 128"
 # The server divides the global prefill budget by DP_SIZE: 4096 per group.
 export CHUNKED_PREFILL_SIZE=8192
 export MAX_PREFILL_TOKENS=8192
 export TPU_COMPILE_TOKENS="4096"
 
-# Reuse the non-DPA recipe's checkpoint, quantization and cache settings.
+# Reuse the non-DPA recipe's checkpoint and weight quantization settings.
 exec bash "$(dirname "$0")/deepseek_r1_0528_mh.sh" "$@"
