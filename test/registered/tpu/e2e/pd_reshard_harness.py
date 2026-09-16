@@ -247,7 +247,16 @@ MODEL_PROFILES = {
             # wrong only for this model -- gpt-oss runs the same bucket set and
             # scores 0.98 at 885 cold tokens, so fp8 weights are the suspect,
             # gpt-oss being MXFP4-native. Remove this once that is fixed.
-            "CHUNKED_PREFILL_SIZE": "256",
+            "CHUNKED_PREFILL_SIZE": "64",
+            # EXPERIMENT (#718): the bucket law's own prediction. Corruption
+            # follows the compiled extend graph's token bucket, not the
+            # request: on libtpu 0.0.44.1/0.0.45 the 1024 bucket was wrong and
+            # 64/256 were right, and 0.0.46 made 256 wrong too, leaving only 64.
+            # Compiling nothing but the 64 bucket should therefore be clean at
+            # every prompt length, a ~900-token prompt becoming fifteen extends
+            # instead of four. Clean confirms the law and is a workaround that
+            # touches no dependency; corrupt kills the law outright.
+            "TPU_COMPILE_TOKENS": "64",
         },
         chat_template_kwargs={"enable_thinking": False},
     ),
