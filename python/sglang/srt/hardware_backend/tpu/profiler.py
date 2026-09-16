@@ -21,7 +21,11 @@ def start_tpu_profile(
     Returns the entered profiler. Pass it to :func:`stop_tpu_profile` to end
     the session. ``with_cpu`` adds the host-CPU activity to the device trace.
     """
-    from torch_tpu._internal.profiler import profiler_api
+    # torch_tpu exports the profiler API from the package itself
+    # (torch_tpu._internal.profiler), not from a profiler_api submodule. The
+    # submodule does not exist in the shipped wheel, so importing it raised
+    # ImportError and made --profile-activities TPU unusable.
+    from torch_tpu._internal import profiler as profiler_api
 
     _install_tpu_profile_options_patch(profiler_api)
 
