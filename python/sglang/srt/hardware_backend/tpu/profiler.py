@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
-from contextlib import AbstractContextManager
 from pathlib import Path
-from types import ModuleType
+
+import msgspec
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
@@ -13,43 +13,59 @@ from sglang.srt.hardware_backend.tpu._logging import get_logger
 logger = get_logger(__name__)
 
 
-def start_tpu_profile(
-    *, output_dir: Path, with_cpu: bool = True
-) -> AbstractContextManager:
+def start_tpu_profile(*, output_dir: Path, with_cpu: bool = True) -> _TpuTrace:
     """Start an xprof capture writing to ``output_dir``.
 
-    Returns the entered profiler. Pass it to :func:`stop_tpu_profile` to end
-    the session. ``with_cpu`` adds the host-CPU activity to the device trace.
-    """
-    # torch_tpu exports the profiler API from the package itself
-    # (torch_tpu._internal.profiler), not from a profiler_api submodule. The
-    # submodule does not exist in the shipped wheel, so importing it raised
-    # ImportError and made --profile-activities TPU unusable.
-    from torch_tpu._internal import profiler as profiler_api
+    Returns a handle. Pass it to :func:`stop_tpu_profile` to end the session.
 
-    _install_tpu_profile_options_patch(profiler_api)
+    Uses torch_tpu's start_trace, which drives libtpu's profiler directly, and
+    not torch.profiler. The torch.profiler route reaches TPU device activity
+    only through kineto, which needs libtpu registered via PyTorch's
+    PrivateUse1ProfilerRegistry -- absent before torch 2.12, and the TPU stack
+    pins torch 2.11 (pyproject_tpu.toml). On that route libtpu logs
+
+        PyTorch PrivateUse1ProfilerRegistry not found. Native TPU profiling
+        will be disabled (this is expected on PyTorch < 2.12).
+
+    and the capture still succeeds, holding host activity only: a 43 s run gave
+    905,956 /host:CPU events against /device:TPU:0 at 0.0 ms busy. start_trace
+    has no such dependency: it calls libtpu's trace backend directly, so it
+    should not care which torch is installed.
+
+    ``with_cpu`` is accepted for call compatibility. libtpu's trace always
+    carries the host plane, so there is nothing to switch off.
+    """
+    # start_trace/stop_trace live in _impl; the package root re-exports only
+    # the torch.profiler-facing names (profile, xprof_trace_handler) and the
+    # remote-capture server.
+    from torch_tpu._internal.profiler import _impl as tpu_profiler
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    handler = profiler_api.xprof_trace_handler(dir_name=str(output_dir))
-    activities = [profiler_api.ProfilerActivity.TPU]
-    if with_cpu:
-        activities.append(profiler_api.ProfilerActivity.CPU)
-    profiler = profiler_api.profile(activities=activities, on_trace_ready=handler)
-    profiler.__enter__()
-    return profiler
+    tpu_profiler.start_trace(str(output_dir), _tpu_profile_options())
+    return _TpuTrace(output_dir=output_dir)
 
 
-def stop_tpu_profile(profiler: AbstractContextManager) -> None:
+def stop_tpu_profile(trace: _TpuTrace) -> None:
     """Stop an xprof session started by :func:`start_tpu_profile`."""
-    # Exiting the context stops the xprof session.
-    profiler.__exit__(None, None, None)
+    del trace  # the session is process-global; only one may run at a time
+    from torch_tpu._internal.profiler import _impl as tpu_profiler
+
+    tpu_profiler.stop_trace()
 
 
-def _install_tpu_profile_options_patch(profiler_api: ModuleType) -> None:
-    """Add libtpu trace-limit fields to torch_tpu profile options."""
-    if getattr(profiler_api, "_sglang_tpu_profile_options_patch_installed", False):
-        return
+class _TpuTrace(msgspec.Struct, frozen=True):
+    """Handle for an in-flight capture. torch_tpu keeps the session itself."""
 
+    output_dir: Path
+
+
+def _tpu_profile_options():
+    """Build libtpu trace-limit options, or None to trace everything.
+
+    start_trace takes the options directly, so the narrowing no longer needs to
+    monkeypatch profiler_api._get_profile_options the way the torch.profiler
+    route did.
+    """
     num_chips = envs.SGLANG_TPU_PROFILE_NUM_CHIPS.get()
     num_sparse_cores = envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.get()
     chip_limit = num_chips if num_chips > 0 else None
@@ -59,13 +75,11 @@ def _install_tpu_profile_options_patch(profiler_api: ModuleType) -> None:
     # tracing more steps, otherwise we may run into dropping trace.
     sparse_core_tile_limit = 1 if sparse_core_limit == 1 else None
     if chip_limit is None and sparse_core_limit is None:
-        profiler_api._sglang_tpu_profile_options_patch_installed = True
-        return
+        return None
 
     try:
         from torch_tpu._internal.profiler import _impl as _tpu_impl
 
-        orig_get_options = profiler_api._get_profile_options
         if not dataclasses.is_dataclass(_tpu_impl.ProfileOptions):
             raise TypeError("ProfileOptions is no longer a dataclass")
 
@@ -75,41 +89,19 @@ def _install_tpu_profile_options_patch(profiler_api: ModuleType) -> None:
             tpu_num_sparse_cores_to_trace: int | None = None
             tpu_num_sparse_core_tiles_to_trace: int | None = None
 
+        options = _ProfileOptions(
+            tpu_num_chips_to_profile_per_task=chip_limit,
+            tpu_num_sparse_cores_to_trace=sparse_core_limit,
+            tpu_num_sparse_core_tiles_to_trace=sparse_core_tile_limit,
+        )
     except (ImportError, AttributeError, TypeError):
         logger.warning(
             "[TPU profiler] this torch_tpu does not expose the expected "
             "profile-options hook. Tracing all chips/SparseCores "
             "(traces may be large)."
         )
-        profiler_api._sglang_tpu_profile_options_patch_installed = True
-        return
+        return None
 
-    def _get_options(
-        activities: list[profiler_api.ProfilerActivity],
-    ) -> _tpu_impl.ProfileOptions:
-        base = orig_get_options(activities)
-        try:
-            # Merge into a dict first. A future ProfileOptions that grows one
-            # of these fields would make **asdict raise on duplicate keywords.
-            fields = dataclasses.asdict(base)
-            fields.update(
-                tpu_num_chips_to_profile_per_task=chip_limit,
-                tpu_num_sparse_cores_to_trace=sparse_core_limit,
-                tpu_num_sparse_core_tiles_to_trace=sparse_core_tile_limit,
-            )
-            return _ProfileOptions(**fields)
-        except Exception:
-            # Restore the original hook so the failure is logged once.
-            profiler_api._get_profile_options = orig_get_options
-            logger.warning(
-                "[TPU profiler] failed to extend ProfileOptions. Tracing all "
-                "chips/SparseCores (traces may be large).",
-                exc_info=True,
-            )
-            return base
-
-    profiler_api._get_profile_options = _get_options
-    profiler_api._sglang_tpu_profile_options_patch_installed = True
     # The tile cap is only derived when tracing a single SparseCore; omit the
     # clause otherwise so the log doesn't read "(all tile(s))" for a branch
     # that was never entered.
@@ -124,3 +116,4 @@ def _install_tpu_profile_options_patch(profiler_api: ModuleType) -> None:
         sparse_core_limit or "all",
         tile_clause,
     )
+    return options

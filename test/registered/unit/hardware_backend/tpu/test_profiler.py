@@ -1,13 +1,18 @@
-"""Unit tests for the TPU xprof profile-options patch."""
+"""Unit tests for the TPU xprof profiler wiring."""
 
 import dataclasses
 import sys
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.profiler import _install_tpu_profile_options_patch
+from sglang.srt.hardware_backend.tpu.profiler import (
+    _tpu_profile_options,
+    start_tpu_profile,
+    stop_tpu_profile,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -21,10 +26,19 @@ class _BaseProfileOptions:
     host_tracer_level: int = 2
 
 
-def _fake_torch_tpu(profile_options_cls):
-    """Build sys.modules entries faking torch_tpu's private profiler layout."""
+def _fake_torch_tpu(profile_options_cls=_BaseProfileOptions, calls=None):
+    """Fake torch_tpu's private profiler layout.
+
+    start_trace/stop_trace live in _impl; the package root exports only the
+    torch.profiler-facing names. A fake that puts them at the root would let a
+    regression to the wrong import path pass here.
+    """
     impl = types.ModuleType("torch_tpu._internal.profiler._impl")
-    impl.ProfileOptions = profile_options_cls
+    if profile_options_cls is not None:
+        impl.ProfileOptions = profile_options_cls
+    if calls is not None:
+        impl.start_trace = lambda d, o=None: calls.append(("start", d, o))
+        impl.stop_trace = lambda: calls.append(("stop",))
     profiler = types.ModuleType("torch_tpu._internal.profiler")
     profiler._impl = impl
     internal = types.ModuleType("torch_tpu._internal")
@@ -39,115 +53,105 @@ def _fake_torch_tpu(profile_options_cls):
     }
 
 
-def _fake_profiler_api(get_options=lambda activities: _BaseProfileOptions()):
-    module = types.ModuleType("fake_profiler_api")
-    module._get_profile_options = get_options
-    return module
-
-
-class TestInstallTpuProfileOptionsPatch(CustomTestCase):
-    def _install(
-        self,
-        profiler_api,
-        *,
-        num_chips,
-        num_sparse_cores,
-        profile_options_cls=_BaseProfileOptions
+class TestTpuProfileOptions(CustomTestCase):
+    def _options(
+        self, *, num_chips, num_sparse_cores, profile_options_cls=_BaseProfileOptions
     ):
         with (
             envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(num_chips),
             envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(num_sparse_cores),
             patch.dict(sys.modules, _fake_torch_tpu(profile_options_cls)),
         ):
-            _install_tpu_profile_options_patch(profiler_api)
-            return profiler_api._get_profile_options(["TPU"])
+            return _tpu_profile_options()
 
     def test_limits_enabled(self):
-        profiler_api = _fake_profiler_api()
-        options = self._install(profiler_api, num_chips=1, num_sparse_cores=2)
+        options = self._options(num_chips=1, num_sparse_cores=2)
 
-        self.assertTrue(profiler_api._sglang_tpu_profile_options_patch_installed)
         self.assertEqual(options.tpu_num_chips_to_profile_per_task, 1)
         self.assertEqual(options.tpu_num_sparse_cores_to_trace, 2)
         # Tile cap only kicks in at a single SparseCore; here 2 leaves it off.
         self.assertIsNone(options.tpu_num_sparse_core_tiles_to_trace)
-        # Base fields survive the merge.
+        # Base fields survive.
         self.assertEqual(options.host_tracer_level, 2)
 
     def test_single_sparse_core_narrows_to_one_tile(self):
-        profiler_api = _fake_profiler_api()
-        options = self._install(profiler_api, num_chips=1, num_sparse_cores=1)
+        options = self._options(num_chips=1, num_sparse_cores=1)
 
         self.assertEqual(options.tpu_num_chips_to_profile_per_task, 1)
         self.assertEqual(options.tpu_num_sparse_cores_to_trace, 1)
         self.assertEqual(options.tpu_num_sparse_core_tiles_to_trace, 1)
 
     def test_one_limit_disabled(self):
-        profiler_api = _fake_profiler_api()
-        options = self._install(profiler_api, num_chips=4, num_sparse_cores=0)
+        options = self._options(num_chips=4, num_sparse_cores=0)
 
         self.assertEqual(options.tpu_num_chips_to_profile_per_task, 4)
         self.assertIsNone(options.tpu_num_sparse_cores_to_trace)
         self.assertIsNone(options.tpu_num_sparse_core_tiles_to_trace)
 
-    def test_both_limits_disabled_leaves_hook_untouched(self):
-        profiler_api = _fake_profiler_api()
-        original = profiler_api._get_profile_options
-        self._install(profiler_api, num_chips=0, num_sparse_cores=-1)
-
-        self.assertIs(profiler_api._get_profile_options, original)
-        self.assertTrue(profiler_api._sglang_tpu_profile_options_patch_installed)
-
-    def test_repeated_installation_is_a_noop(self):
-        profiler_api = _fake_profiler_api()
-        self._install(profiler_api, num_chips=1, num_sparse_cores=1)
-        patched = profiler_api._get_profile_options
-        self._install(profiler_api, num_chips=1, num_sparse_cores=1)
-
-        self.assertIs(profiler_api._get_profile_options, patched)
-
-    def test_missing_private_hook_degrades(self):
-        profiler_api = types.ModuleType("fake_profiler_api")
-        with (
-            envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(1),
-            envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(1),
-            patch.dict(sys.modules, _fake_torch_tpu(_BaseProfileOptions)),
-        ):
-            _install_tpu_profile_options_patch(profiler_api)
-
-        self.assertTrue(profiler_api._sglang_tpu_profile_options_patch_installed)
-        self.assertFalse(hasattr(profiler_api, "_get_profile_options"))
+    def test_both_limits_disabled_traces_everything(self):
+        # None means "pass no options", i.e. every chip and SparseCore.
+        self.assertIsNone(self._options(num_chips=0, num_sparse_cores=-1))
 
     def test_non_dataclass_profile_options_degrades(self):
         class _NotADataclass:
             pass
 
-        profiler_api = _fake_profiler_api()
-        original = profiler_api._get_profile_options
-        self._install(
-            profiler_api,
-            num_chips=1,
-            num_sparse_cores=1,
-            profile_options_cls=_NotADataclass,
+        # A torch_tpu that reshapes ProfileOptions must lose the narrowing, not
+        # break capture altogether.
+        self.assertIsNone(
+            self._options(
+                num_chips=1, num_sparse_cores=1, profile_options_cls=_NotADataclass
+            )
         )
 
-        self.assertIs(profiler_api._get_profile_options, original)
-        self.assertTrue(profiler_api._sglang_tpu_profile_options_patch_installed)
+    def test_missing_profile_options_degrades(self):
+        self.assertIsNone(
+            self._options(num_chips=1, num_sparse_cores=1, profile_options_cls=None)
+        )
 
-    def test_getter_failure_returns_base_and_restores_hook(self):
-        base = object()  # asdict on a non-dataclass raises
-        original = lambda activities: base  # noqa: E731
-        profiler_api = _fake_profiler_api(original)
+
+class TestStartStopUsesLibtpuTrace(CustomTestCase):
+    """The capture must not go through torch.profiler.
+
+    torch.profiler reaches TPU device activity only via kineto, which needs
+    libtpu registered through PyTorch's PrivateUse1ProfilerRegistry -- absent
+    before torch 2.12, while the TPU stack pins 2.11. On that route the capture
+    succeeds and contains host activity only, which is silent and easy to
+    reintroduce. These assert the libtpu path is the one taken.
+    """
+
+    def test_start_calls_start_trace_with_output_dir(self):
+        calls = []
+        with (
+            envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(0),
+            envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(0),
+            patch.dict(sys.modules, _fake_torch_tpu(calls=calls)),
+        ):
+            trace = start_tpu_profile(output_dir=Path("/tmp/xprof-unit-test"))
+
+        self.assertEqual([c[0] for c in calls], ["start"])
+        self.assertEqual(calls[0][1], "/tmp/xprof-unit-test")
+        self.assertEqual(trace.output_dir, Path("/tmp/xprof-unit-test"))
+
+    def test_start_forwards_narrowing_options(self):
+        calls = []
         with (
             envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(1),
             envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(1),
-            patch.dict(sys.modules, _fake_torch_tpu(_BaseProfileOptions)),
+            patch.dict(sys.modules, _fake_torch_tpu(calls=calls)),
         ):
-            _install_tpu_profile_options_patch(profiler_api)
-            result = profiler_api._get_profile_options(["TPU"])
+            start_tpu_profile(output_dir=Path("/tmp/xprof-unit-test"))
 
-        self.assertIs(result, base)
-        self.assertIs(profiler_api._get_profile_options, original)
+        options = calls[0][2]
+        self.assertEqual(options.tpu_num_chips_to_profile_per_task, 1)
+        self.assertEqual(options.tpu_num_sparse_core_tiles_to_trace, 1)
+
+    def test_stop_calls_stop_trace(self):
+        calls = []
+        with patch.dict(sys.modules, _fake_torch_tpu(calls=calls)):
+            stop_tpu_profile(None)
+
+        self.assertEqual([c[0] for c in calls], ["stop"])
 
 
 if __name__ == "__main__":
