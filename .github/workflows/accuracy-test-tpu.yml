@@ -37,3 +37,20 @@ jobs:
               echo "PASS: absent tag correctly returns a cache miss"
             fi
           done
+      - name: Inspect cache regression history
+        env:
+          CI_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: |
+          set +e
+          tokfile="${RUNNER_TEMP}/tpu-ci-history.token"
+          printf '%s' "$CI_ACCESS_TOKEN" > "$tokfile"
+          trap 'rm -f "$tokfile"' EXIT
+          gcloud version
+          gcloud logging read 'timestamp>="2026-08-27T00:00:00Z" AND timestamp<="2026-09-03T00:00:00Z" AND (protoPayload.methodName:SetIamPolicy OR protoPayload.methodName:EnableService OR protoPayload.methodName:BatchEnableServices)' \
+            --project=sglang-torchtpu --access-token-file="$tokfile" --limit=200 \
+            --format='json(timestamp,protoPayload.methodName,protoPayload.resourceName,protoPayload.serviceData.policyDelta,protoPayload.metadata,protoPayload.request.serviceIds)'
+          echo "audit_read_rc=$?"
+          gcloud projects get-iam-policy sglang-torchtpu --access-token-file="$tokfile" \
+            --flatten='bindings[].members' --filter='bindings.members:serviceAccount:tpu-ci@sglang-torchtpu.iam.gserviceaccount.com' \
+            --format='table(bindings.role)'
+          echo "policy_read_rc=$?"
