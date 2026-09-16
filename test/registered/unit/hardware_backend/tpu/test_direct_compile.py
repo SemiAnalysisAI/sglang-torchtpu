@@ -188,12 +188,15 @@ class TestDirectCompile(CustomTestCase):
             ):
                 pending = compiled.warmup_async(value)
                 build.assert_called_once()
-                self.assertEqual(build.call_args.kwargs["argument_layouts"], [[]])
+                self.assertNotIn("argument_layouts", build.call_args.kwargs)
                 compile_mlir.assert_not_called()
 
                 pending.start_compiling()
                 self.assertTrue(torch.equal(pending.wait(), result))
-                compile_mlir.assert_called_once_with("module")
+                compile_mlir.assert_called_once_with(
+                    "module",
+                    argument_layouts=((),),
+                )
         finally:
             executor.shutdown()
 

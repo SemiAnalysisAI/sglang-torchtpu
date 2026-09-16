@@ -523,11 +523,11 @@ class CompiledFunction:
                 module = tpu_torch_compile.build_mlir(
                     result_tensors,
                     graph_inputs,
-                    argument_layouts=argument_layouts,
                 )
             executable = _DeferredExecutable(
                 module=module,
                 executor=executor,
+                argument_layouts=argument_layouts,
             )
             logger.info("[direct_compile] MLIR prepared")
         return _CompiledArtifact(
@@ -621,9 +621,15 @@ class _CompiledArtifact:
 class _DeferredExecutable:
     """Compile a fully built MLIR module after all direct traces are complete."""
 
-    def __init__(self, module: Any, executor: _BoundedCompileExecutor) -> None:
+    def __init__(
+        self,
+        module: Any,
+        executor: _BoundedCompileExecutor,
+        argument_layouts: list[list[int]],
+    ) -> None:
         self._module = module
         self._executor = executor
+        self._argument_layouts = tuple(tuple(layout) for layout in argument_layouts)
         self._future: Future[Any] | None = None
         self._lock = threading.Lock()
 
@@ -632,7 +638,11 @@ class _DeferredExecutable:
             if self._future is not None:
                 return
             module = self._module
-            self._future = self._executor.submit(_compile_mlir, module)
+            self._future = self._executor.submit(
+                _compile_mlir,
+                module,
+                self._argument_layouts,
+            )
             self._module = None
 
     def result(self) -> Any:
@@ -656,10 +666,16 @@ def _compile_executable(
     return result.executable
 
 
-def _compile_mlir(module: Any) -> Any:
+def _compile_mlir(
+    module: Any,
+    argument_layouts: Sequence[Sequence[int]],
+) -> Any:
     """Compile an already-built MLIR module without touching trace state."""
     with dynamo_timed("direct_compile_compile_mlir"):
-        executable = tpu_torch_compile.compile_mlir(module)
+        executable = tpu_torch_compile.compile_mlir(
+            module,
+            argument_layouts=argument_layouts,
+        )
     logger.info("[direct_compile] compilation finished")
     return executable
 
