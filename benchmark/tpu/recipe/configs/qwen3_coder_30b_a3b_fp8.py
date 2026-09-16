@@ -1,4 +1,12 @@
-"""TPU serving configuration. Callers copy CONFIG before overriding it."""
+"""Qwen3-Coder-30B (FP8 MoE) on one tpu7x host, tp8/ep8. Callers copy CONFIG
+before overriding it.
+
+Sample usage (from the repo root):
+    python3 -m benchmark.tpu.recipe.bench_matrix.serve_group \\
+        --config recipe/configs/qwen3_coder_30b_a3b_fp8.py
+    # add --dry-run to print the resolved sglang.launch_server command
+    # (inherited base args included) without launching.
+"""
 
 from copy import deepcopy
 

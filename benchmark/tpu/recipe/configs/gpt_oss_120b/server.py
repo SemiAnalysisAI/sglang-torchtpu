@@ -1,4 +1,11 @@
-"""GPT-OSS-120B (MXFP4 MoE) on one tpu7x host, 4 chips x 2 cores = tp8."""
+"""GPT-OSS-120B (MXFP4 MoE) on one tpu7x host, 4 chips x 2 cores = tp8.
+
+Sample usage (from the repo root):
+    python3 -m benchmark.tpu.recipe.bench_matrix.serve_group \\
+        --config recipe/configs/gpt_oss_120b/server.py
+    # add --dry-run to print the resolved sglang.launch_server command
+    # (inherited base args included) without launching.
+"""
 
 from copy import deepcopy
 
