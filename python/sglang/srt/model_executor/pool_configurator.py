@@ -448,6 +448,11 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         kv_cache_dtype = kvc.kv_cache_dtype
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
+        # DCP ranks replicate KV, so each rank holds the heads of a
+        # tp // dcp group -- the count _build_hybrid_swa_kv_pool and
+        # _build_tpu_swa_kv_pool allocate the sub-pools with.
+        dcp_size = get_parallel().attn_dcp_size
+        self._dcp_size = dcp_size
 
         self._full_layers_num = len(model_config.full_attention_layer_ids)
         self._swa_layers_num = len(model_config.swa_attention_layer_ids)
@@ -487,14 +492,14 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         else:
             # Full layer per-token memory (bytes)
             self._full_per_token = (
-                model_config.get_num_kv_heads(tp_size)
+                model_config.get_num_kv_heads(tp_size, dcp_size)
                 * (model_config.head_dim + model_config.v_head_dim)
                 * kv_size
             )
 
             # SWA layer per-token memory (bytes)
             self._swa_per_token = (
-                model_config.get_swa_num_kv_heads(tp_size)
+                model_config.get_swa_num_kv_heads(tp_size, dcp_size)
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
                 * kv_size
             )
@@ -502,11 +507,11 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         if self.kv_cache_dtype_str == "mxfp8":
             scale_block_size = 32
             self._full_per_token += (
-                model_config.get_num_kv_heads(tp_size)
+                model_config.get_num_kv_heads(tp_size, dcp_size)
                 * (model_config.head_dim + model_config.v_head_dim)
             ) // scale_block_size
             self._swa_per_token += (
-                model_config.get_swa_num_kv_heads(tp_size)
+                model_config.get_swa_num_kv_heads(tp_size, dcp_size)
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
 
@@ -598,14 +603,18 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         full_tokens = align_page_size(max_total_num_tokens)
         swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
 
+        # The admission floor lives in the allocator's location space, which DCP
+        # widens by dcp_size in both the pool size and the page.
+        swa_locs = swa_tokens * self._dcp_size
+        alloc_page_size = self._page_size * self._dcp_size
         if (
             self._sliding_window_size is not None
-            and self._sliding_window_size + self._page_size >= swa_tokens
+            and self._sliding_window_size + alloc_page_size >= swa_locs
         ):
             raise ValueError(
-                f"SWA pool ({swa_tokens} tokens) cannot hold even one request: "
+                f"SWA pool ({swa_locs} tokens) cannot hold even one request: "
                 f"the prefill admission floor is sliding_window_size "
-                f"({self._sliding_window_size}) + page_size ({self._page_size}). "
+                f"({self._sliding_window_size}) + page_size ({alloc_page_size}). "
                 f"Increase --swa-full-tokens-ratio or the total KV budget."
             )
 
