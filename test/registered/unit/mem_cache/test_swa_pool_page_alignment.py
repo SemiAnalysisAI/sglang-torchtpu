@@ -2,12 +2,12 @@
 
 The two-pool hybrid-SWA KV cache miscompiles under torch.compile on TPU unless
 the SWA sub-pool's page count is a multiple of the sublane tiling factor (8);
-_derive_pool_sizes rounds down to enforce that. The round-down is guarded by
-`aligned > 0`, which was meant to stop a small pool being zeroed -- but its
-effect is that a pool of fewer than 8 pages skips the alignment entirely and is
-allocated at its unaligned size, which is exactly the state the round-down
-exists to prevent. Nothing logs, and the failure surfaces much later as a
-serving hang rather than a startup error.
+_derive_pool_sizes rounds down to enforce that. The round-down used to be
+guarded by `aligned > 0`, meant to stop a small pool being zeroed -- but its
+effect was that a pool of fewer than 8 pages skipped the alignment entirely and
+was allocated at its unaligned size, which is exactly the state the round-down
+exists to prevent. Nothing logged, and the failure surfaced much later as a
+serving hang rather than a startup error. Such a pool is now refused at startup.
 
 That floor is reachable from ordinary flags: `--max-total-tokens 32768` with
 the TPU recipes' `--swa-full-tokens-ratio 0.10` and page_size 512 gives a
@@ -81,9 +81,11 @@ class TestSWAPageAlignment(unittest.TestCase):
         the `aligned > 0` guard declined to act and the pool was allocated at 6
         pages, and the miscompile surfaced as a permanent serving hang.
 
-        Match on the message, not just the type: returning 0 pages would satisfy
-        both `ValueError`-or-nothing and `pages % 8 == 0`, so a weaker assertion
-        passes for a pool that cannot hold a single token.
+        Match on the message, not just the type. The assertion this replaces
+        accepted either a raised ValueError or a returned size with
+        `pages % 8 == 0`. A guard that returned a zero-token pool raises
+        nothing, so it fell through to the modulus arm -- where `0 % 8 == 0`
+        passed it. Matching the message pins the branch actually intended.
         """
         with self.assertRaisesRegex(ValueError, "below the 8-page minimum"):
             _swa_pool_tokens(6 * PAGE_SIZE)
