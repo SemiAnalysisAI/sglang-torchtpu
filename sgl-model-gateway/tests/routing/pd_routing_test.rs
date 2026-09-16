@@ -87,6 +87,67 @@ mod pd_routing_tests {
         ctx.shutdown().await;
     }
 
+    /// /server_info must come from a DECODE worker, not a prefill one.
+    ///
+    /// `internal_states[].avg_spec_accept_length` only exists where speculative
+    /// accept/reject happens. A P/D prefill engine reports no internal_states at
+    /// all, so proxying there makes the field unreadable and every spec-decoding
+    /// accuracy test that reads it fails -- while the model itself is fine.
+    /// mini-LB builds its response from the decode servers for the same reason
+    /// (mini_lb.py:318-324), and this handler's own comment always said decode
+    /// even while the code called the prefill helper.
+    ///
+    /// The mock echoes its own port, which is what makes this discriminating:
+    /// a prefill answer returns 19820, a decode answer returns 19821.
+    #[tokio::test]
+    async fn test_server_info_is_answered_by_a_decode_worker() {
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![("http://127.0.0.1:19820".to_string(), None)],
+                vec!["http://127.0.0.1:19821".to_string()],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(3820)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                TestWorkerConfig::prefill(19820),
+                TestWorkerConfig::decode(19821),
+            ],
+        )
+        .await;
+
+        let app = ctx.create_app().await;
+        let req = Request::builder()
+            .method("GET")
+            .uri("/server_info")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            json["port"], 19821,
+            "/server_info was answered by the wrong worker: {json}"
+        );
+
+        ctx.shutdown().await;
+    }
+
     /// Test PD mode with round robin policy
     #[tokio::test]
     async fn test_pd_mode_round_robin() {
