@@ -344,7 +344,10 @@ class GptOssSparseMoeBlock(nn.Module):
             topk_output = self.topk(router_input, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
+        # Sharded experts return partial sums to reduce; replicated experts (MoE
+        # data parallelism) already hold every token's full output.
+        experts_sharded = self.experts.moe_ep_size > 1 or self.experts.moe_tp_size > 1
+        if experts_sharded and not get_forward().fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         # When input was pre-padded, FusedMoE.forward_impl captured the
