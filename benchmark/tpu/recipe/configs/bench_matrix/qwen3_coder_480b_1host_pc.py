@@ -2,9 +2,7 @@
 
 from copy import deepcopy
 
-from benchmark.tpu.recipe.configs.bench_matrix.config import (
-    BENCHMARK as BASE_BENCHMARK,
-)
+from benchmark.tpu.recipe.configs.bench_matrix.config import BENCHMARK as BASE_BENCHMARK
 from benchmark.tpu.recipe.configs.bench_matrix.config import CONFIG as BASE_CONFIG
 
 CONFIG = deepcopy(BASE_CONFIG)
