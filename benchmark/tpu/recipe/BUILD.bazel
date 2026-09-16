@@ -1,0 +1,30 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# One py_binary per single-host serve config: `bazel run //benchmark/tpu/recipe:<model>`
+# boots that model's server. The binary is serve_group.py with the config fixed;
+# extra serve_group args (e.g. --dry-run) pass through after `--`.
+#
+# The launcher re-execs `sys.executable -m sglang.launch_server`, so the
+# hermetic interpreter must carry sglang on its path (//python:sglang). The
+# recipe configs are read as runfiles, not installed packages (see the sys.path
+# bootstrap in serve_group.py), so the benchmark/tpu tree rides along in data.
+[py_binary(
+    name = name,
+    srcs = ["bench_matrix/serve_group.py"],
+    args = ["--config", "recipe/configs/%s" % config],
+    data = ["//benchmark/tpu:runtime"],
+    main = "bench_matrix/serve_group.py",
+    python_version = "3.12",
+    deps = [
+        "//benchmark/tpu:python_configs",
+        "//python:sglang",
+    ],
+) for name, config in {
+    "gpt_oss_120b": "gpt_oss_120b/server.py",
+    "qwen3_coder_480b": "qwen3_coder_480b/server.py",
+    "qwen3_coder_30b": "qwen3_coder_30b_a3b_fp8.py",
+    "qwen3_0_6b": "qwen3_0_6b.py",
+}.items()]
+

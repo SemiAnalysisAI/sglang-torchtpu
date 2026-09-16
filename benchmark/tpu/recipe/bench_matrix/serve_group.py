@@ -27,9 +27,17 @@ from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 
+TPU_ROOT = Path(__file__).resolve().parents[2]
+# Under Bazel the configs are not installed packages; they are runfiles beside
+# this file. Put the repo root (or runfiles root) on sys.path so the
+# `benchmark.tpu...` imports below and the `--config` module resolve.
+for _candidate in (TPU_ROOT.parent.parent, Path.cwd()):
+    if (_candidate / "benchmark" / "tpu" / "recipe").is_dir():
+        sys.path.insert(0, str(_candidate))
+        break
+
 from benchmark.tpu.recipe.configs.config_eval import server_args_to_cli
 
-TPU_ROOT = Path(__file__).resolve().parents[2]
 SLICE_ENV = (
     "TPU_WORKER_ID",
     "TPU_WORKER_HOSTNAMES",
