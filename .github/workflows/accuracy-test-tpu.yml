@@ -20,6 +20,7 @@ jobs:
         env:
           CI_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
         run: |
+          set +e
           set -uo pipefail
           tokfile="${RUNNER_TEMP}/tpu-ci.token"
           printf '%s' "$CI_ACCESS_TOKEN" > "$tokfile"
