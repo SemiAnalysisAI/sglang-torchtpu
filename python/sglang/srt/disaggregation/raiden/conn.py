@@ -64,6 +64,7 @@ from sglang.srt.disaggregation.raiden.serde import (
     ReshardChunkReady,
     ReshardReady,
     ReshardReq,
+    RoomFailed,
     decode_text,
     read_aux_blob,
     write_aux_blob,
@@ -192,6 +193,7 @@ class RaidenKVManager(CommonKVManager):
             Chunk.TAG: self._on_chunk,
             ReshardChunk.TAG: self._on_reshard_chunk,
             ReshardChunkReady.TAG: self._on_reshard_chunk_ready,
+            RoomFailed.TAG: self._on_room_failed,
         }
 
         self._engine: Optional[Any] = None  # raiden KVCacheManager
@@ -286,6 +288,13 @@ class RaidenKVManager(CommonKVManager):
         # skipped -- its pages then ride the closing transfer.
         self._announce_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        # Prefill->decode room failures waiting to go out, as
+        # (room, decode addr, reason). _fail_room_locked runs inside the
+        # _state_lock transaction and a send can park for SNDTIMEO, so the
+        # notice is queued there and published by _flush_room_failures once the
+        # lock is back down. The decode address is captured at queue time
+        # because _drop_room_state forgets it before the flush runs.
+        self._pending_room_failures: List[Tuple[int, Tuple[str, int], str]] = []
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # room -> accumulated page block-ids, aux blob, decode reply addr
@@ -636,6 +645,9 @@ class RaidenKVManager(CommonKVManager):
         return start, tail
 
     def _drain_engine(self) -> None:
+        # Ahead of the early return: a room can fail before this rank ever
+        # builds an engine, and its notice still has to go out.
+        self._flush_room_failures()
         if self._engine is None and self._swa_engine is None:
             return
         for engine in (self._engine, self._swa_engine):
@@ -680,7 +692,12 @@ class RaidenKVManager(CommonKVManager):
             return super().clear_status(bootstrap_room)
 
     def _fail_room_locked(
-        self, room: int, reason: str, *, preserve_reason: bool = False
+        self,
+        room: int,
+        reason: str,
+        *,
+        preserve_reason: bool = False,
+        notify_peer: bool = True,
     ) -> None:
         """Publish a room failure while holding ``_state_lock``.
 
@@ -689,6 +706,10 @@ class RaidenKVManager(CommonKVManager):
         this transaction means a poll can never observe ``_failed`` before
         its reason exists, and a late writer cannot recreate a record after
         clear.
+
+        On a prefill the failure is also queued for the decode, which has no
+        other way to hear about it: pass ``notify_peer=False`` when the decode
+        is the one that asked for the failure.
         """
         if preserve_reason:
             with self.failure_lock:
@@ -696,6 +717,58 @@ class RaidenKVManager(CommonKVManager):
         else:
             self.record_failure(room, reason)
         self._failed.add(str(room))
+        if notify_peer:
+            self._queue_room_failure_locked(room, reason)
+
+    def _queue_room_failure_locked(self, room: int, reason: str) -> None:
+        """Queue a prefill->decode failure notice, if there is a decode to tell.
+
+        Only a prefill sends this, and only once the decode has named itself in
+        a PULL_REQ or RESHARD_REQ. Before that the prefill has no address for
+        it -- which is also the case the prefill's own decode-silence deadline
+        already covers.
+        """
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return
+        addr = self._decode_addr.get(room) or self._reshard_decode_addr(room)
+        if addr is None:
+            return
+        self._pending_room_failures.append((room, addr, reason))
+
+    def _reshard_decode_addr(self, room: int) -> Optional[Tuple[str, int]]:
+        """Reply address a resharding decode gave in its RESHARD_REQ."""
+        req = self._reshard_req.get(room)
+        return req.get("reply_addr") if req else None
+
+    def _flush_room_failures(self) -> None:
+        """Send the failure notices ``_fail_room_locked`` queued.
+
+        Best-effort by design: a notice that cannot be delivered leaves the
+        decode exactly where it was before this message existed -- waiting on
+        its own timeout -- so a send failure must never propagate into the
+        scheduler thread that is unwinding the room.
+        """
+        if not self._pending_room_failures:
+            return
+        with self._state_lock:
+            pending = self._pending_room_failures
+            self._pending_room_failures = []
+        for room, (decode_ip, decode_port), reason in pending:
+            try:
+                na = NetworkAddress(decode_ip, decode_port)
+                self._send_multipart_locked(
+                    na.to_tcp(),
+                    RoomFailed(room, self._prefill_unique_rank(), reason).to_frames(),
+                    is_ipv6=na.is_ipv6,
+                )
+            except Exception as error:
+                logger.debug(
+                    "RaidenKVManager could not tell %s:%s that room %d failed: %s",
+                    decode_ip,
+                    decode_port,
+                    room,
+                    error,
+                )
 
     def _handle_node_failure(self, failed_bootstrap_addr: str) -> None:
         """Fail the rooms of a prefill the heartbeat declared down and close
@@ -907,9 +980,56 @@ class RaidenKVManager(CommonKVManager):
             self._mark_aborted_locked(room)
             if status is None:
                 return
-            self._fail_room_locked(room, "Aborted by decode-side abort notification.")
+            # No notice back: this failure is the decode's own request.
+            self._fail_room_locked(
+                room,
+                "Aborted by decode-side abort notification.",
+                notify_peer=False,
+            )
             self.update_status(room, KVPoll.Failed)
         self._drop_room_state(room)
+
+    def _on_room_failed(self, msg: List[bytes]) -> None:
+        """Conclude a room the prefill gave up on.
+
+        This is the decode's only prompt signal for a per-room prefill
+        failure. Without it the room sits in ``WaitingForInput`` until
+        ``_check_waiting_timeout`` fires at 300 s -- holding its KV pages, its
+        metadata buffer and one of the engine's ``--max-running-requests``
+        slots the whole time, while every engine still reports healthy.
+
+        A room this rank does not know is only tombstoned, matching
+        ``_on_abort``: the notice can outrun the receiver's own creation, and
+        reviving a cleared room would let a stale failure settle on whatever
+        request reuses its id.
+        """
+        try:
+            req = RoomFailed.from_frames(msg)
+        except ValueError as error:
+            logger.error("RaidenKVManager received malformed ROOM_FAILED: %s", error)
+            return
+        room = req.room
+        with self._state_lock:
+            try:
+                status = self.check_status(room)
+            except KeyError:
+                status = None
+            # The transfer landed before the notice did; the KV is already here
+            # and the request is finishable, so the failure is stale.
+            if status == KVPoll.Success:
+                return
+            self._mark_aborted_locked(room)
+            if status is None:
+                return
+            self.record_failure(
+                room,
+                f"Prefill rank {req.prefill_rank} failed room {room}: {req.reason}",
+            )
+            # Routed through the status, not _failed: _failed means a native
+            # transfer of ours failed and gates page release on its drain.
+            # This lands the receiver's poll on the branch that concludes
+            # without sending an ABORT back to the prefill that just told us.
+            self.update_status(room, KVPoll.Failed)
 
     def _mark_aborted_locked(self, room: int) -> None:
         now = time.time()
@@ -2936,6 +3056,19 @@ class RaidenKVSender(CommonKVSender):
             )
 
     def poll(self) -> KVPoll:
+        """Report this room's state, then publish any failure it just decided.
+
+        The flush belongs here rather than only in ``_drain_engine`` because
+        the poll that concludes a room is the last one it ever runs: after
+        ``conclude_state`` is set this sender stops pumping, and on an
+        otherwise idle rank nothing else would carry the notice out.
+        """
+        try:
+            return self._poll_state()
+        finally:
+            self.kv_mgr._flush_room_failures()
+
+    def _poll_state(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
         if self.kv_mgr.is_dummy_cp_rank:

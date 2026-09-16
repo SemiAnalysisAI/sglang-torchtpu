@@ -39,6 +39,14 @@ class MessageTag(bytes, enum.Enum):
         b"RAIDEN_RESHARD_CHUNK_READY"  # decode -> prefill: chunk registered, push it
     )
 
+    # Failure notice for either transfer path. ABORT's counterpart: without it
+    # a per-room prefill failure is purely local, and the decode only learns of
+    # it from its own waiting timeout -- pinning that room's KV pages, metadata
+    # buffer and transfer-queue slot for the whole 300 s. The heartbeat does
+    # not cover this: it reports a whole prefill dying, not one room failing on
+    # a live one.
+    ROOM_FAILED = b"RAIDEN_ROOM_FAILED"  # prefill -> decode: room, rank, reason
+
     # CommonKVReceiver owns this backend-independent positional message.
     ABORT = b"ABORT"  # decode -> prefill: room, decode ip, decode port
 
@@ -180,6 +188,25 @@ class ReshardChunkReady(WireMessage):
         require_non_negative(self.room, "room")
         require_non_negative(self.index, "index")
         require_non_negative(self.uuid, "uuid")
+
+
+class RoomFailed(WireMessage):
+    """Tell the decode that this prefill rank gave up on a room.
+
+    Sent for both the symmetric-TP pull path and the reshard push path: the
+    decode's recourse is the same either way, and so is the state it frees.
+    ``reason`` is carried so the decode can surface the prefill's own
+    diagnostic instead of a generic timeout message.
+    """
+
+    TAG: ClassVar[bytes] = MessageTag.ROOM_FAILED
+    room: int
+    prefill_rank: int
+    reason: str
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        require_non_negative(self.prefill_rank, "prefill_rank")
 
 
 def decode_text(frame: bytes, field: str) -> str:
