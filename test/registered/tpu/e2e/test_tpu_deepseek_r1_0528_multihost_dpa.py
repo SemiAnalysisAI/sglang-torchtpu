@@ -1,9 +1,9 @@
 """DeepSeek-R1-0528 DPA serving regression on one two-host TPU instance.
 
 TP16/EP16/DP2 gives attention TP8 per group and a shared distributed MoE.
-This is not two independent TP8 servers. Use concurrent AIME25 requests to
+This is not two independent TP8 servers. Use concurrent GPQA, AIME25, and MMLU requests to
 exercise DPA prefill, decode, and the shrinking-batch tail. The protocol and
-broad accuracy floor match the existing non-DPA AIME25 regression; this is
+broad accuracy floors match the existing non-DPA regression; this is
 not the eight-repeat accuracy qualification or a DPA-vs-TP parity measurement.
 """
 
@@ -43,6 +43,17 @@ MODEL_CONFIG = {
     ),
     "gates": [
         {
+            "dataset": "gpqa",
+            "label": "gpqa_diamond",
+            "baseline": 0.715,
+            "atol": 0.10,
+            "repeat": 2,
+            "num_threads": 4,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "max_tokens": 32768,
+        },
+        {
             "dataset": "aime25",
             "label": "aime25",
             # Same broad serving-regression threshold as the non-DPA test.
@@ -53,6 +64,19 @@ MODEL_CONFIG = {
             "temperature": 0.6,
             "top_p": 0.95,
             "max_tokens": 32768,
+        },
+        {
+            "dataset": "mmlu",
+            "label": "mmlu",
+            "baseline": 0.90,
+            "atol": 0.08,
+            "repeat": 2,
+            # Match the non-DPA test: 250 sampled questions per repeat.
+            "num_examples": 250,
+            "num_threads": 4,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "max_tokens": 16384,
         },
     ],
 }
