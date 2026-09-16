@@ -1,4 +1,16 @@
-"""CI caller for Python server configs and the benchmark matrix's P/D groups."""
+"""CI caller for Python server configs and the benchmark matrix's P/D groups.
+
+The CI JobSet runs this on every host of the slice; what a host does depends on
+the recipe's GROUP and its TPU_WORKER_ID. A 1host_* recipe serves a single tp=8
+engine on rank 0 (the registered suite's smallest slice is 2 hosts, so a 1-host
+recipe deliberately strands the second); the pd_2p2d recipe runs four tp=8
+engines (ranks 0-1 prefill, 2-3 decode, KV over raiden) with rank 0 fronting
+them with the mini-LB on :30000, the port the JobSet health-gates and benches.
+
+Children must die with this process: the JobSet template kills the recipe
+process on teardown, and a surviving engine would hold the slice's chips
+against the next group.
+"""
 
 import argparse
 import importlib
