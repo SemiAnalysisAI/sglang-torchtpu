@@ -476,6 +476,27 @@ def _pad_forward_batch_inputs(
     for field in _TOKEN_FIELDS:
         val = getattr(forward_batch, field, None)
         if isinstance(val, torch.Tensor) and val.shape[0] < pad_t:
+            if field == "input_ids":
+                # EXPERIMENT (#718): pad input_ids with VARYING ids instead of
+                # zeros. Zero-padded rows all embed identically, so the MoE
+                # router sends every one of them to the same expert and
+                # group_sizes skews with the padding count -- 2 extra rows on
+                # that expert in the 64-token extend graph, 194 in the 256-token
+                # one. The Pallas fused grouped GEMM tiles off group_sizes, and
+                # the 62-token prompt flips from clean to garbage exactly when
+                # the graph changes (35137271950 vs 35162473833).
+                #
+                # Done here, in the shim, because this runs eagerly before the
+                # compiled call; the same construction inside the traced region
+                # aborts every rank in fx_to_mlir (35182741283).
+                #
+                # Padded rows are discarded, so their ids only have to differ.
+                n = pad_t - val.shape[0]
+                filler = (
+                    torch.arange(n, device=val.device, dtype=val.dtype) % 1024
+                ) + 1
+                setattr(forward_batch, field, torch.cat([val, filler], dim=0))
+                continue
             setattr(forward_batch, field, _zero_pad_dim0(val, pad_t))
 
     # MROPE positions are (3, num_tokens); pad along the token dim.
