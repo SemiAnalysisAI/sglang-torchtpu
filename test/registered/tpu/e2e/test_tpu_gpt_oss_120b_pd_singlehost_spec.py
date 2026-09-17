@@ -321,11 +321,6 @@ def build_model_config() -> Dict[str, Any]:
         "model": SERVED_MODEL_NAME,
         "test_name": "gpt-oss-120b-pd-singlehost-spec-gsm8k",
         "variant": "PD-1P1D-TP8+EP8+Raiden+EAGLE3-c16",
-        "launch": {
-            "external": True,
-            "health_timeout": HEALTH_TIMEOUT,
-            "tag": "gpt-oss-120b-pd-spec-gsm8k-e2e",
-        },
         "gates": [
             {
                 "dataset": "gsm8k",

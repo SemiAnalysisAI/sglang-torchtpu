@@ -96,6 +96,4 @@ class PDSingleHostTestCase(TPULauncherTestCase):
 
         from sglang.test.tpu import run_model_config
 
-        run_model_config(
-            self.build_model_config(), base_url=self.base_url, server_ready=True
-        )
+        run_model_config(self.build_model_config(), base_url=self.base_url)

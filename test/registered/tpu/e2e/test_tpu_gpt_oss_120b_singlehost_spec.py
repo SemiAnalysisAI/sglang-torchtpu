@@ -67,7 +67,7 @@ MODEL_CONFIG = {
 @pytest.mark.tpu
 class TestGptOssSingleHostSpec(GptOssSpecClassFixture):
     def test_accuracy(self):
-        run_model_config(MODEL_CONFIG, base_url=self.base_url, server_ready=True)
+        run_model_config(MODEL_CONFIG, base_url=self.base_url)
 
 
 if __name__ == "__main__":
