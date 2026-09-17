@@ -566,8 +566,11 @@ class TestPerfConfigsAreValid(CustomTestCase):
             # files sharing one would quietly serialise onto the same slice.
             suite = _registered_suite(path)
             self.assertTrue(suite, f"{path.name} registers no suite")
-            self.assertNotIn(suite, suites, f"{path.name} shares a suite")
-            suites.add(suite)
+            # Multi-host discovery creates one job per file, even when files
+            # share a suite. Single-host discovery creates one job per suite.
+            if not hasattr(mod, "MULTIHOST_LAUNCH"):
+                self.assertNotIn(suite, suites, f"{path.name} shares a suite")
+                suites.add(suite)
 
     def test_every_model_measures_a_named_workload(self):
         # The dashboard groups by workload name; an unnamed point would fall back to
@@ -616,15 +619,27 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
             # files sharing one would quietly serialise onto the same slice.
             suite = _registered_suite(path)
             self.assertTrue(suite, f"{path.name} registers no suite")
-            self.assertNotIn(suite, suites, f"{path.name} shares a suite")
-            suites.add(suite)
+            # Multi-host discovery creates one job per file, even when files
+            # share a suite. Single-host discovery creates one job per suite.
+            if not hasattr(mod, "MULTIHOST_LAUNCH"):
+                self.assertNotIn(suite, suites, f"{path.name} shares a suite")
+                suites.add(suite)
 
-    def test_every_gate_is_report_only(self):
+    def test_every_gate_declares_its_accuracy_policy(self):
         for path, mod in self._accuracy_modules():
             for gate in mod.MODEL_CONFIG["gates"]:
-                self.assertTrue(gate.get("report_only"), path.name)
-                self.assertNotIn("baseline", gate, path.name)
-                self.assertNotIn("atol", gate, path.name)
+                if mod.MODEL_CONFIG["id"] in {
+                    "accuracy-deepseek-r1-0528",
+                    "accuracy-deepseek-r1-0528-dpa",
+                }:
+                    # Preserve R1's existing regression floors after relocation.
+                    self.assertFalse(gate.get("report_only"), path.name)
+                    self.assertIn("baseline", gate, path.name)
+                    self.assertIn("atol", gate, path.name)
+                else:
+                    self.assertTrue(gate.get("report_only"), path.name)
+                    self.assertNotIn("baseline", gate, path.name)
+                    self.assertNotIn("atol", gate, path.name)
 
     def test_every_gate_reaches_the_dashboard(self):
         # "accuracy" is the literal the dashboard's metric_kind() matches on; a
