@@ -1,0 +1,21 @@
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Shared fixtures live outside test/registered, which CI scans for test entries.
+py_library(
+    name = "launcher_test_case",
+    srcs = ["launcher_test_case.py"],
+    imports = ["."],
+    deps = ["//benchmark/tpu:launcher"],
+)
+
+py_library(
+    name = "pd_singlehost_base",
+    srcs = ["pd_singlehost_base.py"],
+    imports = ["."],
+    deps = [
+        ":launcher_test_case",
+        "//benchmark/tpu:launcher",
+    ],
+)

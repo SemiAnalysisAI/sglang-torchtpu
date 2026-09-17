@@ -11,21 +11,6 @@ from typing import ClassVar
 
 from benchmark.tpu import launch_server
 
-try:
-    from sglang.test.ci.ci_register import register_tpu_ci
-except ModuleNotFoundError:
-    # Keep source-only configuration checks independent of serving dependencies.
-    def register_tpu_ci(*_args, **_kwargs):
-        return None
-
-
-register_tpu_ci(
-    est_time=0,
-    suite="tpu-integration",
-    nightly=True,
-    disabled="helper module, no tests",
-)
-
 
 class TPULauncherTestCase(unittest.TestCase):
     """Share one launcher across every test method in a subclass.

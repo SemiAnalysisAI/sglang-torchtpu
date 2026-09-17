@@ -8,21 +8,6 @@ from launcher_test_case import TPULauncherTestCase
 
 from benchmark.tpu import launch_server
 
-try:
-    from sglang.test.ci.ci_register import register_tpu_ci
-except ModuleNotFoundError:
-    # Keep source-only configuration checks independent of serving dependencies.
-    def register_tpu_ci(*_args, **_kwargs):
-        return None
-
-
-register_tpu_ci(
-    est_time=0,
-    suite="tpu-integration",
-    nightly=True,
-    disabled="helper module, no tests",
-)
-
 
 def peer_hostname(hostname: str, *, from_role: str, to_role: str) -> str:
     """Map this pod's DNS name onto the pod of the peer role."""
@@ -43,7 +28,7 @@ class PDSingleHostTestCase(TPULauncherTestCase):
     base_url = f"http://127.0.0.1:{int(os.environ.get('LB_PORT', '8000'))}"
     health_timeout = 2 * int(os.environ.get("WAIT_SECS", "3600")) + 300
     health_generate_timeout = float(os.environ.get("HEALTH_TIMEOUT", "3600"))
-    cwd = str(Path(__file__).absolute().parents[4] / "benchmark" / "tpu")
+    cwd = str(Path(__file__).absolute().parents[2] / "benchmark" / "tpu")
     keep_up = os.environ.get("KEEP_UP", "0") == "1"
     tag = "pd-singlehost"
     decode_log_path: ClassVar[str | None] = None

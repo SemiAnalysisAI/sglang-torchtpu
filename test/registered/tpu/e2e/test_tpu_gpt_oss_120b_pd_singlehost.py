@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+sys.path.insert(0, str(Path(__file__).absolute().parents[4] / "test" / "e2e"))
 
 from pd_singlehost_base import PDSingleHostTestCase, peer_hostname
 
