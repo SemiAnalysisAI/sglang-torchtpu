@@ -3,13 +3,21 @@ load("//bazel:defs.bzl", "sglang_tpu_e2e_test")
 
 package(default_visibility = ["//visibility:public"])
 
+# A lightweight unittest fixture sharing one launcher per test class.
+py_library(
+    name = "launcher_test_case",
+    srcs = ["launcher_test_case.py"],
+    imports = ["."],
+    deps = ["//benchmark/tpu:launcher"],
+)
+
 py_library(
     name = "pd_singlehost_base",
     srcs = ["pd_singlehost_base.py"],
     imports = ["."],
     deps = [
+        ":launcher_test_case",
         "//benchmark/tpu:launcher",
-        "//benchmark/tpu:launcher_test_case",
     ],
 )
 
@@ -46,7 +54,7 @@ sglang_tpu_e2e_test(
         "requires-tpu-v7x",
     ],
     deps = [
-        "//benchmark/tpu:launcher_test_case",
+        ":launcher_test_case",
         "//python:sglang",
         "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],
@@ -82,7 +90,7 @@ sglang_tpu_e2e_test(
         "requires-tpu-v7x",
     ],
     deps = [
-        "//benchmark/tpu:launcher_test_case",
+        ":launcher_test_case",
         "//python:sglang",
         "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],

@@ -1,7 +1,7 @@
 """Class fixtures for tests using the shared TPU launcher.
 
-Only the standard library and launcher are imported here, so configuration
-tests can import their test classes without loading SGLang or TPU libraries.
+Configuration tests can import this fixture without installing SGLang or TPU
+libraries; the serving process loads those dependencies when it starts.
 """
 
 import subprocess
@@ -10,6 +10,21 @@ from collections.abc import Mapping
 from typing import ClassVar
 
 from benchmark.tpu import launch_server
+
+try:
+    from sglang.test.ci.ci_register import register_tpu_ci
+except ModuleNotFoundError:
+    # Keep source-only configuration checks independent of serving dependencies.
+    def register_tpu_ci(*_args, **_kwargs):
+        return None
+
+
+register_tpu_ci(
+    est_time=0,
+    suite="tpu-integration",
+    nightly=True,
+    disabled="helper module, no tests",
+)
 
 
 class TPULauncherTestCase(unittest.TestCase):
