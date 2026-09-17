@@ -1,64 +1,22 @@
-load("@rules_python//python:defs.bzl", "py_library", "py_test")
+load("@rules_python//python:defs.bzl", "py_library")
 load("//bazel:defs.bzl", "sglang_tpu_e2e_test")
 
 package(default_visibility = ["//visibility:public"])
 
-[py_test(
-    name = "test_tpu_gpt_oss_120b_pd_singlehost_" + variant + "_config",
-    size = "small",
-    srcs = ["test_tpu_gpt_oss_120b_pd_singlehost_" + variant + ".py"],
-    args = [
-        "$(location :test_tpu_gpt_oss_120b_pd_singlehost_" + variant + ".py)",
-        "-k",
-        "Configuration",
-    ],
-    data = ["//benchmark/tpu:runtime"],
-    main_module = "pytest",
-    python_version = "3.12",
-    deps = [
-        "//test/e2e:pd_singlehost_base",
-        "@sglang_pypi//pytest",
-    ],
-) for variant in ["decode_radix", "spec"]]
-
-py_test(
-    name = "test_tpu_gpt_oss_120b_pd_singlehost_config",
-    size = "small",
-    srcs = ["test_tpu_gpt_oss_120b_pd_singlehost.py"],
-    args = [
-        "$(location :test_tpu_gpt_oss_120b_pd_singlehost.py)",
-        "-k",
-        "Configuration",
-    ],
-    data = ["//benchmark/tpu:runtime"],
-    main_module = "pytest",
-    python_version = "3.12",
-    deps = [
-        "//test/e2e:pd_singlehost_base",
-        "@sglang_pypi//pytest",
-    ],
-)
-
 sglang_tpu_e2e_test(
     name = "test_tpu_gpt_oss_120b_singlehost_spec",
     srcs = ["test_tpu_gpt_oss_120b_singlehost_spec.py"],
-    args = [
-        "$(location :test_tpu_gpt_oss_120b_singlehost_spec.py)",
-        "-s",
-    ],
     data = [
         # Shell recipes, eval configs, and helpers the launcher resolves at
         # runtime (benchmark/tpu/**, reached via _TPU_BENCH_DIR).
         "//benchmark/tpu:runtime",
     ],
-    main_module = "pytest",
+    main = "test_tpu_gpt_oss_120b_singlehost_spec.py",
     tags = [
         "requires-tpu-v7x",
     ],
     deps = [
         "//python:sglang",
-        "//test/e2e:launcher_test_case",
-        "@sglang_pypi//pytest",
         "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],
 )
@@ -84,22 +42,16 @@ sglang_tpu_e2e_test(
 sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_coder_30b_singlehost_lm_eval",
     srcs = ["test_tpu_qwen3_coder_30b_singlehost_lm_eval.py"],
-    args = [
-        "$(location :test_tpu_qwen3_coder_30b_singlehost_lm_eval.py)",
-        "-s",
-    ],
     data = [
         "//benchmark/tpu:runtime",
         "//test/lm_eval_configs:Qwen3-Coder-30B-A3B-Instruct-FP8-TPU.yaml",
     ],
-    main_module = "pytest",
+    main = "test_tpu_qwen3_coder_30b_singlehost_lm_eval.py",
     tags = [
         "requires-tpu-v7x",
     ],
     deps = [
         "//python:sglang",
-        "//test/e2e:launcher_test_case",
-        "@sglang_pypi//pytest",
         "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],
 )

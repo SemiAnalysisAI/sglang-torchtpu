@@ -25,7 +25,7 @@ __all__ = [
 # `register_cpu_ci(5, "base-a-test-cpu")` style positional calls. New fields
 # (`stage`, `runner_config`) are kwarg-only.
 _PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
-_KWARG_ONLY = ("stage", "runner_config", "labels", "weights_pvc", "runner")
+_KWARG_ONLY = ("stage", "runner_config", "labels", "weights_pvc")
 _ALL_PARAMS = _PARAM_ORDER + _KWARG_ONLY
 _UNSET = object()
 
@@ -59,8 +59,6 @@ class CIRegistry:
     # Weights PVC to mount at /weights, for a test whose checkpoint is not on the
     # shared disk its lane mounts by default.
     weights_pvc: Optional[str] = None
-    # Files migrate independently; existing registrations keep script execution.
-    runner: str = "unittest"
 
     @property
     def effective_suite(self) -> Optional[str]:
@@ -144,7 +142,6 @@ def register_tpu_ci(
     runner_config: Optional[str] = None,
     labels: Optional[List[str]] = None,
     weights_pvc: Optional[str] = None,
-    runner: str = "unittest",
 ):
     """Marker for TPU CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -314,9 +311,6 @@ class RegistryVisitor(ast.NodeVisitor):
                 f"{self.filename}: weights_pvc must be a non-empty string "
                 f"in {func_call.func.id}()"
             )
-        runner = args["runner"] if args["runner"] is not _UNSET else "unittest"
-        if runner not in ("unittest", "pytest"):
-            raise ValueError(f"{self.filename}: runner must be 'unittest' or 'pytest'")
 
         return {
             "est_time": float(est_time),
@@ -327,7 +321,6 @@ class RegistryVisitor(ast.NodeVisitor):
             "disabled": disabled,
             "labels": labels,
             "weights_pvc": weights_pvc,
-            "runner": runner,
         }
 
     def _collect_ci_registry(self, func_call: ast.Call):
