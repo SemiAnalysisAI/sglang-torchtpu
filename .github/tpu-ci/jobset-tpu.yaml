@@ -142,8 +142,13 @@ ${WEIGHTS_VOLUME}
                       # that does not exist. Printed once, unconditionally, so attribution never
                       # depends on how far the run got.
                       echo "== test files: ${TEST_FILES} =="
-                      ( HOST=127.0.0.1 PORT=30000 ENABLE_PROFILER_ENDPOINT=0 ENABLE_COMPILE_CACHE=0 \
-                          bash "benchmark/tpu/${LAUNCH_SCRIPT}" ) > >(tee /tmp/server.log) 2>&1 &
+                      (
+                        export HOST=127.0.0.1 PORT=30000 ENABLE_PROFILER_ENDPOINT=0 ENABLE_COMPILE_CACHE=0
+                        case "${LAUNCH_SCRIPT}" in
+                          *.py) exec python3 -m benchmark.tpu.launch_server --config "${LAUNCH_SCRIPT}" ;;
+                          *) exec bash "benchmark/tpu/${LAUNCH_SCRIPT}" ;;
+                        esac
+                      ) > >(tee /tmp/server.log) 2>&1 &
                       spid=$!
                       if [ "$RANK" = "0" ]; then
                         ok=0

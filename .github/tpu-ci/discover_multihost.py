@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Discover multi-host test files as one matrix row per test file.
 
+Recipes may be shell scripts or Python configs consumed by benchmark.tpu.launch_server.
+
 A multi-host test file declares a module-level MULTIHOST_LAUNCH dict:
     MULTIHOST_LAUNCH = {"hosts": 2, "launch_script": "recipe/x.sh", "weights_pvc": "..."}
 and registers to a suite via register_tpu_ci(suite=..., nightly=...). This scans

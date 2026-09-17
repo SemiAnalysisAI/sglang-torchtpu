@@ -1,10 +1,22 @@
 """GPT-OSS-20B nightly GPQA, AIME25 and 250-question MMLU, one pass each."""
 
 import os
+import sys
+from copy import deepcopy
+from pathlib import Path
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 from sglang.test.tpu.server_test_suite import resolve_tpu_model_path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu.recipe.configs.gpt_oss_20b_accuracy import CONFIG
+
+LAUNCH_CONFIG = deepcopy(CONFIG)
+LAUNCH_CONFIG["server_args"]["model_path"] = resolve_tpu_model_path(
+    "openai/gpt-oss-20b"
+)
 
 register_tpu_ci(
     est_time=7200,
@@ -22,25 +34,9 @@ MODEL_CONFIG = {
     "dashboard": "accuracy",
     "dashboard_model": "gpt-oss-20b",
     "launch": {
-        "recipe": "recipe/gpt_oss_120b/server.sh",
+        **LAUNCH_CONFIG,
         "health_timeout": 3000,
         "tag": "gpt-oss-20b-accuracy",
-        "env": {
-            "MODEL": resolve_tpu_model_path("openai/gpt-oss-20b"),
-            "EXTRA_ARGS": "--reasoning-parser gpt-oss --served-model-name gpt-oss-20b",
-            "KV_CACHE_DTYPE": "",
-            "PAGE_SIZE": "128",
-            "DISABLE_RADIX_CACHE": "1",
-            "MEM_FRACTION_STATIC": "0.60",
-            "ISL": "4096",
-            "OSL": "65536",
-            "CONCUR": "16",
-            "CONTEXT_LEN": "69632",
-            "MAX_TOTAL_TOKENS": "1114112",
-            "TPU_COMPILE_TOKENS": "4096",
-            "TPU_COMPILE_BS": "1 2 4 8 16",
-            "ENABLE_PROFILER_ENDPOINT": "0",
-        },
     },
     "gates": [
         {
