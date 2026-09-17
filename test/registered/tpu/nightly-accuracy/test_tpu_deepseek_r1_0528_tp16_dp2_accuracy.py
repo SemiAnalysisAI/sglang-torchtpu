@@ -1,6 +1,10 @@
-"""DeepSeek-V3.1 TP16/EP16 FP8-KV evaluation, no DP attention.
+"""DeepSeek-R1-0528 DPA serving regression on one two-host TPU instance.
 
-One pass each of GPQA, AIME25 and 250 MMLU questions at concurrency 128.
+TP16/EP16/DP2 gives attention TP8 per group and a shared distributed MoE.
+This is not two independent TP8 servers. Use concurrent GPQA, AIME25, and MMLU requests to
+exercise DPA prefill, decode, and the shrinking-batch tail. The protocol and
+broad accuracy floors match the existing non-DPA regression; this is
+not the eight-repeat accuracy qualification or a DPA-vs-TP parity measurement.
 """
 
 import os
@@ -11,27 +15,31 @@ from sglang.test.tpu import model_config_main
 
 register_tpu_ci(
     est_time=7200,
-    suite="nightly-tpu-multihost-accuracy",
+    suite="nightly-tpu-multihost-ondemand",
     nightly=True,
-    labels=["multihost", "deepseek-v3-1", "accuracy"],
+    labels=["multihost", "deepseek-r1", "dpa", "accuracy"],
 )
 
 MULTIHOST_LAUNCH = {
     "hosts": 2,
-    "launch_script": "recipe/configs/deepseek_v3_1_fp8kv_mh.py",
+    "launch_script": "recipe/configs/deepseek_r1_0528_dpa_mh.py",
     "weights_pvc": "model-weights-rox",
     "timeout_per_file": 10800,
 }
 
 BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
 MODEL_CONFIG = {
-    "model": os.environ.get("MODEL", "/weights/DeepSeek-V3.1"),
-    "test_name": "DeepSeek-V3.1-multihost-fp8kv",
-    "variant": "2host-TP16+EP16+DP1-FP8KV",
+    "id": "accuracy-deepseek-r1-0528-dpa",
+    "display_name": "DeepSeek R1-0528 DPA",
+    "dashboard": "accuracy",
+    "dashboard_model": "deepseek-r1-0528-dpa",
+    "model": os.environ.get("MODEL", "/weights/DeepSeek-R1-0528"),
+    "test_name": "DeepSeek-R1-0528-multihost-dpa",
+    "variant": "2host-TP16+EP16+DP2(attn-tp8)",
     "launch": {
         "external": True,
         "health_timeout": float(os.environ.get("HEALTH_TIMEOUT", "3000")),
-        "tag": "v3-1-fp8kv-e2e",
+        "tag": "r1-dpa-e2e",
     },
     "skip_unless": (
         os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
@@ -41,8 +49,8 @@ MODEL_CONFIG = {
         {
             "dataset": "gpqa",
             "label": "gpqa_diamond",
-            "report_only": True,
-            "thinking": True,
+            "baseline": 0.715,
+            "atol": 0.10,
             "repeat": 1,
             "num_threads": 128,
             "temperature": 0.6,
@@ -52,8 +60,9 @@ MODEL_CONFIG = {
         {
             "dataset": "aime25",
             "label": "aime25",
-            "report_only": True,
-            "thinking": True,
+            # Same broad serving-regression threshold as the non-DPA test.
+            "baseline": 0.875,
+            "atol": 0.20,
             "repeat": 1,
             "num_threads": 128,
             "temperature": 0.6,
@@ -63,8 +72,8 @@ MODEL_CONFIG = {
         {
             "dataset": "mmlu",
             "label": "mmlu",
-            "report_only": True,
-            "thinking": True,
+            "baseline": 0.90,
+            "atol": 0.08,
             "repeat": 1,
             # Match the non-DPA test: 250 sampled questions per repeat.
             "num_examples": 250,

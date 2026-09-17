@@ -195,8 +195,8 @@ class TestJobMapsToOneTest(CustomTestCase):
         self.assertEqual(
             {g["name"] for g in groups},
             {
-                "test_tpu_deepseek_r1_0528_multihost_fp8kv",
-                "test_tpu_deepseek_v3_1_multihost_fp8kv",
+                "test_tpu_deepseek_r1_0528_tp16_dp1_accuracy",
+                "test_tpu_deepseek_v3_1_tp16_dp1_accuracy",
             },
         )
         gpt = workflow["jobs"]["accuracy-gpt-oss-20b"]
