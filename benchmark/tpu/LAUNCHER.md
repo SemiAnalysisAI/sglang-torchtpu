@@ -72,9 +72,9 @@ tests and JobSet launch paths retain their existing launchers.
 
 ## Telemetry library outside Bazel
 
-The P/D recipes preload the existing libtpu telemetry workaround. The TPU Docker
-image builds this library ahead of time. For a source checkout outside Bazel or
-that image, build it and provide the path:
+The P/D recipes preload the existing libtpu telemetry workaround. Bazel supplies
+the compiled library through runfiles. For launches outside Bazel, supply a
+prebuilt library through `LIBTPU_TELEMETRY_STUB`; for example:
 
 ```bash
 bazel build //benchmark/tpu:libtpu_telemetry_stub.so
