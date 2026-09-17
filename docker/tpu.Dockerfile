@@ -15,6 +15,11 @@ COPY test      ./test
 COPY scripts   ./scripts
 COPY benchmark ./benchmark
 
+# Python-only CI uses the same prebuilt telemetry workaround as Bazel runfiles.
+# Keep compilation out of server startup.
+RUN cc -O2 -fPIC -shared benchmark/tpu/libtpu_telemetry_stub.c \
+    -o benchmark/tpu/libtpu_telemetry_stub.so
+
 # Swap the TPU dependency manifest into place
 RUN cd python && rm -f pyproject.toml && cp pyproject_tpu.toml pyproject.toml
 

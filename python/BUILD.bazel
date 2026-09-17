@@ -50,6 +50,7 @@ py_library(
         "//python/sglang:data_files",
     ],
     deps = [
+        "//benchmark/tpu:launcher",
         "@sglang_pypi//accelerate",
         "@sglang_pypi//aiohttp",
         "@sglang_pypi//anthropic",

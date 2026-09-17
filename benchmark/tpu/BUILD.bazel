@@ -1,11 +1,59 @@
-load("@rules_python//python:defs.bzl", "py_library")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
 
 package(default_visibility = ["//visibility:public"])
+
+exports_files(["launch_server.py"])
+
+# Build the telemetry workaround hermetically, never with runtime gcc.
+cc_binary(
+    name = "libtpu_telemetry_stub.so",
+    srcs = ["libtpu_telemetry_stub.c"],
+    linkshared = True,
+)
+
+py_library(
+    name = "launcher",
+    srcs = ["launch_server.py"],
+    data = [
+        "dump_meta.py",
+        ":libtpu_telemetry_stub.so",
+    ],
+    imports = ["../.."],
+    deps = [":python_configs"],
+)
+
+# A lightweight unittest fixture sharing one launcher per test class.
+py_library(
+    name = "launcher_test_case",
+    srcs = ["launcher_test_case.py"],
+    deps = [":launcher"],
+)
+
+# The same runtime closure serves the generic binary and recipe presets.
+py_library(
+    name = "launcher_runtime",
+    deps = [
+        ":launcher",
+        "//python:sglang",
+        "@sglang_pypi//sglang_router",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
+    ],
+)
+
+# One implementation for recipes, JSON configs and P/D orchestration.
+py_binary(
+    name = "launch_server",
+    srcs = ["launch_server.py"],
+    main = "launch_server.py",
+    python_version = "3.12",
+    deps = [":launcher_runtime"],
+)
 
 # Expose Python recipe configs to Bazel's hermetic Python interpreter.
 py_library(
     name = "python_configs",
-    srcs = glob(["recipe/configs/*.py"]),
+    srcs = glob(["recipe/configs/**/*.py"]),
     imports = ["../.."],
 )
 
