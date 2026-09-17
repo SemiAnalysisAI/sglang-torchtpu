@@ -14,7 +14,7 @@ from sglang.test.tpu import model_config_main
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
-from benchmark.tpu.launcher_test_case import TPULauncherTestCase
+from launcher_test_case import TPULauncherTestCase
 
 register_tpu_ci(
     est_time=3600,

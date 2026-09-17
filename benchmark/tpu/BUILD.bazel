@@ -23,13 +23,6 @@ py_library(
     deps = [":python_configs"],
 )
 
-# A lightweight unittest fixture sharing one launcher per test class.
-py_library(
-    name = "launcher_test_case",
-    srcs = ["launcher_test_case.py"],
-    deps = [":launcher"],
-)
-
 # The same runtime closure serves the generic binary and recipe presets.
 py_library(
     name = "launcher_runtime",

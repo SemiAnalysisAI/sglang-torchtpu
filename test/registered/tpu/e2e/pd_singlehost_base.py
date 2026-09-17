@@ -4,8 +4,9 @@ import os
 from pathlib import Path
 from typing import Any, ClassVar
 
+from launcher_test_case import TPULauncherTestCase
+
 from benchmark.tpu import launch_server
-from benchmark.tpu.launcher_test_case import TPULauncherTestCase
 
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
