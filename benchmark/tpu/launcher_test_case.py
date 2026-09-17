@@ -17,6 +17,8 @@ class TPULauncherTestCase(unittest.TestCase):
 
     Set config_module to a Python recipe and base_url to its server or router.
     Override get_runtime_envs when topology is only available at setup time.
+    Set health_generate_timeout to check generation after server configuration
+    validation, as P/D tests do once both engines and the router are healthy.
     """
 
     config_module: ClassVar[str] = ""
@@ -24,6 +26,7 @@ class TPULauncherTestCase(unittest.TestCase):
     base_url: ClassVar[str] = ""
     health_timeout: ClassVar[float] = 3600
     health_endpoint: ClassVar[str] = "/health"
+    health_generate_timeout: ClassVar[float | None] = None
     cwd: ClassVar[str | None] = None
     log_path: ClassVar[str | None] = None
     keep_up: ClassVar[bool] = False
@@ -65,6 +68,15 @@ class TPULauncherTestCase(unittest.TestCase):
                 tag=cls.tag,
             )
             cls.check_server_configuration()
+            if cls.health_generate_timeout is not None:
+                launch_server.wait_healthy(
+                    cls.base_url,
+                    cls.health_generate_timeout,
+                    check,
+                    interval=5,
+                    endpoint="/health_generate",
+                    tag=cls.tag,
+                )
         except BaseException:
             # unittest does not call tearDownClass if setUpClass fails.
             cls._stop_launcher()

@@ -356,6 +356,7 @@ class PdSingleHostSpecClassFixture(PDSingleHostTestCase):
     decode_host_env = DECODE_HOST_ENV
     tag = "pd-singlehost-spec"
     health_timeout = 2 * WAIT_SECS + 300
+    health_generate_timeout = HEALTH_TIMEOUT
 
     @classmethod
     def build_model_config(cls) -> Dict[str, Any]:
