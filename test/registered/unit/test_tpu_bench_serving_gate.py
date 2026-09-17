@@ -56,6 +56,28 @@ class _FakeSampler:
         return {"role": role, "content": content}
 
 
+class TestThinkingGate(CustomTestCase):
+    def test_thinking_and_effort_reach_eval_runner_together(self):
+        gates = model_config.build_gates(
+            {
+                "model": "deepseek-ai/DeepSeek-V3.1",
+                "test_name": "thinking-test",
+                "gates": [
+                    {
+                        "dataset": "gpqa",
+                        "report_only": True,
+                        "thinking": True,
+                        "reasoning_effort": "high",
+                    }
+                ],
+            }
+        )
+        self.assertEqual(
+            gates[0].extra_eval_args,
+            {"sgl_eval_thinking": True, "reasoning_effort": "high"},
+        )
+
+
 class TestBoundedGptOssSampler(CustomTestCase):
     @staticmethod
     def _module(sleeps):
@@ -617,7 +639,7 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
                 )
                 self.assertEqual(
                     (params.metric_labels or {}).get("model"),
-                    "gpt-oss-120b",
+                    mod.MODEL_CONFIG["dashboard_model"],
                     f"{path.name}: gate {params.name} has the wrong model series",
                 )
 
