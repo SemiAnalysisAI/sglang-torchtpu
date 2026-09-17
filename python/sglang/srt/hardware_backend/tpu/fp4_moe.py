@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """TPU NVFP4 (``modelopt_fp4``) MoE helpers.
 
-Serves block-128/256/512 NVFP4 MoE weights via the packed-FP4 path of the Pallas
-``gmm_v2`` kernels. Checkpoint global scales are folded into the per-block
+Serves block-16/32/64/128/256/512 NVFP4 MoE weights via the packed-FP4 path of
+Pallas ``gmm_v2`` kernels. Checkpoint global scales are folded into the per-block
 scales. No native fp4 MXU on TPU. Block-512 and block-256 weights use W4A8;
-block-128 uses W4A16. Blocks below 512 require the fused-RS kernel because the
-stock Pallas packed-FP4 path supports block-512 only. The static ``input_scale``
-is unused.
+blocks 16/32/64/128 use W4A16. Blocks below 512 require the fused-RS kernel because
+the stock Pallas packed-FP4 path supports block-512 only. The static
+``input_scale`` is unused.
 """
 
 from __future__ import annotations
@@ -30,10 +30,10 @@ from sglang.srt.layers.quantization.mxfp4_tpu_util import (
 from sglang.srt.layers.utils import copy_or_rebind_param
 
 # Block-512 matches the original FP8 activation quantization block. The fused-RS
-# kernel additionally supports block-256 with W4A8 and block-128 with W4A16.
+# kernel additionally supports block-256 with W4A8 and blocks 16-128 with W4A16.
 # Keep the singular constant as the default/alignment contract for compatibility.
 TPU_NVFP4_GROUP_SIZE = 512
-TPU_NVFP4_SUPPORTED_GROUP_SIZES = (128, 256, TPU_NVFP4_GROUP_SIZE)
+TPU_NVFP4_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256, TPU_NVFP4_GROUP_SIZE)
 PACKING = 2  # two FP4 codes per uint8 byte
 
 # Keep a bounded fallback above the largest configured serving bucket. The 8K
@@ -134,7 +134,6 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
     *,
     group_size: int,
     no_combine: bool,
-    supported_group_sizes: tuple[int, ...] = TPU_NVFP4_SUPPORTED_GROUP_SIZES,
 ) -> list[str]:
     """Return the fused-RS contract requirements this layer does not meet."""
     from sglang.srt.distributed import get_tp_group, get_world_group
@@ -145,8 +144,8 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
     runner_config = layer.moe_runner_config
     requirements = (
         (
-            f"group_size in {supported_group_sizes}",
-            group_size in supported_group_sizes,
+            f"group_size in {TPU_NVFP4_SUPPORTED_GROUP_SIZES}",
+            group_size in TPU_NVFP4_SUPPORTED_GROUP_SIZES,
         ),
         ("expert parallelism enabled", layer.moe_ep_size > 1),
         (
@@ -388,7 +387,7 @@ def apply_tpu_nvfp4_moe(
                 topk=int(topk_ids.shape[-1]),
                 activation=activation,
                 has_post_expert_norm=has_post_expert_norm,
-                # Block-128 uses W4A16; block-256/512 already quantize the
+                # Blocks 16-128 use W4A16; block-256/512 already quantize the
                 # GMM activation. A direct FP8 write would add another loss.
                 fp8_direct_write=False,
                 tp_rank_to_device_id=layer._tpu_fused_rs_tp_rank_to_device_id,

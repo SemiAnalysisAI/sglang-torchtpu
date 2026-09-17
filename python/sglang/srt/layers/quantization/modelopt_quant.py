@@ -1652,12 +1652,12 @@ class ModelOptFp4Config(ModelOptQuantConfig):
 
 
 class TpuModelOptCompatibleFp4Config(ModelOptFp4Config):
-    """TPU block-128/256/512 packed-FP4 checkpoint schema.
+    """TPU block-16/32/64/128/256/512 packed-FP4 checkpoint schema.
 
     Reuses ModelOpt tensor names and packed E2M1 weights, but is not standard
     NVIDIA NVFP4: block scales may use fp32/bf16/fp8, the per-tensor global
     scale may be absent, only MoE experts are quantized, and execution is W4A8
-    (block 256/512) or W4A16 (block 128) through Pallas fused-RS rather than
+    (block 256/512) or W4A16 (blocks 16/32/64/128) through Pallas fused-RS rather than
     native Blackwell FP4.
     """
 
@@ -3066,7 +3066,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     """TPU adapter for ModelOpt NVFP4 MoE checkpoints."""
 
-    SUPPORTED_GROUP_SIZES = (128, 256, 512)
+    SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256, 512)
 
     def __init__(self, quant_config: TpuModelOptCompatibleFp4Config):
         # Do not run the GPU backend/capability validation in the parent
@@ -3175,7 +3175,6 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             layer,
             group_size=self.quant_config.group_size,
             no_combine=self.moe_runner_config.no_combine,
-            supported_group_sizes=self.SUPPORTED_GROUP_SIZES,
         )
         self.handles_moe_reduction = not unmet_requirements
         if self.handles_moe_reduction:

@@ -21,7 +21,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
 
 BLOCK_SIZE = 512
-SUPPORTED_BLOCK_SIZES = (128, 256, BLOCK_SIZE)
+SUPPORTED_BLOCK_SIZES = (16, 32, 64, 128, 256, BLOCK_SIZE)
 EXPERTS = 2
 HIDDEN_SIZE = 512
 INTERMEDIATE_SIZE = 512
@@ -158,19 +158,19 @@ class TestNvfp4Block512Contract(CustomTestCase):
                     )
                     self.assertTrue(torch.equal(out, expected))
 
-    def test_rejects_small_blocks_even_with_fused_rs(self):
+    def test_rejects_unsupported_blocks_even_with_fused_rs(self):
         from sglang.srt.hardware_backend.tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
         )
 
-        for group_size in (16, 32, 64):
+        for group_size in (8, 96, 1024):
             for use_fused_rs in (False, True):
                 with (
                     self.subTest(group_size=group_size, use_fused_rs=use_fused_rs),
                     self.assertRaisesRegex(NotImplementedError, "group_size in"),
                 ):
                     prepare_tpu_nvfp4_moe_weights(
-                        _make_block512_layer(group_size=group_size),
+                        _make_block512_layer(),
                         group_size=group_size,
                         use_fused_rs=use_fused_rs,
                     )
@@ -180,7 +180,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
             prepare_tpu_nvfp4_moe_weights,
         )
 
-        for group_size in (128, 256):
+        for group_size in (16, 32, 64, 128, 256):
             with (
                 self.subTest(group_size=group_size),
                 self.assertRaisesRegex(NotImplementedError, "requires the fused-RS"),
@@ -372,28 +372,11 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 ),
                 ["no_combine matches the model's post-expert-norm contract"],
             )
-            for group_size in (16, 32, 64):
-                with self.subTest(group_size=group_size):
-                    self.assertEqual(
-                        unmet_tpu_nvfp4_fused_rs_requirements(
-                            layer, group_size=group_size, no_combine=False
-                        ),
-                        [f"group_size in {TPU_NVFP4_SUPPORTED_GROUP_SIZES}"],
-                    )
-                    self.assertEqual(
-                        unmet_tpu_nvfp4_fused_rs_requirements(
-                            layer,
-                            group_size=group_size,
-                            no_combine=False,
-                            supported_group_sizes=(16, 32, 64, 128, 256, 512),
-                        ),
-                        [],
-                    )
             # Every unmet requirement is reported, not just the first.
             layer.allow_backend_reduction = False
             self.assertEqual(
                 unmet_tpu_nvfp4_fused_rs_requirements(
-                    layer, group_size=16, no_combine=True
+                    layer, group_size=8, no_combine=True
                 ),
                 [
                     f"group_size in {TPU_NVFP4_SUPPORTED_GROUP_SIZES}",
@@ -1115,7 +1098,7 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
 
         unsupported_tpu_config = (
             modelopt_quant.TpuModelOptCompatibleFp4Config.from_config(
-                self._checkpoint_config(group_size=16)
+                self._checkpoint_config(group_size=8)
             )
         )
         unsupported_hybrid = modelopt_quant.HybridFp8NvFp4Config(
@@ -1223,7 +1206,7 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
     def test_tpu_moe_rejects_unsupported_group_sizes(self):
         from sglang.srt.layers.quantization import modelopt_quant
 
-        for group_size in (16, 32, 64, 1024, None):
+        for group_size in (8, 96, 1024, None):
             config = modelopt_quant.TpuModelOptCompatibleFp4Config(
                 is_checkpoint_nvfp4_serialized=True,
                 group_size=group_size,
@@ -1291,7 +1274,6 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         model_contract: bool = False,
         backend: str = "auto",
         group_size: int = BLOCK_SIZE,
-        method_class=None,
     ):
         from sglang.srt.layers.moe import MoeRunnerBackend
         from sglang.srt.layers.quantization import modelopt_quant
@@ -1362,9 +1344,7 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
                 _fake_prepare,
             ),
         ):
-            method = (method_class or modelopt_quant.TpuModelOptNvFp4FusedMoEMethod)(
-                config
-            )
+            method = modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
             method.create_moe_runner(layer, moe_runner_config)
             constructed = method.handles_moe_reduction
             if not model_contract:
@@ -1384,31 +1364,6 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
                 )
                 self.assertTrue(resolved)
                 self.assertTrue(prepared["use_fused_rs"])
-
-    def test_gate_honors_provider_group_sizes_without_relaxing_topology(self):
-        from sglang.srt.layers.quantization import modelopt_quant
-
-        class SmallBlockMethod(modelopt_quant.TpuModelOptNvFp4FusedMoEMethod):
-            SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256, 512)
-
-        # Preparation is mocked: this tests the gate, not stock kernel support.
-        for group_size in (16, 32, 64):
-            with self.subTest(group_size=group_size):
-                _, resolved, prepared, _ = self._run_gate(
-                    group_size=group_size, method_class=SmallBlockMethod
-                )
-                self.assertTrue(resolved)
-                self.assertTrue(prepared["use_fused_rs"])
-                self.assertEqual(prepared["group_size"], group_size)
-                with self.assertRaisesRegex(
-                    ValueError, "moe_ep_size == tp_size == world_size"
-                ):
-                    self._run_gate(
-                        ep_size=2,
-                        world_size=4,
-                        group_size=group_size,
-                        method_class=SmallBlockMethod,
-                    )
 
     def test_gate_accepts_post_expert_norm_contract(self):
         _, resolved, prepared, layer = self._run_gate(model_contract=True)
@@ -1438,7 +1393,7 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         self.assertFalse(prepared["use_fused_rs"])
 
     def test_sub512_auto_backend_fails_closed_on_unsupported_layout(self):
-        for group_size in (128, 256):
+        for group_size in (16, 32, 64, 128, 256):
             with (
                 self.subTest(group_size=group_size),
                 self.assertRaisesRegex(ValueError, "requires the fused-RS"),
