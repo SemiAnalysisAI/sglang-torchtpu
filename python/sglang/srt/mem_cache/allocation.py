@@ -658,7 +658,13 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         if _r2t.device.type == "cpu":
             # Host-resident pool: gather last_loc on host (alloc_decode runs
             # its formula on host).
-            last_loc = _r2t[batch.req_pool_indices.cpu(), seq_lens - 1]
+            # TPU keeps a host mirror updated during batch merge/filter. A
+            # device-to-host copy here can wait on in-flight overlap work
+            # before this rank has submitted the next collective.
+            indices_cpu = (
+                batch.req_pool_indices_cpu if _is_tpu else batch.req_pool_indices.cpu()
+            )
+            last_loc = _r2t[indices_cpu, seq_lens - 1]
         else:
             last_loc = _r2t[batch.req_pool_indices, seq_lens - 1]
         seq_lens_next = seq_lens + token_per_req
