@@ -63,6 +63,62 @@ mod power_of_two_tests {
         ctx.shutdown().await;
     }
 
+    /// The LoadMonitor must parse a real engine /v1/loads body.
+    ///
+    /// Half of a cross-language guard: the engine side pins that it *emits*
+    /// `aggregate.total_tokens` (test_v1_loads_aggregate.py), this pins that the
+    /// gateway *reads* it. Neither alone catches a rename, because the mock
+    /// would keep emitting whatever the gateway expects.
+    ///
+    /// Without the key, parse_load_response yields -1 for every worker. -1 is
+    /// then inserted into the load map rather than omitted, so power_of_two's
+    /// missing-key fallback never fires and `-1 <= anything` wins every pair --
+    /// a non-reporting worker becomes a black hole, which is worse than the
+    /// uniform-random behaviour it replaces.
+    #[tokio::test]
+    async fn test_worker_loads_are_parsed_not_minus_one() {
+        let config = TestRouterConfig::power_of_two(3610);
+        let ctx =
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19640, 2))
+                .await;
+
+        let app = ctx.create_app().await;
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/loads")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // The body is {"workers":[{"worker","load",...}]}; this build carries no
+        // successful/failed counters, so assert on the loads themselves.
+        let workers = json["workers"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no `workers` array in {json}"));
+        assert_eq!(workers.len(), 2);
+
+        // The mock reports aggregate.total_tokens == its own port, so a parsed
+        // load is the port and an unparsed one is -1.
+        for entry in workers {
+            let url = entry["worker"].as_str().unwrap();
+            let port: i64 = url.rsplit(':').next().unwrap().parse().unwrap();
+            let load = entry["load"].as_i64().unwrap();
+            assert_ne!(load, -1, "load for {url} was not parsed at all");
+            assert_eq!(
+                load, port,
+                "load for {url} did not come from aggregate.total_tokens"
+            );
+        }
+
+        ctx.shutdown().await;
+    }
+
     /// Test that power of two prefers less loaded workers
     #[tokio::test]
     async fn test_power_of_two_prefers_less_loaded() {

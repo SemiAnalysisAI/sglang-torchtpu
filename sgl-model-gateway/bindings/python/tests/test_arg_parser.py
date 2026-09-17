@@ -567,6 +567,30 @@ class TestParseRouterArgs:
         assert router_args.queue_timeout_secs == 120
         assert router_args.rate_limit_tokens_per_second == 100
 
+    def test_parse_prefix_hash_tunables(self):
+        """Test parsing the prefix_hash tunables."""
+        args = [
+            "--policy",
+            "prefix_hash",
+            "--prefix-token-count",
+            "7",
+            "--prefix-hash-load-factor",
+            "2.5",
+        ]
+
+        router_args = parse_router_args(args)
+
+        assert router_args.prefix_token_count == 7
+        assert isinstance(router_args.prefix_token_count, int)
+        assert router_args.prefix_hash_load_factor == 2.5
+
+    def test_prefix_hash_tunable_defaults_match_the_rust_cli(self):
+        """Unset, both must match sgl-model-gateway/src/main.rs:182-188."""
+        router_args = parse_router_args([])
+
+        assert router_args.prefix_token_count == 256
+        assert router_args.prefix_hash_load_factor == 1.25
+
     def test_parse_health_check_args(self):
         """Test parsing health check arguments."""
         args = [

@@ -245,7 +245,10 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, HashRing, WorkerType};
+    use crate::{
+        config::PolicyConfig,
+        core::{BasicWorkerBuilder, HashRing, WorkerType},
+    };
 
     fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
         urls.iter()
@@ -388,6 +391,71 @@ mod tests {
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, None);
         assert_eq!(branch, Branch::NoHealthyWorkers);
+    }
+
+    #[test]
+    fn test_factory_forwards_both_tunables() {
+        // factory.rs tests every PolicyConfig variant except PrefixHash, and
+        // `config` is private, so this has to live here.
+        let policy =
+            crate::policies::PolicyFactory::create_from_config(&PolicyConfig::PrefixHash {
+                prefix_token_count: 7,
+                load_factor: 2.5,
+            });
+        let prefix_hash = policy
+            .as_any()
+            .downcast_ref::<PrefixHashPolicy>()
+            .expect("factory returned a different policy");
+
+        assert_eq!(prefix_hash.config.prefix_token_count, 7);
+        assert_eq!(prefix_hash.config.load_factor, 2.5);
+    }
+
+    #[test]
+    fn test_prefix_token_count_bounds_the_hashed_window() {
+        // Assert on the hash, not the selected index: with a small worker set a
+        // ring collision would make an index-based assertion pass by accident.
+        let shared_then_diverging_a = [1, 2, 3, 4, 5, 100, 200, 300];
+        let shared_then_diverging_b = [1, 2, 3, 4, 5, 999, 888, 777];
+
+        let narrow = PrefixHashPolicy::new(PrefixHashConfig {
+            prefix_token_count: 5,
+            ..Default::default()
+        });
+        assert_eq!(
+            narrow.compute_prefix_hash(&shared_then_diverging_a),
+            narrow.compute_prefix_hash(&shared_then_diverging_b),
+            "a 5-token window sees only the shared head"
+        );
+
+        let wide = PrefixHashPolicy::new(PrefixHashConfig {
+            prefix_token_count: 8,
+            ..Default::default()
+        });
+        assert_ne!(
+            wide.compute_prefix_hash(&shared_then_diverging_a),
+            wide.compute_prefix_hash(&shared_then_diverging_b),
+            "an 8-token window reaches the diverging tail"
+        );
+    }
+
+    #[test]
+    fn test_load_factor_scales_the_overload_threshold() {
+        // avg = (100 + 1) / 4 = 25, so the threshold tracks load_factor.
+        let strict = PrefixHashPolicy::new(PrefixHashConfig {
+            load_factor: 1.25,
+            ..Default::default()
+        });
+        let lax = PrefixHashPolicy::new(PrefixHashConfig {
+            load_factor: 2.0,
+            ..Default::default()
+        });
+
+        // 50 is over the 1.25 threshold and under the 2.0 one; the existing
+        // test only exercises 1.25, so it passes with the value hardcoded.
+        assert!(!strict.load_ok(50, 100, 4));
+        assert!(lax.load_ok(50, 100, 4));
+        assert!(!lax.load_ok(51, 100, 4));
     }
 
     #[test]
