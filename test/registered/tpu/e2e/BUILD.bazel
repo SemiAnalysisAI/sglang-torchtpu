@@ -3,24 +3,6 @@ load("//bazel:defs.bzl", "sglang_tpu_e2e_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# A lightweight unittest fixture sharing one launcher per test class.
-py_library(
-    name = "launcher_test_case",
-    srcs = ["launcher_test_case.py"],
-    imports = ["."],
-    deps = ["//benchmark/tpu:launcher"],
-)
-
-py_library(
-    name = "pd_singlehost_base",
-    srcs = ["pd_singlehost_base.py"],
-    imports = ["."],
-    deps = [
-        ":launcher_test_case",
-        "//benchmark/tpu:launcher",
-    ],
-)
-
 [py_test(
     name = "test_tpu_gpt_oss_120b_pd_singlehost_" + variant + "_config",
     size = "small",
@@ -28,7 +10,7 @@ py_library(
     data = ["//benchmark/tpu:runtime"],
     main = "test_tpu_gpt_oss_120b_pd_singlehost_" + variant + ".py",
     python_version = "3.12",
-    deps = [":pd_singlehost_base"],
+    deps = ["//test/e2e:pd_singlehost_base"],
 ) for variant in ["decode_radix", "spec"]]
 
 py_test(
@@ -38,7 +20,7 @@ py_test(
     data = ["//benchmark/tpu:runtime"],
     main = "test_tpu_gpt_oss_120b_pd_singlehost.py",
     python_version = "3.12",
-    deps = [":pd_singlehost_base"],
+    deps = ["//test/e2e:pd_singlehost_base"],
 )
 
 sglang_tpu_e2e_test(
@@ -54,8 +36,8 @@ sglang_tpu_e2e_test(
         "requires-tpu-v7x",
     ],
     deps = [
-        ":launcher_test_case",
         "//python:sglang",
+        "//test/e2e:launcher_test_case",
         "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],
 )
@@ -90,8 +72,8 @@ sglang_tpu_e2e_test(
         "requires-tpu-v7x",
     ],
     deps = [
-        ":launcher_test_case",
         "//python:sglang",
+        "//test/e2e:launcher_test_case",
         "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],
 )

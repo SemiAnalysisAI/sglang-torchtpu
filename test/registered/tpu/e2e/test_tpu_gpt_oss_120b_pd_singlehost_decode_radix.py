@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tup
 
 # Support both source checkout execution and Bazel runfiles imports.
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+sys.path.insert(0, str(Path(__file__).absolute().parents[4] / "test" / "e2e"))
 
 from pd_singlehost_base import PDSingleHostTestCase
 
