@@ -11,7 +11,7 @@ from typing import Callable, Dict, List, Optional, Union
 
 from sglang.srt.debug_utils import cuda_coredump
 from sglang.srt.utils.common import kill_process_tree
-from sglang.test.ci.ci_register import CIRegistry, HWBackend
+from sglang.test.ci.ci_register import CIRegistry
 
 # Configure logger to output to stdout
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -294,8 +294,6 @@ def run_unittest_files(
                     "-s",
                     full_path,
                 ]
-                if isinstance(file, CIRegistry) and file.backend == HWBackend.TPU:
-                    cmd.append("--run-tpu")
             else:
                 cmd = ["python3", full_path, "-f"]
             logger.info(

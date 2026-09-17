@@ -303,7 +303,6 @@ class PdSingleHostClassFixture(PDSingleHostTestCase):
         return build_model_config(decode_host=cls.decode_hostname())
 
 
-@pytest.mark.tpu
 class TestPdSingleHostGptOss120bIntegration(PdSingleHostClassFixture):
     @classmethod
     def setUpClass(cls) -> None:
@@ -315,7 +314,7 @@ class TestPdSingleHostGptOss120bIntegration(PdSingleHostClassFixture):
 
 
 def run_integration() -> int:
-    return pytest.main([__file__, "--run-tpu", "-m", "tpu", *sys.argv[1:]])
+    return pytest.main([__file__, "-k", "Integration", *sys.argv[1:]])
 
 
 def render_jobset_yaml(
@@ -345,7 +344,7 @@ def render_jobset_yaml(
         "--files",
         rel_path,
         "--exec",
-        f"uv run --no-project python -m pytest -s --run-tpu -m tpu {rel_path}",
+        f"uv run --no-project python -m pytest -s -k Integration {rel_path}",
     ]
     return subprocess.check_output(cmd, text=True)
 
@@ -462,7 +461,7 @@ class TestPdSingleHostGptOss120bConfiguration(unittest.TestCase):
         self.assertNotIn("name: router", yaml_content)
         self.assertIn("CI_PD_ROLE", yaml_content)
         self.assertIn(
-            "uv run --no-project python -m pytest -s --run-tpu -m tpu test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py",
+            "uv run --no-project python -m pytest -s -k Integration test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py",
             yaml_content,
         )
 
