@@ -29,7 +29,7 @@ from typing import Any, Mapping
 
 from benchmark.tpu.recipe.configs.config_eval import server_args_to_cli
 
-TPU_ROOT = Path(__file__).resolve().parent
+TPU_ROOT = Path(__file__).absolute().parent
 SLICE_ENV = (
     "TPU_WORKER_ID",
     "TPU_WORKER_HOSTNAMES",
@@ -181,44 +181,41 @@ def resolve_server(config: LaunchConfig, inherited, *, single_host=False):
 def server_command(
     config: LaunchConfig, inherited: Mapping[str, str] | None = None
 ) -> tuple[list[str], dict[str, str]]:
-    """Build argv/env without changing the caller's config or environment.
-
-    Preserve the interpreter and import paths supplied by Bazel's bootstrap;
-    using sys.executable alone does not preserve runfiles imports in a child.
-    The same PYTHONPATH also reaches server workers started with subprocess.
-    """
-    env = python_env(
-        child_env(os.environ if inherited is None else inherited, config.runtime_envs)
-    )
+    """Build argv/env without changing the caller's config or environment."""
+    env = child_env(os.environ if inherited is None else inherited, config.runtime_envs)
     command = [
-        sys.executable,
-        "-u",
-        "-m",
-        "sglang.launch_server",
+        *python_command("sglang.launch_server"),
         *server_args_to_cli(config.server_args),
         *config.extra_args,
     ]
     return command, env
 
 
-def python_env(env):
-    """Carry Bazel's interpreter import paths to every Python child."""
-    env = dict(env)
-    paths = [os.path.abspath(path) for path in sys.path]
-    if env.get("PYTHONPATH"):
-        paths.extend(env["PYTHONPATH"].split(os.pathsep))
-    env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(paths))
-    return env
+def python_command(module: str) -> list[str]:
+    """Use declared Bazel executables, or the caller's installed Python."""
+    if not (os.environ.get("RUNFILES_DIR") or os.environ.get("RUNFILES_MANIFEST_FILE")):
+        return [sys.executable, "-u", "-m", module]
+
+    from python.runfiles import runfiles
+
+    binaries = {
+        "benchmark.tpu.launch_server": "launch_server",
+        "sglang.launch_server": "sglang_server",
+        "sglang_router.launch_router": "sglang_router",
+    }
+    path = runfiles.Create().Rlocation(
+        f"sglang_torchtpu/benchmark/tpu/{binaries[module]}"
+    )
+    if not path or not os.path.isfile(path):
+        raise FileNotFoundError(f"Missing Bazel executable for {module}: {path}")
+    return [path]
 
 
 def router_command(
     prefill_urls, decode_urls, *, bootstrap_port=8998, host="0.0.0.0", port=30000
 ):
     command = [
-        sys.executable,
-        "-u",
-        "-m",
-        "sglang_router.launch_router",
+        *python_command("sglang_router.launch_router"),
         "--pd-disaggregation",
         "--mini-lb",
     ]
@@ -302,8 +299,9 @@ def _tee_log(pipe, log):
 
 
 def start_process(command, env, *, cwd=None, log_path=None):
-    """Start an owned process group with the launcher interpreter's imports."""
-    env = prepare_runtime_env(python_env(env))
+    """Start an owned process group after applying its runtime environment."""
+    env = prepare_runtime_env(env)
+    env.setdefault("PYTHONUNBUFFERED", "1")
     log = open(log_path, "a", encoding="utf-8", buffering=1) if log_path else None
     try:
         process = subprocess.Popen(
@@ -652,16 +650,19 @@ def start_launcher(config_module, runtime_envs=None, *, cwd=None, log_path=None)
     child shutdown to finish before terminating the supervisor itself.
     """
     command = [
-        sys.executable,
-        "-u",
-        "-m",
-        "benchmark.tpu.launch_server",
+        *python_command("benchmark.tpu.launch_server"),
         "--config",
         config_module,
+        "--working-directory",
+        os.path.abspath(cwd or os.getcwd()),
     ]
     if runtime_envs is not None:
         command.extend(["--runtime-envs", json.dumps(_envs(runtime_envs))])
-    return start_process(command, dict(os.environ), cwd=cwd, log_path=log_path)
+    # Source execution imports benchmark as a package from the repository root.
+    # The supervisor then uses the requested cwd for engines and their artifacts.
+    return start_process(
+        command, dict(os.environ), cwd=TPU_ROOT.parents[1], log_path=log_path
+    )
 
 
 def serve(plan, *, dry_run=False, grace=30):
@@ -738,8 +739,13 @@ def main(argv: list[str] | None = None) -> int:
         "--runtime-envs", type=_json_object, help="JSON or @file; overrides config envs"
     )
     parser.add_argument("--shutdown-grace", type=_grace, default=30)
+    parser.add_argument(
+        "--working-directory", help="Working directory for child servers"
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    if args.working_directory:
+        os.chdir(args.working_directory)
     try:
         plan = plan_launch(args.config, runtime_envs=args.runtime_envs)
     except (TypeError, ValueError) as exc:

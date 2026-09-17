@@ -5,19 +5,17 @@ functional integration test, then scores 200 GSM8K examples through run_eval.
 """
 
 import os
-import sys
-from pathlib import Path
+import unittest
+from test.e2e.launcher_test_case import TPULauncherTestCase
 from urllib.parse import urlsplit
 
+import pytest
+
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import model_config_main
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
-sys.path.insert(0, str(Path(__file__).absolute().parents[4] / "test" / "e2e"))
-
-from launcher_test_case import TPULauncherTestCase
+from sglang.test.tpu import run_model_config
 
 register_tpu_ci(
+    runner="pytest",
     est_time=3600,
     suite="nightly-tpu-4-v7",
     nightly=True,
@@ -66,7 +64,11 @@ MODEL_CONFIG = {
 }
 
 
+@pytest.mark.tpu
+class TestGptOssSingleHostSpec(GptOssSpecClassFixture):
+    def test_accuracy(self):
+        run_model_config(MODEL_CONFIG, base_url=self.base_url, server_ready=True)
+
+
 if __name__ == "__main__":
-    model_config_main(
-        MODEL_CONFIG, base_url=BASE_URL, server_fixture=GptOssSpecClassFixture
-    )
+    unittest.main()

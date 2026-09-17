@@ -106,6 +106,9 @@ ${WEIGHTS_VOLUME}
                       # exist. Printed unconditionally, as in jobset-tpu.yaml.
                       echo "== test files: ${TEST_FILES} =="
                       t0=$SECONDS
+                      if [[ "${EXEC_CMD}" == "uv "* ]]; then
+                        source scripts/ci/tpu/prepare_pytest.sh
+                      fi
                       ${EXEC_CMD}
                       rc=$?
                       # Only the prefill leader's verdict gates. On a non-leader
@@ -209,6 +212,9 @@ ${WEIGHTS_VOLUME}
                       # Same announcement as the prefill side; the verdict is
                       # the prefill leader's alone, so no TIMINGS record here.
                       echo "== test files: ${TEST_FILES} =="
+                      if [[ "${EXEC_CMD}" == "uv "* ]]; then
+                        source scripts/ci/tpu/prepare_pytest.sh
+                      fi
                       ${EXEC_CMD}
                       rc=$?
                       # Decode pods never gate the verdict, so a teardown exit is

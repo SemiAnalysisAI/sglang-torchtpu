@@ -21,14 +21,10 @@ import subprocess
 import sys
 import unittest
 import urllib.request
-from pathlib import Path
+from test.e2e.pd_singlehost_base import PDSingleHostTestCase
 from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
-# Support both source checkout execution and Bazel runfiles imports.
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
-sys.path.insert(0, str(Path(__file__).absolute().parents[4] / "test" / "e2e"))
-
-from pd_singlehost_base import PDSingleHostTestCase
+import pytest
 
 SGLANG_IMPORT_ERROR = None
 try:
@@ -43,6 +39,7 @@ except ModuleNotFoundError as exc:
 
 # Expected runtime: the single-host P/D GSM8K gate plus a few minutes of probe.
 register_tpu_ci(
+    runner="pytest",
     est_time=3000,
     suite="tpu-integration",
     nightly=True,
@@ -527,14 +524,23 @@ class PdSingleHostDecodeRadixClassFixture(PDSingleHostTestCase):
         return build_model_config(decode_host=cls.decode_hostname())
 
 
+@pytest.mark.tpu
+class TestPdSingleHostDecodeRadixGptOss120bIntegration(
+    PdSingleHostDecodeRadixClassFixture
+):
+    @classmethod
+    def setUpClass(cls) -> None:
+        if SGLANG_IMPORT_ERROR is not None:
+            raise SGLANG_IMPORT_ERROR
+        validate_model_source(resolve_model_path())
+        super().setUpClass()
+
+    def test_accuracy(self) -> None:
+        self.run_evaluations()
+
+
 def run_integration() -> int:
-    """Dispatch on the role this pod was given."""
-    if SGLANG_IMPORT_ERROR is not None:
-        # Fallback stubs only support host-side unittests;
-        # integration runs require real imports to execute the gate pipeline.
-        raise SGLANG_IMPORT_ERROR
-    validate_model_source(resolve_model_path())
-    return PdSingleHostDecodeRadixClassFixture.run_role(resolve_role())
+    return pytest.main([__file__, "--run-tpu", "-m", "tpu", *sys.argv[1:]])
 
 
 def render_jobset_yaml(
@@ -564,7 +570,7 @@ def render_jobset_yaml(
         "--files",
         rel_path,
         "--exec",
-        f"python3 {rel_path} integration",
+        f"uv run --no-project python -m pytest -s --run-tpu -m tpu {rel_path}",
     ]
     return subprocess.check_output(cmd, text=True)
 
@@ -694,8 +700,8 @@ class TestPdSingleHostDecodeRadixGptOss120bConfiguration(unittest.TestCase):
         self.assertNotIn("name: router", yaml_content)
         self.assertIn("CI_PD_ROLE", yaml_content)
         self.assertIn(
-            "python3 test/registered/tpu/e2e/"
-            "test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py integration",
+            "uv run --no-project python -m pytest -s --run-tpu -m tpu "
+            "test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py",
             yaml_content,
         )
 
@@ -718,7 +724,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.mode == "integration":
-        # Remove the mode before model_config_main passes argv to unittest.
+        # Remove the mode before forwarding test selection to pytest.
         sys.argv = [sys.argv[0], *extra_args]
         sys.exit(run_integration())
     sys.argv = [
