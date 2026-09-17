@@ -1,10 +1,11 @@
 """Shared class fixture and role dispatch for one-host-per-engine P/D tests."""
 
 import os
+import re
+import signal
 from pathlib import Path
+from test.e2e.launcher_test_case import TPULauncherTestCase
 from typing import Any, ClassVar
-
-from launcher_test_case import TPULauncherTestCase
 
 from benchmark.tpu import launch_server
 
@@ -57,32 +58,44 @@ class PDSingleHostTestCase(TPULauncherTestCase):
         raise NotImplementedError("Provide this test's evaluation configuration")
 
     @classmethod
-    def run_prefill_leader(cls) -> int:
-        # Evaluation dependencies are only needed on the integration path.
-        from sglang.test.tpu import model_config_main
+    def setUpClass(cls) -> None:
+        cls.role = os.environ.get("CI_PD_ROLE")
+        if cls.role == "prefill":
+            super().setUpClass()
+        elif cls.role == "decode":
+            cls._launcher_process = launch_server.start_launcher(
+                cls.config_module + ":DECODE_CONFIG",
+                {**cls.runtime_envs, "SGLANG_LAUNCHER_RANK": "0"},
+                cwd=cls.cwd,
+                log_path=cls.decode_log_path,
+            )
+        else:
+            raise ValueError(f"Expected CI_PD_ROLE=prefill or decode, got {cls.role!r}")
 
-        model_config_main(
-            cls.build_model_config(), base_url=cls.base_url, server_fixture=cls
+    def run_evaluations(self) -> None:
+        if self.role == "decode":
+            # Match the JobSet's worker teardown policy before pytest turns all
+            # assertion failures into exit code 1: SIGTERM is expected, and a
+            # SIGKILL is expected only when the prefill peer disconnected.
+            code = self._launcher_process.wait()
+            if code in (-signal.SIGTERM, 128 + signal.SIGTERM):
+                return
+            if code in (-signal.SIGKILL, 128 + signal.SIGKILL):
+                log = Path(self.decode_log_path) if self.decode_log_path else None
+                if (
+                    log
+                    and log.is_file()
+                    and re.search(
+                        r"Connection (closed|reset) by peer",
+                        log.read_text(errors="replace"),
+                    )
+                ):
+                    return
+            self.assertEqual(code, 0)
+            return
+
+        from sglang.test.tpu import run_model_config
+
+        run_model_config(
+            self.build_model_config(), base_url=self.base_url, server_ready=True
         )
-        return 0
-
-    @classmethod
-    def run_decode_worker(cls) -> int:
-        proc = launch_server.start_launcher(
-            cls.config_module + ":DECODE_CONFIG",
-            {**cls.runtime_envs, "SGLANG_LAUNCHER_RANK": "0"},
-            cwd=cls.cwd,
-            log_path=cls.decode_log_path,
-        )
-        try:
-            return proc.wait()
-        finally:
-            launch_server.stop_processes([proc], grace=60)
-
-    @classmethod
-    def run_role(cls, role: str) -> int:
-        if role == "prefill":
-            return cls.run_prefill_leader()
-        if role == "decode":
-            return cls.run_decode_worker()
-        raise ValueError(f"Expected prefill or decode role, got {role!r}")

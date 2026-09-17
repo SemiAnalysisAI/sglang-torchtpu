@@ -411,28 +411,18 @@ def run_model_config(
     )
 
 
-def build_test_case(
-    config: Dict[str, Any],
-    base_url: Optional[str] = None,
-    *,
-    server_fixture: Optional[type[unittest.TestCase]] = None,
-):
+def build_test_case(config: Dict[str, Any], base_url: Optional[str] = None):
     """Synthesise the unittest.TestCase for ``config``.
 
     ``skip_unless`` is ``(condition, reason)`` -- the config equivalent of
     ``@unittest.skipUnless``, used by the multi-host gates that only run when an
     external server was provided.
-
-    ``server_fixture`` owns the server in setUpClass/tearDownClass, including
-    readiness checks. Evaluations then attach without using a launcher adapter.
     """
     name = config.get("test_name", config["model"])
 
-    class ModelConfigTest(server_fixture or unittest.TestCase):
+    class ModelConfigTest(unittest.TestCase):
         def test_accuracy(self):
-            run_model_config(
-                config, base_url=base_url, server_ready=server_fixture is not None
-            )
+            run_model_config(config, base_url=base_url)
 
     # Strip every non-alphanumeric char: unittest test IDs are dot-separated, so a
     # name like "MiMo-V2.5-Pro" would otherwise produce an ambiguous id.
@@ -454,16 +444,11 @@ def build_test_case(
 def model_config_main(
     config: Union[Dict[str, Any], List[Dict[str, Any]]],
     base_url: Optional[str] = None,
-    *,
-    server_fixture: Optional[type[unittest.TestCase]] = None,
 ) -> None:
     """Entry point for a test file's ``__main__`` block.
 
     Registers the synthesised case(s) in the caller's module so ``unittest.main()``
     finds them -- the loader only looks at ``__main__``, not at this module.
-
-    When ``server_fixture`` is supplied, its class lifecycle owns serving and
-    readiness. Evaluation helpers only send requests to ``base_url``.
 
     A LIST of configs puts several models in one file, one TestCase each, run in
     sequence. They share ``base_url``, and RecipeLauncher evicts whoever holds it,
@@ -477,6 +462,6 @@ def model_config_main(
 
     configs = config if isinstance(config, list) else [config]
     for entry in configs:
-        case = build_test_case(entry, base_url=base_url, server_fixture=server_fixture)
+        case = build_test_case(entry, base_url=base_url)
         setattr(__main__, case.__name__, case)
     unittest.main()

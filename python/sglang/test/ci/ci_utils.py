@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import threading
 import time
@@ -10,7 +11,7 @@ from typing import Callable, Dict, List, Optional, Union
 
 from sglang.srt.debug_utils import cuda_coredump
 from sglang.srt.utils.common import kill_process_tree
-from sglang.test.ci.ci_register import CIRegistry
+from sglang.test.ci.ci_register import CIRegistry, HWBackend
 
 # Configure logger to output to stdout
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -250,7 +251,6 @@ def run_unittest_files(
     # TIMINGS block emitted at the end of this function.
     file_elapsed: Dict[str, float] = {}
     fork_worker = None
-    use_fork_worker = fork_worker_batch_size > 1 and not enable_retry
 
     for i, file in enumerate(files):
         if isinstance(file, CIRegistry):
@@ -258,6 +258,16 @@ def run_unittest_files(
         else:
             # FIXME: remove this branch after migrating all tests to use CIRegistry
             filename, estimated_time = file.name, file.estimated_time
+
+        pytest_runner = getattr(file, "runner", "unittest") == "pytest"
+        use_fork_worker = (
+            fork_worker_batch_size > 1 and not enable_retry and not pytest_runner
+        )
+        # A pytest process owns its own collection and fixtures. Finish an idle
+        # fork worker before switching runners, including timeout cleanup.
+        if pytest_runner and fork_worker is not None:
+            fork_worker.close()
+            fork_worker = None
 
         file_timeout = (
             timeout_per_file
@@ -272,8 +282,24 @@ def run_unittest_files(
             nonlocal process, output_lines, fork_worker
 
             full_path = os.path.join(os.getcwd(), filename)
+            if pytest_runner:
+                cmd = [
+                    "uv",
+                    "run",
+                    "--no-project",
+                    "python",
+                    "-m",
+                    "pytest",
+                    "-x",
+                    "-s",
+                    full_path,
+                ]
+                if isinstance(file, CIRegistry) and file.backend == HWBackend.TPU:
+                    cmd.append("--run-tpu")
+            else:
+                cmd = ["python3", full_path, "-f"]
             logger.info(
-                f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {full_path}\n.\n.\n"
+                f".\n.\nBegin ({i}/{len(files) - 1}):\n{shlex.join(cmd)}\n.\n.\n"
             )
             file_tic = time.perf_counter()
 
@@ -294,7 +320,6 @@ def run_unittest_files(
                 elapsed = time.perf_counter() - file_tic
             elif capture_output:
                 # Capture output for retry decision
-                cmd = ["python3", full_path, "-f"]
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -316,7 +341,6 @@ def run_unittest_files(
                 # Bounded wait for the reader to finish.
                 reader_thread.join(timeout=60)
             else:
-                cmd = ["python3", full_path, "-f"]
                 process = subprocess.Popen(cmd, stdout=None, stderr=None)
                 process.wait()
 
@@ -434,11 +458,11 @@ def run_unittest_files(
         logger.info(f"Fail. Time elapsed: {elapsed_total:.2f}s")
 
     # Print summary
-    logger.info(f"\n{'='*60}")
+    logger.info(f"\n{'=' * 60}")
     logger.info(f"Test Summary: {len(passed_tests)}/{len(files)} passed")
     if enable_retry and retried_tests:
         logger.info(f"Retries: {len(retried_tests)} test(s) were retried")
-    logger.info(f"{'='*60}")
+    logger.info(f"{'=' * 60}")
     if passed_tests:
         logger.info("✓ PASSED:")
         for test in passed_tests:
@@ -451,7 +475,7 @@ def run_unittest_files(
         logger.info("\n↻ RETRIED:")
         for test, attempts, result in retried_tests:
             logger.info(f"  {test} ({attempts} attempts, {result})")
-    logger.info(f"{'='*60}\n")
+    logger.info(f"{'=' * 60}\n")
 
     # Machine-readable timings block for downstream scrapers/dashboards.
     # One JSON object per executed file (post-retry: only the latest
