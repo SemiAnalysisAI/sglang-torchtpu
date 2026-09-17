@@ -423,18 +423,31 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    async fn get_server_info(&self, _req: Request<Body>) -> Response {
-        // TODO: Aggregate info from all routers with healthy workers
-        (
-            StatusCode::OK,
-            serde_json::json!({
-                "router_manager": true,
-                "routers_count": self.routers.len(),
-                "workers_count": self.worker_registry.get_all().len()
-            })
-            .to_string(),
-        )
-            .into_response()
+    async fn get_server_info(&self, req: Request<Body>) -> Response {
+        // Delegate, the same way get_model_info does. The previous stub answered
+        // {"router_manager", "routers_count", "workers_count"} without consulting
+        // any worker, so `internal_states` was absent no matter what the engines
+        // reported -- which makes avg_spec_accept_length unreadable for every
+        // caller behind this manager.
+        let router_id = {
+            let default_router = self
+                .default_router
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            default_router.clone()
+        };
+
+        let router = if let Some(id) = router_id {
+            self.routers.get(&id).map(|r| r.clone())
+        } else {
+            self.routers.iter().next().map(|r| r.value().clone())
+        };
+
+        if let Some(router) = router {
+            router.get_server_info(req).await
+        } else {
+            (StatusCode::SERVICE_UNAVAILABLE, "No routers available").into_response()
+        }
     }
 
     async fn get_models(&self, _req: Request<Body>) -> Response {

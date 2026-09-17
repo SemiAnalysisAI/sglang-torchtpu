@@ -2,17 +2,23 @@
 //!
 //! Tests for prefill-decode disaggregation routing mode.
 
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
 use serde_json::json;
-use smg::config::RouterConfig;
+use smg::{
+    config::RouterConfig,
+    routers::router_manager::{RouterId, RouterManager},
+};
 use tower::ServiceExt;
 
 use crate::common::{
     mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
+    test_app::create_test_app_with_context,
     AppTestContext, TestWorkerConfig,
 };
 
@@ -143,6 +149,74 @@ mod pd_routing_tests {
         assert_eq!(
             json["port"], 19821,
             "/server_info was answered by the wrong worker: {json}"
+        );
+
+        ctx.shutdown().await;
+    }
+
+    /// The same thing, but through a RouterManager -- which is what production
+    /// actually wires as `AppState.router`.
+    ///
+    /// This test exists because its sibling above passed while the deployed
+    /// system still failed. The harness sets `router_manager: None` and installs
+    /// the PD router directly, so nothing exercised RouterManager's own
+    /// RouterTrait impl -- whose get_server_info was a stub returning
+    /// {"router_manager", "routers_count", "workers_count"} and never consulting
+    /// a worker. Fixing the PD router alone changed nothing observable.
+    #[tokio::test]
+    async fn test_server_info_through_router_manager_reaches_decode() {
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![("http://127.0.0.1:19830".to_string(), None)],
+                vec!["http://127.0.0.1:19831".to_string()],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(3830)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                TestWorkerConfig::prefill(19830),
+                TestWorkerConfig::decode(19831),
+            ],
+        )
+        .await;
+
+        // Wrap the PD router exactly as production does.
+        let manager = Arc::new(RouterManager::new(Arc::clone(
+            &ctx.app_context.worker_registry,
+        )));
+        manager.register_router(RouterId::new("pd"), Arc::clone(&ctx.router));
+        let app = create_test_app_with_context(manager, Arc::clone(&ctx.app_context));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/server_info")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(
+            json.get("router_manager").is_none(),
+            "RouterManager answered from its own stub instead of delegating: {json}"
+        );
+        assert_eq!(
+            json["port"], 19831,
+            "/server_info did not reach the decode worker through the manager: {json}"
         );
 
         ctx.shutdown().await;
