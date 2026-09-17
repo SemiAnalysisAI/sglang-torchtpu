@@ -134,6 +134,7 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
     *,
     group_size: int,
     no_combine: bool,
+    supported_group_sizes: tuple[int, ...] = TPU_NVFP4_SUPPORTED_GROUP_SIZES,
 ) -> list[str]:
     """Return the fused-RS contract requirements this layer does not meet."""
     from sglang.srt.distributed import get_tp_group, get_world_group
@@ -144,8 +145,8 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
     runner_config = layer.moe_runner_config
     requirements = (
         (
-            f"group_size in {TPU_NVFP4_SUPPORTED_GROUP_SIZES}",
-            group_size in TPU_NVFP4_SUPPORTED_GROUP_SIZES,
+            f"group_size in {supported_group_sizes}",
+            group_size in supported_group_sizes,
         ),
         ("expert parallelism enabled", layer.moe_ep_size > 1),
         (

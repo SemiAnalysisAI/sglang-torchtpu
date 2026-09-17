@@ -3175,6 +3175,7 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             layer,
             group_size=self.quant_config.group_size,
             no_combine=self.moe_runner_config.no_combine,
+            supported_group_sizes=self.SUPPORTED_GROUP_SIZES,
         )
         self.handles_moe_reduction = not unmet_requirements
         if self.handles_moe_reduction:
