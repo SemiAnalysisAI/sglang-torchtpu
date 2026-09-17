@@ -346,23 +346,10 @@ def apply_tpu_fp8_moe(
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)
-    # Padded tokens carry expert index -1. Their combine weight is zeroed
-    # below, so where they are sent cannot change the result -- but it does
-    # change group_sizes, and the fused grouped GEMM tiles off that. Sending
-    # them all to expert 0 makes group_sizes[0] grow with the token padding:
-    # a 62-token prompt in the 64-token extend graph adds 2, the same prompt
-    # in the 256-token graph adds 194. Spread them over the local experts
-    # instead, so the group-size distribution does not depend on how far the
-    # batch happened to be padded (issue #718).
-    #
-    # row indices come from ones_like + cumsum rather than torch.arange: every
-    # device tensor inside a direct_compile region must derive from an existing
-    # one, and a freshly constructed one aborts all ranks.
+    # Padded tokens might have expert index of -1, override the expert
+    # selection to expert 0.
     valid = topk_ids >= 0
-    num_local_experts = max(1, int(layer.num_local_experts))
-    row = torch.cumsum(torch.ones_like(topk_ids[:, :1]), dim=0) - 1
-    filler = (row % num_local_experts).expand_as(topk_ids)
-    topk_ids = torch.where(valid, topk_ids, filler)
+    topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
     topk_weights = topk_weights * valid.to(topk_weights.dtype)
     if layer.num_fused_shared_experts:
         raise NotImplementedError(
