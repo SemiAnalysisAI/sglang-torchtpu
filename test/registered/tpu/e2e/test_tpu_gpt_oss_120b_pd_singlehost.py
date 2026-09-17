@@ -97,7 +97,6 @@ ATOL = float(E("GSM8K_ATOL", "0.03"))
 NUM_EXAMPLES = int(E("GSM8K_NUM_EXAMPLES", "100"))
 NUM_THREADS = int(E("GSM8K_NUM_THREADS", "8"))
 MAX_TOKENS = int(E("GSM8K_MAX_TOKENS", "1024"))
-HEALTH_TIMEOUT = float(E("HEALTH_TIMEOUT", "3600"))
 
 
 def resolve_model_path(env: Optional[Mapping[str, str]] = None) -> str:
@@ -267,12 +266,6 @@ def build_model_config(*, decode_host: str) -> Dict[str, Any]:
         "model": SERVED_MODEL_NAME,
         "test_name": "gpt-oss-120b-pd-singlehost-gsm8k",
         "variant": f"PD-singlehost-TP{TP_SIZE}+EP{EP_SIZE}-raiden",
-        "launch": {
-            # The role processes launch the servers and router before this runner attaches.
-            "external": True,
-            "health_timeout": HEALTH_TIMEOUT,
-            "tag": "gpt-oss-120b-pd-singlehost-gsm8k-e2e",
-        },
         # Keep this specialized P/D result off the standard accuracy dashboard.
         "gates": [
             {

@@ -28,7 +28,8 @@ Top level
     model         Model path or HF id. Reported, and sent as the model id by the eval
                   clients; the recipe is what actually sets MODEL on the server.
     gates         Evaluations to run, all sharing one server boot.
-    launch        How to bring the server up (see below).
+    launch        How to bring the server up (see below). Omit when a test fixture
+                  owns the server and supplies its ready base_url.
     test_name     Report label, and the basis of the generated TestCase name.
                   Defaults to `model`.
     id            Stable series slug, e.g. "accuracy-gpt-oss-120b". The dashboard's
@@ -381,27 +382,29 @@ def build_model(config: Dict[str, Any]) -> TpuModelLaunchSettings:
     )
 
 
-def run_model_config(
-    config: Dict[str, Any],
-    base_url: Optional[str] = None,
-    *,
-    server_ready: bool = False,
-) -> dict:
-    """Run every gate, attaching directly when a fixture made the server ready."""
+def run_model_config(config: Dict[str, Any], base_url: Optional[str] = None) -> dict:
+    """Run every gate using the configured launcher or a fixture's ready URL.
+
+    Without a ``launch`` entry, ``base_url`` is required and its caller owns
+    startup, readiness, and shutdown. Explicit launch entries retain their
+    behavior even when ``base_url`` is supplied.
+    """
     _reject_unknown(config, _CONFIG_KEYS, "MODEL_CONFIG")
     for required in ("model", "gates"):
         if required not in config:
             raise ValueError(f'MODEL_CONFIG needs "{required}"')
 
-    if server_ready:
+    if "launch" in config:
+        model = build_model(config)
+    else:
+        if not base_url:
+            raise ValueError('MODEL_CONFIG without "launch" needs a ready base_url')
         # The class fixture owns startup, readiness, and shutdown. Each gate
         # enters the existing server without another launch or health check.
         model = ModelLaunchSettings(
             config["model"], launcher=nullcontext, variant=config.get("variant")
         )
         model.extra_args = []
-    else:
-        model = build_model(config)
 
     return run_combined_tests(
         models=[model],
