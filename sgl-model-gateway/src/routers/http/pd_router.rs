@@ -101,6 +101,21 @@ impl PDRouter {
         }
     }
 
+    async fn proxy_to_first_decode_worker(
+        &self,
+        endpoint: &str,
+        headers: Option<Vec<(String, String)>>,
+    ) -> Response {
+        let workers = self.worker_registry.get_decode_workers();
+
+        if let Some(worker) = workers.first() {
+            self.proxy_to_worker(worker.as_ref(), endpoint, headers)
+                .await
+        } else {
+            error::service_unavailable("no_decode_servers", "No decode servers available")
+        }
+    }
+
     async fn proxy_to_worker(
         &self,
         worker: &dyn Worker,
@@ -1535,10 +1550,11 @@ impl RouterTrait for PDRouter {
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
-        // Get info from the first decode server to match sglang's server info format
-        // Note: We use decode workers for server info to match expected format
-        self.proxy_to_first_prefill_worker("server_info", None)
-            .await
+        // Decode, not prefill: `internal_states[].avg_spec_accept_length` only
+        // exists where the accept/reject happens, and a P/D prefill engine
+        // reports no internal_states at all. mini-LB builds its response from
+        // the decode servers for the same reason (mini_lb.py:318-324).
+        self.proxy_to_first_decode_worker("server_info", None).await
     }
 
     async fn get_models(&self, req: Request<Body>) -> Response {
