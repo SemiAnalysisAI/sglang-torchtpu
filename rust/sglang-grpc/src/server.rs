@@ -13,9 +13,12 @@ use tonic::{Request, Response, Status};
 
 use crate::bridge::{PyBridge, ResponseChunk, TerminalError};
 use crate::proto;
+use crate::smg::SmgSchedulerServiceImpl;
+use crate::smg::response_map::StreamMode;
+use crate::smg_proto;
 use crate::utils::{
     build_classify_dict, build_embed_dict, build_generate_dict, build_text_embed_dict,
-    build_text_generate_dict, extract_model_path,
+    build_text_generate_dict, extract_model_path, merge_metadata_trace_context,
 };
 
 pub struct SglangServiceImpl {
@@ -63,7 +66,7 @@ fn resolve_max_message_size() -> usize {
 /// `INVALID_ARGUMENT` so callers can distinguish them from server failures.
 /// Everything else (typically `PyRuntimeError`, but also Python tracebacks
 /// from inside the tokenizer manager) maps to `INTERNAL`.
-fn pyerr_to_status(err: PyErr, context: &str) -> Status {
+pub(crate) fn pyerr_to_status(err: PyErr, context: &str) -> Status {
     let is_client_error = Python::attach(|py| {
         err.is_instance_of::<PyValueError>(py) || err.is_instance_of::<PyTypeError>(py)
     });
@@ -75,7 +78,7 @@ fn pyerr_to_status(err: PyErr, context: &str) -> Status {
     }
 }
 
-async fn recv_chunk_with_timeout(
+pub(crate) async fn recv_chunk_with_timeout(
     receiver: &mut Receiver<ResponseChunk>,
     response_timeout: Duration,
     timeout_message: impl FnOnce() -> String,
@@ -85,14 +88,14 @@ async fn recv_chunk_with_timeout(
         .map_err(|_| Status::deadline_exceeded(timeout_message()))
 }
 
-struct RequestAbortGuard {
+pub(crate) struct RequestAbortGuard {
     bridge: Arc<PyBridge>,
     rid: String,
     armed: bool,
 }
 
 impl RequestAbortGuard {
-    fn new(bridge: Arc<PyBridge>, rid: impl Into<String>) -> Self {
+    pub(crate) fn new(bridge: Arc<PyBridge>, rid: impl Into<String>) -> Self {
         Self {
             bridge,
             rid: rid.into(),
@@ -100,11 +103,11 @@ impl RequestAbortGuard {
         }
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
 
-    fn abort_now(&mut self) {
+    pub(crate) fn abort_now(&mut self) {
         if self.armed {
             self.armed = false;
             spawn_abort(self.bridge.clone(), self.rid.clone());
@@ -139,7 +142,7 @@ fn spawn_abort(bridge: Arc<PyBridge>, rid: String) {
     }
 }
 
-async fn recv_terminal_chunk_for_request(
+pub(crate) async fn recv_terminal_chunk_for_request(
     bridge: &Arc<PyBridge>,
     rid: &str,
     receiver: &mut Receiver<ResponseChunk>,
@@ -186,7 +189,7 @@ async fn recv_terminal_chunk_for_request(
     }
 }
 
-fn closed_stream_status(bridge: &Arc<PyBridge>, rid: &str) -> (Status, bool) {
+pub(crate) fn closed_stream_status(bridge: &Arc<PyBridge>, rid: &str) -> (Status, bool) {
     if let Some(error) = bridge.take_terminal_error(rid) {
         (terminal_error_status(error), false)
     } else {
@@ -224,12 +227,14 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         request: Request<proto::TextGenerateRequest>,
     ) -> Result<Response<Self::TextGenerateStream>, Status> {
-        let req = request.into_inner();
+        let (metadata, _extensions, req) = request.into_parts();
         let rid = req
             .rid
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let req_dict = build_text_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
+        let mut req_dict =
+            build_text_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
+        merge_metadata_trace_context(&metadata, &mut req_dict);
 
         let mut receiver = self
             .bridge
@@ -293,12 +298,13 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         request: Request<proto::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        let req = request.into_inner();
+        let (metadata, _extensions, req) = request.into_parts();
         let rid = req
             .rid
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let req_dict = build_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
+        let mut req_dict = build_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
+        merge_metadata_trace_context(&metadata, &mut req_dict);
 
         let mut receiver = self
             .bridge
@@ -981,9 +987,11 @@ pub async fn run_grpc_server(
     bridge: Arc<PyBridge>,
     shutdown: Arc<Notify>,
     response_timeout: Duration,
+    stream_mode: StreamMode,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = listener.local_addr()?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
+    let smg_bridge = bridge.clone();
     let service = SglangServiceImpl {
         bridge,
         response_timeout,
@@ -994,10 +1002,23 @@ pub async fn run_grpc_server(
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size);
 
+    // Second service on the same listener. `/<package>.<service>/<Method>`
+    // dispatch keys are disjoint, so the two never interact.
+    let smg_svc =
+        smg_proto::sglang_scheduler_server::SglangSchedulerServer::new(SmgSchedulerServiceImpl {
+            bridge: smg_bridge,
+            response_timeout,
+            stream_mode,
+            rooms: Arc::new(crate::smg::rooms::RoomRegistry::new()),
+        })
+        .max_decoding_message_size(max_message_size)
+        .max_encoding_message_size(max_message_size);
+
     tracing::info!("gRPC server listening on {}", addr);
 
     tonic::transport::Server::builder()
         .add_service(svc)
+        .add_service(smg_svc)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.notified().await;
             tracing::info!("gRPC server shutting down");

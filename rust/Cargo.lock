@@ -3667,9 +3667,11 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "prost",
+ "prost-types",
  "protoc-bin-vendored",
  "pyo3",
  "serde_json",
+ "sha2",
  "tokenizers",
  "tokio",
  "tokio-stream",
