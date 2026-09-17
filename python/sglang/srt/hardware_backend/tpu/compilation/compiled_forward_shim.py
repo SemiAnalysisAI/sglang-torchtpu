@@ -456,6 +456,23 @@ def _pad_forward_batch_inputs(
         pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
         real_q_out, real_b_out = real_q, real_b
 
+    # EXPERIMENT (#718): one host-side line per (mode, real_q, pad_t) so a probe
+    # can be checked for effect instead of assumed. num_token_non_padded is what
+    # gates the MoE's padded-row masking; if it is None here, those rows are not
+    # marked -1 and every fix aimed at that masking is inert.
+    _pad_seen = globals().setdefault("_TPU_718_PAD_SEEN", set())
+    _pad_key = (str(forward_batch.forward_mode), real_q, pad_t)
+    if _pad_key not in _pad_seen:
+        _pad_seen.add(_pad_key)
+        logger.info(
+            "[718] mode=%s real_q=%d pad_t=%d pad_rows=%d num_token_non_padded=%s",
+            forward_batch.forward_mode,
+            real_q,
+            pad_t,
+            pad_t - real_q,
+            getattr(forward_batch, "num_token_non_padded", None),
+        )
+
     for field in _TOKEN_FIELDS:
         val = getattr(forward_batch, field, None)
         if isinstance(val, torch.Tensor) and val.shape[0] < pad_t:
