@@ -72,7 +72,10 @@ use super::{
     get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
     CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
 };
-use crate::core::{Worker, WorkerType, UNKNOWN_MODEL_ID};
+use crate::{
+    core::{Worker, WorkerType, UNKNOWN_MODEL_ID},
+    observability::metrics::Metrics,
+};
 
 /// Tag used to isolate prefill/decode/regular worker pools in the cache_aware tree key.
 ///
@@ -413,6 +416,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
         if is_imbalanced {
+            Metrics::record_worker_cache_aware_policy_branch("imbalanced");
             return self.select_worker_min_load(
                 workers,
                 &request_text,
@@ -439,6 +443,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             } else {
                 result.matched_char_count as f32 / result.input_char_count as f32
             };
+            Metrics::record_cache_aware_match_rate(match_rate);
+            let took_affinity = match_rate > self.config.cache_threshold;
 
             // Select worker without String allocation
             let selected_idx = if match_rate > self.config.cache_threshold {
@@ -486,11 +492,17 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 // Increment processed counter
                 workers[idx].increment_processed();
 
+                Metrics::record_worker_cache_aware_policy_branch(if took_affinity {
+                    "affinity_hit"
+                } else {
+                    "below_threshold"
+                });
                 return Some(idx);
             }
 
             // Selected worker no longer exists or unhealthy, remove stale tenant from tree
             if match_rate > self.config.cache_threshold {
+                Metrics::record_worker_cache_aware_policy_branch("stale_tenant");
                 let tenant_url: &str = &result.tenant;
                 tree.remove_tenant(tenant_url);
                 debug!("Removed stale worker {} from cache tree", tenant_url);
@@ -519,6 +531,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                  clears",
                 tree_key
             );
+            Metrics::record_worker_cache_aware_policy_branch("no_tree");
             let mut rng = rand::rng();
             let random_idx = rng.random_range(0..healthy_indices.len());
             Some(healthy_indices[random_idx])
@@ -558,8 +571,115 @@ impl Default for CacheAwarePolicy {
 
 #[cfg(test)]
 mod tests {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
+
+    fn regular_worker(url: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .build(),
+        )
+    }
+
+    /// Branch labels emitted for one run, plus how many match rates were recorded.
+    fn capture_branches(
+        body: impl FnOnce(&CacheAwarePolicy, &[Arc<dyn Worker>]),
+    ) -> (Vec<String>, usize) {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+                eviction_interval_secs: 0,
+                ..Default::default()
+            });
+            let workers = vec![
+                regular_worker("http://w1:8000"),
+                regular_worker("http://w2:8000"),
+            ];
+            body(&policy, &workers);
+        });
+
+        let mut branches = Vec::new();
+        let mut rates = 0;
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            let key = key.key();
+            if key.name() == "smg_cache_aware_policy_branch_total" {
+                if let DebugValue::Counter(n) = value {
+                    for label in key.labels() {
+                        if label.key() == "branch" {
+                            for _ in 0..n {
+                                branches.push(label.value().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            if key.name() == "smg_cache_aware_match_rate" {
+                if let DebugValue::Histogram(samples) = value {
+                    rates += samples.len();
+                }
+            }
+        }
+        branches.sort();
+        (branches, rates)
+    }
+
+    #[test]
+    fn test_branch_metric_reports_no_tree_when_the_pool_was_never_seeded() {
+        // init_workers is deliberately not called: this is the silent degradation
+        // where cache_aware falls back to random with affinity disabled.
+        let (branches, rates) = capture_branches(|policy, workers| {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                policy
+                    .select_worker(
+                        workers,
+                        &SelectWorkerInfo {
+                            request_text: Some("hello world"),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+        });
+        assert_eq!(branches, vec!["no_tree".to_string()]);
+        // No tree means no match rate was computed.
+        assert_eq!(rates, 0);
+    }
+
+    #[test]
+    fn test_branch_metric_separates_a_cold_miss_from_a_later_affinity_hit() {
+        let (branches, rates) = capture_branches(|policy, workers| {
+            policy.init_workers(workers);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                for _ in 0..2 {
+                    policy
+                        .select_worker(
+                            workers,
+                            &SelectWorkerInfo {
+                                request_text: Some("a shared prefix, long enough to match"),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+            });
+        });
+        assert_eq!(
+            branches,
+            vec!["affinity_hit".to_string(), "below_threshold".to_string()],
+            "first request has an empty tree to match against, second should hit affinity"
+        );
+        assert_eq!(
+            rates, 2,
+            "a match rate is recorded per decision that reaches a tree"
+        );
+    }
 
     #[tokio::test]
     async fn test_cache_aware_with_balanced_load() {
