@@ -277,7 +277,6 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_page_size
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -2442,7 +2441,7 @@ class Scheduler(
         # smaller than max_total_num_tokens. Otherwise a request can be accepted
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
-        alloc_page_size = get_alloc_page_size()
+        alloc_page_size = self.page_size * get_parallel().attn_dcp_size
         paged_input_len = -(-input_len // alloc_page_size) * alloc_page_size
         req.sampling_params.max_new_tokens = max(
             0,
@@ -3628,7 +3627,7 @@ class Scheduler(
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
         adder = PrefillAdder(
-            get_alloc_page_size(),
+            self.page_size * get_parallel().attn_dcp_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             running_batch,

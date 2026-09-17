@@ -1450,9 +1450,9 @@ class KVCacheConfigurator:
         # attn_tp_size // attn_dcp_size groups, as get_num_kv_heads does for
         # the full sub-pool below. A draft model never joins the DCP group, so
         # it shards over the whole attn TP group.
-        swa_dcp_size = (
-            1 if self.model_config.is_draft_model else get_parallel().attn_dcp_size
-        )
+        swa_dcp_size = get_parallel().attn_dcp_size
+        if swa_dcp_size > 1 and self.model_config.is_draft_model:
+            swa_dcp_size = 1
         swa_head_num = max(
             1,
             getattr(
