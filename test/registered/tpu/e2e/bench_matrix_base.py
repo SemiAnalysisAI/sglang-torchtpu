@@ -457,13 +457,28 @@ def build_bench_test(
                     # with probability 1/N. A round that lands elsewhere still
                     # hits that engine's older copy of the session, so 1/N of
                     # the ideal is a floor, not an estimate.
+                    #
+                    # cache_aware routing sends a session back to the engine that
+                    # holds it, so that 1/N discount does not apply. Keeping it
+                    # would leave the floor N times looser than the run can
+                    # achieve, and the gate would stop measuring the routing it
+                    # is there to check.
                     prefill_engines = int(config.get("pd_prefill_engines") or 1)
-                    reachable /= prefill_engines
-                    routing = (
-                        f" across {prefill_engines} randomly paired prefill engines"
-                        if prefill_engines > 1
-                        else ""
-                    )
+                    affinity_routed = config.get("pd_router") == "smg"
+                    if affinity_routed:
+                        routing = (
+                            f" with cache-aware affinity across {prefill_engines}"
+                            " prefill engines"
+                            if prefill_engines > 1
+                            else ""
+                        )
+                    else:
+                        reachable /= prefill_engines
+                        routing = (
+                            f" across {prefill_engines} randomly paired prefill engines"
+                            if prefill_engines > 1
+                            else ""
+                        )
                     floor = MIN_PREFIX_HIT_FRACTION * reachable
                     how = (
                         f"{MIN_PREFIX_HIT_FRACTION:.0%} of the {reachable:.1%} "
