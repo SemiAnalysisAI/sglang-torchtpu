@@ -106,7 +106,7 @@ ${WEIGHTS_VOLUME}
                       # exist. Printed unconditionally, as in jobset-tpu.yaml.
                       echo "== test files: ${TEST_FILES} =="
                       t0=$SECONDS
-                      ${EXEC_CMD}
+                      uv run --no-project --no-managed-python -- ${EXEC_CMD}
                       rc=$?
                       # Only the prefill leader's verdict gates. On a non-leader
                       # host teardown is expected in two shapes: SIGTERM (143), or
@@ -209,7 +209,7 @@ ${WEIGHTS_VOLUME}
                       # Same announcement as the prefill side; the verdict is
                       # the prefill leader's alone, so no TIMINGS record here.
                       echo "== test files: ${TEST_FILES} =="
-                      ${EXEC_CMD}
+                      uv run --no-project --no-managed-python -- ${EXEC_CMD}
                       rc=$?
                       # Decode pods never gate the verdict, so a teardown exit is
                       # success: SIGTERM (143), or a 137 whose log shows the peer
