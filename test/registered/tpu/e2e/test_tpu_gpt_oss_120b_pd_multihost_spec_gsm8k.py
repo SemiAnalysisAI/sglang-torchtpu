@@ -28,6 +28,7 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.tpu import model_config_main
+    from sglang.test.tpu.pd_router import build_router_cmd
 except ModuleNotFoundError as exc:
     SGLANG_IMPORT_ERROR = exc
 
@@ -36,6 +37,9 @@ except ModuleNotFoundError as exc:
 
     def model_config_main(*_args, **_kwargs):
         return None
+
+    def build_router_cmd(**_kwargs):
+        raise SGLANG_IMPORT_ERROR
 
 
 register_tpu_ci(
@@ -393,21 +397,18 @@ def execute_router(
     decode_port: int = DECODE_PORT,
     log_path: str = LB_LOG,
 ) -> subprocess.Popen:
-    """Launch mini-LB router connecting prefill and decode engines."""
-    cmd = (
-        PYTHON,
-        "-m",
-        "sglang_router.launch_router",
-        "--pd-disaggregation",
-        "--mini-lb",
-        "--prefill",
-        f"http://{prefill_host}:{prefill_port}",
-        "--decode",
-        f"http://{decode_host}:{decode_port}",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(port),
+    """Launch the router connecting prefill and decode engines.
+
+    ``SGLANG_TPU_PD_ROUTER`` selects mini-LB (the default, and what this test
+    has always used) or the SGLang Model Gateway PD router.
+    """
+    cmd = build_router_cmd(
+        python=PYTHON,
+        prefill_url=f"http://{prefill_host}:{prefill_port}",
+        decode_url=f"http://{decode_host}:{decode_port}",
+        host="0.0.0.0",
+        port=port,
+        bootstrap_port=BOOTSTRAP_PORT,
     )
     return _launch(cmd, log_path=log_path)
 
