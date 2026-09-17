@@ -13,21 +13,16 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
-from benchmark.tpu import launch_server as tpu_launcher
-from benchmark.tpu.launcher_test_case import TPULauncherTestCase
+from pd_singlehost_base import PDSingleHostTestCase, peer_hostname
 
 SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
-    from sglang.test.tpu import model_config_main
 except ModuleNotFoundError as exc:
     # Source-only checkout: the host-side configuration tests still run.
     SGLANG_IMPORT_ERROR = exc
 
     def register_tpu_ci(*_args, **_kwargs):
-        return None
-
-    def model_config_main(*_args, **_kwargs):
         return None
 
 
@@ -139,14 +134,6 @@ def self_hostname(env: Optional[Mapping[str, str]] = None) -> str:
     values = os.environ if env is None else env
     hostnames = [h for h in values.get("TPU_WORKER_HOSTNAMES", "").split(",") if h]
     return hostnames[0] if hostnames else socket.gethostname()
-
-
-def peer_hostname(hostname: str, *, from_role: str, to_role: str) -> str:
-    """Map this pod's DNS name onto the pod of the peer role."""
-    needle, replacement = f"-{from_role}-", f"-{to_role}-"
-    if needle not in hostname:
-        raise ValueError(f"hostname {hostname!r} has no {needle!r} segment")
-    return hostname.replace(needle, replacement)
 
 
 def _common_launch_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
@@ -311,68 +298,23 @@ def build_model_config(*, decode_host: str) -> Dict[str, Any]:
     }
 
 
-def launcher_runtime_envs() -> Dict[str, str]:
-    """Describe the two-role group without rewriting slice-local TPU ranks."""
-    this_host = self_hostname()
-    hosts = [
-        this_host,
-        peer_hostname(this_host, from_role=PREFILL_ROLE, to_role=DECODE_ROLE),
-    ]
-    return {
-        "SGLANG_LAUNCHER_HOSTNAMES": ",".join(hosts),
-        "SGLANG_LAUNCHER_RANK": "0",
-    }
-
-
-class PdSingleHostClassFixture(TPULauncherTestCase):
-    """Use the shared class fixture with this test's P/D configuration."""
+class PdSingleHostClassFixture(PDSingleHostTestCase):
+    """Configure the shared P/D fixture for this test's recipe and gates."""
 
     config_module = LAUNCH_CONFIG_MODULE
-    base_url = f"http://{LOCAL_HOST}:{LB_PORT}"
-    health_timeout = 2 * WAIT_SECS + 300
-    cwd = BENCH
     log_path = PREFILL_LOG
-    keep_up = KEEP_UP
-    tag = "pd-singlehost"
+    decode_log_path = DECODE_LOG
+    self_hostname = staticmethod(self_hostname)
 
     @classmethod
-    def get_runtime_envs(cls) -> Dict[str, str]:
-        return launcher_runtime_envs()
-
-
-def run_prefill_leader() -> int:
-    """Run the existing gates, sharing the class fixture's serving group."""
-    decode_host = peer_hostname(
-        self_hostname(), from_role=PREFILL_ROLE, to_role=DECODE_ROLE
-    )
-    model_config_main(
-        build_model_config(decode_host=decode_host),
-        base_url=f"http://{LOCAL_HOST}:{LB_PORT}",
-        test_case_base=PdSingleHostClassFixture,
-    )
-    return 0
-
-
-def run_decode_worker() -> int:
-    """Run the same launcher on the service pod until JobSet teardown."""
-    proc = tpu_launcher.start_launcher(
-        LAUNCH_CONFIG_MODULE + ":DECODE_CONFIG",
-        {"SGLANG_LAUNCHER_RANK": "0"},
-        cwd=BENCH,
-        log_path=DECODE_LOG,
-    )
-    try:
-        return proc.wait()
-    finally:
-        tpu_launcher.stop_processes([proc], grace=60)
+    def build_model_config(cls) -> Dict[str, Any]:
+        return build_model_config(decode_host=cls.decode_hostname())
 
 
 def run_integration() -> int:
     """Dispatch on the role this pod was given."""
     validate_model_source(resolve_model_path())
-    if resolve_role() == PREFILL_ROLE:
-        return run_prefill_leader()
-    return run_decode_worker()
+    return PdSingleHostClassFixture.run_role(resolve_role())
 
 
 def render_jobset_yaml(

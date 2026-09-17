@@ -3,6 +3,16 @@ load("//bazel:defs.bzl", "sglang_tpu_e2e_test")
 
 package(default_visibility = ["//visibility:public"])
 
+py_library(
+    name = "pd_singlehost_base",
+    srcs = ["pd_singlehost_base.py"],
+    imports = ["."],
+    deps = [
+        "//benchmark/tpu:launcher",
+        "//benchmark/tpu:launcher_test_case",
+    ],
+)
+
 [py_test(
     name = "test_tpu_gpt_oss_120b_pd_singlehost_" + variant + "_config",
     size = "small",
@@ -10,10 +20,7 @@ package(default_visibility = ["//visibility:public"])
     data = ["//benchmark/tpu:runtime"],
     main = "test_tpu_gpt_oss_120b_pd_singlehost_" + variant + ".py",
     python_version = "3.12",
-    deps = [
-        "//benchmark/tpu:launcher",
-        "//benchmark/tpu:launcher_test_case",
-    ],
+    deps = [":pd_singlehost_base"],
 ) for variant in ["decode_radix", "spec"]]
 
 py_test(
@@ -23,10 +30,7 @@ py_test(
     data = ["//benchmark/tpu:runtime"],
     main = "test_tpu_gpt_oss_120b_pd_singlehost.py",
     python_version = "3.12",
-    deps = [
-        "//benchmark/tpu:launcher",
-        "//benchmark/tpu:launcher_test_case",
-    ],
+    deps = [":pd_singlehost_base"],
 )
 
 sglang_tpu_e2e_test(
