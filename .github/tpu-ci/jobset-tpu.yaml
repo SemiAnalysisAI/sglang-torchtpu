@@ -132,6 +132,7 @@ ${WEIGHTS_VOLUME}
 
                       if [ "$NNODES" -le 1 ]; then
                         # Single-host: each test self-launches its own server.
+                        source scripts/ci/tpu/prepare_pytest.sh
                         exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} ${PARTITION_FLAGS} ${TEST_FILE_FLAG} --timeout-per-file ${TIMEOUT_PER_FILE}
                       fi
 
