@@ -275,7 +275,8 @@ def get_vmem_estimate_bytes(
     # Attention compute intermediates (f32). The for-loop over kv_heads is
     # statically unrolled by the compiler, so all heads' intermediates coexist
     # in VMEM.  Per head: QK^T scores (bq*qpkv, bkv_csz) + PV result (bq*qpkv, hd)
-    # in f32, with ~4x overhead for softmax temps, pipelining, and spills.
+    # in f32, counted once (e.g. gpt-oss-120b at 256 query rows: 86.0 MiB
+    # estimated, 81.7 MiB reported by the compiler).
     # Use bkv_csz (compute size) since that determines the matmul tile size.
     compute_bkv = bkv_csz if bkv_csz is not None else bkv_sz
     compute_bits = (
@@ -284,7 +285,6 @@ def get_vmem_estimate_bytes(
         * num_q_heads_per_kv_head
         * (compute_bkv + head_dim)
         * 32  # f32
-        * 4  # compiler overhead factor
     )
     total_bits += compute_bits
 
@@ -1593,12 +1593,12 @@ def get_default_block_sizes(
     bkv_csz = align_to(bkv_csz, bkv_alignment)
 
     # Reduce block sizes if VMEM estimate exceeds limit.
-    # Use 30% of vmem_limit to account for compiler overhead (intermediates,
-    # stack, spills, f32 softmax pipeline) not captured by get_vmem_estimate_bytes.
+    # Use a fraction of vmem_limit as margin for shapes the estimate has not
+    # been checked against.
     if vmem_limit_bytes is not None:
-        # Give higher vmem budget for prefill and mixed.
-        # TODO(wyzhang): Evaluate if we still need the capping.
-        _budget_frac = 0.30 if case == RpaCase.DECODE else 0.70
+        # Give higher vmem budget for prefill and mixed; a larger decode KV
+        # block measured slower per token.
+        _budget_frac = 0.15 if case == RpaCase.DECODE else 0.60
         vmem_budget = int(vmem_limit_bytes * _budget_frac)
         while bq_sz > 1 or bkv_sz > bkv_alignment:
             vmem_est = get_vmem_estimate_bytes(
@@ -1659,9 +1659,9 @@ def get_default_block_sizes(
 
 def get_vmem_limit():
     try:
-        # Use half of VMEM capacity as default to approximate the scoped VMEM limit.
-        # The compiler's scoped VMEM allocation is typically ~50% of total capacity.
-        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes // 2
+        # The kernel's own VMEM limit: the whole capacity, which is also what
+        # the scoped-VMEM setting of the benchmark and CI flags grants XLA.
+        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
     except Exception:
         vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
     return vmem_limit_bytes

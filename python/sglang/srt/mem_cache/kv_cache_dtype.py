@@ -32,8 +32,7 @@ def configure_kv_cache_dtype(
     resolved_kv_cache_dtype: Optional[str] = None
     if is_draft_worker and speculative_draft_kv_cache_dtype is not None:
         server_args_kv_cache_dtype = speculative_draft_kv_cache_dtype
-        if server_args_kv_cache_dtype != "auto":
-            resolved_kv_cache_dtype = server_args_kv_cache_dtype
+        resolved_kv_cache_dtype = server_args_kv_cache_dtype
     if server_args_kv_cache_dtype == "auto":
         quant_config = getattr(model, "quant_config", None)
         kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
@@ -55,6 +54,11 @@ def configure_kv_cache_dtype(
             kv_cache_dtype = fp8_dtype
         else:
             kv_cache_dtype = torch.float8_e4m3fn
+    elif server_args_kv_cache_dtype == "mxint8":
+        if model_dtype != torch.bfloat16:
+            raise ValueError("MXINT8 KV cache requires a BF16 model")
+        kv_cache_dtype = torch.int8
+        resolved_kv_cache_dtype = "mxint8"
     elif server_args_kv_cache_dtype == "mxfp8":
         kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):

@@ -85,6 +85,33 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _draft_kv_cache_format(kvc: KVCacheConfigurator) -> str | None:
+    draft_format = get_spec().speculative_draft_kv_cache_dtype or kvc.kv_cache_dtype_str
+    if (
+        kvc.spec_algorithm.is_dflash_family()
+        and (
+            kvc.speculative_draft_attention_backend
+            or get_spec().speculative_draft_attention_backend
+        )
+        == "fa4"
+    ):
+        # configure_kv_cache_dtype gives this runner an unquantized cache.
+        return "auto"
+    return draft_format
+
+
+def _has_mxint8_draft(kvc: KVCacheConfigurator) -> bool:
+    return (
+        not kvc.is_draft_worker
+        and (
+            kvc.spec_algorithm.is_eagle()
+            or kvc.spec_algorithm.is_standalone()
+            or kvc.spec_algorithm.is_dflash_family()
+        )
+        and _draft_kv_cache_format(kvc) == "mxint8"
+    )
+
+
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     """Bytes/token the DFLASH draft KV pool adds to the target's budget, 0 if none.
 
@@ -98,8 +125,53 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
         return 0
     cell_size = kvc.spec_aux_config.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
+        if kvc.kv_cache_dtype_str == "mxint8" or _has_mxint8_draft(kvc):
+            raise ValueError("MXINT8 requires a resolved DFLASH draft KV memory budget")
         return 0
+    if _draft_kv_cache_format(kvc) == "mxint8":
+        from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
+            ROW_ALIGNMENT,
+        )
+
+        # The estimator reports raw INT8 payload bytes. Quantization groups
+        # vary, but physical exponent rows retain their fixed alignment.
+        group_size = getattr(
+            getattr(kvc, "server_args", None), "tpu_mxint8_group_size", 32
+        )
+        if group_size not in (16, 32, 64):
+            raise ValueError("MXINT8 group_size must be 16, 32, or 64")
+        layers = int(kvc.spec_aux_config.dflash_draft_num_layers)
+        if layers <= 0 or int(cell_size) % (layers * group_size):
+            raise ValueError(
+                f"MXINT8 draft budget requires group-{group_size} per-layer geometry"
+            )
+        rows = int(cell_size) // layers // group_size
+        cell_size += layers * ceil_align(rows, ROW_ALIGNMENT)
     return int(cell_size) * get_parallel().attn_dcp_size
+
+
+def _mxint8_draft_per_token(kvc, head_num: int, head_dim: int) -> int:
+    """EAGLE shares geometry, but its runner can select a different KV format."""
+    from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
+        cache_bytes_per_token,
+    )
+
+    draft_format = _draft_kv_cache_format(kvc)
+    if draft_format == "mxint8":
+        return cache_bytes_per_token(
+            head_num,
+            head_dim,
+            kvc.pool_page_size,
+            group_size=getattr(
+                getattr(kvc, "server_args", None), "tpu_mxint8_group_size", 32
+            ),
+        )
+    if draft_format in ("auto", "bf16", "bfloat16"):
+        # Auto may discover FP8 model quantization later; BF16 is the safe bound.
+        return 2 * head_num * head_dim * 2
+    if draft_format in ("fp8_e4m3", "fp8_e5m2"):
+        return 2 * head_num * head_dim
+    raise ValueError(f"Unsupported TPU draft KV format with MXINT8: {draft_format}")
 
 
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
@@ -149,6 +221,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
+        self._uses_mxint8 = self.kv_cache_dtype_str == "mxint8" or _has_mxint8_draft(
+            kvc
+        )
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
             effective_layer_ids = [
@@ -209,6 +284,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         allocate_all_layers=True,
                     )
                     self._cell_size += draft_kv_size + draft_indexer_size
+                elif self._uses_mxint8:
+                    self._cell_size += draft_num_layers * _mxint8_draft_per_token(
+                        kvc,
+                        kvc.model_config.get_num_kv_heads(
+                            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                        ),
+                        kvc.model_config.head_dim,
+                    )
                 else:
                     self._cell_size = int(
                         self._cell_size * (1 + draft_num_layers / int(num_layers))
@@ -240,6 +323,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
+        if self.kv_cache_dtype_str == "mxint8":
+            from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
+                cache_bytes_per_token,
+            )
+
+            return num_layers * cache_bytes_per_token(
+                kvc.model_config.get_num_kv_heads(
+                    get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                ),
+                kvc.model_config.head_dim,
+                kvc.pool_page_size,
+                group_size=getattr(kvc, "kv_group_size", 32),
+            )
         # args to config cell size
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
@@ -420,6 +516,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        if self._uses_mxint8:
+            available_bytes -= self._cell_size * page_size
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size
@@ -444,6 +542,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
+        self._uses_mxint8 = self.kv_cache_dtype_str == "mxint8" or _has_mxint8_draft(
+            kvc
+        )
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
         kv_size = torch._utils._element_size(kv_cache_dtype)
@@ -464,7 +565,24 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self._sliding_window_size = kvc.sliding_window_size
         self._page_size = kvc.page_size
 
-        if model_config.attention_arch == AttentionArch.MLA:
+        if self.kv_cache_dtype_str == "mxint8":
+            from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
+                cache_bytes_per_token,
+            )
+
+            self._full_per_token = cache_bytes_per_token(
+                model_config.get_num_kv_heads(tp_size),
+                model_config.head_dim,
+                kvc.pool_page_size,
+                group_size=getattr(kvc, "kv_group_size", 32),
+            )
+            self._swa_per_token = cache_bytes_per_token(
+                model_config.get_swa_num_kv_heads(tp_size),
+                model_config.swa_head_dim,
+                kvc.pool_page_size,
+                group_size=getattr(kvc, "kv_group_size", 32),
+            )
+        elif model_config.attention_arch == AttentionArch.MLA:
             # MLA pool sizing uses latent dimensions rather than MHA heads.
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,
@@ -515,6 +633,22 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
 
+        self._draft_full_per_token = self._full_per_token
+        self._draft_swa_per_token = self._swa_per_token
+        if (
+            self._uses_mxint8
+            and not kvc.is_draft_worker
+            and (kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone())
+        ):
+            self._draft_full_per_token = _mxint8_draft_per_token(
+                kvc, model_config.get_num_kv_heads(tp_size), model_config.head_dim
+            )
+            self._draft_swa_per_token = _mxint8_draft_per_token(
+                kvc,
+                model_config.get_swa_num_kv_heads(tp_size),
+                model_config.swa_head_dim,
+            )
+
         # Draft KV tensors use full, SWA, or full-capacity SWA geometry.
         self._draft_full_layers_num = 0
         self._draft_swa_layers_num = 0
@@ -561,21 +695,35 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         if self._full_layers_num == 0:
             self._cell_size = (
                 self._swa_per_token * self._swa_layers_num
-                + self._full_per_token * self._draft_full_layers_num
-                + self._swa_per_token * self._draft_swa_layers_num
-                + self._swa_per_token * self._draft_swa_full_layers_num
+                + self._draft_full_per_token * self._draft_full_layers_num
+                + self._draft_swa_per_token * self._draft_swa_layers_num
+                + self._draft_swa_per_token * self._draft_swa_full_layers_num
                 + self._draft_cell_size
             )
         else:
             self._cell_size = (
-                self._full_per_token
-                * (self._full_layers_num + self._draft_full_layers_num)
-                + self._swa_per_token * self._draft_swa_full_layers_num
+                self._full_per_token * self._full_layers_num
+                + self._draft_full_per_token * self._draft_full_layers_num
+                + self._draft_swa_per_token * self._draft_swa_full_layers_num
                 + self._swa_full_tokens_ratio
-                * self._swa_per_token
-                * (self._swa_layers_num + self._draft_swa_layers_num)
+                * (
+                    self._swa_per_token * self._swa_layers_num
+                    + self._draft_swa_per_token * self._draft_swa_layers_num
+                )
                 + self._draft_cell_size
             )
+
+    def _dummy_page_bytes(self, page_size: int) -> int:
+        if not self._uses_mxint8:
+            return 0
+        return page_size * (
+            self._full_per_token * self._full_layers_num
+            + self._draft_full_per_token * self._draft_full_layers_num
+            + self._swa_per_token * self._swa_layers_num
+            + self._draft_swa_per_token
+            * (self._draft_swa_layers_num + self._draft_swa_full_layers_num)
+            + self._draft_cell_size
+        )
 
     def _solve_pool_sizes(
         self, max_total_num_tokens: int, page_size: int
@@ -632,6 +780,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        available_bytes -= self._dummy_page_bytes(page_size)
         max_total_num_tokens = int(available_bytes // self._cell_size)
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
@@ -712,16 +861,19 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
         # SWA pool sized tightly from the cap; the rest of the budget goes to full.
+        available_bytes -= self._dummy_page_bytes(page_size)
         swa_tokens = ceil_align(self._swa_cap, page_size)
-        fixed_swa_bytes = (
-            swa_tokens
-            * self._swa_per_token
-            * (self._swa_layers_num + self._draft_swa_layers_num)
+        fixed_swa_bytes = swa_tokens * (
+            self._swa_per_token * self._swa_layers_num
+            + self._draft_swa_per_token * self._draft_swa_layers_num
         )
         full_cell_size = (
-            self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
-            + self._swa_per_token * self._draft_swa_full_layers_num
+            self._full_per_token * self._full_layers_num
+            + self._draft_full_per_token * self._draft_full_layers_num
+            + self._draft_swa_per_token * self._draft_swa_full_layers_num
         )
+        if self._uses_mxint8:
+            full_cell_size += self._draft_cell_size
         full_tokens = (
             int((available_bytes - fixed_swa_bytes) // full_cell_size) // page_size
         ) * page_size
