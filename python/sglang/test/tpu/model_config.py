@@ -4,13 +4,18 @@ Adding a model means copying a test file and editing its dict. This module turns
 dict into the launcher, the ``AccuracyTestParams`` list and the ``run_combined_tests``
 call, so a test file is a register call, a dict, and two lines to run it:
 
+    from copy import deepcopy
+    from benchmark.tpu.recipe.configs.gpt_oss_120b.server import CONFIG
+
+    launch_config = deepcopy(CONFIG)
+    launch_config["server_args"].update(model_path="/weights/gpt-oss-120b")
     register_tpu_ci(est_time=10800, suite="nightly-tpu-4-v7", nightly=True)
 
     MODEL_CONFIG = {
         "model": "/weights/gpt-oss-120b",
         "test_name": "gpt-oss-120b",
         "variant": "TP8+EP8",
-        "launch": {"recipe": "recipe/gpt_oss_120b/eval.sh", "tag": "gpqa-e2e"},
+        "launch": {**launch_config, "tag": "gpqa-e2e"},
         "gates": [
             {"dataset": "mmlu", "baseline": 0.859, "atol": 0.03,
              "num_examples": 2000, "reasoning_effort": "low"},
@@ -26,7 +31,7 @@ different servers. One TestCase per config, run in sequence.
 
 Top level
     model         Model path or HF id. Reported, and sent as the model id by the eval
-                  clients; the recipe is what actually sets MODEL on the server.
+                  clients; server_args.model_path identifies the weights to load.
     gates         Evaluations to run, all sharing one server boot.
     launch        How to bring the server up (see below).
     test_name     Report label, and the basis of the generated TestCase name.
@@ -51,13 +56,11 @@ Top level
     skip_unless   (condition, reason) -- the config form of @unittest.skipUnless.
 
 launch
-    recipe        Script under benchmark/tpu/ that brings the server up, e.g.
-                  "recipe/gpt_oss_120b/eval.sh". It is also what a human runs to
-                  reproduce a CI failure, so the serving config stays one copy: point at
-                  the model's recipe, or at a wrapper that execs it with the eval delta.
-    env           Environment for the recipe. The launcher logs it on boot, so a red run
-                  stays reproducible by hand. Config describing *how* the model is
-                  served belongs in the recipe.
+    server_args   Final CLI settings from a copied Python recipe CONFIG.
+    runtime_env   Environment passed to the server process.
+    recipe        Legacy shell script under benchmark/tpu/ (mutually exclusive
+                  with server_args/runtime_env).
+    env           Environment for a legacy shell recipe.
     external      True -> attach to a server an external orchestrator already started
                   (the multi-host JobSets). Takes no recipe/env.
     tag           Prefix on this model's progress lines, e.g. "gpqa-e2e".
@@ -146,7 +149,16 @@ _CONFIG_KEYS = {
     "dashboard_model",
     "skip_unless",
 }
-_LAUNCH_KEYS = {"recipe", "env", "tag", "health_timeout", "external"}
+_LAUNCH_KEYS = {
+    "recipe",
+    "env",
+    "server_args",
+    "runtime_env",
+    "runtime_envs",
+    "tag",
+    "health_timeout",
+    "external",
+}
 # Gate keys that map straight onto AccuracyTestParams.
 _GATE_PASSTHROUGH = {
     "dataset",
@@ -189,9 +201,26 @@ def _build_launcher(launch: Dict[str, Any]):
     tag = launch.get("tag", "tpu-e2e")
 
     if launch.get("external"):
-        if "recipe" in launch or "env" in launch:
+        if any(
+            key in launch
+            for key in ("recipe", "env", "server_args", "runtime_env", "runtime_envs")
+        ):
             raise ValueError("external launch takes no recipe/env: the JobSet owns it")
         return ExternalServerLauncher(health_timeout=timeout, tag=tag)
+
+    if "server_args" in launch:
+        if "recipe" in launch or "env" in launch:
+            raise ValueError(
+                "Python configs use server_args/runtime_env, not recipe/env"
+            )
+        if "runtime_env" in launch and "runtime_envs" in launch:
+            raise ValueError("Use only one of runtime_envs and runtime_env")
+        return RecipeLauncher(
+            server_args=launch["server_args"],
+            env=launch.get("runtime_envs", launch.get("runtime_env")),
+            health_timeout=timeout,
+            tag=tag,
+        )
 
     recipe = launch.get("recipe")
     if not recipe:
@@ -370,7 +399,7 @@ def build_gates(config: Dict[str, Any]) -> List[AccuracyTestParams]:
 
 def build_model(config: Dict[str, Any]) -> TpuModelLaunchSettings:
     """Build the launch settings. Split out so tests can assert on it directly."""
-    # No tp_size: the recipe owns parallelism and TpuModelLaunchSettings clears the
+    # The recipe owns parallelism and TpuModelLaunchSettings clears the
     # extra_args it would have fed, so it would only be a second copy that can drift.
     return TpuModelLaunchSettings(
         config["model"],
@@ -394,16 +423,24 @@ def run_model_config(config: Dict[str, Any], base_url: Optional[str] = None) -> 
     )
 
 
-def build_test_case(config: Dict[str, Any], base_url: Optional[str] = None):
+def build_test_case(
+    config: Dict[str, Any],
+    base_url: Optional[str] = None,
+    *,
+    test_case_base: type[unittest.TestCase] = unittest.TestCase,
+):
     """Synthesise the unittest.TestCase for ``config``.
 
     ``skip_unless`` is ``(condition, reason)`` -- the config equivalent of
     ``@unittest.skipUnless``, used by the multi-host gates that only run when an
     external server was provided.
+
+    ``test_case_base`` can supply class fixtures without changing the generated
+    evaluation method or the gate definitions.
     """
     name = config.get("test_name", config["model"])
 
-    class ModelConfigTest(unittest.TestCase):
+    class ModelConfigTest(test_case_base):
         def test_accuracy(self):
             run_model_config(config, base_url=base_url)
 
@@ -427,6 +464,8 @@ def build_test_case(config: Dict[str, Any], base_url: Optional[str] = None):
 def model_config_main(
     config: Union[Dict[str, Any], List[Dict[str, Any]]],
     base_url: Optional[str] = None,
+    *,
+    test_case_base: type[unittest.TestCase] = unittest.TestCase,
 ) -> None:
     """Entry point for a test file's ``__main__`` block.
 
@@ -445,6 +484,6 @@ def model_config_main(
 
     configs = config if isinstance(config, list) else [config]
     for entry in configs:
-        case = build_test_case(entry, base_url=base_url)
+        case = build_test_case(entry, base_url=base_url, test_case_base=test_case_base)
         setattr(__main__, case.__name__, case)
     unittest.main()

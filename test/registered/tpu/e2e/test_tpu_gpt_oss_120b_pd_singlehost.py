@@ -3,15 +3,18 @@
 import argparse
 import json
 import os
-import signal
 import socket
 import subprocess
 import sys
-import time
 import unittest
-import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu import launch_server as tpu_launcher
+from benchmark.tpu.launcher_test_case import TPULauncherTestCase
 
 SGLANG_IMPORT_ERROR = None
 try:
@@ -78,6 +81,7 @@ RUN_NAME = "gpt-oss-120b-pd-singlehost-gsm8k"
 PREFILL_LOG = "/tmp/pd_singlehost_prefill.log"
 DECODE_LOG = "/tmp/pd_singlehost_decode.log"
 LB_LOG = "/tmp/pd_singlehost_lb.log"
+LAUNCH_CONFIG_MODULE = "recipe/configs/gpt_oss_120b/pd_singlehost.py"
 
 PAGE_SIZE = 64
 MEM_FRACTION_STATIC = "0.35"
@@ -218,111 +222,9 @@ def build_decode_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
     }
 
 
-def _tee_command(argv: Tuple[str, ...], log_path: str) -> Tuple[str, ...]:
-    quoted = " ".join(f"'{a}'" for a in argv)
-    return ("bash", "-c", f"set -o pipefail; {quoted} 2>&1 | tee -a '{log_path}'")
-
-
-def _launch(
-    cmd: Tuple[str, ...],
-    log_path: str,
-    extra_env: Optional[Dict[str, str]] = None,
-    cwd: Optional[str] = None,
-) -> subprocess.Popen:
-    env = dict(os.environ)
-    if extra_env:
-        env.update(extra_env)
-    return subprocess.Popen(
-        _tee_command(cmd, log_path=log_path),
-        env=env,
-        start_new_session=True,
-        cwd=cwd,
-    )
-
-
-def execute_prefill(log_path: str = PREFILL_LOG) -> subprocess.Popen:
-    """Launch the prefill engine across this pod's whole slice."""
-    return _launch(
-        ("bash", os.path.join(BENCH, "launch_prefill.sh")),
-        log_path=log_path,
-        extra_env=build_prefill_env(),
-        cwd=BENCH,
-    )
-
-
-def execute_decode(log_path: str = DECODE_LOG) -> subprocess.Popen:
-    """Launch the decode engine across this pod's whole slice."""
-    return _launch(
-        ("bash", os.path.join(BENCH, "launch_decode.sh")),
-        log_path=log_path,
-        extra_env=build_decode_env(),
-        cwd=BENCH,
-    )
-
-
-def execute_router(
-    *, prefill_host: str, decode_host: str, log_path: str = LB_LOG
-) -> subprocess.Popen:
-    """Launch the mini-LB in front of the prefill and decode pods."""
-    cmd = (
-        PYTHON,
-        "-m",
-        "sglang_router.launch_router",
-        "--pd-disaggregation",
-        "--mini-lb",
-        "--prefill",
-        f"http://{prefill_host}:{PREFILL_PORT}",
-        "--decode",
-        f"http://{decode_host}:{DECODE_PORT}",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(LB_PORT),
-    )
-    return _launch(cmd, log_path=log_path)
-
-
-def _kill(proc: Optional[subprocess.Popen]) -> None:
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-
-
-def _http_ok(url: str, timeout: int = 5) -> bool:
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            return 200 <= r.status < 300
-    except (urllib.error.URLError, TimeoutError, OSError, ConnectionError):
-        return False
-
-
 def _get_json(url: str, timeout: int = 30) -> Dict[str, Any]:
     with urllib.request.urlopen(url, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
-
-
-def _wait_http_200(
-    *, url: str, secs: int, procs: Tuple[Tuple[str, subprocess.Popen], ...] = ()
-) -> None:
-    """Poll url until it answers 200, failing early if a local process dies."""
-    deadline = time.time() + secs
-    while time.time() < deadline:
-        for name, p in procs:
-            if p is not None and p.poll() is not None:
-                raise RuntimeError(
-                    f"{name} exited rc={p.returncode} while waiting on {url}"
-                )
-        if _http_ok(url):
-            return
-        time.sleep(10)
-    raise TimeoutError(f"{url} not ready after {secs}s")
 
 
 def transport_failures(*, prefill_info: Dict[str, Any], decode_info: Dict[str, Any]):
@@ -409,50 +311,60 @@ def build_model_config(*, decode_host: str) -> Dict[str, Any]:
     }
 
 
-def run_prefill_leader() -> int:
-    """Serve prefill, wait for the decode pod, then score GSM8K through the LB."""
+def launcher_runtime_envs() -> Dict[str, str]:
+    """Describe the two-role group without rewriting slice-local TPU ranks."""
     this_host = self_hostname()
-    decode_host = peer_hostname(this_host, from_role=PREFILL_ROLE, to_role=DECODE_ROLE)
-    procs: List[Tuple[str, subprocess.Popen]] = []
-    try:
-        procs.append((PREFILL_ROLE, execute_prefill()))
-        _wait_http_200(
-            url=f"http://{LOCAL_HOST}:{PREFILL_PORT}/health",
-            secs=WAIT_SECS,
-            procs=tuple(procs),
-        )
-        # The decode process runs in another pod, so only its health endpoint is visible.
-        _wait_http_200(url=f"http://{decode_host}:{DECODE_PORT}/health", secs=WAIT_SECS)
+    hosts = [
+        this_host,
+        peer_hostname(this_host, from_role=PREFILL_ROLE, to_role=DECODE_ROLE),
+    ]
+    return {
+        "SGLANG_LAUNCHER_HOSTNAMES": ",".join(hosts),
+        "SGLANG_LAUNCHER_RANK": "0",
+    }
 
-        procs.append(
-            ("router", execute_router(prefill_host=this_host, decode_host=decode_host))
-        )
-        _wait_http_200(
-            url=f"http://{LOCAL_HOST}:{LB_PORT}/health", secs=300, procs=tuple(procs)
-        )
 
-        model_config_main(
-            build_model_config(decode_host=decode_host),
-            base_url=f"http://{LOCAL_HOST}:{LB_PORT}",
-        )
-        return 0
-    finally:
-        if not KEEP_UP:
-            for _, p in procs:
-                _kill(p)
+class PdSingleHostClassFixture(TPULauncherTestCase):
+    """Use the shared class fixture with this test's P/D configuration."""
+
+    config_module = LAUNCH_CONFIG_MODULE
+    base_url = f"http://{LOCAL_HOST}:{LB_PORT}"
+    health_timeout = 2 * WAIT_SECS + 300
+    cwd = BENCH
+    log_path = PREFILL_LOG
+    keep_up = KEEP_UP
+    tag = "pd-singlehost"
+
+    @classmethod
+    def get_runtime_envs(cls) -> Dict[str, str]:
+        return launcher_runtime_envs()
+
+
+def run_prefill_leader() -> int:
+    """Run the existing gates, sharing the class fixture's serving group."""
+    decode_host = peer_hostname(
+        self_hostname(), from_role=PREFILL_ROLE, to_role=DECODE_ROLE
+    )
+    model_config_main(
+        build_model_config(decode_host=decode_host),
+        base_url=f"http://{LOCAL_HOST}:{LB_PORT}",
+        test_case_base=PdSingleHostClassFixture,
+    )
+    return 0
 
 
 def run_decode_worker() -> int:
-    """Serve decode until the engine exits, which the JobSet deadline bounds."""
-    proc = execute_decode()
+    """Run the same launcher on the service pod until JobSet teardown."""
+    proc = tpu_launcher.start_launcher(
+        LAUNCH_CONFIG_MODULE + ":DECODE_CONFIG",
+        {"SGLANG_LAUNCHER_RANK": "0"},
+        cwd=BENCH,
+        log_path=DECODE_LOG,
+    )
     try:
-        while True:
-            rc = proc.poll()
-            if rc is not None:
-                return rc
-            time.sleep(10)
+        return proc.wait()
     finally:
-        _kill(proc)
+        tpu_launcher.stop_processes([proc], grace=60)
 
 
 def run_integration() -> int:
