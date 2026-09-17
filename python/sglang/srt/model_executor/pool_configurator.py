@@ -129,7 +129,7 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
             raise ValueError("MXINT8 requires a resolved DFLASH draft KV memory budget")
         return 0
     if _draft_kv_cache_format(kvc) == "mxint8":
-        from sglang_torchtpu_meta.srt.backends.attention.kv_mxint8 import (
+        from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
             ROW_ALIGNMENT,
         )
 
@@ -152,7 +152,7 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
 
 def _mxint8_draft_per_token(kvc, head_num: int, head_dim: int) -> int:
     """EAGLE shares geometry, but its runner can select a different KV format."""
-    from sglang_torchtpu_meta.srt.backends.attention.kv_mxint8 import (
+    from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
         cache_bytes_per_token,
     )
 
@@ -324,7 +324,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
         if self.kv_cache_dtype_str == "mxint8":
-            from sglang_torchtpu_meta.srt.backends.attention.kv_mxint8 import (
+            from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
                 cache_bytes_per_token,
             )
 
@@ -561,7 +561,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self._page_size = kvc.page_size
 
         if self.kv_cache_dtype_str == "mxint8":
-            from sglang_torchtpu_meta.srt.backends.attention.kv_mxint8 import (
+            from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
                 cache_bytes_per_token,
             )
 
