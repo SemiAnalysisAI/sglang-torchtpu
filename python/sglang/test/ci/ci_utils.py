@@ -4,6 +4,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -284,10 +285,7 @@ def run_unittest_files(
             full_path = os.path.join(os.getcwd(), filename)
             if pytest_runner:
                 cmd = [
-                    "uv",
-                    "run",
-                    "--no-project",
-                    "python",
+                    sys.executable,
                     "-m",
                     "pytest",
                     "-x",

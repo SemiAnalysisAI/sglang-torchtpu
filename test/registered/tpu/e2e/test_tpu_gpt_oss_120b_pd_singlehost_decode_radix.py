@@ -562,7 +562,7 @@ def render_jobset_yaml(
         "--files",
         rel_path,
         "--exec",
-        f"uv run --no-project python -m pytest -s -k Integration {rel_path}",
+        f"python -m pytest -s -k Integration {rel_path}",
     ]
     return subprocess.check_output(cmd, text=True)
 
@@ -692,7 +692,7 @@ class TestPdSingleHostDecodeRadixGptOss120bConfiguration(unittest.TestCase):
         self.assertNotIn("name: router", yaml_content)
         self.assertIn("CI_PD_ROLE", yaml_content)
         self.assertIn(
-            "uv run --no-project python -m pytest -s -k Integration "
+            "python -m pytest -s -k Integration "
             "test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py",
             yaml_content,
         )
