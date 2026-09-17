@@ -13,8 +13,6 @@ import unittest
 from test.e2e.launcher_test_case import TPULauncherTestCase
 from urllib.parse import urlsplit
 
-import pytest
-
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import run_model_config
 
@@ -59,7 +57,6 @@ MODEL_CONFIG = {
 }
 
 
-@pytest.mark.tpu
 class TestQwenCoderSingleHostLmEval(QwenCoderClassFixture):
     def test_accuracy(self):
         run_model_config(MODEL_CONFIG, base_url=self.base_url)

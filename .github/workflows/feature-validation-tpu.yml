@@ -286,7 +286,7 @@ jobs:
       hosts: 1
       pd_prefill_hosts: 1
       pd_decode_hosts: 1
-      exec_cmd: uv run --no-project python -m pytest -s --run-tpu -m tpu test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py
+      exec_cmd: uv run --no-project python -m pytest -s -k Integration test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py
       weights_pvc: model-weights-filestore
@@ -313,7 +313,7 @@ jobs:
       hosts: 1
       pd_prefill_hosts: 1
       pd_decode_hosts: 1
-      exec_cmd: uv run --no-project python -m pytest -s --run-tpu -m tpu test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py
+      exec_cmd: uv run --no-project python -m pytest -s -k Integration test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py
       weights_pvc: model-weights-filestore
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_spec)[0].run_name }}
@@ -338,7 +338,7 @@ jobs:
       hosts: 1
       pd_prefill_hosts: 1
       pd_decode_hosts: 1
-      exec_cmd: uv run --no-project python -m pytest -s --run-tpu -m tpu test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py
+      exec_cmd: uv run --no-project python -m pytest -s -k Integration test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py
       weights_pvc: model-weights-filestore
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_decode_radix)[0].run_name }}

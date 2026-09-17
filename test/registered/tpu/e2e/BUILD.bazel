@@ -6,11 +6,12 @@ package(default_visibility = ["//visibility:public"])
 [py_test(
     name = "test_tpu_gpt_oss_120b_pd_singlehost_" + variant + "_config",
     size = "small",
-    srcs = [
-        "conftest.py",
-        "test_tpu_gpt_oss_120b_pd_singlehost_" + variant + ".py",
+    srcs = ["test_tpu_gpt_oss_120b_pd_singlehost_" + variant + ".py"],
+    args = [
+        "$(location :test_tpu_gpt_oss_120b_pd_singlehost_" + variant + ".py)",
+        "-k",
+        "Configuration",
     ],
-    args = ["$(location :test_tpu_gpt_oss_120b_pd_singlehost_" + variant + ".py)"],
     data = ["//benchmark/tpu:runtime"],
     main_module = "pytest",
     python_version = "3.12",
@@ -23,11 +24,12 @@ package(default_visibility = ["//visibility:public"])
 py_test(
     name = "test_tpu_gpt_oss_120b_pd_singlehost_config",
     size = "small",
-    srcs = [
-        "conftest.py",
-        "test_tpu_gpt_oss_120b_pd_singlehost.py",
+    srcs = ["test_tpu_gpt_oss_120b_pd_singlehost.py"],
+    args = [
+        "$(location :test_tpu_gpt_oss_120b_pd_singlehost.py)",
+        "-k",
+        "Configuration",
     ],
-    args = ["$(location :test_tpu_gpt_oss_120b_pd_singlehost.py)"],
     data = ["//benchmark/tpu:runtime"],
     main_module = "pytest",
     python_version = "3.12",
@@ -39,13 +41,9 @@ py_test(
 
 sglang_tpu_e2e_test(
     name = "test_tpu_gpt_oss_120b_singlehost_spec",
-    srcs = [
-        "conftest.py",
-        "test_tpu_gpt_oss_120b_singlehost_spec.py",
-    ],
+    srcs = ["test_tpu_gpt_oss_120b_singlehost_spec.py"],
     args = [
         "$(location :test_tpu_gpt_oss_120b_singlehost_spec.py)",
-        "--run-tpu",
         "-s",
     ],
     data = [
@@ -85,13 +83,9 @@ sglang_tpu_e2e_test(
 
 sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_coder_30b_singlehost_lm_eval",
-    srcs = [
-        "conftest.py",
-        "test_tpu_qwen3_coder_30b_singlehost_lm_eval.py",
-    ],
+    srcs = ["test_tpu_qwen3_coder_30b_singlehost_lm_eval.py"],
     args = [
         "$(location :test_tpu_qwen3_coder_30b_singlehost_lm_eval.py)",
-        "--run-tpu",
         "-s",
     ],
     data = [
