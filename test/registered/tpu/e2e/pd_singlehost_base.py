@@ -41,6 +41,7 @@ class PDSingleHostTestCase(TPULauncherTestCase):
 
     base_url = f"http://127.0.0.1:{int(os.environ.get('LB_PORT', '8000'))}"
     health_timeout = 2 * int(os.environ.get("WAIT_SECS", "3600")) + 300
+    health_generate_timeout = float(os.environ.get("HEALTH_TIMEOUT", "3600"))
     cwd = str(Path(__file__).absolute().parents[4] / "benchmark" / "tpu")
     keep_up = os.environ.get("KEEP_UP", "0") == "1"
     tag = "pd-singlehost"
@@ -75,7 +76,7 @@ class PDSingleHostTestCase(TPULauncherTestCase):
         from sglang.test.tpu import model_config_main
 
         model_config_main(
-            cls.build_model_config(), base_url=cls.base_url, test_case_base=cls
+            cls.build_model_config(), base_url=cls.base_url, server_fixture=cls
         )
         return 0
 

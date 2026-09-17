@@ -664,20 +664,6 @@ def start_launcher(config_module, runtime_envs=None, *, cwd=None, log_path=None)
     return start_process(command, dict(os.environ), cwd=cwd, log_path=log_path)
 
 
-def start_server(config, inherited=None, runtime_envs=None, *, cwd=None, log_path=None):
-    """Start one local server/rank for a caller that owns its evaluation lifetime.
-
-    RecipeLauncher and P/D test drivers use this same planning, metadata and
-    process path as the CLI. Use serve() for a whole P/D group with a router.
-    """
-    plan = plan_launch(config, inherited, runtime_envs)
-    if plan is None or plan.hosts:
-        raise ValueError("start_server expects one server config; use serve for groups")
-    env = prepare_runtime_env(plan.env)
-    dump_launch({"server_args": plan.config.server_args}, plan.command, env)
-    return start_process(plan.command, env, cwd=cwd, log_path=log_path)
-
-
 def serve(plan, *, dry_run=False, grace=30):
     if plan is None:
         if dry_run:

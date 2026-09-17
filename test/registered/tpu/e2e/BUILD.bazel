@@ -46,6 +46,7 @@ sglang_tpu_e2e_test(
         "requires-tpu-v7x",
     ],
     deps = [
+        "//benchmark/tpu:launcher_test_case",
         "//python:sglang",
         "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],
@@ -81,6 +82,7 @@ sglang_tpu_e2e_test(
         "requires-tpu-v7x",
     ],
     deps = [
+        "//benchmark/tpu:launcher_test_case",
         "//python:sglang",
         "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],

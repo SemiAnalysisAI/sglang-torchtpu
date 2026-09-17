@@ -10,15 +10,15 @@ Serving config lives in recipe/configs/qwen3_coder_30b_a3b_fp8.py, which CI runs
 
 import os
 import sys
-from copy import deepcopy
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
-from benchmark.tpu.recipe.configs.qwen3_coder_30b_a3b_fp8 import CONFIG
+from benchmark.tpu.launcher_test_case import TPULauncherTestCase
 
 register_tpu_ci(
     est_time=3600,
@@ -33,19 +33,23 @@ BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
 
 
-LAUNCH_CONFIG = deepcopy(CONFIG)
-# RecipeLauncher delegates this config to benchmark.tpu.launch_server.
-LAUNCH_CONFIG["runtime_envs"] = LAUNCH_CONFIG.pop("runtime_env")
+class QwenCoderClassFixture(TPULauncherTestCase):
+    config_module = "recipe/configs/qwen3_coder_30b_a3b_fp8.py"
+    base_url = BASE_URL
+    health_timeout = HEALTH_TIMEOUT
+    health_endpoint = "/health_generate"
+    tag = "qwen3-coder-e2e"
+    runtime_envs = {
+        "MODEL": None,
+        "HOST": urlsplit(BASE_URL).hostname,
+        "PORT": str(urlsplit(BASE_URL).port),
+    }
+
 
 MODEL_CONFIG = {
     "model": MODEL_PATH,
     "test_name": "Qwen3-Coder-30B-A3B-Instruct-FP8",
     "variant": "TP8+EP8",
-    "launch": {
-        **LAUNCH_CONFIG,
-        "health_timeout": HEALTH_TIMEOUT,
-        "tag": "qwen3-coder-e2e",
-    },
     "gates": [
         {
             "dataset": "mmlu_llama+mmlu_pro",
@@ -57,4 +61,6 @@ MODEL_CONFIG = {
 
 
 if __name__ == "__main__":
-    model_config_main(MODEL_CONFIG, base_url=BASE_URL)
+    model_config_main(
+        MODEL_CONFIG, base_url=BASE_URL, server_fixture=QwenCoderClassFixture
+    )

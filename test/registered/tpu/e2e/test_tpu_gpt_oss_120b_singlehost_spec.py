@@ -6,15 +6,15 @@ functional integration test, then scores 200 GSM8K examples through run_eval.
 
 import os
 import sys
-from copy import deepcopy
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
-from benchmark.tpu.recipe.configs.gpt_oss_120b.server import CONFIG
+from benchmark.tpu.launcher_test_case import TPULauncherTestCase
 
 register_tpu_ci(
     est_time=3600,
@@ -33,39 +33,23 @@ SPEC_ACCEPT_LENGTH_THRESHOLD = float(
 )
 
 
-LAUNCH_CONFIG = deepcopy(CONFIG)
-# RecipeLauncher delegates this config to benchmark.tpu.launch_server.
-LAUNCH_CONFIG["runtime_envs"] = LAUNCH_CONFIG.pop("runtime_env")
-LAUNCH_CONFIG["server_args"].update(
-    {
-        "context_length": 8192,
-        "max_running_requests": 16,
-        "torch_compile_max_bs": 16,
-        "chunked_prefill_size": min(max(4096, 2048), 8192),
-        "max_prefill_tokens": min(max(4096, 2048), 8192),
-        "max_total_tokens": 8192,
-        "model_path": "/weights/gpt-oss-120b",
-        "tpu_compile_tokens": [512, 2048, 4096],
-        "tpu_compile_bs": [1, 2, 4, 16],
-        "reasoning_parser": "gpt-oss",
-        "served_model_name": SERVED_MODEL_NAME,
-        "speculative_algorithm": "EAGLE3",
-        "speculative_draft_model_path": "lmsys/EAGLE3-gpt-oss-120b-bf16",
-        "speculative_num_steps": 3,
-        "speculative_eagle_topk": 1,
-        "speculative_num_draft_tokens": 4,
+class GptOssSpecClassFixture(TPULauncherTestCase):
+    config_module = "recipe/configs/gpt_oss_120b/singlehost_spec.py"
+    base_url = BASE_URL
+    health_timeout = HEALTH_TIMEOUT
+    health_endpoint = "/health_generate"
+    tag = "gpt-oss-spec-gsm8k-e2e"
+    runtime_envs = {
+        "MODEL": None,
+        "HOST": urlsplit(BASE_URL).hostname,
+        "PORT": str(urlsplit(BASE_URL).port),
     }
-)
+
 
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "gpt-oss-120b-spec-decoding-gsm8k",
     "variant": "TP8+EP8+EAGLE3",
-    "launch": {
-        **LAUNCH_CONFIG,
-        "health_timeout": HEALTH_TIMEOUT,
-        "tag": "gpt-oss-spec-gsm8k-e2e",
-    },
     "gates": [
         {
             "dataset": "gsm8k",
@@ -82,4 +66,6 @@ MODEL_CONFIG = {
 
 
 if __name__ == "__main__":
-    model_config_main(MODEL_CONFIG, base_url=BASE_URL)
+    model_config_main(
+        MODEL_CONFIG, base_url=BASE_URL, server_fixture=GptOssSpecClassFixture
+    )

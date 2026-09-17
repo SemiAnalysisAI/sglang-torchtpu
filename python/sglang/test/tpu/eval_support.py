@@ -2,9 +2,10 @@
 
 Plugs into the two extension points on the shared accuracy runner:
 
-* ``ModelLaunchSettings.launcher`` -- keeps a server alive across gates. Python
-  recipes delegate process startup, readiness and cleanup to the shared TPU
-  launcher; this adapter keeps servers alive across evaluations.
+* ``ModelLaunchSettings.launcher`` -- a TPU server cannot be started from a bare
+  argv, because chiplet visibility, the torch_tpu compile cache and the multi-host
+  topology must all be exported before exec, and only ``launch_server.sh`` (plus its
+  recipe wrappers) knows how.
 * ``AccuracyTestParams.runner`` -- scores a gate with a harness the shared runner has
   no dependency on: lm-eval, and OpenAI's own gpt_oss.evals package.
 """
@@ -15,20 +16,15 @@ import json
 import os
 import subprocess
 import sys
-from copy import deepcopy
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlsplit
 
 import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kits.lm_eval_kit import LMEvalMixin
 from sglang.test.test_utils import ModelLaunchSettings, dump_metric
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
-
-from benchmark.tpu import launch_server as tpu_launcher
 
 DEFAULT_HEALTH_TIMEOUT = 1800.0
 
@@ -48,13 +44,35 @@ def wait_for_health(
     Notes progress every 60s: weight load plus compile takes ~10 min single-host and
     longer multi-host, and a silent wait is indistinguishable from a hang in CI logs.
     """
-
-    def check():
+    start = time.perf_counter()
+    deadline = start + timeout
+    last_note = start
+    last = None
+    while time.perf_counter() < deadline:
         if process is not None and process.poll() is not None:
             raise RuntimeError(f"server exited with code {process.returncode}")
-
-    tpu_launcher.wait_healthy(
-        base_url, timeout, check, interval=5, endpoint=endpoint, tag=tag
+        try:
+            response = requests.get(base_url.rstrip("/") + endpoint, timeout=10)
+            if response.status_code == 200:
+                print(
+                    f"[{tag}] server healthy after "
+                    f"{time.perf_counter() - start:.0f}s",
+                    flush=True,
+                )
+                return
+            last = f"HTTP {response.status_code}"
+        except requests.RequestException as e:
+            last = str(e)
+        if time.perf_counter() - last_note >= 60:
+            last_note = time.perf_counter()
+            print(
+                f"[{tag}] waiting for {base_url}{endpoint} "
+                f"({time.perf_counter() - start:.0f}s elapsed; last: {last})",
+                flush=True,
+            )
+        time.sleep(5)
+    raise TimeoutError(
+        f"{base_url}{endpoint} did not return 200 within {timeout}s (last: {last})"
     )
 
 
@@ -64,7 +82,7 @@ _HOLDERS: Dict[str, "RecipeLauncher"] = {}
 
 
 class RecipeLauncher:
-    """Launch from a Python config or shell recipe, keeping the server up across evals.
+    """Launch a TPU server from a shell recipe, and keep it up across evals.
 
     The shared runner brings the server up once per evaluation, but a TPU boot costs
     tens of minutes (weight load plus per-shape compile). This boots on first entry,
@@ -76,21 +94,17 @@ class RecipeLauncher:
 
     def __init__(
         self,
-        script: Optional[str] = None,
+        script: str,
         env: Optional[Dict[str, str]] = None,
         cwd: Optional[str] = None,
         health_timeout: float = DEFAULT_HEALTH_TIMEOUT,
         tag: str = "tpu-e2e",
-        server_args: Optional[Dict[str, Any]] = None,
     ):
-        self.script = os.path.abspath(script) if script else "Python config"
-        self.server_args = deepcopy(server_args)
-        if script and not os.path.exists(self.script):
+        self.script = os.path.abspath(script)
+        if not os.path.exists(self.script):
             raise FileNotFoundError(f"launch recipe not found: {self.script}")
-        if (script is None) == (server_args is None):
-            raise ValueError("Supply either a shell recipe or server_args")
         self.env = dict(env or {})
-        self.cwd = cwd or (os.path.dirname(self.script) if script else None)
+        self.cwd = cwd or os.path.dirname(self.script)
         self.health_timeout = health_timeout
         self.tag = tag
         self._process: Optional[subprocess.Popen] = None
@@ -108,51 +122,33 @@ class RecipeLauncher:
                 )
                 incumbent.shutdown()
 
-            if self.server_args is not None:
-                settings = deepcopy(self.server_args)
-                address = urlsplit(base_url)
-                settings.update(host=address.hostname, port=address.port)
-                settings.setdefault("device", "tpu")
-                self._process = tpu_launcher.start_server(
-                    {
-                        "server_args": settings,
-                        "runtime_envs": {
-                            **self.env,
-                            "MODEL": None,
-                            "HOST": None,
-                            "PORT": None,
-                        },
-                    },
-                    cwd=self.cwd,
-                )
-            else:
-                env = os.environ.copy()
-                env.update(self.env)
-                # Default shell recipes to this interpreter; explicit PYTHON wins.
+            env = os.environ.copy()
+            env.update(self.env)
+            # Default shell recipes to this interpreter; explicit PYTHON wins.
+            if sys.executable:
                 env.setdefault("PYTHON", sys.executable)
-                overrides = " ".join(f"{k}={v!r}" for k, v in sorted(self.env.items()))
-                print(
-                    f"[{self.tag}] boot: {overrides + ' ' if overrides else ''}"
-                    f"bash {self.script} (cwd={self.cwd})",
-                    flush=True,
-                )
-                self._process = subprocess.Popen(
-                    ["bash", self.script], cwd=self.cwd, env=env
-                )
-            # Both paths retain the server pid for worker-tree teardown.
+            # The whole invocation, env included: this line is what a reader reproduces
+            # a red nightly with.
+            overrides = " ".join(f"{k}={v!r}" for k, v in sorted(self.env.items()))
+            print(
+                f"[{self.tag}] boot: {overrides + ' ' if overrides else ''}"
+                f"bash {self.script} (cwd={self.cwd})",
+                flush=True,
+            )
+            self._process = subprocess.Popen(
+                ["bash", self.script], cwd=self.cwd, env=env
+            )
+            # The recipe and launch_server.sh both `exec`, so this pid IS the
+            # server process -- kill_process_tree on it does the right thing.
             _HOLDERS[base_url] = self
             self._base_url = base_url
             atexit.register(self.shutdown)
-            try:
-                wait_for_health(
-                    base_url,
-                    timeout=self.health_timeout,
-                    process=self._process,
-                    tag=self.tag,
-                )
-            except BaseException:
-                self.shutdown()
-                raise
+            wait_for_health(
+                base_url,
+                timeout=self.health_timeout,
+                process=self._process,
+                tag=self.tag,
+            )
         else:
             if self._process.poll() is not None:
                 raise RuntimeError(
@@ -163,12 +159,9 @@ class RecipeLauncher:
         # Not torn down here -- see the class docstring.
 
     def shutdown(self) -> None:
-        if self._process is not None:
+        if self._process is not None and self._process.poll() is None:
             print(f"[{self.tag}] shutting down server", flush=True)
-            if self.server_args is not None:
-                tpu_launcher.stop_processes([self._process], grace=60)
-            elif self._process.poll() is None:
-                kill_process_tree(self._process.pid, wait_timeout=60)
+            kill_process_tree(self._process.pid, wait_timeout=60)
         self._process = None
         if self._base_url is not None and _HOLDERS.get(self._base_url) is self:
             del _HOLDERS[self._base_url]
@@ -204,8 +197,9 @@ class TpuModelLaunchSettings(ModelLaunchSettings):
     """ModelLaunchSettings that delegates bring-up to a ``launcher``.
 
     ``launcher`` itself is a plain ModelLaunchSettings field; this subclass exists
-    only to clear ``extra_args``: the launcher already owns the complete serving
-    config, including parallelism and multimodal flags.
+    only to clear ``extra_args``, because the base class synthesises ``--tp`` /
+    ``--enable-multimodal`` -- dead config here (the recipe derives every flag from
+    environment) that would mislead in reports.
     """
 
     def __init__(self, model_path: str, **kwargs):
