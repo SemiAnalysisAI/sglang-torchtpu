@@ -88,8 +88,9 @@ MULTIHOST_LAUNCH = {"hosts": 2, "launch_script": "recipe/qwen3_30b_a3b_fp8_mh.sh
                     "weights_pvc": "model-weights-rox"}   # weights_pvc optional
 ```
 
-`launch_script` is a recipe under `benchmark/tpu/recipe/` that sets `MODEL`/`EP_SIZE`/…
-and execs `launch_server.sh`. `discover_multihost.py` scans the files registered to a
+`launch_script` is a recipe path relative to `benchmark/tpu/`. Python recipes
+(`recipe/configs/*.py`) run through `python3 -m benchmark.tpu.launch_server --config`;
+legacy shell recipes still run through Bash. `discover_multihost.py` scans the files registered to a
 suite, **groups** those with an identical `(launch_script, weights_pvc, hosts)`, and
 emits one group per unique setup. Each group → **one** JobSet: launch the server once,
 rank 0 runs every file in the group against it. So files with the same setup **share a

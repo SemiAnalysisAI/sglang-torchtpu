@@ -5,9 +5,14 @@ py_test(
     name = "test_tpu_config_eval",
     size = "small",
     srcs = ["test_tpu_config_eval.py"],
+    data = [
+        "//:.github/tpu-ci/jobset-tpu.yaml",
+        "//:.github/tpu-ci/external/jobset-external-tpu.yaml",
+    ],
     env = {"TORCH_DEVICE_BACKEND_AUTOLOAD": "0"},
     python_version = "3.12",
     deps = [
+        "//benchmark/tpu:launcher",
         "//benchmark/tpu:python_configs",
         "//python:sglang",
     ],

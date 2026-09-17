@@ -30,7 +30,7 @@ export TPU_COMPILE_BS=${TPU_COMPILE_BS:-"64 128"}
 export TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$MAX_RUNNING}
 
 # drop mapped checkpoint pages as they load; keeps the CI pod off node-memory eviction
-export EXTRA_ARGS="--reasoning-parser ${REASONING_PARSER:-deepseek-r1} --weight-loader-drop-cache-after-load${EXTRA_ARGS:+ $EXTRA_ARGS}"
+export EXTRA_ARGS="--reasoning-parser deepseek-r1 --weight-loader-drop-cache-after-load${EXTRA_ARGS:+ $EXTRA_ARGS}"
 export ENABLE_PROFILER_ENDPOINT=${ENABLE_PROFILER_ENDPOINT:-0}
 
 cd "$(dirname "$0")/.."
