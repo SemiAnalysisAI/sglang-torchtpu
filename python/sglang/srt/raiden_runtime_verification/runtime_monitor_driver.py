@@ -6,7 +6,7 @@ import logging
 import os
 import threading
 
-from sglang.srt.runtime_verification.generated_runtime_monitor import (
+from sglang.srt.raiden_runtime_verification.generated_runtime_monitor import (
     GeneratedRuntimeMonitor,
 )
 

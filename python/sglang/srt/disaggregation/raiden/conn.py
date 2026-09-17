@@ -181,7 +181,7 @@ class RaidenKVManager(CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
-        from sglang.srt.runtime_verification.instrumentation import (
+        from sglang.srt.raiden_runtime_verification.instrumentation import (
             install_runtime_verification,
         )
 

@@ -3,7 +3,10 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from sglang.srt.runtime_verification import instrumentation, runtime_monitor_driver
+from sglang.srt.raiden_runtime_verification import (
+    instrumentation,
+    runtime_monitor_driver,
+)
 
 
 @pytest.fixture

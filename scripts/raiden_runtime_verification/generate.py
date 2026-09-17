@@ -23,7 +23,7 @@ except ModuleNotFoundError as error:
 
 TOOL_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TOOL_DIR.parent.parent
-RUNTIME_DIR = REPO_ROOT / "python" / "sglang" / "srt" / "runtime_verification"
+RUNTIME_DIR = REPO_ROOT / "python" / "sglang" / "srt" / "raiden_runtime_verification"
 DEFAULT_LTL_PATH = TOOL_DIR / "formulas.ltl"
 DEFAULT_HOA_PATH = TOOL_DIR / "generated_runtime_monitor.hoa"
 DEFAULT_MONITOR_PY_PATH = RUNTIME_DIR / "generated_runtime_monitor.py"

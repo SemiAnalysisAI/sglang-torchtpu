@@ -1,4 +1,4 @@
-# TPU runtime verification
+# TPU Raiden runtime verification
 
 `formulas.ltl` contains one LTL property per line. It is passed through the C
 preprocessor before Spot parses it, so `#define` macros and `//` comments are

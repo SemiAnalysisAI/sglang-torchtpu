@@ -1,4 +1,4 @@
-"""Generated from scripts/runtime_verification/formulas.ltl. Do not edit by hand."""
+"""Generated from scripts/raiden_runtime_verification/formulas.ltl. Do not edit by hand."""
 
 import logging
 

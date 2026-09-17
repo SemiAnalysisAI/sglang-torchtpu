@@ -94,7 +94,9 @@ HICACHE_IO_BACKEND = "raiden"
 EXTRA_SERVER_ARGS: Tuple[str, ...] = ("--reasoning-parser", "gpt-oss")
 # GPT-OSS does not support the SparseCore fused-MoE gather path.
 EXTRA_LAUNCH_ENV: Dict[str, str] = {"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"}
-RUNTIME_VERIFICATION_SMOKE = E("SGLANG_TPU_RUNTIME_VERIFICATION_SMOKE", "0") == "1"
+RUNTIME_VERIFICATION_SMOKE = (
+    E("SGLANG_TPU_RAIDEN_RUNTIME_VERIFICATION_SMOKE", "0") == "1"
+)
 RUNTIME_VERIFICATION_REQUESTS = 4
 
 # Defaults to a 0.77 passing floor; this topology measured 0.97.
@@ -168,7 +170,7 @@ def _common_launch_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str
         **EXTRA_LAUNCH_ENV,
     }
     if RUNTIME_VERIFICATION_SMOKE:
-        launch_env["SGLANG_TPU_ENABLE_RUNTIME_VERIFICATION"] = "1"
+        launch_env["SGLANG_TPU_ENABLE_RAIDEN_RUNTIME_VERIFICATION"] = "1"
     return launch_env
 
 

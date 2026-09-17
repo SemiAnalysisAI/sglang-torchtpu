@@ -8,11 +8,11 @@ from collections.abc import Callable
 from typing import Any
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_verification.runtime_monitor_driver import (
+from sglang.srt.raiden_runtime_verification.runtime_monitor_driver import (
     get_runtime_monitor_driver,
 )
 
-_METHOD_HOOKS_MARKER = "_sglang_runtime_verification_hooks_registered"
+_METHOD_HOOKS_MARKER = "_sglang_raiden_runtime_verification_hooks_registered"
 
 
 def _register_method_hooks(
@@ -179,7 +179,7 @@ def install_kv_transfer_state_instrumentation() -> None:
 
 def install_runtime_verification() -> bool:
     """Install the process-local hooks when explicitly enabled."""
-    if not envs.SGLANG_TPU_ENABLE_RUNTIME_VERIFICATION.get():
+    if not envs.SGLANG_TPU_ENABLE_RAIDEN_RUNTIME_VERIFICATION.get():
         return False
 
     install_tpu_sync_api_instrumentation()
