@@ -21,9 +21,9 @@ COPY benchmark ./benchmark
 # Swap the TPU dependency manifest into place
 RUN cd python && rm -f pyproject.toml && cp pyproject_tpu.toml pyproject.toml
 
-# Install SGLang into the base image's Python environment without reinstalling dependencies.
-# Keep uv's cache in the image for subsequent installs.
-RUN uv pip install --system --no-deps -e ./python
+# Install SGLang in editable mode without reinstalling dependencies
+# Fast build on top of base
+RUN pip install --no-deps -e ./python
 
 # Verify that uv runs against the Python environment installed in this image.
 RUN uv run --no-project --no-managed-python python3 -c "import sglang, pytest"
