@@ -214,12 +214,18 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             self.assertTrue(worker._should_fuse_draft_steps())
 
     def test_fused_steps_thread_per_step_inputs(self):
+        for tracer in ("dynamo", "direct"):
+            for dtype in (torch.int32, torch.int64):
+                with self.subTest(tracer=tracer, dtype=dtype):
+                    self._check_fused_steps_thread_per_step_inputs(tracer, dtype)
+
+    def _check_fused_steps_thread_per_step_inputs(self, tracer, dtype):
         from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
             build_topk1_verify_chain_torch,
         )
 
         worker = _make_worker(num_steps=3, num_draft_tokens=4)
-        worker.server_args.tpu_compile_tracer = "direct"
+        worker.server_args.tpu_compile_tracer = tracer
         worker.hot_token_id = None
 
         calls = []
@@ -252,7 +258,6 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
                 rpa_draft_kv_lens=None,
             ),
         )
-        kv_lens = torch.tensor([[10], [11]], device=DEVICE)
         out_cache_loc = torch.tensor([[20], [21]], device=DEVICE)
 
         def select_step(i, topk_p, topk_index, hidden_states, scores, topk):
@@ -276,19 +281,20 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
                 torch.ones((1, 1), device=DEVICE),
                 torch.zeros((1, 1), dtype=torch.long, device=DEVICE),
                 torch.zeros((1, 2), device=DEVICE),
-                kv_lens,
                 out_cache_loc,
                 None,
                 torch.tensor([99], dtype=torch.long, device=DEVICE),
-                torch.tensor([5], dtype=torch.long, device=DEVICE),
+                # Page boundary: step lengths cross from page 0 into page 1.
+                torch.tensor([63], dtype=dtype, device=DEVICE),
             )
 
         self.assertEqual(tree[-1].tolist(), [[99, 100, 101, 102]])
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][0].tolist(), calls[0][1].tolist())
         self.assertEqual(calls[1][0].tolist(), calls[1][1].tolist())
-        self.assertEqual(calls[0][2].item(), 10)
-        self.assertEqual(calls[1][2].item(), 11)
+        # Each step attends the base length plus the draft KV written so far.
+        self.assertEqual([call[2].tolist() for call in calls], [[64], [65]])
+        self.assertTrue(all(call[2].dtype == torch.int32 for call in calls))
         self.assertEqual(calls[0][3].tolist(), [[1.0, 1.0]])
         self.assertEqual(calls[1][3].tolist(), [[12.0, 12.0]])
         self.assertEqual(calls[0][4].item(), 20)
@@ -315,6 +321,9 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
 
         def compiled_fused_steps(*args):
             observed_prefill_only.append(args[0].is_prefill_only)
+            # Only base lengths enter the graph; no stacked per-step lengths.
+            self.assertEqual(len(args), 8)
+            self.assertIs(args[-1], forward_batch.seq_lens)
             return (
                 torch.empty((0,), dtype=torch.bool, device=DEVICE),
                 torch.tensor([[5, 6, 7, 8], [10, 11, 12, 13]], device=DEVICE),
@@ -331,15 +340,9 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         )
         worker._compiled_fused_steps = None
         worker.draft_runner = SimpleNamespace(compile_policy=compile_policy)
+        # Step lengths are derived inside the fused loop, not read from here.
         worker.draft_attn_backend = SimpleNamespace(
-            attn_backends=[
-                SimpleNamespace(
-                    forward_metadata=SimpleNamespace(
-                        kv_lens=torch.tensor([10 + i], device=DEVICE)
-                    )
-                )
-                for i in range(2)
-            ]
+            attn_backends=[SimpleNamespace() for _ in range(2)]
         )
         spec_info = SimpleNamespace(
             topk_p=torch.ones((2, 1), device=DEVICE),

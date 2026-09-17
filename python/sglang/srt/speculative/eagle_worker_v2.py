@@ -651,7 +651,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.compile_policy.refresh_fused_draft_dp_metadata(
                 forward_batch
             )
-        self.draft_attn_backend.init_forward_metadata(forward_batch)
+            self.draft_attn_backend.init_forward_metadata(
+                forward_batch, fused_draft=True
+            )
+        else:
+            self.draft_attn_backend.init_forward_metadata(forward_batch)
         forward_batch.mark_forward_metadata_ready()
 
     def _fused_draft_forward(self, forward_batch: ForwardBatch):
@@ -667,7 +671,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk_index = self.hot_token_id[topk_index]
 
         attn_backends = self.draft_attn_backend.attn_backends
-        kv_lens_stack = torch.stack([b.forward_metadata.kv_lens for b in attn_backends])
         out_cache_loc = per_step_draft_out_cache_loc(
             forward_batch.out_cache_loc,
             forward_batch.batch_size,
@@ -703,7 +706,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     topk_p,
                     topk_index,
                     hidden_states,
-                    kv_lens_stack,
                     out_cache_loc,
                     self.hot_token_id,
                     spec_info.bonus_tokens,
@@ -724,7 +726,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         topk_p: torch.Tensor,
         topk_index: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_lens_stack: torch.Tensor,
         out_cache_loc: torch.Tensor,
         hot_token_id: torch.Tensor | None,
         bonus_tokens: torch.Tensor,
@@ -734,6 +735,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         num_steps = self.speculative_num_steps
         model = self.draft_runner.model
         base_positions = forward_batch.positions
+        base_kv_lens = seq_lens.to(torch.int32)
         tokens: tuple = ()
         scores = None
         for i in range(num_steps):
@@ -744,7 +746,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if i == num_steps - 1:
                 break
 
-            forward_batch.spec_info.rpa_draft_kv_lens = kv_lens_stack[i]
+            forward_batch.spec_info.rpa_draft_kv_lens = base_kv_lens + i + 1
             if self.server_args.tpu_compile_tracer == "direct":
                 # direct_compile treats explicit inputs as immutable graph
                 # arguments. Rebind the traced ForwardBatch field instead of
