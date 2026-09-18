@@ -15,7 +15,9 @@ import torch
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.model_executor.pool_configurator import (
+    MemoryPoolConfig,
     SWAChunkCapPoolConfigurator,
     create_memory_pool_configurator,
 )
@@ -37,9 +39,8 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
     """Mock GPU-dependent functions for CPU-only testing.
 
-    swa_eviction_interval pins SGLANG_SWA_EVICTION_INTERVAL (decode batches between
-    SWA evictions) to a small value so the chunk-cap formula stays hand-computable;
-    only SWAChunkCapPoolConfigurator reads it.
+    Pin SGLANG_SWA_EVICTION_INTERVAL so the shared per-request bound stays
+    hand-computable for both chunk-cap and ratio-sized caches.
     """
     from sglang.srt.environ import envs
 
@@ -695,6 +696,7 @@ class TestExplicitSWARatio(CustomTestCase):
                 if ratio is None:
                     self.assertIsInstance(configurator, SWAChunkCapPoolConfigurator)
                     self.assertEqual(config.swa_max_total_num_tokens, 307200)
+                    self.assertIsNone(config.swa_tokens_per_request)
                 else:
                     self.assertNotIsInstance(configurator, SWAChunkCapPoolConfigurator)
                     self.assertLess(
@@ -704,6 +706,7 @@ class TestExplicitSWARatio(CustomTestCase):
                         ),
                         512,
                     )
+                    self.assertEqual(config.swa_tokens_per_request, 5120)
 
     def test_model_declared_ratio_does_not_imply_operator_intent(self):
         runner = self._runner()
@@ -711,6 +714,86 @@ class TestExplicitSWARatio(CustomTestCase):
             self.assertIsInstance(
                 create_memory_pool_configurator(runner), SWAChunkCapPoolConfigurator
             )
+
+    def test_ratio_pool_rejects_insufficient_speculative_headroom(self):
+        runner = self._runner(0.1)
+        with mock_cpu_env(swa_eviction_interval=128):
+            configurator = create_memory_pool_configurator(runner)
+            with self.assertRaisesRegex(ValueError, "including decode headroom"):
+                configurator.calculate_pool_sizes_from_max_tokens(40960, 512)
+
+    def test_tpu_alignment_revalidates_minimum(self):
+        runner = self._runner(0.1)
+        kvc = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        kvc.device = "tpu"
+        kvc.is_hybrid_swa = True
+        kvc.is_draft_worker = False
+        kvc.model_config = runner.model_config
+        for swa_size, message in ((3584, "TPU alignment"), (5632, "decode headroom")):
+            with self.subTest(swa_size=swa_size):
+                config = MemoryPoolConfig(
+                    max_total_num_tokens=65536,
+                    max_running_requests=64,
+                    full_max_total_num_tokens=65536,
+                    swa_max_total_num_tokens=swa_size,
+                    swa_tokens_per_request=5120,
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    kvc._derive_pool_sizes(config=config)
+        config.swa_max_total_num_tokens = 9216
+        sizes = kvc._derive_pool_sizes(config=config)
+        self.assertEqual(sizes.swa_max_total_num_tokens, 8192)
+
+    def test_ratio_pool_checks_capacity_after_tpu_alignment(self):
+        runner = self._runner(0.1)
+        kvc = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        kvc.device = "tpu"
+        kvc.is_hybrid_swa = True
+        kvc.is_draft_worker = False
+        kvc.model_config = runner.model_config
+        for full_tokens, window, message in (
+            (36864, 2048, "TPU alignment"),
+            (61440, 4096, "decode headroom"),
+        ):
+            with (
+                self.subTest(full_tokens=full_tokens, window=window),
+                get_spec().override(
+                    speculative_algorithm=None, speculative_num_draft_tokens=None
+                ),
+                mock_cpu_env(swa_eviction_interval=128),
+            ):
+                runner.sliding_window_size = window
+                config = create_memory_pool_configurator(
+                    runner
+                ).calculate_pool_sizes_from_max_tokens(full_tokens, 512)
+                with self.assertRaisesRegex(ValueError, message):
+                    kvc._derive_pool_sizes(config=config)
+
+    def test_draft_without_swa_ignores_target_swa_reservation(self):
+        runner = self._runner(0.1)
+        with mock_cpu_env(swa_eviction_interval=128):
+            config = create_memory_pool_configurator(
+                runner
+            ).calculate_pool_sizes_from_max_tokens(81920, 512)
+        self.assertEqual(config.swa_tokens_per_request, 5120)
+        kvc = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        kvc.is_hybrid_swa = False
+        kvc.is_draft_worker = True
+        kvc.model_config = runner.model_config
+        for device in ("cpu", "tpu"):
+            for dcp_size in (1, 2):
+                with (
+                    self.subTest(device=device, dcp_size=dcp_size),
+                    get_parallel().override(attn_dcp_size=dcp_size),
+                ):
+                    kvc.device = device
+                    sizes = kvc._derive_pool_sizes(config=config)
+                    self.assertIsNone(sizes.swa_max_total_num_tokens)
+                    self.assertEqual(sizes.max_total_num_tokens, 81920 * dcp_size)
+        kvc.is_hybrid_swa = True
+        config.swa_max_total_num_tokens = 6144
+        with self.assertRaisesRegex(ValueError, "decode headroom"):
+            kvc._derive_pool_sizes(config=config)
 
 
 class TestAllSWAConfigurator(CustomTestCase):

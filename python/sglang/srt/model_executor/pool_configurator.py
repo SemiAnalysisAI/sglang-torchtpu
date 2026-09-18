@@ -32,7 +32,7 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.mem_cache.allocation_sizing import swa_chunk_cache_tokens_per_request
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
     get_compress_state_write_pad,
@@ -50,7 +50,6 @@ from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
     is_float4_e2m1fn_x2,
-    spec_decode_alloc_len_per_request,
 )
 
 
@@ -62,6 +61,8 @@ class MemoryPoolConfig:
     max_running_requests: Optional[int] = None
     full_max_total_num_tokens: Optional[int] = None
     swa_max_total_num_tokens: Optional[int] = None
+    # Ratio-sized chunk caches reserve growth per admitted request, not max batch.
+    swa_tokens_per_request: Optional[int] = None
 
     # DSV4 compressed-attention pool sizes (target only; draft workers leave at 0).
     c4_max_total_num_tokens: int = 0
@@ -746,6 +747,21 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         full_tokens = align_page_size(max_total_num_tokens)
         swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
 
+        swa_tokens_per_request = None
+        if get_memory().disable_radix_cache and self._sliding_window_size is not None:
+            swa_tokens_per_request = ceil_align(
+                swa_chunk_cache_tokens_per_request(
+                    self._sliding_window_size, page_size
+                ),
+                page_size,
+            )
+            if swa_tokens < swa_tokens_per_request:
+                raise ValueError(
+                    f"SWA pool ({swa_tokens} tokens) cannot hold one chunk-cache "
+                    f"request including decode headroom ({swa_tokens_per_request} tokens). "
+                    "Increase --swa-full-tokens-ratio or the total KV budget."
+                )
+
         if (
             self._sliding_window_size is not None
             and self._sliding_window_size + self._page_size >= swa_tokens
@@ -766,6 +782,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             max_total_num_tokens=full_tokens,
             full_max_total_num_tokens=full_tokens,
             swa_max_total_num_tokens=swa_tokens,
+            swa_tokens_per_request=swa_tokens_per_request,
         )
 
     def calculate_pool_sizes(
@@ -796,29 +813,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
 
         page_size = kvc.page_size
         window = kvc.sliding_window_size
-        draft_tokens = get_spec().speculative_num_draft_tokens or 1
-        eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
-
-        """
-        __________[padding][eviction_interval][window]
-        Padding to make sure eviction point is page-aligned.
-        """
-        trailing_tokens = window + eviction_interval * draft_tokens + page_size
-        if get_spec().speculative_algorithm is None:
-            decode_alloc = page_size
-        elif get_schedule().disable_overlap_schedule:
-            # spec-v1: new_tokens_required_next_decode per request.
-            decode_alloc = spec_decode_alloc_len_per_request(
-                page_size=page_size,
-                speculative_num_steps=get_spec().speculative_num_steps,
-                speculative_eagle_topk=get_spec().speculative_eagle_topk,
-                speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
-            )
-        else:
-            # spec-v2: the overlap allocator keeps 2 * alloc_len outstanding
-            # (eagle_utils.eagle_prepare_for_decode: kv_committed_len + 2 * alloc_len).
-            decode_alloc = 2 * get_alloc_len_per_decode()
-        per_request = trailing_tokens + decode_alloc
+        per_request = swa_chunk_cache_tokens_per_request(window, page_size)
 
         num_reqs = get_schedule().max_running_requests // kvc.ps.attn_dp_size
         if get_disagg().disaggregation_mode == "decode":

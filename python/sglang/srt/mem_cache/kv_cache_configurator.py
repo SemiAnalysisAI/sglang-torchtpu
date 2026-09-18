@@ -411,7 +411,13 @@ class KVCacheConfigurator:
         if self.device == "tpu" and swa_max_total_num_tokens is not None:
             align_tokens = self.pool_page_size * 8
             aligned = (swa_max_total_num_tokens // align_tokens) * align_tokens
-            if aligned != swa_max_total_num_tokens and aligned > 0:
+            if aligned == 0:
+                raise ValueError(
+                    f"SWA pool ({swa_max_total_num_tokens} tokens) cannot satisfy "
+                    f"TPU alignment of {align_tokens} tokens. Increase "
+                    "--swa-full-tokens-ratio or the total KV budget."
+                )
+            if aligned != swa_max_total_num_tokens:
                 logger.info(
                     "[hybrid-SWA] aligning swa_max_total_num_tokens "
                     f"{swa_max_total_num_tokens} -> {aligned} "
@@ -419,6 +425,25 @@ class KVCacheConfigurator:
                     "torch.compile decode on TPU)"
                 )
                 swa_max_total_num_tokens = aligned
+
+        if self.is_hybrid_swa and config.swa_tokens_per_request is not None:
+            per_request = config.swa_tokens_per_request * loc_scale
+            if swa_max_total_num_tokens < per_request:
+                raise ValueError(
+                    f"Aligned SWA pool ({swa_max_total_num_tokens} tokens) cannot "
+                    f"hold one chunk-cache request including decode headroom "
+                    f"({per_request} tokens). Increase --swa-full-tokens-ratio "
+                    "or the total KV budget."
+                )
+            logger.info(
+                "Ratio-sized SWA chunk cache: %s tokens, %s tokens reserved per "
+                "admitted request, at most %s concurrent reservations "
+                "(max_running_requests=%s).",
+                swa_max_total_num_tokens,
+                per_request,
+                swa_max_total_num_tokens // per_request,
+                max_running_requests,
+            )
 
         # DSV4 compressed-attention pool sizes. Draft worker reuses target's
         # full/swa sizes but does NOT own c4/c128/state pools (those live on

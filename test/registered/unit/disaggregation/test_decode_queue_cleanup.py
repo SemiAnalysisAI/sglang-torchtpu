@@ -3,6 +3,8 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -14,8 +16,10 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -82,6 +86,203 @@ class TestHiCacheReceiverCapabilityProxy(CustomTestCase):
         self.assertIs(pollers[0].decode_req, decode_req)
         self.assertIs(reduce.call_args.args[1], tp_group)
         self.assertEqual(reduce.call_args.kwargs["additional_groups"], [cp_group])
+
+
+class TestRatioSWABudgets(CustomTestCase):
+    def _queue(self, size_swa=4096):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.swa_tokens_per_request = 512
+        queue.num_reserved_decode_tokens = 1
+        queue.retracted_queue = []
+        queue.scheduler = SimpleNamespace(
+            sliding_window_size=256,
+            server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
+            running_batch=SimpleNamespace(reqs=[]),
+            waiting_queue=[],
+            last_batch=None,
+        )
+        queue.transfer_queue = SimpleNamespace(queue=[])
+        queue.req_to_token_pool = SimpleNamespace(available_size=lambda: 64)
+        queue.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=128,
+            size_swa=size_swa,
+            swa_available_size=MagicMock(return_value=size_swa),
+        )
+        queue.tree_cache = SimpleNamespace(swa_evictable_size=lambda: 0)
+        queue._uses_swa_tail_prealloc = lambda: True
+        return queue
+
+    def _req(self, rid="test"):
+        return SimpleNamespace(
+            rid=rid, origin_input_ids=[0] * 2048, output_ids=[], is_retracted=True
+        )
+
+    def test_new_request_reserves_growth_only_for_ratio_chunk_pool(self):
+        queue = self._queue()
+        override = get_context().override_server_args(disable_radix_cache=True)
+        override.install()
+        self.addCleanup(override.restore)
+        self.assertEqual(queue._prealloc_required_tokens(self._req()), (2049, 512))
+        queue.swa_tokens_per_request = None
+        self.assertEqual(queue._prealloc_required_tokens(self._req()), (2049, 256))
+
+    def test_running_waiting_transfer_and_prebuilt_growth_is_counted_once(self):
+        queue = self._queue()
+        queue.scheduler.running_batch.reqs = [self._req()]
+        queue.scheduler.waiting_queue = [self._req()]
+        queue.transfer_queue.queue = [object()]
+        queue.scheduler.last_batch = SimpleNamespace(
+            reqs=[self._req()], forward_mode=SimpleNamespace(is_prebuilt=lambda: True)
+        )
+        queue.token_to_kv_pool_allocator.swa_available_size.return_value = (
+            4096 - 4 * 256
+        )
+        self.assertEqual(queue._swa_tail_allocatable_token_budget(), 4096 - 4 * 512)
+        queue.token_to_kv_pool_allocator.swa_available_size.return_value -= 256
+        self.assertEqual(
+            queue._swa_tail_allocatable_token_budget(extra_reserved_reqs=1),
+            4096 - 5 * 512,
+        )
+
+    def test_pending_retractions_are_charged_once_and_excluded_during_restore(self):
+        queue = self._queue()
+        queue.retracted_queue = [self._req()]
+        self.assertEqual(queue._swa_tail_allocatable_token_budget(), 4096 - 512)
+        self.assertEqual(
+            queue._swa_tail_allocatable_token_budget(count_retracted=False), 4096
+        )
+
+    def test_running_request_progress_uses_bounded_swa_reservation(self):
+        queue = self._queue()
+        req = self._req()
+        req.sampling_params = SimpleNamespace(max_new_tokens=4096)
+        queue.scheduler.running_batch.reqs = [req]
+        queue.token_to_kv_pool_allocator.swa_available_size.return_value = 4096 - 256
+        self.assertEqual(
+            queue._swa_tail_allocatable_token_budget(
+                retractable_tokens=2048, retractable_swa_tokens=256
+            ),
+            4096 - 512,
+        )
+
+    def test_preallocation_checks_bounded_swa_and_full_capacity(self):
+        override = get_context().override_server_args(disable_radix_cache=True)
+        override.install()
+        self.addCleanup(override.restore)
+        for active, swa_capacity, full_free, reservation, admitted in (
+            (0, 4096, 65536, 3584, True),
+            (1, 8192, 65536, 3584, True),
+            (1, 4096, 65536, 3584, False),
+            (0, 4096, 4096, 3584, False),
+            (0, 4096, 65536, None, False),
+        ):
+            with self.subTest(
+                active=active,
+                swa_capacity=swa_capacity,
+                full_free=full_free,
+                reservation=reservation,
+            ):
+                queue = self._queue(size_swa=swa_capacity)
+                queue.pp_size = 1
+                queue.max_total_num_tokens = 65536
+                queue.swa_tokens_per_request = reservation
+                queue.num_reserved_decode_tokens = 512
+                queue.scheduler.sliding_window_size = 2048
+                queue.scheduler.enable_hisparse = False
+                queue.scheduler.enable_priority_scheduling = False
+                allocator = queue.token_to_kv_pool_allocator
+                allocator.page_size = 512
+                allocator.full_available_size = lambda: full_free
+                allocator.swa_available_size.return_value = swa_capacity - active * 2048
+                queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+                    available_size=lambda: 64
+                )
+                queue._resolve_pending_reqs = MagicMock()
+                queue._update_handshake_waiters = MagicMock()
+                queue._hicache_pending_restore_tokens = lambda: 0
+                queue.pending_reqs = []
+                req = SimpleNamespace(
+                    rid="new",
+                    origin_input_ids=[0] * 4096,
+                    output_ids=[],
+                    finished_reason=None,
+                    sampling_params=SimpleNamespace(max_new_tokens=4096),
+                )
+                running_req = SimpleNamespace(**vars(req))
+                running_req.rid = "running"
+                queue.scheduler.running_batch.reqs = [running_req] * active
+                queue.queue = [
+                    SimpleNamespace(
+                        req=req, waiting_for_input=True, is_rebootstrap=False
+                    )
+                ]
+                # Stop at the allocation boundary, before transport setup.
+                queue._pre_alloc = MagicMock(
+                    side_effect=RuntimeError("allocation reached")
+                )
+                self.assertFalse(queue._check_if_req_exceed_kv_capacity(req))
+                if admitted:
+                    with self.assertRaisesRegex(RuntimeError, "allocation reached"):
+                        queue.pop_preallocated()
+                    queue._pre_alloc.assert_called_once()
+                else:
+                    self.assertEqual(queue.pop_preallocated(), ([], []))
+                    queue._pre_alloc.assert_not_called()
+
+    def test_existing_policy_keeps_prebuilt_reserve_outside_progress_floor(self):
+        queue = self._queue()
+        queue.swa_tokens_per_request = None
+        queue.num_reserved_decode_tokens = 128
+        queue.scheduler.running_batch.reqs = [self._req()]
+        queue.scheduler.last_batch = SimpleNamespace(
+            reqs=[self._req()], forward_mode=SimpleNamespace(is_prebuilt=lambda: True)
+        )
+        queue.token_to_kv_pool_allocator.swa_available_size.return_value = 4096 - 128
+        with patch.object(queue, "_need_space_for_single_req", return_value=256):
+            self.assertEqual(queue._swa_tail_allocatable_token_budget(), 3584)
+
+    @patch("sglang.srt.disaggregation.decode.retraction_restore")
+    def test_restore_stops_at_swa_limit_despite_full_pool_capacity(self, restore):
+        override = get_context().override_server_args(
+            disaggregation_decode_retraction_backup="cpu_tensor"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        queue = self._queue(size_swa=1024)
+        reqs = [self._req(str(i)) for i in range(3)]
+        queue.retracted_queue = reqs.copy()
+        queue._swa_aware_allocatable_token_budgets = lambda **kw: (
+            100000,
+            queue._swa_tail_allocatable_token_budget(**kw),
+        )
+
+        def prealloc(req):
+            queue.token_to_kv_pool_allocator.swa_available_size.return_value -= 256
+
+        queue._pre_alloc = prealloc
+        self.assertEqual(queue.resume_retracted_reqs(), reqs[:2])
+        self.assertEqual(queue.retracted_queue, reqs[2:])
+        self.assertEqual(restore.call_count, 2)
+
+    def test_decode_memory_check_uses_real_swa_allocator_limit(self):
+        allocator = SWATokenToKVPoolAllocator(
+            size=4096,
+            size_swa=128,
+            page_size=1,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=MagicMock(spec=BaseSWAKVPool),
+            need_sort=False,
+        )
+        batch = ScheduleBatch.__new__(ScheduleBatch)
+        batch.token_to_kv_pool_allocator = allocator
+        batch.tree_cache = SimpleNamespace()
+        batch.new_tokens_required_next_decode = lambda _: 32
+        occupied = allocator.swa_attn_allocator.alloc(112)
+        with patch("sglang.srt.managers.schedule_batch.evict_from_tree_cache"):
+            self.assertFalse(batch.check_decode_mem())
+            allocator.swa_attn_allocator.free(occupied)
+            self.assertTrue(batch.check_decode_mem())
 
 
 class TestDecodeQueueCleanup(CustomTestCase):

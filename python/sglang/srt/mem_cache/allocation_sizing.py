@@ -1,11 +1,37 @@
 from __future__ import annotations
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
     max_speculative_num_draft_tokens,
 )
+from sglang.srt.utils.common import spec_decode_alloc_len_per_request
+
+
+def swa_chunk_cache_tokens_per_request(window: int, page_size: int) -> int:
+    """Bound a chunk-cache request's window, eviction lag, and decode allocation."""
+    spec = get_spec()
+    draft_tokens = spec.speculative_num_draft_tokens or 1
+    eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
+    # Allow padding so the eviction point can be page-aligned.
+    trailing_tokens = window + eviction_interval * draft_tokens + page_size
+    if spec.speculative_algorithm is None:
+        decode_alloc = page_size
+    elif get_schedule().disable_overlap_schedule:
+        # Non-overlap speculative reserve includes top-k branch page rounding.
+        decode_alloc = spec_decode_alloc_len_per_request(
+            page_size=page_size,
+            speculative_num_steps=spec.speculative_num_steps,
+            speculative_eagle_topk=spec.speculative_eagle_topk,
+            speculative_num_draft_tokens=spec.speculative_num_draft_tokens,
+        )
+    else:
+        # Reserve the overlap double buffer; see get_alloc_reserve_per_decode()
+        # and its caller eagle_utils.eagle_prepare_for_decode().
+        decode_alloc = 2 * get_alloc_len_per_decode()
+    return trailing_tokens + decode_alloc
 
 
 def get_alloc_page_size() -> int:

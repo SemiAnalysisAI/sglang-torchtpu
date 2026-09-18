@@ -337,6 +337,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     Store the requests that are preallocating.
     """
 
+    swa_tokens_per_request: Optional[int] = None
+
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
@@ -382,6 +384,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pp_rank = pp_rank
         self.pp_size = scheduler.ps.pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
+        pool_config = scheduler.tp_worker.model_runner.memory_pool_config
+        if pool_config is not None:
+            self.swa_tokens_per_request = pool_config.swa_tokens_per_request
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
@@ -515,12 +520,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Match the allocator, which charges whole pages for both pools.
             full_len = ceil_align(full_len, page_size)
             swa_len = ceil_align(swa_len, page_size)
-        swa_reserved = self.num_reserved_decode_tokens
-        if get_memory().disable_radix_cache:
-            swa_reserved = 0
+        if self.swa_tokens_per_request is not None:
+            swa_required = max(swa_len, self.swa_tokens_per_request)
+        elif get_memory().disable_radix_cache:
+            swa_required = swa_len
+        else:
+            swa_required = swa_len + self.num_reserved_decode_tokens
         return (
             full_len + self.num_reserved_decode_tokens,
-            swa_len + swa_reserved,
+            swa_required,
         )
 
     def _init_kv_manager(self) -> CommonKVManager:
@@ -1345,17 +1353,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if uses_swa_tail_prealloc:
                 _, swa_required = self._prealloc_required_tokens(decode_req.req)
                 _, swa_len = self._prealloc_kv_lens(decode_req.req)
-                max_new_tokens = min(
-                    decode_req.req.sampling_params.max_new_tokens,
-                    CLIP_MAX_NEW_TOKEN,
-                )
-                if (
-                    max(
+                if self.swa_tokens_per_request is None:
+                    max_new_tokens = min(
+                        decode_req.req.sampling_params.max_new_tokens,
+                        CLIP_MAX_NEW_TOKEN,
+                    )
+                    swa_required = max(
                         swa_required,
                         swa_len + max_new_tokens - retractable_swa_tokens,
                     )
-                    > swa_allocatable_tokens
-                ):
+                if swa_required > swa_allocatable_tokens:
                     if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                         self._release_matched_prefix_lock(decode_req.req)
                     break
@@ -1733,62 +1740,70 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         reserved_tokens: Optional[int] = None,
         extra_reserved_reqs: int = 0,
     ) -> int:
-        need_swa_space_for_single_req = self._need_space_for_single_req(
-            retractable_tokens
-        )
-        if (
-            retractable_swa_tokens is not None
-            and len(self.scheduler.running_batch.reqs) > 0
-        ):
-            need_swa_space_for_single_req = max(
-                self._swa_tail_len(len(x.origin_input_ids))
-                + min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
-                - retractable_swa_tokens
-                for x in self.scheduler.running_batch.reqs
+        # Ratio-sized chunk caches reserve bounded growth for every active
+        # request below; they do not need a linear output-length floor as well.
+        need_swa_space_for_single_req = 0
+        if self.swa_tokens_per_request is None:
+            need_swa_space_for_single_req = self._need_space_for_single_req(
+                retractable_tokens
             )
+            if (
+                retractable_swa_tokens is not None
+                and len(self.scheduler.running_batch.reqs) > 0
+            ):
+                need_swa_space_for_single_req = max(
+                    self._swa_tail_len(len(x.origin_input_ids))
+                    + min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+                    - retractable_swa_tokens
+                    for x in self.scheduler.running_batch.reqs
+                )
 
         if n_active is None:
             n_active = self._active_req_count(extra_reserved_reqs)
         if reserved_tokens is None:
             reserved_tokens = self._active_reserved_tokens(n_active)
 
-        # SWA growth is bounded by the sliding window: once a req's SWA
-        # footprint reaches `sliding_window_size`, further decode tokens
-        # evict old ones and net growth is zero. The linear reservation
-        # `num_reserved_decode_tokens * n_active` (correct for the full
-        # pool) over-reserves SWA in steady state. Cap by the actual
-        # remaining headroom up to per-req window cap.
         window_size = self.scheduler.sliding_window_size or 0
         swa_total = self.token_to_kv_pool_allocator.size_swa
         swa_available = self.token_to_kv_pool_allocator.swa_available_size()
         swa_evictable = self.tree_cache.swa_evictable_size()
         swa_used = swa_total - swa_available - swa_evictable
-        swa_growth_potential = max(0, n_active * window_size - swa_used)
-        swa_reserved_tokens = min(reserved_tokens, swa_growth_potential)
+        # Prebuilt requests own KV before entering an active queue.
+        last_batch = self.scheduler.last_batch
+        prebuilt_n = (
+            len(last_batch.reqs)
+            if last_batch and last_batch.forward_mode.is_prebuilt()
+            else 0
+        )
+        prebuilt_reserved = 0
+        if self.swa_tokens_per_request is not None:
+            # Credit live KV once across active and prebuilt reservations.
+            swa_reserved = max(
+                0,
+                (n_active + prebuilt_n) * self.swa_tokens_per_request - swa_used,
+            )
+        else:
+            # The existing policy caps full-pool decode reservations by the
+            # remaining SWA window growth; prebuilt reservations are separate
+            # from the single-request progress floor.
+            swa_reserved = min(
+                reserved_tokens,
+                max(0, n_active * window_size - swa_used),
+            )
+            prebuilt_reserved = min(
+                self.num_reserved_decode_tokens * prebuilt_n,
+                max(0, prebuilt_n * window_size - swa_used),
+            )
         swa_allocatable_tokens = (
             swa_available
             + swa_evictable
-            - max(swa_reserved_tokens, need_swa_space_for_single_req)
+            - max(swa_reserved, need_swa_space_for_single_req)
+            - prebuilt_reserved
         )
-
-        # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
-        #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
-        if (
-            self.scheduler.last_batch
-            and self.scheduler.last_batch.forward_mode.is_prebuilt()
-        ):
-            prebuilt_reserved_tokens = self.num_reserved_decode_tokens * len(
-                self.scheduler.last_batch.reqs
-            )
-            prebuilt_n = len(self.scheduler.last_batch.reqs)
-            prebuilt_swa_growth = max(0, prebuilt_n * window_size - swa_used)
-            swa_allocatable_tokens -= min(prebuilt_reserved_tokens, prebuilt_swa_growth)
-
         if count_retracted:
-            for req in self.retracted_queue:
-                _, swa_required = self._prealloc_required_tokens(req)
-                swa_allocatable_tokens -= swa_required
-
+            swa_allocatable_tokens -= sum(
+                self._prealloc_required_tokens(req)[1] for req in self.retracted_queue
+            )
         return swa_allocatable_tokens
 
     def _required_alloc_tokens(self, *, fill_len: int, prefix_len: int) -> int:
