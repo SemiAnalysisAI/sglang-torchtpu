@@ -14,10 +14,12 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -567,20 +569,55 @@ def dump_launch(config, command, env):
         print(f"[launcher] metadata unavailable: {exc}", file=sys.stderr)
 
 
+def telemetry_stub(env):
+    """Use Bazel's built library, or compile it for a source checkout."""
+    stub = Path(
+        env.get("LIBTPU_TELEMETRY_STUB", str(TPU_ROOT / "libtpu_telemetry_stub.so"))
+    )
+    if stub.is_file():
+        return stub.absolute()
+    if (
+        "LIBTPU_TELEMETRY_STUB" in env
+        or env.get("RUNFILES_DIR")
+        or env.get("RUNFILES_MANIFEST_FILE")
+    ):
+        raise FileNotFoundError(f"Missing telemetry library: {stub}")
+
+    # Match common_env.sh for direct Python runs in the existing TPU image.
+    stub = Path(tempfile.gettempdir()) / "libtpu_telemetry_stub.so"
+    if not stub.is_file():
+        compiler = shutil.which("gcc") or shutil.which("clang")
+        if not compiler:
+            raise FileNotFoundError(
+                "Source launches need gcc or clang for the telemetry library; "
+                "alternatively set LIBTPU_TELEMETRY_STUB to a built library"
+            )
+        with tempfile.TemporaryDirectory(
+            dir=stub.parent, prefix="sglang-telemetry-"
+        ) as directory:
+            output = Path(directory) / stub.name
+            subprocess.run(
+                [
+                    compiler,
+                    "-O2",
+                    "-fPIC",
+                    "-shared",
+                    str(TPU_ROOT / "libtpu_telemetry_stub.c"),
+                    "-o",
+                    str(output),
+                ],
+                env=env,
+                check=True,
+            )
+            output.replace(stub)
+    return stub
+
+
 def prepare_runtime_env(env):
     """Materialize explicitly configured runtime artifacts before importing TPU."""
     env = dict(env)
     if env.get("SGLANG_TPU_PRELOAD_TELEMETRY_STUB") == "1":
-        stub = Path(
-            env.get(
-                "LIBTPU_TELEMETRY_STUB",
-                str(Path(__file__).with_name("libtpu_telemetry_stub.so")),
-            )
-        )
-        if not stub.is_file():
-            raise FileNotFoundError(
-                "Build //benchmark/tpu:libtpu_telemetry_stub.so or set LIBTPU_TELEMETRY_STUB to the built library"
-            )
+        stub = telemetry_stub(env)
         preloads = env.get("LD_PRELOAD", "").split(":") if env.get("LD_PRELOAD") else []
         if str(stub.absolute()) not in preloads:
             preloads.insert(0, str(stub.absolute()))

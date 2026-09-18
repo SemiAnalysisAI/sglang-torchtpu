@@ -5,7 +5,7 @@ package(default_visibility = ["//visibility:public"])
 
 exports_files(["launch_server.py"])
 
-# Build the telemetry workaround hermetically, never with runtime gcc.
+# Bazel supplies the telemetry workaround as a hermetically built dependency.
 cc_binary(
     name = "libtpu_telemetry_stub.so",
     srcs = ["libtpu_telemetry_stub.c"],
