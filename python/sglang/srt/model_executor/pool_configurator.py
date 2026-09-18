@@ -784,10 +784,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     """Hybrid SWA configurator with the SWA pool sized from a fixed token cap.
 
-    When max_running_requests is explicit, the SWA pool's worst-case
-    footprint is bounded per request. The SWA pool is sized tightly from that
-    cap and the freed memory is redirected to the full pool, instead of sizing
-    both pools by swa_full_tokens_ratio.
+    When the ratio is omitted and max_running_requests is explicit, the SWA
+    pool's worst-case footprint is bounded per request. The SWA pool is sized
+    from that cap and the remaining memory goes to the full pool.
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
@@ -838,6 +837,8 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     @staticmethod
     def is_applicable(kvc: KVCacheConfigurator) -> bool:
         """True when SWAChunkCache can be sized from explicit max requests."""
+        if kvc.server_args.has_explicit_swa_ratio():
+            return False
         if get_schedule().max_running_requests is None:
             return False
         if not get_memory().disable_radix_cache:

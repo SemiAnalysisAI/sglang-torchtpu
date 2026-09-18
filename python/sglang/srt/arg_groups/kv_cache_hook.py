@@ -21,6 +21,14 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
+def handle_swa_ratio_default(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.swa_full_tokens_ratio is None:
+        declare_resolution(server_args, "swa_ratio_default", swa_full_tokens_ratio=0.8)
+    if not (0 < cfg.swa_full_tokens_ratio <= 1.0):
+        raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+
+
 def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
     """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
     cfg = resolving_view(server_args)
@@ -204,8 +212,7 @@ def handle_cache_compatibility(server_args: Any) -> None:
     # Validate the effective ratio: model branches may declare a reset
     # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes
     # the user input before it ever takes effect.
-    if not (0 < resolved_view(server_args).swa_full_tokens_ratio <= 1.0):
-        raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+    handle_swa_ratio_default(server_args)
 
 
 def handle_unified_memory_pool(server_args: Any) -> None:

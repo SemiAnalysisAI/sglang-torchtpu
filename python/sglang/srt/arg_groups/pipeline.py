@@ -106,6 +106,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     handle_hardware_runtime_validation()
     if cfg.model_path.lower() in ["none", "dummy"]:
+        from sglang.srt.arg_groups.kv_cache_hook import handle_swa_ratio_default
+
+        handle_swa_ratio_default(server_args)
         return
 
     from sglang.srt.arg_groups.model_path_hook import (

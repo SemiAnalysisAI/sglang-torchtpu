@@ -828,18 +828,21 @@ class ServerArgs:
         NS("schedule"),
     ] = 16
     swa_full_tokens_ratio: A[
-        float,
+        Optional[float],
         Arg(
             help=(
                 "The ratio of SWA layer KV tokens / full layer KV tokens, regardless "
                 "of the number of swa:full layers. It should be between 0 and 1. "
                 "E.g. 0.5 means if each swa layer has 50 tokens, then each full "
-                "layer has 100 tokens."
+                "layer has 100 tokens. An explicit ratio takes precedence over "
+                "concurrency-based chunk-cache sizing. When omitted, use "
+                "concurrency-based sizing when applicable; otherwise use the "
+                "model-specific ratio default, or 0.8 if none is defined."
             ),
             resolvable=True,
         ),
         NS("schedule"),
-    ] = 0.8
+    ] = None
     disable_hybrid_swa_memory: A[
         bool,
         Arg(help="Disable the hybrid SWA memory pool.", resolvable=True),
@@ -3750,6 +3753,10 @@ class ServerArgs:
         # end of the pipeline that normally sets it: the gate is about whether
         # the handlers ran, not how far they got.
         self._resolution_finished = True
+
+    def has_explicit_swa_ratio(self) -> bool:
+        """Whether the launch input specifies a ratio, before default resolution."""
+        return self.swa_full_tokens_ratio is not None
 
     def resolved_dict(self) -> Dict[str, Any]:
         """This configuration as a plain dict of resolved field values.

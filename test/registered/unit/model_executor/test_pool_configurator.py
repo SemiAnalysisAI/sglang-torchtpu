@@ -7,6 +7,7 @@ invariants hold (tokens * per_token_cost <= available_bytes).
 
 import contextlib
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +15,10 @@ import torch
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.model_executor.pool_configurator import (
+    SWAChunkCapPoolConfigurator,
+    create_memory_pool_configurator,
+)
 from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
@@ -21,6 +26,7 @@ from sglang.srt.runtime_context import (
     get_server_args,
     get_spec,
 )
+from sglang.srt.speculative import spec_registry
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -72,7 +78,7 @@ def _make_model_runner(
     swa_num_kv_heads=None,
     swa_head_dim=None,
     swa_v_head_dim=None,
-    swa_full_tokens_ratio=0.5,
+    swa_full_tokens_ratio=None,
     page_size=1,
     mambaish_config=None,
     disable_radix_cache=False,
@@ -141,7 +147,9 @@ def _make_model_runner(
     _publish_config(
         testcase,
         max_total_tokens=None,
-        swa_full_tokens_ratio=swa_full_tokens_ratio,
+        swa_full_tokens_ratio=(
+            0.8 if swa_full_tokens_ratio is None else swa_full_tokens_ratio
+        ),
         page_size=page_size,
         disable_radix_cache=disable_radix_cache,
         chunked_prefill_size=chunked_prefill_size,
@@ -158,7 +166,9 @@ def _make_model_runner(
         enable_dsa_cache_layer_split=False,
         kv_cache_dtype="auto",
     )
-    mr.server_args = get_server_args()
+    mr.server_args = replace(
+        get_server_args(), swa_full_tokens_ratio=swa_full_tokens_ratio
+    )
 
     spec = MagicMock()
     spec.is_eagle.return_value = False
@@ -450,7 +460,6 @@ class TestHybridSWAConfigurator(CustomTestCase):
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
             swa_num_kv_heads=4,
-            swa_full_tokens_ratio=0.5,
             disable_radix_cache=True,
             chunked_prefill_size=4,
             sliding_window_size=8,
@@ -490,7 +499,6 @@ class TestHybridSWAConfigurator(CustomTestCase):
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
             swa_num_kv_heads=4,
-            swa_full_tokens_ratio=0.5,
             disable_radix_cache=True,
             chunked_prefill_size=4,
             sliding_window_size=8,
@@ -555,7 +563,6 @@ class TestHybridSWAConfigurator(CustomTestCase):
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
             swa_num_kv_heads=4,
-            swa_full_tokens_ratio=0.5,
             disable_radix_cache=True,
             chunked_prefill_size=1000,
             sliding_window_size=4,
@@ -586,7 +593,6 @@ class TestHybridSWAConfigurator(CustomTestCase):
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
             swa_num_kv_heads=4,
-            swa_full_tokens_ratio=0.5,
             disable_radix_cache=True,
             chunked_prefill_size=16,
             sliding_window_size=8,
@@ -619,7 +625,6 @@ class TestHybridSWAConfigurator(CustomTestCase):
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
             swa_num_kv_heads=4,
-            swa_full_tokens_ratio=0.5,
             disable_radix_cache=True,
             chunked_prefill_size=1000,
             sliding_window_size=4,
@@ -641,6 +646,71 @@ class TestHybridSWAConfigurator(CustomTestCase):
         # cap = 10 * 10 + 5 * 2 = 110.
         self.assertEqual(config.swa_max_total_num_tokens, 110)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
+
+
+class TestExplicitSWARatio(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        registry = patch.dict(
+            spec_registry._REGISTRY,
+            {
+                "TEST_SWA_RATIO": spec_registry.CustomSpecAlgo(
+                    "TEST_SWA_RATIO", lambda _: None, supports_overlap=True
+                )
+            },
+        )
+        registry.start()
+        self.addCleanup(registry.stop)
+
+    def _runner(self, ratio=None):
+        return _make_model_runner(
+            self,
+            num_kv_heads=1,
+            swa_num_kv_heads=1,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(16)),
+            swa_attention_layer_ids=list(range(16, 62)),
+            swa_full_tokens_ratio=ratio,
+            page_size=512,
+            sliding_window_size=2048,
+            disable_radix_cache=True,
+            chunked_prefill_size=8192,
+            max_running_requests=64,
+            disaggregation_mode="decode",
+            disaggregation_decode_extra_slots=4,
+            speculative_algorithm="TEST_SWA_RATIO",
+            speculative_num_steps=15,
+            speculative_num_draft_tokens=16,
+            speculative_eagle_topk=1,
+        )
+
+    def test_explicit_ratio_controls_split_with_chunk_cache(self):
+        for ratio in (None, 0.1, 0.8):
+            with self.subTest(ratio=ratio):
+                runner = self._runner(ratio)
+                with mock_cpu_env(swa_eviction_interval=128):
+                    configurator = create_memory_pool_configurator(runner)
+                    config = configurator.calculate_pool_sizes(4 * 2**30, 512)
+                self.assertLessEqual(_actual_memory_used(runner, config), 4 * 2**30)
+                if ratio is None:
+                    self.assertIsInstance(configurator, SWAChunkCapPoolConfigurator)
+                    self.assertEqual(config.swa_max_total_num_tokens, 307200)
+                else:
+                    self.assertNotIsInstance(configurator, SWAChunkCapPoolConfigurator)
+                    self.assertLess(
+                        abs(
+                            config.swa_max_total_num_tokens
+                            - ratio * config.full_max_total_num_tokens
+                        ),
+                        512,
+                    )
+
+    def test_model_declared_ratio_does_not_imply_operator_intent(self):
+        runner = self._runner()
+        with get_schedule().override(swa_full_tokens_ratio=0.1), mock_cpu_env():
+            self.assertIsInstance(
+                create_memory_pool_configurator(runner), SWAChunkCapPoolConfigurator
+            )
 
 
 class TestAllSWAConfigurator(CustomTestCase):
@@ -1062,6 +1132,7 @@ class TestMixedKVFormats(CustomTestCase):
                         is_hybrid_swa=hybrid,
                         full_attention_layer_ids=[] if layout == "all_swa" else [0],
                         swa_attention_layer_ids=[0, 1] if layout == "all_swa" else [1],
+                        swa_full_tokens_ratio=0.5 if layout == "hybrid" else None,
                         disable_radix_cache=chunk_cap,
                         chunked_prefill_size=4 if chunk_cap else None,
                         sliding_window_size=8 if chunk_cap else None,
@@ -1174,6 +1245,7 @@ class TestMixedKVFormats(CustomTestCase):
                     swa_num_kv_heads=2,
                     swa_head_dim=64,
                     swa_v_head_dim=64,
+                    swa_full_tokens_ratio=0.5,
                 )
                 mr.kv_cache_dtype_str = "mxint8"
                 mr.kv_cache_dtype = torch.int8

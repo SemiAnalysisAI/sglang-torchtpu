@@ -42,7 +42,7 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # cuda_graph_backend_prefill declared here lands too late (the breakable
     # default would already have been auto-disabled for this multimodal arch).
     # It is set inline before _handle_cuda_graph_config instead.
-    if cfg.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
+    if cfg.swa_full_tokens_ratio is None:
         overrides["swa_full_tokens_ratio"] = 0.1
     if cfg.mamba_full_memory_ratio == ServerArgs.mamba_full_memory_ratio:
         overrides["mamba_full_memory_ratio"] = 0.1
