@@ -173,6 +173,9 @@ def _run_sgl_eval(eval_name, args) -> dict:
     elif sgl_eval_thinking:
         cmd += ["--thinking"]
 
+    # Use the same sampling seed in both token-budget legs.
+    cmd += ["--seed", "20260917"]
+
     try:
         completed = subprocess.run(
             cmd,
@@ -203,6 +206,22 @@ def _run_sgl_eval(eval_name, args) -> dict:
     aggregate = payload.get("aggregate")
     if not isinstance(aggregate, dict) or "score" not in aggregate:
         raise KeyError(f"{metrics_files[0]} missing aggregate.score")
+
+    # Diagnostic branch: preserve every response before CI removes the pod.
+    # Chunks stay below the container log line limit; reconstruct with base64.
+    import base64
+    import io
+    import tarfile
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        archive.add(metrics_files[0].parent, arcname=metrics_files[0].parent.name)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    print("=== AIME_DIAGNOSTIC_ARCHIVE_BEGIN ===", flush=True)
+    for offset in range(0, len(encoded), 6000):
+        print("AIME_ARCHIVE_CHUNK " + encoded[offset : offset + 6000], flush=True)
+    print("=== AIME_DIAGNOSTIC_ARCHIVE_END ===", flush=True)
+    print("AIME_DIAGNOSTIC_METRICS " + json.dumps(payload), flush=True)
 
     metrics = dict(aggregate)
     metrics["latency"] = payload.get("latency_seconds", 0.0)
