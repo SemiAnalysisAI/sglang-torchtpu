@@ -68,6 +68,12 @@
 #                                  # --chunked-prefill-size by DP_SIZE, so pass
 #                                  # CHUNKED_PREFILL_SIZE = per-rank budget x
 #                                  # DP_SIZE to get the per-rank chunk you want.
+#   DCP_SIZE=                      # >1 passes --dcp-size N (decode context
+#                                  # parallelism): each request's KV is sharded
+#                                  # by token position over N ranks of the TP
+#                                  # group instead of replicating KV heads.
+#                                  # Needs pallas_tpu_rpa_v3 and torch.compile;
+#                                  # cannot be combined with DP_SIZE.
 #   CONC=64                        # bench concurrency this server is sized for
 #   MAX_RUNNING=$CONC              # in-flight request cap (InferenceX parity:
 #                                  # exactly the bench concurrency)
@@ -226,6 +232,25 @@ if [[ -n "$DP_SIZE" && "$DP_SIZE" != "1" ]]; then
     ATTN_TP_SIZE=$((TP_SIZE / DP_SIZE))
 else
     ATTN_TP_SIZE=$TP_SIZE
+fi
+
+# Decode context parallelism: each request's KV is sharded by absolute token
+# position across DCP_SIZE ranks of the TP group (rank r owns position p iff
+# p % DCP_SIZE == r) and the per-rank partial attention is merged by
+# log-sum-exp. It trades KV-head replication for KV capacity, so it only pays
+# off on models with fewer KV heads than TP ranks. Mutually exclusive with DP
+# attention on TPU, which tpu_platform rejects; caught here so the failure
+# names the two knobs rather than arriving from the platform hook.
+DCP_SIZE=${DCP_SIZE:-}
+if [[ -n "$DCP_SIZE" && "$DCP_SIZE" != "1" ]]; then
+    if (( TP_SIZE % DCP_SIZE != 0 )); then
+        echo "ERROR: TP_SIZE=$TP_SIZE is not divisible by DCP_SIZE=$DCP_SIZE" >&2
+        exit 2
+    fi
+    if [[ -n "$DP_SIZE" && "$DP_SIZE" != "1" ]]; then
+        echo "ERROR: DCP_SIZE=$DCP_SIZE cannot be combined with DP_SIZE=$DP_SIZE" >&2
+        exit 2
+    fi
 fi
 
 TS=$(date +%Y%m%d_%H%M%S)
@@ -412,6 +437,7 @@ if [[ "$ENABLE_MULTIHOST" == "1" ]]; then
 fi
 echo "  ep_size            = ${EP_SIZE:-<unset>}"
 echo "  dp_size            = ${DP_SIZE:-<unset>}  (attn_tp=$ATTN_TP_SIZE)"
+echo "  dcp_size           = ${DCP_SIZE:-<unset>}"
 echo "  host:port          = $HOST:$PORT"
 echo "  max_running        = $MAX_RUNNING  (CONC=$CONC)"
 echo "  page_size          = $PAGE_SIZE"
@@ -475,6 +501,7 @@ if [[ -n "$DP_SIZE" && "$DP_SIZE" != "1" ]]; then
     args+=(--dp-size "$DP_SIZE" --enable-dp-attention)
     (( ATTN_TP_SIZE > 1 )) && args+=(--enable-dp-lm-head)
 fi
+[[ -n "$DCP_SIZE" && "$DCP_SIZE" != "1" ]] && args+=(--dcp-size "$DCP_SIZE")
 [[ -n "$MEM_FRACTION_STATIC" ]] && args+=(--mem-fraction-static "$MEM_FRACTION_STATIC")
 [[ -n "$QUANTIZATION" ]] && args+=(--quantization "$QUANTIZATION")
 [[ -n "$KV_CACHE_DTYPE" ]] && args+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
