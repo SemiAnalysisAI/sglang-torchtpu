@@ -330,16 +330,20 @@ def run_server(
                 wait_healthy(url, health_timeout, check)
             check()
             children.append(start_process(router, env))
-        while received_signal is None:
-            if pd or router:
+        if pd or router:
+            # Engines are long-lived services; the test process owns the verdict.
+            # Any unsolicited engine/router exit fails the group, even exit 0.
+            # SIGTERM/SIGINT to this supervisor instead trigger graceful cleanup.
+            while received_signal is None:
                 check()
-            try:
-                code = children[0].wait(timeout=0.2)
-                if pd or router:
-                    raise RuntimeError(f"P/D engine exited with {code}")
+                time.sleep(0.2)
+        else:
+            while received_signal is None:
+                try:
+                    code = children[0].wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    continue
                 return code if code >= 0 else 128 - code
-            except subprocess.TimeoutExpired:
-                pass
         return 128 + received_signal
     finally:
         try:
@@ -384,7 +388,7 @@ def load_recipe(name):
         # These JobSet variables describe the public router, not its engines.
         env.update(HOST=None, PORT=None)
         return config
-    if group and group["prefill_engines"]:
+    if group and group.get("prefill_engines", 0):
         return {
             "group": deepcopy(group),
             "prefill": deepcopy(module.PREFILL_CONFIG),
@@ -410,6 +414,85 @@ def _count(value, name, minimum=1):
     if type(value) is not int or value < minimum:
         raise ValueError(f"{name} must be an integer >= {minimum}")
     return value
+
+
+def _plan_pd_group(config, group, topology, common_env, overrides, *, inherited, rank):
+    """Plan one host's P/D role and the rank-zero router after group validation."""
+    host_count = group["hosts"]
+    prefill_count = group["prefill_engines"]
+    router = None
+    hosts = [
+        host.strip()
+        for host in topology.get(
+            "SGLANG_LAUNCHER_HOSTNAMES",
+            topology.get("TPU_WORKER_HOSTNAMES", ""),
+        ).split(",")
+        if host.strip()
+    ]
+    decode_count = _count(
+        group.get("decode_engines", host_count - prefill_count),
+        "decode_engines",
+    )
+    if prefill_count + decode_count != host_count or len(hosts) != host_count:
+        raise ValueError(
+            "P/D group needs one host per engine and a matching TPU_WORKER_HOSTNAMES list"
+        )
+    if rank >= host_count:
+        raise ValueError("TPU_WORKER_ID outside the P/D group")
+    unknown = config.keys() - {
+        "prefill",
+        "decode",
+        "runtime_envs",
+        "runtime_env",
+    }
+    if unknown:
+        raise ValueError(f"Unknown P/D config fields: {sorted(unknown)}")
+    roles = {}
+    for role in ("prefill", "decode"):
+        role_config = LaunchConfig.from_dict(config.get(role))
+        if role_config.server_args.get("nnodes", 1) != 1 or role_config.server_args.get(
+            "use_ray"
+        ):
+            raise ValueError("P/D groups use one single-host server per engine")
+        if role_config.server_args.get("disaggregation_mode", role) != role:
+            raise ValueError(f"{role} config has a conflicting disaggregation_mode")
+        role_config.server_args["disaggregation_mode"] = role
+        role_config.server_args.setdefault("host", "0.0.0.0")
+        role_config.runtime_envs.update(
+            {**common_env, **role_config.runtime_envs, **overrides}
+        )
+        roles[role] = role_config
+    selected = roles["prefill" if rank < prefill_count else "decode"]
+    # HOST/PORT describe the public endpoint in JobSets, not P/D engines.
+    inherited.pop("HOST", None)
+    inherited.pop("PORT", None)
+    for role_config in roles.values():
+        role_config.runtime_envs.pop("HOST", None)
+        role_config.runtime_envs.pop("PORT", None)
+    env = child_env(inherited, selected.runtime_envs)
+    selected.runtime_envs["SGLANG_HOST_IP"] = env.get(
+        "SGLANG_HOST_IP"
+    ) or socket.gethostbyname(socket.gethostname())
+    prefill_port = roles["prefill"].server_args.get("port", 30000)
+    decode_port = roles["decode"].server_args.get("port", 30000)
+    bootstrap = roles["prefill"].server_args.get("disaggregation_bootstrap_port", 8998)
+    urls = tuple(
+        f"http://{host}:{prefill_port if i < prefill_count else decode_port}"
+        for i, host in enumerate(hosts)
+    )
+    if rank == 0:
+        lb_port = env.get("LB_PORT", "30000")
+        if int(lb_port) == int(prefill_port):
+            raise ValueError(
+                "LB_PORT must differ from the rank-zero prefill server port"
+            )
+        router = router_command(
+            urls[:prefill_count],
+            urls[prefill_count:],
+            bootstrap_port=bootstrap,
+            port=lb_port,
+        )
+    return selected, hosts, router, urls
 
 
 def plan_launch(config, inherited=None, runtime_envs=None):
@@ -441,81 +524,15 @@ def plan_launch(config, inherited=None, runtime_envs=None):
         if rank < 0:
             raise ValueError("TPU_WORKER_ID must be nonnegative")
         if prefill_count:
-            hosts = [
-                host.strip()
-                for host in topology.get(
-                    "SGLANG_LAUNCHER_HOSTNAMES",
-                    topology.get("TPU_WORKER_HOSTNAMES", ""),
-                ).split(",")
-                if host.strip()
-            ]
-            decode_count = _count(
-                group.get("decode_engines", host_count - prefill_count),
-                "decode_engines",
+            selected, hosts, router, urls = _plan_pd_group(
+                config,
+                group,
+                topology,
+                common_env,
+                overrides,
+                inherited=inherited,
+                rank=rank,
             )
-            if prefill_count + decode_count != host_count or len(hosts) != host_count:
-                raise ValueError(
-                    "P/D group needs one host per engine and a matching TPU_WORKER_HOSTNAMES list"
-                )
-            if rank >= host_count:
-                raise ValueError("TPU_WORKER_ID outside the P/D group")
-            unknown = config.keys() - {
-                "prefill",
-                "decode",
-                "runtime_envs",
-                "runtime_env",
-            }
-            if unknown:
-                raise ValueError(f"Unknown P/D config fields: {sorted(unknown)}")
-            roles = {}
-            for role in ("prefill", "decode"):
-                role_config = LaunchConfig.from_dict(config.get(role))
-                if role_config.server_args.get(
-                    "nnodes", 1
-                ) != 1 or role_config.server_args.get("use_ray"):
-                    raise ValueError("P/D groups use one single-host server per engine")
-                if role_config.server_args.get("disaggregation_mode", role) != role:
-                    raise ValueError(
-                        f"{role} config has a conflicting disaggregation_mode"
-                    )
-                role_config.server_args["disaggregation_mode"] = role
-                role_config.server_args.setdefault("host", "0.0.0.0")
-                role_config.runtime_envs.update(
-                    {**common_env, **role_config.runtime_envs, **overrides}
-                )
-                roles[role] = role_config
-            selected = roles["prefill" if rank < prefill_count else "decode"]
-            # HOST/PORT describe the public endpoint in JobSets, not P/D engines.
-            inherited.pop("HOST", None)
-            inherited.pop("PORT", None)
-            for role_config in roles.values():
-                role_config.runtime_envs.pop("HOST", None)
-                role_config.runtime_envs.pop("PORT", None)
-            env = child_env(inherited, selected.runtime_envs)
-            selected.runtime_envs["SGLANG_HOST_IP"] = env.get(
-                "SGLANG_HOST_IP"
-            ) or socket.gethostbyname(socket.gethostname())
-            prefill_port = roles["prefill"].server_args.get("port", 30000)
-            decode_port = roles["decode"].server_args.get("port", 30000)
-            bootstrap = roles["prefill"].server_args.get(
-                "disaggregation_bootstrap_port", 8998
-            )
-            urls = tuple(
-                f"http://{host}:{prefill_port if i < prefill_count else decode_port}"
-                for i, host in enumerate(hosts)
-            )
-            if rank == 0:
-                lb_port = env.get("LB_PORT", "30000")
-                if int(lb_port) == int(prefill_port):
-                    raise ValueError(
-                        "LB_PORT must differ from the rank-zero prefill server port"
-                    )
-                router = router_command(
-                    urls[:prefill_count],
-                    urls[prefill_count:],
-                    bootstrap_port=bootstrap,
-                    port=lb_port,
-                )
         else:
             if host_count != 1 or group.get("decode_engines", 0) != 0:
                 raise ValueError(
@@ -619,7 +636,8 @@ def prepare_runtime_env(env):
     env = dict(env)
     if env.get("SGLANG_TPU_PRELOAD_TELEMETRY_STUB") == "1":
         stub = telemetry_stub(env)
-        preloads = env.get("LD_PRELOAD", "").split(":") if env.get("LD_PRELOAD") else []
+        preload = env.get("LD_PRELOAD")
+        preloads = preload.split(":") if preload else []
         if str(stub.absolute()) not in preloads:
             preloads.insert(0, str(stub.absolute()))
         env["LD_PRELOAD"] = ":".join(preloads)
