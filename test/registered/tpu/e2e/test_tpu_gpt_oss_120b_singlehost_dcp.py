@@ -54,8 +54,13 @@ LAUNCH_ENV = {
     "TPU_COMPILE_BS": "1 2 4 8 16",
     "MAX_TOTAL_TOKENS": "16384",
     "ENABLE_PROFILER_ENDPOINT": "0",
-    # TP8 with a DCP group of 2: each rank keeps four of the eight KV heads and
-    # half the positions of every request.
+    # TP8 with DCP groups of 2: the eight ranks form four groups of adjacent
+    # ranks, and each group owns a quarter of the KV heads -- two of gpt-oss's
+    # eight -- with the two ranks in a group splitting the positions. Plain TP8
+    # gives each rank one head over every position, so this is the same bytes
+    # per rank re-partitioned: gpt-oss replicates no KV at TP8, so DCP buys it
+    # no capacity and costs it two collectives per layer. This gate is here for
+    # the mechanism, not for a win.
     "DCP_SIZE": str(DCP_SIZE),
     # The DCP backend requires RPA v3 (the only TPU kernel with the cache-only
     # and log-sum-exp modes the merge consumes) and torch.compile. Both are the
