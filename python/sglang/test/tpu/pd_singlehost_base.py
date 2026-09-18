@@ -4,10 +4,9 @@ import os
 import re
 import signal
 from pathlib import Path
-from test.e2e.launcher_test_case import TPULauncherTestCase
 from typing import Any, ClassVar
 
-from benchmark.tpu import launch_server
+from sglang.test.tpu.launcher_test_case import TPULauncherTestCase
 
 
 def peer_hostname(hostname: str, *, from_role: str, to_role: str) -> str:
@@ -29,7 +28,6 @@ class PDSingleHostTestCase(TPULauncherTestCase):
     base_url = f"http://127.0.0.1:{int(os.environ.get('LB_PORT', '8000'))}"
     health_timeout = 2 * int(os.environ.get("WAIT_SECS", "3600")) + 300
     health_generate_timeout = float(os.environ.get("HEALTH_TIMEOUT", "3600"))
-    cwd = str(Path(__file__).absolute().parents[2] / "benchmark" / "tpu")
     keep_up = os.environ.get("KEEP_UP", "0") == "1"
     tag = "pd-singlehost"
     decode_log_path: ClassVar[str | None] = None
@@ -63,10 +61,9 @@ class PDSingleHostTestCase(TPULauncherTestCase):
         if cls.role == "prefill":
             super().setUpClass()
         elif cls.role == "decode":
-            cls._launcher_process = launch_server.start_launcher(
+            cls._launcher_process = cls._start_launcher(
                 cls.config_module + ":DECODE_CONFIG",
                 {**cls.runtime_envs, "SGLANG_LAUNCHER_RANK": "0"},
-                cwd=cls.cwd,
                 log_path=cls.decode_log_path,
             )
         else:
@@ -74,10 +71,12 @@ class PDSingleHostTestCase(TPULauncherTestCase):
 
     def run_evaluations(self) -> None:
         if self.role == "decode":
-            # Match the JobSet's worker teardown policy before pytest turns all
-            # assertion failures into exit code 1: SIGTERM is expected, and a
+            # Match the JobSet's worker teardown policy: SIGTERM is expected, and a
             # SIGKILL is expected only when the prefill peer disconnected.
             code = self._launcher_process.wait()
+            reader = getattr(self._launcher_process, "_tpu_log_reader", None)
+            if reader is not None:
+                reader.join(timeout=5)
             if code in (-signal.SIGTERM, 128 + signal.SIGTERM):
                 return
             if code in (-signal.SIGKILL, 128 + signal.SIGKILL):

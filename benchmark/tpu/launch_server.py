@@ -18,7 +18,6 @@ import signal
 import socket
 import subprocess
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -199,7 +198,6 @@ def python_command(module: str) -> list[str]:
     from python.runfiles import runfiles
 
     binaries = {
-        "benchmark.tpu.launch_server": "launch_server",
         "sglang.launch_server": "sglang_server",
         "sglang_router.launch_router": "sglang_router",
     }
@@ -282,50 +280,13 @@ def stop_processes(processes, grace=30):
         finally:
             _kill_group(process, signal.SIGKILL)
             process.wait()
-            reader = getattr(process, "_tpu_log_reader", None)
-            if reader is not None:
-                reader.join(timeout=5)
 
 
-def _tee_log(pipe, log):
-    with pipe, log:
-        for line in pipe:
-            log.write(line)
-            try:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-            except (OSError, ValueError):
-                pass  # Keep file logging if the caller's stdout has closed.
-
-
-def start_process(command, env, *, cwd=None, log_path=None):
+def start_process(command, env, *, cwd=None):
     """Start an owned process group after applying its runtime environment."""
     env = prepare_runtime_env(env)
     env.setdefault("PYTHONUNBUFFERED", "1")
-    log = open(log_path, "a", encoding="utf-8", buffering=1) if log_path else None
-    try:
-        process = subprocess.Popen(
-            command,
-            env=env,
-            start_new_session=True,
-            cwd=cwd,
-            stdout=subprocess.PIPE if log else None,
-            stderr=subprocess.STDOUT if log else None,
-            text=bool(log),
-            encoding="utf-8" if log else None,
-            errors="replace" if log else None,
-        )
-    except BaseException:
-        if log is not None:
-            log.close()
-        raise
-    if log is not None:
-        # Preserve the shell recipes' live CI output plus per-role log files.
-        process._tpu_log_reader = threading.Thread(
-            target=_tee_log, args=(process.stdout, log), daemon=True
-        )
-        process._tpu_log_reader.start()
-    return process
+    return subprocess.Popen(command, env=env, start_new_session=True, cwd=cwd)
 
 
 def run_server(
@@ -640,29 +601,6 @@ def prepare_runtime_env(env):
         except OSError:
             pass  # The tier-2 cache is optional, as in the shell launcher.
     return env
-
-
-def start_launcher(config_module, runtime_envs=None, *, cwd=None, log_path=None):
-    """Start the shared CLI supervisor for a class fixture or service pod.
-
-    The supervisor loads the Python recipe and owns its engine and router.
-    Stop it with stop_processes(grace=60), allowing its default 30-second
-    child shutdown to finish before terminating the supervisor itself.
-    """
-    command = [
-        *python_command("benchmark.tpu.launch_server"),
-        "--config",
-        config_module,
-        "--working-directory",
-        os.path.abspath(cwd or os.getcwd()),
-    ]
-    if runtime_envs is not None:
-        command.extend(["--runtime-envs", json.dumps(_envs(runtime_envs))])
-    # Source execution imports benchmark as a package from the repository root.
-    # The supervisor then uses the requested cwd for engines and their artifacts.
-    return start_process(
-        command, dict(os.environ), cwd=TPU_ROOT.parents[1], log_path=log_path
-    )
 
 
 def serve(plan, *, dry_run=False, grace=30):
