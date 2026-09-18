@@ -40,11 +40,23 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_dcp import (
+    DcpWriteSpans,
+    broadcast_own_kv_heads,
+    build_dcp_kernel_op,
+    build_owner_write_spans,
+    fused_kv_rows,
+    gather_heads,
+    merge_across_ranks,
+    merge_lse,
+    sink_fold,
+    write_owned_kv,
+)
 from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -100,6 +112,21 @@ class PallasForwardMetadata:
     # Static query rows per DECODE sequence for this forward (1 = ordinary
     # decode); above 1 the active rows take the kernel's DECODE range.
     decode_query_size: int = 1
+    # Decode context parallelism: all three are None unless the DCP group size
+    # is > 1, in which case ``kv_lens`` holds this rank's shard of each sequence.
+    # i32[max_num_seqs]  unsharded KV length per sequence
+    dcp_kv_lens_global: torch.Tensor | None = None
+    # i32[max_num_seqs]  this rank's shard of the KV cached before this step
+    dcp_prefix_kv_lens: torch.Tensor | None = None
+    # i32[1]  this rank's index inside its DCP group
+    dcp_cp_rank: torch.Tensor | None = None
+    # Compaction index and DMA spans of the rows this rank writes into the
+    # full pool this step; under DCP the backend and not the kernel writes
+    # the step's K/V.
+    dcp_write: DcpWriteSpans | None = None
+    # The same targets in the SWA sub-pool's slot space, set only for
+    # hybrid-SWA models.
+    dcp_swa_write: DcpWriteSpans | None = None
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
@@ -193,6 +220,18 @@ class RpaKernelSpec:
 # torch custom ops are process-global; cache one per op_name so repeated backend
 # construction (e.g. one backend per draft step) reuses the registered op.
 _OP_CACHE: dict = {}
+
+
+def _import_dcp_helpers():
+    """Return ``get_dcp_lens``, imported on first use.
+
+    ``layers.dcp`` reaches back into ``distributed`` and ``runtime_context``;
+    importing it from inside the DCP branch of ``__init__`` keeps this module's
+    import graph the same whether or not DCP is configured.
+    """
+    from sglang.srt.layers.dcp.layout import get_dcp_lens
+
+    return get_dcp_lens
 
 
 def _quantize_kv_to_fp8(
@@ -403,9 +442,62 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 "RPA context capacity exceeds the request-to-token table width: "
                 f"required={self.max_context_len}, available={req_to_token_width}."
             )
+        # Decode context parallelism (DCP): a group of ranks splits every
+        # sequence's KV by absolute position (pos % dcp == rank), and the
+        # allocator hands out slots from a pool widened by dcp, so one page
+        # spans page_size * dcp logical tokens over page_size physical slots.
+        parallel = get_parallel()
+        self._dcp = parallel.attn_dcp_size
+        self._dcp_rank = parallel.attn_dcp_rank
+        self._dcp_group = parallel.dcp_group if self._dcp > 1 else None
+        self._page_stride = self.page_size * self._dcp
+        self._cp_rank_t: torch.Tensor | None = None
+        self._cp_rank_index: torch.Tensor | None = None
+        self._cp_rank_mask: torch.Tensor | None = None
+        self._dcp_op = None
+        self._kv_write_op = None
+        self._get_dcp_lens = None
+        if self._dcp > 1:
+            if self.req_to_token_pool.req_to_token.device.type != "cpu":
+                raise ValueError(
+                    "Decode context parallelism needs the host-resident "
+                    "request-to-token table to build per-rank page tables; set "
+                    "SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 (the default)."
+                )
+            cls = type(self)
+            if (
+                cls.forward_decode is not BaseTpuPallasRpaAttnBackend.forward_decode
+                or cls.forward_extend is not BaseTpuPallasRpaAttnBackend.forward_extend
+            ):
+                raise ValueError(
+                    f"{cls.__name__} runs its own attention forward, which reads "
+                    "the DCP-sharded kv_lens and page table as if they were "
+                    "unsharded; decode context parallelism needs "
+                    "--attention-backend pallas_tpu_rpa_v3."
+                )
+            self._get_dcp_lens = _import_dcp_helpers()
+            self._cp_rank_t = torch.tensor(
+                [self._dcp_rank], dtype=torch.int32, device=self.device
+            )
+            # The rank enters the compiled forward as data (kernel scalar,
+            # one-hot mask, index) so every rank traces one program.
+            self._cp_rank_index = torch.tensor(
+                [self._dcp_rank], dtype=torch.int64, device=self.device
+            )
+            self._cp_rank_mask = (
+                torch.arange(self._dcp, dtype=torch.int64, device=self.device)
+                == self._dcp_rank
+            )
+            self._dcp_op = build_dcp_kernel_op(self.kernel_spec)
+            from sglang.srt.hardware_backend.tpu.kv_span_write import (
+                get_kv_span_write_op,
+            )
+
+            self._kv_write_op = get_kv_span_write_op()
+
         max_bs = get_exec().graph.torch_compile_max_bs
         if max_bs:
-            pages_per_seq = _get_pages_per_seq(self.max_context_len, self.page_size)
+            pages_per_seq = _get_pages_per_seq(self.max_context_len, self._page_stride)
             table_bytes = _page_table_smem_bytes(max_bs, pages_per_seq)
             if table_bytes > _SCOPED_SMEM_BYTES:
                 logger.warning(
@@ -485,6 +577,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         if self.kernel_spec.uses_draft_extend_v2:
             return forward_mode.is_extend(include_draft_extend_v2=True)
         return forward_mode.is_extend()
+
+    def _dcp_local_kv_len(self, length: int) -> int:
+        """Scalar form of ``layers.dcp.layout.get_dcp_lens``; identity without DCP.
+
+        Monotone in ``length``, so the batch's longest sequence also holds the
+        longest shard and the page-table capacity check can use it.
+        """
+        return length // self._dcp + (self._dcp_rank < length % self._dcp)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # Land deferred HiCache reload commits into the KV buffers before any
@@ -610,7 +710,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         )
         bs = int(forward_batch.seq_lens.shape[0])
         req_to_token = self.req_to_token_pool.req_to_token
-        pages_per_seq = _get_pages_per_seq(self.max_context_len, page_size)
+        pages_per_seq = _get_pages_per_seq(self.max_context_len, self._page_stride)
 
         # Host-resident fast path: when req_to_token is on CPU, build the
         # metadata on host (one H2D) instead of the on-device gather/reshape
@@ -626,6 +726,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 distribution,
                 non_empty_bs,
                 decode_query_size,
+            )
+
+        if self._dcp > 1:
+            raise ValueError(
+                "Decode context parallelism needs the host-resident "
+                "request-to-token table: the on-device metadata path reads the "
+                "page table at the unsharded page stride. Set "
+                "SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 (the default)."
             )
 
         # -------------------------------------------------------------- #
@@ -750,7 +858,21 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         req_to_token is on CPU, so page_indices / cu-lens are built with
         torch-CPU ops (never traced -> no per-shape recompile) and H2D'd once.
         kv_lens stays on device; ``distribution`` is the caller's cached buffer.
+
+        Under DCP ``kv_lens`` becomes this rank's shard of each sequence and the
+        page table is read at the widened logical page stride.
         """
+        if self._dcp > 1 and forward_batch.forward_mode not in (
+            ForwardMode.DECODE,
+            ForwardMode.EXTEND,
+        ):
+            raise ValueError(
+                "Decode context parallelism supports plain decode and extend "
+                f"batches only; got {forward_batch.forward_mode.name}. "
+                "Speculative decoding, mixed batches and split prefill are not "
+                "supported on the TPU DCP path."
+            )
+
         kv_len_bump = 0
         if forward_batch.forward_mode.is_target_verify():
             assert forward_batch.spec_info is not None
@@ -781,17 +903,55 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             if isinstance(seq_lens_cpu, list):
                 slice_cpu = seq_lens_cpu[:bs]
                 if slice_cpu:
-                    max_kv_len = max(slice_cpu) + kv_len_bump
+                    max_kv_len = self._dcp_local_kv_len(max(slice_cpu) + kv_len_bump)
                     _validate_kv_len_capacity(max_kv_len, pages_per_seq * page_size)
             elif isinstance(seq_lens_cpu, torch.Tensor) and seq_lens_cpu.numel() > 0:
                 slice_cpu = seq_lens_cpu[:bs]
                 if slice_cpu.numel() > 0:
-                    max_kv_len = int(slice_cpu.max().item()) + kv_len_bump
+                    max_kv_len = self._dcp_local_kv_len(
+                        int(slice_cpu.max().item()) + kv_len_bump
+                    )
                     _validate_kv_len_capacity(max_kv_len, pages_per_seq * page_size)
             else:
                 # Empty seq_lens_cpu (e.g. idle rank forced into decode for DP
                 # collectives) or unhandled type.
                 pass
+
+        dcp_kv_lens_global: torch.Tensor | None = None
+        dcp_prefix_kv_lens: torch.Tensor | None = None
+        dcp_cp_rank: torch.Tensor | None = None
+        seq_lens_host: torch.Tensor | None = None
+        ext_host: torch.Tensor | None = None
+        if self._dcp > 1:
+            # The kernel derives the global query position of a local key from
+            # the unsharded lengths, so it needs them alongside the shard. The
+            # prefix shard excludes this step's own tokens: the extend path
+            # attends those in a separate chunk-local pass. seq_lens_cpu holds
+            # the live rows only; the bucket's padding rows stay at length 0.
+            seq_lens_host = torch.as_tensor(
+                list(seq_lens_cpu) if isinstance(seq_lens_cpu, list) else seq_lens_cpu,
+                dtype=torch.int64,
+            )[:bs]
+            live = seq_lens_host.numel()
+            ext_host = extend_seq_lens[:live].to(torch.int64)
+            if forward_batch.forward_mode.is_decode():
+                prefix_host = seq_lens_host
+            else:
+                prefix_host = seq_lens_host - ext_host
+
+            def _padded(values: torch.Tensor) -> torch.Tensor:
+                out = torch.zeros(bs, dtype=torch.int32)
+                out[:live] = values.to(torch.int32)
+                return out.to(device, non_blocking=True)
+
+            kv_lens = _padded(
+                self._get_dcp_lens(seq_lens_host, self._dcp, self._dcp_rank)
+            )
+            dcp_kv_lens_global = _padded(seq_lens_host)
+            dcp_prefix_kv_lens = _padded(
+                self._get_dcp_lens(prefix_host, self._dcp, self._dcp_rank)
+            )
+            dcp_cp_rank = self._cp_rank_t
 
         req_pool_indices = forward_batch.req_pool_indices_cpu
         assert req_pool_indices is not None
@@ -811,11 +971,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         page_cols = getattr(self, "_host_page_cols", None)
         if page_cols is None or page_cols.numel() != pages_per_seq:
             page_cols = torch.arange(
-                0, pages_per_seq * page_size, page_size, dtype=torch.long
+                0,
+                pages_per_seq * self._page_stride,
+                self._page_stride,
+                dtype=torch.long,
             )
             self._host_page_cols = page_cols
         per_seq = req_to_token[req_pool_indices[:, None], page_cols[None, :]]
-        page_indices = (per_seq // page_size).to(torch.int32)
+        page_indices = (per_seq // self._page_stride).to(torch.int32)
         page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
 
         # Hybrid-SWA: translate full-pool pages to SWA-pool pages. The host path
@@ -825,21 +988,72 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # lookup here on the CPU page_indices and H2D the result once — keeping
         # this builder free of on-device gathers.
         swa_page_indices: torch.Tensor | None = None
+        write_spans: DcpWriteSpans | None = None
+        swa_write_spans: DcpWriteSpans | None = None
+        step_slots: torch.Tensor | None = None
+        step_positions: torch.Tensor | None = None
+        num_tokens = 0
+        if self._dcp > 1:
+            # The slots and positions of this step's tokens come from the host
+            # request-to-token table, so the owner-masked write targets are
+            # built here and shipped with the rest of the metadata, padded to
+            # the token bucket like the batch's own token fields.
+            starts = (seq_lens_host - ext_host).tolist()
+            counts = ext_host.tolist()
+            step_positions = torch.cat(
+                [
+                    torch.arange(s, s + n, dtype=torch.int64)
+                    for s, n in zip(starts, counts)
+                ]
+                + [torch.zeros(0, dtype=torch.int64)]
+            )
+            rows = torch.repeat_interleave(
+                req_pool_indices[: ext_host.numel()], ext_host
+            )
+            step_slots = req_to_token[rows, step_positions].to(torch.int64)
+            padded = getattr(forward_batch, "out_cache_loc", None)
+            num_tokens = (
+                padded.shape[0] if padded is not None else step_positions.numel()
+            )
+            write_spans = build_owner_write_spans(
+                step_positions,
+                step_slots,
+                self._dcp,
+                self._dcp_rank,
+                page_size,
+                num_tokens,
+                bs,
+            ).to_device(device)
         if self._is_hybrid_swa:
             full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping
             assert full_to_swa is not None, (
                 "Hybrid-SWA model is configured but full_to_swa_index_mapping "
                 "has not been registered yet — did the allocator finish init?"
             )
-            # First token index of each full-pool page (page_indices * page_size).
-            # page_indices and full_to_swa are both CPU here, so gather on CPU and
-            # H2D the small int32 result once.
-            full_token_starts = page_indices.to(torch.int64) * page_size
+            # First token index of each full-pool page (page_indices * the
+            # logical page stride). page_indices and full_to_swa are both CPU
+            # here, so gather on CPU and H2D the small int32 result once.
+            full_token_starts = page_indices.to(torch.int64) * self._page_stride
             swa_page_indices = (
-                (full_to_swa[full_token_starts] // page_size)
+                (full_to_swa[full_token_starts] // self._page_stride)
                 .to(torch.int32)
                 .to(device, non_blocking=True)
             )
+            if self._dcp > 1:
+                # SWA layers write into the SWA sub-pool, whose slots the
+                # mapping gives for the same tokens.
+                swa_slots = full_to_swa[step_slots.to(full_to_swa.device)].to(
+                    torch.int64
+                )
+                swa_write_spans = build_owner_write_spans(
+                    step_positions,
+                    swa_slots,
+                    self._dcp,
+                    self._dcp_rank,
+                    page_size,
+                    num_tokens,
+                    bs,
+                ).to_device(device)
 
         # H2D for host-built cu-lens / page_indices; kv_lens already on device,
         # distribution is the caller's cached buffer.
@@ -853,6 +1067,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             active_num_tokens=_make_active_num_tokens(cu_q_lens, non_empty_bs),
             swa_page_indices=swa_page_indices,
             decode_query_size=decode_query_size,
+            dcp_kv_lens_global=dcp_kv_lens_global,
+            dcp_prefix_kv_lens=dcp_prefix_kv_lens,
+            dcp_cp_rank=dcp_cp_rank,
+            dcp_write=write_spans,
+            dcp_swa_write=swa_write_spans,
         )
 
     # ------------------------------------------------------------------ #
@@ -935,7 +1154,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # For hybrid-SWA models, SWA layers index into the SWA sub-pool;
         # full-attention layers (or non-hybrid models) use the full-pool indices.
         is_swa_layer = sliding_window is not None
-        if is_swa_layer and self.forward_metadata.swa_page_indices is not None:
+        uses_swa_pool = (
+            is_swa_layer and self.forward_metadata.swa_page_indices is not None
+        )
+        if uses_swa_pool:
             page_indices = self.forward_metadata.swa_page_indices
         else:
             page_indices = self.forward_metadata.page_indices
@@ -963,24 +1185,48 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             if draft_kv_lens is not None
             else self.forward_metadata.kv_lens
         )
-        out = op(
-            q,
-            k,
-            v,
-            kv_cache,
-            kv_lens,
-            page_indices,
-            self.forward_metadata.cu_q_lens,
-            self.forward_metadata.cu_kv_lens,
-            self.forward_metadata.distribution,
-            sinks,
-            float(layer.scaling),
-            sliding_window,
-            soft_cap,
-            k_scale,
-            v_scale,
-            self.forward_metadata.decode_query_size,
-        )
+        if self._dcp > 1:
+            # SWA layers of a hybrid model write into the SWA sub-pool, whose
+            # slots the metadata builder translated from the full-pool ones.
+            spans = (
+                self.forward_metadata.dcp_swa_write
+                if uses_swa_pool
+                else self.forward_metadata.dcp_write
+            )
+            out = self._forward_dcp(
+                q,
+                k,
+                v,
+                kv_cache,
+                page_indices,
+                spans,
+                forward_batch,
+                sinks,
+                float(layer.scaling),
+                sliding_window,
+                soft_cap,
+                k_scale,
+                v_scale,
+            )
+        else:
+            out = op(
+                q,
+                k,
+                v,
+                kv_cache,
+                kv_lens,
+                page_indices,
+                self.forward_metadata.cu_q_lens,
+                self.forward_metadata.cu_kv_lens,
+                self.forward_metadata.distribution,
+                sinks,
+                float(layer.scaling),
+                sliding_window,
+                soft_cap,
+                k_scale,
+                v_scale,
+                self.forward_metadata.decode_query_size,
+            )
 
         capture_mode = getattr(forward_batch, "capture_hidden_mode", None)
         # FULL capture retains padded rows for later EAGLE steps.
@@ -993,6 +1239,144 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # When qk == v this view+slice is a no-op reshape.
         out = out.reshape(num_tokens, layer.tp_q_head_num, -1)[..., : layer.v_head_dim]
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _forward_dcp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_indices: torch.Tensor,
+        spans: DcpWriteSpans,
+        forward_batch: ForwardBatch,
+        sinks: torch.Tensor | None,
+        sm_scale: float,
+        sliding_window: int | None,
+        soft_cap: float | None,
+        k_scale: float | None,
+        v_scale: float | None,
+    ) -> torch.Tensor:
+        """One layer of attention over a position-sharded KV cache, ``[T, H, D]``.
+
+        The rank writes only the tokens it owns and the kernel is told to leave
+        the cache alone, so the step's K/V reaches exactly one shard. The kernel
+        then runs on this rank's shard with the whole group's query heads, and
+        ``cp_lse_ag_out_rs_mha`` merges the partial softmaxes and hands each rank
+        back its own heads.
+
+        Extend takes a second pass because the chunk's own tokens are spread
+        across the group yet have to be attended causally: the chunk is attended
+        locally, uncached, and merged into the prefix result by log-sum-exp. The
+        sink belongs to whichever pass covers every key, so it is applied once.
+
+        The cached passes hand the kernel the group's gathered query heads
+        against the full replicated KV block. The chunk pass keeps this rank's
+        query heads, whose KV is one slice of that block, so it takes the block
+        rebuilt out of that slice alone.
+        """
+        md = self.forward_metadata
+        cp = self._dcp
+        group = self._dcp_group
+
+        write_owned_kv(
+            self._kv_write_op, kv_cache, fused_kv_rows(k, v, kv_cache), spans
+        )
+
+        q_all = gather_heads(q.contiguous(), group, cp, self._cp_rank_mask)
+        if forward_batch.forward_mode.is_decode():
+            out_p, lse_p = self._dcp_op(
+                q_all,
+                k,
+                v,
+                kv_cache,
+                md.kv_lens,
+                page_indices,
+                md.cu_q_lens,
+                md.cu_kv_lens,
+                md.distribution,
+                md.dcp_kv_lens_global,
+                md.dcp_cp_rank,
+                None,  # attention_sink: folded in after the merge
+                sm_scale,
+                sliding_window,
+                soft_cap,
+                k_scale,
+                v_scale,
+                True,  # cache_only
+                True,  # skip_kv_write
+                cp,  # cp_group_size
+            )
+            out, lse = merge_across_ranks(
+                out_p.float(),
+                lse_p,
+                group,
+                cp,
+                self._cp_rank_mask,
+                self._cp_rank_index,
+            )
+            if sinks is not None:
+                out = sink_fold(out, lse, sinks)
+            return out.to(q.dtype)
+
+        out_prefix, lse_prefix = self._dcp_op(
+            q_all,
+            k,
+            v,
+            kv_cache,
+            md.dcp_prefix_kv_lens,
+            page_indices,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.distribution,
+            md.dcp_kv_lens_global,
+            md.dcp_cp_rank,
+            None,  # attention_sink: folded in by the chunk pass below
+            sm_scale,
+            sliding_window,
+            soft_cap,
+            k_scale,
+            v_scale,
+            True,  # cache_only
+            True,  # skip_kv_write
+            cp,  # cp_group_size
+        )
+        out_prefix, lse_prefix = merge_across_ranks(
+            out_prefix.float(),
+            lse_prefix,
+            group,
+            cp,
+            self._cp_rank_mask,
+            self._cp_rank_index,
+        )
+
+        # kv_len == q_len makes the kernel take every key from the keys/values
+        # operands, so the page table is never followed and zeros will do.
+        q_lens = md.cu_q_lens[1:] - md.cu_q_lens[:-1]
+        k_own, v_own = broadcast_own_kv_heads(k, v, cp, self._cp_rank_index)
+        out_chunk, lse_chunk = self._dcp_op(
+            q,
+            k_own,
+            v_own,
+            kv_cache,
+            q_lens,
+            torch.zeros_like(page_indices),
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.distribution,
+            md.dcp_kv_lens_global,  # unused: this pass is not context-parallel
+            md.dcp_cp_rank,
+            sinks,
+            sm_scale,
+            sliding_window,
+            soft_cap,
+            k_scale,
+            v_scale,
+            False,  # cache_only
+            True,  # skip_kv_write
+            0,  # cp_group_size
+        )
+        out, _lse = merge_lse(out_prefix, lse_prefix, out_chunk.float(), lse_chunk)
+        return out.to(q.dtype)
 
     # ------------------------------------------------------------------ #
     # Capability flags
