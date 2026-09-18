@@ -141,7 +141,7 @@ PD_DP=2                         # -> attn_tp = 8/2 = 4
 # healthy -- "ran out of memory on HBM, HLO temporaries (110.23G) exceeds
 # available HBM (94.74G)". Pinning makes the pool independent of DP, so this
 # cannot silently return the next time the parallelism changes.
-MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-877440}
+MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-524288}
 export MAX_TOTAL_TOKENS
 
 # ===== CONTRACT DEFAULT: prefill chunking =====

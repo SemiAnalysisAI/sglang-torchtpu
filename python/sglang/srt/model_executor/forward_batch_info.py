@@ -28,6 +28,7 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import logging
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -65,6 +66,9 @@ from sglang.srt.utils import (
     support_triton,
 )
 from sglang.srt.utils.common import is_pin_memory_available
+
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
@@ -1551,6 +1555,31 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
+        # Every pad below grows a tensor to a size agreed across DP ranks.
+        # That size derives from the extend_num_tokens each rank reported to the
+        # all-gather, and the derivation only rounds up, so it cannot land below
+        # this rank's own contribution -- unless the batch changed after the
+        # report. Observed on a 16-session agentic sweep: a request lost one
+        # cached prefix page between the all-gather and prepare_for_extend, so
+        # it needed 128 more tokens of recompute than it had announced
+        # (input_ids=1523 against a 1400 target, prefix 54 pages -> 53).
+        #
+        # Fail here with both sides rather than four frames down inside torch as
+        # "empty(): expected dimension sizes to be >= 0, got [-123]", which says
+        # nothing about which rank disagreed or by how much.
+        if num_tokens < self.input_ids.shape[0] or bs < self.req_pool_indices.shape[0]:
+            raise RuntimeError(
+                "DP sync shape is smaller than this rank's batch: "
+                f"rank={get_parallel().attn_dp_rank} mode={self.forward_mode} "
+                f"dp_padding_mode={self.dp_padding_mode} "
+                f"input_ids={self.input_ids.shape[0]} -> num_tokens={num_tokens} "
+                f"req_pool_indices={self.req_pool_indices.shape[0]} -> bs={bs} | "
+                f"gathered={self.original_global_num_tokens_cpu} "
+                f"padded={self.global_num_tokens_cpu} | "
+                f"extend_seq_lens={self.extend_seq_lens.tolist() if self.extend_seq_lens is not None else None} "
+                f"seq_lens={self.seq_lens_cpu.tolist() if self.seq_lens_cpu is not None else None} "
+                "-- the batch grew after its token count was all-gathered"
+            )
         # padding
         self._original_num_tokens = self.positions.shape[0]
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
