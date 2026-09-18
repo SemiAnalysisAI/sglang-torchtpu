@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.pd_singlehost_base import PDSingleHostTestCase
+from sglang.test.tpu.pd_singlehost_base import PDSingleHostTestCase, peer_hostname
 
 # Expected runtime: 45 minutes; CI uses this for scheduling and timeouts.
 register_tpu_ci(
@@ -121,14 +121,6 @@ def self_hostname(env: Mapping[str, str] | None = None) -> str:
     values = os.environ if env is None else env
     hostnames = [h for h in values.get("TPU_WORKER_HOSTNAMES", "").split(",") if h]
     return hostnames[0] if hostnames else socket.gethostname()
-
-
-def peer_hostname(hostname: str, *, from_role: str, to_role: str) -> str:
-    """Map this pod's DNS name onto the pod of the peer role."""
-    needle, replacement = f"-{from_role}-", f"-{to_role}-"
-    if needle not in hostname:
-        raise ValueError(f"hostname {hostname!r} has no {needle!r} segment")
-    return hostname.replace(needle, replacement)
 
 
 def _common_launch_env(env: Mapping[str, str] | None = None) -> dict[str, str]:

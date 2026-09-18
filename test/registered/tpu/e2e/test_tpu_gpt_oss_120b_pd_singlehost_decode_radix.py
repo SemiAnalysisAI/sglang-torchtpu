@@ -162,14 +162,6 @@ def self_hostname(env: Mapping[str, str] | None = None) -> str:
     return hostnames[0] if hostnames else socket.gethostname()
 
 
-def peer_hostname(hostname: str, *, from_role: str, to_role: str) -> str:
-    """Map this pod's DNS name onto the pod of the peer role."""
-    needle, replacement = f"-{from_role}-", f"-{to_role}-"
-    if needle not in hostname:
-        raise ValueError(f"hostname {hostname!r} has no {needle!r} segment")
-    return hostname.replace(needle, replacement)
-
-
 def _common_launch_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
     values = os.environ if env is None else env
     return {

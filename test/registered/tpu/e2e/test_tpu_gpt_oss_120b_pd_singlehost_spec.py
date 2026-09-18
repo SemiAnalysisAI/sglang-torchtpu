@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.pd_singlehost_base import PDSingleHostTestCase
+from sglang.test.tpu.pd_singlehost_base import PDSingleHostTestCase, peer_hostname
 
 register_tpu_ci(
     est_time=7200,
@@ -182,13 +182,6 @@ def _shared_server_args(values: Mapping[str, str]) -> list[str]:
     if model.startswith("gs://"):
         args += ["--load-format", "runai_streamer"]
     return args
-
-
-def peer_hostname(hostname: str, *, from_role: str, to_role: str) -> str:
-    needle, replacement = f"-{from_role}-", f"-{to_role}-"
-    if needle not in hostname:
-        raise ValueError(f"hostname {hostname!r} has no {needle!r} segment")
-    return hostname.replace(needle, replacement)
 
 
 def _common_launch_env(
