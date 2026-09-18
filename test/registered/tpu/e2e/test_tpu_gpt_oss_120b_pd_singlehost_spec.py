@@ -16,7 +16,7 @@ import sys
 import unittest
 import urllib.request
 from collections.abc import Mapping
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu.pd_singlehost_base import PDSingleHostTestCase
@@ -98,12 +98,12 @@ MAX_TOKENS = int(E("GSM8K_MAX_TOKENS", "512"))
 HEALTH_TIMEOUT = float(E("HEALTH_TIMEOUT", "5400"))
 
 
-def resolve_model_path(env: Optional[Mapping[str, str]] = None) -> str:
+def resolve_model_path(env: Mapping[str, str] | None = None) -> str:
     values = os.environ if env is None else env
     return values.get(MODEL_ENV) or values.get("MODEL") or DEFAULT_MODEL_PATH
 
 
-def resolve_draft_model_path(env: Optional[Mapping[str, str]] = None) -> str:
+def resolve_draft_model_path(env: Mapping[str, str] | None = None) -> str:
     values = os.environ if env is None else env
     return (
         values.get(DRAFT_MODEL_ENV)
@@ -123,7 +123,7 @@ def validate_model_source(model_path: str, *, label: str) -> None:
         )
 
 
-def resolve_role(env: Optional[Mapping[str, str]] = None) -> str:
+def resolve_role(env: Mapping[str, str] | None = None) -> str:
     values = os.environ if env is None else env
     role = values.get(ROLE_ENV, "")
     if role not in (PREFILL_ROLE, DECODE_ROLE):
@@ -133,7 +133,7 @@ def resolve_role(env: Optional[Mapping[str, str]] = None) -> str:
     return role
 
 
-def self_hostname(env: Optional[Mapping[str, str]] = None) -> str:
+def self_hostname(env: Mapping[str, str] | None = None) -> str:
     values = os.environ if env is None else env
     if values.get(SELF_HOST_ENV):
         return values[SELF_HOST_ENV]
@@ -141,7 +141,7 @@ def self_hostname(env: Optional[Mapping[str, str]] = None) -> str:
     return hostnames[0] if hostnames else socket.gethostname()
 
 
-def _spec_server_args(draft_model: str) -> List[str]:
+def _spec_server_args(draft_model: str) -> list[str]:
     args = [
         "--speculative-algorithm",
         "EAGLE3",
@@ -159,7 +159,7 @@ def _spec_server_args(draft_model: str) -> List[str]:
     return args
 
 
-def _shared_server_args(values: Mapping[str, str]) -> List[str]:
+def _shared_server_args(values: Mapping[str, str]) -> list[str]:
     model = resolve_model_path(values)
     args = [
         "--served-model-name",
@@ -192,8 +192,8 @@ def peer_hostname(hostname: str, *, from_role: str, to_role: str) -> str:
 
 
 def _common_launch_env(
-    env: Optional[Mapping[str, str]] = None,
-) -> Dict[str, str]:
+    env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     values = os.environ if env is None else env
     return {
         "MODEL": resolve_model_path(values),
@@ -231,8 +231,8 @@ def _common_launch_env(
 
 
 def build_prefill_env(
-    env: Optional[Mapping[str, str]] = None,
-) -> Dict[str, str]:
+    env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     values = os.environ if env is None else env
     extra_args = _shared_server_args(values)
     if values.get("EXTRA_PREFILL_ARGS"):
@@ -246,8 +246,8 @@ def build_prefill_env(
 
 
 def build_decode_env(
-    env: Optional[Mapping[str, str]] = None,
-) -> Dict[str, str]:
+    env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     values = os.environ if env is None else env
     extra_args = _shared_server_args(values) + [
         # Keep this gate focused on P/D + spec. A host-pool backup would also
@@ -271,7 +271,7 @@ def _get_json(url: str, timeout: int = 30) -> Any:
 
 def engine_configuration_failures(
     *, prefill_info: Mapping[str, Any], decode_info: Mapping[str, Any]
-) -> List[str]:
+) -> list[str]:
     failures = []
     for label, info, expected_mode in (
         (PREFILL_ROLE, prefill_info, PREFILL_ROLE),
@@ -312,7 +312,7 @@ def engine_configuration_failures(
     return failures
 
 
-def build_model_config() -> Dict[str, Any]:
+def build_model_config() -> dict[str, Any]:
     return {
         "model": SERVED_MODEL_NAME,
         "test_name": "gpt-oss-120b-pd-singlehost-spec-gsm8k",
@@ -350,7 +350,7 @@ class TestPdSingleHostSpecGptOss120bIntegration(PDSingleHostTestCase):
     health_generate_timeout = HEALTH_TIMEOUT
 
     @classmethod
-    def build_model_config(cls) -> Dict[str, Any]:
+    def build_model_config(cls) -> dict[str, Any]:
         return build_model_config()
 
     @classmethod

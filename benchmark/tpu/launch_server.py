@@ -23,10 +23,11 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from benchmark.tpu.recipe.configs.config_eval import server_args_to_cli
 

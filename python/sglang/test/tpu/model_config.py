@@ -121,7 +121,7 @@ import re
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.run_combined_tests import run_combined_tests
@@ -186,7 +186,7 @@ def _reject_unknown(got, allowed, where: str) -> None:
         )
 
 
-def _build_launcher(launch: Dict[str, Any]):
+def _build_launcher(launch: dict[str, Any]):
     _reject_unknown(launch, _LAUNCH_KEYS, "launch")
     timeout = launch.get("health_timeout", DEFAULT_HEALTH_TIMEOUT)
     tag = launch.get("tag", "tpu-e2e")
@@ -211,14 +211,14 @@ def _build_launcher(launch: Dict[str, Any]):
     )
 
 
-def _smoke_wrapped(runner, smoke_state: Dict[str, Any], name: str):
+def _smoke_wrapped(runner, smoke_state: dict[str, Any], name: str):
     """Record a smoke leg's failure so the sweep can withhold its numbers.
 
     The reason is taken from the actual failure -- the runner's own "_failures"
     text, or the exception -- because it is what the dashboard shows on the ✕.
     """
 
-    def run(base_url: str) -> Dict[str, Any]:
+    def run(base_url: str) -> dict[str, Any]:
         try:
             result = runner(base_url)
         except Exception as exc:
@@ -233,14 +233,14 @@ def _smoke_wrapped(runner, smoke_state: Dict[str, Any], name: str):
 
 
 def _build_gate(
-    gate: Dict[str, Any],
+    gate: dict[str, Any],
     test_name: str = "",
     model: str = "",
-    dashboard: Optional[str] = None,
-    dashboard_model: Optional[str] = None,
+    dashboard: str | None = None,
+    dashboard_model: str | None = None,
     series_id: str = "",
     display_name: str = "",
-    smoke_state: Optional[Dict[str, Any]] = None,
+    smoke_state: dict[str, Any] | None = None,
 ) -> AccuracyTestParams:
     _reject_unknown(gate, _GATE_PASSTHROUGH | _GATE_TRANSLATED, "gate")
     kwargs = {k: v for k, v in gate.items() if k in _GATE_PASSTHROUGH}
@@ -336,7 +336,7 @@ def _build_gate(
     return AccuracyTestParams(**kwargs)
 
 
-def build_gates(config: Dict[str, Any]) -> List[AccuracyTestParams]:
+def build_gates(config: dict[str, Any]) -> list[AccuracyTestParams]:
     """Expand the ``gates`` list. Split out so tests can assert on it directly."""
     model = str(config.get("model", ""))
     test_name = str(config.get("test_name", model))
@@ -355,7 +355,7 @@ def build_gates(config: Dict[str, Any]) -> List[AccuracyTestParams]:
 
     # Shared between the smoke legs (writers) and the sweep runners (readers):
     # what withholds a sweep's numbers when a leg has already failed.
-    smoke_state: Dict[str, Any] = {"failures": []}
+    smoke_state: dict[str, Any] = {"failures": []}
     return [
         _build_gate(
             g,
@@ -371,7 +371,7 @@ def build_gates(config: Dict[str, Any]) -> List[AccuracyTestParams]:
     ]
 
 
-def build_model(config: Dict[str, Any]) -> TpuModelLaunchSettings:
+def build_model(config: dict[str, Any]) -> TpuModelLaunchSettings:
     """Build the launch settings. Split out so tests can assert on it directly."""
     # No tp_size: the recipe owns parallelism and TpuModelLaunchSettings clears the
     # extra_args it would have fed, so it would only be a second copy that can drift.
@@ -382,7 +382,7 @@ def build_model(config: Dict[str, Any]) -> TpuModelLaunchSettings:
     )
 
 
-def run_model_config(config: Dict[str, Any], base_url: Optional[str] = None) -> dict:
+def run_model_config(config: dict[str, Any], base_url: str | None = None) -> dict:
     """Run every gate using the configured launcher or a fixture's ready URL.
 
     Without a ``launch`` entry, ``base_url`` is required and its caller owns
@@ -414,7 +414,7 @@ def run_model_config(config: Dict[str, Any], base_url: Optional[str] = None) -> 
     )
 
 
-def build_test_case(config: Dict[str, Any], base_url: Optional[str] = None):
+def build_test_case(config: dict[str, Any], base_url: str | None = None):
     """Synthesise the unittest.TestCase for ``config``.
 
     ``skip_unless`` is ``(condition, reason)`` -- the config equivalent of
@@ -445,8 +445,8 @@ def build_test_case(config: Dict[str, Any], base_url: Optional[str] = None):
 
 
 def model_config_main(
-    config: Union[Dict[str, Any], List[Dict[str, Any]]],
-    base_url: Optional[str] = None,
+    config: dict[str, Any] | list[dict[str, Any]],
+    base_url: str | None = None,
 ) -> None:
     """Entry point for a test file's ``__main__`` block.
 

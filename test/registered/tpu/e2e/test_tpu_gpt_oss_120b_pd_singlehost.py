@@ -8,7 +8,8 @@ import subprocess
 import sys
 import unittest
 import urllib.request
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from collections.abc import Mapping
+from typing import Any
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu.pd_singlehost_base import PDSingleHostTestCase
@@ -75,9 +76,9 @@ MAX_TOTAL_TOKENS = 393216
 DISAGG_TRANSFER_BACKEND = "raiden"
 # Raiden handles both P/D KV transfer and decode host-pool I/O.
 HICACHE_IO_BACKEND = "raiden"
-EXTRA_SERVER_ARGS: Tuple[str, ...] = ("--reasoning-parser", "gpt-oss")
+EXTRA_SERVER_ARGS: tuple[str, ...] = ("--reasoning-parser", "gpt-oss")
 # GPT-OSS does not support the SparseCore fused-MoE gather path.
-EXTRA_LAUNCH_ENV: Dict[str, str] = {"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"}
+EXTRA_LAUNCH_ENV: dict[str, str] = {"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"}
 
 # Defaults to a 0.77 passing floor; this topology measured 0.97.
 GSM8K_BASELINE = float(E("GSM8K_THRESHOLD_GPT_OSS_120B", E("GSM8K_THRESHOLD", "0.80")))
@@ -87,7 +88,7 @@ NUM_THREADS = int(E("GSM8K_NUM_THREADS", "8"))
 MAX_TOKENS = int(E("GSM8K_MAX_TOKENS", "1024"))
 
 
-def resolve_model_path(env: Optional[Mapping[str, str]] = None) -> str:
+def resolve_model_path(env: Mapping[str, str] | None = None) -> str:
     """Resolve the checkpoint from the environment, else the mounted default."""
     values = os.environ if env is None else env
     return values.get(MODEL_ENV) or values.get("MODEL") or DEFAULT_MODEL_PATH
@@ -104,7 +105,7 @@ def validate_model_source(model_path: str) -> None:
         )
 
 
-def resolve_role(env: Optional[Mapping[str, str]] = None) -> str:
+def resolve_role(env: Mapping[str, str] | None = None) -> str:
     """Read this pod's P/D role, which the JobSet template sets per replica."""
     values = os.environ if env is None else env
     role = values.get(ROLE_ENV, "")
@@ -115,7 +116,7 @@ def resolve_role(env: Optional[Mapping[str, str]] = None) -> str:
     return role
 
 
-def self_hostname(env: Optional[Mapping[str, str]] = None) -> str:
+def self_hostname(env: Mapping[str, str] | None = None) -> str:
     """This pod's own DNS name."""
     values = os.environ if env is None else env
     hostnames = [h for h in values.get("TPU_WORKER_HOSTNAMES", "").split(",") if h]
@@ -130,7 +131,7 @@ def peer_hostname(hostname: str, *, from_role: str, to_role: str) -> str:
     return hostname.replace(needle, replacement)
 
 
-def _common_launch_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+def _common_launch_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
     values = os.environ if env is None else env
     return {
         "MODEL": resolve_model_path(values),
@@ -150,7 +151,7 @@ def _common_launch_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str
     }
 
 
-def _shared_server_args() -> List[str]:
+def _shared_server_args() -> list[str]:
     # EXTRA_ARGS overrides the launchers' default TPU transfer backend.
     return [
         "--served-model-name",
@@ -166,7 +167,7 @@ def _shared_server_args() -> List[str]:
     ]
 
 
-def build_prefill_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+def build_prefill_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Construct the environment for the prefill engine."""
     values = os.environ if env is None else env
     extra_args = _shared_server_args()
@@ -180,7 +181,7 @@ def build_prefill_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]
     }
 
 
-def _decode_host_pool_args() -> List[str]:
+def _decode_host_pool_args() -> list[str]:
     """Make the decode retraction host pool buildable on a fused TPU KV pool."""
     return [
         "--hicache-mem-layout",
@@ -190,7 +191,7 @@ def _decode_host_pool_args() -> List[str]:
     ]
 
 
-def build_decode_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+def build_decode_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Construct the environment for the decode engine."""
     values = os.environ if env is None else env
     extra_args = _shared_server_args() + _decode_host_pool_args()
@@ -203,12 +204,12 @@ def build_decode_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
     }
 
 
-def _get_json(url: str, timeout: int = 30) -> Dict[str, Any]:
+def _get_json(url: str, timeout: int = 30) -> dict[str, Any]:
     with urllib.request.urlopen(url, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
-def transport_failures(*, prefill_info: Dict[str, Any], decode_info: Dict[str, Any]):
+def transport_failures(*, prefill_info: dict[str, Any], decode_info: dict[str, Any]):
     """Reject a run where the two engines are not a raiden P/D pair."""
     failures = []
     for label, info, expected_mode in (
@@ -233,7 +234,7 @@ def transport_failures(*, prefill_info: Dict[str, Any], decode_info: Dict[str, A
 def pd_transport_runner(*, prefill_url: str, decode_url: str):
     """Verify that both servers report the expected P/D roles and backend."""
 
-    def run(base_url: str) -> Dict[str, Any]:
+    def run(base_url: str) -> dict[str, Any]:
         prefill_info = _get_json(f"{prefill_url}/server_info")
         decode_info = _get_json(f"{decode_url}/server_info")
         failures = transport_failures(
@@ -256,7 +257,7 @@ def pd_transport_runner(*, prefill_url: str, decode_url: str):
     return run
 
 
-def build_model_config(*, decode_host: str) -> Dict[str, Any]:
+def build_model_config(*, decode_host: str) -> dict[str, Any]:
     """Assemble the gate list, which needs the decode pod's resolved name."""
     return {
         "model": SERVED_MODEL_NAME,
@@ -297,7 +298,7 @@ class TestPdSingleHostGptOss120bIntegration(PDSingleHostTestCase):
     self_hostname = staticmethod(self_hostname)
 
     @classmethod
-    def build_model_config(cls) -> Dict[str, Any]:
+    def build_model_config(cls) -> dict[str, Any]:
         return build_model_config(decode_host=cls.decode_hostname())
 
     @classmethod

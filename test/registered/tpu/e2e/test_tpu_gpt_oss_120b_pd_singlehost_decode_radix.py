@@ -21,7 +21,8 @@ import subprocess
 import sys
 import unittest
 import urllib.request
-from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from collections.abc import Mapping, Sequence
+from typing import Any, NamedTuple
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu.pd_singlehost_base import PDSingleHostTestCase
@@ -91,14 +92,14 @@ MAX_TOTAL_TOKENS = 393216
 DISAGG_TRANSFER_BACKEND = "raiden"
 # Raiden handles both P/D KV transfer and decode host-pool I/O.
 HICACHE_IO_BACKEND = "raiden"
-EXTRA_SERVER_ARGS: Tuple[str, ...] = ("--reasoning-parser", "gpt-oss")
+EXTRA_SERVER_ARGS: tuple[str, ...] = ("--reasoning-parser", "gpt-oss")
 # GPT-OSS does not support the SparseCore fused-MoE gather path.
-EXTRA_LAUNCH_ENV: Dict[str, str] = {"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"}
+EXTRA_LAUNCH_ENV: dict[str, str] = {"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"}
 
 DECODE_RADIX_ARG = "--disaggregation-decode-enable-radix-cache"
 # Enables unified radix tree generation in kv_cache_builder,
 # required for decode-side radix caching on hybrid sliding-window models.
-DECODE_RADIX_ENV: Dict[str, str] = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
+DECODE_RADIX_ENV: dict[str, str] = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
 
 # Unique filler ensures turn 1 is cold (~1900 tokens);
 # exceeds the 128-token sliding window to verify reuse beyond SWA eviction.
@@ -124,7 +125,7 @@ NUM_THREADS = int(E("GSM8K_NUM_THREADS", "8"))
 MAX_TOKENS = int(E("GSM8K_MAX_TOKENS", "1024"))
 
 
-def resolve_model_path(env: Optional[Mapping[str, str]] = None) -> str:
+def resolve_model_path(env: Mapping[str, str] | None = None) -> str:
     """Resolve the checkpoint from the environment, else the mounted default."""
     values = os.environ if env is None else env
     return values.get(MODEL_ENV) or values.get("MODEL") or DEFAULT_MODEL_PATH
@@ -141,7 +142,7 @@ def validate_model_source(model_path: str) -> None:
         )
 
 
-def resolve_role(env: Optional[Mapping[str, str]] = None) -> str:
+def resolve_role(env: Mapping[str, str] | None = None) -> str:
     """Read this pod's P/D role, which the JobSet template sets per replica."""
     values = os.environ if env is None else env
     role = values.get(ROLE_ENV, "")
@@ -152,7 +153,7 @@ def resolve_role(env: Optional[Mapping[str, str]] = None) -> str:
     return role
 
 
-def self_hostname(env: Optional[Mapping[str, str]] = None) -> str:
+def self_hostname(env: Mapping[str, str] | None = None) -> str:
     """This pod's own DNS name."""
     values = os.environ if env is None else env
     if values.get(SELF_HOST_ENV):
@@ -169,7 +170,7 @@ def peer_hostname(hostname: str, *, from_role: str, to_role: str) -> str:
     return hostname.replace(needle, replacement)
 
 
-def _common_launch_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+def _common_launch_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
     values = os.environ if env is None else env
     return {
         "MODEL": resolve_model_path(values),
@@ -189,7 +190,7 @@ def _common_launch_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str
     }
 
 
-def _shared_server_args() -> List[str]:
+def _shared_server_args() -> list[str]:
     # EXTRA_ARGS overrides the launchers' default TPU transfer backend.
     return [
         "--served-model-name",
@@ -205,7 +206,7 @@ def _shared_server_args() -> List[str]:
     ]
 
 
-def build_prefill_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+def build_prefill_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Construct the environment for the prefill engine."""
     values = os.environ if env is None else env
     extra_args = _shared_server_args()
@@ -219,7 +220,7 @@ def build_prefill_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]
     }
 
 
-def _decode_host_pool_args() -> List[str]:
+def _decode_host_pool_args() -> list[str]:
     """Make the decode retraction host pool buildable on a fused TPU KV pool."""
     return [
         "--hicache-mem-layout",
@@ -229,7 +230,7 @@ def _decode_host_pool_args() -> List[str]:
     ]
 
 
-def build_decode_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+def build_decode_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Construct the environment for the decode engine, radix cache on."""
     values = os.environ if env is None else env
     extra_args = _shared_server_args() + _decode_host_pool_args() + [DECODE_RADIX_ARG]
@@ -243,12 +244,12 @@ def build_decode_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
     }
 
 
-def _get_json(url: str, timeout: int = 30) -> Dict[str, Any]:
+def _get_json(url: str, timeout: int = 30) -> dict[str, Any]:
     with urllib.request.urlopen(url, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
-def _post_json(url: str, payload: Dict[str, Any], timeout: int) -> Dict[str, Any]:
+def _post_json(url: str, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -261,7 +262,7 @@ def _post_json(url: str, payload: Dict[str, Any], timeout: int) -> Dict[str, Any
 
 def engine_configuration_failures(
     *, prefill_info: Mapping[str, Any], decode_info: Mapping[str, Any]
-) -> List[str]:
+) -> list[str]:
     """Reject a run where the engines are not a Raiden P/D pair in radix mode."""
     failures = []
     for label, info, expected_mode in (
@@ -293,7 +294,7 @@ def engine_configuration_failures(
 def engine_configuration_runner(*, prefill_url: str, decode_url: str):
     """Verify both servers report the expected P/D roles, backend and cache mode."""
 
-    def run(base_url: str) -> Dict[str, Any]:
+    def run(base_url: str) -> dict[str, Any]:
         prefill_info = _get_json(f"{prefill_url}/server_info")
         decode_info = _get_json(f"{decode_url}/server_info")
         failures = engine_configuration_failures(
@@ -331,7 +332,7 @@ class ConversationRecord(NamedTuple):
     answered: bool
 
 
-def conversation(index: int) -> Tuple[int, str, str]:
+def conversation(index: int) -> tuple[int, str, str]:
     """Return the secret, the turn-1 prompt and the turn-2 question."""
     secret = 40007 + index * 37
     filler = "".join(
@@ -350,7 +351,7 @@ def conversation(index: int) -> Tuple[int, str, str]:
     return secret, turn1, question
 
 
-def decode_radix_failures(records: Sequence[ConversationRecord]) -> List[str]:
+def decode_radix_failures(records: Sequence[ConversationRecord]) -> list[str]:
     """Gate the probe on decode-side reuse plus a known-answer sanity check."""
     total = len(records)
     failures = []
@@ -377,7 +378,7 @@ def decode_radix_failures(records: Sequence[ConversationRecord]) -> List[str]:
     return failures
 
 
-def _tokenize(tokenize_url: str, text: str) -> List[int]:
+def _tokenize(tokenize_url: str, text: str) -> list[int]:
     reply = _post_json(
         f"{tokenize_url}/tokenize",
         {"model": SERVED_MODEL_NAME, "prompt": text, "add_special_tokens": False},
@@ -387,8 +388,8 @@ def _tokenize(tokenize_url: str, text: str) -> List[int]:
 
 
 def _generate(
-    base_url: str, input_ids: List[int], max_new_tokens: int, *, ignore_eos: bool
-) -> Tuple[str, List[int], Dict[str, Any]]:
+    base_url: str, input_ids: list[int], max_new_tokens: int, *, ignore_eos: bool
+) -> tuple[str, list[int], dict[str, Any]]:
     reply = _post_json(
         f"{base_url}/generate",
         {
@@ -439,7 +440,7 @@ def run_conversation(
 def decode_radix_runner(*, tokenize_url: str):
     """Score the fraction of conversations whose turn 2 reused decode-held KV."""
 
-    def run(base_url: str) -> Dict[str, Any]:
+    def run(base_url: str) -> dict[str, Any]:
         records = [
             run_conversation(base_url=base_url, tokenize_url=tokenize_url, index=i)
             for i in range(NUM_CONVERSATIONS)
@@ -462,7 +463,7 @@ def decode_radix_runner(*, tokenize_url: str):
     return run
 
 
-def build_model_config(*, decode_host: str) -> Dict[str, Any]:
+def build_model_config(*, decode_host: str) -> dict[str, Any]:
     """Assemble the gate list, which needs the decode pod's resolved name."""
     prefill_url = f"http://{LOCAL_HOST}:{PREFILL_PORT}"
     return {
@@ -511,7 +512,7 @@ class TestPdSingleHostDecodeRadixGptOss120bIntegration(PDSingleHostTestCase):
     tag = "pd-singlehost-decode-radix"
 
     @classmethod
-    def build_model_config(cls) -> Dict[str, Any]:
+    def build_model_config(cls) -> dict[str, Any]:
         return build_model_config(decode_host=cls.decode_hostname())
 
     @classmethod
