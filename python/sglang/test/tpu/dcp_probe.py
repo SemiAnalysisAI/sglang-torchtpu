@@ -61,9 +61,13 @@ _PARAS = (
     "point behind the loading dock.",
 )
 
-# (case, filler paragraphs, codes). "tiny" is the degenerate shard case.
+# (case, filler paragraphs, codes). "tiny" is the degenerate shard case: three
+# paragraphs is short enough that several ranks of any real group own no key
+# for it, and long enough to still read as a memo -- a one-line prompt holding
+# only the three codes sends gpt-oss into an "assistantanalysis" loop and
+# costs the gate two codes on a TP control (cdk job j-e8f67d67).
 _CASES: Tuple[Tuple[str, int, Tuple[str, str, str]], ...] = (
-    ("tiny", 0, ("QUJ-417", "QUJ-418", "QUJ-419")),
+    ("tiny", 3, ("QUJ-417", "QUJ-418", "QUJ-419")),
     ("short", 12, ("TKR-880", "TKR-881", "TKR-882")),
     ("mid", 90, ("HVN-534", "HVN-535", "HVN-536")),
     ("long", 280, ("PLD-191", "PLD-192", "PLD-193")),
@@ -78,20 +82,19 @@ _TAIL_CHARS = 200
 
 def _build_prompt(index: int, case: str, num_paras: int, codes: Sequence[str]) -> str:
     rotation = index + 1
-    if not num_paras:
-        body = [f"Operations note: access codes {', '.join(codes)} apply."]
-    else:
-        at = {
-            max(0, int(num_paras * f)): code
-            for f, code in zip(_CODE_POSITIONS, codes)
-        }
-        body = []
-        for i in range(num_paras):
-            if i in at:
-                body.append(
-                    f"Operations note: access code {at[i]} applies to this section."
-                )
-            body.append(_PARAS[(i + rotation) % len(_PARAS)])
+    at = {int(num_paras * f): code for f, code in zip(_CODE_POSITIONS, codes)}
+    if len(at) != len(codes):
+        raise ValueError(
+            f"{case}: {num_paras} paragraphs cannot hold {len(codes)} codes at "
+            f"distinct positions {_CODE_POSITIONS}"
+        )
+    body: List[str] = []
+    for i in range(num_paras):
+        if i in at:
+            body.append(
+                f"Operations note: access code {at[i]} applies to this section."
+            )
+        body.append(_PARAS[(i + rotation) % len(_PARAS)])
     return (
         f"Memo {case}-{index:02d}-{rotation * 7 + 3}. Read the following record.\n\n"
         + "\n".join(body)
