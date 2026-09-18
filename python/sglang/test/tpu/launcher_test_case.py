@@ -2,28 +2,13 @@
 
 import json
 import os
-import subprocess
 import sys
-import threading
 import unittest
 from collections.abc import Mapping
-from contextlib import ExitStack
 from pathlib import Path
 from typing import ClassVar
 
-from sglang.test.test_utils import terminate_and_kill_process_tree
-from sglang.test.tpu.eval_support import wait_for_health
-
-
-def _tee_log(pipe, log):
-    with pipe, log:
-        for line in pipe:
-            log.write(line)
-            try:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-            except (OSError, ValueError):
-                pass  # Keep file logging if the caller's stdout has closed.
+from sglang.test.tpu.eval_support import RecipeLauncher, wait_for_health
 
 
 class TPULauncherTestCase(unittest.TestCase):
@@ -49,7 +34,7 @@ class TPULauncherTestCase(unittest.TestCase):
     log_path: ClassVar[str | None] = None
     keep_up: ClassVar[bool] = False
     tag: ClassVar[str] = "tpu-launcher"
-    _launcher_process: ClassVar[subprocess.Popen | None] = None
+    _launcher: ClassVar[RecipeLauncher | None] = None
 
     @classmethod
     def get_runtime_envs(cls) -> dict[str, str | None]:
@@ -89,39 +74,25 @@ class TPULauncherTestCase(unittest.TestCase):
                 os.path.abspath(cls.cwd or root / "benchmark/tpu"),
             ]
         )
-        env = dict(os.environ)
-        env.setdefault("PYTHONUNBUFFERED", "1")
-        with ExitStack() as stack:
-            log = (
-                stack.enter_context(open(log_path, "a", encoding="utf-8", buffering=1))
-                if log_path
-                else None
-            )
-            process = subprocess.Popen(
-                command,
-                env=env,
-                cwd=root,
-                start_new_session=True,
-                stdout=subprocess.PIPE if log else None,
-                stderr=subprocess.STDOUT if log else None,
-                text=bool(log),
-                encoding="utf-8" if log else None,
-                errors="replace" if log else None,
-            )
-            if log is not None:
-                process._tpu_log_reader = threading.Thread(
-                    target=_tee_log, args=(process.stdout, log), daemon=True
-                )
-                process._tpu_log_reader.start()
-                stack.pop_all()  # The reader thread now owns the log file.
-        return process
+        launcher = RecipeLauncher(
+            command=command,
+            env={"PYTHONUNBUFFERED": os.environ.get("PYTHONUNBUFFERED", "1")},
+            cwd=str(root),
+            log_path=log_path,
+            start_new_session=True,
+            # Allow the supervisor's 30-second child shutdown to finish.
+            terminate_timeout=60,
+            tag=cls.tag,
+        )
+        launcher.start()
+        return launcher
 
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
         if not cls.config_module or not cls.base_url:
             raise ValueError("Set config_module and base_url on the test class")
-        cls._launcher_process = cls._start_launcher(
+        cls._launcher = cls._start_launcher(
             cls.config_module,
             cls.get_runtime_envs(),
             log_path=cls.log_path,
@@ -131,7 +102,7 @@ class TPULauncherTestCase(unittest.TestCase):
             wait_for_health(
                 cls.base_url,
                 cls.health_timeout,
-                process=cls._launcher_process,
+                process=cls._launcher.process,
                 endpoint=cls.health_endpoint,
                 tag=cls.tag,
             )
@@ -140,7 +111,7 @@ class TPULauncherTestCase(unittest.TestCase):
                 wait_for_health(
                     cls.base_url,
                     cls.health_generate_timeout,
-                    process=cls._launcher_process,
+                    process=cls._launcher.process,
                     endpoint="/health_generate",
                     tag=cls.tag,
                 )
@@ -151,15 +122,11 @@ class TPULauncherTestCase(unittest.TestCase):
 
     @classmethod
     def _stop_launcher(cls) -> None:
-        if cls._launcher_process is not None:
-            # Allow the supervisor's 30-second child shutdown to finish.
+        if cls._launcher is not None:
             try:
-                terminate_and_kill_process_tree(cls._launcher_process)
+                cls._launcher.shutdown()
             finally:
-                reader = getattr(cls._launcher_process, "_tpu_log_reader", None)
-                if reader is not None:
-                    reader.join(timeout=5)
-                cls._launcher_process = None
+                cls._launcher = None
 
     @classmethod
     def tearDownClass(cls) -> None:

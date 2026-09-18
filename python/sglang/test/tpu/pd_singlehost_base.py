@@ -61,7 +61,7 @@ class PDSingleHostTestCase(TPULauncherTestCase):
         if cls.role == "prefill":
             super().setUpClass()
         elif cls.role == "decode":
-            cls._launcher_process = cls._start_launcher(
+            cls._launcher = cls._start_launcher(
                 cls.config_module + ":DECODE_CONFIG",
                 {**cls.runtime_envs, "SGLANG_LAUNCHER_RANK": "0"},
                 log_path=cls.decode_log_path,
@@ -73,10 +73,7 @@ class PDSingleHostTestCase(TPULauncherTestCase):
         if self.role == "decode":
             # Match the JobSet's worker teardown policy: SIGTERM is expected, and a
             # SIGKILL is expected only when the prefill peer disconnected.
-            code = self._launcher_process.wait()
-            reader = getattr(self._launcher_process, "_tpu_log_reader", None)
-            if reader is not None:
-                reader.join(timeout=5)
+            code = self._launcher.wait()
             if code in (-signal.SIGTERM, 128 + signal.SIGTERM):
                 return
             if code in (-signal.SIGKILL, 128 + signal.SIGKILL):
