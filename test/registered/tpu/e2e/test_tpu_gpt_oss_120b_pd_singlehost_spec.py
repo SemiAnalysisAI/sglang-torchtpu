@@ -58,13 +58,11 @@ EP_SIZE = CHIPLETS_PER_HOST
 # The roles live in different pods, so their HTTP and Raiden ports may match.
 PREFILL_PORT = int(E("PREFILL_PORT", "30000"))
 DECODE_PORT = int(E("DECODE_PORT", "30000"))
-LB_PORT = int(E("LB_PORT", "8000"))
 BOOTSTRAP_PORT = int(E("BOOTSTRAP_PORT", "8998"))
 RAIDEN_KV_PORT = int(E("SGLANG_RAIDEN_KV_PORT", "31000"))
 LOCAL_HOST = "127.0.0.1"
 
 WAIT_SECS = int(E("WAIT_SECS", "5400"))
-KEEP_UP = E("KEEP_UP", "0") == "1"
 PYTHON = E("PYTHON", "python3")
 
 # Keep the run name short enough for the generated Job and Pod suffixes. It
@@ -74,7 +72,6 @@ RUN_NAME = "pd-sh-gpt-120b-spec"
 
 PREFILL_LOG = "/tmp/pd_spec_prefill.log"
 DECODE_LOG = "/tmp/pd_spec_decode.log"
-LB_LOG = "/tmp/pd_spec_lb.log"
 
 PAGE_SIZE = 64
 MEM_FRACTION_STATIC = "0.6"

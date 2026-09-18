@@ -49,7 +49,6 @@ MODEL_ENV = "GPT_OSS_MODEL"
 
 PREFILL_ROLE = "prefill"
 DECODE_ROLE = "decode"
-ROLE_ENV = "CI_PD_ROLE"
 SELF_HOST_ENV = "PD_SELF_HOST"
 DECODE_HOST_ENV = "PD_DECODE_HOST"
 
@@ -62,13 +61,10 @@ EP_SIZE = TP_SIZE
 # Separate pods may reuse the same service and Raiden ports.
 PREFILL_PORT = int(E("PREFILL_PORT", "30000"))
 DECODE_PORT = int(E("DECODE_PORT", "30000"))
-LB_PORT = int(E("LB_PORT", "8000"))
 BOOTSTRAP_PORT = int(E("BOOTSTRAP_PORT", "8998"))
 RAIDEN_KV_PORT = int(E("SGLANG_RAIDEN_KV_PORT", "31000"))
 LOCAL_HOST = "127.0.0.1"
 
-WAIT_SECS = int(E("WAIT_SECS", "3600"))
-KEEP_UP = E("KEEP_UP", "0") == "1"
 PYTHON = E("PYTHON", "python3")
 
 # The runtime image excludes the JobSet renderer.
@@ -80,7 +76,6 @@ RUN_NAME = "gpt-oss-120b-pd-sh-radix"
 
 PREFILL_LOG = "/tmp/pd_decode_radix_prefill.log"
 DECODE_LOG = "/tmp/pd_decode_radix_decode.log"
-LB_LOG = "/tmp/pd_decode_radix_lb.log"
 
 PAGE_SIZE = 64
 MEM_FRACTION_STATIC = "0.35"
@@ -140,17 +135,6 @@ def validate_model_source(model_path: str) -> None:
             f"GPT-OSS-120B checkpoint incomplete or missing at {model_path}, "
             f"provision it on the weights volume or set {MODEL_ENV}"
         )
-
-
-def resolve_role(env: Mapping[str, str] | None = None) -> str:
-    """Read this pod's P/D role, which the JobSet template sets per replica."""
-    values = os.environ if env is None else env
-    role = values.get(ROLE_ENV, "")
-    if role not in (PREFILL_ROLE, DECODE_ROLE):
-        raise ValueError(
-            f"{ROLE_ENV} must be {PREFILL_ROLE!r} or {DECODE_ROLE!r}, got {role!r}"
-        )
-    return role
 
 
 def self_hostname(env: Mapping[str, str] | None = None) -> str:

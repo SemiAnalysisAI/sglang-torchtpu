@@ -45,14 +45,10 @@ EP_SIZE = TP_SIZE
 # Separate pods may reuse the same service and Raiden ports.
 PREFILL_PORT = int(E("PREFILL_PORT", "30000"))
 DECODE_PORT = int(E("DECODE_PORT", "30000"))
-LB_PORT = int(E("LB_PORT", "8000"))
 BOOTSTRAP_PORT = int(E("BOOTSTRAP_PORT", "8998"))
 RAIDEN_KV_PORT = int(E("SGLANG_RAIDEN_KV_PORT", "31000"))
-RAIDEN_PORTS_PER_RANK = 4
 LOCAL_HOST = "127.0.0.1"
 
-WAIT_SECS = int(E("WAIT_SECS", "3600"))
-KEEP_UP = E("KEEP_UP", "0") == "1"
 PYTHON = E("PYTHON", "python3")
 
 # The runtime image excludes the JobSet renderer.
@@ -63,7 +59,6 @@ RUN_NAME = "gpt-oss-120b-pd-singlehost-gsm8k"
 
 PREFILL_LOG = "/tmp/pd_singlehost_prefill.log"
 DECODE_LOG = "/tmp/pd_singlehost_decode.log"
-LB_LOG = "/tmp/pd_singlehost_lb.log"
 LAUNCH_CONFIG_MODULE = "recipe/configs/gpt_oss_120b/pd_singlehost.py"
 
 PAGE_SIZE = 64
