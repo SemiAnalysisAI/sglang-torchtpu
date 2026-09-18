@@ -111,11 +111,11 @@ class RecipeLauncher:
     def __init__(
         self,
         script: str | None = None,
+        *,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
         health_timeout: float = DEFAULT_HEALTH_TIMEOUT,
         tag: str = "tpu-e2e",
-        *,
         command: list[str] | None = None,
         log_path: str | None = None,
         start_new_session: bool = False,
