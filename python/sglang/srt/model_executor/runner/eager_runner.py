@@ -77,6 +77,13 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_tpu = is_tpu()
 
+
+def _is_eager_only(model_runner) -> bool:
+    from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
+
+    return isinstance(model_runner.compile_policy, NoopCompilePolicy)
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -296,6 +303,14 @@ class EagerRunner(BaseRunner):
         cp_v2_active = is_cp_v2_active(forward_batch)
         if cp_v2_active:
             prepare_cp_forward(forward_batch)
+            if _is_tpu and _is_eager_only(model_runner):
+                # The TPU context-parallel layout is applied by the compiled
+                # forward's padding step; there is no eager equivalent.
+                raise NotImplementedError(
+                    "Prefill context parallelism on TPU runs through the "
+                    "compiled forward; start the server with "
+                    "--enable-torch-compile."
+                )
 
         # Target verify can arrive with ``forward_metadata_ready`` set by an
         # upstream/speculative planning step.  That mark does not initialize
@@ -379,9 +394,12 @@ class EagerRunner(BaseRunner):
                         forward_batch,
                         **kwargs,
                     )
-            elif cp_v2_active:
+            elif cp_v2_active and not _is_tpu:
                 ret = self._execute_extend_cp_v2(forward_batch, kwargs)
             else:
+                # On TPU a context-parallel extend also takes this call: the
+                # compiled forward shim shards the batch onto this rank's
+                # zigzag rows and the attention backend gathers K/V per layer.
                 ret = model_runner.model.forward(
                     forward_batch.input_ids,
                     forward_batch.positions,

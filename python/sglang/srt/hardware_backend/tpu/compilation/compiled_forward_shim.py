@@ -24,6 +24,12 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
+from sglang.srt.hardware_backend.tpu.cp_forward import (
+    cp_token_inputs,
+    get_tpu_cp_layout,
+    pinned_extend_seq_lens_cpu,
+)
+from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
@@ -509,22 +515,29 @@ def _pad_forward_batch_inputs(
         pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
         real_q_out, real_b_out = real_q, real_b
 
-    for field in _TOKEN_FIELDS:
-        val = getattr(forward_batch, field, None)
-        if isinstance(val, torch.Tensor) and val.shape[0] < pad_t:
-            setattr(forward_batch, field, _zero_pad_dim0(val, pad_t))
+    _pad_batch_fields(
+        forward_batch,
+        pad_t=pad_t,
+        pad_b=pad_b,
+        is_draft_extend_v2=is_draft_extend_v2,
+    )
+    return real_q_out, real_b_out
 
-    # MROPE positions are (3, num_tokens); pad along the token dim.
-    mrope_pos = getattr(forward_batch, "mrope_positions", None)
-    if isinstance(mrope_pos, torch.Tensor) and mrope_pos.shape[-1] < pad_t:
-        forward_batch.mrope_positions = F.pad(
-            mrope_pos, (0, pad_t - mrope_pos.shape[-1])
-        )
 
-    if is_draft_extend_v2:
-        out_cache_loc = forward_batch.out_cache_loc
-        if out_cache_loc.shape[0] < pad_t:
-            forward_batch.out_cache_loc = _zero_pad_dim0(out_cache_loc, pad_t)
+def _pad_batch_fields(
+    forward_batch: Any,
+    *,
+    pad_t: int | None,
+    pad_b: int,
+    is_draft_extend_v2: bool,
+) -> None:
+    """Pad the batch's tensors and lists in place to ``(pad_t, pad_b)``.
+
+    ``pad_t`` None leaves every token-indexed field at its live row count
+    (context-parallel batches present their local rows to the graph instead).
+    """
+    if pad_t is not None:
+        _pad_token_fields(forward_batch, pad_t, is_draft_extend_v2)
 
     for field in _BS_FIELDS:
         val = getattr(forward_batch, field, None)
@@ -556,6 +569,27 @@ def _pad_forward_batch_inputs(
     if len(mm_inputs) < pad_b:
         forward_batch.mm_inputs = mm_inputs + [None] * (pad_b - len(mm_inputs))
 
+    forward_batch.batch_size = pad_b
+
+
+def _pad_token_fields(forward_batch: Any, pad_t: int, is_draft_extend_v2: bool) -> None:
+    for field in _TOKEN_FIELDS:
+        val = getattr(forward_batch, field, None)
+        if isinstance(val, torch.Tensor) and val.shape[0] < pad_t:
+            setattr(forward_batch, field, _zero_pad_dim0(val, pad_t))
+
+    # MROPE positions are (3, num_tokens); pad along the token dim.
+    mrope_pos = getattr(forward_batch, "mrope_positions", None)
+    if isinstance(mrope_pos, torch.Tensor) and mrope_pos.shape[-1] < pad_t:
+        forward_batch.mrope_positions = F.pad(
+            mrope_pos, (0, pad_t - mrope_pos.shape[-1])
+        )
+
+    if is_draft_extend_v2:
+        out_cache_loc = forward_batch.out_cache_loc
+        if out_cache_loc.shape[0] < pad_t:
+            forward_batch.out_cache_loc = _zero_pad_dim0(out_cache_loc, pad_t)
+
     # Pad spec_info tensors whose token dim must match input_ids after padding
     # (spec target verify/extend feeds spec_info.hidden_states through the
     # compiled forward). Guarded so non-spec runs are unaffected.
@@ -567,10 +601,6 @@ def _pad_forward_batch_inputs(
             spec_info.hidden_states = F.pad(
                 hs, (0,) * (2 * (hs.ndim - 1)) + (0, pad_rows)
             )
-
-    forward_batch.batch_size = pad_b
-
-    return real_q_out, real_b_out
 
 
 def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) -> None:
@@ -687,6 +717,11 @@ class CompiledForwardShim:
         # it is frozen for this shim's lifetime. Caching it also keeps the
         # disabled path at a single attribute read per forward.
         self._prompt_logprob_enabled = envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+        # Prefill context parallelism: above 1, extend batches present their
+        # local zigzag rows to the graph and a batch-independent
+        # extend_seq_lens_cpu (see __call__).
+        cp_strategy = get_cp_strategy()
+        self._attn_cp_size = cp_strategy.cp_size if cp_strategy is not None else 1
         signature = getattr(compiled_fn, "__signature__", None)
         if signature is not None:
             self.__signature__ = signature
@@ -844,6 +879,32 @@ class CompiledForwardShim:
                 forward_batch.seq_lens.shape[0]
             )
         saved.update(_pin_fields(forward_batch, _PINNED_LOGPROB_FIELDS))
+        live_extend_seq_lens_cpu = None
+        if self._attn_cp_size > 1:
+            cp_layout = get_tpu_cp_layout(forward_batch)
+            # The graph tests every extend length against 2 * cp_size to pick
+            # the context-parallel or the plain program; one constant per
+            # program family keeps that test off the live lengths. The live
+            # list goes back at whatever length the output unpadding leaves.
+            if isinstance(forward_batch.extend_seq_lens_cpu, list):
+                live_extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                forward_batch.extend_seq_lens_cpu = pinned_extend_seq_lens_cpu(
+                    len(live_extend_seq_lens_cpu),
+                    cp_size=self._attn_cp_size,
+                    cp_active=cp_layout is not None,
+                )
+            if cp_layout is not None:
+                # The graph embeds the global ids (identical on every rank)
+                # and runs the model on the rank's zigzag rows; every
+                # token-indexed field on the batch is local.
+                saved["input_ids"] = forward_batch.input_ids
+                saved["positions"] = forward_batch.positions
+                input_ids, local_ids, positions = cp_token_inputs(
+                    input_ids, positions, cp_layout
+                )
+                kwargs["cp_local_rows"] = cp_layout.local_rows
+                forward_batch.input_ids = local_ids
+                forward_batch.positions = positions
         try:
             out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
             spec_info = forward_batch.spec_info
@@ -852,6 +913,10 @@ class CompiledForwardShim:
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
             _restore_fields(forward_batch, saved)
+            if live_extend_seq_lens_cpu is not None:
+                forward_batch.extend_seq_lens_cpu = live_extend_seq_lens_cpu[
+                    : len(forward_batch.extend_seq_lens_cpu)
+                ]
 
         # After the restore: LogitsMetadata.from_forward_batch branches on
         # capture_hidden_mode, so the gather must see the caller's value.

@@ -74,7 +74,14 @@ def is_prefill_cp_in_seq_split():
 
 
 def is_mla_prefill_cp_enabled() -> bool:
-    return get_parallel().enable_prefill_context_parallel and uses_mla_backend()
+    return get_parallel().enable_prefill_context_parallel and _uses_mla_backend()
+
+
+@torch.compiler.assume_constant_result
+def _uses_mla_backend() -> bool:
+    """A compiled forward evaluates this once at trace time: the answer is fixed
+    for the process, and the config view it reads is not traceable."""
+    return uses_mla_backend()
 
 
 def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
