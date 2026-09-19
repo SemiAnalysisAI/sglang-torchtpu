@@ -17,11 +17,10 @@ Both are captured by ``head_slice_params`` (the same math as sglang's
 module stays free of torch/triton and the byte-math is unit-testable anywhere.
 
 The fused KV pool stores one ``[num_blocks, page_size, kv_heads_packed,
-kv_packing, padded_head_dim]`` tensor per layer. One kv-head's K and V are a
-single contiguous run (``kv_packing`` is outer to ``padded_head_dim``), so a
-per-token head slice is a contiguous ``num_heads * head_pair_bytes`` granule that
-lands strided (period ``dst_heads_per_rank * head_pair_bytes``) in the decode
-token. These builders turn that geometry into
+kv_packing, padded_head_dim]`` tensor per layer. Native host copies retain
+32-bit packing: BF16 packs one head's K/V into each word, while FP8 packs two
+heads. Complete head packs are contiguous; a partial FP8 pack selects two
+bytes in each head-dimension word. These builders turn that geometry into
 ``raiden_service_pb2.StartTransferRequest`` push schedules.
 """
 
@@ -73,6 +72,14 @@ def head_pair_bytes(fused_layer_tensor: FusedKVLayerTensor) -> int:
     """
     shape = fused_layer_tensor.shape
     return int(shape[3]) * int(shape[4]) * fused_layer_tensor.element_size()
+
+
+def head_bytes(fused_layer_tensor: FusedKVLayerTensor) -> int:
+    """Bytes of one kv-head's K+V values, padding lanes of a partial pack
+    excluded; the granule of a geometry that addresses single heads inside a
+    32-bit pack."""
+    shape = fused_layer_tensor.shape
+    return 2 * int(shape[4]) * fused_layer_tensor.element_size()
 
 
 def per_rank_head_count(fused_layer_tensor: FusedKVLayerTensor) -> int:
@@ -134,26 +141,97 @@ def head_slice_params(
 class ReshardGeometry:
     """Byte geometry for one (src_tp -> dst_tp) reshard over ``total_kv_heads``."""
 
-    def __init__(self, src_tp: int, dst_tp: int, hp_bytes: int, total_kv_heads: int):
+    def __init__(
+        self,
+        src_tp: int,
+        dst_tp: int,
+        hp_bytes: int,
+        total_kv_heads: int,
+        kv_packing: int = 2,
+        element_size: int = 2,
+    ):
         self.src_tp = src_tp
         self.dst_tp = dst_tp
         self.ratio = reshard_ratio(src_tp, dst_tp)
         self.hp_bytes = hp_bytes
         self.total_kv_heads = total_kv_heads
+        if kv_packing not in (1, 2, 4) or kv_packing * element_size != 4:
+            raise ValueError("Raiden fused KV requires native 32-bit dtype packing")
+        if hp_bytes <= 0 or hp_bytes % (2 * element_size):
+            raise ValueError("Raiden head-pair bytes must contain whole K/V elements")
+        self.kv_packing = kv_packing
+        self.element_size = element_size
 
     def entry_bytes(self, prefill_rank: int, decode_rank: int):
-        """Byte (src_offset, size, src_stride, dst_offset, dst_stride) for the
-        prefill_rank -> decode_rank contribution, per token."""
+        """Byte geometry for a head slice that occupies one contiguous region."""
+        fragments = self.entry_fragments(prefill_rank, decode_rank)
+        if len(fragments) != 1:
+            raise ValueError("Partial FP8 head packs require multiple entry fragments")
+        return fragments[0]
+
+    def entry_fragments(self, prefill_rank: int, decode_rank: int):
+        """Per-token (src offset, size, src stride, dst offset, dst stride)."""
         sh_start, num_heads, dh_start, src_hpr, dst_hpr = head_slice_params(
             self.src_tp, self.dst_tp, prefill_rank, decode_rank, self.total_kv_heads
         )
-        return (
-            sh_start * self.hp_bytes,  # src_offset
-            num_heads * self.hp_bytes,  # size
-            src_hpr * self.hp_bytes,  # src_stride (src per-token width)
-            dh_start * self.hp_bytes,  # dst_offset
-            dst_hpr * self.hp_bytes,  # dst_stride (dst per-token width)
-        )
+        if self.kv_packing <= 2:
+            return [
+                (
+                    sh_start * self.hp_bytes,
+                    num_heads * self.hp_bytes,
+                    src_hpr * self.hp_bytes,
+                    dh_start * self.hp_bytes,
+                    dst_hpr * self.hp_bytes,
+                )
+            ]
+
+        heads_per_pack = self.kv_packing // 2
+        pack_bytes = heads_per_pack * self.hp_bytes
+        src_stride = (src_hpr + heads_per_pack - 1) // heads_per_pack * pack_bytes
+        dst_stride = (dst_hpr + heads_per_pack - 1) // heads_per_pack * pack_bytes
+        lane_bytes = 2 * self.element_size
+        head_dim = self.hp_bytes // lane_bytes
+        fragments = []
+        while num_heads:
+            if (
+                sh_start % heads_per_pack == 0
+                and dh_start % heads_per_pack == 0
+                and num_heads >= heads_per_pack
+            ):
+                count = num_heads // heads_per_pack * heads_per_pack
+                fragments.append(
+                    (
+                        sh_start * self.hp_bytes,
+                        count * self.hp_bytes,
+                        src_stride,
+                        dh_start * self.hp_bytes,
+                        dst_stride,
+                    )
+                )
+            else:
+                count = 1
+                src_base = (
+                    sh_start // heads_per_pack * pack_bytes
+                    + sh_start % heads_per_pack * lane_bytes
+                )
+                dst_base = (
+                    dh_start // heads_per_pack * pack_bytes
+                    + dh_start % heads_per_pack * lane_bytes
+                )
+                fragments.extend(
+                    (
+                        src_base + dim * 4,
+                        lane_bytes,
+                        src_stride,
+                        dst_base + dim * 4,
+                        dst_stride,
+                    )
+                    for dim in range(head_dim)
+                )
+            sh_start += count
+            dh_start += count
+            num_heads -= count
+        return fragments
 
 
 def _add_entry(
@@ -205,9 +283,7 @@ def build_sender_request(
         raise ValueError(
             "src_block_ids, dst_block_ids, live_tokens must be equal length"
         )
-    src_off, size, src_stride, dst_off, dst_stride = geom.entry_bytes(
-        prefill_rank % geom.src_tp, decode_rank
-    )
+    fragments = geom.entry_fragments(prefill_rank % geom.src_tp, decode_rank)
     req = pb2.StartTransferRequest()
     req.uuid = uuid
     req.req_id = req_id
@@ -218,19 +294,20 @@ def build_sender_request(
     for src_b, dst_b, n in zip(src_block_ids, dst_block_ids, live_tokens):
         if n <= 0:
             continue
-        _add_entry(
-            schedule,
-            peer=peer,
-            src_block_id=int(src_b),
-            dst_block_id=int(dst_b),
-            dst_shard_idx=0,
-            src_offset=src_off,
-            dst_offset=dst_off,
-            size=size,
-            src_stride=src_stride,
-            dst_stride=dst_stride,
-            count=int(n),
-        )
+        for src_off, size, src_stride, dst_off, dst_stride in fragments:
+            _add_entry(
+                schedule,
+                peer=peer,
+                src_block_id=int(src_b),
+                dst_block_id=int(dst_b),
+                dst_shard_idx=0,
+                src_offset=src_off,
+                dst_offset=dst_off,
+                size=size,
+                src_stride=src_stride,
+                dst_stride=dst_stride,
+                count=int(n),
+            )
     return req
 
 
@@ -265,26 +342,25 @@ def build_receiver_request(
     req.use_block_chunks = True
     total = 0
     for sender_id, src_block_ids in sources:
-        src_off, size, src_stride, dst_off, dst_stride = geom.entry_bytes(
-            sender_id % geom.src_tp, decode_rank
-        )
+        fragments = geom.entry_fragments(sender_id % geom.src_tp, decode_rank)
         schedule = req.shard_push_schedules[sender_id]
         for src_b, dst_b, n in zip(src_block_ids, dst_block_ids, live_tokens):
             if n <= 0:
                 continue
-            _add_entry(
-                schedule,
-                peer=peer,
-                src_block_id=int(src_b),
-                dst_block_id=int(dst_b),
-                dst_shard_idx=0,
-                src_offset=src_off,
-                dst_offset=dst_off,
-                size=size,
-                src_stride=src_stride,
-                dst_stride=dst_stride,
-                count=int(n),
-            )
+            for src_off, size, src_stride, dst_off, dst_stride in fragments:
+                _add_entry(
+                    schedule,
+                    peer=peer,
+                    src_block_id=int(src_b),
+                    dst_block_id=int(dst_b),
+                    dst_shard_idx=0,
+                    src_offset=src_off,
+                    dst_offset=dst_off,
+                    size=size,
+                    src_stride=src_stride,
+                    dst_stride=dst_stride,
+                    count=int(n),
+                )
             total += 1
     req.expected_block_count = (
         total if expected_block_count is None else int(expected_block_count)

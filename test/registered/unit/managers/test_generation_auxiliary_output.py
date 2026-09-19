@@ -472,6 +472,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         disagg_prefill_inflight_queue=[],
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
+        transfer_backend=None,
     )
 
     with patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"):

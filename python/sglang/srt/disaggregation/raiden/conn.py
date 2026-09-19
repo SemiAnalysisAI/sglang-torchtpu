@@ -127,6 +127,12 @@ class RaidenKVManager(
         self._swa_kv_caches: Optional[list] = None
         self.raiden_endpoint: Optional[str] = None
         self.swa_raiden_endpoint: Optional[str] = None
+        self._pipeline = None
+        self._pipeline_enabled = (
+            os.environ.get("SGLANG_RAIDEN_PIPELINE_TRANSFER", "0") == "1"
+        )
+        self._pipeline_init_lock = threading.Lock()
+        self._pipeline_messages = []
         # Each rank reserves control+data ports for full KV and SWA KV. The
         # rank counts every worker on the node -- attention-TP ranks of every
         # context-parallel, attention-DP, and system-DP replica -- so
@@ -140,6 +146,8 @@ class RaidenKVManager(
             self.system_dp_rank,
             self.attn_cp_rank,
             self.attn_cp_size,
+            self.pp_rank,
+            self.pp_size,
         )
         self._control_port = base_port + 4 * self._local_rank
         self._timeout_s = float(os.environ.get("SGLANG_RAIDEN_TIMEOUT_S", "120"))
@@ -263,6 +271,7 @@ class RaidenKVManager(
         """
         from sglang.srt.disaggregation.raiden.reshard_schedule import (
             ReshardGeometry,
+            head_bytes,
             head_pair_bytes,
         )
 
@@ -278,7 +287,18 @@ class RaidenKVManager(
         # Distinct model kv-head count (model_config.get_total_num_kv_heads()),
         # set on both the prefill and decode KVArgs.
         total_kv_heads = int(self.kv_args.total_kv_head_num)
-        return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, total_kv_heads)
+        if not getattr(self, "_pipeline_enabled", False):
+            return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, total_kv_heads)
+        # The pipeline transfer addresses single heads inside a 32-bit pack, so
+        # a decode rank can gather head slices of FP8 pages from its sources.
+        return ReshardGeometry(
+            src_attn_tp,
+            dst_attn_tp,
+            head_bytes(tensor),
+            total_kv_heads,
+            kv_packing=int(tensor.shape[3]),
+            element_size=tensor.element_size(),
+        )
 
     # ----- engine lifecycle -------------------------------------------------
 
@@ -292,6 +312,23 @@ class RaidenKVManager(
         """
         self._kv_caches = list(kv_caches.full)
         self._swa_kv_caches = list(kv_caches.swa)
+        if os.environ.get("SGLANG_RAIDEN_PIPELINE_TRANSFER", "0") == "1":
+            from sglang.srt.disaggregation.raiden.pipeline import PipelineTransfer
+
+            pipeline = PipelineTransfer(self, kv_caches)
+            self._engine = pipeline.engine
+            self.chunked_transfer = False
+            with self._pipeline_init_lock:
+                self._pipeline = pipeline
+                for message in self._pipeline_messages:
+                    pipeline.on_message(message)
+                self._pipeline_messages.clear()
+            return
+        if self.pp_size > 1:
+            raise ValueError(
+                "Raiden pipeline transfer requires "
+                "SGLANG_RAIDEN_PIPELINE_TRANSFER=1 on both peers"
+            )
         # Full-attention KV moves piece by piece during the prefill. A hybrid
         # model's sliding-window pool holds only the last window, which is
         # settled when the prefill ends, so it rides on the closing read.
@@ -428,6 +465,7 @@ class RaidenKVManager(
             self.system_dp_size,
             self.server_args.nnodes,
             self.attn_cp_size,
+            self.pp_size,
         )
         budget /= local_ranks * max(1, engines)
         slot_bytes = slot_host_bytes(kv_caches, max_blocks)
@@ -481,6 +519,9 @@ class RaidenKVManager(
         return start, tail
 
     def _drain_engine(self) -> None:
+        if getattr(self, "_pipeline", None) is not None:
+            self._pipeline.poll()
+            return
         if self._engine is None and self._swa_engine is None:
             return
         for engine in (self._engine, self._swa_engine):
@@ -701,11 +742,33 @@ class RaidenKVManager(
         if tag == MessageTag.ABORT:
             self._on_abort(msg)
             return
+        if tag in (
+            MessageTag.PIPELINE_REQ,
+            MessageTag.PIPELINE_READY,
+            MessageTag.PIPELINE_RELEASE,
+        ):
+            if not getattr(self, "_pipeline_enabled", False):
+                raise ValueError("Peer requires SGLANG_RAIDEN_PIPELINE_TRANSFER=1")
+            with self._pipeline_init_lock:
+                if self._pipeline is None:
+                    self._pipeline_messages.append(msg)
+                    return
+                pipeline = self._pipeline
+            pipeline.on_message(msg)
+            return
         handler = self._message_handlers.get(tag)
         if handler is None:
             logger.error("RaidenKVManager unknown message tag: %s", tag)
             return
         handler(msg)
+
+    @staticmethod
+    def _require_frames(msg: List[bytes], tag: MessageTag, n: int) -> None:
+        """Validate the frame count of a positional pipeline message."""
+        if len(msg) != n:
+            raise ValueError(
+                f"malformed {tag.name} message: expected {n} frames, got {len(msg)}"
+            )
 
     # ----- prefill side ------------------------------------------------------
 
@@ -775,6 +838,8 @@ class RaidenKVManager(
         transfer would write them under their next owner. Raiden's own
         transfer deadline bounds how long this can stay true.
         """
+        if getattr(self, "_pipeline", None) is not None:
+            return self._pipeline.active(room)
         rid, swa_rid, chunk_prefix = str(room), self._swa_req_id(room), f"{room}#"
 
         def belongs(key: str) -> bool:
@@ -799,6 +864,8 @@ class RaidenKVManager(
         An abort tombstone survives the room: frames for it can still arrive
         and must stay rejected. Tombstones age out on their own.
         """
+        if getattr(self, "_pipeline", None) is not None:
+            self._pipeline.clear(room)
         self._drop_room_state(room, clear_failure_record=True)
 
     def _drop_room_state(

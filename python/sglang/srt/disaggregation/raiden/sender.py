@@ -230,6 +230,8 @@ class RaidenSenderMixin:
         finalized room and fails it terminally, or wins and this returns
         False without touching the status.
         """
+        if getattr(self, "_pipeline", None) is not None:
+            return self._pipeline.finalize_send(room, aux_index)
         self._ensure_engine()
         with self._state_lock:
             if room in self._aborted:
@@ -264,7 +266,14 @@ class RaidenSenderMixin:
         decode's court, the window is timed from that latest progress.
         """
         with self._state_lock:
-            if room in self._prefill.decode_addr or room in self._prefill.reshard_ready:
+            if (
+                room in self._prefill.decode_addr
+                or room in self._prefill.reshard_ready
+                or (
+                    getattr(self, "_pipeline", None) is not None
+                    and room in self._pipeline.replies
+                )
+            ):
                 return None
             if room in self._prefill.reshard_req:
                 return self._prefill.reshard_replied_at.get(room)
@@ -279,7 +288,14 @@ class RaidenSenderMixin:
         decode can never be told to pull KV whose room just failed.
         """
         with self._state_lock:
-            if room in self._prefill.decode_addr or room in self._prefill.reshard_ready:
+            if (
+                room in self._prefill.decode_addr
+                or room in self._prefill.reshard_ready
+                or (
+                    getattr(self, "_pipeline", None) is not None
+                    and room in self._pipeline.replies
+                )
+            ):
                 return False
             if room in self._prefill.reshard_req:
                 started = self._prefill.reshard_replied_at.get(room)
@@ -354,6 +370,8 @@ class RaidenSenderMixin:
         comes for is expired by raiden at its own deadline and settles
         through poll_stats like any other.
         """
+        if getattr(self, "_pipeline", None) is not None:
+            return self._pipeline.active(room)
         with self._state_lock:
             if self._send_reads.get(room):
                 return True
