@@ -1,0 +1,396 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Torch glue for prefill context parallelism on TPU.
+
+The compiled forward of every context-parallel rank runs on that rank's
+zigzag token rows (``cp_layout``): the forward batch is padded to the local
+token bucket, the attention backend all-gathers K/V per layer and writes the
+whole sequence into its own KV pool, and the logits step reduces the last-token
+rows so every rank samples identical tokens. All rank-dependent data enter the
+compiled program as tensors built on the host; nothing here bakes the rank
+into a traced graph.
+"""
+
+from __future__ import annotations
+
+import functools
+from typing import Any, NamedTuple
+
+import numpy as np
+import torch
+
+from sglang.srt.hardware_backend.tpu.cp_layout import (
+    TpuCpHostLayout,
+    build_tpu_cp_layout,
+    max_local_rows,
+)
+
+_LAYOUT_ATTR = "_tpu_cp_layout"
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+class TpuCpBatchLayout(NamedTuple):
+    """Per-batch context-parallel layout carried on the forward batch."""
+
+    host: TpuCpHostLayout
+    # Device int64 [local_rows_padded]: global token index of each local row
+    # (padding rows point at token 0; their contents are never consumed).
+    local_rows: torch.Tensor
+
+
+def get_tpu_cp_layout(forward_batch: Any) -> TpuCpBatchLayout | None:
+    """Layout attached by ``prepare_tpu_cp_forward_batch``; None otherwise."""
+    return getattr(forward_batch, _LAYOUT_ATTR, None)
+
+
+# ---------------------------------------------------------------------------
+# Rank tensor (in-graph rank arithmetic without a baked constant)
+# ---------------------------------------------------------------------------
+
+_CP_RANK_TENSORS: dict[torch.device, torch.Tensor] = {}
+
+
+def ensure_cp_rank_tensor(device: torch.device, cp_rank: int) -> torch.Tensor:
+    """Create (once per device) the 0-D int64 context-parallel rank tensor.
+
+    Called eagerly before every context-parallel forward so the tensor is a
+    runtime graph input rather than a constant traced into the program.
+    """
+    device = torch.device(device)
+    tensor = _CP_RANK_TENSORS.get(device)
+    if tensor is None:
+        tensor = torch.tensor(cp_rank, dtype=torch.int64, device=device)
+        _CP_RANK_TENSORS[device] = tensor
+        _CP_RANK_TENSORS[tensor.device] = tensor
+    return tensor
+
+
+def cp_rank_tensor(device: torch.device) -> torch.Tensor:
+    tensor = _CP_RANK_TENSORS.get(torch.device(device))
+    if tensor is None:
+        raise RuntimeError(
+            f"context-parallel rank tensor for {device} was not created; "
+            "prepare_tpu_cp_forward_batch must run before the compiled forward."
+        )
+    return tensor
+
+
+def select_cp_local_rows(
+    hidden_states: torch.Tensor, *, slot_rows: int, num_rows: int
+) -> torch.Tensor:
+    """This rank's rows of a rank-major all-gathered ``[cp * slot_rows, H]``
+    tensor, selected with the rank tensor so the offset stays a runtime operand.
+    """
+    device = hidden_states.device
+    rows = cp_rank_tensor(device) * slot_rows + torch.arange(num_rows, device=device)
+    return hidden_states.index_select(0, rows)
+
+
+# ---------------------------------------------------------------------------
+# Forward-batch preparation (host side, before attention metadata)
+# ---------------------------------------------------------------------------
+
+
+def _int_list(values: Any, count: int, name: str) -> list[int]:
+    if values is None:
+        raise ValueError(f"{name} is required for a context-parallel extend batch.")
+    values = [int(x) for x in values]
+    if len(values) < count:
+        raise ValueError(f"{name} has {len(values)} entries for {count} requests.")
+    return values[:count]
+
+
+def prepare_tpu_cp_forward_batch(
+    forward_batch: Any,
+    *,
+    t_bucketer: Any,
+    b_bucketer: Any,
+    extend_bs: int | None,
+    cp_size: int,
+    cp_rank: int,
+    device: torch.device,
+) -> tuple[int, int]:
+    """Bucket a context-parallel extend batch on its local rows.
+
+    Builds the zigzag layout from the batch's CPU lengths, picks the local
+    token bucket from the largest per-rank row count (identical on every
+    rank), pads the request-indexed fields to the request bucket, and attaches
+    the layout to the batch. Token-indexed fields keep the global row count;
+    the compiled-forward shim gathers the local rows from them.
+
+    Returns the real (global) token count and the real request count.
+    """
+    from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+        _extend_batch_cap,
+        _pad_batch_fields,
+    )
+
+    real_q = int(forward_batch.input_ids.shape[0])
+    real_b = int(forward_batch.seq_lens.shape[0])
+    pad_b = _extend_batch_cap(t_bucketer, b_bucketer, extend_bs)
+    if real_b > pad_b:
+        raise ValueError(
+            f"TPU extend batch size {real_b} exceeds its compile cap {pad_b}. "
+            "Set --prefill-max-requests to at least the largest extend batch."
+        )
+    extend_lens = _int_list(
+        forward_batch.extend_seq_lens_cpu, real_b, "extend_seq_lens_cpu"
+    )
+    prefix_lens = _int_list(
+        forward_batch.extend_prefix_lens_cpu, real_b, "extend_prefix_lens_cpu"
+    )
+    if sum(extend_lens) != real_q:
+        raise ValueError(
+            f"extend_seq_lens_cpu sums to {sum(extend_lens)} but input_ids has "
+            f"{real_q} rows; context parallelism needs a pure extend batch."
+        )
+
+    local_rows_padded = t_bucketer.next_bucket(
+        max(max_local_rows(extend_lens, cp_size), pad_b)
+    )
+    host = build_tpu_cp_layout(
+        extend_lens=extend_lens,
+        prefix_lens=prefix_lens,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        pad_b=pad_b,
+        local_rows_padded=local_rows_padded,
+    )
+    local_rows = torch.from_numpy(np.clip(host.local_rows, 0, None)).to(
+        device, non_blocking=True
+    )
+
+    _pad_batch_fields(
+        forward_batch,
+        pad_t=None,
+        pad_b=pad_b,
+        is_draft_extend_v2=False,
+    )
+    metadata = forward_batch.attn_cp_metadata
+    metadata.per_rank_logical_token = [local_rows_padded] * cp_size
+    metadata.per_rank_actual_token = [local_rows_padded] * cp_size
+    metadata.max_rank_len = [local_rows_padded] * cp_size
+
+    ensure_cp_rank_tensor(device, cp_rank)
+    setattr(
+        forward_batch, _LAYOUT_ATTR, TpuCpBatchLayout(host=host, local_rows=local_rows)
+    )
+    return real_q, real_b
+
+
+def cp_token_inputs(
+    input_ids: torch.Tensor, positions: torch.Tensor, layout: TpuCpBatchLayout
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(global_ids, local_ids, local_positions)`` for a context-parallel forward.
+
+    ``global_ids`` is the whole batch's token ids padded with zeros to
+    ``cp_size * local_rows_padded`` rows; it is identical on every rank, so the
+    vocab-parallel embedding's all-reduce inside the compiled forward sees the
+    same inputs everywhere. ``local_ids`` and ``local_positions`` are this
+    rank's zigzag rows.
+    """
+    rows = layout.local_rows
+    global_rows = layout.host.cp_size * layout.host.local_rows_padded
+    global_ids = torch.nn.functional.pad(
+        input_ids, (0, global_rows - input_ids.shape[0])
+    )
+    return global_ids, input_ids.index_select(0, rows), positions.index_select(0, rows)
+
+
+def wrap_cp_embedding_forward(fn: Any, embed_tokens: Any) -> Any:
+    """Model forward that embeds the global token ids and runs the model on
+    this rank's rows.
+
+    With ``cp_local_rows`` set, ``input_ids`` holds the global (padded) ids:
+    they are embedded in full, the local rows are selected from the
+    embeddings, and ``fn`` runs on those rows through ``input_embeds``.
+    Without it the call passes straight through.
+    """
+
+    @functools.wraps(fn)
+    def forward(
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: Any,
+        *args: Any,
+        cp_local_rows: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        if cp_local_rows is None:
+            return fn(input_ids, positions, forward_batch, *args, **kwargs)
+        input_embeds = embed_tokens(input_ids).index_select(0, cp_local_rows)
+        return fn(
+            input_ids.index_select(0, cp_local_rows),
+            positions,
+            forward_batch,
+            *args,
+            input_embeds=input_embeds,
+            **kwargs,
+        )
+
+    return forward
+
+
+def pinned_extend_seq_lens_cpu(
+    num_reqs: int, *, cp_size: int, cp_active: bool
+) -> list[int]:
+    """Batch-independent stand-in for ``extend_seq_lens_cpu`` inside the graph.
+
+    The compiled forward decides between the context-parallel and the plain
+    program by testing every entry against ``2 * cp_size``; feeding one value
+    per program family keeps that test static instead of guarding on the
+    live lengths of each batch.
+    """
+    return [2 * cp_size if cp_active else 0] * num_reqs
+
+
+# ---------------------------------------------------------------------------
+# Per-layer K/V all-gather and full-sequence write (inside the compiled graph)
+# ---------------------------------------------------------------------------
+
+
+def fused_kv_rows(
+    k: torch.Tensor, v: torch.Tensor, kv_cache: torch.Tensor
+) -> torch.Tensor:
+    """Rows ``[T, packed, packing, padded_head_dim]`` of ``k``/``v`` (each
+    ``[T, heads, head_dim]``) in the fused pool layout of ``kv_cache``.
+
+    fp8 tensors are handled as their byte view so the interleave, padding and
+    reshape run on uint8.
+    """
+    if k.dtype in _FP8_DTYPES:
+        k = k.view(torch.uint8)
+        v = v.view(torch.uint8)
+    num_tokens, heads, head_dim = k.shape
+    packed, packing, padded_head_dim = kv_cache.shape[2:]
+    rows = torch.stack([k, v], dim=2).reshape(num_tokens, 2 * heads, head_dim)
+    pad_dim = padded_head_dim - head_dim
+    pad_heads = packed * packing - 2 * heads
+    if pad_dim or pad_heads:
+        rows = torch.nn.functional.pad(rows, (0, pad_dim, 0, pad_heads))
+    return rows.reshape(num_tokens, packed, packing, padded_head_dim)
+
+
+def all_gather_and_write_kv(
+    *,
+    kv_cache: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dest_slots: torch.Tensor,
+    group: Any,
+) -> None:
+    """All-gather this layer's local K/V over the context-parallel group and
+    write every gathered row into ``kv_cache`` at ``dest_slots``.
+
+    ``dest_slots`` is rank-major (``[cp * T]``) and maps padding rows to slot
+    0, the reserved padding page. The write covers this rank's own rows too;
+    the attention kernel rewrites them with identical bytes afterwards.
+    """
+    rows = fused_kv_rows(k, v, kv_cache).contiguous()
+    target = kv_cache
+    if kv_cache.dtype in _FP8_DTYPES:
+        target = kv_cache.view(torch.uint8)
+    gathered = rows.new_empty((group.world_size * rows.shape[0], *rows.shape[1:]))
+    group.all_gather_into_tensor(gathered, rows)
+    target.flatten(0, 1).index_copy_(0, dest_slots, gathered)
+
+
+# ---------------------------------------------------------------------------
+# Logits on the last-token rows (inside the compiled graph)
+# ---------------------------------------------------------------------------
+
+
+def cp_last_token_rows(
+    hidden_states: torch.Tensor,
+    *,
+    last_rows: torch.Tensor,
+    last_owner_mask: torch.Tensor,
+    group: Any,
+) -> torch.Tensor:
+    """``[pad_b, H]`` last-token hidden states, identical on every rank.
+
+    Each rank contributes the rows it owns (rank 0 owns every request's last
+    token) and zeros elsewhere; a sum all-reduce over the group broadcasts
+    them. ``torch.where`` rather than a 0/1 scale keeps an overflow on one
+    rank from turning into NaN on the others.
+    """
+    rows = hidden_states.index_select(0, last_rows)
+    zero = torch.zeros((), dtype=rows.dtype, device=rows.device)
+    rows = torch.where(last_owner_mask.to(torch.bool)[:, None], rows, zero)
+    return group.all_reduce(rows)
+
+
+class TpuCpLogitsForward:
+    """``LogitsProcessor.forward`` replacement for context-parallel prefill.
+
+    For a batch carrying context-parallel attention metadata it reduces the
+    last-token rows across ranks and runs the processor on those ``pad_b``
+    rows with one query token per request; any other batch goes straight to
+    the original forward.
+    """
+
+    def __init__(self, logits_processor: Any) -> None:
+        from sglang.srt.layers.logits_processor import LogitsMetadata
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+        from sglang.srt.model_executor.forward_context import get_forward_context
+        from sglang.srt.runtime_context import get_parallel
+
+        self._logits_processor = logits_processor
+        self._forward = logits_processor.forward
+        self._logits_metadata_cls = LogitsMetadata
+        self._forward_batch_cls = ForwardBatch
+        self._get_forward_context = get_forward_context
+        self._get_parallel = get_parallel
+
+    def __call__(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        lm_head: Any,
+        logits_metadata: Any,
+        aux_hidden_states: Any = None,
+        hidden_states_before_norm: torch.Tensor | None = None,
+    ) -> Any:
+        attn_metadata = self._get_forward_context().attn_backend.forward_metadata
+        last_rows = attn_metadata.cp_last_rows
+        if last_rows is None or not isinstance(
+            logits_metadata, self._forward_batch_cls
+        ):
+            return self._forward(
+                input_ids,
+                hidden_states,
+                lm_head,
+                logits_metadata,
+                aux_hidden_states,
+                hidden_states_before_norm,
+            )
+        rows = cp_last_token_rows(
+            hidden_states,
+            last_rows=last_rows,
+            last_owner_mask=attn_metadata.cp_last_owner_mask,
+            group=self._get_parallel().attn_cp_group,
+        )
+        metadata = self._logits_metadata_cls.from_forward_batch(
+            logits_metadata,
+            compute_input_logprobs=self._logits_processor.compute_input_logprobs,
+        )
+        # One query row per request, so the extend last-index gather is the
+        # identity over the reduced rows.
+        metadata.extend_seq_lens = torch.ones_like(last_rows, dtype=torch.int32)
+        return self._forward(
+            input_ids,
+            rows,
+            lm_head,
+            metadata,
+            aux_hidden_states,
+            hidden_states_before_norm,
+        )
+
+
+def install_cp_logits_forward(logits_processor: Any) -> TpuCpLogitsForward:
+    """Install ``TpuCpLogitsForward`` on ``logits_processor`` (idempotent)."""
+    current = logits_processor.forward
+    if isinstance(current, TpuCpLogitsForward):
+        return current
+    wrapper = TpuCpLogitsForward(logits_processor)
+    logits_processor.forward = wrapper
+    return wrapper
