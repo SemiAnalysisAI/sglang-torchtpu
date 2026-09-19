@@ -1790,10 +1790,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 reserved_tokens,
                 max(0, n_active * window_size - swa_used),
             )
-            prebuilt_reserved = min(
-                self.num_reserved_decode_tokens * prebuilt_n,
-                max(0, prebuilt_n * window_size - swa_used),
-            )
+            if prebuilt_n:
+                prebuilt_reserved = min(
+                    self.num_reserved_decode_tokens * prebuilt_n,
+                    max(0, prebuilt_n * window_size - swa_used),
+                )
         swa_allocatable_tokens = (
             swa_available
             + swa_evictable

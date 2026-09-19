@@ -11,7 +11,6 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
-from sglang.srt.arg_groups.kv_cache_hook import handle_swa_ratio_default
 from sglang.srt.arg_groups.overrides import (
     _page_size_default,
     _pipeline_parallel_overlap_disable,
@@ -107,6 +106,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     handle_hardware_runtime_validation()
     if cfg.model_path.lower() in ["none", "dummy"]:
+        from sglang.srt.arg_groups.kv_cache_hook import handle_swa_ratio_default
+
         handle_swa_ratio_default(server_args)
         return
 

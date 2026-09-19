@@ -42,6 +42,12 @@ _FIELDS = frozenset(field.name for field in dataclasses.fields(ServerArgs))
 # allowlist below would then have to carry.
 _HOLDER_NAMES = frozenset({"server_args", "sa", "args"})
 
+# Intent queries must distinguish an omitted field from a resolved default.
+# test_swa_ratio.py pins this distinction through resolution and worker copies.
+_RAW_INTENT_READS = frozenset(
+    {("ServerArgs.has_explicit_swa_ratio", "swa_full_tokens_ratio")}
+)
+
 
 def _holders(fn):
     names = {
@@ -476,7 +482,7 @@ class TestResolutionReadsTheDeclarations(CustomTestCase):
         for name, fn in sorted(members.items()):
             holders = _holders(fn) | {"self"}
             for lineno, field in _field_reads(fn, holders):
-                if field in decided:
+                if field in decided and (name, field) not in _RAW_INTENT_READS:
                     offenders.append(f"server_args.py:{lineno} {name} reads .{field}")
         self.assertEqual(
             offenders,
