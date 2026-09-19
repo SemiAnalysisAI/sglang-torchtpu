@@ -2248,6 +2248,18 @@ class Scheduler(
             get_require_mlp_sync=lambda: self.require_mlp_sync,
         )
 
+    def _widen_tokens_per_layer(self, tokens_per_layer: Optional[int]) -> Optional[int]:
+        """Per-layer token capacity in the allocator's location space.
+
+        A DCP allocator hands out locations in a space widened by
+        attn_dcp_size, so the pool counters it reports (available, evictable,
+        protected) count locations while the configured per-layer totals count
+        physical slots.
+        """
+        if tokens_per_layer is None:
+            return None
+        return tokens_per_layer * get_parallel().attn_dcp_size
+
     def init_pool_stats_observer(self) -> None:
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
@@ -2258,8 +2270,12 @@ class Scheduler(
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_ssm=self.is_hybrid_ssm,
             enable_hisparse=self.enable_hisparse,
-            full_tokens_per_layer=self.full_tokens_per_layer,
-            swa_tokens_per_layer=self.swa_tokens_per_layer,
+            full_tokens_per_layer=self._widen_tokens_per_layer(
+                self.full_tokens_per_layer
+            ),
+            swa_tokens_per_layer=self._widen_tokens_per_layer(
+                self.swa_tokens_per_layer
+            ),
             max_total_num_tokens=self.max_total_num_tokens
             * get_parallel().attn_dcp_size,
             get_last_batch=lambda: self.last_batch,
@@ -2272,8 +2288,12 @@ class Scheduler(
             is_hybrid_ssm=self.is_hybrid_ssm,
             disaggregation_mode=self.disaggregation_mode,
             page_size=self.page_size,
-            full_tokens_per_layer=self.full_tokens_per_layer,
-            swa_tokens_per_layer=self.swa_tokens_per_layer,
+            full_tokens_per_layer=self._widen_tokens_per_layer(
+                self.full_tokens_per_layer
+            ),
+            swa_tokens_per_layer=self._widen_tokens_per_layer(
+                self.swa_tokens_per_layer
+            ),
             max_total_num_tokens=self.max_total_num_tokens,
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -2429,7 +2449,8 @@ class Scheduler(
         # smaller than max_total_num_tokens. Otherwise a request can be accepted
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
-        paged_input_len = -(-input_len // self.page_size) * self.page_size
+        alloc_page_size = self.page_size * get_parallel().attn_dcp_size
+        paged_input_len = -(-input_len // alloc_page_size) * alloc_page_size
         req.sampling_params.max_new_tokens = max(
             0,
             min(
@@ -2437,7 +2458,7 @@ class Scheduler(
                 self.max_req_len - input_len - 1,
                 self.max_total_num_tokens * get_parallel().attn_dcp_size
                 - paged_input_len
-                - self.page_size
+                - alloc_page_size
                 - 1,
             ),
         )
@@ -3628,7 +3649,7 @@ class Scheduler(
             }
 
         adder = adder_cls(
-            self.page_size,
+            self.page_size * get_parallel().attn_dcp_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             running_batch,

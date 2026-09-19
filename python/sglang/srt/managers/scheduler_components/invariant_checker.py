@@ -105,17 +105,9 @@ class SchedulerInvariantChecker:
             protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
             total = self.max_total_num_tokens
-        full_evictable_size = ps.full_evictable_size
-        allocator = self.token_to_kv_pool_allocator
-        if get_parallel().dcp_enabled and allocator.page_size > 1:
-            # DCP stores logical tokens in widened physical pages.  Prefix cache
-            # counters are logical-token based, while the allocator frees whole
-            # physical pages, so round cached tokens up to physical page units.
-            full_evictable_size = (
-                (full_evictable_size + allocator.page_size - 1)
-                // allocator.page_size
-                * allocator.page_size
-            )
+        full_evictable_size, dcp_page_slack = self._dcp_page_align_evictable(
+            ps.full_evictable_size
+        )
         leak, msg = self._check_pool_invariant(
             "full",
             ps.full_available_size,
@@ -125,24 +117,45 @@ class SchedulerInvariantChecker:
             total,
             uncached,
         )
-        if leak and get_parallel().dcp_enabled and allocator.page_size > 1:
-            # Radix/Mamba cache accounting is logical-token based while DCP full
-            # KV allocation is physical-page based. Partial physical pages can
-            # leave a small page-level slack even when all pages are owned by
-            # either the allocator or the prefix cache.
+        if leak and dcp_page_slack:
             return False, f"{msg}, dcp_physical_page_slack_allowed=True"
         return leak, msg
 
+    def _dcp_page_align_evictable(self, evictable_size: int) -> Tuple[int, bool]:
+        """Round cached tokens up to whole DCP physical pages.
+
+        DCP stores logical tokens in widened physical pages. Prefix cache
+        counters are logical-token based, while the allocator frees whole
+        physical pages, so round cached tokens up to physical page units. The
+        second return value says whether the residual page-level slack -- a
+        partial physical page owned by neither the allocator nor the prefix
+        cache -- is allowed for this pool.
+        """
+        allocator = self.token_to_kv_pool_allocator
+        if not (get_parallel().dcp_enabled and allocator.page_size > 1):
+            return evictable_size, False
+        page_size = allocator.page_size
+        return (
+            (evictable_size + page_size - 1) // page_size * page_size,
+            True,
+        )
+
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
-        return self._check_pool_invariant(
+        swa_evictable_size, dcp_page_slack = self._dcp_page_align_evictable(
+            ps.swa_evictable_size
+        )
+        leak, msg = self._check_pool_invariant(
             "swa",
             ps.swa_available_size,
-            ps.swa_evictable_size,
+            swa_evictable_size,
             self.tree_cache.swa_protected_size(),
             self.pool_stats_observer.session_held_swa_tokens(),
             self.swa_tokens_per_layer,
             uncached,
         )
+        if leak and dcp_page_slack:
+            return False, f"{msg}, dcp_physical_page_slack_allowed=True"
+        return leak, msg
 
     def _check_mamba_pool(self, ps: PoolStats) -> Tuple[bool, str]:
         ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
