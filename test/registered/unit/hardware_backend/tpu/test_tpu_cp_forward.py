@@ -26,11 +26,21 @@ from sglang.srt.hardware_backend.tpu.cp_forward import (
     wrap_cp_embedding_forward,
 )
 from sglang.srt.hardware_backend.tpu.cp_layout import build_tpu_cp_layout
+from sglang.srt.hardware_backend.tpu.kv_row_write import kv_write_segments
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
+
+def _expand_write_segments(segments, num_segments):
+    """``{gathered row: KV slot}`` covered by the write runs."""
+    rows = {}
+    for src, dst, n in segments[:, : int(num_segments)].T.tolist():
+        for i in range(n):
+            rows[src + i] = dst + i
+    return rows
 
 
 class _FakeGatherGroup:
@@ -111,9 +121,17 @@ class TestAllGatherAndWriteKv(unittest.TestCase):
         kv_cache = torch.zeros(8, 4, 1, 2, 128, dtype=dtype)
         # Rank 0 owns slots 5, 6, 9, 10; rank 1 owns 17, 18 and two padding rows.
         dest_slots = torch.tensor([5, 6, 9, 10, 17, 18, 0, 0])
+        segments, count = kv_write_segments(
+            dest_slots.numpy(), np.array([1, 1, 1, 1, 1, 1, 0, 0], dtype=bool)
+        )
         group = _FakeGatherGroup(2, [fused_kv_rows(k1, v1, kv_cache)])
         all_gather_and_write_kv(
-            kv_cache=kv_cache, k=k0, v=v0, dest_slots=dest_slots, group=group
+            kv_cache=kv_cache,
+            k=k0,
+            v=v0,
+            write_segments=segments,
+            write_num_segments=torch.tensor([count], dtype=torch.int32),
+            group=group,
         )
         flat = (
             kv_cache.view(torch.uint8).flatten(0, 1)
@@ -417,17 +435,22 @@ class TestCpMetadata(unittest.TestCase):
         self.assertEqual(metadata.distribution.tolist(), [0, 4, 4])
         self.assertEqual(int(metadata.active_num_tokens), host.local_len)
 
-        expected_slots = []
-        for req, pos in zip(host.gathered_req.tolist(), host.gathered_pos.tolist()):
-            if req < 0:
-                expected_slots.append(0)
-            else:
-                expected_slots.append(
-                    int(req_to_token[req, host.prefix_lens[req] + pos])
+        expected_slots = {}
+        for row, (req, pos) in enumerate(
+            zip(host.gathered_req.tolist(), host.gathered_pos.tolist())
+        ):
+            if req >= 0:
+                expected_slots[row] = int(
+                    req_to_token[req, host.prefix_lens[req] + pos]
                 )
-        self.assertEqual(metadata.cp_dest_slots.tolist(), expected_slots)
+        self.assertEqual(
+            _expand_write_segments(
+                metadata.cp_write_segments, metadata.cp_write_num_segments
+            ),
+            expected_slots,
+        )
         self.assertIsNone(metadata.swa_page_indices)
-        self.assertIsNone(metadata.cp_swa_dest_slots)
+        self.assertIsNone(metadata.cp_swa_write_segments)
         self.assertEqual(metadata.cp_last_rows.tolist(), host.last_rows.tolist())
         self.assertEqual(
             metadata.cp_last_owner_mask.tolist(), host.last_owner_mask.tolist()
@@ -438,7 +461,11 @@ class TestCpMetadata(unittest.TestCase):
         backend.token_to_kv_pool.tpu_commit_pending_loads = lambda: None
         backend.init_forward_metadata(batch)
         self.assertEqual(
-            backend.forward_metadata.cp_dest_slots.tolist(), expected_slots
+            _expand_write_segments(
+                backend.forward_metadata.cp_write_segments,
+                backend.forward_metadata.cp_write_num_segments,
+            ),
+            expected_slots,
         )
 
     def test_hybrid_swa_rows_and_slots_are_translated(self):
@@ -469,12 +496,15 @@ class TestCpMetadata(unittest.TestCase):
                 ).to(torch.int32),
             )
         )
-        expected = torch.where(
-            metadata.cp_dest_slots > 0,
-            full_to_swa[metadata.cp_dest_slots],
-            torch.zeros_like(metadata.cp_dest_slots),
+        full_rows = _expand_write_segments(
+            metadata.cp_write_segments, metadata.cp_write_num_segments
         )
-        self.assertEqual(metadata.cp_swa_dest_slots.tolist(), expected.tolist())
+        self.assertEqual(
+            _expand_write_segments(
+                metadata.cp_swa_write_segments, metadata.cp_swa_write_num_segments
+            ),
+            {row: int(full_to_swa[slot]) for row, slot in full_rows.items()},
+        )
 
     def test_hybrid_swa_rejects_unmapped_extend_rows(self):
         req_to_token = torch.zeros(2, self.POOL_WIDTH, dtype=torch.int32)
@@ -504,7 +534,10 @@ class TestCpMetadata(unittest.TestCase):
             req_pool_indices_cpu=torch.tensor([0, 1, 0, 0]),
         )
         metadata = backend._build_cp_metadata(batch, layout)
-        self.assertEqual(int(metadata.cp_swa_dest_slots.max()), 0)
+        swa_rows = _expand_write_segments(
+            metadata.cp_swa_write_segments, metadata.cp_swa_write_num_segments
+        )
+        self.assertEqual(set(swa_rows.values()), {0})
 
 
 if __name__ == "__main__":

@@ -45,6 +45,10 @@ from sglang.srt.hardware_backend.tpu.cp_forward import (
     all_gather_and_write_kv,
     get_tpu_cp_layout,
 )
+from sglang.srt.hardware_backend.tpu.kv_row_write import (
+    get_write_rows_op,
+    kv_write_segments,
+)
 from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
@@ -105,12 +109,14 @@ class PallasForwardMetadata:
     # Prefill context parallelism only (None otherwise). The kernel then runs
     # two rows per request (one per owned zigzag block) on this rank's local
     # token rows; see ``cp_layout``.
-    # i64[cp_size * local_tokens]  KV slot of every row of the rank-major
-    # all-gathered K/V (slot 0 for padding rows)
-    cp_dest_slots: torch.Tensor | None = None
-    # Same rows as ``cp_dest_slots`` translated to the SWA sub-pool (hybrid
-    # sliding-window models only).
-    cp_swa_dest_slots: torch.Tensor | None = None
+    # i32[3, cp_size * local_tokens]  (source row, KV slot, length) runs of
+    # the rank-major all-gathered K/V rows, and i32[1] their count
+    cp_write_segments: torch.Tensor | None = None
+    cp_write_num_segments: torch.Tensor | None = None
+    # The same rows as runs of SWA sub-pool slots (hybrid sliding-window
+    # models only).
+    cp_swa_write_segments: torch.Tensor | None = None
+    cp_swa_write_num_segments: torch.Tensor | None = None
     # i64[max_num_seqs]  local row of each request's last token (0 when this
     # rank does not own it)
     cp_last_rows: torch.Tensor | None = None
@@ -441,6 +447,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # traced region — dynamo can't handle ``inspect.signature`` on the
         # wrapped JAX function. The forward path then just looks the op up.
         self._op = self._build_kernel_op()
+        if get_parallel().attn_cp_size > 1 and model_runner.device == "tpu":
+            get_write_rows_op()
 
     def _build_kernel_op(self):
         """Build the Pallas custom op stored as ``self._op``.
@@ -887,7 +895,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         )
 
         # KV slot of every all-gathered row: the request's req_to_token entry
-        # at prefix + offset; padding rows go to slot 0.
+        # at prefix + offset; padding rows are not written.
         gathered_req = torch.from_numpy(host.gathered_req)
         gathered_pos = torch.from_numpy(host.gathered_pos)
         valid = gathered_req >= 0
@@ -895,11 +903,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         prefix = torch.from_numpy(host.prefix_lens)[req]
         slots = req_to_token[req_pool_indices[req], prefix + gathered_pos.clamp(min=0)]
         dest_slots = torch.where(valid, slots.to(torch.int64), torch.zeros_like(req))
+        write_segments, num_segments = kv_write_segments(slots.numpy(), valid.numpy())
+        write_num_segments = torch.tensor([num_segments], dtype=torch.int32)
 
         # Hybrid-SWA: sliding-window layers read and write the SWA sub-pool, so page
         # rows and write slots go through the host-resident full-to-SWA mapping.
         swa_page_indices: torch.Tensor | None = None
-        swa_dest_slots: torch.Tensor | None = None
+        swa_write_segments: torch.Tensor | None = None
+        swa_write_num_segments: torch.Tensor | None = None
         if self._is_hybrid_swa:
             full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping
             assert full_to_swa is not None, (
@@ -920,7 +931,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                     "context-parallel extend rows without an SWA slot: the "
                     "sliding-window allocator did not map every token of the chunk."
                 )
-            swa_dest_slots = torch.where(valid, translated, torch.zeros_like(req))
+            swa_write_segments, swa_num_segments = kv_write_segments(
+                translated.numpy(), valid.numpy()
+            )
+            swa_write_num_segments = torch.tensor([swa_num_segments], dtype=torch.int32)
 
         distribution = self._get_cached_rpa_distribution(
             False, 2 * host.num_reqs, device
@@ -934,11 +948,17 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             distribution=distribution,
             active_num_tokens=_make_active_num_tokens(cu_q_lens, 2 * host.num_reqs),
             swa_page_indices=swa_page_indices,
-            cp_dest_slots=dest_slots.to(device, non_blocking=True),
-            cp_swa_dest_slots=(
+            cp_write_segments=write_segments.to(device, non_blocking=True),
+            cp_write_num_segments=write_num_segments.to(device, non_blocking=True),
+            cp_swa_write_segments=(
                 None
-                if swa_dest_slots is None
-                else swa_dest_slots.to(device, non_blocking=True)
+                if swa_write_segments is None
+                else swa_write_segments.to(device, non_blocking=True)
+            ),
+            cp_swa_write_num_segments=(
+                None
+                if swa_write_num_segments is None
+                else swa_write_num_segments.to(device, non_blocking=True)
             ),
             cp_last_rows=torch.from_numpy(host.last_rows).to(device, non_blocking=True),
             cp_last_owner_mask=torch.from_numpy(host.last_owner_mask)
@@ -1051,15 +1071,18 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # Prefill context parallelism: every rank writes the whole sequence's
         # K/V for this layer into its own pool before the kernel reads the
         # earlier blocks through the page table.
-        cp_dest_slots = self.forward_metadata.cp_dest_slots
-        if is_swa_layer and self.forward_metadata.cp_swa_dest_slots is not None:
-            cp_dest_slots = self.forward_metadata.cp_swa_dest_slots
-        if cp_dest_slots is not None:
+        cp_write_segments = self.forward_metadata.cp_write_segments
+        cp_write_num_segments = self.forward_metadata.cp_write_num_segments
+        if is_swa_layer and self.forward_metadata.cp_swa_write_segments is not None:
+            cp_write_segments = self.forward_metadata.cp_swa_write_segments
+            cp_write_num_segments = self.forward_metadata.cp_swa_write_num_segments
+        if cp_write_segments is not None:
             all_gather_and_write_kv(
                 kv_cache=kv_cache,
                 k=k,
                 v=v,
-                dest_slots=cp_dest_slots,
+                write_segments=cp_write_segments,
+                write_num_segments=cp_write_num_segments,
                 group=get_parallel().attn_cp_group,
             )
 
