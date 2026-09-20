@@ -1,6 +1,6 @@
 """DeepSeek-V3.1 TP16/EP16 FP8-KV evaluation, no DP attention.
 
-Rerun the five truncated AIME25 questions with FP32 MoE scales and 64K output.
+Run all 30 AIME25 questions with FP32 MoE scales and 64K output.
 """
 
 import os
@@ -44,7 +44,7 @@ MODEL_CONFIG = {
     "gates": [
         {
             "dataset": "aime25",
-            "label": "aime25_truncated_64k",
+            "label": "aime25_full_64k",
             "report_only": True,
             "thinking": True,
             "repeat": 1,
