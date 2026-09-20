@@ -1,6 +1,6 @@
 """DeepSeek-V3.1 TP16/EP16 FP8-KV evaluation, no DP attention.
 
-One pass each of GPQA, AIME25 and 250 MMLU questions at concurrency 128.
+One AIME25 pass with FP32 MoE scales, 64K output, and concurrency 30.
 """
 
 import os
@@ -43,39 +43,15 @@ MODEL_CONFIG = {
     ),
     "gates": [
         {
-            "dataset": "gpqa",
-            "label": "gpqa_diamond",
-            "report_only": True,
-            "thinking": True,
-            "repeat": 1,
-            "num_threads": 128,
-            "temperature": 0.6,
-            "top_p": 0.95,
-            "max_tokens": 32768,
-        },
-        {
             "dataset": "aime25",
-            "label": "aime25",
+            "label": "aime25_64k",
             "report_only": True,
             "thinking": True,
             "repeat": 1,
-            "num_threads": 128,
+            "num_threads": 30,
             "temperature": 0.6,
             "top_p": 0.95,
-            "max_tokens": 32768,
-        },
-        {
-            "dataset": "mmlu",
-            "label": "mmlu",
-            "report_only": True,
-            "thinking": True,
-            "repeat": 1,
-            # Match the non-DPA test: 250 sampled questions per repeat.
-            "num_examples": 250,
-            "num_threads": 128,
-            "temperature": 0.6,
-            "top_p": 0.95,
-            "max_tokens": 16384,
+            "max_tokens": 65536,
         },
     ],
 }

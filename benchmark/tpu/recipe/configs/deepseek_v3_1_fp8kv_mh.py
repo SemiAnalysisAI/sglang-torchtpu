@@ -12,5 +12,6 @@ CONFIG["server_args"].update(
     {
         "model_path": "/weights/DeepSeek-V3.1",
         "reasoning_parser": "deepseek-v3",
+        "context_length": 73728,
     }
 )
