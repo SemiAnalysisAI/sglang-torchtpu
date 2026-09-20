@@ -15,6 +15,7 @@ from sglang.srt.hardware_backend.tpu.cp_forward import (
     TpuCpBatchLayout,
     all_gather_and_write_kv,
     cp_last_token_rows,
+    cp_local_embeds,
     cp_token_inputs,
     ensure_cp_rank_tensor,
     fused_kv_rows,
@@ -187,6 +188,61 @@ class TestRankTensorSelection(unittest.TestCase):
         self.assertIsNone(calls[1][2])
         self.assertIs(calls[1][0], global_ids)
 
+    def test_embedding_wrapper_fills_a_positional_input_embeds_slot(self):
+        """A caller that passes input_embeds positionally must not also get it as
+        a keyword: binding it twice is a TypeError, and the arity must not change
+        because dynamo keys its warmup entries on len(args)."""
+        table = torch.arange(20, dtype=torch.float32).reshape(10, 2)
+        calls = []
+
+        def fn(input_ids, positions, forward_batch, input_embeds=None, proxy=None):
+            calls.append((input_ids, input_embeds, proxy))
+            return "out"
+
+        forward = wrap_cp_embedding_forward(fn, lambda ids: table[ids])
+        global_ids = torch.tensor([3, 1, 4, 1, 5, 9, 0, 0])
+        sentinel = object()
+        out = forward(
+            global_ids,
+            torch.tensor([0, 5, 2]),
+            None,
+            None,
+            sentinel,
+            cp_local_rows=torch.tensor([0, 5, 2]),
+        )
+        self.assertEqual(out, "out")
+        ids, embeds, proxy = calls[0]
+        self.assertEqual(ids.tolist(), [3, 9, 4])
+        self.assertTrue(torch.equal(embeds, table[[3, 9, 4]]))
+        # The trailing positional (pp_proxy_tensors in the real model) survives.
+        self.assertIs(proxy, sentinel)
+
+    def test_cp_local_embeds_match_the_rows_cp_token_inputs_selects(self):
+        """Caller-supplied embeddings arrive at the batch's global token count
+        while every other token-indexed graph input is local, so a forward that
+        takes input_embeds must narrow them to the same rows and the same width
+        as the ids -- otherwise the compiled ladder, built at the local width,
+        never matches at serve time."""
+        layout = _layout()
+        host = layout.host
+        embeds = torch.arange(64, dtype=torch.float32).reshape(64, 1).expand(64, 3)
+        local = cp_local_embeds(embeds, layout)
+        _, ids, _ = cp_token_inputs(torch.arange(64), torch.arange(64), layout)
+        self.assertEqual(local.shape[0], ids.shape[0])
+        self.assertEqual(local.shape[0], host.local_rows_padded)
+        real = host.local_len
+        self.assertEqual(local[:real, 0].tolist(), host.local_rows[:real].tolist())
+
+    def test_cp_local_embeds_zero_pad_reaches_the_global_row_space(self):
+        """Local rows index cp_size * local_rows_padded rows, which is wider
+        than the batch's own token count, so a short embedding must be padded
+        rather than indexed out of bounds."""
+        layout = _layout()
+        host = layout.host
+        short = host.cp_size * host.local_rows_padded - 8
+        local = cp_local_embeds(torch.ones(short, 3), layout)
+        self.assertEqual(local.shape, (host.local_rows_padded, 3))
+
     def test_pinned_extend_seq_lens_are_batch_independent(self):
         self.assertEqual(
             pinned_extend_seq_lens_cpu(3, cp_size=8, cp_active=True), [16, 16, 16]
@@ -346,7 +402,7 @@ class TestCpMetadata(unittest.TestCase):
     PAGE_SIZE = 64
     DRAFT_TOKENS = 8
 
-    def _make_backend(self, req_to_token):
+    def _make_backend(self, req_to_token, full_to_swa=None):
         override = get_context().override_server_args(
             speculative_num_draft_tokens=self.DRAFT_TOKENS,
             speculative_algorithm="EAGLE3",
@@ -369,8 +425,8 @@ class TestCpMetadata(unittest.TestCase):
             model_config=SimpleNamespace(context_len=self.CONTEXT_LEN),
             server_args=server_args,
             req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
-            token_to_kv_pool=SimpleNamespace(),
-            is_hybrid_swa=False,
+            token_to_kv_pool=SimpleNamespace(full_to_swa_index_mapping=full_to_swa),
+            is_hybrid_swa=full_to_swa is not None,
             kv_cache_dtype=torch.bfloat16,
             spec_algorithm=SimpleNamespace(is_none=lambda: False),
         )
@@ -427,6 +483,8 @@ class TestCpMetadata(unittest.TestCase):
                     int(req_to_token[req, host.prefix_lens[req] + pos])
                 )
         self.assertEqual(metadata.cp_dest_slots.tolist(), expected_slots)
+        self.assertIsNone(metadata.swa_page_indices)
+        self.assertIsNone(metadata.cp_swa_dest_slots)
         self.assertEqual(metadata.cp_last_rows.tolist(), host.last_rows.tolist())
         self.assertEqual(
             metadata.cp_last_owner_mask.tolist(), host.last_owner_mask.tolist()
@@ -439,6 +497,71 @@ class TestCpMetadata(unittest.TestCase):
         self.assertEqual(
             backend.forward_metadata.cp_dest_slots.tolist(), expected_slots
         )
+
+    def test_hybrid_swa_rows_and_slots_are_translated(self):
+        req_to_token = torch.zeros(2, self.POOL_WIDTH, dtype=torch.int32)
+        req_to_token[0] = 1000 + torch.arange(self.POOL_WIDTH)
+        req_to_token[1] = 5000 + torch.arange(self.POOL_WIDTH)
+        # Full-pool slot s lives at SWA slot s // 2 (page 64 -> SWA page 32).
+        full_to_swa = torch.arange(8192, dtype=torch.int64) // 2
+        backend = self._make_backend(req_to_token, full_to_swa=full_to_swa)
+        layout = _layout(
+            cp_size=4, cp_rank=1, extend=(40, 24), prefix=(0, 100), pad_b=4
+        )
+        batch = SimpleNamespace(
+            seq_lens=torch.tensor([40, 124, 0, 0], dtype=torch.int32),
+            req_pool_indices_cpu=torch.tensor([0, 1, 0, 0]),
+        )
+        metadata = backend._build_cp_metadata(batch, layout)
+
+        pages_per_seq = (backend.max_context_len + self.PAGE_SIZE - 1) // self.PAGE_SIZE
+        full_pages = metadata.page_indices.reshape(8, pages_per_seq)
+        swa_pages = metadata.swa_page_indices.reshape(8, pages_per_seq)
+        self.assertTrue(
+            torch.equal(
+                swa_pages,
+                (
+                    full_to_swa[full_pages.to(torch.int64) * self.PAGE_SIZE]
+                    // self.PAGE_SIZE
+                ).to(torch.int32),
+            )
+        )
+        expected = torch.where(
+            metadata.cp_dest_slots > 0,
+            full_to_swa[metadata.cp_dest_slots],
+            torch.zeros_like(metadata.cp_dest_slots),
+        )
+        self.assertEqual(metadata.cp_swa_dest_slots.tolist(), expected.tolist())
+
+    def test_hybrid_swa_rejects_unmapped_extend_rows(self):
+        req_to_token = torch.zeros(2, self.POOL_WIDTH, dtype=torch.int32)
+        req_to_token[0] = 1000 + torch.arange(self.POOL_WIDTH)
+        req_to_token[1] = 5000 + torch.arange(self.POOL_WIDTH)
+        full_to_swa = torch.zeros(8192, dtype=torch.int64)  # nothing mapped
+        backend = self._make_backend(req_to_token, full_to_swa=full_to_swa)
+        layout = _layout(
+            cp_size=4, cp_rank=1, extend=(40, 24), prefix=(0, 100), pad_b=4
+        )
+        batch = SimpleNamespace(
+            seq_lens=torch.tensor([40, 124, 0, 0], dtype=torch.int32),
+            req_pool_indices_cpu=torch.tensor([0, 1, 0, 0]),
+        )
+        with self.assertRaisesRegex(RuntimeError, "without an SWA slot"):
+            backend._build_cp_metadata(batch, layout)
+
+    def test_hybrid_swa_accepts_warmup_rows_on_the_padding_slot(self):
+        req_to_token = torch.zeros(2, self.POOL_WIDTH, dtype=torch.int32)
+        full_to_swa = torch.zeros(8192, dtype=torch.int64)  # nothing mapped
+        backend = self._make_backend(req_to_token, full_to_swa=full_to_swa)
+        layout = _layout(
+            cp_size=4, cp_rank=1, extend=(40, 24), prefix=(0, 100), pad_b=4
+        )
+        batch = SimpleNamespace(
+            seq_lens=torch.tensor([40, 124, 0, 0], dtype=torch.int32),
+            req_pool_indices_cpu=torch.tensor([0, 1, 0, 0]),
+        )
+        metadata = backend._build_cp_metadata(batch, layout)
+        self.assertEqual(int(metadata.cp_swa_dest_slots.max()), 0)
 
 
 if __name__ == "__main__":
