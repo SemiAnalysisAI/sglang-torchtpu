@@ -8,6 +8,17 @@ whole sequence into its own KV pool, and the logits step reduces the last-token
 rows so every rank samples identical tokens. All rank-dependent data enter the
 compiled program as tensors built on the host; nothing here bakes the rank
 into a traced graph.
+
+Admission parity is an unenforced precondition. Every rank of a context-parallel
+group must admit the same prefill batch in the same step: the per-layer K/V
+all-gather is a group collective, so a rank that admits a chunk its sibling
+refused blocks in that collective forever, with no timeout and no error. Nothing
+in this module or in the scheduler enforces it; the ranks agree only because
+they run identical admission code over identical state. A two-rank group was
+seen to diverge at an input length whose wave oversubscribes the pool: the group
+wedged on the first batch of the wave, and the first visible symptom was a
+libtpu telemetry abort minutes later. The mechanism of that divergence is not
+established.
 """
 
 from __future__ import annotations
@@ -196,6 +207,24 @@ def cp_token_inputs(
     return global_ids, input_ids.index_select(0, rows), positions.index_select(0, rows)
 
 
+def cp_local_embeds(
+    input_embeds: torch.Tensor, layout: TpuCpBatchLayout
+) -> torch.Tensor:
+    """This rank's zigzag rows of a global ``[tokens, hidden]`` embedding.
+
+    A caller that hands the compiled forward its own embeddings hands them at
+    the batch's global token count, while every other token-indexed input the
+    graph takes is local. The zero pad matches ``cp_token_inputs``: local rows
+    index the ``cp_size * local_rows_padded`` row space, which is wider than
+    the batch's own padded token count.
+    """
+    global_rows = layout.host.cp_size * layout.host.local_rows_padded
+    padded = torch.nn.functional.pad(
+        input_embeds, (0, 0, 0, global_rows - input_embeds.shape[0])
+    )
+    return padded.index_select(0, layout.local_rows)
+
+
 def wrap_cp_embedding_forward(fn: Any, embed_tokens: Any) -> Any:
     """Model forward that embeds the global token ids and runs the model on
     this rank's rows.
@@ -218,11 +247,19 @@ def wrap_cp_embedding_forward(fn: Any, embed_tokens: Any) -> Any:
         if cp_local_rows is None:
             return fn(input_ids, positions, forward_batch, *args, **kwargs)
         input_embeds = embed_tokens(input_ids).index_select(0, cp_local_rows)
+        local_ids = input_ids.index_select(0, cp_local_rows)
+        if args:
+            # ``input_embeds`` is fn's 4th positional parameter, so a caller that
+            # fills it positionally already occupies args[0]; passing the keyword
+            # as well binds it twice. Overwrite the slot rather than appending to
+            # it, because dynamo keys its warmup entries on len(args).
+            return fn(
+                local_ids, positions, forward_batch, input_embeds, *args[1:], **kwargs
+            )
         return fn(
-            input_ids.index_select(0, cp_local_rows),
+            local_ids,
             positions,
             forward_batch,
-            *args,
             input_embeds=input_embeds,
             **kwargs,
         )

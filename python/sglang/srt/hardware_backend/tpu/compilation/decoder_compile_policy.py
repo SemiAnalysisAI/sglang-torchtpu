@@ -393,10 +393,23 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         self.extend_bs: int | None = None
         self.compiled_forward_shim: CompiledForwardShim | None = None
         self._logged_vl_warmup_variants: set[str] = set()
-        # Prefill context parallelism (None when not configured): extend
-        # batches it applies to are bucketed on their local zigzag rows and
-        # warmed as their own program family.
-        self._cp_strategy = get_cp_strategy()
+        # Variant tags actually warmed, so precompile() can tell a family that
+        # was compiled from one an override dropped.
+        self._compiled_extend_variants: set[str] = set()
+
+    @property
+    def _cp_strategy(self) -> Any:
+        """Prefill context-parallel strategy, or None when not configured.
+
+        Read through on every access rather than snapshotted in ``__init__``:
+        the strategy initializes lazily from the global parallel context, and
+        a policy built before that context is installed would snapshot None
+        for the process's whole life, which silently disables the
+        context-parallel warmup family, the batch bucketing and the embedding
+        wrapper at once. ``get_cp_strategy`` memoizes, so this stays cheap on
+        the forward path.
+        """
+        return get_cp_strategy()
 
     def _extend_compile_cap(self) -> int:
         assert self.t_bucketer is not None
@@ -889,6 +902,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         disagg_mode = get_disagg().disaggregation_mode
         if disagg_mode != "decode":
             self._precompile_extend()
+            self._assert_cp_family_compiled()
         if disagg_mode != "prefill":
             self._precompile_decode()
         logger.info(
@@ -896,9 +910,39 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             time.perf_counter() - overall,
         )
 
+    def _assert_cp_family_compiled(self) -> None:
+        """Fail warmup if context parallelism is on but its family was skipped.
+
+        ``_precompile_extend`` is an override point, and a subclass that builds
+        its own variant grid drops the context-parallel family by omission.
+        Nothing downstream reports that: the server boots, serves whatever
+        shapes the tracer happened to touch, and dies on the first one it did
+        not, several requests into a run.
+        """
+        if self._cp_strategy is None or "cp" in self._compiled_extend_variants:
+            return
+        raise RuntimeError(
+            f"{type(self).__name__} compiled no context-parallel extend graphs "
+            "while prefill context parallelism is enabled. A _precompile_extend "
+            "override must add _extend_cp_compile_items() to its warmup grid; "
+            "without it every context-parallel batch recompiles at serve time."
+        )
+
     def _extend_input_variants(self) -> tuple[str, ...]:
         """Input signatures an extend graph must be compiled for."""
         return ("plain",)
+
+    def _extend_cp_compile_items(self) -> list[tuple[int, int, ForwardMode, str, Any]]:
+        """Warmup items of the context-parallel extend family.
+
+        Separate from the plain grid so a ``_precompile_extend`` override can
+        add the family back without restating how it is shaped.
+        """
+        return [
+            (num_tokens, bs, ForwardMode.EXTEND, "cp", logits_output_mode)
+            for num_tokens, bs in self._extend_cp_compile_cases()
+            for logits_output_mode in self._warmup_logits_output_modes(bs)
+        ]
 
     def _precompile_extend(self) -> None:
         """Compile extend at each token bucket and the fixed batch cap."""
@@ -918,12 +962,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             for num_tokens, bs, mode in compile_cases
             for logits_output_mode in self._warmup_logits_output_modes(bs)
         ]
-        cp_cases = self._extend_cp_compile_cases()
-        compile_items += [
-            (num_tokens, bs, ForwardMode.EXTEND, "cp", logits_output_mode)
-            for num_tokens, bs in cp_cases
-            for logits_output_mode in self._warmup_logits_output_modes(bs)
-        ]
+        cp_items = self._extend_cp_compile_items()
+        compile_items += cp_items
         # Input (prompt) logprobs need every prefill row, so they warm the
         # FULL-capture variant instead of the NULL one -- a replacement, not an
         # addition, because the shim then presents FULL on every extend and a
@@ -940,7 +980,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             len(compile_items),
             sorted({(mode.name, batch_size) for _, batch_size, mode in compile_cases}),
             list(self.t_bucketer.buckets),
-            len(cp_cases),
+            len(cp_items),
         )
         compile_range = (
             tqdm.tqdm(
@@ -1083,6 +1123,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         attn_backend: Any | None = None,
     ) -> None:
         """Build and execute one dummy forward pass for compilation."""
+        self._compiled_extend_variants.add(variant)
         args, kwargs = self._make_warmup_inputs(
             num_tokens=num_tokens,
             bs=bs,
@@ -1506,13 +1547,16 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             for variant in variants
             for logits_output_mode in self._warmup_logits_output_modes(bs)
         ]
+        cp_items = self._extend_cp_compile_items()
+        compile_items += cp_items
         logger.info(
             "[decoder compile policy] VL EXTEND: %d graph variants "
-            "(batch_caps=%s, token_buckets=%s, variants=%s)",
+            "(batch_caps=%s, token_buckets=%s, variants=%s, context_parallel_cases=%d)",
             len(compile_items),
             sorted({(mode.name, batch_size) for _, batch_size, mode in compile_cases}),
             list(self.t_bucketer.buckets),
             variants,
+            len(cp_items),
         )
         compile_range = (
             tqdm.tqdm(

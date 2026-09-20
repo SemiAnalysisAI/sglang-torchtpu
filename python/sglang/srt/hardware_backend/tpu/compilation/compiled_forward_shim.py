@@ -25,6 +25,7 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     PowerBucketer,
 )
 from sglang.srt.hardware_backend.tpu.cp_forward import (
+    cp_local_embeds,
     cp_token_inputs,
     get_tpu_cp_layout,
     pinned_extend_seq_lens_cpu,
@@ -105,6 +106,21 @@ def _matches_default(value: Any, default: Any) -> bool:
     if default is None:
         return value is None
     return type(value) is type(default) and value == default
+
+
+def _cp_localize_embeds_in_args(
+    args: tuple[Any, ...], cp_layout: Any
+) -> tuple[Any, ...]:
+    """Narrow a positionally-passed ``input_embeds`` to this rank's rows.
+
+    ``input_embeds`` is the compiled inner forward's 4th parameter, so for a
+    model that fills it positionally rather than by keyword it lands at
+    ``args[0]``, where the keyword lookup at the call site cannot see it.
+    Arity is unchanged.
+    """
+    if not args or not isinstance(args[0], torch.Tensor):
+        return args
+    return (cp_local_embeds(args[0], cp_layout),) + args[1:]
 
 
 def _zero_pad_dim0(t: torch.Tensor, target_size: int) -> torch.Tensor:
@@ -833,7 +849,24 @@ class CompiledForwardShim:
                 input_ids, local_ids, positions = cp_token_inputs(
                     input_ids, positions, cp_layout
                 )
-                kwargs["cp_local_rows"] = cp_layout.local_rows
+                # Embeddings a caller supplies are global, and the precompile
+                # ladder builds them local like every other token-indexed
+                # input; leaving them global is a serve-time recompile, which
+                # `fail_on_recompile` turns into a crash on the first request.
+                supplied_embeds = kwargs.get("input_embeds") is not None
+                if supplied_embeds:
+                    kwargs["input_embeds"] = cp_local_embeds(
+                        kwargs["input_embeds"], cp_layout
+                    )
+                else:
+                    args = _cp_localize_embeds_in_args(args, cp_layout)
+                if supplied_embeds:
+                    # A caller that supplies embeddings has no lookup to run;
+                    # the ids only size the local rows.
+                    input_ids = local_ids
+                else:
+                    # The embedding takes the global ids and keeps the rank's rows.
+                    kwargs["cp_local_rows"] = cp_layout.local_rows
                 forward_batch.input_ids = local_ids
                 forward_batch.positions = positions
         try:
