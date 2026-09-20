@@ -34,6 +34,7 @@ from sglang.srt.hardware_backend.tpu.cp_layout import (
     build_tpu_cp_layout,
     max_local_rows,
 )
+from sglang.srt.hardware_backend.tpu.kv_row_write import write_rows_torch
 
 _LAYOUT_ATTR = "_tpu_cp_layout"
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -312,15 +313,18 @@ def all_gather_and_write_kv(
     kv_cache: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    dest_slots: torch.Tensor,
+    write_segments: torch.Tensor,
+    write_num_segments: torch.Tensor,
     group: Any,
 ) -> None:
     """All-gather this layer's local K/V over the context-parallel group and
-    write every gathered row into ``kv_cache`` at ``dest_slots``.
+    write the gathered rows into ``kv_cache`` along ``write_segments``.
 
-    ``dest_slots`` is rank-major (``[cp * T]``) and maps padding rows to slot
-    0, the reserved padding page. The write covers this rank's own rows too;
-    the attention kernel rewrites them with identical bytes afterwards.
+    The rows are rank-major (``[cp * T]``); the segments are their runs of
+    consecutive KV slots (padding rows have none). The write covers this rank's
+    own rows too; the attention kernel rewrites them with identical bytes
+    afterwards. Runs are DMAed into the layer buffer in place: an XLA scatter
+    here would re-lay out the whole pool around it on every layer.
     """
     rows = fused_kv_rows(k, v, kv_cache).contiguous()
     target = kv_cache
@@ -328,7 +332,7 @@ def all_gather_and_write_kv(
         target = kv_cache.view(torch.uint8)
     gathered = rows.new_empty((group.world_size * rows.shape[0], *rows.shape[1:]))
     group.all_gather_into_tensor(gathered, rows)
-    target.flatten(0, 1).index_copy_(0, dest_slots, gathered)
+    write_rows_torch(write_num_segments, write_segments, gathered, target)
 
 
 # ---------------------------------------------------------------------------
