@@ -547,7 +547,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 if self._cp_strategy is not None:
                     install_cp_logits_forward(logits_processor)
 
-        if self._cp_strategy is not None and not is_draft_worker:
+        if (
+            self._cp_strategy is not None
+            and not is_draft_worker
+            and self._embeds_input_tokens()
+        ):
             compile_fn = wrap_cp_embedding_forward(
                 compile_fn, self.model_runner.model.get_input_embeddings()
             )
@@ -768,6 +772,12 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         return self.owner is self.model_runner.model and not bool(
             getattr(self.model_runner, "is_draft_worker", False)
         )
+
+    def _embeds_input_tokens(self) -> bool:
+        """Whether this worker's forward embeds token ids (the first pipeline
+        stage, or any stage of a model without pipeline parallelism)."""
+        pp_group = getattr(self.model_runner, "pp_group", None)
+        return pp_group is None or bool(pp_group.is_first_rank)
 
     def _pp_warmup_kwargs(self, num_tokens: int) -> dict[str, Any]:
         """The ``pp_proxy_tensors`` kwarg a non-first pipeline stage warms up with.

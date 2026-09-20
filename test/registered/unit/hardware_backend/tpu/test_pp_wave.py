@@ -15,7 +15,7 @@ import unittest
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.pp_wave import PPWave
+from sglang.srt.hardware_backend.tpu.pp_wave import PPWave, pipeline_permutation
 from sglang.test.test_utils import CustomTestCase
 
 ROWS, HIDDEN = 8, 4
@@ -286,6 +286,35 @@ class TestWaveGuards(CustomTestCase):
         wave = _wave(2, 3)
         wave._launcher = wrong
         self.assertFalse(wave.probe())
+
+    def test_probe_tells_the_device_columns_apart(self):
+        def from_device(index):
+            return lambda x: torch.full_like(x, float(index + 1))
+
+        # Stage 2, column 1 of 2 receives from stage 1: device 3 is its column.
+        wave = _wave(2, 3)
+        wave._launcher = from_device(3)
+        self.assertTrue(wave.probe(column=1, columns=2))
+        wave = _wave(2, 3)
+        wave._launcher = from_device(2)
+        self.assertFalse(wave.probe(column=1, columns=2))
+
+    def test_permutation_forms_one_cycle_per_column(self):
+        physical = (4, 5, 0, 1, 6, 7, 2, 3)  # rank -> device, stages of two
+        perm = pipeline_permutation(physical, size=4, columns=2)
+        # Column 0: ranks 0,2,4,6 -> devices 4,0,6,2; column 1: ranks 1,3,5,7.
+        self.assertEqual(
+            perm,
+            ((4, 0), (0, 6), (6, 2), (2, 4), (5, 1), (1, 7), (7, 3), (3, 5)),
+        )
+        self.assertEqual(sorted(s for s, _ in perm), sorted(physical))
+        self.assertEqual(sorted(t for _, t in perm), sorted(physical))
+        self.assertEqual(
+            pipeline_permutation((0, 1, 2), size=3, columns=1),
+            ((0, 1), (1, 2), (2, 0)),
+        )
+        with self.assertRaisesRegex(ValueError, "cannot form"):
+            pipeline_permutation((0, 1, 2), size=2, columns=2)
 
 
 if __name__ == "__main__":

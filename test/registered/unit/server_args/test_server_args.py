@@ -1185,6 +1185,21 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
 
+    def test_pipeline_stage_moe_dp_is_accepted_on_tpu_only(self):
+        stage_args = dict(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            attn_cp_size=2,
+            tp_size=2,
+            moe_dp_size=2,
+            pp_size=4,
+        )
+
+        handle_context_parallelism(self._new_cp_args(device="tpu", **stage_args))
+
+        with self.assertRaisesRegex(AssertionError, "PP is not supported"):
+            handle_context_parallelism(self._new_cp_args(device="cuda", **stage_args))
+
 
 class TestFlashinferA2ADispatchType(CustomTestCase):
     def setUp(self):
