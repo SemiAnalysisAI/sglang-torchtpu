@@ -242,7 +242,6 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             attn_cp_size=1,
             enable_prefill_cp=False,
             cp_strategy=None,
-            pp_size=1,
             moe_dp_size=1,
             tpu_compile_tracer="dynamo",
         )
@@ -476,6 +475,14 @@ class TestPrefillContextParallelValidation(TestTpuPlatformServerDefaults):
         with patch.dict(os.environ, {}, clear=False):
             self._apply(self._cp_args(moe_dp_size=8))
 
+    def test_accepts_pipeline_stages_made_of_the_cp_group(self):
+        with patch.dict(os.environ, {}, clear=False):
+            self._apply(
+                self._cp_args(
+                    pp_size=4, tp_size=2, attn_cp_size=2, pp_async_batch_depth=1
+                )
+            )
+
     def test_attn_cp_size_one_is_untouched(self):
         args = self._args(tp_size=8, attn_cp_size=1, enable_prefill_cp=False)
         self._apply(args)
@@ -489,7 +496,10 @@ class TestPrefillContextParallelValidation(TestTpuPlatformServerDefaults):
                 dict(attention_backend="pallas_tpu_rpa_batched"),
                 "requires --attention-backend pallas_tpu_rpa_v3",
             ),
-            (dict(pp_size=2), "does not support pipeline parallelism"),
+            (
+                dict(pp_size=2, tp_size=16, pp_async_batch_depth=1),
+                "tensor parallelism inside a pipeline stage",
+            ),
             (dict(speculative_algorithm="EAGLE3"), "speculative decoding"),
             (dict(enable_dp_attention=True, dp_size=8), "DP attention"),
             (dict(moe_dp_size=2), "requires --moe-dp-size 1"),
