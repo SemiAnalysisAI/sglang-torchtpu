@@ -300,3 +300,6 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+
+# Dataset for the five-question V3.1 diagnostic.
+!test/registered/tpu/nightly-accuracy/data/v31-aime25-truncated.jsonl
