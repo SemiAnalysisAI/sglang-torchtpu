@@ -113,6 +113,16 @@ def is_dsa_enable_prefill_cp():
     # DeepSeek Sparse Attention model.
     if get_parallel().attn_cp_size <= 1:
         return False
+    return _model_uses_dsa()
+
+
+@torch.compiler.assume_constant_result
+def _model_uses_dsa() -> bool:
+    """Whether the loaded model is a DeepSeek sparse-attention architecture.
+
+    A compiled forward evaluates this once at trace time: the answer is fixed
+    for the process, and the config view it reads is not traceable.
+    """
     from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
     hf_config = process_model_config().hf_config

@@ -743,6 +743,53 @@ class TestCompiledForwardShim(CustomTestCase):
         self.assertIs(fb.is_prefill_only, True)
 
 
+class TestContextParallelInputs(CustomTestCase):
+    """Under prefill context parallelism the compiled forward takes the rank's
+    zigzag rows; only the in-graph embedding sees the global ids."""
+
+    @staticmethod
+    def _batch():
+        fb = TestCompiledForwardShim._forward_batch(
+            input_ids=torch.zeros(48, dtype=torch.int64),
+            positions=torch.arange(48),
+            forward_mode=_ForwardModeMock("extend"),
+        )
+        fb._tpu_cp_layout = SimpleNamespace(
+            host=SimpleNamespace(cp_size=2, local_rows_padded=32),
+            local_rows=torch.arange(32),
+        )
+        return fb
+
+    @staticmethod
+    def _shim():
+        compiled = MagicMock(return_value="out")
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        shim._attn_cp_size = 2
+        return shim, compiled
+
+    def test_embeds_the_global_ids_and_keeps_the_rows(self):
+        shim, compiled = self._shim()
+        fb = self._batch()
+        shim(fb.input_ids, fb.positions, fb)
+        args, kwargs = compiled.call_args
+        self.assertEqual(args[0].shape[0], 64)  # global ids padded to cp x rows
+        self.assertEqual(kwargs["cp_local_rows"].shape[0], 32)
+        self.assertNotIn("input_embeds", kwargs)
+
+    def test_supplied_embeddings_skip_the_lookup(self):
+        """A caller that hands the forward its own embeddings has no lookup to
+        run: they are narrowed to the rank's rows and the graph takes local
+        ids, not the global ids plus the row selector."""
+        shim, compiled = self._shim()
+        fb = self._batch()
+        fb.input_embeds = torch.ones(48, 3)
+        shim(fb.input_ids, fb.positions, fb)
+        args, kwargs = compiled.call_args
+        self.assertEqual(args[0].shape[0], 32)
+        self.assertNotIn("cp_local_rows", kwargs)
+        self.assertEqual(kwargs["input_embeds"].shape, (32, 3))
+
+
 class TestBuildBucketers(CustomTestCase):
     """tpu_compile_bs is read off exec.graph, so the case publishes its config."""
 
