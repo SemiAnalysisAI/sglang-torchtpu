@@ -132,6 +132,12 @@ def _run_sgl_eval(eval_name, args) -> dict:
         "--out-dir",
         str(out_parent),
     ]
+    if eval_name == "aime25":
+        subset = (
+            Path(__file__).resolve().parents[3]
+            / "test/registered/tpu/nightly-accuracy/data/v31-aime25-truncated.jsonl"
+        )
+        cmd += ["--from-dataset", str(subset)]
     if model_preset_id:
         cmd += ["--load-preset-from-model-id", model_preset_id]
     if getattr(args, "model", None):

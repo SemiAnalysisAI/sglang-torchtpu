@@ -1,6 +1,6 @@
 """DeepSeek-V3.1 TP16/EP16 FP8-KV evaluation, no DP attention.
 
-One AIME25 pass with FP32 MoE scales, 32K output, and concurrency 30.
+Rerun the five truncated AIME25 questions with FP32 MoE scales and 64K output.
 """
 
 import os
@@ -44,14 +44,14 @@ MODEL_CONFIG = {
     "gates": [
         {
             "dataset": "aime25",
-            "label": "aime25_32k",
+            "label": "aime25_truncated_64k",
             "report_only": True,
             "thinking": True,
             "repeat": 1,
             "num_threads": 30,
             "temperature": 0.6,
             "top_p": 0.95,
-            "max_tokens": 32768,
+            "max_tokens": 65536,
         },
     ],
 }
