@@ -114,6 +114,7 @@ class TestNightlyAccuracyRecipes(unittest.TestCase):
                         (args["tp_size"], args["ep_size"], args["dp_size"]),
                         (16, 16, dp),
                     )
+                    self.assertEqual(plan.env["SGLANG_TPU_FP8_MOE_FP32_SCALES"], "1")
                     self.assertEqual(args["quantization"], "fp8")
                     self.assertEqual(args["kv_cache_dtype"], "fp8_e4m3")
                     self.assertEqual(args["reasoning_parser"], parser)

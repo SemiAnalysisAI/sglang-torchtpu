@@ -31,9 +31,10 @@ CONFIG["server_args"].update(
     }
 )
 
-# Preserve the shell recipes' long-run diagnostic settings.
+# DeepSeek accuracy settings and long-run diagnostics.
 CONFIG["runtime_env"].update(
     {
+        "SGLANG_TPU_FP8_MOE_FP32_SCALES": "1",
         "TPU_ENABLE_DIAGNOSTIC_COORDINATOR": "0",
         "TPU_DISABLE_DIAGNOSTIC_COORDINATOR": "1",
         "TPU_DIAGNOSTIC_HARVESTER_INTERVAL_SEC": "86400",
