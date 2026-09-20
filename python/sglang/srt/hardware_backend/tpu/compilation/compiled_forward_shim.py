@@ -111,18 +111,23 @@ def _matches_default(value: Any, default: Any) -> bool:
     return type(value) is type(default) and value == default
 
 
-def _fit_pp_proxy_rows(proxy: Any, input_ids: Any, forward_batch: Any) -> Any:
+def _fit_pp_proxy_rows(
+    proxy: Any, input_ids: Any, forward_batch: Any, rows: int | None = None
+) -> Any:
     """Bring a pipeline proxy to the padded batch's token axis.
 
     The ICI wave delivers the previous stage's activations at its fixed buffer
     size (the largest token bucket), so a longer proxy is trimmed to this
-    stage's padded token count; a shorter one means the two stages padded to
-    different buckets and is rejected.
+    stage's padded token count (``rows`` when given, else the input row
+    count); a shorter one means the two stages padded to different buckets
+    and is rejected.
     """
-    reference = input_ids if input_ids is not None else forward_batch.input_ids
-    if reference is None:
-        return proxy
-    expected = int(reference.shape[0])
+    if rows is None:
+        reference = input_ids if input_ids is not None else forward_batch.input_ids
+        if reference is None:
+            return proxy
+        rows = int(reference.shape[0])
+    expected = int(rows)
     tensors = {}
     trimmed = False
     for name, tensor in proxy.tensors.items():
@@ -142,7 +147,10 @@ def _fit_pp_proxy_rows(proxy: Any, input_ids: Any, forward_batch: Any) -> Any:
 
 
 def _fit_pp_proxy_in_args(
-    args: tuple[Any, ...], input_ids: Any, forward_batch: Any
+    args: tuple[Any, ...],
+    input_ids: Any,
+    forward_batch: Any,
+    rows: int | None = None,
 ) -> tuple[Any, ...]:
     """Trim a pipeline proxy that arrived as a positional argument.
 
@@ -154,7 +162,7 @@ def _fit_pp_proxy_in_args(
     """
     for index, value in enumerate(args):
         if isinstance(value, PPProxyTensors):
-            fitted = _fit_pp_proxy_rows(value, input_ids, forward_batch)
+            fitted = _fit_pp_proxy_rows(value, input_ids, forward_batch, rows=rows)
             if fitted is not value:
                 return args[:index] + (fitted,) + args[index + 1 :]
             break
@@ -845,6 +853,10 @@ class CompiledForwardShim:
             )
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds
+        # A context-parallel extend runs on the rank's padded local rows,
+        # which is also the row count the previous stage handed on.
+        cp_layout = get_tpu_cp_layout(forward_batch) if self._attn_cp_size > 1 else None
+        cp_rows = cp_layout.host.local_rows_padded if cp_layout is not None else None
         pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
         if pp_proxy_tensors is not None:
             if self._is_first_pp_stage():
@@ -852,11 +864,13 @@ class CompiledForwardShim:
                 kwargs.pop("pp_proxy_tensors")
             else:
                 kwargs["pp_proxy_tensors"] = _fit_pp_proxy_rows(
-                    pp_proxy_tensors, input_ids, forward_batch
+                    pp_proxy_tensors, input_ids, forward_batch, rows=cp_rows
                 )
         elif any(isinstance(value, PPProxyTensors) for value in args):
             if not self._is_first_pp_stage():
-                args = _fit_pp_proxy_in_args(args, input_ids, forward_batch)
+                args = _fit_pp_proxy_in_args(
+                    args, input_ids, forward_batch, rows=cp_rows
+                )
         # Pin is_prefill_only for the compiled forward. An idle batch computes
         # it as True (all() over zero requests) while real batches are False;
         # the compiled forward reads the value, so it must be identical across
@@ -897,7 +911,6 @@ class CompiledForwardShim:
         saved.update(_pin_fields(forward_batch, _PINNED_LOGPROB_FIELDS))
         live_extend_seq_lens_cpu = None
         if self._attn_cp_size > 1:
-            cp_layout = get_tpu_cp_layout(forward_batch)
             # The graph tests every extend length against 2 * cp_size to pick
             # the context-parallel or the plain program; one constant per
             # program family keeps that test off the live lengths. The live
@@ -929,9 +942,10 @@ class CompiledForwardShim:
                     )
                 else:
                     args = _cp_localize_embeds_in_args(args, cp_layout)
-                if supplied_embeds:
-                    # A caller that supplies embeddings has no lookup to run;
-                    # the ids only size the local rows.
+                if supplied_embeds or not self.policy._embeds_input_tokens():
+                    # Later stages take their activations from the proxy, and a
+                    # caller that supplies embeddings has no lookup to run; the
+                    # ids only size the local rows.
                     input_ids = local_ids
                 else:
                     # The embedding takes the global ids and keeps the rank's rows.
