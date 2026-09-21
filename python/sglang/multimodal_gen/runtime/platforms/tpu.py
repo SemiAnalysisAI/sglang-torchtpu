@@ -116,13 +116,10 @@ def _install_qwen_vl_host_rope_dispatch() -> None:
     global _qwen_vl_rope_installed
     if _qwen_vl_rope_installed:
         return
-    from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
-        MiniMaxH3Qwen3VLTextModel,
-    )
     from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl import Qwen2_5_VLModel
     from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLModel
 
-    for cls in (Qwen2_5_VLModel, Qwen3VLModel, MiniMaxH3Qwen3VLTextModel):
+    for cls in (Qwen2_5_VLModel, Qwen3VLModel):
         cls.get_rope_index = dispatch_rope_index_to_host_on_tpu(cls.get_rope_index)
     _qwen_vl_rope_installed = True
 
