@@ -8,7 +8,7 @@ from sglang.test.tpu import model_config_main
 from sglang.test.tpu.mmmu_full import run_shard
 
 register_tpu_ci(
-    est_time=18000,
+    est_time=14400,
     suite="nightly-tpu-multihost-accuracy",
     nightly=True,
     labels=["multihost", "kimi-k2.6", "accuracy"],
@@ -17,7 +17,7 @@ MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/configs/kimi_k26_mmmu.py",
     "weights_pvc": "model-weights-rox",
-    "timeout_per_file": 18000,
+    "timeout_per_file": 14400,
 }
 MODEL_CONFIG = {
     "id": "accuracy-kimi-k26-mmmu-shard0",

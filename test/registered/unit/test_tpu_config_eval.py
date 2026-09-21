@@ -237,6 +237,29 @@ class TestNightlyAccuracyRecipes(unittest.TestCase):
         self.assertEqual(module.select_nightly(runs, cutoff)["databaseId"], 2)
         self.assertIsNone(module.select_nightly(runs[:1], cutoff))
 
+    def test_full_evaluations_fit_hosted_runner_with_admission_time(self):
+        groups = json.loads(
+            subprocess.check_output(
+                [
+                    sys.executable,
+                    str(ROOT / ".github/tpu-ci/discover_multihost.py"),
+                    "--suite",
+                    "nightly-tpu-multihost-accuracy",
+                    "--root",
+                    str(ROOT / "test/registered"),
+                ],
+                text=True,
+            )
+        )
+        self.assertTrue(groups)
+        for group in groups:
+            with self.subTest(name=group["name"]):
+                runtime = (
+                    3600 + len(group["files"].split()) * group["timeout_per_file"] + 600
+                )
+                admission = 21600 - runtime - 900 - 600
+                self.assertGreaterEqual(admission, 900)
+
     def test_gpt_oss_keeps_checkpoint_quantization_and_bf16_kv(self):
         config = load_recipe("recipe/configs/gpt_oss_20b_accuracy.py")
         plan = plan_launch(config, {})
