@@ -108,8 +108,59 @@ class TestVmemFp8Preparation(CustomTestCase):
         torch.testing.assert_close(layer.w13_weight_packed, packed, rtol=0, atol=0)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestScaleStorage(CustomTestCase):
+    def _layer(self):
+        torch.manual_seed(2)
+        q = torch.randint(-8, 8, (2, 64, 16))
+        scales = (torch.rand(2, 2, 16) * 0.1).bfloat16()
+        packed = _pack_offset_binary(q)
+        layer = _FakeMoELayer(
+            packed.clone(), scales.clone(), packed.clone(), scales.clone()
+        )
+        return layer, scales
+
+    def test_default_stores_f32_scales(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.hardware_backend.tpu.w4a16_moe import (
+            prepare_tpu_w4a16_moe_weights,
+        )
+
+        layer, scales = self._layer()
+        with envs.SGLANG_TPU_INT4_MOE_FP32_SCALES.override(True):
+            prepare_tpu_w4a16_moe_weights(layer, 32)
+        self.assertEqual(layer.w13_weight_scale.dtype, torch.float32)
+        torch.testing.assert_close(
+            layer.w2_weight_scale, scales.float().unsqueeze(2), rtol=0, atol=0
+        )
+
+    def test_opt_out_keeps_bf16_scales(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.hardware_backend.tpu.w4a16_moe import (
+            prepare_tpu_w4a16_moe_weights,
+        )
+
+        layer, scales = self._layer()
+        with envs.SGLANG_TPU_INT4_MOE_FP32_SCALES.override(False):
+            prepare_tpu_w4a16_moe_weights(layer, 32)
+        self.assertEqual(layer.w13_weight_scale.dtype, torch.bfloat16)
+        self.assertEqual(tuple(layer.w13_weight_scale.shape), (2, 2, 1, 16))
+        torch.testing.assert_close(
+            layer.w2_weight_scale, scales.unsqueeze(2), rtol=0, atol=0
+        )
+
+    def test_vmem_fp8_ignores_the_opt_out(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.hardware_backend.tpu.w4a16_moe import (
+            prepare_tpu_w4a16_moe_weights,
+        )
+
+        layer, _ = self._layer()
+        with (
+            envs.SGLANG_TPU_INT4_MOE_FP32_SCALES.override(False),
+            envs.SGLANG_TPU_INT4_MOE_MODE.override("vmem-fp8"),
+        ):
+            prepare_tpu_w4a16_moe_weights(layer, 32)
+        self.assertEqual(layer.w13_weight_scale.dtype, torch.float32)
 
 
 class TestResolveInt4MoeMode(CustomTestCase):
@@ -138,3 +189,7 @@ class TestResolveInt4MoeMode(CustomTestCase):
         with envs.SGLANG_TPU_INT4_MOE_MODE.override("w4a8"):
             with self.assertRaisesRegex(ValueError, "Unsupported TPU INT4 MoE mode"):
                 resolve_int4_moe_mode()
+
+
+if __name__ == "__main__":
+    unittest.main()

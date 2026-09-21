@@ -9,7 +9,8 @@ with ``w_quant_bits=4``. Checkpoint layout (group strategy, symmetric):
 
 ``pltpu.bitcast(..., int4)`` reads nibbles as two's complement, so each nibble's
 top bit is flipped once at load ((q+8) ^ 0x8 == int4(q)); the words then go to
-gmm_v2 as-is. Scales are stored f32 in the kernel's ``[E, blocks, 1, out]`` layout.
+gmm_v2 as-is. Scales are stored in the kernel's ``[E, blocks, 1, out]`` layout,
+f32 by default (``SGLANG_TPU_INT4_MOE_FP32_SCALES``).
 """
 
 from __future__ import annotations
@@ -87,18 +88,27 @@ def prepare_tpu_w4a16_moe_weights(layer: torch.nn.Module, group_size: int) -> No
 
     Keeps the packed int32 weights exactly as loaded (their [E, K//8, N]
     orientation is already gmm_v2's (g, k, n) convention) and converts the
-    group scales to the kernel's [E, num_blocks, 1, out] fp32 layout, in f32.
+    group scales to the kernel's [E, num_blocks, 1, out] layout, f32 unless
+    SGLANG_TPU_INT4_MOE_FP32_SCALES=0.
     """
     if getattr(layer, "is_tpu_w4a16_converted", False):
         return
 
+    from sglang.srt.environ import envs
     from sglang.srt.layers.moe.tpu_moe_utils import (
         INT4_MOE_MODE_VMEM_FP8,
         resolve_int4_moe_mode,
     )
 
-    if resolve_int4_moe_mode() == INT4_MOE_MODE_VMEM_FP8:
+    mode = resolve_int4_moe_mode()
+    if mode == INT4_MOE_MODE_VMEM_FP8:
         prepare_tpu_vmem_fp8_scales(layer, group_size)
+    # vmem-fp8 normalizes the scales to f32 and the kernel requires them so.
+    scale_dtype = (
+        torch.float32
+        if envs.SGLANG_TPU_INT4_MOE_FP32_SCALES.get() or mode == INT4_MOE_MODE_VMEM_FP8
+        else torch.bfloat16
+    )
 
     # Offset-binary -> two's complement nibbles for pltpu's signed int4
     # unpack: flip each nibble's top bit ((q+8) ^ 0x8 == int4(q)).
@@ -122,9 +132,9 @@ def prepare_tpu_w4a16_moe_weights(layer: torch.nn.Module, group_size: int) -> No
         old_scale = getattr(layer, scale_name).data
         packed = getattr(layer, packed_name).data
         num_blocks = old_scale.shape[1]
-        # [E, num_blocks, out] -> [E, num_blocks, 1, out] in f32: gmm_v2 casts
-        # scales to f32 every step, so store them that way once.
-        new_scale = _own_storage(old_scale.unsqueeze(2).contiguous().to(torch.float32))
+        # [E, num_blocks, out] -> [E, num_blocks, 1, out]; f32 by default so
+        # gmm_v2 does not re-cast the scales every step.
+        new_scale = _own_storage(old_scale.unsqueeze(2).contiguous().to(scale_dtype))
         assert packed.shape[1] * 8 == num_blocks * group_size, (
             f"{packed_name} packed K {packed.shape[1]}*8 inconsistent with "
             f"{scale_name} blocks {num_blocks}*group_size {group_size}"
