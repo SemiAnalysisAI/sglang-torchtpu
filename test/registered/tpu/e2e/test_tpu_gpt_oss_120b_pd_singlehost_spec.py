@@ -45,7 +45,6 @@ DRAFT_MODEL_ENV = "GPT_OSS_DRAFT_MODEL"
 
 PREFILL_ROLE = "prefill"
 DECODE_ROLE = "decode"
-ROLE_ENV = "CI_PD_ROLE"
 SELF_HOST_ENV = "PD_SELF_HOST"
 DECODE_HOST_ENV = "PD_DECODE_HOST"
 
@@ -58,8 +57,6 @@ EP_SIZE = CHIPLETS_PER_HOST
 # The roles live in different pods, so their HTTP and Raiden ports may match.
 PREFILL_PORT = int(E("PREFILL_PORT", "30000"))
 DECODE_PORT = int(E("DECODE_PORT", "30000"))
-BOOTSTRAP_PORT = int(E("BOOTSTRAP_PORT", "8998"))
-RAIDEN_KV_PORT = int(E("SGLANG_RAIDEN_KV_PORT", "31000"))
 LOCAL_HOST = "127.0.0.1"
 
 WAIT_SECS = int(E("WAIT_SECS", "5400"))
@@ -73,17 +70,9 @@ RUN_NAME = "pd-sh-gpt-120b-spec"
 PREFILL_LOG = "/tmp/pd_spec_prefill.log"
 DECODE_LOG = "/tmp/pd_spec_decode.log"
 
-PAGE_SIZE = 64
-MEM_FRACTION_STATIC = "0.6"
-KV_CACHE_DTYPE = "bfloat16"
-MAX_TOTAL_TOKENS = 8192
-MAX_RUNNING_REQUESTS = 16
 DISAGG_TRANSFER_BACKEND = "raiden"
 RETRACTION_BACKUP = "cpu_tensor"
 
-SPEC_NUM_STEPS = 3
-SPEC_EAGLE_TOPK = 1
-SPEC_NUM_DRAFT_TOKENS = 4
 SPEC_ACCEPT_LENGTH_THRESHOLD = float(E("SPEC_ACCEPT_LENGTH_THRESHOLD", "1.90"))
 
 # The non-P/D GPT-OSS EAGLE3 gate measured 0.785 over 200 examples. Keep the
@@ -120,138 +109,12 @@ def validate_model_source(model_path: str, *, label: str) -> None:
         )
 
 
-def resolve_role(env: Mapping[str, str] | None = None) -> str:
-    values = os.environ if env is None else env
-    role = values.get(ROLE_ENV, "")
-    if role not in (PREFILL_ROLE, DECODE_ROLE):
-        raise ValueError(
-            f"{ROLE_ENV} must be {PREFILL_ROLE!r} or {DECODE_ROLE!r}, got {role!r}"
-        )
-    return role
-
-
 def self_hostname(env: Mapping[str, str] | None = None) -> str:
     values = os.environ if env is None else env
     if values.get(SELF_HOST_ENV):
         return values[SELF_HOST_ENV]
     hostnames = [h for h in values.get("TPU_WORKER_HOSTNAMES", "").split(",") if h]
     return hostnames[0] if hostnames else socket.gethostname()
-
-
-def _spec_server_args(draft_model: str) -> list[str]:
-    args = [
-        "--speculative-algorithm",
-        "EAGLE3",
-        "--speculative-draft-model-path",
-        draft_model,
-        "--speculative-num-steps",
-        str(SPEC_NUM_STEPS),
-        "--speculative-eagle-topk",
-        str(SPEC_EAGLE_TOPK),
-        "--speculative-num-draft-tokens",
-        str(SPEC_NUM_DRAFT_TOKENS),
-    ]
-    if draft_model.startswith("gs://"):
-        args += ["--speculative-draft-load-format", "runai_streamer"]
-    return args
-
-
-def _shared_server_args(values: Mapping[str, str]) -> list[str]:
-    model = resolve_model_path(values)
-    args = [
-        "--served-model-name",
-        SERVED_MODEL_NAME,
-        "--reasoning-parser",
-        "gpt-oss",
-        "--disaggregation-transfer-backend",
-        DISAGG_TRANSFER_BACKEND,
-        "--max-total-tokens",
-        str(MAX_TOTAL_TOKENS),
-        "--max-running-requests",
-        str(MAX_RUNNING_REQUESTS),
-        "--skip-server-warmup",
-        "--sampling-backend",
-        "pytorch",
-        "--watchdog-timeout",
-        "7200",
-        *_spec_server_args(resolve_draft_model_path(values)),
-    ]
-    if model.startswith("gs://"):
-        args += ["--load-format", "runai_streamer"]
-    return args
-
-
-def _common_launch_env(
-    env: Mapping[str, str] | None = None,
-) -> dict[str, str]:
-    values = os.environ if env is None else env
-    return {
-        "MODEL": resolve_model_path(values),
-        "DRAFT_MODEL": resolve_draft_model_path(values),
-        "TP_SIZE": str(TP_SIZE),
-        "EP_SIZE": str(EP_SIZE),
-        # Each role is an independent single-host engine even though both pods
-        # belong to one P/D JobSet.
-        "FORCE_SINGLE_HOST": "1",
-        "SGLANG_USE_RAY": "0",
-        "PAGE_SIZE": str(PAGE_SIZE),
-        "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
-        # GPT-OSS carries checkpoint-provided MXFP4 weights.
-        "QUANTIZATION": "",
-        "KV_CACHE_DTYPE": KV_CACHE_DTYPE,
-        "DISABLE_RADIX_CACHE": "1",
-        "ENABLE_TORCH_COMPILE": values.get("ENABLE_TORCH_COMPILE", "1"),
-        "CONTEXT_LEN": values.get("CONTEXT_LEN", "8192"),
-        "CHUNKED_PREFILL_SIZE": values.get("CHUNKED_PREFILL_SIZE", "4096"),
-        "MAX_PREFILL_TOKENS": values.get("MAX_PREFILL_TOKENS", "4096"),
-        "MAX_RUNNING": values.get("MAX_RUNNING", str(MAX_RUNNING_REQUESTS)),
-        "TORCH_COMPILE_MAX_BS": values.get(
-            "TORCH_COMPILE_MAX_BS", str(MAX_RUNNING_REQUESTS)
-        ),
-        # Match the established one-host GPT-OSS EAGLE3 GSM8K grid.
-        "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1 2 4 16"),
-        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "512 2048 4096"),
-        "MEM_FRACTION_STATIC": values.get("MEM_FRACTION_STATIC", MEM_FRACTION_STATIC),
-        "SGLANG_RAIDEN_KV_PORT": str(RAIDEN_KV_PORT),
-        "SGLANG_RAIDEN_RESHARD": "0",
-        "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
-        "ENABLE_PROFILER_ENDPOINT": "0",
-        "PYTHON": PYTHON,
-    }
-
-
-def build_prefill_env(
-    env: Mapping[str, str] | None = None,
-) -> dict[str, str]:
-    values = os.environ if env is None else env
-    extra_args = _shared_server_args(values)
-    if values.get("EXTRA_PREFILL_ARGS"):
-        extra_args.append(values["EXTRA_PREFILL_ARGS"])
-    return {
-        **_common_launch_env(values),
-        "PORT": str(PREFILL_PORT),
-        "BOOTSTRAP_PORT": str(BOOTSTRAP_PORT),
-        "EXTRA_ARGS": " ".join(extra_args).strip(),
-    }
-
-
-def build_decode_env(
-    env: Mapping[str, str] | None = None,
-) -> dict[str, str]:
-    values = os.environ if env is None else env
-    extra_args = _shared_server_args(values) + [
-        # Keep this gate focused on P/D + spec. A host-pool backup would also
-        # pull in HiCache layout and draft-pool behavior, which has its own test.
-        "--disaggregation-decode-retraction-backup",
-        RETRACTION_BACKUP,
-    ]
-    if values.get("EXTRA_DECODE_ARGS"):
-        extra_args.append(values["EXTRA_DECODE_ARGS"])
-    return {
-        **_common_launch_env(values),
-        "PORT": str(DECODE_PORT),
-        "EXTRA_ARGS": " ".join(extra_args).strip(),
-    }
 
 
 def _get_json(url: str, timeout: int = 30) -> Any:
@@ -398,57 +261,74 @@ def render_jobset_yaml(
 class TestPdSingleHostSpecGptOss120bConfiguration(unittest.TestCase):
     """Launch-contract tests that do not initialize TPU hardware."""
 
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.plans = {}
+        for role in (PREFILL_ROLE, DECODE_ROLE):
+            output = subprocess.check_output(
+                [
+                    sys.executable,
+                    "-m",
+                    "benchmark.tpu.launch_server",
+                    "--config",
+                    LAUNCH_CONFIG_MODULE + ":" + role.upper() + "_CONFIG",
+                    "--runtime-envs",
+                    json.dumps(
+                        {"FORCE_SINGLE_HOST": "1", "SGLANG_HOST_IP": "127.0.0.1"}
+                    ),
+                    "--dry-run",
+                ],
+                cwd=REPO,
+                text=True,
+            )
+            cls.plans[role] = json.loads(output)
+
     def test_each_engine_owns_one_full_host_without_ray(self) -> None:
-        for env in (build_prefill_env(env={}), build_decode_env(env={})):
-            self.assertEqual(env["TP_SIZE"], str(CHIPLETS_PER_HOST))
-            self.assertEqual(env["EP_SIZE"], str(CHIPLETS_PER_HOST))
-            self.assertEqual(env["FORCE_SINGLE_HOST"], "1")
-            self.assertEqual(env["SGLANG_USE_RAY"], "0")
+        for plan in self.plans.values():
+            self.assertEqual(plan["server_args"]["tp_size"], CHIPLETS_PER_HOST)
+            self.assertEqual(plan["server_args"]["ep_size"], CHIPLETS_PER_HOST)
+            self.assertEqual(plan["server_args"]["nnodes"], 1)
+            self.assertFalse(plan["server_args"].get("use_ray", False))
             for name in (
                 "TPU_VISIBLE_DEVICES",
                 "TPU_VISIBLE_CHIPS",
                 "TPU_CHIPS_PER_HOST_BOUNDS",
                 "TPU_HOST_BOUNDS",
             ):
-                self.assertNotIn(name, env)
+                self.assertNotIn(name, plan["runtime_env_keys"])
 
     def test_both_engines_enable_the_same_eagle3_and_raiden_config(self) -> None:
-        for env in (build_prefill_env(env={}), build_decode_env(env={})):
-            args = env["EXTRA_ARGS"]
-            self.assertIn("--disaggregation-transfer-backend raiden", args)
-            self.assertIn("--speculative-algorithm EAGLE3", args)
-            self.assertIn(
-                f"--speculative-draft-model-path {DEFAULT_DRAFT_MODEL_PATH}", args
+        for plan in self.plans.values():
+            args = plan["server_args"]
+            self.assertEqual(args["disaggregation_transfer_backend"], "raiden")
+            self.assertEqual(args["speculative_algorithm"], "EAGLE3")
+            self.assertEqual(
+                args["speculative_draft_model_path"], resolve_draft_model_path()
             )
-            self.assertIn("--speculative-num-steps 3", args)
-            self.assertIn("--speculative-eagle-topk 1", args)
-            self.assertIn("--speculative-num-draft-tokens 4", args)
+            self.assertEqual(args["speculative_num_steps"], 3)
+            self.assertEqual(args["speculative_eagle_topk"], 1)
+            self.assertEqual(args["speculative_num_draft_tokens"], 4)
 
     def test_decode_uses_cpu_retraction_without_hicache_layout(self) -> None:
-        prefill_args = build_prefill_env(env={})["EXTRA_ARGS"]
-        decode_args = build_decode_env(env={})["EXTRA_ARGS"]
-        self.assertNotIn("disaggregation-decode-retraction-backup", prefill_args)
-        self.assertIn(
-            "--disaggregation-decode-retraction-backup cpu_tensor", decode_args
+        prefill_args = self.plans[PREFILL_ROLE]["server_args"]
+        decode_args = self.plans[DECODE_ROLE]["server_args"]
+        self.assertNotIn("disaggregation_decode_retraction_backup", prefill_args)
+        self.assertEqual(
+            decode_args["disaggregation_decode_retraction_backup"], "cpu_tensor"
         )
         for args in (prefill_args, decode_args):
-            self.assertNotIn("hicache", args)
-            self.assertNotIn("page_first", args)
+            self.assertFalse(any(name.startswith("hicache") for name in args))
 
-    def test_peer_hostname_and_role_resolution(self) -> None:
+    def test_peer_hostname_resolution(self) -> None:
         prefill = "tpu-ci-pd-sh-gpt-120b-spec-prefill-0-0"
         self.assertEqual(
             peer_hostname(prefill, from_role=PREFILL_ROLE, to_role=DECODE_ROLE),
             "tpu-ci-pd-sh-gpt-120b-spec-decode-0-0",
         )
-        self.assertEqual(resolve_role({ROLE_ENV: PREFILL_ROLE}), PREFILL_ROLE)
-        self.assertEqual(resolve_role({ROLE_ENV: DECODE_ROLE}), DECODE_ROLE)
         self.assertEqual(
             self_hostname({SELF_HOST_ENV: "retained-prefill.example"}),
             "retained-prefill.example",
         )
-        with self.assertRaisesRegex(ValueError, ROLE_ENV):
-            resolve_role({})
 
     def test_gsm8k_uses_chat_api_and_spec_acceptance_threshold(self) -> None:
         gsm8k_gate = build_model_config()["gates"][0]

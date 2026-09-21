@@ -47,13 +47,6 @@ _COMMON_CONFIG = {
     },
     "runtime_envs": {
         **_FP8_BASE_CONFIG["runtime_env"],
-        "HF_HUB_OFFLINE": "0",
-        "TRANSFORMERS_OFFLINE": "0",
-        "TORCH_LOGS": "+recompiles",
-        "TPU_ENABLE_DIAGNOSTIC_COORDINATOR": "0",
-        "TPU_DISABLE_DIAGNOSTIC_COORDINATOR": "1",
-        "TPU_DIAGNOSTIC_HARVESTER_INTERVAL_SEC": "86400",
-        "SGLANG_TPU_PRELOAD_TELEMETRY_STUB": "1",
         # GPT-OSS does not support the SparseCore MoE gather path.
         "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
         "SGLANG_RAIDEN_KV_PORT": os.environ.get("SGLANG_RAIDEN_KV_PORT", "31000"),

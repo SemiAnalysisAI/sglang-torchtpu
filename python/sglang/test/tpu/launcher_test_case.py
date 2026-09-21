@@ -85,6 +85,11 @@ class TPULauncherTestCase(unittest.TestCase):
             tag=cls.tag,
         )
         launcher.start()
+        if not cls.keep_up:
+            # unittest skips tearDownClass when any subclass's setUpClass fails.
+            # Class cleanups still run, including for the decode-only fixture.
+            # atexit would wait for the runner to exit, not for a child to crash.
+            cls.addClassCleanup(cls._stop_launcher)
         return launcher
 
     @classmethod

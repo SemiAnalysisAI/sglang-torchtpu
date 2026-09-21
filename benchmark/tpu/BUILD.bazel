@@ -1,9 +1,17 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
-load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 
 package(default_visibility = ["//visibility:public"])
 
 exports_files(["launch_server.py"])
+
+py_test(
+    name = "test_launch_server",
+    size = "small",
+    srcs = ["test_launch_server.py"],
+    python_version = "3.12",
+    deps = [":launcher"],
+)
 
 # Bazel supplies the telemetry workaround as a hermetically built dependency.
 cc_binary(

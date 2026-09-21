@@ -61,8 +61,6 @@ EP_SIZE = TP_SIZE
 # Separate pods may reuse the same service and Raiden ports.
 PREFILL_PORT = int(E("PREFILL_PORT", "30000"))
 DECODE_PORT = int(E("DECODE_PORT", "30000"))
-BOOTSTRAP_PORT = int(E("BOOTSTRAP_PORT", "8998"))
-RAIDEN_KV_PORT = int(E("SGLANG_RAIDEN_KV_PORT", "31000"))
 LOCAL_HOST = "127.0.0.1"
 
 PYTHON = E("PYTHON", "python3")
@@ -78,23 +76,7 @@ PREFILL_LOG = "/tmp/pd_decode_radix_prefill.log"
 DECODE_LOG = "/tmp/pd_decode_radix_decode.log"
 
 PAGE_SIZE = 64
-MEM_FRACTION_STATIC = "0.35"
-# Use checkpoint-provided MXFP4 weights and FP8 KV cache.
-QUANTIZATION = ""
-KV_CACHE_DTYPE = "fp8_e4m3"
-# One host has half the HBM of the two-host P/D configuration.
-MAX_TOTAL_TOKENS = 393216
 DISAGG_TRANSFER_BACKEND = "raiden"
-# Raiden handles both P/D KV transfer and decode host-pool I/O.
-HICACHE_IO_BACKEND = "raiden"
-EXTRA_SERVER_ARGS: tuple[str, ...] = ("--reasoning-parser", "gpt-oss")
-# GPT-OSS does not support the SparseCore fused-MoE gather path.
-EXTRA_LAUNCH_ENV: dict[str, str] = {"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"}
-
-DECODE_RADIX_ARG = "--disaggregation-decode-enable-radix-cache"
-# Enables unified radix tree generation in kv_cache_builder,
-# required for decode-side radix caching on hybrid sliding-window models.
-DECODE_RADIX_ENV: dict[str, str] = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
 
 # Unique filler ensures turn 1 is cold (~1900 tokens);
 # exceeds the 128-token sliding window to verify reuse beyond SWA eviction.
@@ -144,80 +126,6 @@ def self_hostname(env: Mapping[str, str] | None = None) -> str:
         return values[SELF_HOST_ENV]
     hostnames = [h for h in values.get("TPU_WORKER_HOSTNAMES", "").split(",") if h]
     return hostnames[0] if hostnames else socket.gethostname()
-
-
-def _common_launch_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
-    values = os.environ if env is None else env
-    return {
-        "MODEL": resolve_model_path(values),
-        "TP_SIZE": str(TP_SIZE),
-        "EP_SIZE": str(EP_SIZE),
-        "PAGE_SIZE": str(PAGE_SIZE),
-        # Raiden requires the fused KV pool provided by RPA v3.
-        "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
-        "QUANTIZATION": QUANTIZATION,
-        "KV_CACHE_DTYPE": KV_CACHE_DTYPE,
-        "DISABLE_RADIX_CACHE": "0",
-        "ENABLE_TORCH_COMPILE": values.get("ENABLE_TORCH_COMPILE", "1"),
-        "MEM_FRACTION_STATIC": values.get("MEM_FRACTION_STATIC", MEM_FRACTION_STATIC),
-        "SGLANG_RAIDEN_KV_PORT": str(RAIDEN_KV_PORT),
-        "PYTHON": PYTHON,
-        **EXTRA_LAUNCH_ENV,
-    }
-
-
-def _shared_server_args() -> list[str]:
-    # EXTRA_ARGS overrides the launchers' default TPU transfer backend.
-    return [
-        "--served-model-name",
-        SERVED_MODEL_NAME,
-        *EXTRA_SERVER_ARGS,
-        "--disaggregation-transfer-backend",
-        DISAGG_TRANSFER_BACKEND,
-        "--max-total-tokens",
-        str(MAX_TOTAL_TOKENS),
-        "--skip-server-warmup",
-        "--sampling-backend",
-        "pytorch",
-    ]
-
-
-def build_prefill_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Construct the environment for the prefill engine."""
-    values = os.environ if env is None else env
-    extra_args = _shared_server_args()
-    if values.get("EXTRA_PREFILL_ARGS"):
-        extra_args.append(values["EXTRA_PREFILL_ARGS"])
-    return {
-        **_common_launch_env(values),
-        "PORT": str(PREFILL_PORT),
-        "BOOTSTRAP_PORT": str(BOOTSTRAP_PORT),
-        "EXTRA_ARGS": " ".join(extra_args).strip(),
-    }
-
-
-def _decode_host_pool_args() -> list[str]:
-    """Make the decode retraction host pool buildable on a fused TPU KV pool."""
-    return [
-        "--hicache-mem-layout",
-        "page_first_fused",
-        "--hicache-io-backend",
-        HICACHE_IO_BACKEND,
-    ]
-
-
-def build_decode_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Construct the environment for the decode engine, radix cache on."""
-    values = os.environ if env is None else env
-    extra_args = _shared_server_args() + _decode_host_pool_args() + [DECODE_RADIX_ARG]
-    if values.get("EXTRA_DECODE_ARGS"):
-        extra_args.append(values["EXTRA_DECODE_ARGS"])
-    return {
-        **_common_launch_env(values),
-        **DECODE_RADIX_ENV,
-        "PORT": str(DECODE_PORT),
-        "EXTRA_ARGS": " ".join(extra_args).strip(),
-    }
 
 
 def _get_json(url: str, timeout: int = 30) -> dict[str, Any]:
@@ -545,6 +453,28 @@ def _record(
 class TestPdSingleHostDecodeRadixGptOss120bConfiguration(unittest.TestCase):
     """Host-side gate tests, runnable without TPU hardware."""
 
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.plans = {}
+        for role in (PREFILL_ROLE, DECODE_ROLE):
+            output = subprocess.check_output(
+                [
+                    sys.executable,
+                    "-m",
+                    "benchmark.tpu.launch_server",
+                    "--config",
+                    LAUNCH_CONFIG_MODULE + ":" + role.upper() + "_CONFIG",
+                    "--runtime-envs",
+                    json.dumps(
+                        {"FORCE_SINGLE_HOST": "1", "SGLANG_HOST_IP": "127.0.0.1"}
+                    ),
+                    "--dry-run",
+                ],
+                cwd=REPO,
+                text=True,
+            )
+            cls.plans[role] = json.loads(output)
+
     # A 1900-token turn-1 prompt, as the probe's filler tokenizes to.
     T1_PROMPT = 1900
 
@@ -567,12 +497,17 @@ class TestPdSingleHostDecodeRadixGptOss120bConfiguration(unittest.TestCase):
         )
 
     def test_decode_enables_the_radix_cache_and_prefill_does_not(self) -> None:
-        decode = build_decode_env(env={})
-        self.assertIn(DECODE_RADIX_ARG, decode["EXTRA_ARGS"].split())
-        for key, value in DECODE_RADIX_ENV.items():
-            self.assertEqual(decode.get(key), value)
-        prefill = build_prefill_env(env={})
-        self.assertNotIn(DECODE_RADIX_ARG, prefill["EXTRA_ARGS"].split())
+        decode = self.plans[DECODE_ROLE]
+        self.assertTrue(
+            decode["server_args"]["disaggregation_decode_enable_radix_cache"]
+        )
+        self.assertIn("SGLANG_ENABLE_UNIFIED_RADIX_TREE", decode["runtime_env_keys"])
+        prefill = self.plans[PREFILL_ROLE]
+        self.assertFalse(
+            prefill["server_args"].get(
+                "disaggregation_decode_enable_radix_cache", False
+            )
+        )
 
     def test_configuration_gate_requires_decode_radix_mode(self) -> None:
         prefill = {

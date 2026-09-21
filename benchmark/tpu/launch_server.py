@@ -32,17 +32,14 @@ from typing import Any
 from benchmark.tpu.recipe.configs.config_eval import server_args_to_cli
 
 TPU_ROOT = Path(__file__).absolute().parent
-SLICE_ENV = (
+# Clear cross-host rendezvous when each P/D engine owns a separate host. Keep
+# hardware metadata (notably TPU_TOPOLOGY) available to libtpu and diagnostics.
+MULTIHOST_ENV = (
     "TPU_WORKER_ID",
     "TPU_WORKER_HOSTNAMES",
     "TPU_PROCESS_ADDRESSES",
-    "TPU_TOPOLOGY",
-    "TPU_TOPOLOGY_WRAP",
-    "TPU_TOPOLOGY_ALT",
-    "TPU_HOST_BOUNDS",
-    "TPU_ACCELERATOR_TYPE",
-    "TPU_VISIBLE_CHIPS",
-    "TPU_CHIPS_PER_HOST_BOUNDS",
+    "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+    "TORCH_TPU_TOPOLOGY",
 )
 
 
@@ -121,7 +118,7 @@ def resolve_server(config: LaunchConfig, inherited, *, single_host=False):
     env = child_env(inherited, config.runtime_envs)
     if single_host or env.get("FORCE_SINGLE_HOST") == "1":
         for key in list(env):
-            if key in SLICE_ENV or key.startswith("MEGASCALE"):
+            if key in MULTIHOST_ENV or key.startswith("MEGASCALE"):
                 env.pop(key)
         settings["nnodes"] = 1
         settings.pop("node_rank", None)
@@ -129,14 +126,17 @@ def resolve_server(config: LaunchConfig, inherited, *, single_host=False):
         settings.pop("use_ray", None)
         env.pop("SGLANG_USE_RAY", None)
         # Keep an explicitly configured single-chip recipe usable in a slice.
-        if settings.get("tp_size", 1) == 1:
-            for key in (
-                "TPU_VISIBLE_CHIPS",
-                "TPU_CHIPS_PER_HOST_BOUNDS",
-                "TPU_HOST_BOUNDS",
+        for key in (
+            "TPU_VISIBLE_CHIPS",
+            "TPU_CHIPS_PER_HOST_BOUNDS",
+            "TPU_HOST_BOUNDS",
+        ):
+            env.pop(key, None)
+            if (
+                settings.get("tp_size", 1) == 1
+                and config.runtime_envs.get(key) is not None
             ):
-                if config.runtime_envs.get(key) is not None:
-                    env[key] = config.runtime_envs[key]
+                env[key] = config.runtime_envs[key]
     elif env.get("SGLANG_USE_RAY") == "1" or settings.get("use_ray"):
         settings["use_ray"] = True
         settings.pop("node_rank", None)
@@ -166,6 +166,31 @@ def resolve_server(config: LaunchConfig, inherited, *, single_host=False):
     for name, flag in (("MODEL", "model_path"), ("HOST", "host"), ("PORT", "port")):
         if env.get(name):
             settings[flag] = int(env[name]) if flag == "port" else env[name]
+    if (
+        settings.get("enable_torch_compile")
+        and env.get("ENABLE_COMPILE_CACHE", "1") == "1"
+    ):
+        # Match the shell launcher's per-model cache defaults after MODEL is
+        # resolved. Explicit runtime_envs nulls must still remove a variable.
+        model_slug = re.sub(r"[^a-z0-9]+", "_", settings["model_path"].lower()).strip(
+            "_"
+        )
+        cache_defaults = {
+            "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE": env.get(
+                "TORCH_TPU_TIER2_NAME", f"torchtpu_{model_slug}"
+            ),
+            "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT": env.get(
+                "TORCH_TPU_TIER3_ROOT",
+                str(
+                    Path(env.get("HOME", str(Path.home())))
+                    / ".cache/torch_tpu_compile_cache"
+                ),
+            ),
+            "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_LOCAL_BACKUP_TASK": "1",
+        }
+        for name, value in cache_defaults.items():
+            if name not in config.runtime_envs:
+                env.setdefault(name, value)
     if settings.get("tp_size", 1) > 1:
         for key in (
             "TPU_VISIBLE_CHIPS",

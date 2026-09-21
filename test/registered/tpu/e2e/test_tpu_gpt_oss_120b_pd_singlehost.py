@@ -34,7 +34,6 @@ MODEL_ENV = "GPT_OSS_MODEL"
 
 PREFILL_ROLE = "prefill"
 DECODE_ROLE = "decode"
-ROLE_ENV = "CI_PD_ROLE"
 
 # Each engine uses one eight-chiplet TPU host.
 HOSTS_PER_ENGINE = 1
@@ -45,8 +44,6 @@ EP_SIZE = TP_SIZE
 # Separate pods may reuse the same service and Raiden ports.
 PREFILL_PORT = int(E("PREFILL_PORT", "30000"))
 DECODE_PORT = int(E("DECODE_PORT", "30000"))
-BOOTSTRAP_PORT = int(E("BOOTSTRAP_PORT", "8998"))
-RAIDEN_KV_PORT = int(E("SGLANG_RAIDEN_KV_PORT", "31000"))
 LOCAL_HOST = "127.0.0.1"
 
 PYTHON = E("PYTHON", "python3")
@@ -61,19 +58,7 @@ PREFILL_LOG = "/tmp/pd_singlehost_prefill.log"
 DECODE_LOG = "/tmp/pd_singlehost_decode.log"
 LAUNCH_CONFIG_MODULE = "recipe/configs/gpt_oss_120b/pd_singlehost.py"
 
-PAGE_SIZE = 64
-MEM_FRACTION_STATIC = "0.35"
-# Use checkpoint-provided MXFP4 weights and FP8 KV cache.
-QUANTIZATION = ""
-KV_CACHE_DTYPE = "fp8_e4m3"
-# One host has half the HBM of the two-host P/D configuration.
-MAX_TOTAL_TOKENS = 393216
 DISAGG_TRANSFER_BACKEND = "raiden"
-# Raiden handles both P/D KV transfer and decode host-pool I/O.
-HICACHE_IO_BACKEND = "raiden"
-EXTRA_SERVER_ARGS: tuple[str, ...] = ("--reasoning-parser", "gpt-oss")
-# GPT-OSS does not support the SparseCore fused-MoE gather path.
-EXTRA_LAUNCH_ENV: dict[str, str] = {"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"}
 
 # Defaults to a 0.77 passing floor; this topology measured 0.97.
 GSM8K_BASELINE = float(E("GSM8K_THRESHOLD_GPT_OSS_120B", E("GSM8K_THRESHOLD", "0.80")))
@@ -100,95 +85,11 @@ def validate_model_source(model_path: str) -> None:
         )
 
 
-def resolve_role(env: Mapping[str, str] | None = None) -> str:
-    """Read this pod's P/D role, which the JobSet template sets per replica."""
-    values = os.environ if env is None else env
-    role = values.get(ROLE_ENV, "")
-    if role not in (PREFILL_ROLE, DECODE_ROLE):
-        raise ValueError(
-            f"{ROLE_ENV} must be {PREFILL_ROLE!r} or {DECODE_ROLE!r}, got {role!r}"
-        )
-    return role
-
-
 def self_hostname(env: Mapping[str, str] | None = None) -> str:
     """This pod's own DNS name."""
     values = os.environ if env is None else env
     hostnames = [h for h in values.get("TPU_WORKER_HOSTNAMES", "").split(",") if h]
     return hostnames[0] if hostnames else socket.gethostname()
-
-
-def _common_launch_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
-    values = os.environ if env is None else env
-    return {
-        "MODEL": resolve_model_path(values),
-        "TP_SIZE": str(TP_SIZE),
-        "EP_SIZE": str(EP_SIZE),
-        "PAGE_SIZE": str(PAGE_SIZE),
-        # Raiden requires the fused KV pool provided by RPA v3.
-        "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
-        "QUANTIZATION": QUANTIZATION,
-        "KV_CACHE_DTYPE": KV_CACHE_DTYPE,
-        "DISABLE_RADIX_CACHE": "0",
-        "ENABLE_TORCH_COMPILE": values.get("ENABLE_TORCH_COMPILE", "1"),
-        "MEM_FRACTION_STATIC": values.get("MEM_FRACTION_STATIC", MEM_FRACTION_STATIC),
-        "SGLANG_RAIDEN_KV_PORT": str(RAIDEN_KV_PORT),
-        "PYTHON": PYTHON,
-        **EXTRA_LAUNCH_ENV,
-    }
-
-
-def _shared_server_args() -> list[str]:
-    # EXTRA_ARGS overrides the launchers' default TPU transfer backend.
-    return [
-        "--served-model-name",
-        SERVED_MODEL_NAME,
-        *EXTRA_SERVER_ARGS,
-        "--disaggregation-transfer-backend",
-        DISAGG_TRANSFER_BACKEND,
-        "--max-total-tokens",
-        str(MAX_TOTAL_TOKENS),
-        "--skip-server-warmup",
-        "--sampling-backend",
-        "pytorch",
-    ]
-
-
-def build_prefill_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Construct the environment for the prefill engine."""
-    values = os.environ if env is None else env
-    extra_args = _shared_server_args()
-    if values.get("EXTRA_PREFILL_ARGS"):
-        extra_args.append(values["EXTRA_PREFILL_ARGS"])
-    return {
-        **_common_launch_env(values),
-        "PORT": str(PREFILL_PORT),
-        "BOOTSTRAP_PORT": str(BOOTSTRAP_PORT),
-        "EXTRA_ARGS": " ".join(extra_args).strip(),
-    }
-
-
-def _decode_host_pool_args() -> list[str]:
-    """Make the decode retraction host pool buildable on a fused TPU KV pool."""
-    return [
-        "--hicache-mem-layout",
-        "page_first_fused",
-        "--hicache-io-backend",
-        HICACHE_IO_BACKEND,
-    ]
-
-
-def build_decode_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Construct the environment for the decode engine."""
-    values = os.environ if env is None else env
-    extra_args = _shared_server_args() + _decode_host_pool_args()
-    if values.get("EXTRA_DECODE_ARGS"):
-        extra_args.append(values["EXTRA_DECODE_ARGS"])
-    return {
-        **_common_launch_env(values),
-        "PORT": str(DECODE_PORT),
-        "EXTRA_ARGS": " ".join(extra_args).strip(),
-    }
 
 
 def _get_json(url: str, timeout: int = 30) -> dict[str, Any]:
@@ -332,10 +233,32 @@ def render_jobset_yaml(
 class TestPdSingleHostGptOss120bConfiguration(unittest.TestCase):
     """Host-side configuration tests, runnable without TPU hardware."""
 
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.plans = {}
+        for role in (PREFILL_ROLE, DECODE_ROLE):
+            output = subprocess.check_output(
+                [
+                    sys.executable,
+                    "-m",
+                    "benchmark.tpu.launch_server",
+                    "--config",
+                    LAUNCH_CONFIG_MODULE + ":" + role.upper() + "_CONFIG",
+                    "--runtime-envs",
+                    json.dumps(
+                        {"FORCE_SINGLE_HOST": "1", "SGLANG_HOST_IP": "127.0.0.1"}
+                    ),
+                    "--dry-run",
+                ],
+                cwd=REPO,
+                text=True,
+            )
+            cls.plans[role] = json.loads(output)
+
     def test_each_engine_takes_one_whole_host(self) -> None:
-        for env in (build_prefill_env(env={}), build_decode_env(env={})):
-            self.assertEqual(env["TP_SIZE"], str(CHIPLETS_PER_HOST))
-            self.assertEqual(env["EP_SIZE"], str(CHIPLETS_PER_HOST))
+        for plan in self.plans.values():
+            self.assertEqual(plan["server_args"]["tp_size"], CHIPLETS_PER_HOST)
+            self.assertEqual(plan["server_args"]["ep_size"], CHIPLETS_PER_HOST)
             # Do not mask chiplets when each engine owns its host.
             for var in (
                 "TPU_VISIBLE_DEVICES",
@@ -343,13 +266,13 @@ class TestPdSingleHostGptOss120bConfiguration(unittest.TestCase):
                 "TPU_CHIPS_PER_HOST_BOUNDS",
                 "TPU_HOST_BOUNDS",
             ):
-                self.assertNotIn(var, env)
+                self.assertNotIn(var, plan["runtime_env_keys"])
 
     def test_both_engines_select_the_raiden_transport(self) -> None:
-        for env in (build_prefill_env(env={}), build_decode_env(env={})):
-            self.assertIn(
-                f"--disaggregation-transfer-backend {DISAGG_TRANSFER_BACKEND}",
-                env["EXTRA_ARGS"],
+        for plan in self.plans.values():
+            self.assertEqual(
+                plan["server_args"]["disaggregation_transfer_backend"],
+                DISAGG_TRANSFER_BACKEND,
             )
 
     def test_peer_hostname_maps_prefill_to_decode(self) -> None:
@@ -372,12 +295,6 @@ class TestPdSingleHostGptOss120bConfiguration(unittest.TestCase):
             self_hostname({"TPU_WORKER_HOSTNAMES": "a-prefill-0-0"}), "a-prefill-0-0"
         )
         self.assertEqual(self_hostname({}), socket.gethostname())
-
-    def test_role_must_be_set_by_the_jobset(self) -> None:
-        self.assertEqual(resolve_role({ROLE_ENV: DECODE_ROLE}), DECODE_ROLE)
-        for bad in ({}, {ROLE_ENV: ""}, {ROLE_ENV: "both"}):
-            with self.assertRaisesRegex(ValueError, ROLE_ENV):
-                resolve_role(bad)
 
     def test_transport_gate_rejects_a_non_disaggregated_pair(self) -> None:
         raiden = {
@@ -408,13 +325,6 @@ class TestPdSingleHostGptOss120bConfiguration(unittest.TestCase):
             ),
             [],
         )
-
-    def test_launcher_scripts_resolve(self) -> None:
-        for script in ("launch_prefill.sh", "launch_decode.sh"):
-            self.assertTrue(
-                os.path.isfile(os.path.join(BENCH, script)),
-                f"BENCH does not point at benchmark/tpu: {BENCH}",
-            )
 
     def test_local_model_path_validation(self) -> None:
         with self.assertRaisesRegex(FileNotFoundError, MODEL_ENV):
