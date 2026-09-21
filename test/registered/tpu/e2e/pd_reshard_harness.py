@@ -276,7 +276,7 @@ MODEL_PROFILES = {
             # been wrong. Clean here means the residual is shape-related too and
             # this pair is shippable today; still 0.76 means the residual is a
             # separate, non-shape bug.
-            "CHUNKED_PREFILL_SIZE": "64",
+            "CHUNKED_PREFILL_SIZE": "128",
         },
         chat_template_kwargs={"enable_thinking": False},
     ),
