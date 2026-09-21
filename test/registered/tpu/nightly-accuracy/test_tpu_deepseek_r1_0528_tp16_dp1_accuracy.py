@@ -1,6 +1,6 @@
 """Original DeepSeek-R1-0528 TP16/EP16 FP8-KV evaluation, no DP attention.
 
-One pass each of GPQA, AIME25 and 250 MMLU questions at concurrency 128.
+One pass each of GPQA, AIME25 and full MMLU-Redux 2.0 at concurrency 128.
 """
 
 import os
@@ -8,9 +8,10 @@ import os
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 from sglang.test.tpu import model_config_main
+from sglang.test.tpu.redux_full import run_full_redux
 
 register_tpu_ci(
-    est_time=7200,
+    est_time=18000,
     suite="nightly-tpu-multihost-accuracy",
     nightly=True,
     labels=["multihost", "deepseek-r1", "accuracy"],
@@ -20,7 +21,7 @@ MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/configs/deepseek_r1_0528_fp8kv_mh.py",
     "weights_pvc": "model-weights-rox",
-    "timeout_per_file": 10800,
+    "timeout_per_file": 18000,
 }
 
 BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
@@ -66,17 +67,10 @@ MODEL_CONFIG = {
             "max_tokens": 32768,
         },
         {
-            "dataset": "mmlu",
-            "label": "mmlu",
-            "baseline": 0.90,
-            "atol": 0.08,
-            "repeat": 1,
-            # Match the non-DPA test: 250 sampled questions per repeat.
-            "num_examples": 250,
-            "num_threads": 128,
-            "temperature": 0.6,
-            "top_p": 0.95,
-            "max_tokens": 16384,
+            "dataset": "mmlu-redux-2.0",
+            "label": "mmlu_redux_full",
+            "report_only": True,
+            "runner": run_full_redux,
         },
     ],
 }

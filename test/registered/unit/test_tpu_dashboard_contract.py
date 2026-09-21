@@ -197,6 +197,8 @@ class TestJobMapsToOneTest(CustomTestCase):
             {
                 "test_tpu_deepseek_r1_0528_tp16_dp1_accuracy",
                 "test_tpu_deepseek_v3_1_tp16_dp1_accuracy",
+                "test_tpu_kimi_k26_mmmu_shard0",
+                "test_tpu_kimi_k26_mmmu_shard1",
             },
         )
         gpt = workflow["jobs"]["accuracy-gpt-oss-20b"]

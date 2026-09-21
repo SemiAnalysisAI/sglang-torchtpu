@@ -167,6 +167,59 @@ class TestNightlyAccuracyRecipes(unittest.TestCase):
                         actual[0] = Path(actual[0]).name
                         self.assertEqual(actual, expected)
 
+    def test_kimi_full_mmmu_shards(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "mmmu_full", ROOT / "python/sglang/test/tpu/mmmu_full.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        rows = list(range(1730))
+        left = module.shard_rows(rows, 0, 2)
+        right = module.shard_rows(rows, 1, 2)
+        self.assertEqual(len(left), 865)
+        self.assertEqual(len(right), 865)
+        self.assertEqual(set(left) & set(right), set())
+        self.assertEqual(sorted(left + right), list(enumerate(rows)))
+        for invalid in (-1, 2):
+            with self.assertRaises(ValueError):
+                module.shard_rows(rows, invalid, 2)
+        config = load_recipe("recipe/configs/kimi_k26_mmmu.py")
+        plan = plan_launch(
+            config, {"TPU_WORKER_ID": "1", "TPU_WORKER_HOSTNAMES": "a,b"}
+        )
+        self.assertEqual(plan.config.server_args["nnodes"], 2)
+        self.assertEqual(plan.config.server_args["dp_size"], 4)
+        self.assertEqual(plan.config.server_args["context_length"], 106496)
+        self.assertNotIn("--quantization", plan.command)
+
+    def test_full_mmmu_aggregation_rejects_missing_or_duplicate_ids(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "collect_full_evals", ROOT / ".github/tpu-ci/collect_full_evals.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        shards = [
+            {
+                "shard": i,
+                "shards": 2,
+                "questions": 865,
+                "correct": 700,
+                "ids": list(range(i, 1730, 2)),
+            }
+            for i in range(2)
+        ]
+        result = module.combine_shards(shards)
+        self.assertEqual(result["correct"], 1400)
+        with self.assertRaises(ValueError):
+            module.combine_shards(shards[:1])
+        shards[1]["ids"][0] = shards[0]["ids"][0]
+        with self.assertRaises(ValueError):
+            module.combine_shards(shards)
+
     def test_gpt_oss_keeps_checkpoint_quantization_and_bf16_kv(self):
         config = load_recipe("recipe/configs/gpt_oss_20b_accuracy.py")
         plan = plan_launch(config, {})

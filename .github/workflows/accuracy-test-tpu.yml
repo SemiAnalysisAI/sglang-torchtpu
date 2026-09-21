@@ -32,6 +32,11 @@ on:
         required: false
         default: ""
         type: string
+      after-run-id:
+        description: "Wait for this scheduled nightly run to finish before building/testing"
+        required: false
+        default: ""
+        type: string
       update-dashboard:
         description: "Publish this run's results to the dashboard (main only)"
         required: false
@@ -64,9 +69,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  wait-for-nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    permissions:
+      actions: read
+    steps:
+      - name: Wait for the selected nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WAIT_RUN_ID: ${{ inputs.after-run-id || '' }}
+        run: |
+          set -euo pipefail
+          [[ -z "$WAIT_RUN_ID" ]] && exit 0
+          [[ "$WAIT_RUN_ID" =~ ^[0-9]+$ ]] || { echo "Invalid run ID"; exit 1; }
+          while true; do
+            state=$(gh api "repos/$GH_REPO/actions/runs/$WAIT_RUN_ID")
+            jq -e '.event == "schedule" and .path == ".github/workflows/nightly-test-tpu.yml"' <<< "$state" > /dev/null
+            if [[ $(jq -r '.status' <<< "$state") == completed ]]; then
+              echo "Nightly $WAIT_RUN_ID completed: $(jq -r '.conclusion' <<< "$state")"
+              break
+            fi
+            echo "Waiting for nightly $WAIT_RUN_ID"
+            sleep 60
+          done
   # Standalone runs build their own image; the nightly passes one in so every
   # stage of the run tests a single build.
   build:
+    needs: wait-for-nightly
     if: ${{ (inputs.image || '') == '' }}
     uses: ./.github/workflows/_tpu-build.yml
     with:
@@ -219,3 +250,28 @@ jobs:
     permissions:
       contents: read
       id-token: write
+
+  collect-full-evaluations:
+    needs: accuracy-multihost
+    if: ${{ always() && needs.accuracy-multihost.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+      - name: Collect predictions and validate full MMMU-Pro coverage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: python3 .github/tpu-ci/collect_full_evals.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: full-evaluation-results
+          path: full-eval-results/
+          if-no-files-found: ignore
+          retention-days: 30

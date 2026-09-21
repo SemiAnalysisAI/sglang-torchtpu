@@ -20,7 +20,7 @@ CONFIG["server_args"].update(
         "page_size": 64,
         "mem_fraction_static": 0.85,
         "max_running_requests": 128,
-        "context_length": 40960,
+        "context_length": 73728,
         "chunked_prefill_size": 8192,
         "max_prefill_tokens": 8192,
         "tpu_compile_tokens": [8192],

@@ -604,3 +604,33 @@ python3 .github/tpu-ci/discover_multihost.py --suite nightly-tpu-multihost   # -
 The old per-manifest files (`job-integration.yaml`, `job-nightly.yaml`,
 `jobset-nightly.yaml`) and `_tpu-test-stage.yml` were replaced by the unified
 template + `_tpu-build`/`_tpu-test`.
+
+### Full accuracy runs from an unmerged branch
+
+The scheduled accuracy suite includes R1-0528 (GPQA, AIME25, full MMLU-Redux
+2.0), V3.1, GPT-OSS-20B, and two Kimi MMMU-Pro shards. Each Kimi shard uses its
+own two-host 2x2x2 slice and evaluates 865 distinct questions, one pass at 98,304
+output tokens. The collector rejects missing/duplicate IDs and reports the
+combined 1,730-question score. Predictions and metrics are retained in the
+`full-evaluation-results` workflow artifact.
+
+Redux generates all 5,700 rows at 65,536 output tokens, scoring only rows marked
+`ok` or with an unambiguous corrected answer key (5,431 rows in the pinned
+revision). This preserves the September experiment's protocol; it is not the
+original 14,042-question MMLU benchmark or an exact model-card reproduction.
+
+A branch workflow can wait for a scheduled nightly without merging first:
+
+```sh
+gh workflow run accuracy-test-tpu.yml --ref test/deepseek-r1-0528-dpa \
+  -f ref=test/deepseek-r1-0528-dpa -f model=nightly \
+  -f after-run-id=RUN_ID -f update-dashboard=false
+```
+
+`RUN_ID` must identify a scheduled `nightly-test-tpu.yml` run in this repository.
+The wait ends when that run completes, regardless of its conclusion. Waiting is
+bounded to 355 minutes; a timeout prevents the branch build from starting.
+This is a one-off dispatch, not a recurring schedule for an unmerged branch.
+The selected branch must contain the model/kernel dependencies for its recipes.
+In particular, Kimi's previously measured optimized `vmem-bf16` mode belongs to
+PR #725 and is not supplied by this CI configuration change.
