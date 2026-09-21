@@ -266,7 +266,17 @@ MODEL_PROFILES = {
             # wrong only for this model -- gpt-oss runs the same bucket set and
             # scores 0.98 at 885 cold tokens, so fp8 weights are the suspect,
             # gpt-oss being MXFP4-native. Remove this once that is fixed.
-            "CHUNKED_PREFILL_SIZE": "256",
+            # EXPERIMENT (#718): pallas_tpu MoE backend AND chunk 64 together.
+            # Backend alone took the sweep from 3/3 everywhere and gsm8k 0.0 to
+            # 13 of 15 lengths fully clean and gsm8k 0.76 (35660956719), so the
+            # fused reduce-scatter path is the dominant fault. What is left is
+            # intermittent -- 1/3 at 93 and at 627 tokens, on identical prompts,
+            # which means nondeterminism rather than a deterministic miscompile.
+            # Chunk 64 pins every extend to the one graph shape that has never
+            # been wrong. Clean here means the residual is shape-related too and
+            # this pair is shippable today; still 0.76 means the residual is a
+            # separate, non-shape bug.
+            "CHUNKED_PREFILL_SIZE": "64",
         },
         chat_template_kwargs={"enable_thinking": False},
     ),
