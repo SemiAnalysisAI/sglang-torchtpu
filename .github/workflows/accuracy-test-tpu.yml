@@ -168,7 +168,7 @@ jobs:
     needs: build
     if: >-
       ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","nightly","gpt-oss-20b"]'), inputs.model || 'all') }}
+          && contains(fromJSON('["all","nightly","full-set","gpt-oss-20b"]'), inputs.model || 'all') }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -219,9 +219,7 @@ jobs:
             groups="$(jq -cn --argjson scheduled "$groups" --argjson ondemand "$ondemand" \
                         '$scheduled + $ondemand')"
           fi
-          if [ "$MODEL" = "full-set" ]; then
-            groups="$(jq -c '[.[] | select(.name == "test_tpu_deepseek_r1_0528_tp16_dp1_accuracy" or (.name | startswith("test_tpu_kimi_k26_mmmu_shard")))]' <<< "$groups")"
-          elif [ "$MODEL" != "all" ] && [ "$MODEL" != "nightly" ]; then
+          if [ "$MODEL" != "all" ] && [ "$MODEL" != "nightly" ] && [ "$MODEL" != "full-set" ]; then
             groups="$(jq -c --arg m "$MODEL" \
                         '[.[] | select(.name | contains($m | gsub("-"; "_")))]' <<< "$groups")"
           fi

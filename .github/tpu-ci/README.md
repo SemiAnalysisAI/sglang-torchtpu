@@ -635,3 +635,8 @@ This is a one-off dispatch, not a recurring schedule for an unmerged branch.
 The selected branch must contain the model/kernel dependencies for its recipes.
 In particular, Kimi's previously measured optimized `vmem-bf16` mode belongs to
 PR #725 and is not supplied by this CI configuration change.
+
+The `model=full-set` dispatch selects Kimi (both MMMU-Pro shards), R1-0528,
+V3.1, and GPT-OSS-20B. It excludes GPT-OSS-120B and the on-demand DPA/GSM8K
+variants. R1 uses full Redux; V3.1 and GPT-OSS-20B retain their configured
+GPQA/AIME25/MMLU gates.
