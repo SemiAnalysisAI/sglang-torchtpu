@@ -1508,12 +1508,6 @@ class ServerArgs(DisaggServerArgsMixin):
             if self.dist_init_addr is None:
                 self.dist_init_addr = f"{hosts[0]}:{_TPU_DIST_PORT}"
 
-        from sglang.srt.hardware_backend.tpu.env_override import (
-            apply_tpu_env_overrides,
-        )
-
-        apply_tpu_env_overrides()
-
         if self.num_gpus > 1:
             from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
 

@@ -57,6 +57,74 @@ if hasattr(torch, "tpu"):
     _install_device_module_shims()
 
 _total_memory_cache: dict[int, int] = {}
+_qwen_vl_rope_installed: bool = False
+
+
+def dispatch_rope_index_to_host_on_tpu(fn):
+    """Run `get_rope_index` on CPU when `input_ids` resides on TPU (`PrivateUse1`)."""
+    import functools
+
+    @functools.wraps(fn)
+    def _wrapped(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        video_grid_thw: torch.LongTensor | None = None,
+        *args,
+        attention_mask: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        if input_ids is None or input_ids.device.type != "tpu":
+            return fn(
+                self,
+                input_ids,
+                image_grid_thw,
+                video_grid_thw,
+                *args,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+
+        target_device = input_ids.device
+        cpu_args = tuple(
+            a.to("cpu") if isinstance(a, torch.Tensor) else a for a in args
+        )
+        cpu_kwargs = {
+            k: (v.to("cpu") if isinstance(v, torch.Tensor) else v)
+            for k, v in kwargs.items()
+        }
+        position_ids, mrope_position_deltas = fn(
+            self,
+            input_ids.to("cpu"),
+            image_grid_thw.to("cpu") if image_grid_thw is not None else None,
+            video_grid_thw.to("cpu") if video_grid_thw is not None else None,
+            *cpu_args,
+            attention_mask=(
+                attention_mask.to("cpu") if attention_mask is not None else None
+            ),
+            **cpu_kwargs,
+        )
+        return (
+            position_ids.to(target_device),
+            mrope_position_deltas.to(target_device),
+        )
+
+    return _wrapped
+
+
+def _install_qwen_vl_host_rope_dispatch() -> None:
+    global _qwen_vl_rope_installed
+    if _qwen_vl_rope_installed:
+        return
+    from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
+        MiniMaxH3Qwen3VLTextModel,
+    )
+    from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl import Qwen2_5_VLModel
+    from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLModel
+
+    for cls in (Qwen2_5_VLModel, Qwen3VLModel, MiniMaxH3Qwen3VLTextModel):
+        cls.get_rope_index = dispatch_rope_index_to_host_on_tpu(cls.get_rope_index)
+    _qwen_vl_rope_installed = True
 
 
 class TpuPlatform(Platform):
@@ -197,6 +265,7 @@ class TpuPlatform(Platform):
         _register_aten_fallbacks()
 
         _install_device_module_shims()
+        _install_qwen_vl_host_rope_dispatch()
         torch.zeros(1, device="tpu")
 
     def get_torch_distributed_backend_str(self) -> str:

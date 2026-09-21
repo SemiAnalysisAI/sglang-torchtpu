@@ -11,7 +11,11 @@ import torch
 
 from sglang.multimodal_gen.runtime.platforms import tpu_platform_plugin
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
+from sglang.multimodal_gen.runtime.platforms.tpu import (
+    TpuPlatform,
+    _install_qwen_vl_host_rope_dispatch,
+    dispatch_rope_index_to_host_on_tpu,
+)
 
 _HAS_TORCH_TPU = hasattr(torch, "tpu")
 

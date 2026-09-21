@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared SRT rotary embedding adapter for Qwen-VL text encoders."""
 
-import functools
-from collections.abc import Callable
 from typing import Any
 
 import torch
 
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.utils.hf_transformers.common import get_rope_config
@@ -66,43 +63,3 @@ def apply_qwen_vl_text_rope(
     query = query.view(batch_size, sequence_length, num_query_heads, head_dim)
     key = key.view(batch_size, sequence_length, num_key_value_heads, head_dim)
     return query.transpose(1, 2), key.transpose(1, 2)
-
-
-def dispatch_rope_index_to_host_on_tpu(fn: Callable) -> Callable:
-    """Run get_rope_index on CPU when on TPU.
-
-    Empirically, the multimodal RoPE index subgraph miscompiles in libtpu
-    (windowing_util.cc:317) on TPU; executing this prefill-only helper on host
-    avoids the compilation failure and returns tensors on the input tensor's device.
-    """
-
-    @functools.wraps(fn)
-    def wrapper(
-        self: Any, *args: Any, **kwargs: Any
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not current_platform.is_tpu():
-            return fn(self, *args, **kwargs)
-        device = None
-        for val in (*args, *kwargs.values()):
-            if isinstance(val, torch.Tensor):
-                device = val.device
-                break
-
-        def to_host(val: Any) -> Any:
-            return val.cpu() if isinstance(val, torch.Tensor) else val
-
-        def to_device(val: Any) -> Any:
-            return (
-                val.to(device)
-                if device is not None and isinstance(val, torch.Tensor)
-                else val
-            )
-
-        pos, deltas = fn(
-            self,
-            *(to_host(a) for a in args),
-            **{k: to_host(v) for k, v in kwargs.items()},
-        )
-        return to_device(pos), to_device(deltas)
-
-    return wrapper
