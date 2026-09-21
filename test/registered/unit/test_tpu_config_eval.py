@@ -220,6 +220,23 @@ class TestNightlyAccuracyRecipes(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.combine_shards(shards)
 
+    def test_next_nightly_selects_first_run_after_cutoff(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "dispatch_after_nightly", ROOT / ".github/tpu-ci/dispatch_after_nightly.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        runs = [
+            {"databaseId": 1, "createdAt": "2026-09-20T09:00:00Z"},
+            {"databaseId": 3, "createdAt": "2026-09-22T09:00:00Z"},
+            {"databaseId": 2, "createdAt": "2026-09-21T09:00:00Z"},
+        ]
+        cutoff = "2026-09-21T08:00:00Z"
+        self.assertEqual(module.select_nightly(runs, cutoff)["databaseId"], 2)
+        self.assertIsNone(module.select_nightly(runs[:1], cutoff))
+
     def test_gpt_oss_keeps_checkpoint_quantization_and_bf16_kv(self):
         config = load_recipe("recipe/configs/gpt_oss_20b_accuracy.py")
         plan = plan_launch(config, {})

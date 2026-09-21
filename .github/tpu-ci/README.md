@@ -627,9 +627,10 @@ gh workflow run accuracy-test-tpu.yml --ref test/deepseek-r1-0528-dpa \
   -f after-run-id=RUN_ID -f update-dashboard=false
 ```
 
-`RUN_ID` must identify a scheduled `nightly-test-tpu.yml` run in this repository.
-The wait ends when that run completes, regardless of its conclusion. Waiting is
-bounded to 355 minutes; a timeout prevents the branch build from starting.
+`RUN_ID` can be `next` to select the next scheduled nightly, or identify a scheduled `nightly-test-tpu.yml` run in this repository.
+The wait ends when that run completes, regardless of its conclusion. Waiting uses no TPU resources. After five hours it hands off to another
+workflow with the same selected run ID, avoiding the hosted runner timeout.
+The overall wait expires after two days.
 This is a one-off dispatch, not a recurring schedule for an unmerged branch.
 The selected branch must contain the model/kernel dependencies for its recipes.
 In particular, Kimi's previously measured optimized `vmem-bf16` mode belongs to

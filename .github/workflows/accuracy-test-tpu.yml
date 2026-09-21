@@ -33,7 +33,12 @@ on:
         default: ""
         type: string
       after-run-id:
-        description: "Wait for this scheduled nightly run to finish before building/testing"
+        description: "Scheduled nightly run ID, or next; dispatch accuracy after it completes"
+        required: false
+        default: ""
+        type: string
+      after-created-at:
+        description: "UTC cutoff for next-nightly waiting (used for automatic handoff)"
         required: false
         default: ""
         type: string
@@ -73,32 +78,40 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     permissions:
-      actions: read
+      contents: read
+      actions: write
+    outputs:
+      ready: ${{ steps.mode.outputs.ready }}
     steps:
-      - name: Wait for the selected nightly
+      - id: mode
+        env:
+          WAIT_RUN_ID: ${{ inputs.after-run-id || '' }}
+        run: |
+          if [[ -z "$WAIT_RUN_ID" ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.mode.outputs.ready == 'false'
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+      - name: Wait and dispatch without holding TPU resources
+        if: steps.mode.outputs.ready == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           WAIT_RUN_ID: ${{ inputs.after-run-id || '' }}
-        run: |
-          set -euo pipefail
-          [[ -z "$WAIT_RUN_ID" ]] && exit 0
-          [[ "$WAIT_RUN_ID" =~ ^[0-9]+$ ]] || { echo "Invalid run ID"; exit 1; }
-          while true; do
-            state=$(gh api "repos/$GH_REPO/actions/runs/$WAIT_RUN_ID")
-            jq -e '.event == "schedule" and .path == ".github/workflows/nightly-test-tpu.yml"' <<< "$state" > /dev/null
-            if [[ $(jq -r '.status' <<< "$state") == completed ]]; then
-              echo "Nightly $WAIT_RUN_ID completed: $(jq -r '.conclusion' <<< "$state")"
-              break
-            fi
-            echo "Waiting for nightly $WAIT_RUN_ID"
-            sleep 60
-          done
+          AFTER_CREATED_AT: ${{ inputs.after-created-at || '' }}
+          TARGET_REF: ${{ inputs.ref || 'main' }}
+          TARGET_MODEL: ${{ inputs.model || 'nightly' }}
+          TEST_FILTER: ${{ inputs.test_filter || '' }}
+        run: python3 .github/tpu-ci/dispatch_after_nightly.py
   # Standalone runs build their own image; the nightly passes one in so every
   # stage of the run tests a single build.
   build:
     needs: wait-for-nightly
-    if: ${{ (inputs.image || '') == '' }}
+    if: ${{ needs.wait-for-nightly.outputs.ready == 'true' && (inputs.image || '') == '' }}
     uses: ./.github/workflows/_tpu-build.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
