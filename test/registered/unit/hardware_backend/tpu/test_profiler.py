@@ -23,7 +23,11 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 @dataclasses.dataclass
 class _BaseProfileOptions:
-    host_tracer_level: int = 2
+    """Mirrors torch_tpu's _impl.ProfileOptions: three levels, all unset."""
+
+    host_tracer_level: int | None = None
+    device_tracer_level: int | None = None
+    python_tracer_level: int | None = None
 
 
 def _fake_torch_tpu(profile_options_cls=_BaseProfileOptions, calls=None):
@@ -55,14 +59,19 @@ def _fake_torch_tpu(profile_options_cls=_BaseProfileOptions, calls=None):
 
 class TestTpuProfileOptions(CustomTestCase):
     def _options(
-        self, *, num_chips, num_sparse_cores, profile_options_cls=_BaseProfileOptions
+        self,
+        *,
+        num_chips,
+        num_sparse_cores,
+        with_cpu=True,
+        profile_options_cls=_BaseProfileOptions,
     ):
         with (
             envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(num_chips),
             envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(num_sparse_cores),
             patch.dict(sys.modules, _fake_torch_tpu(profile_options_cls)),
         ):
-            return _tpu_profile_options()
+            return _tpu_profile_options(with_cpu=with_cpu)
 
     def test_limits_enabled(self):
         options = self._options(num_chips=1, num_sparse_cores=2)
@@ -71,8 +80,9 @@ class TestTpuProfileOptions(CustomTestCase):
         self.assertEqual(options.tpu_num_sparse_cores_to_trace, 2)
         # Tile cap only kicks in at a single SparseCore; here 2 leaves it off.
         self.assertIsNone(options.tpu_num_sparse_core_tiles_to_trace)
-        # Base fields survive.
+        # Levels survive the narrowing subclass.
         self.assertEqual(options.host_tracer_level, 2)
+        self.assertEqual(options.device_tracer_level, 1)
 
     def test_single_sparse_core_narrows_to_one_tile(self):
         options = self._options(num_chips=1, num_sparse_cores=1)
@@ -89,8 +99,38 @@ class TestTpuProfileOptions(CustomTestCase):
         self.assertIsNone(options.tpu_num_sparse_core_tiles_to_trace)
 
     def test_both_limits_disabled_traces_everything(self):
-        # None means "pass no options", i.e. every chip and SparseCore.
-        self.assertIsNone(self._options(num_chips=0, num_sparse_cores=-1))
+        # No narrowing fields at all, so start_trace sends the levels alone.
+        options = self._options(num_chips=0, num_sparse_cores=-1)
+
+        self.assertEqual(
+            dataclasses.asdict(options),
+            {
+                "host_tracer_level": 2,
+                "device_tracer_level": 1,
+                "python_tracer_level": 0,
+            },
+        )
+
+    def test_host_tracer_off_without_cpu(self):
+        # with_cpu was a no-op on the first cut of this PR: the levels went
+        # unset, and the backend default fills the host plane either way.
+        options = self._options(num_chips=1, num_sparse_cores=1, with_cpu=False)
+
+        self.assertEqual(options.host_tracer_level, 0)
+        self.assertEqual(options.device_tracer_level, 1)
+
+    def test_python_tracer_off_by_default(self):
+        # torch_tpu's profile() sets python_tracer_level=1 whenever CPU
+        # activity is on, at 4.9 s of host busy time against 0.36 s.
+        options = self._options(num_chips=1, num_sparse_cores=1)
+
+        self.assertEqual(options.python_tracer_level, 0)
+
+    def test_python_tracer_opt_in(self):
+        with envs.SGLANG_TPU_PROFILE_PYTHON_TRACER.override(True):
+            options = self._options(num_chips=1, num_sparse_cores=1)
+
+        self.assertEqual(options.python_tracer_level, 1)
 
     def test_non_dataclass_profile_options_degrades(self):
         class _NotADataclass:
@@ -111,13 +151,12 @@ class TestTpuProfileOptions(CustomTestCase):
 
 
 class TestStartStopUsesLibtpuTrace(CustomTestCase):
-    """The capture must not go through torch.profiler.
+    """The capture must reach _impl.start_trace with its options.
 
-    torch.profiler reaches TPU device activity only via kineto, which needs
-    libtpu registered through PyTorch's PrivateUse1ProfilerRegistry -- absent
-    before torch 2.12, while the TPU stack pins 2.11. On that route the capture
-    succeeds and contains host activity only, which is silent and easy to
-    reintroduce. These assert the libtpu path is the one taken.
+    torch_tpu renamed profiler_api -> _api between the 0817 and 0913 pins,
+    which is what broke the import this PR started from. _impl was untouched,
+    so these pin the capture to it -- and to the options going along with it,
+    since a capture with the wrong ones still succeeds.
     """
 
     def test_start_calls_start_trace_with_output_dir(self):

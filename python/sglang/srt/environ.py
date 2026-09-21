@@ -1651,6 +1651,8 @@ class Envs:
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)
+    # xprof python tracer. Off by default: it dominates host busy time.
+    SGLANG_TPU_PROFILE_PYTHON_TRACER = EnvBool(False)
     # raiden KV-offload backend
     SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
     # Workaround for a TPU v7 warmup crash; disable to debug the root cause.
