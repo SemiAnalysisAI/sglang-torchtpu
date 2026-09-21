@@ -11,20 +11,19 @@ from typing import Any, ClassVar, Literal
 import msgspec
 import torch
 import tqdm
-
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
-    _REAL_B_KEY,
-    _REAL_Q_KEY,
-    CompiledForwardShim,
     _extend_batch_cap,
     _pad_forward_batch_inputs,
+    _REAL_B_KEY,
+    _REAL_Q_KEY,
     _restore_forward_batch_inputs,
     build_bucketers,
+    CompiledForwardShim,
 )
 from sglang.srt.hardware_backend.tpu.cp_forward import (
     install_cp_logits_forward,
@@ -1223,8 +1222,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # ForwardContext). Serving establishes it in ModelRunner.forward, but the
         # warmup path invokes the compiled forward directly, so set it here too.
         from sglang.srt.model_executor.forward_context import (
-            ForwardContext,
             forward_context,
+            ForwardContext,
         )
 
         # Profiling enters at the outer model: only that wrapper passes
@@ -1687,8 +1686,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                     host_mask=torch.zeros((num_tokens, 1), dtype=torch.bool),
                 )
         logger.info(
-            "[decoder compile policy] VL MM EMBED PLACEMENT: %d token buckets "
-            "in %.1fs",
+            "[decoder compile policy] VL MM EMBED PLACEMENT: %d token buckets in %.1fs",
             len(buckets),
             time.perf_counter() - start,
         )

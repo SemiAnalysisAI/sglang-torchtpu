@@ -36,15 +36,14 @@ Design notes
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Protocol
+from typing import ClassVar, Protocol, TYPE_CHECKING
 
 import torch
-
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_dcp import (
-    DcpWriteSpans,
     broadcast_own_kv_heads,
     build_dcp_kernel_op,
     build_owner_write_spans,
+    DcpWriteSpans,
     fused_kv_rows,
     gather_heads,
     merge_across_ranks,
@@ -53,9 +52,9 @@ from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_dcp import (
     write_owned_kv,
 )
 from sglang.srt.hardware_backend.tpu.cp_forward import (
-    TpuCpBatchLayout,
     all_gather_and_write_kv,
     get_tpu_cp_layout,
+    TpuCpBatchLayout,
 )
 from sglang.srt.hardware_backend.tpu.kv_row_write import (
     get_write_rows_op,
@@ -573,9 +572,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # Cached ``distribution`` tensors on TPU, keyed by
         # (is_decode, real_batch, device) -- it depends only on those, so a
         # cached buffer is reused every step (see init_forward_metadata).
-        self._distribution_cache: dict[tuple[bool, int, torch.device], torch.Tensor] = (
-            {}
-        )
+        self._distribution_cache: dict[
+            tuple[bool, int, torch.device], torch.Tensor
+        ] = {}
         # Register the custom op eagerly so the (Python-introspection-heavy)
         # ``jax_op`` registration does not happen inside a ``torch.compile``
         # traced region — dynamo can't handle ``inspect.signature`` on the

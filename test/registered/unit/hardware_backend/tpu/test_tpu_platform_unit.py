@@ -13,10 +13,9 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch.compiler.config as compiler_config
-
 from sglang.srt.hardware_backend.tpu.tpu_platform import (
-    TpuSRTPlatform,
     _validate_decode_context_parallel,
+    TpuSRTPlatform,
 )
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.runtime_context import get_context

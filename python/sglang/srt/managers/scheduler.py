@@ -26,7 +26,7 @@ from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple, TYPE_CHECKING, Union
 
 from sglang.srt.runtime_context import (
     attention_backends,
@@ -68,10 +68,10 @@ except ImportError:
 from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.configs.model_config import (
-    ModelConfig,
-    ModelImpl,
     is_deepseek_v4,
     is_minimax_sparse,
+    ModelConfig,
+    ModelImpl,
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
@@ -85,17 +85,17 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 )
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
+    maybe_release_metadata_buffer,
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
-    maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    get_dsa_seed_metadata_dim,
     MetadataBuffers,
+    prepare_abort,
     ReqToMetadataIdxAllocator,
     TransferBackend,
-    get_dsa_seed_metadata_dim,
-    prepare_abort,
     unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -171,6 +171,7 @@ from sglang.srt.managers.io_struct import (
     ShutdownReq,
     SlowDownReqInput,
     SlowDownReqOutput,
+    sock_send,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
@@ -181,7 +182,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     UpdateWeightVersionReqOutput,
-    sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
 from sglang.srt.managers.min_free_slots_delayer import (
@@ -190,9 +190,9 @@ from sglang.srt.managers.min_free_slots_delayer import (
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
-    RelayPayload,
     decide_needs_confidence_relay,
     decide_needs_cpu_seq_lens,
+    RelayPayload,
     resolve_forward_inputs,
 )
 from sglang.srt.managers.prefill_delayer import (
@@ -206,8 +206,8 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     NextBatchPlan,
     Req,
-    ScheduleBatch,
     retract_all,
+    ScheduleBatch,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -224,8 +224,8 @@ from sglang.srt.managers.scheduler_components.idle_sleeper import (
     RustServerIdleSleeper,
 )
 from sglang.srt.managers.scheduler_components.invariant_checker import (
-    SchedulerInvariantChecker,
     create_scheduler_watchdog,
+    SchedulerInvariantChecker,
 )
 from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (
@@ -243,8 +243,8 @@ from sglang.srt.managers.scheduler_components.memory_usage import (
     combine_graph_memory_usage,
 )
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
-    RECORD_STEP_TIME,
     PrefillStats,
+    RECORD_STEP_TIME,
     SchedulerMetricsReporter,
 )
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
@@ -259,9 +259,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
-from sglang.srt.managers.scheduler_components.recv_skipper import (
-    SchedulerRecvSkipper,
-)
+from sglang.srt.managers.scheduler_components.recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -298,7 +296,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
+from sglang.srt.server_args import compute_world_size, PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
@@ -308,9 +306,9 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
-    DynamicGradMode,
     configure_gc_logger,
     configure_logger,
+    DynamicGradMode,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -342,7 +340,7 @@ from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
     record_weight_version_events,
 )
-from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.utils import get_exception_traceback, TypeBasedDispatcher
 
 if is_mps():
     CudaStreamContext = nullcontext
@@ -3638,8 +3636,8 @@ class Scheduler(
         adder_kwargs = {}
         if self._tpu_pp_chunk_cost is not None:
             from sglang.srt.hardware_backend.tpu.pp_chunk_scheduler import (
-                TpuPipelinePrefillAdder,
                 pending_step_limit,
+                TpuPipelinePrefillAdder,
             )
 
             adder_cls = TpuPipelinePrefillAdder
@@ -3711,9 +3709,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req
                 ):
                     break
 

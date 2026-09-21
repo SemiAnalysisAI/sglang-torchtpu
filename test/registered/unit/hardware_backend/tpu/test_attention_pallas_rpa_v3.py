@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
     _zero_inactive_rpa_rows,
 )
@@ -21,9 +20,9 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
-    _SCOPED_SMEM_BYTES,
     _get_pages_per_seq,
     _page_table_smem_bytes,
+    _SCOPED_SMEM_BYTES,
 )
 
 

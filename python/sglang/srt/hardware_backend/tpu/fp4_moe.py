@@ -11,7 +11,6 @@ smaller blocks require the fused-RS kernel. The static ``input_scale`` is unused
 from __future__ import annotations
 
 import torch
-
 from sglang.srt.hardware_backend.tpu.fp8_moe import _clear_replaced_param, _own_storage
 from sglang.srt.hardware_backend.tpu.fused_rs_sequence_parallel import (
     get_tpu_fused_rs_post_expert_norm_weight,
@@ -269,9 +268,7 @@ def prepare_tpu_nvfp4_moe_weights(
     w2_scale = _to_gmm_v2_scale_layout(w2_s, scale_dtype)  # (E, I_pad/G, 1, H)
 
     if use_fused_rs:
-        from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
-            prepare_fused_moe_rs,
-        )
+        from sglang.srt.layers.moe.pallas.fused_moe_rs_op import prepare_fused_moe_rs
 
         prepare_tpu_fused_rs_post_expert_norm(layer)
         prepare_fused_moe_rs(layer)
@@ -311,9 +308,7 @@ def apply_tpu_nvfp4_moe(
         )
 
     if use_fused_rs:
-        from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
-            fused_moe_rs_gather,
-        )
+        from sglang.srt.layers.moe.pallas.fused_moe_rs_op import fused_moe_rs_gather
 
         prepared_input = prepare_fused_moe_sequence_parallel_input(
             layer, dispatch_output

@@ -19,7 +19,6 @@ from sglang.test.test_utils import CustomTestCase
 
 try:
     import jax.numpy as jnp
-
     from sglang.srt.layers.moe.pallas import gmm_v2
 
     _HAS_GMM = True

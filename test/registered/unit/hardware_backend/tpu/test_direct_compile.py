@@ -9,16 +9,12 @@ from unittest.mock import MagicMock, patch
 
 import torch
 from jax import tree_util
-from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayout
-
 from sglang.srt.hardware_backend.tpu.compilation import direct_compile
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.speculative.eagle_info import (
-    EagleDraftExtendInput,
-    EagleDraftInput,
-)
+from sglang.srt.speculative.eagle_info import EagleDraftExtendInput, EagleDraftInput
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayout
 
 register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit")
 

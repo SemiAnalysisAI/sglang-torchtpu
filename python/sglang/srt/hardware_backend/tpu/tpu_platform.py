@@ -9,10 +9,9 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Optional, Type
+from typing import Optional, Type, TYPE_CHECKING
 
 import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.platforms.device_mixin import PlatformEnum
@@ -114,10 +113,7 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
     (this needs a torch_tpu that compiles a collective for its device group
     only), while the hand-off stays the one collective every stage launches.
     """
-    from sglang.srt.arg_groups.overrides import (
-        declare_late_resolution,
-        resolving_view,
-    )
+    from sglang.srt.arg_groups.overrides import declare_late_resolution, resolving_view
 
     cfg = resolving_view(server_args)
     pp = cfg.pp_size
@@ -167,10 +163,7 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
     every rank's own RPA v3 pool and reduces the last-token rows before the
     logits step; it exists only inside the compiled forward.
     """
-    from sglang.srt.arg_groups.overrides import (
-        declare_late_resolution,
-        resolving_view,
-    )
+    from sglang.srt.arg_groups.overrides import declare_late_resolution, resolving_view
 
     cfg = resolving_view(server_args)
     attn_cp_size = cfg.attn_cp_size
@@ -236,10 +229,7 @@ def _apply_page_size_default(server_args) -> None:
     width -- must not silently receive the generic default, or it fails deep
     inside the Pallas trace with a shape error that reads like a kernel bug.
     """
-    from sglang.srt.arg_groups.overrides import (
-        declare_late_resolution,
-        resolving_view,
-    )
+    from sglang.srt.arg_groups.overrides import declare_late_resolution, resolving_view
 
     # The backend may be a declaration (record left pristine); read it back through the stash.
     cfg = resolving_view(server_args)
@@ -272,10 +262,7 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
     until its accuracy is validated, and ``pallas_tpu_flash`` has no
     dequantization scale, so defaulting it to fp8 silently degrades it.
     """
-    from sglang.srt.arg_groups.overrides import (
-        declare_late_resolution,
-        resolving_view,
-    )
+    from sglang.srt.arg_groups.overrides import declare_late_resolution, resolving_view
 
     # Same as above: the RPA default backend is a declaration, not a field.
     cfg = resolving_view(server_args)
@@ -619,9 +606,7 @@ class TpuSRTPlatform(SRTPlatform):
         if backend == "pallas_tpu_rpa_batched" and _uses_seq_along_lane_kv():
             # SEQ_ALONG_LANE puts the token index on the lane axis, so the
             # buffer shape differs from the fused one the other backends read.
-            from sglang.srt.hardware_backend.tpu.kv_pool import (
-                TpuSeqAlongLaneKVPool,
-            )
+            from sglang.srt.hardware_backend.tpu.kv_pool import TpuSeqAlongLaneKVPool
 
             return TpuSeqAlongLaneKVPool
 
@@ -629,9 +614,7 @@ class TpuSRTPlatform(SRTPlatform):
             "pallas_tpu_rpa_v3",
             "pallas_tpu_rpa_batched",
         ):
-            from sglang.srt.hardware_backend.tpu.kv_pool import (
-                TpuFusedMHATokenToKVPool,
-            )
+            from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
 
             return TpuFusedMHATokenToKVPool
 
@@ -648,9 +631,7 @@ class TpuSRTPlatform(SRTPlatform):
 
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
-        from sglang.srt.mem_cache.memory_pool_host import (
-            TpuFusedMHATokenToKVPoolHost,
-        )
+        from sglang.srt.mem_cache.memory_pool_host import TpuFusedMHATokenToKVPoolHost
 
         # Upstream relocated MHATokenToKVPoolHost from mem_cache.memory_pool_host
         # into the mem_cache.pool_host package; TpuFusedMHATokenToKVPoolHost is the
@@ -678,9 +659,7 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang.srt.runtime_context import get_exec
 
         if get_exec().kernel.attention_backend == "pallas_tpu_mla":
-            from sglang.srt.hardware_backend.tpu.kv_pool import (
-                TpuFusedMLATokenToKVPool,
-            )
+            from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMLATokenToKVPool
 
             return TpuFusedMLATokenToKVPool
 

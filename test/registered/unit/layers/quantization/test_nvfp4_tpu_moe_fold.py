@@ -13,7 +13,6 @@ import unittest
 from unittest import mock
 
 import torch
-
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -133,9 +132,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         detect the alias; ownership must be asserted directly on the helper's
         return value.
         """
-        from sglang.srt.hardware_backend.tpu.fp4_moe import (
-            _to_gmm_v2_scale_layout,
-        )
+        from sglang.srt.hardware_backend.tpu.fp4_moe import _to_gmm_v2_scale_layout
 
         for out_size in (2 * INTERMEDIATE_SIZE, HIDDEN_SIZE):
             for scale_dtype in (torch.float32, torch.bfloat16):
@@ -255,9 +252,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         torch.testing.assert_close(layer.w2_weight_scale, expected_w2)
 
     def test_fused_rs_requires_ep_only_reduced_combined_output(self):
-        from sglang.srt.hardware_backend.tpu.fp4_moe import (
-            can_use_tpu_nvfp4_fused_rs,
-        )
+        from sglang.srt.hardware_backend.tpu.fp4_moe import can_use_tpu_nvfp4_fused_rs
 
         layer = types.SimpleNamespace(
             moe_ep_size=4,
@@ -814,9 +809,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         self.assertIn("weight_p_spec,  # group_offset", body)
 
     def test_fused_packed_transpose_preserves_codes(self):
-        from sglang.srt.hardware_backend.tpu.fp4_moe import (
-            _transpose_packed_fp4,
-        )
+        from sglang.srt.hardware_backend.tpu.fp4_moe import _transpose_packed_fp4
 
         codes = torch.arange(2 * 4 * 6, dtype=torch.uint8).reshape(2, 4, 6) & 0x0F
         packed = codes[..., 0::2] | (codes[..., 1::2] << 4)
@@ -829,7 +822,6 @@ class TestNvfp4Block512Contract(CustomTestCase):
 
     def test_fused_rs_selects_expected_activation_mode_by_group_size(self):
         import jax.numpy as jnp
-
         from sglang.srt.layers.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
             get_maybe_quantize_lhs,
         )
