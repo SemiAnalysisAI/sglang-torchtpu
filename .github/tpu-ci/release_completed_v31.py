@@ -24,17 +24,17 @@ for repeat in range(2, 6):
             continue
         if pod['status']['phase'] != 'Running':
             raise RuntimeError(f'{pod_name}: unexpected phase')
-        check = '''import json
-from pathlib import Path
-p=Path('/cache/upstream-run')
-assert (p/'complete.json').is_file(), 'Evaluation not marked complete'
-files=list((p/'results').glob('*/metrics.json'))
-assert len(files)==1
-m=json.loads(files[0].read_text())
-assert m['num_examples']==EXPECTED
-assert m['aggregate']['error_rate']==0
-print(json.dumps({'completed': m['num_examples'], 'score':m['aggregate']['score']}))
-'''.replace('EXPECTED', str(expected_rows))
-        print(pod_name, kc('exec', pod_name, '--', 'python3', '-c', check), flush=True)
+        log = kc('logs', pod_name, '--tail=200')
+        marker = log.rfind('METRICS ')
+        if marker < 0:
+            raise RuntimeError(f'{pod_name}: no completed evaluation metrics in logs')
+        payload = log[marker + len('METRICS '):]
+        start = payload.index('{')
+        metrics, end = json.JSONDecoder().raw_decode(payload[start:])
+        assert metrics['num_examples'] == expected_rows
+        assert metrics['aggregate']['error_rate'] == 0
+        assert metrics['total_completion_tokens'] > 0
+        assert 'Traceback' not in payload[start + end:]
+        print(pod_name, json.dumps({'completed':metrics['num_examples'], 'score':metrics['aggregate']['score']}), flush=True)
     print(kc('delete', 'jobset', name, '--wait=true', '--timeout=120s'), flush=True)
 print(kc('get', 'pods', '-o', 'wide'), flush=True)
