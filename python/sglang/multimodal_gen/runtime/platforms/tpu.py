@@ -263,6 +263,12 @@ class TpuPlatform(Platform):
 
         _install_device_module_shims()
         _install_qwen_vl_host_rope_dispatch()
+
+        from sglang.multimodal_gen.runtime.platforms.tpu_spmd import (
+            install_tpu_spmd_overrides,
+        )
+
+        install_tpu_spmd_overrides()
         torch.zeros(1, device="tpu")
 
     def get_torch_distributed_backend_str(self) -> str:
