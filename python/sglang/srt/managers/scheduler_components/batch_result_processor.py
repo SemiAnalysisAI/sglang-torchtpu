@@ -40,7 +40,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.sampling.sampling_observer import CommittedTokens
+from sglang.srt.managers.auxiliary_output import CommittedTokens
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -70,7 +70,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
-    from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
+    from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
 
 logger = logging.getLogger(__name__)
 
