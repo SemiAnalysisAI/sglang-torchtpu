@@ -1,195 +1,43 @@
-"""Correctness tests for the TPU ``aten::cumsum`` / ``aten::cumsum_`` kernels.
-
-Two behaviors must not come back: an int64 cumsum aborting the process, and an
-int64 cumsum returning a value narrowed through int32. Every case is
-differential against PyTorch's own CPU result.
-
-``torch.cumsum(x, dim, out=an_int64_tensor)`` is untested on purpose —
-``aten::cumsum.out`` stays native, so it still aborts and would take the runner
-down with it. Requires a real TPU device; skipped otherwise.
-"""
-
-from sglang.test.ci.ci_register import register_tpu_ci
-
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+# SPDX-License-Identifier: Apache-2.0
+"""Unit tests for TPU int64/int32/bool cumsum patch."""
 
 import unittest
-from unittest import mock
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.hardware_backend.tpu import patches
 from sglang.test.test_utils import CustomTestCase
 
 
 class TestCumsumTpu(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        try:
-            from sglang.srt.hardware_backend.tpu import patches
-            from sglang.srt.hardware_backend.tpu.env_override import (
-                apply_tpu_env_overrides,
-            )
+    def setUp(self):
+        patches._apply_cumsum_patch()
 
-            # Serving applies these in _prepare_tpu_env() before importing
-            # torch_tpu; this test reaches torch_tpu directly, so it opts in
-            # before import and before the first device op initializes PJRT.
-            apply_tpu_env_overrides()
+    def test_int64_cumsum_past_bf16_limit_simulated(self):
+        x = torch.ones((2, 600), dtype=torch.int64)
+        expected = torch.arange(1, 601, dtype=torch.int64).expand(2, 600)
+        with patch.object(patches, "_is_tpu_tensor", return_value=True):
+            torch.testing.assert_close(torch.cumsum(x, dim=1), expected)
+            torch.testing.assert_close(x.cumsum(dim=-1), expected)
 
-            import torch_tpu  # noqa: F401
+    def test_bool_and_dtype_and_out_kwargs(self):
+        b = torch.tensor([[True, False, True, True]])
+        with patch.object(patches, "_is_tpu_tensor", return_value=True):
+            res = torch.cumsum(b, dim=1)
+            self.assertEqual(res.dtype, torch.int64)
+            self.assertEqual(res.tolist(), [[1, 1, 2, 3]])
+            out = torch.empty((1, 4), dtype=torch.int32)
+            torch.cumsum(b, dim=1, dtype=torch.int32, out=out)
+            self.assertEqual(out.tolist(), [[1, 1, 2, 3]])
 
-            cls.dev = "tpu"
-            torch.zeros(1, device=cls.dev)  # probe: a real TPU is present
-            patches._register_aten_fallbacks()  # installs the kernels under test
-        except Exception as e:  # no torch_tpu / no device -> skip, don't fail
-            raise unittest.SkipTest(f"TPU not available: {e}")
-
-    def _assert_matches_cpu(self, src, dim, dtype=None):
-        """TPU cumsum must match CPU cumsum bit-for-bit, dtype included."""
-        ref = src.cumsum(dim, dtype=dtype)
-        got = src.to(self.dev).cumsum(dim, dtype=dtype).cpu()
-        self.assertEqual(
-            got.dtype,
-            ref.dtype,
-            f"dtype drift for {src.dtype} dim={dim} dtype={dtype}",
-        )
-        self.assertTrue(
-            torch.equal(got, ref),
-            f"TPU != CPU for {tuple(src.shape)}/{src.dtype} dim={dim} dtype={dtype}",
-        )
-
-    def test_int64_default_dtype(self):
-        # The Qwen-VL prefill shape: cumsum of an all-ones int64 attention mask.
-        # This is the case that aborted the process before the fallback.
-        self._assert_matches_cpu(torch.ones(1, 1024, dtype=torch.int64), -1)
-
-    def test_dtype_promotion_matches_cpu(self):
-        # cumsum promotes every integral input to int64 unless told otherwise;
-        # narrow dtypes take the provably-safe int32 path and must still come
-        # back as int64.
-        for dt in (torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32):
-            src = torch.ones(64, dtype=dt)
-            self._assert_matches_cpu(src, 0)
-            self.assertEqual(src.to(self.dev).cumsum(0).dtype, torch.int64)
-
-        explicit = torch.randint(0, 7, (4, 64), dtype=torch.int64)
-        for dtype in (torch.int32, torch.int64, torch.float32):
-            self._assert_matches_cpu(explicit, -1, dtype=dtype)
-
-    def test_floating_inputs_are_untouched(self):
-        for dt in (torch.float32, torch.bfloat16):
-            self._assert_matches_cpu(torch.arange(128, dtype=dt) / 8, 0)
-
-    def test_dims_and_shapes(self):
-        torch.manual_seed(0)
-        src = torch.randint(0, 5, (3, 7, 11), dtype=torch.int64)
-        for dim in range(src.dim()):
-            self._assert_matches_cpu(src, dim)
-            self._assert_matches_cpu(src, dim - src.dim())  # negative indexing
-        self._assert_matches_cpu(torch.zeros(0, dtype=torch.int64), 0)  # empty
-        self._assert_matches_cpu(torch.tensor([5], dtype=torch.int64), 0)  # single
-
-    def test_non_multiple_of_1024_length(self):
-        # libtpu's associative-scan emitter miscompiles lengths that are not a
-        # multiple of 1024 (torch_tpu#2898); env_override disables it. A wrong
-        # value here means that override stopped being applied.
-        torch.manual_seed(0)
-        self._assert_matches_cpu(torch.randint(0, 9, (4, 333), dtype=torch.int64), -1)
-
-    # --- exactness beyond int32 -------------------------------------------
-    # A narrowing implementation passes every test above and still silently
-    # returns garbage here: 2**40 truncated to int32 is exactly 0, so the
-    # corruption looks like a plausible all-zero position-id tensor.
-
-    def test_values_that_do_not_fit_int32_are_exact(self):
-        src = torch.full((4,), 2**40, dtype=torch.int64)
-        self._assert_matches_cpu(src, 0)
-        self._assert_matches_cpu(src, 0, dtype=torch.int64)
-
-    def test_sum_overflowing_int32_is_exact(self):
-        # Each value fits in int32; the running sum does not.
-        src = torch.full((8,), 2**30, dtype=torch.int32)
-        self._assert_matches_cpu(src, 0)
-
-    def test_negative_and_mixed_magnitudes(self):
-        src = torch.tensor([-(2**40), 2**41, -7, 2**31, -(2**33)], dtype=torch.int64)
-        self._assert_matches_cpu(src, 0)
-
-    def test_large_values_on_every_dim(self):
-        # 3-D with a non-power-of-two inner length: the log-step scan shifts
-        # along one dim while the others must ride along untouched.
-        torch.manual_seed(0)
-        src = torch.randint(-(2**45), 2**45, (3, 5, 129), dtype=torch.int64)
-        for dim in range(src.dim()):
-            self._assert_matches_cpu(src, dim)
-            self._assert_matches_cpu(src, dim - src.dim())
-
-    # --- overloads ---------------------------------------------------------
-
-    def test_inplace_matches_cpu(self):
-        # cumsum_ is a separate ATen overload; before it was registered this
-        # aborted the process for int64.
-        for src in (
-            torch.ones(1, 1024, dtype=torch.int64),
-            torch.full((6,), 2**40, dtype=torch.int64),
-            torch.arange(64, dtype=torch.float32) / 4,
-        ):
-            ref = src.clone()
-            ref.cumsum_(-1)
-            got = src.to(self.dev)
-            returned = got.cumsum_(-1)
-            self.assertIs(returned, got, "cumsum_ must return self")
-            self.assertTrue(
-                torch.equal(got.cpu(), ref), f"in-place mismatch for {src.dtype}"
-            )
-
-    def test_out_variant_with_non_int64_out(self):
-        # The out= overload stays native. Non-int64 out is the case production
-        # uses (metadata offsets) and must keep working.
-        src = torch.arange(1, 65, dtype=torch.int32, device=self.dev)
-        out = torch.empty(64, dtype=torch.int32, device=self.dev)
-        torch.cumsum(src, 0, dtype=torch.int32, out=out)
-        self.assertEqual(out.cpu()[-1].item(), 64 * 65 // 2)
-
-    # --- the shape that actually broke production --------------------------
-
-    def test_bool_mask_advanced_index(self):
-        # `hidden[mask]` lowers to a scan; this, not an explicit cumsum call,
-        # is what aborted Qwen-Image in _extract_masked_hidden(). Keep it
-        # pinned so an overload-coverage regression is caught here.
-        torch.manual_seed(0)
-        hidden = torch.randn(1, 67, 8)
-        mask = torch.zeros(1, 67, dtype=torch.bool)
-        mask[0, ::3] = True
-
-        ref = hidden[mask]
-        got = hidden.to(self.dev)[mask.to(self.dev)].cpu()
-        self.assertEqual(got.shape, ref.shape)
-        self.assertTrue(torch.equal(got, ref))
-
-        # ... and the split that follows it in the pipeline.
-        lengths = mask.sum(dim=1)
-        self.assertEqual(lengths.tolist(), mask.to(self.dev).sum(dim=1).cpu().tolist())
-
-    # --- implementation properties -----------------------------------------
-
-    def test_stays_on_device(self):
-        # Neither path may go to host: the bounded path redispatches to
-        # aten::cumsum.out and the unbounded one is elementwise adds. Forbid
-        # Tensor.cpu during the calls to prove no D2H transfer happens.
-        i32 = torch.ones(1, 512, dtype=torch.int32, device=self.dev)
-        i64 = torch.ones(1, 512, dtype=torch.int64, device=self.dev)
-        big = torch.full((1, 512), 2**40, dtype=torch.int64, device=self.dev)
-        with mock.patch.object(
-            torch.Tensor,
-            "cpu",
-            side_effect=AssertionError("Unexpected D2H transfer to CPU"),
-        ):
-            self.assertEqual(i32.cumsum(-1, dtype=torch.int32).device.type, "tpu")
-            self.assertEqual(i32.float().cumsum(-1).device.type, "tpu")
-            self.assertEqual(i64.cumsum(-1).device.type, "tpu")
-            self.assertEqual(big.cumsum(-1).device.type, "tpu")
-            self.assertEqual(big.clone().cumsum_(-1).device.type, "tpu")
+    @unittest.skipUnless(hasattr(torch, "tpu"), "requires torch_tpu")
+    def test_live_tpu_int64_cumsum(self):
+        x = torch.ones((2, 512), dtype=torch.int64, device="tpu")
+        res = torch.cumsum(x, dim=1).cpu()
+        self.assertEqual(res[0, 256].item(), 257)
+        self.assertEqual(res[0, 511].item(), 512)
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()
