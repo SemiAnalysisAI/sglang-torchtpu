@@ -103,6 +103,46 @@ class TestTpuPlatformSurface(unittest.TestCase):
     def test_device_tensor_pickle_is_unsupported(self):
         self.assertFalse(TpuPlatform.supports_device_tensor_pickle())
 
+    def test_non_tpu_platform_runs_rope_index_directly(self):
+        from sglang.multimodal_gen.runtime.models.encoders import qwen_vl_rope
+
+        seen = []
+
+        class _Model:
+            @qwen_vl_rope.dispatch_rope_index_to_host_on_tpu
+            def get_rope_index(self, input_ids, *_args, **_kwargs):
+                seen.append(input_ids)
+                return torch.zeros(3, 1, 4), torch.zeros(1)
+
+        input_ids = torch.ones(1, 4, dtype=torch.long)
+        platform = MagicMock()
+        platform.is_tpu.return_value = False
+        with patch.object(qwen_vl_rope, "current_platform", platform):
+            pos, deltas = _Model().get_rope_index(input_ids)
+        self.assertIs(seen[0], input_ids)
+        self.assertEqual(pos.shape, (3, 1, 4))
+
+    def test_tpu_platform_dispatches_rope_to_host_and_restores_device(self):
+        from sglang.multimodal_gen.runtime.models.encoders import qwen_vl_rope
+
+        seen_devices = []
+
+        class _Model:
+            @qwen_vl_rope.dispatch_rope_index_to_host_on_tpu
+            def get_rope_index(self, input_ids, *_args, **_kwargs):
+                seen_devices.append(input_ids.device)
+                return torch.zeros(3, 1, 4), torch.zeros(1)
+
+        target_device = torch.device("cpu")
+        input_ids = torch.ones(1, 4, dtype=torch.long, device=target_device)
+        platform = MagicMock()
+        platform.is_tpu.return_value = True
+        with patch.object(qwen_vl_rope, "current_platform", platform):
+            pos, deltas = _Model().get_rope_index(input_ids)
+        self.assertEqual(seen_devices[0], torch.device("cpu"))
+        self.assertEqual(pos.device, target_device)
+        self.assertEqual(deltas.device, target_device)
+
     def test_supporting_platforms_get_plain_pickle(self):
         import pickle
 
@@ -172,11 +212,15 @@ class TestTorchTpuIntegration(unittest.TestCase):
     def test_srt_symbols_the_platform_imports_exist(self):
         # tpu.py imports this lazily; a rename on the srt side must fail here,
         # not at worker bootstrap.
+        from sglang.srt.hardware_backend.tpu.env_override import (
+            apply_tpu_env_overrides,
+        )
         from sglang.srt.hardware_backend.tpu.patches import (
             _prepare_tpu_env,
             _register_aten_fallbacks,
         )
 
+        self.assertTrue(callable(apply_tpu_env_overrides))
         self.assertTrue(callable(_prepare_tpu_env))
         self.assertTrue(callable(_register_aten_fallbacks))
 

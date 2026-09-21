@@ -76,6 +76,11 @@ class TpuPlatform(Platform):
     def get_device_name(cls, device_id: int = 0) -> str:
         # Real kind ("TPU v7"); the query reads the host config, no PJRT init.
         try:
+            from sglang.srt.hardware_backend.tpu.env_override import (
+                apply_tpu_env_overrides,
+            )
+
+            apply_tpu_env_overrides()
             from torch_tpu._internal.utils import hardware
 
             return hardware.get_tpu_device_name() or "tpu"
@@ -96,6 +101,11 @@ class TpuPlatform(Platform):
         else:
             # Pre-init query for offload sizing; get_device_properties() would
             # initialize PJRT.
+            from sglang.srt.hardware_backend.tpu.env_override import (
+                apply_tpu_env_overrides,
+            )
+
+            apply_tpu_env_overrides()
             from torch_tpu._internal.utils import hardware
 
             total = hardware.get_hbm_bytes_per_device()
