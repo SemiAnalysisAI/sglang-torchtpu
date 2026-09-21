@@ -26,7 +26,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, nightly, gpt-oss-120b, gpt-oss-20b, deepseek-r1-0528, deepseek-v3-1, kimi-k26]
+        options: [all, nightly, full-set, gpt-oss-120b, gpt-oss-20b, deepseek-r1-0528, deepseek-v3-1, kimi-k26]
       test_filter:
         description: "Substring of a multihost test file path; runs only matching tests"
         required: false
@@ -190,7 +190,7 @@ jobs:
     needs: build
     if: >-
       ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","nightly","deepseek-r1-0528","deepseek-v3-1","kimi-k26"]'), inputs.model || 'all') }}
+          && contains(fromJSON('["all","nightly","full-set","deepseek-r1-0528","deepseek-v3-1","kimi-k26"]'), inputs.model || 'all') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -213,13 +213,15 @@ jobs:
           fi
           groups="$(python3 .github/tpu-ci/discover_multihost.py \
                       --suite nightly-tpu-multihost-accuracy)"
-          if [ "$MODEL" != "nightly" ]; then
+          if [ "$MODEL" != "nightly" ] && [ "$MODEL" != "full-set" ]; then
             ondemand="$(python3 .github/tpu-ci/discover_multihost.py \
                          --suite nightly-tpu-multihost-ondemand)"
             groups="$(jq -cn --argjson scheduled "$groups" --argjson ondemand "$ondemand" \
                         '$scheduled + $ondemand')"
           fi
-          if [ "$MODEL" != "all" ] && [ "$MODEL" != "nightly" ]; then
+          if [ "$MODEL" = "full-set" ]; then
+            groups="$(jq -c '[.[] | select(.name == "test_tpu_deepseek_r1_0528_tp16_dp1_accuracy" or (.name | startswith("test_tpu_kimi_k26_mmmu_shard")))]' <<< "$groups")"
+          elif [ "$MODEL" != "all" ] && [ "$MODEL" != "nightly" ]; then
             groups="$(jq -c --arg m "$MODEL" \
                         '[.[] | select(.name | contains($m | gsub("-"; "_")))]' <<< "$groups")"
           fi
