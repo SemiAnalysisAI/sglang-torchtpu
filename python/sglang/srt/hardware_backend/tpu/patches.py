@@ -295,12 +295,12 @@ _aten_fallbacks_registered = False
 
 
 def _register_aten_fallbacks() -> None:
-    """Register Python fallbacks for ATen ops not yet implemented in torch_tpu.
+    """Register Python fallbacks for ATen ops missing or inaccurate in torch_tpu.
 
     These should eventually move into torch_tpu's C++ kernel set (see
     torch_tpu/ops/* for the registration pattern). Kept here as a stopgap
     until those land — each fallback is a pure-torch equivalent of the
-    missing op.
+    missing or buggy op.
     """
     global _aten_fallbacks_registered
     if _aten_fallbacks_registered:
@@ -334,6 +334,9 @@ def _register_aten_fallbacks() -> None:
         self.copy_(out)
         return self
 
+    # TODO: Remove after torch_tpu fixes integer/bool aten::cumsum prefix-sum
+    # lowering (torch_tpu casts integer cumsum through fp32, losing exactness
+    # above 2^24 and corrupting int64/int32/bool prefix sums).
     def _cumsum_exact(src, dim, dtype):
         target = (
             dtype
@@ -344,28 +347,25 @@ def _register_aten_fallbacks() -> None:
                 else torch.int64
             )
         )
-        if target != torch.int64:
+        if target.is_floating_point or target.is_complex:
             out = torch.empty(src.shape, dtype=target, device=src.device)
             torch.ops.aten.cumsum.out(src, dim, dtype=target, out=out)
             return out
-        length = src.shape[dim] if src.dim() else 1
-        if src.dtype is torch.bool and length <= 0x7FFFFFFF:
-            out = torch.empty(src.shape, dtype=torch.int32, device=src.device)
-            torch.ops.aten.cumsum.out(src, dim, dtype=torch.int32, out=out)
-            return out.to(torch.int64)
-        out, step = src.to(torch.int64), 1
+        out = src.to(target)
+        if out.dim() == 0:
+            return out
+        d = dim if dim >= 0 else dim + out.dim()
+        length, step = out.shape[d], 1
         while step < length:
-            pad = list(out.shape)
-            pad[dim] = step
-            shifted = torch.cat(
+            out = torch.cat(
                 [
-                    torch.zeros(pad, dtype=out.dtype, device=out.device),
-                    out.narrow(dim, 0, length - step),
+                    out.narrow(d, 0, step),
+                    out.narrow(d, step, length - step)
+                    + out.narrow(d, 0, length - step),
                 ],
-                dim=dim,
+                dim=d,
             )
-            out = out + shifted
-            step *= 2
+            step <<= 1
         return out
 
     @torch.library.register_kernel("aten::cumsum", "PrivateUse1")

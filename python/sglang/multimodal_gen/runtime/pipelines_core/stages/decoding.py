@@ -155,7 +155,10 @@ class DecodingStage(PipelineStage):
     @property
     def parallelism_type(self) -> StageParallelismType:
         server_args = get_global_server_args()
-        if server_args.enable_cfg_parallel:
+        if (
+            server_args.enable_cfg_parallel
+            and not current_platform.requires_uniform_spmd_shapes()
+        ):
             if self._can_use_parallel_decode():
                 return StageParallelismType.REPLICATED
             return StageParallelismType.MAIN_RANK_ONLY
@@ -381,6 +384,8 @@ class DecodingStage(PipelineStage):
                     trajectory_decoded = None
 
         frames = server_args.pipeline_config.post_decoding(frames, server_args)
+        if current_platform.decode_output_on_host() and frames is not None:
+            frames = frames.cpu()
 
         # Update batch with decoded image
         output_batch = OutputBatch(

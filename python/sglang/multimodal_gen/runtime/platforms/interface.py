@@ -221,6 +221,7 @@ class Platform:
         return True
 
     @classmethod
+    @lru_cache(maxsize=1)
     def is_float64_supported(cls) -> bool:
         """Whether the device computes float64 elementwise.
 
@@ -234,6 +235,22 @@ class Platform:
 
     @classmethod
     def supports_device_tensor_pickle(cls) -> bool:
+        return True
+
+    @classmethod
+    def requires_group_barrier(cls) -> bool:
+        return False
+
+    @classmethod
+    def requires_uniform_spmd_shapes(cls) -> bool:
+        return False
+
+    @classmethod
+    def decode_output_on_host(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_varlen_attn_mask_meta(cls) -> bool:
         return True
 
     @classmethod

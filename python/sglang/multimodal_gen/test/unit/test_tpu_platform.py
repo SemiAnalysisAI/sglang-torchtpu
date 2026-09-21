@@ -11,11 +11,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.platforms import tpu_platform_plugin
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.platforms.tpu import (
-    TpuPlatform,
-    _install_qwen_vl_host_rope_dispatch,
-    dispatch_rope_index_to_host_on_tpu,
-)
+from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
 
 _HAS_TORCH_TPU = hasattr(torch, "tpu")
 
@@ -103,6 +99,89 @@ class TestTpuPlatformSurface(unittest.TestCase):
 
         self.assertTrue(Platform.supports_distributed_p2p())
         self.assertTrue(Platform.supports_device_tensor_pickle())
+        self.assertFalse(Platform.requires_group_barrier())
+        self.assertFalse(Platform.requires_uniform_spmd_shapes())
+        self.assertFalse(Platform.decode_output_on_host())
+        self.assertTrue(Platform.supports_varlen_attn_mask_meta())
+
+    def test_tpu_spmd_and_attention_capabilities(self):
+        self.assertTrue(TpuPlatform.requires_group_barrier())
+        self.assertTrue(TpuPlatform.requires_uniform_spmd_shapes())
+        self.assertTrue(TpuPlatform.decode_output_on_host())
+        self.assertFalse(TpuPlatform.supports_varlen_attn_mask_meta())
+
+    def test_qwen_and_ernie_keep_full_len_mask_under_uniform_cfg_seq_len(self):
+        from sglang.multimodal_gen.configs.pipeline_configs.ernie_image import (
+            ErnieImagePipelineConfig,
+        )
+        from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+            QwenImagePipelineConfig,
+        )
+
+        qwen_cfg = QwenImagePipelineConfig()
+        batch = MagicMock()
+        batch.do_classifier_free_guidance = True
+        batch.prompt_seq_lens = [[8]]
+        batch.prompt_embeds_mask = [torch.ones((1, 8), dtype=torch.bool, device="cpu")]
+        batch.prompt_embeds = [torch.zeros((1, 8, 16), device="cpu")]
+        batch.height = 64
+        batch.width = 64
+
+        with patch(
+            "sglang.multimodal_gen.configs.pipeline_configs.qwen_image.requires_uniform_cfg_seq_len",
+            return_value=True,
+        ):
+            lens, mask = qwen_cfg._prepare_text_conditioning(
+                batch, encoder_index=0, text_seq_len=8, batch_size=1
+            )
+        self.assertEqual(lens, [8])
+        self.assertIsNotNone(mask)
+        self.assertEqual(mask.shape, (1, 8))
+
+        ernie_cfg = ErnieImagePipelineConfig()
+        with patch(
+            "sglang.multimodal_gen.configs.pipeline_configs.ernie_image.requires_uniform_cfg_seq_len",
+            return_value=True,
+        ):
+            cond_kwargs = ernie_cfg._prepare_cond_kwargs(
+                batch,
+                batch.prompt_embeds,
+                rotary_emb=None,
+                device=torch.device("cpu"),
+                dtype=torch.bfloat16,
+            )
+        self.assertIsNotNone(cond_kwargs["encoder_hidden_states_mask"])
+        self.assertEqual(cond_kwargs["encoder_hidden_states_mask"].shape, (1, 8))
+
+    def test_decoding_stage_is_replicated_when_uniform_spmd_shapes_required(self):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages import base as base_mod
+        from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+            decoding as decoding_mod,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+            StageParallelismType,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+            DecodingStage,
+        )
+
+        server_args = MagicMock(enable_cfg_parallel=True)
+        platform = MagicMock()
+        platform.requires_uniform_spmd_shapes.return_value = True
+        with (
+            patch.object(base_mod, "get_global_server_args", return_value=server_args),
+            patch.object(
+                decoding_mod, "get_global_server_args", return_value=server_args
+            ),
+            patch.object(decoding_mod, "current_platform", platform),
+        ):
+            stage = DecodingStage(vae=MagicMock())
+            self.assertEqual(stage.parallelism_type, StageParallelismType.REPLICATED)
+            platform.requires_uniform_spmd_shapes.return_value = False
+            with patch.object(stage, "_can_use_parallel_decode", return_value=False):
+                self.assertEqual(
+                    stage.parallelism_type, StageParallelismType.MAIN_RANK_ONLY
+                )
 
     def test_device_tensor_pickle_is_unsupported(self):
         self.assertFalse(TpuPlatform.supports_device_tensor_pickle())
@@ -146,6 +225,35 @@ class TestTpuPlatformSurface(unittest.TestCase):
         self.assertEqual(seen_devices[0], torch.device("cpu"))
         self.assertEqual(pos.device, target_device)
         self.assertEqual(deltas.device, target_device)
+
+    def test_qwen2_5_vl_get_rope_index_with_video_grid_thw(self):
+        from sglang.multimodal_gen.runtime.models.encoders import qwen_vl_rope
+        from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl import (
+            Qwen2_5_VLModel,
+        )
+
+        dummy_self = MagicMock()
+        dummy_self.config.vision_start_token_id = 151652
+        dummy_self.config.image_token_id = 151655
+        dummy_self.config.video_token_id = 151656
+        dummy_self.config.vision_config.tokens_per_second = 2
+        dummy_self.config.vision_config.spatial_merge_size = 1
+        input_ids = torch.tensor(
+            [[151652, 151656, 151656, 10]], dtype=torch.long, device="cpu"
+        )
+        attn_mask = torch.tensor([[1, 1, 1, 1]], dtype=torch.long, device="cpu")
+        video_grid_thw = torch.tensor([[2, 1, 1]], dtype=torch.long, device="cpu")
+        platform = MagicMock()
+        platform.is_tpu.return_value = True
+        with patch.object(qwen_vl_rope, "current_platform", platform):
+            pos_ids, deltas = Qwen2_5_VLModel.get_rope_index(
+                dummy_self,
+                input_ids=input_ids,
+                video_grid_thw=video_grid_thw,
+                attention_mask=attn_mask,
+            )
+        self.assertEqual(pos_ids.shape, (3, 1, 4))
+        self.assertEqual(deltas.shape, (1, 1))
 
     def test_supporting_platforms_get_plain_pickle(self):
         import pickle

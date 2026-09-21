@@ -25,6 +25,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     QwenImageRolloutPipelineMixin,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    requires_uniform_cfg_seq_len,
+)
 from sglang.multimodal_gen.runtime.utils.condition_expansion import (
     PromptToSampleBatchExpander,
 )
@@ -386,7 +389,10 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         Single-request execution uses the full padded length. Batched execution
         uses stored per-request lengths and masks from text encoding.
         """
-        if batch_size == 1:
+        keep_full_len_mask = requires_uniform_cfg_seq_len(
+            batch.do_classifier_free_guidance
+        )
+        if batch_size == 1 and not keep_full_len_mask:
             return [text_seq_len], None
 
         txt_seq_lens = self.require_text_seq_lens(
@@ -399,8 +405,12 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
             text_seq_len,
             batch_size,
             negative=negative,
+            keep_full_len_mask=keep_full_len_mask,
         )
-        return txt_seq_lens, encoder_hidden_states_mask
+        return (
+            ([text_seq_len] if batch_size == 1 else txt_seq_lens),
+            encoder_hidden_states_mask,
+        )
 
     def _prepare_encoder_hidden_states_mask(
         self,
@@ -411,6 +421,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         batch_size: int,
         *,
         negative: bool = False,
+        keep_full_len_mask: bool | None = None,
     ):
         """Return the text attention mask passed to the Qwen image DiT.
 
@@ -426,7 +437,14 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         `txt_seq_lens`: position j is valid for row i when
         `j < txt_seq_lens[i]`.
         """
-        if all(seq_len == text_seq_len for seq_len in txt_seq_lens):
+        if keep_full_len_mask is None:
+            keep_full_len_mask = requires_uniform_cfg_seq_len(
+                batch.do_classifier_free_guidance
+            )
+        if (
+            all(seq_len == text_seq_len for seq_len in txt_seq_lens)
+            and not keep_full_len_mask
+        ):
             return None
 
         masks_by_encoder = (

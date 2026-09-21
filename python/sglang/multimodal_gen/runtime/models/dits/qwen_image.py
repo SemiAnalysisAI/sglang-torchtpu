@@ -1734,6 +1734,18 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             encoder_hidden_states_mask = encoder_hidden_states_mask.to(
                 device=hidden_states.device, dtype=torch.bool
             )
+            if current_platform.requires_uniform_spmd_shapes() and should_shard_text(
+                encoder_hidden_states.shape[1]
+            ):
+                txt_shard = build_shard_plan(encoder_hidden_states.shape[1])
+                encoder_hidden_states = shard_like(encoder_hidden_states, txt_shard)
+                encoder_hidden_states_mask = shard_like(
+                    encoder_hidden_states_mask, txt_shard
+                )
+                if freqs_cis is not None:
+                    img_cache, txt_cache = freqs_cis
+                    freqs_cis = (img_cache, shard_like(txt_cache, txt_shard, dim=0))
+                sp_text_sharded = True
             batch_size, image_seq_len = hidden_states.shape[:2]
             image_mask = torch.ones(
                 (batch_size, image_seq_len),
@@ -1742,38 +1754,47 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
             joint_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
             block_attention_kwargs["attn_mask"] = joint_mask
-            if is_in_breakable_cuda_graph():
-                # Qwen/FireRed BCG buckets text inputs so different prompt
-                # lengths can share a graph. Attention break kwargs are captured
-                # once, so build varlen metadata replay-locally from the current
-                # static mask instead of closing over stale cu_seqlens/indices.
-                block_attention_kwargs["attn_mask_meta"] = DynamicVarlenMaskMeta()
-            elif (
-                txt_seq_lens is not None
-                and len(txt_seq_lens) == batch_size
-                and all(0 <= n <= encoder_hidden_states.shape[1] for n in txt_seq_lens)
-            ):
-                # txt_seq_lens already carries each row's valid text prefix
-                # (the mask is built from it), so the varlen metadata can be
-                # assembled host-side; the mask-based builder costs a GPU
-                # nonzero plus a device sync on every denoising step.
-                txt_len = encoder_hidden_states.shape[1]
-                block_attention_kwargs["attn_mask_meta"] = (
-                    build_varlen_mask_meta_from_ranges(
-                        [
-                            [(0, int(n)), (txt_len, txt_len + image_seq_len)]
-                            for n in txt_seq_lens
-                        ],
-                        max_seqlen=txt_len + image_seq_len,
-                        device=hidden_states.device,
+            # When supports_varlen_attn_mask_meta() is False, attn_mask_meta is
+            # omitted so _attn_mask_meta_local_pad returns sp_txt_pad = 0.
+            # If sp_text_sharded is True, shard_like zero-pads any tail columns on
+            # encoder_hidden_states_mask so SDPA masks out padded text keys, and
+            # split_seqs uses the post-shard encoder_hidden_states.shape[1] with
+            # sp_txt_pad = 0 to slice the exact [sharded_txt_len : sharded_txt_len + sharded_img_len] segment.
+            if current_platform.supports_varlen_attn_mask_meta():
+                if is_in_breakable_cuda_graph():
+                    # Qwen/FireRed BCG buckets text inputs so different prompt
+                    # lengths can share a graph. Attention break kwargs are captured
+                    # once, so build varlen metadata replay-locally from the current
+                    # static mask instead of closing over stale cu_seqlens/indices.
+                    block_attention_kwargs["attn_mask_meta"] = DynamicVarlenMaskMeta()
+                elif (
+                    txt_seq_lens is not None
+                    and len(txt_seq_lens) == batch_size
+                    and all(
+                        0 <= n <= encoder_hidden_states.shape[1] for n in txt_seq_lens
                     )
-                )
-            else:
-                # Precompute varlen metadata once per request so every block
-                # reuses the same cu_seqlens / indices instead of rebuilding.
-                block_attention_kwargs["attn_mask_meta"] = build_varlen_mask_meta(
-                    joint_mask
-                )
+                ):
+                    # txt_seq_lens already carries each row's valid text prefix
+                    # (the mask is built from it), so the varlen metadata can be
+                    # assembled host-side; the mask-based builder costs a GPU
+                    # nonzero plus a device sync on every denoising step.
+                    txt_len = encoder_hidden_states.shape[1]
+                    block_attention_kwargs["attn_mask_meta"] = (
+                        build_varlen_mask_meta_from_ranges(
+                            [
+                                [(0, int(n)), (txt_len, txt_len + image_seq_len)]
+                                for n in txt_seq_lens
+                            ],
+                            max_seqlen=txt_len + image_seq_len,
+                            device=hidden_states.device,
+                        )
+                    )
+                else:
+                    # Precompute varlen metadata once per request so every block
+                    # reuses the same cu_seqlens / indices instead of rebuilding.
+                    block_attention_kwargs["attn_mask_meta"] = build_varlen_mask_meta(
+                        joint_mask
+                    )
         elif should_shard_text(encoder_hidden_states.shape[1]):
             # Shard the replicated text stream across SP ranks; non-divisible
             # lengths tail-pad the last rank and attention skips the pad via the

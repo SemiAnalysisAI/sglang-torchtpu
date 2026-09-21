@@ -1,13 +1,41 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared SRT rotary embedding adapter for Qwen-VL text encoders."""
 
+import functools
 from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.utils.hf_transformers.common import get_rope_config
+
+
+def _move_to_cpu(v):
+    return v.to("cpu") if isinstance(v, torch.Tensor) and v.device.type != "cpu" else v
+
+
+def dispatch_rope_index_to_host_on_tpu(fn):
+    """Run Qwen-VL get_rope_index on host CPU on TPU to avoid per-token XLA syncs."""
+
+    @functools.wraps(fn)
+    def _wrapped(self, *args, **kwargs):
+        if not current_platform.is_tpu():
+            return fn(self, *args, **kwargs)
+        tensors = [t for t in (*args, *kwargs.values()) if isinstance(t, torch.Tensor)]
+        dev = next(
+            (t.device for t in tensors if t.device.type != "cpu"),
+            tensors[0].device if tensors else torch.device("cpu"),
+        )
+        pos_ids, deltas = fn(
+            self,
+            *(_move_to_cpu(a) for a in args),
+            **{k: _move_to_cpu(v) for k, v in kwargs.items()},
+        )
+        return pos_ids.to(dev), deltas.to(dev)
+
+    return _wrapped
 
 
 def build_qwen_vl_text_rope(
