@@ -28,6 +28,7 @@ def _args(**overrides):
         mem_fraction_static=None,
         tp_size=1,
         pp_size=1,
+        dcp_size=1,
         dp_size=1,
         enable_dp_attention=False,
         enable_dp_lm_head=False,
