@@ -1,4 +1,4 @@
-"""Layer-addressed Raiden transfers from a pipeline to DP or matching PP stages."""
+"""Layer-addressed Raiden transfers from a pipeline to DP, TP, or matching PP stages."""
 
 from __future__ import annotations
 
@@ -19,6 +19,10 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.raiden.host_pool import (
     StagingAdmission,
     ranks_per_node,
+)
+from sglang.srt.disaggregation.raiden.reshard_schedule import (
+    ReshardGeometry,
+    head_pair_bytes,
 )
 from sglang.srt.disaggregation.raiden.serde import (
     MessageTag,
@@ -90,7 +94,9 @@ def materialized_storage_layout(tensor, getter):
 
 
 def layout_fingerprint(pools: Sequence[dict], tensors: Sequence[Any], getter) -> str:
-    """Compare per-class page geometry and materialized layout across layer subsets."""
+    """Compare per-class page geometry and materialized layout across layer
+    subsets; the per-rank head count is left out so a tensor-parallel consumer
+    matches its producer."""
     classes = {}
     for pool, tensor in zip(pools, tensors):
         layout = materialized_storage_layout(tensor, getter)
@@ -98,7 +104,11 @@ def layout_fingerprint(pools: Sequence[dict], tensors: Sequence[Any], getter) ->
             raise ValueError("Raiden pipeline KV must have a materialized TPU layout")
         major, tiles, bits = layout
         signature = dict(
-            page_shape=[int(n) for n in tensor.shape[1:]],
+            page_shape=[
+                int(tensor.shape[1]),
+                int(tensor.shape[3]),
+                int(tensor.shape[4]),
+            ],
             dtype=pool["dtype_tag"],
             minor_to_major=[int(n) for n in major],
             tiles=[[int(n) for n in tile] for tile in tiles],
@@ -109,7 +119,7 @@ def layout_fingerprint(pools: Sequence[dict], tensors: Sequence[Any], getter) ->
             raise ValueError(f"Raiden {kind} layers have differing page layouts")
         classes[kind] = signature
     value = json.dumps(
-        dict(schema="sglang-fused-kv-v1", classes=classes), sort_keys=True
+        dict(schema="sglang-fused-kv-v2", classes=classes), sort_keys=True
     )
     return hashlib.sha256(value.encode()).hexdigest()
 
@@ -138,6 +148,59 @@ def source_spans(pools: Sequence[dict], full: list[int], swa: list[int]) -> list
                 tag=pool["tag"],
                 block_ids=list(blocks),
                 declared_bytes=len(blocks) * stride,
+                dst_space_version=1,
+                spans=spans,
+            )
+        )
+    return result
+
+
+def head_slice_spans(
+    pools: Sequence[dict],
+    tensors: Sequence[Any],
+    full: list[int],
+    swa: list[int],
+    dst_attn_tp: int,
+    total_kv_heads: int,
+) -> list[Any]:
+    """Describe each destination rank's kv-head slice of every locally owned
+    page: one strided span per page and rank, routed to that rank only."""
+    result = []
+    for pool, tensor in zip(pools, tensors):
+        blocks = swa if pool["tag"].startswith("swa.") else full
+        geometry = ReshardGeometry(
+            1,
+            dst_attn_tp,
+            head_pair_bytes(tensor),
+            total_kv_heads,
+            kv_packing=int(tensor.shape[3]),
+            element_size=tensor.element_size(),
+        )
+        page_tokens = int(tensor.shape[1])
+        spans = []
+        for rank in range(dst_attn_tp):
+            src_offset, size, src_stride, dst_offset, dst_stride = geometry.entry_bytes(
+                0, rank
+            )
+            spans.extend(
+                SimpleNamespace(
+                    src_block_ordinal=index,
+                    src_offset_bytes=src_offset,
+                    dst_block_index=0,
+                    dst_offset_bytes=index * dst_stride * page_tokens + dst_offset,
+                    size_bytes=size,
+                    src_stride_bytes=src_stride,
+                    dst_stride_bytes=dst_stride,
+                    count=page_tokens,
+                    dst_unit_ordinal=rank,
+                )
+                for index in range(len(blocks))
+            )
+        result.append(
+            SimpleNamespace(
+                tag=pool["tag"],
+                block_ids=list(blocks),
+                declared_bytes=len(blocks) * pool["block_stride_bytes"],
                 dst_space_version=1,
                 spans=spans,
             )
@@ -279,12 +342,18 @@ class PipelineTransfer:
 
         self.manager = manager
         self.producer = manager.disaggregation_mode == DisaggregationMode.PREFILL
-        if manager.attn_tp_size != 1 or manager.attn_cp_size != 1:
+        if manager.attn_cp_size != 1:
+            raise ValueError("Raiden pipeline transfer requires attention CP=1")
+        if self.producer and (manager.attn_tp_size != 1 or manager.pp_size <= 1):
             raise ValueError(
-                "Raiden pipeline transfer requires attention TP=1 and CP=1"
+                "Raiden pipeline transfer requires a pipeline producer with "
+                "attention TP=1"
             )
-        if self.producer and manager.pp_size <= 1:
-            raise ValueError("Raiden pipeline transfer requires a pipeline producer")
+        if manager.attn_tp_size != 1 and manager.pp_size != 1:
+            raise ValueError(
+                "Raiden pipeline transfer takes attention TP>1 only on a decode "
+                "without pipeline stages"
+            )
         if get_spec().speculative_algorithm is not None:
             raise ValueError(
                 "Raiden pipeline transfer does not support speculative decoding"
@@ -299,6 +368,12 @@ class PipelineTransfer:
         self.lock = threading.RLock()
         self.pools = pool_manifest(groups)
         tensors = list(groups.full) + list(groups.swa)
+        self.tensors = tensors
+        # One worker per pipeline stage or attention-TP rank. Rank 0 hosts the
+        # shared controller and, on a tensor-parallel decode, plans every
+        # transfer for all ranks.
+        self.rank = manager.pp_rank * manager.attn_tp_size + manager.attn_tp_rank
+        self.workers = manager.pp_size * manager.attn_tp_size
         self.client_type = ReshardClient
         self.clients = {}
         self.executor = concurrent.futures.ThreadPoolExecutor(
@@ -315,7 +390,7 @@ class PipelineTransfer:
         self.retired = set()
         self.store = None
         addresses = None
-        if manager.pp_rank == 0:
+        if self.rank == 0:
             self.store = ReshardStore(
                 RaidenId(
                     job_name="sglang",
@@ -333,15 +408,28 @@ class PipelineTransfer:
             )
         if manager.pp_size > 1:
             addresses = get_pp_group().broadcast_object(addresses, src=0)
+        if manager.attn_tp_size > 1:
+            addresses = get_parallel().attn_tp_group.broadcast_object(addresses, src=0)
         self.controller, dispatch = addresses
         self.client = ReshardClient(self.controller)
         self.unit_fields = dict(
             job_name="sglang",
             job_replica_id=self.controller,
             data_name="prefill" if self.producer else "decode",
-            data_replica_idx=manager.pp_rank,
+            data_replica_idx=self.rank,
         )
         self.unit = SimpleNamespace(**self.unit_fields)
+        # A tensor-parallel decode receives one transfer into every rank's
+        # engine; a stage or DP replica receives into its own unit only.
+        self.dst_units = [
+            SimpleNamespace(
+                **(
+                    self.unit_fields
+                    | {"data_replica_idx": self.rank - manager.attn_tp_rank + rank}
+                )
+            )
+            for rank in range(manager.attn_tp_size)
+        ]
         full_blocks = manager._max_request_blocks()
         swa_blocks = manager._swa_max_request_blocks() if groups.swa else 0
         self.max_blocks = max(full_blocks, swa_blocks)
@@ -410,7 +498,7 @@ class PipelineTransfer:
             listener_port=0,
             parallelism=1,
             raiden_controller_address=dispatch,
-            worker_id=f"worker_{manager.pp_rank}",
+            worker_id=f"worker_{self.rank}",
         )
         self.engine.register_pools(self.pools, **staging_options)
         fingerprint = layout_fingerprint(
@@ -423,17 +511,19 @@ class PipelineTransfer:
             pool_manifest=self.pools,
             layout_fingerprint=fingerprint,
             page_tokens=manager.kv_args.page_size,
-            transfer_parallelism=manager.pp_size,
-            transfer_rank=manager.pp_rank,
+            transfer_parallelism=self.workers,
+            transfer_rank=self.rank,
         )
         manager.raiden_endpoint = self.controller
         logger.info(
-            "Raiden pipeline ready: mode=%s pp=%d/%d local_rank=%d "
+            "Raiden pipeline ready: mode=%s pp=%d/%d tp=%d/%d local_rank=%d "
             "page_tokens=%d staging=%s slots=%d native_slot_bytes=%d mirror_peak_bytes=%d "
             "layout_fingerprint=%s pools=%s",
             "prefill" if self.producer else "decode",
             manager.pp_rank,
             manager.pp_size,
+            manager.attn_tp_rank,
+            manager.attn_tp_size,
             manager._local_rank,
             manager.kv_args.page_size,
             staging_mode,
@@ -470,34 +560,66 @@ class PipelineTransfer:
                     mgr.kv_args.aux_data_ptrs, mgr.kv_args.aux_item_lens, aux_index
                 )
             )
+            # The pages register with the consumer's head geometry, so
+            # registration waits for the first consumer request.
             self.sent[room] = dict(
-                full=len(full),
-                swa=len(swa),
+                full=full,
+                swa=swa,
                 aux=aux,
                 expires=time.monotonic() + mgr._timeout_s,
+                registered=False,
+                replied=set(),
             )
-            try:
-                self.client.register_request_blocks(
-                    req_id=str(room),
-                    uuid=room,
-                    unit=self.unit,
-                    block_ids=full,
-                    pool_spans=source_spans(self.pools, full, swa),
-                )
-            except RuntimeError as error:
-                if "Request block registration was cancelled" not in str(error):
-                    raise
-                self.failed.add(room)
-                self.retired.add(room)
+            self._reply(room)
+            if room in self.failed:
                 return False
             mgr.update_status(room, KVPoll.Transferring)
-            self._reply(room)
             return True
 
-    def _reply(self, room):
-        if room not in self.sent or room not in self.replies:
-            return
+    def _register(self, room) -> bool:
+        """Register the room's pages once, sliced for the consumer's attention TP."""
         item = self.sent[room]
+        widths = {int(meta["attn_tp_size"]) for meta in self.replies[room].values()}
+        if len(widths) != 1:
+            raise ValueError(
+                "Raiden pipeline consumers of one request disagree on attention TP"
+            )
+        dst_attn_tp = widths.pop()
+        if dst_attn_tp == 1:
+            spans = source_spans(self.pools, item["full"], item["swa"])
+        else:
+            spans = head_slice_spans(
+                self.pools,
+                self.tensors,
+                item["full"],
+                item["swa"],
+                dst_attn_tp,
+                int(self.manager.kv_args.total_kv_head_num),
+            )
+        try:
+            self.client.register_request_blocks(
+                req_id=str(room),
+                uuid=room,
+                unit=self.unit,
+                block_ids=item["full"],
+                pool_spans=spans,
+            )
+        except RuntimeError as error:
+            if "Request block registration was cancelled" not in str(error):
+                raise
+            self.failed.add(room)
+            self.retired.add(room)
+            return False
+        item["registered"] = True
+        return True
+
+    def _reply(self, room):
+        item = self.sent.get(room)
+        consumers = self.replies.get(room)
+        if item is None or not consumers or room in self.failed:
+            return
+        if not item["registered"] and not self._register(room):
+            return
         mgr = self.manager
         metadata = dict(
             controller=self.controller,
@@ -505,18 +627,18 @@ class PipelineTransfer:
             rank=mgr.pp_rank,
             pp_size=mgr.pp_size,
             pool_tags=[pool["tag"] for pool in self.pools],
-            full=item["full"],
-            swa=item["swa"],
+            full=len(item["full"]),
+            swa=len(item["swa"]),
         )
-        self._send(
-            self.replies[room],
-            [
-                MessageTag.PIPELINE_READY,
-                str(room).encode(),
-                json.dumps(metadata).encode(),
-                item["aux"],
-            ],
-        )
+        payload = json.dumps(metadata).encode()
+        for endpoint in consumers:
+            if endpoint in item["replied"]:
+                continue
+            self._send(
+                endpoint,
+                [MessageTag.PIPELINE_READY, str(room).encode(), payload, item["aux"]],
+            )
+            item["replied"].add(endpoint)
 
     def register_decode(self, room, full, swa, aux_index, infos):
         self._validate_room(room)
@@ -540,10 +662,19 @@ class PipelineTransfer:
                 ),
             )
         endpoint = NetworkAddress(mgr.local_ip, mgr.rank_port).to_tcp()
+        consumer = json.dumps(
+            dict(attn_tp_size=mgr.attn_tp_size, attn_tp_rank=mgr.attn_tp_rank)
+        ).encode()
         for info in infos:
             peer = NetworkAddress(info["rank_ip"], int(info["rank_port"])).to_tcp()
             self._send(
-                peer, [MessageTag.PIPELINE_REQ, str(room).encode(), endpoint.encode()]
+                peer,
+                [
+                    MessageTag.PIPELINE_REQ,
+                    str(room).encode(),
+                    endpoint.encode(),
+                    consumer,
+                ],
             )
 
     def on_message(self, msg):
@@ -565,10 +696,10 @@ class PipelineTransfer:
                 self._try_release(room)
                 return
             if msg[0] == MessageTag.PIPELINE_REQ:
-                mgr._require_frames(msg, MessageTag.PIPELINE_REQ, 3)
+                mgr._require_frames(msg, MessageTag.PIPELINE_REQ, 4)
                 if not self.producer:
                     raise ValueError("A pipeline request must target a prefill worker")
-                self.replies[room] = msg[2].decode()
+                self.replies.setdefault(room, {})[msg[2].decode()] = json.loads(msg[3])
                 self._reply(room)
                 return
             mgr._require_frames(msg, MessageTag.PIPELINE_READY, 4)
@@ -625,31 +756,37 @@ class PipelineTransfer:
                 self.pools, request.full, request.swa, source_full, source_swa
             )
             if not args["transfer_pool_tags"]:
-                for endpoint in request.endpoints:
-                    self._send(
-                        endpoint,
-                        [
-                            MessageTag.PIPELINE_RELEASE,
-                            str(room).encode(),
-                            str(mgr.pp_size).encode(),
-                        ],
-                    )
+                if mgr.attn_tp_rank == 0:
+                    for endpoint in request.endpoints:
+                        self._send(
+                            endpoint,
+                            [
+                                MessageTag.PIPELINE_RELEASE,
+                                str(room).encode(),
+                                str(mgr.pp_size).encode(),
+                            ],
+                        )
                 self.done_recv.add(room)
                 mgr._completed_recv.add(str(room))
                 return True
             if not self.admission.admit(room, self.max_blocks):
                 return False
+            mgr.update_status(room, KVPoll.Transferring)
+            if mgr.attn_tp_rank != 0:
+                # Rank 0 plans one transfer into every attention-TP rank's
+                # engine; this rank's engine reports its own landing.
+                request.accepted = True
+                return True
             if address not in self.clients:
                 self.clients[address] = self.client_type(address)
             client = self.clients[address]
-            mgr.update_status(room, KVPoll.Transferring)
             request.future = self.executor.submit(
                 client.coordinate_transfer,
                 src_units=[
                     SimpleNamespace(**(sources[0]["unit"] | {"data_replica_idx": rank}))
                     for rank in range(int(sources[0]["pp_size"]))
                 ],
-                dst_units=[self.unit],
+                dst_units=self.dst_units,
                 req_id=str(room),
                 uuid=room,
                 use_block_chunks=True,
@@ -670,7 +807,9 @@ class PipelineTransfer:
             or time.monotonic() < release["next_attempt"]
         ):
             return
-        if release["pp_size"] == 1:
+        if not self.sent[room]["registered"]:
+            pass  # nothing is registered natively, so nothing can be claimed
+        elif release["pp_size"] == 1:
             if not self.client.cancel_request_blocks_if_unclaimed(str(room), room):
                 return
         else:
@@ -714,7 +853,9 @@ class PipelineTransfer:
                     if room in self.done_send | self.failed:
                         continue
                     if room in mgr._aborted or time.monotonic() >= item["expires"]:
-                        if self.client.cancel_request_blocks_if_unclaimed(
+                        if not item[
+                            "registered"
+                        ] or self.client.cancel_request_blocks_if_unclaimed(
                             str(room), room
                         ):
                             if (
@@ -755,6 +896,15 @@ class PipelineTransfer:
                             )
                         request.accepted = True
                         request.future = None
+                    if (
+                        request.accepted
+                        and mgr.attn_tp_rank != 0
+                        and room not in self.done_recv | self.failed
+                        and time.monotonic() >= request.deadline + mgr._timeout_s
+                    ):
+                        # Rank 0 submits by its deadline and the native
+                        # transfer deadline bounds the landing after that.
+                        self.failed.add(room)
                     if room in self.done_recv | self.failed and request.future is None:
                         self.admission.release(room)
             with mgr._state_lock:

@@ -18,6 +18,7 @@ from sglang.srt.disaggregation.raiden.pipeline import (
     PipelineTransfer,
     Receive,
     destination_blocks,
+    head_slice_spans,
     layout_fingerprint,
     legacy_mirror_slots,
     legacy_slot_host_bytes,
@@ -46,16 +47,43 @@ class Buffer:
         return SimpleNamespace(dtype=str(dtype), shape=self.shape)
 
 
-def groups(full=(0, 2), swa=(1, 3), pages=64):
+class Bf16Buffer(Buffer):
+    """Eight kv-heads of head_dim 128 in bf16: one head's K+V is 512 bytes."""
+
+    dtype = "torch.bfloat16"
+
+    def element_size(self):
+        return 2
+
+
+class Fp8Buffer(Buffer):
+    """Eight kv-heads in fp8: two heads share every 32-bit pack."""
+
+    def __init__(self, pages=64):
+        self.shape = (pages, 128, 4, 4, 128)
+
+
+def groups(full=(0, 2), swa=(1, 3), pages=64, buffer=Buffer):
     return SimpleNamespace(
-        full=[Buffer(pages) for _ in full],
-        swa=[Buffer(pages) for _ in swa],
+        full=[buffer(pages) for _ in full],
+        swa=[buffer(pages) for _ in swa],
         full_layer_ids=list(full),
         swa_layer_ids=list(swa),
     )
 
 
-def transfer(producer=False, pp_size=1, pp_rank=0):
+def sent(expires=None, registered=True):
+    return dict(
+        full=[20, 21],
+        swa=[30],
+        aux=b"",
+        expires=time.monotonic() + 120 if expires is None else expires,
+        registered=registered,
+        replied=set(),
+    )
+
+
+def transfer(producer=False, pp_size=1, pp_rank=0, attn_tp_size=1, attn_tp_rank=0):
     pipe = PipelineTransfer.__new__(PipelineTransfer)
     pipe.manager = SimpleNamespace(
         _state_lock=threading.Lock(),
@@ -66,19 +94,41 @@ def transfer(producer=False, pp_size=1, pp_rank=0):
         _failed=set(),
         _norm_req_id=lambda value: value.removeprefix("resharded_transfer_"),
         _require_frames=Mock(),
+        _prefill=SimpleNamespace(send_blocks={}, send_swa_blocks={}),
+        _timeout_s=120,
         update_status=Mock(),
+        kv_args=SimpleNamespace(total_kv_head_num=8),
+        local_ip="10.0.0.2",
+        rank_port=31000,
         pp_size=pp_size,
         pp_rank=pp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_tp_rank=attn_tp_rank,
     )
     pipe.producer = producer
     pipe.lock = threading.RLock()
     pipe.engine = SimpleNamespace(poll_stats=Mock(return_value=([], [], [])))
-    pipe.pools = pool_manifest(groups(full=(6,), swa=(7,)))
+    layers = groups(full=(6,), swa=(7,), buffer=Bf16Buffer)
+    pipe.pools = pool_manifest(layers)
+    pipe.tensors = list(layers.full) + list(layers.swa)
     pipe.client = Mock()
     pipe.clients = {}
     pipe.client_type = Mock(return_value=Mock())
     pipe.controller = "decode:30001"
-    pipe.unit = SimpleNamespace(data_replica_idx=pp_rank)
+    pipe.rank = pp_rank * attn_tp_size + attn_tp_rank
+    pipe.unit_fields = dict(
+        job_name="sglang",
+        job_replica_id="decode:30001",
+        data_name="prefill" if producer else "decode",
+        data_replica_idx=pipe.rank,
+    )
+    pipe.unit = SimpleNamespace(**pipe.unit_fields)
+    pipe.dst_units = [
+        SimpleNamespace(
+            **(pipe.unit_fields | {"data_replica_idx": pp_rank * attn_tp_size + rank})
+        )
+        for rank in range(attn_tp_size)
+    ]
     pipe.executor = Mock()
     pipe.executor.submit.return_value = concurrent.futures.Future()
     pipe.max_blocks = 4
@@ -212,6 +262,49 @@ class TestLayerPools(unittest.TestCase):
         result = destination_blocks(pools, [23, 24, 25], [], 2, 0)
         self.assertEqual(result["dst_device_block_ids"], [23, 24])
         self.assertEqual(result["dst_skip_bytes"], [0])
+
+    def test_head_slice_spans_route_one_slice_per_rank(self):
+        layers = groups(full=(6,), swa=(7,), buffer=Bf16Buffer)
+        pools = pool_manifest(layers)
+        spans = head_slice_spans(pools, layers.full + layers.swa, [20, 21], [30], 8, 8)
+        self.assertEqual([len(entry.spans) for entry in spans], [16, 8])
+        self.assertEqual(
+            [entry.declared_bytes for entry in spans], [2 * 524288, 524288]
+        )
+        self.assertEqual(
+            {span.dst_unit_ordinal for span in spans[0].spans}, set(range(8))
+        )
+        (span,) = [
+            span
+            for span in spans[0].spans
+            if span.dst_unit_ordinal == 3 and span.src_block_ordinal == 1
+        ]
+        # Rank 3 takes head 3 of every token: 512 bytes every 4096, landing
+        # contiguously in its own 65536-byte page.
+        self.assertEqual(
+            (span.src_offset_bytes, span.size_bytes, span.src_stride_bytes),
+            (1536, 512, 4096),
+        )
+        self.assertEqual(
+            (span.dst_block_index, span.dst_offset_bytes, span.dst_stride_bytes),
+            (0, 65536, 512),
+        )
+        self.assertEqual((span.count, spans[0].dst_space_version), (128, 1))
+
+    def test_partial_fp8_head_packs_are_rejected(self):
+        layers = groups(full=(6,), swa=(), buffer=Fp8Buffer)
+        with self.assertRaisesRegex(ValueError, "Partial FP8"):
+            head_slice_spans(pool_manifest(layers), layers.full, [20], [], 8, 8)
+
+    def test_fingerprint_ignores_the_per_rank_head_count(self):
+        getter = lambda tensor: ((4, 3, 2, 1, 0), ((8, 128),), 8)
+        producer = groups(full=(6,), swa=(), buffer=Bf16Buffer)
+        consumer = groups(full=(6,), swa=(), buffer=Bf16Buffer)
+        consumer.full[0].shape = (64, 128, 1, 2, 128)
+        self.assertEqual(
+            layout_fingerprint(pool_manifest(producer), producer.full, getter),
+            layout_fingerprint(pool_manifest(consumer), consumer.full, getter),
+        )
 
     def test_fingerprint_matches_an_uneven_stage_subset(self):
         full = groups(full=tuple(range(62)), swa=(), pages=64)
@@ -353,6 +446,74 @@ class TestPipelineLifetimes(unittest.TestCase):
         self.assertEqual(args["dst_units"], [pipe.unit])
         self.assertEqual(args["dst_mem_type"], 2)
 
+    def test_tp_rank_zero_plans_one_transfer_into_every_rank(self):
+        pipe = transfer(attn_tp_size=2)
+        pipe.receives[7] = receive()
+        self.assertTrue(pipe.maybe_start_pull(7))
+        args = pipe.executor.submit.call_args.kwargs
+        self.assertEqual([u.data_replica_idx for u in args["dst_units"]], [0, 1])
+
+    def test_tp_follower_waits_for_its_own_engine(self):
+        pipe = transfer(attn_tp_size=2, attn_tp_rank=1)
+        pipe.receives[7] = receive()
+        self.assertTrue(pipe.maybe_start_pull(7))
+        pipe.executor.submit.assert_not_called()
+        self.assertTrue(pipe.active(7))
+        pipe.engine.poll_stats.return_value = ([], ["7"], [])
+        pipe.poll()
+        self.assertFalse(pipe.active(7))
+        self.assertIn("7", pipe.manager._completed_recv)
+
+    def test_tp_follower_fails_after_the_planning_and_transfer_deadlines(self):
+        pipe = transfer(attn_tp_size=2, attn_tp_rank=1)
+        request = receive()
+        request.deadline = time.monotonic() - 121
+        pipe.receives[7] = request
+        self.assertTrue(pipe.maybe_start_pull(7))
+        pipe.poll()
+        self.assertIn("7", pipe.manager._failed)
+        self.assertFalse(pipe.active(7))
+
+    def test_producer_registers_once_with_the_consumer_head_geometry(self):
+        pipe = transfer(producer=True)
+        pipe.manager._prefill.send_blocks[7] = [20, 21]
+        pipe.manager._prefill.send_swa_blocks[7] = [30]
+        self.assertTrue(pipe.finalize_send(7, None))
+        pipe.client.register_request_blocks.assert_not_called()
+        request = [MessageTag.PIPELINE_REQ, b"7", b"tcp://decode:31003"]
+        pipe.on_message(request + [b'{"attn_tp_size": 8, "attn_tp_rank": 3}'])
+        spans = pipe.client.register_request_blocks.call_args.kwargs["pool_spans"]
+        self.assertEqual([len(entry.spans) for entry in spans], [16, 8])
+        request[2] = b"tcp://decode:31000"
+        pipe.on_message(request + [b'{"attn_tp_size": 8, "attn_tp_rank": 0}'])
+        pipe.client.register_request_blocks.assert_called_once()
+        self.assertEqual(
+            [call.args[0] for call in pipe._send.call_args_list],
+            ["tcp://decode:31003", "tcp://decode:31000"],
+        )
+        frames = pipe._send.call_args.args[1]
+        self.assertEqual(frames[0], MessageTag.PIPELINE_READY)
+        self.assertEqual(json.loads(frames[2])["full"], 2)
+
+    def test_producer_rejects_consumers_that_disagree_on_attention_tp(self):
+        pipe = transfer(producer=True)
+        pipe.sent[7] = sent(registered=False)
+        pipe.replies[7] = {
+            "tcp://a": dict(attn_tp_size=8),
+            "tcp://b": dict(attn_tp_size=1),
+        }
+        with self.assertRaisesRegex(ValueError, "disagree on attention TP"):
+            pipe._reply(7)
+
+    def test_unrequested_room_expires_without_a_native_cancel(self):
+        pipe = transfer(producer=True)
+        pipe.sent[7] = sent(expires=0, registered=False)
+        pipe.poll()
+        self.assertFalse(pipe.active(7))
+        self.assertIn("7", pipe.manager._failed)
+        pipe.client.cancel_request_blocks_if_unclaimed.assert_not_called()
+        pipe.client.complete_request_blocks.assert_not_called()
+
     def test_matching_pipeline_rejects_different_stage_layer_subsets(self):
         pipe = transfer(pp_size=8, pp_rank=3)
         pipe.receives[7] = receive(rank=3)
@@ -432,7 +593,7 @@ class TestPipelineLifetimes(unittest.TestCase):
 
     def test_aborted_claimed_source_keeps_its_pages(self):
         pipe = transfer(producer=True)
-        pipe.sent[7] = dict(expires=time.monotonic() + 120)
+        pipe.sent[7] = sent()
         pipe.manager._aborted[7] = time.time()
         pipe.client.cancel_request_blocks_if_unclaimed.return_value = False
         pipe.poll()
@@ -449,7 +610,7 @@ class TestPipelineLifetimes(unittest.TestCase):
         cached = transfer(producer=True, pp_size=2, pp_rank=0)
         pulling = transfer(producer=True, pp_size=2, pp_rank=1)
         for pipe in (cached, pulling):
-            pipe.sent[7] = dict(expires=time.monotonic() + 120)
+            pipe.sent[7] = sent()
         cached.client.complete_request_blocks.side_effect = RuntimeError(
             "Only an empty producer registration may complete before the request block snapshot is claimed"
         )
@@ -475,7 +636,7 @@ class TestPipelineLifetimes(unittest.TestCase):
     def test_all_pp_cache_hits_cancel_only_after_unclaimed_expiry(self):
         for rank in range(2):
             pipe = transfer(producer=True, pp_size=2, pp_rank=rank)
-            pipe.sent[7] = dict(expires=time.monotonic() + 120)
+            pipe.sent[7] = sent()
             pipe.client.complete_request_blocks.side_effect = RuntimeError(
                 "Only an empty producer registration may complete before the request block snapshot is claimed"
             )
@@ -494,7 +655,7 @@ class TestPipelineLifetimes(unittest.TestCase):
 
     def test_native_source_completion_retires_exactly_once(self):
         pipe = transfer(producer=True)
-        pipe.sent[7] = dict(expires=time.monotonic() + 120)
+        pipe.sent[7] = sent()
         pipe.engine.poll_stats.return_value = (["7"], [], [])
         pipe.poll()
         pipe.engine.poll_stats.return_value = ([], [], [])
@@ -542,6 +703,7 @@ class TestPipelineInitialization(unittest.TestCase):
         manager = SimpleNamespace(
             disaggregation_mode="decode",
             attn_tp_size=1,
+            attn_tp_rank=0,
             attn_dp_size=1,
             system_dp_size=1,
             attn_cp_size=1,
@@ -653,7 +815,7 @@ class TestPipelineInitialization(unittest.TestCase):
         manager._pipeline_init_lock = threading.Lock()
         manager._pipeline_messages = []
         manager._pipeline = None
-        message = [MessageTag.PIPELINE_REQ, b"7", b"tcp://decode:31000"]
+        message = [MessageTag.PIPELINE_REQ, b"7", b"tcp://decode:31000", b"{}"]
         manager._dispatch(message)
         self.assertEqual(manager._pipeline_messages, [message])
 

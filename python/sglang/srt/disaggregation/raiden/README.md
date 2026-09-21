@@ -90,7 +90,7 @@ speculative draft KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `SGLANG_RAIDEN_PIPELINE_TRANSFER` | `0` | named layer pools for a PP producer and DP or matching-PP consumer; set to `1` on both peers |
+| `SGLANG_RAIDEN_PIPELINE_TRANSFER` | `0` | named layer pools for a PP producer and a DP, TP, or matching-PP consumer; set to `1` on both peers |
 | `SGLANG_RAIDEN_KV_PORT` | `31000` | base control port, kept clear of the default serving ports; local rank uses `base + 4*node_worker_rank` over every PP/CP/DP replica's TP ranks (data = `+1`, SWA engine control/data = `+2`/`+3`) |
 | `SGLANG_RAIDEN_HOST_POOL_GB` | `128` | host staging ceiling per node, split across local ranks and engines; each rank's pool is sized for at most one max-length transfer per running request and seats in-flight transfers page by page. Startup fails with the required and available sizes when not even one max-length transfer fits |
 | `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | full-attention max pages/request; auto = `ceil(context_len/page_size)` |
@@ -131,15 +131,23 @@ Drive both through the standard SGLang PD router, same as mooncake.
 ## Pipeline-parallel prefill
 
 Set `SGLANG_RAIDEN_PIPELINE_TRANSFER=1` on both servers to transfer KV from
-PP prefill to attention-DP decode or a decode pipeline with the same stage
-count. Both sides use attention TP=1 and CP=1. The producer can use
-`--pp-size 8 --tp-size 1`; an eight-way attention-DP consumer uses
-`--tp-size 8 --dp-size 8 --enable-dp-attention`, and a matching pipeline
-consumer uses `--pp-size 8 --tp-size 1`.
+PP prefill to an attention-DP decode, a tensor-parallel decode, or a decode
+pipeline with the same stage count. The producer uses attention TP=1 and
+CP=1 (`--pp-size 8 --tp-size 1`); an eight-way attention-DP consumer uses
+`--tp-size 8 --dp-size 8 --enable-dp-attention`, a tensor-parallel consumer
+uses `--tp-size 8`, and a matching pipeline consumer uses
+`--pp-size 8 --tp-size 1`.
 
-This path requires the [tpu-sync PP resharding support](https://github.com/google/tpu-sync/tree/yinlin/pp-reshard):
+A tensor-parallel consumer receives every source page split by kv-head:
+each rank's engine lands its own head slice of every token, and rank 0
+plans the one transfer that fills all ranks. A slice must be whole 32-bit
+packs of the fused page, so BF16 KV takes any head count per rank and FP8
+KV needs at least two heads per rank.
+
+This path requires the [tpu-sync PP resharding support](https://github.com/google/tpu-sync/tree/yinlin/pp-reshard-tp-consumer):
 per-layer pool pairing, sender-local pool indices on the wire, registered
-transfer ranks, and shared claims across destination pipeline stages. For
+transfer ranks, shared claims across destination pipeline stages, and byte
+spans routed per destination rank as one strided entry per page. For
 full throughput the controller also needs its own thread pool for worker
 RPCs ([tpu-sync main 6b3e8206](https://github.com/google/tpu-sync/commit/6b3e8206f5a0f4ad7bf4717790bff4c8eb7e1c1c)):
 a transfer coordinates every source stage, and on asyncio's default

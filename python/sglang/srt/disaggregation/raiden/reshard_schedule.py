@@ -40,12 +40,13 @@ class FusedKVLayerTensor(Protocol):
 
 
 def reshard_ratio(src_tp: int, dst_tp: int) -> int:
-    """Prefill ranks feeding one decode rank. Requires src_tp a multiple of dst_tp."""
-    if src_tp % dst_tp != 0:
+    """Prefill ranks feeding one decode rank; 1 when the decode is sharded
+    finer. Requires one attention TP to be a multiple of the other."""
+    if src_tp % dst_tp != 0 and dst_tp % src_tp != 0:
         raise ValueError(
-            f"src attn TP ({src_tp}) must be a multiple of dst attn TP ({dst_tp})"
+            f"src attn TP ({src_tp}) and dst attn TP ({dst_tp}) must be multiples"
         )
-    return src_tp // dst_tp
+    return max(1, src_tp // dst_tp)
 
 
 def decode_rank_for(prefill_rank: int, ratio: int) -> int:
@@ -124,8 +125,10 @@ def head_slice_params(
     else:
         # Equal / fan-out: the prefill rank holds a superset of this decode rank's
         # heads, so the decode takes a contiguous sub-slice of the source and
-        # fills its own block from slot 0.
-        tp_head_start = tp_dst_rank * dst_heads_per_rank
+        # fills its own block from slot 0. Consecutive decode ranks share a
+        # kv-head when the model has fewer kv-heads than decode ranks.
+        dst_replication = max(1, dst_tp // total_kv_heads)
+        tp_head_start = tp_dst_rank // dst_replication * dst_heads_per_rank
         src_head_start = tp_head_start % src_heads_per_rank
         num_heads = dst_heads_per_rank
         dst_head_start = 0

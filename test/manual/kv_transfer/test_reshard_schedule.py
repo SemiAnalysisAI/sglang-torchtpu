@@ -331,14 +331,20 @@ class PackedKVScheduleTest(unittest.TestCase):
             with self.subTest(src_tp=src_tp, dst_tp=dst_tp):
                 self.check_transfer(src_tp, dst_tp, 2, 2, 128, 64)
 
-    def test_increasing_attention_tp_is_rejected(self):
-        for packing, itemsize in [(2, 2), (4, 1)]:
-            for src_tp in [1, 4]:
-                with self.subTest(packing=packing, src_tp=src_tp):
-                    with self.assertRaises(ValueError):
-                        rs.ReshardGeometry(
-                            src_tp, 8, 256, 8, kv_packing=packing, element_size=itemsize
-                        )
+    def test_fan_out_takes_the_decode_ranks_head_slice(self):
+        geom = rs.ReshardGeometry(1, 8, 512, 8, kv_packing=2, element_size=2)
+        self.assertEqual(geom.ratio, 1)
+        self.assertEqual(geom.entry_bytes(0, 3), (1536, 512, 4096, 0, 512))
+        # Consecutive decode ranks share a kv-head when the model has fewer
+        # kv-heads than decode ranks.
+        geom = rs.ReshardGeometry(1, 8, 512, 4, kv_packing=2, element_size=2)
+        self.assertEqual(geom.entry_bytes(0, 5), (1024, 512, 2048, 0, 512))
+        self.assertEqual(rs.head_slice_params(1, 8, 0, 5, 4), (2, 1, 0, 4, 1))
+        geom = rs.ReshardGeometry(1, 8, 256, 8, kv_packing=4, element_size=1)
+        with self.assertRaises(ValueError):
+            geom.entry_bytes(0, 3)
+        with self.assertRaises(ValueError):
+            rs.reshard_ratio(3, 8)
 
     def test_fp8_complete_packs_remain_contiguous(self):
         geom = rs.ReshardGeometry(4, 1, 256, 8, kv_packing=4, element_size=1)
