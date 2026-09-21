@@ -16,6 +16,7 @@ decode-phase draft extension run on the kernel's DECODE range with a static
 
 from typing import Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
     BaseTpuPallasRpaMultiStepDraftBackend,
@@ -58,6 +59,14 @@ def _invoke_v3_kernel(
     v_scale,
     decode_query_size=1,
 ):
+    block_sizes = envs.SGLANG_TPU_RPA_V3_PREFILL_BLOCK_SIZES.get()
+    prefill_blocks = None
+    if block_sizes:
+        prefill_blocks = tuple(map(int, block_sizes))
+        if len(prefill_blocks) != 4 or any(size <= 0 for size in prefill_blocks):
+            raise ValueError(
+                "RPA v3 prefill block sizes require four positive integers"
+            )
     return jax_rpa(
         queries,
         keys,
@@ -70,6 +79,8 @@ def _invoke_v3_kernel(
         distribution,
         None,  # custom_mask
         attention_sink,
+        p_block_sizes=prefill_blocks,
+        m_block_sizes=prefill_blocks,
         causal=1,
         sm_scale=sm_scale,
         sliding_window=sliding_window,

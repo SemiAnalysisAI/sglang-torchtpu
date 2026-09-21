@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -281,6 +281,69 @@ class TestInactiveRpaRows(unittest.TestCase):
 
         self.assertTrue(torch.isnan(output[0, 0]))
         self.assertTrue(torch.equal(output[2], torch.zeros(4)))
+
+
+class TestPrefillTileOverride(unittest.TestCase):
+    def invoke(self, kernel):
+        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
+            _invoke_v3_kernel,
+        )
+
+        return _invoke_v3_kernel(
+            kernel,
+            queries=None,
+            keys=None,
+            values=None,
+            kv_cache_fused=None,
+            kv_lens=None,
+            page_indices=None,
+            cu_q_lens=None,
+            cu_kv_lens=None,
+            distribution=None,
+            attention_sink=None,
+            sm_scale=0.125,
+            sliding_window=2049,
+            soft_cap=None,
+            k_scale=1.0,
+            v_scale=1.0,
+            decode_query_size=8,
+        )
+
+    def test_override_changes_prefill_and_mixed_only(self):
+        from sglang.srt.environ import envs
+
+        for value, expected in [
+            ("", None),
+            ("32,256,32,256", (32, 256, 32, 256)),
+        ]:
+            with self.subTest(value=value):
+                kernel = Mock()
+                with envs.SGLANG_TPU_RPA_V3_PREFILL_BLOCK_SIZES.override(value):
+                    self.assertIs(self.invoke(kernel), kernel.return_value)
+                kwargs = kernel.call_args.kwargs
+                self.assertEqual(kwargs["p_block_sizes"], expected)
+                self.assertEqual(kwargs["m_block_sizes"], expected)
+                self.assertNotIn("d_block_sizes", kwargs)
+                self.assertEqual(kwargs["decode_query_size"], 8)
+                self.assertEqual(kwargs["sliding_window"], 2049)
+                self.assertEqual(kwargs["sm_scale"], 0.125)
+
+    def test_invalid_override_fails_before_kernel(self):
+        from sglang.srt.environ import envs
+
+        for value in [
+            "32,256",
+            "32,256,32,256,1",
+            "0,256,32,256",
+            "-1,256,32,256",
+            "bad,256,32,256",
+        ]:
+            with self.subTest(value=value):
+                kernel = Mock()
+                with envs.SGLANG_TPU_RPA_V3_PREFILL_BLOCK_SIZES.override(value):
+                    with self.assertRaises(ValueError):
+                        self.invoke(kernel)
+                kernel.assert_not_called()
 
 
 if __name__ == "__main__":

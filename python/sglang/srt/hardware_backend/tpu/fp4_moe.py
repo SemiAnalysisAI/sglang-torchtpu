@@ -4,9 +4,8 @@
 Serves block-16/32/64/128/256/512 NVFP4 MoE weights via the packed-FP4 path of
 Pallas ``gmm_v2`` kernels. Checkpoint global scales are folded into the per-block
 scales. No native fp4 MXU on TPU. Block-512 and block-256 weights use W4A8;
-blocks 16/32/64/128 use W4A16. Blocks below 512 require the fused-RS kernel because
-the stock Pallas packed-FP4 path supports block-512 only. The static
-``input_scale`` is unused.
+blocks 16/32/64/128 use W4A16. The local Pallas path supports block-256/512;
+smaller blocks require the fused-RS kernel. The static ``input_scale`` is unused.
 """
 
 from __future__ import annotations
@@ -29,8 +28,8 @@ from sglang.srt.layers.quantization.mxfp4_tpu_util import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 
-# Block-512 matches the original FP8 activation quantization block. The fused-RS
-# kernel additionally supports block-256 with W4A8 and blocks 16-128 with W4A16.
+# Block-512 matches the original FP8 activation quantization block. Both paths
+# support block-256 W4A8; the fused-RS kernel also supports blocks 16-128 W4A16.
 # Keep the singular constant as the default/alignment contract for compatibility.
 TPU_NVFP4_GROUP_SIZE = 512
 TPU_NVFP4_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256, TPU_NVFP4_GROUP_SIZE)
@@ -222,11 +221,11 @@ def prepare_tpu_nvfp4_moe_weights(
             f"{TPU_NVFP4_SUPPORTED_GROUP_SIZES}, "
             f"got {group_size}."
         )
-    if group_size != TPU_NVFP4_GROUP_SIZE and not use_fused_rs:
+    if group_size not in (256, TPU_NVFP4_GROUP_SIZE) and not use_fused_rs:
         raise NotImplementedError(
             f"TPU NVFP4 MoE group_size={group_size} requires the fused-RS "
-            "backend; the stock Pallas packed-FP4 path supports only "
-            f"group_size={TPU_NVFP4_GROUP_SIZE}."
+            "backend; the local Pallas packed-FP4 path supports "
+            f"group_size=256 or {TPU_NVFP4_GROUP_SIZE}."
         )
 
     if not layer.moe_runner_config.is_gated:

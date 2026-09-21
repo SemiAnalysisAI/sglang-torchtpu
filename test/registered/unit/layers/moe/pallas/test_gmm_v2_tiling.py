@@ -111,6 +111,41 @@ class TestCalculateTilingFuseAct(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "over\\s+half"):
             self._tiling(1024, fuse_act="silu")
 
+    def test_block256_fp4_budgets_scales_and_source_activations(self):
+        # Avocado's unsharded experts overflow scoped VMEM with a full N tile.
+        # Block512 remains unchanged, and small M still fits full-width N.
+        budget = int(64 * _MiB * 0.9)
+        for block, rows, expected_n in (
+            (256, 8192, 2048),
+            (512, 8192, 4096),
+            (256, 16, 4096),
+        ):
+            with self.subTest(block=block, rows=rows):
+                lhs = gmm_v2.InputConfigs(
+                    quant_dtype=jnp.float8_e4m3fn,
+                    quant_block_size=block,
+                    dtype=jnp.bfloat16,
+                )
+                rhs = gmm_v2.InputConfigs(
+                    quant_dtype=jnp.float4_e2m1fn,
+                    quant_block_size=block,
+                    dtype=jnp.float4_e2m1fn,
+                    has_scale=True,
+                    num_quant_blocks=4096 // block,
+                    scale_size_n=8192,
+                    scale_block_n=1,
+                    scale_dtype=jnp.float32,
+                )
+                tiles = gmm_v2.calculate_tiling(
+                    self._dims(size_m=rows, size_k=4096, size_n=4096),
+                    lhs,
+                    rhs,
+                    vmem_limit_bytes=budget,
+                    fuse_act="silu",
+                )
+                self.assertEqual(tiles.tile_k, 4096)
+                self.assertEqual(tiles.tile_n, expected_n)
+
     def test_non_fused_no_scratch_reservation(self):
         # The non-fused byte model reserves no scratch, so the same tiny budget
         # that trips the fused guard still produces valid tiles here (behavior is

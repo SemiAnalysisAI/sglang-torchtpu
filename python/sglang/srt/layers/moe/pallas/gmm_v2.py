@@ -1017,11 +1017,30 @@ def calculate_tiling(
         dims.size_k * dims.size_n * rhs_bits // 8 * base_rhs_bytes_multiplier
     )
 
+    # Block-256 FP4 needs room for expanded scales as well as packed weights.
+    # Limit this budget change to that format to preserve existing tiling.
+    block256_fp4 = (
+        rhs_bits == 4
+        and jnp.issubdtype(rhs_dtype, jnp.floating)
+        and rhs_cfgs.quant_block_size == 256
+    )
+    if block256_fp4 and rhs_cfgs.has_scale:
+        base_rhs_size_bytes += (
+            pl.cdiv(dims.size_k, rhs_cfgs.quant_block_size)
+            * pl.cdiv(dims.size_n, rhs_cfgs.scale_block_n)
+            * jax.dtypes.itemsize_bits(rhs_cfgs.scale_dtype)
+            // 8
+            * base_rhs_bytes_multiplier
+        )
+
     scratch_reserve_bytes = 0
     if fuse_act:
         acc_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4  # bf16 vs f32 acc
         out_bytes = 2  # bf16 output / partial-out tile
-        lhs_bytes = lhs_bits // 8
+        # DMA buffers contain the source activation dtype before quantizing.
+        lhs_bytes = (
+            jax.dtypes.itemsize_bits(lhs_cfgs.dtype) if block256_fp4 else lhs_bits
+        ) // 8
         scratch_bytes_per_m = (
             (
                 2 * dims.size_n * acc_bytes  # gate||up accumulator
@@ -1297,9 +1316,10 @@ def make_gmm_configs(
     )
 
     lhs_quant_block_size = 512
-    if packed_fp4 and block_size != lhs_quant_block_size:
+    if packed_fp4 and block_size not in (256, lhs_quant_block_size):
         raise NotImplementedError(
-            "Packed FP4 GMM requires quantization block size 512, " f"got {block_size}."
+            "Packed FP4 GMM requires quantization block size 256 or 512, "
+            f"got {block_size}."
         )
 
     lhs_q_dtype = None

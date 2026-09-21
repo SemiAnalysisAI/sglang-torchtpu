@@ -175,12 +175,12 @@ class TestNvfp4Block512Contract(CustomTestCase):
                         use_fused_rs=use_fused_rs,
                     )
 
-    def test_sub512_rejects_stock_pallas_layout(self):
+    def test_sub256_rejects_stock_pallas_layout(self):
         from sglang.srt.hardware_backend.tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
         )
 
-        for group_size in (16, 32, 64, 128, 256):
+        for group_size in (16, 32, 64, 128):
             with (
                 self.subTest(group_size=group_size),
                 self.assertRaisesRegex(NotImplementedError, "requires the fused-RS"),
@@ -189,6 +189,34 @@ class TestNvfp4Block512Contract(CustomTestCase):
                     _make_block512_layer(group_size=group_size),
                     group_size=group_size,
                 )
+
+    def test_block256_local_layout_preserves_weights_and_effective_scales(self):
+        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+            prepare_tpu_nvfp4_moe_weights,
+        )
+
+        layer = _make_block512_layer(group_size=256)
+        original = {
+            name: value.detach().clone() for name, value in layer.named_parameters()
+        }
+        layer.w13_weight_scale_2.data.copy_(torch.tensor([2.0, 4.0]))
+        layer.w2_weight_scale_2.data.copy_(torch.tensor([8.0, 16.0]))
+        prepare_tpu_nvfp4_moe_weights(layer, group_size=256)
+        parameters = dict(layer.named_parameters())
+        for name in ("w13_weight", "w2_weight"):
+            self.assertTrue(
+                torch.equal(parameters[name], original[name].permute(0, 2, 1))
+            )
+        for name, factors in (
+            ("w13_weight_scale", [2.0, 4.0]),
+            ("w2_weight_scale", [8.0, 16.0]),
+        ):
+            expected = (
+                (original[name] * torch.tensor(factors)[:, None, None])
+                .permute(0, 2, 1)
+                .unsqueeze(2)
+            )
+            self.assertTrue(torch.equal(parameters[name], expected))
 
     def test_scale_storage_dtype(self):
         from sglang.srt.hardware_backend.tpu.fp4_moe import (
