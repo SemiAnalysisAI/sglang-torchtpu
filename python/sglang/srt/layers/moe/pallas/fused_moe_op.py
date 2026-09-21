@@ -249,6 +249,7 @@ def _vmem_safe_packed_tile_n(base_tile_info):
     import dataclasses
 
     import jax
+    import jax.numpy as jnp
 
     from sglang.srt.layers.moe.pallas.gmm_v2 import (
         TileSizes,
@@ -260,7 +261,9 @@ def _vmem_safe_packed_tile_n(base_tile_info):
             tiles = base_tile_info
         else:
             tiles = base_tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
-        if rhs_cfgs.packing <= 1:
+        # Only pre-packed INT4 has the unpack staging tile; fp8 also reports
+        # packing 4 (32-bit words) but needs none.
+        if rhs_cfgs.quant_dtype != jnp.int4.dtype:
             return tiles
 
         rhs_bits = jax.dtypes.itemsize_bits(rhs_cfgs.dtype)

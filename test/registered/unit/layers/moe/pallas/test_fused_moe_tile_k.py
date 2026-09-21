@@ -328,18 +328,31 @@ class TestVmemSafePackedTileN(CustomTestCase):
         tiles = self._resolve(2048, 7168, 7168, self._packed_int4_cfgs(2048))
         self.assertEqual(tiles.tile_n, 7168)
 
-    def test_unpacked_weights_are_untouched(self):
-        # bf16 and FP8 carry packing == 1; shrinking them would retune stock MoE.
-        for dtype in (jnp.bfloat16, jnp.float8_e4m3fn):
-            with self.subTest(dtype=dtype.__name__):
-                cfgs = gmm_v2.InputConfigs(
-                    quant_dtype=None,
-                    quant_block_size=7168,
-                    dtype=dtype,
-                    has_scale=False,
-                )
-                tiles = self._resolve(7168, 4096, 4096, cfgs)
-                self.assertEqual(tiles.tile_n, 4096)
+    def test_bf16_weights_are_untouched(self):
+        cfgs = gmm_v2.InputConfigs(
+            quant_dtype=None,
+            quant_block_size=7168,
+            dtype=jnp.bfloat16,
+            has_scale=False,
+        )
+        tiles = self._resolve(7168, 4096, 4096, cfgs)
+        self.assertEqual(tiles.tile_n, 4096)
+
+    def test_fp8_weights_are_untouched(self):
+        # As make_gmm_configs builds them: quant_dtype fp8 and packing 4 (four
+        # codes per 32-bit word). fp8 has no unpack staging tile, so the DeepSeek
+        # GMM1 tile must keep the kernel's choice.
+        cfgs = gmm_v2.InputConfigs(
+            quant_dtype=jnp.float8_e4m3fn.dtype,
+            quant_block_size=128,
+            dtype=jnp.float8_e4m3fn,
+            has_scale=True,
+            packing=4,
+            num_quant_blocks=7168 // 128,
+            scale_dtype=jnp.float32,
+        )
+        tiles = self._resolve(7168, 4096, 4096, cfgs)
+        self.assertEqual(tiles.tile_n, 4096)
 
     def test_result_is_a_fixed_point(self):
         # Re-wrapping an already-safe tile must not shrink it again.
