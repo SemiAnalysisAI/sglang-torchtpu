@@ -1957,13 +1957,19 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertEqual(mgr._reshard_plans, {self.ROOM: {"41#0": uuid}})
         return mgr, uuid
 
-    def test_chunk_plan_id_fits_signed_int64(self):
-        with patch("secrets.randbits", side_effect=lambda bits: (1 << bits) - 1):
-            mgr, uuid = self._decode_with_chunk_plan()
+    def test_chunk_plan_id_fits_positive_int64(self):
+        for upper_bound in (False, True):
+            with self.subTest(upper_bound=upper_bound):
+                with patch(
+                    "secrets.randbelow",
+                    side_effect=lambda bound: bound - 1 if upper_bound else 0,
+                ):
+                    mgr, uuid = self._decode_with_chunk_plan()
 
-        _, req = mgr._engine.register_active_plan.call_args.args
-        # StartTransferRequest.uuid uses protobuf's signed int64 range.
-        self.assertEqual(Int64Value(value=uuid).value, req.uuid)
+                _, req = mgr._engine.register_active_plan.call_args.args
+                self.assertGreater(uuid, 0)
+                # StartTransferRequest.uuid uses protobuf's signed int64 range.
+                self.assertEqual(Int64Value(value=uuid).value, req.uuid)
 
     def test_aborted_room_keeps_its_chunk_plan_until_the_push_settles(self):
         mgr, uuid = self._decode_with_chunk_plan()

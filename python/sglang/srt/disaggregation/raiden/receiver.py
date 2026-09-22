@@ -665,8 +665,9 @@ class RaidenReceiverMixin:
             (p_rank, sources_map[p_rank][1][lo:hi]) for p_rank in sorted(sources_map)
         ]
         dst = local_blocks[window.local_offset : window.local_offset + window.length]
-        # Independent decoders share a prefill; the reshard RPC uses int64.
-        uuid = secrets.randbits(63)
+        # Independent decoders share a prefill. Use positive IDs that
+        # fit the reshard RPC's signed int64 field.
+        uuid = secrets.randbelow((1 << 63) - 1) + 1
         req_id = f"{room}#{index}"
         req = build_receiver_request(
             pb2,
