@@ -224,26 +224,7 @@ MODEL_PROFILES = {
         max_total_tokens=262144,
         device_pool_tokens_hint=262144,
         gsm8k_threshold=0.80,
-        extra_server_args=(
-            "--tpu-fp8-runtime",
-            "channelwise",
-            # EXPERIMENT (#718): take the FP8 fused reduce-scatter MoE backend
-            # out of the picture and use the plain Pallas one.
-            #
-            # test_tpu_qwen3_coder_480b_singlehost_prefix_cache_kv_offload_gsm8k
-            # fails on this same model and was independently traced to the MoE
-            # reduce-scatter kernel, with the plain pallas backend making it
-            # pass. fp8_moe_fused_rs.py:105 refuses the fused-RS path when
-            # attn_dp_size != 1 or DP attention is on, so it is active on the
-            # P/D PREFILL engine (TP16, EP16, DP1, DP attention off) and
-            # inactive on the decode engine (DP2, DP attention on) -- which is
-            # exactly where this bug was localized. It is fp8-only, so gpt-oss
-            # never touches it, and every qwen row that still passes
-            # (singlehost spec dpa, multihost agentic spec) runs DP attention
-            # and therefore has it disabled too.
-            "--moe-runner-backend",
-            "pallas_tpu",
-        ),
+        extra_server_args=("--tpu-fp8-runtime", "channelwise"),
         extra_launch_env={
             "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
             # Keep every prefill forward inside the 256-token compile graph.
