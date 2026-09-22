@@ -146,23 +146,27 @@ def _build_custom_splash_kernel(
         from jax._src.pallas.mosaic import tpu_info as _tpu_info
 
         if "cpu" not in _tpu_info.registry:
-            _tpu_info.registry["cpu"] = lambda: _tpu_info.TpuInfo(
-                chip_version=_tpu_info.ChipVersion.TPU_7X,
-                generation=7,
-                num_cores=1,
-                num_lanes=128,
-                num_sublanes=8,
-                mxu_column_size=256,
-                vmem_capacity_bytes=64 * 1024 * 1024,
-                cmem_capacity_bytes=0,
-                smem_capacity_bytes=1024 * 1024,
-                hbm_capacity_bytes=206_000_000_000 // 2,
-                mem_bw_bytes_per_second=int(7.40e12 // 2),
-                bf16_ops_per_second=int(2.31e15 // 2),
-                int8_ops_per_second=0,
-                fp8_ops_per_second=int(4.60e15 // 2),
-                int4_ops_per_second=0,
-                sparse_core=None,
+            _tpu_info.registry["cpu"] = lambda: (
+                _tpu_info.get_tpu_info_for_chip(_tpu_info.ChipVersion.TPU_7X, 1)
+                if hasattr(_tpu_info, "get_tpu_info_for_chip")
+                else _tpu_info.TpuInfo(
+                    chip_version=_tpu_info.ChipVersion.TPU_7X,
+                    generation=7,
+                    num_cores=1,
+                    num_lanes=128,
+                    num_sublanes=8,
+                    mxu_column_size=256,
+                    vmem_capacity_bytes=64 * 1024 * 1024,
+                    cmem_capacity_bytes=0,
+                    smem_capacity_bytes=1024 * 1024,
+                    hbm_capacity_bytes=206_000_000_000 // 2,
+                    mem_bw_bytes_per_second=int(7.40e12 // 2),
+                    bf16_ops_per_second=int(2.31e15 // 2),
+                    int8_ops_per_second=0,
+                    fp8_ops_per_second=int(4.60e15 // 2),
+                    int4_ops_per_second=0,
+                    sparse_core=None,
+                )
             )
     except Exception:
         pass
