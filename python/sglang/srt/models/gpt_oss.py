@@ -257,6 +257,52 @@ class GptOssSparseMoeBlock(nn.Module):
             prefix=add_prefix("gate", prefix),
             params_dtype=config.dtype,
         )
+        self._tpu_token_owned_moe = False
+        self._tpu_native_packed_moe = False
+        if _is_tpu:
+            from sglang.srt.environ import envs
+
+            self._tpu_token_owned_moe = envs.SGLANG_TPU_GPTOSS_TOKEN_OWNED_MOE.get()
+            self._tpu_native_packed_moe = envs.SGLANG_TPU_GPTOSS_NATIVE_MXFP4.get()
+            if (
+                self._tpu_token_owned_moe
+                or envs.SGLANG_TPU_GPTOSS_OWNER_LAYERS.get()
+                or self._tpu_native_packed_moe
+            ):
+                from sglang.srt.hardware_backend.tpu.gptoss_token_owned_moe import (
+                    prepare_gptoss_token_owned_moe,
+                )
+
+                if (
+                    self.top_k != 4
+                    or self.gemm1_alpha != 1.702
+                    or self.gemm1_clamp_limit != 7
+                    or get_parallel().dwdp_size != 1
+                ):
+                    raise ValueError(
+                        "Token-owned MoE requires original GPT-OSS routing/activation and DWDP1."
+                    )
+                prepare_gptoss_token_owned_moe(self.experts)
+            if self._tpu_native_packed_moe:
+                from sglang.srt.hardware_backend.tpu.gptoss_packed_mxfp4 import (
+                    configure_gptoss_native_mxfp4,
+                )
+
+                if config.hidden_size != 2880 or config.intermediate_size != 2880:
+                    raise ValueError(
+                        "Native GPT-OSS MXFP4 requires the 120B dimensions."
+                    )
+                configure_gptoss_native_mxfp4(self.experts)
+
+    def uses_token_owned_moe(self, forward_batch, num_tokens):
+        return (
+            self._tpu_token_owned_moe
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_decode()
+            and forward_batch.spec_info is None
+            and num_tokens > 0
+            and num_tokens % self.tp_size == 0
+        )
 
     def forward(
         self,
@@ -267,7 +313,12 @@ class GptOssSparseMoeBlock(nn.Module):
             return self.forward_dwdp(hidden_states)
 
         if not get_moe_a2a_backend().is_deepep():
-            return self.forward_normal(hidden_states)
+            return self.forward_normal(
+                hidden_states,
+                token_owned=self.uses_token_owned_moe(
+                    forward_batch, hidden_states.shape[0]
+                ),
+            )
         else:
             raise NotImplementedError("forward_deepep branch not implemented yet")
 
@@ -311,6 +362,8 @@ class GptOssSparseMoeBlock(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
+        token_owned: bool = False,
+        return_owner: bool = False,
     ) -> torch.Tensor:
         # `hidden_states` may arrive pre-padded along the last dim when the
         # preceding RMSNorm fused the MoE input pad (gated by
@@ -333,6 +386,34 @@ class GptOssSparseMoeBlock(nn.Module):
         else:
             router_logits, _ = self.router(router_input)
             topk_output = self.topk(router_input, router_logits)
+            if self._tpu_native_packed_moe:
+                from sglang.srt.hardware_backend.tpu.gptoss_packed_mxfp4 import (
+                    gptoss_native_mxfp4_moe,
+                )
+
+                output_layout = (
+                    "owner" if return_owner else ("island" if token_owned else "full")
+                )
+                return gptoss_native_mxfp4_moe(
+                    router_input,
+                    self.experts,
+                    topk_output[0],
+                    topk_output[1],
+                    output_layout=output_layout,
+                )
+            if token_owned:
+                from sglang.srt.hardware_backend.tpu.gptoss_token_owned_moe import (
+                    gptoss_token_owned_moe,
+                )
+
+                final_hidden_states = gptoss_token_owned_moe(
+                    hidden_states,
+                    self.experts,
+                    topk_output[0],
+                    topk_output[1],
+                    return_owner=return_owner,
+                )
+                return final_hidden_states[..., :hidden_dim_unpadded].contiguous()
             final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
@@ -626,13 +707,14 @@ class GptOssDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         captured_last_layer_outputs: list[torch.Tensor] | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-            )
+        (
+            hidden_states,
+            residual,
+        ) = self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+            hidden_states,
+            residual,
+            forward_batch,
+            captured_last_layer_outputs=captured_last_layer_outputs,
         )
 
         if hidden_states.shape[0] != 0:
@@ -646,8 +728,16 @@ class GptOssDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+        if self.mlp.uses_token_owned_moe(forward_batch, hidden_states.shape[0]):
+            hidden_states = self.mlp(hidden_states, forward_batch)
+            # Expert destinations already restore this island's token rows;
+            # the residual has stayed in that same local attention layout.
+            assert hidden_states.shape == residual.shape
+            return hidden_states, residual
+
         fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+            not self.mlp._tpu_native_packed_moe
+            and self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
@@ -714,6 +804,23 @@ class GptOssModel(nn.Module):
             self.norm = PPMissingLayer(return_tuple=True)
 
         self.layers_to_capture: list[int] = []
+        self._tpu_owner_layers = False
+        if _is_tpu:
+            from sglang.srt.environ import envs
+
+            self._tpu_owner_layers = envs.SGLANG_TPU_GPTOSS_OWNER_LAYERS.get()
+            if self._tpu_owner_layers:
+                from sglang.srt.hardware_backend.tpu.gptoss_owner_layers import (
+                    prepare_owner_model,
+                )
+
+                prepare_owner_model(self)
+            elif envs.SGLANG_TPU_GPTOSS_FUSED_ATTN_BOUNDARIES.get():
+                raise ValueError(
+                    "Fused attention boundaries require token-owner layers."
+                )
+            elif envs.SGLANG_TPU_GPTOSS_OWNER_BASELINE_MOE.get():
+                raise ValueError("Owner baseline MoE requires token-owner layers.")
 
     def set_eagle3_layers_to_capture(self, layers_to_capture: list[int]) -> None:
         self.layers_to_capture = layers_to_capture
@@ -744,21 +851,46 @@ class GptOssModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        owner_layout = False
+        if self._tpu_owner_layers:
+            from sglang.srt.hardware_backend.tpu.gptoss_owner_layers import (
+                can_use_owner_layers,
+                forward_owner_layer,
+                select_owner_rows,
+            )
+
+            owner_layout = can_use_owner_layers(self, forward_batch, hidden_states)
+            if owner_layout:
+                hidden_states = select_owner_rows(self, hidden_states)
+                if residual is not None:
+                    residual = select_owner_rows(self, residual)
+
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
-                )
+                if owner_layout:
+                    hidden_states, residual = forward_owner_layer(
+                        layer,
+                        positions,
+                        hidden_states,
+                        residual,
+                        forward_batch,
+                        fused_attention=self._tpu_owner_fused_attention,
+                        baseline_moe=self._tpu_owner_baseline_moe,
+                    )
+                else:
+                    hidden_states, residual = layer(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states
+                            if getattr(layer, "_is_layer_to_capture", False)
+                            else None
+                        ),
+                    )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -772,6 +904,10 @@ class GptOssModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+            if owner_layout:
+                hidden_states = get_parallel().attn_tp_group.all_gather(
+                    hidden_states, dim=0
+                )
         if len(aux_hidden_states) == 0:
             return hidden_states
 
@@ -959,6 +1095,12 @@ class GptOssForCausalLM(nn.Module):
             self._load_normal_weights(
                 weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
             )
+        if getattr(self.model, "_tpu_owner_layers", False):
+            from sglang.srt.hardware_backend.tpu.gptoss_owner_layers import (
+                prepare_owner_attention_weights,
+            )
+
+            prepare_owner_attention_weights(self.model)
 
     def _load_weights_mxfp4(self, weights, is_nextn, weight_name_mapping):
         normal_weights = []

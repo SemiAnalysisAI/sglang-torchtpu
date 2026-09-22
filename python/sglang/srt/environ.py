@@ -1389,6 +1389,9 @@ class Envs:
     # Capture all multi-layer EAGLE draft-extend steps and the in-graph chain
     # rotation into ONE CUDA graph instead of one captured graph per step.
     SGLANG_ENABLE_SINGLE_CG_DRAFT = EnvBool(True)
+    # Optional TPU execution optimizations.
+    SGLANG_TPU_MXFP4_MOE_INTERMEDIATE_ALIGNMENT = EnvInt(128)
+    SGLANG_TPU_MXFP4_MOE_HIDDEN_ALIGNMENT = EnvInt(128)
     # Draft sampler uses the Gumbel-max trick (argmax(probs / Exp(1))) instead of
     # torch.multinomial, whose device-side validity assert breaks draft-graph replay.
     SGLANG_OPT_USE_GUMBEL_SAMPLE = EnvBool(True)
@@ -1637,6 +1640,18 @@ class Envs:
     # Physical TPU v7 TP8 measurements favor distributed TopK from batch 64.
     # Deployments can override this cutoff after measuring their topology.
     SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = EnvInt(64)
+    # Exchange one score/token pair per vocabulary shard for pure greedy decode.
+    SGLANG_TPU_ENABLE_DISTRIBUTED_GREEDY = EnvBool(False)
+    # Deliver fused GPT-OSS expert slots to token owners before island gathering.
+    SGLANG_TPU_GPTOSS_TOKEN_OWNED_MOE = EnvBool(False)
+    # Preserve GPT-OSS checkpoint FP4 codes for fused expert decode and prefill.
+    SGLANG_TPU_GPTOSS_NATIVE_MXFP4 = EnvBool(False)
+    # Keep GPT-OSS decode residuals and norms on their global token owners.
+    SGLANG_TPU_GPTOSS_OWNER_LAYERS = EnvBool(False)
+    # Return original expert GEMM partials through a token-owner reduce-scatter.
+    SGLANG_TPU_GPTOSS_OWNER_BASELINE_MOE = EnvBool(False)
+    # Fuse the attention entry/exit of the experimental token-owner layout.
+    SGLANG_TPU_GPTOSS_FUSED_ATTN_BOUNDARIES = EnvBool(False)
     # Filter top-k/top-p/min-p with the sort-free binary-search cutoff instead
     # of the full-vocabulary torch sort. Disable to A/B the sampled
     # distribution against the reference path.

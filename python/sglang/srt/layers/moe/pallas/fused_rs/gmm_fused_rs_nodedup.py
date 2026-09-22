@@ -665,11 +665,23 @@ def kernel_main_fused_rs(
                     sem=w1_sem_ref.at[buf_id],
                 ).start()
         if has_bias:
-            pltpu.make_async_copy(
-                src_ref=w1_bias_ref.at[expert_id, :, pl.ds(n_id * w1_dma_n, w1_dma_n)],
-                dst_ref=w1_bias_buf_ref,
-                sem=w1_sem_ref.at[buf_id],
-            ).start()
+            if act_fn and num_n1 > 1:
+                for half, offset in ((0, n_id * tile_n1), (1, out_n1 + n_id * tile_n1)):
+                    pltpu.make_async_copy(
+                        src_ref=w1_bias_ref.at[expert_id, :, pl.ds(offset, tile_n1)],
+                        dst_ref=w1_bias_buf_ref.at[
+                            buf_id, :, pl.ds(half * tile_n1, tile_n1)
+                        ],
+                        sem=w1_sem_ref.at[buf_id],
+                    ).start()
+            else:
+                pltpu.make_async_copy(
+                    src_ref=w1_bias_ref.at[
+                        expert_id, :, pl.ds(n_id * w1_dma_n, w1_dma_n)
+                    ],
+                    dst_ref=w1_bias_buf_ref.at[buf_id],
+                    sem=w1_sem_ref.at[buf_id],
+                ).start()
 
     @jax.named_scope("start_w2_dma")
     def start_w2_dma(buf_id, expert_id, n_id, k_id=0):
@@ -694,7 +706,7 @@ def kernel_main_fused_rs(
         if has_bias:
             pltpu.make_async_copy(
                 src_ref=w2_bias_ref.at[expert_id, :, pl.ds(n_id * tile_n2, tile_n2)],
-                dst_ref=w2_bias_buf_ref,
+                dst_ref=w2_bias_buf_ref.at[buf_id],
                 sem=w2_sem_ref.at[buf_id],
             ).start()
 
@@ -713,8 +725,8 @@ def kernel_main_fused_rs(
             ).wait()
         if has_bias:
             pltpu.make_async_copy(
-                src_ref=w1_bias_buf_ref,
-                dst_ref=w1_bias_buf_ref,
+                src_ref=w1_bias_buf_ref.at[buf_id],
+                dst_ref=w1_bias_buf_ref.at[buf_id],
                 sem=w1_sem_ref.at[buf_id],
             ).wait()
 
@@ -733,8 +745,8 @@ def kernel_main_fused_rs(
             ).wait()
         if has_bias:
             pltpu.make_async_copy(
-                src_ref=w2_bias_buf_ref,
-                dst_ref=w2_bias_buf_ref,
+                src_ref=w2_bias_buf_ref.at[buf_id],
+                dst_ref=w2_bias_buf_ref.at[buf_id],
                 sem=w2_sem_ref.at[buf_id],
             ).wait()
 
@@ -752,7 +764,7 @@ def kernel_main_fused_rs(
         ].reshape(-1, dims.size_lhs_sublane, tile_k1)
         w1_tile = w1_buf_ref.at[buf_id]
         w1_sc = w1_scale_buf_ref.at[buf_id] if has_scale else None
-        w1_bias_tile = w1_bias_buf_ref if has_bias else None
+        w1_bias_tile = w1_bias_buf_ref.at[buf_id] if has_bias else None
         w1_weights = WeightsRef(weight=w1_tile, scale=w1_sc, bias=w1_bias_tile)
         if cfgs1.fuse_act is not None:
             w1_up = WeightsRef(
@@ -799,7 +811,9 @@ def kernel_main_fused_rs(
         inner_kernel(
             lhs_data,
             WeightsRef(
-                weight=w2_tile, scale=w2_sc, bias=w2_bias_buf_ref if has_bias else None
+                weight=w2_tile,
+                scale=w2_sc,
+                bias=w2_bias_buf_ref.at[buf_id] if has_bias else None,
             ),
             tiled_out_2x_ref.at[
                 sem_id, pl.ds(0, m_rows), pl.ds(n_id * tile_n2, tile_n2)
@@ -1009,21 +1023,9 @@ def kernel_main_fused_rs(
                 if step + num_w1_bufs < total_w1_steps:
                     ns = step + num_w1_bufs
                     start_w1_dma(ns % num_w1_bufs, expert_id, ns // num_k1, ns % num_k1)
-                if step == 0:
 
-                    @pl.when(gm_id + 1 < local_num_gm)
-                    def _():
-                        next_e = metadata_ref.gm_id_to_group_id[gm_id + 1]
-                        # Skip cross-prefetch when next gm reuses same expert
-                        # (caching only makes sense when buffers fit all tiles).
-                        next_same = jnp.logical_and(
-                            next_e == expert_id, jnp.bool_(can_cache_w1)
-                        )
-
-                        @pl.when(jnp.logical_not(next_same))
-                        def _():
-                            start_w1_dma(0, next_e, 0, 0)
-
+            # Refill next-expert slots only after every current-expert tile has
+            # consumed them; rotating buffers can still be live after step 0.
             @pl.when(gm_id + 1 < local_num_gm)
             def _():
                 next_e = metadata_ref.gm_id_to_group_id[gm_id + 1]
@@ -1033,7 +1035,7 @@ def kernel_main_fused_rs(
 
                 @pl.when(jnp.logical_not(next_same))
                 def _():
-                    for _i in range(1, min(num_w1_bufs, total_w1_steps)):
+                    for _i in range(min(num_w1_bufs, total_w1_steps)):
                         start_w1_dma(_i, next_e, _i // num_k1, _i % num_k1)
 
             with jax.named_scope("interlude"):
@@ -1835,9 +1837,12 @@ def gmm_v2_fused_rs(
             jnp.float32,
         ),
         # w1_bias_buf_ref
-        pltpu.VMEM((1, tile_n1 * 2 if act_fn else tile_n1), jnp.float32),
+        pltpu.VMEM(
+            (num_w1_bufs if has_bias else 1, 1, tile_n1 * 2 if act_fn else tile_n1),
+            jnp.float32,
+        ),
         # w2_bias_buf_ref
-        pltpu.VMEM((1, tile_n2), jnp.float32),
+        pltpu.VMEM((num_w2_bufs if has_bias else 1, 1, tile_n2), jnp.float32),
         # w1_sem_ref
         pltpu.SemaphoreType.DMA((num_w1_bufs,)),
         # w2_sem_ref

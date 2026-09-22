@@ -63,6 +63,7 @@ from __future__ import annotations
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 
 # block size is always 32 for MXFP4
@@ -157,6 +158,7 @@ def process_mxfp4_moe_weights_bf16(
     *,
     w13_interleaved: bool,
     align_to: int = 128,
+    hidden_align_to: int = 128,
 ) -> tuple[
     torch.Tensor,  # w13_weight  (E, hidden_K_padded, 2*N_int_padded)  bfloat16
     torch.Tensor,  # w13_bias    (E, 1, 2*N_int_padded)                fp32
@@ -191,7 +193,7 @@ def process_mxfp4_moe_weights_bf16(
 
     # requires K % 128 == 0 for gmm_v2 (the TPU lane width)
     w13 = torch.nn.functional.pad(
-        w13, (0, 0, 0, (-hidden) % 128)
+        w13, (0, 0, 0, (-hidden) % hidden_align_to)
     )  # pad K (axis 1) → (E, hidden_padded, 2*N_padded)
 
     w13_b = w13_bias
@@ -211,7 +213,7 @@ def process_mxfp4_moe_weights_bf16(
     w2 = w2.permute(0, 2, 1).contiguous()  # (E, N_padded, hidden) bf16
 
     # pad for irregular shape
-    pad_n_out = (-hidden) % 128
+    pad_n_out = (-hidden) % hidden_align_to
     w2 = _pad_last_axis(w2, pad_n_out)  # (E, N_padded, hidden_padded_out)
     w2_b = w2_bias.to(torch.float32).unsqueeze(1).contiguous()  # (E, 1, hidden)
     w2_b = _pad_last_axis(w2_b, pad_n_out)  # (E, 1, hidden_padded_out)
@@ -376,6 +378,16 @@ def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module) -> None:
     # non-interleaved MXFP4 MoE checkpoint would not. Mirrors tpu-inference's
     # ``w13_interleave = layer.activation == MoEActivation.SWIGLUOAI`` — sglang
     # carries the activation as a string on the MoE runner config.
+    alignment = envs.SGLANG_TPU_MXFP4_MOE_INTERMEDIATE_ALIGNMENT.get()
+    hidden_alignment = envs.SGLANG_TPU_MXFP4_MOE_HIDDEN_ALIGNMENT.get()
+    if alignment <= 0 or alignment % 128:
+        raise ValueError(
+            "TPU MXFP4 intermediate alignment must be a positive multiple of 128"
+        )
+    if hidden_alignment <= 0 or hidden_alignment % 128:
+        raise ValueError(
+            "TPU MXFP4 hidden alignment must be a positive multiple of 128"
+        )
     w13_interleaved = layer.moe_runner_config.activation == "swigluoai"
     w13, w13_bias, w2, w2_bias = process_mxfp4_moe_weights_bf16(
         layer.w13_weight.data,
@@ -385,6 +397,8 @@ def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module) -> None:
         layer.w2_weight_scale.data,
         layer.w2_weight_bias.data,
         w13_interleaved=w13_interleaved,
+        align_to=alignment,
+        hidden_align_to=hidden_alignment,
     )
     layer.w13_weight = Parameter(w13, requires_grad=False)
     layer.w13_weight_scale = None
