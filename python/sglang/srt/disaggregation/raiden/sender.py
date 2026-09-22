@@ -10,6 +10,7 @@ not instantiated on its own and deliberately defines no ``__init__``.
 
 from __future__ import annotations
 
+import secrets
 import threading
 import time
 from typing import TYPE_CHECKING, Any, List, Optional
@@ -193,8 +194,9 @@ class RaidenSenderMixin:
                 ]
                 index = self._prefill.chunk_seq.get(room, 0)
                 self._prefill.chunk_seq[room] = index + 1
-                self._uuid_seq += 1
-                uuid = (self._uuid_seq << 20) | (self._local_rank & 0xFFFFF)
+                # A decode engine receives reads from multiple prefills. Their
+                # process-local counters would collide in its native UUID map.
+                uuid = secrets.randbits(64)
                 addr = self._prefill.decode_addr[room]
             req_id = f"{room}#{index}"
             self._register_sender_read(
