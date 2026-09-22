@@ -640,7 +640,7 @@ class TestPrefillContextParallelValidation(TestTpuPlatformServerDefaults):
             ),
             (
                 dict(pp_size=2, tp_size=16, pp_async_batch_depth=1),
-                "tensor parallelism inside a pipeline stage",
+                r"--attn-cp-size 1 \(PPxTP\) or --attn-cp-size 16 \(PPxPCP\)",
             ),
             (dict(speculative_algorithm="EAGLE3"), "speculative decoding"),
             (dict(enable_dp_attention=True, dp_size=8), "DP attention"),
