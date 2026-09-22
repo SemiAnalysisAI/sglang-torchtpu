@@ -331,21 +331,41 @@ def build_pp_wave(
             f"(pp {size} stages of {columns} devices, world {world_size})"
         )
     physical = physical_device_by_rank(world_group)
-    perm = pipeline_permutation(physical, size, columns)
-    op = build_pp_permute_op(perm)
-    wave = PPWave(
-        rank=rank,
-        size=size,
-        rows=rows,
-        hidden=hidden,
-        dtype=dtype,
-        device=device,
-        launcher=lambda x: launch_now(op, x),
-    )
-    ok = wave.probe(column=column, columns=columns)
-    # Every device must agree on the routing, so the verdict is gathered.
-    verdicts: list = [None] * world_size
-    torch.distributed.all_gather_object(verdicts, bool(ok), group=world_group.cpu_group)
+    candidates = [
+        ("physical", pipeline_permutation(physical, size, columns)),
+    ]
+    identity = tuple(range(world_size))
+    if physical != identity:
+        candidates.append(("rank_order", pipeline_permutation(identity, size, columns)))
+    verdicts: list = [False] * world_size
+    wave = None
+    for perm_name, perm in candidates:
+        op = build_pp_permute_op(perm)
+        wave = PPWave(
+            rank=rank,
+            size=size,
+            rows=rows,
+            hidden=hidden,
+            dtype=dtype,
+            device=device,
+            launcher=lambda x, _op=op: launch_now(_op, x),
+        )
+        ok = wave.probe(column=column, columns=columns)
+        # Every device must agree on the routing, so the verdict is gathered.
+        verdicts = [None] * world_size
+        torch.distributed.all_gather_object(
+            verdicts, bool(ok), group=world_group.cpu_group
+        )
+        if all(verdicts):
+            logger.info(
+                "pipeline wave probe succeeded with %s permutation on stage %d/%d col %d/%d",
+                perm_name,
+                rank,
+                size,
+                column,
+                columns,
+            )
+            break
     if not all(verdicts):
         raise RuntimeError(
             f"pipeline wave stage {rank} column {column}: the hand-off probe "

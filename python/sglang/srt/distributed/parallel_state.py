@@ -1761,7 +1761,13 @@ class GroupCoordinator:
                 tensor = _tpu_pp_transfer().to_host(tensor)
 
             # send-allgather: send only a slice, then do allgather.
-            if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+            # On TPU, each column's pp_group circulates the full host tensor
+            # over Gloo cpu_group independently without a device all_gather.
+            if (
+                not _is_tpu
+                and all_gather_group is not None
+                and tensor.numel() % all_gather_size == 0
+            ):
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
@@ -1819,7 +1825,8 @@ class GroupCoordinator:
 
                 # send-allgather: send only a slice, then do allgather.
                 use_all_gather = (
-                    all_gather_group is not None
+                    not _is_tpu
+                    and all_gather_group is not None
                     and tensor.numel() % all_gather_size == 0
                 )
 

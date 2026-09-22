@@ -11,6 +11,11 @@ import os
 from contextlib import contextmanager
 from typing import Optional, Type, TYPE_CHECKING
 
+# Ensure c10d functional collectives inside TP/PCP stages stay inside a single
+# traced Dynamo graph rather than materializing at every collective boundary.
+os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
+os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
+
 import torch
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
@@ -100,18 +105,18 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
     """Reject server configurations pipeline parallelism on TPU cannot run,
     and pin the scheduler order the stage hand-off needs.
 
-    Every device is one process, and a stage is one device or one
-    context-parallel group of devices. Activations move over
+    Every device is one process, and a stage is one device, a tensor-parallel
+    group (--tp-size > 1, --attn-cp-size 1), or a prefill context-parallel
+    group (--tp-size equal to --attn-cp-size). Activations move over
     ICI as one collective-permute launched by every stage in lockstep, so a
     stage's forward waits on launches the other stages issue at the top of
     their next iteration. The scheduler must therefore receive and forward
     the last stage's outputs before it launches a forward, not after: that is
     the async-batch-depth 1 order (depth 0 does the ring exchange after the
-    forward and the two waits form a cycle). A stage may span several devices
-    only as a prefill context-parallel group (--tp-size equal to
-    --attn-cp-size): its collectives then run over the stage's own devices
-    (this needs a torch_tpu that compiles a collective for its device group
-    only), while the hand-off stays the one collective every stage launches.
+    forward and the two waits form a cycle). When a stage spans several
+    devices (TP or PCP), its intra-stage collectives run over the stage's own
+    devices (compiled as subgroup programs by torch_tpu), while the hand-off
+    stays the one collective every stage launches.
     """
     from sglang.srt.arg_groups.overrides import declare_late_resolution, resolving_view
 
@@ -132,13 +137,12 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
         declare_late_resolution(
             server_args, "tpu.apply_server_args_defaults", pp_async_batch_depth=1
         )
-    if cfg.tp_size > 1 and cfg.attn_cp_size != cfg.tp_size:
+    if cfg.tp_size > 1 and cfg.attn_cp_size not in (1, cfg.tp_size):
         raise NotImplementedError(
-            "Pipeline parallelism on TPU runs a stage on one device or on a "
-            "prefill context-parallel group of --tp-size devices "
-            f"(got --tp-size {cfg.tp_size} with --attn-cp-size {cfg.attn_cp_size} "
-            f"and --pp-size {pp}): tensor parallelism inside a pipeline stage "
-            "is not supported."
+            "Pipeline parallelism on TPU with --tp-size > 1 requires either "
+            f"--attn-cp-size 1 (PPxTP) or --attn-cp-size {cfg.tp_size} (PPxPCP), "
+            f"got --tp-size {cfg.tp_size} with --attn-cp-size {cfg.attn_cp_size} "
+            f"and --pp-size {pp}."
         )
     if cfg.speculative_algorithm is not None:
         raise NotImplementedError(

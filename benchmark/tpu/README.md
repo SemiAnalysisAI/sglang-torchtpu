@@ -166,14 +166,51 @@ EXTRA_ARGS="--sampling-backend pytorch --watchdog-timeout 3600" \
 Supported: `--enable-torch-compile` and eager, chunked prefill,
 `--kv-cache-dtype fp8_e4m3`, `--max-total-tokens` (every stage sizes its pool
 to the smallest stage; a hybrid model's SWA pool holds one prefill chunk per
-pipeline slot on top of `--swa-full-tokens-ratio`). Rejected at launch with
-`--pp-size > 1` on TPU: `--tp-size > 1` (a stage is one device, or one
-context-parallel group as below), speculative decoding, and
+pipeline slot on top of `--swa-full-tokens-ratio`). With `--pp-size > 1` on
+TPU, a stage may be one device (`--tp-size 1`), a tensor-parallel group
+(`--tp-size K --attn-cp-size 1`), or a prefill context-parallel group
+(`--tp-size K --attn-cp-size K`). Rejected at launch: speculative decoding and
 `--enable-dynamic-chunking`. Input (prompt) logprobs are rejected per request.
 `--dp-size` has not been run with pipeline parallelism on
 TPU. Overlap scheduling is switched off by pipeline parallelism itself. A
 stage waiting for the previous stage looks idle to the watchdog, so pass
 `--watchdog-timeout` at least `pp_size` times the longest microbatch.
+
+### Tensor-parallel stages (PP8 x TP2 & PP4 x TP2)
+
+`--pp-size N --tp-size 2` pairs the two TensorCores of each physical TPU7x
+megachip into a single tensor-parallel pipeline stage (`--attn-cp-size 1`):
+each core shards Q/KV heads (`1/2` per core) and MLP/MoE weights (`1/2` per
+core), runs intra-stage `all_reduce` strictly inside the physical chip (zero
+external ICI hops), and leaves inter-chip ICI dedicated to the `PPWave`
+two-column `collective-permute` hand-off. Unlike `PP x PCP2`, `PP x TP2`
+halves per-core weight and KV-cache HBM (`1/16` of model weights and KV cache
+per core at `PP8 x TP2`) and supports native continuous-batching decode.
+
+```bash
+# Single-host PP4 x TP2 (8 TensorCores / 4 physical chips on 2x2x1):
+MODEL=openai/gpt-oss-120b \
+PP_SIZE=4 TP_SIZE=2 PP_MAX_MICRO_BATCH_SIZE=16 \
+PAGE_SIZE=128 CONTEXT_LEN=131072 CONC=64 \
+CHUNKED_PREFILL_SIZE=16384 MAX_PREFILL_TOKENS=16384 \
+MAX_TOTAL_TOKENS=2097152 MEM_FRACTION_STATIC=0.85 \
+TPU_COMPILE_BS="1 2 4 8 16 32 64" \
+TPU_COMPILE_TOKENS="1024 2048 4096 8192 16384" \
+EXTRA_ARGS="--sampling-backend pytorch --watchdog-timeout 3600" \
+./launch_server.sh
+
+# Two-host PP8 x TP2 (16 TensorCores / 8 physical chips on 2x2x2, run on each node):
+NNODES=2 NODE_RANK=0 RANK0_HOST=<host0-ip> \
+MODEL=openai/gpt-oss-120b \
+PP_SIZE=8 TP_SIZE=2 PP_MAX_MICRO_BATCH_SIZE=8 \
+PAGE_SIZE=128 CONTEXT_LEN=131072 CONC=64 \
+CHUNKED_PREFILL_SIZE=16384 MAX_PREFILL_TOKENS=16384 \
+MAX_TOTAL_TOKENS=2097152 MEM_FRACTION_STATIC=0.85 \
+TPU_COMPILE_BS="1 2 4 8 16 32 64" \
+TPU_COMPILE_TOKENS="1024 2048 4096 8192 16384" \
+EXTRA_ARGS="--sampling-backend pytorch --watchdog-timeout 3600" \
+./launch_server.sh
+```
 
 ### Context-parallel stages (PP4 x PCP2)
 
