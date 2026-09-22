@@ -7,7 +7,10 @@ import unittest
 from unittest.mock import patch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.profiler import _install_tpu_profile_options_patch
+from sglang.srt.hardware_backend.tpu.profiler import (
+    _install_tpu_profile_options_patch,
+    _load_profiler_api,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -46,13 +49,32 @@ def _fake_profiler_api(get_options=lambda activities: _BaseProfileOptions()):
 
 
 class TestInstallTpuProfileOptionsPatch(CustomTestCase):
+    def test_loads_renamed_profiler_api(self):
+        replacement = types.ModuleType("torch_tpu._internal.profiler._api")
+        missing_legacy = ModuleNotFoundError(
+            name="torch_tpu._internal.profiler.profiler_api"
+        )
+        with patch(
+            "sglang.srt.hardware_backend.tpu.profiler.importlib.import_module",
+            side_effect=(missing_legacy, replacement),
+        ) as import_module:
+            self.assertIs(_load_profiler_api(), replacement)
+
+        self.assertEqual(
+            [call.args[0] for call in import_module.call_args_list],
+            [
+                "torch_tpu._internal.profiler.profiler_api",
+                "torch_tpu._internal.profiler._api",
+            ],
+        )
+
     def _install(
         self,
         profiler_api,
         *,
         num_chips,
         num_sparse_cores,
-        profile_options_cls=_BaseProfileOptions
+        profile_options_cls=_BaseProfileOptions,
     ):
         with (
             envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(num_chips),

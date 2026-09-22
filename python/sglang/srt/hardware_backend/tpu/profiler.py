@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib
 from contextlib import AbstractContextManager
 from pathlib import Path
 from types import ModuleType
@@ -13,6 +14,16 @@ from sglang.srt.hardware_backend.tpu._logging import get_logger
 logger = get_logger(__name__)
 
 
+def _load_profiler_api() -> ModuleType:
+    legacy_module = "torch_tpu._internal.profiler.profiler_api"
+    try:
+        return importlib.import_module(legacy_module)
+    except ModuleNotFoundError as error:
+        if error.name != legacy_module:
+            raise
+    return importlib.import_module("torch_tpu._internal.profiler._api")
+
+
 def start_tpu_profile(
     *, output_dir: Path, with_cpu: bool = True
 ) -> AbstractContextManager:
@@ -21,7 +32,7 @@ def start_tpu_profile(
     Returns the entered profiler. Pass it to :func:`stop_tpu_profile` to end
     the session. ``with_cpu`` adds the host-CPU activity to the device trace.
     """
-    from torch_tpu._internal.profiler import profiler_api
+    profiler_api = _load_profiler_api()
 
     _install_tpu_profile_options_patch(profiler_api)
 
