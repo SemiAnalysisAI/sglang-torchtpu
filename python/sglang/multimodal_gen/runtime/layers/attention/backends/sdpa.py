@@ -95,6 +95,20 @@ class SDPAImpl(AttentionImpl):
                     device=query.device,
                 ).tril(diagonal=key_length - query_length)
 
+        if query.device.type == "tpu" and attn_mask is None and self.dropout == 0.0:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.tpu_splash_attn import (
+                tpu_attention,
+            )
+
+            output = tpu_attention(
+                query,
+                key,
+                value,
+                scale=self.softmax_scale,
+                is_causal=is_causal,
+            )
+            return output.transpose(1, 2)
+
         attn_kwargs = {
             "attn_mask": attn_mask,
             "dropout_p": self.dropout,

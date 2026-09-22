@@ -305,16 +305,20 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     # Move the dimension to be split (h_global) to dim 0 for all_to_all_single
     if head_dim == 1:
         b, h_global, s_local, d = x.shape
+        pad_h = (-h_global) % world_size
+        if pad_h > 0:
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, pad_h))
+            h_global += pad_h
         # Shape transition: [b, h_global, s_local, d] -> [h_global, b, s_local, d]
         permute_order = (1, 0, 2, 3)
     else:  # head_dim == 2
         b, s_local, h_global, d = x.shape
+        pad_h = (-h_global) % world_size
+        if pad_h > 0:
+            x = torch.nn.functional.pad(x, (0, 0, 0, pad_h))
+            h_global += pad_h
         # Shape transition: [b, s_local, h_global, d] -> [h_global, b, s_local, d]
         permute_order = (2, 0, 1, 3)
-
-    assert (
-        h_global % world_size == 0
-    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
 
     h_local, s_global = h_global // world_size, s_local * world_size
 
@@ -419,6 +423,29 @@ def _usp_input_all_to_all_qkv(
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return q, k, v
+    if (
+        q.device.type == "tpu"
+        and q.ndim == 4
+        and q.shape == k.shape == v.shape
+        and q.dtype == k.dtype == v.dtype
+    ):
+        b, s_local, h_global, d = q.shape
+        pad_h = (-h_global) % world_size
+        if pad_h > 0:
+            q = torch.nn.functional.pad(q, (0, 0, 0, pad_h))
+            k = torch.nn.functional.pad(k, (0, 0, 0, pad_h))
+            v = torch.nn.functional.pad(v, (0, 0, 0, pad_h))
+            h_global += pad_h
+        h_local, s_global = h_global // world_size, s_local * world_size
+        qkv = torch.stack([q, k, v], dim=0).permute(3, 0, 1, 2, 4).contiguous()
+        qkv = _usp_all_to_all_single(qkv, role="usp_packed_qkv_tpu")
+        qkv = (
+            qkv.reshape(world_size, h_local, 3, b, s_local, d)
+            .permute(2, 3, 0, 4, 1, 5)
+            .contiguous()
+            .reshape(3, b, s_global, h_local, d)
+        )
+        return qkv[0], qkv[1], qkv[2]
     if not _can_use_packed_qkv_a2a_4d(q, k, v, world_size):
         return (
             _usp_input_all_to_all(q, head_dim=2),

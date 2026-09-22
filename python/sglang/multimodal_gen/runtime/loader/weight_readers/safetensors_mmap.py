@@ -34,13 +34,14 @@ class SafetensorsMmapReader:
         clone_tensors: bool = True,
         show_progress: bool = True,
     ) -> Iterator[tuple[str, torch.Tensor]]:
+        open_device = "cpu" if str(device).startswith("tpu") else device
         for path in tqdm(
             files,
             desc="Loading safetensors checkpoint shards",
             disable=not show_progress,
             bar_format=_BAR_FORMAT,
         ):
-            with safe_open(path, framework="pt", device=device) as handle:
+            with safe_open(path, framework="pt", device=open_device) as handle:
                 for name in handle.keys():  # noqa: SIM118
                     if key_filter is not None and not key_filter(name):
                         continue

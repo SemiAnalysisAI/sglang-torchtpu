@@ -824,6 +824,20 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.vae_cpu_offload = False
             return
 
+        if (
+            current_platform.is_tpu()
+            and current_platform.get_device_total_memory() / BYTES_PER_GB >= 64
+        ):
+            if self.dit_cpu_offload is None:
+                self.dit_cpu_offload = False
+            if self.text_encoder_cpu_offload is None:
+                self.text_encoder_cpu_offload = False
+            if self.image_encoder_cpu_offload is None:
+                self.image_encoder_cpu_offload = False
+            if self.vae_cpu_offload is None:
+                self.vae_cpu_offload = False
+            return
+
         # TODO: to be handled by each platform
         if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
             logger.info(

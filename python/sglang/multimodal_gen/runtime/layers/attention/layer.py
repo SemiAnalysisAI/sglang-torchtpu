@@ -861,6 +861,36 @@ class USPAttention(nn.Module):
         effective_skip_sp = (
             self.skip_sequence_parallel or skip_sequence_parallel_override
         )
+        sp_size = get_ulysses_parallel_world_size()
+        if (
+            sp_size > 1
+            and not effective_skip_sp
+            and not qkv_pre_all_to_all
+            and self.sp_attention_mode != "kv_gather"
+            and (q.shape[2] % sp_size != 0 or k.shape[2] % sp_size != 0)
+        ):
+            orig_q_heads = q.shape[2]
+            pad_q = (-orig_q_heads) % sp_size
+            pad_kv = (-k.shape[2]) % sp_size
+            if pad_q > 0:
+                q = torch.nn.functional.pad(q, (0, 0, 0, pad_q))
+            if pad_kv > 0:
+                k = torch.nn.functional.pad(k, (0, 0, 0, pad_kv))
+                v = torch.nn.functional.pad(v, (0, 0, 0, pad_kv))
+            out = self.forward(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                num_replicated_prefix=num_replicated_prefix,
+                num_replicated_suffix=num_replicated_suffix,
+                num_replicated_kv_prefix=num_replicated_kv_prefix,
+                skip_sequence_parallel_override=skip_sequence_parallel_override,
+                attn_mask_meta=attn_mask_meta,
+                qkv_pre_all_to_all=qkv_pre_all_to_all,
+                seq_lens=seq_lens,
+            )
+            return out[:, :, :orig_q_heads, :]
         if seq_lens is not None:
             assert (
                 attn_mask is None
@@ -1529,9 +1559,9 @@ class USPAttention(nn.Module):
         k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
         v_rep, v_shard = v[:, :num_rep], v[:, num_rep:]
 
-        q_shard = _usp_input_all_to_all(q_shard, head_dim=2)
-        k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
-        v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+        q_shard, k_shard, v_shard = _usp_input_all_to_all_qkv(
+            q_shard, k_shard, v_shard
+        )
 
         # Q and KV can have different head counts (GQA), so slice each replicated
         # prefix by its own per-rank head shard to match the all-to-all'd suffix.
@@ -1693,9 +1723,7 @@ class USPAttention(nn.Module):
             k_shard = k_shard.contiguous()
             v_shard = v_shard.contiguous()
         else:
-            q = _usp_input_all_to_all(q, head_dim=2)
-            k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
-            v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+            q, k_shard, v_shard = _usp_input_all_to_all_qkv(q, k_shard, v_shard)
 
         h_kv_local = k_shard.shape[2]
         h_start = u_rank * h_kv_local
@@ -1732,9 +1760,9 @@ class USPAttention(nn.Module):
         k_shard, k_rep = k[:, :-num_rep], k[:, -num_rep:]
         v_shard, v_rep = v[:, :-num_rep], v[:, -num_rep:]
 
-        q_shard = _usp_input_all_to_all(q_shard, head_dim=2)
-        k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
-        v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+        q_shard, k_shard, v_shard = _usp_input_all_to_all_qkv(
+            q_shard, k_shard, v_shard
+        )
 
         h_local = q_shard.shape[2]
         kv_h_local = k_shard.shape[2]

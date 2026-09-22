@@ -350,19 +350,13 @@ def apply_split_rotary_emb(
     r = last // 2
 
     split_x = x.reshape(*x.shape[:-1], 2, r)
-    first_x = split_x[..., :1, :]
-    second_x = split_x[..., 1:, :]
+    first_x = split_x[..., 0, :]
+    second_x = split_x[..., 1, :]
 
-    cos_u = cos.unsqueeze(-2)
-    sin_u = sin.unsqueeze(-2)
+    first_out = first_x * cos - second_x * sin
+    second_out = second_x * cos + first_x * sin
 
-    out = split_x * cos_u
-    first_out = out[..., :1, :]
-    second_out = out[..., 1:, :]
-    first_out.addcmul_(-sin_u, second_x)
-    second_out.addcmul_(sin_u, first_x)
-
-    out = out.reshape(*out.shape[:-2], last)
+    out = torch.stack([first_out, second_out], dim=-2).reshape(*x.shape[:-1], last)
     if needs_reshape:
         out = out.swapaxes(1, 2).reshape(b, t, -1)
     return out.to(dtype=x_dtype)

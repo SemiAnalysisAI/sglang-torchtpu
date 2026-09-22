@@ -56,14 +56,9 @@ def apply_split_rotary_emb(
     cos_u = cos.unsqueeze(-2)  # broadcast to (..., 1, r) against (..., 2, r)
     sin_u = sin.unsqueeze(-2)
 
-    out = split_x * cos_u
-    first_out = out[..., :1, :]
-    second_out = out[..., 1:, :]
-
-    first_out.addcmul_(-sin_u, second_x)
-    second_out.addcmul_(sin_u, first_x)
-
-    out = out.reshape(*out.shape[:-2], last)
+    first_out = first_x * cos_u - sin_u * second_x
+    second_out = second_x * cos_u + sin_u * first_x
+    out = torch.cat([first_out, second_out], dim=-2).reshape(*split_x.shape[:-2], last)
 
     if needs_reshape:
         out = out.transpose(1, 2).reshape(b, t, -1)

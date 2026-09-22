@@ -171,6 +171,12 @@ class TpuPlatform(Platform):
         os.environ.setdefault(
             "TPU_PREMAPPED_BUFFER_SIZE", str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE)
         )
+        tier2_cache_dir = "/dev/shm/torch_tpu_cache"
+        try:
+            os.makedirs(tier2_cache_dir, exist_ok=True)
+            os.environ.setdefault("TORCH_TPU_TIER2_COMPILATION_CACHE", tier2_cache_dir)
+        except Exception:
+            pass
         _prepare_tpu_env(world_size=_world_size(), resolve_single_host_topology=True)
         import torch_tpu  # noqa: F401
 
