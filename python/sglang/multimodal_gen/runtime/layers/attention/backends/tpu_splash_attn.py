@@ -162,12 +162,7 @@ def _build_custom_splash_kernel(
                 int8_ops_per_second=0,
                 fp8_ops_per_second=int(4.60e15 // 2),
                 int4_ops_per_second=0,
-                sparse_core=_tpu_info.SparseCoreInfo(
-                    num_cores=4,
-                    num_subcores=16,
-                    num_lanes=16,
-                    dma_granule_size_bytes=64,
-                ),
+                sparse_core=None,
             )
     except Exception:
         pass
