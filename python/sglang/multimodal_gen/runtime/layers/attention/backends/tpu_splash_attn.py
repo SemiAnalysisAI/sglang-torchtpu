@@ -172,11 +172,18 @@ def _build_custom_splash_kernel(
         pass
 
     block_q, block_kv, block_kv_compute = autotune_block_sizes(q_seq, kv_seq, head_dim)
+    # Under torch_tpu, each logical device is 1 TensorCore (64 MiB VMEM).
+    # Keep (block_kv_compute x block_q) float32 intermediates well within 64 MiB VMEM
+    # so Mosaic/XLA compiles in <2s without LP scheduler stalls.
+    if block_q > 3072:
+        block_q = 3072 if (q_seq % 3072 == 0 or q_seq > 16384) else 2048
+    if block_kv_compute > 512:
+        block_kv_compute = 512
     q_padded = _round_up(q_seq, block_q)
     kv_padded = _round_up(kv_seq, block_kv)
 
     mask_value = -0.7 * float(np.finfo(np.dtype("float32")).max)
-    vmem_limit_bytes = 128 * (2**20)  # 2x 64 MiB VMEM on TPU v7x
+    vmem_limit_bytes = 64 * (2**20)  # 64 MiB VMEM per TensorCore on TPU v7x
 
     def _flash_attention_kernel(
         mk_ref,
@@ -416,19 +423,15 @@ def _build_fullmask_splash_kernel(
             mask_arr = np.zeros((q_padded, kv_padded), dtype=np.bool_)
             mask_arr[:q_seq, :kv_seq] = np.tril(np.ones((q_seq, kv_seq), dtype=np.bool_))
             mask = sam.NumpyMask(mask_arr)
-    elif kv_padded == kv_seq:
-        # Query padding alone does not require NumpyMask: softmax is independent per query row,
-        # and extra query rows are sliced off after the kernel completes.
+    elif not is_causal:
+        # Always use FullMask((q_padded, kv_padded)) to avoid allocating multi-GB
+        # dense NumpyMask arrays in CPU/HBM for long video sequences (e.g. S=75,600).
         mask = sam.FullMask((q_padded, kv_padded))
-    else:
-        mask_arr = np.zeros((q_padded, kv_padded), dtype=np.bool_)
-        mask_arr[:q_seq, :kv_seq] = True
-        mask = sam.NumpyMask(mask_arr)
 
     block_sizes = splash.BlockSizes(
         block_q=block_q,
         block_kv=block_kv,
-        block_kv_compute=block_kv,
+        block_kv_compute=min(block_kv, 512),
     )
 
     def splash_fn(q, k, v):
@@ -460,16 +463,12 @@ def _get_or_create_splash_kernel(
         return cached
 
     # 1. Long-sequence video/image self-attention (e.g. Wan2.2 14B S=75600, LTX-2 S=14080):
-    # Use DiffusionServing's custom_splash_attention with autotuned blocks (e.g. 6912x2048)
-    # and hybrid fixed-m softmax whenever kv_seq >= 2048 and kv_seq % 128 == 0 (or % 16 == 0).
-    if (
-        not is_causal
-        and q_seq >= 2048
-        and kv_seq >= 2048
-        and kv_seq % 16 == 0
-        and dtype == torch.bfloat16
-    ):
-        result = _build_custom_splash_kernel(q_seq, kv_seq, head_dim, use_fixed_m=True)
+    # Use make_splash_mha with FullMask((q_padded, kv_padded)) and 2048x2048 (kv_compute=512)
+    # blocks so VMEM stays under 16 MiB per TensorCore and XLA compiles in <2s with 0 NumpyMask HBM.
+    if not is_causal and q_seq >= 2048 and kv_seq >= 2048:
+        result = _build_splash_fn(
+            q_seq, kv_seq, is_causal=False, block_q_override=2048, block_kv_override=2048
+        )
         _splash_kernel_cache[cache_key] = result
         return result
 
