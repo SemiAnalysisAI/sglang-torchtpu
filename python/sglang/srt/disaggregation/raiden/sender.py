@@ -196,7 +196,8 @@ class RaidenSenderMixin:
                 self._prefill.chunk_seq[room] = index + 1
                 # A decode engine receives reads from multiple prefills. Their
                 # process-local counters would collide in its native UUID map.
-                uuid = secrets.randbits(64)
+                # Reshard RPCs represent transfer IDs as signed int64.
+                uuid = secrets.randbits(63)
                 addr = self._prefill.decode_addr[room]
             req_id = f"{room}#{index}"
             self._register_sender_read(

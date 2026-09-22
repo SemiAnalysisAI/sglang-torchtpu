@@ -665,8 +665,8 @@ class RaidenReceiverMixin:
             (p_rank, sources_map[p_rank][1][lo:hi]) for p_rank in sorted(sources_map)
         ]
         dst = local_blocks[window.local_offset : window.local_offset + window.length]
-        # A prefill can serve plans from multiple decode engines as well.
-        uuid = secrets.randbits(64)
+        # Independent decoders share a prefill; the reshard RPC uses int64.
+        uuid = secrets.randbits(63)
         req_id = f"{room}#{index}"
         req = build_receiver_request(
             pb2,

@@ -31,6 +31,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from google.protobuf.wrappers_pb2 import Int64Value
 
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
@@ -243,6 +244,15 @@ class RaidenRendezvousTestCase(CustomTestCase):
 
 
 class TestRaidenPullHandshake(RaidenRendezvousTestCase):
+    def test_chunk_transfer_id_fits_signed_int64(self):
+        prefill, decode = self._prefill(), self._decode()
+        prefill._on_pull_req(self._pull_req_frames(decode, 7000, 2))
+        with patch("secrets.randbits", side_effect=lambda bits: (1 << bits) - 1):
+            prefill._announce_chunk(7000, 0, [1], total_pages=2)
+
+        chunk = Chunk.from_frames(self.inboxes[decode.endpoint].take(MessageTag.CHUNK))
+        self.assertEqual(Int64Value(value=chunk.uuid).value, chunk.uuid)
+
     def test_chunks_from_different_prefills_have_distinct_transfer_ids(self):
         decode = self._decode()
         transfer_ids = []

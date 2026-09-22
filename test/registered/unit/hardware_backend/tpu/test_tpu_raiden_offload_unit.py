@@ -30,6 +30,7 @@ from unittest.mock import Mock, patch
 
 import torch
 import zmq
+from google.protobuf.wrappers_pb2 import Int64Value
 
 from sglang.srt.disaggregation.base.conn import BaseKVSender, KVArgs, StateType
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeReqToTokenPool
@@ -1955,6 +1956,14 @@ class TestRaidenChunkedResharding(CustomTestCase):
         uuid = mgr._engine.register_active_plan.call_args.args[0]
         self.assertEqual(mgr._reshard_plans, {self.ROOM: {"41#0": uuid}})
         return mgr, uuid
+
+    def test_chunk_plan_id_fits_signed_int64(self):
+        with patch("secrets.randbits", side_effect=lambda bits: (1 << bits) - 1):
+            mgr, uuid = self._decode_with_chunk_plan()
+
+        _, req = mgr._engine.register_active_plan.call_args.args
+        # StartTransferRequest.uuid uses protobuf's signed int64 range.
+        self.assertEqual(Int64Value(value=uuid).value, req.uuid)
 
     def test_aborted_room_keeps_its_chunk_plan_until_the_push_settles(self):
         mgr, uuid = self._decode_with_chunk_plan()
