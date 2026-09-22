@@ -365,12 +365,8 @@ def _fused_moe_jax(
     # SparseCore (and crashing on). Pad tokens route to expert 0 with zero
     # weight, so they contribute nothing to any real token and are sliced off
     # at the very end.
-    # Weights arrive lane-aligned from the loader (bf16: pad activations to
-    # match; quantized: unpadded-at-load dims are unsupported). Pad
-    # ``hidden_states`` (m rows) before the permute/gather rather than
-    # ``x_sorted`` (m*topk rows) after it so SparseCore ``ragged_gather_v2``
-    # receives a 128-lane-aligned column dimension (e.g. 2880 -> 2944 on
-    # GPT-OSS) and avoids a 4x larger post-gather HBM pad copy.
+    # bf16 weights arrive with K padded to a 128-lane multiple at load; zero-pad
+    # hidden_states to that K before the gather, which then runs lane-aligned.
     if w1_scale is None:
         assert w1.shape[1] % 128 == 0, (
             f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight K "
@@ -524,11 +520,8 @@ def _fused_moe_jax(
     gmm2_tiling = _dividing_tile_k(
         _gmm2_tile_source(gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed)
     )
-    # Keep ``gmm2_out`` at its lane-aligned weight output width (e.g. 2944 on
-    # GPT-OSS) through the SparseCore un-permute / gather-reduce so
-    # ``dense_gather_reduce`` / ``ragged_gather_reduce`` / ``ragged_gather_v2``
-    # see a 128-divisible column dimension instead of falling back to JAX on
-    # the TensorCore. Slice back to ``hidden_size`` on the final output.
+    # gmm2_out keeps the weights' lane-aligned output width through the SparseCore
+    # un-permute; every output is sliced back to hidden_size.
     gmm2_out = gmm_v2(
         lhs=gmm1_out,
         rhs=w2,

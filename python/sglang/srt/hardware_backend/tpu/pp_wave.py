@@ -7,15 +7,15 @@ So every hand-off is one collective-permute over all pipeline stages at once,
 around closed cycles: stage r hands the sum of its hidden states and
 residual to stage r+1 and receives stage r-1's, and the last stage's block
 lands on stage 0, which ignores it. A stage of several devices (a prefill
-context-parallel group) forms one cycle per device column: each device hands
-its rows to the device holding the same rows in the next stage, and all
-columns move in the same launch. The stage after a boundary must add
-hidden states and residual before its first norm, as a pre-norm decoder's
-fused add-norm does, so the sum with a zero residual carries the same
-residual stream at half the bytes. That norm reads the sum rounded to the
-model dtype instead of the float32 sum, a small difference at every stage
-boundary. The closed cycles let XLA lower the permute to full-bandwidth
-ring transfers. A batch's activations
+context-parallel group or a tensor-parallel pair) forms one cycle per device
+column: each device hands its rows to the device holding the same rows in
+the next stage, and all columns move in the same launch. The stage after a
+boundary must add hidden states and residual before its first norm, as a
+pre-norm decoder's fused add-norm does, so the sum with a zero residual
+carries the same residual stream at half the bytes. That norm reads the sum
+rounded to the model dtype instead of the float32 sum, a small difference
+at every stage boundary. The closed cycles let XLA lower the permute to
+full-bandwidth ring transfers. A batch's activations
 leave stage 0 at some launch k and reach stage r at launch k+r-1, so every
 stage issues launches by one count:
 

@@ -144,6 +144,12 @@ class TestProxyReceive(CustomTestCase):
         self.assertIsNone(scheduler._pp_recv_proxy_tensors())
         scheduler._pp_recv_typed_dict.assert_not_called()
 
+    def test_hand_offs_all_gather_over_attention_tp_only_off_the_wave(self):
+        scheduler = self._scheduler({})
+        self.assertIs(scheduler._pp_dict_all_gather_group(), scheduler.attn_tp_group)
+        scheduler._pp_wave = object()
+        self.assertIsNone(scheduler._pp_dict_all_gather_group())
+
 
 class TestWaveRows(CustomTestCase):
     def _rows(self, compile_policy):

@@ -182,13 +182,15 @@ Supported: chunked prefill, `--kv-cache-dtype fp8_e4m3`, `--max-total-tokens`
 holds one prefill chunk per pipeline slot on top of `--swa-full-tokens-ratio`).
 Rejected at launch with `--pp-size > 1` on TPU: eager mode (without
 `--enable-torch-compile`),
-`--tp-size > 1` (a stage is one device, or one context-parallel group as
-below), speculative decoding, and `--enable-dynamic-chunking`. Input (prompt)
+`--tp-size > 1` (a stage is one device, a tensor-parallel pair, or one
+context-parallel group, as below), speculative decoding, and
+`--enable-dynamic-chunking`. Input (prompt)
 logprobs are rejected per request.
 `--dp-size` has not been run with pipeline parallelism on
 TPU. Overlap scheduling is switched off by pipeline parallelism itself. A
 stage waiting for the previous stage looks idle to the watchdog, so pass
 `--watchdog-timeout` at least `pp_size` times the longest microbatch.
+
 
 Optional warmup — run between launch and bench *only* while the in-server
 torch.compile warmup doesn't yet cover all compile-shape buckets:
@@ -209,6 +211,24 @@ PAGE_SIZE=128 CONTEXT_LEN=32768 CONC=32 \
 CHUNKED_PREFILL_SIZE=16384 MAX_PREFILL_TOKENS=16384 \
 MEM_FRACTION_STATIC=0.30 TORCH_COMPILE_MAX_BS=32 \
 EXTRA_ARGS="--attn-cp-size 2 --enable-prefill-cp --cp-strategy zigzag --moe-dp-size 2 --sampling-backend pytorch --watchdog-timeout 3600" \
+./launch_server.sh
+```
+
+### Tensor-parallel stages (PP4 x TP2)
+
+`--tp-size 2` with `--attn-cp-size 1` makes each stage a tensor-parallel pair
+that shards the stage's heads and expert weights; it needs the same torch_tpu
+as the context-parallel stages.
+
+```bash
+MODEL=openai/gpt-oss-120b \
+PP_SIZE=4 TP_SIZE=2 PP_MAX_MICRO_BATCH_SIZE=16 \
+PAGE_SIZE=128 CONTEXT_LEN=131072 CONC=64 \
+CHUNKED_PREFILL_SIZE=16384 MAX_PREFILL_TOKENS=16384 \
+MAX_TOTAL_TOKENS=2097152 MEM_FRACTION_STATIC=0.85 \
+TPU_COMPILE_BS="1 2 4 8 16 32 64" \
+TPU_COMPILE_TOKENS="1024 2048 4096 8192 16384" \
+EXTRA_ARGS="--sampling-backend pytorch --watchdog-timeout 3600" \
 ./launch_server.sh
 ```
 

@@ -126,11 +126,16 @@ class TestPipelineParallelValidation(CustomTestCase):
         prepare_tpu_env = _apply(_args(tp_size=8))
         prepare_tpu_env.assert_called_once_with(8, setup_slicebuilder=True)
 
-    def test_rejects_tensor_parallel_stages(self):
-        with self.assertRaisesRegex(
-            NotImplementedError, r"--attn-cp-size equal to --tp-size"
-        ):
-            _apply(_args(pp_size=2, tp_size=2))
+    def test_accepts_tensor_parallel_pair_stages(self):
+        with patch.dict("os.environ", {}):
+            prepare_tpu_env = _apply(
+                _args(pp_size=8, tp_size=2, enable_torch_compile=True)
+            )
+        prepare_tpu_env.assert_called_once_with(16, setup_slicebuilder=True)
+
+    def test_rejects_tensor_parallel_stages_wider_than_a_pair(self):
+        with self.assertRaisesRegex(NotImplementedError, r"tensor-parallel pair"):
+            _apply(_args(pp_size=2, tp_size=4, enable_torch_compile=True))
 
     def test_rejects_stages_wider_than_their_context_parallel_group(self):
         with self.assertRaisesRegex(
@@ -178,7 +183,9 @@ class TestPipelineParallelValidation(CustomTestCase):
             "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
         ) as prepare_tpu_env:
             with self.assertRaises(NotImplementedError):
-                TpuSRTPlatform().apply_server_args_defaults(_args(pp_size=2, tp_size=2))
+                TpuSRTPlatform().apply_server_args_defaults(
+                    _cp_stage_args(tp_size=4, attn_cp_size=2)
+                )
         prepare_tpu_env.assert_not_called()
 
     def test_single_stage_keeps_every_flag(self):
