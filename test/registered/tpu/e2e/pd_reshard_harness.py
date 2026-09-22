@@ -511,7 +511,15 @@ def build_prefill_env(
         "ENABLE_DP_ATTENTION": "0",
         "MAX_RUNNING": values.get("MAX_RUNNING", "8"),
         "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1"),
-        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024"),
+        # EXPERIMENT (#718): add a real 128 bucket. Run 35668541890 set chunk 128
+        # but the compile list stayed "64 256 1024", so the bucketer produced
+        # token_buckets=[64, 256] and every extend over 64 tokens still landed
+        # in the broken 256 graph -- gsm8k 0.80, three lengths at 1/3, i.e. the
+        # chunk-256 behaviour. 128 was never actually tested as a graph shape.
+        # Set here rather than in the profile because build_prefill_env and
+        # build_decode_env overwrite TPU_COMPILE_TOKENS after spreading
+        # extra_launch_env.
+        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 128"),
         "MEM_FRACTION_STATIC": values.get(
             "MEM_FRACTION_STATIC", profile.mem_fraction_prefill
         ),
@@ -561,7 +569,15 @@ def build_decode_env(
         "ENABLE_DP_ATTENTION": "1",
         "MAX_RUNNING": values.get("MAX_RUNNING", "8"),
         "TPU_COMPILE_BS": values.get("TPU_COMPILE_BS", "1 2 4 8"),
-        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 256 1024"),
+        # EXPERIMENT (#718): add a real 128 bucket. Run 35668541890 set chunk 128
+        # but the compile list stayed "64 256 1024", so the bucketer produced
+        # token_buckets=[64, 256] and every extend over 64 tokens still landed
+        # in the broken 256 graph -- gsm8k 0.80, three lengths at 1/3, i.e. the
+        # chunk-256 behaviour. 128 was never actually tested as a graph shape.
+        # Set here rather than in the profile because build_prefill_env and
+        # build_decode_env overwrite TPU_COMPILE_TOKENS after spreading
+        # extra_launch_env.
+        "TPU_COMPILE_TOKENS": values.get("TPU_COMPILE_TOKENS", "64 128"),
         "MEM_FRACTION_STATIC": values.get(
             "MEM_FRACTION_STATIC", profile.mem_fraction_decode
         ),
