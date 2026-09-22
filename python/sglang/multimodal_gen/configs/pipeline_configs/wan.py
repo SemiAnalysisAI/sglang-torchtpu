@@ -282,6 +282,13 @@ class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
         return ModelDeploymentConfig(
             dit_layerwise_offload_modes=("auto", "memory"),
             auto_dit_offload_prefetch_size=2,
+            keep_resident_min_available_gb=85,
+            keep_resident_components=(
+                "dit",
+                "text_encoder",
+                "image_encoder",
+                "vae",
+            ),
         )
 
 
@@ -299,6 +306,13 @@ class Wan2_2_I2V_A14B_Config(WanI2V720PConfig):
         return ModelDeploymentConfig(
             dit_layerwise_offload_modes=("auto", "memory"),
             auto_dit_offload_prefetch_size=2,
+            keep_resident_min_available_gb=85,
+            keep_resident_components=(
+                "dit",
+                "text_encoder",
+                "image_encoder",
+                "vae",
+            ),
         )
 
 
