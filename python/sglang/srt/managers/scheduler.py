@@ -3528,6 +3528,16 @@ class Scheduler(
 
         return res
 
+    def _dynamic_first_chunk_cap(self, req: Req) -> Optional[int]:
+        # The batch budget only sizes a chunked request's continuation; a new
+        # request behind a long matched prefix needs the same sizing.
+        if not self.enable_dynamic_chunking:
+            return None
+        history_len = len(req.prefix_indices) + req.host_hit_length
+        if history_len == 0:
+            return None
+        return self.predict_next_chunk_size(history_len)
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -3748,6 +3758,7 @@ class Scheduler(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
+                chunk_tokens_cap=self._dynamic_first_chunk_cap(req),
             )
 
             if self.enable_lora:

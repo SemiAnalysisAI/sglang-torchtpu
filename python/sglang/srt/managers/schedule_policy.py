@@ -1259,7 +1259,11 @@ class PrefillAdder:
         return self.budget_state()
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        chunk_tokens_cap: Optional[int] = None,
     ):
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
@@ -1395,6 +1399,10 @@ class PrefillAdder:
                 # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
                 # - if the can_run_list is empty, always accept the first prefill request
                 return AddReqResult.OTHER
+
+            if chunk_tokens_cap is not None and chunk_tokens_limit is not None:
+                # Per-request cap from dynamic chunking, below the batch budget.
+                chunk_tokens_limit = min(chunk_tokens_limit, chunk_tokens_cap)
 
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
