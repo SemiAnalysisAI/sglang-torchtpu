@@ -17,10 +17,32 @@ from sglang.srt.hardware_backend.tpu.pp_chunks import (
     uses_dynamic_chunks,
 )
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
+
+
+def _pending_tokens(tree_cache, req) -> int:
+    token_ids = req.origin_input_ids + req.output_ids
+    matched = len(req.prefix_indices)
+    if matched == 0:
+        # A waiting request is matched only when it is admitted; the cached
+        # prefix it will reuse is not pending work.
+        matched = len(
+            tree_cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(
+                        token_ids=token_ids,
+                        extra_key=req.extra_key,
+                        cache_salt=req.cache_salt,
+                    )
+                )
+            ).device_indices
+        )
+    return max(len(token_ids) - matched, 0)
 
 
 def pending_step_limit(scheduler):
@@ -42,8 +64,10 @@ def pending_step_limit(scheduler):
         if req.rid in seen:
             continue
         seen.add(req.rid)
-        tokens = len(req.origin_input_ids) + len(req.output_ids)
-        pending += max(tokens - len(req.prefix_indices), 0)
+        pending += _pending_tokens(scheduler.tree_cache, req)
+        if pending >= scheduler.ps.pp_size * cost.buckets[-1]:
+            # The limit saturates at a full step; the rest need no match.
+            break
     # A micro-batch slot holds its batch until the result is processed, when
     # the same batch is recorded as the slot's last batch.
     for batch, done in zip(scheduler.mbs, scheduler.last_mbs):

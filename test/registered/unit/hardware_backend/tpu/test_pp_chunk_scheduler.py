@@ -34,6 +34,8 @@ def req(tokens, prefix=0, rid="r"):
         prefix_indices=[0] * prefix,
         full_untruncated_fill_ids=[0] * tokens,
         needs_host_load_back=lambda: False,
+        extra_key=None,
+        cache_salt=None,
     )
 
 
@@ -52,7 +54,7 @@ def adder(model=None):
     return obj
 
 
-def scheduler(waiting, chunked=None, mbs=(), last_mbs=()):
+def scheduler(waiting, chunked=None, mbs=(), last_mbs=(), matched=0):
     return NS(
         _tpu_pp_chunk_cost=cost(),
         ps=NS(pp_size=8),
@@ -60,6 +62,7 @@ def scheduler(waiting, chunked=None, mbs=(), last_mbs=()):
         chunked_req=chunked,
         mbs=list(mbs),
         last_mbs=list(last_mbs),
+        tree_cache=NS(match_prefix=lambda params: NS(device_indices=[0] * matched)),
     )
 
 
@@ -72,6 +75,14 @@ def test_pending_work_splits_lone_prompt_and_preserves_busy_steps():
     assert pending_step_limit(sched) == 4096
     sched.waiting_queue = [req(32768, rid=str(i)) for i in range(8)]
     assert pending_step_limit(sched) == 16384
+
+
+def test_cached_prefix_of_a_waiting_request_is_not_pending_work():
+    # A waiting request is only matched when it is admitted, so the step
+    # limit counted its cached prefix as pending work and a 64K-cached + 4K
+    # prompt ran as one 4K chunk instead of one chunk per stage.
+    assert pending_step_limit(scheduler([req(65536)], matched=61440)) == 2048
+    assert pending_step_limit(scheduler([req(65536)], matched=0)) == 8192
 
 
 def test_pending_continuation_counts_only_unscheduled_tokens_once():
