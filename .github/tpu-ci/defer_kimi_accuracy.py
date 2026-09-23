@@ -8,7 +8,8 @@ from pathlib import Path
 
 REPO = "sgl-project/sglang-torchtpu"
 NIGHTLY_RUN = 35815394025
-CANCELLED_RETRY = 35831467790
+PREVIOUS_RETRY = 35840663944
+NIGHTLY_QUIET_SECONDS = 5 * 60
 TARGET_BRANCH = "test/kimi-mmmu-vmem-20260923"
 TARGET_SHA = "8fe64967eff0bcbfa6b06a237d93579d4a05cfc8"
 
@@ -23,6 +24,7 @@ def active_nightly_runs(runs):
 
 def main():
     deadline = time.monotonic() + 330 * 60
+    quiet_since = None
     while time.monotonic() < deadline:
         try:
             nightly = gh_json("api", f"repos/{REPO}/actions/runs/{NIGHTLY_RUN}")
@@ -39,6 +41,7 @@ def main():
                 "databaseId,status",
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            quiet_since = None
             print(
                 f"Nightly status query failed ({type(error).__name__}); retrying",
                 flush=True,
@@ -51,7 +54,14 @@ def main():
             flush=True,
         )
         if nightly["status"] == "completed" and not active:
-            break
+            # Allow time for a failed nightly to be rerun before taking TPU capacity.
+            now = time.monotonic()
+            if quiet_since is None:
+                quiet_since = now
+            if now - quiet_since >= NIGHTLY_QUIET_SECONDS:
+                break
+        else:
+            quiet_since = None
         time.sleep(60)
     else:
         raise SystemExit("Nightly has not finished; no Kimi evaluation submitted")
@@ -72,7 +82,7 @@ def main():
         "databaseId,headSha",
     )
     for run in existing:
-        if run["headSha"] == TARGET_SHA and run["databaseId"] > CANCELLED_RETRY:
+        if run["headSha"] == TARGET_SHA and run["databaseId"] > PREVIOUS_RETRY:
             print(f"Kimi retry already submitted: {run['databaseId']}", flush=True)
             return
     branch = gh_json("api", f"repos/{REPO}/git/ref/heads/{TARGET_BRANCH}")
