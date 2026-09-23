@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
-    from sglang.test.tpu import model_config_main
+    from sglang.test.tpu import model_config_main, sgl_router
 except ModuleNotFoundError as exc:
     # Source-only checkout: the host-side configuration tests still run.
     SGLANG_IMPORT_ERROR = exc
@@ -26,6 +26,19 @@ except ModuleNotFoundError as exc:
 
     def model_config_main(*_args, **_kwargs):
         return None
+
+    class sgl_router:  # stands in for the module in source-only checkouts
+        @staticmethod
+        def selected(**_kwargs):
+            return False
+
+        @staticmethod
+        def health_path(**_kwargs):
+            return "/health"
+
+        @staticmethod
+        def spec_server_info_env(*_args, **_kwargs):
+            return {}
 
 
 # Expected runtime: 45 minutes; CI uses this for scheduling and timeouts.
@@ -264,6 +277,17 @@ def execute_router(
     *, prefill_host: str, decode_host: str, log_path: str = LB_LOG
 ) -> subprocess.Popen:
     """Launch the mini-LB in front of the prefill and decode pods."""
+    if sgl_router.selected():
+        return _launch(
+            sgl_router.build_cmd(
+                prefill_urls=[f"http://{prefill_host}:{PREFILL_PORT}"],
+                decode_urls=[f"http://{decode_host}:{DECODE_PORT}"],
+                host="0.0.0.0",
+                port=LB_PORT,
+                model_path=resolve_model_path(),
+            ),
+            log_path=log_path,
+        )
     cmd = (
         PYTHON,
         "-m",
@@ -428,7 +452,9 @@ def run_prefill_leader() -> int:
             ("router", execute_router(prefill_host=this_host, decode_host=decode_host))
         )
         _wait_http_200(
-            url=f"http://{LOCAL_HOST}:{LB_PORT}/health", secs=300, procs=tuple(procs)
+            url=f"http://{LOCAL_HOST}:{LB_PORT}{sgl_router.health_path()}",
+            secs=300,
+            procs=tuple(procs),
         )
 
         model_config_main(

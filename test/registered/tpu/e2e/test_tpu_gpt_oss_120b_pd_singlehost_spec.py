@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
-    from sglang.test.tpu import model_config_main
+    from sglang.test.tpu import model_config_main, sgl_router
 except ModuleNotFoundError as exc:
     # Source-only checkouts can still run the launch-configuration tests.
     SGLANG_IMPORT_ERROR = exc
@@ -34,6 +34,19 @@ except ModuleNotFoundError as exc:
 
     def model_config_main(*_args, **_kwargs):
         return None
+
+    class sgl_router:  # stands in for the module in source-only checkouts
+        @staticmethod
+        def selected(**_kwargs):
+            return False
+
+        @staticmethod
+        def health_path(**_kwargs):
+            return "/health"
+
+        @staticmethod
+        def spec_server_info_env(*_args, **_kwargs):
+            return {}
 
 
 register_tpu_ci(
@@ -321,6 +334,17 @@ def execute_decode(log_path: str = DECODE_LOG) -> subprocess.Popen:
 def execute_router(
     *, prefill_host: str, decode_host: str, log_path: str = LB_LOG
 ) -> subprocess.Popen:
+    if sgl_router.selected():
+        return _launch(
+            sgl_router.build_cmd(
+                prefill_urls=[f"http://{prefill_host}:{PREFILL_PORT}"],
+                decode_urls=[f"http://{decode_host}:{DECODE_PORT}"],
+                host="0.0.0.0",
+                port=LB_PORT,
+                model_path=resolve_model_path(),
+            ),
+            log_path=log_path,
+        )
     return _launch(
         (
             PYTHON,
@@ -487,7 +511,13 @@ def run_prefill_leader() -> int:
             )
         )
         _wait_http_200(
-            url=f"http://{LOCAL_HOST}:{LB_PORT}/health", secs=300, procs=procs
+            url=f"http://{LOCAL_HOST}:{LB_PORT}{sgl_router.health_path()}",
+            secs=300,
+            procs=procs,
+        )
+        # sgl-router serves no /server_info; the accept-length gate reads decode.
+        os.environ.update(
+            sgl_router.spec_server_info_env([f"http://{decode_host}:{DECODE_PORT}"])
         )
         model_config_main(
             build_model_config(),

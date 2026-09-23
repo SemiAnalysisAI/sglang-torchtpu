@@ -1,3 +1,4 @@
+import os
 from types import SimpleNamespace
 from typing import Optional
 
@@ -9,14 +10,43 @@ from sglang.test.test_utils import is_in_amd_ci, is_in_ci, write_github_step_sum
 _THRESHOLD_NOT_SET = float("nan")
 
 
-def _check_accept_length(test_case, base_url, threshold=None):
-    """Print speculative accept length; optionally assert it exceeds threshold."""
+def _accept_length_from(url):
+    """``avg_spec_accept_length`` from one ``/server_info``, or None."""
     try:
-        server_info = requests.get(base_url + "/server_info").json()
-        val = server_info["internal_states"][0]["avg_spec_accept_length"]
-    except (KeyError, IndexError, requests.RequestException):
+        server_info = requests.get(url.rstrip("/") + "/server_info", timeout=30).json()
+        return server_info["internal_states"][0]["avg_spec_accept_length"]
+    except (KeyError, IndexError, TypeError, ValueError, requests.RequestException):
+        return None
+
+
+def _check_accept_length(test_case, base_url, threshold=None):
+    """Print speculative accept length; optionally assert it exceeds threshold.
+
+    ``base_url`` is the server under test, or a router that proxies
+    ``/server_info`` from its decode workers (the mini-LB does). A router that
+    serves no ``/server_info`` -- experimental/sgl-router -- is covered by
+    ``SGLANG_TPU_SPEC_SERVER_INFO_URLS``, a comma-separated list of engine URLs
+    the P/D test exports (``sglang.test.tpu.sgl_router.spec_server_info_env``);
+    values are averaged. With neither source the check is skipped, as before.
+    """
+    vals = []
+    val = _accept_length_from(base_url)
+    if val is not None:
+        vals.append(val)
+    else:
+        for url in filter(
+            None, os.environ.get("SGLANG_TPU_SPEC_SERVER_INFO_URLS", "").split(",")
+        ):
+            val = _accept_length_from(url)
+            if val is not None:
+                vals.append(val)
+    if not vals:
         return
-    print(f"avg_spec_accept_length={val:.4f}")
+    val = sum(vals) / len(vals)
+    print(
+        f"avg_spec_accept_length={val:.4f}"
+        + (f" (mean of {len(vals)} engines)" if len(vals) > 1 else "")
+    )
     if threshold is not None:
         test_case.assertGreater(val, threshold)
 

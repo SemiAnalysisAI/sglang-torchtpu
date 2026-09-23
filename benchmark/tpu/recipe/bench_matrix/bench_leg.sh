@@ -216,6 +216,7 @@ bench_argv_json=$("$PYTHON" -c 'import json,sys; print(json.dumps(sys.argv[1:]))
     --set workload="$WORKLOAD" \
     --set base_url="$BASE_URL" \
     --set backend=sglang-oai-chat \
+    --set pd_router="${SGLANG_TPU_PD_ROUTER:-mini_lb}" \
     --set dataset_name=agentic-trace \
     --set dataset_path="$TRACE" \
     --set run_profile="$PROFILE" \

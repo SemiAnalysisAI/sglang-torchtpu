@@ -458,6 +458,11 @@ def build_bench_test(
                     # hits that engine's older copy of the session, so 1/N of
                     # the ideal is a floor, not an estimate.
                     prefill_engines = int(config.get("pd_prefill_engines") or 1)
+                    if config.get("pd_router") == "sgl_router":
+                        # cache_aware routing returns a session to the engine
+                        # holding it, so the random-pairing discount does not
+                        # apply; leaving it would make the floor N times too slack.
+                        prefill_engines = 1
                     reachable /= prefill_engines
                     routing = (
                         f" across {prefill_engines} randomly paired prefill engines"

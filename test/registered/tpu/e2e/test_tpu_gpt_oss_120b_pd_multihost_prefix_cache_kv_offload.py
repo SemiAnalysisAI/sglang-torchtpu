@@ -62,6 +62,7 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.test_utils import dump_metric
+    from sglang.test.tpu import sgl_router
 except ModuleNotFoundError as exc:
     # Keep the configuration tests runnable in a source-only checkout; the
     # end-to-end cases need the full SGLang TPU environment anyway.
@@ -72,6 +73,19 @@ except ModuleNotFoundError as exc:
 
     def dump_metric(*_args, **_kwargs):
         return None
+
+    class sgl_router:  # stands in for the module in source-only checkouts
+        @staticmethod
+        def selected(**_kwargs):
+            return False
+
+        @staticmethod
+        def health_path(**_kwargs):
+            return "/health"
+
+        @staticmethod
+        def spec_server_info_env(*_args, **_kwargs):
+            return {}
 
 
 # One invocation runs two GPT-OSS-120B engines (weight load + compile), the
@@ -493,6 +507,17 @@ class GenerationRecord(msgspec.Struct, frozen=True, kw_only=True):
 
 def _generate(base_url: str, prompt: str, max_new_tokens: int) -> GenerationRecord:
     started = time.perf_counter()
+    if sgl_router.selected():
+        # No /generate behind sgl-router: the same accounting off a chat completion.
+        g = sgl_router.chat_generate(base_url, prompt, max_new_tokens)
+        return GenerationRecord(
+            text=g.text,
+            prompt_tokens=g.prompt_tokens,
+            completion_tokens=g.completion_tokens,
+            device_cached_tokens=g.device_cached_tokens,
+            host_cached_tokens=g.host_cached_tokens,
+            latency_seconds=round(time.perf_counter() - started, 3),
+        )
     req = urllib.request.Request(
         base_url.rstrip("/") + "/generate",
         data=json.dumps(
@@ -839,26 +864,40 @@ class TestPdPrefixCachingKvOffload(unittest.TestCase):
             subprocess.Popen(
                 _tee_command(
                     (
-                        PYTHON,
-                        "-m",
-                        "sglang_router.launch_router",
-                        "--pd-disaggregation",
-                        "--mini-lb",
-                        "--prefill",
-                        f"http://{self_host}:{PREFILL_PORT}",
-                        "--decode",
-                        f"http://{decode_host}:{DECODE_PORT}",
-                        "--host",
-                        "0.0.0.0",
-                        "--port",
-                        str(LB_PORT),
+                        sgl_router.build_cmd(
+                            prefill_urls=[f"http://{self_host}:{PREFILL_PORT}"],
+                            decode_urls=[f"http://{decode_host}:{DECODE_PORT}"],
+                            host="0.0.0.0",
+                            port=LB_PORT,
+                            model_path=model_path,
+                        )
+                        if sgl_router.selected()
+                        else (
+                            PYTHON,
+                            "-m",
+                            "sglang_router.launch_router",
+                            "--pd-disaggregation",
+                            "--mini-lb",
+                            "--prefill",
+                            f"http://{self_host}:{PREFILL_PORT}",
+                            "--decode",
+                            f"http://{decode_host}:{DECODE_PORT}",
+                            "--host",
+                            "0.0.0.0",
+                            "--port",
+                            str(LB_PORT),
+                        )
                     ),
                     log_path=LB_LOG,
                 ),
                 preexec_fn=os.setsid,
             )
         )
-        _wait_http_200(f"http://127.0.0.1:{LB_PORT}/health", 300, tuple(cls.procs))
+        _wait_http_200(
+            f"http://127.0.0.1:{LB_PORT}{sgl_router.health_path()}",
+            300,
+            tuple(cls.procs),
+        )
 
     @classmethod
     def tearDownClass(cls) -> None:

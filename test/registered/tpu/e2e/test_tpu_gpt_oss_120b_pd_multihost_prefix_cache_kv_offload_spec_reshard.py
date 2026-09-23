@@ -44,7 +44,7 @@ from typing import Dict, List, Mapping, Optional, Tuple
 SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
-    from sglang.test.tpu import model_config_main
+    from sglang.test.tpu import model_config_main, sgl_router
 except ModuleNotFoundError as exc:
     SGLANG_IMPORT_ERROR = exc
 
@@ -53,6 +53,19 @@ except ModuleNotFoundError as exc:
 
     def model_config_main(*_args, **_kwargs):
         return None
+
+    class sgl_router:  # stands in for the module in source-only checkouts
+        @staticmethod
+        def selected(**_kwargs):
+            return False
+
+        @staticmethod
+        def health_path(**_kwargs):
+            return "/health"
+
+        @staticmethod
+        def spec_server_info_env(*_args, **_kwargs):
+            return {}
 
 
 register_tpu_ci(
@@ -463,6 +476,17 @@ def execute_router(
     log_path: str = LB_LOG,
 ) -> subprocess.Popen:
     """Launch mini-LB router connecting prefill and decode engines."""
+    if sgl_router.selected():
+        return _launch(
+            sgl_router.build_cmd(
+                prefill_urls=[f"http://{prefill_host}:{prefill_port}"],
+                decode_urls=[f"http://{decode_host}:{decode_port}"],
+                host="0.0.0.0",
+                port=port,
+                model_path=resolve_model_path(),
+            ),
+            log_path=log_path,
+        )
     cmd = (
         PYTHON,
         "-m",
@@ -521,6 +545,17 @@ def _probe_prompt(index: int, words: int) -> str:
 
 
 def _generate_probe(base_url: str, prompt: str, max_new_tokens: int) -> Dict:
+    if sgl_router.selected():
+        # No /generate behind sgl-router: the same accounting off a chat completion.
+        g = sgl_router.chat_generate(base_url, prompt, max_new_tokens)
+        return {
+            "text": g.text,
+            "prompt_tokens": g.prompt_tokens,
+            "completion_tokens": g.completion_tokens,
+            "device_cached_tokens": g.device_cached_tokens,
+            "host_cached_tokens": g.host_cached_tokens,
+            "spec_verify_ct": g.spec_verify_ct,
+        }
     req = urllib.request.Request(
         base_url.rstrip("/") + "/generate",
         data=json.dumps(
@@ -757,7 +792,9 @@ def _serve_prefill_leader(topology: PodTopology) -> int:
                 decode_port=DECODE_PORT,
             )
         )
-        _wait_http_200(f"http://127.0.0.1:{LB_PORT}/health", 300, tuple(procs))
+        _wait_http_200(
+            f"http://127.0.0.1:{LB_PORT}{sgl_router.health_path()}", 300, tuple(procs)
+        )
 
         base_url = f"http://127.0.0.1:{LB_PORT}"
         run_cache_offload_spec_probe(

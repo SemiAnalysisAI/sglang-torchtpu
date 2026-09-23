@@ -178,13 +178,33 @@ if [[ "$WORKER_ID" == "0" ]]; then
     wait_url "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "prefill engine 1" "$HEALTH_TIMEOUT" || exit 1
     wait_url "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" "decode engine 0" "$HEALTH_TIMEOUT" || exit 1
     wait_url "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" "decode engine 1" "$HEALTH_TIMEOUT" || exit 1
-    "$PYTHON" -m sglang_router.launch_router \
-        --pd-disaggregation --mini-lb \
-        --prefill "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
-        --prefill "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
-        --decode "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" \
-        --decode "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" \
-        --host 0.0.0.0 --port "$LB_PORT" > >(sed 's/^/[mini-lb] /') 2>&1 &
+    if [[ "${SGLANG_TPU_PD_ROUTER:-mini_lb}" == "sgl_router" ]]; then
+        # experimental/sgl-router (binary in the image): one flat worker list,
+        # roles and bootstrap ports come from each engine's /server_info.
+        # cache_aware is token-accurate over HTTP (the router tokenizes) and
+        # power_of_two on decode reads real engine load. Serves /readyz, not
+        # /health; the JobSet gate and run_sweep accept both. Knobs:
+        # TPU_PD_PREFILL_POLICY (e.g. prefix_hash), SGLANG_TPU_OTLP_ENDPOINT.
+        ROUTER_ARGS=(--policy "${TPU_PD_PREFILL_POLICY:-cache_aware}" --decode-policy power_of_two)
+        [[ -n "${SGLANG_TPU_OTLP_ENDPOINT:-}" ]] && ROUTER_ARGS+=(--otlp-endpoint "$SGLANG_TPU_OTLP_ENDPOINT")
+        "${SGLANG_TPU_SGL_ROUTER_BIN:-sgl-router}" \
+            --host 0.0.0.0 --port "$LB_PORT" \
+            --model-id "$MODEL" --tokenizer-path "$MODEL" \
+            --worker-urls \
+                "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" \
+                "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" \
+                "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" \
+                "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" \
+            "${ROUTER_ARGS[@]}" > >(sed 's/^/[sgl-router] /') 2>&1 &
+    else
+        "$PYTHON" -m sglang_router.launch_router \
+            --pd-disaggregation --mini-lb \
+            --prefill "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
+            --prefill "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
+            --decode "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" \
+            --decode "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" \
+            --host 0.0.0.0 --port "$LB_PORT" > >(sed 's/^/[mini-lb] /') 2>&1 &
+    fi
     CHILD_PIDS+=("$!")
 fi
 

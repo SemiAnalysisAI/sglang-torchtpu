@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tup
 SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
-    from sglang.test.tpu import model_config_main
+    from sglang.test.tpu import model_config_main, sgl_router
 except ModuleNotFoundError as exc:
     # Source-only checkout: the host-side configuration tests still run.
     SGLANG_IMPORT_ERROR = exc
@@ -39,6 +39,19 @@ except ModuleNotFoundError as exc:
 
     def model_config_main(*_args, **_kwargs):
         return None
+
+    class sgl_router:  # stands in for the module in source-only checkouts
+        @staticmethod
+        def selected(**_kwargs):
+            return False
+
+        @staticmethod
+        def health_path(**_kwargs):
+            return "/health"
+
+        @staticmethod
+        def spec_server_info_env(*_args, **_kwargs):
+            return {}
 
 
 # Expected runtime: the single-host P/D GSM8K gate plus a few minutes of probe.
@@ -846,6 +859,15 @@ class TestPdSingleHostDecodeRadixGptOss120bConfiguration(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    if sgl_router.selected():
+        # The two-turn probe reads output_ids and per-turn cached_tokens off
+        # /generate, which sgl-router does not serve; there is no chat-completion
+        # equivalent for the output_ids the second turn is built from.
+        print(
+            "SKIPPED: decode-radix probe needs /generate; not reachable through sgl-router",
+            flush=True,
+        )
+        raise SystemExit(0)
     parser = argparse.ArgumentParser(
         description="Single-host-per-engine P/D decode radix cache gate"
     )

@@ -11,6 +11,7 @@ import msgspec
 import requests
 
 from sglang.test.test_utils import dump_metric
+from sglang.test.tpu import sgl_router
 
 # Common English words (~1 token each), so a word count is a good enough token
 # estimate without pulling a tokenizer into the runner. Same trick as
@@ -267,6 +268,24 @@ def generate_with_cache_report(
     Note --enable-cache-report does not gate any of this. It gates the OpenAI usage
     block, which is the path GSM8K takes, not /generate.
     """
+    if sgl_router.selected():
+        # No /generate behind sgl-router: read the same tiers and spec counters
+        # off a chat completion (usage + sglext).
+        if routed_dp_rank is not None:
+            raise RuntimeError(
+                "routed_dp_rank pins a DP rank through /generate; the chat-completions "
+                "path used behind sgl-router cannot pin one"
+            )
+        g = sgl_router.chat_generate(
+            base_url, prompt, max_new_tokens, timeout=_REQUEST_TIMEOUT
+        )
+        return CacheObservation(
+            text=g.text,
+            device_tokens=g.device_cached_tokens,
+            host_tokens=g.host_cached_tokens,
+            completion_tokens=g.completion_tokens,
+            spec_verify_ct=g.spec_verify_ct,
+        )
     payload = {
         "text": prompt,
         "sampling_params": {
