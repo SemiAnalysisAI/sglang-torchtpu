@@ -55,6 +55,7 @@ def main_kernel_v2(
     core_axis_name: str,
     subcore_axis_name: str,
     num_row_subchunks: int,
+    col_size: int,
 ):
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core
@@ -63,7 +64,6 @@ def main_kernel_v2(
     hidden_size = in_hbm_ref.shape[-1]
     dtype_bits = jax.dtypes.itemsize_bits(out_hbm_ref.dtype)
     packing = 32 // dtype_bits
-    col_size = calculate_col_size(hidden_size, packing)
 
     assert isinstance(
         hidden_size, int
@@ -234,6 +234,11 @@ def ragged_gather_v2(
     col_size = calculate_col_size(hidden_size, packing)
 
     aligned_hidden_size = ((hidden_size + col_size - 1) // col_size) * col_size
+    if aligned_hidden_size != hidden_size:
+        # SparseCore indirect DMA via pltpu.emit_pipeline requires in_hbm_ref's
+        # column dimension to be an exact multiple of col_size so _create_blocked_slice
+        # emits a static slice size rather than a dynamic clamped BlockArgument.
+        x = jnp.pad(x, ((0, 0), (0, aligned_hidden_size - hidden_size)))
 
     num_simd_lanes = sc_info.num_lanes
     num_cores = sc_info.num_cores * sc_info.num_subcores
@@ -263,6 +268,7 @@ def ragged_gather_v2(
             core_axis_name=vector_mesh.core_axis_name,
             subcore_axis_name=vector_mesh.subcore_axis_name,
             num_row_subchunks=num_row_subchunks,
+            col_size=col_size,
         ),
         out_type=jax.ShapeDtypeStruct(
             (out_size + out_pad_size, aligned_hidden_size), dtype
