@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=300, suite="stage-a-test-tpu-unit")
 
 import unittest
 
@@ -167,6 +167,12 @@ class TestGmmV2W4A16(CustomTestCase):
 
     def test_float32(self):
         self._run(jnp.float32)
+
+    def test_kimi_gate_up_width(self):
+        # Same tile dimensions and 32-element quantization groups as Kimi
+        # prefill; the former packed-only VMEM estimate fails to compile it.
+        self.G, self.M, self.K, self.N = 2, 128, 7168, 4096
+        self._run(jnp.bfloat16)
 
 
 if __name__ == "__main__":
