@@ -464,7 +464,7 @@ def build_bench_test(
                     # achieve, and the gate would stop measuring the routing it
                     # is there to check.
                     prefill_engines = int(config.get("pd_prefill_engines") or 1)
-                    affinity_routed = config.get("pd_router") == "smg"
+                    affinity_routed = config.get("pd_router") in ("smg", "sgl_router")
                     if affinity_routed:
                         routing = (
                             f" with cache-aware affinity across {prefill_engines}"

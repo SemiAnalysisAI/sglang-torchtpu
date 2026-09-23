@@ -64,10 +64,14 @@ It becomes usable on the gRPC path, which carries real token ids.
 
 sgl-router has neither of those problems and a different vocabulary: prefill
 policies are ``round_robin``, ``random``, ``power_of_two``, ``load_based``,
-``cache_aware`` and ``session_aware``; decode policies are ``power_of_two`` and
-``legacy_host_affinity``. Its ``power_of_two`` reads engine load from
-``/server_info`` rather than ``/v1/loads``, so it is the decode default there.
-It has no ``prefix_hash``; asking for one under ``sgl_router`` raises.
+``cache_aware``, ``session_aware`` and ``prefix_hash``; decode policies are
+``power_of_two`` and ``legacy_host_affinity``. Its ``power_of_two`` reads engine
+load from ``/server_info`` rather than ``/v1/loads``, so it is the decode
+default there. Its ``prefix_hash`` works over HTTP because the router
+tokenizes; its two knobs come from ``TPU_PD_PREFIX_TOKEN_COUNT`` and
+``TPU_PD_PREFIX_HASH_LOAD_FACTOR`` (the gateway's tunables of the same names).
+``SGLANG_TPU_OTLP_ENDPOINT`` turns on span export and router-to-engine trace
+propagation.
 """
 
 from __future__ import annotations
@@ -108,6 +112,7 @@ SGL_ROUTER_PREFILL_POLICIES = (
     "load_based",
     "cache_aware",
     "session_aware",
+    "prefix_hash",
 )
 SGL_ROUTER_DECODE_POLICIES = ("power_of_two", "legacy_host_affinity")
 # power_of_two IS sound here: sgl-router scores decode load from /server_info,
@@ -147,15 +152,7 @@ def _resolve_policy(
 ) -> str:
     policy = explicit or env.get(env_key) or default
     if policy not in choices:
-        hint = ""
-        if policy == "prefix_hash" and choices is not POLICY_CHOICES:
-            hint = (
-                " experimental/sgl-router has no prefix_hash policy; use "
-                "cache_aware (token-accurate over HTTP there) or run smg."
-            )
-        raise ValueError(
-            f"{name} policy {policy!r} is not one of {tuple(choices)}.{hint}"
-        )
+        raise ValueError(f"{name} policy {policy!r} is not one of {tuple(choices)}.")
     return policy
 
 
@@ -332,10 +329,32 @@ def _sgl_router_cmd(
             choices=SGL_ROUTER_DECODE_POLICIES,
         ),
     ]
+    if cmd[cmd.index("--policy") + 1] == "prefix_hash":
+        cmd += _prefix_hash_args(env=env)
+    otlp = env.get("SGLANG_TPU_OTLP_ENDPOINT", "").strip()
+    if otlp:
+        cmd += ["--otlp-endpoint", otlp]
     if request_timeout_secs is not None:
         cmd += ["--request-timeout-secs", str(request_timeout_secs)]
     cmd += list(extra)
     return tuple(cmd)
+
+
+def _prefix_hash_args(*, env: Dict[str, str]) -> Tuple[str, ...]:
+    """sgl-router's prefix_hash knobs, emitted only when overridden.
+
+    Unset, the router applies its own defaults (256 tokens, load factor 1.25),
+    which are the gateway's defaults for the same names.
+    """
+    args: list[str] = []
+    for flag, env_key in (
+        ("--prefix-token-count", "TPU_PD_PREFIX_TOKEN_COUNT"),
+        ("--prefix-hash-load-factor", "TPU_PD_PREFIX_HASH_LOAD_FACTOR"),
+    ):
+        value = env.get(env_key, "").strip()
+        if value:
+            args += [flag, value]
+    return tuple(args)
 
 
 def router_health_path(

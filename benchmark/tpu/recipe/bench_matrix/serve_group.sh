@@ -184,22 +184,44 @@ if [[ "$WORKER_ID" == "0" ]]; then
     # correspond to a cache hit. round_robin rather than power_of_two on decode
     # because the load monitor reads aggregate.total_tokens from /v1/loads, which
     # the server does not emit, and scores every worker -1.
-    ROUTER_ARGS=(--pd-disaggregation)
-    if [[ "$PD_ROUTER" == "smg" ]]; then
-        ROUTER_ARGS+=(--prefill-policy cache_aware --decode-policy round_robin)
-        ROUTER_LABEL="smg"
+    if [[ "$PD_ROUTER" == "sgl_router" ]]; then
+        # experimental/sgl-router: one flat worker list, roles and bootstrap
+        # ports come from each engine's /server_info. cache_aware is
+        # token-accurate over HTTP (the router tokenizes) and power_of_two on
+        # decode reads real engine load, so both defaults are sound here.
+        # Serves /readyz, not /health: the JobSet gate and run_sweep accept both.
+        # Optional knobs: SGLANG_TPU_PD_PREFILL_POLICY (e.g. prefix_hash),
+        # SGLANG_TPU_OTLP_ENDPOINT for span export.
+        ROUTER_ARGS=(--policy "${SGLANG_TPU_PD_PREFILL_POLICY:-cache_aware}" --decode-policy power_of_two)
+        [[ -n "${SGLANG_TPU_OTLP_ENDPOINT:-}" ]] && ROUTER_ARGS+=(--otlp-endpoint "$SGLANG_TPU_OTLP_ENDPOINT")
+        "${SGLANG_TPU_SGL_ROUTER_BIN:-sgl-router}" \
+            --host 0.0.0.0 --port "$LB_PORT" \
+            --model-id "$MODEL" --tokenizer-path "$MODEL" \
+            --worker-urls \
+                "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" \
+                "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" \
+                "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" \
+                "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" \
+            "${ROUTER_ARGS[@]}" > >(sed "s/^/[sgl-router] /") 2>&1 &
+        CHILD_PIDS+=("$!")
     else
-        ROUTER_ARGS+=(--mini-lb)
-        ROUTER_LABEL="mini-lb"
+        ROUTER_ARGS=(--pd-disaggregation)
+        if [[ "$PD_ROUTER" == "smg" ]]; then
+            ROUTER_ARGS+=(--prefill-policy cache_aware --decode-policy round_robin)
+            ROUTER_LABEL="smg"
+        else
+            ROUTER_ARGS+=(--mini-lb)
+            ROUTER_LABEL="mini-lb"
+        fi
+        "$PYTHON" -m sglang_router.launch_router \
+            "${ROUTER_ARGS[@]}" \
+            --prefill "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
+            --prefill "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
+            --decode "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" \
+            --decode "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" \
+            --host 0.0.0.0 --port "$LB_PORT" > >(sed "s/^/[$ROUTER_LABEL] /") 2>&1 &
+        CHILD_PIDS+=("$!")
     fi
-    "$PYTHON" -m sglang_router.launch_router \
-        "${ROUTER_ARGS[@]}" \
-        --prefill "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
-        --prefill "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
-        --decode "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" \
-        --decode "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" \
-        --host 0.0.0.0 --port "$LB_PORT" > >(sed "s/^/[$ROUTER_LABEL] /") 2>&1 &
-    CHILD_PIDS+=("$!")
 fi
 
 wait "$ENGINE_PID"

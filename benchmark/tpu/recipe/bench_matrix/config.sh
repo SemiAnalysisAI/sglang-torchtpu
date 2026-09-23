@@ -269,13 +269,14 @@ esac
 # the engine that holds it, so the gate does not scale (see bench_matrix_base).
 PD_PREFILL_ENGINES=${PD_PREFILL_ENGINES:-1}
 
-# Which P/D router fronts the engines: mini_lb (debug, random only) or smg.
-# Same variable the TPU P/D e2e tests read.
+# Which P/D router fronts the engines: mini_lb (debug, random only), smg (the
+# gateway) or sgl_router (upstream's experimental/sgl-router binary, built into
+# the TPU image). Same variable the TPU P/D e2e tests read.
 PD_ROUTER=${SGLANG_TPU_PD_ROUTER:-mini_lb}
-if [[ "$PD_ROUTER" != "mini_lb" && "$PD_ROUTER" != "smg" ]]; then
-    echo "ERROR: SGLANG_TPU_PD_ROUTER='$PD_ROUTER' is not mini_lb or smg" >&2
-    exit 2
-fi
+case "$PD_ROUTER" in
+    mini_lb|smg|sgl_router) ;;
+    *) echo "ERROR: SGLANG_TPU_PD_ROUTER='$PD_ROUTER' is not mini_lb, smg or sgl_router" >&2; exit 2 ;;
+esac
 export PD_ROUTER
 
 # Spec verify/draft graph capture is expensive and host-RAM hungry when the

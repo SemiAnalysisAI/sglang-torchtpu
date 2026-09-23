@@ -196,12 +196,34 @@ class TestSglRouterArgv(CustomTestCase):
         self.assertEqual(cmd[cmd.index("--policy") + 1], "round_robin")
         self.assertEqual(cmd[cmd.index("--decode-policy") + 1], "legacy_host_affinity")
 
-    def test_prefix_hash_is_rejected_with_a_pointer(self):
-        with self.assertRaisesRegex(ValueError, "no prefix_hash"):
-            self._sgl(prefill_policy="prefix_hash")
-        # A gateway decode policy the binary does not know is rejected too.
+    def test_prefix_hash_is_a_prefill_policy_with_its_own_knobs(self):
+        cmd = self._sgl(prefill_policy="prefix_hash")
+        self.assertEqual(cmd[cmd.index("--policy") + 1], "prefix_hash")
+        self.assertNotIn("--prefix-token-count", cmd)  # router defaults apply
+        tuned = self._sgl(
+            prefill_policy="prefix_hash",
+            env={
+                "TPU_PD_PREFIX_TOKEN_COUNT": "64",
+                "TPU_PD_PREFIX_HASH_LOAD_FACTOR": "2.0",
+            },
+        )
+        self.assertEqual(tuned[tuned.index("--prefix-token-count") + 1], "64")
+        self.assertEqual(tuned[tuned.index("--prefix-hash-load-factor") + 1], "2.0")
+        # The knobs are prefix_hash-only; the router rejects them otherwise.
+        plain = self._sgl(env={"TPU_PD_PREFIX_TOKEN_COUNT": "64"})
+        self.assertNotIn("--prefix-token-count", plain)
+        # A gateway decode policy the binary does not know is rejected.
         with self.assertRaises(ValueError):
             self._sgl(decode_policy="round_robin")
+        with self.assertRaises(ValueError):
+            self._sgl(prefill_policy="consistent_hashing")
+
+    def test_otlp_endpoint_passes_through_from_env(self):
+        self.assertNotIn("--otlp-endpoint", self._sgl())
+        cmd = self._sgl(env={"SGLANG_TPU_OTLP_ENDPOINT": "http://otel-collector:4317"})
+        self.assertEqual(
+            cmd[cmd.index("--otlp-endpoint") + 1], "http://otel-collector:4317"
+        )
 
     def test_no_prometheus_flags_metrics_share_the_listener(self):
         cmd = self._sgl()

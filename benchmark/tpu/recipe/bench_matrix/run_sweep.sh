@@ -56,7 +56,9 @@ log_config | tee "$RUN_ROOT/config.log"
 echo "[sweep] waiting for $BASE_URL"
 start=$SECONDS
 while :; do
+    # /health for an engine, mini-LB or the gateway; /readyz for sgl-router.
     code=$(curl -sS -o /dev/null -m "$CURL_MAX_TIME" -w "%{http_code}" "$BASE_URL/health" 2>/dev/null || echo 000)
+    [[ "$code" == "200" ]] || code=$(curl -sS -o /dev/null -m "$CURL_MAX_TIME" -w "%{http_code}" "$BASE_URL/readyz" 2>/dev/null || echo 000)
     [[ "$code" == "200" ]] && break
     if (( SECONDS - start >= HEALTH_TIMEOUT )); then
         echo "[sweep] ERROR: $BASE_URL never healthy (last=$code)" >&2
