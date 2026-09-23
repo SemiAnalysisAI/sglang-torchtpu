@@ -121,15 +121,15 @@ def main():
     for volume in pod["volumes"]:
         if volume["name"] == "dshm":
             volume["emptyDir"]["sizeLimit"] = "256Gi"
-    pod["volumes"].append({"name": "campaign", "configMap": {"name": NAME}})
     container = pod["containers"][0]
+    driver = Path(".github/tpu-ci/kimi_dev_driver.py").read_text()
     container["args"] = [
         "set -euo pipefail\ncd /sgl-workspace/sglang\n"
-        "exec python3 -u /campaign/driver.py\n"
+        "cat > /tmp/kimi_dev_driver.py <<'KIMI_DEV_DRIVER_PY'\n"
+        + driver
+        + "\nKIMI_DEV_DRIVER_PY\n"
+        "exec python3 -u /tmp/kimi_dev_driver.py\n"
     ]
-    container["volumeMounts"].append(
-        {"name": "campaign", "mountPath": "/campaign", "readOnly": True}
-    )
     source = Path("python/sglang/srt/layers/moe/pallas/gmm_v2.py")
     container["env"].append(
         {
@@ -137,16 +137,9 @@ def main():
             "value": hashlib.sha256(source.read_bytes()).hexdigest(),
         }
     )
-    cm = {
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": {"name": NAME, "namespace": "tpu-ci"},
-        "immutable": True,
-        "data": {"driver.py": Path(".github/tpu-ci/kimi_dev_driver.py").read_text()},
-    }
     rendered = Path("/tmp/kimi-dev-jobset.yaml")
-    rendered.write_text(yaml.safe_dump_all([cm, job], sort_keys=False))
-    # Server-side dry run validates both objects without creating either.
+    rendered.write_text(yaml.safe_dump(job, sort_keys=False))
+    # Use the CI account's existing JobSet permissions; no ConfigMap is needed.
     subprocess.run(
         ["kubectl", "create", "--dry-run=server", "-f", str(rendered)], check=True
     )
