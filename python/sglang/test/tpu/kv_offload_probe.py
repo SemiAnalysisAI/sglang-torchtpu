@@ -298,6 +298,13 @@ def generate_with_cache_report(
     Note --enable-cache-report does not gate any of this. It gates the OpenAI usage
     block, which is the path GSM8K takes, not /generate.
     """
+    if _router_lacks_generate():
+        return _generate_via_chat_completions(
+            base_url=base_url,
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+            routed_dp_rank=routed_dp_rank,
+        )
     payload = {
         "text": prompt,
         "sampling_params": {
@@ -343,6 +350,103 @@ def generate_with_cache_report(
         completion_tokens=meta_info.get("completion_tokens", 0),
         # Missing and zero both mean speculative verification did not run.
         spec_verify_ct=meta_info.get("spec_verify_ct") or 0,
+    )
+
+
+def _router_lacks_generate() -> bool:
+    """True when the URL under test is experimental/sgl-router.
+
+    That router serves the OpenAI surface only. The probe then goes through
+    ``/v1/chat/completions`` and reads the same accounting off the usage block
+    and SGLang's ``sglext`` extension instead of ``meta_info``.
+    """
+    from sglang.test.tpu.pd_router import SGL_ROUTER, resolve_mode
+
+    return resolve_mode() == SGL_ROUTER
+
+
+_SERVED_MODEL_CACHE: Dict[str, str] = {}
+
+
+def _served_model_id(base_url: str) -> str:
+    """The single model id a router advertises on ``/v1/models``."""
+    base = base_url.rstrip("/")
+    if base not in _SERVED_MODEL_CACHE:
+        response = requests.get(base + "/v1/models", timeout=60)
+        response.raise_for_status()
+        data = response.json().get("data") or []
+        if not data:
+            raise RuntimeError(
+                f"{base}/v1/models lists no model, so no chat request can target it"
+            )
+        _SERVED_MODEL_CACHE[base] = data[0]["id"]
+    return _SERVED_MODEL_CACHE[base]
+
+
+def _generate_via_chat_completions(
+    *,
+    base_url: str,
+    prompt: str,
+    max_new_tokens: int,
+    routed_dp_rank: Optional[int],
+) -> CacheObservation:
+    """The ``/generate`` probe re-expressed as one chat completion.
+
+    ``usage.prompt_tokens_details.cached_tokens`` is the total (needs the engines
+    launched with ``--enable-cache-report``, which every prefix-cache P/D test
+    already does); ``sglext.cached_tokens_details`` breaks it into device/host
+    and ``sglext.spec_tokens_details`` carries ``spec_verify_ct``. Both extras
+    are opt-in per request. The prompt goes through the chat template, so the
+    token count differs slightly from the raw-text path; nothing here asserts
+    an exact count, only the tier split.
+    """
+    if routed_dp_rank is not None:
+        raise RuntimeError(
+            "routed_dp_rank pins a DP rank through /generate; the chat-completions "
+            "path used behind sgl-router cannot pin one"
+        )
+    base = base_url.rstrip("/")
+    payload = {
+        "model": _served_model_id(base),
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_new_tokens,
+        "temperature": 0.0,
+        "return_cached_tokens_details": True,
+        "return_spec_tokens_details": True,
+    }
+    response = requests.post(
+        base + "/v1/chat/completions", json=payload, timeout=_REQUEST_TIMEOUT
+    )
+    response.raise_for_status()
+    output = response.json()
+    choice = output["choices"][0]
+    usage = output.get("usage") or {}
+    details_total = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    if details_total is None:
+        raise RuntimeError(
+            "the chat response carried no usage.prompt_tokens_details.cached_tokens; "
+            "launch the engines with --enable-cache-report so the probe can read "
+            f"cache accounting off the usage block: {usage!r}"
+        )
+    ext = choice.get("sglext") or {}
+    details = ext.get("cached_tokens_details")
+    if details is None:
+        if details_total:
+            raise RuntimeError(
+                f"the server reported {details_total} cached tokens with no "
+                "sglext.cached_tokens_details to break them down, so the tier that "
+                "served them cannot be identified"
+            )
+        details = {}
+    spec = ext.get("spec_tokens_details") or {}
+    if isinstance(spec, list):
+        spec = spec[0] if spec else {}
+    return CacheObservation(
+        text=(choice.get("message") or {}).get("content") or "",
+        device_tokens=details.get("device", 0),
+        host_tokens=details.get("host", 0),
+        completion_tokens=usage.get("completion_tokens", 0) or 0,
+        spec_verify_ct=spec.get("spec_verify_ct") or 0,
     )
 
 

@@ -32,7 +32,11 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.tpu import model_config_main
-    from sglang.test.tpu.pd_router import build_router_cmd
+    from sglang.test.tpu.pd_router import (
+        build_router_cmd,
+        router_health_path,
+        spec_server_info_env,
+    )
 except ModuleNotFoundError as exc:
     SGLANG_IMPORT_ERROR = exc
 
@@ -44,6 +48,12 @@ except ModuleNotFoundError as exc:
 
     def build_router_cmd(**_kwargs):
         raise SGLANG_IMPORT_ERROR
+
+    def router_health_path(**_kwargs):
+        return "/health"
+
+    def spec_server_info_env(*_args, **_kwargs):
+        return {}
 
 
 register_tpu_ci(
@@ -426,6 +436,7 @@ def execute_router(
         decode_url=f"http://{decode_host}:{decode_port}",
         host="0.0.0.0",
         port=port,
+        model_path=resolve_model_path(),
         bootstrap_port=BOOTSTRAP_PORT,
     )
     return _launch(cmd, log_path=log_path)
@@ -628,12 +639,15 @@ def _serve_prefill_leader(topology: PodTopology) -> int:
                 decode_port=DECODE_PORT,
             )
         )
-        _wait_http_200(f"http://127.0.0.1:{LB_PORT}/health", 300, tuple(procs))
+        _wait_http_200(
+            f"http://127.0.0.1:{LB_PORT}{router_health_path()}", 300, tuple(procs)
+        )
 
         base_url = f"http://127.0.0.1:{LB_PORT}"
         run_cache_offload_spec_probe(
             base_url, flush_url=f"http://127.0.0.1:{PREFILL_PORT}"
         )
+        os.environ.update(spec_server_info_env([f"http://{decode_host}:{DECODE_PORT}"]))
         model_config_main(MODEL_CONFIG, base_url=base_url)
         return 0
     finally:

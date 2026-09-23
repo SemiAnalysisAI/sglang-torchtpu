@@ -11,14 +11,27 @@ Two front ends can sit in front of a P/D pair, and both ship in the same
 * ``smg`` -- the SGLang Model Gateway's real PD router (compiled Rust). It runs
   an independent, configurable policy over the prefill pool and the decode pool,
   and exports its own Prometheus metrics.
+* ``sgl_router`` -- upstream's ``experimental/sgl-router``, the single-model
+  router that is replacing the gateway. A standalone Rust binary (built into the
+  TPU image by ``docker/tpu.Dockerfile``, name overridable with
+  ``SGLANG_TPU_SGL_ROUTER_BIN``), not a Python module. It takes one flat
+  ``--worker-urls`` list and classifies each worker as prefill or decode from the
+  ``disaggregation_mode`` the engine reports on ``/server_info``, reads the
+  prefill's bootstrap port from the same place, tokenizes at the router and
+  forwards ``input_ids`` so ``cache_aware`` routes on tokens over plain HTTP.
 
-Both speak the identical bootstrap contract to the engines -- ``bootstrap_host``,
-``bootstrap_port`` and ``bootstrap_room`` injected into the request body -- so
-switching between them needs no server-side change.
+All three speak the identical bootstrap contract to the engines --
+``bootstrap_host``, ``bootstrap_port`` and ``bootstrap_room`` injected into the
+request body -- so switching between them needs no server-side change. What
+does differ is the client surface: sgl-router serves only the OpenAI endpoints
+plus ``/healthz``, ``/readyz``, ``/metrics`` and ``/flush_cache``. It has no
+``/health``, ``/generate`` or ``/server_info``; see :func:`router_health_path`
+and :func:`spec_server_info_env` for how the harness adapts.
 
 Selecting one
 -------------
-``SGLANG_TPU_PD_ROUTER=mini_lb|smg`` (default ``mini_lb``), or pass ``mode=`` explicitly.
+``SGLANG_TPU_PD_ROUTER=mini_lb|smg|sgl_router`` (default ``mini_lb``), or pass
+``mode=`` explicitly.
 Policies come from ``TPU_PD_PREFILL_POLICY`` / ``TPU_PD_DECODE_POLICY`` so a CDK
 recipe can sweep them without editing a test.
 
@@ -48,6 +61,13 @@ the server grows an ``aggregate`` block.
 ``prefix_hash`` cannot work over HTTP at all: the HTTP PD router passes
 ``tokens: None`` to the policy, so it always takes its ``no_tokens`` branch.
 It becomes usable on the gRPC path, which carries real token ids.
+
+sgl-router has neither of those problems and a different vocabulary: prefill
+policies are ``round_robin``, ``random``, ``power_of_two``, ``load_based``,
+``cache_aware`` and ``session_aware``; decode policies are ``power_of_two`` and
+``legacy_host_affinity``. Its ``power_of_two`` reads engine load from
+``/server_info`` rather than ``/v1/loads``, so it is the decode default there.
+It has no ``prefix_hash``; asking for one under ``sgl_router`` raises.
 """
 
 from __future__ import annotations
@@ -57,7 +77,8 @@ from typing import Dict, Optional, Sequence, Tuple
 
 MINI_LB = "mini_lb"
 SMG = "smg"
-ROUTER_MODES = (MINI_LB, SMG)
+SGL_ROUTER = "sgl_router"
+ROUTER_MODES = (MINI_LB, SMG, SGL_ROUTER)
 
 # Mirrors ``_POLICY_CHOICES`` in sglang_router.router_args. Note that the Rust
 # binary's own value_parser accepts a subset; we always launch through
@@ -77,6 +98,23 @@ POLICY_CHOICES = (
 DEFAULT_PREFILL_POLICY = "cache_aware"
 DEFAULT_DECODE_POLICY = "round_robin"
 
+# experimental/sgl-router's own vocabulary (config/types.rs: PolicyKind and
+# DecodePolicyKind). Kept apart from POLICY_CHOICES so a typo is caught here
+# rather than by the binary at launch.
+SGL_ROUTER_PREFILL_POLICIES = (
+    "round_robin",
+    "random",
+    "power_of_two",
+    "load_based",
+    "cache_aware",
+    "session_aware",
+)
+SGL_ROUTER_DECODE_POLICIES = ("power_of_two", "legacy_host_affinity")
+# power_of_two IS sound here: sgl-router scores decode load from /server_info,
+# not from the /v1/loads aggregate the gateway never receives.
+SGL_ROUTER_DEFAULT_DECODE_POLICY = "power_of_two"
+SGL_ROUTER_DEFAULT_BIN = "sgl-router"
+
 # SMG binds its Prometheus exporter on its own listener, not the gateway port.
 DEFAULT_PROMETHEUS_PORT = 29000
 
@@ -91,8 +129,9 @@ def resolve_mode(*, env: Optional[Dict[str, str]] = None) -> str:
     if mode not in ROUTER_MODES:
         raise ValueError(
             f"SGLANG_TPU_PD_ROUTER={mode!r} is not one of {ROUTER_MODES}. "
-            f"Use {MINI_LB!r} for the legacy debug load balancer or {SMG!r} "
-            f"for the SGLang Model Gateway PD router."
+            f"Use {MINI_LB!r} for the legacy debug load balancer, {SMG!r} "
+            f"for the SGLang Model Gateway PD router or {SGL_ROUTER!r} for "
+            f"upstream's experimental/sgl-router binary."
         )
     return mode
 
@@ -104,10 +143,19 @@ def _resolve_policy(
     env_key: str,
     default: str,
     env: Dict[str, str],
+    choices: Sequence[str] = POLICY_CHOICES,
 ) -> str:
     policy = explicit or env.get(env_key) or default
-    if policy not in POLICY_CHOICES:
-        raise ValueError(f"{name} policy {policy!r} is not one of {POLICY_CHOICES}.")
+    if policy not in choices:
+        hint = ""
+        if policy == "prefix_hash" and choices is not POLICY_CHOICES:
+            hint = (
+                " experimental/sgl-router has no prefix_hash policy; use "
+                "cache_aware (token-accurate over HTTP there) or run smg."
+            )
+        raise ValueError(
+            f"{name} policy {policy!r} is not one of {tuple(choices)}.{hint}"
+        )
     return policy
 
 
@@ -143,6 +191,9 @@ def build_router_cmd(
     balance_rel_threshold: Optional[float] = None,
     extra: Sequence[str] = (),
     env: Optional[Dict[str, str]] = None,
+    model_path: Optional[str] = None,
+    tokenizer_path: Optional[str] = None,
+    binary: Optional[str] = None,
 ) -> Tuple[str, ...]:
     """Build the argv that fronts one prefill and one decode engine.
 
@@ -150,9 +201,35 @@ def build_router_cmd(
     every TPU P/D test used before this helper existed, so the default path is
     unchanged. Policy and Prometheus arguments are only emitted for ``smg``:
     mini-LB ignores the first and does not implement the second.
+
+    ``mode="sgl_router"`` launches the standalone binary instead. It needs
+    ``model_path``: sgl-router serves exactly one model and registers each
+    worker under the ``served_model_name`` the engine reports, which for a bare
+    ``--model-path`` launch is the path itself, so ``--model-id`` must be that
+    same string for dispatch to find the workers (and for the ``model`` field
+    the eval clients send to match). ``tokenizer_path`` defaults to
+    ``model_path``; the router tokenizes there to route on tokens.
+    ``bootstrap_port`` is accepted and ignored: sgl-router reads the prefill's
+    ``disaggregation_bootstrap_port`` off ``/server_info``.
     """
     values = _env(env)
     mode = mode or resolve_mode(env=values)
+
+    if mode == SGL_ROUTER:
+        return _sgl_router_cmd(
+            prefill_url=prefill_url,
+            decode_url=decode_url,
+            host=host,
+            port=port,
+            prefill_policy=prefill_policy,
+            decode_policy=decode_policy,
+            request_timeout_secs=request_timeout_secs,
+            extra=extra,
+            env=values,
+            model_path=model_path,
+            tokenizer_path=tokenizer_path,
+            binary=binary,
+        )
 
     cmd = [python, "-m", "sglang_router.launch_router", "--pd-disaggregation"]
     if mode == MINI_LB:
@@ -194,6 +271,110 @@ def build_router_cmd(
 
     cmd += list(extra)
     return tuple(cmd)
+
+
+def _sgl_router_cmd(
+    *,
+    prefill_url: str,
+    decode_url: str,
+    host: str,
+    port: int,
+    prefill_policy: Optional[str],
+    decode_policy: Optional[str],
+    request_timeout_secs: Optional[int],
+    extra: Sequence[str],
+    env: Dict[str, str],
+    model_path: Optional[str],
+    tokenizer_path: Optional[str],
+    binary: Optional[str],
+) -> Tuple[str, ...]:
+    """argv for ``experimental/sgl-router`` fronting one prefill and one decode.
+
+    One flat ``--worker-urls`` list: the router asks each worker's
+    ``/server_info`` for ``disaggregation_mode`` and pairs the roles itself.
+    ``--policy`` governs the prefill pick, ``--decode-policy`` the decode pick.
+    """
+    if not model_path:
+        raise ValueError(
+            "mode='sgl_router' needs model_path: sgl-router serves one model and "
+            "must be told its id (the engines' served_model_name, i.e. the "
+            "--model-path they were launched with)."
+        )
+    cmd = [
+        binary or env.get("SGLANG_TPU_SGL_ROUTER_BIN") or SGL_ROUTER_DEFAULT_BIN,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--model-id",
+        model_path,
+        "--tokenizer-path",
+        tokenizer_path or model_path,
+        "--worker-urls",
+        prefill_url,
+        decode_url,
+        "--policy",
+        _resolve_policy(
+            name="prefill",
+            explicit=prefill_policy,
+            env_key="TPU_PD_PREFILL_POLICY",
+            default=DEFAULT_PREFILL_POLICY,
+            env=env,
+            choices=SGL_ROUTER_PREFILL_POLICIES,
+        ),
+        "--decode-policy",
+        _resolve_policy(
+            name="decode",
+            explicit=decode_policy,
+            env_key="TPU_PD_DECODE_POLICY",
+            default=SGL_ROUTER_DEFAULT_DECODE_POLICY,
+            env=env,
+            choices=SGL_ROUTER_DECODE_POLICIES,
+        ),
+    ]
+    if request_timeout_secs is not None:
+        cmd += ["--request-timeout-secs", str(request_timeout_secs)]
+    cmd += list(extra)
+    return tuple(cmd)
+
+
+def router_health_path(
+    *, mode: Optional[str] = None, env: Optional[Dict[str, str]] = None
+) -> str:
+    """The path a test polls for 200 before sending traffic to the router.
+
+    mini-LB and the gateway proxy ``/health``; sgl-router exposes ``/readyz``,
+    which turns 200 only once at least one worker of each role it needs has
+    been introspected, so it is the stronger gate of the two.
+    """
+    mode = mode or resolve_mode(env=env)
+    return "/readyz" if mode == SGL_ROUTER else "/health"
+
+
+# Read by sglang.test.kits.eval_accuracy_kit._check_accept_length when the
+# router's own /server_info carries no internal_states.
+SPEC_SERVER_INFO_ENV = "SGLANG_TPU_SPEC_SERVER_INFO_URLS"
+
+
+def spec_server_info_env(
+    decode_urls: Sequence[str],
+    *,
+    mode: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """Where the accept-length gate should read ``avg_spec_accept_length``.
+
+    Speculative accept/reject happens on the decode engine, so that is the
+    ``/server_info`` that carries ``internal_states``. mini-LB and the gateway
+    aggregate it onto the router URL; sgl-router serves no ``/server_info`` at
+    all, so under it the gate must go to the decode engines directly. Returns
+    the env entries to export before ``model_config_main`` -- empty for the
+    routers that proxy it, so exporting unconditionally is safe.
+    """
+    mode = mode or resolve_mode(env=env)
+    if mode != SGL_ROUTER:
+        return {}
+    return {SPEC_SERVER_INFO_ENV: ",".join(u.rstrip("/") for u in decode_urls)}
 
 
 def _cache_aware_args(
@@ -243,11 +424,20 @@ def _prometheus_args(
 
 
 def router_metrics_url(
-    *, host: str, env: Optional[Dict[str, str]] = None
+    *,
+    host: str,
+    env: Optional[Dict[str, str]] = None,
+    router_port: Optional[int] = None,
 ) -> Optional[str]:
     """Where ``build_router_cmd`` put the router's ``/metrics``, if anywhere."""
     values = _env(env)
+    mode = resolve_mode(env=values)
+    if mode == SGL_ROUTER:
+        # Same listener as the API; needs the router port, not a metrics port.
+        if router_port is None:
+            return None
+        return f"http://{host}:{router_port}/metrics"
     port = int(values.get("TPU_PD_PROMETHEUS_PORT", DEFAULT_PROMETHEUS_PORT))
-    if port == 0 or resolve_mode(env=values) != SMG:
+    if port == 0 or mode != SMG:
         return None
     return f"http://{host}:{port}/metrics"

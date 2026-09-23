@@ -17,7 +17,11 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.tpu import model_config_main
-    from sglang.test.tpu.pd_router import build_router_cmd
+    from sglang.test.tpu.pd_router import (
+        build_router_cmd,
+        router_health_path,
+        spec_server_info_env,
+    )
 except ModuleNotFoundError as exc:
     # Source-only checkout: the host-side configuration tests still run.
     SGLANG_IMPORT_ERROR = exc
@@ -30,6 +34,12 @@ except ModuleNotFoundError as exc:
 
     def build_router_cmd(**_kwargs):
         raise SGLANG_IMPORT_ERROR
+
+    def router_health_path(**_kwargs):
+        return "/health"
+
+    def spec_server_info_env(*_args, **_kwargs):
+        return {}
 
 
 # Expected runtime: 45 minutes; CI uses this for scheduling and timeouts.
@@ -283,6 +293,7 @@ def execute_router(
         decode_url=f"http://{decode_host}:{DECODE_PORT}",
         host="0.0.0.0",
         port=LB_PORT,
+        model_path=resolve_model_path(),
         bootstrap_port=BOOTSTRAP_PORT,
     )
     return _launch(cmd, log_path=log_path)
@@ -434,7 +445,9 @@ def run_prefill_leader() -> int:
             ("router", execute_router(prefill_host=this_host, decode_host=decode_host))
         )
         _wait_http_200(
-            url=f"http://{LOCAL_HOST}:{LB_PORT}/health", secs=300, procs=tuple(procs)
+            url=f"http://{LOCAL_HOST}:{LB_PORT}{router_health_path()}",
+            secs=300,
+            procs=tuple(procs),
         )
 
         model_config_main(

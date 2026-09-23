@@ -20,10 +20,15 @@ from sglang.test.tpu.pd_router import (
     DEFAULT_DECODE_POLICY,
     DEFAULT_PREFILL_POLICY,
     MINI_LB,
+    SGL_ROUTER,
+    SGL_ROUTER_DEFAULT_DECODE_POLICY,
     SMG,
+    SPEC_SERVER_INFO_ENV,
     build_router_cmd,
     resolve_mode,
+    router_health_path,
     router_metrics_url,
+    spec_server_info_env,
 )
 
 PREFILL_URL = "http://prefill-0:30000"
@@ -128,6 +133,116 @@ class TestSmgArgv(CustomTestCase):
             self.assertEqual(cmd[cmd.index("--request-timeout-secs") + 1], "3600")
 
 
+MODEL_PATH = "/weights/gpt-oss-120b"
+
+
+class TestSglRouterArgv(CustomTestCase):
+    def _sgl(self, **overrides):
+        kwargs = dict(
+            mode=SGL_ROUTER, model_path=MODEL_PATH, bootstrap_port=BOOTSTRAP_PORT
+        )
+        kwargs.update(overrides)
+        return _cmd(**kwargs)
+
+    def test_launches_the_binary_not_the_python_module(self):
+        cmd = self._sgl()
+        self.assertEqual(cmd[0], "sgl-router")
+        self.assertNotIn("sglang_router.launch_router", cmd)
+        self.assertNotIn("--pd-disaggregation", cmd)
+        self.assertNotIn("--mini-lb", cmd)
+
+    def test_binary_overridable_from_env(self):
+        cmd = self._sgl(env={"SGLANG_TPU_SGL_ROUTER_BIN": "/opt/bin/sgl-router"})
+        self.assertEqual(cmd[0], "/opt/bin/sgl-router")
+        self.assertEqual(self._sgl(binary="./sgl-router")[0], "./sgl-router")
+
+    def test_one_flat_worker_list_roles_come_from_server_info(self):
+        """No --prefill/--decode: the router classifies each URL itself."""
+        cmd = self._sgl()
+        i = cmd.index("--worker-urls")
+        self.assertEqual(cmd[i + 1 : i + 3], (PREFILL_URL, DECODE_URL))
+        for flag in ("--prefill", "--decode"):
+            self.assertNotIn(flag, cmd)
+        # bootstrap_port is read off the prefill's /server_info, never passed.
+        self.assertNotIn(str(BOOTSTRAP_PORT), cmd)
+
+    def test_model_id_and_tokenizer_default_to_the_model_path(self):
+        cmd = self._sgl()
+        self.assertEqual(cmd[cmd.index("--model-id") + 1], MODEL_PATH)
+        self.assertEqual(cmd[cmd.index("--tokenizer-path") + 1], MODEL_PATH)
+        cmd = self._sgl(tokenizer_path="/tok")
+        self.assertEqual(cmd[cmd.index("--tokenizer-path") + 1], "/tok")
+
+    def test_model_path_is_required(self):
+        with self.assertRaises(ValueError):
+            self._sgl(model_path=None)
+
+    def test_defaults_are_cache_aware_prefill_power_of_two_decode(self):
+        """Unlike the gateway, sgl-router's power_of_two reads real load."""
+        cmd = self._sgl()
+        self.assertEqual(cmd[cmd.index("--policy") + 1], DEFAULT_PREFILL_POLICY)
+        self.assertEqual(
+            cmd[cmd.index("--decode-policy") + 1], SGL_ROUTER_DEFAULT_DECODE_POLICY
+        )
+        self.assertEqual(SGL_ROUTER_DEFAULT_DECODE_POLICY, "power_of_two")
+        self.assertNotIn("--prefill-policy", cmd)
+
+    def test_policies_from_env_use_the_routers_vocabulary(self):
+        env = {
+            "TPU_PD_PREFILL_POLICY": "round_robin",
+            "TPU_PD_DECODE_POLICY": "legacy_host_affinity",
+        }
+        cmd = self._sgl(env=env)
+        self.assertEqual(cmd[cmd.index("--policy") + 1], "round_robin")
+        self.assertEqual(cmd[cmd.index("--decode-policy") + 1], "legacy_host_affinity")
+
+    def test_prefix_hash_is_rejected_with_a_pointer(self):
+        with self.assertRaisesRegex(ValueError, "no prefix_hash"):
+            self._sgl(prefill_policy="prefix_hash")
+        # A gateway decode policy the binary does not know is rejected too.
+        with self.assertRaises(ValueError):
+            self._sgl(decode_policy="round_robin")
+
+    def test_no_prometheus_flags_metrics_share_the_listener(self):
+        cmd = self._sgl()
+        self.assertNotIn("--prometheus-port", cmd)
+        env = {"SGLANG_TPU_PD_ROUTER": SGL_ROUTER}
+        self.assertEqual(
+            router_metrics_url(host="h", env=env, router_port=LB_PORT),
+            f"http://h:{LB_PORT}/metrics",
+        )
+        self.assertIsNone(router_metrics_url(host="h", env=env))
+
+    def test_request_timeout_is_forwarded(self):
+        cmd = self._sgl(request_timeout_secs=3600)
+        self.assertEqual(cmd[cmd.index("--request-timeout-secs") + 1], "3600")
+
+    def test_smg_and_mini_lb_argv_unchanged_by_the_new_mode(self):
+        """Adding a third router must not disturb the two existing argvs."""
+        self.assertEqual(_cmd()[:3], ("python3", "-m", "sglang_router.launch_router"))
+        self.assertNotIn("--worker-urls", _cmd(mode=SMG, bootstrap_port=BOOTSTRAP_PORT))
+
+
+class TestHarnessAdapters(CustomTestCase):
+    def test_health_path_per_router(self):
+        self.assertEqual(router_health_path(mode=MINI_LB), "/health")
+        self.assertEqual(router_health_path(mode=SMG), "/health")
+        self.assertEqual(router_health_path(mode=SGL_ROUTER), "/readyz")
+        self.assertEqual(
+            router_health_path(env={"SGLANG_TPU_PD_ROUTER": "sgl_router"}), "/readyz"
+        )
+        self.assertEqual(router_health_path(env={}), "/health")
+
+    def test_spec_server_info_env_only_for_sgl_router(self):
+        urls = ["http://decode-0:30000/", "http://decode-1:30000"]
+        self.assertEqual(spec_server_info_env(urls, mode=MINI_LB), {})
+        self.assertEqual(spec_server_info_env(urls, mode=SMG), {})
+        self.assertEqual(
+            spec_server_info_env(urls, mode=SGL_ROUTER),
+            {SPEC_SERVER_INFO_ENV: "http://decode-0:30000,http://decode-1:30000"},
+        )
+
+
 class TestEnvResolution(CustomTestCase):
     def test_default_mode_is_the_legacy_router(self):
         self.assertEqual(resolve_mode(env={}), MINI_LB)
@@ -135,6 +250,9 @@ class TestEnvResolution(CustomTestCase):
     def test_mode_from_env(self):
         self.assertEqual(resolve_mode(env={"SGLANG_TPU_PD_ROUTER": "smg"}), SMG)
         self.assertEqual(resolve_mode(env={"SGLANG_TPU_PD_ROUTER": "  SMG  "}), SMG)
+        self.assertEqual(
+            resolve_mode(env={"SGLANG_TPU_PD_ROUTER": "sgl_router"}), SGL_ROUTER
+        )
 
     def test_unknown_mode_is_rejected(self):
         with self.assertRaises(ValueError):

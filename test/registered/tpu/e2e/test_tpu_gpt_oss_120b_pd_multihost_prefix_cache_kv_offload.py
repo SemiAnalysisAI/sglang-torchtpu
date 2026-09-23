@@ -62,7 +62,11 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.test_utils import dump_metric
-    from sglang.test.tpu.pd_router import build_router_cmd
+    from sglang.test.tpu.pd_router import (
+        build_router_cmd,
+        router_health_path,
+        spec_server_info_env,
+    )
 except ModuleNotFoundError as exc:
     # Keep the configuration tests runnable in a source-only checkout; the
     # end-to-end cases need the full SGLang TPU environment anyway.
@@ -76,6 +80,12 @@ except ModuleNotFoundError as exc:
 
     def build_router_cmd(**_kwargs):
         raise SGLANG_IMPORT_ERROR
+
+    def router_health_path(**_kwargs):
+        return "/health"
+
+    def spec_server_info_env(*_args, **_kwargs):
+        return {}
 
 
 # One invocation runs two GPT-OSS-120B engines (weight load + compile), the
@@ -848,6 +858,7 @@ class TestPdPrefixCachingKvOffload(unittest.TestCase):
                         decode_url=f"http://{decode_host}:{DECODE_PORT}",
                         host="0.0.0.0",
                         port=LB_PORT,
+                        model_path=model_path,
                         bootstrap_port=BOOTSTRAP_PORT,
                     ),
                     log_path=LB_LOG,
@@ -855,7 +866,9 @@ class TestPdPrefixCachingKvOffload(unittest.TestCase):
                 preexec_fn=os.setsid,
             )
         )
-        _wait_http_200(f"http://127.0.0.1:{LB_PORT}/health", 300, tuple(cls.procs))
+        _wait_http_200(
+            f"http://127.0.0.1:{LB_PORT}{router_health_path()}", 300, tuple(cls.procs)
+        )
 
     @classmethod
     def tearDownClass(cls) -> None:

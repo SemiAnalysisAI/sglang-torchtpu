@@ -89,7 +89,11 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.test_utils import dump_metric
-    from sglang.test.tpu.pd_router import build_router_cmd
+    from sglang.test.tpu.pd_router import (
+        build_router_cmd,
+        router_health_path,
+        spec_server_info_env,
+    )
 except ModuleNotFoundError as exc:
     # Keep the configuration tests runnable in a source-only checkout; the
     # integration cases need the full SGLang TPU environment anyway.
@@ -103,6 +107,12 @@ except ModuleNotFoundError as exc:
 
     def build_router_cmd(**_kwargs):
         raise SGLANG_IMPORT_ERROR
+
+    def router_health_path(**_kwargs):
+        return "/health"
+
+    def spec_server_info_env(*_args, **_kwargs):
+        return {}
 
 
 # One invocation runs ONE model profile: two engines (weight load + compile),
@@ -765,6 +775,7 @@ class TestPdTpResharding(unittest.TestCase):
                             decode_url=f"http://{decode_host}:{DECODE_PORT}",
                             host="0.0.0.0",
                             port=LB_PORT,
+                            model_path=model_path,
                             request_timeout_secs=3600,
                             bootstrap_port=BOOTSTRAP_PORT,
                         ),
@@ -773,7 +784,11 @@ class TestPdTpResharding(unittest.TestCase):
                     preexec_fn=os.setsid,
                 )
             )
-            _wait_http_200(f"http://127.0.0.1:{LB_PORT}/health", 300, tuple(cls.procs))
+            _wait_http_200(
+                f"http://127.0.0.1:{LB_PORT}{router_health_path()}",
+                300,
+                tuple(cls.procs),
+            )
         except Exception:
             for log_file, name in [
                 (PREFILL_LOG, "prefill"),
