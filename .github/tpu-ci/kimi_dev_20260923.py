@@ -104,7 +104,7 @@ def main():
     ]
     job = yaml.safe_load(subprocess.check_output(command, text=True))
     # The user explicitly moved this run to their dev slice, outside CI queues.
-    # Full TPU requests and preemptionPolicy=Never protect existing workloads.
+    # Full TPU requests prevent sharing a host with another TPU workload.
     job["metadata"] = {
         "name": NAME,
         "namespace": "tpu-ci",
@@ -117,7 +117,6 @@ def main():
     pod = child["template"]["spec"]
     pod.pop("affinity", None)
     pod["nodeSelector"]["cloud.google.com/gke-nodepool"] = POOL
-    pod["preemptionPolicy"] = "Never"
     for volume in pod["volumes"]:
         if volume["name"] == "dshm":
             volume["emptyDir"]["sizeLimit"] = "256Gi"
@@ -138,11 +137,47 @@ def main():
         }
     )
     rendered = Path("/tmp/kimi-dev-jobset.yaml")
+    job["metadata"]["name"] = NAME + "-validate"
     rendered.write_text(yaml.safe_dump(job, sort_keys=False))
     # Use the CI account's existing JobSet permissions; no ConfigMap is needed.
     subprocess.run(
         ["kubectl", "create", "--dry-run=server", "-f", str(rendered)], check=True
     )
+    existing = [
+        item
+        for item in read_kube("-n", "tpu-ci", "get", "jobsets")["items"]
+        if item["metadata"]["name"] == NAME
+    ]
+    if existing:
+        pods = read_kube("-n", "tpu-ci", "get", "pods")["items"]
+        own_pods = [
+            pod
+            for pod in pods
+            if pod["metadata"].get("labels", {}).get("jobset.sigs.k8s.io/jobset-name")
+            == NAME
+        ]
+        if (
+            existing[0]["metadata"]["uid"] != "3adce7f5-cf83-4920-9808-ceef31187df3"
+            or own_pods
+        ):
+            raise SystemExit(
+                "Existing Kimi job changed or created pods; leaving it intact"
+            )
+        subprocess.run(
+            [
+                "kubectl",
+                "-n",
+                "tpu-ci",
+                "delete",
+                "jobset",
+                NAME,
+                "--wait=true",
+                "--timeout=120s",
+            ],
+            check=True,
+        )
+    job["metadata"]["name"] = NAME
+    rendered.write_text(yaml.safe_dump(job, sort_keys=False))
     subprocess.run(["kubectl", "create", "-f", str(rendered)], check=True)
     summary = {
         "jobset": NAME,
