@@ -50,8 +50,23 @@ jobs:
           print('\n'.join(lines[-20:]))
           PY
           fi
+          for artifact in status.json eval.log.tail.gz results.tar.gz; do
+            gcloud storage ls "gs://sglang-torchtpu-gcs-shared/evals/kimi-dev-mmmu-20260923-r1/rank0/*/$artifact" > /tmp/objects.txt || true
+            if test -s /tmp/objects.txt; then
+              latest=$(sort /tmp/objects.txt | tail -n 1)
+              gcloud storage cat "$latest" > "/tmp/kimi-dev-$artifact"
+            fi
+          done
+          if test -f /tmp/kimi-dev-status.json; then
+            cat /tmp/kimi-dev-status.json
+          fi
+          if test -f /tmp/kimi-dev-eval.log.tail.gz; then
+            gzip -dc /tmp/kimi-dev-eval.log.tail.gz | tail -n 25
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: kimi-server-tail
-          path: /tmp/kimi-server-tail.log
+          path: |
+            /tmp/kimi-server-tail.log
+            /tmp/kimi-dev-*
