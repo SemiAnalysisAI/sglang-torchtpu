@@ -63,3 +63,9 @@ def test_long_runs_are_staged_in_pieces():
     expected = kv.reshape(-1, packed, packing, hd).copy()
     expected[slots] = rows
     np.testing.assert_array_equal(np.asarray(out).reshape(expected.shape), expected)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

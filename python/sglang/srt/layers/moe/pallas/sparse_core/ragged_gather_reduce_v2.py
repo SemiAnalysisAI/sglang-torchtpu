@@ -646,6 +646,8 @@ def ragged_gather_reduce(
     )
 
     aligned_hidden_size = _align_to(hidden_size, 128 * num_column_partitions)
+    if aligned_hidden_size != hidden_size:
+        x = jnp.pad(x, ((0, 0), (0, aligned_hidden_size - hidden_size)))
     col_size = aligned_hidden_size // num_column_partitions
     col_chunk_size = _calculate_col_chunk_size(col_size, num_simd_lanes)
 
