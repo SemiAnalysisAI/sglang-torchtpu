@@ -283,7 +283,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         )
         self.assertIs(kwargs["kv_pool"], kv_pool)
         self.assertEqual(
-            kwargs["specialization_key"], policy._attention_compile_specialization_key
+            kwargs["specialization_key"], policy._direct_compile_specialization_key
         )
         self.assertIn(
             "forward_batch.extend_input_logprob_token_ids_gpu",
@@ -292,40 +292,90 @@ class TestDirectCompileExtraModelState(CustomTestCase):
 
 
 class TestAttentionTileSpecialization(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.input_ids = torch.arange(8)
+        self.input_embeds = torch.empty(8, 4)
+        self.forward_batch = SimpleNamespace(
+            forward_mode="extend",
+            capture_hidden_mode="null",
+            batch_size=1,
+            logits_output_mode="full_vocab",
+        )
+
     def test_missing_tile_preserves_existing_model_key(self):
+        for policy_cls in (DecoderTpuCompilePolicy, Qwen3VLDecoderTpuCompilePolicy):
+            policy = object.__new__(policy_cls)
+            is_vl = policy_cls is Qwen3VLDecoderTpuCompilePolicy
+            kwargs = {"input_embeds": self.input_embeds} if is_vl else {}
+            for compiles_logits in (False, True):
+                policy._compiles_logits_processor = MagicMock(
+                    return_value=compiles_logits
+                )
+                base_key = ("extend", "null", 1, 8)
+                if is_vl:
+                    base_key += (False,)
+                base_key += ("full_vocab" if compiles_logits else None,)
+                for metadata in (
+                    None,
+                    SimpleNamespace(),
+                    SimpleNamespace(prefill_kv_tile=None),
+                ):
+                    with self.subTest(
+                        policy=policy_cls.__name__,
+                        compiles_logits=compiles_logits,
+                        metadata=metadata,
+                    ):
+                        self.assertEqual(
+                            policy._direct_compile_specialization_key(
+                                metadata,
+                                None if is_vl else self.input_ids,
+                                None,
+                                self.forward_batch,
+                                **kwargs,
+                            ),
+                            base_key,
+                        )
+
+    def test_tiles_compose_with_base_specialization(self):
         policy = object.__new__(DecoderTpuCompilePolicy)
-        base_key = ("model", 8192)
-        policy._direct_compile_specialization_key = MagicMock(return_value=base_key)
-        for metadata in (
-            None,
-            SimpleNamespace(),
-            SimpleNamespace(prefill_kv_tile=None),
-        ):
-            with self.subTest(metadata=metadata):
-                self.assertIs(
-                    policy._attention_compile_specialization_key(metadata, "input"),
-                    base_key,
-                )
-                policy._direct_compile_specialization_key.assert_called_with(
-                    metadata, "input"
-                )
-
-    def test_tiles_compose_with_subclass_specialization(self):
-        class ModelPolicy(DecoderTpuCompilePolicy):
-            def _direct_compile_specialization_key(self, metadata, tokens, *, variant):
-                return (tokens, variant)
-
-        policy = object.__new__(ModelPolicy)
+        policy._compiles_logits_processor = MagicMock(return_value=True)
         keys = set()
         for tile in (0, 1024, 2048):
             metadata = SimpleNamespace(prefill_kv_tile=tile)
-            for variant in ("text", "embeddings"):
-                key = policy._attention_compile_specialization_key(
-                    metadata, 8192, variant=variant
+            for logits_mode in ("full_vocab", "top_k"):
+                self.forward_batch.logits_output_mode = logits_mode
+                key = policy._direct_compile_specialization_key(
+                    metadata, self.input_ids, None, self.forward_batch
                 )
-                self.assertEqual(key, (8192, variant, ("prefill_kv_tile", tile)))
+                self.assertEqual(
+                    key,
+                    ("extend", "null", 1, 8, logits_mode, ("prefill_kv_tile", tile)),
+                )
                 keys.add(key)
         self.assertEqual(len(keys), 6)
+
+    def test_tiles_compose_with_multimodal_specialization(self):
+        policy = object.__new__(Qwen3VLDecoderTpuCompilePolicy)
+        policy._compiles_logits_processor = MagicMock(return_value=True)
+        keys = set()
+        for tile in (None, 0, 1024, 2048):
+            metadata = SimpleNamespace(prefill_kv_tile=tile)
+            for deepstack in (None, torch.empty(8, 12)):
+                key = policy._direct_compile_specialization_key(
+                    metadata,
+                    None,
+                    None,
+                    self.forward_batch,
+                    input_embeds=self.input_embeds,
+                    input_deepstack_embeds=deepstack,
+                )
+                expected = ("extend", "null", 1, 8, deepstack is not None, "full_vocab")
+                if tile is not None:
+                    expected += (("prefill_kv_tile", tile),)
+                self.assertEqual(key, expected)
+                keys.add(key)
+        self.assertEqual(len(keys), 8)
 
     def test_metadata_preserves_positional_decode_query_size(self):
         from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (

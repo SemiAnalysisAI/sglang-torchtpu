@@ -553,7 +553,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         compiled = direct_compile(
             trace_forward,
-            specialization_key=self._attention_compile_specialization_key,
+            specialization_key=self._direct_compile_specialization_key,
             model=model,
             model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
             kv_pool=self.model_runner.token_to_kv_pool,
@@ -600,21 +600,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """
         return self.model_extra_tensor_attrs
 
-    def _attention_compile_specialization_key(
-        self, attention_metadata, *args, **kwargs
-    ):
-        """Keep model-specific keys, with a finite attention-tile specialization."""
-        key = self._direct_compile_specialization_key(
-            attention_metadata, *args, **kwargs
-        )
-        tile = getattr(attention_metadata, "prefill_kv_tile", None)
-        if tile is None:
-            return key
-        return (*key, ("prefill_kv_tile", tile))
-
     def _direct_compile_specialization_key(
         self,
-        _attention_metadata: Any,
+        attention_metadata: Any,
         input_ids: torch.Tensor,
         _positions: torch.Tensor,
         forward_batch: Any,
@@ -626,13 +614,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             if self._compiles_logits_processor()
             else None
         )
-        return (
+        key = (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
             input_ids.shape[0],
             logits_output_mode,
         )
+        tile = getattr(attention_metadata, "prefill_kv_tile", None)
+        return key if tile is None else (*key, ("prefill_kv_tile", tile))
 
     def _compiles_logits_processor(self) -> bool:
         """Whether this compiled callable includes target-model logits processing."""
@@ -1259,7 +1249,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
     def _direct_compile_specialization_key(
         self,
-        _attention_metadata: Any,
+        attention_metadata: Any,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         forward_batch: Any,
@@ -1273,7 +1263,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             if self._compiles_logits_processor()
             else None
         )
-        return (
+        key = (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
@@ -1281,6 +1271,8 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             input_deepstack_embeds is not None,
             logits_output_mode,
         )
+        tile = getattr(attention_metadata, "prefill_kv_tile", None)
+        return key if tile is None else (*key, ("prefill_kv_tile", tile))
 
     def _decode_uses_input_ids(self) -> bool:
         """Whether the wrapper hands decode raw ``input_ids``, skipping embed.
