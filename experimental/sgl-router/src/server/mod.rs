@@ -7,5 +7,6 @@ pub mod error;
 pub mod header_utils;
 pub mod inflight;
 pub mod metrics;
+pub mod otel;
 pub mod routes;
 pub mod shutdown;

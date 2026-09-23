@@ -41,6 +41,13 @@ pub(super) async fn forward_chat_request(
     mut headers: HeaderMap,
     request_started_at: Instant,
 ) -> Result<Response<Body>, ApiError> {
+    {
+        let span = tracing::Span::current();
+        span.record("worker.prefill", workers.prefill.url.as_str());
+        if let Some(decode) = workers.decode.as_ref() {
+            span.record("worker.decode", decode.url.as_str());
+        }
+    }
     let SelectedWorkers {
         prefill,
         decode,

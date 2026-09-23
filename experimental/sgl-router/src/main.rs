@@ -50,7 +50,14 @@ const DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 async fn main() -> Result<()> {
     // Resolve CLI configuration and set up startup logging.
     let cli = Cli::parse();
-    init_tracing(&cli.server.log_level, cli.server.log_format)?;
+    let otel_provider = init_tracing(
+        &cli.server.log_level,
+        cli.server.log_format,
+        cli.server
+            .otlp_endpoint
+            .as_deref()
+            .map(|endpoint| (endpoint, cli.server.otlp_service_name.as_str())),
+    )?;
     let config = cli
         .into_config()
         .context("resolve configuration from CLI flags")?;
@@ -117,22 +124,42 @@ async fn main() -> Result<()> {
     worker_manager_handle.abort();
     inflight_cleanup.shutdown().await;
     log_shutdown(&outcome.result, outcome.inflight_drain_secs);
+    if let Some(provider) = otel_provider {
+        // Flush the batch processor; a failure here loses spans, not requests.
+        if let Err(e) = provider.shutdown() {
+            tracing::warn!(error = %e, "OTLP span exporter did not shut down cleanly");
+        }
+    }
     outcome.result
 }
 
-// Respect RUST_LOG and tolerate an already-installed subscriber.
-fn init_tracing(default_level: &str, format: LogFormat) -> Result<()> {
+// Respect RUST_LOG and tolerate an already-installed subscriber. With an
+// OTLP `(endpoint, service_name)`, spans also export; the returned provider
+// owns the exporter and must be shut down at exit to flush it.
+fn init_tracing(
+    default_level: &str,
+    format: LogFormat,
+    otlp: Option<(&str, &str)>,
+) -> Result<Option<sgl_router::server::otel::SdkTracerProviderHandle>> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
+    let (otel_layer, provider) = match otlp {
+        Some((endpoint, service_name)) => {
+            let (layer, provider) = sgl_router::server::otel::build_layer(endpoint, service_name)?;
+            (Some(layer), Some(provider))
+        }
+        None => (None, None),
+    };
+    let registry = tracing_subscriber::registry().with(filter).with(otel_layer);
     let install_result = match format {
-        LogFormat::Json => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(true)
-            .json()
+        LogFormat::Json => registry
+            .with(tracing_subscriber::fmt::layer().with_target(true).json())
             .try_init(),
-        LogFormat::Text => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(true)
+        LogFormat::Text => registry
+            .with(tracing_subscriber::fmt::layer().with_target(true))
             .try_init(),
     };
     if let Err(e) = install_result {
@@ -143,7 +170,7 @@ fn init_tracing(default_level: &str, format: LogFormat) -> Result<()> {
             "tracing subscriber already installed; continuing"
         );
     }
-    Ok(())
+    Ok(provider)
 }
 
 fn install_signal_handlers() -> Result<(Signal, Signal)> {
@@ -521,12 +548,19 @@ mod tests {
 
     #[test]
     fn init_tracing_is_idempotent() {
-        let _ = init_tracing("info", LogFormat::Text);
-        let _ = init_tracing("info", LogFormat::Text);
+        let _ = init_tracing("info", LogFormat::Text, None);
+        let _ = init_tracing("info", LogFormat::Text, None);
     }
 
     #[test]
     fn init_tracing_accepts_json_format() {
-        assert!(init_tracing("info", LogFormat::Json).is_ok());
+        assert!(init_tracing("info", LogFormat::Json, None).is_ok());
+    }
+
+    #[test]
+    fn init_tracing_without_otlp_returns_no_provider() {
+        assert!(init_tracing("info", LogFormat::Text, None)
+            .unwrap()
+            .is_none());
     }
 }

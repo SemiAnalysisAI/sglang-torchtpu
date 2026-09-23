@@ -132,6 +132,16 @@ pub struct ServerArgs {
     /// Log output format.
     #[arg(long, value_enum, default_value = "text")]
     pub log_format: LogFormat,
+
+    /// Export request spans to this OTLP/gRPC collector (e.g. http://otel:4317).
+    /// Also adopts incoming W3C trace context and hands the router span's
+    /// context to the engines, so router and engine spans share one trace.
+    #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
+    pub otlp_endpoint: Option<String>,
+
+    /// `service.name` on exported spans.
+    #[arg(long, default_value = crate::server::otel::DEFAULT_SERVICE_NAME)]
+    pub otlp_service_name: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -376,6 +386,8 @@ impl Cli {
             observability: ObservabilityConfig {
                 log_level: self.server.log_level,
                 log_format: self.server.log_format,
+                otlp_endpoint: self.server.otlp_endpoint,
+                otlp_service_name: self.server.otlp_service_name,
             },
             model: ModelConfig {
                 tokenizer_path: self
