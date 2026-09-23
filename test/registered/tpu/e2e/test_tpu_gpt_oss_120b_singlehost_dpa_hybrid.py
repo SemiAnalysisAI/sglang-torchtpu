@@ -37,6 +37,7 @@ LAUNCH_ENV = {
         f"--served-model-name {SERVED_MODEL_NAME} "
         "--tpu-compile-tracer dynamo"
     ),
+    "GLOG_v": "1",
 }
 
 MODEL_CONFIG = {
