@@ -282,10 +282,60 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             CustomPolicy.model_extra_tensor_attrs,
         )
         self.assertIs(kwargs["kv_pool"], kv_pool)
+        self.assertEqual(
+            kwargs["specialization_key"], policy._attention_compile_specialization_key
+        )
         self.assertIn(
             "forward_batch.extend_input_logprob_token_ids_gpu",
             kwargs["ignored_argnames"],
         )
+
+
+class TestAttentionTileSpecialization(CustomTestCase):
+    def test_missing_tile_preserves_existing_model_key(self):
+        policy = object.__new__(DecoderTpuCompilePolicy)
+        base_key = ("model", 8192)
+        policy._direct_compile_specialization_key = MagicMock(return_value=base_key)
+        for metadata in (
+            None,
+            SimpleNamespace(),
+            SimpleNamespace(prefill_kv_tile=None),
+        ):
+            with self.subTest(metadata=metadata):
+                self.assertIs(
+                    policy._attention_compile_specialization_key(metadata, "input"),
+                    base_key,
+                )
+                policy._direct_compile_specialization_key.assert_called_with(
+                    metadata, "input"
+                )
+
+    def test_tiles_compose_with_subclass_specialization(self):
+        class ModelPolicy(DecoderTpuCompilePolicy):
+            def _direct_compile_specialization_key(self, metadata, tokens, *, variant):
+                return (tokens, variant)
+
+        policy = object.__new__(ModelPolicy)
+        keys = set()
+        for tile in (0, 1024, 2048):
+            metadata = SimpleNamespace(prefill_kv_tile=tile)
+            for variant in ("text", "embeddings"):
+                key = policy._attention_compile_specialization_key(
+                    metadata, 8192, variant=variant
+                )
+                self.assertEqual(key, (8192, variant, ("prefill_kv_tile", tile)))
+                keys.add(key)
+        self.assertEqual(len(keys), 6)
+
+    def test_metadata_preserves_positional_decode_query_size(self):
+        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
+            PallasForwardMetadata,
+        )
+
+        tensor = torch.empty(0, dtype=torch.int32)
+        metadata = PallasForwardMetadata(*([tensor] * 7), 4)
+        self.assertEqual(metadata.decode_query_size, 4)
+        self.assertIsNone(metadata.prefill_kv_tile)
 
 
 class TestEagle3DirectCompile(_SpecPolicyTestCase):

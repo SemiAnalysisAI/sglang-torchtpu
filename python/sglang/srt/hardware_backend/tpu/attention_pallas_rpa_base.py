@@ -103,6 +103,9 @@ class PallasForwardMetadata:
     # Static query rows per DECODE sequence for this forward (1 = ordinary
     # decode); above 1 the active rows take the kernel's DECODE range.
     decode_query_size: int = 1
+    # Finite host-selected specialization: 0=automatic, 1024 or 2048 tokens.
+    # None leaves unrelated backends' direct-compile keys unchanged.
+    prefill_kv_tile: int | None = None
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
