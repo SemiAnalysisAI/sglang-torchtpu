@@ -38,5 +38,20 @@ jobs:
           gcloud storage ls 'gs://sglang-torchtpu-gcs-shared/evals/kimi-dev-mmmu-20260923-r1/rank0/*/server.log.tail.gz' > /tmp/objects.txt || true
           if test -s /tmp/objects.txt; then
             latest=$(sort /tmp/objects.txt | tail -n 1)
-            gcloud storage cat "$latest" | gzip -dc | tail -n 45
+            gcloud storage cat "$latest" | gzip -dc > /tmp/kimi-server-tail.log
+            python3 - <<'PY'
+          import re
+          from pathlib import Path
+          lines = Path('/tmp/kimi-server-tail.log').read_text(errors='replace').splitlines()
+          pattern = re.compile(r'compil|batch.?size|bs=|Loading|loaded|weight|Capture|captur|precompil|Ready|running|Decode batch|VMEM|Vmem|Traceback|Error|Exception', re.I)
+          matches = [line for line in lines if pattern.search(line) and len(line) < 2000]
+          for line in matches[-100:]:
+              print(line)
+          print('\n'.join(lines[-20:]))
+          PY
           fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kimi-server-tail
+          path: /tmp/kimi-server-tail.log
