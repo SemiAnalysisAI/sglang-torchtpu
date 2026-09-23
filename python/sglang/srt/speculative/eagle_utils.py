@@ -57,6 +57,11 @@ _is_xpu = is_xpu()
 _use_torch_native = is_tpu()
 _is_cpu = is_cpu()
 
+if _use_torch_native:
+    from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+        build_topk1_verify_tree_tpu,
+    )
+
 logger = logging.getLogger(__name__)
 
 if _is_cuda or _is_hip or _is_musa:
@@ -204,6 +209,16 @@ def build_tree_kernel_efficient(
     tree_mask_buf: Optional[torch.Tensor] = None,
     fill_prefix_mask: bool = True,
 ):
+    if (
+        _use_torch_native
+        and topk == 1
+        and tree_mask_mode == TreeMaskMode.FULL_MASK
+        and tree_mask_buf is None
+    ):
+        return build_topk1_verify_tree_tpu(
+            bonus_tokens=bonus_tokens, draft_tokens=draft_tokens, seq_lens=seq_lens
+        )
+
     draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
 
     # seq_lens_sum == sum(seq_lens); seq_lens: sequence length without draft tokens

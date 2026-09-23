@@ -12,6 +12,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_utils import organize_draft_results
+from sglang.srt.speculative.eagle_worker_common import (
+    _select_verify_bookkeeping_seq_lens,
+)
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -124,6 +127,28 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
                 self.assertTrue(fast_parent.is_contiguous())
                 self.assertTrue(fast_index.is_contiguous())
 
+    def test_idle_dp_rank_uses_logical_seq_lens_for_verify_bookkeeping(self):
+        physical_seq_lens = torch.tensor([8])
+        logical_seq_lens = torch.empty(0, dtype=torch.int64)
+        batch = SimpleNamespace(seq_lens=physical_seq_lens)
+        idle_padding = SimpleNamespace(
+            state=SimpleNamespace(logical_batch_size=0),
+            seq_lens=logical_seq_lens,
+        )
+        active_padding = SimpleNamespace(
+            state=SimpleNamespace(logical_batch_size=1),
+            seq_lens=logical_seq_lens,
+        )
+
+        self.assertIs(
+            _select_verify_bookkeeping_seq_lens(batch, idle_padding),
+            logical_seq_lens,
+        )
+        self.assertIs(
+            _select_verify_bookkeeping_seq_lens(batch, active_padding),
+            physical_seq_lens,
+        )
+
     def test_assert_on_inconsistent_steps_and_draft_tokens(self):
         # num_draft_tokens must equal num_steps + 1 for topk=1.
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
@@ -214,6 +239,10 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             self.assertTrue(worker._should_fuse_draft_steps())
 
     def test_fused_steps_thread_per_step_inputs(self):
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+            build_topk1_verify_chain_torch,
+        )
+
         worker = _make_worker(num_steps=3, num_draft_tokens=4)
         worker.server_args.tpu_compile_tracer = "direct"
         worker.hot_token_id = None
@@ -256,11 +285,18 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             token = torch.tensor([[100 + i]], device=DEVICE)
             return token, hidden_states + 1, None, (None, token, None)
 
-        with patch(
-            "sglang.srt.speculative.eagle_worker_v2.select_top_k_tokens",
-            side_effect=select_step,
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.select_top_k_tokens",
+                side_effect=select_step,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.build_topk1_verify_chain_torch",
+                new=build_topk1_verify_chain_torch,
+                create=True,
+            ),
         ):
-            tokens = worker._fused_draft_steps(
+            tree = worker._fused_draft_steps(
                 forward_batch,
                 torch.ones((1, 1), device=DEVICE),
                 torch.zeros((1, 1), dtype=torch.long, device=DEVICE),
@@ -268,9 +304,11 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
                 kv_lens,
                 out_cache_loc,
                 None,
+                torch.tensor([99], dtype=torch.long, device=DEVICE),
+                torch.tensor([5], dtype=torch.long, device=DEVICE),
             )
 
-        self.assertEqual([token.item() for token in tokens], [100, 101, 102])
+        self.assertEqual(tree[-1].tolist(), [[99, 100, 101, 102]])
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][0].tolist(), calls[0][1].tolist())
         self.assertEqual(calls[1][0].tolist(), calls[1][1].tolist())
@@ -292,14 +330,24 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             3, dtype=torch.long, device=DEVICE
         ).repeat(2, 1)
         worker.hot_token_id = None
-        tokens = tuple(
-            torch.full((2, 1), i, dtype=torch.long, device=DEVICE) for i in range(3)
+        tokens = torch.cat(
+            tuple(
+                torch.full((2, 1), i, dtype=torch.long, device=DEVICE) for i in range(3)
+            ),
+            dim=1,
         )
         observed_prefill_only = []
 
         def compiled_fused_steps(*args):
             observed_prefill_only.append(args[0].is_prefill_only)
-            return tokens
+            return (
+                torch.empty((0,), dtype=torch.bool, device=DEVICE),
+                torch.tensor([[5, 6, 7, 8], [10, 11, 12, 13]], device=DEVICE),
+                torch.arange(8, device=DEVICE).view(2, 4),
+                torch.tensor([[1, 2, 3, -1]] * 2, device=DEVICE),
+                torch.full((2, 4), -1, device=DEVICE),
+                torch.cat((torch.tensor([[7], [8]], device=DEVICE), tokens), dim=1),
+            )
 
         reload_gate = MagicMock()
         compile_policy = SimpleNamespace(
@@ -322,12 +370,14 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             topk_p=torch.ones((2, 1), device=DEVICE),
             topk_index=torch.zeros((2, 1), dtype=torch.long, device=DEVICE),
             hidden_states=torch.zeros((2, 2), device=DEVICE),
+            bonus_tokens=torch.tensor([7, 8], device=DEVICE),
             rpa_draft_kv_lens=torch.tensor([-1], device=DEVICE),
         )
         forward_batch = SimpleNamespace(
             spec_info=spec_info,
             out_cache_loc=torch.arange(6, device=DEVICE),
             batch_size=2,
+            seq_lens=torch.tensor([5, 10], device=DEVICE),
             is_prefill_only=True,
         )
         per_step_cache = torch.arange(4, device=DEVICE).reshape(2, 2)
@@ -342,14 +392,9 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
                 return_value=contextlib.nullcontext(),
             ),
         ):
-            parents, indices, draft_tokens, draft_probs = worker._fused_draft_forward(
-                forward_batch
-            )
+            tree = worker._fused_draft_forward(forward_batch)
 
-        self.assertEqual(parents.tolist(), [[-1, 0, 1], [-1, 0, 1]])
-        self.assertEqual(indices.tolist(), [[0, 1, 2], [0, 1, 2]])
-        self.assertEqual(draft_tokens.tolist(), [[0, 1, 2], [0, 1, 2]])
-        self.assertIsNone(draft_probs)
+        self.assertEqual(tree[-1].tolist(), [[7, 0, 1, 2], [8, 0, 1, 2]])
         self.assertIsNone(spec_info.rpa_draft_kv_lens)
         self.assertEqual(observed_prefill_only, [False])
         self.assertTrue(forward_batch.is_prefill_only)
@@ -357,6 +402,62 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         compile_policy.compile_fused_draft_steps.assert_called_once_with(
             worker._fused_draft_steps
         )
+
+    def test_fused_draft_unpads_verify_tree_to_logical_batch(self):
+        worker = _make_worker(num_steps=3, num_draft_tokens=4)
+        worker.req_to_token_pool = None
+        worker.cuda_graph_runner = None
+        worker.seed_dsa_topk_from_draft_extend = False
+        worker.tree_mask_mode = None
+        worker.target_worker = SimpleNamespace()
+        worker._prepare_draft_forward_batch = MagicMock()
+
+        physical_bs = 16
+        logical_bs = 1
+        physical_tree = (
+            torch.empty((0,), dtype=torch.bool, device=DEVICE),
+            torch.arange(physical_bs * 4, device=DEVICE).view(physical_bs, 4),
+            torch.arange(physical_bs * 4, device=DEVICE).view(physical_bs, 4),
+            torch.tensor([[1, 2, 3, -1]] * physical_bs, device=DEVICE),
+            torch.full((physical_bs, 4), -1, device=DEVICE),
+            torch.arange(physical_bs * 4, device=DEVICE).view(physical_bs, 4),
+        )
+        worker._fused_draft_forward = MagicMock(return_value=physical_tree)
+        worker.draft_runner = SimpleNamespace(
+            canary_manager=None,
+            compile_policy=SimpleNamespace(
+                prepare_spec_draft_input=lambda *_args: None,
+                finalize_spec_forward_batch=lambda *, outputs, forward_batch: outputs,
+            ),
+        )
+
+        draft_input = SimpleNamespace(
+            padding_state=SimpleNamespace(
+                physical_batch_size=physical_bs,
+                logical_batch_size=logical_bs,
+            ),
+            dsa_topk_indices=None,
+        )
+        batch = SimpleNamespace(
+            spec_info=draft_input,
+            forward_mode=ForwardMode.DECODE,
+            seq_lens=torch.ones(logical_bs, dtype=torch.int32, device=DEVICE),
+        )
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+        with (
+            patch("sglang.srt.speculative.eagle_worker_v2._is_tpu", True),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
+                return_value=(forward_batch, False),
+            ),
+        ):
+            verify_input = worker.draft(batch)
+
+        self.assertEqual(verify_input.draft_token.shape, (logical_bs * 4,))
+        self.assertEqual(verify_input.positions.shape, (logical_bs * 4,))
+        self.assertEqual(verify_input.retrieve_index.shape, (logical_bs, 4))
+        self.assertEqual(verify_input.draft_token[-1].item(), logical_bs * 4 - 1)
 
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
