@@ -6,6 +6,7 @@ on:
     paths:
       - .github/workflows/kimi-dev-20260923.yml
       - .github/tpu-ci/kimi_dev_20260923.py
+      - .github/tpu-ci/kimi_dev_driver.py
 
 permissions:
   contents: read
@@ -30,4 +31,5 @@ jobs:
         with:
           cluster_name: tpu-cluster
           location: us-central1-c
+      - run: python3 -m pip install pyyaml
       - run: python3 .github/tpu-ci/kimi_dev_20260923.py
