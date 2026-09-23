@@ -149,7 +149,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.retracted_queue = reqs.copy()
         queue.num_reserved_decode_tokens = 0
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
-        queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=page_size)
+        queue.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=page_size, swa_available_size=lambda: physical_available
+        )
         queue.tree_cache = MagicMock()
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,
@@ -176,6 +178,66 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(queue.retracted_queue, reqs[3:])
         self.assertEqual(physical_available, 3 * page_size)
         self.assertEqual(queue._pre_alloc.call_count, 3)
+        queue.tree_cache.evict_for_alloc.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.decode.retraction_restore")
+    def test_resume_reclaims_evictable_swa_before_allocating(self, restore):
+        override = get_context().override_server_args(
+            disaggregation_decode_retraction_backup="cpu_tensor"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        for reclaimed_tokens in (0, 1024, 2048):
+            with self.subTest(reclaimed_tokens=reclaimed_tokens):
+                restore.reset_mock()
+                backup = object()
+                req = SimpleNamespace(
+                    rid="retracted",
+                    is_retracted=True,
+                    kv=SimpleNamespace(retraction_backup=backup),
+                )
+                queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+                queue.retracted_queue = [req]
+                queue.req_to_token_pool = SimpleNamespace(available_size=lambda: 1)
+                swa_available = 512
+                queue.token_to_kv_pool_allocator = SimpleNamespace(
+                    page_size=512, swa_available_size=lambda: swa_available
+                )
+                queue.tree_cache = MagicMock()
+                queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
+                queue._swa_aware_allocatable_token_budgets = MagicMock(
+                    return_value=(500224, 4096)
+                )
+                queue._prealloc_required_tokens = MagicMock(return_value=(8192, 2560))
+                queue._prealloc_kv_lens = MagicMock(return_value=(8192, 2559))
+                queue._swa_tail_allocatable_token_budget = MagicMock(return_value=0)
+
+                def evict(params):
+                    nonlocal swa_available
+                    self.assertTrue(req.is_retracted)
+                    self.assertEqual(params.swa_num_tokens, 2048)
+                    swa_available += reclaimed_tokens
+
+                def allocate(_req):
+                    nonlocal swa_available
+                    self.assertGreaterEqual(swa_available, 2560)
+                    swa_available -= 2560
+
+                queue.tree_cache.evict_for_alloc.side_effect = evict
+                queue._pre_alloc = MagicMock(side_effect=allocate)
+
+                resumed = queue.resume_retracted_reqs()
+
+                succeeded = reclaimed_tokens == 2048
+                self.assertEqual(resumed, [req] if succeeded else [])
+                self.assertEqual(queue.retracted_queue, [] if succeeded else [req])
+                self.assertEqual(req.is_retracted, not succeeded)
+                self.assertEqual(queue._pre_alloc.call_count, int(succeeded))
+                self.assertEqual(restore.call_count, int(succeeded))
+                if not succeeded:
+                    self.assertIs(req.kv.retraction_backup, backup)
+                queue.tree_cache.evict_for_alloc.assert_called_once()
 
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()

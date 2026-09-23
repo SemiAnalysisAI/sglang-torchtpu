@@ -922,6 +922,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
                 break
 
+            if uses_swa_tail_prealloc:
+                _, swa_len = self._prealloc_kv_lens(req)
+                reclaim_error = self._reclaim_swa_tail_capacity(swa_len, req.rid)
+                if reclaim_error is not None:
+                    logger.warning(reclaim_error)
+                    break
+
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
