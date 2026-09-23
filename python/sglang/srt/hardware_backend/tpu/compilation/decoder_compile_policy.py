@@ -602,7 +602,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
     def _direct_compile_specialization_key(
         self,
-        _attention_metadata: Any,
+        attention_metadata: Any,
         input_ids: torch.Tensor,
         _positions: torch.Tensor,
         forward_batch: Any,
@@ -614,13 +614,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             if self._compiles_logits_processor()
             else None
         )
-        return (
+        key = (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
             input_ids.shape[0],
             logits_output_mode,
         )
+        tile = getattr(attention_metadata, "prefill_kv_tile", None)
+        return key if tile is None else (*key, ("prefill_kv_tile", tile))
 
     def _compiles_logits_processor(self) -> bool:
         """Whether this compiled callable includes target-model logits processing."""
@@ -1247,7 +1249,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
     def _direct_compile_specialization_key(
         self,
-        _attention_metadata: Any,
+        attention_metadata: Any,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         forward_batch: Any,
@@ -1261,7 +1263,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             if self._compiles_logits_processor()
             else None
         )
-        return (
+        key = (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
@@ -1269,6 +1271,8 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             input_deepstack_embeds is not None,
             logits_output_mode,
         )
+        tile = getattr(attention_metadata, "prefill_kv_tile", None)
+        return key if tile is None else (*key, ("prefill_kv_tile", tile))
 
     def _decode_uses_input_ids(self) -> bool:
         """Whether the wrapper hands decode raw ``input_ids``, skipping embed.
