@@ -25,6 +25,20 @@ use tokio_util::sync::CancellationToken;
 /// circuit breaker so the malformed worker drops out of subsequent
 /// `healthy_workers_for(...)` selection, then surface the error as
 /// `ApiError::WorkerMisconfigured`.
+/// The caller headers a worker may see, plus the router span's trace context
+/// when tracing export is on (which then replaces any forwarded
+/// `traceparent`, so the engine's spans hang under the router's).
+fn forwarded_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::with_capacity(headers.len() + 2);
+    for (k, v) in headers {
+        if should_forward_request_header(k) {
+            out.append(k.clone(), v.clone());
+        }
+    }
+    crate::server::otel::inject_current_context(&mut out);
+    out
+}
+
 fn parse_worker_url(worker_url: &str, breaker: &CircuitBreaker) -> Result<Url, ApiError> {
     Url::parse(worker_url).map_err(|e| {
         breaker.record_failure();
@@ -224,13 +238,11 @@ impl Proxy {
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })?;
-        let mut req = self.client_for(protocol).post(url.clone()).body(body);
-        for (k, v) in headers {
-            if should_forward_request_header(k) {
-                req = req.header(k, v);
-            }
-        }
-        req = req
+        let req = self
+            .client_for(protocol)
+            .post(url.clone())
+            .headers(forwarded_headers(headers))
+            .body(body)
             .header("content-type", "application/json")
             .timeout(self.request_timeout);
         let mut abort =
@@ -322,13 +334,11 @@ impl Proxy {
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })?;
-        let mut req = self.client_for(protocol).post(url.clone()).body(body);
-        for (k, v) in headers {
-            if should_forward_request_header(k) {
-                req = req.header(k, v);
-            }
-        }
-        req = req
+        let req = self
+            .client_for(protocol)
+            .post(url.clone())
+            .headers(forwarded_headers(headers))
+            .body(body)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream");
         let mut abort =

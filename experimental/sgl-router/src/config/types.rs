@@ -273,6 +273,10 @@ pub struct ObservabilityConfig {
     pub log_level: String,
     /// Tracing output format.
     pub log_format: LogFormat,
+    /// OTLP/gRPC collector for spans; None leaves tracing export off.
+    pub otlp_endpoint: Option<String>,
+    /// `service.name` on exported spans.
+    pub otlp_service_name: String,
 }
 
 /// `text` for human-readable dev output, `json` for one-line-per-record
@@ -295,6 +299,8 @@ impl Default for ObservabilityConfig {
         Self {
             log_level: default_log_level(),
             log_format: LogFormat::default(),
+            otlp_endpoint: None,
+            otlp_service_name: crate::server::otel::DEFAULT_SERVICE_NAME.to_string(),
         }
     }
 }

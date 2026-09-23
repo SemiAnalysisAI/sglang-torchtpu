@@ -92,6 +92,10 @@ rustc-hash = "2"
 sha2 = "0.10"
 url = "2"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "trace"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.32"
 
 [dev-dependencies]
 base64 = "0.22"

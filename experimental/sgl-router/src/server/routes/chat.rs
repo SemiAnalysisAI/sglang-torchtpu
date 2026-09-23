@@ -26,6 +26,7 @@ use forward::{forward_chat_request, SelectedWorkers};
 use preparation::{parse_routing_fields, PreparedChatRequest};
 use std::sync::Arc;
 use std::time::Instant;
+use tracing::Instrument;
 
 const X_SGL_TTFT_SLO_MS: HeaderName = HeaderName::from_static("x-sgl-ttft-slo-ms");
 const X_SGL_TPS_SLO: HeaderName = HeaderName::from_static("x-sgl-tps-slo");
@@ -40,12 +41,24 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
-    match &ctx.chat_routing {
-        ChatRouting::Legacy => chat_completions_legacy(&ctx, headers, body).await,
-        ChatRouting::Reorg(resolvers) => {
-            reorg::chat_completions(&ctx, resolvers, headers, body).await
+    // One server span per request, parented on the caller's trace context;
+    // the worker forward injects this span's context downstream.
+    let span = crate::server::otel::request_span("chat_completions", &headers);
+    async move {
+        let result = match &ctx.chat_routing {
+            ChatRouting::Legacy => chat_completions_legacy(&ctx, headers, body).await,
+            ChatRouting::Reorg(resolvers) => {
+                reorg::chat_completions(&ctx, resolvers, headers, body).await
+            }
+        };
+        if let Ok(response) = &result {
+            tracing::Span::current()
+                .record("http.response.status_code", response.status().as_u16());
         }
+        result
     }
+    .instrument(span)
+    .await
 }
 
 async fn chat_completions_legacy(

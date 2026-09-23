@@ -308,6 +308,18 @@ Prefer `cache_aware` when the fleet's real cache state is available: it
 matches the full prefix against what each engine holds, while `prefix_hash`
 cannot distinguish prompts that diverge after the hashed window.
 
+## Tracing
+
+`--otlp-endpoint http://collector:4317` (or `OTEL_EXPORTER_OTLP_ENDPOINT`)
+exports one server span per chat request over OTLP/gRPC, named
+`chat_completions`, carrying the model, the selected prefill and decode
+workers and the response status. The span adopts the caller's W3C
+`traceparent`, and the router writes its own span context onto the request it
+forwards, so an engine started with tracing enabled reports its spans as
+children of the router's rather than as a separate trace. `--otlp-service-name`
+sets `service.name` (default `sgl-router`). Without the flag nothing is
+exported and the caller's `traceparent`/`tracestate` pass through unchanged.
+
 ## Upgrading from `cache_aware_zmq`
 
 The `cache_aware_zmq` policy has been removed. Configurations using it should
