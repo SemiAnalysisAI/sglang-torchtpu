@@ -59,6 +59,7 @@ fn config() -> Config {
             decode_policy: Default::default(),
             bucket_config: None,
             circuit_breaker: None,
+            prefix_hash: None,
             cache_aware: None,
             // Push eviction far out so the background sweeper never fires
             // mid-test; round-robin fallback for the initial pin of a key.

@@ -32,6 +32,7 @@
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
+//! | `sgl_router_prefix_hash_total` | Counter | `outcome` |
 //! | `sgl_router_policy_decisions_total` | Counter | `policy`, `reason` |
 //! | `sgl_router_policy_selection_failures_total` | Counter | `policy`, `reason` |
 //! | `sgl_router_cache_admission_evaluated_total` | Counter | — |
@@ -329,6 +330,31 @@ impl StickyOutcome {
     }
 }
 
+/// Prefix-hash selection outcome — see `PrefixHashPolicy::select` for the
+/// four branches.
+#[derive(Debug, Clone, Copy)]
+pub enum PrefixHashOutcome {
+    /// The hashed target was within the load bound and took the request.
+    HashHit,
+    /// The hashed target was over `mean * load_factor`; a lower-ranked worker took it.
+    LoadShed,
+    /// No load snapshot was available; the hashed target took it unbounded.
+    Unbounded,
+    /// The request carried no tokens to hash; delegated to power-of-two.
+    NoTokens,
+}
+
+impl PrefixHashOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::HashHit => "hash_hit",
+            Self::LoadShed => "load_shed",
+            Self::Unbounded => "unbounded",
+            Self::NoTokens => "no_tokens",
+        }
+    }
+}
+
 /// Stale-request outcome label.
 #[derive(Debug, Clone, Copy)]
 pub enum StaleRequestOutcome {
@@ -420,6 +446,7 @@ pub struct MetricsRegistry {
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    prefix_hash_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     policy_decisions_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
     policy_selection_failures_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
     cache_admission_evaluated_total: AtomicU64,
@@ -709,6 +736,17 @@ impl MetricsRegistry {
     /// Bump `sgl_router_sticky_total{outcome}`.
     pub fn record_sticky(&self, outcome: StickyOutcome) {
         let mut guard = self.sticky_total.lock();
+        let counter = guard
+            .entry(outcome.as_str())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_prefix_hash_total{outcome}`.
+    pub fn record_prefix_hash(&self, outcome: PrefixHashOutcome) {
+        let mut guard = self.prefix_hash_total.lock();
         let counter = guard
             .entry(outcome.as_str())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
@@ -1130,6 +1168,25 @@ impl MetricsRegistry {
         for (outcome, value) in entries {
             out.push_str(&format!(
                 "sgl_router_sticky_total{{outcome=\"{}\"}} {}\n",
+                outcome, value,
+            ));
+        }
+        drop(guard);
+
+        // prefix_hash_total
+        out.push_str(
+            "# HELP sgl_router_prefix_hash_total Prefix-hash selection outcomes from PrefixHashPolicy.\n",
+        );
+        out.push_str("# TYPE sgl_router_prefix_hash_total counter\n");
+        let guard = self.prefix_hash_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|e| *e.0);
+        for (outcome, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_prefix_hash_total{{outcome=\"{}\"}} {}\n",
                 outcome, value,
             ));
         }
@@ -1704,6 +1761,22 @@ mod tests {
         assert!(out.contains(r#"sgl_router_decode_affinity_total{outcome="fallback_breaker"} 1"#));
         assert!(out
             .contains(r#"sgl_router_decode_affinity_total{outcome="fallback_load_imbalance"} 1"#,));
+    }
+
+    #[test]
+    fn prefix_hash_counter_emits_all_outcomes() {
+        let reg = MetricsRegistry::new();
+        reg.record_prefix_hash(PrefixHashOutcome::HashHit);
+        reg.record_prefix_hash(PrefixHashOutcome::HashHit);
+        reg.record_prefix_hash(PrefixHashOutcome::LoadShed);
+        reg.record_prefix_hash(PrefixHashOutcome::Unbounded);
+        reg.record_prefix_hash(PrefixHashOutcome::NoTokens);
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_prefix_hash_total counter"));
+        assert!(out.contains(r#"sgl_router_prefix_hash_total{outcome="hash_hit"} 2"#));
+        assert!(out.contains(r#"sgl_router_prefix_hash_total{outcome="load_shed"} 1"#));
+        assert!(out.contains(r#"sgl_router_prefix_hash_total{outcome="unbounded"} 1"#));
+        assert!(out.contains(r#"sgl_router_prefix_hash_total{outcome="no_tokens"} 1"#));
     }
 
     #[test]

@@ -44,6 +44,7 @@ fn config(_worker_url: &str) -> Config {
             decode_policy: Default::default(),
             bucket_config: None,
             circuit_breaker: None,
+            prefix_hash: None,
             cache_aware: None,
             sticky: None,
             affinity: None,

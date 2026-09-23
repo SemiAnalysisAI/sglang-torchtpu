@@ -43,6 +43,7 @@ async fn failover_when_one_worker_dies() {
                 threshold: std::num::NonZeroU32::new(1).unwrap(), // open after first failure
                 cool_down_secs: 30,
             }),
+            prefix_hash: None,
             cache_aware: None,
             sticky: None,
             affinity: None,

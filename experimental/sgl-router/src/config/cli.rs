@@ -14,8 +14,9 @@ use crate::config::{
     AffinityMode, CacheAwareConfig, CachePrefixProvider, CircuitBreakerConfig, Config,
     DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
     InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
-    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
+    ObservabilityConfig, PolicyKind, PrefixHashConfig, ProxyConfig, ServerConfig,
+    SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
+    DEFAULT_PREFIX_HASH_LOAD_FACTOR, DEFAULT_PREFIX_TOKEN_COUNT,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -171,6 +172,9 @@ pub struct RoutingArgs {
     /// Policy used to select decode workers for PD requests.
     #[arg(long, value_enum, default_value = "power_of_two")]
     pub decode_policy: DecodePolicyKind,
+    /// `--policy prefix_hash` knobs; same help group, they tune a policy.
+    #[command(flatten)]
+    pub prefix_hash: PrefixHashArgs,
 
     /// Static P/D bucket configuration. Omit to use the global candidate domain.
     #[arg(long)]
@@ -345,6 +349,7 @@ impl Cli {
             .transpose()?;
         let circuit_breaker = self.routing.build_circuit_breaker()?;
         let cache_aware = self.cache.into_config(self.routing.policy)?;
+        let prefix_hash = self.routing.prefix_hash.build_config(self.routing.policy)?;
         let fused = self.routing.build_fused()?;
         let eligibility = self.routing.build_eligibility()?;
         let sticky = self.affinity.into_sticky_config(self.routing.policy)?;
@@ -384,6 +389,7 @@ impl Cli {
                 bucket_config,
                 circuit_breaker,
                 cache_aware,
+                prefix_hash,
                 sticky,
                 affinity,
                 fused,
@@ -591,6 +597,49 @@ impl CacheArgs {
         Ok(Some(CacheAwareConfig {
             prefix_provider: cache_prefix_provider,
             kv_indexer_endpoint,
+        }))
+    }
+}
+
+#[derive(clap::Args, Debug, Default)]
+pub struct PrefixHashArgs {
+    /// Leading tokens hashed for routing. Requests that agree on this many
+    /// tokens route together. Defaults to 256; requires --policy prefix_hash.
+    #[arg(long)]
+    pub prefix_token_count: Option<usize>,
+    /// Skip the hashed target once its load exceeds the fleet mean times this
+    /// factor (>= 1.0). Defaults to 1.25; requires --policy prefix_hash.
+    #[arg(long)]
+    pub prefix_hash_load_factor: Option<f64>,
+}
+
+impl PrefixHashArgs {
+    fn build_config(&self, policy: PolicyKind) -> Result<Option<PrefixHashConfig>> {
+        let tuned = self.prefix_token_count.is_some() || self.prefix_hash_load_factor.is_some();
+        ensure!(
+            !tuned || policy == PolicyKind::PrefixHash,
+            "--prefix-token-count / --prefix-hash-load-factor require --policy prefix_hash"
+        );
+        ensure!(
+            self.prefix_token_count != Some(0),
+            "--prefix-token-count must be greater than zero"
+        );
+        if let Some(factor) = self.prefix_hash_load_factor {
+            ensure!(
+                factor.is_finite() && factor >= 1.0,
+                "--prefix-hash-load-factor must be a finite number >= 1.0 (got {factor})"
+            );
+        }
+        if policy != PolicyKind::PrefixHash {
+            return Ok(None);
+        }
+        Ok(Some(PrefixHashConfig {
+            prefix_token_count: self
+                .prefix_token_count
+                .unwrap_or(DEFAULT_PREFIX_TOKEN_COUNT),
+            load_factor: self
+                .prefix_hash_load_factor
+                .unwrap_or(DEFAULT_PREFIX_HASH_LOAD_FACTOR),
         }))
     }
 }
@@ -1749,6 +1798,68 @@ mod tests {
         into_config_owned(with_model(
             &[&["--worker-urls", "http://10.0.0.1:30000"], &extra[..]].concat(),
         ))
+    }
+
+    #[test]
+    fn prefix_hash_policy_gets_default_knobs() {
+        let c = cfg_of("--policy prefix_hash").unwrap();
+        assert_eq!(c.model.policy, PolicyKind::PrefixHash);
+        let ph = c.model.prefix_hash.expect("prefix_hash config");
+        assert_eq!(ph.prefix_token_count, DEFAULT_PREFIX_TOKEN_COUNT);
+        assert_eq!(ph.load_factor, DEFAULT_PREFIX_HASH_LOAD_FACTOR);
+        assert!(c.model.cache_aware.is_none());
+    }
+
+    #[test]
+    fn prefix_hash_knobs_are_plumbed() {
+        let c =
+            cfg_of("--policy prefix_hash --prefix-token-count 64 --prefix-hash-load-factor 2.0")
+                .unwrap();
+        let ph = c.model.prefix_hash.expect("prefix_hash config");
+        assert_eq!(ph.prefix_token_count, 64);
+        assert_eq!(ph.load_factor, 2.0);
+    }
+
+    #[test]
+    fn prefix_hash_knobs_require_the_policy() {
+        for argv in [
+            "--prefix-token-count 64",
+            "--policy cache_aware --prefix-hash-load-factor 1.5",
+        ] {
+            let err = cfg_of(argv).unwrap_err().to_string();
+            assert!(
+                err.contains("require --policy prefix_hash"),
+                "{argv}: got: {err}"
+            );
+        }
+        assert!(cfg_of("--policy round_robin")
+            .unwrap()
+            .model
+            .prefix_hash
+            .is_none());
+    }
+
+    #[test]
+    fn prefix_hash_knobs_are_bounds_checked() {
+        let err = cfg_of("--policy prefix_hash --prefix-token-count 0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--prefix-token-count must be greater than zero"),
+            "got: {err}"
+        );
+        for bad in ["0.5", "0", "NaN", "inf"] {
+            let err = cfg_of(&format!(
+                "--policy prefix_hash --prefix-hash-load-factor {bad}"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("--prefix-hash-load-factor must be"),
+                "{bad}: got: {err}"
+            );
+        }
+        assert!(cfg_of("--policy prefix_hash --prefix-hash-load-factor 1.0").is_ok());
     }
 
     fn fuse_err(argv: &str) -> String {

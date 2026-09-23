@@ -9,6 +9,7 @@ use crate::policies::{
     cache_aware::CacheAwarePolicy,
     load_based::LoadBasedPolicy,
     power_of_two::PowerOfTwoChoicesPolicy,
+    prefix_hash::PrefixHashPolicy,
     random::RandomPolicy,
     round_robin::RoundRobinPolicy,
     scoring::{
@@ -106,6 +107,9 @@ fn build_kind(
         PolicyKind::Sticky => build_sticky(model),
         PolicyKind::FusedScore => build_fused(model, &tree, &block_size_oracle)?,
         PolicyKind::ScorePolicy => build_score_policy(model, &tree, &block_size_oracle)?,
+        PolicyKind::PrefixHash => Arc::new(PrefixHashPolicy::new(
+            model.prefix_hash.clone().unwrap_or_default(),
+        )),
     })
 }
 
@@ -208,6 +212,9 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
                 build_sticky_fallback(s.fallback_policy),
             ))
         }
+        PolicyKind::PrefixHash => Arc::new(PrefixHashPolicy::new(
+            crate::config::PrefixHashConfig::default(),
+        )),
         PolicyKind::FusedScore | PolicyKind::ScorePolicy => {
             return Err(anyhow!("--policy {kind} needs --fuse terms from the model"))
         }
@@ -342,6 +349,7 @@ mod tests {
                 decode_policy: Default::default(),
                 bucket_config: None,
                 circuit_breaker: None,
+                prefix_hash: None,
                 cache_aware: None,
                 sticky: None,
                 affinity: None,

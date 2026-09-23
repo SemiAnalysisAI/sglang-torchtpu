@@ -136,6 +136,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
             decode_policy: Default::default(),
             bucket_config: None,
             circuit_breaker: None,
+            prefix_hash: None,
             cache_aware: None,
             sticky: None,
             affinity: None,

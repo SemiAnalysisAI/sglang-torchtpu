@@ -599,6 +599,7 @@ mod tests {
                     threshold: NonZeroU32::new(threshold).unwrap(),
                     cool_down_secs,
                 }),
+                prefix_hash: None,
                 cache_aware: None,
                 sticky: None,
                 affinity: None,
