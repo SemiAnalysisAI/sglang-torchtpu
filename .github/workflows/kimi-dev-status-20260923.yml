@@ -28,6 +28,8 @@ jobs:
         run: |
           set -euo pipefail
           kubectl -n tpu-ci get jobset kimi-dev-mmmu-20260923-r1 -o json
+          kubectl -n tpu-ci get events --field-selector involvedObject.name=kimi-dev-mmmu-20260923-r1
+          kubectl -n tpu-ci get jobs -l jobset.sigs.k8s.io/jobset-name=kimi-dev-mmmu-20260923-r1 -o json
           kubectl -n tpu-ci get pods -l jobset.sigs.k8s.io/jobset-name=kimi-dev-mmmu-20260923-r1 -o wide
           for p in $(kubectl -n tpu-ci get pods -l jobset.sigs.k8s.io/jobset-name=kimi-dev-mmmu-20260923-r1 -o name); do
             kubectl -n tpu-ci logs "$p" --tail=12 || true
