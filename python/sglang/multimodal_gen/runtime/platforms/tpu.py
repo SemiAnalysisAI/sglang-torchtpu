@@ -194,7 +194,21 @@ class TpuPlatform(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
-        if selected_backend in (None, AttentionBackendEnum.TORCH_SDPA):
+        # Splash is the default because plain SDPA cannot run the video models
+        # this backend exists for: at Wan2.2-14B 720p/81f the self-attention
+        # sequence is 75600 tokens, and XLA materializing that score matrix
+        # needs 214.50G of HLO temporaries against 94.74G of HBM. The Pallas
+        # kernels never materialize it. This does change the TPU default; the
+        # impl subclasses SDPAImpl and falls back to it for anything the
+        # kernels do not cover, and `--attention-backend torch_sdpa` forces
+        # plain SDPA.
+        if selected_backend in (None, AttentionBackendEnum.TPU_SPLASH_ATTN):
+            logger.info("Using TPU Pallas splash attention backend.")
+            return (
+                "sglang.multimodal_gen.runtime.layers.attention.backends."
+                "tpu_splash_attn.TpuSplashAttentionBackend"
+            )
+        if selected_backend is AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend.")
             return (
                 "sglang.multimodal_gen.runtime.layers.attention.backends."
@@ -202,7 +216,8 @@ class TpuPlatform(Platform):
             )
         raise ValueError(
             f"Attention backend {selected_backend} is not supported on TPU; "
-            "the supported backend is TORCH_SDPA (default)."
+            "the supported backends are TPU_SPLASH_ATTN (default) and "
+            "TORCH_SDPA."
         )
 
     @classmethod

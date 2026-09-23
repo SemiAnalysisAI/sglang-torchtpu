@@ -30,6 +30,46 @@ class TestTpuPlatformPlugin(unittest.TestCase):
             self.assertIsNone(tpu_platform_plugin())
 
 
+class TestSplashBackendAdmission(unittest.TestCase):
+    """Any layer that admits TORCH_SDPA must also admit the splash backend.
+
+    This is what lets a model opt in with ``--attention-backend
+    tpu_splash_attn`` without editing its ``supported_attention_backends``.
+    """
+
+    def test_admitted_wherever_sdpa_is(self):
+        from sglang.multimodal_gen.runtime.layers.attention.selector import (
+            _is_backend_supported,
+        )
+
+        self.assertTrue(
+            _is_backend_supported(
+                AttentionBackendEnum.TPU_SPLASH_ATTN,
+                {AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            )
+        )
+
+    def test_not_admitted_where_sdpa_is_not(self):
+        from sglang.multimodal_gen.runtime.layers.attention.selector import (
+            _is_backend_supported,
+        )
+
+        self.assertFalse(
+            _is_backend_supported(
+                AttentionBackendEnum.TPU_SPLASH_ATTN,
+                {AttentionBackendEnum.SLA_ATTN},
+            )
+        )
+
+    def test_selectable_by_cli_name(self):
+        # server_args resolves --attention-backend via the enum name.
+        self.assertIs(
+            AttentionBackendEnum["TPU_SPLASH_ATTN".upper()],
+            AttentionBackendEnum.TPU_SPLASH_ATTN,
+        )
+        self.assertEqual(str(AttentionBackendEnum.TPU_SPLASH_ATTN), "tpu_splash_attn")
+
+
 class TestTpuPlatformSurface(unittest.TestCase):
     def test_identity(self):
         self.assertEqual(TpuPlatform.device_type, "tpu")
@@ -42,12 +82,22 @@ class TestTpuPlatformSurface(unittest.TestCase):
     def test_inference_mode_is_no_grad(self):
         self.assertIsInstance(TpuPlatform.inference_mode(), torch.no_grad)
 
-    def test_attn_backend_default_is_sdpa(self):
-        for selected in (None, AttentionBackendEnum.TORCH_SDPA):
+    def test_attn_backend_defaults_to_splash(self):
+        # The Pallas kernels are the optimized TPU path, so TPU defaults to
+        # them rather than to plain SDPA.
+        for selected in (None, AttentionBackendEnum.TPU_SPLASH_ATTN):
             self.assertIn(
-                "sdpa.SDPABackend",
+                "tpu_splash_attn.TpuSplashAttentionBackend",
                 TpuPlatform.get_attn_backend_cls_str(selected, 128, torch.bfloat16),
             )
+
+    def test_attn_backend_sdpa_is_still_selectable(self):
+        self.assertIn(
+            "sdpa.SDPABackend",
+            TpuPlatform.get_attn_backend_cls_str(
+                AttentionBackendEnum.TORCH_SDPA, 128, torch.bfloat16
+            ),
+        )
 
     def test_attn_backend_unsupported_raises(self):
         with self.assertRaises(ValueError):
