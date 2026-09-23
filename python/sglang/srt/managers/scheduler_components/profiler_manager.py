@@ -215,19 +215,28 @@ class SchedulerProfilerManager:
         if "TPU" in activities:
             # TorchTPU xprof: capture TPU device activity (and host CPU only if
             # "CPU" was also requested).
-            if _is_tpu and self._is_global_primary_rank():
-                from sglang.srt.hardware_backend.tpu.profiler import start_tpu_profile
+            if _is_tpu:
+                # A scheduler stage switch can precede device completion. Drain
+                # every rank before capture so queued prefill stays out of decode.
+                current_platform.synchronize()
+                torch.distributed.barrier(self.dp_tp_cpu_group)
+                if self._is_global_primary_rank():
+                    from sglang.srt.hardware_backend.tpu.profiler import (
+                        start_tpu_profile,
+                    )
 
-                subdir_parts = [self.profile_prefix or "profile"]
-                if self.profile_id:
-                    subdir_parts.append(str(self.profile_id))
-                if stage is not None:
-                    subdir_parts.append(stage.name)
-                # "TPU" -> TPU-only. "TPU"+"CPU" -> CPU and TPU.
-                self.tpu_profiler = start_tpu_profile(
-                    output_dir=self.torch_profiler_output_dir / "-".join(subdir_parts),
-                    with_cpu="CPU" in activities,
-                )
+                    subdir_parts = [self.profile_prefix or "profile"]
+                    if self.profile_id:
+                        subdir_parts.append(str(self.profile_id))
+                    if stage is not None:
+                        subdir_parts.append(stage.name)
+                    # "TPU" -> TPU-only. "TPU"+"CPU" -> CPU and TPU.
+                    self.tpu_profiler = start_tpu_profile(
+                        output_dir=self.torch_profiler_output_dir
+                        / "-".join(subdir_parts),
+                        with_cpu="CPU" in activities,
+                    )
+                torch.distributed.barrier(self.dp_tp_cpu_group)
             self.profile_in_progress = True
         elif "RPD" in activities:  # for ROCM
             from rpdTracerControl import rpdTracerControl
@@ -411,11 +420,17 @@ class SchedulerProfilerManager:
             self.rpd_profiler = None
             self.rpd_profile_path = None
 
-        if self.tpu_profiler is not None:
-            from sglang.srt.hardware_backend.tpu.profiler import stop_tpu_profile
+        if _is_tpu and "TPU" in self.profiler_activities:
+            # Include the last queued step before closing the window, and keep
+            # peers from launching the next stage while xprof flushes the trace.
+            current_platform.synchronize()
+            torch.distributed.barrier(self.dp_tp_cpu_group)
+            if self.tpu_profiler is not None:
+                from sglang.srt.hardware_backend.tpu.profiler import stop_tpu_profile
 
-            stop_tpu_profile(self.tpu_profiler)
-            self.tpu_profiler = None
+                stop_tpu_profile(self.tpu_profiler)
+                self.tpu_profiler = None
+            torch.distributed.barrier(self.dp_tp_cpu_group)
 
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
