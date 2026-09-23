@@ -1,0 +1,27 @@
+name: Submit Kimi after nightly
+
+on:
+  push:
+    branches: [ops/kimi-after-nightly-20260923]
+    paths:
+      - .github/workflows/defer-kimi-accuracy.yml
+      - .github/tpu-ci/defer_kimi_accuracy.py
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: kimi-after-nightly-20260923
+  cancel-in-progress: false
+
+jobs:
+  wait-and-submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for nightly completion, then submit Kimi
+        run: python3 .github/tpu-ci/defer_kimi_accuracy.py
