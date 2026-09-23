@@ -32,11 +32,6 @@ HICACHE_RATIO = 3.0
 PROBE_TOKENS = 2048
 PAGE_SIZE = 64
 
-# Calibrated floor at ~90% of the measured probe accept length: a spec
-# acceptance-rate regression fails here. This is the gpt-oss-120b accept_length
-# guard formerly in test_spec_decoding.py (integration job, since removed).
-MIN_ACCEPT_LENGTH = 2.4  # measured 2.67 on the probe reads, 2.77 over GSM8K
-
 LAUNCH_ENV = {
     "MODEL": "/weights/gpt-oss-120b",
     "ISL": "4096",
@@ -94,8 +89,9 @@ MODEL_CONFIG = {
                 page_size=PAGE_SIZE,
                 probe_tokens=PROBE_TOKENS,
                 hicache_ratio=HICACHE_RATIO,
-                # Require verify forwards on every read and mean accept length above 1.0.
-                min_accept_length=MIN_ACCEPT_LENGTH,
+                # Require verify forwards on every read, and the host reload to
+                # cost the same forwards as the device hit.
+                spec_decoding=True,
             ),
         },
         {

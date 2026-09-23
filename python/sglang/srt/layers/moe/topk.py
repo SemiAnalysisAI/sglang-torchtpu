@@ -794,6 +794,30 @@ class TopK(BaseFusedOp):
 # ------------------------------- TopK implementation -------------------------------------
 
 
+def _stable_topk(values: torch.Tensor, topk: int):
+    """Top-k over the last dim with deterministic, lowest-index-wins ties.
+
+    ``torch.topk`` makes no guarantee about which index is returned when two
+    values compare equal, and the result is permitted to depend on the shape of
+    the input.  On backends that select via a bitonic comparator network the
+    tie-break genuinely does change with the size of the batch being reduced.
+
+    That is fatal for MoE routing under speculative decoding: the same token is
+    routed once in a small decode step and again in a much larger verify step,
+    and if the two disagree on a tied expert the verify logits no longer match
+    what the draft proposed, so every speculated token is rejected.
+
+    ``torch.sort(..., stable=True)`` pins ties to the lowest index regardless of
+    shape.  It is only affordable because the reduced dimension here is the
+    expert count (8-256), not the vocabulary -- do not reuse this for vocab-wide
+    selection such as the EAGLE draft top-k.
+    """
+    sorted_values, sorted_indices = torch.sort(
+        values, dim=-1, descending=True, stable=True
+    )
+    return sorted_values[..., :topk], sorted_indices[..., :topk]
+
+
 def fused_topk_torch_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -824,13 +848,8 @@ def fused_topk_torch_native(
         assert (
             hidden_states.shape[0] == gating_output.shape[0]
         ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
-        M, _ = hidden_states.shape
-        topk_weights = torch.empty(
-            M, topk, dtype=torch.float32, device=hidden_states.device
-        )
-        topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
         topk_weights = scoring_func_impl(gating_output.float())
-        topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+        topk_weights, topk_ids = _stable_topk(topk_weights, topk)
 
     if renormalize:
         # fp32 like the reference gate (the epsilon is not representable in
@@ -2180,6 +2199,16 @@ def _post_process_topk_ids(
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
         # That final pass re-zeros after any shared-expert append/remap, so a
         # second zeroing here would be redundant (zeroing is idempotent).
+
+    elif _is_tpu and num_token_non_padded is not None:
+        # Compile-bucket pad rows would route to random experts and stream their
+        # weights; send them to -1 with zero weight (every TPU MoE path maps
+        # negative ids to a zero-weight slot). Out of place: boolean-index
+        # assignment does not lower on torch_tpu.
+        row_ids = torch.arange(topk_ids.shape[0], device=topk_ids.device)
+        valid = (row_ids < num_token_non_padded).unsqueeze(1)
+        topk_ids = torch.where(valid, topk_ids, torch.full_like(topk_ids, -1))
+        topk_weights = torch.where(valid, topk_weights, torch.zeros_like(topk_weights))
 
     if recorder_topk_ids is None:
         recorder_topk_ids = topk_ids

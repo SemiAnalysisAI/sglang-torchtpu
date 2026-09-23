@@ -1,0 +1,14 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+# Pure config tests; no server processes or accelerator access.
+py_test(
+    name = "test_tpu_config_eval",
+    size = "small",
+    srcs = ["test_tpu_config_eval.py"],
+    env = {"TORCH_DEVICE_BACKEND_AUTOLOAD": "0"},
+    python_version = "3.12",
+    deps = [
+        "//benchmark/tpu:python_configs",
+        "//python:sglang",
+    ],
+)

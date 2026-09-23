@@ -513,6 +513,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "Target model must have an lm_head for DFLASH TPU draft sampling."
             )
         self.draft_model.lm_head = target_model.lm_head
+        # The draft's distributed-TopK path borrows this head but never runs the
+        # target's capability negotiation, so publish the kernel's rank operand
+        # here -- it has to be a graph input before the draft graphs below are
+        # captured. Same guard as the draft's use site, so heads that cannot take
+        # the path do not gain an unused buffer (and a changed graph signature).
+        from sglang.srt.distributed import get_tp_group
+        from sglang.srt.hardware_backend.tpu.top_k import (
+            register_distributed_top_k_rank,
+            supports_distributed_tpu_top_k,
+        )
+
+        tp_group = get_tp_group()
+        if int(tp_group.world_size) > 1 and supports_distributed_tpu_top_k(
+            target_model.lm_head, top_k=1
+        ):
+            register_distributed_top_k_rank(target_model.lm_head, group=tp_group)
         self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
         compile_policy = getattr(self.draft_model_runner, "compile_policy", None)
         if compile_policy is not None:
@@ -1846,8 +1862,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
-            target_predict = torch.argmax(next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
+            # argmax straight to 2-D: a .view() of the 1-D result is an as_strided
+            # whose src-rank broadcast collapses to the flat base, so rank 0 enters
+            # this collective as s64[bs*block_size] and the rest as s64[bs,block_size].
+            target_predict = torch.argmax(
+                next_token_logits.view(bs, int(self.block_size), -1), dim=-1
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
             if _is_tpu:

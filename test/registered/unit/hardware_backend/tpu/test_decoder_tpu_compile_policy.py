@@ -59,6 +59,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.speculative.eagle_worker_common import run_eagle_verify
 from sglang.srt.speculative.spec_info import SpecInputType, SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 
@@ -966,6 +967,45 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
             deepstack_key, policy._direct_compile_specialization_key(None, **kwargs)
         )
 
+    def test_text_ids_warmup_uses_the_positional_serving_convention(self):
+        """A multimodal model still serves text-only requests.
+
+        Those call the decoder positionally, and Dynamo guards on len(args), so
+        a graph warmed through the input_embeds keyword convention can never
+        satisfy them. Warming only the embeds convention left every text graph
+        to be compiled lazily at serving time, where the first batch width that
+        had not been seen yet tripped fail_on_recompile and killed the server.
+        """
+
+        model_runner = _model_runner()
+        model_runner.model.get_image_feature = MagicMock()
+        model_runner.model.get_input_embeddings = MagicMock(
+            return_value=torch.nn.Embedding(2, 4)
+        )
+        forward_batch = SimpleNamespace(
+            input_ids=torch.ones(8, dtype=torch.int64),
+            positions=torch.arange(8),
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            batch_size=8,
+        )
+        policy = Qwen3VLDecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model_runner.model
+        )
+        policy._make_dummy_forward_batch = MagicMock(return_value=forward_batch)
+
+        args, kwargs = policy._make_warmup_inputs(
+            num_tokens=8,
+            bs=8,
+            mode=ForwardMode.DECODE,
+            variant="text_ids",
+        )
+
+        self.assertEqual(kwargs, {})
+        self.assertEqual(len(args), 3)
+        self.assertIs(args[0], forward_batch.input_ids)
+        self.assertIs(args[2], forward_batch)
+
     def test_slices_hidden_and_aux_tuple(self):
         policy = Qwen3VLDecoderTpuCompilePolicy()
         hidden = torch.zeros(5, 4)
@@ -1222,10 +1262,49 @@ class TestPrecompileLoops(_PolicyTestCase):
         with get_parallel().override(tp_rank=1):
             policy._precompile_extend()
 
-        self.assertEqual(policy._run_one.call_count, 2)
+        # 2 token buckets x 2 conventions: the input_embeds one a VL request
+        # takes, and the positional one a text-only request takes.
+        self.assertEqual(policy._run_one.call_count, 4)
         self.assertEqual(
             {call.kwargs["bs"] for call in policy._run_one.call_args_list},
             {16},
+        )
+        self.assertEqual(
+            {call.kwargs["variant"] for call in policy._run_one.call_args_list},
+            {"text_only", "text_ids"},
+        )
+
+    def test_qwen3_vl_decode_warms_both_call_conventions(self):
+        """Text-only requests reach the decoder positionally, so every batch
+        bucket needs a graph in that convention. Warming only the input_embeds
+        one left them to compile lazily at serving time, where the first
+        unseen batch width tripped fail_on_recompile and killed the server."""
+
+        mr = _model_runner()
+        mr.model.get_image_feature = MagicMock()
+        mr.model.get_input_embeddings = MagicMock()
+        policy = Qwen3VLDecoderTpuCompilePolicy(
+            model_runner=mr,
+            b_bucketer=Bucketer(name="Bs", buckets=[64, 128]),
+            owner=mr.model,
+        )
+        policy._run_one = MagicMock()
+
+        with get_parallel().override(tp_rank=1):
+            policy._precompile_decode()
+
+        warmed = {
+            (call.kwargs["bs"], call.kwargs["variant"])
+            for call in policy._run_one.call_args_list
+        }
+        self.assertEqual(
+            warmed,
+            {
+                (64, "text_only"),
+                (128, "text_only"),
+                (64, "text_ids"),
+                (128, "text_ids"),
+            },
         )
 
     def test_qwen3_vl_warmup_crosses_logits_modes(self):
@@ -1245,6 +1324,8 @@ class TestPrecompileLoops(_PolicyTestCase):
             policy._precompile_extend()
             policy._precompile_decode()
 
+        # Both calling conventions (input_embeds and positional text ids)
+        # warm every logits mode, for EXTEND and DECODE alike.
         self.assertEqual(
             [
                 call.kwargs["logits_output_mode"]
@@ -1253,9 +1334,8 @@ class TestPrecompileLoops(_PolicyTestCase):
             [
                 LogitsOutputMode.DISTRIBUTED_TOP_K,
                 LogitsOutputMode.FULL_VOCAB,
-                LogitsOutputMode.DISTRIBUTED_TOP_K,
-                LogitsOutputMode.FULL_VOCAB,
-            ],
+            ]
+            * 4,
         )
 
     def test_qwen3_vl_warms_mm_embed_placement_for_every_token_bucket(self):
@@ -2556,6 +2636,9 @@ class TestSpecDraftExtendPadding(_SpecPolicyTestCase):
 
         self.assertEqual(forward_batch.batch_size, 4)
         self.assertEqual(forward_batch.extend_seq_lens.tolist(), [4, 4, 4, 0])
+        self.assertEqual(
+            forward_batch.extend_seq_lens_cpu, forward_batch.extend_seq_lens.tolist()
+        )
         self.assertEqual(forward_batch.extend_prefix_lens.tolist(), [8, 7, 6, 0])
         self.assertEqual(forward_batch.extend_start_loc.tolist(), [0, 4, 8, 0])
 
@@ -2923,6 +3006,7 @@ class TestSpecForwardBatchPreparation(_SpecPolicyTestCase):
             spec_info=draft_extend_input,
             input_ids=draft_extend_input.input_ids,
             seq_lens=draft_extend_input.seq_lens,
+            extend_seq_lens_cpu=None,
             batch_size=2,
             _pad_inputs_to_size=fake_pad_inputs_to_size,
         )
@@ -3063,7 +3147,7 @@ def _serving_stubs():
             "apply_scaling_penalties",
             eager_scaling_penalties,
         ),
-        patch("sglang.srt.speculative.eagle_utils._use_torch_native", True),
+        patch("sglang.srt.speculative.eagle_utils._is_tpu", True),
         patch(
             "sglang.srt.distributed.get_tp_group",
             return_value=SimpleNamespace(world_size=1),
@@ -3172,6 +3256,91 @@ class TestSpecVerifyPaddingRecord(_SpecPolicyTestCase):
             )
         )
         self.assertFalse(verify_input.keep_outputs_padded)
+
+    def test_idle_peer_verify_keeps_bookkeeping_padded_until_finalize(self):
+        """An idle DP peer must drain verification without mixing empty and padded rows."""
+        for physical_bs in (1, 2, 4):
+            with self.subTest(physical_bs=physical_bs):
+                batch = _make_batch(temperature=0.0)
+                batch.forward_mode = ForwardMode.IDLE
+                batch.global_num_tokens_cpu = [physical_bs * DRAFT_TOKEN_NUM, 0]
+                batch.seq_lens = batch.seq_lens[:0]
+                logical_seq_lens = batch.seq_lens
+                batch.input_ids = torch.empty(0, dtype=torch.int64)
+                batch.out_cache_loc = torch.empty(0, dtype=torch.int64)
+                batch.sampling_info.temperatures = batch.sampling_info.temperatures[:0]
+                batch.sampling_info.top_ks = batch.sampling_info.top_ks[:0]
+                batch.sampling_info.top_ps = batch.sampling_info.top_ps[:0]
+                verify_input = EagleVerifyInput.create_idle_input(
+                    topk=1,
+                    spec_steps=DRAFT_TOKEN_NUM - 1,
+                    num_verify_tokens=DRAFT_TOKEN_NUM,
+                    device="cpu",
+                )
+                verify_input.record_padding(
+                    logical_batch_size=0,
+                    physical_batch_size=physical_bs,
+                    logical_num_tokens=0,
+                    physical_num_tokens=physical_bs * DRAFT_TOKEN_NUM,
+                )
+                batch.spec_info = verify_input
+                policy = _policy()
+                logits_output = LogitsProcessorOutput(
+                    next_token_logits=torch.zeros(
+                        (physical_bs * DRAFT_TOKEN_NUM, VOCAB_SIZE)
+                    )
+                )
+                target_worker = SimpleNamespace(
+                    model_runner=SimpleNamespace(compile_policy=policy),
+                    forward_batch_generation=MagicMock(
+                        return_value=SimpleNamespace(
+                            logits_output=logits_output,
+                            routed_experts_output=None,
+                            indexer_topk_output=None,
+                        )
+                    ),
+                )
+                forward_batch = SimpleNamespace(spec_info=verify_input)
+                module = "sglang.srt.speculative.eagle_worker_common"
+                with (
+                    _serving_stubs(),
+                    _dp_attention(True),
+                    patch(f"{module}.record_stream_for_v2_verify"),
+                    patch(f"{module}.record_stream_each"),
+                    patch(
+                        f"{module}.eagle_prepare_for_verify",
+                        return_value=(forward_batch, False),
+                    ),
+                    patch(f"{module}.commit_mamba_states_after_verify"),
+                    patch.object(
+                        policy, "finalize_forward_batch", return_value=logits_output
+                    ),
+                ):
+                    result = run_eagle_verify(
+                        batch,
+                        target_worker=target_worker,
+                        req_to_token_pool=None,
+                        token_to_kv_pool_allocator=SimpleNamespace(
+                            get_kvcache=lambda: SimpleNamespace()
+                        ),
+                        plan_stream=None,
+                        plan_stream_ctx=contextlib.nullcontext(),
+                        topk=1,
+                        num_draft_tokens=DRAFT_TOKEN_NUM,
+                        device="cpu",
+                        metadata_ready_pre_pad=False,
+                        finalize_tree_path=False,
+                    )
+                self.assertEqual(batch.forward_mode, ForwardMode.IDLE)
+                self.assertIs(batch.seq_lens, logical_seq_lens)
+                self.assertEqual(verify_input.draft_token.numel(), 0)
+                for tensor in (
+                    result.next_token_ids,
+                    result.accept_lens,
+                    result.new_seq_lens,
+                    result.next_draft_input.bonus_tokens,
+                ):
+                    self.assertEqual(tensor.numel(), 0)
 
     def test_widens_every_per_request_input(self):
         batch = _make_batch(temperature=0.7)

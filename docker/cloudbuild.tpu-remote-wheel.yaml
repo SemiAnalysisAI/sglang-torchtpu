@@ -1,0 +1,61 @@
+# Cloud Build: override torch_tpu wheel in the built SGLang TPU image and push to Artifact Registry.
+substitutions:
+  _IMAGE: "us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu"
+  _TAG: "latest"
+  _BASE_IMAGE: "us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu:latest"
+  _WHEEL: "torch-tpu"
+
+serviceAccount: "projects/sglang-torchtpu/serviceAccounts/tpu-ci@sglang-torchtpu.iam.gserviceaccount.com"
+
+logsBucket: "gs://sglang-torchtpu_cloudbuild/logs"
+
+options:
+  logging: LEGACY
+  machineType: E2_HIGHCPU_8
+
+steps:
+  - id: override-wheel
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        echo "============================================================"
+        echo "Cloud Build: Starting Single-Layer Mutation"
+        echo "Base Container: ${_BASE_IMAGE}"
+        echo "Target Wheel:   ${_WHEEL}"
+        echo "Target Tag:     ${_IMAGE}:${_TAG}"
+        echo "============================================================"
+
+        TOKEN="$$(curl -sf -H 'Metadata-Flavor: Google' \
+          http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token \
+          | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')"
+        printf '%s' "$$TOKEN" > /workspace/gcp_token
+
+        mkdir -p /workspace/wheel_override
+        touch /workspace/wheel_override/.gitkeep
+        LOCAL_WHL="$$(find /workspace/wheel_override -name '*.whl' 2>/dev/null | head -n 1 || true)"
+        if [[ -n "$$LOCAL_WHL" && -f "$$LOCAL_WHL" ]]; then
+          echo "Using pre-staged candidate wheel file: $$LOCAL_WHL ($$(ls -lh "$$LOCAL_WHL"))"
+        elif [[ "${_WHEEL}" == gs://* ]]; then
+          echo "Fetching wheel from GCS: ${_WHEEL}"
+          tok_file="/workspace/tok.txt"
+          printf '%s' "$$TOKEN" > "$$tok_file"
+          gcloud storage cp "${_WHEEL}" /workspace/wheel_override/ --access-token-file="$$tok_file" || true
+          rm -f "$$tok_file"
+        elif [[ "${_WHEEL}" == http://* || "${_WHEEL}" == https://* ]]; then
+          echo "Fetching wheel from URL: ${_WHEEL}"
+          curl -sSL -H "Authorization: Bearer $$TOKEN" -O --output-dir /workspace/wheel_override "${_WHEEL}"
+        fi
+
+        DOCKER_BUILDKIT=1 docker build \
+          -f docker/tpu-override-wheel.Dockerfile \
+          --secret id=gcp_token,src=/workspace/gcp_token \
+          --build-arg BASE_IMAGE="${_BASE_IMAGE}" \
+          --build-arg WHEEL="${_WHEEL}" \
+          -t "${_IMAGE}:${_TAG}" .
+        rm -rf /workspace/gcp_token /workspace/wheel_override/*.whl
+
+images:
+  - "${_IMAGE}:${_TAG}"

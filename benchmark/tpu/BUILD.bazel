@@ -1,0 +1,17 @@
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Expose Python recipe configs to Bazel's hermetic Python interpreter.
+py_library(
+    name = "python_configs",
+    srcs = glob(["recipe/configs/*.py"]),
+    imports = ["../.."],
+)
+
+# Shell recipes, evaluation configs, and helper programs resolved at runtime by
+# sglang.test.tpu. Executable bits are preserved in Bazel runfiles.
+filegroup(
+    name = "runtime",
+    srcs = glob(["**"], exclude = ["BUILD.bazel"]),
+)

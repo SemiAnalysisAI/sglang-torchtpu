@@ -1602,6 +1602,10 @@ class Envs:
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
 
     # TPU
+    SGLANG_TPU_ASYNC_COPY_WORKER = EnvBool(True)
+    # Restore device MM scatter instead of host placement.
+    # https://github.com/sgl-project/sglang-torchtpu/issues/741
+    SGLANG_TPU_MM_EMBED_ON_DEVICE = EnvBool(False)
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
@@ -1619,10 +1623,16 @@ class Envs:
     # structural, so the VL wrappers undo the slice in _restore_full_rope_cache
     # (the config cannot tell -- the text checkpoint carries mrope_section too).
     SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE = EnvBool(False)
+    # Preserve FP32 expert scales and apply GMM partial scales in FP32.
+    SGLANG_TPU_FP8_MOE_FP32_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
     SGLANG_TPU_REQ_TO_TOKEN_ON_HOST = EnvBool(True)
+    # Reuse uploaded attention metadata across forwards; applies to all TPU batches.
+    SGLANG_TPU_ENABLE_ATTN_METADATA_CACHE = EnvBool(True)
+    # Read extend query lengths from a complete host mirror instead of the device.
+    SGLANG_TPU_ENABLE_HOST_QUERY_LENS = EnvBool(True)
     SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
     # Physical TPU v7 TP8 measurements favor distributed TopK from batch 64.
     # Deployments can override this cutoff after measuring their topology.
@@ -1647,6 +1657,8 @@ class Envs:
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)
+    # xprof python tracer. Off by default: it dominates host busy time.
+    SGLANG_TPU_PROFILE_PYTHON_TRACER = EnvBool(False)
     # raiden KV-offload backend
     SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
     # Workaround for a TPU v7 warmup crash; disable to debug the root cause.
@@ -1667,6 +1679,11 @@ class Envs:
     # TPU slice by assigning half the chips to prefill and half to decode.
     # This is intended primarily for development and is not for production use.
     SGLANG_TPU_PD_COLOCATED = EnvBool(False)
+    # Hack to workaround libtpu bug in 0.0.46 and 0.0.47 causing performance
+    # regression in fused MoE with reduce scatter.
+    # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
+    # (likely 0.0.48).
+    SGLANG_TPU_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE = EnvBool(True)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)

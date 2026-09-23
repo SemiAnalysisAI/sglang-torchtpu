@@ -712,6 +712,89 @@ class TestIsTorchFxAvailableCompat(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _patch_dynamic_module_cache_lock
+# ---------------------------------------------------------------------------
+
+
+class TestDynamicModuleCacheLock(unittest.TestCase):
+    """Remote-code source files must be copied under a cross-process lock.
+
+    Without it, ranks starting together truncate each other's copy and import a
+    partial module, which fails much later as a missing attribute.
+    """
+
+    def setUp(self):
+        import transformers.dynamic_module_utils as dmu
+
+        self.dmu = dmu
+        self.addCleanup(
+            setattr, dmu, "get_cached_module_file", dmu.get_cached_module_file
+        )
+        hf_transformers_patches._dynamic_module_locks.clear()
+        self.addCleanup(hf_transformers_patches._dynamic_module_locks.clear)
+
+        self.cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.cache_dir.cleanup)
+        patcher = patch.object(self.dmu, "HF_MODULES_CACHE", self.cache_dir.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _install(self, impl):
+        self.dmu.get_cached_module_file = impl
+        hf_transformers_patches._patch_dynamic_module_cache_lock()
+        return self.dmu.get_cached_module_file
+
+    def test_copy_runs_while_the_lock_is_held(self):
+        observed = {}
+
+        def probe(*args, **kwargs):
+            lock = hf_transformers_patches._dynamic_module_cache_lock()
+            observed["locked"] = lock.is_locked
+            return "module.py"
+
+        wrapped = self._install(probe)
+        self.assertEqual(wrapped("model", "module.py"), "module.py")
+        self.assertTrue(observed["locked"])
+        self.assertFalse(hf_transformers_patches._dynamic_module_cache_lock().is_locked)
+
+    def test_relative_import_recursion_does_not_self_deadlock(self):
+        calls = []
+
+        def probe(name, module_file, **kwargs):
+            calls.append(module_file)
+            if module_file == "outer.py":
+                # transformers recurses through the module attribute to fetch
+                # the relative imports of the file it just copied.
+                self.dmu.get_cached_module_file(name, "inner.py")
+            return module_file
+
+        wrapped = self._install(probe)
+        with patch.object(hf_transformers_patches, "_DYNAMIC_MODULE_LOCK_TIMEOUT_S", 5):
+            wrapped("model", "outer.py")
+
+        self.assertEqual(calls, ["outer.py", "inner.py"])
+
+    def test_lock_timeout_propagates_instead_of_copying_unlocked(self):
+        import filelock
+
+        wrapped = self._install(lambda *args, **kwargs: "module.py")
+        other_holder = filelock.FileLock(
+            hf_transformers_patches._dynamic_module_cache_lock().lock_file
+        )
+        with other_holder, patch.object(
+            hf_transformers_patches, "_DYNAMIC_MODULE_LOCK_TIMEOUT_S", 0.1
+        ):
+            hf_transformers_patches._dynamic_module_locks.clear()
+            with self.assertRaises(filelock.Timeout):
+                wrapped("model", "module.py")
+
+    def test_patch_does_not_wrap_twice(self):
+        wrapped = self._install(lambda *args, **kwargs: "module.py")
+        hf_transformers_patches._patch_dynamic_module_cache_lock()
+        self.assertIs(self.dmu.get_cached_module_file, wrapped)
+
+
+# ---------------------------------------------------------------------------
 # compat: _patch_nemotron_h_pattern
 # ---------------------------------------------------------------------------
 

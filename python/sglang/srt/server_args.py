@@ -605,7 +605,9 @@ class ServerArgs:
                 'Data type for kv cache storage. "auto" will use model data type. '
                 '"bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and '
                 '"fp8_e4m3" are supported for CUDA 11.8+. "mxfp8" is supported '
-                'by the FA4 backend. "nvfp4" selects '
+                'by the FA4 backend. "mxint8" uses grouped INT8 storage with '
+                "a BF16 model and requires a compatible backend extension. "
+                '"nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
                 "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
@@ -615,6 +617,7 @@ class ServerArgs:
                 "fp8_e5m2",
                 "fp8_e4m3",
                 "mxfp8",
+                "mxint8",
                 "bf16",
                 "bfloat16",
                 "nvfp4",
@@ -2236,7 +2239,7 @@ class ServerArgs:
             "pool; the saving shows up as free device memory, so raise "
             "--mem-fraction-static to convert it into KV capacity. Default follows "
             "--kv-cache-dtype.",
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "mxint8", "bf16", "bfloat16"],
         ),
         NS("spec"),
     ] = None

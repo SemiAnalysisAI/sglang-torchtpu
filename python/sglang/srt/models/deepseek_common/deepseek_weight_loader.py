@@ -616,12 +616,13 @@ class DeepseekV2WeightLoaderMixin:
                         )
 
                     if (
-                        (_is_cuda or _is_musa or _is_xpu)
+                        (_is_cuda or _is_musa or _is_xpu or _is_tpu)
                         and weight_block_size[0] == 128
                         and weight_block_size[1] == 128
                     ):
                         if (
-                            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                            not _is_tpu
+                            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                             and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
                             and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
                         ):

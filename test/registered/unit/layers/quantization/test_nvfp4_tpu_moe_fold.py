@@ -21,7 +21,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
 
 BLOCK_SIZE = 512
-SUPPORTED_BLOCK_SIZES = (128, 256, BLOCK_SIZE)
+SUPPORTED_BLOCK_SIZES = (16, 32, 64, 128, 256, BLOCK_SIZE)
 EXPERTS = 2
 HIDDEN_SIZE = 512
 INTERMEDIATE_SIZE = 512
@@ -158,20 +158,29 @@ class TestNvfp4Block512Contract(CustomTestCase):
                     )
                     self.assertTrue(torch.equal(out, expected))
 
-    def test_rejects_block16(self):
+    def test_rejects_unsupported_blocks_even_with_fused_rs(self):
         from sglang.srt.hardware_backend.tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
         )
 
-        with self.assertRaisesRegex(NotImplementedError, "group_size in"):
-            prepare_tpu_nvfp4_moe_weights(_make_block512_layer(), group_size=16)
+        for group_size in (8, 96, 1024):
+            for use_fused_rs in (False, True):
+                with (
+                    self.subTest(group_size=group_size, use_fused_rs=use_fused_rs),
+                    self.assertRaisesRegex(NotImplementedError, "group_size in"),
+                ):
+                    prepare_tpu_nvfp4_moe_weights(
+                        _make_block512_layer(),
+                        group_size=group_size,
+                        use_fused_rs=use_fused_rs,
+                    )
 
     def test_sub512_rejects_stock_pallas_layout(self):
         from sglang.srt.hardware_backend.tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
         )
 
-        for group_size in (128, 256):
+        for group_size in (16, 32, 64, 128, 256):
             with (
                 self.subTest(group_size=group_size),
                 self.assertRaisesRegex(NotImplementedError, "requires the fused-RS"),
@@ -367,7 +376,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
             layer.allow_backend_reduction = False
             self.assertEqual(
                 unmet_tpu_nvfp4_fused_rs_requirements(
-                    layer, group_size=16, no_combine=True
+                    layer, group_size=8, no_combine=True
                 ),
                 [
                     f"group_size in {TPU_NVFP4_SUPPORTED_GROUP_SIZES}",
@@ -1089,7 +1098,7 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
 
         unsupported_tpu_config = (
             modelopt_quant.TpuModelOptCompatibleFp4Config.from_config(
-                self._checkpoint_config(group_size=16)
+                self._checkpoint_config(group_size=8)
             )
         )
         unsupported_hybrid = modelopt_quant.HybridFp8NvFp4Config(
@@ -1197,7 +1206,7 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
     def test_tpu_moe_rejects_unsupported_group_sizes(self):
         from sglang.srt.layers.quantization import modelopt_quant
 
-        for group_size in (16, 64, 1024, None):
+        for group_size in (8, 96, 1024, None):
             config = modelopt_quant.TpuModelOptCompatibleFp4Config(
                 is_checkpoint_nvfp4_serialized=True,
                 group_size=group_size,
@@ -1384,7 +1393,7 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         self.assertFalse(prepared["use_fused_rs"])
 
     def test_sub512_auto_backend_fails_closed_on_unsupported_layout(self):
-        for group_size in (128, 256):
+        for group_size in (16, 32, 64, 128, 256):
             with (
                 self.subTest(group_size=group_size),
                 self.assertRaisesRegex(ValueError, "requires the fused-RS"),

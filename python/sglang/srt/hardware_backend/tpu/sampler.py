@@ -109,8 +109,15 @@ def distributed_top_k_candidate_width(logits_processor, lm_head) -> Optional[int
         from sglang.srt.hardware_backend.tpu.distributed_topk_pallas import (
             register_pallas_distributed_top_k_op,
         )
+        from sglang.srt.hardware_backend.tpu.top_k import (
+            register_distributed_top_k_rank,
+        )
 
         register_pallas_distributed_top_k_op(config.world_size)
+        # Must happen here, not on the first forward: direct_compile lifts the
+        # model's buffers into graph inputs when it traces, and the kernel's
+        # rank operand has to be one of them.
+        register_distributed_top_k_rank(lm_head, group=group)
 
     # Publish only after consensus and registration both succeed. A transport
     # or export failure must remain fatal instead of becoming a local fallback.
@@ -312,7 +319,21 @@ def sample_from_global_top_k_logits(
             positions.unsqueeze(0) >= top_ks.unsqueeze(1), -torch.inf
         )
     global_top_k_probs = torch.softmax(global_top_k_logits / temperatures, dim=-1)
-    return sampling_from_probs_torch(global_top_k_probs)
+    return sampling_from_probs_torch(
+        global_top_k_probs, unseeded_sampling_fn=sample_exponential_race
+    )
+
+
+def sample_exponential_race(probs: torch.Tensor) -> torch.Tensor:
+    """Exact categorical draw per row as argmax(p_i / E_i), E_i ~ Exp(1).
+
+    Elementwise ops plus one reduce, so it stays inside the compiled graph;
+    ``torch.multinomial`` runs eagerly on TPU. All-zero rows return 0.
+    """
+    u = torch.rand_like(probs)
+    # -log(u) ~ Exp(1); clamp keeps u=0 from producing inf/nan.
+    e = torch.log(u.clamp_min(torch.finfo(probs.dtype).tiny)).neg_()
+    return torch.argmax(probs / e, dim=-1).to(torch.int32)
 
 
 class TpuSampler(Sampler):
@@ -373,6 +394,7 @@ class TpuSampler(Sampler):
                 probs,
                 sampling_seed=sampling_info.sampling_seed,
                 positions=positions,
+                unseeded_sampling_fn=sample_exponential_race,
             )
         top_k = sampling_info.uniform_top_k
         needs_top_p_or_min_p = (
@@ -394,7 +416,9 @@ class TpuSampler(Sampler):
                 global_top_k_probs = _filter_gathered_top_k_probs(
                     global_top_k_probs, sampling_info
                 )
-            sampled_top_k_position = sampling_from_probs_torch(global_top_k_probs)
+            sampled_top_k_position = sampling_from_probs_torch(
+                global_top_k_probs, unseeded_sampling_fn=sample_exponential_race
+            )
             return torch.gather(
                 global_top_k_token_ids,
                 dim=1,
@@ -404,8 +428,7 @@ class TpuSampler(Sampler):
         if sampling_info.sampling_seed is None and _use_bsearch_filtering(probs):
             # Sort-free path: the torch fallback below needs a full-vocab sort
             # plus boolean-mask scatters, which run eagerly on TPU at ~415 ms
-            # per decode step. The binary-search mask is one compiled program;
-            # the remaining multinomial is the cheap tier-2 op.
+            # per decode step. The binary-search mask is one compiled program.
             from sglang.srt.hardware_backend.tpu.sampling_mask import tpu_filter_probs
 
             filtered_probs = tpu_filter_probs(
@@ -417,7 +440,7 @@ class TpuSampler(Sampler):
                 need_top_p=sampling_info.need_top_p_sampling,
                 need_min_p=sampling_info.need_min_p_sampling,
             )
-            return sampling_from_probs_torch(filtered_probs)
+            return sample_exponential_race(filtered_probs)
 
         # Seeded (deterministic) sampling keeps the sort-based reference path.
         return top_k_top_p_min_p_sampling_from_probs_torch(

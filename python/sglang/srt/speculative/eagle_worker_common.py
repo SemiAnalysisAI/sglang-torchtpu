@@ -11,6 +11,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -28,7 +29,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_tpu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -38,6 +39,14 @@ from sglang.srt.utils.common import is_npu
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
+
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+        device_accept_verify_cache_locs_tpu,
+        draft_extend_positions_tpu,
+        prepare_draft_cache_locs_tpu,
+    )
 
 if _is_cpu:
     from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
@@ -51,23 +60,6 @@ if TYPE_CHECKING:
         EAGLEDraftCudaGraphRunner,
     )
     from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-
-
-def _select_verify_bookkeeping_seq_lens(
-    batch: Any, verify_padding: Any
-) -> torch.Tensor:
-    """Use the scheduler-logical empty tensor for a padded idle DP rank.
-
-    TPU hybrid-DP verification temporarily widens an idle rank to its peer's
-    physical request width so sampling sees the padded target logits. Sampling
-    itself intentionally returns empty tensors on that logical idle rank. Keep
-    bookkeeping on the original empty ``seq_lens`` tensor; otherwise the fused
-    bookkeeping op sees a padded sequence row paired with an empty prediction
-    tensor and attempts an un-warmed zero-width recompile.
-    """
-    if verify_padding is not None and verify_padding.state.logical_batch_size == 0:
-        return verify_padding.seq_lens
-    return batch.seq_lens
 
 
 def duplicate_prefix_tail_to_draft_branches(
@@ -138,8 +130,9 @@ def prepare_for_draft_extend(
     front_offset = num_front_tokens if widen else 0
     num_window_tokens = num_draft_tokens + front_offset
     extend_num_tokens = bs * num_window_tokens
-    # When seq_lens_cpu is absent, stay on GPU-only path -- no .tolist()/.cpu().
-    gpu_only = batch.seq_lens_cpu is None
+    # If seq_lens has no host copy, keep length arithmetic on the device
+    # to avoid a device-to-host sync, regardless of accelerator type.
+    device_lens_only = batch.seq_lens_cpu is None
 
     batch.spec_info = draft_extend_input
     # Do NOT cast predict dtype here. The caller (e.g., _draft_extend_for_decode)
@@ -161,15 +154,18 @@ def prepare_for_draft_extend(
             )
     else:
         batch.input_ids = predict
+        if _is_tpu and not batch.forward_mode.is_idle():
+            draft_extend_input.positions = draft_extend_positions_tpu(
+                batch.seq_lens, num_window_tokens
+            )
     maybe_detect_oob(
         batch.input_ids,
         0,
         batch.model_config.vocab_size,
         "v2 prepare_for_draft_extend input_ids",
     )
-    # init_new requires both list or both Tensor;
-    # gpu_only emits device tensors to skip H2D.
-    if gpu_only:
+    # init_new requires prefix_lens and extend_lens to be both lists or both tensors.
+    if device_lens_only:
         batch.prefix_lens = (batch.seq_lens - front_offset).clamp(min=0).to(torch.int32)
         batch.extend_lens = torch.full(
             (bs,), num_window_tokens, dtype=torch.int32, device=batch.seq_lens.device
@@ -196,18 +192,18 @@ def prepare_for_draft_extend(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=return_hidden_states_before_norm,
     )
+    if device_lens_only and not forward_batch.forward_mode.is_idle():
+        # The query width is known without reading seq_lens back from the device.
+        # Set active-rank counts here; normalization below supplies idle-rank counts.
+        forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
     # Normalize idle DP ranks before the shared sequence-length update.
     draft_model_runner.compile_policy.normalize_spec_forward_batch(forward_batch)
     # Forward sees post-write length (draft extend writes num_draft_tokens
     # slots); mutation stays on forward_batch to preserve SB.seq_lens.
     forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
-    if not gpu_only:
+    if not device_lens_only:
         forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
         forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
-    else:
-        # Supply CPU mirror (extend_seq_lens are all num_window_tokens) so
-        # backend max() reads from list without a per-iter D2H sync.
-        forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
     draft_model_runner.compile_policy.prepare_spec_forward_batch(forward_batch)
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
@@ -243,7 +239,17 @@ def prepare_for_draft(
 
         # Assign cache locations (draft-write targets).
         page_size = batch.token_to_kv_pool_allocator.page_size
-        if page_size == 1 or topk == 1:
+        if _is_tpu and prepare_draft_cache_locs_tpu(
+            batch,
+            draft_input,
+            bs=bs,
+            topk=topk,
+            num_steps=num_steps,
+            num_verify_tokens=get_spec().speculative_num_draft_tokens,
+            host_resident=req_to_token_pool.host_resident,
+        ):
+            pass
+        elif page_size == 1 or topk == 1:
             batch.out_cache_loc = torch.empty(
                 (bs * topk * num_steps,),
                 dtype=torch.int64,
@@ -420,7 +426,7 @@ def build_eagle_verify_input(
             fill_prefix_mask=fill_mask,
         )
 
-    return EagleVerifyInput(
+    verify_input = EagleVerifyInput(
         draft_token=draft_tokens,
         custom_mask=tree_mask,
         positions=position,
@@ -436,6 +442,14 @@ def build_eagle_verify_input(
         seq_lens_cpu=None,
         draft_probs=draft_probs,
     )
+
+    if _is_tpu:
+        verify_input.device_accept_cache_locs = device_accept_verify_cache_locs_tpu(
+            draft_input,
+            bs=batch.seq_lens.shape[0],
+            num_verify_tokens=num_draft_tokens,
+        )
+    return verify_input
 
 
 def _finalize_accept_tree_path(
@@ -631,8 +645,10 @@ def run_eagle_verify(
     try:
         verify_result = eagle_sample(verify_input, batch, logits_output, grammar_mask)
         post_predict, post_accept_lens, post_accept_index = verify_result
+        # Sampling and bookkeeping must use the same physical rows, including
+        # padded idle DP peers. finalize_spec_verify restores the logical batch.
         verify_bookkeeping_result = verify_bookkeeping_func(
-            _select_verify_bookkeeping_seq_lens(batch, verify_padding),
+            batch.seq_lens,
             post_accept_lens,
             post_predict,
             post_accept_index,
@@ -691,6 +707,8 @@ def run_eagle_verify(
         )
 
     next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
+    if _is_tpu:
+        next_draft_input.accept_lens_device = accept_lens
 
     # verify_forward_batch transitively holds verify-time GPU tensors
     # (draft_token / out_cache_loc / ...) that must outlive the imminent

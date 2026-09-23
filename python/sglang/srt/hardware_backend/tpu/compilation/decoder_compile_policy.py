@@ -1344,7 +1344,9 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 f"extend batch cap {self._extend_compile_cap()}."
             )
 
-        variants = self._extend_input_variants()
+        # "text_ids" warms positional token-ID calls used by text-only serving,
+        # in addition to the input_embeds calls used by multimodal serving.
+        variants = (*self._extend_input_variants(), "text_ids")
 
         compile_items = [
             (num_tokens, bs, mode, variant, logits_output_mode)
@@ -1354,10 +1356,11 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         ]
         logger.info(
             "[decoder compile policy] VL EXTEND: %d graph variants "
-            "(batch_caps=%s, token_buckets=%s)",
+            "(batch_caps=%s, token_buckets=%s, variants=%s)",
             len(compile_items),
             sorted({(mode.name, batch_size) for _, batch_size, mode in compile_cases}),
             list(self.t_bucketer.buckets),
+            variants,
         )
         compile_range = (
             tqdm.tqdm(
@@ -1430,15 +1433,20 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
         assert self.b_bucketer is not None
 
+        bs_buckets = list(self.b_bucketer.buckets)
+        # (bs, variant, logits_output_mode): warm the embeds convention VL
+        # requests use and the positional one text-only serving actually
+        # takes (mirrors the base policy).
         compile_items = [
-            (bs, logits_output_mode)
-            for bs in self.b_bucketer.buckets
+            (bs, variant, logits_output_mode)
+            for bs in bs_buckets
+            for variant in ("text_only", "text_ids")
             for logits_output_mode in self._warmup_logits_output_modes(bs)
         ]
         logger.info(
             "[decoder compile policy] VL DECODE: %d graph variants (bs=%s)",
             len(compile_items),
-            list(self.b_bucketer.buckets),
+            bs_buckets,
         )
         compile_range = (
             tqdm.tqdm(
@@ -1449,14 +1457,14 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             if get_parallel().tp_rank == 0
             else compile_items
         )
-        for bs, logits_output_mode in compile_range:
+        for bs, variant, logits_output_mode in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             self._run_one(
                 num_tokens=bs,
                 bs=bs,
                 mode=ForwardMode.DECODE,
-                variant="text_only",
+                variant=variant,
                 logits_output_mode=logits_output_mode,
             )
             if get_parallel().tp_rank == 0:
@@ -1464,7 +1472,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
-                    f"Compiled VL DECODE (bs={bs}, "
+                    f"Compiled VL DECODE (bs={bs}, variant={variant}, "
                     f"logits={logits_output_mode.name}) in {elapsed:.1f}s{hbm_str}"
                 )
 
@@ -1478,12 +1486,12 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
         spec_info: Any | None = None,
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-        if not self._uses_input_embeds(self.owner):
+        if variant == "text_ids" or not self._uses_input_embeds(self.owner):
             return super()._make_warmup_inputs(
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=mode,
-                variant=variant,
+                variant="plain" if variant == "text_ids" else variant,
                 capture_hidden_mode=capture_hidden_mode,
                 spec_info=spec_info,
             )

@@ -40,11 +40,14 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.host_metadata_cache import HostMetadataCache
 from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.speculative.spec_info import SpecInputType
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -97,6 +100,9 @@ class PallasForwardMetadata:
     active_num_tokens: torch.Tensor
     # i32[max_num_seqs * pages_per_seq]  page indices
     swa_page_indices: torch.Tensor | None = None
+    # Static query rows per DECODE sequence for this forward (1 = ordinary
+    # decode); above 1 the active rows take the kernel's DECODE range.
+    decode_query_size: int = 1
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
@@ -106,6 +112,16 @@ def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch
     # [new_bs + 1] even though the scalar's logical shape remains unchanged.
     # Compiler-level tracking: https://github.com/sgl-project/sglang-torchtpu/issues/565
     return cu_q_lens[non_empty_bs].clone()
+
+
+def _is_fixed_width_eagle_refresh(forward_batch) -> bool:
+    spec_info = forward_batch.spec_info
+    return (
+        forward_batch.forward_mode.is_draft_extend_v2()
+        and spec_info is not None
+        and spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT_EXTEND
+        and spec_info.num_tokens_per_req > 0
+    )
 
 
 def _zero_inactive_rpa_rows(
@@ -146,6 +162,7 @@ class InvokeKernelFn(Protocol):
         soft_cap,
         k_scale,
         v_scale,
+        decode_query_size: int = 1,
     ) -> tuple: ...
 
 
@@ -180,6 +197,10 @@ class RpaKernelSpec:
     # Minimum KV page/block size the kernel needs (None = no floor). Consumed by
     # the TPU platform's page-size defaulting, not by this module.
     min_page_size: int | None = None
+    # Whether the kernel's DECODE range accepts ``decode_query_size`` query rows
+    # per sequence, so fixed-width target verification and decode-phase draft
+    # extension run as decode.
+    supports_decode_query_size: bool = False
 
 
 # torch custom ops are process-global; cache one per op_name so repeated backend
@@ -203,6 +224,21 @@ def _quantize_kv_to_fp8(
     scaled = t.to(torch.float32) / scale
     scaled = torch.clamp(scaled, finfo.min, finfo.max)
     return scaled.to(fp8_dtype)
+
+
+def _resolve_decode_query_size(
+    *, supports_decode_query_size: bool, spec_enabled: bool
+) -> int:
+    """Static query rows per DECODE sequence for one backend instance.
+
+    With speculative decoding both fixed-width phases carry this many query
+    rows per request: the target's verification and the draft's extension
+    over the verified window. Without it every phase is single-token decode
+    or ragged extend.
+    """
+    if not supports_decode_query_size or not spec_enabled:
+        return 1
+    return get_spec().speculative_num_draft_tokens or 1
 
 
 def _build_pallas_kernel_op(spec: RpaKernelSpec):
@@ -241,6 +277,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         soft_cap: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
+        decode_query_size: int = 1,
     ) -> tuple[jax.Array, jax.Array]:
         if not spec.supports_attention_sink and attention_sink is not None:
             raise NotImplementedError(f"{op_name} does not support attention sinks")
@@ -265,14 +302,16 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
             soft_cap=soft_cap,
             k_scale=k_scale,
             v_scale=v_scale,
+            decode_query_size=decode_query_size,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
         # Static (non-traced) args by _wrapped position: 10=sm_scale,
-        # 11=sliding_window, 12=soft_cap, 13=k_scale, 14=v_scale.
-        static_argnums=(10, 11, 12, 13, 14),
+        # 11=sliding_window, 12=soft_cap, 13=k_scale, 14=v_scale,
+        # 15=decode_query_size.
+        static_argnums=(10, 11, 12, 13, 14, 15),
         donate_argnums=(3,),
         input_output_aliases={3: 1},
         warn_deprecated=False,
@@ -299,6 +338,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         soft_cap: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
+        decode_query_size: int = 1,
     ) -> torch.Tensor:
         with tpu_info_for_cpu_export():
             output, _updated_kv = jax_kernel(
@@ -317,6 +357,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
                 soft_cap,
                 k_scale,
                 v_scale,
+                decode_query_size,
             )
         return output
 
@@ -363,6 +404,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             )
         super().__init__()
         self.device = model_runner.device
+        self._host_metadata_cache = (
+            HostMetadataCache()
+            if envs.SGLANG_TPU_ENABLE_ATTN_METADATA_CACHE.get()
+            else None
+        )
         self.speculative_step_id = speculative_step_id
         self.page_size = model_runner.page_size
         self.max_context_len = (
@@ -408,6 +454,15 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
         self.kv_cache_quant_dtype: torch.dtype | None = (
             kv_cache_dtype if kv_cache_dtype in fp8_dtypes else None
+        )
+
+        # Query rows per DECODE sequence. Target verification and the draft's
+        # decode-phase extension both carry a fixed number of draft tokens per
+        # request and run on the decode schedule; non-speculative servers keep
+        # single-token decode.
+        self.decode_query_size = _resolve_decode_query_size(
+            supports_decode_query_size=self.kernel_spec.supports_decode_query_size,
+            spec_enabled=not model_runner.spec_algorithm.is_none(),
         )
 
         self.forward_metadata: PallasForwardMetadata | None = None
@@ -491,6 +546,26 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             )
         return live
 
+    def _forward_decode_query_size(self, forward_batch: ForwardBatch) -> int:
+        """Static DECODE query width for this forward, or 1.
+
+        The kernel's decode loop bounds are static, so the width the batch
+        carries has to be the one this backend was built for. Target
+        verification publishes it on ``spec_info``; the draft's decode-phase
+        extension carries it as a uniform ``extend_seq_lens``. A widened DP
+        window or the ragged prompt-phase extension stays on MIXED.
+        """
+        width = self.decode_query_size
+        if width == 1:
+            return 1
+        mode = forward_batch.forward_mode
+        if mode.is_target_verify():
+            return width if forward_batch.spec_info.num_tokens_per_req == width else 1
+        if self._is_draft_extend(mode):
+            lens = forward_batch.extend_seq_lens_cpu
+            return width if lens and all(n == width for n in lens) else 1
+        return 1
+
     def _get_cached_rpa_distribution(
         self, is_decode: bool, non_empty_bs: int, device
     ) -> torch.Tensor:
@@ -545,8 +620,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         """
         page_size = self.page_size
         device = forward_batch.seq_lens.device
+        decode_query_size = self._forward_decode_query_size(forward_batch)
         distribution = self._get_cached_rpa_distribution(
-            forward_batch.forward_mode.is_decode(), non_empty_bs, device
+            forward_batch.forward_mode.is_decode() or decode_query_size > 1,
+            non_empty_bs,
+            device,
         )
         bs = int(forward_batch.seq_lens.shape[0])
         req_to_token = self.req_to_token_pool.req_to_token
@@ -565,6 +643,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 pages_per_seq,
                 distribution,
                 non_empty_bs,
+                decode_query_size,
             )
 
         # -------------------------------------------------------------- #
@@ -669,7 +748,56 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             distribution=distribution,
             active_num_tokens=_make_active_num_tokens(cu_q_lens, non_empty_bs),
             swa_page_indices=swa_page_indices,
+            decode_query_size=decode_query_size,
         )
+
+    def _get_query_metadata(
+        self,
+        *,
+        bs: int,
+        kv_stride: int,
+        non_empty_bs: int,
+        device,
+        query_width: int | None = None,
+        query_lens: tuple[int, ...] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Device offsets for one fixed ``query_width`` or per-row ``query_lens``."""
+        assert (query_width is None) != (query_lens is None)
+        if query_width is not None:
+            # Decode uses one token per row; target verify uses query_width.
+            # Padded rows have the same width, so (bs, query_width) fixes the offsets.
+            cu_q_lens = self._layout_metadata(
+                key=("cu_q_lens", bs, query_width),
+                build=lambda: torch.arange(bs + 1, dtype=torch.int32) * query_width,
+                device=device,
+            )
+            active_tokens = non_empty_bs * query_width
+        else:
+            # Extend query lengths can differ across requests, even at the same bs.
+            # Include padded rows in the offsets, but exclude them from active_tokens.
+            assert len(query_lens) == bs
+            cu_q_lens_cpu = torch.zeros(bs + 1, dtype=torch.int32)
+            cu_q_lens_cpu[1:] = torch.cumsum(
+                torch.tensor(query_lens, dtype=torch.int32), dim=0, dtype=torch.int32
+            )
+            # One value slot, so varying prefills cannot grow the cache.
+            cu_q_lens = self._value_metadata(
+                name="cu_q_lens", value=cu_q_lens_cpu, device=device
+            )
+            active_tokens = sum(query_lens[:non_empty_bs])
+        cu_kv_lens = self._layout_metadata(
+            key=("cu_kv_lens", bs, kv_stride),
+            build=lambda: torch.arange(bs + 1, dtype=torch.int32) * kv_stride,
+            device=device,
+        )
+        # Own the scalar's storage so its compiled input layout stays the same
+        # across batch sizes (see _make_active_num_tokens).
+        active_num_tokens = self._layout_metadata(
+            key=("active_num_tokens", active_tokens),
+            build=lambda: torch.tensor(active_tokens, dtype=torch.int32),
+            device=device,
+        )
+        return cu_q_lens, cu_kv_lens, active_num_tokens
 
     def _build_metadata_host(
         self,
@@ -681,25 +809,27 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         pages_per_seq,
         distribution: torch.Tensor,
         non_empty_bs: int,
+        decode_query_size: int = 1,
     ) -> PallasForwardMetadata:
-        """Host-resident metadata build (gated in ``_build_metadata``).
+        """Build metadata on the CPU and reuse cached device copies when possible.
 
-        req_to_token is on CPU, so page_indices / cu-lens are built with
-        torch-CPU ops (never traced -> no per-shape recompile) and H2D'd once.
-        kv_lens stays on device; ``distribution`` is the caller's cached buffer.
+        CPU operations stay outside tracing, avoiding shape-specific recompiles.
+        kv_lens stays on device; distribution is the caller's cached buffer.
         """
         kv_len_bump = 0
+        query_width = None
+        query_lens = None
         if forward_batch.forward_mode.is_target_verify():
             assert forward_batch.spec_info is not None
             verify_width = forward_batch.spec_info.num_tokens_per_req
             kv_len_bump = verify_width
             kv_lens = (forward_batch.seq_lens + verify_width).to(torch.int32)
-            extend_seq_lens = torch.full((bs,), verify_width, dtype=torch.int32)
+            query_width = verify_width
         elif self._is_extend_including_draft(forward_batch.forward_mode):
             # EXTEND and DRAFT_EXTEND use current lengths.
             assert forward_batch.extend_seq_lens is not None
             kv_lens = forward_batch.seq_lens.to(torch.int32)
-            extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
+            query_lens = self._extend_query_lens(forward_batch, bs)
         else:
             kv_lens = forward_batch.seq_lens.to(torch.int32)
             if (
@@ -711,7 +841,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 # entries from prior draft steps.
                 kv_len_bump = self.speculative_step_id + 1
                 kv_lens = kv_lens + kv_len_bump
-            extend_seq_lens = torch.ones(bs, dtype=torch.int32)
+            query_width = 1
 
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is not None and bs > 0:
@@ -736,10 +866,13 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         assert req_pool_indices.shape[0] == bs
         req_pool_indices = req_pool_indices.to(torch.int64)
 
-        cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32)
-        cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
-        cu_kv_lens = torch.arange(bs + 1, dtype=torch.int32) * (
-            pages_per_seq * page_size
+        cu_q_lens, cu_kv_lens, active_num_tokens = self._get_query_metadata(
+            bs=bs,
+            kv_stride=pages_per_seq * page_size,
+            non_empty_bs=non_empty_bs,
+            device=device,
+            query_width=query_width,
+            query_lens=query_lens,
         )
 
         # Gather only the strided page-slot columns [bs, pages_per_seq] (one
@@ -755,12 +888,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         page_indices = (per_seq // page_size).to(torch.int32)
         page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
 
-        # Hybrid-SWA: translate full-pool pages to SWA-pool pages. The host path
-        # gates only on req_to_token residency, so this must mirror the device
-        # path or SWA layers would address the full pool.
-        # full_to_swa_index_mapping is host-resident (CPU) on TPU, so do the
-        # lookup here on the CPU page_indices and H2D the result once — keeping
-        # this builder free of on-device gathers.
+        # Sliding-window attention uses a separate KV pool. Translate full-pool
+        # page indices through the CPU mapping before uploading or reusing them.
         swa_page_indices: torch.Tensor | None = None
         if self._is_hybrid_swa:
             full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping
@@ -768,28 +897,57 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 "Hybrid-SWA model is configured but full_to_swa_index_mapping "
                 "has not been registered yet — did the allocator finish init?"
             )
-            # First token index of each full-pool page (page_indices * page_size).
-            # page_indices and full_to_swa are both CPU here, so gather on CPU and
-            # H2D the small int32 result once.
+            # The mapping uses token slots, so look up each page's first token.
             full_token_starts = page_indices.to(torch.int64) * page_size
-            swa_page_indices = (
-                (full_to_swa[full_token_starts] // page_size)
-                .to(torch.int32)
-                .to(device, non_blocking=True)
+            swa_page_indices = self._value_metadata(
+                name="swa_page_indices",
+                value=(full_to_swa[full_token_starts] // page_size).to(torch.int32),
+                device=device,
             )
 
-        # H2D for host-built cu-lens / page_indices; kv_lens already on device,
-        # distribution is the caller's cached buffer.
-        cu_q_lens = cu_q_lens.to(device, non_blocking=True)
+        # Page tables change with KV growth, so they are value-checked.
         return PallasForwardMetadata(
             kv_lens=kv_lens,
             cu_q_lens=cu_q_lens,
-            cu_kv_lens=cu_kv_lens.to(device, non_blocking=True),
-            page_indices=page_indices.to(device, non_blocking=True),
+            cu_kv_lens=cu_kv_lens,
+            page_indices=self._value_metadata(
+                name="page_indices", value=page_indices, device=device
+            ),
             distribution=distribution,
-            active_num_tokens=_make_active_num_tokens(cu_q_lens, non_empty_bs),
+            active_num_tokens=active_num_tokens,
             swa_page_indices=swa_page_indices,
+            decode_query_size=decode_query_size,
         )
+
+    def _extend_query_lens(self, forward_batch, bs: int) -> tuple[int, ...]:
+        """Per-request query lengths, read from the host mirror when complete."""
+        host_lens = forward_batch.extend_seq_lens_cpu
+        if isinstance(host_lens, torch.Tensor):
+            assert host_lens.device.type == "cpu"
+            host_lens = host_lens.tolist() if host_lens.dim() == 1 else None
+        if not envs.SGLANG_TPU_ENABLE_HOST_QUERY_LENS.get():
+            host_lens = None
+        elif _is_fixed_width_eagle_refresh(forward_batch):
+            # prepare_for_draft_extend supplies these counts; padding keeps them
+            # complete. Missing entries indicate a producer or padding bug.
+            assert forward_batch.extend_seq_lens.shape == (bs,)
+            assert host_lens is not None and len(host_lens) == bs
+        if host_lens is None or len(host_lens) != bs:
+            # Padding clears incomplete mirrors instead of inventing counts.
+            host_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32).tolist()
+        return tuple(host_lens)
+
+    def _layout_metadata(self, *, key, build, device) -> torch.Tensor:
+        cache = self._host_metadata_cache
+        if cache is None:
+            return build().to(device, non_blocking=True)
+        return cache.get_by_layout(key=key, build=build, device=device)
+
+    def _value_metadata(self, *, name, value, device) -> torch.Tensor:
+        cache = self._host_metadata_cache
+        if cache is None:
+            return value.to(device, non_blocking=True)
+        return cache.get_by_value(name=name, value=value, device=device)
 
     # ------------------------------------------------------------------ #
     # Forward
@@ -915,6 +1073,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             soft_cap,
             k_scale,
             v_scale,
+            self.forward_metadata.decode_query_size,
         )
 
         capture_mode = getattr(forward_batch, "capture_hidden_mode", None)

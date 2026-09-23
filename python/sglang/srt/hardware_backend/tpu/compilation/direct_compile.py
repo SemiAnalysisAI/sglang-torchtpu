@@ -133,6 +133,7 @@ def direct_compile(
     model_extra_tensor_attrs: Sequence[str] = (),
     kv_pool: KVPool | None = None,
     ignored_argnames: tuple[str, ...] = (),
+    prune_unused_inputs: bool = True,
 ) -> CompiledFunction:
     """Compile and dispatch ``fn`` directly, without torch.compile's
     Dynamo or AOTAutograd.
@@ -173,6 +174,12 @@ def direct_compile(
     `direct_compile` assumes that the values of Tensors on the model do not
     change during inference.
 
+    `prune_unused_inputs` excludes model tensors unused by a specialization
+    from its executable and runtime arguments. Set it to False to retain all
+    model tensors and skip pruning's MLIR inspection and extra lowerings.
+    This option is fixed when constructing the compiled function; explicit
+    function inputs and KV-pool state are never pruned.
+
     `kv_pool` exposes every KV-cache Tensor through `get_state`; all of
     them are assumed to be mutated during inference and are copied back
     after execution. The KV pool is the only mutable input.
@@ -208,6 +215,7 @@ def direct_compile(
         model_extra_tensor_attrs=model_extra_tensor_attrs,
         kv_pool=kv_pool,
         ignored_argnames=ignored_argnames,
+        prune_unused_inputs=prune_unused_inputs,
     )
     return functools.update_wrapper(compiled, fn)
 
@@ -228,6 +236,7 @@ class CompiledFunction:
         model_extra_tensor_attrs: Sequence[str] = (),
         kv_pool: KVPool | None = None,
         ignored_argnames: tuple[str, ...] = (),
+        prune_unused_inputs: bool = True,
     ) -> None:
         self.fn = fn
         self.specialization_key = specialization_key
@@ -243,6 +252,7 @@ class CompiledFunction:
             raise ValueError("model_extra_tensor_attrs contains duplicate paths")
         self._kv_pool = kv_pool
         self._ignored_argnames = ignored_argnames
+        self._prune_unused_inputs = prune_unused_inputs
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         key = self.specialization_key(*args, **kwargs)
@@ -347,7 +357,8 @@ class CompiledFunction:
         # Clone mutated KV inputs; XLA will optimize these away.
         # The strategy for these is that during runtime, we will copy_ the
         # updated values back into the original Tensors. copy_ doesn't launch a
-        # kernel, it just swizzles some metadata around.
+        # kernel, it just swizzles some metadata around (the KV pool buffers
+        # are base tensors of their storage dtype; see kv_pool._zeros_kv_buffer).
         for input_index in range(kv_pool_input_start, kv_pool_input_stop):
             trace_inputs[input_index] = graph_inputs[input_index].clone()
         kv_pool_trace_inputs = trace_inputs[kv_pool_input_start:kv_pool_input_stop]
@@ -360,7 +371,9 @@ class CompiledFunction:
         # placeholders. The goal is to get a flat list of output Tensors.
         with (
             dynamo_timed("direct_compile_trace"),
-            execution_mode.set_eager_mode(execution_mode.EagerMode.INTERNAL_DEFER_ALL),
+            execution_mode.set_eager_mode(
+                execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
+            ),
             ExitStack() as stack,
         ):
             # Respect torch.compiler.is_compiling() during tracing by returning True.
@@ -421,6 +434,27 @@ class CompiledFunction:
                 "direct_compile requires TPU tensor outputs or KV-pool mutations"
             )
 
+        if self._prune_unused_inputs:
+            # Only immutable model state can be dropped. Keep every explicit input
+            # (and its runtime shape check), KV input/output, and callback output.
+            # Compute liveness after collecting all three kinds of graph roots.
+            with dynamo_timed("direct_compile_prune_model_inputs"):
+                live_model_indices = _live_model_input_indices(
+                    result_tensors, graph_inputs, model_input_count
+                )
+            retained_indices = (
+                *live_model_indices,
+                *range(model_input_count, len(graph_inputs)),
+            )
+            model_inputs = [model_inputs[index] for index in live_model_indices]
+            graph_inputs = [graph_inputs[index] for index in retained_indices]
+            flat_inputs = [flat_inputs[index] for index in retained_indices]
+            logger.info(
+                "[direct_compile] retained %d/%d model inputs",
+                len(model_inputs),
+                model_input_count,
+            )
+
         # Step 4: Finish lowering to MLIR, then compile it.
         logger.info(
             "[direct_compile] lowering %d inputs, %d outputs, %d mutations, "
@@ -431,8 +465,15 @@ class CompiledFunction:
             len(inserted_callbacks),
         )
         with dynamo_timed("direct_compile_traverse_and_compile"):
+            # Placeholders do not retain the physical layout of their buffers.
+            argument_layouts = []
+            for tensor in flat_inputs:
+                layout = None
+                if tensor.device.type == "tpu":
+                    layout = tpu_torch_compile.get_device_layout_if_materialized(tensor)
+                argument_layouts.append(layout[0] if layout is not None else [])
             compile_result = tpu_torch_compile.traverse_and_compile(
-                result_tensors, graph_inputs
+                result_tensors, graph_inputs, argument_layouts=argument_layouts
             )
         logger.info("[direct_compile] compilation finished")
         return _CompiledArtifact(
@@ -508,6 +549,65 @@ class _CompiledArtifact:
         return tree_util.tree_unflatten(
             self.output_treespec, outputs[: self.output_count]
         )
+
+
+def _live_model_input_indices(
+    result_tensors: list[torch.Tensor],
+    graph_inputs: list[torch.Tensor],
+    model_input_count: int,
+) -> tuple[int, ...]:
+    """Find model arguments used by the deferred graph, once per specialization.
+
+    TorchTPU's traversal accepts a superset of the graph's inputs, retaining
+    unused model weights/buffers as executable arguments. Its MLIR exporter
+    preserves that argument order, so argument uses identify pruning candidates.
+    Validate those candidates against the original deferred graph: lowering can
+    discard operands that traversal still requires. Recompile through the normal
+    compile cache; neither the model computation nor the MLIR is rewritten.
+    """
+    if model_input_count == 0:
+        return ()
+
+    from jax._src.interpreters import mlir
+    from jaxlib.mlir import ir
+
+    lowered = tpu_torch_compile.build_mlir(result_tensors, graph_inputs)
+    bytecode = tpu_torch_compile.serialize_mlir_bytecode(lowered)
+    del lowered
+    with mlir.make_ir_context():
+        module = ir.Module.parse(bytecode)
+        entry = ir.SymbolTable(module.operation)["main"]
+        arguments = entry.regions[0].blocks[0].arguments
+        if len(arguments) != len(graph_inputs):
+            raise RuntimeError(
+                "TorchTPU MLIR input count changed during model-input pruning: "
+                f"expected {len(graph_inputs)}, got {len(arguments)}"
+            )
+        live_model_indices = tuple(
+            index for index in range(model_input_count) if any(arguments[index].uses)
+        )
+
+    if len(live_model_indices) == model_input_count:
+        return live_model_indices
+
+    compact_inputs = [graph_inputs[index] for index in live_model_indices]
+    compact_inputs.extend(graph_inputs[model_input_count:])
+    try:
+        # For example, integer isnan lowers to a constant but its deferred node
+        # still references the integer input. Validate before traverse_and_compile,
+        # whose argument validation can abort the process on a missing dependency.
+        lowered = tpu_torch_compile.build_mlir(result_tensors, compact_inputs)
+    except RuntimeError as error:
+        if "identified an argument that was not provided" not in str(error):
+            raise
+        logger.info(
+            "[direct_compile] retaining all %d model inputs: deferred traversal "
+            "requires an input discarded by MLIR lowering",
+            model_input_count,
+        )
+        return tuple(range(model_input_count))
+    del lowered
+    return live_model_indices
 
 
 def _get_path(value: Any, path: tree_util.KeyPath) -> Any:

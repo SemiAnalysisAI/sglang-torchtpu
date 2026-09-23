@@ -30,6 +30,19 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang.srt.environ import envs
+
+_FP32_MOE_SCALES = envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.get()
+
+
+def _scale_quantized_partial(partial, lhs_scale, rhs_scale, *, scales_dtype):
+    """Apply scales without changing dot-result rounding or accumulator dtype."""
+    scaled = partial.astype(scales_dtype) * lhs_scale.astype(scales_dtype)
+    if rhs_scale is not None:
+        scaled = scaled * rhs_scale.astype(scales_dtype)
+    return scaled.astype(partial.dtype)
+
+
 # Util.
 
 
@@ -551,19 +564,23 @@ def inner_kernel(
                         preferred_element_type=preferred_element_type,
                     ).astype(acc_ref.dtype)
 
-                    block_acc *= block_scale.astype(acc_ref.dtype)
-
+                    rhs_scale = None
                     # Apply rhs subchannel scale per quant block.
                     if cfgs.rhs_cfgs.has_scale:
                         b_id = start_k // cfgs.rhs_cfgs.quant_block_size
                         rhs_scale_slice = tiled_rhs_ref.get_scale(
                             b_id, cfgs.rhs_cfgs.scale_block_n
                         )
-                        block_acc *= rhs_scale_slice[..., start_n:end_n].astype(
-                            acc_ref.dtype
-                        )
+                        rhs_scale = rhs_scale_slice[..., start_n:end_n]
 
-                    acc_n += block_acc
+                    acc_n += _scale_quantized_partial(
+                        block_acc,
+                        block_scale,
+                        rhs_scale,
+                        scales_dtype=(
+                            jnp.float32 if _FP32_MOE_SCALES else acc_ref.dtype
+                        ),
+                    )
                 acc_list.append(acc_n)
             acc = jnp.concatenate(acc_list, axis=1)
 
