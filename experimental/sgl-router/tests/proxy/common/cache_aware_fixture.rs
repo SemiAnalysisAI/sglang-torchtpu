@@ -31,6 +31,7 @@ pub fn config() -> Config {
             decode_policy: Default::default(),
             bucket_config: None,
             circuit_breaker: None,
+            prefix_hash: None,
             cache_aware: Some(CacheAwareConfig::default()),
             affinity: None,
             sticky: None,

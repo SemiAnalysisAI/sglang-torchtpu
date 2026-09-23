@@ -36,6 +36,7 @@ async fn forwards_whitelisted_headers_strips_others() {
             decode_policy: Default::default(),
             bucket_config: None,
             circuit_breaker: None,
+            prefix_hash: None,
             cache_aware: None,
             sticky: None,
             affinity: None,

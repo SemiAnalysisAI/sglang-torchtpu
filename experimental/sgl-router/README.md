@@ -278,6 +278,36 @@ nothing re-registers. So a worker registered over h2c that later stops serving
 it (a proxy interposed on its port, say) is not detected until it
 is re-registered; its circuit breaker will open in the meantime.
 
+## Prefix-hash routing
+
+`--policy prefix_hash` is the stateless alternative to `cache_aware`: the
+first `--prefix-token-count` tokens (default 256) of each request are hashed
+and mapped onto the worker set with rendezvous hashing, so requests that
+share that prefix -- a session's turns, or all users of one system prompt --
+land on the same worker without the router keeping a radix tree or learning
+anything from the fleet. Replicas agree without shared state, and removing a
+worker moves only the keys it owned.
+
+```bash
+sgl-router \
+  --model-id qwen3 \
+  --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000 \
+  --policy prefix_hash \
+  --prefix-token-count 256 \
+  --prefix-hash-load-factor 1.25
+```
+
+The load bound reuses the engine-reported load the router already polls: a
+hashed target carrying more than `mean * --prefix-hash-load-factor` (default
+1.25, must be >= 1.0) running+waiting requests is skipped for the next worker
+in hash order. A request the router could not tokenize falls back to
+power-of-two. Branches are counted in `sgl_router_prefix_hash_total{outcome}`
+(`hash_hit`, `load_shed`, `unbounded`, `no_tokens`).
+
+Prefer `cache_aware` when the fleet's real cache state is available: it
+matches the full prefix against what each engine holds, while `prefix_hash`
+cannot distinguish prompts that diverge after the hashed window.
+
 ## Upgrading from `cache_aware_zmq`
 
 The `cache_aware_zmq` policy has been removed. Configurations using it should

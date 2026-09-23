@@ -66,6 +66,7 @@ fn build_app_context(
             decode_policy: Default::default(),
             bucket_config: Some(bucket_config),
             circuit_breaker: None,
+            prefix_hash: None,
             cache_aware: None,
             sticky: None,
             affinity,

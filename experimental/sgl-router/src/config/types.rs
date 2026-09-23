@@ -83,6 +83,9 @@ pub enum PolicyKind {
     /// Pin a request-header routing key to a worker.
     #[value(name = "sticky")]
     Sticky,
+    /// Consistent-hash affinity on the request's leading tokens.
+    #[value(name = "prefix_hash")]
+    PrefixHash,
 }
 
 /// Policy used to select decode workers for PD requests.
@@ -313,6 +316,8 @@ pub struct ModelConfig {
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Cache-Aware prefix configuration.
     pub cache_aware: Option<CacheAwareConfig>,
+    /// Present only for `--policy prefix_hash`.
+    pub prefix_hash: Option<PrefixHashConfig>,
     /// Present only for the sticky policy; the header supplies the request routing key.
     pub sticky: Option<StickyConfig>,
     /// Session and cache-affinity tuning.
@@ -398,6 +403,35 @@ pub struct CacheAwareConfig {
     pub prefix_provider: CachePrefixProvider,
     /// External Indexer configuration when `prefix_provider = indexer`.
     pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
+}
+
+/// `--policy prefix_hash` knobs.
+///
+/// The policy hashes the first `prefix_token_count` request tokens and maps
+/// the hash onto the worker set with rendezvous hashing, so requests that
+/// agree on that prefix land on the same worker and a membership change moves
+/// only the keys that lived on the departed worker. `load_factor` bounds the
+/// affinity: a target whose engine-reported load exceeds the fleet mean times
+/// this factor is skipped for the next-ranked worker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrefixHashConfig {
+    pub prefix_token_count: usize,
+    pub load_factor: f64,
+}
+
+/// Roughly a paragraph of text: long enough to separate system prompts,
+/// short enough that a session's turns keep hashing together.
+pub const DEFAULT_PREFIX_TOKEN_COUNT: usize = 256;
+/// Skip the hashed target once it carries 125% of the mean load.
+pub const DEFAULT_PREFIX_HASH_LOAD_FACTOR: f64 = 1.25;
+
+impl Default for PrefixHashConfig {
+    fn default() -> Self {
+        Self {
+            prefix_token_count: DEFAULT_PREFIX_TOKEN_COUNT,
+            load_factor: DEFAULT_PREFIX_HASH_LOAD_FACTOR,
+        }
+    }
 }
 
 /// Default request header for sticky routing.

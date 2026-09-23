@@ -230,6 +230,7 @@ mod tests {
                 decode_policy: DecodePolicyKind::PowerOfTwo,
                 bucket_config: None,
                 circuit_breaker: None,
+                prefix_hash: None,
                 cache_aware: None,
                 sticky: None,
                 affinity: None,

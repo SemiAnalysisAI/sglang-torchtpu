@@ -8,6 +8,7 @@ pub mod decode;
 pub mod factory;
 pub mod load_based;
 pub mod power_of_two;
+pub mod prefix_hash;
 pub mod prefix_provider;
 pub mod random;
 pub mod registry;
