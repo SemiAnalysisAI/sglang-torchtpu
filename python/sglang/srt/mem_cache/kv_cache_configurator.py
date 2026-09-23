@@ -408,10 +408,37 @@ class KVCacheConfigurator:
         # decode read of the SWA pool returns wrong K/V. Round the SWA pool
         # down to an 8-page-aligned size (costs at most 7 pages and keeps the
         # window-ring HBM savings).
+        # Below 8 pages there is no aligned size to round down to, so the pool
+        # cannot satisfy the constraint at all. Falling through would leave it
+        # unaligned -- the exact state this block exists to prevent -- and the
+        # miscompile surfaces as a permanent serving hang rather than an error,
+        # so refuse at startup instead.
+        # Deliberately not gated on the attention backend: the hang was observed
+        # on the RPA decode path, but nothing establishes that the other TPU
+        # backends are exempt, and the cost of refusing a working config is a
+        # startup error while the cost of missing one is a silent hang.
         if self.device == "tpu" and swa_max_total_num_tokens is not None:
             align_tokens = self.pool_page_size * 8
             aligned = (swa_max_total_num_tokens // align_tokens) * align_tokens
-            if aligned != swa_max_total_num_tokens and aligned > 0:
+            if aligned == 0:
+                raise ValueError(
+                    "[hybrid-SWA] SWA pool is "
+                    f"{swa_max_total_num_tokens // self.pool_page_size} pages "
+                    f"({swa_max_total_num_tokens} tokens), below the 8-page "
+                    "minimum required for correct torch.compile decode on TPU. "
+                    f"Raise the SWA pool to at least {align_tokens} tokens; "
+                    "which knob works depends on how it was sized. A ratio-sized "
+                    "hybrid pool scales with --swa-full-tokens-ratio and with the "
+                    "KV budget (--mem-fraction-static); a model with no "
+                    "full-attention layers has no ratio to raise. A chunk-capped "
+                    "pool is computed from --max-running-requests and the sliding "
+                    "window, plus --chunked-prefill-size outside disaggregated "
+                    "decode or --disaggregation-decode-extra-slots within it; it "
+                    "does not grow with --mem-fraction-static, which redirects "
+                    "freed memory to the full pool. --max-total-tokens is only an "
+                    "upper bound in either case."
+                )
+            if aligned != swa_max_total_num_tokens:
                 logger.info(
                     "[hybrid-SWA] aligning swa_max_total_num_tokens "
                     f"{swa_max_total_num_tokens} -> {aligned} "
