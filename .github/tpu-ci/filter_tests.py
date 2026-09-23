@@ -36,6 +36,12 @@ def _row_path(row: dict) -> str:
 
 
 def _filter_rows(rows: list[dict], needle: str) -> list[dict]:
+    if "," in needle:
+        return [
+            row
+            for row in rows
+            if any(p.strip() == row.get("name") for p in needle.split(",") if p.strip())
+        ]
     return [row for row in rows if needle in _row_path(row)]
 
 
@@ -72,7 +78,11 @@ def main() -> None:
     args = parser.parse_args()
     if args.verify:
         files = _stage_test_files()
-        matched = [path for path in files if args.filter in path]
+        if "," in args.filter:
+            tokens = {p.strip() for p in args.filter.split(",") if p.strip()}
+            matched = [path for path in files if Path(path).stem in tokens]
+        else:
+            matched = [path for path in files if args.filter in path]
         if not matched:
             sys.exit(
                 f"filter {args.filter!r} matched none of the {len(files)} tests "
