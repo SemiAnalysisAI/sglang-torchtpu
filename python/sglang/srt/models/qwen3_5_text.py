@@ -97,6 +97,21 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         self.capture_aux_hidden_states = False
 
+        if current_platform.is_tpu():
+            from sglang.srt.compilation.support_torch_compile import (
+                NoopCompilePolicy,
+                support_torch_compile,
+            )
+            from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+                DecoderTpuCompilePolicy,
+            )
+
+            # Keep padded idle rows through the logits gather. Compiling only
+            # the shared VL backbone trims them before the eager LM head,
+            # making idle DP groups skip attention-TP collectives.
+            support_torch_compile(self, policy=DecoderTpuCompilePolicy)
+            support_torch_compile(self.model, policy=NoopCompilePolicy)
+
     @property
     def start_layer(self) -> int:
         return self.model.start_layer
@@ -167,7 +182,14 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         **kwargs,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        if self.is_mrope_enabled:
+        # Text-only TPU warmup uses ordinary 1-D positions. Text MRoPE rows
+        # repeat those same positions; retaining the 1-D form also keeps real
+        # and idle DP batches consistent with the compiled signature.
+        if (
+            self.is_mrope_enabled
+            and not current_platform.is_tpu()
+            and forward_batch.mrope_positions is not None
+        ):
             positions = forward_batch.mrope_positions
 
         hidden_states = self.model(
