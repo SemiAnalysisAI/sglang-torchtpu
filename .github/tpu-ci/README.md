@@ -85,14 +85,14 @@ own launch in a module-level `MULTIHOST_LAUNCH` dict:
 
 ```python
 MULTIHOST_LAUNCH = {"hosts": 2, "launch_script": "recipe/qwen3_30b_a3b_fp8_mh.sh",
-                    "weights_pvc": "shared"}   # weights_pvc optional
+                    "weights_pvc": "model-weights"}   # weights_pvc optional
 ```
 
 The physical PVC names are defined once in `.github/tpu-ci/weights.yaml`:
-`shared` selects the shared model weights, and `qwen3-vl` selects the separate
+`model-weights` selects the shared model weights, and `qwen3-vl` selects the separate
 Qwen3-VL claim. Use these literal keys in `register_tpu_ci(weights_pvc="qwen3-vl")`,
 `MULTIHOST_LAUNCH`, standalone launcher defaults, and workflow inputs such as
-`weights_pvc: shared`. CI discovery reads ordinary literals; the JobSet renderer
+`weights_pvc: model-weights`. CI discovery reads ordinary literals; the JobSet renderer
 resolves the keys for both ordinary and P/D jobs.
 
 `render_jobset.py --weights-pvc` also accepts a literal PVC name for custom
