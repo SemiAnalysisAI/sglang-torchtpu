@@ -197,6 +197,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         # across model processes can exceed host memory before GPU copies finish.
         def body_weights():
             for name, loaded_weight in weights:
+                if name.startswith("model.language_model."):
+                    name = _MODEL_PREFIX + name[len("model.language_model.") :]
+                elif name.startswith(("model.visual.", "visual.", "mtp.")):
+                    continue
                 if name.startswith(_MODEL_PREFIX):
                     yield name[len(_MODEL_PREFIX) :], loaded_weight
                 elif name == "lm_head.weight":
