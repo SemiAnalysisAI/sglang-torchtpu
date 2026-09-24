@@ -88,6 +88,8 @@ def _apply_qk_norm(
     q_norm: nn.RMSNorm,
     k_norm: nn.RMSNorm,
     head_dim: int,
+    *,
+    cuda_platform: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (
         q.is_cuda
@@ -97,6 +99,7 @@ def _apply_qk_norm(
         and q.stride(-2) == k.stride(-2) == head_dim
         and q_norm.eps == k_norm.eps
         and not torch.compiler.is_compiling()
+        and cuda_platform
     ):
         from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 
