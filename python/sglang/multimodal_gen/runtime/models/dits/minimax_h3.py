@@ -58,12 +58,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
-from sglang.multimodal_gen.runtime.models.dits.minimax_h3_ops import (
-    _apply_qk_norm,
-    _modulate_gate,
-    _modulate_scale_shift,
-    _silu_mul,
-)
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
     MiniMaxH3AdalnCache,
@@ -73,6 +67,12 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     native_adaln_weight_files,
+)
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_ops import (
+    _apply_qk_norm,
+    _modulate_gate,
+    _modulate_scale_shift,
+    _silu_mul,
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
     MiniMaxH3VDNHybridAttention,
