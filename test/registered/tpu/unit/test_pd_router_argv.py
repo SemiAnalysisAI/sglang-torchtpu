@@ -275,6 +275,25 @@ class TestPdRouterArgv(CustomTestCase):
         with self.assertRaises(ValueError):
             resolve_mode(env={"SGLANG_TPU_PD_ROUTER": "nginx"})
 
+    def test_smg_resolves_tokenizer_directory_to_tokenizer_json(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok_file = os.path.join(tmpdir, "tokenizer.json")
+            with open(tok_file, "w") as f:
+                f.write("{}")
+            cmd = build_router_cmd(
+                python="python3",
+                prefill_url="http://10.0.0.1:8080",
+                decode_url="http://10.0.0.2:8081",
+                host="0.0.0.0",
+                port=8000,
+                tokenizer_path=tmpdir,
+                env={"SGLANG_TPU_PD_ROUTER": "smg"},
+            )
+            idx = cmd.index("--tokenizer-path")
+            self.assertEqual(cmd[idx + 1], tok_file)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -276,6 +276,12 @@ def build_router_cmd(
             or source.get("GPT_OSS_MODEL")
             or source.get("MODEL")
         )
+        if resolved_tokenizer_path and os.path.isdir(resolved_tokenizer_path):
+            for candidate in ("tokenizer.json", "tiktoken.model"):
+                candidate_path = os.path.join(resolved_tokenizer_path, candidate)
+                if os.path.isfile(candidate_path):
+                    resolved_tokenizer_path = candidate_path
+                    break
         p_policy = _resolve_policy(
             name="prefill",
             explicit=prefill_policy,
