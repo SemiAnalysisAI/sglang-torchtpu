@@ -114,6 +114,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.tree_cache = tree_cache
     s.chunked_req = chunked_req
     s._pending_chunked_abort_req = None
+    s._deferred_chunked_sender_aborts = []
     return s
 
 
@@ -191,6 +192,7 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.chunked_req = req
         scheduler._pending_chunked_abort_req = req
+        scheduler._deferred_chunked_sender_aborts = []
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler.req_to_metadata_buffer_idx_allocator = MagicMock()
         scheduler.enable_hicache_storage = False
@@ -228,22 +230,45 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         self.assertEqual(scheduler._deferred_chunked_sender_aborts, [req])
 
     @patch("sglang.srt.managers.scheduler.release_kv_cache")
-    def test_deferred_pages_release_only_after_sender_drains(self, release_kv):
+    def test_sender_drain_keeps_prefill_non_idle_until_pages_release(self, release_kv):
         sender = MagicMock()
         sender.drained.side_effect = [False, True]
         req = SimpleNamespace(disagg_kv_sender=sender)
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.tree_cache = MagicMock()
-        scheduler._deferred_chunked_sender_aborts = [req]
+        scheduler.running_batch = MagicMock()
+        scheduler.running_batch.is_empty.return_value = True
+        scheduler.chunked_req = None
+        scheduler.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
+        scheduler.last_batch = None
+        scheduler.enable_overlap = False
+        scheduler.ps = SimpleNamespace(pp_size=1)
+        scheduler.waiting_queue = []
+        scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+        scheduler.enable_hisparse = False
+        scheduler.enable_hierarchical_cache = False
+        scheduler._engine_paused = False
+        scheduler._deferred_chunked_sender_aborts = []
+        self.assertTrue(scheduler.is_fully_idle())
 
+        scheduler._deferred_chunked_sender_aborts.append(req)
         scheduler._drain_deferred_chunked_sender_aborts()
+        sender.poll.assert_called_once_with()
+        sender.clear.assert_not_called()
         release_kv.assert_not_called()
         self.assertEqual(scheduler._deferred_chunked_sender_aborts, [req])
+        self.assertFalse(scheduler.is_fully_idle())
+        self.assertTrue(scheduler.is_fully_idle(for_health_check=True))
 
         scheduler._drain_deferred_chunked_sender_aborts()
+        self.assertEqual(sender.poll.call_count, 2)
         sender.clear.assert_called_once_with()
         release_kv.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
         self.assertEqual(scheduler._deferred_chunked_sender_aborts, [])
+        self.assertTrue(scheduler.is_fully_idle())
 
 
 if __name__ == "__main__":
