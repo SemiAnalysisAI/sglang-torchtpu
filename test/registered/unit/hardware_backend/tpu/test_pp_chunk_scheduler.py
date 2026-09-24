@@ -80,6 +80,7 @@ def scheduler(waiting, chunked=None, mbs=(), last_mbs=(), matched=0, host=0, tai
         mbs=list(mbs),
         last_mbs=list(last_mbs),
         tree_cache=Cache(matched, host, tail),
+        _tpu_pp_cached_prefix={},
     )
 
 
@@ -118,6 +119,18 @@ def test_at_most_128_waiting_requests_are_matched_per_step():
     sched = scheduler(waiting, matched=65536)
     assert pending_step_limit(sched) == 16384
     assert len(sched.tree_cache.limits) == 128
+
+
+def test_a_waiting_request_is_matched_once():
+    """A match walks the whole cached prefix, so a waiting request keeps its
+    first match on later steps; the entry goes when it leaves the queue."""
+    sched = scheduler([req(65536 + 256)], matched=65536)
+    assert pending_step_limit(sched) == 2048
+    assert pending_step_limit(sched) == 2048
+    assert len(sched.tree_cache.limits) == 1
+    sched.waiting_queue = []
+    pending_step_limit(sched)
+    assert sched._tpu_pp_cached_prefix == {}
 
 
 def test_pending_continuation_counts_only_unscheduled_tokens_once():

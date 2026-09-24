@@ -27,7 +27,7 @@ from sglang.srt.runtime_context import get_exec
 logger = logging.getLogger(__name__)
 
 
-# Waiting requests matched per step; the LPM policy stops matching the
+# New waiting requests matched per step; the LPM policy stops matching the
 # waiting queue past the same count (SchedulePolicy._determine_active_policy).
 _MAX_MATCHED_WAITING = 128
 
@@ -45,6 +45,10 @@ def pending_step_limit(scheduler):
     requests = list(scheduler.waiting_queue)
     if scheduler.chunked_req is not None:
         requests.append(scheduler.chunked_req)
+    cached_prefix = scheduler._tpu_pp_cached_prefix
+    waiting = {req.rid for req in scheduler.waiting_queue}
+    for rid in [rid for rid in cached_prefix if rid not in waiting]:
+        del cached_prefix[rid]
     seen = set()
     pending = 0
     matches_left = _MAX_MATCHED_WAITING
@@ -53,12 +57,15 @@ def pending_step_limit(scheduler):
             continue
         seen.add(req.rid)
         cached = len(req.prefix_indices)
-        if cached == 0 and matches_left > 0:
+        if cached == 0 and req.rid in cached_prefix:
+            cached = cached_prefix[req.rid]
+        elif cached == 0 and matches_left > 0:
             # A waiting request is matched only when it is admitted; the cached
-            # prefix it will reuse is not pending work. Matching refreshes that
-            # prefix's recency, as the LPM policy's pass over the queue does.
+            # prefix it will reuse is not pending work. Each request is matched
+            # once, which refreshes that prefix's recency ahead of admission.
             matches_left -= 1
             cached = matched_prefix_len(scheduler.tree_cache, req)
+            cached_prefix[req.rid] = cached
         pending += max(len(req.origin_input_ids) + len(req.output_ids) - cached, 0)
         if pending >= scheduler.ps.pp_size * cost.buckets[-1]:
             # The limit saturates at a full step; the rest need no match.
@@ -216,4 +223,6 @@ def profile_and_install_cost_model(scheduler):
         min(schedules) if schedules else None,
     )
     scheduler._tpu_pp_chunk_cost = cost
+    # Cached prefix tokens of each waiting request, matched once.
+    scheduler._tpu_pp_cached_prefix = {}
     logger.info("TPU pipeline chunks: %s; stage samples %s", cost.describe(), samples)
