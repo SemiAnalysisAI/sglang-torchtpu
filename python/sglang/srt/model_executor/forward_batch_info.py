@@ -1582,8 +1582,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
                 # Fabricate a single dummy request covering num_tokens for an
-                # empty (idle) rank. Hybrid-SSM families always take this path;
-                # non-hybrid ranks reach it once MAX_LEN is forced for the
+                # empty (idle) rank. Non-TPU hybrid-SSM families require
+                # this path; non-hybrid ranks reach it once MAX_LEN is forced for the
                 # prefill breakable CUDA graph (idle + prefill), which needs
                 # every DP rank to run the same captured shape. The `else`
                 # branch handles decode rows padded to a 1-token extend.
@@ -1599,7 +1599,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     if self.num_token_non_padded is not None:
                         self.num_token_non_padded.fill_(num_tokens)
                     self.num_token_non_padded_cpu = num_tokens
-                elif hybrid_ssm or self.seq_lens.shape[0] == 0:
+                elif (hybrid_ssm and not _is_tpu) or self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
                     assert self.seq_lens.shape[0] == 0, (
                         "extend-idle conversion expects an empty rank"
@@ -1649,6 +1649,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                             self.global_num_token_non_padded.fill_(num_tokens)
                         self.global_num_token_non_padded_cpu = num_tokens
                 else:
+                    # TPU hybrid attention can continue its cached recurrent
+                    # state with a one-token extend while a DP peer prefills.
+                    # Preserve these live requests instead of fabricating an
+                    # empty-rank request with a zero-length prefix.
                     self.extend_num_tokens = bs
                     self.extend_seq_lens = torch.full_like(
                         self.seq_lens, 1, dtype=torch.int32
@@ -1657,8 +1661,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.extend_start_loc = torch.arange(
                         bs, dtype=torch.int32, device=self.seq_lens.device
                     )
-                    self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu().tolist()
-                    self.extend_seq_lens_cpu = self.extend_seq_lens.cpu().tolist()
+                    if _is_tpu and self.seq_lens_cpu is not None:
+                        self.extend_prefix_lens_cpu = (self.seq_lens_cpu - 1).tolist()
+                        self.extend_seq_lens_cpu = [1] * bs
+                    else:
+                        self.extend_prefix_lens_cpu = (
+                            self.extend_prefix_lens.cpu().tolist()
+                        )
+                        self.extend_seq_lens_cpu = self.extend_seq_lens.cpu().tolist()
                     self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
                 if self.spec_info is not None:
