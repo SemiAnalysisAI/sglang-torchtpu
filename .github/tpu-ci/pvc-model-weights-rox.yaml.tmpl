@@ -1,5 +1,3 @@
-# LEGACY: retained for existing jobs and rollback. New CI uses the existing
-# Filestore share in pvc-model-weights-filestore.yaml.
 # SHARED model-weights disk: ONE ReadOnlyMany Hyperdisk holding every CI model,
 # mounted at /weights by any pod that declares weights_pvc: model-weights-rox.
 # Contents (paths are what recipes/tests reference via MODEL=/weights/<dir>):

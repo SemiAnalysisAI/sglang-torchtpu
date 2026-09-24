@@ -171,10 +171,6 @@ jobs:
       test_file: ${{ matrix.test.file }}
       nightly: true
       run_name: ${{ matrix.test.run_name }}
-      # The spec-decoding gsm8k gates serve gpt-oss-120b / qwen3-coder-480b from
-      # the read-only Filestore share at /weights; harmless for tests that don't use it.
-      # A test whose checkpoint lives on another disk overrides it via
-      # register_tpu_ci(weights_pvc=...).
       weights_pvc: ${{ matrix.test.weights_pvc || 'model-weights-filestore' }}
     permissions:
       contents: read

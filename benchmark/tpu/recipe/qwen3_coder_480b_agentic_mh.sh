@@ -17,11 +17,6 @@
 # HOST / PORT / ENABLE_PROFILER_ENDPOINT / ENABLE_COMPILE_CACHE come from the
 # JobSet template.
 #
-# WEIGHTS: /weights/Qwen3-Coder-480B-A35B-Instruct-FP8 is already on the shared
-# model-weights-filestore PVC (49 safetensors
-# shards, config + tokenizer + index), alongside the EAGLE3 draft the combo test
-# uses. The share's PV/PVC manifest lives in
-# .github/tpu-ci/pvc-model-weights-filestore.yaml.
 set -uo pipefail
 cd "$(dirname "$0")/.."   # recipe/ -> benchmark/tpu
 

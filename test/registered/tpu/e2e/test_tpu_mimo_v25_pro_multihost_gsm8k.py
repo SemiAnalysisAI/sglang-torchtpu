@@ -37,7 +37,6 @@ register_tpu_ci(
     labels=["multihost", "mimo-v2.5-pro"],
 )
 
-# Own launch group: MiMo-V2.5-Pro DP-attention recipe + the shared Filestore weights volume.
 MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/mimo_v25_pro_mh.sh",
