@@ -8,8 +8,7 @@ routes chat-completion requests to them.
 from __future__ import annotations
 
 import httpx
-import pytest
-from conftest import NAMESPACE, _kubectl, _poll_until, logger
+from conftest import NAMESPACE, _kubectl, _poll_until
 
 
 def _scale_fake_worker(replicas: int) -> None:
@@ -66,15 +65,17 @@ def test_router_discovers_multiple_workers(router_url):
     # Scale down to 1 — router should still route after reconverging
     _scale_fake_worker(1)
     _poll_until(
-        lambda: httpx.post(
-            f"{router_url}/v1/chat/completions",
-            json={
-                "model": "tiny",
-                "messages": [{"role": "user", "content": "post-scale-down"}],
-            },
-            timeout=10.0,
-        ).status_code
-        == 200,
+        lambda: (
+            httpx.post(
+                f"{router_url}/v1/chat/completions",
+                json={
+                    "model": "tiny",
+                    "messages": [{"role": "user", "content": "post-scale-down"}],
+                },
+                timeout=10.0,
+            ).status_code
+            == 200
+        ),
         "router routes after scale-down to 1",
         timeout=60,
         interval=3,

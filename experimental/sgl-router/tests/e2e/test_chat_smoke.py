@@ -5,7 +5,6 @@ Smoke tests for /v1/models and /v1/chat/completions (streaming + non-streaming).
 from __future__ import annotations
 
 import httpx
-import pytest
 
 MODEL = "Qwen/Qwen3-0.6B"
 
