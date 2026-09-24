@@ -1,0 +1,43 @@
+# Existing Filestore: sglang-torchtpu/us-central1-c/model-weights.
+# Statically bind the existing 10Ti NFSv3 share; do not provision another instance.
+# CI mounts this claim read-only at /weights. Hydration uses a separate RW mount.
+# Resize the instance in Filestore, then update the PV capacity recorded here.
+# Apply before switching workflows to model-weights-filestore; keep the old
+# model-weights-rox claim/disk available for running jobs and rollback.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: model-weights-filestore-pv
+spec:
+  storageClassName: ""
+  capacity:
+    storage: 10Ti
+  accessModes:
+    - ReadOnlyMany
+  persistentVolumeReclaimPolicy: Retain
+  volumeMode: Filesystem
+  claimRef:
+    namespace: tpu-ci
+    name: model-weights-filestore
+  mountOptions:
+    - nfsvers=3
+    - hard
+  nfs:
+    server: 10.93.193.130
+    path: /weights
+    readOnly: true
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-weights-filestore
+  namespace: tpu-ci
+spec:
+  storageClassName: ""
+  volumeName: model-weights-filestore-pv
+  accessModes:
+    - ReadOnlyMany
+  volumeMode: Filesystem
+  resources:
+    requests:
+      storage: 10Ti

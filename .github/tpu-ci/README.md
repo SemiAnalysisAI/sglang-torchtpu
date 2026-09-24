@@ -85,7 +85,7 @@ own launch in a module-level `MULTIHOST_LAUNCH` dict:
 
 ```python
 MULTIHOST_LAUNCH = {"hosts": 2, "launch_script": "recipe/qwen3_30b_a3b_fp8_mh.sh",
-                    "weights_pvc": "model-weights-rox"}   # weights_pvc optional
+                    "weights_pvc": "model-weights-filestore"}   # weights_pvc optional
 ```
 
 `launch_script` is a recipe under `benchmark/tpu/recipe/` that sets `MODEL`/`EP_SIZE`/…
@@ -445,13 +445,43 @@ Topology-Aware Scheduling instead.
 
 - **PR gate (single-host, run_suite)** — validated GREEN on the 2x2x1 slice.
 - **Multi-host (2x2x2, tp=16)** — validated GREEN: Qwen3-30B-A3B-FP8 MoE (EP=8) serving
-  from the **ReadOnlyMany** Hyperdisk (now the shared `model-weights-rox`; both hosts mount concurrently),
+  from the original **ReadOnlyMany** Hyperdisk (both hosts mount concurrently),
   rank-0 asserting on real inference.
-- **Hyperdisk ML weights** — `model-weights-rox` is a hydrated RWO disk (all models on one 5Ti disk) converted to
-  `READ_ONLY_MANY` (GKE ≥1.30.2 auto-converts on first ROX mount; cluster is 1.35.x).
-  Lifecycle (hydrate → convert → append-later) is documented in
-  `pvc-model-weights-rox.yaml.tmpl`; note ROX conversion is one-way, so adding a model
-  goes through a snapshot → new RWO disk → re-convert cycle.
+- **Filestore weights** — CI selects `model-weights-filestore`, a static 10Ti
+  NFSv3 share at `10.93.193.130:/weights` on the existing `model-weights` instance
+  in project `sglang-torchtpu`, zone `us-central1-c`, network `default`.
+  All consumers still mount `/weights` read-only. The share contains the models
+  migrated from `model-weights-v3` and `model-weights-glm53-kimik3`.
+
+### Deploy the Filestore weights claim
+
+Apply the new claim before enabling workflows from this revision:
+
+```bash
+gcloud container clusters get-credentials tpu-cluster \
+  --project sglang-torchtpu --zone us-central1-c
+kubectl apply --dry-run=server -f .github/tpu-ci/pvc-model-weights-filestore.yaml
+kubectl apply -f .github/tpu-ci/pvc-model-weights-filestore.yaml
+kubectl -n tpu-ci wait pvc/model-weights-filestore \
+  --for=jsonpath='{.status.phase}'=Bound --timeout=60s
+```
+
+The manifest binds the existing NFS export directly; it does not need a dynamic
+StorageClass or create a new Filestore instance. CI nodes must be able to reach
+the export on the default VPC. Validate a CI job mounting the new claim before
+retiring the old storage. The separate `qwen3-spec-vl-rox` claim remains in use
+for Qwen3-VL tests.
+
+Keep `model-weights-rox` and its backing Hyperdisk while old jobs finish and until
+the new CI runs pass. Rolling back the workflow/test changes selects that old
+claim again; neither claim needs to be rebound or deleted during migration.
+`hyperdisk-ml-fast-storageclass.yaml` and `pvc-model-weights-rox.yaml.tmpl` describe
+the legacy storage only.
+
+To add models, use a separate writable mount of the Filestore share. Resize the
+instance through Filestore, then update this manifest's PV capacity to match.
+The PVC request can remain 10Ti: it is a binding minimum, not an NFS quota. This
+static NFS claim does not drive resizing through Kubernetes PVC expansion.
 
 ### ⚠️ Model note: Qwen3-0.6B is single-host only
 

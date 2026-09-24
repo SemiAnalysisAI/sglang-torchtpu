@@ -27,7 +27,7 @@
 # outside the precompiled buckets takes the recompile path that crashes
 # torch_tpu.
 #
-# Weights: /weights/Kimi-K2.6 on the shared model-weights-rox ROX Hyperdisk.
+# Weights: /weights/Kimi-K2.6 on the read-only model-weights-filestore claim.
 set -uo pipefail
 
 export MODEL=${MODEL:-/weights/Kimi-K2.6}
