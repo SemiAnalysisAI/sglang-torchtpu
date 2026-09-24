@@ -187,8 +187,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(queue._pre_alloc.call_count, 3)
         queue.tree_cache.evict_for_alloc.assert_not_called()
 
-    @patch("sglang.srt.disaggregation.decode.retraction_restore")
-    def test_resume_reclaims_evictable_kv_before_allocating(self, restore):
+    def test_resume_reclaims_evictable_kv_before_allocating(self):
         override = get_context().override_server_args(
             disaggregation_decode_retraction_backup="cpu_tensor",
             disaggregation_decode_enable_radix_cache=True,
@@ -213,13 +212,13 @@ class TestDecodeQueueCleanup(CustomTestCase):
                     reclaimed_halves=reclaimed_halves,
                 ):
                     self._check_resume_reclaim(
-                        restore, uses_swa, initial_full, initial_swa, reclaimed_halves
+                        uses_swa, initial_full, initial_swa, reclaimed_halves
                     )
 
     def _check_resume_reclaim(
-        self, restore, uses_swa, full_available, swa_available, reclaimed_halves
+        self, uses_swa, full_available, swa_available, reclaimed_halves
     ):
-        restore.reset_mock()
+        page_size = 512
         backup = object()
         req = SimpleNamespace(
             rid="retracted",
@@ -227,15 +226,18 @@ class TestDecodeQueueCleanup(CustomTestCase):
             output_ids=[],
             is_retracted=True,
             kv=SimpleNamespace(retraction_backup=backup),
+            load_kv_cache=MagicMock(),
         )
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.retracted_queue = [req]
         queue.num_reserved_decode_tokens = 512
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: 1)
         queue.token_to_kv_pool_allocator = (
-            SimpleNamespace(page_size=512, swa_available_size=lambda: swa_available)
+            SimpleNamespace(
+                page_size=page_size, swa_available_size=lambda: swa_available
+            )
             if uses_swa
-            else SimpleNamespace(page_size=512)
+            else SimpleNamespace(page_size=page_size)
         )
         queue.scheduler = SimpleNamespace(
             enable_hisparse=False, sliding_window_size=2048
@@ -254,8 +256,12 @@ class TestDecodeQueueCleanup(CustomTestCase):
         def evict(params):
             nonlocal full_available, swa_available
             self.assertTrue(req.is_retracted)
-            full_available += params.num_tokens * reclaimed_halves // 2
-            swa_available += params.swa_num_tokens * reclaimed_halves // 2
+            full_available += (
+                params.num_tokens // page_size * reclaimed_halves // 2
+            ) * page_size
+            swa_available += (
+                params.swa_num_tokens // page_size * reclaimed_halves // 2
+            ) * page_size
 
         def allocate(_req):
             nonlocal full_available, swa_available
@@ -265,8 +271,15 @@ class TestDecodeQueueCleanup(CustomTestCase):
                 self.assertGreaterEqual(swa_available, 2560)
                 swa_available -= 2560
 
+        def restore(_req_pool, _allocator):
+            queue._pre_alloc.assert_called_once_with(req)
+            self.assertFalse(req.is_retracted)
+            self.assertIs(req.kv.retraction_backup, backup)
+            req.kv.retraction_backup = None
+
         queue.tree_cache.evict_for_alloc.side_effect = evict
         queue._pre_alloc = MagicMock(side_effect=allocate)
+        req.load_kv_cache.side_effect = restore
 
         resumed = queue.resume_retracted_reqs()
 
@@ -275,8 +288,13 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(queue.retracted_queue, [] if succeeded else [req])
         self.assertEqual(req.is_retracted, not succeeded)
         self.assertEqual(queue._pre_alloc.call_count, int(succeeded))
-        self.assertEqual(restore.call_count, int(succeeded))
-        if not succeeded:
+        if succeeded:
+            req.load_kv_cache.assert_called_once_with(
+                queue.req_to_token_pool, queue.token_to_kv_pool_allocator
+            )
+            self.assertIsNone(req.kv.retraction_backup)
+        else:
+            req.load_kv_cache.assert_not_called()
             self.assertIs(req.kv.retraction_backup, backup)
         if full_shortfall or swa_shortfall:
             queue.tree_cache.evict_for_alloc.assert_called_once()
@@ -285,6 +303,17 @@ class TestDecodeQueueCleanup(CustomTestCase):
             self.assertEqual(params.swa_num_tokens, swa_shortfall)
         else:
             queue.tree_cache.evict_for_alloc.assert_not_called()
+
+        if not succeeded:
+            # A later scheduler pass can resume the same backup once pages are free.
+            full_available, swa_available = 8192, 2560
+            self.assertEqual(queue.resume_retracted_reqs(), [req])
+            self.assertEqual(queue.retracted_queue, [])
+            self.assertFalse(req.is_retracted)
+            req.load_kv_cache.assert_called_once_with(
+                queue.req_to_token_pool, queue.token_to_kv_pool_allocator
+            )
+            self.assertIsNone(req.kv.retraction_backup)
 
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()
@@ -491,11 +520,28 @@ class TestDecodeQueueCleanup(CustomTestCase):
         waiting_req = SimpleNamespace(
             req=SimpleNamespace(finished_reason=None), waiting_for_input=False
         )
+        ready_req = SimpleNamespace(
+            req=SimpleNamespace(
+                rid="fits-without-eviction",
+                origin_input_ids=[0] * 31,
+                output_ids=[],
+                finished_reason=None,
+                sampling_params=SimpleNamespace(max_new_tokens=1),
+                kv=ReqKvInfo(),
+                time_stats=MagicMock(),
+            ),
+            kv_receiver=MagicMock(spec=["send_metadata", "abort", "clear"]),
+            waiting_for_input=True,
+            is_rebootstrap=False,
+        )
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
-        queue.queue = [decode_req, waiting_req]
+        queue.queue = [decode_req, ready_req, waiting_req]
         queue.pending_reqs = [decode_req, waiting_req]
+        queue._num_published_destinations = 0
+        queue.transfer_queue = SimpleNamespace(enable_staging=False)
+        queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 512
         queue._resolve_pending_reqs = MagicMock()
@@ -512,28 +558,36 @@ class TestDecodeQueueCleanup(CustomTestCase):
             if uses_swa
             else SimpleNamespace(page_size=512)
         )
+        queue.token_to_kv_pool_allocator.translate_kv_indices_for_transfer = (
+            lambda indices: indices
+        )
         queue.tree_cache = MagicMock()
 
         def match_prefix(req):
             # Mamba matching reserves the deferred COW destination before a
             # request slot or full-attention KV has been allocated.
-            if has_mamba:
+            if has_mamba and req is decode_req.req:
                 req.kv.mamba_pool_idx = torch.tensor(1)
+            prefix_len = 4096 if req is decode_req.req else 0
             return SimpleNamespace(
-                prefix_indices=list(range(4096)),
-                l1_prefix_len=4096,
-                decode_prefix_len=4096,
+                prefix_indices=list(range(prefix_len)),
+                l1_prefix_len=prefix_len,
+                decode_prefix_len=prefix_len,
+                restore_token_count=0,
             )
+
+        def allocate(req, _prefix_indices, prefix_len, total_prefix_len):
+            self.assertIs(req, ready_req.req)
+            self.assertEqual((prefix_len, total_prefix_len), (0, 0))
+            req.kv.req_pool_idx = 0
+            return torch.arange(31)
 
         queue._match_prefix_and_lock = MagicMock(side_effect=match_prefix)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
-        queue._pre_alloc = MagicMock(
-            side_effect=AssertionError(
-                "allocation attempted before sufficient KV capacity"
-            )
-        )
+        queue._pre_alloc = MagicMock(side_effect=allocate)
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 1
+        queue.req_to_token_pool.req_to_token = torch.arange(31).reshape(1, -1)
         queue.tree_cache.req_to_token_pool = queue.req_to_token_pool
         queue.tree_cache.supports_mamba.return_value = has_mamba
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
@@ -544,13 +598,14 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
         scheduler.enable_lora = False
+        scheduler.enable_decode_hicache = False
         scheduler.sliding_window_size = 2048
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 
         preallocated, failed = queue.pop_preallocated()
 
-        self.assertEqual(preallocated, [])
+        self.assertEqual(preallocated, [ready_req])
         self.assertEqual(failed, [decode_req])
         self.assertEqual(queue.queue, [waiting_req])
         self.assertEqual(queue.pending_reqs, [waiting_req])
@@ -587,8 +642,11 @@ class TestDecodeQueueCleanup(CustomTestCase):
                 req.last_node, req.lock_receipt
             )
         self.assertFalse(req.swa_prefix_lock_released)
-        queue._pre_alloc.assert_not_called()
+        queue._pre_alloc.assert_called_once()
         queue.req_to_token_pool.alloc.assert_not_called()
+        ready_req.kv_receiver.send_metadata.assert_called_once()
+        ready_req.kv_receiver.abort.assert_not_called()
+        ready_req.kv_receiver.clear.assert_not_called()
         scheduler.output_streamer.stream_output.assert_called_once_with(
             [req], req.return_logprob
         )
