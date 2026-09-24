@@ -25,8 +25,11 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.tpu import model_config_main
+    from sglang.test.tpu.pd_router import build_router_cmd, router_ready_url
 except ModuleNotFoundError as exc:
     # Source-only checkouts can still run the launch-configuration tests.
+    import importlib.util
+
     SGLANG_IMPORT_ERROR = exc
 
     def register_tpu_ci(*_args, **_kwargs):
@@ -34,6 +37,23 @@ except ModuleNotFoundError as exc:
 
     def model_config_main(*_args, **_kwargs):
         return None
+
+    _pd_router_path = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            *[".."] * 4,
+            "python",
+            "sglang",
+            "test",
+            "tpu",
+            "pd_router.py",
+        )
+    )
+    _spec = importlib.util.spec_from_file_location("pd_router", _pd_router_path)
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    build_router_cmd = _mod.build_router_cmd
+    router_ready_url = _mod.router_ready_url
 
 
 register_tpu_ci(
@@ -322,20 +342,15 @@ def execute_router(
     *, prefill_host: str, decode_host: str, log_path: str = LB_LOG
 ) -> subprocess.Popen:
     return _launch(
-        (
-            PYTHON,
-            "-m",
-            "sglang_router.launch_router",
-            "--pd-disaggregation",
-            "--mini-lb",
-            "--prefill",
-            f"http://{prefill_host}:{PREFILL_PORT}",
-            "--decode",
-            f"http://{decode_host}:{DECODE_PORT}",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            str(LB_PORT),
+        build_router_cmd(
+            python=PYTHON,
+            prefill_url=f"http://{prefill_host}:{PREFILL_PORT}",
+            decode_url=f"http://{decode_host}:{DECODE_PORT}",
+            host="0.0.0.0",
+            port=LB_PORT,
+            bootstrap_port=BOOTSTRAP_PORT,
+            model_id=SERVED_MODEL_NAME,
+            tokenizer_path=resolve_model_path(),
         ),
         log_path=log_path,
     )
@@ -430,7 +445,22 @@ def engine_configuration_failures(
     return failures
 
 
-def build_model_config() -> Dict[str, Any]:
+def build_model_config(*, decode_host: Optional[str] = None) -> Dict[str, Any]:
+    gsm8k_gate: Dict[str, Any] = {
+        "dataset": "gsm8k",
+        "label": "gsm8k",
+        "baseline": GSM8K_BASELINE,
+        "spec_accept_length_threshold": SPEC_ACCEPT_LENGTH_THRESHOLD,
+        "num_examples": NUM_EXAMPLES,
+        "num_threads": NUM_THREADS,
+        "max_tokens": MAX_TOKENS,
+        "temperature": 0.0,
+        # Match the other speculative GSM8K gates so their acceptance
+        # measurements use the same request contract.
+        "api": "chat",
+    }
+    if decode_host is not None:
+        gsm8k_gate["spec_accept_length_url"] = f"http://{decode_host}:{DECODE_PORT}"
     return {
         "model": SERVED_MODEL_NAME,
         "test_name": "gpt-oss-120b-pd-singlehost-spec-gsm8k",
@@ -440,21 +470,7 @@ def build_model_config() -> Dict[str, Any]:
             "health_timeout": HEALTH_TIMEOUT,
             "tag": "gpt-oss-120b-pd-spec-gsm8k-e2e",
         },
-        "gates": [
-            {
-                "dataset": "gsm8k",
-                "label": "gsm8k",
-                "baseline": GSM8K_BASELINE,
-                "spec_accept_length_threshold": SPEC_ACCEPT_LENGTH_THRESHOLD,
-                "num_examples": NUM_EXAMPLES,
-                "num_threads": NUM_THREADS,
-                "max_tokens": MAX_TOKENS,
-                "temperature": 0.0,
-                # Match the other speculative GSM8K gates so their acceptance
-                # measurements use the same request contract.
-                "api": "chat",
-            },
-        ],
+        "gates": [gsm8k_gate],
     }
 
 
@@ -487,10 +503,12 @@ def run_prefill_leader() -> int:
             )
         )
         _wait_http_200(
-            url=f"http://{LOCAL_HOST}:{LB_PORT}/health", secs=300, procs=procs
+            url=router_ready_url(host=LOCAL_HOST, port=LB_PORT),
+            secs=300,
+            procs=procs,
         )
         model_config_main(
-            build_model_config(),
+            build_model_config(decode_host=decode_host),
             base_url=f"http://{LOCAL_HOST}:{LB_PORT}",
         )
         return 0
