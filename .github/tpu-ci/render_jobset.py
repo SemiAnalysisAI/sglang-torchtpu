@@ -163,7 +163,7 @@ def main():
     ap.add_argument(
         "--weights-pvc",
         default="",
-        help="TPU weights constant name or literal PVC name; empty disables the mount.",
+        help="Key from weights.yaml or literal PVC name; empty disables the mount.",
     )
     ap.add_argument("--timeout-per-file", type=int, default=3600)
     ap.add_argument(
@@ -182,7 +182,6 @@ def main():
         help="Print the CI poll budget (s) for --suite and exit (no rendering).",
     )
     a = ap.parse_args()
-    a.weights_pvc = _ci_register.resolve_tpu_weights_pvc(a.weights_pvc)
 
     partitioned = a.partition_id != -1 or a.partition_size != 0
     if partitioned and not (
@@ -208,6 +207,11 @@ def main():
 
     if not a.image:
         ap.error("--image is required when rendering")
+
+    # Resolve shared storage names once, before either JobSet rendering mode.
+    with open(f"{a.dir}/weights.yaml") as f:
+        weights_pvcs = yaml.safe_load(f)
+    a.weights_pvc = weights_pvcs.get(a.weights_pvc, a.weights_pvc)
 
     lanes = yaml.safe_load(open(f"{a.dir}/topology.yaml"))["lanes"]
     if a.lane not in lanes:

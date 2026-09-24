@@ -26,10 +26,7 @@ stays the only place those numbers live.
 
 import os
 
-from sglang.test.ci.ci_register import (
-    TPU_MODEL_WEIGHTS_PVC,
-    register_tpu_ci,
-)
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 from sglang.test.tpu import model_config_main
 
@@ -43,7 +40,7 @@ register_tpu_ci(
 MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/mimo_v25_pro_mh.sh",
-    "weights_pvc": TPU_MODEL_WEIGHTS_PVC,
+    "weights_pvc": "shared",
 }
 
 MODEL_PATH = "XiaomiMiMo/MiMo-V2.5-Pro"

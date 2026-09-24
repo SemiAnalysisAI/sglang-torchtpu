@@ -1,0 +1,4 @@
+# Shared PVC selections for workflows and test metadata.
+# render_jobset.py resolves these keys for both ordinary and P/D JobSets.
+shared: model-weights-filestore
+qwen3-vl: qwen3-spec-vl-rox
