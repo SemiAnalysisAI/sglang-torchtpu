@@ -36,7 +36,24 @@ def req(tokens, prefix=0, rid="r"):
         needs_host_load_back=lambda: False,
         extra_key=None,
         cache_salt=None,
+        _compute_max_prefix_len=lambda length: max(length - 1, 0),
     )
+
+
+class Cache:
+    """Radix cache stand-in: every prompt hits ``matched`` device tokens and
+    ``host`` host tokens; records each match's key limit."""
+
+    def __init__(self, matched=0, host=0, tail=0):
+        self.matched, self.host, self.tail = matched, host, tail
+        self.limits = []
+
+    def swa_reprefill_tail_tokens(self):
+        return self.tail
+
+    def match_prefix(self, params):
+        self.limits.append(params.key.limit)
+        return NS(device_indices=[0] * self.matched, host_hit_length=self.host)
 
 
 def adder(model=None):
@@ -54,7 +71,7 @@ def adder(model=None):
     return obj
 
 
-def scheduler(waiting, chunked=None, mbs=(), last_mbs=(), matched=0):
+def scheduler(waiting, chunked=None, mbs=(), last_mbs=(), matched=0, host=0, tail=0):
     return NS(
         _tpu_pp_chunk_cost=cost(),
         ps=NS(pp_size=8),
@@ -62,7 +79,7 @@ def scheduler(waiting, chunked=None, mbs=(), last_mbs=(), matched=0):
         chunked_req=chunked,
         mbs=list(mbs),
         last_mbs=list(last_mbs),
-        tree_cache=NS(match_prefix=lambda params: NS(device_indices=[0] * matched)),
+        tree_cache=Cache(matched, host, tail),
     )
 
 
@@ -83,6 +100,24 @@ def test_cached_prefix_of_a_waiting_request_is_not_pending_work():
     # prompt ran as one 4K chunk instead of one chunk per stage.
     assert pending_step_limit(scheduler([req(65536)], matched=61440)) == 2048
     assert pending_step_limit(scheduler([req(65536)], matched=0)) == 8192
+
+
+def test_pending_match_counts_the_cache_as_admission_does():
+    """The estimate uses admission's match: a host-cache hit is cached work,
+    and the SWA re-prefill tail limits the match."""
+    sched = scheduler([req(65536)], matched=32768, host=28672, tail=4096)
+    assert pending_step_limit(sched) == 2048
+    assert sched.tree_cache.limits == [65536 - 4096]
+
+
+def test_at_most_128_waiting_requests_are_matched_per_step():
+    """Short questions behind a long cached prefix add little pending work
+    each, so matching every queued request would walk the prefix hundreds of
+    times per step; past 128 they count at full length."""
+    waiting = [req(65536 + 256, rid=str(i)) for i in range(600)]
+    sched = scheduler(waiting, matched=65536)
+    assert pending_step_limit(sched) == 16384
+    assert len(sched.tree_cache.limits) == 128
 
 
 def test_pending_continuation_counts_only_unscheduled_tokens_once():

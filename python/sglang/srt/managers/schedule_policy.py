@@ -137,17 +137,14 @@ def estimate_prefill_extend_tile_metrics(
     }
 
 
-def match_prefix_for_req(
+def _match_prefix_result(
     tree_cache: BasePrefixCache,
     req: Req,
-    token_ids: Optional[array[int]] = None,
+    token_ids: array[int],
     *,
     cow_mamba: bool = False,
     include_req: bool = False,
 ):
-    if token_ids is None:
-        token_ids = req.origin_input_ids + req.output_ids
-
     # unified_kv SWA lives in a per-request ring that's not content-stable and is
     # never stored in the radix tree, so a reused prefix carries stale SWA. Cap
     # the match by the trailing sliding window so it gets re-prefilled, rewriting
@@ -171,6 +168,33 @@ def match_prefix_for_req(
         match_result = zero_match_result(
             tree_cache, match_result, extra_key=req.extra_key
         )
+    return match_result
+
+
+def matched_prefix_len(tree_cache: BasePrefixCache, req: Req) -> int:
+    """Cached tokens admission would reuse for ``req`` (device and host hits,
+    capped like ``num_matched_prefix_tokens``), without writing to ``req``."""
+    token_ids = req.origin_input_ids + req.output_ids
+    match_result = _match_prefix_result(tree_cache, req, token_ids)
+    return min(
+        len(match_result.device_indices) + match_result.host_hit_length,
+        req._compute_max_prefix_len(len(token_ids)),
+    )
+
+
+def match_prefix_for_req(
+    tree_cache: BasePrefixCache,
+    req: Req,
+    token_ids: Optional[array[int]] = None,
+    *,
+    cow_mamba: bool = False,
+    include_req: bool = False,
+):
+    if token_ids is None:
+        token_ids = req.origin_input_ids + req.output_ids
+    match_result = _match_prefix_result(
+        tree_cache, req, token_ids, cow_mamba=cow_mamba, include_req=include_req
+    )
     (
         req.prefix_indices,
         req.last_node,
