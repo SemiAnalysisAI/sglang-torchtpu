@@ -36,7 +36,7 @@ class TestPackedSDPA(unittest.TestCase):
         dtype=torch.float32,
         causal=False,
         strided=False,
-        host=True
+        host=True,
     ):
         q, k, v = packed_inputs(
             bounds, heads, kv_heads, dim, value_dim, dtype, strided=strided
@@ -150,10 +150,13 @@ class TestPackedSDPA(unittest.TestCase):
         impl = sdpa.SDPAImpl(2, 32, False, 0.37)
         # A meta tensor cannot be copied to the host or converted to a list.
         cu = torch.empty(len(bounds), device="meta", dtype=torch.int32)
-        with patch.object(
-            torch.Tensor, "tolist", side_effect=AssertionError("device read")
-        ), patch.object(
-            torch.Tensor, "item", side_effect=AssertionError("device read")
+        with (
+            patch.object(
+                torch.Tensor, "tolist", side_effect=AssertionError("device read")
+            ),
+            patch.object(
+                torch.Tensor, "item", side_effect=AssertionError("device read")
+            ),
         ):
             actual = impl.forward_varlen(
                 q, k, v, cu_seqlens=cu, cu_seqlens_host=bounds, max_seqlen=5
@@ -200,8 +203,9 @@ class TestPackedSDPAMpsChunking(unittest.TestCase):
                     bounds = (0, 3, 3, 3 + length)
                     q, k, v = packed_inputs(bounds, 2, 1, 32, 32, torch.float32)
                     impl = CpuChunks(2, 32, causal, 0.37, num_kv_heads=1)
-                    with patch.object(torch.mps, "synchronize"), patch.object(
-                        torch.mps, "empty_cache"
+                    with (
+                        patch.object(torch.mps, "synchronize"),
+                        patch.object(torch.mps, "empty_cache"),
                     ):
                         actual = impl.forward_varlen(
                             q.as_subclass(_MpsBranchTensor),

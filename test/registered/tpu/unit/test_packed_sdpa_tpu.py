@@ -42,14 +42,17 @@ class TestPackedSDPATpu(unittest.TestCase):
         ):
             for dtype in (torch.float32, torch.bfloat16):
                 for causal in (False, True):
-                    with self.subTest(
-                        heads=heads,
-                        kv_heads=kv_heads,
-                        dim=dim,
-                        value_dim=value_dim,
-                        dtype=dtype,
-                        causal=causal,
-                    ), torch.no_grad():
+                    with (
+                        self.subTest(
+                            heads=heads,
+                            kv_heads=kv_heads,
+                            dim=dim,
+                            value_dim=value_dim,
+                            dtype=dtype,
+                            causal=causal,
+                        ),
+                        torch.no_grad(),
+                    ):
                         host = packed_inputs(
                             bounds, heads, kv_heads, dim, value_dim, dtype
                         )
