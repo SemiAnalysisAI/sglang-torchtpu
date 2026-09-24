@@ -17,8 +17,15 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.tpu import model_config_main
+    from sglang.test.tpu.pd_router import (
+        build_router_cmd,
+        prefill_kv_events_args,
+        router_ready_url,
+    )
 except ModuleNotFoundError as exc:
     # Source-only checkout: the host-side configuration tests still run.
+    import importlib.util
+
     SGLANG_IMPORT_ERROR = exc
 
     def register_tpu_ci(*_args, **_kwargs):
@@ -26,6 +33,24 @@ except ModuleNotFoundError as exc:
 
     def model_config_main(*_args, **_kwargs):
         return None
+
+    _pd_router_path = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            *[".."] * 4,
+            "python",
+            "sglang",
+            "test",
+            "tpu",
+            "pd_router.py",
+        )
+    )
+    _spec = importlib.util.spec_from_file_location("pd_router", _pd_router_path)
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    build_router_cmd = _mod.build_router_cmd
+    prefill_kv_events_args = _mod.prefill_kv_events_args
+    router_ready_url = _mod.router_ready_url
 
 
 # Expected runtime: 45 minutes; CI uses this for scheduling and timeouts.
@@ -184,7 +209,7 @@ def _shared_server_args() -> List[str]:
 def build_prefill_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
     """Construct the environment for the prefill engine."""
     values = os.environ if env is None else env
-    extra_args = _shared_server_args()
+    extra_args = _shared_server_args() + list(prefill_kv_events_args(env=values))
     if values.get("EXTRA_PREFILL_ARGS"):
         extra_args.append(values["EXTRA_PREFILL_ARGS"])
     return {
@@ -263,21 +288,16 @@ def execute_decode(log_path: str = DECODE_LOG) -> subprocess.Popen:
 def execute_router(
     *, prefill_host: str, decode_host: str, log_path: str = LB_LOG
 ) -> subprocess.Popen:
-    """Launch the mini-LB in front of the prefill and decode pods."""
-    cmd = (
-        PYTHON,
-        "-m",
-        "sglang_router.launch_router",
-        "--pd-disaggregation",
-        "--mini-lb",
-        "--prefill",
-        f"http://{prefill_host}:{PREFILL_PORT}",
-        "--decode",
-        f"http://{decode_host}:{DECODE_PORT}",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(LB_PORT),
+    """Launch the router in front of the prefill and decode pods."""
+    cmd = build_router_cmd(
+        python=PYTHON,
+        prefill_url=f"http://{prefill_host}:{PREFILL_PORT}",
+        decode_url=f"http://{decode_host}:{DECODE_PORT}",
+        host="0.0.0.0",
+        port=LB_PORT,
+        bootstrap_port=BOOTSTRAP_PORT,
+        model_id=SERVED_MODEL_NAME,
+        tokenizer_path=resolve_model_path(),
     )
     return _launch(cmd, log_path=log_path)
 
@@ -428,7 +448,9 @@ def run_prefill_leader() -> int:
             ("router", execute_router(prefill_host=this_host, decode_host=decode_host))
         )
         _wait_http_200(
-            url=f"http://{LOCAL_HOST}:{LB_PORT}/health", secs=300, procs=tuple(procs)
+            url=router_ready_url(host=LOCAL_HOST, port=LB_PORT),
+            secs=300,
+            procs=tuple(procs),
         )
 
         model_config_main(
