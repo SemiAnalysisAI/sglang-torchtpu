@@ -621,8 +621,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             input_ids.shape[0],
             logits_output_mode,
         )
-        tile = getattr(attention_metadata, "prefill_kv_tile", None)
-        return key if tile is None else (*key, ("prefill_kv_tile", tile))
+        return key
 
     def _compiles_logits_processor(self) -> bool:
         """Whether this compiled callable includes target-model logits processing."""
@@ -1278,8 +1277,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             input_deepstack_embeds is not None,
             logits_output_mode,
         )
-        tile = getattr(attention_metadata, "prefill_kv_tile", None)
-        return key if tile is None else (*key, ("prefill_kv_tile", tile))
+        return key
 
     def _decode_uses_input_ids(self) -> bool:
         """Whether the wrapper hands decode raw ``input_ids``, skipping embed.

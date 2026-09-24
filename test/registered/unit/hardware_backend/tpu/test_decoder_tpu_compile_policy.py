@@ -320,7 +320,7 @@ class TestAttentionTileSpecialization(CustomTestCase):
                 for metadata in (
                     None,
                     SimpleNamespace(),
-                    SimpleNamespace(prefill_kv_tile=None),
+                    SimpleNamespace(prefill_kv_tile_hint=None),
                 ):
                     with self.subTest(
                         policy=policy_cls.__name__,
@@ -338,12 +338,14 @@ class TestAttentionTileSpecialization(CustomTestCase):
                             base_key,
                         )
 
-    def test_tiles_compose_with_base_specialization(self):
+    def test_tile_hints_preserve_base_specialization(self):
         policy = object.__new__(DecoderTpuCompilePolicy)
         policy._compiles_logits_processor = MagicMock(return_value=True)
         keys = set()
-        for tile in (0, 1024, 2048):
-            metadata = SimpleNamespace(prefill_kv_tile=tile)
+        for tile in (-1, 0, 1024, 2048):
+            metadata = SimpleNamespace(
+                prefill_kv_tile_hint=torch.tensor(tile, dtype=torch.int32)
+            )
             for logits_mode in ("full_vocab", "top_k"):
                 self.forward_batch.logits_output_mode = logits_mode
                 key = policy._direct_compile_specialization_key(
@@ -351,17 +353,21 @@ class TestAttentionTileSpecialization(CustomTestCase):
                 )
                 self.assertEqual(
                     key,
-                    ("extend", "null", 1, 8, logits_mode, ("prefill_kv_tile", tile)),
+                    ("extend", "null", 1, 8, logits_mode),
                 )
                 keys.add(key)
-        self.assertEqual(len(keys), 6)
+        self.assertEqual(len(keys), 2)
 
-    def test_tiles_compose_with_multimodal_specialization(self):
+    def test_tile_hints_preserve_multimodal_specialization(self):
         policy = object.__new__(Qwen3VLDecoderTpuCompilePolicy)
         policy._compiles_logits_processor = MagicMock(return_value=True)
         keys = set()
-        for tile in (None, 0, 1024, 2048):
-            metadata = SimpleNamespace(prefill_kv_tile=tile)
+        for tile in (None, -1, 0, 1024, 2048):
+            metadata = SimpleNamespace(
+                prefill_kv_tile_hint=(
+                    None if tile is None else torch.tensor(tile, dtype=torch.int32)
+                )
+            )
             for deepstack in (None, torch.empty(8, 12)):
                 key = policy._direct_compile_specialization_key(
                     metadata,
@@ -372,11 +378,9 @@ class TestAttentionTileSpecialization(CustomTestCase):
                     input_deepstack_embeds=deepstack,
                 )
                 expected = ("extend", "null", 1, 8, deepstack is not None, "full_vocab")
-                if tile is not None:
-                    expected += (("prefill_kv_tile", tile),)
                 self.assertEqual(key, expected)
                 keys.add(key)
-        self.assertEqual(len(keys), 8)
+        self.assertEqual(len(keys), 2)
 
     def test_metadata_preserves_positional_decode_query_size(self):
         from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
@@ -386,7 +390,67 @@ class TestAttentionTileSpecialization(CustomTestCase):
         tensor = torch.empty(0, dtype=torch.int32)
         metadata = PallasForwardMetadata(*([tensor] * 7), 4)
         self.assertEqual(metadata.decode_query_size, 4)
-        self.assertIsNone(metadata.prefill_kv_tile)
+        self.assertIsNone(metadata.prefill_kv_tile_hint)
+
+    def test_shared_op_forwards_dynamic_hint_and_preserves_decode_width(self):
+        from sglang.srt.hardware_backend.tpu import attention_pallas_rpa_base as rpa
+
+        tensor = torch.empty(0)
+        jax_kernel = MagicMock(return_value=(tensor, tensor))
+        register_jax = MagicMock(return_value=jax_kernel)
+        invoker = MagicMock()
+        spec = rpa.RpaKernelSpec(
+            op_name="sglang_tpu_pallas::test_prefill_hint",
+            import_kernel=lambda: None,
+            invoke_kernel=invoker,
+            supports_attention_sink=False,
+            extend_distribution_mask=(0, 1, 1),
+            uses_draft_extend_v2=True,
+        )
+        modules = {
+            "jax": SimpleNamespace(Array=object),
+            "torch_tpu": ModuleType("torch_tpu"),
+            "torch_tpu._internal": SimpleNamespace(
+                pallas=SimpleNamespace(custom_jax_kernel=register_jax)
+            ),
+        }
+        with (
+            patch.dict(sys.modules, modules),
+            patch.dict(rpa._OP_CACHE, clear=True),
+            patch.object(torch.library, "custom_op") as register_torch,
+            patch.object(rpa, "tpu_info_for_cpu_export", contextlib.nullcontext),
+        ):
+            op = rpa._build_pallas_kernel_op(spec)
+            self.assertIs(rpa._build_pallas_kernel_op(spec), op)
+            wrapped = register_jax.call_args.args[0]
+            torch_op = register_torch.return_value.call_args.args[0]
+            self.assertEqual(
+                register_jax.call_args.kwargs["static_argnums"],
+                (10, 11, 12, 13, 14, 15),
+            )
+            self.assertEqual(
+                register_jax.call_args.kwargs["input_output_aliases"], {3: 1}
+            )
+            for hint in (
+                None,
+                torch.tensor(0, dtype=torch.int32),
+                torch.tensor(2048, dtype=torch.int32),
+            ):
+                args = [tensor] * 9
+                wrapped(*args, decode_query_size=4, prefill_kv_tile_hint=hint)
+                self.assertEqual(invoker.call_args.kwargs["decode_query_size"], 4)
+                if hint is None:
+                    self.assertNotIn("prefill_kv_tile_hint", invoker.call_args.kwargs)
+                else:
+                    self.assertIs(
+                        invoker.call_args.kwargs["prefill_kv_tile_hint"], hint
+                    )
+                self.assertIs(
+                    torch_op(*args, decode_query_size=4, prefill_kv_tile_hint=hint),
+                    tensor,
+                )
+                self.assertEqual(jax_kernel.call_args.args[15], 4)
+                self.assertIs(jax_kernel.call_args.args[16], hint)
 
 
 class TestEagle3DirectCompile(_SpecPolicyTestCase):

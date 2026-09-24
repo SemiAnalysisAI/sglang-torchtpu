@@ -103,9 +103,9 @@ class PallasForwardMetadata:
     # Static query rows per DECODE sequence for this forward (1 = ordinary
     # decode); above 1 the active rows take the kernel's DECODE range.
     decode_query_size: int = 1
-    # Finite host-selected specialization: 0=automatic, 1024 or 2048 tokens.
-    # None leaves unrelated backends' direct-compile keys unchanged.
-    prefill_kv_tile: int | None = None
+    # Owned scalar i32: -1=native fallback, 0=static base, 1024/2048=promotion.
+    # Backends without runtime tile selection leave this unset.
+    prefill_kv_tile_hint: torch.Tensor | None = None
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
@@ -281,6 +281,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         k_scale: float | None = None,
         v_scale: float | None = None,
         decode_query_size: int = 1,
+        prefill_kv_tile_hint: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         if not spec.supports_attention_sink and attention_sink is not None:
             raise NotImplementedError(f"{op_name} does not support attention sinks")
@@ -288,6 +289,11 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         # kernel dequantizes on read by multiplying the attention scores /
         # output by these per-tensor scales. ``q_scale`` is left unset so
         # queries stay bf16 — only K/V are quantized, matching the GPU backends.
+        hint_options = (
+            {}
+            if prefill_kv_tile_hint is None
+            else {"prefill_kv_tile_hint": prefill_kv_tile_hint}
+        )
         return spec.invoke_kernel(
             _jax_rpa,
             queries=queries,
@@ -306,6 +312,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
             k_scale=k_scale,
             v_scale=v_scale,
             decode_query_size=decode_query_size,
+            **hint_options,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
@@ -342,6 +349,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         k_scale: float | None = None,
         v_scale: float | None = None,
         decode_query_size: int = 1,
+        prefill_kv_tile_hint: torch.Tensor | None = None,
     ) -> torch.Tensor:
         with tpu_info_for_cpu_export():
             output, _updated_kv = jax_kernel(
@@ -361,6 +369,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
                 k_scale,
                 v_scale,
                 decode_query_size,
+                prefill_kv_tile_hint,
             )
         return output
 
