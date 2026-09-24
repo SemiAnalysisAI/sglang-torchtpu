@@ -1036,6 +1036,26 @@ class TestPrefillAdder(CustomTestCase):
         req.set_extend_range.assert_called_once_with(4096, 4992)
         self.assertIs(adder.new_chunked_req, req)
 
+    def test_capped_partial_ends_admission(self):
+        """A partial request cut by the cap leaves chunk budget, but it must
+        still end the batch: the scheduler tracks one partial request and
+        treats any other as fully prefilled."""
+        adder = self._prefix_hit_adder(rem_chunk_tokens=8192)
+        first = self._prefix_hit_req()
+        second = self._prefix_hit_req(prefix_len=0, remaining=16384, rid="big")
+
+        verdict = adder.add_one_req(
+            first,
+            has_chunked_req=False,
+            truncation_align_size=None,
+            chunk_tokens_cap=1000,
+        )
+        self.assertEqual(verdict, AddReqResult.OTHER)
+        adder.add_one_req(second, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertIs(adder.new_chunked_req, first)
+        self.assertEqual(adder.can_run_list, [first])
+
     def test_chunk_tokens_cap_above_remaining_admits_whole_request(self):
         adder = self._prefix_hit_adder(rem_chunk_tokens=8192)
         req = self._prefix_hit_req()

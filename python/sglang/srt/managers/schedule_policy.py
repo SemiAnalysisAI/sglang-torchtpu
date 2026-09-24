@@ -1495,6 +1495,9 @@ class PrefillAdder:
                     host_hit_len=req.host_hit_length,
                     storage_hit_len=req.storage_hit_length,
                 )
+                if self.rem_chunk_tokens is not None:
+                    # The scheduler tracks one partial request, so it ends the batch.
+                    self.rem_chunk_tokens = 0
 
         return self.budget_state()
 
