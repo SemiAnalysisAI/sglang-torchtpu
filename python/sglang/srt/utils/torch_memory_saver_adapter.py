@@ -16,8 +16,9 @@ try:
     _memory_saver = torch_memory_saver.torch_memory_saver
     import_error = None
 except ImportError as e:
-    import_error = e
-    pass
+    # A kept traceback pins every frame of the first importer's stack, and
+    # their locals, for the life of the process.
+    import_error = e.with_traceback(None)
 
 logger = logging.getLogger(__name__)
 
