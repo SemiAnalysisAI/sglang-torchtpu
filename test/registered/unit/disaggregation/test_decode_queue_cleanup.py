@@ -3,6 +3,8 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -18,7 +20,7 @@ from sglang.srt.disaggregation.fake.conn import (
 from sglang.srt.disaggregation.fake.conn import FakeKVReceiver as DisaggFakeKVReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -31,9 +33,14 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 class FakeReceiver:
     def __init__(self):
         self.clear_called = False
+        self.calls = []
         self.conclude_state = None
 
+    def abort(self):
+        self.calls.append("abort")
+
     def clear(self):
+        self.calls.append("clear")
         self.clear_called = True
 
     def failure_exception(self):
@@ -331,6 +338,64 @@ class TestDecodeQueueCleanup(CustomTestCase):
             [req], req.return_logprob
         )
 
+    def test_prealloc_reclaims_capacity_consumed_by_request_state(self):
+        override = get_context().override_server_args(
+            disaggregation_decode_enable_radix_cache=True
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        available = 29
+        req = SimpleNamespace(
+            rid="shared-mamba",
+            origin_input_ids=[0] * 29,
+            output_ids=[],
+            kv=ReqKvInfo(),
+            set_extend_range=MagicMock(),
+        )
+
+        def alloc_request_slot(reqs):
+            nonlocal available
+            # A Mamba slot can consume bytes from the shared full-attention pool.
+            available -= 3
+            reqs[0].kv.req_pool_idx = 0
+            return [0]
+
+        def evict(params):
+            nonlocal available
+            self.assertEqual(req.kv.req_pool_idx, 0)
+            self.assertEqual(params.num_tokens, 3)
+            available += 3
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.req_to_token_pool = SimpleNamespace(
+            alloc=MagicMock(side_effect=alloc_request_slot), write=MagicMock()
+        )
+        queue.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=1,
+            available_size=lambda: available,
+            alloc=MagicMock(
+                side_effect=lambda n: torch.arange(n) if available >= n else None
+            ),
+        )
+        queue.scheduler = SimpleNamespace(
+            enable_hisparse=False, tp_worker=SimpleNamespace(is_hybrid_swa=False)
+        )
+        queue.tree_cache = MagicMock()
+        queue.tree_cache.evict_for_alloc.side_effect = evict
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+
+        self.assertIsNone(
+            queue._reclaim_prealloc_capacity(
+                full_alloc_tokens=29, swa_tail_len=None, req_id=req.rid
+            )
+        )
+        queue.tree_cache.evict_for_alloc.assert_not_called()
+        indices = queue._pre_alloc(req)
+
+        self.assertEqual(len(indices), 29)
+        queue.tree_cache.evict_for_alloc.assert_called_once()
+        queue.token_to_kv_pool_allocator.alloc.assert_called_once_with(29)
+
     def test_prealloc_abort_also_drops_from_pending_reqs(self):
         # Same DecodeRequest lives in both queue and pending_reqs (add() slow
         # path). Aborting must drop it from both, and compare by identity since
@@ -384,22 +449,26 @@ class TestDecodeQueueCleanup(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
-        for uses_swa, full_available, swa_available in (
-            (False, 512, 0),
-            (True, 512, 2560),
-            (True, 4096, 512),
-            (True, 512, 512),
+        for uses_swa, full_available, swa_available, has_mamba in (
+            (False, 512, 0, False),
+            (False, 512, 0, True),
+            (True, 512, 2560, False),
+            (True, 4096, 512, False),
+            (True, 512, 512, True),
         ):
             with self.subTest(
                 uses_swa=uses_swa,
                 full_available=full_available,
                 swa_available=swa_available,
+                has_mamba=has_mamba,
             ):
                 self._check_prealloc_reclaim_failure(
-                    uses_swa, full_available, swa_available
+                    uses_swa, full_available, swa_available, has_mamba
                 )
 
-    def _check_prealloc_reclaim_failure(self, uses_swa, full_available, swa_available):
+    def _check_prealloc_reclaim_failure(
+        self, uses_swa, full_available, swa_available, has_mamba
+    ):
         receiver = FakeReceiver()
         req = SimpleNamespace(
             rid="kv-reclaim-failed",
@@ -411,6 +480,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             last_node=object(),
             lock_receipt=object(),
             swa_prefix_lock_released=False,
+            kv=ReqKvInfo(),
         )
         decode_req = SimpleNamespace(
             req=req,
@@ -443,13 +513,19 @@ class TestDecodeQueueCleanup(CustomTestCase):
             else SimpleNamespace(page_size=512)
         )
         queue.tree_cache = MagicMock()
-        queue._match_prefix_and_lock = MagicMock(
-            return_value=SimpleNamespace(
+
+        def match_prefix(req):
+            # Mamba matching reserves the deferred COW destination before a
+            # request slot or full-attention KV has been allocated.
+            if has_mamba:
+                req.kv.mamba_pool_idx = torch.tensor(1)
+            return SimpleNamespace(
                 prefix_indices=list(range(4096)),
                 l1_prefix_len=4096,
                 decode_prefix_len=4096,
             )
-        )
+
+        queue._match_prefix_and_lock = MagicMock(side_effect=match_prefix)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
         queue._pre_alloc = MagicMock(
             side_effect=AssertionError(
@@ -458,6 +534,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 1
+        queue.tree_cache.req_to_token_pool = queue.req_to_token_pool
+        queue.tree_cache.supports_mamba.return_value = has_mamba
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
 
@@ -480,6 +558,16 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertIsNone(decode_req.kv_receiver)
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
         self.assertEqual(req.finished_reason.status_code, 503)
+        self.assertFalse(req.kv.holds_mamba)
+        free_mamba = queue.req_to_token_pool.mamba_allocator.free
+        if has_mamba:
+            free_mamba.assert_called_once()
+            self.assertTrue(
+                torch.equal(free_mamba.call_args.args[0], torch.tensor([1]))
+            )
+        else:
+            free_mamba.assert_not_called()
+        self.assertEqual(receiver.calls, ["abort", "clear"])
         self.assertIn("eviction insufficient", req.finished_reason.message)
         queue.tree_cache.evict_for_alloc.assert_called_once()
         params = queue.tree_cache.evict_for_alloc.call_args.args[0]

@@ -954,7 +954,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 req_id=req.rid,
             )
             if reclaim_error is not None:
-                logger.warning(reclaim_error)
                 break
 
             resumed_reqs.append(req)
@@ -1456,6 +1455,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if reclaim_error is not None:
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self._release_matched_prefix_lock(decode_req.req)
+                # Prefix matching can reserve a Mamba COW slot before KV allocation.
+                if decode_req.req.kv.holds_mamba:
+                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 logger.error(reclaim_error)
                 prepare_abort(
                     decode_req.req,
@@ -1465,6 +1467,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.scheduler.output_streamer.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
+                decode_req.kv_receiver.abort()
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)
@@ -1957,6 +1960,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         required_alloc_tokens = self._required_alloc_tokens(
             fill_len=fill_len, prefix_len=prefix_len
         )
+
+        # Request-slot allocation can consume shared full/Mamba bytes after
+        # preflight. Preserve late reclamation for that capacity change.
+        if get_disagg().disaggregation_decode_enable_radix_cache:
+            shortfall = required_alloc_tokens - self._radix_full_available()
+            if shortfall > 0:
+                self.tree_cache.evict_for_alloc(EvictParams(num_tokens=shortfall))
 
         allocator = self.token_to_kv_pool_allocator
         uses_swa_tail = self._uses_swa_tail_prealloc()
