@@ -10,7 +10,10 @@ is what goes flat when the draft stops tracking the target on image prompts.
 
 import os
 
-from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.ci_register import (
+    TPU_QWEN3_VL_WEIGHTS_PVC,
+    register_tpu_ci,
+)
 from sglang.test.tpu import model_config_main
 
 register_tpu_ci(
@@ -19,7 +22,7 @@ register_tpu_ci(
     nightly=True,
     labels=["singlehost", "qwen3-vl-8b", "spec", "eagle3", "multimodal"],
     # Not on model-weights-filestore, which the lane mounts by default.
-    weights_pvc="qwen3-spec-vl-rox",
+    weights_pvc=TPU_QWEN3_VL_WEIGHTS_PVC,
 )
 
 SERVED_MODEL_NAME = "qwen3-vl-8b"

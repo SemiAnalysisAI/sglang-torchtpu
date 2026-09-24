@@ -2,7 +2,10 @@
 
 import os
 
-from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.ci_register import (
+    TPU_MODEL_WEIGHTS_PVC,
+    register_tpu_ci,
+)
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 from sglang.test.tpu import model_config_main
 
@@ -16,7 +19,7 @@ register_tpu_ci(
 MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/gpt_120b_spec_mh.sh",
-    "weights_pvc": "model-weights-filestore",
+    "weights_pvc": TPU_MODEL_WEIGHTS_PVC,
 }
 
 SERVED_MODEL_NAME = "gpt-oss-120b"

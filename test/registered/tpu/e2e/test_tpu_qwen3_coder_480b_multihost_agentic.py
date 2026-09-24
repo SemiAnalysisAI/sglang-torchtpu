@@ -25,7 +25,10 @@ import unittest
 
 from bench_matrix_base import build_bench_test
 
-from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.ci_register import (
+    TPU_MODEL_WEIGHTS_PVC,
+    register_tpu_ci,
+)
 
 register_tpu_ci(
     est_time=1800,
@@ -38,7 +41,7 @@ register_tpu_ci(
 MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/qwen3_coder_480b_agentic_mh.sh",
-    "weights_pvc": "model-weights-filestore",
+    "weights_pvc": TPU_MODEL_WEIGHTS_PVC,
 }
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 4))

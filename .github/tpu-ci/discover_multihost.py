@@ -14,11 +14,19 @@ Prints a JSON array for the CI matrix:
 import argparse
 import ast
 import glob
+import importlib.util
 import json
 import os
 import sys
 
 from test_names import names_from_path
+
+_CI_REGISTER_PATH = os.path.join(
+    os.path.dirname(__file__), "../../python/sglang/test/ci/ci_register.py"
+)
+_spec = importlib.util.spec_from_file_location("tpu_ci_register", _CI_REGISTER_PATH)
+_ci_register = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_ci_register)
 
 
 def _literal(node):
@@ -35,7 +43,7 @@ def _scan(root, suite, nightly_only):
             tree = ast.parse(open(path).read())
         except SyntaxError:
             continue
-        launch, registered = None, False
+        launch_node, registered = None, False
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Call)
@@ -56,8 +64,18 @@ def _scan(root, suite, nightly_only):
             elif isinstance(node, ast.Assign):
                 for t in node.targets:
                     if isinstance(t, ast.Name) and t.id == "MULTIHOST_LAUNCH":
-                        launch = _literal(node.value)
-        if registered and isinstance(launch, dict):
+                        launch_node = node.value
+        if registered and launch_node is not None:
+            try:
+                launch = _ci_register.tpu_ci_literal(
+                    launch_node, _ci_register.tpu_weights_bindings(tree)
+                )
+                if not isinstance(launch, dict):
+                    raise ValueError("expected a dictionary")
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"{path}: invalid MULTIHOST_LAUNCH: {error}"
+                ) from error
             found[path] = launch
     return found
 

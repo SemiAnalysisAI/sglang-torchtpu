@@ -84,9 +84,27 @@ The model+config is **not** bound to a suite — each multi-host test file decla
 own launch in a module-level `MULTIHOST_LAUNCH` dict:
 
 ```python
+from sglang.test.ci.ci_register import TPU_MODEL_WEIGHTS_PVC
+
 MULTIHOST_LAUNCH = {"hosts": 2, "launch_script": "recipe/qwen3_30b_a3b_fp8_mh.sh",
-                    "weights_pvc": "model-weights-filestore"}   # weights_pvc optional
+                    "weights_pvc": TPU_MODEL_WEIGHTS_PVC}   # weights_pvc optional
 ```
+
+The two shared PVC names are defined in
+`python/sglang/test/ci/ci_register.py`: `TPU_MODEL_WEIGHTS_PVC` for the shared
+model weights and `TPU_QWEN3_VL_WEIGHTS_PVC` for Qwen3-VL. Import these constants
+directly at module scope for `register_tpu_ci(weights_pvc=...)` or
+`MULTIHOST_LAUNCH`; CI discovery resolves these imports without executing tests.
+Keep the remaining registration and launch metadata literal.
+
+Workflows pass the constant's **name**, for example
+`weights_pvc: TPU_MODEL_WEIGHTS_PVC`. `render_jobset.py --weights-pvc` resolves
+it to the physical claim name for both ordinary and P/D JobSets. Standalone
+launchers can also pass the name as a string, without importing SGLang.
+Explicit custom PVC names still work; an empty value mounts no weights.
+The container mount remains `/weights` (test-side lookup can be overridden with
+`SGLANG_TPU_WEIGHTS_ROOT`). PVC provisioning manifests must still name the actual
+cluster resources; changing a constant selects a claim, it does not create one.
 
 `launch_script` is a recipe under `benchmark/tpu/recipe/` that sets `MODEL`/`EP_SIZE`/…
 and execs `launch_server.sh`. `discover_multihost.py` scans the files registered to a

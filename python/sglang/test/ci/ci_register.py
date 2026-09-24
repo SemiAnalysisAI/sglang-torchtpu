@@ -19,7 +19,64 @@ __all__ = [
     "register_musa_ci",
     "register_mlx_ci",
     "ut_parse_one_file",
+    "TPU_MODEL_WEIGHTS_PVC",
+    "TPU_QWEN3_VL_WEIGHTS_PVC",
 ]
+
+# Physical claim names live here so test metadata and workflow rendering agree.
+# CI loads this module directly without importing sglang or device dependencies.
+TPU_MODEL_WEIGHTS_PVC = "model-weights-filestore"
+TPU_QWEN3_VL_WEIGHTS_PVC = "qwen3-spec-vl-rox"
+
+
+def _tpu_weights_pvcs() -> dict[str, str]:
+    return {
+        "TPU_MODEL_WEIGHTS_PVC": TPU_MODEL_WEIGHTS_PVC,
+        "TPU_QWEN3_VL_WEIGHTS_PVC": TPU_QWEN3_VL_WEIGHTS_PVC,
+    }
+
+
+def resolve_tpu_weights_pvc(value: str) -> str:
+    """Resolve a workflow's constant name, preserving literal PVCs and no mount."""
+    return _tpu_weights_pvcs().get(value, value)
+
+
+def tpu_weights_bindings(tree: ast.Module) -> dict[str, str]:
+    """Read approved constant imports without importing or executing test files."""
+    constants = _tpu_weights_pvcs()
+    bindings = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.level == 0
+            and node.module == "sglang.test.ci.ci_register"
+        ):
+            for alias in node.names:
+                if alias.name in constants:
+                    bindings[alias.asname or alias.name] = constants[alias.name]
+    # Static declarations cannot redefine an imported constant. Fail instead of
+    # discovering a different PVC from the one Python would use at runtime.
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                for name in ast.walk(target):
+                    if isinstance(name, ast.Name) and name.id in bindings:
+                        raise ValueError(f"CI weights constant {name.id} is reassigned")
+    return bindings
+
+
+def tpu_ci_literal(node: ast.AST, bindings: dict[str, str]) -> object:
+    """Evaluate literal launch metadata with only the approved imported constants."""
+    if isinstance(node, ast.Name) and node.id in bindings:
+        return bindings[node.id]
+    if isinstance(node, ast.Dict):
+        return {
+            ast.literal_eval(key): tpu_ci_literal(value, bindings)
+            for key, value in zip(node.keys, node.values)
+        }
+    return ast.literal_eval(node)
+
 
 # `suite` stays in positional slot 2 for backward compat with existing
 # `register_cpu_ci(5, "base-a-test-cpu")` style positional calls. New fields
@@ -191,8 +248,11 @@ class RegistryVisitor(ast.NodeVisitor):
         self.filename = filename
         self.registries: list[CIRegistry] = []
         self.has_main_entry: bool = False
+        self.weights_bindings: dict[str, str] = {}
 
     def _constant_value(self, node: ast.AST) -> object:
+        if isinstance(node, ast.Name) and node.id in self.weights_bindings:
+            return self.weights_bindings[node.id]
         if isinstance(node, ast.Constant):
             return node.value
         # A ["a", "b"] literal (labels). Anything non-constant inside stays _UNSET.
@@ -303,6 +363,11 @@ class RegistryVisitor(ast.NodeVisitor):
                 f"in {func_call.func.id}()"
             )
 
+        if "weights_pvc" in seen and args["weights_pvc"] is _UNSET:
+            raise ValueError(
+                f"{self.filename}: weights_pvc must be a literal or an imported "
+                "TPU weights constant from sglang.test.ci.ci_register"
+            )
         weights_pvc = args["weights_pvc"] if args["weights_pvc"] is not _UNSET else None
         if weights_pvc is not None and not (
             isinstance(weights_pvc, str) and weights_pvc.strip()
@@ -361,6 +426,7 @@ class RegistryVisitor(ast.NodeVisitor):
         return False
 
     def visit_Module(self, node):
+        self.weights_bindings = tpu_weights_bindings(node)
         for stmt in node.body:
             if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
                 cr = self._collect_ci_registry(stmt.value)

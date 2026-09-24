@@ -160,7 +160,11 @@ def main():
     # (with --exec); --hosts is ignored in this mode.
     ap.add_argument("--pd-prefill-hosts", type=int, default=0)
     ap.add_argument("--pd-decode-hosts", type=int, default=0)
-    ap.add_argument("--weights-pvc", default="")
+    ap.add_argument(
+        "--weights-pvc",
+        default="",
+        help="TPU weights constant name or literal PVC name; empty disables the mount.",
+    )
     ap.add_argument("--timeout-per-file", type=int, default=3600)
     ap.add_argument(
         "--service-account",
@@ -178,6 +182,7 @@ def main():
         help="Print the CI poll budget (s) for --suite and exit (no rendering).",
     )
     a = ap.parse_args()
+    a.weights_pvc = _ci_register.resolve_tpu_weights_pvc(a.weights_pvc)
 
     partitioned = a.partition_id != -1 or a.partition_size != 0
     if partitioned and not (
