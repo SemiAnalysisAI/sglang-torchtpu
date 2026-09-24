@@ -32,22 +32,12 @@ Usage: render_jobset.py --image <ref> --suite <name> [--nightly] > job.yaml
 
 import argparse
 import glob
-import importlib.util
 import os
 import re
 import sys
 
 import yaml
-
-_REPO_ROOT = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-)
-_CI_REGISTER_PATH = os.path.join(
-    _REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py"
-)
-_spec = importlib.util.spec_from_file_location("tpu_ci_register", _CI_REGISTER_PATH)
-_ci_register = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_ci_register)
+from ci_register_loader import ci_register as _ci_register
 
 _WAIT_MARGIN = 1.5
 _WAIT_FLOOR_SECONDS = 360
