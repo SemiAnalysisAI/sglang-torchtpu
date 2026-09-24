@@ -189,9 +189,13 @@ if [[ "$WORKER_ID" == "0" ]]; then
         # from each worker's /server_info. Affinity is prefill-only: a P/D
         # decode engine runs with disable_radix_cache, so a decode-side match
         # could never correspond to a cache hit.
+        TOK_PATH="${TOKENIZER:-$MODEL}"
+        if [[ -d "$TOK_PATH" && -f "$TOK_PATH/tokenizer.json" ]]; then
+            TOK_PATH="$TOK_PATH/tokenizer.json"
+        fi
         "${SGLANG_TPU_SMG_BIN:-sgl-router}" \
             --model-id "$MODEL" \
-            --tokenizer-path "${TOKENIZER:-$MODEL}" \
+            --tokenizer-path "$TOK_PATH" \
             --worker-urls \
                 "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" \
                 "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" \
@@ -199,7 +203,7 @@ if [[ "$WORKER_ID" == "0" ]]; then
                 "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" \
             --host 0.0.0.0 --port "$LB_PORT" \
             --policy "${SGLANG_TPU_PD_PREFILL_POLICY:-cache_aware}" \
-            --decode-policy "${SGLANG_TPU_PD_DECODE_POLICY:-round_robin}" \
+            --decode-policy "${SGLANG_TPU_PD_DECODE_POLICY:-power_of_two}" \
             > >(sed 's/^/[smg] /') 2>&1 &
     else
         "$PYTHON" -m sglang_router.launch_router \
