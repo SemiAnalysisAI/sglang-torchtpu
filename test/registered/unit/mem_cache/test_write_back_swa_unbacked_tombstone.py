@@ -8,6 +8,7 @@ from unittest import mock
 
 import torch
 
+import sglang.srt.mem_cache.pool_host.base as pool_host_base
 import sglang.srt.mem_cache.pool_host.common as pool_host_common
 import sglang.srt.mem_cache.pool_host.mha as pool_host_mha
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -52,6 +53,13 @@ class TestWriteBackUnbackedSwaTombstone(CustomTestCase):
         # Host pools pin their buffers with cudaHostRegister, which needs a CUDA
         # driver. Pinning only affects copy speed, not what eviction releases.
         patcher = mock.patch.object(pool_host_common, "_cuda_host_register")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # The budget subtracts a fixed reserve from free RAM, which goes negative
+        # on small CI runners; these pools need a few MB.
+        patcher = mock.patch.object(
+            pool_host_base, "host_memory_budget_bytes", return_value=1024**3
+        )
         patcher.start()
         self.addCleanup(patcher.stop)
         # The layer-first direct D2H copy is a CUDA kernel; this is its CPU form.
