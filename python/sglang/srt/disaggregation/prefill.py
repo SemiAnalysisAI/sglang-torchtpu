@@ -738,6 +738,7 @@ class SchedulerDisaggregationPrefillMixin:
             # KV page ids the in-flight forward may write, None when nothing is
             # in flight. The cached-prefix early send must not read these pages.
             self.tpu_inflight_kv_write_page_ids = None
+        self.defer_backup_flush = self._enable_deferred_backup_flush()
 
         while True:
             if self.gracefully_exit:
@@ -746,6 +747,13 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
+                if self.defer_backup_flush:
+                    # With no forward in flight (retract pause or idle), every queued
+                    # backup can go out now; flush_cache waits on them.
+                    if self.last_batch is None:
+                        self.tree_cache.flush_pending_backups()
+                    else:
+                        self.tree_cache.flush_sealed_backups()
                 self._record_scheduler_state_for_paused_engine()
                 continue
             self.waiting_queue.extend(
@@ -774,6 +782,10 @@ class SchedulerDisaggregationPrefillMixin:
                 self.result_queue.append((batch.copy(), batch_result))
                 if self.kv_free_fence is not None:
                     self.kv_free_fence.on_forward_launched(batch_result)
+                if self.defer_backup_flush:
+                    # Queue backups sealed by the last process_batch_result behind
+                    # this forward's inputs, so they no longer delay its start.
+                    self.tree_cache.flush_sealed_backups()
             else:
                 batch_result = None
                 self._sched_idled = True
@@ -790,6 +802,11 @@ class SchedulerDisaggregationPrefillMixin:
                 tpu_update_inflight_kv_write_pages(self, batch)
 
             self.process_disagg_prefill_inflight_queue()
+
+            if self.defer_backup_flush and batch is None:
+                # No forward is in flight, so every queued backup reads final KV,
+                # including those queued by the releases just above.
+                self.tree_cache.flush_pending_backups()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.

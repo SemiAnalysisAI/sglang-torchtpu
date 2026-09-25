@@ -614,6 +614,9 @@ class StreamingSession(BasePrefixCache):
     def enable_deferred_backup_flush(self) -> bool:
         return self.inner.enable_deferred_backup_flush()
 
+    def disable_deferred_backup_flush(self) -> None:
+        self.inner.disable_deferred_backup_flush()
+
     def seal_pending_backups(self) -> None:
         self.inner.seal_pending_backups()
 

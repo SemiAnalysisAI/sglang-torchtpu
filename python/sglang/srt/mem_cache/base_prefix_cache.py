@@ -612,6 +612,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         return False
 
+    def disable_deferred_backup_flush(self) -> None:
+        """Submit the queued backups and resume flushing on the cache's own schedule."""
+        pass
+
     def seal_pending_backups(self) -> None:
         """Mark every queued host backup as reading final KV."""
         pass

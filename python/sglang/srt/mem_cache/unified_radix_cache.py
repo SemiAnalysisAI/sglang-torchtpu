@@ -3524,6 +3524,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self.defer_backup_flush = True
         return True
 
+    def disable_deferred_backup_flush(self) -> None:
+        if self.defer_backup_flush:
+            self.defer_backup_flush = False
+            self.flush_pending_backups()
+
     def seal_pending_backups(self) -> None:
         if self.defer_backup_flush:
             self.cache_controller.seal_writes()

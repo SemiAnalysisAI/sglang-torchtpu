@@ -508,7 +508,7 @@ class Scheduler(
         self.page_size = get_schedule().page_size
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_lmcache = get_memory().enable_lmcache
-        # Set by event_loop_overlap when it takes over submitting host backups.
+        # True while the event loop, not the cache, submits host backups.
         self.defer_backup_flush = False
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
@@ -2135,8 +2135,12 @@ class Scheduler(
             self.ingest_requests()
             if self._engine_paused:
                 if self.defer_backup_flush:
-                    # A retract-mode pause may be followed by a KV release.
-                    self.tree_cache.flush_sealed_backups()
+                    # With no forward in flight (retract pause or idle), every queued
+                    # backup can go out now; flush_cache waits on them.
+                    if self.last_batch is None:
+                        self.tree_cache.flush_pending_backups()
+                    else:
+                        self.tree_cache.flush_sealed_backups()
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
@@ -5084,7 +5088,7 @@ class Scheduler(
 
         if self.defer_backup_flush:
             # This batch's forward has finished, so every backup queued so far
-            # reads final KV; event_loop_overlap submits them after the next launch.
+            # reads final KV; the overlap loop submits them after the next launch.
             self.tree_cache.seal_pending_backups()
         else:
             # Submit this batch's queued host backups before the next scheduler step.
@@ -6282,6 +6286,11 @@ def dispatch_event_loop(scheduler: Scheduler):
 
 def _dispatch_event_loop_once(scheduler: Scheduler):
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
+    if scheduler.defer_backup_flush:
+        # Only the loop that enabled deferral submits deferred backups; after a
+        # PD role switch the next loop re-enables it only if it supports it.
+        scheduler.defer_backup_flush = False
+        scheduler.tree_cache.disable_deferred_backup_flush()
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()

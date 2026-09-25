@@ -774,8 +774,9 @@ class Envs:
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
     # Submit write-through backups after the next forward launches instead of
-    # between forwards (overlap loop only). Helps backends whose D2H shares one
-    # transfer queue with the next forward's inputs (TPU). Only measured on TPU.
+    # between forwards (non-PP overlap and PD-prefill overlap loops only). Helps
+    # backends whose D2H shares one transfer queue with the next forward's inputs
+    # (TPU). Only measured on TPU.
     SGLANG_OPT_HICACHE_SUBMIT_BACKUPS_AFTER_LAUNCH = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).

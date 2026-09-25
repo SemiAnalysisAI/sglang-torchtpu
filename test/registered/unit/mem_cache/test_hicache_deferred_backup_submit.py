@@ -171,9 +171,12 @@ class _FakeScheduler:
         return self.defer
 
     def ingest_requests(self):
-        self._engine_paused = (
-            self.paused_steps.popleft() if self.paused_steps else False
-        )
+        step = self.paused_steps.popleft() if self.paused_steps else False
+        if step == "retract":
+            # pause_generation(mode="retract") processes the in-flight batch.
+            self.process_batch_result(*self.result_queue.popleft())
+            self.last_batch = None
+        self._engine_paused = bool(step)
 
     def _record_scheduler_state_for_paused_engine(self):
         self.events.append("paused")
@@ -254,6 +257,20 @@ class TestOverlapLoopPlacement(CustomTestCase):
             ],
         )
 
+    def test_retract_pause_submits_every_backup(self):
+        """A retract-mode pause must not hold backups until resume: flush_cache
+        refuses to run while any backup is outstanding."""
+        sched = _FakeScheduler(
+            [_batch("A"), _batch("B")], paused_steps=[False, "retract"]
+        )
+
+        Scheduler.event_loop_overlap(sched)
+
+        self.assertEqual(
+            sched.events[:5],
+            ["launch A", "flush_sealed", "process A", "flush_all", "paused"],
+        )
+
     def test_non_overlapped_batch_submits_after_its_launch(self):
         sched = _FakeScheduler([_batch("A"), _batch("B", disable_overlap=True)])
 
@@ -279,6 +296,130 @@ class TestOverlapLoopPlacement(CustomTestCase):
 
         self.assertNotIn("flush_sealed", sched.events)
         self.assertNotIn("flush_all", sched.events)
+
+
+class _StopLoop(Exception):
+    pass
+
+
+class _FakeDisaggPrefillScheduler(_FakeScheduler):
+    """Drives Scheduler.event_loop_overlap_disagg_prefill, which never exits.
+
+    After the batches run out, one idle step runs and then the loop is stopped.
+    """
+
+    def __init__(self, batches, **kwargs):
+        super().__init__(batches, **kwargs)
+        self.waiting_queue = []
+        self.chunked_req = None
+        self.enable_staging = False
+        self.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            pop_bootstrapped=lambda: []
+        )
+        self.ngram_embedding_manager = SimpleNamespace(
+            prepare_for_forward=lambda batch, chunked_req: batch
+        )
+        self.idle_steps = 0
+
+    def get_next_disagg_prefill_batch_to_run(self, running_batch, last_batch):
+        if self.batches:
+            batch = self.batches.popleft()
+        elif self.idle_steps == 0:
+            self.idle_steps += 1
+            batch = None
+        else:
+            raise _StopLoop
+        return SimpleNamespace(running_batch=None, batch_to_run=batch)
+
+    def process_disagg_prefill_inflight_queue(self):
+        self.events.append("release")
+
+    def launch_batch_sample_if_needed(self, batch_result, batch):
+        pass
+
+
+class TestDisaggPrefillLoopPlacement(CustomTestCase):
+    def _run(self, sched):
+        with self.assertRaises(_StopLoop):
+            Scheduler.event_loop_overlap_disagg_prefill(sched)
+        return sched.events
+
+    def test_sealed_backups_submit_after_each_launch(self):
+        sched = _FakeDisaggPrefillScheduler([_batch("A"), _batch("B")])
+
+        self.assertEqual(
+            self._run(sched),
+            [
+                "launch A",
+                "flush_sealed",
+                "release",
+                "launch B",
+                "flush_sealed",
+                "process A",
+                "release",
+                "process B",  # no next batch: idle
+                "release",
+                "flush_all",  # after the releases, which may queue backups
+            ],
+        )
+
+    def test_pause_submits_sealed_backups(self):
+        sched = _FakeDisaggPrefillScheduler([_batch("A")], paused_steps=[False, True])
+
+        self.assertEqual(
+            self._run(sched),
+            [
+                "launch A",
+                "flush_sealed",
+                "release",
+                "flush_sealed",  # paused: KV may be released before resume
+                "paused",
+                "process A",
+                "release",
+                "flush_all",
+            ],
+        )
+
+    def test_retract_pause_submits_every_backup(self):
+        sched = _FakeDisaggPrefillScheduler(
+            [_batch("A")], paused_steps=[False, "retract"]
+        )
+
+        self.assertEqual(
+            self._run(sched)[:5],
+            ["launch A", "flush_sealed", "release", "process A", "flush_all"],
+        )
+
+
+class TestRoleSwitchRedispatch(CustomTestCase):
+    def test_decode_loop_after_prefill_resumes_eager_backups(self):
+        """After a prefill->decode switch, the decode loop never submits deferred
+        backups, so queued backups must go out and the cache must flush eagerly."""
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        cache = _unified_cache()
+        cache.enable_deferred_backup_flush()
+        seen = {}
+        sched = SimpleNamespace(
+            disaggregation_mode=DisaggregationMode.DECODE,
+            enable_overlap=True,
+            defer_backup_flush=True,
+            tree_cache=cache,
+        )
+
+        def decode_loop():
+            seen["sched"] = sched.defer_backup_flush
+            seen["cache"] = cache.defer_backup_flush
+            seen["flushed"] = cache.cache_controller.start_writing.called
+
+        sched.event_loop_overlap_disagg_decode = decode_loop
+        with mock.patch.object(
+            scheduler_module, "get_parallel", return_value=SimpleNamespace(pp_size=1)
+        ):
+            scheduler_module._dispatch_event_loop_once(sched)
+
+        self.assertEqual(seen, {"sched": False, "cache": False, "flushed": True})
 
 
 class TestEnableDeferredBackupFlush(CustomTestCase):
