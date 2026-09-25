@@ -85,6 +85,12 @@ class TestPackedSDPATpu(unittest.TestCase):
                             run = forward
                         if dtype == torch.bfloat16:
                             tolerance = 2e-2
+                        elif not compiled:
+                            # Eager TPU SDPA can also use reduced-precision
+                            # MXU math for FP32 inputs. The observed max error
+                            # is below 8e-3; the CPU reference checks stay
+                            # strict in test/registered/unit/utils.
+                            tolerance = 1e-2
                         elif compiled and (dim >= 128 or value_dim < dim):
                             # The 128-wide compiled TPU specialization uses
                             # BF16 MXU math for FP32 inputs. The narrower-value
