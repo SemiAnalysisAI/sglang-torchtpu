@@ -52,6 +52,14 @@ RUN cd python && rm -f pyproject.toml && cp pyproject_tpu.toml pyproject.toml
 # Fast build on top of base
 RUN pip install --no-deps -e ./python
 
+# libssl-dev provides <openssl/sha.h> required by hicache_hash_cpp when
+# prefill workers enable --kv-events-config for experimental/sgl-router.
+# Pre-compile the extension at build time so workers do not JIT-compile on
+# their first request.
+RUN apt-get update && apt-get install -y --no-install-recommends libssl-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -c "from sglang.srt.mem_cache.cpp_utils.native_hash import get_native_hash; get_native_hash([1, 2], None)"
+
 # Install the sgl-router binary built from experimental/sgl-router/
 COPY --from=router_builder /build/sgl-router-bin /usr/local/bin/sgl-router
 
