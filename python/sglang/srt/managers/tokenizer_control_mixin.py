@@ -5,6 +5,7 @@ import hashlib
 import logging
 import time
 import uuid
+from collections import Counter
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
@@ -159,25 +160,6 @@ def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOut
         error_message=" | ".join(error_messages),
         loaded_adapters=failed[0].loaded_adapters,
     )
-
-
-def _merge_raiden_fault_results(results: List[RaidenFaultReqOutput]) -> Dict[str, Any]:
-    """Merge per-worker fault replies; one failed worker fails the call.
-
-    armed_workers is reported separately so a caller can refuse to start a fault
-    phase on a partly armed server instead of misattributing its failures.
-    """
-    hits: Dict[str, int] = {}
-    for r in results:
-        for hook, count in r.hits.items():
-            hits[hook] = hits.get(hook, 0) + count
-    return {
-        "success": all(r.success for r in results),
-        "errors": list(dict.fromkeys(r.message for r in results if not r.success)),
-        "workers": len(results),
-        "armed_workers": sum(r.armed for r in results),
-        "hits": hits,
-    }
 
 
 class TokenizerControlMixin:
@@ -873,7 +855,14 @@ class TokenizerControlMixin:
     ) -> Dict[str, Any]:
         self.auto_create_handle_loop()
         results: List[RaidenFaultReqOutput] = await self.raiden_fault_communicator(obj)
-        return _merge_raiden_fault_results(results)
+        # armed_workers < workers means a partly armed server; callers should not start.
+        return {
+            "success": all(r.success for r in results),
+            "errors": [r.message for r in results if not r.success],
+            "workers": len(results),
+            "armed_workers": sum(r.armed for r in results),
+            "hits": dict(sum((Counter(r.hits) for r in results), Counter())),
+        }
 
     async def pd_role_switch(
         self: TokenizerManager,

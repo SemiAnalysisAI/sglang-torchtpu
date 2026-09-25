@@ -20,6 +20,7 @@ import math
 import os
 import signal
 import sys
+import threading
 import time
 from array import array
 from collections import deque
@@ -688,7 +689,8 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
-        self.maybe_init_raiden_fault_controller()
+        # Auto-disarm timer of the /raiden_faults window armed in this process.
+        self.raiden_fault_timer: Optional[threading.Timer] = None
 
         # Init overlap schedule
         self.init_overlap()
@@ -2383,17 +2385,6 @@ class Scheduler(
 
     def init_grammar_manager(self) -> None:
         self.grammar_manager = GrammarManager(self)
-
-    def maybe_init_raiden_fault_controller(self) -> None:
-        """Construct the tpu-sync fault injection controller when enabled."""
-        if envs.SGLANG_ENABLE_RAIDEN_FAULT_INJECTION.get():
-            from sglang.srt.disaggregation.raiden.fault_control import (
-                create_raiden_fault_controller,
-            )
-
-            self.raiden_fault_controller = create_raiden_fault_controller()
-        else:
-            self.raiden_fault_controller = None
 
     def maybe_init_scripted_scheduler_hook(self) -> None:
         if envs.SGLANG_TEST_SCRIPTED_RUNTIME.get():
@@ -5995,13 +5986,54 @@ class Scheduler(
         return SlowDownReqOutput()
 
     def handle_raiden_fault(self, recv_req: RaidenFaultReqInput):
-        """Arm, disarm, or report tpu-sync fault injection rules in this process."""
-        if self.raiden_fault_controller is None:
-            return RaidenFaultReqOutput(
-                success=False,
-                message="SGLANG_ENABLE_RAIDEN_FAULT_INJECTION is not set",
+        """Arm (inject), disarm (reset), or report (status) tpu-sync fault rules.
+
+        The tpu-sync injector is process-wide, so each scheduler arms its own copy.
+        An armed window disarms itself from a timer thread after duration_s, so a
+        scheduler wedged by an injected fault still recovers.
+        """
+        try:
+            from tpu_sync.api.torch import fault_injection
+
+            # Hits of the armed window; a reset returns the window it disarms.
+            hits = (
+                {}
+                if recv_req.op == "inject"
+                else dict(fault_injection.get_fault_status())
             )
-        return self.raiden_fault_controller.handle(recv_req)
+            if recv_req.op != "status":
+                if self.raiden_fault_timer is not None:
+                    self.raiden_fault_timer.cancel()
+                # Also zeroes the hit counts, which inject_faults would carry over.
+                fault_injection.reset_faults()
+            if recv_req.op == "inject":
+                fault_injection.inject_faults(recv_req.rules)
+                self.raiden_fault_timer = threading.Timer(
+                    recv_req.duration_s, self._expire_raiden_faults
+                )
+                self.raiden_fault_timer.daemon = True
+                self.raiden_fault_timer.start()
+            logger.warning(
+                "RAIDEN_FAULT %s rules=%s duration_s=%s hits=%s",
+                recv_req.op,
+                recv_req.rules,
+                recv_req.duration_s,
+                hits,
+            )
+            armed = fault_injection.has_active_injections()
+            return RaidenFaultReqOutput(success=True, armed=armed, hits=hits)
+        except Exception as e:
+            logger.error("RAIDEN_FAULT %s failed: %s", recv_req.op, e)
+            return RaidenFaultReqOutput(success=False, message=str(e))
+
+    def _expire_raiden_faults(self):
+        from tpu_sync.api.torch import fault_injection
+
+        # A later inject or reset replaced this timer and owns the rules now.
+        if self.raiden_fault_timer is threading.current_thread():
+            hits = dict(fault_injection.get_fault_status())
+            fault_injection.reset_faults()
+            logger.warning("RAIDEN_FAULT disarmed (duration elapsed) hits=%s", hits)
 
     def handle_pd_role_switch(self, recv_req: PdRoleSwitchReqInput):
         return role_switch.handle_pd_role_switch(self, recv_req)
