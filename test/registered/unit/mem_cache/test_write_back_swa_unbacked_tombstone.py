@@ -12,11 +12,6 @@ destroys the only copy. The prefix then has SWA on neither tier, the stateful
 SWA match validator rejects it, `best_match_node` never advances, and no
 load_back is issued. Nothing logs a warning; reuse silently drops to zero.
 
-Observed on a hybrid SWA + raiden + write_back server running speculative
-decoding: host reload failed 9/9, with the same prefix node showing 0 evictions
-and 0 SWA backups while its SWA device slots were released 8 times with
-`host_value is None`.
-
 These tests pin the invariant rather than the symptom: no path may release a
 component's device value under write_back while its host value is None.
 """
