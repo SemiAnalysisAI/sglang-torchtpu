@@ -199,9 +199,7 @@ def prefill_kv_events_args(
         if port is not None
         else int(source.get(ENV_KV_EVENTS_PORT, str(DEFAULT_KV_EVENTS_PORT)))
     )
-    config_json = (
-        f'{{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:{resolved_port}"}}'
-    )
+    config_json = f'{{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:{resolved_port}"}}'
     return ("--kv-events-config", config_json)
 
 
@@ -266,9 +264,7 @@ def build_router_cmd(
     else:
         binary = router_bin or source.get(ENV_ROUTER_BIN, DEFAULT_ROUTER_BIN)
         resolved_model_id = (
-            model_id
-            or source.get("SERVED_MODEL_NAME")
-            or DEFAULT_MODEL_ID
+            model_id or source.get("SERVED_MODEL_NAME") or DEFAULT_MODEL_ID
         )
         resolved_tokenizer_path = (
             tokenizer_path
@@ -319,6 +315,9 @@ def build_router_cmd(
                 d_policy,
             ]
         )
+        if p_policy == "sticky":
+            rkey_header = source.get("TPU_PD_ROUTING_KEY_HEADER", "x-smg-routing-key")
+            cmd.extend(["--routing-key-header", rkey_header])
 
         min_tokens = (
             str(cache_affinity_min_matched_tokens)

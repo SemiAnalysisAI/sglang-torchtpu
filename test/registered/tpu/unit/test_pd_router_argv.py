@@ -294,6 +294,19 @@ class TestPdRouterArgv(CustomTestCase):
             idx = cmd.index("--tokenizer-path")
             self.assertEqual(cmd[idx + 1], tok_file)
 
+    def test_smg_sticky_policy_sets_routing_key_header(self):
+        cmd = build_router_cmd(
+            python="python3",
+            prefill_url="http://10.0.0.1:8080",
+            decode_url="http://10.0.0.2:8081",
+            host="0.0.0.0",
+            port=8000,
+            prefill_policy="sticky",
+            env={"SGLANG_TPU_PD_ROUTER": "smg"},
+        )
+        idx = cmd.index("--routing-key-header")
+        self.assertEqual(cmd[idx + 1], "x-smg-routing-key")
+
 
 if __name__ == "__main__":
     unittest.main()
