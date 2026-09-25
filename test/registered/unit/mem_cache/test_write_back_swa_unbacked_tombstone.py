@@ -34,7 +34,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10)
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 CT = ComponentType.SWA
 COMPONENTS = (ComponentType.FULL, ComponentType.SWA)
