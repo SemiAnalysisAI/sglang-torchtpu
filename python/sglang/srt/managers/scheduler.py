@@ -508,6 +508,8 @@ class Scheduler(
         self.page_size = get_schedule().page_size
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_lmcache = get_memory().enable_lmcache
+        # Set by event_loop_overlap when it takes over submitting host backups.
+        self.defer_backup_flush = False
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_unified_cache_external_linker = (
@@ -2123,6 +2125,8 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        self.defer_backup_flush = self._enable_deferred_backup_flush()
+
         while True:
             if self.gracefully_exit:
                 break
@@ -2130,6 +2134,9 @@ class Scheduler(
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
+                if self.defer_backup_flush:
+                    # A retract-mode pause may be followed by a KV release.
+                    self.tree_cache.flush_sealed_backups()
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
@@ -2172,6 +2179,10 @@ class Scheduler(
                 self.result_queue.append((batch.copy(), batch_result))
                 if self.kv_free_fence is not None:
                     self.kv_free_fence.on_forward_launched(batch_result)
+                if self.defer_backup_flush:
+                    # Queue backups sealed by the last process_batch_result behind
+                    # this forward's inputs, so they no longer delay its start.
+                    self.tree_cache.flush_sealed_backups()
             else:
                 batch_result = None
                 self._sched_idled = True
@@ -2184,6 +2195,10 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
 
+            if self.defer_backup_flush and batch is None:
+                # No forward is in flight, so every queued backup reads final KV.
+                self.tree_cache.flush_pending_backups()
+
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
@@ -2194,6 +2209,25 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _enable_deferred_backup_flush(self) -> bool:
+        if not envs.SGLANG_OPT_HICACHE_SUBMIT_BACKUPS_AFTER_LAUNCH.get():
+            return False
+        enabled = bool(
+            self.enable_hierarchical_cache
+            and self.spec_algorithm.is_none()
+            and self.tree_cache.enable_deferred_backup_flush()
+        )
+        if enabled:
+            logger.info(
+                "HiCache: submitting host backups after the next forward launch."
+            )
+        else:
+            logger.warning(
+                "SGLANG_OPT_HICACHE_SUBMIT_BACKUPS_AFTER_LAUNCH is ignored: it needs "
+                "HiCache write-through on UnifiedRadixCache without spec decoding."
+            )
+        return enabled
 
     def is_disable_overlap_for_batch(
         self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
@@ -5048,8 +5082,13 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
-        # Submit this batch's queued host backups before the next scheduler step.
-        self.tree_cache.flush_pending_backups()
+        if self.defer_backup_flush:
+            # This batch's forward has finished, so every backup queued so far
+            # reads final KV; event_loop_overlap submits them after the next launch.
+            self.tree_cache.seal_pending_backups()
+        else:
+            # Submit this batch's queued host backups before the next scheduler step.
+            self.tree_cache.flush_pending_backups()
 
         self._record_step_counters(batch, result)
 

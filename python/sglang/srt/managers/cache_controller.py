@@ -196,6 +196,8 @@ class CacheOperation:
         self.node_ids = [node_id]
         self.data = None
         self.pool_transfers = pool_transfers
+        # Set by seal_writes() once the source KV is final (write ops only).
+        self.sealed = False
 
         self.id = CacheOperation.counter
         CacheOperation.counter += 1
@@ -916,6 +918,32 @@ class HiCacheController:
         )
         self.start_writing()
         return host_indices
+
+    def seal_writes(self) -> None:
+        """Mark every queued write as safe to submit: its source KV is final."""
+        for op in self.write_queue:
+            op.sealed = True
+
+    def start_sealed_writing(self) -> None:
+        """Submit the queued writes sealed so far; later ones stay queued.
+
+        Sealing marks the whole queue and new writes are appended unsealed, so
+        the sealed writes are always a prefix of the queue.
+        """
+        num_sealed = 0
+        while (
+            num_sealed < len(self.write_queue) and self.write_queue[num_sealed].sealed
+        ):
+            num_sealed += 1
+        if num_sealed == 0:
+            return
+        unsealed = self.write_queue[num_sealed:]
+        del self.write_queue[num_sealed:]
+        try:
+            self.start_writing()
+        finally:
+            # A lost unsealed op would keep its node locked forever.
+            self.write_queue.extend(unsealed)
 
     def start_writing(self) -> None:
         if len(self.write_queue) == 0:

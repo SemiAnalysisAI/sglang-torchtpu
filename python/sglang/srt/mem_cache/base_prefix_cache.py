@@ -604,6 +604,22 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         pass
 
+    def enable_deferred_backup_flush(self) -> bool:
+        """
+        Stop flushing queued backups on the cache's own schedule; the caller then
+        seals them once their source KV is final and flushes the sealed ones.
+        Returns False if the cache does not support it.
+        """
+        return False
+
+    def seal_pending_backups(self) -> None:
+        """Mark every queued host backup as reading final KV."""
+        pass
+
+    def flush_sealed_backups(self) -> None:
+        """Submit the queued host backups sealed so far."""
+        pass
+
     def take_events(self):
         return [] if self.kv_events is None else self.kv_events.take()
 

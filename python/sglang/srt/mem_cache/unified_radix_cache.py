@@ -279,6 +279,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # constructs the pipeline collaborator (None = cache mode).
         self.host_memory_mode = "cache"
         self.buffer_pipeline: Optional[BufferModePipeline] = None
+        # Set by enable_deferred_backup_flush(); the scheduler then submits backups.
+        self.defer_backup_flush = False
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
@@ -3466,7 +3468,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._drain_async_work()
         # Backups queued outside process_batch_result: the chunked-prefill stash
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
-        self.flush_pending_backups()
+        # Under deferred flush the scheduler seals and submits them instead.
+        if not self.defer_backup_flush:
+            self.flush_pending_backups()
 
         (
             write_finish_count,
@@ -3506,6 +3510,27 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None or self.cache_controller is None:
             return
         self.cache_controller.start_writing()
+
+    def enable_deferred_backup_flush(self) -> bool:
+        # write_back blocks on its own backups during eviction, and buffer mode
+        # queues backups from its own pipeline; keep both on the eager path.
+        if (
+            self.linker is not None
+            or self.cache_controller is None
+            or self.buffer_pipeline is not None
+            or self.cache_controller.write_policy == "write_back"
+        ):
+            return False
+        self.defer_backup_flush = True
+        return True
+
+    def seal_pending_backups(self) -> None:
+        if self.defer_backup_flush:
+            self.cache_controller.seal_writes()
+
+    def flush_sealed_backups(self) -> None:
+        if self.defer_backup_flush:
+            self.cache_controller.start_sealed_writing()
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
