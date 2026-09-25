@@ -150,7 +150,7 @@ if [[ "$ROLE" == "prefill" ]]; then
     KV_EVENTS_ARGS=""
     if [[ "$PD_ROUTER" == "smg" ]]; then
         KV_EVENTS_PORT=$(( ${SGLANG_TPU_KV_EVENTS_PORT:-5557} + WORKER_ID ))
-        KV_EVENTS_ARGS="--kv-events-config {\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:${KV_EVENTS_PORT}\"}"
+        KV_EVENTS_ARGS="--kv-events-config {\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://0.0.0.0:${KV_EVENTS_PORT}\"}"
     fi
     export EXTRA_ARGS="$BASE_EXTRA_ARGS \
 --disaggregation-mode prefill \
