@@ -81,6 +81,13 @@ class SDPAImpl(AttentionImpl):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
+        value_dim = value.shape[-1]
+        # The compiled TPU SDPA shape path currently infers result width from
+        # the query head size. Zero-pad narrower values to that width, then
+        # discard the padded channels; this leaves the attention result exact.
+        trim_value_width = query.device.type == "tpu" and value_dim < query.shape[-1]
+        if trim_value_width:
+            value = torch.nn.functional.pad(value, (0, query.shape[-1] - value_dim))
         attn_mask = None
         is_causal = self.causal
         if self.causal and query.shape[-2] != key.shape[-2]:
@@ -107,6 +114,8 @@ class SDPAImpl(AttentionImpl):
             output = torch.nn.functional.scaled_dot_product_attention(
                 query, key, value, **attn_kwargs
             )
+        if trim_value_width:
+            output = output[..., :value_dim]
         output = output.transpose(1, 2)
         return output
 
