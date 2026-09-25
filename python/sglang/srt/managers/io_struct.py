@@ -2053,8 +2053,6 @@ class RaidenFaultReqInput(BaseReq, kw_only=True):
     op: Literal["inject", "reset", "status"]
     # Rule dicts as accepted by tpu_sync.api.torch.fault_injection.inject_faults.
     rules: List[Dict[str, Any]] = []
-    # Arbitrary default; long enough for one bench phase, short enough to self-heal.
-    duration_s: float = 300.0
 
 
 class RaidenFaultReqOutput(BaseReq, kw_only=True):

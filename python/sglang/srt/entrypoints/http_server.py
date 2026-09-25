@@ -1575,9 +1575,8 @@ async def raiden_faults(request: Request):
     """Arm (POST), report (GET), or disarm (DELETE) tpu-sync fault injection.
 
     Testing only; 404 unless SGLANG_ENABLE_RAIDEN_FAULT_INJECTION is set. The POST
-    body is {"rules": [...], "duration_s": 60}, rules in the
-    tpu_sync.api.torch.fault_injection format. They replace any armed rules and
-    disarm themselves after duration_s even if the scheduler is wedged.
+    body is {"rules": [...]}, rules in the tpu_sync.api.torch.fault_injection
+    format. They replace any armed rules and stay armed until a DELETE.
     """
     if not envs.SGLANG_ENABLE_RAIDEN_FAULT_INJECTION.get():
         return ORJSONResponse(
@@ -1587,8 +1586,7 @@ async def raiden_faults(request: Request):
     try:
         if request.method == "POST":
             body = await request.json()
-            fields = {k: body[k] for k in ("rules", "duration_s") if k in body}
-            obj = RaidenFaultReqInput(op="inject", **fields)
+            obj = RaidenFaultReqInput(op="inject", rules=body.get("rules", []))
         elif request.method == "DELETE":
             obj = RaidenFaultReqInput(op="reset")
         else:
