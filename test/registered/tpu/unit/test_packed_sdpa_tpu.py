@@ -85,10 +85,12 @@ class TestPackedSDPATpu(unittest.TestCase):
                             run = forward
                         if dtype == torch.bfloat16:
                             tolerance = 2e-2
-                        elif compiled and dim >= 128:
+                        elif compiled and (dim >= 128 or value_dim < dim):
                             # The 128-wide compiled TPU specialization uses
-                            # BF16 MXU math for FP32 inputs; its deterministic
-                            # max error is about 3e-2 against the FP64 oracle.
+                            # BF16 MXU math for FP32 inputs. The narrower-value
+                            # workaround pads to the query width and selects the
+                            # same reduced-precision path. Observed max errors
+                            # against the FP64 oracle are below 4e-2.
                             tolerance = 4e-2
                         elif compiled:
                             # The compiled TPU SDPA path uses reduced-precision
