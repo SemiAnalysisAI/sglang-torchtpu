@@ -5,6 +5,7 @@ import hashlib
 import logging
 import time
 import uuid
+from collections import Counter
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
@@ -54,6 +55,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    RaidenFaultReqInput,
+    RaidenFaultReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     RemoveExternalCorpusReqInput,
@@ -119,6 +122,7 @@ _COMMUNICATOR_SPECS = [
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
+    ("raiden_fault", RaidenFaultReqOutput),
     ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
@@ -845,6 +849,20 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
+
+    async def raiden_fault(
+        self: TokenizerManager, obj: RaidenFaultReqInput
+    ) -> Dict[str, Any]:
+        self.auto_create_handle_loop()
+        results: List[RaidenFaultReqOutput] = await self.raiden_fault_communicator(obj)
+        # armed_workers < workers means a partly armed server; callers should not start.
+        return {
+            "success": all(r.success for r in results),
+            "errors": [r.message for r in results if not r.success],
+            "workers": len(results),
+            "armed_workers": sum(r.armed for r in results),
+            "hits": dict(sum((Counter(r.hits) for r in results), Counter())),
+        }
 
     async def pd_role_switch(
         self: TokenizerManager,

@@ -2049,6 +2049,22 @@ class SlowDownReqOutput(BaseReq, kw_only=True):
     pass
 
 
+class RaidenFaultReqInput(BaseReq, kw_only=True):
+    op: Literal["inject", "reset", "status"]
+    # Rule dicts as accepted by tpu_sync.api.torch.fault_injection.inject_faults.
+    rules: List[Dict[str, Any]] = []
+    # Arbitrary default; long enough for one bench phase, short enough to self-heal.
+    duration_s: float = 300.0
+
+
+class RaidenFaultReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+    armed: bool = False
+    # Per-hook hits of the armed window, or of the last window once disarmed.
+    hits: Dict[str, int] = {}
+
+
 class PdRoleSwitchReqInput(BaseReq, kw_only=True):
     # Target role; "" is an invalid sentinel rejected by the handler.
     new_role: Literal["prefill", "decode", ""] = ""
