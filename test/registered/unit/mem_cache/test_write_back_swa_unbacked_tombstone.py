@@ -148,15 +148,14 @@ class TestWriteBackUnbackedSwaTombstone(CustomTestCase):
         result = self._evict_swa_of(cache, node)
 
         swa = node.component_data[SWA]
-        # Open defect. Unwrap this once write_back eviction backs up an internal
-        # node's SWA; "AssertionError not raised" then signals the fix landed.
-        # Not expectedFailure: that would also absorb a crash in evict().
+        # Open defect: unwrap once write_back backs up an internal node's SWA first.
+        # CustomTestCase re-raises errors as Exception; expectedFailure hides crashes.
         with self.assertRaises(AssertionError):
             self.assertTrue(
                 swa.value is not None or swa.host_value is not None,
                 "write_back released SWA device slots that had no host copy",
             )
-        # Skipping the node keeps the SWA but starves SWA allocation.
+        # Skipping the node without freeing SWA elsewhere starves SWA allocation.
         self.assertGreaterEqual(result.swa_num_tokens_evicted, len(node.key))
 
     def test_write_back_may_release_swa_that_is_already_on_host(self):
