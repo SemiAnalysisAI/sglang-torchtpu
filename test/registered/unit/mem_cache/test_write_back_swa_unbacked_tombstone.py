@@ -1,121 +1,177 @@
-"""write_back must not drop a node's SWA device slots when it has no host copy.
+"""Under write_back, SWA eviction must not release an internal node's SWA
+device slots before they have a host copy."""
 
-`SWAComponent._evict_device_next_node` returns evictable device leaves to the
-caller, which stages them to host and demotes them. For an *internal* node it
-instead tombstones the SWA device slots in place, via
-`_evict_component_and_detach_lru(..., EvictLayer.DEVICE)`.
-
-Under `write_through` that is free: the host copy was taken while the page was
-still resident. Under `write_back` the host copy is only taken when the *node*
-is evicted, and an internal node never reaches that path -- so the tombstone
-destroys the only copy. The prefix then has SWA on neither tier, the stateful
-SWA match validator rejects it, `best_match_node` never advances, and no
-load_back is issued. Nothing logs a warning; reuse silently drops to zero.
-
-These tests pin the invariant rather than the symptom: no path may release a
-component's device value under write_back while its host value is None.
-"""
-
+import atexit
 import unittest
-from collections import defaultdict
+from array import array
 from unittest import mock
 
 import torch
 
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
-    ComponentType,
-    UnifiedTreeNode,
+import sglang.srt.mem_cache.pool_host.common as pool_host_common
+import sglang.srt.mem_cache.pool_host.mha as pool_host_mha
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    EvictResult,
+    InsertParams,
 )
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.unified_cache.cache_action import BackupKV
+from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-CT = ComponentType.SWA
-COMPONENTS = (ComponentType.FULL, ComponentType.SWA)
+SWA = ComponentType.SWA
+FULL_LAYER_IDS = [3]
+SWA_LAYER_IDS = [0, 1, 2]
+KV_SIZE = 256
+
+# Nested inserts build root -> [1, 2] -> [3, 4] -> [5, 6]: two internal nodes
+# and one device leaf.
+PREFIXES = ([1, 2], [1, 2, 3, 4], [1, 2, 3, 4, 5, 6])
 
 
-class _SingleNodeLru:
-    """Minimal LRU holding one node; the walk only needs these four calls."""
-
-    def __init__(self, node):
-        self._node = node
-
-    def in_list(self, node):
-        return node is self._node
-
-    def get_lru_no_lock(self):
-        return self._node
-
-    def get_prev_no_lock(self, node):
-        return None
-
-    def cursor_next(self):
-        return None
-
-
-def _run_walk(*, is_write_back: bool, has_host_copy: bool):
-    """Drive one SWA eviction step over a node that is NOT a device leaf.
-
-    Returns the mocked tree_core so the caller can assert whether the in-place
-    tombstone (`_evict_component_and_detach_lru`) was taken.
-    """
-    from sglang.srt.mem_cache.unified_cache.components.swa import (
-        SWAComponent,
-    )
-
-    node = UnifiedTreeNode(COMPONENTS)
-    cd = node.component_data[CT]
-    cd.value = torch.arange(8, dtype=torch.int64)
-    cd.host_value = torch.arange(8, dtype=torch.int64) if has_host_copy else None
-
-    core = mock.Mock()
-    core.lru_lists = {CT: _SingleNodeLru(node)}
-    core.enable_session_radix_cache = False
-    # Empty on purpose: an internal node, so the walk takes the tombstone path
-    # rather than returning the node for a proper staged eviction.
-    core.evictable_device_leaves = set()
-    core.is_write_back = is_write_back
-
-    comp = SWAComponent.__new__(SWAComponent)
-    comp.component_type = CT
-    comp.tree_core = core
-    comp._evict_device_cursor = node
-    comp._evict_device_request_cnt = 1
-
-    node_id = comp._evict_device_next_node(
-        defaultdict(int), defaultdict(list), defaultdict(list)
-    )
-    return core, node, node_id
+def _transfer_kv_direct_cpu(
+    src_layers, dst_layers, src_indices, dst_indices, page_size
+):
+    assert page_size == 1
+    for src, dst in zip(src_layers, dst_layers, strict=True):
+        dst[dst_indices] = src[src_indices]
 
 
 class TestWriteBackUnbackedSwaTombstone(CustomTestCase):
-    # Open defect: this fails on main today. Marked xfail so it documents the
-    # bug without reddening CI. When the fix lands pytest reports an UNEXPECTED
-    # SUCCESS -- remove this marker then.
-    @unittest.expectedFailure
-    def test_write_back_does_not_tombstone_swa_without_a_host_copy(self):
-        """The defect: write_back drops SWA device slots that have no host copy."""
-        core, node, node_id = _run_walk(is_write_back=True, has_host_copy=False)
-
-        core._evict_component_and_detach_lru.assert_not_called()
-        self.assertIsNotNone(
-            node.component_data[CT].value,
-            "write_back released SWA device slots for a node with no host copy; "
-            "the node is not a device leaf, so it never reaches the backup path "
-            "and the prefix becomes silently unreloadable",
+    def setUp(self):
+        # Host pools pin their buffers with cudaHostRegister, which needs a CUDA
+        # driver. Pinning only affects copy speed, not what eviction releases.
+        patcher = mock.patch.object(pool_host_common, "_cuda_host_register")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # The layer-first direct D2H copy is a CUDA kernel; this is its CPU form.
+        patcher = mock.patch.object(
+            pool_host_mha,
+            "transfer_kv_direct",
+            _transfer_kv_direct_cpu,
+            create=True,
         )
-        self.assertIsNone(node_id)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-    def test_write_back_may_tombstone_swa_that_is_already_on_host(self):
-        """Reclaim is still allowed once the host copy exists."""
-        core, _, _ = _run_walk(is_write_back=True, has_host_copy=True)
-        core._evict_component_and_detach_lru.assert_called_once()
+    def _build_cache(self, write_policy: str):
+        """Returns the cache and its SWA LRU tail, an internal device-only node."""
+        override = get_context().override_server_args(
+            page_size=1,
+            hicache_io_backend="direct",
+            hicache_mem_layout="layer_first",
+            hicache_write_policy=write_policy,
+        )
+        server_args = override.install()
+        self.addCleanup(override.restore)
 
-    def test_write_through_tombstones_unbacked_swa_as_before(self):
-        """write_through copies while resident, so this path stays untouched."""
-        core, _, _ = _run_walk(is_write_back=False, has_host_copy=False)
-        core._evict_component_and_detach_lru.assert_called_once()
+        kv_pool = SWAKVPool(
+            size=KV_SIZE,
+            size_swa=KV_SIZE,
+            page_size=1,
+            dtype=torch.bfloat16,
+            head_num=2,
+            head_dim=64,
+            swa_attention_layer_ids=SWA_LAYER_IDS,
+            full_attention_layer_ids=FULL_LAYER_IDS,
+            device="cpu",
+        )
+        allocator = SWATokenToKVPoolAllocator(
+            size=KV_SIZE,
+            size_swa=KV_SIZE,
+            page_size=1,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=kv_pool,
+            need_sort=False,
+        )
+        params = CacheInitParams(
+            req_to_token_pool=ReqToTokenPool(
+                size=4, max_context_len=64, device="cpu", enable_memory_saver=False
+            ),
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            disable=False,
+            sliding_window_size=128,
+            tree_components=(ComponentType.FULL, SWA),
+        )
+        cache = UnifiedRadixCache(params=params)
+        cache.init_hicache(server_args, params)
+        self.addCleanup(atexit.unregister, cache.shutdown)
+        self.addCleanup(cache.release_host_resources)
+        # No backup on insert or hit, so neither policy starts with a host copy.
+        cache.write_through_threshold = 1 << 30
+
+        for tokens in PREFIXES:
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", tokens)),
+                    value=allocator.alloc(len(tokens)),
+                )
+            )
+        # Read the target off the LRU: a match_prefix lookup would refresh it.
+        node = cache.tree_core.lru_lists[SWA].get_lru_no_lock()
+        swa = node.component_data[SWA]
+        self.assertEqual(cache.tree_core.is_write_back, write_policy == "write_back")
+        self.assertTrue(node.children)
+        self.assertNotIn(node, cache.tree_core.evictable_device_leaves)
+        self.assertIsNotNone(swa.value)
+        self.assertIsNone(swa.host_value)
+        return cache, node
+
+    def _evict_swa_of(self, cache, node) -> EvictResult:
+        """Request exactly the node's SWA size, so the walk stops after it."""
+        return cache.evict(EvictParams(swa_num_tokens=len(node.key)))
+
+    # Open defect. Drop expectedFailure once write_back eviction backs up an
+    # internal node's SWA; the runner then reports an UNEXPECTED SUCCESS.
+    @unittest.expectedFailure
+    def test_write_back_frees_swa_without_losing_it(self):
+        """write_back must free the requested SWA slots and keep the SWA on a tier."""
+        cache, node = self._build_cache("write_back")
+
+        result = self._evict_swa_of(cache, node)
+
+        swa = node.component_data[SWA]
+        self.assertTrue(
+            swa.value is not None or swa.host_value is not None,
+            "write_back released SWA device slots that had no host copy",
+        )
+        # Skipping the node keeps the SWA but starves SWA allocation.
+        self.assertGreaterEqual(result.swa_num_tokens_evicted, len(node.key))
+
+    def test_write_back_may_release_swa_that_is_already_on_host(self):
+        """Guards against a fix that stops write_back SWA eviction altogether."""
+        cache, node = self._build_cache("write_back")
+        cache._execute_and_commit_kv_backup(
+            BackupKV(node_ids=[node.id]), write_back=True
+        )
+        cache.writing_check(write_back=True)
+        self.assertIsNotNone(node.component_data[SWA].host_value)
+
+        self._evict_swa_of(cache, node)
+
+        swa = node.component_data[SWA]
+        self.assertIsNone(swa.value)
+        self.assertIsNotNone(swa.host_value)
+
+    def test_write_through_releases_internal_swa(self):
+        """Shows the eviction call reaches the internal node's SWA."""
+        cache, node = self._build_cache("write_through")
+
+        self._evict_swa_of(cache, node)
+
+        self.assertIsNone(node.component_data[SWA].value)
 
 
 if __name__ == "__main__":
