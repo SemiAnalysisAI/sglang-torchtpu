@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 import tqdm
 
 from sglang.srt.hardware_backend.tpu._logging import get_logger
@@ -31,8 +30,8 @@ from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
-    _pad_first_dim,
 )
+from sglang.srt.hardware_backend.tpu.row_padding import PadTarget, RowPadder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -77,12 +76,6 @@ class _SpecVerifyPadding:
     temperatures: torch.Tensor | None
     top_ks: torch.Tensor | None
     top_ps: torch.Tensor | None
-
-
-def _pad_rows(tensor: torch.Tensor, pad_rows: int, fill: float) -> torch.Tensor:
-    """Append filler requests to a per-request tensor."""
-    pad_spec = [0, 0] * (tensor.dim() - 1) + [0, pad_rows]
-    return F.pad(tensor, pad_spec, value=fill)
 
 
 def _deferred_padding_state(
@@ -143,16 +136,26 @@ def _get_dp_peer_request_rows(
     return aligned_tokens // tokens_per_request
 
 
-def _pad_eagle_draft_input(draft_input: EagleDraftInput, request_rows: int) -> int:
+def _eagle_draft_seed_targets(
+    draft_input: EagleDraftInput, request_rows: int
+) -> tuple[int, list[PadTarget]]:
+    """Return the seed rows and the ``pad_attrs`` targets that widen them."""
     current_rows = 0 if draft_input.topk_p is None else int(draft_input.topk_p.shape[0])
     if current_rows >= request_rows:
-        return current_rows
-    draft_input.topk_p = _pad_first_dim(draft_input.topk_p, request_rows)
-    draft_input.topk_index = _pad_first_dim(draft_input.topk_index, request_rows)
-    draft_input.hidden_states = _pad_first_dim(draft_input.hidden_states, request_rows)
-    draft_input.bonus_tokens = _pad_first_dim(draft_input.bonus_tokens, request_rows)
-    draft_input.draft_probs = _pad_first_dim(draft_input.draft_probs, request_rows)
-    return current_rows
+        return current_rows, []
+    fields = ("topk_p", "topk_index", "hidden_states", "bonus_tokens", "draft_probs")
+    return current_rows, [(draft_input, name, request_rows, 0) for name in fields]
+
+
+def _row_pad_warm_batch_sizes(buckets: list[int]) -> list[tuple[int, int]]:
+    """Every (logical, physical) request count that bucketing pads."""
+    if not buckets:
+        return []
+    return [
+        (rows, next(b for b in buckets if b >= rows))
+        for rows in range(1, buckets[-1])
+        if rows not in buckets
+    ]
 
 
 def fold_last_token_embeds(
@@ -191,6 +194,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         self._draft_eager_backbone_forward: Callable[..., Any] | None = None
         self._draft_eager_model_forward: Callable[..., Any] | None = None
         self._draft_eager_logits_forward: Callable[..., Any] | None = None
+        self._row_padder_instance: RowPadder | None = None
 
         if self.speculative_algorithm and self.speculative_algorithm != "EAGLE3":
             raise ValueError(
@@ -314,6 +318,16 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             return compiled(backend.forward_metadata, *args, **kwargs)
 
         return call
+
+    @property
+    def _row_padder(self) -> RowPadder:
+        # b_bucketer can be installed after construction.
+        if self._row_padder_instance is None:
+            buckets = self.b_bucketer.buckets if self.b_bucketer is not None else []
+            self._row_padder_instance = RowPadder(
+                warm_batch_sizes=_row_pad_warm_batch_sizes(buckets)
+            )
+        return self._row_padder_instance
 
     def prepare_spec_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Bucket a draft forward before constructing attention metadata."""
@@ -718,9 +732,10 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         request_rows = self._get_dp_peer_request_rows(forward_batch)
         if request_rows <= 0:
             return
-        seed_rows = _pad_eagle_draft_input(draft_input, request_rows)
+        seed_rows, seed_targets = _eagle_draft_seed_targets(draft_input, request_rows)
         if seed_rows >= request_rows:
             return
+        self._row_padder.pad_attrs(seed_targets)
         original_mode = getattr(forward_batch, "_original_forward_mode", None)
         logical_rows = (
             0 if original_mode is not None and original_mode.is_idle() else seed_rows
@@ -1210,19 +1225,33 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         if pad_b == real_bs:
             return
 
-        forward_batch.seq_lens = _pad_first_dim(forward_batch.seq_lens, pad_b)
-        seq_lens_cpu = forward_batch.seq_lens_cpu
-        if isinstance(seq_lens_cpu, torch.Tensor):
-            forward_batch.seq_lens_cpu = _pad_first_dim(seq_lens_cpu, pad_b)
-        forward_batch.req_pool_indices = _pad_first_dim(
-            forward_batch.req_pool_indices, pad_b
-        )
-        forward_batch.req_pool_indices_cpu = _pad_first_dim(
-            forward_batch.req_pool_indices_cpu, pad_b
-        )
-        forward_batch.positions = _pad_first_dim(
-            forward_batch.positions,
-            forward_batch.positions.shape[0] // real_bs * pad_b,
+        # EagleDraftInput seeds consumed by select_top_k_tokens.
+        spec_info = forward_batch.spec_info
+        seed_targets = []
+        if isinstance(spec_info, EagleDraftInput):
+            _, seed_targets = _eagle_draft_seed_targets(spec_info, pad_b)
+        # CPU mirrors pad on the host; the device tensors share one program.
+        self._row_padder.pad_attrs(
+            [
+                (forward_batch, "seq_lens", pad_b, 0),
+                (forward_batch, "seq_lens_cpu", pad_b, 0),
+                (forward_batch, "req_pool_indices", pad_b, 0),
+                (forward_batch, "req_pool_indices_cpu", pad_b, 0),
+                (
+                    forward_batch,
+                    "positions",
+                    forward_batch.positions.shape[0] // real_bs * pad_b,
+                    0,
+                ),
+                (
+                    forward_batch,
+                    "out_cache_loc",
+                    forward_batch.out_cache_loc.shape[0] // real_bs * pad_b,
+                    0,
+                ),
+                *seed_targets,
+            ],
+            batch_size=(real_bs, pad_b),
         )
         mrope_positions = forward_batch.mrope_positions
         if (
@@ -1239,19 +1268,12 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 ],
                 dim=-1,
             )
-        forward_batch.out_cache_loc = _pad_first_dim(
-            forward_batch.out_cache_loc,
-            forward_batch.out_cache_loc.shape[0] // real_bs * pad_b,
-        )
 
         mm_inputs = getattr(forward_batch, "mm_inputs", None)
         if isinstance(mm_inputs, list) and len(mm_inputs) < pad_b:
             forward_batch.mm_inputs = mm_inputs + [None] * (pad_b - len(mm_inputs))
 
-        # EagleDraftInput seeds consumed by select_top_k_tokens.
-        spec_info = forward_batch.spec_info
         if isinstance(spec_info, EagleDraftInput):
-            _pad_eagle_draft_input(spec_info, pad_b)
             logical_bs, logical_tokens = self._logical_spec_shape(
                 forward_batch,
                 fallback_batch_size=real_bs,
@@ -1304,19 +1326,9 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         if pad_b != real_bs:
             # Draft extend has a fixed width, so it needs no token bucket.
             # This also grows its owned token- and request-axis tensors.
-            forward_batch._pad_inputs_to_size(
-                model_runner=self.model_runner,
-                num_tokens=pad_tokens,
-                bs=pad_b,
+            self._pad_draft_extend_inputs(
+                forward_batch=forward_batch, num_tokens=pad_tokens, bs=pad_b
             )
-            # Pad any remaining extend metadata to the compiled batch size.
-            # Outputs for padded requests are discarded.
-            for field in ("extend_seq_lens", "extend_prefix_lens", "extend_start_loc"):
-                value = getattr(forward_batch, field, None)
-                if isinstance(value, torch.Tensor) and value.shape[0] < pad_b:
-                    setattr(
-                        forward_batch, field, F.pad(value, (0, pad_b - value.shape[0]))
-                    )
             forward_batch.batch_size = pad_b
             # Intentionally leave _REAL_Q_KEY unset. draft extend consumes the
             # output later using its own select-index gather instead of generic
@@ -1352,6 +1364,99 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 fallback_logical_num_tokens=real_tokens,
                 physical_num_tokens=pad_tokens,
             )
+
+    def _pad_draft_extend_inputs(
+        self, *, forward_batch: ForwardBatch, num_tokens: int, bs: int
+    ) -> None:
+        """Match ForwardBatch._pad_inputs_to_size for DRAFT_EXTEND_V2, plus
+        extend_start_loc, but pad every device tensor in one program.
+
+        Outputs for padded requests are discarded.
+        """
+        fb = forward_batch
+        spec_info = fb.spec_info
+        seq_len_fill = (
+            self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+        )
+        # Draft-extend padding uses the fixed per-request token width.
+        dummy_extend_len = 0
+        if spec_info is not None and spec_info.num_tokens_per_req > 0:
+            dummy_extend_len = spec_info.num_tokens_per_req
+
+        fb._original_num_tokens = fb.positions.shape[0]
+        if fb.lora_ids is not None:
+            fb.lora_ids.extend((bs - len(fb.lora_ids)) * [None])
+        # Keep gpu_only batches sync-free: leave seq_lens_sum None.
+        if fb.seq_lens_sum is not None:
+            fb.seq_lens_sum = fb.seq_lens_sum + seq_len_fill * (
+                bs - fb.seq_lens.shape[0]
+            )
+        if fb.mrope_positions is not None:
+            fb.mrope_positions = torch.cat(
+                [
+                    fb.mrope_positions,
+                    fb.mrope_positions.new_zeros(
+                        3, num_tokens - fb.mrope_positions.shape[1]
+                    ),
+                ],
+                dim=1,
+            )
+        if fb.extend_seq_lens_cpu is not None:
+            fb.extend_seq_lens_cpu = fb.extend_seq_lens_cpu + [dummy_extend_len] * (
+                bs - len(fb.extend_seq_lens_cpu)
+            )
+        if fb.extend_prefix_lens_cpu is not None:
+            fb.extend_prefix_lens_cpu.extend(
+                [0] * (bs - len(fb.extend_prefix_lens_cpu))
+            )
+        if fb.extend_logprob_start_lens_cpu is not None:
+            fb.extend_logprob_start_lens_cpu.extend(
+                [0] * (bs - len(fb.extend_logprob_start_lens_cpu))
+            )
+
+        targets = [
+            (fb, "input_ids", num_tokens, 0),
+            (fb, "input_embeds", num_tokens, 0),
+            (fb, "req_pool_indices", bs, 0),
+            (fb, "req_pool_indices_cpu", bs, 0),
+            (fb, "seq_lens", bs, seq_len_fill),
+            (fb, "seq_lens_cpu", bs, seq_len_fill),
+            (fb, "out_cache_loc", num_tokens, 0),
+            (fb, "encoder_lens", bs, 0),
+            (fb, "positions", num_tokens, 0),
+            (fb, "mamba_track_indices", bs, 0),
+            (fb, "mamba_track_mask", bs, 0),
+            (fb, "mamba_track_seqlens", bs, 0),
+            (fb, "extend_seq_lens", bs, dummy_extend_len),
+            (fb, "extend_prefix_lens", bs, 0),
+            (fb, "extend_start_loc", bs, 0),
+            (fb, "rids_int", bs, 0),
+            (fb, "bootstrap_room_ids_int", bs, -1),
+        ]
+        is_draft_input = spec_info is not None and spec_info.is_draft_input()
+        if is_draft_input:
+            fb.hidden_states_backup = spec_info.hidden_states
+            if isinstance(spec_info, EagleDraftInput):
+                targets += [
+                    (spec_info, name, bs, 0)
+                    for name in ("topk_p", "topk_index", "draft_probs")
+                ]
+            elif spec_info.num_correct_drafts is not None:
+                targets += [
+                    (spec_info, "num_correct_drafts", bs, 0),
+                    (spec_info, "num_accept_tokens", bs, 0),
+                ]
+            targets.append((spec_info, "hidden_states", num_tokens, 0))
+        real_bs = int(fb.seq_lens.shape[0])
+        self._row_padder.pad_attrs(targets, batch_size=(real_bs, bs))
+
+        if fb.sampling_info is not None:
+            if fb.rids_int is not None:
+                fb.sampling_info.rids_int = fb.rids_int
+            if fb.bootstrap_room_ids_int is not None:
+                fb.sampling_info.bootstrap_room_ids_int = fb.bootstrap_room_ids_int
+        if is_draft_input:
+            fb.output_cache_loc_backup = fb.out_cache_loc
 
     def should_defer_verify_output_unpadding(
         self, batch: Any, verify_input: SpecInput
@@ -1397,27 +1502,30 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
 
         # Build every replacement before publishing any of them, so an error
         # cannot leave the caller with a partially padded batch.
-        seq_lens = _pad_rows(padding.seq_lens, pad_bs, 0)
-        draft_token = _pad_rows(
-            padding.draft_token,
-            pad_bs * verify_input.draft_token_num,
-            _DRAFT_TOKEN_FILL,
+        per_request = (
+            (padding.seq_lens, pad_bs, 0),
+            (
+                padding.draft_token,
+                pad_bs * verify_input.draft_token_num,
+                _DRAFT_TOKEN_FILL,
+            ),
+            (padding.retrieve_index, pad_bs, _RETRIEVE_INDEX_FILL),
+            (padding.temperatures, pad_bs, _TEMPERATURE_FILL),
+            (padding.top_ks, pad_bs, _TOP_K_FILL),
+            (padding.top_ps, pad_bs, _TOP_P_FILL),
         )
-        retrieve_index = _pad_rows(padding.retrieve_index, pad_bs, _RETRIEVE_INDEX_FILL)
-        temperatures = (
-            _pad_rows(padding.temperatures, pad_bs, _TEMPERATURE_FILL)
-            if padding.temperatures is not None
-            else None
-        )
-        top_ks = (
-            _pad_rows(padding.top_ks, pad_bs, _TOP_K_FILL)
-            if padding.top_ks is not None
-            else None
-        )
-        top_ps = (
-            _pad_rows(padding.top_ps, pad_bs, _TOP_P_FILL)
-            if padding.top_ps is not None
-            else None
+        (
+            seq_lens,
+            draft_token,
+            retrieve_index,
+            temperatures,
+            top_ks,
+            top_ps,
+        ) = self._row_padder.pad(
+            tensors=[t for t, _, _ in per_request],
+            rows=[0 if t is None else t.shape[0] + pad for t, pad, _ in per_request],
+            fills=[fill for _, _, fill in per_request],
+            batch_size=(state.logical_batch_size, state.physical_batch_size),
         )
 
         # Publish padded tensors only while eagle_sample runs.

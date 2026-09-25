@@ -46,6 +46,7 @@ from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOu
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardBatch,
     ForwardMode,
     LogitsOutputMode,
     PPProxyTensors,
@@ -74,6 +75,9 @@ class _FakeAttnBackend:
         self.calls.append(
             (forward_batch.input_ids.shape[0], forward_batch.seq_lens.shape[0])
         )
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 0
 
 
 # Config the compile policies read from the namespace bags; it reaches production
@@ -2681,11 +2685,16 @@ class TestSpecDraftExtendPadding(_SpecPolicyTestCase):
         DRAFT_EXTEND_V2 graph (traced with them at the bucket length) was
         invoked with shapes the trace never saw."""
         policy = _make_spec_policy(bs_buckets=(1, 4))
-        forward_batch = SimpleNamespace(
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            batch_size=3,
             input_ids=torch.ones(12, dtype=torch.int32),
+            positions=torch.arange(12),
+            req_pool_indices=torch.arange(3),
             seq_lens=torch.ones(3, dtype=torch.int32),
+            seq_lens_sum=3,
+            out_cache_loc=torch.arange(12),
             spec_info=None,
-            _pad_inputs_to_size=MagicMock(),
             extend_seq_lens=torch.tensor([4, 4, 4], dtype=torch.int32),
             extend_prefix_lens=torch.tensor([8, 7, 6], dtype=torch.int32),
             extend_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
@@ -2737,13 +2746,19 @@ class TestSpecDraftExtendPadding(_SpecPolicyTestCase):
             mm_inputs=[None],
         )
         pad_calls: list[tuple[int, int]] = []
-        forward_batch._pad_inputs_to_size = lambda *, model_runner, num_tokens, bs: (
-            pad_calls.append((num_tokens, bs))
-        )
 
-        with patch(
-            _SPEC_POLICY + "is_dp_attention_enabled",
-            return_value=True,
+        with (
+            patch(
+                _SPEC_POLICY + "is_dp_attention_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                policy,
+                "_pad_draft_extend_inputs",
+                side_effect=lambda *, forward_batch, num_tokens, bs: pad_calls.append(
+                    (num_tokens, bs)
+                ),
+            ),
         ):
             policy._pad_draft_extend(forward_batch)
 
@@ -3060,10 +3075,6 @@ class TestSpecForwardBatchPreparation(_SpecPolicyTestCase):
             positions=torch.arange(8),
         )
         pad_calls = []
-
-        def fake_pad_inputs_to_size(model_runner, num_tokens, bs):
-            pad_calls.append((num_tokens, bs))
-
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.DRAFT_EXTEND_V2,
             spec_info=draft_extend_input,
@@ -3071,10 +3082,16 @@ class TestSpecForwardBatchPreparation(_SpecPolicyTestCase):
             seq_lens=draft_extend_input.seq_lens,
             extend_seq_lens_cpu=None,
             batch_size=2,
-            _pad_inputs_to_size=fake_pad_inputs_to_size,
         )
 
-        policy.prepare_spec_forward_batch(forward_batch)
+        with patch.object(
+            policy,
+            "_pad_draft_extend_inputs",
+            side_effect=lambda *, forward_batch, num_tokens, bs: pad_calls.append(
+                (num_tokens, bs)
+            ),
+        ):
+            policy.prepare_spec_forward_batch(forward_batch)
 
         # bs=2 buckets to 4; draft extend fills draft_token_num (=4) per request.
         self.assertEqual(pad_calls, [(16, 4)])

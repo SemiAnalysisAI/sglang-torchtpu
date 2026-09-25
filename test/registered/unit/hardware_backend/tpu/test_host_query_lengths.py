@@ -148,6 +148,7 @@ def test_query_mirror_survives_padding_before_metadata(
             policy.b_bucketer = Bucketer(name="Batch", buckets=[physical_bs])
             policy.draft_token_num = 4
             policy._dp_peer_draft_extend_rows = lambda _: 0
+            policy._row_padder_instance = None
             policy.model_runner = SimpleNamespace(
                 attn_backend=SimpleNamespace(
                     get_cpu_graph_seq_len_fill_value=lambda: 0,

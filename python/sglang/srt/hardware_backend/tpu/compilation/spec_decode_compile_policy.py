@@ -32,22 +32,6 @@ from sglang.srt.speculative.spec_info import SpecInput
 logger = get_logger(__name__)
 
 
-def _pad_first_dim(t: torch.Tensor | None, target_rows: int) -> torch.Tensor | None:
-    """Zero-pad a tensor's first (row) dim to target_rows (any ndim).
-
-    Args:
-      t: Input tensor to pad or None.
-      target_rows: Target number of rows.
-
-    Returns:
-      Padded tensor or None if input was None.
-    """
-    if t is None or t.shape[0] >= target_rows:
-        return t
-    pad = t.new_zeros((target_rows - t.shape[0], *t.shape[1:]))
-    return torch.cat([t, pad], dim=0)
-
-
 class BaseSpecDecodeCompilePolicyMixin:
     """Base mixin adding speculative decoding warmup and batch shaping to a decoder compile policy."""
 
