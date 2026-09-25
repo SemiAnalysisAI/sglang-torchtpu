@@ -417,8 +417,7 @@ jobs:
       pd_decode_hosts: 2
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py integration
       files: test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py
-      # Qwen3-VL-8B is not on model-weights-filestore; it has its own ROX disk.
-      weights_pvc: qwen3-vl
+      weights_pvc: model-weights
       run_name: pd-mh-qwen3-vl-8b-spec
     permissions:
       contents: read
