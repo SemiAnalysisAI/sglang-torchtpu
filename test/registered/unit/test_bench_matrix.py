@@ -297,7 +297,11 @@ class TestBenchMatrix(CustomTestCase):
             "WORKLOAD": "agentic",
             "PROFILE": "ci",
         }
-        for env_val, expected in ((None, "mini_lb"), ("mini_lb", "mini_lb"), ("smg", "smg")):
+        for env_val, expected in (
+            (None, "mini_lb"),
+            ("mini_lb", "mini_lb"),
+            ("smg", "smg"),
+        ):
             env = dict(base_env)
             if env_val is not None:
                 env["SGLANG_TPU_PD_ROUTER"] = env_val

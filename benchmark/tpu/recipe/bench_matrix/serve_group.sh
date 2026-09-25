@@ -150,7 +150,7 @@ if [[ "$ROLE" == "prefill" ]]; then
     KV_EVENTS_ARGS=""
     if [[ "$PD_ROUTER" == "smg" ]]; then
         KV_EVENTS_PORT=$(( ${SGLANG_TPU_KV_EVENTS_PORT:-5557} + WORKER_ID ))
-        KV_EVENTS_ARGS="--kv-events-config {\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://0.0.0.0:${KV_EVENTS_PORT}\"}"
+        KV_EVENTS_ARGS="--load-publish-endpoint auto --kv-events-config {\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://0.0.0.0:${KV_EVENTS_PORT}\"}"
     fi
     export EXTRA_ARGS="$BASE_EXTRA_ARGS \
 --disaggregation-mode prefill \
@@ -193,6 +193,11 @@ if [[ "$WORKER_ID" == "0" ]]; then
         if [[ -d "$TOK_PATH" && -f "$TOK_PATH/tokenizer.json" ]]; then
             TOK_PATH="$TOK_PATH/tokenizer.json"
         fi
+        PREFILL_POL="${SGLANG_TPU_PD_PREFILL_POLICY:-cache_aware}"
+        ROUTER_EXTRA_ARGS=()
+        if [[ "$PREFILL_POL" == "sticky" ]]; then
+            ROUTER_EXTRA_ARGS+=(--routing-key-header "${SGLANG_TPU_ROUTING_KEY_HEADER:-x-smg-routing-key}")
+        fi
         "${SGLANG_TPU_SMG_BIN:-sgl-router}" \
             --model-id "$MODEL" \
             --tokenizer-path "$TOK_PATH" \
@@ -202,8 +207,9 @@ if [[ "$WORKER_ID" == "0" ]]; then
                 "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" \
                 "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" \
             --host 0.0.0.0 --port "$LB_PORT" \
-            --policy "${SGLANG_TPU_PD_PREFILL_POLICY:-cache_aware}" \
+            --policy "$PREFILL_POL" \
             --decode-policy "${SGLANG_TPU_PD_DECODE_POLICY:-power_of_two}" \
+            "${ROUTER_EXTRA_ARGS[@]}" \
             > >(sed 's/^/[smg] /') 2>&1 &
     else
         "$PYTHON" -m sglang_router.launch_router \
