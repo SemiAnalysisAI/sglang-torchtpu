@@ -56,7 +56,7 @@ class TestWriteBackUnbackedSwaTombstone(CustomTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         # The budget subtracts a fixed reserve from free RAM, which goes negative
-        # on small CI runners; these pools need a few MB.
+        # on small CI runners; these pools need far less than the stubbed 1 GB.
         patcher = mock.patch.object(
             pool_host_base, "host_memory_budget_bytes", return_value=1024**3
         )
@@ -141,9 +141,6 @@ class TestWriteBackUnbackedSwaTombstone(CustomTestCase):
         """Request exactly the node's SWA size, so the walk stops after it."""
         return cache.evict(EvictParams(swa_num_tokens=len(node.key)))
 
-    # Open defect. Drop expectedFailure once write_back eviction backs up an
-    # internal node's SWA; the runner then reports an UNEXPECTED SUCCESS.
-    @unittest.expectedFailure
     def test_write_back_frees_swa_without_losing_it(self):
         """write_back must free the requested SWA slots and keep the SWA on a tier."""
         cache, node = self._build_cache("write_back")
@@ -151,10 +148,14 @@ class TestWriteBackUnbackedSwaTombstone(CustomTestCase):
         result = self._evict_swa_of(cache, node)
 
         swa = node.component_data[SWA]
-        self.assertTrue(
-            swa.value is not None or swa.host_value is not None,
-            "write_back released SWA device slots that had no host copy",
-        )
+        # Open defect. Unwrap this once write_back eviction backs up an internal
+        # node's SWA; "AssertionError not raised" then signals the fix landed.
+        # Not expectedFailure: that would also absorb a crash in evict().
+        with self.assertRaises(AssertionError):
+            self.assertTrue(
+                swa.value is not None or swa.host_value is not None,
+                "write_back released SWA device slots that had no host copy",
+            )
         # Skipping the node keeps the SWA but starves SWA allocation.
         self.assertGreaterEqual(result.swa_num_tokens_evicted, len(node.key))
 
