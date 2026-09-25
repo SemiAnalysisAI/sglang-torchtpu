@@ -1,7 +1,13 @@
 from sglang.test.ci.ci_register import register_tpu_ci
 
-# One TPU server launch + torch.compile warmup.
-register_tpu_ci(est_time=600, suite="tpu-hicache")
+# One TPU server launch + torch.compile warmup, then ~11 short generations.
+# feature-validation discovers single-host rows by this suite and nightly=True.
+register_tpu_ci(
+    est_time=2400,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "qwen3-0.6b", "kv-offload", "rpa-v3"],
+)
 
 """E2E correctness for the TPU torch_tpu KV-offload backend.
 
@@ -56,6 +62,10 @@ _OFFLOAD_ARGS = [
     "--enable-hierarchical-cache",
     "--hicache-io-backend",
     "torch_tpu",
+    # The TPU host pool mirrors the fused device pool; the io backend rejects
+    # any other layout at startup.
+    "--hicache-mem-layout",
+    "page_first_fused",
     "--hicache-ratio",
     str(HICACHE_RATIO),
     "--enable-cache-report",
