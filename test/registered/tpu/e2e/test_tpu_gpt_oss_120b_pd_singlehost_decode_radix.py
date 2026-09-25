@@ -411,7 +411,7 @@ class TestPdSingleHostDecodeRadixGptOss120bIntegration(PDSingleHostTestCase):
 def render_jobset_yaml(
     image: str = "us-central1-docker.pkg.dev/sgl-project/tpu-ci/sglang:latest",
     lane: str = "nightly",
-    weights_pvc: str = "model-weights-filestore",
+    weights_pvc: str = "model-weights",
     run_name: str = RUN_NAME,
 ) -> str:
     """Render the JobSet for this lane: one host of prefill, one of decode."""
