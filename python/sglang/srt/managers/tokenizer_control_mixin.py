@@ -54,6 +54,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    RaidenFaultReqInput,
+    RaidenFaultReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     RemoveExternalCorpusReqInput,
@@ -119,6 +121,7 @@ _COMMUNICATOR_SPECS = [
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
+    ("raiden_fault", RaidenFaultReqOutput),
     ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
@@ -156,6 +159,25 @@ def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOut
         error_message=" | ".join(error_messages),
         loaded_adapters=failed[0].loaded_adapters,
     )
+
+
+def _merge_raiden_fault_results(results: List[RaidenFaultReqOutput]) -> Dict[str, Any]:
+    """Merge per-worker fault replies; one failed worker fails the call.
+
+    armed_workers is reported separately so a caller can refuse to start a fault
+    phase on a partly armed server instead of misattributing its failures.
+    """
+    hits: Dict[str, int] = {}
+    for r in results:
+        for hook, count in r.hits.items():
+            hits[hook] = hits.get(hook, 0) + count
+    return {
+        "success": all(r.success for r in results),
+        "errors": list(dict.fromkeys(r.message for r in results if not r.success)),
+        "workers": len(results),
+        "armed_workers": sum(r.armed for r in results),
+        "hits": hits,
+    }
 
 
 class TokenizerControlMixin:
@@ -845,6 +867,13 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
+
+    async def raiden_fault(
+        self: TokenizerManager, obj: RaidenFaultReqInput
+    ) -> Dict[str, Any]:
+        self.auto_create_handle_loop()
+        results: List[RaidenFaultReqOutput] = await self.raiden_fault_communicator(obj)
+        return _merge_raiden_fault_results(results)
 
     async def pd_role_switch(
         self: TokenizerManager,

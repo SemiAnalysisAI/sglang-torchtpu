@@ -164,6 +164,8 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
     ProfileReq,
+    RaidenFaultReqInput,
+    RaidenFaultReqOutput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -686,6 +688,7 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+        self.maybe_init_raiden_fault_controller()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1909,6 +1912,7 @@ class Scheduler(
                     self.weight_updater.check_weights,
                 ),
                 (SlowDownReqInput, self.slow_down),
+                (RaidenFaultReqInput, self.handle_raiden_fault),
                 (PdRoleSwitchReqInput, self.handle_pd_role_switch),
                 (
                     ProfileReq,
@@ -2379,6 +2383,17 @@ class Scheduler(
 
     def init_grammar_manager(self) -> None:
         self.grammar_manager = GrammarManager(self)
+
+    def maybe_init_raiden_fault_controller(self) -> None:
+        """Construct the tpu-sync fault injection controller when enabled."""
+        if envs.SGLANG_ENABLE_RAIDEN_FAULT_INJECTION.get():
+            from sglang.srt.disaggregation.raiden.fault_control import (
+                create_raiden_fault_controller,
+            )
+
+            self.raiden_fault_controller = create_raiden_fault_controller()
+        else:
+            self.raiden_fault_controller = None
 
     def maybe_init_scripted_scheduler_hook(self) -> None:
         if envs.SGLANG_TEST_SCRIPTED_RUNTIME.get():
@@ -5978,6 +5993,15 @@ class Scheduler(
             t = None
         self.forward_sleep_time = t
         return SlowDownReqOutput()
+
+    def handle_raiden_fault(self, recv_req: RaidenFaultReqInput):
+        """Arm, disarm, or report tpu-sync fault injection rules in this process."""
+        if self.raiden_fault_controller is None:
+            return RaidenFaultReqOutput(
+                success=False,
+                message="SGLANG_ENABLE_RAIDEN_FAULT_INJECTION is not set",
+            )
+        return self.raiden_fault_controller.handle(recv_req)
 
     def handle_pd_role_switch(self, recv_req: PdRoleSwitchReqInput):
         return role_switch.handle_pd_role_switch(self, recv_req)

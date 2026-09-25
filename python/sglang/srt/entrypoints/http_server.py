@@ -135,6 +135,7 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
     ProfileReq,
+    RaidenFaultReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -1566,6 +1567,39 @@ async def slow_down(obj: Annotated[SlowDownReqInput, Body()], request: Request):
         await _global_state.tokenizer_manager.slow_down(obj, request)
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.api_route("/raiden_faults", methods=["GET", "POST", "DELETE"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def raiden_faults(request: Request):
+    """Arm (POST), report (GET), or disarm (DELETE) tpu-sync fault injection.
+
+    Testing only; 404 unless SGLANG_ENABLE_RAIDEN_FAULT_INJECTION is set. The POST
+    body is {"rules": [...], "duration_s": 60}, rules in the
+    tpu_sync.api.torch.fault_injection format. They replace any armed rules and
+    disarm themselves after duration_s even if the scheduler is wedged.
+    """
+    if not envs.SGLANG_ENABLE_RAIDEN_FAULT_INJECTION.get():
+        return ORJSONResponse(
+            {"error": {"message": "SGLANG_ENABLE_RAIDEN_FAULT_INJECTION is not set"}},
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+    try:
+        if request.method == "POST":
+            body = await request.json()
+            fields = {k: body[k] for k in ("rules", "duration_s") if k in body}
+            obj = RaidenFaultReqInput(op="inject", **fields)
+        elif request.method == "DELETE":
+            obj = RaidenFaultReqInput(op="reset")
+        else:
+            obj = RaidenFaultReqInput(op="status")
+        result = await _global_state.tokenizer_manager.raiden_fault(obj)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse(
+        result,
+        status_code=HTTPStatus.OK if result["success"] else HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.api_route("/pd_role_switch", methods=["POST"])
