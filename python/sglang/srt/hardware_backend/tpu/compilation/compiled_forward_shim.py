@@ -24,6 +24,9 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
+from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+    snapshot_recompilation_baseline,
+)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
@@ -44,6 +47,33 @@ _TOKEN_FIELDS = (
     "input_embeds",
     # Draft extend inherits the target's real-length embeds, so re-pad them.
     "mm_input_embeds",
+    "mrope_positions",
+)
+
+# Token dim of each field above. MROPE positions are (3, num_tokens). Every
+# other field has tokens on dim 0.
+_TOKEN_FIELD_DIM = {"mrope_positions": -1}
+
+# Token fields that prefill pads on the host instead of on the TPU.
+#
+# Padding on the TPU compiles a new XLA program for each distinct input
+# length. Prefill lengths are arbitrary, so that would trigger one
+# compilation for each unique input length seen while serving. These fields
+# are small integer tensors, so it is cheap to copy them to the host, pad
+# there, and copy the bucket-sized result back.
+# Embeddings and hidden states are too large for that and stay on the TPU.
+#
+# Guideline for adding a field here:
+#   1. Preferred: keep the tensor on host until reaching the padding here,
+#      pad it, and copy it to the TPU once. No copy back to the host is
+#      needed.
+#   2. Fallback: when that would require changing shared sglang code, let
+#      the tensor reach the TPU as usual and add the extra TPU-to-host copy
+#      here for padding. Do this only for tensors that are not too large.
+# Every field below uses the fallback today, because shared code copies them
+# to the TPU before this step.
+_HOST_PAD_TOKEN_FIELDS = frozenset(
+    ("input_ids", "positions", "out_cache_loc", "mrope_positions")
 )
 
 # Fields whose batch dim gets padded to the bs bucket.
@@ -393,6 +423,32 @@ def _attach_input_logprobs(
     logits_output.input_token_ids_logprobs_idx = eager.input_token_ids_logprobs_idx
 
 
+def _pad_tensor_on_host(
+    t: torch.Tensor, target_size: int, *, dim: int = 0
+) -> torch.Tensor:
+    """Pad a small tensor along dim to target_size on the host."""
+    if t.shape[dim] >= target_size:
+        return t
+    padded_shape = list(t.shape)
+    padded_shape[dim] = target_size
+    padded = torch.zeros(padded_shape, dtype=t.dtype, device="cpu")
+    padded.narrow(dim, 0, t.shape[dim]).copy_(t.to("cpu"))
+    return padded.to(t.device)
+
+
+def _pad_tensor(
+    t: torch.Tensor, target_size: int, *, dim: int = 0, on_host: bool = False
+) -> torch.Tensor:
+    """Pad a tensor along dim to target_size."""
+    if t.shape[dim] >= target_size:
+        return t
+    if on_host and t.device.type == "tpu":
+        return _pad_tensor_on_host(t, target_size, dim=dim)
+    dim = dim % t.ndim
+    padding = (0,) * (2 * (t.ndim - dim - 1)) + (0, target_size - t.shape[dim])
+    return F.pad(t, padding)
+
+
 def _pad_forward_batch_inputs(
     forward_batch: Any,
     t_bucketer: Bucketer,
@@ -439,9 +495,9 @@ def _pad_forward_batch_inputs(
     elif is_draft_extend_v2 and forward_batch.spec_info is not None:
         pad_b = b_bucketer.next_bucket(real_b)
         num_tokens_per_req = forward_batch.spec_info.num_tokens_per_req
-        assert (
-            num_tokens_per_req > 0
-        ), f"DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, got {num_tokens_per_req}"
+        assert num_tokens_per_req > 0, (
+            f"DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, got {num_tokens_per_req}"
+        )
         pad_t = pad_b * num_tokens_per_req
         real_q_out, real_b_out = real_q, real_b
     else:
@@ -456,17 +512,23 @@ def _pad_forward_batch_inputs(
         pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
         real_q_out, real_b_out = real_q, real_b
 
+    # Opt-in host padding applies only to prefill with arbitrary token counts.
+    # Decode and target verify have a small, fixed set of token counts. The
+    # TPU pad compiles each of those once, and avoids a blocking copy on
+    # every generation step.
+    mode = forward_batch.forward_mode
+    host_pad = (
+        envs.SGLANG_TPU_HOST_PADDING.get()
+        and mode.is_extend()
+        and not mode.is_target_verify()
+    )
     for field in _TOKEN_FIELDS:
         val = getattr(forward_batch, field, None)
-        if isinstance(val, torch.Tensor) and val.shape[0] < pad_t:
-            setattr(forward_batch, field, _zero_pad_dim0(val, pad_t))
-
-    # MROPE positions are (3, num_tokens); pad along the token dim.
-    mrope_pos = getattr(forward_batch, "mrope_positions", None)
-    if isinstance(mrope_pos, torch.Tensor) and mrope_pos.shape[-1] < pad_t:
-        forward_batch.mrope_positions = F.pad(
-            mrope_pos, (0, pad_t - mrope_pos.shape[-1])
-        )
+        dim = _TOKEN_FIELD_DIM.get(field, 0)
+        if isinstance(val, torch.Tensor) and val.shape[dim] < pad_t:
+            on_host = host_pad and field in _HOST_PAD_TOKEN_FIELDS
+            val = _pad_tensor(val, pad_t, dim=dim, on_host=on_host)
+            setattr(forward_batch, field, val)
 
     if is_draft_extend_v2:
         out_cache_loc = forward_batch.out_cache_loc
@@ -536,12 +598,9 @@ def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) 
     """
     for field in _TOKEN_FIELDS:
         value = getattr(forward_batch, field, None)
-        if isinstance(value, torch.Tensor) and value.shape[0] > real_q:
-            setattr(forward_batch, field, value[:real_q])
-
-    mrope_positions = getattr(forward_batch, "mrope_positions", None)
-    if isinstance(mrope_positions, torch.Tensor) and mrope_positions.shape[-1] > real_q:
-        forward_batch.mrope_positions = mrope_positions[..., :real_q]
+        dim = _TOKEN_FIELD_DIM.get(field, 0)
+        if isinstance(value, torch.Tensor) and value.shape[dim] > real_q:
+            setattr(forward_batch, field, value.narrow(dim, 0, real_q))
 
     for field in _BS_FIELDS:
         value = getattr(forward_batch, field, None)
@@ -624,6 +683,7 @@ def precompile_kv_offload(host_pool: TpuFusedMHATokenToKVPoolHost) -> None:
         max_blocks,
         time.perf_counter() - start,
     )
+    snapshot_recompilation_baseline()
 
 
 class CompiledForwardShim:
@@ -727,6 +787,44 @@ class CompiledForwardShim:
                     and _matches_default(v, self._default_kwargs[k])
                 )
             }
+        # The fused draft loop inlines this call into its own Dynamo graph.
+        # Reading the checker there would put it in that graph's guards, so
+        # attaching it later would recompile the graph this very tool exists to
+        # protect. Compiles from inside it surface on the next eager forward.
+        if torch.compiler.is_compiling():
+            return self._forward(input_ids, positions, forward_batch, *args, **kwargs)
+
+        checker = self._recompilation_checker
+        if checker is None:
+            return self._forward(input_ids, positions, forward_batch, *args, **kwargs)
+        # Read at entry: the padded shapes are what the graph compiled for.
+        pad_q = int(forward_batch.input_ids.shape[0])
+        pad_b = int(forward_batch.seq_lens.shape[0])
+        try:
+            return self._forward(input_ids, positions, forward_batch, *args, **kwargs)
+        finally:
+            checker.check(
+                context_fn=lambda: self._describe_forward(
+                    forward_batch, pad_q=pad_q, pad_b=pad_b
+                )
+            )
+
+    def _describe_forward(self, forward_batch: Any, *, pad_q: int, pad_b: int) -> str:
+        # Dynamic keys, unset on eagle3 draft extend (as in _unpad_decoder_outputs).
+        real_q = getattr(forward_batch, _REAL_Q_KEY, None)
+        real_b = getattr(forward_batch, _REAL_B_KEY, None)
+        real = f" real=q{real_q},b{real_b}" if real_q is not None else ""
+        mode = forward_batch.forward_mode.name
+        return f"{self._model_label} {mode}{real} pad=q{pad_q},b{pad_b}"
+
+    def _forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        forward_batch: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
         # EAGLE3 draft extend: EagleDraftExtendInput also rides DRAFT_EXTEND_V2,
         # which is_extend() excludes.
         if (
@@ -799,14 +897,6 @@ class CompiledForwardShim:
                 logits_output=out,
                 forward_batch=forward_batch,
                 model=self.policy.model_runner.model,
-            )
-
-        # Check for serving-time XLA recompilation (once per forward call).
-        # Gated by SGLANG_TPU_CHECK_RECOMPILATION=1 (off by default).
-        if self._recompilation_checker is not None:
-            fm = getattr(forward_batch, "forward_mode", "N/A")
-            self._recompilation_checker.check(
-                f"{self._model_label} {fm.name if hasattr(fm, 'name') else fm}"
             )
 
         return out

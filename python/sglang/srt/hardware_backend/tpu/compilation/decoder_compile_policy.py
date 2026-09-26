@@ -556,7 +556,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             specialization_key=self._direct_compile_specialization_key,
             model=model,
             model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
-            kv_pool=self.model_runner.token_to_kv_pool,
+            kv_pool=self.get_direct_compile_kv_pool(),
             ignored_argnames=self._ignored_argnames(),
         )
 
@@ -570,6 +570,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
 
         return call
+
+    def get_direct_compile_kv_pool(self):
+        return self.model_runner.token_to_kv_pool
 
     def _ignored_argnames(self) -> tuple[str, ...]:
         return (
@@ -602,7 +605,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
     def _direct_compile_specialization_key(
         self,
-        _attention_metadata: Any,
+        attention_metadata: Any,
         input_ids: torch.Tensor,
         _positions: torch.Tensor,
         forward_batch: Any,
@@ -614,13 +617,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             if self._compiles_logits_processor()
             else None
         )
-        return (
+        key = (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
             input_ids.shape[0],
             logits_output_mode,
         )
+        return key
 
     def _compiles_logits_processor(self) -> bool:
         """Whether this compiled callable includes target-model logits processing."""
@@ -785,12 +789,6 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         self.compiled_forward_shim.set_recompilation_checker(
             checker, model_label=model_label
         )
-
-    def snapshot_recompilation_baseline(self) -> None:
-        """Re-baseline the recompilation checker; no-op unless it is enabled."""
-        checker = self.compiled_forward_shim._recompilation_checker
-        if checker is not None:
-            checker.snapshot_baseline()
 
     def precompile(self) -> None:
         """Warm decoder graphs for this policy's bucket grid."""
@@ -958,6 +956,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         forward_batch = (
             kwargs["forward_batch"] if "forward_batch" in kwargs else args[2]
         )
+        prepared_batch = self.model_runner.prepare_dummy_forward_batch(forward_batch)
+        if prepared_batch is not forward_batch:
+            if "forward_batch" in kwargs:
+                kwargs["forward_batch"] = prepared_batch
+            else:
+                args = (*args[:2], prepared_batch, *args[3:])
+            forward_batch = prepared_batch
         if spec_info is None:
             if logits_output_mode is LogitsOutputMode.DISTRIBUTED_TOP_K:
                 forward_batch.sampling_info = self._make_top_k_warmup_sampling_info(bs)
@@ -1247,7 +1252,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
     def _direct_compile_specialization_key(
         self,
-        _attention_metadata: Any,
+        attention_metadata: Any,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         forward_batch: Any,
@@ -1261,7 +1266,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             if self._compiles_logits_processor()
             else None
         )
-        return (
+        key = (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
@@ -1269,6 +1274,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             input_deepstack_embeds is not None,
             logits_output_mode,
         )
+        return key
 
     def _decode_uses_input_ids(self) -> bool:
         """Whether the wrapper hands decode raw ``input_ids``, skipping embed.
@@ -1421,8 +1427,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                     host_mask=torch.zeros((num_tokens, 1), dtype=torch.bool),
                 )
         logger.info(
-            "[decoder compile policy] VL MM EMBED PLACEMENT: %d token buckets "
-            "in %.1fs",
+            "[decoder compile policy] VL MM EMBED PLACEMENT: %d token buckets in %.1fs",
             len(buckets),
             time.perf_counter() - start,
         )
