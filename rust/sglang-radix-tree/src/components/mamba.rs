@@ -6,8 +6,8 @@ use std::collections::HashMap;
 
 use tch::Tensor;
 
-use crate::components::TreeComponent;
 use crate::components::{ComponentType, MAMBA};
+use crate::components::{DeviceEvictStep, TreeComponent};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
@@ -344,7 +344,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-    ) -> Option<NodeIdx_> {
+    ) -> Option<DeviceEvictStep> {
         let ct = MAMBA;
         assert!(
             tree_core.component_state(MAMBA).is_evict_device_ongoing,
@@ -380,7 +380,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 continue;
             }
             if tree_core.evictable_device_leaves.contains(x) {
-                break Some(x);
+                break Some(DeviceEvictStep::Leaf(x));
             }
             // Internal nodes are tombstoned inline (no IO).
             tree_core.evict_component_and_detach_lru_(

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.unified_cache.cache_action import (
+        BackupKV,
         CacheAction,
         ComponentAction,
     )
@@ -522,9 +523,11 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
+    ) -> Optional[NodeId | BackupKV]:
         """Advance one eviction step and return a device leaf, if selected.
 
+        A BackupKV instead names a node whose value this component may release
+        only with a host copy; the caller backs it up, then releases it.
         Implementations must return after one allocator-relevant internal
         mutation so the caller can drain pending frees before continuing.
         """
@@ -552,7 +555,7 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
+    ) -> Optional[NodeId | BackupKV]:
         """Advance the walk by at most one allocator-relevant mutation."""
         ...
 

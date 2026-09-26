@@ -43,12 +43,15 @@ class BaseEvictionResult(msgspec.Struct):
 class EvictDeviceNextNodeResult(BaseEvictionResult):
     """One device-walk step.
 
-    ``node_id`` selects a leaf for the Controller to evict. ``made_progress``
-    also covers an internal tombstone that returned no leaf, distinguishing it
-    from true walk exhaustion.
+    ``node_id`` selects a leaf for the Controller to evict. With ``backup_kv``
+    set it is instead a node whose walking-component value the Controller backs
+    up, then releases via ``evict_component_device``. ``made_progress`` also
+    covers an internal tombstone that returned no leaf, distinguishing it from
+    true walk exhaustion.
     """
 
     node_id: Optional[NodeId] = None
+    backup_kv: Optional[BackupKV] = None
     made_progress: bool = False
     unbacked_tokens: int = 0
 
@@ -60,6 +63,10 @@ class EvictDeviceLeafResult(BaseEvictionResult):
 
 class DemoteResult(BaseEvictionResult):
     pass
+
+
+class EvictComponentDeviceResult(BaseEvictionResult):
+    is_unbacked: bool = False
 
 
 class DropSubtreeNoHostResult(BaseEvictionResult):
@@ -314,6 +321,14 @@ class UnifiedTreeCoreInterface(ABC):
     def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:
         """Drop an unbacked D-leaf's subtree when its write-back backup failed
         under host pressure; declines (is_dropped=False) if any node is locked."""
+        ...
+
+    @abstractmethod
+    def evict_component_device(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> EvictComponentDeviceResult:
+        """Release one component's device value on a node, host copy or not;
+        ``is_unbacked`` reports that the value had no host copy."""
         ...
 
     @abstractmethod

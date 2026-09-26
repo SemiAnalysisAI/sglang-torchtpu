@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use tch::{Device, Kind, Tensor};
 
 use crate::components::{
-    self, ComponentSet, FullComponent, MambaComponent, SwaComponent, TreeComponent,
+    self, ComponentSet, DeviceEvictStep, FullComponent, MambaComponent, SwaComponent, TreeComponent,
 };
 use crate::components::{
     BASE_COMPONENT_TYPE, ComponentType, FULL, MAMBA, NUM_COMPONENT_TYPES, SWA,
@@ -366,7 +366,7 @@ pub struct PoolTransferResult {
 }
 
 /// A device->host backup work item for the cache to execute.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct BackupKV {
     /// Backup these nodes device->host in order, stopping at the first failure; the
     /// caller orders them parent-before-child for write-through and child-first for
@@ -517,6 +517,9 @@ pub struct EvictionStepResult {
     pub tracker: HashMap<ComponentType, usize>,
     pub device_frees: HashMap<ComponentType, Vec<Tensor>>,
     pub host_frees: HashMap<ComponentType, Vec<Tensor>>,
+    /// Set by a device-walk step whose node the Controller backs up, then
+    /// releases via `evict_component_device`.
+    pub backup_kv: Option<BackupKV>,
 }
 
 /// The radix tree mechanism: owns the tree structure, per-node values, the
@@ -2159,7 +2162,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         // The walk gates on the walked component's entry, so seed it.
         tracker.entry(component_type).or_insert(0);
         let mut result = EvictionStepResult::default();
-        let node_id = self
+        let step = self
             .component_by_type_(component_type)
             .evict_device_next_node(
                 self,
@@ -2173,7 +2176,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 result.tracker.insert(ct, delta);
             }
         }
-        (node_id.map(|idx| self.arena.node(idx).id), result)
+        let node_id = match step {
+            None => None,
+            Some(DeviceEvictStep::Leaf(idx)) => Some(self.arena.node(idx).id),
+            Some(DeviceEvictStep::BackupFirst(idx)) => {
+                let id = self.arena.node(idx).id;
+                result.backup_kv = Some(BackupKV { node_ids: vec![id] });
+                Some(id)
+            }
+        };
+        (node_id, result)
     }
 
     /// Finish a component's device-eviction walk.
@@ -2222,6 +2234,41 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             &mut result.host_frees,
         );
         Ok((None, result))
+    }
+
+    /// Release one component's device value on a node, host copy or not;
+    /// the flag reports that the value had no host copy.
+    pub fn evict_component_device(
+        &mut self,
+        node_id: NodeId,
+        component_type: ComponentType,
+    ) -> Result<(bool, EvictionStepResult), NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        let mut result = EvictionStepResult::default();
+        {
+            let node = self.arena.node(node_id);
+            // A queued D2H copy would read the slots this frees; a lock pins them.
+            assert!(node.write_through_pending_id.is_none());
+            assert_eq!(node.lock_ref_(ValueSlotIdx::device(component_type)), 0);
+        }
+        let is_unbacked = !self.arena.has_host_value(node_id, component_type);
+        self.evict_component_and_detach_lru_(
+            node_id,
+            component_type,
+            &mut result.device_frees,
+            &mut result.host_frees,
+            EvictLayer::Device,
+            Some(&mut result.tracker),
+        );
+        self.cascade_evict_(
+            node_id,
+            component_type,
+            &mut result.tracker,
+            &mut result.device_frees,
+            &mut result.host_frees,
+            EvictLayer::Device,
+        );
+        Ok((is_unbacked, result))
     }
 
     /// Write-back fallback when a D-leaf's D->H backup fails under host

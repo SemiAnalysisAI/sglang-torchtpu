@@ -761,12 +761,14 @@ fn tracker_to_py(tracker: HashMap<ComponentType, usize>) -> HashMap<u8, usize> {
 }
 
 /// Next-eviction-node step result: the node to evict, whether the walk made
-/// progress, this step's per-component evicted counts, and this step's newly
-/// freed tensors.
+/// progress, the backup action when the node must be backed up before its
+/// component is released (else None), this step's per-component evicted
+/// counts, and this step's newly freed tensors.
 #[pyclass(get_all)]
 pub struct EvictDeviceNextNodeResultBinding {
     node_id: Option<NodeId>,
     made_progress: bool,
+    backup_kv: Option<Py<PyAny>>,
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
@@ -788,6 +790,16 @@ pub struct EvictDeviceLeafResultBinding {
 #[pyclass(get_all)]
 pub struct DropSubtreeResultBinding {
     dropped: bool,
+    tracker: HashMap<u8, usize>,
+    new_device_frees: Py<PyDict>,
+    new_host_frees: Py<PyDict>,
+}
+
+/// Component-release result: whether the released value had no host copy,
+/// this step's per-component evicted counts, and the newly freed tensors.
+#[pyclass(get_all)]
+pub struct EvictComponentDeviceResultBinding {
+    is_unbacked: bool,
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
@@ -1269,6 +1281,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         Ok(EvictDeviceNextNodeResultBinding {
             node_id,
             made_progress,
+            backup_kv: result
+                .backup_kv
+                .map(|backup| cache_action_to_py(py, CacheAction::BackupKV(backup)))
+                .transpose()?,
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
             new_host_frees: frees_to_py(py, result.host_frees)?,
@@ -1916,6 +1932,25 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             .map_err(node_access_error)?;
         Ok(DropSubtreeResultBinding {
             dropped,
+            tracker: tracker_to_py(result.tracker),
+            new_device_frees: frees_to_py(py, result.device_frees)?,
+            new_host_frees: frees_to_py(py, result.host_frees)?,
+        })
+    }
+
+    /// Release one component's device value on a node, host copy or not.
+    fn evict_component_device(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+    ) -> PyResult<EvictComponentDeviceResultBinding> {
+        let ct = parse_component_type(component_type)?;
+        let (is_unbacked, result) = py
+            .allow_threads(move || self.core().evict_component_device(node_id, ct))
+            .map_err(node_access_error)?;
+        Ok(EvictComponentDeviceResultBinding {
+            is_unbacked,
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
             new_host_frees: frees_to_py(py, result.host_frees)?,
@@ -2589,8 +2624,9 @@ macro_rules! tree_core_binding {
                     .evict_device_start(py, component_type, request_cnt)
             }
 
-            /// The next device leaf to evict, or None when the walk is done; the
-            /// passed running tracker gates the budget, and the result carries
+            /// The next device leaf to evict, or None when the walk is done; a
+            /// set backup_kv marks a node to back up before evict_component_device.
+            /// The passed running tracker gates the budget, and the result carries
             /// this step's deltas.
             fn evict_device_next_node(
                 &self,
@@ -3045,6 +3081,16 @@ macro_rules! tree_core_binding {
                 node_id: NodeId,
             ) -> PyResult<DropSubtreeResultBinding> {
                 self.inner.drop_subtree_no_host(py, node_id)
+            }
+
+            /// Release one component's device value on a node, host copy or not.
+            fn evict_component_device(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<EvictComponentDeviceResultBinding> {
+                self.inner.evict_component_device(py, node_id, component_type)
             }
 
             /// Mark the nodes one write-through backup covers; returns them ancestors first.
@@ -3576,6 +3622,7 @@ fn register_mem_cache_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<EvictDeviceNextNodeResultBinding>()?;
     m.add_class::<EvictDeviceLeafResultBinding>()?;
     m.add_class::<DropSubtreeResultBinding>()?;
+    m.add_class::<EvictComponentDeviceResultBinding>()?;
     m.add_class::<DemoteResultBinding>()?;
     m.add_class::<KvCanaryWalkResultBinding>()?;
     m.add_class::<StorageBackupSpecBinding>()?;

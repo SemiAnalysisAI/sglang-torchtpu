@@ -6,8 +6,8 @@ use std::collections::{BinaryHeap, HashMap};
 
 use tch::{Kind, Tensor};
 
-use crate::components::TreeComponent;
 use crate::components::{ComponentType, FULL};
+use crate::components::{DeviceEvictStep, TreeComponent};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
@@ -151,7 +151,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-    ) -> Option<NodeIdx_> {
+    ) -> Option<DeviceEvictStep> {
         let ct = FULL;
         assert!(
             tree_core.component_state(FULL).is_evict_device_ongoing,
@@ -182,7 +182,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             }
             let last_node_parent = tree_core.arena.node(x).try_parent();
             tree_core.component_state_mut(FULL).evict_device_cursor = last_node_parent;
-            return Some(x);
+            return Some(DeviceEvictStep::Leaf(x));
         }
         None
     }

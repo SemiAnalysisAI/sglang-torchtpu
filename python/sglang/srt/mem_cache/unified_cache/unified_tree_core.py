@@ -72,6 +72,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DemoteResult,
     DriveHostEvictionResult,
     DropSubtreeNoHostResult,
+    EvictComponentDeviceResult,
     EvictDeviceLeafResult,
     EvictDeviceNextNodeResult,
     InsertStepResult,
@@ -1582,13 +1583,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         updated_tracker = defaultdict(int, tracker)
         self._begin_tracking_unbacked_tokens()
         try:
-            result.node_id = self.components_by_type[
-                component_type
-            ].evict_device_next_node(
+            step = self.components_by_type[component_type].evict_device_next_node(
                 updated_tracker, result.device_frees, result.host_frees
             )
         finally:
             result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
+        if isinstance(step, BackupKV):
+            assert len(step.node_ids) == 1
+            result.node_id = step.node_ids[0]
+            result.backup_kv = step
+        else:
+            result.node_id = step
         for ct, n in updated_tracker.items():
             delta = n - tracker.get(ct, 0)
             if delta:
@@ -1853,6 +1858,35 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.evictable_host_leaves.discard(node)
         self._remove_leaf_from_parent(node)
         self._iteratively_delete_tombstone_leaf(node, tracker, device_frees, host_frees)
+
+    def evict_component_device(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> EvictComponentDeviceResult:
+        """Release one component's device value on a node, host copy or not."""
+        node = self.node_by_id(node_id)
+        # A queued D2H copy would read the slots this frees; a lock pins them.
+        assert node.write_through_pending_id is None
+        assert node.component_data[component_type].lock_ref == 0
+        comp = self.components_by_type[component_type]
+        result = EvictComponentDeviceResult(
+            is_unbacked=node.component_data[component_type].host_value is None
+        )
+        self._evict_component_and_detach_lru(
+            node,
+            comp,
+            target=EvictLayer.DEVICE,
+            tracker=result.tracker,
+            device_frees=result.device_frees,
+            host_frees=result.host_frees,
+        )
+        self._cascade_evict(
+            node,
+            comp,
+            result.tracker,
+            device_frees=result.device_frees,
+            host_frees=result.host_frees,
+        )
+        return result
 
     def demote(self, node_id: NodeId) -> DemoteResult:
         """Release a node's device KV once its host copy exists; the node stays in the

@@ -20,6 +20,16 @@ pub use full::FullComponent;
 pub use mamba::MambaComponent;
 pub use swa::SwaComponent;
 
+/// A node a device-eviction walk hands to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceEvictStep {
+    /// A device leaf for the caller to evict.
+    Leaf(NodeIdx_),
+    /// A node whose value the walking component may release only with a host
+    /// copy; the caller backs it up, then releases it.
+    BackupFirst(NodeIdx_),
+}
+
 /// Whether `node_id` holds the component's data on `target`, checking its
 /// device or host slot.
 pub(crate) fn node_has_component_data<K: ChildKeyType>(
@@ -283,7 +293,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-    ) -> Option<NodeIdx_>;
+    ) -> Option<DeviceEvictStep>;
 
     /// Clear this component's device-eviction walk state.
     fn evict_device_end(&self, tree_core: &mut UnifiedTreeCore<K>);

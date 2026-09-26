@@ -69,7 +69,7 @@ impl TreeComponent<Vec<i64>> for RecordingComponentForTest {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-    ) -> Option<NodeIdx_> {
+    ) -> Option<DeviceEvictStep> {
         unimplemented!()
     }
 
@@ -191,7 +191,7 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-    ) -> Option<NodeIdx_> {
+    ) -> Option<DeviceEvictStep> {
         unimplemented!()
     }
 
@@ -271,7 +271,7 @@ impl TreeComponent<Vec<i64>> for LowPriorityComponentForTest {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-    ) -> Option<NodeIdx_> {
+    ) -> Option<DeviceEvictStep> {
         unimplemented!()
     }
 
@@ -346,7 +346,7 @@ impl TreeComponent<Vec<i64>> for SwaComponentForTest {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-    ) -> Option<NodeIdx_> {
+    ) -> Option<DeviceEvictStep> {
         unimplemented!()
     }
 
@@ -459,7 +459,7 @@ impl TreeComponent<Vec<i64>> for SwaEvictionComponentForTest {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-    ) -> Option<NodeIdx_> {
+    ) -> Option<DeviceEvictStep> {
         unimplemented!()
     }
 

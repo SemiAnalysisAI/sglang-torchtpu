@@ -1,5 +1,5 @@
 """Under write_back, SWA eviction must not release an internal node's SWA
-device slots before they have a host copy."""
+device slots before they have a host copy, unless the host tier is full."""
 
 import atexit
 import unittest
@@ -72,7 +72,7 @@ class TestWriteBackUnbackedSwaTombstone(CustomTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _build_cache(self, write_policy: str):
+    def _build_cache(self, write_policy: str, enable_session: bool = False):
         """Returns the cache and its SWA LRU tail, an internal device-only node."""
         override = get_context().override_server_args(
             page_size=1,
@@ -112,6 +112,7 @@ class TestWriteBackUnbackedSwaTombstone(CustomTestCase):
             disable=False,
             sliding_window_size=128,
             tree_components=(ComponentType.FULL, SWA),
+            enable_session_radix_cache=enable_session,
         )
         cache = UnifiedRadixCache(params=params)
         cache.init_hicache(server_args, params)
@@ -142,21 +143,75 @@ class TestWriteBackUnbackedSwaTombstone(CustomTestCase):
         return cache.evict(EvictParams(swa_num_tokens=len(node.key)))
 
     def test_write_back_frees_swa_without_losing_it(self):
-        """write_back must free the requested SWA slots and keep the SWA on a tier."""
+        """write_back must back up the SWA before freeing the requested slots."""
+        # Session mode advances the eviction cursor through a different LRU API.
+        for enable_session in (False, True):
+            with self.subTest(enable_session=enable_session):
+                cache, node = self._build_cache("write_back", enable_session)
+
+                result = self._evict_swa_of(cache, node)
+
+                self.assertIsNotNone(
+                    node.component_data[SWA].host_value,
+                    "write_back released SWA device slots that had no host copy",
+                )
+                # Skipping the node without freeing SWA elsewhere starves SWA
+                # allocation.
+                self.assertGreaterEqual(result.swa_num_tokens_evicted, len(node.key))
+
+    def test_write_back_releases_unbacked_swa_when_host_is_full(self):
+        """A failed backup must still free the SWA slots rather than stall eviction."""
+        for pool_name in ("full", "swa"):
+            with self.subTest(full_host_pool=pool_name):
+                cache, node = self._build_cache("write_back")
+                cache.metrics_collector = mock.Mock()
+                host_pool = (
+                    cache.cache_controller.mem_pool_host
+                    if pool_name == "full"
+                    else cache.components[SWA]._swa_kv_pool_host
+                )
+                self.assertIsNotNone(host_pool.alloc(host_pool.available_size()))
+
+                result = self._evict_swa_of(cache, node)
+
+                swa = node.component_data[SWA]
+                self.assertIsNone(swa.value)
+                self.assertIsNone(swa.host_value)
+                self.assertGreaterEqual(result.swa_num_tokens_evicted, len(node.key))
+                cache.metrics_collector.increment_dropped_tokens.assert_called_once_with(
+                    num_tokens=len(node.key), reason="host_pressure", pool="swa"
+                )
+
+    def test_write_back_backs_up_swa_of_node_whose_full_kv_is_on_host(self):
+        """The SWA-only backup of a node already holding a Full host copy must
+        complete before its device slots are freed."""
         cache, node = self._build_cache("write_back")
-
-        result = self._evict_swa_of(cache, node)
-
-        swa = node.component_data[SWA]
-        # Open defect: unwrap once write_back backs up an internal node's SWA first.
-        # CustomTestCase re-raises errors as Exception; expectedFailure hides crashes.
-        with self.assertRaises(AssertionError):
-            self.assertTrue(
-                swa.value is not None or swa.host_value is not None,
-                "write_back released SWA device slots that had no host copy",
+        cache._execute_and_commit_kv_backup(
+            BackupKV(node_ids=[node.id]), write_back=True
+        )
+        cache.writing_check(write_back=True)
+        # Drop the SWA device copy, then its host copy, then re-insert the path:
+        # the node keeps its Full host copy but its SWA is back on device only.
+        self._evict_swa_of(cache, node)
+        self.assertEqual(cache.evict_host(len(node.key), SWA), len(node.key))
+        tokens = PREFIXES[-1]
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=cache.token_to_kv_pool_allocator.alloc(len(tokens)),
             )
-        # Skipping the node without freeing SWA elsewhere starves SWA allocation.
-        self.assertGreaterEqual(result.swa_num_tokens_evicted, len(node.key))
+        )
+        swa = node.component_data[SWA]
+        self.assertIs(cache.tree_core.lru_lists[SWA].get_lru_no_lock(), node)
+        self.assertTrue(node.backuped)
+        self.assertIsNotNone(swa.value)
+        self.assertIsNone(swa.host_value)
+
+        self._evict_swa_of(cache, node)
+
+        self.assertIsNone(swa.value)
+        self.assertIsNotNone(swa.host_value)
+        self.assertIsNone(node.write_through_pending_id)
 
     def test_write_back_may_release_swa_that_is_already_on_host(self):
         """Guards against a fix that stops write_back SWA eviction altogether."""

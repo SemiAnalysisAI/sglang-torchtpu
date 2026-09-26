@@ -48,7 +48,7 @@ impl TreeComponent<Vec<i64>> for DefaultComponentForTest {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-    ) -> Option<NodeIdx_> {
+    ) -> Option<DeviceEvictStep> {
         unimplemented!()
     }
 

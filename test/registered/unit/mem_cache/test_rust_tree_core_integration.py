@@ -1292,6 +1292,36 @@ def test_swa_core_rejects_a_missing_or_non_positive_window():
             _swa_tree_core(window=window)
 
 
+def test_write_back_swa_walk_backs_up_an_internal_node_before_release():
+    """The SWA walk must hand an unbacked internal node to the caller through
+    the binding, and the release must report the value had no host copy."""
+    core = _swa_tree_core(window=2)
+    core.set_hicache_enabled()
+    core.has_swa_host_pool = True
+    core.is_write_back = True
+    internal = _insert(core, [1, 2], [10, 11]).last_device_node
+    leaf = _insert(core, [1, 2, 3, 4], [10, 11, 12, 13]).last_device_node
+    for node, indices in ((internal, [10, 11]), (leaf, [12, 13])):
+        core.set_component_device_value(
+            node, ComponentType.SWA, torch.tensor(indices, dtype=torch.int64)
+        )
+
+    core.evict_device_start(ComponentType.SWA, 100)
+    step = core.evict_device_next_node(
+        ComponentType.SWA, {ComponentType.FULL: 0, ComponentType.SWA: 0}
+    )
+    assert step.node_id == internal
+    assert step.backup_kv == BackupKV(node_ids=[internal])
+    assert core.get_component_device_value(internal, ComponentType.SWA) is not None
+
+    released = core.evict_component_device(internal, ComponentType.SWA)
+    core.evict_device_end(ComponentType.SWA)
+    assert released.is_unbacked
+    assert released.tracker == {ComponentType.SWA: 2}
+    assert torch.cat(released.device_frees.pop(ComponentType.SWA)).tolist() == [10, 11]
+    assert core.get_component_device_value(internal, ComponentType.SWA) is None
+
+
 def test_write_back_load_back_ignores_auxiliary_nodes_for_pending_ownership():
     core = _swa_tree_core(window=4)
     core.set_hicache_enabled()

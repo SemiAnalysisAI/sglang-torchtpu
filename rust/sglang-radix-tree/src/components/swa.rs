@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use tch::{Kind, Tensor};
 
-use crate::components::TreeComponent;
 use crate::components::{ComponentType, FULL, SWA};
+use crate::components::{DeviceEvictStep, TreeComponent};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
@@ -765,7 +765,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-    ) -> Option<NodeIdx_> {
+    ) -> Option<DeviceEvictStep> {
         let ct = SWA;
         assert!(
             tree_core.component_state(SWA).is_evict_device_ongoing,
@@ -801,7 +801,15 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 continue;
             }
             if tree_core.evictable_device_leaves.contains(x) {
-                break Some(x);
+                break Some(DeviceEvictStep::Leaf(x));
+            }
+            if tree_core.is_write_back
+                && tree_core.has_swa_host_pool
+                && !tree_core.arena.has_host_value(x, SWA)
+            {
+                // write_back copies to host only on eviction, so tombstoning now
+                // would drop the only copy; the caller backs x up, then releases it.
+                break Some(DeviceEvictStep::BackupFirst(x));
             }
             // Internal nodes are tombstoned inline (no IO).
             tree_core.evict_component_and_detach_lru_(

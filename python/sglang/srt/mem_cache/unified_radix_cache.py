@@ -509,11 +509,14 @@ class UnifiedRadixCache(BasePrefixCache):
             reasons = ["host_pressure"]
             if self._tracks_write_through_unbacked_evictions():
                 reasons.append("write_through_unbacked_eviction")
-            for reason in reasons:
+            series = [(reason, PoolName.KV) for reason in reasons]
+            if self.is_write_back and self.tree_core.has_swa_host_pool:
+                series.append(("host_pressure", PoolName.SWA))
+            for reason, pool in series:
                 self.metrics_collector.increment_dropped_tokens(
                     num_tokens=0,
                     reason=reason,
-                    pool=PoolName.KV.value,
+                    pool=pool.value,
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
@@ -765,7 +768,40 @@ class UnifiedRadixCache(BasePrefixCache):
                 reason="write_through_unbacked_eviction",
             )
         self._accumulate_tracker(tracker, result.tracker)
+        if result.backup_kv is not None:
+            self._back_up_and_release_component(
+                component_type, result.node_id, result.backup_kv, tracker
+            )
+            return None, True
         return result.node_id, result.made_progress
+
+    def _back_up_and_release_component(
+        self,
+        component_type: ComponentType,
+        node_id: NodeId,
+        backup_kv: BackupKV,
+        tracker: dict[ComponentType, int],
+    ) -> None:
+        """Release a component value the walk may drop only with a host copy,
+        backing it up first; without host room it is released unbacked."""
+        self._execute_and_commit_kv_backup(backup_kv, write_back=True)
+        # Drain even a failed chain's queued copies before freeing device slots.
+        self.writing_check(write_back=True)
+        result = self.tree_core.evict_component_device(node_id, component_type)
+        self._free_values(result.device_frees, result.host_frees)
+        self._accumulate_tracker(tracker, result.tracker)
+        if result.is_unbacked:
+            self._record_dropped_tokens(
+                result.tracker.get(component_type, 0),
+                reason="host_pressure",
+                pool=PoolName[component_type.name],
+            )
+            logger.warning(
+                "write_back: %s device value dropped without backup due to host "
+                "memory pressure, node %d",
+                component_type.name,
+                node_id,
+            )
 
     def _evict_device_leaf(
         self, node_id: NodeId, tracker: dict[ComponentType, int]
@@ -895,14 +931,16 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.cache_controller.write_policy == "write_through"
         )
 
-    def _record_dropped_tokens(self, dropped_tokens: int, reason: str) -> None:
+    def _record_dropped_tokens(
+        self, dropped_tokens: int, reason: str, pool: PoolName = PoolName.KV
+    ) -> None:
         """Record logical KV tokens irreversibly dropped without a host backup."""
         if self.metrics_collector is None or dropped_tokens <= 0:
             return
         self.metrics_collector.increment_dropped_tokens(
             num_tokens=dropped_tokens,
             reason=reason,
-            pool=PoolName.KV.value,
+            pool=pool.value,
         )
 
     def inc_lock_ref(

@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.unified_cache.cache_action import (
+    BackupKV,
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
     FreeDeviceKVFullOnly,
@@ -715,7 +716,7 @@ class SWAComponent(TreeComponent):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
+    ) -> Optional[NodeId | BackupKV]:
         """Advance one device-eviction step and return a leaf, if selected.
 
         An internal tombstone is one complete step so the caller can apply its
@@ -749,6 +750,17 @@ class SWAComponent(TreeComponent):
                 lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
             )
             return x.id
+        if (
+            self.tree_core.is_write_back
+            and self.tree_core.has_swa_host_pool
+            and x.component_data[ct].host_value is None
+        ):
+            # write_back copies to host only on eviction, so tombstoning now would
+            # drop the only copy; the caller backs x up, then releases it.
+            self._evict_device_cursor = (
+                lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
+            )
+            return BackupKV(node_ids=[x.id])
         if not enabled:
             x_next = lru.get_prev_no_lock(x)
         self.tree_core._evict_component_and_detach_lru(

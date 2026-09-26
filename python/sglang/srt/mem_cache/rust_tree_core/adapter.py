@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DemoteResult,
     DriveHostEvictionResult,
     DropSubtreeNoHostResult,
+    EvictComponentDeviceResult,
     EvictDeviceLeafResult,
     EvictDeviceNextNodeResult,
     InsertStepResult,
@@ -474,9 +475,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         binding_result = self._binding.evict_device_next_node(
             int(component_type), _tracker_to_binding(tracker)
         )
+        backup = binding_result.backup_kv
         result = EvictDeviceNextNodeResult(
             node_id=binding_result.node_id,
             made_progress=binding_result.made_progress,
+            backup_kv=_cache_action_from_tagged(backup) if backup is not None else None,
         )
         return _fill_evict_result(binding_result, result)
 
@@ -492,6 +495,15 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceLeafResult(
             backup_kv=_cache_action_from_tagged(backup) if backup is not None else None
         )
+        return _fill_evict_result(binding_result, result)
+
+    def evict_component_device(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> EvictComponentDeviceResult:
+        binding_result = self._binding.evict_component_device(
+            node_id, int(component_type)
+        )
+        result = EvictComponentDeviceResult(is_unbacked=binding_result.is_unbacked)
         return _fill_evict_result(binding_result, result)
 
     def demote(self, node_id: NodeId) -> DemoteResult:

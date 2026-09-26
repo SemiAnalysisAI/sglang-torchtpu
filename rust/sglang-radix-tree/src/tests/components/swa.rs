@@ -2754,6 +2754,70 @@ fn evict_walk_step_tracker_carries_only_the_deltas_over_the_baseline() {
     tc.evict_device_end(SWA);
 }
 
+// A write_back core that can back SWA values up to host.
+fn swa_write_back_core() -> UnifiedTreeCore<Vec<i64>> {
+    UnifiedTreeCore::new(
+        CacheInitParams {
+            is_write_back: true,
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            ..swa_params_with_window(2)
+        },
+        vec![FULL, SWA],
+    )
+}
+
+#[test]
+fn write_back_evict_walk_hands_back_an_internal_node_without_a_host_copy() {
+    let mut tc = swa_write_back_core();
+    let [a, b, c] = swa_evict_chain(&mut tc);
+    set_swa_host(&mut tc, b);
+    let mut tracker = swa_tracker();
+    tc.evict_device_start(SWA, /* request_cnt = */ 100);
+    let (first, step) = tc.evict_device_next_node(SWA, &tracker);
+    // Tombstoning a would drop its only SWA copy: the caller backs it up first.
+    let a_id = tc.arena.node(a).id;
+    assert_eq!(first, Some(a_id));
+    assert_eq!(
+        step.backup_kv.map(|backup| backup.node_ids),
+        Some(vec![a_id])
+    );
+    assert!(step.tracker.is_empty());
+    assert!(tc.arena.has_device_value(a, SWA));
+
+    // b already has a host copy, so the walk tombstones it inline.
+    let (second, step) = tc.evict_device_next_node(SWA, &tracker);
+    accumulate_step(step, &mut tracker, &mut HashMap::new(), &mut HashMap::new());
+    assert_eq!(second, None);
+    assert!(!tc.arena.has_device_value(b, SWA));
+    assert!(tc.arena.has_host_value(b, SWA));
+    assert!(tc.arena.has_device_value(c, SWA));
+    assert_eq!(tracker[&SWA], 1);
+    tc.evict_device_end(SWA);
+}
+
+#[test]
+fn evict_component_device_reports_a_value_without_a_host_copy() {
+    let mut tc = swa_write_back_core();
+    let [a, b, _c] = swa_evict_chain(&mut tc);
+    set_swa_host(&mut tc, b);
+
+    let (is_unbacked, step) = tc
+        .evict_component_device(tc.arena.node(a).id, SWA)
+        .expect("live test node");
+    assert!(is_unbacked);
+    assert!(!tc.arena.has_device_value(a, SWA));
+    assert_eq!(step.tracker[&SWA], 1);
+    assert!(step.device_frees[&SWA][0].equal(&Tensor::from_slice(&[10i64])));
+
+    let (is_unbacked, _) = tc
+        .evict_component_device(tc.arena.node(b).id, SWA)
+        .expect("live test node");
+    assert!(!is_unbacked);
+    assert!(!tc.arena.has_device_value(b, SWA));
+    assert!(tc.arena.has_host_value(b, SWA));
+}
+
 #[test]
 fn evict_walk_skips_locked_nodes() {
     let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
