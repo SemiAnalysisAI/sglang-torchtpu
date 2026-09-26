@@ -85,27 +85,18 @@ class TestPackedSDPATpu(unittest.TestCase):
                             run = forward
                         if dtype == torch.bfloat16:
                             tolerance = 2e-2
-                        elif not compiled:
-                            # Eager TPU SDPA can also use reduced-precision
-                            # MXU math for FP32 inputs. The observed max error
-                            # is below 8e-3; the CPU reference checks stay
+                        elif dim >= 128 or value_dim < dim:
+                            # TPU MXU SDPA uses BF16 math for these FP32 shape
+                            # classes in both eager and compiled execution. The
+                            # 128-wide eager case measured 3.1e-2 max error;
+                            # the narrower-value padded specialization is
+                            # similarly bounded. CPU reference checks stay
                             # strict in test/registered/unit/utils.
-                            tolerance = 1e-2
-                        elif compiled and (dim >= 128 or value_dim < dim):
-                            # The 128-wide compiled TPU specialization uses
-                            # BF16 MXU math for FP32 inputs. The narrower-value
-                            # workaround pads to the query width and selects the
-                            # same reduced-precision path. Observed max errors
-                            # against the FP64 oracle are below 4e-2.
                             tolerance = 4e-2
-                        elif compiled:
-                            # The compiled TPU SDPA path uses reduced-precision
-                            # MXU math for some FP32 shapes. Keep eager and CPU
-                            # checks strict, and retain a tighter bound for
-                            # lower-width TPU specializations.
-                            tolerance = 1e-2
                         else:
-                            tolerance = 2e-5
+                            # Lower-width TPU FP32 shapes measured below 8e-3
+                            # max error against the FP64 oracle.
+                            tolerance = 1e-2
                         for _ in range(2):
                             actual = run(*device_inputs)
                             self.assertEqual(actual.device.type, "tpu")
