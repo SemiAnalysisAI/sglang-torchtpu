@@ -1364,6 +1364,14 @@ class Scheduler(
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
 
+        self._tpu_pp_chunk_cost = None
+        if current_platform.is_tpu() and self.ps.pp_size > 1:
+            from sglang.srt.hardware_backend.tpu.pp_chunk_scheduler import (
+                profile_and_install_cost_model,
+            )
+
+            profile_and_install_cost_model(self)
+
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
         self.dynamic_chunk_sizer: Optional[DynamicChunkSizer] = None
@@ -4040,7 +4048,21 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
-        adder = PrefillAdder(
+        adder_cls = PrefillAdder
+        adder_kwargs = {}
+        if self._tpu_pp_chunk_cost is not None:
+            from sglang.srt.hardware_backend.tpu.pp_chunk_scheduler import (
+                TpuPipelinePrefillAdder,
+                pending_step_limit,
+            )
+
+            adder_cls = TpuPipelinePrefillAdder
+            adder_kwargs = {
+                "cost": self._tpu_pp_chunk_cost,
+                "step_limit": pending_step_limit(self),
+            }
+
+        adder = adder_cls(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
@@ -4057,6 +4079,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            **adder_kwargs,
         )
 
         if self.chunked_req is not None:

@@ -812,6 +812,25 @@ class TestBuildBucketers(CustomTestCase):
         # Only what production still reads off the handed record.
         return SimpleNamespace(tpu_compile_tokens=tpu_compile_tokens)
 
+    def test_dynamic_chunk_ladder_uses_resolved_page_size(self):
+        with (
+            patch.dict("os.environ", {"SGLANG_TPU_PP_DYNAMIC_CHUNKS": "1"}),
+            get_context().override_server_args(
+                device="tpu",
+                pp_size=8,
+                disaggregation_mode="null",
+                chunked_prefill_size=16384,
+                page_size=256,
+                tpu_compile_bs=[1, 8],
+            ) as raw,
+        ):
+            self.assertIsNone(raw.page_size)
+            self.assertIsNone(raw.device)
+            self.assertIsNone(raw.chunked_prefill_size)
+            token, batch = build_bucketers(raw, max_t=16384, max_b=8)
+            self.assertTrue(set(range(2048, 16385, 2048)).issubset(token.buckets))
+            self.assertEqual(batch.buckets, [1, 8])
+
     def test_clipping_keeps_smallest_configured_bucket_covering_scheduler_limit(self):
         # Keep the next configured shape even when the real token limit is
         # unaligned; synthesizing a bucket at that limit loses its alignment.
