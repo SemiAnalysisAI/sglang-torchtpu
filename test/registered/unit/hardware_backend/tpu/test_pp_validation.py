@@ -126,7 +126,7 @@ class TestPipelineParallelValidation(CustomTestCase):
         prepare_tpu_env.assert_called_once_with(8, setup_slicebuilder=True)
 
     def test_accepts_tensor_parallel_stages(self):
-        prepare_tpu_env = _apply(_args(pp_size=8, tp_size=2))
+        prepare_tpu_env = _apply(_args(pp_size=8, tp_size=2, enable_torch_compile=True))
         prepare_tpu_env.assert_called_once_with(16, setup_slicebuilder=True)
 
     def test_rejects_stages_wider_than_their_context_parallel_group(self):
