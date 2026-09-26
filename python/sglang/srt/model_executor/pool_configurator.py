@@ -648,6 +648,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
 
+def _prefill_chunks_in_flight() -> int:
+    # One or two chunks per engine; a pipeline stage keeps one per pipeline slot.
+    chunks = 1 if get_schedule().disable_overlap_schedule else 2
+    if get_parallel().pp_size > 1:
+        chunks *= get_parallel().pp_size + get_parallel().pp_async_batch_depth
+    return chunks
+
+
 class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     """Configurator for MHA or MLA models with sliding-window layers.
 
@@ -674,6 +682,17 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self._swa_full_tokens_ratio = get_schedule().swa_full_tokens_ratio
         self._sliding_window_size = kvc.sliding_window_size
         self._page_size = kvc.page_size
+        # The ratio sizes the cache share of the SWA pool; a pipeline stage also
+        # pins one prefill chunk per pipeline slot, which the ratio does not see.
+        chunked_prefill_size = get_schedule().chunked_prefill_size or 0
+        self._pipeline_swa_tokens = (
+            _prefill_chunks_in_flight() * chunked_prefill_size
+            if get_parallel().pp_size > 1
+            and chunked_prefill_size > 0
+            and self._full_layers_num > 0
+            and get_disagg().disaggregation_mode != "decode"
+            else 0
+        )
         self._enable_unified_memory = get_memory().enable_unified_memory
 
         if self.kv_cache_dtype_str == "mxint8":
@@ -910,6 +929,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # Hybrid: full_tokens = max_total_num_tokens, swa_tokens = full_tokens * ratio
         full_tokens = align_page_size(max_total_num_tokens)
         swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
+        swa_tokens += ceil_align(self._pipeline_swa_tokens, page_size)
 
         if not self._enable_unified_memory:
             self.validate_swa_pool_size(
@@ -935,10 +955,17 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             ),
         )
 
+    def _pipeline_swa_bytes(self, page_size: int) -> int:
+        return ceil_align(self._pipeline_swa_tokens, page_size) * (
+            self._swa_per_token * self._swa_layers_num
+            + self._draft_swa_per_token * self._draft_swa_layers_num
+        )
+
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
         available_bytes -= self._dummy_page_bytes(page_size)
+        available_bytes -= self._pipeline_swa_bytes(page_size)
         if self._enable_unified_memory and self._full_layers_num > 0:
             max_total_num_tokens = self._max_unified_full_tokens(
                 available_bytes, page_size
@@ -1000,15 +1027,9 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
                 + (window + page_size) * get_disagg().disaggregation_decode_extra_slots
             )
         else:
-            chunks_in_flight = 1 if get_schedule().disable_overlap_schedule else 2
-            if get_parallel().pp_size > 1:
-                # A pipeline stage keeps one chunk per pipeline slot in flight.
-                chunks_in_flight *= (
-                    get_parallel().pp_size + get_parallel().pp_async_batch_depth
-                )
             self._swa_cap = (
                 per_request * num_reqs
-                + chunks_in_flight * get_schedule().chunked_prefill_size
+                + _prefill_chunks_in_flight() * get_schedule().chunked_prefill_size
                 + page_size
             )
 
