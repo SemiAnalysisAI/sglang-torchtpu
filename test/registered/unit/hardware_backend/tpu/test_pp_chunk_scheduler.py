@@ -269,7 +269,16 @@ def test_real_admission_finishes_unaligned_prompt(monkeypatch, tokens, has_chunk
     request.set_extend_range = lambda start, end: setattr(
         request, "extend_range", NS(length=end - start)
     )
-    assert obj.add_one_req(request, has_chunked_req, None) == AddReqResult.CONTINUE
+    # Called the way the scheduler calls every prefill adder.
+    assert (
+        obj.add_one_req(
+            request,
+            has_chunked_req=has_chunked_req,
+            truncation_align_size=None,
+            chunk_tokens_cap=None,
+        )
+        == AddReqResult.CONTINUE
+    )
     assert obj.can_run_list == [request]
     assert obj.new_chunked_req is None
     assert request.extend_range.length == tokens
