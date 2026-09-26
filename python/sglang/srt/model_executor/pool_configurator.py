@@ -665,8 +665,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
 
-        self._full_layers_num = len(model_config.full_attention_layer_ids)
-        self._swa_layers_num = len(model_config.swa_attention_layer_ids)
+        self._full_layers_num = len(kvc.layer_info.full_attention_layer_ids)
+        self._swa_layers_num = len(kvc.layer_info.swa_attention_layer_ids)
         assert self._swa_layers_num > 0, (
             "Hybrid SWA model must have at least one SWA layer"
         )
@@ -1001,6 +1001,11 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             )
         else:
             chunks_in_flight = 1 if get_schedule().disable_overlap_schedule else 2
+            if get_parallel().pp_size > 1:
+                # A pipeline stage keeps one chunk per pipeline slot in flight.
+                chunks_in_flight *= (
+                    get_parallel().pp_size + get_parallel().pp_async_batch_depth
+                )
             self._swa_cap = (
                 per_request * num_reqs
                 + chunks_in_flight * get_schedule().chunked_prefill_size
@@ -1018,7 +1023,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             return False
         if kvc.sliding_window_size is None:
             return False
-        return len(kvc.model_config.full_attention_layer_ids) > 0
+        return len(kvc.layer_info.full_attention_layer_ids) > 0
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
