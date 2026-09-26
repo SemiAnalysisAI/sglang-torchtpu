@@ -165,10 +165,11 @@ EXTRA_ARGS="--sampling-backend pytorch --watchdog-timeout 3600" \
 
 Supported: `--enable-torch-compile` and eager, chunked prefill,
 `--kv-cache-dtype fp8_e4m3`, `--max-total-tokens` (every stage sizes its pool
-to the smallest stage). Rejected at launch with `--pp-size > 1` on TPU:
-`--tp-size > 1` (a stage is one device, or one context-parallel group as
-below), speculative decoding, and `--enable-dynamic-chunking`. Input (prompt)
-logprobs are rejected per request.
+to the smallest stage; a hybrid model's SWA pool holds one prefill chunk per
+pipeline slot on top of `--swa-full-tokens-ratio`). Rejected at launch with
+`--pp-size > 1` on TPU: `--tp-size > 1` (a stage is one device, or one
+context-parallel group as below), speculative decoding, and
+`--enable-dynamic-chunking`. Input (prompt) logprobs are rejected per request.
 `--dp-size` has not been run with pipeline parallelism on
 TPU. Overlap scheduling is switched off by pipeline parallelism itself. A
 stage waiting for the previous stage looks idle to the watchdog, so pass
