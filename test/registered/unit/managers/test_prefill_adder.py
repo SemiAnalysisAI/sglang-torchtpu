@@ -2,19 +2,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import torch
-
 import sglang.srt.managers.schedule_policy as schedule_policy
+import torch
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
-    PrefillAdder,
     estimate_prefill_extend_tile_metrics,
+    PrefillAdder,
 )
-from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefResult,
-    IncLockRefResult,
-)
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefResult, IncLockRefResult
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range

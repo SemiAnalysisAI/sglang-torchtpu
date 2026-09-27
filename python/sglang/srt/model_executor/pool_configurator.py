@@ -15,10 +15,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import Optional, TYPE_CHECKING
 
 import torch
-
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -129,9 +128,7 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
             raise ValueError("MXINT8 requires a resolved DFLASH draft KV memory budget")
         return 0
     if _draft_kv_cache_format(kvc) == "mxint8":
-        from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
-            ROW_ALIGNMENT,
-        )
+        from sglang.srt.hardware_backend.tpu.kv_mxint8 import ROW_ALIGNMENT
 
         # The estimator reports raw INT8 payload bytes. Quantization groups
         # vary, but physical exponent rows retain their fixed alignment.
@@ -152,9 +149,7 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
 
 def _mxint8_draft_per_token(kvc, head_num: int, head_dim: int) -> int:
     """EAGLE shares geometry, but its runner can select a different KV format."""
-    from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
-        cache_bytes_per_token,
-    )
+    from sglang.srt.hardware_backend.tpu.kv_mxint8 import cache_bytes_per_token
 
     draft_format = _draft_kv_cache_format(kvc)
     if draft_format == "mxint8":
@@ -324,9 +319,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
         if self.kv_cache_dtype_str == "mxint8":
-            from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
-                cache_bytes_per_token,
-            )
+            from sglang.srt.hardware_backend.tpu.kv_mxint8 import cache_bytes_per_token
 
             return num_layers * cache_bytes_per_token(
                 kvc.model_config.get_num_kv_heads(
@@ -471,9 +464,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             indexer_ratio = parse_hisparse_config().host_to_device_ratio
 
-        from sglang.srt.mem_cache.kv_cache_configurator import (
-            _should_elide_dsa_index_k,
-        )
+        from sglang.srt.mem_cache.kv_cache_configurator import _should_elide_dsa_index_k
 
         if allocate_all_layers or not _should_elide_dsa_index_k(
             is_draft_worker=kvc.is_draft_worker
@@ -565,9 +556,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._full_layers_num = len(model_config.full_attention_layer_ids)
         self._swa_layers_num = len(model_config.swa_attention_layer_ids)
-        assert (
-            self._swa_layers_num > 0
-        ), "Hybrid SWA model must have at least one SWA layer"
+        assert self._swa_layers_num > 0, (
+            "Hybrid SWA model must have at least one SWA layer"
+        )
 
         self._swa_full_tokens_ratio = get_schedule().swa_full_tokens_ratio
         self._sliding_window_size = kvc.sliding_window_size
@@ -585,9 +576,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         )
 
         if self.kv_cache_dtype_str == "mxint8":
-            from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
-                cache_bytes_per_token,
-            )
+            from sglang.srt.hardware_backend.tpu.kv_mxint8 import cache_bytes_per_token
 
             self._full_per_token = cache_bytes_per_token(
                 model_config.get_num_kv_heads(tp_size),
@@ -1189,9 +1178,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
 
         if self.requested_max_running_requests_per_worker is not None:
             c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
@@ -1219,9 +1208,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
         sizes = self._compute_dsv4_sizes(max_total_num_tokens, page_size)
         return self._to_config(sizes)
 

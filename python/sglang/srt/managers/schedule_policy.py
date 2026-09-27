@@ -5,10 +5,7 @@ from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
-from sglang.srt.runtime_context import (
-    get_disagg,
-    get_schedule,
-)
+from sglang.srt.runtime_context import get_disagg, get_schedule
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
@@ -33,11 +30,10 @@ import os
 import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
-from enum import Enum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from enum import auto, Enum
+from typing import Dict, List, Optional, Set, TYPE_CHECKING, Union
 
 import torch
-
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
@@ -634,9 +630,7 @@ class PrefillAdder:
         # fail-loud `RuntimeError`. `None` outside the unified Mamba pool.
         self.rem_mamba_slots = None
         if self._mamba_slot_cost:
-            self.rem_mamba_slots = (
-                self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
-            )
+            self.rem_mamba_slots = self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
             if self.is_hybrid_ssm_cache:
                 self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
 
@@ -1408,9 +1402,9 @@ class PrefillAdder:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
 
-                assert (
-                    truncation_align_size is None
-                ), "truncation_align_size is not supported for dllm prefill"
+                assert truncation_align_size is None, (
+                    "truncation_align_size is not supported for dllm prefill"
+                )
 
                 if (
                     tile_stop := self._check_prefill_tile_budget(input_tokens)
