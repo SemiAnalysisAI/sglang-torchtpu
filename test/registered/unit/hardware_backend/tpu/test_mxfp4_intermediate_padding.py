@@ -68,24 +68,32 @@ def test_loader_forwards_alignment_and_rejects_invalid_values():
         "w2_weight_bias",
     ):
         setattr(layer, name, torch.zeros(1))
-    with patch.object(
-        module.envs.SGLANG_TPU_MXFP4_MOE_INTERMEDIATE_ALIGNMENT, "get", return_value=256
-    ), patch.object(
-        module,
-        "process_mxfp4_moe_weights_bf16",
-        return_value=tuple(torch.zeros(1) for _ in range(4)),
-    ) as process:
+    with (
+        patch.object(
+            module.envs.SGLANG_TPU_MXFP4_MOE_INTERMEDIATE_ALIGNMENT,
+            "get",
+            return_value=256,
+        ),
+        patch.object(
+            module,
+            "process_mxfp4_moe_weights_bf16",
+            return_value=tuple(torch.zeros(1) for _ in range(4)),
+        ) as process,
+    ):
         module.prepare_tpu_mxfp4_moe_weights(layer)
         assert process.call_args.kwargs["align_to"] == 256
         assert process.call_args.kwargs["w13_interleaved"] is True
         assert layer.w13_weight_scale is None
         assert layer.w2_weight_scale is None
     for invalid in (0, -128, 129):
-        with patch.object(
-            module.envs.SGLANG_TPU_MXFP4_MOE_INTERMEDIATE_ALIGNMENT,
-            "get",
-            return_value=invalid,
-        ), pytest.raises(ValueError):
+        with (
+            patch.object(
+                module.envs.SGLANG_TPU_MXFP4_MOE_INTERMEDIATE_ALIGNMENT,
+                "get",
+                return_value=invalid,
+            ),
+            pytest.raises(ValueError),
+        ):
             module.prepare_tpu_mxfp4_moe_weights(layer)
 
 
