@@ -1012,8 +1012,8 @@ class TestPrefillAdder(CustomTestCase):
             rem_chunk_tokens=rem_chunk_tokens,
         )
 
-    def _prefix_hit_req(self, prefix_len=4096, remaining=2048):
-        req = self.create_mock_req("hit", priority=0, max_new_tokens=64)
+    def _prefix_hit_req(self, prefix_len=4096, remaining=2048, rid="hit"):
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=64)
         req.prefix_indices = list(range(prefix_len))
         req.full_untruncated_fill_ids = list(range(prefix_len + remaining))
         req.last_node = MagicMock()
