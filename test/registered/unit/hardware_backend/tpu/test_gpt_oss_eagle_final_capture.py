@@ -1,7 +1,9 @@
 import contextlib
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.srt.models.gpt_oss import GptOssModel
@@ -69,3 +71,7 @@ def test_interior_only_capture_keeps_existing_behavior():
     model.set_eagle3_layers_to_capture([1, 2])
     assert not model.capture_final_eagle_hidden_state
     assert model.layers[1]._is_layer_to_capture and model.layers[2]._is_layer_to_capture
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
