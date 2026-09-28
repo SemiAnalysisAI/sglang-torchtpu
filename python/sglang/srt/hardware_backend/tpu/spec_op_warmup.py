@@ -60,11 +60,13 @@ def make_draft_extend_select_args(
     context: SpecOpWarmupContext,
 ) -> tuple[torch.Tensor, ...]:
     num_verify_rows = context.physical_bs * context.num_verify_tokens
-    select_index = (
-        torch.arange(context.physical_bs, dtype=torch.int64, device=context.device)
-        * context.num_verify_tokens
-        + context.num_verify_tokens
-        - 1
+    # int32 matches `num_correct_drafts` from `eagle_sample`, which the padding
+    # helpers preserve; the helper reads the window width off the logits rows.
+    num_accept_tokens = torch.full(
+        (context.physical_bs,),
+        context.num_verify_tokens,
+        dtype=torch.int32,
+        device=context.device,
     )
     return (
         torch.zeros(
@@ -77,7 +79,7 @@ def make_draft_extend_select_args(
             dtype=context.hidden_dtype,
             device=context.device,
         ),
-        select_index,
+        num_accept_tokens,
     )
 
 
