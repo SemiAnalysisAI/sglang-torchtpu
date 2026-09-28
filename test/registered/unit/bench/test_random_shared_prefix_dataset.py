@@ -1,6 +1,6 @@
 import sys
 from argparse import Namespace
-from unittest.mock import Mock, sentinel
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -16,22 +16,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def test_dataset_shares_representative_prefix_without_mutating_source_rows() -> None:
+def test_share_representative_prefix_preserves_suffixes_and_metadata() -> None:
     rows = [
         DatasetRow(prompt=[1, 2, 3, 4], prompt_len=4, output_len=8),
         DatasetRow(prompt=[5, 6, 7, 8], prompt_len=4, output_len=9),
         DatasetRow(prompt=[9, 10, 11, 12], prompt_len=4, output_len=10),
     ]
-    source = Mock()
-    source.load.return_value = rows
+    transformed = share_representative_prefix(rows, shared_prefix_len=2)
 
-    transformed = RandomWithSharedPrefixDataset(
-        source=source, shared_prefix_len=2
-    ).load(tokenizer=sentinel.tokenizer, model_id=sentinel.model_id)
-
-    source.load.assert_called_once_with(
-        tokenizer=sentinel.tokenizer, model_id=sentinel.model_id
-    )
     assert [row.prompt for row in transformed] == [
         [1, 2, 3, 4],
         [1, 2, 7, 8],
@@ -46,11 +38,11 @@ def test_dataset_shares_representative_prefix_without_mutating_source_rows() -> 
     ]
 
 
-def test_from_args_wraps_exact_random_id_dataset() -> None:
+def test_from_args_builds_exact_random_id_dataset() -> None:
     dataset = RandomWithSharedPrefixDataset.from_args(
         Namespace(
-            dataset_name="random-ids",
-            tokenize_prompt=True,
+            dataset_name="random-ids-shared-prefix",
+            tokenize_prompt=False,
             random_shared_prefix_len=3,
             random_input_len=8,
             random_output_len=2,
@@ -62,18 +54,18 @@ def test_from_args_wraps_exact_random_id_dataset() -> None:
     )
 
     assert dataset.shared_prefix_len == 3
-    assert dataset.source.input_len == 8
-    assert dataset.source.output_len == 2
-    assert dataset.source.num_requests == 4
-    assert not dataset.source.random_sample
-    assert not dataset.source.return_text
+    assert dataset.input_len == 8
+    assert dataset.output_len == 2
+    assert dataset.num_requests == 4
+    assert not dataset.random_sample
+    assert not dataset.return_text
 
 
 def test_generated_random_dataset_shares_prefix() -> None:
     np.random.seed(42)
     args = Namespace(
-        dataset_name="random-ids",
-        tokenize_prompt=True,
+        dataset_name="random-ids-shared-prefix",
+        tokenize_prompt=False,
         random_shared_prefix_len=4,
         random_input_len=8,
         random_output_len=2,

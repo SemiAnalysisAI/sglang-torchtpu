@@ -27,6 +27,7 @@ DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
     # not two separate dataset names sharing the same class.
     "random": RandomDataset,
     "random-ids": RandomDataset,
+    "random-ids-shared-prefix": RandomWithSharedPrefixDataset,
     "generated-shared-prefix": GeneratedSharedPrefixDataset,
     "mmmu": MMMUDataset,
     "image": ImageDataset,
@@ -44,10 +45,7 @@ def get_dataset(args, tokenizer, model_id=None):
     if dataset_name not in DATASET_MAPPING:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
-    if dataset_name == "random-ids" and getattr(args, "random_shared_prefix_len", 0):
-        dataset_cls = RandomWithSharedPrefixDataset
-    else:
-        dataset_cls = DATASET_MAPPING[dataset_name]
+    dataset_cls = DATASET_MAPPING[dataset_name]
     dataset = dataset_cls.from_args(args)
     return dataset.load(tokenizer=tokenizer, model_id=model_id)
 

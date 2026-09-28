@@ -4,39 +4,52 @@ from argparse import Namespace
 from dataclasses import dataclass, replace
 from typing import Any, List
 
-from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
+from sglang.benchmark.datasets.common import DatasetRow
 from sglang.benchmark.datasets.random import RandomDataset
 
 
 @dataclass
-class RandomWithSharedPrefixDataset(BaseDataset):
-    """Wrap ``RandomDataset`` and give every request one token-id prefix.
+class RandomWithSharedPrefixDataset(RandomDataset):
+    """Generate random requests that share one exact token-id prefix.
 
     The first generated request is the representative. Its first
     ``shared_prefix_len`` token ids replace the same span in every request;
     each request keeps its original suffix, length, and metadata.
     """
 
-    source: BaseDataset
     shared_prefix_len: int
 
     @classmethod
     def from_args(cls, args: Namespace) -> "RandomWithSharedPrefixDataset":
-        if args.dataset_name != "random-ids":
+        if args.dataset_name != "random-ids-shared-prefix":
             raise ValueError(
-                "RandomWithSharedPrefixDataset requires dataset_name='random-ids'"
+                "RandomWithSharedPrefixDataset requires "
+                "dataset_name='random-ids-shared-prefix'"
             )
-        if not getattr(args, "tokenize_prompt", False):
+        if args.random_shared_prefix_len <= 0:
             raise ValueError(
-                "RandomWithSharedPrefixDataset requires tokenize_prompt=True"
+                "random-ids-shared-prefix requires "
+                "--random-shared-prefix-len to be positive"
+            )
+        source = RandomDataset.from_args(args)
+        if source.return_text:
+            raise ValueError(
+                "RandomWithSharedPrefixDataset requires token-id prompts; use "
+                "an SGLang backend or --tokenize-prompt"
             )
         return cls(
-            source=RandomDataset.from_args(args),
+            input_len=source.input_len,
+            output_len=source.output_len,
+            num_requests=source.num_requests,
+            range_ratio=source.range_ratio,
+            dataset_path=source.dataset_path,
+            return_text=source.return_text,
+            random_sample=source.random_sample,
             shared_prefix_len=args.random_shared_prefix_len,
         )
 
     def load(self, tokenizer: Any, model_id: Any = None) -> List[DatasetRow]:
-        rows = self.source.load(tokenizer=tokenizer, model_id=model_id)
+        rows = super().load(tokenizer=tokenizer, model_id=model_id)
         return share_representative_prefix(rows, self.shared_prefix_len)
 
 

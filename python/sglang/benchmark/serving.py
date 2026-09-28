@@ -2252,6 +2252,7 @@ def cli_main():
             "openai",
             "random",
             "random-ids",
+            "random-ids-shared-prefix",
             "generated-shared-prefix",
             "mmmu",
             "image",
@@ -2349,8 +2350,8 @@ def cli_main():
         type=int,
         default=0,
         help=(
-            "Number of leading token ids shared by every random-ids request. "
-            "The default 0 preserves independent prompts."
+            "Number of leading token ids shared by every "
+            "random-ids-shared-prefix request."
         ),
     )
     # image dataset args
