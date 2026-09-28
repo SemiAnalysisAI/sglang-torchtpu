@@ -489,9 +489,9 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     between token indices and their page/lane coordinates.
     """
 
-    # raiden's page copy is layout-agnostic, but torch_tpu's host pool is
-    # shaped for the fused 5D row, not this one.
-    kv_offload_io_backends: frozenset[str] = frozenset({"raiden"})
+    # raiden's page copy is layout-agnostic, and torch_tpu's host pool reads
+    # its page shape from get_fused_kv_buffer, so it mirrors this layout too.
+    kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
 
     def _head_dim_lanes(self) -> int:
         # Under TorchTPU, JAX is initialised CPU-only so Pallas can export
