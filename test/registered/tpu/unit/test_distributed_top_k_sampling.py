@@ -330,6 +330,18 @@ def _run_distributed_worker() -> None:
                     f"dtype={dtype}, k={top_k}"
                 )
 
+    # More than 64 ties on every shard: local selection must retain the lowest
+    # IDs, not just sort an arbitrary subset after the ring merge.
+    for tied_k in (2, 50, 64):
+        tied = torch.ones((33, local_vocab), dtype=torch.bfloat16, device="tpu")
+        tied_values, tied_ids = top_k_module.distributed_tpu_top_k(
+            tied, shard, tied_k, group=group
+        )
+        torch.testing.assert_close(tied_values.cpu(), torch.ones(33, tied_k))
+        torch.testing.assert_close(
+            tied_ids.cpu(), torch.arange(tied_k, dtype=torch.int32).expand(33, -1)
+        )
+
     # Exercise the production dispatch under the same full-graph compilation
     # mode used by the TPU engine. This catches graph breaks in validation,
     # environment reads, rank materialization, and custom-op registration.

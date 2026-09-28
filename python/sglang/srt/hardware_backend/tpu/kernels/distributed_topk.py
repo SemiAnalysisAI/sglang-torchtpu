@@ -142,10 +142,21 @@ def _compare_and_swap(
     else:
         compare_left, compare_right = left_values, right_values
 
-    if isinstance(descending, bool) and descending:
-        take_left = compare_left > compare_right
+    if right_half is not None:
+        compare_left_indices = jnp.where(right_half, right_indices, left_indices)
+        compare_right_indices = jnp.where(right_half, left_indices, right_indices)
     else:
-        take_left = compare_right > compare_left
+        compare_left_indices, compare_right_indices = left_indices, right_indices
+    left_better = (compare_left > compare_right) | (
+        (compare_left == compare_right) & (compare_left_indices < compare_right_indices)
+    )
+    right_better = (compare_right > compare_left) | (
+        (compare_left == compare_right) & (compare_right_indices < compare_left_indices)
+    )
+    if isinstance(descending, bool) and descending:
+        take_left = left_better
+    else:
+        take_left = right_better
     if not isinstance(descending, bool):
         take_left = take_left ^ descending.astype(bool)
 
@@ -677,10 +688,8 @@ def distributed_top_k(
         candidate_indices[:, :tokens, :MAX_DISTRIBUTED_TOP_K], (1, 0, 2)
     ).reshape(tokens, world_size * MAX_DISTRIBUTED_TOP_K)
 
-    values, candidate_positions = jax.lax.top_k(candidate_values, k)
-    packed_ids = jnp.take_along_axis(candidate_indices, candidate_positions, axis=1)
-    source_rank = packed_ids // aligned_width
-    local_position = packed_ids % aligned_width
+    source_rank = candidate_indices // aligned_width
+    local_position = candidate_indices % aligned_width
     added_width = local_width - org_vocab_padded_count
     token_ids = jnp.where(
         local_position < org_vocab_padded_count,
@@ -690,4 +699,9 @@ def distributed_top_k(
         + local_position
         - org_vocab_padded_count,
     )
-    return values, token_ids.astype(jnp.int32)
+    # Sort global IDs, not packed shard offsets: added vocabulary follows all
+    # original vocabulary even when its shard appears earlier in mesh order.
+    negative_values, token_ids = jax.lax.sort(
+        (-candidate_values, token_ids.astype(jnp.int32)), dimension=-1, num_keys=2
+    )
+    return -negative_values[:, :k], token_ids[:, :k]
