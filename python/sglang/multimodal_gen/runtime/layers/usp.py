@@ -9,7 +9,7 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
-from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
+from sglang.kernels.ops.diffusion import usp_merge_heads
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_sp_group,
@@ -369,6 +369,8 @@ def _usp_input_all_to_all_packed_qkv(
         and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
         and not torch.compiler.is_compiling()
     ):
+        from sglang.kernels.ops.diffusion import pack_qkv_destination_major
+
         packed = pack_qkv_destination_major(
             q,
             k,
@@ -443,6 +445,8 @@ def _usp_input_all_to_all_qkv(
     b, s_local, h_global, d = q.shape
     h_local = h_global // world_size
     rows = b * s_local
+    from sglang.kernels.ops.diffusion import pack_qkv_destination_major
+
     packed = pack_qkv_destination_major(
         q.view(rows, h_global, d),
         k.view(rows, h_global, d),
