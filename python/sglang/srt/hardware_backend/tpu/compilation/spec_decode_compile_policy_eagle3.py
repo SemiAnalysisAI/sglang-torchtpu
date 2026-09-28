@@ -1147,6 +1147,8 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             return outputs
 
         next_token_logits = getattr(outputs, "next_token_logits", None)
+        if next_token_logits is None:
+            next_token_logits = getattr(outputs, "next_token_global_top_k_logits", None)
         hidden_states = getattr(outputs, "hidden_states", None)
         if next_token_logits is None and hidden_states is None:
             # Inner decoder boundaries return raw tensors/tuples. Delegate
@@ -1180,7 +1182,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 else real_b
             )
             if logit_rows < next_token_logits.shape[0]:
-                outputs.next_token_logits = next_token_logits[:logit_rows]
+                outputs.trim_next_token_outputs(logit_rows)
 
         if hidden_states is not None and not preserve_padded_outputs:
             # Capture-LAST (draft extend) emits one hidden row per

@@ -641,12 +641,12 @@ def run_eagle_verify(
             barrier=grammar_barrier,
         )
 
-    # Sample
-    maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
-    maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
+    verify_logits = logits_output.get_next_token_sampling_logits()
+    maybe_detect_nan(verify_logits, "verify: target model logits")
+    maybe_detect_inf(verify_logits, "verify: target model logits")
     # Match scheduler inputs to any padded target logits.
     verify_padding = target_compile_policy.prepare_spec_verify(
-        batch, verify_input, logits_output.next_token_logits
+        batch, verify_input, verify_logits
     )
     verify_result = (None, None, None)
     verify_bookkeeping_result = (None, None)

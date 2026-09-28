@@ -12,7 +12,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import is_tpu
 
-WarmupArgsFactory = Callable[[Any], tuple[Any, ...]]
+WarmupArgsFactory = Callable[[Any], tuple[Any, ...] | None]
 
 
 @dataclass(frozen=True)
@@ -36,7 +36,8 @@ def compiled_op(*, warmup: WarmupArgsFactory):
 
     Active only on TPU with ``--enable-torch-compile``. The caller must pass
     TPU tensors and ``fn`` must be compile-safe. Every helper must provide a
-    callable that builds representative arguments for ahead-of-time warm-up.
+    callable that builds representative arguments for ahead-of-time warm-up,
+    or returns None when the helper is ineligible for that shape.
     """
 
     def decorator(fn):

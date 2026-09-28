@@ -82,6 +82,63 @@ def _forward_batch(*, batch_size=1, **info_overrides):
     )
 
 
+class TestDistributedVerifyEligibility(CustomTestCase):
+    def test_supported_and_fallback_features(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+        batch = _forward_batch(batch_size=64, need_top_p_sampling=True)
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
+        spec = object.__new__(EagleVerifyInput)
+        spec.topk, spec.spec_steps, spec.draft_token_num = 1, 3, 4
+        batch.spec_info = spec
+        model = SimpleNamespace(
+            logits_processor=SimpleNamespace(final_logit_softcapping=None)
+        )
+        config = SimpleNamespace(speculative_use_rejection_sampling=False)
+        with (
+            patch("sglang.srt.runtime_context.get_spec", return_value=config),
+            patch("sglang.srt.speculative.spec_utils.SIMULATE_ACC_LEN", 0),
+            patch.object(tpu_sampler_module, "_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE", 64),
+        ):
+            select = lambda: tpu_sampler_module.distributed_top_k_for_verify(
+                batch, model
+            )
+            self.assertEqual(select(), 50)
+            batch.sampling_info.sampling_seed = torch.tensor([42])
+            self.assertEqual(select(), 50)
+            for key, value in (
+                ("uniform_top_k", 65),
+                ("uniform_top_k", None),
+                ("need_min_p_sampling", True),
+                ("is_any_greedy", True),
+                ("has_custom_logit_processor", True),
+                ("logit_bias", object()),
+                ("grammars", [object()]),
+                ("acc_additive_penalties", object()),
+                ("acc_scaling_penalties", object()),
+                ("sampling_mask_batch_indices", object()),
+            ):
+                old = getattr(batch.sampling_info, key)
+                setattr(batch.sampling_info, key, value)
+                self.assertIsNone(select(), key)
+                setattr(batch.sampling_info, key, old)
+            for obj, key, value in (
+                (batch, "return_logprob", True),
+                (batch, "batch_size", 32),
+                (batch, "forward_mode", ForwardMode.DRAFT_EXTEND_V2),
+                (batch, "spec_info", object()),
+                (spec, "topk", 2),
+                (spec, "draft_token_num", 8),
+                (config, "speculative_use_rejection_sampling", True),
+                (model.logits_processor, "final_logit_softcapping", 30.0),
+            ):
+                old = getattr(obj, key)
+                setattr(obj, key, value)
+                self.assertIsNone(select(), key)
+                setattr(obj, key, old)
+
+
 def _distributed_top_k_config(
     *, shard_width=202_048 // 16, world_size=16
 ) -> PallasDistributedTopKConfig:

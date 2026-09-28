@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, Mock, patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
@@ -202,7 +203,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             sampling_info=sampling_info,
             forward_mode=SimpleNamespace(is_idle=lambda: False),
         )
-        logits_output = SimpleNamespace(next_token_logits=torch.randn((2, 8)))
+        logits_output = LogitsProcessorOutput(next_token_logits=torch.randn((2, 8)))
         spec_config = SimpleNamespace(
             speculative_use_rejection_sampling=False,
             speculative_accept_threshold_single=1.0,

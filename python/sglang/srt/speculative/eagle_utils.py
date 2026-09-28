@@ -61,6 +61,7 @@ if _is_tpu:
         build_topk1_verify_tree_tpu,
         prepare_device_accept_tpu,
         prepare_verify_cache_locs_tpu,
+        sample_distributed_verify_tpu,
     )
 
 logger = logging.getLogger(__name__)
@@ -982,7 +983,7 @@ def eagle_sample(
 
     bs = len(batch.seq_lens)
     sampling_info = batch.sampling_info
-    next_token_logits = logits_output.next_token_logits
+    next_token_logits = logits_output.get_next_token_sampling_logits()
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
@@ -1099,6 +1100,16 @@ def eagle_sample(
             tp_group.broadcast(predict, src=0)
             tp_group.broadcast(accept_index, src=0)
             tp_group.broadcast(num_correct_drafts, src=0)
+    elif _is_tpu and logits_output.has_next_token_global_top_k:
+        sample_distributed_verify_tpu(
+            verify_input=verify_input,
+            batch=batch,
+            logits_output=logits_output,
+            candidates=candidates,
+            predict=predict,
+            accept_index=accept_index,
+            num_correct_drafts=num_correct_drafts,
+        )
     else:
         if _is_tpu:
             top_k_renorm_prob = top_k_renorm_prob_func

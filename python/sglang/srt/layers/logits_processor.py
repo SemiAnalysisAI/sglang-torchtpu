@@ -291,6 +291,14 @@ class LogitsProcessorOutput:
 
         return self.next_token_global_top_k_logits is not None
 
+    def get_next_token_sampling_logits(self) -> Optional[torch.Tensor]:
+        """Return the populated next-token logits: global TopK or full vocabulary.
+        Both carry one row per sampled position."""
+
+        if self.has_next_token_global_top_k:
+            return self.next_token_global_top_k_logits
+        return self.next_token_logits
+
     def trim_next_token_outputs(
         self,
         logits_rows: int,

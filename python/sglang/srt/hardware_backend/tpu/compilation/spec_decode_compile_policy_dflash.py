@@ -31,6 +31,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    LogitsOutputMode,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_disagg, get_spec
@@ -479,6 +480,10 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             draft_token_num=self.draft_token_num,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+
+    def _verify_logits_output_modes(self, bs):
+        # DFlash verify samples dense target logits outside eagle_sample.
+        return (LogitsOutputMode.FULL_VOCAB,)
 
     def make_verify_spec_info(self) -> DFlashVerifyInput:
         """Create dummy DFlash verify input metadata for TARGET_VERIFY compilation.

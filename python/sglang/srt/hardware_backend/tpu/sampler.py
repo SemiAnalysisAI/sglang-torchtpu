@@ -291,6 +291,54 @@ def distributed_top_k_for_batch(
     return top_k
 
 
+def distributed_top_k_for_verify(forward_batch, model) -> Optional[int]:
+    """Exact-k chain verification lane; inspect CPU metadata before tracing only.
+
+    Any algorithm whose verify input is sampled by ``eagle_sample`` qualifies.
+    Boundary ties retain exactly k candidates. Full-vocabulary transforms,
+    rejection sampling, and other verify inputs keep dense logits.
+    """
+    from sglang.srt.runtime_context import get_spec
+    from sglang.srt.speculative.eagle_info import EagleVerifyInput
+    from sglang.srt.speculative.spec_utils import SIMULATE_ACC_LEN
+
+    spec = getattr(forward_batch, "spec_info", None)
+    info = getattr(forward_batch, "sampling_info", None)
+    if (
+        not isinstance(spec, EagleVerifyInput)
+        or not forward_batch.forward_mode.is_target_verify()
+        or spec.tree_topk != 1
+        or spec.draft_token_num != spec.max_tree_depth
+        or get_spec().speculative_use_rejection_sampling
+        or SIMULATE_ACC_LEN > 0
+        or info is None
+        or forward_batch.batch_size < _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
+        or forward_batch.return_logprob
+        or getattr(model.logits_processor, "final_logit_softcapping", None)
+    ):
+        return None
+    k = info.uniform_top_k
+    if (
+        k is None
+        or not 1 < k <= MAX_DISTRIBUTED_TOP_K
+        or info.is_any_greedy
+        or not info.need_top_k_sampling
+        or info.need_min_p_sampling
+        or info.has_custom_logit_processor
+        or info.logit_bias is not None
+        or any(info.grammars or ())
+        or info.sampling_mask_batch_indices is not None
+        or info.acc_additive_penalties is not None
+        or info.acc_scaling_penalties is not None
+        or (
+            info.penalizer_orchestrator is not None
+            and info.penalizer_orchestrator.is_required
+        )
+    ):
+        return None
+    return k
+
+
 def select_logits_output_mode(forward_batch, model) -> LogitsOutputMode:
     """Select full-vocabulary logits or distributed TopK candidates."""
 
@@ -298,6 +346,8 @@ def select_logits_output_mode(forward_batch, model) -> LogitsOutputMode:
     if candidate_width is None:
         return LogitsOutputMode.FULL_VOCAB
     requested_top_k = distributed_top_k_for_batch(forward_batch, sampling_backend="tpu")
+    if requested_top_k is None and forward_batch is not None:
+        requested_top_k = distributed_top_k_for_verify(forward_batch, model)
     if requested_top_k is None or requested_top_k > candidate_width:
         return LogitsOutputMode.FULL_VOCAB
     return LogitsOutputMode.DISTRIBUTED_TOP_K

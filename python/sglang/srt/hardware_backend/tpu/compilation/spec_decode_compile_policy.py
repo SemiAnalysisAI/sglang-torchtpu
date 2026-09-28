@@ -24,6 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    LogitsOutputMode,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
@@ -88,6 +89,27 @@ class BaseSpecDecodeCompilePolicyMixin:
         if disagg_mode != "decode":
             self._precompile_extend_full()
 
+    def _verify_logits_output_modes(self, bs):
+        """Return every logits mode TARGET_VERIFY can select at this batch size.
+
+        Must stay in sync with ``distributed_top_k_for_verify``, which picks the
+        mode per batch at runtime.
+        """
+        from sglang.srt.hardware_backend.tpu.sampler import (
+            distributed_top_k_min_batch_size,
+        )
+
+        spec = get_spec()
+        if (
+            bs >= distributed_top_k_min_batch_size()
+            and spec.speculative_eagle_topk == 1
+            and not spec.speculative_use_rejection_sampling
+            and self._distributed_top_k_width() is not None
+            and not self.model_runner.model.logits_processor.final_logit_softcapping
+        ):
+            return (LogitsOutputMode.FULL_VOCAB, LogitsOutputMode.DISTRIBUTED_TOP_K)
+        return (LogitsOutputMode.FULL_VOCAB,)
+
     def _precompile_target_verify(self) -> None:
         """Compile TARGET_VERIFY across the batch-size buckets."""
         assert self.b_bucketer is not None
@@ -113,13 +135,15 @@ class BaseSpecDecodeCompilePolicyMixin:
             num_tokens = bs * draft_token_num
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
-            self._run_one(
-                num_tokens=num_tokens,
-                bs=bs,
-                mode=ForwardMode.TARGET_VERIFY,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
-                spec_info=self.make_verify_spec_info(),
-            )
+            for logits_output_mode in self._verify_logits_output_modes(bs):
+                self._run_one(
+                    num_tokens=num_tokens,
+                    bs=bs,
+                    mode=ForwardMode.TARGET_VERIFY,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    spec_info=self.make_verify_spec_info(),
+                    logits_output_mode=logits_output_mode,
+                )
             if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()

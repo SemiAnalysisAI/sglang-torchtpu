@@ -9,6 +9,7 @@ import torch
 from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -259,3 +260,60 @@ def merge_device_accept_tpu(
         draft_input.accept_lens_device = None
         draft_input.device_accept_candidate_locs = None
     draft_input.device_accept_selected_cache_locs = None
+
+
+def sample_distributed_verify_tpu(
+    *,
+    verify_input: EagleVerifyInput,
+    batch: ScheduleBatch,
+    logits_output: LogitsProcessorOutput,
+    candidates: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+) -> None:
+    """Sample a chain verify from global TopK logits, writing results in place.
+
+    ``distributed_top_k_for_verify`` admits only batches this path supports.
+    """
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.hardware_backend.tpu.spec_sampling_distributed_verify import (
+        distributed_verify,
+    )
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.speculative.eagle_utils import _verify_coins
+
+    sampling_info = batch.sampling_info
+    width = verify_input.draft_token_num
+    coins, final_coins = _verify_coins(
+        sampling_info=sampling_info,
+        seq_lens=batch.seq_lens,
+        draft_token_num=width,
+        candidates=candidates,
+        device=batch.device,
+    )
+    distributed_verify(
+        predict,
+        accept_index,
+        num_correct_drafts,
+        candidates,
+        verify_input.retrieve_index,
+        coins,
+        final_coins,
+        logits_output.next_token_global_top_k_logits,
+        logits_output.next_token_global_top_k_token_ids,
+        torch.repeat_interleave(sampling_info.temperatures, width, dim=0),
+        torch.repeat_interleave(sampling_info.top_ks, width, dim=0),
+        torch.repeat_interleave(sampling_info.top_ps, width, dim=0),
+        get_spec().speculative_accept_threshold_single,
+        get_spec().speculative_accept_threshold_acc,
+    )
+
+    tp_group = (
+        get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
+    )
+    if tp_group.world_size > 1:
+        tp_group.broadcast(predict, src=0)
+        tp_group.broadcast(accept_index, src=0)
+        tp_group.broadcast(num_correct_drafts, src=0)

@@ -2794,7 +2794,7 @@ class TestSpecUnpadOutputs(_SpecPolicyTestCase):
     uses real_b; everything else matches the base decoder policy."""
 
     def _out_and_batch(self, forward_mode, capture, real_q, real_b, rows):
-        out = SimpleNamespace(
+        out = LogitsProcessorOutput(
             next_token_logits=torch.zeros(rows, 8),
             hidden_states=torch.zeros(rows, 8),
         )
@@ -2824,6 +2824,29 @@ class TestSpecUnpadOutputs(_SpecPolicyTestCase):
         self.assertEqual(out.hidden_states.shape[0], 16)  # FULL -> real_q
         self.assertEqual(fb.batch_size, 4)
         self.assertEqual(fb.seq_lens.shape[0], 4)
+
+    def test_compact_target_verify_preserves_and_trims_both_outputs(self):
+        policy = _make_spec_policy()
+        out, fb = self._out_and_batch(
+            ForwardMode.TARGET_VERIFY,
+            CaptureHiddenMode.FULL,
+            real_q=4,
+            real_b=1,
+            rows=8,
+        )
+        out.next_token_logits = None
+        out.next_token_global_top_k_logits = torch.zeros(8, 64)
+        out.next_token_global_top_k_token_ids = torch.arange(8 * 64).view(8, 64)
+        fb.spec_info = SimpleNamespace(keep_outputs_padded=True)
+        policy.finalize_forward_batch(out, fb)
+        self.assertEqual(out.next_token_global_top_k_logits.shape, (8, 64))
+        self.assertEqual(out.next_token_global_top_k_token_ids.shape, (8, 64))
+        fb.spec_info.keep_outputs_padded = False
+        policy.finalize_forward_batch(out, fb)
+        self.assertEqual(out.next_token_global_top_k_logits.shape, (4, 64))
+        self.assertEqual(out.next_token_global_top_k_token_ids.shape, (4, 64))
+        self.assertEqual(out.next_token_global_top_k_token_ids[-1, -1], 255)
+        self.assertIsNone(out.next_token_logits)
 
     def test_target_verify_defers_output_unpadding_until_after_sampling(self):
         policy = _make_spec_policy()
@@ -3641,7 +3664,7 @@ class TestSpecVerifyPaddingIsInert(_SpecPolicyTestCase):
             0, VOCAB_SIZE, (LOGICAL_TOKENS,), dtype=verify_input.draft_token.dtype
         )
 
-        logits_output = SimpleNamespace(next_token_logits=logits)
+        logits_output = LogitsProcessorOutput(next_token_logits=logits)
         torch.manual_seed(0)
         with _serving_stubs():
             predict, accept_lens, accept_index = eagle_sample(
@@ -3677,7 +3700,7 @@ class TestSpecVerifyPaddingIsInert(_SpecPolicyTestCase):
         """The same verify with no padding at all, as the reference answer."""
         batch = _make_batch(temperature)
         verify_input = _make_verify_input(deferred=False)
-        logits_output = SimpleNamespace(next_token_logits=_accepting_logits())
+        logits_output = LogitsProcessorOutput(next_token_logits=_accepting_logits())
         self.assertIsNone(
             _policy().prepare_spec_verify(
                 batch, verify_input, logits_output.next_token_logits
@@ -3745,7 +3768,7 @@ class TestSpecVerifyPaddingIsInert(_SpecPolicyTestCase):
             result = eagle_sample(
                 verify_input,
                 batch,
-                SimpleNamespace(next_token_logits=logits),
+                LogitsProcessorOutput(next_token_logits=logits),
                 None,
             )
 

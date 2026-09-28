@@ -42,6 +42,31 @@ def make_verify_tree_greedy_args(
     )
 
 
+def make_target_only_sampling_args(context: SpecOpWarmupContext) -> tuple:
+    bs, width = context.physical_bs, context.num_verify_tokens
+    device = context.device
+    probs = torch.full(
+        (bs, width, context.vocab_size),
+        1 / context.vocab_size,
+        dtype=torch.float32,
+        device=device,
+    )
+    return (
+        torch.zeros(bs * width, dtype=torch.int32, device=device),
+        torch.full((bs, width), -1, dtype=torch.int32, device=device),
+        torch.zeros(bs, dtype=torch.int32, device=device),
+        torch.zeros((bs, width), dtype=torch.int64, device=device),
+        torch.arange(bs * width, dtype=torch.int64, device=device).view(bs, width),
+        torch.full((bs, width), 0.5, device=device),
+        torch.full((bs,), 0.5, device=device),
+        probs,
+        torch.zeros_like(probs),
+        1.0,
+        1.0,
+        1,
+    )
+
+
 def make_verify_bookkeeping_args(
     context: SpecOpWarmupContext,
 ) -> tuple[torch.Tensor, ...]:

@@ -9,6 +9,9 @@ from collections.abc import Sequence
 import torch
 
 from sglang.srt.compilation.compiled_op import get_compiled_ops
+from sglang.srt.hardware_backend.tpu import (  # noqa: F401
+    spec_sampling_distributed_verify as _distributed_verify,
+)
 from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
@@ -56,7 +59,8 @@ def precompile_spec_v2_ops(
         for context in warmup_contexts:
             for registered_op in registered_ops:
                 args = registered_op.make_warmup_args(context)
-                registered_op.op(*args)
+                if args is not None:
+                    registered_op.op(*args)
     if device.type == "tpu":
         torch.get_device_module(device).synchronize()
     logger.info(
