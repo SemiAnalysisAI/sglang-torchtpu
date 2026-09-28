@@ -55,7 +55,12 @@ class TestFusedDraftLengths(unittest.TestCase):
         worker.topk = 1
         worker.speculative_num_steps = steps
         worker.server_args = SimpleNamespace(tpu_compile_tracer=tracer)
-        worker.draft_runner = SimpleNamespace(model=SimpleNamespace(forward=forward))
+        # The rebind-vs-copy branch reads the tracer off the policy that
+        # compiles this loop, so the fixture has to carry one.
+        worker.draft_runner = SimpleNamespace(
+            model=SimpleNamespace(forward=forward),
+            compile_policy=SimpleNamespace(tracer=tracer),
+        )
 
         batch = SimpleNamespace(
             positions=seq.clone(),

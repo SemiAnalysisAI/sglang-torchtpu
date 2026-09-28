@@ -939,6 +939,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Run the compiled draft loop."""
         num_steps = self.speculative_num_steps
         model = self.draft_runner.model
+        # The draft policy compiles this loop, so its tracer -- not the global
+        # server arg -- decides whether hidden states may be rebound. The two
+        # agree while tracer selection is global; a per-worker split would
+        # silently desync them and drop the mutation below.
+        draft_tracer = getattr(self.draft_runner.compile_policy, "tracer", "dynamo")
         base_positions = forward_batch.positions
         base_kv_lens = seq_lens.to(torch.int32)
         tokens: tuple = ()
@@ -952,7 +957,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 break
 
             forward_batch.spec_info.rpa_draft_kv_lens = base_kv_lens + i + 1
-            if self.server_args.tpu_compile_tracer == "direct":
+            if draft_tracer == "direct":
                 # direct_compile treats explicit inputs as immutable graph
                 # arguments. Rebind the traced ForwardBatch field instead of
                 # turning its hidden-state input into a deferred in-place op.
