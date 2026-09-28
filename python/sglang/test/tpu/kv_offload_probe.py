@@ -14,7 +14,7 @@ from sglang.test.test_utils import dump_metric
 
 # Common English words (~1 token each), so a word count is a good enough token
 # estimate without pulling a tokenizer into the runner. Same trick as
-# test/registered/hicache/test_hicache_pallas_tpu.py.
+# test/registered/e2e/hicache/hicache_pallas_tpu_harness.py.
 _PROMPT_VOCAB = (
     "the of and to in a is that for it as was with on be by at this from but not are or "
     "his they she had which were we when your can said there use each their time will how "

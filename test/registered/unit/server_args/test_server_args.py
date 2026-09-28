@@ -1848,8 +1848,8 @@ class TestHiCacheArgs(unittest.TestCase):
         # Offload support is read from the KV pool class the base backend
         # allocates, so an out-of-tree backend whose pool declares raiden is
         # admitted without a core change and torch_tpu is not widened by it;
-        # batched is admitted on the fused pool, and on the seq-along-lane pool
-        # for raiden only. Every prefill/decode backend must still be an RPA
+        # batched is admitted on both the fused and the seq-along-lane pool,
+        # by both io backends. Every prefill/decode backend must still be an RPA
         # backend (the reload-commit hook lives there) that reads the base
         # backend's pool, and mxint8 KV is refused because neither io backend
         # copies the scale buffers.
@@ -1899,13 +1899,7 @@ class TestHiCacheArgs(unittest.TestCase):
             for io_backend in ("raiden", "torch_tpu"):
                 check(io_backend, "pallas_tpu_rpa_v3")
                 check(io_backend, "pallas_tpu_rpa_batched")
-            check("raiden", "pallas_tpu_rpa_batched", seq_along_lane=True)
-            check(
-                "torch_tpu",
-                "pallas_tpu_rpa_batched",
-                seq_along_lane=True,
-                message="TpuSeqAlongLaneKVPool",
-            )
+                check(io_backend, "pallas_tpu_rpa_batched", seq_along_lane=True)
             check("raiden", "unknown_backend", message="MHATokenToKVPool")
             check(
                 "raiden",
