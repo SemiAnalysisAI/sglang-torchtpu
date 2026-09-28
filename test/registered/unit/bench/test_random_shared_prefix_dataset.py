@@ -1,3 +1,4 @@
+import sys
 from argparse import Namespace
 from unittest.mock import Mock, sentinel
 
@@ -109,3 +110,7 @@ def test_share_representative_prefix_rejects_invalid_rows(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         share_representative_prefix(rows, shared_prefix_len=shared_prefix_len)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
