@@ -95,6 +95,10 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
         # 4128 = 2 * 2048 + 32: the last KV block is a 32-row partial block.
         self._check(1, 2, 4128, 4128)
 
+    def test_custom_odd_kv_tail(self):
+        # 8191 = 3 * 2048 + 2047: an odd-length partial last block.
+        self._check(1, 2, 8191, 8191)
+
     def test_custom_short_query_shard(self):
         # A sequence-parallel query shard attending the gathered KV.
         self._check(1, 2, 880, 3520)
@@ -125,6 +129,14 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
     def test_medium_aligned(self):
         self._check(1, 2, 1024, 1024)
 
+    def test_short_query_long_padded_kv(self):
+        # q_seq < 256 with kv >= 2048: make_splash_mha with segment-id masking.
+        self._check(1, 2, 200, 4128, negative_scores=True)
+
+    def test_long_query_unaligned_kv(self):
+        # 1024 < kv < 2048, not 128-aligned: KV padded to 1536, masked.
+        self._check(1, 2, 4096, 1500, negative_scores=True)
+
     def test_causal_padded(self):
         self._check(1, 2, 1000, 1000, is_causal=True)
 
@@ -148,6 +160,56 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
         )
         got = tpu_attention(q.to("tpu"), k.to("tpu"), v.to("tpu"), scale=scale)
         self.assertLess((got.to("cpu").float() - want).abs().max().item(), 2e-2)
+
+    def test_gqa_make_splash_mha(self):
+        from sglang.multimodal_gen.runtime.layers.attention.backends.tpu_splash_attn import (
+            tpu_attention,
+        )
+
+        q, k, v = _inputs(1, 4, 4096, 512)
+        k, v = k[:, :2], v[:, :2]
+        scale = 128**-0.5
+        want = _reference(
+            q, k.repeat_interleave(2, 1), v.repeat_interleave(2, 1), scale, False
+        )
+        got = tpu_attention(q.to("tpu"), k.to("tpu"), v.to("tpu"), scale=scale)
+        self.assertLess((got.to("cpu").float() - want).abs().max().item(), 2e-2)
+
+    def test_varlen_segments_use_sdpa(self):
+        from sglang.multimodal_gen.runtime.layers.attention.backends import (
+            tpu_splash_attn,
+        )
+
+        impl = tpu_splash_attn.TpuSplashAttentionImpl(
+            num_heads=2, head_size=128, causal=False, softmax_scale=128**-0.5
+        )
+        lens = (3000, 2500)
+        q, k, v = (
+            torch.randn(sum(lens), 2, 128, dtype=torch.bfloat16) for _ in range(3)
+        )
+        cu = torch.tensor([0, lens[0], sum(lens)], dtype=torch.int32)
+        cached = dict(tpu_splash_attn._splash_kernel_cache)
+        got = impl.forward_varlen(
+            q.to("tpu"),
+            k.to("tpu"),
+            v.to("tpu"),
+            cu_seqlens=cu.to("tpu"),
+            max_seqlen=max(lens),
+            cu_seqlens_host=(0, lens[0], sum(lens)),
+        ).to("cpu")
+        self.assertEqual(tpu_splash_attn._splash_kernel_cache, cached)
+        start = 0
+        for n in lens:
+            seg = slice(start, start + n)
+            want = _reference(
+                q[None, seg].transpose(1, 2),
+                k[None, seg].transpose(1, 2),
+                v[None, seg].transpose(1, 2),
+                128**-0.5,
+                False,
+            ).transpose(1, 2)[0]
+            self.assertLess((got[seg].float() - want).abs().max().item(), 2e-2)
+            start += n
 
     def test_backend_impl_layout(self):
         # The attention layer calls the impl with [B, S, H, D] tensors.

@@ -55,7 +55,8 @@ def _expand_query_broadcast_mask(query, attn_mask):
     """Expand a mask's size-1 query dim to the query length on TPU.
 
     torch_tpu 0.1.1.dev20260924 SDPA returns NaN for masks that broadcast over
-    queries, e.g. [B, 1, 1, S] key padding.
+    queries, e.g. [B, 1, 1, S] key padding; 0.1.1.dev20260817 is correct.
+    Remove once the pinned torch_tpu handles query-broadcast masks.
     """
     if (
         attn_mask is not None
@@ -71,6 +72,8 @@ def _expand_query_broadcast_mask(query, attn_mask):
 
 
 def _patch_sdpa_query_broadcast_mask() -> None:
+    # Module-level aliases bound before worker init keep the unpatched
+    # function; hunyuan3d_vae's is the only one and passes no mask.
     sdpa = torch.nn.functional.scaled_dot_product_attention
     if getattr(sdpa, "_sglang_tpu_mask_patch", False):
         return

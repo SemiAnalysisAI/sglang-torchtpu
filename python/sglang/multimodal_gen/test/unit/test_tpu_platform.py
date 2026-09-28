@@ -179,7 +179,6 @@ class TestTpuPlatformSurface(unittest.TestCase):
         self.assertFalse(TpuPlatform.enable_dit_layerwise_offload_by_default())
 
 
-@unittest.skipUnless(_HAS_TORCH_TPU, "torch.device('tpu') needs torch_tpu")
 class TestSdpaQueryBroadcastMask(unittest.TestCase):
     """torch_tpu SDPA returns NaN for masks that broadcast over queries."""
 
@@ -245,6 +244,7 @@ class TestSdpaQueryBroadcastMask(unittest.TestCase):
             torch.nn.functional.scaled_dot_product_attention = original
 
 
+@unittest.skipUnless(_HAS_TORCH_TPU, "torch.device('tpu') needs torch_tpu")
 class TestWorkerInitOnce(unittest.TestCase):
     def setUp(self):
         self.addCleanup(setattr, TpuPlatform, "_worker_initialized", False)

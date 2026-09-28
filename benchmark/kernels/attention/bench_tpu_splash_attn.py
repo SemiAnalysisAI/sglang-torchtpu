@@ -64,12 +64,24 @@ def _compare(name, got, want):
     )
 
 
+def _under_tpu_info(kernel):
+    """Call ``kernel`` under the physical chip's Pallas metadata, as the op does."""
+    from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
+
+    def call(*args):
+        with tpu_info_for_cpu_export():
+            return kernel(*args)
+
+    return call
+
+
 def _time_kernel(build_fn, q, k, v, scale, warmup, iters, label, prescale=True):
     """Build, warm up, then time a kernel. Returns (seconds_per_call, output)."""
     print(f"\n=== {label} ===")
     try:
         t0 = time.perf_counter()
         kernel, q_padded, kv_padded = build_fn()
+        kernel = _under_tpu_info(kernel)
         print(
             f"  build: {time.perf_counter() - t0:.2f}s (q_pad={q_padded} kv_pad={kv_padded})"
         )

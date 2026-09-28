@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
 
 logger = init_logger(__name__)
 
@@ -46,8 +47,8 @@ _MEASURED_OVERRIDES: dict[tuple[int, int], dict[str, int]] = {
 def _splash_vmem_limit_bytes(pltpu) -> int:
     """Mosaic scoped-VMEM ceiling per pallas_call: 2x physical core VMEM.
 
-    Pallas is lowered on the JAX CPU backend, where ``get_tpu_info`` reports
-    the v7x entry registered in ``_build_custom_splash_kernel``.
+    Called at trace time under ``tpu_info_for_cpu_export``, so ``get_tpu_info``
+    reports the physical chip.
     """
     try:
         return 2 * int(pltpu.get_tpu_info().vmem_capacity_bytes)
@@ -162,50 +163,19 @@ def _build_custom_splash_kernel(
     from jax.experimental.pallas import tpu as pltpu
     from torch_tpu._internal.pallas.pallas import custom_jax_kernel
 
-    try:
-        from jax._src.pallas.mosaic import tpu_info as _tpu_info
-
-        if "cpu" not in _tpu_info.registry:
-            _tpu_info.registry["cpu"] = lambda: (
-                _tpu_info.get_tpu_info_for_chip(_tpu_info.ChipVersion.TPU_7X, 1)
-                if hasattr(_tpu_info, "get_tpu_info_for_chip")
-                else _tpu_info.TpuInfo(
-                    chip_version=_tpu_info.ChipVersion.TPU_7X,
-                    generation=7,
-                    num_cores=1,
-                    num_lanes=128,
-                    num_sublanes=8,
-                    mxu_column_size=256,
-                    vmem_capacity_bytes=64 * 1024 * 1024,
-                    cmem_capacity_bytes=0,
-                    smem_capacity_bytes=1024 * 1024,
-                    hbm_capacity_bytes=206_000_000_000 // 2,
-                    mem_bw_bytes_per_second=int(7.40e12 // 2),
-                    bf16_ops_per_second=int(2.31e15 // 2),
-                    int8_ops_per_second=0,
-                    fp8_ops_per_second=int(4.60e15 // 2),
-                    int4_ops_per_second=0,
-                    sparse_core=None,
-                )
-            )
-    except Exception:
-        pass
-
     block_q, block_kv, block_kv_compute = autotune_block_sizes(q_seq, kv_seq, head_dim)
     qk_scale = scale * LOG2_E
 
     mask_value = -0.7 * float(np.finfo(np.dtype("float32")).max)
-    # Autotuned score tiles exceed Mosaic's 32 MiB scoped-VMEM default.
-    vmem_limit_bytes = _splash_vmem_limit_bytes(pltpu)
 
     def _flash_attention_kernel(
         q_ref,
         k_ref,
         v_ref,
+        o_ref,
         m_scratch_ref,
         l_scratch_ref,
         o_scratch_ref,
-        o_ref,
         *,
         grid_width: int,
         bkv: int,
@@ -269,9 +239,10 @@ def _build_custom_splash_kernel(
                 if hasattr(pltpu, "repeat")
                 else jnp.tile(1.0 / l, (head_dim_v_repeats, 1))
             )
+            # Scratch is [D, block_q]; write the [block_q, D] output tile.
             o_ref[...] = (
                 o_scratch_ref[...] * l_inv[: o_scratch_ref.shape[0], :]
-            ).astype(o_ref.dtype)
+            ).T.astype(o_ref.dtype)
 
     def _jax_fn(query, key, value):
         def _kernel_3d(q_3d, k_3d, v_3d):
@@ -293,19 +264,7 @@ def _build_custom_splash_kernel(
                     lambda h, i, j: (h // q_heads_per_kv_head, j, 0),
                 ),
             ]
-            out_shapes = [
-                jax.ShapeDtypeStruct((NUM_SUBLANES, block_q), jnp.float32),
-                jax.ShapeDtypeStruct((NUM_SUBLANES, block_q), jnp.float32),
-                jax.ShapeDtypeStruct((head_dim, block_q), jnp.float32),
-                jax.ShapeDtypeStruct((num_q_heads, head_dim, q_seq), q_3d.dtype),
-            ]
-            out_specs = [
-                pl.BlockSpec((NUM_SUBLANES, block_q), lambda *_: (0, 0)),
-                pl.BlockSpec((NUM_SUBLANES, block_q), lambda *_: (0, 0)),
-                pl.BlockSpec((head_dim, block_q), lambda *_: (0, 0)),
-                pl.BlockSpec((None, head_dim, block_q), lambda h, i, j: (h, 0, i)),
-            ]
-            all_out = pl.pallas_call(
+            return pl.pallas_call(
                 functools.partial(
                     _flash_attention_kernel,
                     grid_width=grid_width,
@@ -316,15 +275,24 @@ def _build_custom_splash_kernel(
                 ),
                 grid=(num_q_heads, grid_height, grid_width),
                 in_specs=in_specs,
-                out_specs=out_specs,
-                compiler_params=pltpu.CompilerParams(
-                    dimension_semantics=("parallel", "arbitrary", "arbitrary"),
-                    flags={"XLA_TPU_FORCE_LP_LLO_SCHEDULER": True},
-                    vmem_limit_bytes=vmem_limit_bytes,
+                out_specs=pl.BlockSpec(
+                    (None, block_q, head_dim), lambda h, i, j: (h, i, 0)
                 ),
-                out_shape=out_shapes,
+                scratch_shapes=[
+                    pltpu.VMEM((NUM_SUBLANES, block_q), jnp.float32),
+                    pltpu.VMEM((NUM_SUBLANES, block_q), jnp.float32),
+                    pltpu.VMEM((head_dim, block_q), jnp.float32),
+                ],
+                compiler_params=pltpu.CompilerParams(
+                    dimension_semantics=("parallel", "parallel", "arbitrary"),
+                    flags={"XLA_TPU_FORCE_LP_LLO_SCHEDULER": True},
+                    # Autotuned score tiles exceed Mosaic's 32 MiB default.
+                    vmem_limit_bytes=_splash_vmem_limit_bytes(pltpu),
+                ),
+                out_shape=jax.ShapeDtypeStruct(
+                    (num_q_heads, q_seq, head_dim), q_3d.dtype
+                ),
             )(q_3d, k_3d, v_3d)
-            return jnp.swapaxes(all_out[3], 1, 2)
 
         return jax.vmap(_kernel_3d, in_axes=(0, 0, 0), out_axes=0)(query, key, value)
 
@@ -340,8 +308,9 @@ def _build_fullmask_splash_kernel(
     block_kv: int,
     is_causal: bool = False,
 ):
-    """Build a stock ``make_splash_mha`` kernel; FullMask unless KV is padded."""
+    """Build a stock ``make_splash_mha`` kernel; padded keys are masked by segment ids."""
     import jax
+    import jax.numpy as jnp
     from jax.experimental.pallas.ops.tpu.splash_attention import (
         splash_attention_kernel as splash,
     )
@@ -353,23 +322,13 @@ def _build_fullmask_splash_kernel(
     q_padded = _round_up(q_seq, block_q)
     kv_padded = _round_up(kv_seq, block_kv)
 
+    # Causal attention only reaches here with q_seq == kv_seq, so real rows
+    # never see padded keys. Padded query rows are sliced off after the kernel.
     if is_causal:
-        if q_padded == q_seq and kv_padded == kv_seq:
-            mask = sam.CausalMask((q_padded, kv_padded))
-        else:
-            mask_arr = np.zeros((q_padded, kv_padded), dtype=np.bool_)
-            mask_arr[:q_seq, :kv_seq] = np.tril(
-                np.ones((q_seq, kv_seq), dtype=np.bool_)
-            )
-            mask = sam.NumpyMask(mask_arr)
-    elif kv_padded == kv_seq:
-        # Padded query rows are sliced off after the kernel.
-        mask = sam.FullMask((q_padded, kv_padded))
+        mask = sam.CausalMask((q_padded, kv_padded))
     else:
-        # Zero-padded keys score 0 and must be masked out.
-        mask_arr = np.zeros((q_padded, kv_padded), dtype=np.bool_)
-        mask_arr[:, :kv_seq] = True
-        mask = sam.NumpyMask(mask_arr)
+        mask = sam.FullMask((q_padded, kv_padded))
+    pad_kv = kv_padded != kv_seq
 
     block_sizes = splash.BlockSizes(
         block_q=block_q,
@@ -386,7 +345,14 @@ def _build_fullmask_splash_kernel(
             q_seq_shards=1,
             block_sizes=block_sizes,
         )
-        return kernel(q, k, v)
+        if not pad_kv:
+            return kernel(q, k, v)
+        # Zero-padded keys score 0; segment id 0 excludes them.
+        segment_ids = splash.SegmentIds(
+            q=jnp.ones((q_padded,), jnp.int32),
+            kv=(jnp.arange(kv_padded) < kv_seq).astype(jnp.int32),
+        )
+        return kernel(q, k, v, segment_ids=segment_ids)
 
     wrapped = custom_jax_kernel(jax.vmap(splash_fn), warn_deprecated=False)
     return wrapped, q_padded, kv_padded
@@ -491,7 +457,13 @@ def _tpu_splash_attention_op(
         q_seq, kv_seq, head_dim, q.dtype, is_causal, scale
     )
     if not takes_unscaled_q:
+        # make_splash_mha: pre-scaled query, one KV head per query head. The
+        # custom kernel maps query heads to KV heads itself.
         q = q * scale
+        if q.shape[1] != k.shape[1]:
+            repeat_factor = q.shape[1] // k.shape[1]
+            k = k.repeat_interleave(repeat_factor, dim=1)
+            v = v.repeat_interleave(repeat_factor, dim=1)
 
     need_pad_q = q_padded > q_seq
     need_pad_kv = kv_padded > kv_seq
@@ -501,7 +473,8 @@ def _tpu_splash_attention_op(
         k = F.pad(k, (0, 0, 0, kv_padded - kv_seq))
         v = F.pad(v, (0, 0, 0, kv_padded - kv_seq))
 
-    out = kernel(q.contiguous(), k.contiguous(), v.contiguous())
+    with tpu_info_for_cpu_export():
+        out = kernel(q.contiguous(), k.contiguous(), v.contiguous())
 
     if need_pad_q:
         out = out[:, :, :q_seq, :]
@@ -545,6 +518,8 @@ def tpu_attention(
     # The Pallas kernels compute in bf16.
     if short:
         reason = "short"
+    elif is_causal and q_seq != kv_seq:
+        reason = "ragged causal"
     elif head_dim != 128:
         reason = f"head_dim={head_dim}"
     elif not query.dtype == key.dtype == value.dtype == torch.bfloat16:
@@ -554,10 +529,6 @@ def tpu_attention(
     else:
         reason = None
     if reason is None:
-        if query.shape[1] != key.shape[1]:
-            repeat_factor = query.shape[1] // key.shape[1]
-            key = key.repeat_interleave(repeat_factor, dim=1)
-            value = value.repeat_interleave(repeat_factor, dim=1)
         return _tpu_splash_attention_op(query, key, value, scale, is_causal=is_causal)
 
     log_key = (q_seq, kv_seq, is_causal, reason)
@@ -581,7 +552,7 @@ def tpu_attention(
 
 
 class TpuSplashAttentionBackend(SDPABackend):
-    """TPU Pallas attention; shapes the kernels do not cover fall back to SDPA."""
+    """TPU Pallas attention, tuned on v7x; uncovered shapes fall back to SDPA."""
 
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
@@ -615,6 +586,15 @@ class TpuSplashAttentionImpl(SDPAImpl):
             **extra_impl_args,
         )
         self.use_splash = self.dropout == 0.0 and _check_splash_available()
+        self._sdpa = SDPAImpl(
+            num_heads=num_heads,
+            head_size=head_size,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            num_kv_heads=num_kv_heads,
+            prefix=prefix,
+            **extra_impl_args,
+        )
         if not self.use_splash:
             logger.info(
                 "%s: using SDPA instead of the TPU splash kernels (dropout=%s).",
@@ -646,3 +626,24 @@ class TpuSplashAttentionImpl(SDPAImpl):
             is_causal=self.causal,
         )
         return output.transpose(1, 2)
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        # Packed segment lengths vary per request; a Pallas kernel per length
+        # would recompile, so segments stay on SDPA.
+        return self._sdpa.forward_varlen(
+            query,
+            key,
+            value,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            cu_seqlens_host=cu_seqlens_host,
+        )
