@@ -82,20 +82,18 @@ class TestTpuPlatformSurface(unittest.TestCase):
     def test_inference_mode_is_no_grad(self):
         self.assertIsInstance(TpuPlatform.inference_mode(), torch.no_grad)
 
-    def test_attn_backend_defaults_to_splash(self):
-        # The Pallas kernels are the optimized TPU path, so TPU defaults to
-        # them rather than to plain SDPA.
-        for selected in (None, AttentionBackendEnum.TPU_SPLASH_ATTN):
+    def test_attn_backend_default_is_sdpa(self):
+        for selected in (None, AttentionBackendEnum.TORCH_SDPA):
             self.assertIn(
-                "tpu_splash_attn.TpuSplashAttentionBackend",
+                "sdpa.SDPABackend",
                 TpuPlatform.get_attn_backend_cls_str(selected, 128, torch.bfloat16),
             )
 
-    def test_attn_backend_sdpa_is_still_selectable(self):
+    def test_attn_backend_splash_is_opt_in(self):
         self.assertIn(
-            "sdpa.SDPABackend",
+            "tpu_splash_attn.TpuSplashAttentionBackend",
             TpuPlatform.get_attn_backend_cls_str(
-                AttentionBackendEnum.TORCH_SDPA, 128, torch.bfloat16
+                AttentionBackendEnum.TPU_SPLASH_ATTN, 128, torch.bfloat16
             ),
         )
 
