@@ -171,6 +171,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
@@ -500,6 +501,7 @@ class ModelRunner:
         self.weight_load_time = 0.0
         self.graph_memory_usage: dict[str, float] = {}
         self.graph_time_usage: dict[str, float] = {}
+        self.compile_timing = CompileTimingRecorder()
 
     def _initialize_elastic_ep_joiner(self) -> None:
         if not (

@@ -38,6 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -344,6 +345,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         name: str | None = None,
         label: str | None = None,
         tracer: Literal["dynamo", "direct"] = "dynamo",
+        compile_timing_recorder: CompileTimingRecorder | None = None,
     ) -> None:
         super().__init__(
             model_runner=model_runner,
@@ -352,6 +354,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             method=method,
             name=name,
             label=label,
+            compile_timing_recorder=compile_timing_recorder,
         )
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
@@ -359,6 +362,39 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         self.extend_bs: int | None = None
         self.compiled_forward_shim: CompiledForwardShim | None = None
         self._logged_vl_warmup_variants: set[str] = set()
+
+    def _record_compile_step(
+        self,
+        *,
+        phase: str,
+        duration_seconds: float,
+        batch_size: int | None = None,
+        num_tokens: int | None = None,
+        num_draft_tokens: int | None = None,
+        draft_step: int | None = None,
+        input_variant: str | None = None,
+        logits_output_mode: str | None = None,
+        capture_hidden_mode: str | None = None,
+        has_spec_info: bool | None = None,
+    ) -> None:
+        if self.compile_timing_recorder is None:
+            return
+        assert self.model_runner is not None
+        self.compile_timing_recorder.record(
+            component="draft" if self.model_runner.is_draft_worker else "target",
+            phase=phase,
+            policy=type(self).__name__,
+            duration_seconds=duration_seconds,
+            batch_size=batch_size,
+            num_tokens=num_tokens,
+            num_draft_tokens=num_draft_tokens,
+            draft_step=draft_step,
+            model_index=self.model_runner.draft_model_idx,
+            input_variant=input_variant,
+            logits_output_mode=logits_output_mode,
+            capture_hidden_mode=capture_hidden_mode,
+            has_spec_info=has_spec_info,
+        )
 
     def _extend_compile_cap(self) -> int:
         assert self.t_bucketer is not None
@@ -907,8 +943,16 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 logits_output_mode=logits_output_mode,
                 capture_hidden_mode=extend_capture_hidden_mode,
             )
+            elapsed = time.perf_counter() - start
+            self._record_compile_step(
+                phase=mode.name.lower(),
+                duration_seconds=elapsed,
+                batch_size=bs,
+                num_tokens=num_tokens,
+                logits_output_mode=logits_output_mode.name.lower(),
+                capture_hidden_mode=extend_capture_hidden_mode.name.lower(),
+            )
             if get_parallel().tp_rank == 0:
-                elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
@@ -949,8 +993,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 mode=ForwardMode.DECODE,
                 logits_output_mode=logits_output_mode,
             )
+            elapsed = time.perf_counter() - start
+            self._record_compile_step(
+                phase="decode",
+                duration_seconds=elapsed,
+                batch_size=bs,
+                num_tokens=bs,
+                logits_output_mode=logits_output_mode.name.lower(),
+            )
             if get_parallel().tp_rank == 0:
-                elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
@@ -1454,8 +1505,16 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 variant=variant,
                 logits_output_mode=logits_output_mode,
             )
+            elapsed = time.perf_counter() - start
+            self._record_compile_step(
+                phase=mode.name.lower(),
+                duration_seconds=elapsed,
+                batch_size=bs,
+                num_tokens=num_tokens,
+                input_variant=variant,
+                logits_output_mode=logits_output_mode.name.lower(),
+            )
             if get_parallel().tp_rank == 0:
-                elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
@@ -1493,10 +1552,16 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                     host_src=torch.zeros((num_tokens, hidden), dtype=dtype),
                     host_mask=torch.zeros((num_tokens, 1), dtype=torch.bool),
                 )
+        elapsed = time.perf_counter() - start
         logger.info(
             "[decoder compile policy] VL MM EMBED PLACEMENT: %d token buckets in %.1fs",
             len(buckets),
-            time.perf_counter() - start,
+            elapsed,
+        )
+        self._record_compile_step(
+            phase="mm_embed_placement",
+            duration_seconds=elapsed,
+            input_variant="host_placement",
         )
 
     def _precompile_decode(self) -> None:
@@ -1539,8 +1604,16 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 variant=variant,
                 logits_output_mode=logits_output_mode,
             )
+            elapsed = time.perf_counter() - start
+            self._record_compile_step(
+                phase="decode",
+                duration_seconds=elapsed,
+                batch_size=bs,
+                num_tokens=bs,
+                input_variant=variant,
+                logits_output_mode=logits_output_mode.name.lower(),
+            )
             if get_parallel().tp_rank == 0:
-                elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
