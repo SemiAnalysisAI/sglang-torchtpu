@@ -2344,6 +2344,15 @@ def cli_main():
         help="Range of sampled ratio of input/output length, "
         "used only for random and image dataset.",
     )
+    parser.add_argument(
+        "--random-shared-prefix-len",
+        type=int,
+        default=0,
+        help=(
+            "Number of leading token ids shared by every random-ids request. "
+            "The default 0 preserves independent prompts."
+        ),
+    )
     # image dataset args
     parser.add_argument(
         "--image-count",

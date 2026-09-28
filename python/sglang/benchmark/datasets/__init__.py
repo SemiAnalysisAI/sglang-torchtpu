@@ -12,6 +12,9 @@ from sglang.benchmark.datasets.mmmu import MMMUDataset
 from sglang.benchmark.datasets.mooncake import MooncakeDataset
 from sglang.benchmark.datasets.openai_dataset import OpenAIDataset
 from sglang.benchmark.datasets.random import RandomDataset
+from sglang.benchmark.datasets.random_shared_prefix import (
+    RandomWithSharedPrefixDataset,
+)
 from sglang.benchmark.datasets.sharegpt import ShareGPTDataset
 from sglang.benchmark.datasets.speed_bench import SpeedBenchDataset
 
@@ -41,7 +44,10 @@ def get_dataset(args, tokenizer, model_id=None):
     if dataset_name not in DATASET_MAPPING:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
-    dataset_cls = DATASET_MAPPING[dataset_name]
+    if dataset_name == "random-ids" and getattr(args, "random_shared_prefix_len", 0):
+        dataset_cls = RandomWithSharedPrefixDataset
+    else:
+        dataset_cls = DATASET_MAPPING[dataset_name]
     dataset = dataset_cls.from_args(args)
     return dataset.load(tokenizer=tokenizer, model_id=model_id)
 

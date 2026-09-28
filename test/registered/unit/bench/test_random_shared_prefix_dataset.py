@@ -5,6 +5,7 @@ from unittest.mock import Mock, sentinel
 import numpy as np
 import pytest
 
+from sglang.benchmark.datasets import get_dataset
 from sglang.benchmark.datasets.common import DatasetRow
 from sglang.benchmark.datasets.random_shared_prefix import (
     RandomWithSharedPrefixDataset,
@@ -70,22 +71,20 @@ def test_from_args_wraps_exact_random_id_dataset() -> None:
 
 def test_generated_random_dataset_shares_prefix() -> None:
     np.random.seed(42)
-    dataset = RandomWithSharedPrefixDataset.from_args(
-        Namespace(
-            dataset_name="random-ids",
-            tokenize_prompt=True,
-            random_shared_prefix_len=4,
-            random_input_len=8,
-            random_output_len=2,
-            num_prompts=4,
-            random_range_ratio=1.0,
-            dataset_path="",
-            backend="sglang",
-        )
+    args = Namespace(
+        dataset_name="random-ids",
+        tokenize_prompt=True,
+        random_shared_prefix_len=4,
+        random_input_len=8,
+        random_output_len=2,
+        num_prompts=4,
+        random_range_ratio=1.0,
+        dataset_path="",
+        backend="sglang",
     )
     tokenizer = Mock(vocab_size=128)
 
-    rows = dataset.load(tokenizer)
+    rows = get_dataset(args, tokenizer)
 
     assert all(row.prompt[:4] == rows[0].prompt[:4] for row in rows)
 
