@@ -1,7 +1,9 @@
+import glob
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -211,6 +213,49 @@ def derive_timeout_per_file(est_time: float) -> float:
     return max(est * DERIVED_TIMEOUT_FACTOR, est + DERIVED_TIMEOUT_SLACK)
 
 
+def _clear_compilation_caches():
+    """Clear compilation caches after each test unit to prevent disk/shm exhaustion."""
+    is_tpu_or_ci = (
+        os.environ.get("SGLANG_PLATFORM") == "tpu"
+        or os.environ.get("CI") is not None
+        or os.environ.get("GITHUB_ACTIONS") is not None
+    )
+    if not is_tpu_or_ci:
+        return
+
+    cleared_count = 0
+    patterns = [
+        "/tmp/torchinductor*",
+        "/dev/shm/torchinductor*",
+        "/dev/shm/torch_tpu_cache*",
+        "/root/.cache/torch_tpu_compile_cache*",
+    ]
+    for pattern in patterns:
+        for p in glob.glob(pattern):
+            try:
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                    cleared_count += 1
+                elif os.path.exists(p):
+                    os.remove(p)
+                    cleared_count += 1
+            except Exception:
+                pass
+
+    tier3_root = os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT")
+    if tier3_root and os.path.exists(tier3_root):
+        try:
+            shutil.rmtree(tier3_root, ignore_errors=True)
+            os.makedirs(tier3_root, exist_ok=True)
+            cleared_count += 1
+        except Exception:
+            pass
+
+    logger.info(
+        f"[CI] Cleared compilation caches after test unit ({cleared_count} paths)"
+    )
+
+
 def run_unittest_files(
     files: Union[List[TestFile], List[CIRegistry]],
     timeout_per_file: Optional[float] = None,
@@ -277,58 +322,61 @@ def run_unittest_files(
             )
             file_tic = time.perf_counter()
 
-            if use_fork_worker:
-                if (
-                    fork_worker is None
-                    or fork_worker.files_run >= fork_worker_batch_size
-                ):
-                    if fork_worker is not None:
+            try:
+                if use_fork_worker:
+                    if (
+                        fork_worker is None
+                        or fork_worker.files_run >= fork_worker_batch_size
+                    ):
+                        if fork_worker is not None:
+                            fork_worker.close()
+                        fork_worker = _ForkTestWorker()
+                    process = fork_worker.process
+                    ret_code, _ = fork_worker.run(full_path)
+                    if ret_code != 0 or fork_worker.files_run >= fork_worker_batch_size:
                         fork_worker.close()
-                    fork_worker = _ForkTestWorker()
-                process = fork_worker.process
-                ret_code, _ = fork_worker.run(full_path)
-                if ret_code != 0 or fork_worker.files_run >= fork_worker_batch_size:
-                    fork_worker.close()
-                    fork_worker = None
-                    process = None
-                elapsed = time.perf_counter() - file_tic
-            elif capture_output:
-                # Capture output for retry decision
-                cmd = ["python3", full_path, "-f"]
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    errors="ignore",  # Ignore non-UTF-8 bytes to prevent UnicodeDecodeError
+                        fork_worker = None
+                        process = None
+                    elapsed = time.perf_counter() - file_tic
+                elif capture_output:
+                    # Capture output for retry decision
+                    cmd = ["python3", full_path, "-f"]
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        errors="ignore",  # Ignore non-UTF-8 bytes to prevent UnicodeDecodeError
+                    )
+                    output_lines = []
+
+                    def read_output():
+                        for line in process.stdout:
+                            logger.info(line.rstrip())
+                            output_lines.append(line)
+
+                    # Read stdout on a background thread so the main thread won't block on EOF.
+                    reader_thread = threading.Thread(target=read_output, daemon=True)
+                    reader_thread.start()
+                    process.wait()
+                    # Bounded wait for the reader to finish.
+                    reader_thread.join(timeout=60)
+                else:
+                    cmd = ["python3", full_path, "-f"]
+                    process = subprocess.Popen(cmd, stdout=None, stderr=None)
+                    process.wait()
+
+                if not use_fork_worker:
+                    elapsed = time.perf_counter() - file_tic
+                    ret_code = process.returncode
+                file_elapsed[filename] = elapsed
+
+                logger.info(
+                    f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n"
                 )
-                output_lines = []
-
-                def read_output():
-                    for line in process.stdout:
-                        logger.info(line.rstrip())
-                        output_lines.append(line)
-
-                # Read stdout on a background thread so the main thread won't block on EOF.
-                reader_thread = threading.Thread(target=read_output, daemon=True)
-                reader_thread.start()
-                process.wait()
-                # Bounded wait for the reader to finish.
-                reader_thread.join(timeout=60)
-            else:
-                cmd = ["python3", full_path, "-f"]
-                process = subprocess.Popen(cmd, stdout=None, stderr=None)
-                process.wait()
-
-            if not use_fork_worker:
-                elapsed = time.perf_counter() - file_tic
-                ret_code = process.returncode
-            file_elapsed[filename] = elapsed
-
-            logger.info(
-                f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n"
-            )
-            return ret_code
+                return ret_code
+            finally:
+                _clear_compilation_caches()
 
         # Retry loop for each file
         attempt = 1
@@ -417,8 +465,28 @@ def run_unittest_files(
 
         if not file_passed:
             success = False
-            if not continue_on_error:
-                break
+
+        # Flush per-file so a SIGKILL mid-suite still surfaces completed files.
+        metrics_path = os.environ.get("SGLANG_TEST_METRICS_FILE")
+        if metrics_path and filename in file_elapsed:
+            try:
+                incremental_record = {
+                    "kind": "file",
+                    "test_file": os.path.basename(filename),
+                    "status": "pass" if file_passed else "fail",
+                    "duration": round(file_elapsed[filename], 2),
+                }
+                if not file_passed:
+                    reason = next((r for f, r in failed_tests if f == filename), None)
+                    if reason:
+                        incremental_record["error"] = reason
+                with open(metrics_path, "a") as f:
+                    f.write(json.dumps(incremental_record) + "\n")
+            except OSError:
+                pass
+
+        if not file_passed and not continue_on_error:
+            break
 
     if fork_worker is not None:
         fork_worker.close()
@@ -434,11 +502,11 @@ def run_unittest_files(
         logger.info(f"Fail. Time elapsed: {elapsed_total:.2f}s")
 
     # Print summary
-    logger.info(f"\n{'='*60}")
+    logger.info(f"\n{'=' * 60}")
     logger.info(f"Test Summary: {len(passed_tests)}/{len(files)} passed")
     if enable_retry and retried_tests:
         logger.info(f"Retries: {len(retried_tests)} test(s) were retried")
-    logger.info(f"{'='*60}")
+    logger.info(f"{'=' * 60}")
     if passed_tests:
         logger.info("✓ PASSED:")
         for test in passed_tests:
@@ -451,7 +519,7 @@ def run_unittest_files(
         logger.info("\n↻ RETRIED:")
         for test, attempts, result in retried_tests:
             logger.info(f"  {test} ({attempts} attempts, {result})")
-    logger.info(f"{'='*60}\n")
+    logger.info(f"{'=' * 60}\n")
 
     # Machine-readable timings block for downstream scrapers/dashboards.
     # One JSON object per executed file (post-retry: only the latest

@@ -56,6 +56,7 @@ def _prefill_manager():
     mgr._pulling_cleared = set()
     mgr._cleared_plans = {}
     mgr._stale_plans = []
+    mgr._engine_poll_failing_since = {}
     mgr.chunked_transfer = False
     mgr._send_reads = {}
     mgr._timeout_s = 120.0
@@ -645,9 +646,12 @@ class TestGroupFailureDrainGate(unittest.TestCase):
             if reduce_count == 2:
                 tensor.fill_(int(KVPoll.Failed))
 
-        with patch("sglang.srt.disaggregation.utils.dist") as dist, patch(
-            "sglang.srt.disaggregation.utils._poll_with_failure_injection",
-            return_value=[int(KVPoll.Success)],
+        with (
+            patch("sglang.srt.disaggregation.utils.dist") as dist,
+            patch(
+                "sglang.srt.disaggregation.utils._poll_with_failure_injection",
+                return_value=[int(KVPoll.Success)],
+            ),
         ):
             dist.all_reduce = all_reduce
             polls = poll_and_all_reduce_attn_cp_tp_group([poller], cp_group, tp_group)
@@ -685,12 +689,16 @@ class TestGroupFailureDrainGate(unittest.TestCase):
             if reduce_count == 2:
                 tensor.fill_(int(KVPoll.Failed))
 
-        with patch("sglang.srt.disaggregation.utils.dist") as dist, patch(
-            "sglang.srt.disaggregation.utils._poll_with_failure_injection",
-            return_value=[int(KVPoll.Success)],
-        ), patch(
-            "sglang.srt.disaggregation.utils._apply_metadata_gate",
-            side_effect=lambda *args: events.append("metadata"),
+        with (
+            patch("sglang.srt.disaggregation.utils.dist") as dist,
+            patch(
+                "sglang.srt.disaggregation.utils._poll_with_failure_injection",
+                return_value=[int(KVPoll.Success)],
+            ),
+            patch(
+                "sglang.srt.disaggregation.utils._apply_metadata_gate",
+                side_effect=lambda *args: events.append("metadata"),
+            ),
         ):
             dist.all_reduce = all_reduce
             polls = poll_and_all_reduce(
@@ -873,6 +881,43 @@ class TestSenderLeaseSettlement(unittest.TestCase):
             mgr._settle_sender_reads_locked()
         self.assertFalse(mgr.sender_has_active_io(ROOM))
         self.assertNotIn(ROOM, mgr._send_reads)
+
+
+class TestPollStatsFailure(unittest.TestCase):
+    def test_raising_poll_is_retried_instead_of_killing_the_scheduler(self):
+        """A poll_stats raise must not escape the scheduler's poll; raiden
+        raises before taking any completion, so the next poll delivers it."""
+        mgr = _prefill_manager()
+        mgr._engine = Mock()
+        mgr.attn_tp_rank = 0
+        mgr._engine.poll_stats.side_effect = [
+            RuntimeError("injected complete_read"),
+            ([str(ROOM)], [], []),
+        ]
+        mgr._send_reads[ROOM] = {str(ROOM)}
+
+        mgr._drain_engine()
+        self.assertTrue(mgr.sender_has_active_io(ROOM))
+
+        mgr._drain_engine()
+        self.assertTrue(mgr.is_send_done(ROOM))
+        self.assertFalse(mgr.sender_has_active_io(ROOM))
+
+    def test_polls_failing_past_the_transfer_deadline_raise(self):
+        # No transfer can settle once polls fail for a whole deadline; a
+        # success in between starts the count over.
+        mgr = _prefill_manager()
+        mgr._engine = Mock()
+        mgr.attn_tp_rank = 0
+        broken = RuntimeError("injected complete_read")
+        mgr._engine.poll_stats.side_effect = [broken, ([], [], []), broken, broken]
+        mgr._monotonic = Mock(side_effect=[0.0, 200.0, 321.0])
+
+        mgr._drain_engine()
+        mgr._drain_engine()
+        mgr._drain_engine()
+        with self.assertRaisesRegex(RuntimeError, "transfer deadline"):
+            mgr._drain_engine()
 
 
 class TestFailureWaitsForActiveIo(unittest.TestCase):
@@ -1158,8 +1203,8 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         class PausingStatus(dict):
             paused = False
 
-            def __getitem__(self, room):
-                value = super().__getitem__(room)
+            def get(self, room, default=None):
+                value = super().get(room, default)
                 if threading.current_thread().name == "waiting" and not self.paused:
                     self.paused = True
                     inspected_waiting.set()
@@ -1198,8 +1243,8 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         class PausingStatus(dict):
             paused = False
 
-            def __getitem__(self, room):
-                value = super().__getitem__(room)
+            def get(self, room, default=None):
+                value = super().get(room, default)
                 if threading.current_thread().name == "waiting" and not self.paused:
                     self.paused = True
                     inspected_waiting.set()

@@ -7,11 +7,11 @@ import torch
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.srt.utils.custom_op import register_custom_op
 
+from .usp_relayout import _SUPPORTED_DTYPES, can_use_usp_merge_heads
+from .usp_relayout import usp_merge_heads as usp_merge_heads
+
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
-
-
-_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 @cache_once
@@ -26,7 +26,7 @@ def _jit_usp_relayout_module(dtype: torch.dtype) -> Module:
         cuda_wrappers=[
             (
                 "usp_merge_heads",
-                "usp_relayout::" f"UspMergeHeadsKernel<{args}>::run",
+                f"usp_relayout::UspMergeHeadsKernel<{args}>::run",
             ),
         ],
     )
@@ -50,18 +50,6 @@ def _usp_merge_heads_custom_op(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def can_use_usp_merge_heads(x: torch.Tensor) -> bool:
-    return (
-        isinstance(x, torch.Tensor)
-        and torch.version.hip is None
-        and x.is_cuda
-        and x.dtype in _SUPPORTED_DTYPES
-        and x.dim() == 5
-        and x.numel() > 0
-        and x.is_contiguous()
-    )
-
-
 def _usp_merge_heads_cuda(x: torch.Tensor) -> torch.Tensor:
     """[W, S, B, h_local, D] -> [B, S, W, h_local, D] contiguous.
 
@@ -71,15 +59,3 @@ def _usp_merge_heads_cuda(x: torch.Tensor) -> torch.Tensor:
     if not can_use_usp_merge_heads(x):
         raise RuntimeError("unsupported input for usp_merge_heads CUDA")
     return _usp_merge_heads_custom_op(x)
-
-
-def usp_merge_heads(x: torch.Tensor) -> torch.Tensor:
-    """Merge Ulysses output heads with an exact eager fallback.
-
-    The backend selection lives here so callers only express the layout
-    transformation. Unsupported devices, layouts, and compiled regions retain
-    the original PyTorch operation.
-    """
-    if not torch.compiler.is_compiling() and can_use_usp_merge_heads(x):
-        return _usp_merge_heads_cuda(x)
-    return x.permute(2, 1, 0, 3, 4).contiguous()
