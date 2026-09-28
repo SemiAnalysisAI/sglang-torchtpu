@@ -180,6 +180,71 @@ class TestTpuPlatformSurface(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAS_TORCH_TPU, "torch.device('tpu') needs torch_tpu")
+class TestSdpaQueryBroadcastMask(unittest.TestCase):
+    """torch_tpu SDPA returns NaN for masks that broadcast over queries."""
+
+    @staticmethod
+    def _tpu_query(*shape):
+        query = MagicMock()
+        query.device.type = "tpu"
+        query.shape = torch.Size(shape)
+        return query
+
+    def test_key_padding_mask_is_expanded_over_queries(self):
+        from sglang.multimodal_gen.runtime.platforms.tpu import (
+            _expand_query_broadcast_mask,
+        )
+
+        mask = torch.zeros(2, 1, 1, 8)
+        out = _expand_query_broadcast_mask(self._tpu_query(2, 4, 5, 64), mask)
+        self.assertEqual(out.shape, (2, 1, 5, 8))
+        # expand() is a view: no copy of the mask.
+        self.assertEqual(out.data_ptr(), mask.data_ptr())
+
+    def test_other_masks_are_untouched(self):
+        from sglang.multimodal_gen.runtime.platforms.tpu import (
+            _expand_query_broadcast_mask,
+        )
+
+        full = torch.zeros(2, 1, 5, 8)
+        self.assertIs(
+            _expand_query_broadcast_mask(self._tpu_query(2, 4, 5, 64), full), full
+        )
+        # Single-query attention needs no expansion.
+        row = torch.zeros(2, 1, 1, 8)
+        self.assertIs(
+            _expand_query_broadcast_mask(self._tpu_query(2, 4, 1, 64), row), row
+        )
+        self.assertIsNone(
+            _expand_query_broadcast_mask(self._tpu_query(2, 4, 5, 64), None)
+        )
+        # Non-TPU tensors are never touched.
+        cpu_query = torch.zeros(2, 4, 5, 64)
+        self.assertIs(_expand_query_broadcast_mask(cpu_query, row), row)
+
+    def test_patch_is_idempotent_and_preserves_results(self):
+        from sglang.multimodal_gen.runtime.platforms import tpu as tpu_mod
+
+        original = torch.nn.functional.scaled_dot_product_attention
+        try:
+            tpu_mod._patch_sdpa_query_broadcast_mask()
+            patched = torch.nn.functional.scaled_dot_product_attention
+            tpu_mod._patch_sdpa_query_broadcast_mask()
+            self.assertIs(torch.nn.functional.scaled_dot_product_attention, patched)
+
+            q, k, v = (torch.randn(1, 2, 5, 8) for _ in range(3))
+            mask = torch.zeros(1, 1, 1, 5)
+            mask[..., :2] = float("-inf")
+            torch.testing.assert_close(
+                patched(q, k, v, attn_mask=mask), original(q, k, v, attn_mask=mask)
+            )
+            torch.testing.assert_close(
+                patched(q, k, v, mask, 0.0, False), original(q, k, v, mask, 0.0, False)
+            )
+        finally:
+            torch.nn.functional.scaled_dot_product_attention = original
+
+
 class TestWorkerInitOnce(unittest.TestCase):
     def setUp(self):
         self.addCleanup(setattr, TpuPlatform, "_worker_initialized", False)
