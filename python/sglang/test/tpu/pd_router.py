@@ -6,10 +6,10 @@ decode engines. Historically each test open-coded::
     python -m sglang_router.launch_router --pd-disaggregation --mini-lb ...
 
 Centralizing the argv construction behind ``SGLANG_TPU_PD_ROUTER`` lets the
-same test run either the legacy in-process ``mini_lb`` loop (default, preserving
-current CI behavior) or the standalone ``experimental/sgl-router`` Rust binary
-(``sgl-router``) with ``cache_aware`` prefill routing and ``power_of_two``
-decode routing by flipping one environment variable.
+same test run the standalone ``experimental/sgl-router`` Rust binary
+(``sgl-router``, default ``smg``) with ``cache_aware`` prefill routing and
+``power_of_two`` decode routing, or fall back to the legacy in-process
+``mini_lb`` loop by flipping one environment variable.
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ def resolve_mode(
 ) -> str:
     """Resolve the router backend from ``mode`` or ``$SGLANG_TPU_PD_ROUTER``."""
     source = _env(env)
-    raw = mode if mode is not None else source.get(ENV_ROUTER_MODE, MINI_LB)
+    raw = mode if mode is not None else source.get(ENV_ROUTER_MODE, SMG)
     normalized = raw.strip().lower().replace("-", "_")
     if normalized == "sgl_router":
         normalized = SMG
@@ -231,13 +231,13 @@ def build_router_cmd(
     extra_args: Optional[Iterable[str]] = None,
     env: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, ...]:
-    """Build the router subprocess argv for either ``mini_lb`` or ``sgl-router``.
+    """Build the router subprocess argv for either ``sgl-router`` or ``mini_lb``.
 
-    With ``mode="mini_lb"`` and ``bootstrap_port=None`` this reproduces the argv
-    every TPU P/D test used before this helper existed, so the default path is
-    unchanged. In ``mode="smg"``, this launches ``experimental/sgl-router``
+    In ``mode="smg"`` (default), this launches ``experimental/sgl-router``
     (``sgl-router``), which discovers worker roles and bootstrap ports directly
-    from each worker's ``/server_info``.
+    from each worker's ``/server_info``. With ``mode="mini_lb"`` and
+    ``bootstrap_port=None`` this reproduces the legacy ``sglang_router.launch_router``
+    ``--mini-lb`` argv.
     """
     source = _env(env)
     resolved_mode = resolve_mode(mode, env=source)

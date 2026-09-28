@@ -298,7 +298,7 @@ class TestBenchMatrix(CustomTestCase):
             "PROFILE": "ci",
         }
         for env_val, expected in (
-            (None, "mini_lb"),
+            (None, "smg"),
             ("mini_lb", "mini_lb"),
             ("smg", "smg"),
         ):

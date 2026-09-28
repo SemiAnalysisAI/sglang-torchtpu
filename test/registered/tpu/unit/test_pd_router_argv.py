@@ -52,7 +52,43 @@ register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit")
 
 
 class TestPdRouterArgv(CustomTestCase):
-    def test_default_mode_is_mini_lb_and_preserves_legacy_argv(self):
+    def test_default_mode_is_smg_and_builds_sgl_router_argv(self):
+        self.assertEqual(DEFAULT_PREFILL_POLICY, "cache_aware")
+        self.assertEqual(DEFAULT_DECODE_POLICY, "power_of_two")
+        cmd = build_router_cmd(
+            python="python3",
+            prefill_url="http://10.0.0.1:8080",
+            decode_url="http://10.0.0.2:8081",
+            bootstrap_port=8998,
+            host="0.0.0.0",
+            port=8000,
+            model_id="gpt-oss-120b",
+            tokenizer_path="/models/gpt-oss-120b",
+            env={},
+        )
+        self.assertEqual(
+            cmd,
+            (
+                "sgl-router",
+                "--model-id",
+                "gpt-oss-120b",
+                "--tokenizer-path",
+                "/models/gpt-oss-120b",
+                "--worker-urls",
+                "http://10.0.0.1:8080",
+                "http://10.0.0.2:8081",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "8000",
+                "--policy",
+                "cache_aware",
+                "--decode-policy",
+                "power_of_two",
+            ),
+        )
+
+    def test_mini_lb_mode_preserves_legacy_argv(self):
         cmd = build_router_cmd(
             python="/opt/venv/bin/python3",
             prefill_url="http://10.0.0.1:8080",
@@ -60,7 +96,7 @@ class TestPdRouterArgv(CustomTestCase):
             bootstrap_port=8998,
             host="0.0.0.0",
             port=8000,
-            env={},
+            env={"SGLANG_TPU_PD_ROUTER": "mini_lb"},
         )
         self.assertEqual(
             cmd,
@@ -90,7 +126,7 @@ class TestPdRouterArgv(CustomTestCase):
             host="0.0.0.0",
             port=8000,
             request_timeout_secs=3600,
-            env={},
+            env={"SGLANG_TPU_PD_ROUTER": "mini_lb"},
         )
         self.assertEqual(
             cmd,
@@ -110,42 +146,6 @@ class TestPdRouterArgv(CustomTestCase):
                 "8000",
                 "--request-timeout-secs",
                 "3600",
-            ),
-        )
-
-    def test_smg_mode_builds_sgl_router_argv_with_defaults(self):
-        self.assertEqual(DEFAULT_PREFILL_POLICY, "cache_aware")
-        self.assertEqual(DEFAULT_DECODE_POLICY, "power_of_two")
-        cmd = build_router_cmd(
-            python="python3",
-            prefill_url="http://10.0.0.1:8080",
-            decode_url="http://10.0.0.2:8081",
-            bootstrap_port=8998,
-            host="0.0.0.0",
-            port=8000,
-            model_id="gpt-oss-120b",
-            tokenizer_path="/models/gpt-oss-120b",
-            env={"SGLANG_TPU_PD_ROUTER": "smg"},
-        )
-        self.assertEqual(
-            cmd,
-            (
-                "sgl-router",
-                "--model-id",
-                "gpt-oss-120b",
-                "--tokenizer-path",
-                "/models/gpt-oss-120b",
-                "--worker-urls",
-                "http://10.0.0.1:8080",
-                "http://10.0.0.2:8081",
-                "--host",
-                "0.0.0.0",
-                "--port",
-                "8000",
-                "--policy",
-                "cache_aware",
-                "--decode-policy",
-                "power_of_two",
             ),
         )
 
@@ -219,34 +219,39 @@ class TestPdRouterArgv(CustomTestCase):
     def test_router_ready_and_metrics_url(self):
         self.assertEqual(
             router_ready_url(host="127.0.0.1", port=8000, env={}),
-            "http://127.0.0.1:8000/health",
+            "http://127.0.0.1:8000/readyz",
         )
         self.assertEqual(
             router_ready_url(
                 host="127.0.0.1",
                 port=8000,
-                env={"SGLANG_TPU_PD_ROUTER": "smg"},
+                env={"SGLANG_TPU_PD_ROUTER": "mini_lb"},
             ),
-            "http://127.0.0.1:8000/readyz",
+            "http://127.0.0.1:8000/health",
         )
-        self.assertIsNone(router_metrics_url(host="127.0.0.1", env={}))
         self.assertEqual(
+            router_metrics_url(host="127.0.0.1", port=8000, env={}),
+            "http://127.0.0.1:8000/metrics",
+        )
+        self.assertIsNone(
             router_metrics_url(
                 host="127.0.0.1",
                 port=8000,
-                env={"SGLANG_TPU_PD_ROUTER": "smg"},
-            ),
-            "http://127.0.0.1:8000/metrics",
+                env={"SGLANG_TPU_PD_ROUTER": "mini_lb"},
+            )
         )
 
     def test_prefill_kv_events_args(self):
-        self.assertEqual(prefill_kv_events_args(env={}), ())
         self.assertEqual(
-            prefill_kv_events_args(env={"SGLANG_TPU_PD_ROUTER": "smg"}),
+            prefill_kv_events_args(env={}),
             (
                 "--kv-events-config",
                 '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}',
             ),
+        )
+        self.assertEqual(
+            prefill_kv_events_args(env={"SGLANG_TPU_PD_ROUTER": "mini_lb"}),
+            (),
         )
         self.assertEqual(
             prefill_kv_events_args(
@@ -269,7 +274,8 @@ class TestPdRouterArgv(CustomTestCase):
         )
 
     def test_resolve_mode_rejects_unknown_value(self):
-        self.assertEqual(resolve_mode(env={}), MINI_LB)
+        self.assertEqual(resolve_mode(env={}), SMG)
+        self.assertEqual(resolve_mode(env={"SGLANG_TPU_PD_ROUTER": "mini_lb"}), MINI_LB)
         self.assertEqual(resolve_mode("SMG"), SMG)
         self.assertEqual(resolve_mode("sgl-router"), SMG)
         with self.assertRaises(ValueError):
