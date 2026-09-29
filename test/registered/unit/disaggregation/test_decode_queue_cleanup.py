@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     HiCacheRestoreResult,
+    _max_transfer_slots_per_prefill,
 )
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
@@ -18,8 +19,9 @@ from sglang.srt.disaggregation.fake.conn import (
     FakeKVManager,
 )
 from sglang.srt.disaggregation.fake.conn import FakeKVReceiver as DisaggFakeKVReceiver
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -650,6 +652,115 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.output_streamer.stream_output.assert_called_once_with(
             [req], req.return_logprob
         )
+
+    def test_prefill_at_its_slot_cap_does_not_block_other_prefills(self):
+        """A slow prefill holding its share of transfer slots must not stall the
+        FIFO for rooms of other prefills queued behind it."""
+        override = get_context().override_server_args(
+            disaggregation_decode_enable_radix_cache=True
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        def decode_req(rid, port):
+            return SimpleNamespace(
+                req=SimpleNamespace(
+                    rid=rid,
+                    bootstrap_host="10.0.0.1",
+                    bootstrap_port=port,
+                    origin_input_ids=[0] * 31,
+                    output_ids=[],
+                    finished_reason=None,
+                    sampling_params=SimpleNamespace(max_new_tokens=1),
+                    kv=ReqKvInfo(),
+                    time_stats=MagicMock(),
+                ),
+                kv_receiver=MagicMock(spec=["send_metadata", "abort", "clear"]),
+                waiting_for_input=True,
+                is_rebootstrap=False,
+            )
+
+        slow_in_transfer = decode_req("slow-0", 8998)
+        slow_1, slow_2 = decode_req("slow-1", 8998), decode_req("slow-2", 8998)
+        healthy = decode_req("healthy", 8999)
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue._max_transfer_slots_per_prefill = 2
+        queue.pp_size = 1
+        queue.queue = [slow_1, slow_2, healthy]
+        queue.pending_reqs = []
+        queue._num_published_destinations = 0
+        queue.transfer_queue = SimpleNamespace(
+            enable_staging=False, queue=[slow_in_transfer]
+        )
+        queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+        queue.retracted_queue = []
+        queue.num_reserved_decode_tokens = 512
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=16384)
+        queue._radix_full_available = MagicMock(return_value=16384)
+        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue._match_prefix_and_lock = MagicMock(
+            return_value=SimpleNamespace(
+                prefix_indices=[],
+                l1_prefix_len=0,
+                decode_prefix_len=0,
+                restore_token_count=0,
+            )
+        )
+        queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=512)
+        queue.token_to_kv_pool_allocator.translate_kv_indices_for_transfer = (
+            lambda indices: indices
+        )
+        queue.tree_cache = MagicMock()
+
+        def allocate(req, _prefix_indices, _prefix_len, _total_prefix_len):
+            req.kv.req_pool_idx = 0
+            return torch.arange(31)
+
+        queue._pre_alloc = MagicMock(side_effect=allocate)
+        queue.req_to_token_pool = MagicMock()
+        queue.req_to_token_pool.available_size.return_value = 1
+        queue.req_to_token_pool.req_to_token = torch.arange(31).reshape(1, -1)
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
+
+        scheduler = MagicMock()
+        scheduler.running_batch.reqs = []
+        scheduler.enable_priority_scheduling = False
+        scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
+        scheduler.enable_decode_hicache = False
+        queue.scheduler = scheduler
+
+        preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [slow_1, healthy])
+        self.assertEqual(failed, [])
+        self.assertEqual(queue.queue, [slow_2])
+        slow_2.kv_receiver.send_metadata.assert_not_called()
+
+    def test_prefill_slot_cap_value(self):
+        raiden, mooncake = TransferBackend.RAIDEN, TransferBackend.MOONCAKE
+        for backend, num_req_slots, override, expected in (
+            (raiden, 64, None, 16),
+            (raiden, 8, None, 4),
+            (raiden, 64, 3, 3),
+            (raiden, 64, 0, 0),
+            (mooncake, 64, None, 0),
+        ):
+            with (
+                self.subTest(backend=backend, slots=num_req_slots, override=override),
+                envs.SGLANG_RAIDEN_MAX_TRANSFER_SLOTS_PER_PREFILL.override(override),
+            ):
+                self.assertEqual(
+                    _max_transfer_slots_per_prefill(
+                        transfer_backend=backend, num_req_slots=num_req_slots
+                    ),
+                    expected,
+                )
 
     def test_ensure_prefill_info_tolerates_cleared_receiver(self):
         # A req whose kv_receiver was already cleared must not crash on .abort().

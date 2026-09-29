@@ -23,7 +23,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -136,6 +136,19 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
+
+
+def _max_transfer_slots_per_prefill(
+    *, transfer_backend: TransferBackend, num_req_slots: int
+) -> int:
+    # 0 is uncapped. A quarter of the pool is arbitrary: a healthy prefill holds
+    # a few slots at a time, so only a slow one reaches the cap.
+    if transfer_backend != TransferBackend.RAIDEN:
+        return 0
+    override = envs.SGLANG_RAIDEN_MAX_TRANSFER_SLOTS_PER_PREFILL.get()
+    if override is not None:
+        return max(0, override)
+    return max(4, num_req_slots // 4)
 
 
 class DecodeReqToTokenPool:
@@ -368,6 +381,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     Store the requests that are preallocating.
     """
 
+    # Transfer slots one prefill may hold; 0 is uncapped. Set in __init__.
+    _max_transfer_slots_per_prefill: int = 0
+
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
@@ -414,6 +430,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pp_size = scheduler.ps.pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
+        # Bounds one prefill's share of the decode, so a slow prefill cannot fill it.
+        self._max_transfer_slots_per_prefill = _max_transfer_slots_per_prefill(
+            transfer_backend=transfer_backend,
+            num_req_slots=req_to_token_pool.size + req_to_token_pool.pre_alloc_size,
+        )
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
@@ -1305,6 +1326,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             running_loras.update(r.req.lora_id for r in self.transfer_queue.queue)
             running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
 
+        slot_cap = self._max_transfer_slots_per_prefill
+        slots_per_prefill = (
+            Counter(_bootstrap_addr(r.req) for r in self.transfer_queue.queue)
+            if slot_cap > 0
+            else None
+        )
+
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -1314,6 +1342,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if not decode_req.waiting_for_input:
+                continue
+
+            # Skip, not break: rooms of other prefills behind this one still fit.
+            if (
+                slots_per_prefill is not None
+                and slots_per_prefill[_bootstrap_addr(decode_req.req)] >= slot_cap
+            ):
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
@@ -1686,6 +1721,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.build_rebootstrap_payload(),
                 )
             self._num_published_destinations += 1
+            if slots_per_prefill is not None:
+                slots_per_prefill[_bootstrap_addr(decode_req.req)] += 1
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             if self.scheduler.enable_lora:

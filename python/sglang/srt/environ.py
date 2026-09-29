@@ -707,6 +707,9 @@ class Envs:
     # below fires. Off by default (no behavior/perf impact when disabled).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(False)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    # Raiden decode: transfer slots one prefill may hold; None derives it from
+    # the request pool, 0 is uncapped.
+    SGLANG_RAIDEN_MAX_TRANSFER_SLOTS_PER_PREFILL = EnvInt(None)
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
     )
