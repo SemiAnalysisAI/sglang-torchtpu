@@ -271,7 +271,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads = {}
 
         counter_index = self.layer_done_counter.update_producer()
-        ready_event = _get_device_module().Event()
+        dev_mod = _get_device_module()
+        ready_event = dev_mod.Event()
         ready_event.record()
         self.load_queue.put((counter_index, pending, ready_event))
         self.stats["load"] += len(pending)
@@ -369,7 +370,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
-        ready_event = _get_device_module().Event()
+        dev_mod = _get_device_module()
+        ready_event = dev_mod.Event()
         ready_event.record()
         self.offload_queue.put((expanded, tokens, ready_event))
         return True

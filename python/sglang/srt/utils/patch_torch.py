@@ -170,7 +170,13 @@ def monkey_patch_torch_tpu_env(
         physical_device = cfg.base_gpu_id + local_rank * cfg.gpu_id_step
         # Assign an individual TPU device to each rank.
         os.environ["TPU_VISIBLE_DEVICES"] = str(physical_device)
-    elif not cfg.use_ray and cfg.nnodes == 1 and "TPU_VISIBLE_DEVICES" not in os.environ:
+        os.environ["TPU_VISIBLE_CHIPS"] = str(physical_device)
+    elif (
+        not cfg.use_ray
+        and cfg.nnodes == 1
+        and "TPU_VISIBLE_DEVICES" not in os.environ
+        and "TPU_VISIBLE_CHIPS" not in os.environ
+    ):
         # In single-host multiprocessing spawn, allocate distinct TPU devices per worker
         physical_device = cfg.base_gpu_id + local_rank * cfg.gpu_id_step
         os.environ["TPU_VISIBLE_DEVICES"] = str(physical_device)
