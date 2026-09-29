@@ -20,7 +20,8 @@
 #     `compute_gdn.INVERT_BLOCK` (16) via `batch_align` (LCM of packing and
 #     INVERT_BLOCK), so `invert_triangular_matrix` never truncates the final
 #     <16 rows of a chunk — fixes GDN corruption when a chunk length is not a
-#     multiple of 16 (the GSM8K "rest is 1" bug).
+#     multiple of 16 (the GSM8K "rest is 1" bug);
+#   * `attention_mode` / `gate_lower_bound` add the KDA mode (per-channel gate).
 
 import functools
 import math
@@ -33,6 +34,7 @@ from jax.experimental.pallas import tpu as pltpu
 from sglang.srt.layers.attention.pallas.gdn import (
     compute_conv1d,
     compute_gdn,
+    compute_kda,
     config,
     memory_ref,
     metadata,
@@ -44,7 +46,7 @@ def inner_kernel(
     # Inputs.
     qkv_slot_ref: jax.Array,  # [seq, chunk, 1, dim_size]
     b_slot_ref: jax.Array,  # [seq, chunk, 1, num_v_heads]
-    a_slot_ref: jax.Array,  # [seq, chunk, 1, num_v_heads]
+    a_slot_ref: jax.Array,  # [seq, chunk, 1, gate_dim]
     conv_state_slot_ref: jax.Array,  # [seq, prev_kernel_size, 1, dim_size]
     recurrent_slot_ref: jax.Array,  # [seq, num_v_heads, kq_head, v_head]
     # Outputs.
@@ -128,14 +130,24 @@ def inner_kernel(
     # Step 2: GDN.
 
     # Prepare gdn weights.
-    padding_size = cfg.aligned_num_v_heads - cfg.num_v_heads
-    a_log = jnp.pad(weights_ref.gdn.a_log[...], ((0, padding_size)))
-    dt_bias = jnp.pad(weights_ref.gdn.dt_bias[...], ((0, padding_size)))
+    if cfg.is_kda:
+        # KDA reshapes these per (head, channel) rather than padding out to
+        # a lane multiple over heads.
+        a_log = weights_ref.gdn.a_log[...]
+        dt_bias = weights_ref.gdn.dt_bias[...]
+    else:
+        padding_size = cfg.aligned_num_v_heads - cfg.num_v_heads
+        a_log = jnp.pad(weights_ref.gdn.a_log[...], ((0, padding_size)))
+        dt_bias = jnp.pad(weights_ref.gdn.dt_bias[...], ((0, padding_size)))
 
     # NOTE: Ideally, we want to move this branching logic into gdn.py. However,
     # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
     # Passing refs into gdn.py breaks strict separation of concerns.
-    if cfg.chunk_size == 1:
+    # KDA runs the token recurrence for every chunk size.
+    if cfg.chunk_size == 1 or cfg.is_kda:
+        recurrent_fn = (
+            compute_kda.recurrent_kda if cfg.is_kda else compute_gdn.recurrent_gdn
+        )
         q_compact, k_compact, v_compact, b_compact, a_compact = (
             vmem_ldst.load_activation_as_compact(
                 qkv_vreg=qkv_out_compact,
@@ -146,7 +158,7 @@ def inner_kernel(
             )
         )
 
-        out, new_recurrent_state = compute_gdn.recurrent_gdn(
+        out, new_recurrent_state = recurrent_fn(
             q_compact=q_compact,
             k_compact=k_compact,
             v_compact=v_compact,
@@ -283,6 +295,8 @@ def outer_kernel(
         "d_k",
         "d_v",
         "kernel_size",
+        "attention_mode",
+        "gate_lower_bound",
         "decode_tile_size",
         "mixed_tile_size",
         "zero_initialize_out",
@@ -292,13 +306,13 @@ def outer_kernel(
 def fused_conv1d_gdn(
     qkv: jax.Array,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
     b: jax.Array,  # [batch_size, n_v]
-    a: jax.Array,  # [batch_size, n_v]
+    a: jax.Array,  # [batch_size, n_v]; [batch_size, n_v * d_k] for KDA
     conv_state: jax.Array,  # [num_seqs + 1, kernel_size - 1, dim_size]
     recurrent_state: jax.Array,  # [num_seqs + 1, nv, dk, dv]
     conv_weight: jax.Array,  # [kernel_size - 1, dim_size]
     conv_bias: jax.Array | None,  # [dim_size]
     a_log: jax.Array,  # [n_v]
-    dt_bias: jax.Array,  # [n_v]
+    dt_bias: jax.Array,  # [n_v]; [n_v, d_k] for KDA
     query_start_loc: jax.Array,  # [num_seqs + 1]
     state_indices: jax.Array,  # [num_seqs]
     distribution: jax.Array,  # [3]
@@ -309,6 +323,8 @@ def fused_conv1d_gdn(
     d_k: int,
     d_v: int,
     kernel_size: int,
+    attention_mode: config.AttentionMode = config.AttentionMode.GDN,
+    gate_lower_bound: float | None = None,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
@@ -321,7 +337,8 @@ def fused_conv1d_gdn(
         qkv: Mixed query, key, value input tensor of shape [batch_size, dim_size],
             where `dim_size = n_kq * d_k * 2 + n_v * d_v`.
         b: b tensor (for beta) of shape [batch_size, n_v].
-        a: a tensor (for g) of shape [batch_size, n_v].
+        a: a tensor (for g) of shape [batch_size, n_v]; [batch_size, n_v * d_k]
+            under KDA, whose gate is per-channel.
         conv_state: Convolution state cache tensor of shape [num_seqs + 1,
             kernel_size - 1, dim_size] containing the last (kernel_size - 1) tokens
             from the last sequence invocation. The first slot is a null block used for
@@ -334,7 +351,7 @@ def fused_conv1d_gdn(
         conv_weight: Convolution weight tensor of shape [kernel_size - 1, dim_size].
         conv_bias: Optional convolution bias tensor of shape [dim_size].
         a_log: a_log tensor of shape [n_v].
-        dt_bias: dt_bias tensor of shape [n_v].
+        dt_bias: dt_bias tensor of shape [n_v]; [n_v, d_k] under KDA.
         query_start_loc: Start locations of sequences of shape [num_seqs + 1].
         state_indices: Indices mapping sequences to state cache slots of shape
             [num_seqs].
@@ -346,6 +363,14 @@ def fused_conv1d_gdn(
         d_k: Key/query dimension.
         d_v: Value dimension.
         kernel_size: Convolution kernel size.
+        attention_mode: `GDN` for the per-head scalar gate, `KDA` for the
+            per-channel one.
+        gate_lower_bound: KDA only, and must be negative. `None` gives the
+            unbounded gate `-exp(A_log) * softplus(g + dt_bias)` (Kimi-Linear);
+            a float gives the bounded
+            `gate_lower_bound * sigmoid(exp(A_log) * (g + dt_bias))` (Kimi-K3).
+            Different functions of the same weights, so a mismatch with the
+            model's KDA config silently changes the decay.
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
@@ -369,6 +394,20 @@ def fused_conv1d_gdn(
     conv_state = conv_state.astype(jnp.float32)
 
     # Step 1: Validate inputs.
+    is_kda = attention_mode == config.AttentionMode.KDA
+    if gate_lower_bound is not None:
+        if not is_kda:
+            raise ValueError(
+                "gate_lower_bound only applies to KDA; got "
+                f"attention_mode={attention_mode}."
+            )
+        # The decay must stay below 1 (a non-positive log-decay), which
+        # `gate_lower_bound * sigmoid(.)` only satisfies for a negative bound.
+        if gate_lower_bound >= 0:
+            raise ValueError(
+                "gate_lower_bound must be negative (it bounds a log-decay); "
+                f"got {gate_lower_bound}."
+            )
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
     assert conv_weight.shape == (dim, 1, kernel_size)
@@ -402,9 +441,13 @@ def fused_conv1d_gdn(
 
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
+    # KDA's gate carries d_k channels per value head, so it pads out to a
+    # lane multiple of n_v * d_k rather than of n_v.
+    gate_dim = n_v * d_k if is_kda else n_v
+    gate_padding_size = pl.cdiv(gate_dim, num_lanes) * num_lanes - gate_dim
     qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
-    a = jnp.pad(a, ((0, batch_padding_size), (0, num_v_padding_size)))
+    a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
     qkv = qkv.reshape(padded_batch_size, 1, -1)
     b = b.reshape(padded_batch_size, 1, -1)
@@ -450,6 +493,8 @@ def fused_conv1d_gdn(
             num_v_heads=n_v,
             kq_head_dim=d_k,
             v_head_dim=d_v,
+            attention_mode=attention_mode,
+            gate_lower_bound=gate_lower_bound,
             dtypes=config.Dtypes(
                 act_in=act_in_dtype,
                 act_out=act_out_dtype,

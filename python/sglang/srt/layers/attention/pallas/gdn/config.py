@@ -14,8 +14,8 @@
 #
 # Adapted for SGLang-TorchTPU from vllm-project/tpu-inference
 # `tpu_inference.kernels.gdn.v3.config` (Apache-2.0).
-# Changes: no functional changes and no sibling imports to rebase; reformatted
-# to the repo's black/isort style.
+# Changes: adds the KDA attention mode (per-channel gate); reformatted to the
+# repo's style.
 
 import dataclasses
 import enum
@@ -25,6 +25,14 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+
+class AttentionMode(enum.StrEnum):
+    # Gated Delta Net: one scalar gate per value head.
+    GDN = enum.auto()
+    # Kimi Delta Attention: the gate is per-channel, so it carries
+    # `kq_head_dim` values per value head instead of one.
+    KDA = enum.auto()
 
 
 class GDNMode(enum.StrEnum):
@@ -65,6 +73,10 @@ class GDNConfig:
     num_v_heads: int
     kq_head_dim: int
     v_head_dim: int
+    attention_mode: AttentionMode = AttentionMode.GDN
+    # KDA only, and must be negative. Selects the bounded gate form over the
+    # unbounded one; see `fused_conv1d_gdn` for the two and their validation.
+    gate_lower_bound: float | None = None
     num_buffers: int = 2
 
     @property
@@ -97,9 +109,25 @@ class GDNConfig:
         num_lanes = tpu_info.num_lanes
         return pl.cdiv(self.num_v_heads, num_lanes) * num_lanes
 
+    @property
+    def is_kda(self) -> bool:
+        return self.attention_mode == AttentionMode.KDA
+
+    @property
+    def gate_dim(self) -> int:
+        """Width of the gate activation `a`, in elements per token."""
+        if self.is_kda:
+            return self.num_v_heads * self.kq_head_dim
+        return self.num_v_heads
+
+    @property
+    def aligned_gate_dim(self) -> int:
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        return pl.cdiv(self.gate_dim, num_lanes) * num_lanes
+
     def get_kernel_name(self) -> str:
-        prefix = f"fused_conv1d_gdn_{self.mode.value}"
-        return prefix
+        suffix = "_bounded" if self.is_kda and self.gate_lower_bound is not None else ""
+        return f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}{suffix}"
 
     def get_metadata(self) -> dict[str, str | int | float]:
         cfgs_dict = dataclasses.asdict(self)

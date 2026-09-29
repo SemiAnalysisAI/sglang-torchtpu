@@ -226,7 +226,18 @@ def load_activation_as_compact(
     qkv_vmem_ref[...] = qkv_vreg
     q_compact, k_compact, v_compact = load_as_qkv_compact(qkv_vmem_ref, cfgs)
     b_compact = jnp.expand_dims(b_vmem_ref[...], axis=1)
-    a_compact = jnp.expand_dims(a_vmem_ref[...], axis=1)
+    if cfgs.is_kda:
+        # KDA's gate is per-channel: split it into heads like q/k/v,
+        # [seq_tile_size, num_v_heads, chunk_size, 1, kq_head_dim].
+        a_compact = jnp.stack(
+            [
+                a_vmem_ref[..., h * cfgs.kq_head_dim : (h + 1) * cfgs.kq_head_dim]
+                for h in range(cfgs.num_v_heads)
+            ],
+            axis=1,
+        )
+    else:
+        a_compact = jnp.expand_dims(a_vmem_ref[...], axis=1)
     return q_compact, k_compact, v_compact, b_compact, a_compact
 
 
