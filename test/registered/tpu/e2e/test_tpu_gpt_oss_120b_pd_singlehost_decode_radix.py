@@ -278,7 +278,7 @@ def _generate(
         f"{base_url}/v1/chat/completions",
         {
             "model": SERVED_MODEL_NAME,
-            "messages": [],
+            "messages": [{"role": "user", "content": ""}],
             "input_ids": input_ids,
             "temperature": 0,
             "max_tokens": max_new_tokens,

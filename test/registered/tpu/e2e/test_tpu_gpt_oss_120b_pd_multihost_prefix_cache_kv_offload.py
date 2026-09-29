@@ -518,19 +518,33 @@ class GenerationRecord(msgspec.Struct, frozen=True, kw_only=True):
     latency_seconds: float
 
 
+def _tokenize(prompt: str, model: str) -> Tuple[int, ...]:
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{PREFILL_PORT}/tokenize",
+        data=json.dumps(
+            {"model": model, "prompt": prompt, "add_special_tokens": False}
+        ).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return tuple(json.loads(resp.read())["tokens"])
+
+
 def _generate(
     base_url: str,
     prompt: str,
     max_new_tokens: int,
     model: str = "gpt-oss-120b",
 ) -> GenerationRecord:
+    input_ids = _tokenize(prompt, model)
     started = time.perf_counter()
     req = urllib.request.Request(
         base_url.rstrip("/") + "/v1/chat/completions",
         data=json.dumps(
             {
                 "model": model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [{"role": "user", "content": ""}],
+                "input_ids": list(input_ids),
                 "temperature": 0.0,
                 "max_tokens": max_new_tokens,
                 "separate_reasoning": False,
