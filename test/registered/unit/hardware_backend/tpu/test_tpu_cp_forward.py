@@ -57,14 +57,17 @@ def _expand_write_segments(segments, num_segments):
 
 class _FakeGatherGroup:
     """Context-parallel group of ``world_size`` ranks whose all-gather places
-    this rank's rows first and ``other_rows`` (rank-major) after them."""
+    this rank's rows first and ``other_rows`` (rank-major) after them; with
+    ``per_call`` the other ranks' tensors are consumed one list per call."""
 
-    def __init__(self, world_size, other_rows):
+    def __init__(self, world_size, other_rows, per_call=False):
         self.world_size = world_size
-        self.other_rows = other_rows
+        self.other_rows = list(other_rows)
+        self.per_call = per_call
 
     def all_gather_into_tensor(self, output, input):
-        output.copy_(torch.cat([input] + self.other_rows, dim=0))
+        others = self.other_rows.pop(0) if self.per_call else self.other_rows
+        output.copy_(torch.cat([input] + others, dim=0))
 
 
 class _FakeReduceGroup:
@@ -344,17 +347,27 @@ class TestFusedKvRows(unittest.TestCase):
 class TestAllGatherAndWriteKv(unittest.TestCase):
     def _run(self, dtype):
         torch.manual_seed(0)
-        k0 = torch.randn(4, 1, 128).to(dtype)
-        v0 = torch.randn(4, 1, 128).to(dtype)
-        k1 = torch.randn(4, 1, 128).to(dtype)
-        v1 = torch.randn(4, 1, 128).to(dtype)
+        k0 = torch.randn(4, 1, 128, dtype=torch.bfloat16)
+        v0 = torch.randn(4, 1, 128, dtype=torch.bfloat16)
+        k1 = torch.randn(4, 1, 128, dtype=torch.bfloat16)
+        v1 = torch.randn(4, 1, 128, dtype=torch.bfloat16)
         kv_cache = torch.zeros(8, 4, 1, 2, 128, dtype=dtype)
         # Rank 0 owns slots 5, 6, 9, 10; rank 1 owns 17, 18 and two padding rows.
         dest_slots = torch.tensor([5, 6, 9, 10, 17, 18, 0, 0])
         segments, count = kv_write_segments(
             dest_slots.numpy(), np.array([1, 1, 1, 1, 1, 1, 0, 0], dtype=bool)
         )
-        group = _FakeGatherGroup(2, [fused_kv_rows(k1, v1, kv_cache)])
+        if dtype == torch.float8_e4m3fn:
+            # An fp8 pool gathers the bf16 K/V (one all-gather each) and
+            # quantizes the gathered rows.
+            quantize = lambda k, v: (k.to(dtype), v.to(dtype))  # noqa: E731
+            group = _FakeGatherGroup(2, [[k1], [v1]], per_call=True)
+            k1q, v1q = quantize(k1, v1)
+            k0q, v0q = quantize(k0, v0)
+        else:
+            quantize = None
+            group = _FakeGatherGroup(2, [fused_kv_rows(k1, v1, kv_cache)])
+            k0q, v0q, k1q, v1q = k0, v0, k1, v1
         all_gather_and_write_kv(
             kv_cache=kv_cache,
             k=k0,
@@ -362,6 +375,7 @@ class TestAllGatherAndWriteKv(unittest.TestCase):
             write_segments=segments,
             write_num_segments=torch.tensor([count], dtype=torch.int32),
             group=group,
+            quantize=quantize,
         )
         flat = (
             kv_cache.view(torch.uint8).flatten(0, 1)
@@ -369,7 +383,8 @@ class TestAllGatherAndWriteKv(unittest.TestCase):
             else kv_cache.flatten(0, 1)
         )
         expected = torch.cat(
-            [fused_kv_rows(k0, v0, kv_cache), fused_kv_rows(k1, v1, kv_cache)], dim=0
+            [fused_kv_rows(k0q, v0q, kv_cache), fused_kv_rows(k1q, v1q, kv_cache)],
+            dim=0,
         )
         for row, slot in enumerate(dest_slots.tolist()[:6]):
             self.assertTrue(torch.equal(flat[slot], expected[row]))
