@@ -342,6 +342,25 @@ class RaidenSenderMixin:
     def _settle_sender_reads_locked(self) -> None:
         settled = self._completed_send | self._native_failed
         for room, reads in list(self._send_reads.items()):
+            closing_done = str(room) in self._completed_send and (
+                self._swa_engine is None
+                or self._swa_req_id(room) in self._completed_send
+            )
+            if closing_done:
+                # The closing read covers the whole sequence of pages requested
+                # by decode (whole_pull_registration). Decode issues the closing
+                # read only after every earlier chunk read settled, and drops any
+                # late chunks after final_seen. Raiden cannot cancel a read, so
+                # any unpulled chunk leases will expire at the native deadline;
+                # record them as superseded so _drain_engine discards their failure.
+                unsettled = reads - settled
+                if unsettled:
+                    superseded = getattr(self, "_superseded_sender_reads", None)
+                    if superseded is None:
+                        superseded = self._superseded_sender_reads = set()
+                    superseded.update(unsettled)
+                self._send_reads.pop(room, None)
+                continue
             reads -= settled
             if not reads:
                 self._send_reads.pop(room, None)
