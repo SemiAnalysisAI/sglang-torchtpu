@@ -276,6 +276,14 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
             self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
+    def test_platform_radix_cache_wins_over_the_unified_default(self):
+        ctx = _make_ctx(self, enable_hierarchical_cache=True)
+        fake_platform = MagicMock()
+        with patch("sglang.srt.platforms.current_platform", fake_platform):
+            result = default_radix_cache_factory(ctx)
+        fake_platform.create_radix_cache.assert_called_once_with(ctx)
+        self.assertIs(result, fake_platform.create_radix_cache.return_value)
+
     def test_unified_radix_cache_when_hierarchical_and_hybrid_ssm(self):
         ctx = _make_ctx(self, enable_hierarchical_cache=True, is_hybrid_ssm=True)
         # Hybrid SSM with hierarchical cache now uses UnifiedRadixCache.

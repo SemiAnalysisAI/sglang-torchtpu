@@ -19,6 +19,7 @@ from sglang.srt.platforms.interface import SRTPlatform
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.server_args import ServerArgs
 
 logger = get_logger(__name__)
@@ -616,6 +617,25 @@ class TpuSRTPlatform(SRTPlatform):
 
     def validate_hicache_args(self, server_args: ServerArgs) -> None:
         _validate_hicache_io_backend(server_args)
+
+    def create_radix_cache(self, ctx) -> Optional[BasePrefixCache]:
+        from sglang.srt.runtime_context import get_memory
+
+        if not (
+            ctx.enable_hierarchical_cache
+            and get_memory().hicache_io_backend == "torch_tpu"
+            and not (ctx.is_hybrid_ssm or ctx.is_hybrid_swa or ctx.is_dsa)
+        ):
+            return None
+        # torch_tpu's HiCache data plane (TpuHiCacheController) lives on HiRadixCache;
+        # the unified tree's HybridCacheController has a TPU variant for raiden only.
+        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+
+        cache = HiRadixCache(params=ctx.params, server_args=ctx.server_args)
+        ctx.tp_worker.register_hicache_layer_transfer_counter(
+            cache.cache_controller.layer_done_counter
+        )
+        return cache
 
     def get_mla_kv_pool_cls(self) -> type:
         # pallas_tpu_mla uses the paged fused latent layout the MLA v2 kernel

@@ -18,6 +18,7 @@ from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 # Re-export for convenience
 __all__ = ["SRTPlatform", "PlatformEnum"]
@@ -84,6 +85,16 @@ class SRTPlatform(DeviceMixin):
         ``--hicache-io-backend`` values override this to validate them.
         """
         pass
+
+    def create_radix_cache(self, ctx) -> Optional[BasePrefixCache]:
+        """Build the radix cache when this platform needs a specific one.
+
+        ``ctx`` is a ``mem_cache.registry.TreeCacheBuildContext``. Called by
+        the default selection chain after the chunk-cache and pure-SWA cases.
+        Default: None, which keeps the built-in chain (e.g. TPU returns a
+        HiRadixCache for its torch_tpu HiCache io backend).
+        """
+        return None
 
     def get_mamba_pool_cls(self) -> type:
         """Return the recurrent (GDN / mamba) state pool class for this platform."""
