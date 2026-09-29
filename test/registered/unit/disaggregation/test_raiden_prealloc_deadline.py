@@ -1,7 +1,6 @@
 """A decode room that waits too long for a slot is shed, retryably, and the
 prefill is told to release its copy."""
 
-import os
 import threading
 import unittest
 from http import HTTPStatus
@@ -15,6 +14,7 @@ from sglang.srt.disaggregation.raiden import receiver as receiver_module
 from sglang.srt.disaggregation.raiden.conn import RaidenKVManager, RaidenKVReceiver
 from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
 from sglang.srt.disaggregation.raiden.state import DecodeState
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -113,23 +113,21 @@ class TestPreallocDeadline(unittest.TestCase):
 
 
 class TestPreallocTimeoutKnob(unittest.TestCase):
-    def _resolve(self, value=None, bootstrap=300):
-        with patch.dict(
-            os.environ, {"SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": str(bootstrap)}
+    def _resolve(self, value, bootstrap=300):
+        with (
+            envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.override(bootstrap),
+            envs.SGLANG_RAIDEN_PREALLOC_TIMEOUT_S.override(value),
         ):
-            os.environ.pop("SGLANG_RAIDEN_PREALLOC_TIMEOUT_S", None)
-            if value is not None:
-                os.environ["SGLANG_RAIDEN_PREALLOC_TIMEOUT_S"] = value
             return conn_module._prealloc_timeout_s()
 
     def test_clamped_below_the_prefill_silence_timeout(self):
-        self.assertEqual(self._resolve("400"), 270.0)
-        self.assertEqual(self._resolve("60", bootstrap=60), 30.0)
-        self.assertEqual(self._resolve("60", bootstrap=10), 1.0)
+        self.assertEqual(self._resolve(400), 270.0)
+        self.assertEqual(self._resolve(60, bootstrap=60), 30.0)
+        self.assertEqual(self._resolve(60, bootstrap=10), 1.0)
 
     def test_non_positive_disables(self):
-        self.assertEqual(self._resolve("0"), 0.0)
-        self.assertEqual(self._resolve("-5"), 0.0)
+        self.assertEqual(self._resolve(0), 0.0)
+        self.assertEqual(self._resolve(-5), 0.0)
 
 
 class TestShedStatusCode(unittest.TestCase):

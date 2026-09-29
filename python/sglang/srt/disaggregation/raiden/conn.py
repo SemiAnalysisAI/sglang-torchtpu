@@ -92,7 +92,7 @@ __all__ = [
 def _prealloc_timeout_s() -> float:
     # Must stay below the prefill's decode-silence timeout: a room the prefill
     # failed first is dropped when pulled, holding the decode slot until waiting times out.
-    timeout = float(os.environ.get("SGLANG_RAIDEN_PREALLOC_TIMEOUT_S", "60"))
+    timeout = envs.SGLANG_RAIDEN_PREALLOC_TIMEOUT_S.get()
     if timeout <= 0:
         return 0.0
     limit = max(1.0, envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get() - 30.0)

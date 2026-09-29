@@ -707,6 +707,8 @@ class Envs:
     # below fires. Off by default (no behavior/perf impact when disabled).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(False)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    # Raiden decode: seconds a room may wait for a slot before it is shed; <= 0 is off.
+    SGLANG_RAIDEN_PREALLOC_TIMEOUT_S = EnvFloat(60.0)
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
     )
