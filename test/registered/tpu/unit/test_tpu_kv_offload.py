@@ -132,10 +132,10 @@ def _make_controller(target_dev, target_host):
     write/load rounds touch (the full __init__ wires storage/prefetch threads
     irrelevant to these tests)."""
     from sglang.srt.hardware_backend.tpu.kv_copy_worker import TpuKvCopyWorker
-    from sglang.srt.managers.cache_controller import (
-        BatchDoneCounter,
+    from sglang.srt.hardware_backend.tpu.torch_tpu_cache_controller import (
         TpuHiCacheController,
     )
+    from sglang.srt.managers.cache_controller import BatchDoneCounter
 
     controller = TpuHiCacheController.__new__(TpuHiCacheController)
     controller.io_backend = "torch_tpu"
