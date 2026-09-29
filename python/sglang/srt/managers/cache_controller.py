@@ -465,10 +465,14 @@ class HiCacheController:
 
     @classmethod
     def create_for_backend(cls, *args, **kwargs) -> HiCacheController:
-        """Instantiate the backend-appropriate controller. The torch_tpu data
-        plane uses the TpuHiCacheController subclass (batch-granular gating +
-        copy-worker threads instead of device streams)."""
+        """Instantiate the io-backend-specific controller. The TPU io backends
+        (torch_tpu, raiden) have no device streams and bring their own
+        controller classes."""
         if kwargs.get("io_backend") == "torch_tpu":
+            from sglang.srt.hardware_backend.tpu.torch_tpu_cache_controller import (
+                TpuHiCacheController,
+            )
+
             return TpuHiCacheController(*args, **kwargs)
         if kwargs.get("io_backend") == "raiden":
             from sglang.srt.hardware_backend.tpu.raiden_cache_controller import (
@@ -949,8 +953,6 @@ class HiCacheController:
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
             return None
-        if self.io_backend == "torch_tpu":
-            device_indices = device_indices.cpu()
         self.load_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
@@ -995,8 +997,6 @@ class HiCacheController:
                     host_indices = to_device_no_sync(host_indices, self.device)
                 return host_indices, device_indices
             return host_indices, device_indices.cpu()
-        elif self.io_backend == "torch_tpu":
-            return host_indices.cpu(), device_indices.to(self.device, non_blocking=True)
         else:
             raise ValueError(f"Unsupported io backend")
 
@@ -1447,137 +1447,3 @@ class HiCacheController:
                 self.prefetch_completion_sync_groups,
             )
             ack.completed_tokens = completed_tokens_tensor.item()
-
-
-class TpuHiCacheController(HiCacheController):
-    """torch_tpu data plane for HiCache.
-
-    Swaps the device-stream machinery for a batch-granular BatchDoneCounter and
-    per-direction TpuKvCopyWorker threads (torch_tpu has no per-layer device
-    streams, and gates the whole forward at once). Only __init__ and the
-    load/backup dispatch differ; everything else is inherited.
-
-    Draft KV follows the same logistics: draft and target
-    share device slot indices and the draft host pool is sized to the target's
-    slot count, so each backup/reload reuses the target's index pair for a
-    second gather/copy on the draft pools, covered by the same done-event.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        from sglang.srt.hardware_backend.tpu.kv_copy_worker import TpuKvCopyWorker
-
-        # Whole-batch gate instead of the per-layer device-stream counter; the
-        # base already registered a LayerDoneCounter, so swap + re-register.
-        self.layer_done_counter = BatchDoneCounter()
-        self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
-        # One copy worker per direction; they must not share a thread (a slow
-        # D2H must not head-of-line block an H2D, and vice versa).
-        self._load_worker = TpuKvCopyWorker("kv-offload-h2d")
-        # Depth-1 async write-back (see start_writing).
-        self._backup_worker = TpuKvCopyWorker("kv-offload-d2h")
-        self._backup_inflight = None  # _ThreadDoneEvent | None
-
-    def reset(self):
-        if self._backup_inflight is not None:
-            self._backup_inflight.synchronize()
-            self._backup_inflight = None
-        # FIFO workers: a submitted sentinel completes only after every prior
-        # transfer task, so synchronizing on it drains the queue.
-        self._load_worker.submit(lambda: None).synchronize()
-        self._backup_worker.submit(lambda: None).synchronize()
-        self.layer_done_counter.reset()
-        super().reset()
-
-    def evict_device(self, device_indices: torch.Tensor) -> int:
-        """Eviction lifecycle: land all pending reload commits, then free.
-
-        Ordering invariant (commit-before-free): a staged-but-uncommitted
-        reload targeting these pages must scatter into the kv_buffers while
-        the pages are still owned by their node; freeing first would let a
-        later commit write stale bytes over whoever reallocates them.
-        """
-        self.layer_done_counter.drain_commits()
-        return super().evict_device(device_indices)
-
-    def start_writing(self) -> None:
-        if len(self.write_queue) == 0:
-            return
-
-        op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices = self.move_indices(
-            op.host_indices, op.device_indices
-        )
-        self.write_queue.clear()
-
-        # Async write-back (depth-1): gather inline (reads KV before the next
-        # forward donates it), drain the slow D2H on the worker thread. Block on
-        # the previous backup first to bound in-flight gathered HBM.
-        if self._backup_inflight is not None:
-            self._backup_inflight.synchronize()
-
-        # Write-back lifecycle: land pending reload commits, then gather.
-        # Ordering invariant (commit-before-read): backing up a just-reloaded
-        # node must gather post-reload bytes, so its scatter lands first.
-        self.layer_done_counter.drain_commits()
-
-        staged = self.mem_pool_host.backup_gather(self.mem_pool_device, device_indices)
-
-        mem_pool_host = self.mem_pool_host
-
-        def _drain():
-            if staged is not None:
-                mem_pool_host.backup_copy_d2h(staged, host_indices)
-
-        done = self._backup_worker.submit(_drain)
-        self._backup_inflight = done
-        # Real event: writing_check must see the D2H land before unlocking.
-        self.ack_write_queue.append(HiCacheAck(done, done, op.node_ids))
-
-    def start_loading(self) -> int:
-        if len(self.load_queue) == 0:
-            return -1
-
-        # A dedicated producer thread does the H2D copy + scatter for all layers,
-        # then signals the round done; CompiledForwardShim gates the forward on
-        # it (no per-layer device events on torch_tpu).
-        op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices = self.move_indices(
-            op.host_indices, op.device_indices
-        )
-        self.load_queue.clear()
-
-        producer_id = self.layer_done_counter.update_producer()
-
-        mem_pool_host = self.mem_pool_host
-        mem_pool_device = self.mem_pool_device
-
-        # Reload lifecycle: the worker thread STAGES (host gather + H2D into
-        # fresh tensors); the scatter into live kv_buffers is deferred as a
-        # commit closure that BatchDoneCounter runs at its gate points on the
-        # scheduler thread. Donation safety: worker threads never touch the
-        # (donatable) kv_buffer handles — only the dispatch thread commits.
-        # Values are load_stage's (src_all staging tensor, padded dst page ids).
-        staged: dict[str, Optional[tuple[torch.Tensor, torch.Tensor]]] = {}
-
-        def _producer():
-            staged["target"] = mem_pool_host.load_stage(
-                mem_pool_device, host_indices, device_indices
-            )
-
-        def _commit():
-            mem_pool_host.load_commit(mem_pool_device, staged.get("target"))
-
-        # Worker event = staging enqueued (gather done, async H2D issued); the
-        # commit scatter's operand dependency covers the DMA landing.
-        worker_done = self._load_worker.submit(_producer)
-        self.layer_done_counter.set_event(producer_id, worker_done)
-        self.layer_done_counter.add_commit(worker_done, _commit)
-        self.ack_load_queue.append(
-            HiCacheAck(
-                start_event=worker_done,
-                finish_event=worker_done,
-                node_ids=op.node_ids,
-            )
-        )
-        return producer_id
