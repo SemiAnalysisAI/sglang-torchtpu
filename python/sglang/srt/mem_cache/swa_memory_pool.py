@@ -42,6 +42,7 @@ class SWAKVPool(BaseSWAKVPool):
         swa_kv_pool_class: Optional[type] = None,
         full_kv_pool_kwargs: Optional[dict] = None,
         swa_kv_pool_kwargs: Optional[dict] = None,
+        start_layer: int = 0,
         **kwargs,
     ):
         self.size = size
@@ -53,7 +54,10 @@ class SWAKVPool(BaseSWAKVPool):
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
         self.layer_num = self.full_layer_nums + self.swa_layer_nums
-        self.start_layer = 0
+        # The sub-pools index their own layers from 0; this is the global id
+        # callers walk [start_layer, +layer_num) from, so it is the pipeline
+        # stage's first layer and 0 without pipeline parallelism.
+        self.start_layer = start_layer
         self.page_size = page_size
         self.layer_transfer_counter = None
 
@@ -219,6 +223,15 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_value_buffer(layer_id_pool)
 
+    def get_v_head_dim(self):
+        # The FULL side's dim, as HybridLinearKVPool.get_v_head_dim(): a caller
+        # asking a pool for "the" v_head_dim wants the full-attention geometry.
+        # `start_layer`, not 0, so pipeline parallelism (start_layer > 0) works,
+        # and because layer 0 need not be a full-attention layer.
+        return self.full_kv_pool.get_value_buffer(self.full_kv_pool.start_layer).shape[
+            -1
+        ]
+
     def get_kv_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
@@ -372,10 +385,12 @@ class SWAKVPool(BaseSWAKVPool):
             return swa_kv_cpu
         return self.swa_kv_pool.filter_cpu_copy(swa_kv_cpu, row_mask)
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         # For SWA, we need to copy KV cache from both full and SWA pools
         # The indices are for the full pool, and we use mapping to get SWA indices
-        full_kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
+        full_kv_cpu = self.full_kv_pool.get_cpu_copy(
+            indices, req_pool_index=req_pool_index
+        )
 
         swa_mask = None
         if self.full_to_swa_index_mapping is not None:
@@ -395,14 +410,18 @@ class SWAKVPool(BaseSWAKVPool):
 
         return {"full": full_kv_cpu, "swa": swa_kv_cpu, "swa_mask": swa_mask}
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         # Load KV cache back from CPU to both full and SWA pools
         # Note: indices here are NEW indices (newly allocated), different from get_cpu_copy indices
         full_kv_cpu = kv_cache_cpu["full"]
         swa_kv_cpu = kv_cache_cpu["swa"]
 
         # Load full KV cache to the new indices
-        self.full_kv_pool.load_cpu_copy(full_kv_cpu, indices)
+        self.full_kv_pool.load_cpu_copy(
+            full_kv_cpu, indices, req_pool_index=req_pool_index
+        )
 
         # Load SWA KV cache if it exists
         if swa_kv_cpu is not None and self.full_to_swa_index_mapping is not None:

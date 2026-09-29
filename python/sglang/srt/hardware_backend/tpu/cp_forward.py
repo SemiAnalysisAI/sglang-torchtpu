@@ -175,6 +175,7 @@ def prepare_tpu_cp_forward_batch(
         forward_batch,
         pad_t=None,
         pad_b=pad_b,
+        real_b=real_b,
         is_draft_extend_v2=False,
     )
     metadata = forward_batch.attn_cp_metadata

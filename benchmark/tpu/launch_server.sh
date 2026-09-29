@@ -55,6 +55,11 @@
 #   HOST=127.0.0.1
 #   PORT=30000
 #   TP_SIZE=8                      # tensor-parallel ranks (= chiplets)
+#   PP_SIZE=1                      # pipeline stages; >1 passes --pp-size N and
+#                                  # requires TP_SIZE=1 (one chiplet per stage,
+#                                  # TP_SIZE*PP_SIZE chiplets in all)
+#   PP_MAX_MICRO_BATCH_SIZE=       # requests per pipeline microbatch; passed
+#                                  # only when set (default MAX_RUNNING/PP_SIZE)
 #   EP_SIZE=                       # expert-parallel ranks; passed only when set.
 #                                  # Default off (sglang ep_size=1: experts run
 #                                  # tensor-parallel within the TP group). For a
@@ -100,10 +105,10 @@
 #   KV_OFFLOAD=0                   # 1 → --enable-hierarchical-cache (+ knobs below)
 #   HICACHE_RATIO=2.0              # host pool size / device pool size
 #   HICACHE_SIZE=                  # absolute host pool GB; overrides HICACHE_RATIO
-#   HICACHE_IO_BACKEND=torch_tpu   # TPU host<->HBM transfer path. torch_tpu
-#                                  # REQUIRES ATTENTION_BACKEND=pallas_tpu_rpa_v3
-#                                  # and mem-layout page_first_fused (server_args
-#                                  # rejects other combinations).
+#   HICACHE_IO_BACKEND=torch_tpu   # TPU host<->HBM transfer path (torch_tpu or
+#                                  # raiden). Needs mem-layout page_first_fused
+#                                  # and a Pallas RPA backend whose KV pool
+#                                  # supports it (server_args rejects the rest).
 #   HICACHE_MEM_LAYOUT=page_first_fused
 #   HICACHE_WRITE_POLICY=          # write_through | write_through_selective |
 #                                  # write_back; unset → sglang default
@@ -214,6 +219,10 @@ else
 fi
 
 TP_SIZE=${TP_SIZE:-$DEFAULT_TP}
+PP_SIZE=${PP_SIZE:-1}
+PP_MAX_MICRO_BATCH_SIZE=${PP_MAX_MICRO_BATCH_SIZE:-}
+# One PjRt device per scheduler process: TP ranks per stage times stages.
+WORLD_SIZE_DEVICES=$((TP_SIZE * PP_SIZE))
 EP_SIZE=${EP_SIZE:-}
 # DP attention: attention runs data-parallel across DP_SIZE groups of
 # TP_SIZE/DP_SIZE ranks each ("attn_tp"), while the MoE stays TP/EP-sharded.
@@ -266,8 +275,8 @@ if [[ -n "$JAX_BAZEL" ]]; then
     export PYTHONPATH="${_jax_pp}${PYTHONPATH:+:$PYTHONPATH}"
 fi
 
-# Chiplet visibility, derived from TP_SIZE.
-if [[ "$TP_SIZE" == "1" ]]; then
+# Chiplet visibility, derived from the device count (TP_SIZE * PP_SIZE).
+if [[ "$WORLD_SIZE_DEVICES" == "1" ]]; then
     # tp=1: torch_tpu requires exactly one addressable PjRt device at
     # process-group init (process_group_tpu.cc: "expected exactly one TPU
     # device per PyTorch process."). On a multichip host the PjRt client would
@@ -276,8 +285,8 @@ if [[ "$TP_SIZE" == "1" ]]; then
     export TPU_CHIPS_PER_HOST_BOUNDS=${TPU_CHIPS_PER_HOST_BOUNDS:-1,1,1}
     export TPU_HOST_BOUNDS=${TPU_HOST_BOUNDS:-1,1,1}
 else
-    # tp>1: leave all chiplets visible. hardware_backend/tpu/patches.py::
-    # _prepare_tpu_env(world_size=TP_SIZE) sets TORCH_TPU_TOPOLOGY and
+    # tp*pp>1: leave all chiplets visible. hardware_backend/tpu/patches.py::
+    # _prepare_tpu_env(world_size=TP_SIZE*PP_SIZE) sets TORCH_TPU_TOPOLOGY and
     # TORCH_TPU_SLICEBUILDER_ADDRESSES per-worker, so do NOT pin
     # TPU_VISIBLE_CHIPS / TPU_CHIPS_PER_HOST_BOUNDS — that would mask chiplets
     # and break the slicebuilder handshake.
@@ -376,8 +385,8 @@ ENABLE_METRICS=${ENABLE_METRICS:-0}
 ENABLE_CACHE_REPORT=${ENABLE_CACHE_REPORT:-0}
 # ===== KV offload (HiCache) =====
 # The device KV pool is mirrored into host RAM, so evicted prefixes reload over
-# DMA instead of being recomputed. torch_tpu is the TPU io backend; server_args
-# requires it to pair with page_first_fused + pallas_tpu_rpa_v3.
+# DMA instead of being recomputed. torch_tpu and raiden are the TPU io backends;
+# server_args checks them against the layout and the attention backend's KV pool.
 KV_OFFLOAD=${KV_OFFLOAD:-0}
 HICACHE_RATIO=${HICACHE_RATIO:-2.0}
 HICACHE_SIZE=${HICACHE_SIZE:-}
@@ -385,13 +394,6 @@ HICACHE_IO_BACKEND=${HICACHE_IO_BACKEND:-torch_tpu}
 HICACHE_MEM_LAYOUT=${HICACHE_MEM_LAYOUT:-page_first_fused}
 HICACHE_WRITE_POLICY=${HICACHE_WRITE_POLICY:-}
 if [[ "$KV_OFFLOAD" == "1" ]]; then
-    # Fail here rather than 10 minutes into weight loading: the server_args
-    # validator raises the same error, but only after the engine has started.
-    if [[ "$HICACHE_IO_BACKEND" == "torch_tpu" && "$ATTENTION_BACKEND" != "pallas_tpu_rpa_v3" ]]; then
-        echo "ERROR: KV_OFFLOAD=1 with HICACHE_IO_BACKEND=torch_tpu requires" \
-             "ATTENTION_BACKEND=pallas_tpu_rpa_v3, got '$ATTENTION_BACKEND'." >&2
-        exit 2
-    fi
     if [[ "$DISABLE_RADIX_CACHE" == "1" ]]; then
         echo "WARN: KV_OFFLOAD=1 with DISABLE_RADIX_CACHE=1 — HiCache is built on" \
              "the radix tree, so nothing will ever be offloaded. Set" \
@@ -402,7 +404,11 @@ fi
 echo "==== launch config ===="
 echo "  model              = $MODEL"
 echo "  model_slug         = $MODEL_SLUG"
+if [[ -d /weights ]]; then
+    echo "  weights_disk       = $(ls -1 /weights 2>/dev/null | tr '\n' ' ')"
+fi
 echo "  tp_size            = $TP_SIZE"
+echo "  pp_size            = $PP_SIZE  (micro-batch=${PP_MAX_MICRO_BATCH_SIZE:-<default>})"
 if [[ "$ENABLE_MULTIHOST" == "1" ]]; then
   if [[ "$USE_RAY" == "1" ]]; then
     echo "  multihost          = ray-discovered (nnodes hint=$NNODES, chips/host=$CHIPS_PER_HOST)"
@@ -447,6 +453,13 @@ echo "  ENABLE_PROFILER_ENDPOINT   = $ENABLE_PROFILER_ENDPOINT  ($PROFILER_DIR)"
 echo "  TORCH_LOGS         = $TORCH_LOGS"
 echo "======================="
 
+# An absolute MODEL that is not on the mounted disk reaches transformers as an
+# HF repo id and dies with an unrelated HFValidationError deep in the loader.
+if [[ "$MODEL" == /* && ! -f "$MODEL/config.json" ]]; then
+    echo "ERROR: no checkpoint at $MODEL -- see weights_disk above." >&2
+    exit 1
+fi
+
 # Build the launch_server arg list, only adding optional flags when set.
 args=(
     -u -m sglang.launch_server
@@ -466,6 +479,10 @@ args=(
 [[ -n "$TPU_COMPILE_BS" ]] && args+=(--tpu-compile-bs $TPU_COMPILE_BS)
 [[ -n "$NUM_CONTINUOUS_DECODE_STEPS" ]] && args+=(--num-continuous-decode-steps "$NUM_CONTINUOUS_DECODE_STEPS")
 [[ -n "$EP_SIZE" ]] && args+=(--ep-size "$EP_SIZE")
+if (( PP_SIZE > 1 )); then
+    args+=(--pp-size "$PP_SIZE")
+    [[ -n "$PP_MAX_MICRO_BATCH_SIZE" ]] && args+=(--pp-max-micro-batch-size "$PP_MAX_MICRO_BATCH_SIZE")
+fi
 # --enable-dp-lm-head is not optional here: tpu_platform.apply_server_args_defaults
 # REJECTS attn_tp > 1 under DP attention without it ("--enable-dp-lm-head must be
 # enabled"), so a tp=16 dp=4 launch dies in prepare_server_args before the server
@@ -542,6 +559,7 @@ if [[ "$DUMP_META" == "1" ]]; then
         --set dtype=bfloat16 \
         --set device=tpu \
         --set tp_size="$TP_SIZE" \
+        --set pp_size="$PP_SIZE" \
         --set ep_size="${EP_SIZE:-}" \
         --set dp_size="${DP_SIZE:-}" \
         --set attn_tp_size="$ATTN_TP_SIZE" \

@@ -142,10 +142,8 @@ class TestFusedMoEExpertParallel(CustomTestCase):
             ("tensor_core_prefill", 512, 0),
             # Decode-sized batch takes the kernels' small-input fallbacks.
             ("sparse_core_decode", 16, 1),
-            # Multi-block: the SC gather is restricted to this rank's routed-row
-            # window, so its grid must cover a strict subset of the blocks. At
-            # 512 tokens out_size is 2048 = one 2048-row block on v7x, which
-            # makes the window a no-op and hides any clipping bug.
+            # Multi-block: exercise the full-range SC gather together with the
+            # per-rank GMM and un-permute windows.
             ("sparse_core_multiblock", 4096, 1),
         ]
         for name, tokens, use_sc_gather in cases:
@@ -156,18 +154,17 @@ class TestFusedMoEExpertParallel(CustomTestCase):
                 actual = jnp.stack(partials).sum(axis=0)
                 self.assert_close(actual, expected, context=name)
 
-    def test_sc_window_matches_tensorcore_multiblock(self):
-        """The windowed SparseCore gather must agree per-rank with the
-        full-range TensorCore gather.
+    def test_sc_gather_matches_tensorcore_multiblock(self):
+        """The full-range SparseCore gather must agree per-rank with the
+        TensorCore gather.
 
         ``test_ep_sum_matches_full_moe`` compares a *sum* over ranks, which can
-        hide a clipping bug that moves contribution between ranks. This compares
-        each rank against a path that never narrows its gather, at a token count
-        where the window spans several SC blocks.
+        hide a bug that moves contribution between ranks. This compares each
+        rank directly at a token count spanning several SC blocks.
 
-        Repeated: rows outside the window are left uninitialized, and a fresh
-        HBM buffer is often zero, so a clipping bug can pass once and fail only
-        after the allocator hands back a dirty buffer.
+        Repeated because the GMM leaves non-local rows uninitialized and a fresh
+        HBM buffer is often zero, so an un-permute masking bug can pass once and
+        fail only after the allocator hands back a dirty buffer.
         """
         tokens = 4096  # out_size = tokens * TOPK = 16384 = 8 blocks of 2048
         local = self.GLOBAL_EXPERTS // self.EP_SIZE
@@ -185,10 +182,10 @@ class TestFusedMoEExpertParallel(CustomTestCase):
                     global_num_experts=self.GLOBAL_EXPERTS,
                     expert_group_offset=offset,
                 )
-                windowed = self.run_kernel(use_sc_gather=1, **kw)
+                sparse_core = self.run_kernel(use_sc_gather=1, **kw)
                 full_range = self.run_kernel(use_sc_gather=0, **kw)
                 self.assert_close(
-                    windowed,
+                    sparse_core,
                     full_range,
                     context=f"attempt={attempt} rank={rank}",
                 )
@@ -245,8 +242,9 @@ class TestFusedMoEExpertParallel(CustomTestCase):
     def test_no_combine_zeroes_weight_masked_slots_without_group_offset(self):
         """The TPU FP4 path remaps non-local slots to expert 0 and zeros their
         kernel weights before calling the local Pallas kernel. no_combine must
-        return zeros for those weight-masked slots because Llama4x applies the
-        original router weights later during post-expert norm finalize.
+        return zeros for those weight-masked slots because a model with a
+        post-expert norm applies the original router weights later, when it
+        finalizes the per-expert outputs.
         """
         x, w1, w2, topk_weights, topk_ids = self.make_inputs(tokens=128, seed=2)
         masked_weights = topk_weights.at[:, 1::2].set(0)

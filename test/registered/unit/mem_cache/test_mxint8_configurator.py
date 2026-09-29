@@ -71,7 +71,8 @@ class TestMXINT8Configurator(CustomTestCase):
         self.addCleanup(override.restore)
         self.platform_pool = Mock(name="platform_pool")
         self.platform = SimpleNamespace(
-            get_mha_kv_pool_cls=Mock(return_value=self.platform_pool)
+            get_mha_kv_pool_cls=Mock(return_value=self.platform_pool),
+            is_cpu=lambda: False,
         )
         self.swa_pool = Mock(name="swa_pool")
         self.hybrid_pool = Mock(name="hybrid_pool")
@@ -100,6 +101,7 @@ class TestMXINT8Configurator(CustomTestCase):
                 ),
                 swa_attention_layer_ids=[1],
                 full_attention_layer_ids=[0],
+                hf_config=SimpleNamespace(),
             ),
             server_args=get_server_args(),
             kv_cache_dtype=torch.int8,
@@ -116,7 +118,12 @@ class TestMXINT8Configurator(CustomTestCase):
             is_hybrid_swa_compress=False,
             use_mla_backend=False,
             layer_info=SimpleNamespace(
-                start_layer=0, end_layer=2, num_effective_layers=2
+                start_layer=0,
+                end_layer=2,
+                num_effective_layers=2,
+                swa_attention_layer_ids=[1],
+                full_attention_layer_ids=[0],
+                is_hybrid_swa_mtp_draft=False,
             ),
             forward_stream=None,
             req_to_token_pool=None,
@@ -151,10 +158,11 @@ class TestMXINT8Configurator(CustomTestCase):
                 ("fp8_e4m3", torch.float8_e4m3fn),
                 ("fp8_e5m2", torch.float8_e5m2),
             ):
-                with self.subTest(
-                    algorithm=algorithm, format=name
-                ), get_context().override_server_args(
-                    speculative_draft_kv_cache_dtype="mxint8"
+                with (
+                    self.subTest(algorithm=algorithm, format=name),
+                    get_context().override_server_args(
+                        speculative_draft_kv_cache_dtype="mxint8"
+                    ),
                 ):
                     self._assert_preflight_error(
                         kv_cache_dtype_str=name,

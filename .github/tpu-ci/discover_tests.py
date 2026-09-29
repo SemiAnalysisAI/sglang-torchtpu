@@ -3,19 +3,13 @@
 
 import argparse
 import glob
-import importlib.util
 import json
 import os
 
+from ci_register_loader import ci_register as _ci_register
 from test_names import names_from_path
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-_CI_REGISTER_PATH = os.path.join(
-    REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py"
-)
-_spec = importlib.util.spec_from_file_location("tpu_ci_register", _CI_REGISTER_PATH)
-_ci_register = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_ci_register)
 
 
 def discover(suite: str, nightly: bool, root: str) -> list[dict]:
@@ -34,7 +28,14 @@ def discover(suite: str, nightly: bool, root: str) -> list[dict]:
         ):
             continue
         path = os.path.relpath(test.filename, REPO_ROOT)
-        rows.append({"suite": suite, "file": path, **names_from_path(path)})
+        rows.append(
+            {
+                "suite": suite,
+                "file": path,
+                "weights_pvc": test.weights_pvc or "",
+                **names_from_path(path),
+            }
+        )
     return sorted(rows, key=lambda row: row["name"])
 
 

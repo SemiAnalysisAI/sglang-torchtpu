@@ -13,10 +13,6 @@ from torch import nn
 
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.srt.configs.laguna import normalize_gating
-from sglang.srt.distributed import (
-    get_tp_group,
-    model_parallel_is_initialized,
-)
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -139,8 +135,7 @@ def _get_dflash_layer_attention_params(
             config, default=AttentionType.DECODER
         )
     raise ValueError(
-        "Unsupported DFLASH draft layer type. "
-        f"layer_types[{layer_id}]={layer_type!r}."
+        f"Unsupported DFLASH draft layer type. layer_types[{layer_id}]={layer_type!r}."
     )
 
 
@@ -218,6 +213,7 @@ class DFlashAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=rope_is_neox_style,
+            partial_rotary_factor=float(getattr(config, "partial_rotary_factor", 1.0)),
         )
 
         self.scaling = head_dim**-0.5
@@ -231,6 +227,8 @@ class DFlashAttention(nn.Module):
         self.sliding_window_size, self.attn_type = _get_dflash_layer_attention_params(
             config, layer_id
         )
+        draft_cfg = parse_dflash_draft_config(draft_hf_config=config)
+        self.v_scale: Optional[float] = draft_cfg.attention_value_scale
         self.attention_sink_bias = None
         if is_nemotron_35_draft_config(config) and bool(
             getattr(config, "attention_sink_bias", False)
@@ -242,6 +240,16 @@ class DFlashAttention(nn.Module):
                     "--speculative-draft-attention-backend trtllm_mha, "
                     f"got {draft_attention_backend!r}."
                 )
+            self.attention_sink_bias = nn.Parameter(
+                torch.empty(self.num_heads, dtype=torch.float32), requires_grad=False
+            )
+            set_weight_attrs(
+                self.attention_sink_bias,
+                {"weight_loader": sharded_weight_loader(0)},
+            )
+        elif draft_cfg.attention_sink_bias:
+            # Per-head sink bias; each TP rank owns its slice of the
+            # all-heads checkpoint tensor.
             self.attention_sink_bias = nn.Parameter(
                 torch.empty(self.num_heads, dtype=torch.float32), requires_grad=False
             )
@@ -307,6 +315,8 @@ class DFlashAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
             q, k = self.rotary_emb(positions, q, k)
+        if self.v_scale is not None:
+            v = v * self.v_scale
         if self.attention_sink_bias is None:
             attn_output = self.attn(q, k, v, forward_batch)
         else:
@@ -340,11 +350,14 @@ class DFlashAttention(nn.Module):
             )
             kv = F.linear(hidden_states, weight, bias)
             k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
-            return k, v
-
-        # Fallback: compute full QKV and discard Q (keeps compatibility with quantized weights).
-        qkv, _ = self.qkv_proj(hidden_states)
-        _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        else:
+            # Fallback: compute full QKV and discard Q (keeps compatibility with quantized weights).
+            qkv, _ = self.qkv_proj(hidden_states)
+            _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # Keep V scaling consistent with forward() so ctx and self-generated V
+        # align in the draft cache.
+        if self.v_scale is not None:
+            v = v * self.v_scale
         return k, v
 
     def apply_k_norm(self, k: torch.Tensor) -> torch.Tensor:
@@ -642,6 +655,34 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         self.lm_head: nn.Module | None = None
+        # The model loader calls load_weights() before set_block_size(). Build
+        # Domino projector modules here so their parameters are present while
+        # checkpoint weights are loaded.
+        self.projector_type = draft_config.projector_type
+        self.shift_label = draft_config.shift_label
+        self.prefix_gru: Optional[nn.GRU] = None
+        self.embed_proj: Optional[nn.Sequential] = None
+        if draft_config.is_domino:
+            assert draft_config.gru_hidden_dim is not None
+            assert draft_config.emb_dim is not None
+            self.prefix_gru = nn.GRU(
+                input_size=hidden_size,
+                hidden_size=int(draft_config.gru_hidden_dim),
+                num_layers=1,
+                batch_first=True,
+                bias=False,
+            )
+            self.embed_proj = nn.Sequential(
+                nn.Linear(
+                    hidden_size + int(draft_config.gru_hidden_dim),
+                    int(draft_config.emb_dim),
+                    bias=False,
+                ),
+                nn.SiLU(),
+                nn.Linear(
+                    int(draft_config.emb_dim), int(config.vocab_size), bias=False
+                ),
+            )
 
     def set_block_size(self, block_size: int) -> None:
         """Adopt the block size the worker resolved.
@@ -686,53 +727,26 @@ class DFlashDraftModel(nn.Module):
             projected = projected[0]
         return self.hidden_norm(projected)
 
-    def _sample_draft_tokens_tpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Sample draft tokens on TPU using target lm_head."""
+    def sample_draft_tokens_tpu(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Sample draft tokens on TPU using target lm_head.
+
+        Extension hook: DSpark overrides it with its markov chain, whose first
+        step conditions on the anchor token in input_ids.
+        """
+        from sglang.srt.hardware_backend.tpu.dflash_utils_tpu import (
+            argmax_draft_tokens_tpu,
+        )
+
+        del input_ids
         if self.lm_head is None:
             raise ValueError("DFlash draft on TPU requires lm_head.")
-        hs_3d = hidden_states.view(-1, self.block_size, hidden_states.shape[-1])
-        bs = hs_3d.shape[0]
-        hs_1d = hs_3d[:, 1:, :].reshape(-1, hs_3d.shape[-1])
-        hs = (
-            hs_1d
-            if hs_1d.dtype == self.lm_head.weight.dtype
-            else hs_1d.to(self.lm_head.weight.dtype)
+        return argmax_draft_tokens_tpu(
+            lm_head=self.lm_head,
+            hidden_states=hidden_states,
+            block_size=self.block_size,
         )
-
-        tp_size = (
-            int(get_tp_group().world_size) if model_parallel_is_initialized() else 1
-        )
-
-        from sglang.srt.hardware_backend.tpu.top_k import (
-            TpuVocabShard,
-            distributed_tpu_top_k,
-            supports_distributed_tpu_top_k,
-        )
-
-        if tp_size > 1 and supports_distributed_tpu_top_k(self.lm_head, top_k=1):
-            local_logits = torch.matmul(hs, self.lm_head.weight.T)
-            _, global_token_ids = distributed_tpu_top_k(
-                local_logits,
-                TpuVocabShard.from_lm_head(self.lm_head),
-                k=1,
-                group=get_tp_group(),
-                lm_head=self.lm_head,
-            )
-            tokens = global_token_ids.squeeze(-1).to(torch.long)
-            return tokens.view(bs, self.block_size - 1)
-
-        shard = getattr(self.lm_head, "shard_indices", None)
-        num_org = int(shard.num_org_elements) if shard is not None else 0
-        org_vocab_start = int(shard.org_vocab_start_index) if shard is not None else 0
-        if num_org > 0:
-            local_logits = torch.matmul(hs, self.lm_head.weight[:num_org].T)
-        else:
-            local_logits = torch.matmul(hs, self.lm_head.weight.T)
-
-        tokens = torch.argmax(local_logits, dim=-1).to(torch.long)
-        if org_vocab_start > 0:
-            tokens.add_(org_vocab_start)
-        return tokens.view(bs, self.block_size - 1)
 
     @torch.no_grad()
     def forward(
@@ -784,7 +798,7 @@ class DFlashDraftModel(nn.Module):
                 hidden_states, _ = self.norm(hidden_states, residual)
 
         if _is_tpu and hidden_states.numel() != 0:
-            next_draft_tokens = self._sample_draft_tokens_tpu(hidden_states)
+            next_draft_tokens = self.sample_draft_tokens_tpu(hidden_states, input_ids)
         else:
             next_draft_tokens = None
 
@@ -805,6 +819,7 @@ class DFlashDraftModel(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        loaded_params = set()
 
         # Alias the native export's "encoder." names.
         _VENDOR_ENCODER_ALIASES = {
@@ -829,6 +844,14 @@ class DFlashDraftModel(nn.Module):
             return None
 
         for name, loaded_weight in weights:
+            unprefixed_name = name.removeprefix("model.")
+            if self.projector_type != "domino" and unprefixed_name.startswith(
+                ("prefix_gru.", "embed_proj.")
+            ):
+                raise ValueError(
+                    "DFLASH checkpoint contains Domino projector weights but "
+                    f"projector_type={self.projector_type!r}."
+                )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:
                     continue
@@ -839,6 +862,7 @@ class DFlashDraftModel(nn.Module):
                 param = params_dict[resolved_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(resolved_name)
                 break
             else:
                 resolved_name = resolve_param_name(name)
@@ -873,8 +897,31 @@ class DFlashDraftModel(nn.Module):
                             f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
                             f"but got {loaded_shape} for weight '{name}'."
                         )
+                if resolved_name.startswith(("prefix_gru.", "embed_proj.")) and tuple(
+                    loaded_weight.shape
+                ) != tuple(param.shape):
+                    raise ValueError(
+                        "DFLASH Domino projector weight shape mismatch: "
+                        f"expected {resolved_name}{tuple(param.shape)}, got "
+                        f"{tuple(loaded_weight.shape)} from {name!r}."
+                    )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                loaded_params.add(resolved_name)
+
+        if self.projector_type == "domino":
+            required = {
+                "prefix_gru.weight_ih_l0",
+                "prefix_gru.weight_hh_l0",
+                "embed_proj.0.weight",
+                "embed_proj.2.weight",
+            }
+            missing = required - loaded_params
+            if missing:
+                raise ValueError(
+                    "DFLASH Domino checkpoint is missing required projector weights: "
+                    f"{sorted(missing)}."
+                )
 
 
 class DFlashLagunaAttention(DFlashAttention):
