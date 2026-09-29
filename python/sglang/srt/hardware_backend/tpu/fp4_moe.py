@@ -148,6 +148,10 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
             group_size in TPU_NVFP4_SUPPORTED_GROUP_SIZES,
         ),
         ("expert parallelism enabled", layer.moe_ep_size > 1),
+        # The FP8 fused-RS exclusions: prefill CP has already gathered the MoE
+        # tokens (MOE_FULL); PP is also caught by the world-size check below.
+        ("pipeline parallelism disabled", parallel.pp_size == 1),
+        ("prefill context parallelism disabled", parallel.attn_cp_size == 1),
         (
             "moe_ep_size == tp_size == world_size",
             layer.moe_ep_size
