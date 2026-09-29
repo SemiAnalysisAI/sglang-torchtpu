@@ -1136,7 +1136,6 @@ class RaidenKVReceiver(CommonKVReceiver):
             self.conclude_state = KVPoll.Success
             return KVPoll.Success
         if self._prealloc_timed_out():
-            self.shed_retryable = True
             return self._conclude_failed(
                 reason=f"Request {self.bootstrap_room} waited over "
                 f"{self.kv_mgr._prealloc_timeout_s:.0f}s for a decode slot"
@@ -1157,7 +1156,6 @@ class RaidenKVReceiver(CommonKVReceiver):
             timeout > 0
             and self.init_time is None
             and self.enqueue_time is not None
-            and not self.prealloc_exempt
             and time.time() - self.enqueue_time > timeout
         )
 

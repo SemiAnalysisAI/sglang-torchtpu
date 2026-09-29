@@ -1,14 +1,11 @@
-"""A decode room that waits too long for a slot is shed, retryably, and the
-prefill is told to release its copy."""
+"""A decode room that waits too long for a slot is shed, and the prefill is
+told to release its copy."""
 
 import threading
 import unittest
-from http import HTTPStatus
-from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.raiden import conn as conn_module
 from sglang.srt.disaggregation.raiden import receiver as receiver_module
 from sglang.srt.disaggregation.raiden.conn import RaidenKVManager, RaidenKVReceiver
@@ -86,7 +83,6 @@ class TestPreallocDeadline(unittest.TestCase):
             self.assertEqual(_poll_at(recv, T0 + 62), KVPoll.Failed)
 
         abort.assert_called_once()
-        self.assertTrue(recv.shed_retryable)
         with self.assertRaisesRegex(Exception, "waited over 60s for a decode slot"):
             recv.failure_exception()
 
@@ -98,13 +94,6 @@ class TestPreallocDeadline(unittest.TestCase):
             self.assertNotEqual(_poll_at(recv, T0 + 200), KVPoll.Failed)
 
         abort.assert_not_called()
-        self.assertFalse(recv.shed_retryable)
-
-    def test_rebootstrap_room_is_never_shed(self):
-        recv = _receiver(_decode_manager())
-        recv.prealloc_exempt = True
-
-        self.assertNotEqual(_poll_at(recv, T0 + 10_000), KVPoll.Failed)
 
     def test_zero_timeout_disables_the_deadline(self):
         recv = _receiver(_decode_manager(prealloc_timeout_s=0.0))
@@ -128,49 +117,6 @@ class TestPreallocTimeoutKnob(unittest.TestCase):
     def test_non_positive_disables(self):
         self.assertEqual(self._resolve(0), 0.0)
         self.assertEqual(self._resolve(-5), 0.0)
-
-
-class TestShedStatusCode(unittest.TestCase):
-    def _fail_one(self, receiver):
-        decode_req = SimpleNamespace(
-            waiting_for_input=False,
-            kv_receiver=receiver,
-            req=SimpleNamespace(rid="r", bootstrap_room=ROOM, time_stats=MagicMock()),
-        )
-        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.queue = [decode_req]
-        queue.pp_size = 1
-        queue.tp_rank = 0
-        queue.gloo_group = object()
-        queue.attn_cp_cpu_group = None
-        queue.scheduler = SimpleNamespace(
-            metrics_reporter=SimpleNamespace(enable_metrics=False)
-        )
-        with (
-            patch(
-                "sglang.srt.disaggregation.decode.poll_and_all_reduce",
-                return_value=[KVPoll.Failed],
-            ),
-            patch("sglang.srt.disaggregation.decode.prepare_abort") as abort,
-        ):
-            queue._update_handshake_waiters()
-        return abort.call_args.kwargs["status_code"]
-
-    def _receiver(self, shed):
-        return SimpleNamespace(
-            failure_exception=Mock(side_effect=Exception("boom")),
-            shed_retryable=shed,
-        )
-
-    def test_shed_room_is_retryable(self):
-        self.assertEqual(
-            self._fail_one(self._receiver(True)), HTTPStatus.SERVICE_UNAVAILABLE
-        )
-
-    def test_other_handshake_failures_stay_internal_errors(self):
-        self.assertEqual(
-            self._fail_one(self._receiver(False)), HTTPStatus.INTERNAL_SERVER_ERROR
-        )
 
 
 if __name__ == "__main__":
