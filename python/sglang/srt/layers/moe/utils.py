@@ -783,6 +783,11 @@ def should_skip_post_experts_all_reduce(
         return True
     if get_parallel().dwdp_size > 1:
         return True
+    # Experts replicated on every device of the TP group already hold each
+    # token's full output; a TP all-reduce would sum it tp_size times.
+    parallel = get_parallel()
+    if is_tp_path and parallel.tp_size > 1 and parallel.moe_dp_size == parallel.tp_size:
+        return True
     if should_use_dp_reduce_scatterv():
         return True
     if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():

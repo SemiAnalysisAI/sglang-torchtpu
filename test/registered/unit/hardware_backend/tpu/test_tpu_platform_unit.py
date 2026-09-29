@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import torch.compiler.config as compiler_config
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -483,15 +484,14 @@ class TestPrefillContextParallelValidation(TestTpuPlatformServerDefaults):
         return self._args(**fields)
 
     def test_accepts_the_zigzag_rpa_v3_configuration(self):
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_TPU_REQ_TO_TOKEN_ON_HOST", None)
+        with patch.dict(os.environ, {"SGLANG_TPU_REQ_TO_TOKEN_ON_HOST": "0"}):
             args = self._cp_args(sampling_backend=None)
             self._apply(args)
             self.assertEqual(
                 self._resolved(args, "attention_backend"), "pallas_tpu_rpa_v3"
             )
             self.assertEqual(self._resolved(args, "sampling_backend"), "pytorch")
-            self.assertEqual(os.environ["SGLANG_TPU_REQ_TO_TOKEN_ON_HOST"], "1")
+            self.assertTrue(envs.SGLANG_TPU_REQ_TO_TOKEN_ON_HOST.get())
 
     def test_replicated_experts_match_the_cp_size(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -510,7 +510,6 @@ class TestPrefillContextParallelValidation(TestTpuPlatformServerDefaults):
                 dict(attention_backend="pallas_tpu_rpa_batched"),
                 "requires --attention-backend pallas_tpu_rpa_v3",
             ),
-            (dict(pp_size=2), "does not support pipeline parallelism"),
             (dict(speculative_algorithm="EAGLE3"), "speculative decoding"),
             (dict(enable_dp_attention=True, dp_size=8), "DP attention"),
             (dict(moe_dp_size=2), "requires --moe-dp-size 1"),

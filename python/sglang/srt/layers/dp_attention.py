@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.distributed import (
     GroupCoordinator,
+    get_attn_context_model_parallel_rank,
     get_attn_cp_group,
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
@@ -1169,18 +1170,18 @@ def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attn_tp_group().all_gather(input, output_tensor_list=output_list)
 
 
-# 0-D int64 rank-id tensors, keyed by (axis, device); axis is "attn_tp" or
-# "attn_dp". Created eagerly OUTSIDE compiled regions (initialize_dp_attention):
-# pre-existing tensors are lifted as runtime graph inputs, so every rank traces
-# one identical program. A tensor created inside a traced region — lru_cache
-# factories included, Dynamo traces through them — bakes the rank as a graph
-# constant, and the resulting rank-divergent executables deadlock the in-graph
-# collectives.
+# 0-D int64 rank-id tensors, keyed by (axis, device); axis is "attn_tp",
+# "attn_dp" or "attn_cp". Created eagerly OUTSIDE compiled regions (in
+# initialize_dp_attention): pre-existing tensors are lifted as runtime graph
+# inputs, so every rank traces one identical program. A tensor created inside
+# a traced region — lru_cache factories included, Dynamo traces through them —
+# bakes the rank as a graph constant, and the resulting rank-divergent
+# executables deadlock the in-graph collectives.
 _RANK_TENSORS: dict = {}
 
 
 def _init_rank_tensors(device: torch.device) -> None:
-    """Create the attn_tp and attn_dp rank tensors for a device.
+    """Create the attn_tp, attn_dp and attn_cp rank tensors for a device.
 
     Args:
         device: Device to create the tensors on. An index-less device such
@@ -1191,6 +1192,7 @@ def _init_rank_tensors(device: torch.device) -> None:
     for axis, rank in (
         ("attn_tp", get_attn_tensor_model_parallel_rank()),
         ("attn_dp", get_attention_dp_rank()),
+        ("attn_cp", get_attn_context_model_parallel_rank()),
     ):
         t = torch.tensor(rank, device=device, dtype=torch.int64)
         _RANK_TENSORS[(axis, device)] = t
@@ -1204,7 +1206,8 @@ def _rank_tensor(axis: str, device: torch.device) -> torch.Tensor:
 
     Args:
         axis: Which rank to return: "attn_tp" (attention tensor-parallel
-            rank) or "attn_dp" (attention data-parallel rank).
+            rank), "attn_dp" (attention data-parallel rank) or "attn_cp"
+            (attention context-parallel rank).
         device: Device of the returned tensor.
 
     Returns:
@@ -1245,6 +1248,16 @@ def _dp_rank_slot_rows(num_rows: int, device: torch.device) -> torch.Tensor:
         computed in-graph so the offset stays a runtime operand.
     """
     return _rank_tensor("attn_dp", device) * num_rows + torch.arange(
+        num_rows, device=device
+    )
+
+
+def _cp_rank_slot_rows(
+    *, slot_rows: int, num_rows: int, device: torch.device
+) -> torch.Tensor:
+    """First num_rows row indices of this rank's slot in a rank-major buffer of
+    slot_rows-row slots over the attention CP group, from the rank tensor."""
+    return _rank_tensor("attn_cp", device) * slot_rows + torch.arange(
         num_rows, device=device
     )
 

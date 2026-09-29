@@ -9,16 +9,9 @@ rows so every rank samples identical tokens. All rank-dependent data enter the
 compiled program as tensors built on the host; nothing here bakes the rank
 into a traced graph.
 
-Admission parity is an unenforced precondition. Every rank of a context-parallel
-group must admit the same prefill batch in the same step: the per-layer K/V
-all-gather is a group collective, so a rank that admits a chunk its sibling
-refused blocks in that collective forever, with no timeout and no error. Nothing
-in this module or in the scheduler enforces it; the ranks agree only because
-they run identical admission code over identical state. A two-rank group was
-seen to diverge at an input length whose wave oversubscribes the pool: the group
-wedged on the first batch of the wave, and the first visible symptom was a
-libtpu telemetry abort minutes later. The mechanism of that divergence is not
-established.
+Every rank of a context-parallel group must admit the same prefill batch in the
+same step, because the per-layer K/V all-gather is a group collective; the ranks
+agree by running identical admission code over identical state.
 """
 
 from __future__ import annotations
@@ -35,6 +28,10 @@ from sglang.srt.hardware_backend.tpu.cp_layout import (
     max_local_rows,
 )
 from sglang.srt.hardware_backend.tpu.kv_row_write import write_rows_torch
+from sglang.srt.layers.logits_processor import LogitsMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_forward_context
+from sglang.srt.runtime_context import get_parallel
 
 _LAYOUT_ATTR = "_tpu_cp_layout"
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -52,49 +49,6 @@ class TpuCpBatchLayout(NamedTuple):
 def get_tpu_cp_layout(forward_batch: Any) -> TpuCpBatchLayout | None:
     """Layout attached by ``prepare_tpu_cp_forward_batch``; None otherwise."""
     return getattr(forward_batch, _LAYOUT_ATTR, None)
-
-
-# ---------------------------------------------------------------------------
-# Rank tensor (in-graph rank arithmetic without a baked constant)
-# ---------------------------------------------------------------------------
-
-_CP_RANK_TENSORS: dict[torch.device, torch.Tensor] = {}
-
-
-def ensure_cp_rank_tensor(device: torch.device, cp_rank: int) -> torch.Tensor:
-    """Create (once per device) the 0-D int64 context-parallel rank tensor.
-
-    Called eagerly before every context-parallel forward so the tensor is a
-    runtime graph input rather than a constant traced into the program.
-    """
-    device = torch.device(device)
-    tensor = _CP_RANK_TENSORS.get(device)
-    if tensor is None:
-        tensor = torch.tensor(cp_rank, dtype=torch.int64, device=device)
-        _CP_RANK_TENSORS[device] = tensor
-        _CP_RANK_TENSORS[tensor.device] = tensor
-    return tensor
-
-
-def cp_rank_tensor(device: torch.device) -> torch.Tensor:
-    tensor = _CP_RANK_TENSORS.get(torch.device(device))
-    if tensor is None:
-        raise RuntimeError(
-            f"context-parallel rank tensor for {device} was not created; "
-            "prepare_tpu_cp_forward_batch must run before the compiled forward."
-        )
-    return tensor
-
-
-def select_cp_local_rows(
-    hidden_states: torch.Tensor, *, slot_rows: int, num_rows: int
-) -> torch.Tensor:
-    """This rank's rows of a rank-major all-gathered ``[cp * slot_rows, H]``
-    tensor, selected with the rank tensor so the offset stays a runtime operand.
-    """
-    device = hidden_states.device
-    rows = cp_rank_tensor(device) * slot_rows + torch.arange(num_rows, device=device)
-    return hidden_states.index_select(0, rows)
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +137,6 @@ def prepare_tpu_cp_forward_batch(
     metadata.per_rank_actual_token = [local_rows_padded] * cp_size
     metadata.max_rank_len = [local_rows_padded] * cp_size
 
-    ensure_cp_rank_tensor(device, cp_rank)
     setattr(
         forward_batch, _LAYOUT_ATTR, TpuCpBatchLayout(host=host, local_rows=local_rows)
     )
@@ -371,17 +324,8 @@ class TpuCpLogitsForward:
     """
 
     def __init__(self, logits_processor: Any) -> None:
-        from sglang.srt.layers.logits_processor import LogitsMetadata
-        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-        from sglang.srt.model_executor.forward_context import get_forward_context
-        from sglang.srt.runtime_context import get_parallel
-
         self._logits_processor = logits_processor
         self._forward = logits_processor.forward
-        self._logits_metadata_cls = LogitsMetadata
-        self._forward_batch_cls = ForwardBatch
-        self._get_forward_context = get_forward_context
-        self._get_parallel = get_parallel
 
     def __call__(
         self,
@@ -392,11 +336,9 @@ class TpuCpLogitsForward:
         aux_hidden_states: Any = None,
         hidden_states_before_norm: torch.Tensor | None = None,
     ) -> Any:
-        attn_metadata = self._get_forward_context().attn_backend.forward_metadata
+        attn_metadata = get_forward_context().attn_backend.forward_metadata
         last_rows = attn_metadata.cp_last_rows
-        if last_rows is None or not isinstance(
-            logits_metadata, self._forward_batch_cls
-        ):
+        if last_rows is None or not isinstance(logits_metadata, ForwardBatch):
             return self._forward(
                 input_ids,
                 hidden_states,
@@ -409,9 +351,9 @@ class TpuCpLogitsForward:
             hidden_states,
             last_rows=last_rows,
             last_owner_mask=attn_metadata.cp_last_owner_mask,
-            group=self._get_parallel().attn_cp_group,
+            group=get_parallel().attn_cp_group,
         )
-        metadata = self._logits_metadata_cls.from_forward_batch(
+        metadata = LogitsMetadata.from_forward_batch(
             logits_metadata,
             compute_input_logprobs=self._logits_processor.compute_input_logprobs,
         )

@@ -126,10 +126,6 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
         raise NotImplementedError(
             f"{feature} requires --attention-backend pallas_tpu_rpa_v3, got {backend!r}."
         )
-    if cfg.pp_size != 1:
-        raise NotImplementedError(
-            f"{feature} does not support pipeline parallelism (pp_size={cfg.pp_size})."
-        )
     if cfg.speculative_algorithm is not None:
         raise NotImplementedError(f"{feature} does not support speculative decoding.")
     if cfg.enable_dp_attention:
@@ -162,12 +158,17 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
             "SGLANG_TPU_ENABLE_PROMPT_LOGPROB."
         )
     # The layout and the KV slot table are built from the host req_to_token.
-    if os.environ.get("SGLANG_TPU_REQ_TO_TOKEN_ON_HOST") == "0":
+    _pin_req_to_token_on_host("prefill context parallelism")
+
+
+def _pin_req_to_token_on_host(reason: str) -> None:
+    """Force SGLANG_TPU_REQ_TO_TOKEN_ON_HOST on, warning if it was turned off."""
+    if not envs.SGLANG_TPU_REQ_TO_TOKEN_ON_HOST.get():
         logger.warning(
-            "Overriding SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=0 -> 1: prefill context "
-            "parallelism requires host-resident req_to_token."
+            "Overriding SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=0 -> 1: "
+            f"{reason} requires host-resident req_to_token."
         )
-    os.environ["SGLANG_TPU_REQ_TO_TOKEN_ON_HOST"] = "1"
+    envs.SGLANG_TPU_REQ_TO_TOKEN_ON_HOST.set(True)
 
 
 def _mha_kv_pool_cls(backend: str | None) -> type:
@@ -444,13 +445,7 @@ class TpuSRTPlatform(SRTPlatform):
         # nodes' prefix indices on device and mix devices in the prefix cat. Pin
         # SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 for raiden.
         if cfg.hicache_io_backend == "raiden":
-            if os.environ.get("SGLANG_TPU_REQ_TO_TOKEN_ON_HOST") == "0":
-                logger.warning(
-                    "Overriding SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=0 -> 1: the "
-                    "raiden KV-offload backend requires host-resident "
-                    "req_to_token."
-                )
-            os.environ["SGLANG_TPU_REQ_TO_TOKEN_ON_HOST"] = "1"
+            _pin_req_to_token_on_host("the raiden KV-offload backend")
 
         # The default TPU backend (Pallas RPA v3) expects a paged KV cache where
         # page_size is the HBM<->VMEM DMA chunk and the fused KV buffer's page

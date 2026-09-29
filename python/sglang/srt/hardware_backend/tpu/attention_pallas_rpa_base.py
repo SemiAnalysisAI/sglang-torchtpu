@@ -46,6 +46,7 @@ from sglang.srt.hardware_backend.tpu.cp_forward import (
     all_gather_and_write_kv,
     get_tpu_cp_layout,
 )
+from sglang.srt.hardware_backend.tpu.cp_layout import TpuCpHostLayout
 from sglang.srt.hardware_backend.tpu.host_metadata_cache import HostMetadataCache
 from sglang.srt.hardware_backend.tpu.kv_row_write import (
     get_write_rows_op,
@@ -512,6 +513,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         self._distribution_cache: dict[
             tuple[bool, int, torch.device], torch.Tensor
         ] = {}
+        # Host req_to_token page-slot columns, built by _host_page_columns.
+        self._host_page_cols: torch.Tensor | None = None
         # Register the custom op eagerly so the (Python-introspection-heavy)
         # ``jax_op`` registration does not happen inside a ``torch.compile``
         # traced region — dynamo can't handle ``inspect.signature`` on the
@@ -958,7 +961,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
     def _host_page_columns(self, pages_per_seq: int, page_size: int) -> torch.Tensor:
         """Cached ``[pages_per_seq]`` req_to_token columns, one per page."""
-        page_cols = getattr(self, "_host_page_cols", None)
+        page_cols = self._host_page_cols
         if page_cols is None or page_cols.numel() != pages_per_seq:
             page_cols = torch.arange(
                 0, pages_per_seq * page_size, page_size, dtype=torch.long
@@ -1025,57 +1028,18 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             .contiguous()
         )
 
-        # KV slot of every all-gathered row: the request's req_to_token entry
-        # at prefix + offset; padding rows are not written.
-        gathered_req = torch.from_numpy(host.gathered_req)
-        gathered_pos = torch.from_numpy(host.gathered_pos)
-        valid = gathered_req >= 0
-        req = gathered_req.clamp(min=0)
-        prefix = torch.from_numpy(host.prefix_lens)[req]
-        slots = req_to_token[req_pool_indices[req], prefix + gathered_pos.clamp(min=0)]
-        dest_slots = torch.where(valid, slots.to(torch.int64), torch.zeros_like(req))
-        # Padding rows point at slot 0, the reserved page, and are not written.
-        # The run table is prefetched into SMEM, so it is sized for a served
-        # batch (a run per page and per zigzag block) rather than per row.
-        max_segments = write_run_bound(
-            slots.shape[0],
-            page_size=self.page_size,
-            blocks=2 * host.cp_size * host.pad_b,
+        write_segments, write_num_segments, dest_slots, valid = self._cp_write_runs(
+            host=host, req_to_token=req_to_token, req_pool_indices=req_pool_indices
         )
-        write_segments, num_segments = kv_write_segments(
-            slots.numpy(), (valid & (slots > 0)).numpy(), max_segments
+        swa_page_indices, swa_write_segments, swa_write_num_segments = (
+            self._cp_swa_write_runs(
+                page_indices=page_indices,
+                dest_slots=dest_slots,
+                valid=valid,
+                max_segments=write_segments.shape[1],
+                device=device,
+            )
         )
-        write_num_segments = torch.tensor([num_segments], dtype=torch.int32)
-
-        # Hybrid-SWA: sliding-window layers read and write the SWA sub-pool, so page
-        # rows and write slots go through the host-resident full-to-SWA mapping.
-        swa_page_indices: torch.Tensor | None = None
-        swa_write_segments: torch.Tensor | None = None
-        swa_write_num_segments: torch.Tensor | None = None
-        if self._is_hybrid_swa:
-            full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping
-            assert full_to_swa is not None, (
-                "Hybrid-SWA model is configured but full_to_swa_index_mapping "
-                "has not been registered yet; did the allocator finish init?"
-            )
-            full_token_starts = page_indices.to(torch.int64) * page_size
-            swa_page_indices = (
-                (full_to_swa[full_token_starts] // page_size)
-                .to(torch.int32)
-                .to(device, non_blocking=True)
-            )
-            translated = full_to_swa[dest_slots].to(torch.int64)
-            # An unmapped entry reads 0, the reserved padding slot; warmup batches
-            # point every row at full slot 0 and have nothing mapped.
-            if bool((translated[valid & (dest_slots > 0)] <= 0).any()):
-                raise RuntimeError(
-                    "context-parallel extend rows without an SWA slot: the "
-                    "sliding-window allocator did not map every token of the chunk."
-                )
-            swa_write_segments, swa_num_segments = kv_write_segments(
-                translated.numpy(), (valid & (translated > 0)).numpy(), max_segments
-            )
-            swa_write_num_segments = torch.tensor([swa_num_segments], dtype=torch.int32)
 
         distribution = self._get_cached_rpa_distribution(
             False, 2 * host.num_reqs, device
@@ -1106,6 +1070,84 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             .to(torch.int32)
             .to(device, non_blocking=True),
         )
+
+    def _cp_write_runs(
+        self,
+        *,
+        host: TpuCpHostLayout,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Full-pool write runs of the rank-major all-gathered rows and their
+        i32[1] count, plus each row's KV slot (0 for padding) and validity."""
+        # KV slot of every all-gathered row: the request's req_to_token entry
+        # at prefix + offset; padding rows are not written.
+        gathered_req = torch.from_numpy(host.gathered_req)
+        gathered_pos = torch.from_numpy(host.gathered_pos)
+        valid = gathered_req >= 0
+        req = gathered_req.clamp(min=0)
+        prefix = torch.from_numpy(host.prefix_lens)[req]
+        slots = req_to_token[req_pool_indices[req], prefix + gathered_pos.clamp(min=0)]
+        dest_slots = torch.where(valid, slots.to(torch.int64), torch.zeros_like(req))
+        # Padding rows point at slot 0, the reserved page, and are not written.
+        # The run table is prefetched into SMEM, so it is sized for a served
+        # batch (a run per page and per zigzag block) rather than per row.
+        max_segments = write_run_bound(
+            slots.shape[0],
+            page_size=self.page_size,
+            blocks=2 * host.cp_size * host.pad_b,
+        )
+        write_segments, num_segments = kv_write_segments(
+            dest_slots=slots.numpy(),
+            valid=(valid & (slots > 0)).numpy(),
+            max_segments=max_segments,
+        )
+        write_num_segments = torch.tensor([num_segments], dtype=torch.int32)
+        return write_segments, write_num_segments, dest_slots, valid
+
+    def _cp_swa_write_runs(
+        self,
+        *,
+        page_indices: torch.Tensor,
+        dest_slots: torch.Tensor,
+        valid: torch.Tensor,
+        max_segments: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """SWA page rows, write runs and i32[1] run count; all None unless hybrid-SWA.
+
+        Sliding-window layers read and write the SWA sub-pool, so page rows and
+        write slots go through the host-resident full-to-SWA mapping.
+        """
+        if not self._is_hybrid_swa:
+            return None, None, None
+        page_size = self.page_size
+        full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping
+        assert full_to_swa is not None, (
+            "Hybrid-SWA model is configured but full_to_swa_index_mapping "
+            "has not been registered yet; did the allocator finish init?"
+        )
+        full_token_starts = page_indices.to(torch.int64) * page_size
+        swa_page_indices = (
+            (full_to_swa[full_token_starts] // page_size)
+            .to(torch.int32)
+            .to(device, non_blocking=True)
+        )
+        translated = full_to_swa[dest_slots].to(torch.int64)
+        # An unmapped entry reads 0, the reserved padding slot; warmup batches
+        # point every row at full slot 0 and have nothing mapped.
+        if bool((translated[valid & (dest_slots > 0)] <= 0).any()):
+            raise RuntimeError(
+                "context-parallel extend rows without an SWA slot: the "
+                "sliding-window allocator did not map every token of the chunk."
+            )
+        swa_write_segments, swa_num_segments = kv_write_segments(
+            dest_slots=translated.numpy(),
+            valid=(valid & (translated > 0)).numpy(),
+            max_segments=max_segments,
+        )
+        swa_write_num_segments = torch.tensor([swa_num_segments], dtype=torch.int32)
+        return swa_page_indices, swa_write_segments, swa_write_num_segments
 
     def _extend_query_lens(self, forward_batch, bs: int) -> tuple[int, ...]:
         """Per-request query lengths, read from the host mirror when complete."""

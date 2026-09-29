@@ -156,6 +156,45 @@ def _cp_localize_embeds_in_args(
     return (cp_local_embeds(args[0], cp_layout),) + args[1:]
 
 
+def _localize_cp_inputs(
+    forward_batch: Any,
+    *,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    cp_layout: Any,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[Any, ...]]:
+    """Present this rank's zigzag rows to a context-parallel graph call.
+
+    The graph embeds the global ids (identical on every rank) and runs the
+    model on the rank's rows; every token-indexed field on the batch becomes
+    local. Returns the graph's ``input_ids``, ``positions`` and ``args``;
+    ``kwargs`` is updated in place.
+    """
+    input_ids, local_ids, positions = cp_token_inputs(
+        input_ids=input_ids, positions=positions, layout=cp_layout
+    )
+    # Embeddings a caller supplies are global, and the precompile ladder builds
+    # them local like every other token-indexed input; leaving them global is a
+    # serve-time recompile, which `fail_on_recompile` turns into a crash on the
+    # first request.
+    if kwargs.get("input_embeds") is not None:
+        kwargs["input_embeds"] = cp_local_embeds(
+            input_embeds=kwargs["input_embeds"], layout=cp_layout
+        )
+        # A caller that supplies embeddings has no lookup to run; the ids only
+        # size the local rows.
+        input_ids = local_ids
+    else:
+        args = _cp_localize_embeds_in_args(args=args, cp_layout=cp_layout)
+        # The embedding takes the global ids and keeps the rank's rows.
+        kwargs["cp_local_rows"] = cp_layout.local_rows
+    forward_batch.input_ids = local_ids
+    forward_batch.positions = positions
+    return input_ids, positions, args
+
+
 def _fit_pp_proxy_rows(proxy: Any, input_ids: Any, forward_batch: Any) -> Any:
     """Bring a pipeline proxy to the padded batch's token axis.
 
@@ -1019,34 +1058,16 @@ class CompiledForwardShim:
                     cp_active=cp_layout is not None,
                 )
             if cp_layout is not None:
-                # The graph embeds the global ids (identical on every rank)
-                # and runs the model on the rank's zigzag rows; every
-                # token-indexed field on the batch is local.
                 saved["input_ids"] = forward_batch.input_ids
                 saved["positions"] = forward_batch.positions
-                input_ids, local_ids, positions = cp_token_inputs(
-                    input_ids, positions, cp_layout
+                input_ids, positions, args = _localize_cp_inputs(
+                    forward_batch,
+                    input_ids=input_ids,
+                    positions=positions,
+                    args=args,
+                    kwargs=kwargs,
+                    cp_layout=cp_layout,
                 )
-                # Embeddings a caller supplies are global, and the precompile
-                # ladder builds them local like every other token-indexed
-                # input; leaving them global is a serve-time recompile, which
-                # `fail_on_recompile` turns into a crash on the first request.
-                supplied_embeds = kwargs.get("input_embeds") is not None
-                if supplied_embeds:
-                    kwargs["input_embeds"] = cp_local_embeds(
-                        kwargs["input_embeds"], cp_layout
-                    )
-                else:
-                    args = _cp_localize_embeds_in_args(args, cp_layout)
-                if supplied_embeds:
-                    # A caller that supplies embeddings has no lookup to run;
-                    # the ids only size the local rows.
-                    input_ids = local_ids
-                else:
-                    # The embedding takes the global ids and keeps the rank's rows.
-                    kwargs["cp_local_rows"] = cp_layout.local_rows
-                forward_batch.input_ids = local_ids
-                forward_batch.positions = positions
         try:
             out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
             spec_info = forward_batch.spec_info

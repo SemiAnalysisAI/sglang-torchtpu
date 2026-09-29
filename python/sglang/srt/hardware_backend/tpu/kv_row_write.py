@@ -4,7 +4,7 @@
 ``write_rows`` copies ``rows[src : src + n]`` into token slots ``dst .. dst + n``
 of the layer buffer for every run ``(src, dst, n)`` of a segment table. Each
 run is staged through VMEM with double-buffered DMAs (a direct HBM-to-HBM DMA
-runs an order of magnitude slower on this chip), and the output aliases the
+runs an order of magnitude slower on TPU), and the output aliases the
 buffer, so the layer is updated in place and never re-laid out. JAX is
 imported only when a kernel is built, so the CPU fallback in
 `write_rows_torch` works without it.

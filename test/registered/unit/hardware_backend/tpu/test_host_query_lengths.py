@@ -21,6 +21,7 @@ def _bare_backend():
     backend.kernel_spec = SimpleNamespace(uses_draft_extend_v2=True)
     backend._is_hybrid_swa = False
     backend._host_metadata_cache = None
+    backend._host_page_cols = None
     # Single-token decode: the fixed-width DECODE range is covered separately in
     # test_pallas_rpa_v3_backend.py; these tests are about the query-length source.
     backend.decode_query_size = 1

@@ -1,4 +1,5 @@
-"""Unit tests for the TPU prefill context-parallel forward glue (CPU tensors)."""
+"""Unit tests for the TPU prefill context-parallel layout, K/V row writes and
+forward glue (CPU tensors)."""
 
 import unittest
 from types import SimpleNamespace
@@ -17,25 +18,32 @@ from sglang.srt.hardware_backend.tpu.cp_forward import (
     cp_last_token_rows,
     cp_local_embeds,
     cp_token_inputs,
-    ensure_cp_rank_tensor,
     fused_kv_rows,
     get_tpu_cp_layout,
     install_cp_logits_forward,
-    pinned_extend_seq_lens_cpu,
     prepare_tpu_cp_forward_batch,
-    select_cp_local_rows,
     wrap_cp_embedding_forward,
 )
-from sglang.srt.hardware_backend.tpu.cp_layout import build_tpu_cp_layout
+from sglang.srt.hardware_backend.tpu.cp_layout import (
+    build_tpu_cp_layout,
+    local_row_count,
+    owned_blocks,
+    warmup_request_lengths,
+    zigzag_block_sizes,
+)
 from sglang.srt.hardware_backend.tpu.kv_row_write import (
     kv_write_segments,
+    write_rows_torch,
     write_run_bound,
 )
+from sglang.srt.layers import dp_attention
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+_CP_FORWARD = "sglang.srt.hardware_backend.tpu.cp_forward"
 
 
 def _expand_write_segments(segments, num_segments):
@@ -80,6 +88,224 @@ def _layout(cp_size=4, cp_rank=1, extend=(40, 24), prefix=(0, 100), pad_b=4, buc
     )
     rows = torch.from_numpy(np.clip(host.local_rows, 0, None))
     return TpuCpBatchLayout(host=host, local_rows=rows)
+
+
+class TestZigzagBlocks(unittest.TestCase):
+    def test_block_sizes_sum_to_length_and_front_load_the_remainder(self):
+        self.assertEqual(zigzag_block_sizes(35, 4), [5, 5, 5, 4, 4, 4, 4, 4])
+        self.assertEqual(zigzag_block_sizes(64, 8), [4] * 16)
+        for length in (16, 17, 100, 4095):
+            self.assertEqual(sum(zigzag_block_sizes(length, 8)), length)
+
+    def test_local_rows_partition_the_tokens_across_ranks(self):
+        extend_lens = [40, 24, 17]
+        total = sum(local_row_count(extend_lens, 4, rank) for rank in range(4))
+        self.assertEqual(total, sum(extend_lens))
+
+    def test_local_rows_are_equal_when_lengths_divide_evenly(self):
+        # 64 -> 4 tokens per block, 128 -> 8: every rank holds 2 blocks of each.
+        extend_lens = [64, 128]
+        counts = {local_row_count(extend_lens, 8, rank) for rank in range(8)}
+        self.assertEqual(counts, {24})
+
+
+class TestBuildLayout(unittest.TestCase):
+    CP = 4
+    EXTEND = [40, 24]
+    PREFIX = [0, 100]
+    PAD_B = 4
+    BUCKET = 32
+
+    def _layout(self, rank):
+        return build_tpu_cp_layout(
+            extend_lens=self.EXTEND,
+            prefix_lens=self.PREFIX,
+            cp_size=self.CP,
+            cp_rank=rank,
+            pad_b=self.PAD_B,
+            local_rows_padded=self.BUCKET,
+        )
+
+    def test_every_token_is_owned_by_exactly_one_rank(self):
+        seen = np.zeros(sum(self.EXTEND), dtype=np.int64)
+        for rank in range(self.CP):
+            layout = self._layout(rank)
+            real = layout.local_rows[: layout.local_len]
+            self.assertTrue((layout.local_rows[layout.local_len :] == -1).all())
+            np.add.at(seen, real, 1)
+        self.assertTrue((seen == 1).all())
+
+    def test_local_order_is_request_major_with_adjacent_blocks(self):
+        layout = self._layout(1)
+        blocks0 = zigzag_block_sizes(self.EXTEND[0], self.CP)
+        starts0 = np.concatenate([[0], np.cumsum(blocks0)])
+        early, late = owned_blocks(self.CP, 1)
+        expected = np.concatenate(
+            [
+                np.arange(starts0[early], starts0[early + 1]),
+                np.arange(starts0[late], starts0[late + 1]),
+            ]
+        )
+        self.assertEqual(
+            layout.local_rows[: expected.shape[0]].tolist(), expected.tolist()
+        )
+
+    def test_gathered_rows_are_identical_on_every_rank(self):
+        reference = self._layout(0)
+        for rank in range(1, self.CP):
+            layout = self._layout(rank)
+            self.assertTrue((layout.gathered_req == reference.gathered_req).all())
+            self.assertTrue((layout.gathered_pos == reference.gathered_pos).all())
+        self.assertEqual(reference.gathered_req.shape[0], self.CP * self.BUCKET)
+        # Every (request, offset) pair appears once; padding rows are -1 twice.
+        valid = reference.gathered_req >= 0
+        pairs = set(
+            zip(
+                reference.gathered_req[valid].tolist(),
+                reference.gathered_pos[valid].tolist(),
+            )
+        )
+        self.assertEqual(len(pairs), sum(self.EXTEND))
+        self.assertTrue((reference.gathered_pos[~valid] == -1).all())
+
+    def test_pseudo_rows_follow_the_owned_blocks(self):
+        for rank in range(self.CP):
+            layout = self._layout(rank)
+            early, late = owned_blocks(self.CP, rank)
+            for i, length in enumerate(self.EXTEND):
+                blocks = zigzag_block_sizes(length, self.CP)
+                prefix = self.PREFIX[i]
+                self.assertEqual(
+                    layout.pseudo_kv_lens[2 * i], prefix + sum(blocks[: early + 1])
+                )
+                self.assertEqual(layout.pseudo_q_lens[2 * i], blocks[early])
+                self.assertEqual(
+                    layout.pseudo_kv_lens[2 * i + 1], prefix + sum(blocks[: late + 1])
+                )
+                self.assertEqual(layout.pseudo_q_lens[2 * i + 1], blocks[late])
+            # Padded requests are zero rows at the tail.
+            self.assertTrue((layout.pseudo_kv_lens[2 * len(self.EXTEND) :] == 0).all())
+            self.assertTrue((layout.pseudo_q_lens[2 * len(self.EXTEND) :] == 0).all())
+            self.assertEqual(
+                int(layout.pseudo_q_lens.sum()),
+                local_row_count(self.EXTEND, self.CP, rank),
+            )
+
+    def test_rank_zero_owns_every_last_token(self):
+        layout = self._layout(0)
+        self.assertEqual(layout.last_owner_mask.tolist(), [1, 1, 0, 0])
+        for i, length in enumerate(self.EXTEND):
+            row = layout.last_rows[i]
+            token = layout.local_rows[row]
+            self.assertEqual(token, sum(self.EXTEND[: i + 1]) - 1)
+        for rank in range(1, self.CP):
+            other = self._layout(rank)
+            self.assertEqual(other.last_owner_mask.tolist(), [0] * self.PAD_B)
+            self.assertEqual(other.last_rows.tolist(), [0] * self.PAD_B)
+
+    def test_rejects_short_requests_and_overfull_buckets(self):
+        with self.assertRaisesRegex(ValueError, "below the zigzag minimum"):
+            build_tpu_cp_layout(
+                extend_lens=[7],
+                prefix_lens=[0],
+                cp_size=4,
+                cp_rank=0,
+                pad_b=1,
+                local_rows_padded=8,
+            )
+        with self.assertRaisesRegex(ValueError, "exceed the request bucket"):
+            build_tpu_cp_layout(
+                extend_lens=[16, 16],
+                prefix_lens=[0, 0],
+                cp_size=4,
+                cp_rank=0,
+                pad_b=1,
+                local_rows_padded=8,
+            )
+        with self.assertRaisesRegex(ValueError, "exceed the local token bucket"):
+            build_tpu_cp_layout(
+                extend_lens=[64],
+                prefix_lens=[0],
+                cp_size=4,
+                cp_rank=0,
+                pad_b=1,
+                local_rows_padded=8,
+            )
+
+
+class TestWarmupRequestLengths(unittest.TestCase):
+    def test_lengths_fill_the_local_bucket_on_every_rank(self):
+        for local_rows, cp_size, max_reqs in ((64, 4, 8), (2048, 8, 64), (16, 8, 1)):
+            lengths = warmup_request_lengths(
+                local_rows=local_rows, cp_size=cp_size, max_reqs=max_reqs
+            )
+            self.assertLessEqual(len(lengths), max_reqs)
+            for rank in range(cp_size):
+                self.assertEqual(local_row_count(lengths, cp_size, rank), local_rows)
+            for length in lengths:
+                self.assertEqual(length % (2 * cp_size), 0)
+
+    def test_rejects_odd_or_empty_buckets(self):
+        with self.assertRaises(ValueError):
+            warmup_request_lengths(local_rows=3, cp_size=4, max_reqs=1)
+        with self.assertRaises(ValueError):
+            warmup_request_lengths(local_rows=8, cp_size=4, max_reqs=0)
+
+
+class TestKvWriteSegments(unittest.TestCase):
+    def test_runs_break_at_slot_gaps_and_padding(self):
+        # Slots 5-8 are one run; 9 skipped; 10-11; padding rows; 30 alone.
+        slots = np.array([5, 6, 7, 8, 10, 11, 0, 0, 30])
+        valid = np.array([1, 1, 1, 1, 1, 1, 0, 0, 1], dtype=bool)
+        segments, count = kv_write_segments(slots, valid, max_segments=8)
+        self.assertEqual(count, 3)
+        self.assertEqual(segments.shape, (3, 8))
+        self.assertEqual(
+            segments[:, :3].T.tolist(), [[0, 5, 4], [4, 10, 2], [8, 30, 1]]
+        )
+        self.assertEqual(int(segments[:, 3:].abs().sum()), 0)
+
+    def test_padding_between_consecutive_slots_splits_the_run(self):
+        slots = np.array([5, 6, 7, 8])
+        valid = np.array([1, 1, 0, 1], dtype=bool)
+        segments, count = kv_write_segments(slots, valid)
+        self.assertEqual(count, 2)
+        self.assertEqual(segments[:, :2].T.tolist(), [[0, 5, 2], [3, 8, 1]])
+
+    def test_long_runs_split_into_staging_pieces(self):
+        slots = np.arange(100, 100 + 3000)
+        segments, count = kv_write_segments(slots, np.ones(3000, dtype=bool))
+        self.assertEqual(count, 3)
+        self.assertEqual(
+            segments[:, :3].T.tolist(),
+            [[0, 100, 1024], [1024, 1124, 1024], [2048, 2148, 952]],
+        )
+
+    def test_no_valid_rows_gives_no_runs(self):
+        segments, count = kv_write_segments(
+            np.zeros(4, dtype=np.int64), np.zeros(4, dtype=bool)
+        )
+        self.assertEqual(count, 0)
+        self.assertEqual(int(segments.abs().sum()), 0)
+
+    def test_too_many_runs_is_rejected(self):
+        slots = np.arange(0, 20, 2)
+        with self.assertRaises(ValueError):
+            kv_write_segments(slots, np.ones(10, dtype=bool), max_segments=4)
+
+
+class TestWriteRowsFallback(unittest.TestCase):
+    def test_cpu_write_matches_scatter(self):
+        torch.manual_seed(0)
+        kv = torch.zeros(6, 4, 2, 2, 8, dtype=torch.bfloat16)
+        rows = torch.randn(10, 2, 2, 8).to(torch.bfloat16)
+        slots = np.array([9, 10, 11, 20, 21, 0, 0, 3, 4, 5])
+        valid = np.array([1, 1, 1, 1, 1, 0, 0, 1, 1, 1], dtype=bool)
+        segments, count = kv_write_segments(slots, valid)
+        write_rows_torch(torch.tensor([count], dtype=torch.int32), segments, rows, kv)
+        expected = torch.zeros_like(kv).flatten(0, 1)
+        expected[torch.from_numpy(slots[valid])] = rows[torch.from_numpy(valid)]
+        self.assertTrue(torch.equal(kv.flatten(0, 1), expected))
 
 
 class TestFusedKvRows(unittest.TestCase):
@@ -158,11 +384,16 @@ class TestAllGatherAndWriteKv(unittest.TestCase):
 
 
 class TestRankTensorSelection(unittest.TestCase):
-    def test_select_uses_the_rank_tensor_offset(self):
-        ensure_cp_rank_tensor(torch.device("cpu"), 1)
-        hidden = torch.arange(4 * 6, dtype=torch.float32).reshape(24, 1).expand(24, 3)
-        rows = select_cp_local_rows(hidden, slot_rows=6, num_rows=5)
-        self.assertEqual(rows[:, 0].tolist(), [6.0, 7.0, 8.0, 9.0, 10.0])
+    def test_cp_slot_rows_use_the_rank_tensor_offset(self):
+        device = torch.device("cpu")
+        saved = dict(dp_attention._RANK_TENSORS)
+        self.addCleanup(dp_attention._RANK_TENSORS.update, saved)
+        self.addCleanup(dp_attention._RANK_TENSORS.clear)
+        dp_attention._RANK_TENSORS[("attn_cp", device)] = torch.tensor(
+            1, dtype=torch.int64
+        )
+        rows = dp_attention._cp_rank_slot_rows(slot_rows=6, num_rows=5, device=device)
+        self.assertEqual(rows.tolist(), [6, 7, 8, 9, 10])
 
     def test_cp_token_inputs_follow_the_layout(self):
         layout = _layout()
@@ -264,14 +495,6 @@ class TestRankTensorSelection(unittest.TestCase):
         local = cp_local_embeds(torch.ones(short, 3), layout)
         self.assertEqual(local.shape, (host.local_rows_padded, 3))
 
-    def test_pinned_extend_seq_lens_are_batch_independent(self):
-        self.assertEqual(
-            pinned_extend_seq_lens_cpu(3, cp_size=8, cp_active=True), [16, 16, 16]
-        )
-        self.assertEqual(
-            pinned_extend_seq_lens_cpu(2, cp_size=8, cp_active=False), [0, 0]
-        )
-
 
 class TestLastTokenRows(unittest.TestCase):
     def test_owned_rows_are_kept_and_the_rest_come_from_the_reduce(self):
@@ -296,18 +519,29 @@ class TestLogitsForwardWrapper(unittest.TestCase):
         metadata = SimpleNamespace(
             cp_last_rows=cp_last_rows, cp_last_owner_mask=cp_last_owner_mask
         )
-        wrapper._get_forward_context = lambda: SimpleNamespace(
-            attn_backend=SimpleNamespace(forward_metadata=metadata)
+        self._patch(
+            "get_forward_context",
+            lambda: SimpleNamespace(
+                attn_backend=SimpleNamespace(forward_metadata=metadata)
+            ),
         )
-        wrapper._get_parallel = lambda: SimpleNamespace(
-            attn_cp_group=_FakeReduceGroup(other if other is not None else 0.0)
+        self._patch(
+            "get_parallel",
+            lambda: SimpleNamespace(
+                attn_cp_group=_FakeReduceGroup(other if other is not None else 0.0)
+            ),
         )
+        self._patch("ForwardBatch", SimpleNamespace)
         return wrapper, processor
+
+    def _patch(self, name, value):
+        patcher = patch(f"{_CP_FORWARD}.{name}", value)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_batches_without_cp_rows_go_straight_through(self):
         wrapper, processor = self._wrapper(cp_last_rows=None)
         batch = SimpleNamespace()
-        wrapper._forward_batch_cls = SimpleNamespace
         out = wrapper("ids", "hidden", "head", batch, None, None)
         self.assertEqual(out, "out")
         processor.original_forward.assert_called_once_with(
@@ -320,7 +554,6 @@ class TestLogitsForwardWrapper(unittest.TestCase):
             cp_last_rows=torch.tensor([3, 7, 0, 0]),
             cp_last_owner_mask=torch.tensor([1, 1, 0, 0], dtype=torch.int32),
         )
-        wrapper._forward_batch_cls = SimpleNamespace
         built = []
 
         class _Meta:
@@ -332,7 +565,7 @@ class TestLogitsForwardWrapper(unittest.TestCase):
                 built.append(meta)
                 return meta
 
-        wrapper._logits_metadata_cls = _Meta
+        self._patch("LogitsMetadata", _Meta)
         batch = SimpleNamespace()
         wrapper("ids", hidden, "head", batch)
         args = processor.original_forward.call_args.args
@@ -421,35 +654,20 @@ class TestCpMetadata(unittest.TestCase):
     CONTEXT_LEN = 1024
     POOL_WIDTH = 2048
     PAGE_SIZE = 64
-    DRAFT_TOKENS = 8
 
     def _make_backend(self, req_to_token, full_to_swa=None):
-        override = get_context().override_server_args(
-            speculative_num_draft_tokens=self.DRAFT_TOKENS,
-            speculative_algorithm="EAGLE3",
-            speculative_num_steps=None,
-            speculative_eagle_topk=1,
-            page_size=self.PAGE_SIZE,
-        )
+        override = get_context().override_server_args(page_size=self.PAGE_SIZE)
         override.install()
         self.addCleanup(override.restore)
-        server_args = SimpleNamespace(
-            speculative_num_draft_tokens=self.DRAFT_TOKENS,
-            speculative_algorithm="EAGLE3",
-            speculative_num_steps=None,
-            speculative_eagle_topk=1,
-            page_size=self.PAGE_SIZE,
-        )
         model_runner = SimpleNamespace(
             device=torch.device("cpu"),
             page_size=self.PAGE_SIZE,
             model_config=SimpleNamespace(context_len=self.CONTEXT_LEN),
-            server_args=server_args,
             req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
             token_to_kv_pool=SimpleNamespace(full_to_swa_index_mapping=full_to_swa),
             is_hybrid_swa=full_to_swa is not None,
             kv_cache_dtype=torch.bfloat16,
-            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
         )
         with patch(
             "sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base."

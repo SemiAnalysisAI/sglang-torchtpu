@@ -43,6 +43,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    _cp_rank_slot_rows,
     attn_rank0_scale,
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -1627,23 +1628,16 @@ class CommunicateSummableTensorPairFn:
             per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
             max_tokens_per_rank = max(per_rank_tokens)
             actual_local_tokens = per_rank_tokens[moe_cp_rank]
-            if _is_tpu:
-                # The slot offset must be a runtime operand: a Python rank
-                # constant traces one program per rank (see
-                # cp_forward.select_cp_local_rows).
-                from sglang.srt.hardware_backend.tpu.cp_forward import (
-                    select_cp_local_rows,
-                )
-
-                hidden_states = select_cp_local_rows(
-                    hidden_states,
+            # The slot offset comes from the rank tensor, a runtime operand
+            # rather than a rank constant baked into the traced program.
+            hidden_states = hidden_states.index_select(
+                0,
+                _cp_rank_slot_rows(
                     slot_rows=max_tokens_per_rank,
                     num_rows=actual_local_tokens,
-                )
-            else:
-                hidden_states = hidden_states.narrow(
-                    0, moe_cp_rank * max_tokens_per_rank, actual_local_tokens
-                ).contiguous()
+                    device=hidden_states.device,
+                ),
+            )
 
         # DP scatter (if DP attention is enabled)
         if context.attn_dp_size > 1:

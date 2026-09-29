@@ -338,10 +338,7 @@ class GptOssSparseMoeBlock(nn.Module):
             topk_output = self.topk(router_input, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
-        # Sharded experts return partial sums to reduce; replicated experts (MoE
-        # data parallelism) already hold every token's full output.
-        experts_sharded = self.experts.moe_ep_size > 1 or self.experts.moe_tp_size > 1
-        if experts_sharded and not should_skip_post_experts_all_reduce(
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

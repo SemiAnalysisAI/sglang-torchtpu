@@ -132,18 +132,7 @@ def build_tpu_cp_layout(
     pad_b: int,
     local_rows_padded: int,
 ) -> TpuCpHostLayout:
-    """Build the zigzag layout of one extend batch for ``cp_rank``.
-
-    Args:
-      extend_lens: Extend token count per real request (request-major order of
-        the batch's input_ids). Every entry must be at least ``2 * cp_size``.
-      prefix_lens: Cached prefix length per real request.
-      cp_size: Context-parallel group size.
-      cp_rank: This rank inside the group.
-      pad_b: Request bucket; per-request arrays are padded to it with zeros.
-      local_rows_padded: Local token bucket; must hold the largest per-rank
-        row count.
-    """
+    """Build the zigzag layout of one extend batch for ``cp_rank``."""
     extend_lens = [int(x) for x in extend_lens]
     prefix_lens = [int(x) for x in prefix_lens]
     num_reqs = len(extend_lens)

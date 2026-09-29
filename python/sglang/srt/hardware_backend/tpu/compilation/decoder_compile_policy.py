@@ -418,16 +418,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
     @property
     def _cp_strategy(self) -> Any:
-        """Prefill context-parallel strategy, or None when not configured.
-
-        Read through on every access rather than snapshotted in ``__init__``:
-        the strategy initializes lazily from the global parallel context, and
-        a policy built before that context is installed would snapshot None
-        for the process's whole life, which silently disables the
-        context-parallel warmup family, the batch bucketing and the embedding
-        wrapper at once. ``get_cp_strategy`` memoizes, so this stays cheap on
-        the forward path.
-        """
+        """Prefill context-parallel strategy, or None when not configured; not
+        cached, since the strategy may initialize after this policy is built."""
         return get_cp_strategy()
 
     def _record_compile_step(
@@ -991,14 +983,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
 
     def _assert_cp_family_compiled(self) -> None:
-        """Fail warmup if context parallelism is on but its family was skipped.
-
-        ``_precompile_extend`` is an override point, and a subclass that builds
-        its own variant grid drops the context-parallel family by omission.
-        Nothing downstream reports that: the server boots, serves whatever
-        shapes the tracer happened to touch, and dies on the first one it did
-        not, several requests into a run.
-        """
+        """Raise if prefill context parallelism is on but warmup compiled no
+        context-parallel extend graphs."""
         if self._cp_strategy is None or "cp" in self._compiled_extend_variants:
             return
         raise RuntimeError(
