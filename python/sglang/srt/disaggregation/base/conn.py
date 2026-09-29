@@ -208,6 +208,11 @@ class BaseKVSender(ABC):
 
 
 class BaseKVReceiver(ABC):
+    # Set by the decode prealloc queue; only backends with a prealloc deadline read it.
+    prealloc_exempt: bool = False
+    # Failed because the decode was saturated; the request can be retried elsewhere.
+    shed_retryable: bool = False
+
     @abstractmethod
     def __init__(
         self,

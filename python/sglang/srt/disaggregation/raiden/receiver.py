@@ -1084,6 +1084,7 @@ class RaidenReceiverMixin:
 class RaidenKVReceiver(CommonKVReceiver):
     # See RaidenKVSender: a group Failed waits for every rank's transfers.
     group_failure_requires_drain = True
+    enqueue_time: Optional[float] = None
 
     def __init__(
         self,
@@ -1093,6 +1094,7 @@ class RaidenKVReceiver(CommonKVReceiver):
     ):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self._started = False
+        self.enqueue_time = time.time()
 
     def send_metadata(
         self,
@@ -1133,6 +1135,12 @@ class RaidenKVReceiver(CommonKVReceiver):
         if self.kv_mgr.is_recv_done(self.bootstrap_room):
             self.conclude_state = KVPoll.Success
             return KVPoll.Success
+        if self._prealloc_timed_out():
+            self.shed_retryable = True
+            return self._conclude_failed(
+                reason=f"Request {self.bootstrap_room} waited over "
+                f"{self.kv_mgr._prealloc_timeout_s:.0f}s for a decode slot"
+            )
         if self._check_waiting_timeout() is not None:
             return self._conclude_failed()
         if self.kv_mgr.maybe_start_pull(self.bootstrap_room) and not self._started:
@@ -1140,6 +1148,18 @@ class RaidenKVReceiver(CommonKVReceiver):
             self._started = True
             return KVPoll.Transferring
         return self.kv_mgr.check_status(self.bootstrap_room)
+
+    def _prealloc_timed_out(self) -> bool:
+        # Only before send_metadata, where the waiting timeout takes over. The
+        # poll is all-reduced, so one rank's deadline sheds the room on all.
+        timeout = self.kv_mgr._prealloc_timeout_s
+        return (
+            timeout > 0
+            and self.init_time is None
+            and self.enqueue_time is not None
+            and not self.prealloc_exempt
+            and time.time() - self.enqueue_time > timeout
+        )
 
     def abort(self):
         """Explicit local abort: same terminal path as any failure, so active

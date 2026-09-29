@@ -31,6 +31,8 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class FakeReceiver:
+    shed_retryable = False
+
     def __init__(self):
         self.clear_called = False
         self.calls = []

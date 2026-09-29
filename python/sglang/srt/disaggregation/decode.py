@@ -818,6 +818,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             bootstrap_room=req.bootstrap_room,
         )
 
+        # A rebootstrapped request carries generated output; never shed it.
+        if is_rebootstrap:
+            kv_receiver.prealloc_exempt = True
         decode_req = DecodeRequest(
             req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
         )
@@ -1038,7 +1041,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prepare_abort(
                     decode_req.req,
                     error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    status_code=(
+                        HTTPStatus.SERVICE_UNAVAILABLE
+                        if decode_req.kv_receiver.shed_retryable
+                        else HTTPStatus.INTERNAL_SERVER_ERROR
+                    ),
                 )
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()

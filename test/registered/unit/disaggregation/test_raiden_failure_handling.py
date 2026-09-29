@@ -219,6 +219,7 @@ def _decode_manager_stub(**overrides):
         failure_records={},
         failure_lock=threading.Lock(),
         waiting_timeout=300,
+        _prealloc_timeout_s=0.0,
         _state_lock=threading.Lock(),
         _aborted={},
         _failed=set(),

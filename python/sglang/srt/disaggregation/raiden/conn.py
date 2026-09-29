@@ -68,6 +68,7 @@ from sglang.srt.disaggregation.raiden.serde import (
 )
 from sglang.srt.disaggregation.raiden.state import DecodeState, PrefillState
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_disagg, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
@@ -88,6 +89,24 @@ __all__ = [
 ]
 
 
+def _prealloc_timeout_s() -> float:
+    # Must stay below the prefill's decode-silence timeout: a room the prefill
+    # failed first is dropped when pulled, holding the decode slot until waiting times out.
+    timeout = float(os.environ.get("SGLANG_RAIDEN_PREALLOC_TIMEOUT_S", "60"))
+    if timeout <= 0:
+        return 0.0
+    limit = max(1.0, envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get() - 30.0)
+    if timeout > limit:
+        logger.warning(
+            "SGLANG_RAIDEN_PREALLOC_TIMEOUT_S=%s is not below the prefill "
+            "bootstrap timeout by 30s; using %s",
+            timeout,
+            limit,
+        )
+        return limit
+    return timeout
+
+
 class RaidenKVManager(
     RaidenSenderMixin,
     RaidenReceiverMixin,
@@ -100,6 +119,9 @@ class RaidenKVManager(
     ``base.py`` control plane. Consolidate onto a shared base so raiden reuses it
     instead of reimplementing the coordination.
     """
+
+    # Seconds a decode room may wait for a slot before it is shed; 0 is off.
+    _prealloc_timeout_s: float = 0.0
 
     def __init__(
         self,
@@ -143,6 +165,7 @@ class RaidenKVManager(
         )
         self._control_port = base_port + 4 * self._local_rank
         self._timeout_s = float(os.environ.get("SGLANG_RAIDEN_TIMEOUT_S", "120"))
+        self._prealloc_timeout_s = _prealloc_timeout_s()
         # Raiden's own switch, read when the engine is built in this process:
         # host staging is allocated per transfer (and per reshard plan) from
         # the pool instead of in fixed slots. On unless the operator sets it
