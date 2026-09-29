@@ -28,7 +28,15 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import freeze_gc, get_device_module
 
 logger = logging.getLogger(__name__)
-device_module = get_device_module()
+
+device_module = None
+
+
+def _get_device_module():
+    global device_module
+    if device_module is None:
+        device_module = get_device_module()
+    return device_module
 
 
 def _storage_suffix(
@@ -263,7 +271,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads = {}
 
         counter_index = self.layer_done_counter.update_producer()
-        ready_event = device_module.Event()
+        ready_event = _get_device_module().Event()
         ready_event.record()
         self.load_queue.put((counter_index, pending, ready_event))
         self.stats["load"] += len(pending)
@@ -361,7 +369,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
-        ready_event = device_module.Event()
+        ready_event = _get_device_module().Event()
         ready_event.record()
         self.offload_queue.put((expanded, tokens, ready_event))
         return True

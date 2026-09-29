@@ -31,7 +31,15 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import freeze_gc, get_device_module
 
 logger = logging.getLogger(__name__)
-device_module = get_device_module()
+
+device_module = None
+
+
+def _get_device_module():
+    global device_module
+    if device_module is None:
+        device_module = get_device_module()
+    return device_module
 
 # Keep every control-plane RPC comfortably below gRPC's message-size limit.
 # This is a logical-page count; existence queries carry keys only, no ranges.
@@ -543,7 +551,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         pending = self._pending
         rids = list(pending)
         plans = self._build_load_plans(list(pending.values()))
-        ready_event = device_module.Event()
+        ready_event = _get_device_module().Event()
         ready_event.record()
         counter_index = self.layer_done_counter.update_producer()
         self._load_queue.put((counter_index, rids, plans, ready_event))
@@ -632,13 +640,14 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             return self._fallback_offload_indices(indices, "device mismatch")
 
         try:
-            with device_module.device(indices.device):
+            dev_mod = _get_device_module()
+            with dev_mod.device(indices.device):
                 if self._offload_index_stream is None:
                     self._offload_index_device = indices.device
-                    self._offload_index_stream = device_module.Stream(
+                    self._offload_index_stream = dev_mod.Stream(
                         device=indices.device
                     )
-                    self._offload_index_done = device_module.Event()
+                    self._offload_index_done = dev_mod.Event()
                 while len(self._offload_index_buffers) <= slot:
                     self._offload_index_buffers.append(None)
                 count = indices.numel()
@@ -647,7 +656,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     buffer = self._allocate_offload_index_buffer(count)
                     self._offload_index_buffers[slot] = buffer
                 source = indices.detach()
-                with device_module.stream(self._offload_index_stream):
+                with dev_mod.stream(self._offload_index_stream):
                     # Register before enqueue so a failed copy cannot leave an
                     # untracked side-stream read of the source allocation.
                     source.record_stream(self._offload_index_stream)
@@ -882,7 +891,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return False
         self._freeze_gc_once()
-        ready_event = device_module.Event()
+        ready_event = _get_device_module().Event()
         ready_event.record()
         self._offload_queue.put((expanded, ready_event))
         return True
