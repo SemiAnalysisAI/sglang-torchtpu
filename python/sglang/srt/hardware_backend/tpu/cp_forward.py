@@ -278,15 +278,16 @@ def all_gather_and_write_kv(
     consecutive KV slots (padding rows have none). The write covers this rank's
     own rows too; the attention kernel rewrites them with identical bytes
     afterwards. Runs are DMAed into the layer buffer in place: an XLA scatter
-    here would re-lay out the whole pool around it on every layer.
+    here would re-lay out the whole pool around it on every layer. fp8 rows
+    travel as bytes and are written as the pool's own dtype, so the buffer the
+    write mutates is the pool itself rather than a dtype view of it.
     """
     rows = fused_kv_rows(k, v, kv_cache).contiguous()
-    target = kv_cache
-    if kv_cache.dtype in _FP8_DTYPES:
-        target = kv_cache.view(torch.uint8)
     gathered = rows.new_empty((group.world_size * rows.shape[0], *rows.shape[1:]))
     group.all_gather_into_tensor(gathered, rows)
-    write_rows_torch(write_num_segments, write_segments, gathered, target)
+    if kv_cache.dtype in _FP8_DTYPES:
+        gathered = gathered.view(kv_cache.dtype)
+    write_rows_torch(write_num_segments, write_segments, gathered, kv_cache)
 
 
 # ---------------------------------------------------------------------------
