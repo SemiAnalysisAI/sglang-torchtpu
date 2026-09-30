@@ -17,6 +17,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
+from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -49,10 +50,7 @@ def _make_host_pool(dcp_rank: int, device_size: int = 1024) -> MLATokenToKVPoolH
     # The host pool subtracts a fixed 10 GiB reserve from psutil's available
     # memory, so on a CI runner with less than that free the check rejects even
     # a zero-byte pool. These tests are about index math, not host capacity.
-    with mock.patch(
-        "sglang.srt.mem_cache.pool_host.base.psutil.virtual_memory",
-        return_value=SimpleNamespace(available=64 * 1024**3),
-    ):
+    with host_memory_budget_scope(64 * 1024**3):
         return MLATokenToKVPoolHost(
             _fake_mla_device_pool(device_size),
             host_to_device_ratio=2.0,
@@ -152,10 +150,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
 
     def test_non_dcp_pool_unchanged(self):
         # Pin the memory probe like _make_host_pool (10 GiB reserve vs loaded runner).
-        with mock.patch(
-            "sglang.srt.mem_cache.pool_host.base.psutil.virtual_memory",
-            return_value=SimpleNamespace(available=64 * 1024**3),
-        ):
+        with host_memory_budget_scope(64 * 1024**3):
             pool = MLATokenToKVPoolHost(
                 _fake_mla_device_pool(),
                 host_to_device_ratio=2.0,

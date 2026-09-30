@@ -9,7 +9,11 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -231,6 +235,8 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         self.assertEqual(scheduler._deferred_chunked_sender_aborts, [req])
 
     def _idle_prefill_scheduler(self):
+        # is_fully_idle reads the pipeline width from the published config.
+        self.enterContext(published_topology())
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.tree_cache = MagicMock()
         scheduler.running_batch = SimpleNamespace(
@@ -241,7 +247,7 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         scheduler.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
         scheduler.last_batch = None
         scheduler.enable_overlap = False
-        scheduler.ps = SimpleNamespace(pp_size=1)
+        scheduler.gracefully_exit = False
         scheduler.waiting_queue = []
         scheduler.grammar_manager = SimpleNamespace(grammar_queue=[], clear=MagicMock())
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
@@ -251,6 +257,7 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         )
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False
+        scheduler.enable_lmcache = False
         scheduler._engine_paused = False
         scheduler._deferred_chunked_sender_aborts = []
         scheduler.req_to_token_pool = MagicMock()

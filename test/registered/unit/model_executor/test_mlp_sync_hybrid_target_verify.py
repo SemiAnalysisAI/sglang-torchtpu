@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
 from sglang.srt.model_executor import forward_batch_info as fbi
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -39,7 +40,7 @@ def _sync(forward_mode, num_reqs, global_num_tokens):
         global_num_tokens_for_logprob_cpu=list(global_num_tokens),
         global_num_tokens_gpu=torch.zeros(len(global_num_tokens), dtype=torch.int64),
     )
-    model_runner = MagicMock(is_draft_worker=False)
+    model_runner = MagicMock(is_draft_worker=False, compile_policy=NoopCompilePolicy())
     model_runner.attn_tp_sequence_sharded.return_value = False
     no_prefill_graph = SimpleNamespace(
         graph=SimpleNamespace(

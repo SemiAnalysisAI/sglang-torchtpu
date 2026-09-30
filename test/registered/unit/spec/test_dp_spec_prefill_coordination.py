@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.managers.scheduler_components.dp_attn import _update_gather_batch
@@ -203,7 +204,9 @@ class TestDPSpecPrefillCoordinationPlan(CustomTestCase):
                             is_draft_input=lambda: True,
                         ),
                     )
-                    runner = MagicMock(enable_elastic_ep=False)
+                    runner = MagicMock(
+                        enable_elastic_ep=False, compile_policy=NoopCompilePolicy()
+                    )
                     with (
                         patch(
                             f"{module}.get_parallel",

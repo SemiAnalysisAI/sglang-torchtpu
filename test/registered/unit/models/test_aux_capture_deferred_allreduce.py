@@ -14,7 +14,6 @@ from sglang.srt.models.bailing_moe_v3 import BailingMoELinearModel
 from sglang.srt.models.glm4_moe import Glm4MoeModel
 from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteModel
 from sglang.srt.models.glm5_next import Glm5NextModel
-from sglang.srt.models.gpt_oss import GptOssModel
 from sglang.srt.models.laguna import LagunaModel
 from sglang.srt.models.qwen3_vl_moe import Qwen3MoeLLMModel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -23,13 +22,15 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 NUM_LAYERS = 4
+# GptOssModel is left out in this fork: it captures inside the layer through
+# LayerCommunicator.prepare_attn_and_capture_last_layer_outputs, which these
+# stub layers do not run.
 MODELS = (
     BailingMoEModel,
     BailingMoELinearModel,
     Glm4MoeModel,
     Glm4MoeLiteModel,
     Glm5NextModel,
-    GptOssModel,
     LagunaModel,
     Qwen3MoeLLMModel,
 )

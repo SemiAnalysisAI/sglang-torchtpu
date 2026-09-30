@@ -35,7 +35,10 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
     """Run every loop statement, stopping only at the next request-receive turn."""
     scheduler = SchedulerPPMixin()
     scheduler.pp_group = SimpleNamespace(
-        is_first_rank=rank == 0, is_last_rank=rank == 3
+        rank_in_group=rank,
+        world_size=4,
+        is_first_rank=rank == 0,
+        is_last_rank=rank == 3,
     )
     scheduler.pp_group.send_object = Mock(return_value=[])
     scheduler.pp_group.recv_object = Mock(return_value=[])

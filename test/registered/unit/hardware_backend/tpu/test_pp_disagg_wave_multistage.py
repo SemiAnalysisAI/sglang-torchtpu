@@ -149,7 +149,10 @@ def stage(fabric, rank, mode, schedule):
         enable_dsa_prefill_context_parallel=False,
     )
     scheduler.pp_group = SimpleNamespace(
-        is_first_rank=rank == 0, is_last_rank=rank == fabric.size - 1
+        rank_in_group=rank,
+        world_size=fabric.size,
+        is_first_rank=rank == 0,
+        is_last_rank=rank == fabric.size - 1,
     )
     step = [-1]
     processed = []

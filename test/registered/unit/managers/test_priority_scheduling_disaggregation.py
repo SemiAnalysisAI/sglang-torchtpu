@@ -931,6 +931,7 @@ class TestDecodePrebuilt(unittest.TestCase):
 
         call_order = []
         new_batch = MagicMock()
+        new_batch.is_empty.return_value = False
         new_batch.prepare_for_prebuilt.side_effect = lambda: call_order.append(
             "prepare"
         )
