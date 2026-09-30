@@ -367,9 +367,9 @@ def _registers_forward_hooks_before_capture(model_runner: ModelRunner) -> bool:
     """Compiled TPU execution registers forward hooks before capture; other
     backends register them after the final capture."""
     return (
-        bool(get_observability().forward_hooks)
-        and model_runner.device == "tpu"
+        getattr(model_runner, "device", None) == "tpu"
         and get_flags().capture.enable_torch_compile
+        and bool(get_observability().forward_hooks)
     )
 
 
@@ -427,7 +427,10 @@ def capture_cuda_graphs(
             current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
         ):
             decode = capture_decode_graph(model_runner=model_runner)
-    elif model_runner.device == "tpu" and get_flags().capture.enable_torch_compile:
+    elif (
+        getattr(model_runner, "device", None) == "tpu"
+        and get_flags().capture.enable_torch_compile
+    ):
         # EAGLE draft workers own their decode-style graph capture, but TPU
         # still uses this hook to install its torch.compile policy. The TPU
         # graph runner does not capture or replay a device graph.

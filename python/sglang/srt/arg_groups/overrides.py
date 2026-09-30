@@ -1398,9 +1398,9 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     # TODO(sglang-torchtpu#308): Remove this fallback once fused-RS supports
     # speculative decoding.
     if (
-        view.device == "tpu"
+        moe_runner_backend == "auto"
         and getattr(view, "speculative_algorithm", None) is not None
-        and moe_runner_backend == "auto"
+        and view.device == "tpu"
     ):
         moe_runner_backend = "pallas_tpu"
         logger.info("Speculative decoding on TPU: moe_runner_backend=pallas_tpu.")

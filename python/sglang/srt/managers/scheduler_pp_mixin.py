@@ -910,7 +910,7 @@ class SchedulerPPMixin:
             # the output tensor dictionaries on the pipeline CPU group.
             work = self.pp_group.send_object(
                 data,
-                dst=(get_parallel().pp_rank + 1) % get_parallel().pp_size,
+                dst=(self.pp_group.rank_in_group + 1) % self.pp_group.world_size,
                 async_send=async_send,
                 tag=_PP_PD_CONSENSUS_TAG,
             )
@@ -920,7 +920,7 @@ class SchedulerPPMixin:
     def _pp_pd_recv_consensus_from_prev_stage(self: Scheduler):
         if self._pp_wave is not None:
             return self.pp_group.recv_object(
-                src=(get_parallel().pp_rank - 1) % get_parallel().pp_size,
+                src=(self.pp_group.rank_in_group - 1) % self.pp_group.world_size,
                 tag=_PP_PD_CONSENSUS_TAG,
             )
         return self._pp_recv_pyobj_from_prev_stage()
