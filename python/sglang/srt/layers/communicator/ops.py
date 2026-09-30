@@ -704,10 +704,14 @@ def _reduce_and_redistribute_output_step(
         return _reduce_and_redistribute_output_varlen
     if (
         leaves_for_reduce_scatter
-        # TODO: revert to dp_padding_mode.is_max_len() once the torch pin is
-        # >= 2.14; the pinned torch's dynamo cannot trace methods of enums
-        # computed inside the graph (fixed upstream).
-        and forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN
+        # TODO: drop the TPU branch once the torch pin is >= 2.14; the pinned
+        # torch's dynamo cannot trace methods of enums computed inside the
+        # graph (fixed upstream).
+        and (
+            forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN
+            if _is_tpu
+            else forward_batch.dp_padding_mode.is_max_len()
+        )
         and can_use_dp_reduce_scatter()
         and not _tpu_hybrid_reduce_scatter_unsupported()
     ):

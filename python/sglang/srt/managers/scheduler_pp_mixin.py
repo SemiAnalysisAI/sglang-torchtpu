@@ -1370,7 +1370,7 @@ class SchedulerPPMixin:
             return output_result
 
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
-        if self._pp_wave is not None:
+        if getattr(self, "_pp_wave", None) is not None:
             # The relayed outputs stay on the host; decode reads its input IDs
             # from a device buffer.
             next_token_ids = next_token_ids.to(batch.device, non_blocking=True)

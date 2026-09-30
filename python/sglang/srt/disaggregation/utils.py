@@ -203,7 +203,7 @@ def _gate_group_failure_on_drain(polls, pollers, groups):
         i
         for i, (poll, poller) in enumerate(zip(polls, pollers))
         if poll == KVPoll.Failed
-        and getattr(poller, "group_failure_requires_drain", False)
+        and getattr(poller, "group_failure_requires_drain", False) is True
     ]
     if not gated:
         return polls
@@ -214,14 +214,13 @@ def _gate_group_failure_on_drain(polls, pollers, groups):
                 "A drain-gated transfer poller must implement quiesce_group_failure()"
             )
         quiesce()
-    drained = torch.tensor(
-        [1 if pollers[i].drained() else 0 for i in gated],
-        dtype=torch.uint8,
-        device="cpu",
-    )
-    for group in groups:
-        dist.all_reduce(drained, op=dist.ReduceOp.MIN, group=group)
-    for bit, i in zip(drained.tolist(), gated):
+    drained = [1 if pollers[i].drained() else 0 for i in gated]
+    if groups:
+        drained_tensor = torch.tensor(drained, dtype=torch.uint8, device="cpu")
+        for group in groups:
+            dist.all_reduce(drained_tensor, op=dist.ReduceOp.MIN, group=group)
+        drained = drained_tensor.tolist()
+    for bit, i in zip(drained, gated):
         if not bit:
             polls[i] = KVPoll.Transferring
     return polls
@@ -229,10 +228,14 @@ def _gate_group_failure_on_drain(polls, pollers, groups):
 
 def _reduce_status_and_gate_group_failure(polls, pollers, groups):
     """Reduce transfer status before applying the group-wide drain gate."""
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    for group in groups:
-        dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
-    return _gate_group_failure_on_drain(tensor_to_reduce.tolist(), pollers, groups)
+    # A single-rank group has nothing to reduce.
+    groups = [group for group in groups if dist.get_world_size(group) != 1]
+    if groups:
+        tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+        for group in groups:
+            dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
+        polls = tensor_to_reduce.tolist()
+    return _gate_group_failure_on_drain(polls, pollers, groups)
 
 
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:

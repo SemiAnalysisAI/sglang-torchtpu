@@ -53,6 +53,7 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.mem_cache.allocation import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -1638,10 +1639,6 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     Lazy: gather the positions planned by mamba_lazy_spec_prepare. Runs
     inside forward isolation, so it must not mutate req/pool state.
     """
-    # Function-local: avoids the schedule_batch -> overlap_utils ->
-    # spec_utils import cycle.
-    from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
-
     if not get_exec().mamba.enable_mamba_extra_buffer:
         return
     track_positions = None
