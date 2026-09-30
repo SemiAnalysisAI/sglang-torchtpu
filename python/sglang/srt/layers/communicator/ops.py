@@ -53,6 +53,8 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_reduce_scatter_hidden_states,
 )
 from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
+    attn_rank0_scale,
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     can_use_dp_reduce_scatter,
@@ -66,6 +68,7 @@ from sglang.srt.layers.dp_attention import (
     get_moe_cp_rank,
     get_moe_cp_size,
     is_allocation_symmetric,
+    is_dp_attention_enabled,
     moe_cp_all_gather_into_tensor,
 )
 from sglang.srt.layers.moe import should_use_dp_reduce_scatterv
@@ -73,13 +76,27 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     is_npu,
+    is_tpu,
 )
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
+
+
+def _tpu_hybrid_reduce_scatter_unsupported() -> bool:
+    """True on hybrid DP attention on TPU (attention-TP group > 1 rank, i.e.
+    tp_size > dp_size); plain TP never reaches the gated path.
+
+    dp_reduce_scatter_tensor scatters over the full TP group with output
+    sized input_rows // tp_size, so it needs input_rows divisible by tp_size.
+    Small/idle decode buckets (e.g. 2 rows over 8 ranks) aren't, so route
+    through all-reduce + dp_scatter instead.
+    """
+    return _is_tpu and is_dp_attention_enabled() and get_parallel().attn_tp_size > 1
 
 
 def tp_reduce_scatter(
@@ -335,7 +352,15 @@ def _mlp_input_dp_partial(
     shard of the DP group's tokens beside the others' in the group's slot."""
     if gathers_residual:
         residual = _redistribute_from_attn_tp_shards(residual)
-    if context.attn_tp_rank == 0:
+    if _is_tpu:
+        # Rank-uniform form of the `attn_tp_rank == 0` residual add below: a
+        # rank conditional traces divergent graphs and drops the upstream
+        # collective on ranks whose graph lacks the consumer. The 0/1 scale
+        # keeps every graph identical while only rank 0 adds the residual.
+        # TODO: remove once torch_tpu keeps rank-divergent in-graph
+        # collectives; revert to `elif context.attn_tp_rank == 0`.
+        hidden_states = hidden_states + residual * attn_rank0_scale(hidden_states)
+    elif context.attn_tp_rank == 0:
         hidden_states += residual
     cp_shard_counts = _cp_shard_token_rows(forward_batch) if places_cp_shards else None
     hidden_states = _reduce_and_redistribute_output_to_dp(
@@ -679,8 +704,12 @@ def _reduce_and_redistribute_output_step(
         return _reduce_and_redistribute_output_varlen
     if (
         leaves_for_reduce_scatter
-        and forward_batch.dp_padding_mode.is_max_len()
+        # TODO: revert to dp_padding_mode.is_max_len() once the torch pin is
+        # >= 2.14; the pinned torch's dynamo cannot trace methods of enums
+        # computed inside the graph (fixed upstream).
+        and forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN
         and can_use_dp_reduce_scatter()
+        and not _tpu_hybrid_reduce_scatter_unsupported()
     ):
         return _reduce_and_redistribute_output_max_len
     return None
