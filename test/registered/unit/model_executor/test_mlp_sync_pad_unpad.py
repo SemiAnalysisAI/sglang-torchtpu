@@ -337,6 +337,57 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         self.assertEqual(fb.extend_prefix_lens_cpu, [0])
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0])
 
+    def test_idle_mrope_positions_survive_dp_padding(self):
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+        for is_mrope in (True, False):
+            with self.subTest(is_mrope=is_mrope):
+                empty = torch.empty(0, dtype=torch.int64)
+                scheduled = ScheduleBatch(
+                    reqs=[],
+                    forward_mode=ForwardMode.IDLE,
+                    input_ids=empty,
+                    req_pool_indices=empty,
+                    seq_lens=empty,
+                    seq_lens_cpu=empty,
+                    orig_seq_lens=empty,
+                    out_cache_loc=empty,
+                    seq_lens_sum=0,
+                )
+                runner = _mock_model_runner()
+                runner.device = "cpu"
+                runner.model_config.model_is_mrope = is_mrope
+                runner.model_config.requires_mm_token_modalities = False
+                runner.lora_manager = None
+                runner.attn_backend.get_cpu_graph_seq_len_fill_value.return_value = 1
+                with patch(
+                    "sglang.srt.model_executor.forward_batch_info.enable_num_token_non_padded",
+                    return_value=False,
+                ):
+                    batch = ForwardBatch.init_new(
+                        scheduled,
+                        runner,
+                        capture_hidden_mode=CaptureHiddenMode.NULL,
+                        return_hidden_states_before_norm=False,
+                    )
+                if is_mrope:
+                    self.assertEqual(batch.mrope_positions.shape, (3, 0))
+                    self.assertEqual(batch.mrope_positions.dtype, torch.int64)
+                else:
+                    self.assertIsNone(batch.mrope_positions)
+                batch._pad_inputs_to_size(runner, num_tokens=8, bs=1)
+                if is_mrope:
+                    torch.testing.assert_close(
+                        batch.mrope_positions, torch.zeros(3, 8, dtype=torch.int64)
+                    )
+                    self.assertEqual(
+                        batch.mrope_positions.device, batch.positions.device
+                    )
+                else:
+                    self.assertIsNone(batch.mrope_positions)
+                self.assertEqual(scheduled.input_ids.numel(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

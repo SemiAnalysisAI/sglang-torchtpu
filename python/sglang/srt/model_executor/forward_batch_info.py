@@ -1018,6 +1018,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            if model_runner.model_config.model_is_mrope:
+                # DP synchronization can turn this idle batch into a padded
+                # extend. Seed MRoPE metadata so padding supplies dummy positions
+                # instead of leaving the multimodal wrapper with None.
+                ret.mrope_positions = ret.positions.new_empty((3, 0))
             if model_runner.lora_manager is not None:
                 model_runner.lora_manager.reset_lora_batch()
             return ret
