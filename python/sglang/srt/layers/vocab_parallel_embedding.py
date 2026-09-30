@@ -140,11 +140,11 @@ class VocabParallelEmbeddingShardIndices:
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu or _is_tpu)
 def get_masked_input_and_mask(
     input_: torch.Tensor,
-    org_vocab_start_index: int,
-    org_vocab_end_index: int,
-    num_org_vocab_padding: int,
-    added_vocab_start_index: int,
-    added_vocab_end_index: int,
+    org_vocab_start_index: int | torch.Tensor,
+    org_vocab_end_index: int | torch.Tensor,
+    num_org_vocab_padding: int | torch.Tensor,
+    added_vocab_start_index: int | torch.Tensor,
+    added_vocab_end_index: int | torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # torch.compile will fuse all of the pointwise ops below
     # into a single kernel, making it very fast
@@ -348,6 +348,27 @@ class VocabParallelEmbedding(torch.nn.Module):
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
         )
+
+        if _is_tpu and self.tp_size > 1:
+            # Rank-specific constants can change XLA's temporary-buffer layout
+            # between ranks, breaking the symmetric addresses used by Pallas
+            # collectives. Register the bounds so direct_compile traces them
+            # as model inputs. Use the module's construction device context;
+            # quantized embeddings need not have a parameter named "weight".
+            self.register_buffer(
+                "_tpu_vocab_shard_bounds",
+                torch.tensor(
+                    [
+                        self.shard_indices.org_vocab_start_index,
+                        self.shard_indices.org_vocab_end_index,
+                        self.shard_indices.num_org_vocab_padding,
+                        self.shard_indices.added_vocab_start_index,
+                        self.shard_indices.added_vocab_end_index,
+                    ],
+                    dtype=torch.int64,
+                ),
+                persistent=False,
+            )
 
     @classmethod
     def _get_indices(
@@ -562,14 +583,19 @@ class VocabParallelEmbedding(torch.nn.Module):
                 output_parallel = output_parallel.to(self.output_dtype)
             return output_parallel
         # Map out-of-shard ids to index 0, gather, then zero those rows.
-        masked_input, input_mask = get_masked_input_and_mask(
-            input_,
-            self.shard_indices.org_vocab_start_index,
-            self.shard_indices.org_vocab_end_index,
-            self.shard_indices.num_org_vocab_padding,
-            self.shard_indices.added_vocab_start_index,
-            self.shard_indices.added_vocab_end_index,
-        )
+        if _is_tpu:
+            masked_input, input_mask = get_masked_input_and_mask(
+                input_, *self._tpu_vocab_shard_bounds.unbind()
+            )
+        else:
+            masked_input, input_mask = get_masked_input_and_mask(
+                input_,
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+                self.shard_indices.num_org_vocab_padding,
+                self.shard_indices.added_vocab_start_index,
+                self.shard_indices.added_vocab_end_index,
+            )
         with symm_alloc:
             output_parallel = self.quant_method.embedding(self, masked_input.long())
         if self.output_dtype is not None:
