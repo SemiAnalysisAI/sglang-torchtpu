@@ -1607,8 +1607,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
                     prepare_decode_as_extend(self, bs)
                 elif hybrid_ssm or self.seq_lens.shape[0] == 0:
-                    # Fabricate a dummy request for an empty rank. Non-TPU
-                    # hybrid models retain their existing empty-rank contract.
+                    # Fabricate a single dummy request covering num_tokens for an
+                    # empty (idle) rank. Non-TPU hybrid-SSM models retain this
+                    # empty-rank contract. Non-hybrid ranks also need this when
+                    # MAX_LEN is forced for prefill breakable CUDA graphs, so every
+                    # DP rank runs the same captured shape. Live TPU rows are
+                    # handled above; the final else converts remaining live decode
+                    # rows to one-token extends.
                     dev = self.seq_lens.device
                     assert self.seq_lens.shape[0] == 0, (
                         "extend-idle conversion expects an empty rank"
