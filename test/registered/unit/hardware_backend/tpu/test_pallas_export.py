@@ -414,7 +414,7 @@ class TestPallasExportEnvironment(CustomTestCase):
             # Torch keeps both operands, so JAX must not remove this one.
             unused = torch.zeros(8, dtype=torch.float32, device="tpu")
             y = op(x, unused)
-            torch.tpu.synchronize()
+            torch.accelerator.synchronize()
             print(
                 json.dumps(
                     {
