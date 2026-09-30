@@ -163,16 +163,14 @@ class TestCustomOpDispatchesTpu(CustomTestCase):
     had no TPU branch, so an override would have been silently ignored."""
 
     def _dispatch_with_tpu_platform(self, op_cls):
-        from sglang.multimodal_gen.runtime.layers import custom_op
+        from sglang.multimodal_gen.runtime import platforms
 
         platform = MagicMock()
-        for name in ("is_hip", "is_npu", "is_xpu", "is_musa"):
+        for name in ("is_out_of_tree", "is_cuda", "is_hip", "is_npu", "is_xpu"):
             getattr(platform, name).return_value = False
+        platform.is_musa.return_value = False
         platform.is_tpu.return_value = True
-        with (
-            patch.object(custom_op, "_is_cuda", False),
-            patch.object(custom_op, "current_platform", platform),
-        ):
+        with patch.object(platforms, "current_platform", platform, create=True):
             return op_cls()._forward_method()
 
     def test_subclass_override_is_reached(self):
@@ -205,10 +203,25 @@ class TestGlooDefaultGroupIsNotDeviceBound(CustomTestCase):
 
         from sglang.multimodal_gen.runtime import platforms
         from sglang.multimodal_gen.runtime.distributed import parallel_state
+        from sglang.multimodal_gen.runtime.platforms.interface import Platform
+        from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
 
         platform = MagicMock()
-        for name in ("is_mps", "is_musa", "is_npu", "is_cpu", "is_xpu", "is_tpu"):
+        for name in (
+            "is_out_of_tree",
+            "is_mps",
+            "is_musa",
+            "is_npu",
+            "is_cpu",
+            "is_xpu",
+            "is_tpu",
+        ):
             getattr(platform, name).return_value = predicates.get(name, False)
+        # Answer the device-id question the way the real platform class does.
+        platform_cls = TpuPlatform if predicates.get("is_tpu") else Platform
+        platform.supports_distributed_device_id = lambda: (
+            platform_cls.supports_distributed_device_id(platform)
+        )
         platform.device_name = "test"
         world = MagicMock(world_size=1)
         with (
