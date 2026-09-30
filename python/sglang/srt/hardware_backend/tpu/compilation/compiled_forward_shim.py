@@ -309,9 +309,7 @@ def _dp_attn_compute_padding(
             f"{forward_batch.dp_padding_mode}."
         )
 
-    from sglang.srt.layers.dp_attention import get_attention_dp_rank
-
-    dp_rank = get_attention_dp_rank()
+    dp_rank = get_parallel().attn_dp_rank
     # This rank's real live token count (used below for decode/idle real_q/b).
     # global_num_tokens_cpu is padded.
     # original_global_num_tokens_cpu is the pre-padding counts.

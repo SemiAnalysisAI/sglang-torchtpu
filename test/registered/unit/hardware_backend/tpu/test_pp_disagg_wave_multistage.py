@@ -271,7 +271,10 @@ def stage(fabric, rank, mode, schedule):
     scheduler._pp_send_dict_to_next_stage = lambda data, **kwargs: fabric.send(
         rank, "output", data
     )
-    scheduler._pp_recv_dict_from_prev_stage = lambda: fabric.receive(rank, "output")
+    scheduler._pp_recv_dict_from_prev_stage = lambda: (
+        fabric.receive(rank, "output"),
+        None,
+    )
     scheduler._pp_prep_batch_result = lambda target, metadata, outputs: SimpleNamespace(
         logits_output=None, next_token_ids=outputs["next_token_ids"]
     )
