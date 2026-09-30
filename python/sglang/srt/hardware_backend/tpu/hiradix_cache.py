@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import dataclasses
 import heapq
 import json
 import logging
@@ -32,16 +33,12 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
-    PrefetchTimeoutConfig,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation as HybridPrefetchOperation,
-)
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    attach_hybrid_dsa_pool_to_hiradix_cache,
 )
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -85,6 +82,48 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Upstream removed HiRadixCache (#40787) together with the helpers below; the
+# torch_tpu HiCache data plane still runs on it.
+@dataclasses.dataclass
+class PrefetchTimeoutConfig:
+    """Knobs for the linear prefetch-timeout policy used by HiCache."""
+
+    base: float = 2.0  # seconds, fixed overhead unrelated to token count
+    per_ki_token: float = 0.1  # seconds per 1024 tokens
+    max: float = 30.0  # seconds, upper bound for the linear timeout
+
+
+class HiTreeNode(TreeNode):
+    """A radix node that also tracks its KV copy on host."""
+
+    def __init__(self, id: Optional[int] = None, priority: int = 0):
+        super().__init__(id=id, priority=priority)
+        self.init_host_state()
+
+    def init_host_state(self) -> None:
+        # Incremented while a storage operation references the node, which
+        # protects it from eviction.
+        self.host_ref_counter = 0
+        # Host indices of the node's KV cache.
+        self.host_value: Optional[torch.Tensor] = None
+        self.write_through_pending_id: Optional[int] = None
+
+    @property
+    def backuped(self):
+        return self.host_value is not None
+
+    def protect_host(self):
+        """Protect the host value from eviction."""
+        self.host_ref_counter += 1
+
+    def release_host(self):
+        """Release the host value, allowing it to be evicted."""
+        if self.host_ref_counter > 0:
+            self.host_ref_counter -= 1
+        else:
+            raise RuntimeError("Host reference counter is already zero.")
+
+
 class HiRadixCache(RadixCache):
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
@@ -116,12 +155,6 @@ class HiRadixCache(RadixCache):
                 )
 
                 precompile_kv_offload(self.token_to_kv_pool_host)
-        elif isinstance(self.kv_cache, DSATokenToKVPool):
-            # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
-            self.token_to_kv_pool_host = None
-        elif isinstance(self.kv_cache, MiniMaxSparseKVPool):
-            # Filled by attach_hybrid_minimax_sparse_pool_to_hiradix_cache.
-            self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             _parallel = get_parallel()
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -135,7 +168,7 @@ class HiRadixCache(RadixCache):
                 dcp_rank=_parallel.attn_dcp_rank,
             )
         else:
-            raise ValueError("HiRadixCache only supports MHA, MLA, DSA, and MSA models")
+            raise ValueError("HiRadixCache only supports MHA and MLA models")
 
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
@@ -161,46 +194,23 @@ class HiRadixCache(RadixCache):
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        if isinstance(self.kv_cache, DSATokenToKVPool):
-            attach_hybrid_dsa_pool_to_hiradix_cache(
-                self,
-                params,
-                extra_config=extra_config,
-                prefetch_threshold=prefetch_threshold,
-                enable_storage_metrics=self.enable_storage_metrics,
-                load_cache_event=self.load_cache_event,
-            )
-        elif isinstance(self.kv_cache, MiniMaxSparseKVPool):
-            from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-                attach_hybrid_minimax_sparse_pool_to_hiradix_cache,
-            )
-
-            attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
-                self,
-                params,
-                extra_config=extra_config,
-                prefetch_threshold=prefetch_threshold,
-                enable_storage_metrics=self.enable_storage_metrics,
-                load_cache_event=self.load_cache_event,
-            )
-        else:
-            self.cache_controller = HiCacheController.create_for_backend(
-                params.token_to_kv_pool_allocator,
-                self.token_to_kv_pool_host,
-                self.page_size,
-                self.tp_group,
-                load_cache_event=self.load_cache_event,
-                attn_cp_group=self.attn_cp_group,
-                attn_tp_group=self.attn_tp_group,
-                pp_group=self.pp_group,
-                write_policy=get_memory().hicache_write_policy,
-                io_backend=get_memory().hicache_io_backend,
-                storage_backend=get_memory().hicache_storage_backend,
-                prefetch_threshold=prefetch_threshold,
-                model_name=get_serving().served_model_name,
-                storage_backend_extra_config=extra_config,
-                enable_storage_metrics=self.enable_storage_metrics,
-            )
+        self.cache_controller = HiCacheController.create_for_backend(
+            params.token_to_kv_pool_allocator,
+            self.token_to_kv_pool_host,
+            self.page_size,
+            self.tp_group,
+            load_cache_event=self.load_cache_event,
+            attn_cp_group=self.attn_cp_group,
+            attn_tp_group=self.attn_tp_group,
+            pp_group=self.pp_group,
+            write_policy=get_memory().hicache_write_policy,
+            io_backend=get_memory().hicache_io_backend,
+            storage_backend=get_memory().hicache_storage_backend,
+            prefetch_threshold=prefetch_threshold,
+            model_name=get_serving().served_model_name,
+            storage_backend_extra_config=extra_config,
+            enable_storage_metrics=self.enable_storage_metrics,
+        )
         self._apply_storage_runtime_config(
             storage_backend=get_memory().hicache_storage_backend,
             prefetch_threshold=prefetch_threshold,
@@ -816,6 +826,15 @@ class HiRadixCache(RadixCache):
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
         super().reset()
+        # The base root is a plain TreeNode; give it the host-side state in
+        # place so references taken during reset stay valid.
+        self.root_node.__class__ = HiTreeNode
+        self.root_node.init_host_state()
+        self.root_node.host_value = []
+
+    def is_backuped(self, node: HiTreeNode) -> bool:
+        """Whether the node's Full KV is present on host."""
+        return node.backuped
 
     def release_host_resources(self) -> None:
         if self.token_to_kv_pool_host is not None:
@@ -1869,7 +1888,7 @@ class HiRadixCache(RadixCache):
                 child_key = key.child_key(self.page_size)
 
         if len(key):
-            new_node = TreeNode(priority=node.priority)
+            new_node = HiTreeNode(priority=node.priority)
             new_node.parent = node
             new_node.key = key
             new_node.value = None
@@ -1913,7 +1932,7 @@ class HiRadixCache(RadixCache):
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # child node split into new_node -> child
-        new_node = TreeNode(priority=child.priority)
+        new_node = HiTreeNode(priority=child.priority)
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -2009,7 +2028,7 @@ class HiRadixCache(RadixCache):
                 child_key = key.child_key(self.page_size)
 
         if len(key):
-            new_node = TreeNode(priority=priority)
+            new_node = HiTreeNode(priority=priority)
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
