@@ -242,12 +242,25 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
         )
     if cfg.tp_size > 1 and cfg.attn_cp_size != cfg.tp_size:
         raise NotImplementedError(
-            "Pipeline parallelism on TPU runs a stage on one device or on a "
-            "prefill context-parallel group of --tp-size devices "
-            f"(got --tp-size {cfg.tp_size} with --attn-cp-size {cfg.attn_cp_size} "
-            f"and --pp-size {pp}): tensor parallelism inside a pipeline stage "
-            "is not supported."
+            "Pipeline parallelism on TPU requires --tp-size 1 or --attn-cp-size "
+            f"equal to --tp-size (got --tp-size {cfg.tp_size} with --attn-cp-size "
+            f"{cfg.attn_cp_size} and --pp-size {pp})."
         )
+    if cfg.attn_cp_size > 1:
+        if cfg.kv_cache_dtype in ("fp8_e4m3", "fp8_e5m2"):
+            raise NotImplementedError(
+                "Pipeline stages made of a context-parallel group support only a "
+                "bf16 KV cache (--kv-cache-dtype bfloat16), got --kv-cache-dtype "
+                f"{cfg.kv_cache_dtype}."
+            )
+        if cfg.kv_cache_dtype == "auto":
+            logger.info(
+                "Pipeline stages made of a context-parallel group run with "
+                "--kv-cache-dtype bfloat16."
+            )
+            declare_resolution(
+                server_args, "tpu.apply_server_args_defaults", kv_cache_dtype="bfloat16"
+            )
     if cfg.speculative_algorithm is not None:
         raise NotImplementedError(
             "Speculative decoding "
@@ -634,6 +647,9 @@ class TpuSRTPlatform(SRTPlatform):
 
     def support_piecewise_cuda_graph(self) -> bool:
         return False
+
+    def supports_moe_dp_pipeline_stages(self) -> bool:
+        return True
 
     def supports_overlap_streams(self) -> bool:
         # torch_tpu serialises all device work on a single implicit PJRT queue:

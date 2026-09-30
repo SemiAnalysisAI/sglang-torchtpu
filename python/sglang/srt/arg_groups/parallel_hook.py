@@ -96,8 +96,10 @@ def handle_context_parallelism(server_args: Any):
         assert view.ep_size * cfg.moe_dp_size <= cfg.tp_size, (
             "ep_size * moe_dp_size must be less than or equal to tp_size"
         )
-        # On TPU a pipeline stage may replicate its experts over its own devices.
-        assert cfg.pp_size == 1 or cfg.device == "tpu", (
+        from sglang.srt.platforms import current_platform
+
+        # A platform may let a pipeline stage replicate experts over its own devices.
+        assert cfg.pp_size == 1 or current_platform.supports_moe_dp_pipeline_stages(), (
             "PP is not supported with context parallelism"
         )
 

@@ -128,19 +128,32 @@ class TestPipelineParallelValidation(CustomTestCase):
 
     def test_rejects_tensor_parallel_stages(self):
         with self.assertRaisesRegex(
-            NotImplementedError, r"tensor parallelism inside a pipeline stage"
+            NotImplementedError, r"--attn-cp-size equal to --tp-size"
         ):
             _apply(_args(pp_size=2, tp_size=2))
 
     def test_rejects_stages_wider_than_their_context_parallel_group(self):
         with self.assertRaisesRegex(
-            NotImplementedError, r"tensor parallelism inside a pipeline stage"
+            NotImplementedError, r"--attn-cp-size equal to --tp-size"
         ):
             _apply(_cp_stage_args(tp_size=4, attn_cp_size=2))
 
     def test_accepts_context_parallel_stages(self):
         prepare_tpu_env = _apply(_cp_stage_args())
         prepare_tpu_env.assert_called_once_with(8, setup_slicebuilder=True)
+
+    def test_context_parallel_stages_reject_an_fp8_kv_cache(self):
+        """Context-parallel stages serve only a bf16 KV cache, so an explicit
+        fp8 dtype fails at launch instead of serving."""
+        with self.assertRaisesRegex(NotImplementedError, r"only a bf16 KV cache"):
+            _apply(_cp_stage_args(kv_cache_dtype="fp8_e4m3"))
+
+    def test_context_parallel_stages_default_to_a_bf16_kv_cache(self):
+        """The TPU fp8 default for the RPA backends does not apply to
+        context-parallel stages."""
+        args = _cp_stage_args()
+        _apply(args)
+        self.assertEqual(resolution_result(args, "kv_cache_dtype"), "bfloat16")
 
     def test_rejects_speculative_decoding(self):
         with self.assertRaisesRegex(

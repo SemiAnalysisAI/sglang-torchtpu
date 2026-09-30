@@ -190,22 +190,26 @@ TPU. Overlap scheduling is switched off by pipeline parallelism itself. A
 stage waiting for the previous stage looks idle to the watchdog, so pass
 `--watchdog-timeout` at least `pp_size` times the longest microbatch.
 
-### Context-parallel stages (PP4 x PCP2)
-
-`--pp-size 4 --tp-size 2 --attn-cp-size 2 --enable-prefill-cp --cp-strategy
-zigzag --moe-dp-size 2` runs four stages of two chiplets: each stage splits
-its prefill tokens over its pair by zigzag blocks (each chiplet runs the
-attention of its own blocks and all-gathers the layer's K/V so both hold the
-whole KV of the stage's layers) and replicates the experts on both chiplets
-(`--ep-size 2` splits them instead). `--tp-size` must equal `--attn-cp-size`,
-and the torch_tpu build must compile a stage's collectives for the stage's
-devices only.
-
 Optional warmup — run between launch and bench *only* while the in-server
 torch.compile warmup doesn't yet cover all compile-shape buckets:
 
 ```bash
 MODEL=Qwen/Qwen3-32B ./warmup.sh
+```
+
+### Context-parallel stages (PP4 x PCP2)
+
+Requires `--tp-size` equal to `--attn-cp-size`, a bf16 KV cache, and a
+torch_tpu that compiles a stage's collectives for the stage's devices only.
+
+```bash
+MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
+TP_SIZE=2 PP_SIZE=4 PP_MAX_MICRO_BATCH_SIZE=4 KV_CACHE_DTYPE=bfloat16 \
+PAGE_SIZE=128 CONTEXT_LEN=32768 CONC=32 \
+CHUNKED_PREFILL_SIZE=16384 MAX_PREFILL_TOKENS=16384 \
+MEM_FRACTION_STATIC=0.30 TORCH_COMPILE_MAX_BS=32 \
+EXTRA_ARGS="--attn-cp-size 2 --enable-prefill-cp --cp-strategy zigzag --moe-dp-size 2 --sampling-backend pytorch --watchdog-timeout 3600" \
+./launch_server.sh
 ```
 
 ### Prefill chunk sizing

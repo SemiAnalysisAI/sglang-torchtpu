@@ -284,11 +284,16 @@ def all_gather_and_write_kv(
     here would re-lay out the whole pool around it on every layer.
 
     For an fp8 pool ``k``/``v`` are the compute-dtype tensors and ``quantize``
-    maps gathered K/V to the pool dtype: the gather runs in the compute dtype
-    and the rows are quantized afterwards, because an 8-bit all-gather inside
-    the compiled forward leaves the pool with wrong rows on TPU.
+    maps the gathered K/V to the pool dtype.
     """
+    if quantize is None and kv_cache.dtype in (*_FP8_DTYPES, torch.uint8):
+        raise ValueError(
+            f"A {kv_cache.dtype} KV pool needs `quantize` to write gathered K/V rows."
+        )
     if quantize is not None:
+        # Gathered in the compute dtype: an 8-bit all-gather here writes wrong rows.
+        # TODO(yinlin09): gather the fp8 rows directly
+        # once an 8-bit all-gather inside the compiled forward writes correct rows.
         k_all = k.new_empty((group.world_size * k.shape[0], *k.shape[1:]))
         v_all = v.new_empty((group.world_size * v.shape[0], *v.shape[1:]))
         group.all_gather_into_tensor(k_all, k.contiguous())

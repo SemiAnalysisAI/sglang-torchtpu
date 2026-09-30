@@ -397,6 +397,20 @@ class TestAllGatherAndWriteKv(unittest.TestCase):
     def test_fp8_rows_land_at_their_slots(self):
         self._run(torch.float8_e4m3fn)
 
+    def test_fp8_pool_without_quantize_is_rejected(self):
+        """Compute-dtype rows must not reach an fp8 pool unquantized."""
+        k = torch.randn(4, 1, 128, dtype=torch.bfloat16)
+        kv_cache = torch.zeros(8, 4, 1, 2, 128, dtype=torch.float8_e4m3fn)
+        with self.assertRaisesRegex(ValueError, "needs `quantize`"):
+            all_gather_and_write_kv(
+                kv_cache=kv_cache,
+                k=k,
+                v=k,
+                write_segments=torch.zeros(3, 1, dtype=torch.int32),
+                write_num_segments=torch.tensor([0], dtype=torch.int32),
+                group=_FakeGatherGroup(2, []),
+            )
+
 
 class TestRankTensorSelection(unittest.TestCase):
     def test_cp_slot_rows_use_the_rank_tensor_offset(self):

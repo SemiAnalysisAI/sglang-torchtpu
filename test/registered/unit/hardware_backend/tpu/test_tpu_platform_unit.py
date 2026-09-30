@@ -57,6 +57,9 @@ class TestTpuPlatformIdentity(CustomTestCase):
         self.assertFalse(self.platform.support_cuda_graph())
         self.assertFalse(self.platform.support_piecewise_cuda_graph())
 
+    def test_pipeline_stages_may_replicate_experts(self):
+        self.assertTrue(self.platform.supports_moe_dp_pipeline_stages())
+
     def test_dispatch_key(self):
         self.assertEqual(self.platform.get_dispatch_key_name(), "tpu")
 
@@ -496,14 +499,6 @@ class TestPrefillContextParallelValidation(TestTpuPlatformServerDefaults):
     def test_replicated_experts_match_the_cp_size(self):
         with patch.dict(os.environ, {}, clear=False):
             self._apply(self._cp_args(moe_dp_size=8))
-
-    def test_accepts_pipeline_stages_made_of_the_cp_group(self):
-        with patch.dict(os.environ, {}, clear=False):
-            self._apply(
-                self._cp_args(
-                    pp_size=4, tp_size=2, attn_cp_size=2, pp_async_batch_depth=1
-                )
-            )
 
     def test_attn_cp_size_one_is_untouched(self):
         args = self._args(tp_size=8, attn_cp_size=1, enable_prefill_cp=False)

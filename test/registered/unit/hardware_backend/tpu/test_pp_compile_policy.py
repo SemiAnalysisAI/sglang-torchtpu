@@ -330,7 +330,7 @@ def _proxy(rows: int):
     )
 
 
-def _shim(pp_group=None):
+def _shim(pp_group):
     def forward(input_ids, positions, forward_batch, pp_proxy_tensors=None):
         pass
 
@@ -408,22 +408,6 @@ class TestShimProxyCheck(CustomTestCase):
         passed = compiled.call_args.args[4]
         self.assertEqual(passed.tensors["hidden_states"].shape[0], 16)
 
-    def test_positional_proxy_is_fitted_to_explicit_rows(self):
-        """A context-parallel stage trims a positional proxy to its padded
-        local rows, like the keyword one."""
-        fitted = _fit_pp_proxy_in_args(
-            (None, _proxy(64)), torch.zeros(48), None, rows=32
-        )
-        self.assertEqual(fitted[1].tensors["hidden_states"].shape[0], 32)
-
-    def test_explicit_rows_override_the_input_row_count(self):
-        """A context-parallel extend runs on its padded local rows, not on
-        the global input rows the batch still carries."""
-        fitted = _fit_pp_proxy_rows(_proxy(64), torch.zeros(48), None, rows=32)
-        self.assertEqual(fitted.tensors["hidden_states"].shape[0], 32)
-        with self.assertRaises(ValueError):
-            _fit_pp_proxy_rows(_proxy(16), torch.zeros(8), None, rows=32)
-
     def test_shim_passes_a_matching_proxy_to_the_compiled_forward(self):
         shim, compiled = _shim(_pp_group(first=False, last=False))
         fb = _forward_batch(64)
@@ -443,13 +427,6 @@ class TestShimProxyCheck(CustomTestCase):
         fb = _forward_batch(64)
         shim(fb.input_ids, None, fb, pp_proxy_tensors=_proxy(32))
         self.assertNotIn("pp_proxy_tensors", compiled.call_args.kwargs)
-
-    def test_on_a_single_stage_the_proxy_is_checked_and_forwarded(self):
-        shim, compiled = _shim()
-        fb = _forward_batch(64)
-        proxy = _proxy(64)
-        shim(fb.input_ids, None, fb, pp_proxy_tensors=proxy)
-        self.assertIs(compiled.call_args.kwargs["pp_proxy_tensors"], proxy)
 
     def _cp_layout(self, local_rows: int):
         return SimpleNamespace(

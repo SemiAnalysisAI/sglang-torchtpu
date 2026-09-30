@@ -301,7 +301,7 @@ class TestWaveGuards(CustomTestCase):
 
     def test_permutation_forms_one_cycle_per_column(self):
         physical = (4, 5, 0, 1, 6, 7, 2, 3)  # rank -> device, stages of two
-        perm = pipeline_permutation(physical, size=4, columns=2)
+        perm = pipeline_permutation(physical=physical, size=4, columns=2)
         # Column 0: ranks 0,2,4,6 -> devices 4,0,6,2; column 1: ranks 1,3,5,7.
         self.assertEqual(
             perm,
@@ -310,11 +310,11 @@ class TestWaveGuards(CustomTestCase):
         self.assertEqual(sorted(s for s, _ in perm), sorted(physical))
         self.assertEqual(sorted(t for _, t in perm), sorted(physical))
         self.assertEqual(
-            pipeline_permutation((0, 1, 2), size=3, columns=1),
+            pipeline_permutation(physical=(0, 1, 2), size=3, columns=1),
             ((0, 1), (1, 2), (2, 0)),
         )
         with self.assertRaisesRegex(ValueError, "cannot form"):
-            pipeline_permutation((0, 1, 2), size=2, columns=2)
+            pipeline_permutation(physical=(0, 1, 2), size=2, columns=2)
 
 
 if __name__ == "__main__":

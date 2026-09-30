@@ -68,7 +68,7 @@ def physical_device_by_rank(world_group: Any) -> tuple[int, ...]:
 
 
 def pipeline_permutation(
-    physical: tuple[int, ...], size: int, columns: int
+    *, physical: tuple[int, ...], size: int, columns: int
 ) -> tuple[tuple[int, int], ...]:
     """Source/target physical device pairs of the hand-off: rank
     ``s * columns + j`` (stage s, column j) sends to stage s+1's column j,
@@ -326,7 +326,14 @@ class PPWave:
 
 
 def build_pp_wave(
-    pp_group: Any, *, rows: int, hidden: int, dtype: torch.dtype, device: torch.device
+    pp_group: Any,
+    *,
+    stage_group: Any,
+    world_group: Any,
+    rows: int,
+    hidden: int,
+    dtype: torch.dtype,
+    device: torch.device,
 ) -> PPWave:
     """Create the stage's wave on the device and verify the hand-off routing.
 
@@ -334,13 +341,10 @@ def build_pp_wave(
     order; each column's cycle closes from the last stage back to the first,
     and every device of the slice launches the same program.
     """
-    from sglang.srt.distributed import get_tp_group, get_world_group
-
     rank = int(pp_group.rank_in_group)
     size = int(pp_group.world_size)
-    columns = int(get_tp_group().world_size)
-    column = int(get_tp_group().rank_in_group)
-    world_group = get_world_group()
+    columns = int(stage_group.world_size)
+    column = int(stage_group.rank_in_group)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if size * columns != world_size:
         raise ValueError(
@@ -348,7 +352,7 @@ def build_pp_wave(
             f"(pp {size} stages of {columns} devices, world {world_size})"
         )
     physical = physical_device_by_rank(world_group)
-    perm = pipeline_permutation(physical, size, columns)
+    perm = pipeline_permutation(physical=physical, size=size, columns=columns)
     op = build_pp_permute_op(perm)
     wave = PPWave(
         rank=rank,
@@ -361,7 +365,7 @@ def build_pp_wave(
     )
     ok = wave.probe(column=column, columns=columns)
     # Every device must agree on the routing, so the verdict is gathered.
-    verdicts: list = [None] * world_size
+    verdicts: list = [None] * int(world_group.world_size)
     torch.distributed.all_gather_object(verdicts, bool(ok), group=world_group.cpu_group)
     if not all(verdicts):
         raise RuntimeError(
