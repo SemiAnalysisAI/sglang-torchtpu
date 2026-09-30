@@ -428,6 +428,9 @@ def _simulate_balanced_routing_kernel(
     topk_weights_ptr,
     num_experts,
     step,
+    num_ranks,
+    experts_per_rank,
+    assignment_stride,
     inv_k,
     seed,
     layer_offset,
@@ -440,6 +443,7 @@ def _simulate_balanced_routing_kernel(
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     RANDOM: tl.constexpr,
+    PERFECT_BALANCED: tl.constexpr,
 ):
     """One program per token: overwrite its top-k row with a balanced expert
     assignment and uniform ``1/k`` weights, in a single launch — so the
@@ -452,11 +456,11 @@ def _simulate_balanced_routing_kernel(
     - ``topk_weights_ptr``: ``[num_tokens, K]`` (row-major; strides passed in),
       overwritten in place
 
-    ``RANDOM=False`` is the deterministic round-robin base ``token + layer_offset``;
     ``RANDOM=True`` is a random per-token base (uniform, balanced in expectation;
-    ``seed`` is a kernel arg, so it is baked at CUDA-graph capture and replays stay
-    balanced). Both spread the k experts by ``step`` and emit global expert ids
-    (any EP logical->physical remap happens later in ``_post_process_topk_ids``).
+    ``seed`` is baked at CUDA-graph capture). ``PERFECT_BALANCED`` deals the
+    flattened assignments across EP ranks. Otherwise the legacy round-robin
+    mapping is preserved. All modes emit global expert ids; any EPLB remap runs
+    later in ``_post_process_topk_ids``.
     ``token_shard_rank`` and ``num_token_shards`` ensure scattered DP ranks generate
     different expert assignments for their local tokens when DP > 1."""
     t = tl.program_id(0)
@@ -465,9 +469,15 @@ def _simulate_balanced_routing_kernel(
     mask = j < K
     if RANDOM:
         base = (tl.rand(seed, global_t) * num_experts).to(tl.int32)
+        gid = (base + j * step) % num_experts
+    elif PERFECT_BALANCED:
+        deal = global_t * assignment_stride + j + layer_offset
+        gid = (deal % num_ranks) * experts_per_rank + (
+            deal // num_ranks
+        ) % experts_per_rank
     else:
         base = global_t + layer_offset
-    gid = (base + j * step) % num_experts
+        gid = (base + j * step) % num_experts
     tl.store(topk_ids_ptr + t * stride_im + j * stride_ik, gid, mask=mask)
     tl.store(
         topk_weights_ptr + t * stride_wm + j * stride_wk,
@@ -487,6 +497,9 @@ def _simulate_balanced_routing(
     num_experts: int,
     *,
     random: bool,
+    perfect_balanced: bool = False,
+    num_ranks: int = 1,
+    num_routed_topk: Optional[int] = None,
     layer_id: Optional[int] = None,
     token_shard_rank: int = 0,
     num_token_shards: int = 1,
@@ -494,7 +507,8 @@ def _simulate_balanced_routing(
 ) -> None:
     """Benchmark-only fused override (in place): replace ``topk_ids`` with a
     balanced expert assignment and ``topk_weights`` with ``1/k`` using a single
-    Triton kernel. ``random=False`` is round-robin; ``random=True`` is uniform.
+    Triton kernel. ``random=True`` is uniform, ``perfect_balanced=True`` is
+    rank-first, and both false preserve round-robin behavior.
 
     Shapes:
     - ``topk_ids``: ``[num_tokens, k]``, overwritten in place
@@ -509,6 +523,10 @@ def _simulate_balanced_routing(
     if num_tokens == 0 or k == 0:
         return
     assert 0 <= token_shard_rank < num_token_shards
+    if num_ranks <= 0 or num_experts % num_ranks:
+        num_ranks = 1
+    experts_per_rank = max(num_experts // num_ranks, 1)
+    assignment_stride = k if num_routed_topk is None else num_routed_topk
     if random and seed is None:
         seed = _simulate_uniform_seed
         _simulate_uniform_seed += 1
@@ -519,6 +537,9 @@ def _simulate_balanced_routing(
         topk_weights,
         num_experts,
         max(num_experts // k, 1),
+        num_ranks,
+        experts_per_rank,
+        assignment_stride,
         1.0 / k,
         seed,
         0 if layer_id is None else layer_id,
@@ -531,6 +552,7 @@ def _simulate_balanced_routing(
         K=k,
         BLOCK_K=triton.next_power_of_2(k),
         RANDOM=random,
+        PERFECT_BALANCED=perfect_balanced,
     )
 
 
@@ -2517,12 +2539,25 @@ def select_experts(
 
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
-    if simulate_uniform_experts and simulate_round_robin_experts:
+    simulate_perfect_balanced_experts = (
+        envs.SGLANG_TPU_SIMULATE_PERFECT_BALANCED_EXPERTS.get()
+    )
+    if (
+        simulate_uniform_experts
+        + simulate_round_robin_experts
+        + simulate_perfect_balanced_experts
+        > 1
+    ):
         raise ValueError(
-            "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
-            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS, "
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS, and "
+            "SGLANG_TPU_SIMULATE_PERFECT_BALANCED_EXPERTS are mutually exclusive"
         )
-    routing_overridden = simulate_uniform_experts or simulate_round_robin_experts
+    routing_overridden = (
+        simulate_uniform_experts
+        or simulate_round_robin_experts
+        or simulate_perfect_balanced_experts
+    )
 
     (
         router_logits,
@@ -2756,6 +2791,11 @@ def select_experts(
             topk_weights,
             router_logits.shape[1],
             random=simulate_uniform_experts,
+            perfect_balanced=simulate_perfect_balanced_experts,
+            num_ranks=(
+                get_parallel().moe_ep_size if simulate_perfect_balanced_experts else 1
+            ),
+            num_routed_topk=num_routed_topk,
             layer_id=layer_id,
             token_shard_rank=token_shard_rank,
             num_token_shards=num_token_shards,
@@ -2808,6 +2848,7 @@ def precomputed_topk_postprocess_is_noop(
         and expert_location_dispatch_info is None
         and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
         and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+        and not envs.SGLANG_TPU_SIMULATE_PERFECT_BALANCED_EXPERTS.get()
     )
 
 
