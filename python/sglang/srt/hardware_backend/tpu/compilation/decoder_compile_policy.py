@@ -1504,10 +1504,10 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         return key
 
     def _decode_uses_input_ids(self) -> bool:
-        """Whether the wrapper hands decode raw ``input_ids``, skipping embed.
+        """Whether the wrapper hands decode / verify raw ``input_ids``, skipping embed.
 
         Wrappers that set ``decode_embeds_in_language_model`` bypass
-        ``general_mm_embed_routine`` in decode so the embedding lands inside the
+        ``general_mm_embed_routine`` in decode / verify so the embedding lands inside the
         compiled graph instead of running as eager device programs in front of
         it.
         """
@@ -1686,10 +1686,17 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         # (bs, variant, logits_output_mode): warm the embeds convention VL
         # requests use and the positional one text-only serving actually
         # takes (mirrors the base policy).
+        # In-graph embedding uses "text_only" (input_ids + mrope positions);
+        # "text_ids" would warm unused 1-D positions.
+        variants = (
+            ("text_only",)
+            if self._decode_uses_input_ids()
+            else ("text_only", "text_ids")
+        )
         compile_items = [
             (bs, variant, logits_output_mode)
             for bs in bs_buckets
-            for variant in ("text_only", "text_ids")
+            for variant in variants
             for logits_output_mode in self._warmup_logits_output_modes(bs)
         ]
         logger.info(
@@ -1771,7 +1778,9 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             else forward_batch.positions
         )
 
-        if mode.is_decode() and self._decode_uses_input_ids():
+        if (
+            mode.is_decode() or mode.is_target_verify()
+        ) and self._decode_uses_input_ids():
             # Positions stay mrope-shaped; only the embedding moves into the graph.
             return (
                 (forward_batch.input_ids, positions, forward_batch),

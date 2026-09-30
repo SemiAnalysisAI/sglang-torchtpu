@@ -1502,9 +1502,29 @@ class TestPrecompileLoops(_PolicyTestCase):
         one left them to compile lazily at serving time, where the first
         unseen batch width tripped fail_on_recompile and killed the server."""
 
+        warmed = self._warmed_decode_variants(decode_embeds_in_language_model=False)
+        self.assertEqual(
+            warmed,
+            {
+                (64, "text_only"),
+                (128, "text_only"),
+                (64, "text_ids"),
+                (128, "text_ids"),
+            },
+        )
+
+    def test_qwen3_vl_decode_embedding_in_graph_warms_one_convention(self):
+        """With the embedding in the language model, "text_only" already is the
+        serving call (input_ids + mrope positions). "text_ids" would warm 1-D
+        positions an mrope decode never passes: one unused graph per bucket."""
+        warmed = self._warmed_decode_variants(decode_embeds_in_language_model=True)
+        self.assertEqual(warmed, {(64, "text_only"), (128, "text_only")})
+
+    def _warmed_decode_variants(self, *, decode_embeds_in_language_model):
         mr = _model_runner()
         mr.model.get_image_feature = MagicMock()
         mr.model.get_input_embeddings = MagicMock()
+        mr.model.decode_embeds_in_language_model = decode_embeds_in_language_model
         policy = Qwen3VLDecoderTpuCompilePolicy(
             model_runner=mr,
             b_bucketer=Bucketer(name="Bs", buckets=[64, 128]),
@@ -1522,24 +1542,16 @@ class TestPrecompileLoops(_PolicyTestCase):
         ):
             policy._precompile_decode()
 
-        warmed = {
+        return {
             (call.kwargs["bs"], call.kwargs["variant"])
             for call in policy._run_one.call_args_list
         }
-        self.assertEqual(
-            warmed,
-            {
-                (64, "text_only"),
-                (128, "text_only"),
-                (64, "text_ids"),
-                (128, "text_ids"),
-            },
-        )
 
     def test_qwen3_vl_warmup_crosses_logits_modes(self):
         mr = _model_runner()
         mr.model.get_image_feature = MagicMock()
         mr.model.get_input_embeddings = MagicMock(return_value=torch.nn.Embedding(2, 4))
+        mr.model.decode_embeds_in_language_model = False
         _enable_distributed_top_k(mr)
         policy = Qwen3VLDecoderTpuCompilePolicy(
             model_runner=mr,
