@@ -551,7 +551,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         pending = self._pending
         rids = list(pending)
         plans = self._build_load_plans(list(pending.values()))
-        ready_event = _get_device_module().Event()
+        dev_mod = _get_device_module()
+        ready_event = dev_mod.Event()
         ready_event.record()
         counter_index = self.layer_done_counter.update_producer()
         self._load_queue.put((counter_index, rids, plans, ready_event))
@@ -891,7 +892,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return False
         self._freeze_gc_once()
-        ready_event = _get_device_module().Event()
+        dev_mod = _get_device_module()
+        ready_event = dev_mod.Event()
         ready_event.record()
         self._offload_queue.put((expanded, ready_event))
         return True
