@@ -10,6 +10,7 @@ Pure dataclass logic — CPU only.
 """
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -56,7 +57,20 @@ def _global_top_k_output(num_rows: int) -> LogitsProcessorOutput:
 
 
 class TestMlpSyncPadUnpad(CustomTestCase):
-    def test_tpu_hybrid_decode_continues_cached_rows_during_peer_prefill(self):
+    def test_decode_during_peer_prefill_preserves_backend_behavior(self):
+        for is_tpu, hybrid in (
+            (True, True),
+            (True, False),
+            (False, True),
+            (False, False),
+        ):
+            for host_lengths in (True, False):
+                with self.subTest(
+                    is_tpu=is_tpu, hybrid=hybrid, host_lengths=host_lengths
+                ):
+                    self._check_decode_during_peer_prefill(is_tpu, hybrid, host_lengths)
+
+    def _check_decode_during_peer_prefill(self, is_tpu, hybrid, host_lengths):
         from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
         from sglang.srt.layers.dp_attention import DpPaddingMode
 
@@ -66,7 +80,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             input_ids=torch.tensor([11, 12]),
             req_pool_indices=torch.tensor([5, 6]),
             seq_lens=torch.tensor([7, 9]),
-            seq_lens_cpu=torch.tensor([7, 9]),
+            seq_lens_cpu=torch.tensor([7, 9]) if host_lengths else None,
             out_cache_loc=torch.tensor([20, 21]),
             seq_lens_sum=16,
             positions=torch.tensor([6, 8]),
@@ -82,9 +96,11 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         runner.attn_backend.get_cpu_graph_seq_len_fill_value.return_value = 1
         module = "sglang.srt.model_executor.forward_batch_info"
         with (
-            patch(f"{module}._is_tpu", True),
+            patch(f"{module}._is_tpu", is_tpu),
             patch(f"{module}._is_cpu", True),
-            patch(f"{module}.mambaish_config", return_value=object()),
+            patch(
+                f"{module}.mambaish_config", return_value=object() if hybrid else None
+            ),
             patch(
                 f"{module}._elastic_should_preserve_local_token_counts",
                 return_value=False,
@@ -112,12 +128,22 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             patch(
                 "sglang.srt.batch_overlap.two_batch_overlap.TboForwardBatchPreparer.prepare"
             ),
-            patch.object(
-                torch.Tensor,
-                "cpu",
-                side_effect=AssertionError("unexpected device-to-host synchronization"),
+            (
+                patch.object(
+                    torch.Tensor,
+                    "cpu",
+                    side_effect=AssertionError(
+                        "unexpected device-to-host synchronization"
+                    ),
+                )
+                if is_tpu and host_lengths
+                else nullcontext()
             ),
         ):
+            if hybrid and not is_tpu:
+                with self.assertRaisesRegex(AssertionError, "expects an empty rank"):
+                    batch.prepare_mlp_sync_batch(runner)
+                return
             batch.prepare_mlp_sync_batch(runner)
 
         self.assertEqual(batch.forward_mode, ForwardMode.EXTEND)
