@@ -78,6 +78,7 @@ class _FakeEntry:
         self.name = name
         self.host_pool = host_pool
         self.device_pool = device_pool
+        self.device_indices_from_anchor_fn = None
 
 
 class _FakeGroup:

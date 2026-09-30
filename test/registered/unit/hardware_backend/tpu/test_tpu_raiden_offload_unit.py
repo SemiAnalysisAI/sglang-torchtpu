@@ -208,7 +208,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         queue.tp_rank = 1
         queue.pp_rank = 0
         queue.scheduler = SimpleNamespace(
-            ps=SimpleNamespace(dp_rank=2, gpu_id=3),
             tp_worker=SimpleNamespace(
                 model_runner=SimpleNamespace(kv_cache_dtype_str="bfloat16")
             ),
@@ -228,7 +227,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         with (
             patch(
                 "sglang.srt.disaggregation.decode.get_parallel",
-                return_value=SimpleNamespace(attn_tp_size=2),
+                return_value=SimpleNamespace(attn_tp_size=2, dp_rank=2),
             ),
             patch(
                 "sglang.srt.disaggregation.decode.get_kv_class",

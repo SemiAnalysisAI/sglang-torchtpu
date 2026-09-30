@@ -236,7 +236,14 @@ def _target_and_padding(policy):
 
 
 def _run_cases(policy, mode):
-    with get_parallel().override(tp_rank=1):
+    with get_parallel().override(
+        tp_size=2,
+        tp_rank=1,
+        attn_tp_size=2,
+        attn_tp_rank=1,
+        moe_tp_size=2,
+        moe_tp_rank=1,
+    ):
         if mode == ForwardMode.EXTEND:
             policy._precompile_extend()
         else:
@@ -1234,7 +1241,14 @@ class TestPrecompileLoops(_PolicyTestCase):
         policy = _make_policy(_model_runner(), token_buckets=(8,), bs_buckets=(1, 4))
         policy._run_one = MagicMock()
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy._precompile_extend()
 
         modes = {
@@ -1248,7 +1262,14 @@ class TestPrecompileLoops(_PolicyTestCase):
         policy._run_one = MagicMock()
 
         with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True):
-            with get_parallel().override(tp_rank=1):
+            with get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ):
                 policy._precompile_extend()
 
         modes = {
@@ -1319,7 +1340,14 @@ class TestPrecompileLoops(_PolicyTestCase):
         policy.extend_bs = 16
         policy._run_one = MagicMock()
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy._precompile_extend()
 
         # 2 token buckets x 2 conventions: the input_embeds one a VL request
@@ -1350,7 +1378,14 @@ class TestPrecompileLoops(_PolicyTestCase):
         )
         policy._run_one = MagicMock()
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy._precompile_decode()
 
         warmed = {
@@ -1380,7 +1415,14 @@ class TestPrecompileLoops(_PolicyTestCase):
         )
         policy._run_one = MagicMock()
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy._precompile_extend()
             policy._precompile_decode()
 
@@ -1422,7 +1464,14 @@ class TestPrecompileLoops(_PolicyTestCase):
             patch(
                 "sglang.srt.hardware_backend.tpu.mm_embed_tpu.apply_host_mm_embeds"
             ) as warmed,
-            get_parallel().override(tp_rank=1),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
         ):
             policy._precompile_extend()
 
@@ -1460,7 +1509,14 @@ class TestPrecompileLoops(_PolicyTestCase):
     def test_precompile_combines_extend_and_decode(self):
         mr = _model_runner()
         policy = _make_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy.precompile()
         # EXTEND: (8,4), (64,4) = 2. DECODE: (1,1), (4,4) = 2.
         self.assertEqual(mr.model.forward.call_count, 4)
@@ -1698,7 +1754,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         )
         policy.extend_bs = 16
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy._precompile_draft_prefill_extend()
 
         self.assertEqual(mr.attn_backend.calls, [(1024, 16), (4096, 16)])
@@ -1718,7 +1781,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
                 target_is_multimodal=target_is_multimodal,
             )
             policy.extend_bs = 16
-            with get_parallel().override(tp_rank=1):
+            with get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ):
                 policy._precompile_draft_prefill_extend()
             seen.append(len(mr.attn_backend.calls))
 
@@ -1750,7 +1820,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         )
         policy.extend_bs = 16
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy._precompile_extend_full()
 
         self.assertEqual(
@@ -1762,7 +1839,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         mr = _spec_model_runner()
         policy = _make_spec_policy(mr, token_buckets=(8,), bs_buckets=(4,))
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy._precompile_extend_full()
 
         batches = [call.args[2] for call in mr.model.forward.call_args_list]
@@ -1784,7 +1868,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         # precompile() spans two modules: the base EXTEND/DECODE warmup lives in
         # decoder_compile_policy (via super()), the spec TARGET_VERIFY/EXTEND(FULL)
         # in spec_decode_compile_policy. One topology override serves both.
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy.precompile()
         # EXTEND (8,4),(64,4)=2  DECODE (1,1),(4,4)=2
         # TARGET_VERIFY buckets bs: (4,1),(16,4)=2. EXTEND(FULL) covers two
@@ -1796,7 +1887,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
     def test_draft_worker_skips_precompile(self):
         mr = _spec_model_runner(is_draft_worker=True)
         policy = _make_spec_policy(mr)
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy.precompile()
         self.assertEqual(mr.model.forward.call_count, 0)
         self.assertEqual(mr.attn_backend.calls, [])
@@ -1810,7 +1908,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         draft_backend = SimpleNamespace(attn_backends=decode_backends)
         draft_extend_backend = _FakeAttnBackend()
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy.precompile_draft(draft_backend, draft_extend_backend)
 
         self.assertEqual(mr.attn_backend.calls, [(8, 4), (64, 4)])
@@ -1846,7 +1951,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
             self.assertTrue(kwargs["model_label"].startswith("draft "))
 
         with (
-            get_parallel().override(tp_rank=1),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
             patch(
                 "sglang.srt.hardware_backend.tpu.compilation."
                 "spec_decode_compile_policy_eagle3.install_recompilation_checker",
@@ -1866,7 +1978,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         policy._precompile_draft_decode = MagicMock()
         draft_extend_backend = _FakeAttnBackend()
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy.precompile_draft(SimpleNamespace(), draft_extend_backend)
 
         self.assertEqual(draft_extend_backend.calls, [(4, 1), (16, 4)])
@@ -2274,7 +2393,14 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             embed_draft_block_ids=MagicMock(),
         )
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy.precompile_draft(
                 draft_attn_backend=_FakeAttnBackend(), dflash_worker=worker
             )
@@ -2308,7 +2434,14 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         policy, _ = self._make_dflash_policy()
         with (
             self.assertRaisesRegex(ValueError, "cannot be None"),
-            get_parallel().override(tp_rank=1),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
         ):
             policy.precompile_draft(dflash_worker=None)
 
@@ -2415,7 +2548,14 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
 
         # precompile_draft branches on get_disagg().disaggregation_mode.
         with (
-            get_parallel().override(tp_rank=1),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
             get_disagg().override(disaggregation_mode="prefill"),
         ):
             policy.precompile_draft(
@@ -2444,7 +2584,14 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         )
 
         with (
-            get_parallel().override(tp_rank=1),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
             get_disagg().override(disaggregation_mode="decode"),
         ):
             policy.precompile_draft(
@@ -2485,7 +2632,14 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
 
         # precompile() reads get_disagg().disaggregation_mode per call; scope each half.
         with (
-            get_parallel().override(tp_rank=1),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
             get_disagg().override(disaggregation_mode="prefill"),
         ):
             policy.precompile()
@@ -2501,7 +2655,14 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         )
 
         with (
-            get_parallel().override(tp_rank=1),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
             get_disagg().override(disaggregation_mode="decode"),
         ):
             policy_dec.precompile()
@@ -3148,7 +3309,14 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
         draft_attn_backend = SimpleNamespace(attn_backends=step_backends)
         draft_extend_attn_backend = _FakeAttnBackend()
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy.precompile_draft(draft_attn_backend, draft_extend_attn_backend)
 
         # EXTEND(LAST) 2 token buckets at the bs cap (text-only target, so no
@@ -3196,7 +3364,14 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
             )
             return torch.zeros(forward_batch.batch_size)
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy._precompile_fused_draft_decode(
                 FakeDraftBackend(), fused_draft_forward
             )
@@ -3263,10 +3438,7 @@ def _serving_stubs():
             eager_scaling_penalties,
         ),
         patch("sglang.srt.speculative.eagle_utils._is_tpu", True),
-        patch(
-            "sglang.srt.distributed.get_tp_group",
-            return_value=SimpleNamespace(world_size=1),
-        ),
+        get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
         patch(
             "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
             return_value=False,
