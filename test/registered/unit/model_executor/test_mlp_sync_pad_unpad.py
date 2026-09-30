@@ -341,8 +341,13 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         from sglang.srt.managers.schedule_batch import ScheduleBatch
         from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
-        for is_mrope in (True, False):
-            with self.subTest(is_mrope=is_mrope):
+        for is_tpu, is_mrope in (
+            (True, True),
+            (True, False),
+            (False, True),
+            (False, False),
+        ):
+            with self.subTest(is_tpu=is_tpu, is_mrope=is_mrope):
                 empty = torch.empty(0, dtype=torch.int64)
                 scheduled = ScheduleBatch(
                     reqs=[],
@@ -361,9 +366,14 @@ class TestMlpSyncPadUnpad(CustomTestCase):
                 runner.model_config.requires_mm_token_modalities = False
                 runner.lora_manager = None
                 runner.attn_backend.get_cpu_graph_seq_len_fill_value.return_value = 1
-                with patch(
-                    "sglang.srt.model_executor.forward_batch_info.enable_num_token_non_padded",
-                    return_value=False,
+                with (
+                    patch(
+                        "sglang.srt.model_executor.forward_batch_info.enable_num_token_non_padded",
+                        return_value=False,
+                    ),
+                    patch(
+                        "sglang.srt.model_executor.forward_batch_info._is_tpu", is_tpu
+                    ),
                 ):
                     batch = ForwardBatch.init_new(
                         scheduled,
@@ -371,13 +381,13 @@ class TestMlpSyncPadUnpad(CustomTestCase):
                         capture_hidden_mode=CaptureHiddenMode.NULL,
                         return_hidden_states_before_norm=False,
                     )
-                if is_mrope:
+                if is_tpu and is_mrope:
                     self.assertEqual(batch.mrope_positions.shape, (3, 0))
                     self.assertEqual(batch.mrope_positions.dtype, torch.int64)
                 else:
                     self.assertIsNone(batch.mrope_positions)
                 batch._pad_inputs_to_size(runner, num_tokens=8, bs=1)
-                if is_mrope:
+                if is_tpu and is_mrope:
                     torch.testing.assert_close(
                         batch.mrope_positions, torch.zeros(3, 8, dtype=torch.int64)
                     )
