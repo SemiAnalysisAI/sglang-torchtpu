@@ -193,7 +193,8 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             canary_manager=None,
             forward=draft_forward,
             model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(architectures=["GptOssForCausalLM"])
+                hf_config=SimpleNamespace(architectures=["GptOssForCausalLM"]),
+                model_is_mrope=False,
             ),
         )
         forward_batch = SimpleNamespace(

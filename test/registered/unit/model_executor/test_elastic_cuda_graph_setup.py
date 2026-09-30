@@ -13,7 +13,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 class TestElasticCudaGraphSetup(unittest.TestCase):
     def test_deferred_capture_skips_distributed_setup(self):
-        model_runner = SimpleNamespace(is_draft_worker=False)
+        model_runner = SimpleNamespace(is_draft_worker=False, device="cuda")
         eager_runner = Mock()
         prefill = GraphCapture(
             runner=eager_runner,

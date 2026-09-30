@@ -230,6 +230,7 @@ class TestDSparkPPOutput(CustomTestCase):
         payloads = []
         scheduler = SimpleNamespace(
             _pp_spec_relay=False,
+            _pp_wave=None,
             pp_group=SimpleNamespace(is_first_rank=False),
             future_map=SimpleNamespace(
                 stash=lambda indices, value: payloads.append(value)

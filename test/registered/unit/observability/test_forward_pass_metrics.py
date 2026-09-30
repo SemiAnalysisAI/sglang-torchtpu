@@ -386,12 +386,19 @@ class TestIdleMetrics(CustomTestCase):
         self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
         self.scheduler.enable_priority_scheduling = True
         self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(queue=[])
+        # The fork's KV-transfer age reads each entry's request; 0 means unset.
+        unstamped = types.SimpleNamespace(
+            time_stats=types.SimpleNamespace(decode_transfer_queue_entry_time=0.0)
+        )
         host_reqs = [
-            types.SimpleNamespace(host_staged=True, priority=priority)
+            types.SimpleNamespace(host_staged=True, priority=priority, req=unstamped)
             for priority in (1, 2)
         ]
         self.scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
-            queue=[*host_reqs, types.SimpleNamespace(host_staged=False, priority=1)]
+            queue=[
+                *host_reqs,
+                types.SimpleNamespace(host_staged=False, priority=1, req=unstamped),
+            ]
         )
         for _ in host_reqs:
             collector.increment_decode_host_receive_reqs()

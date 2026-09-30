@@ -2546,7 +2546,17 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             embed_draft_block_ids=embed_draft_block_ids,
             ensure_embed_module=lambda: embedding,
         )
-        with torch.enable_grad(), get_parallel().override(tp_rank=1):
+        with (
+            torch.enable_grad(),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
+        ):
             policy._precompile_embed_draft_block_ids(worker)
             self.assertTrue(torch.is_grad_enabled())
 

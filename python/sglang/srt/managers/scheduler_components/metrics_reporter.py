@@ -1405,11 +1405,9 @@ class SchedulerMetricsReporter:
                 for req in self.scheduler.disagg_prefill_inflight_queue
             )
         elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-            # Entries without a request (queue stand-ins) carry no timestamp.
             entry_times = (
                 entry.req.time_stats.decode_transfer_queue_entry_time
                 for entry in self.scheduler.disagg_decode_transfer_queue.queue
-                if getattr(entry, "req", None) is not None
             )
         else:
             self.stats.kv_transfer_oldest_inflight_age_seconds = 0.0

@@ -403,6 +403,10 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
     def make_scheduler(self, schedule):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.gracefully_exit = False
+        # Fork-only scheduler state read by the PP loops.
+        scheduler.use_overlap_streams = True
+        scheduler._pending_chunked_abort_req = None
+        scheduler._deferred_chunked_sender_aborts = []
         scheduler._engine_paused = False
         scheduler._sched_idled = False
         scheduler._prev_step = None
