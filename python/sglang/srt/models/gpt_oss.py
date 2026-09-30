@@ -30,7 +30,11 @@ from transformers import PretrainedConfig
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerFacts,
+    reduce_output,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -725,7 +729,14 @@ class GptOssModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        # TPU captures inside the layer; other backends capture the boundary
+        # hidden states here: boundary 0 is the embedding output, boundary i + 1
+        # the output of block i.
         aux_hidden_states = []
+        if not _is_tpu and self.start_layer in self.layers_to_capture:
+            aux_hidden_states.append(
+                hidden_states + residual if residual is not None else hidden_states
+            )
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
@@ -736,10 +747,17 @@ class GptOssModel(nn.Module):
                     residual,
                     captured_last_layer_outputs=(
                         aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
+                        if _is_tpu and getattr(layer, "_is_layer_to_capture", False)
                         else None
                     ),
                 )
+                if not _is_tpu and i + 1 in self.layers_to_capture:
+                    hidden_states = reduce_output(hidden_states)
+                    aux_hidden_states.append(
+                        hidden_states + residual
+                        if residual is not None
+                        else hidden_states
+                    )
         last_layer = self.layers[self.end_layer - 1]
         hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
             hidden_states, residual, forward_batch
