@@ -113,7 +113,10 @@ class TestFusedMoeRsOp(CustomTestCase):
         tp_group = Mock(world_size=8)
 
         with (
-            patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=Mock(tp_group=tp_group),
+            ),
             patch.object(
                 fused_moe_rs_op,
                 "fused_moe_rs_call",

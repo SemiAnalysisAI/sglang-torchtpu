@@ -688,13 +688,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         # here -- it has to be a graph input before the draft graphs below are
         # captured. Same guard as the draft's use site, so heads that cannot take
         # the path do not gain an unused buffer (and a changed graph signature).
-        from sglang.srt.distributed import get_tp_group
         from sglang.srt.hardware_backend.tpu.top_k import (
             register_distributed_top_k_rank,
             supports_distributed_tpu_top_k,
         )
 
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         if int(tp_group.world_size) > 1 and supports_distributed_tpu_top_k(
             target_model.lm_head, top_k=1
         ):

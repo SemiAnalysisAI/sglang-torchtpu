@@ -41,9 +41,9 @@ def _get_tp_rank_to_device_id_mapping() -> tuple[int, tuple[int, ...]]:
         return global_device_id, (global_device_id,)
 
     try:
-        from sglang.srt.distributed import get_tp_group
+        from sglang.srt.runtime_context import get_parallel
 
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         group, world_size = tp_group.cpu_group, tp_group.world_size
     except (AssertionError, RuntimeError):
         # Fallback for standalone unit tests running raw torch.distributed without SGLang parallel_state
@@ -315,9 +315,9 @@ def fused_moe_rs_gather(
         return token_shard[:logical_shard_rows].contiguous()
 
     try:
-        from sglang.srt.distributed import get_tp_group
+        from sglang.srt.runtime_context import get_parallel
 
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         if tp_group is not None:
             return tp_group.all_gather(token_shard, dim=0)
     except (AssertionError, RuntimeError):

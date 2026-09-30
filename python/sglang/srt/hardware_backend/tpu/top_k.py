@@ -152,9 +152,9 @@ def _group_spans_world(group) -> bool:
     """Return whether the selected TP group is the complete distributed world."""
 
     try:
-        from sglang.srt.distributed import get_world_group
+        from sglang.srt.runtime_context import get_parallel
 
-        world_group = get_world_group()
+        world_group = get_parallel().world_group
     except (AssertionError, RuntimeError, AttributeError):
         return False
 

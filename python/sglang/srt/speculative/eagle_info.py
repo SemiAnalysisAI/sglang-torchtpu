@@ -7,7 +7,6 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.distributed import get_attn_tp_group, get_tp_group
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
@@ -19,7 +18,7 @@ from sglang.srt.mem_cache.allocation import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_utils import (
     top_k_renorm_prob_func,
@@ -422,7 +421,9 @@ class EagleVerifyInput(SpecInput):
             # non-determinism in softmax/top_k/top_p, causing different
             # sampled tokens. Broadcast from rank 0 to ensure consistency.
             tp_group = (
-                get_attn_tp_group() if is_dp_attention_enabled() else get_tp_group()
+                get_parallel().attn_tp_group
+                if is_dp_attention_enabled()
+                else get_parallel().tp_group
             )
             if tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)

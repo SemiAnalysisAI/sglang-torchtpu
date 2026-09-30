@@ -1030,7 +1030,6 @@ class LogitsProcessor(nn.Module):
         """Reduce sharded LM-head logits into an exact global TopK.
         Monotonic final softcapping is applied after the global merge."""
 
-        from sglang.srt.distributed import get_attn_tp_group, get_tp_group
         from sglang.srt.hardware_backend.tpu.top_k import (
             TpuVocabShard,
             distributed_tpu_top_k,
@@ -1047,7 +1046,9 @@ class LogitsProcessor(nn.Module):
             logits,
             TpuVocabShard.from_lm_head(lm_head),
             top_k,
-            group=get_attn_tp_group() if self.use_attn_tp_group else get_tp_group(),
+            group=get_parallel().attn_tp_group
+            if self.use_attn_tp_group
+            else get_parallel().tp_group,
             lm_head=lm_head,
         )
         if self.final_logit_softcapping:

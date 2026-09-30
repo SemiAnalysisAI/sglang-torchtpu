@@ -256,7 +256,8 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 return_value=True,
             ),
             patch(
-                "sglang.srt.distributed.get_tp_group", return_value=group
+                "sglang.srt.hardware_backend.tpu.sampler.get_parallel",
+                return_value=SimpleNamespace(tp_group=group, attn_tp_group=group),
             ) as get_group,
             patch.object(
                 tpu_top_k_module,
@@ -320,7 +321,10 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 "sglang.srt.distributed.model_parallel_is_initialized",
                 return_value=True,
             ),
-            patch("sglang.srt.distributed.get_tp_group", return_value=group),
+            patch(
+                "sglang.srt.hardware_backend.tpu.sampler.get_parallel",
+                return_value=SimpleNamespace(tp_group=group, attn_tp_group=group),
+            ),
             patch.object(
                 tpu_top_k_module,
                 "negotiate_pallas_distributed_top_k_config",
@@ -485,6 +489,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
             enable_tp_lm_head_all_to_all=False,
             tp_size=8,
             attn_dp_size=1,
+            tp_group=SimpleNamespace(cpu_group=None),
         )
         config = SimpleNamespace(vocab_size=128)
 

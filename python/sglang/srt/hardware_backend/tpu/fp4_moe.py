@@ -136,7 +136,6 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
     no_combine: bool,
 ) -> list[str]:
     """Return the fused-RS contract requirements this layer does not meet."""
-    from sglang.srt.distributed import get_tp_group, get_world_group
     from sglang.srt.layers.moe import get_moe_a2a_backend
     from sglang.srt.runtime_context import get_exec, get_parallel
 
@@ -151,8 +150,8 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
         (
             "moe_ep_size == tp_size == world_size",
             layer.moe_ep_size
-            == get_tp_group().world_size
-            == get_world_group().world_size,
+            == get_parallel().tp_group.world_size
+            == get_parallel().world_group.world_size,
         ),
         ("layer allows backend reduction", layer.allow_backend_reduction),
         ("attn_dp_size == 1", parallel.attn_dp_size == 1),
