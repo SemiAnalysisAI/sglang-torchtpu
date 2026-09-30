@@ -1758,6 +1758,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._decode = None
         mgr._aborted = {}
         mgr._send_reads = {}
+        mgr._superseded_sender_reads = set()
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
@@ -1968,6 +1969,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
+        mgr._superseded_sender_reads = set()
         mgr._socket = Mock()
         mgr._socket_send_locks = collections.defaultdict(threading.Lock)
         mgr._socket_lock = threading.Lock()

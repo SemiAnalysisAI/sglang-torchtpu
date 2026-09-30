@@ -572,34 +572,57 @@ class TestRaidenDecodeBookkeeping(RaidenRendezvousTestCase):
         self.assertEqual(decode._decode.chunk_queue.get(room, []), [])
         self.assertEqual(len(decode._engine.started), 1)
 
-    def test_superseded_chunk_read_does_not_fail_completed_room(self):
-        """When a closing read completes, an unpulled chunk registration that later
-        times out on the native engine must not mark the completed room as failed."""
-        prefill = self._prefill()
-        prefill.chunked_transfer = True
-        room = 7205
+    def _announced_chunked_room(self, room):
+        """A chunked room with chunk 0 announced (pages 0-1 of 4) and prefill
+        finalized. Returns (prefill, decode, CHUNK frames, BLOCKS frames), both
+        still undelivered to the decode."""
+        prefill, decode = self._prefill(), self._decode()
+        decode.chunked_transfer = True
+        decode.register_decode_request(
+            room,
+            [101, 102, 103, 104],
+            [],
+            aux_index=None,
+            bootstrap_infos=self._bootstrap_info(prefill),
+        )
+        prefill._on_pull_req(self.inboxes[prefill.endpoint].take(MessageTag.PULL_REQ))
+        prefill.append_send_blocks(room, [11, 12])
+        prefill._announce_chunk(room, 0, [11, 12], total_pages=4)
+        chunk_frames = self.inboxes[decode.endpoint].take(MessageTag.CHUNK)
+        prefill.append_send_blocks(room, [13, 14])
+        prefill.finalize_send(room, aux_index=None)
+        blocks_frames = self.inboxes[decode.endpoint].take(MessageTag.BLOCKS)
+        return prefill, decode, chunk_frames, blocks_frames
 
-        # Prefill registers chunk 0 and closing read
-        prefill._send_reads[room] = {f"{room}#0", str(room)}
+    def test_duplicate_chunk_is_queued_once(self):
+        """A CHUNK delivered twice must queue one read, not a second pull of
+        the same pages."""
+        _, decode, chunk_frames, _ = self._announced_chunked_room(7205)
 
-        # Closing read completes
-        prefill._completed_send.add(str(room))
-        prefill._settle_sender_reads_locked()
+        decode._dispatch(chunk_frames)
+        decode._dispatch(chunk_frames)
 
-        # The superseded chunk read was retired from _send_reads and recorded as superseded
-        self.assertNotIn(room, prefill._send_reads)
-        self.assertIn(f"{room}#0", prefill._superseded_sender_reads)
-        self.assertFalse(prefill.sender_has_active_io(room))
-        self.assertTrue(prefill.is_send_done(room))
+        self.assertEqual(len(decode._decode.chunk_queue[7205]), 1)
+        self.assertEqual(decode._decode.announced_spans[7205], [(0, 2)])
 
-        # Native engine reports the unpulled chunk timed out / failed
-        prefill._engine._stats = ([], [], [f"{room}#0"])
-        prefill._drain_engine()
+    def test_duplicate_blocks_does_not_requeue_the_closing_read(self):
+        """A BLOCKS delivered again after the closing read was issued must not
+        queue a second closing read of the uncovered pages."""
+        room = 7207
+        _, decode, chunk_frames, blocks_frames = self._announced_chunked_room(room)
+        decode._dispatch(chunk_frames)
+        decode._dispatch(blocks_frames)
+        # Chunk 0 read, then the closing read of pages 2-3.
+        self.assertTrue(decode._start_chunked_pull(room))
+        decode._engine._stats = ([], [f"{room}#0"], [])
+        decode._drain_engine()
+        self.assertTrue(decode._start_chunked_pull(room))
+        self.assertEqual(decode._decode.chunk_reads[room], [f"{room}#0", str(room)])
 
-        # Completed room must NOT be marked as failed and superseded set is cleared
-        self.assertNotIn(f"{room}#0", prefill._superseded_sender_reads)
-        self.assertNotIn(f"{room}#0", prefill._failed)
-        self.assertFalse(prefill.is_failed(room))
+        decode._dispatch(blocks_frames)
+
+        self.assertEqual(decode._decode.chunk_queue.get(room, []), [])
+        self.assertEqual(len(decode._engine.started), 2)
 
     def test_superseded_chunk_read_protocol_driven(self):
         """Drive prefill through _announce_chunk and finalize_send, settle the closing
