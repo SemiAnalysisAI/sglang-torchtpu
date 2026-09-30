@@ -4,12 +4,12 @@ import threading
 import unittest
 import unittest.mock
 from functools import partial
-from unittest.mock import patch
 
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     LogicalHostPool,
@@ -43,10 +43,7 @@ class TestHostKVCache(CustomTestCase):
         # below that reserve, so even a ~0-byte request fails construction.
         # Pretend there is ample free RAM so this bookkeeping test is
         # independent of the runner's memory.
-        with patch(
-            "sglang.srt.mem_cache.pool_host.base.psutil.virtual_memory"
-        ) as mock_vm:
-            mock_vm.return_value.available = 1 << 40  # 1 TiB
+        with host_memory_budget_scope(1 << 40):  # 1 TiB
             self.host_pool = MHATokenToKVPoolHost(
                 device_pool=self.device_pool,
                 host_to_device_ratio=2.0,
@@ -142,10 +139,7 @@ class TestHostKVCache(CustomTestCase):
 
     def test_shm_allocator(self):
         # Pin the memory probe like setUp (10 GB reserve vs low-memory runner).
-        with patch(
-            "sglang.srt.mem_cache.pool_host.base.psutil.virtual_memory"
-        ) as mock_vm:
-            mock_vm.return_value.available = 1 << 40  # 1 TiB
+        with host_memory_budget_scope(1 << 40):  # 1 TiB
             shm_host_pool = MHATokenToKVPoolHost(
                 device_pool=self.device_pool,
                 host_to_device_ratio=2.0,

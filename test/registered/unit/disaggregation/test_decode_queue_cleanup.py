@@ -245,6 +245,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             if uses_swa
             else SimpleNamespace(page_size=page_size)
         )
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.scheduler = SimpleNamespace(
             enable_hisparse=False, sliding_window_size=2048
         )
@@ -416,6 +417,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
                 side_effect=lambda n: torch.arange(n) if available >= n else None
             ),
         )
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.scheduler = SimpleNamespace(
             enable_hisparse=False, tp_worker=SimpleNamespace(is_hybrid_swa=False)
         )

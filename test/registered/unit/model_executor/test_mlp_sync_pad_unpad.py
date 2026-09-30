@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.logits_processor import (
@@ -39,6 +40,7 @@ def _mock_model_runner(seq_len_fill_value: int = 1) -> MagicMock:
     runner.attn_backend.get_cuda_graph_seq_len_fill_value.return_value = (
         seq_len_fill_value
     )
+    runner.compile_policy = NoopCompilePolicy()
     return runner
 
 
