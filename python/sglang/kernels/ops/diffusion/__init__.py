@@ -681,8 +681,9 @@ _EXPORTS: dict[str, str] = {
     "indexed_scale_shift_mxfp8_": "quantization.mxfp8_swizzled_triton",
     "mxfp8_quantize_swizzled": "quantization.mxfp8_swizzled_triton",
     "silu_mul_mxfp8": "quantization.mxfp8_swizzled_triton",
-    "can_use_usp_merge_heads": "layout.usp_relayout_jit",
-    "usp_merge_heads": "layout.usp_relayout_jit",
+    # Ulysses relayout uses native PyTorch for non-CUDA devices.
+    "can_use_usp_merge_heads": "layout.usp_relayout",
+    "usp_merge_heads": "layout.usp_relayout",
     "build_inv_indices": "layout.varlen_pack_pad_triton",
     "fused_pack_qkv": "layout.varlen_pack_pad_triton",
     "fused_pack_segmented_qkv": "layout.varlen_pack_pad_triton",

@@ -2531,6 +2531,33 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         self.assertEqual(fb.extend_prefix_lens.tolist(), [0] * 4)
         self.assertEqual(fb.extend_num_tokens, 16)
 
+    def test_block_embed_warmup_reused_under_serving_grad_mode(self):
+        torch._dynamo.reset()
+        self.addCleanup(torch._dynamo.reset)
+        policy, _ = self._make_dflash_policy(bs_buckets=(1, 4, 64), draft_token_num=6)
+        policy.backend = "eager"
+        policy.dynamic = False
+        embedding = torch.nn.Embedding(16, 8)
+
+        def embed_draft_block_ids(*, block_ids):
+            return embedding(block_ids).flatten(0, 1)
+
+        worker = SimpleNamespace(
+            embed_draft_block_ids=embed_draft_block_ids,
+            ensure_embed_module=lambda: embedding,
+        )
+        with torch.enable_grad(), get_parallel().override(tp_rank=1):
+            policy._precompile_embed_draft_block_ids(worker)
+            self.assertTrue(torch.is_grad_enabled())
+
+        # Startup runs with gradients enabled; the scheduler disables them.
+        # Every warmed bucket must remain usable once recompiles are forbidden.
+        with torch.no_grad(), torch.compiler.set_stance("fail_on_recompile"):
+            for bs in (1, 4, 64):
+                block_ids = torch.arange(bs * 6).reshape(bs, 6) % 16
+                actual = worker.embed_draft_block_ids(block_ids=block_ids)
+                torch.testing.assert_close(actual, embedding(block_ids).flatten(0, 1))
+
     def test_precompile_draft_pd_prefill_mode_skips_verify(self):
         policy, mr = self._make_dflash_policy(
             token_buckets=(16, 64), bs_buckets=(1, 4), draft_token_num=4
@@ -3410,6 +3437,31 @@ def _policy():
         )
 
 
+def _cpu_top_k_renorm(probs, top_ks, need_top_k_sampling=True):
+    """CPU stand-in for the TPU filter: keep values >= the k-th largest."""
+    if not need_top_k_sampling:
+        return probs
+    ks = top_ks.clamp(1, probs.shape[-1]).long().reshape(-1, 1)
+    kth = probs.sort(dim=-1, descending=True).values.gather(-1, ks - 1)
+    kept = torch.where(probs >= kth, probs, torch.zeros_like(probs))
+    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _cpu_top_p_renorm(probs, top_ps):
+    """CPU stand-in for the TPU filter: keep values >= the first value whose
+    prefix mass reaches p; an unreachable p keeps the whole row."""
+    ordered = probs.sort(dim=-1, descending=True).values
+    reached = ordered.cumsum(dim=-1) >= top_ps.to(probs.dtype).reshape(-1, 1)
+    first = reached.to(torch.int64).argmax(dim=-1, keepdim=True)
+    cutoff = torch.where(
+        reached.any(dim=-1, keepdim=True),
+        ordered.gather(-1, first),
+        torch.zeros_like(first, dtype=probs.dtype),
+    )
+    kept = torch.where(probs >= cutoff, probs, torch.zeros_like(probs))
+    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
 @contextlib.contextmanager
 def _serving_stubs():
     """Select TPU-native sampling and stub serving process state.
@@ -3438,6 +3490,15 @@ def _serving_stubs():
             eager_scaling_penalties,
         ),
         patch("sglang.srt.speculative.eagle_utils._is_tpu", True),
+        # The TPU renorm filter only accepts TPU tensors.
+        patch(
+            "sglang.srt.speculative.eagle_utils.top_k_renorm_prob_func",
+            _cpu_top_k_renorm,
+        ),
+        patch(
+            "sglang.srt.speculative.eagle_utils.top_p_renorm_prob_func",
+            _cpu_top_p_renorm,
+        ),
         get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
         patch(
             "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
@@ -3775,6 +3836,12 @@ class TestSpecVerifyPaddingRecord(_SpecPolicyTestCase):
         self.assertEqual(accept_index.shape, (BS, DRAFT_TOKEN_NUM))
         self.assertEqual(new_seq_lens.shape, (BS,))
         self.assertEqual(bonus_tokens.shape, (BS,))
+        # The host copies of these run later on the result-copy thread; they
+        # must own their storage so no slice needs materializing then.
+        self.assertIsNone(predict._base)
+        self.assertIsNone(accept_lens._base)
+        self.assertEqual(predict.tolist(), list(range(LOGICAL_TOKENS)))
+        self.assertEqual(accept_lens.tolist(), list(range(BS)))
 
     def test_skips_when_the_forward_did_not_defer(self):
         batch = _make_batch(temperature=0.7)

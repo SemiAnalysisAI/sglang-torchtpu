@@ -740,6 +740,12 @@ class Scheduler(
                 if self.draft_worker is None
                 else self.draft_worker.graph_time_usage
             ),
+            target_compile_steps=self.tp_worker.compile_timing_steps,
+            draft_compile_steps=(
+                None
+                if self.draft_worker is None
+                else self.draft_worker.compile_timing_steps
+            ),
         )
 
     def maybe_init_hccl_dp_prewarm(self) -> None:
@@ -2075,6 +2081,11 @@ class Scheduler(
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
+
+            if current_platform.is_tpu() and self.spec_algorithm.is_dflash():
+                # The verify window spans a single commit, so a second
+                # unprocessed forward would silently address the wrong KV slots.
+                assert len(self.result_queue) <= 1
 
             # Get the next batch to run
             plan = self.get_next_batch_to_run(

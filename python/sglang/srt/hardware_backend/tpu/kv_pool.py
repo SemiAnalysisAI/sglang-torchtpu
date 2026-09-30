@@ -78,6 +78,12 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     """
 
     HEAD_DIM_ALIGNMENT = 128
+    # HiCache io backends (--hicache-io-backend) that can offload this pool to
+    # host; hicache_hook refuses the rest at startup. raiden copies whole pages
+    # by their dim-0 block id, so it serves any block-major pool exposing
+    # get_fused_kv_buffer; torch_tpu's host pool stores this 5D row verbatim.
+    # A subclass that changes the buffer layout must restate this.
+    kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
 
     def __init__(
         self,
@@ -260,7 +266,12 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
                 maybe_build_backup,
             )
 
-            self._raiden_backup_obj = maybe_build_backup(self)
+            # A staged backup restores whole pages verbatim, while
+            # SWAKVPool.load_cpu_copy row-filters its SWA member's payload
+            # whenever the resume allocation maps fewer window tokens than the
+            # save did. That member takes the row path instead.
+            swa_member = self.allocation_label == "SWA"
+            self._raiden_backup_obj = None if swa_member else maybe_build_backup(self)
         return self._raiden_backup_obj
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
@@ -482,6 +493,10 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     to ``kv_packing``. Host copies retain this native packing while translating
     between token indices and their page/lane coordinates.
     """
+
+    # raiden's page copy is layout-agnostic, and torch_tpu's host pool reads
+    # its page shape from get_fused_kv_buffer, so it mirrors this layout too.
+    kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
 
     def _head_dim_lanes(self) -> int:
         # Under TorchTPU, JAX is initialised CPU-only so Pallas can export

@@ -87,6 +87,7 @@ from sglang.srt.entrypoints.sidecar import (
     start_sidecar,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu import tpu_platform
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
@@ -2206,13 +2207,18 @@ class TestHiCacheArgs(CustomTestCase):
                 )
 
     def _make_tpu_offload_args(
-        self, io_backend: str, is_hybrid_swa: bool
+        self,
+        io_backend: str,
+        is_hybrid_swa: bool,
+        attention_backend: str = "pallas_tpu_rpa_v3",
+        **kwargs,
     ) -> ServerArgs:
         args = self._make_args(
             enable_hierarchical_cache=True,
             hicache_io_backend=io_backend,
             hicache_mem_layout="page_first_fused",
-            attention_backend="pallas_tpu_rpa_v3",
+            attention_backend=attention_backend,
+            **kwargs,
         )
         # Short-circuit model_config_of(): the TPU io-backend guards only read
         # attention_arch (use_mla_backend) and is_hybrid_swa.
@@ -2241,6 +2247,101 @@ class TestHiCacheArgs(CustomTestCase):
         args = self._make_tpu_offload_args("raiden", is_hybrid_swa=False)
         handle_hicache(args)
         self.assertEqual(args.hicache_io_backend, "raiden")
+
+    def test_tpu_io_backend_follows_kv_pool(self):
+        # Offload support is read from the KV pool class the base backend
+        # allocates, so an out-of-tree backend whose pool declares raiden is
+        # admitted without a core change and torch_tpu is not widened by it;
+        # batched is admitted on both the fused and the seq-along-lane pool,
+        # by both io backends. Every prefill/decode backend must still be an RPA
+        # backend (the reload-commit hook lives there) that reads the base
+        # backend's pool, and mxint8 KV is refused because neither io backend
+        # copies the scale buffers.
+        class RaidenOnlyPool:
+            kv_offload_io_backends = frozenset({"raiden"})
+
+        real_spec = tpu_platform._rpa_kernel_spec
+        real_pool_cls = tpu_platform._mha_kv_pool_cls
+        oot_spec = SimpleNamespace()
+
+        def check(io_backend, backend, seq_along_lane=False, message=None, **kw):
+            with self.subTest(
+                io_backend=io_backend,
+                backend=backend,
+                seq_along_lane=seq_along_lane,
+                **kw,
+            ):
+                args = self._make_tpu_offload_args(
+                    io_backend, is_hybrid_swa=False, attention_backend=backend, **kw
+                )
+                with patch.object(
+                    tpu_platform,
+                    "_uses_seq_along_lane_kv",
+                    lambda: seq_along_lane,
+                ):
+                    if message is None:
+                        handle_hicache(args)
+                        self.assertEqual(args.hicache_io_backend, io_backend)
+                    else:
+                        with self.assertRaisesRegex(ValueError, message):
+                            handle_hicache(args)
+
+        with (
+            patch.object(
+                tpu_platform,
+                "_rpa_kernel_spec",
+                lambda b: oot_spec if b == "oot_backend" else real_spec(b),
+            ),
+            patch.object(
+                tpu_platform,
+                "_mha_kv_pool_cls",
+                lambda b: RaidenOnlyPool if b == "oot_backend" else real_pool_cls(b),
+            ),
+        ):
+            check("raiden", "oot_backend")
+            check("torch_tpu", "oot_backend", message="RaidenOnlyPool")
+            for io_backend in ("raiden", "torch_tpu"):
+                check(io_backend, "pallas_tpu_rpa_v3")
+                check(io_backend, "pallas_tpu_rpa_batched")
+                check(io_backend, "pallas_tpu_rpa_batched", seq_along_lane=True)
+            check("raiden", "unknown_backend", message="MHATokenToKVPool")
+            check(
+                "raiden",
+                "oot_backend",
+                message="torch_native",
+                prefill_attention_backend="torch_native",
+            )
+            check(
+                "raiden",
+                "pallas_tpu_rpa_v3",
+                message="torch_native",
+                decode_attention_backend="torch_native",
+            )
+            check(
+                "raiden",
+                "pallas_tpu_rpa_v3",
+                decode_attention_backend="pallas_tpu_rpa_batched",
+            )
+            check(
+                "raiden",
+                "pallas_tpu_rpa_batched",
+                seq_along_lane=True,
+                message="TpuFusedMHATokenToKVPool",
+                decode_attention_backend="pallas_tpu_rpa_v3",
+            )
+            check(
+                "raiden",
+                "oot_backend",
+                message="TpuFusedMHATokenToKVPool",
+                prefill_attention_backend="pallas_tpu_rpa_v3",
+            )
+            check("raiden", "oot_backend", message="mxint8", kv_cache_dtype="mxint8")
+            check(
+                "torch_tpu",
+                "pallas_tpu_rpa_v3",
+                message="mxint8",
+                kv_cache_dtype="mxint8",
+            )
 
     def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
         args = self._make_args(

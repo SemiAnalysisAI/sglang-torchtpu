@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from typing import TYPE_CHECKING, Optional
 
@@ -67,15 +68,29 @@ from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 
 
 class TpuFusedMHATokenToKVPoolHost(HostKVCache):
-    """Host (L2) pool for the TPU fused MHA device pool (rpa_v3).
+    """Host (L2) pool for a TPU fused MHA device pool.
 
-    Stores the device's fused 5D row VERBATIM, page-major (``page_first_fused``)::
+    Stores the device's fused page VERBATIM, page-major
+    (``page_first_fused``)::
 
-        kv_buffer[page_num, layer_num, page_size, kv_heads_packed,
-                  kv_packing, padded_head_dim]
+        kv_buffer[page_num, layer_num, *device_page_shape]
 
     so a page's all-layer KV round-trips as a contiguous per-page copy with no
     de-interleave / un-pad.
+
+    ``device_page_shape`` is read off the live device tensor rather than
+    rebuilt, because it differs per KV layout -- token-major is
+    ``(page_size, kv_heads_packed, kv_packing, padded_head_dim)`` while
+    seq-along-lane is ``(2*kv_heads, head_dim_lanes // kv_packing, kv_packing,
+    page_size)``. The two have the same byte count, so a hardcoded shape sizes
+    the pool correctly and then fails at the first scatter.
+
+    INVARIANT this relies on: the host side addresses **whole pages only**.
+    Every ``kv_buffer[...]`` here indexes dim 0, and ``_to_page_ids`` discards
+    any sub-page offset, so the page interior is never interpreted -- which is
+    what lets an opaque blob of either layout round-trip. Token-granular host
+    access would break that: under seq-along-lane the token axis is innermost,
+    so one token's KV is strided across the whole page rather than contiguous.
 
     DATA PLANE: plain torch indexing -- no Pallas kernels and no pre-allocated
     staging buffer. Reload (``load_to_device_all``) runs on the
@@ -122,25 +137,24 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
             pool_label=pool_label,
         )
 
+    def _device_page_shape(self) -> tuple:
+        """Per-page dims of the device's fused KV tensor, layout and all."""
+        dp = self.device_pool
+        fused = dp.get_fused_kv_buffer(dp.start_layer)
+        return tuple(int(d) for d in fused.shape[1:])
+
     def get_size_per_token(self):
         dp = self.device_pool
         self.layer_num = dp.layer_num
-        self.kv_packing = dp.kv_packing
-        self.kv_heads_packed = dp.num_kv_heads_x2 // dp.kv_packing
-        self.padded_head_dim = dp.padded_head_dim
-        self.fused_row_elems = dp.num_kv_heads_x2 * dp.padded_head_dim
-        return self.fused_row_elems * self.layer_num * self.dtype.itemsize
+        # Real (padded) page bytes off the live tensor, so the budget matches
+        # what the device actually allocated under either layout.
+        fused = dp.get_fused_kv_buffer(dp.start_layer)
+        page_bytes = math.prod(self._device_page_shape()) * fused.element_size()
+        return page_bytes // self.page_size * self.layer_num
 
     def init_kv_buffer(self):
         # layout is asserted page_first_fused in __init__, so no re-check here.
-        dims = (
-            self.page_num,
-            self.layer_num,
-            self.page_size,
-            self.kv_heads_packed,
-            self.kv_packing,
-            self.padded_head_dim,
-        )
+        dims = (self.page_num, self.layer_num) + self._device_page_shape()
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         return alloc_func(
             dims,
