@@ -1049,7 +1049,6 @@ class LogitsProcessor(nn.Module):
             group=get_parallel().attn_tp_group
             if self.use_attn_tp_group
             else get_parallel().tp_group,
-            lm_head=lm_head,
         )
         if self.final_logit_softcapping:
             global_top_k_logits = self.final_logit_softcapping * torch.tanh(
