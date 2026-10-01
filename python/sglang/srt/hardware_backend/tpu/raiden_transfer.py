@@ -9,14 +9,18 @@ fused device KV buffer and raiden's DMA-pinned host pool, returning a pollable
 on its own background thread, so the call returns before anything is submitted.
 Completion is poll-only (``is_ready()``; never ``Await()``, which can deadlock
 the running model), and a DMA that completes with an error raises at the poll.
+raiden's DMAs are not ordered against device compute, so ``RaidenLoadFence``
+holds H2D loads back until the forwards still in flight have finished.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
-from typing import TYPE_CHECKING, List
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 
 from sglang.srt.environ import envs
 
@@ -111,6 +115,89 @@ class CombinedFutureEvent:
         return None
 
 
+class _FencedLoadEvent:
+    """Completion event for an H2D load whose DMAs are issued by the fence worker.
+
+    Ready only once the worker has issued the DMAs (after the fence completed)
+    and every DMA has landed. A fence or DMA failure raises at the poll, like
+    ``RaidenFutureEvent``.
+    """
+
+    def __init__(self, issued: Future):
+        self._issued = issued
+
+    def query(self) -> bool:
+        if not self._issued.done():
+            return False
+        return self._issued.result().query()
+
+    def synchronize(self) -> None:
+        # No timeout here: the worker enforces the fence deadline and raises,
+        # and a wait that gave up first would leave a DMA still to be issued.
+        self._issued.result().synchronize()
+
+    def record(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op
+        return None
+
+    def wait(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op
+        return None
+
+
+class RaidenLoadFence:
+    """Issues raiden H2D loads only after the forwards still in flight finish.
+
+    Under overlap scheduling a load starts while the previous forward still
+    runs, and that forward may write pages already freed and allocated to the
+    load (e.g. the last page of a request that finished one step earlier). This
+    is the raiden counterpart of ``load_fence_stream`` in
+    ``HiCacheController.start_loading``. The caller passes the completion
+    events of the forwards whose results are not yet processed; the DMAs are
+    issued inline when all are already complete, else by a FIFO worker thread
+    so the scheduler never blocks and loads stay in order.
+    """
+
+    def __init__(self):
+        self._enabled = envs.SGLANG_TPU_ENABLE_RAIDEN_LOAD_FENCE.get()
+        # Spawns its thread on the first deferred load.
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="raiden-load-fence"
+        )
+        self._last_deferred: Optional[Future] = None
+
+    def issue(
+        self,
+        issue_dmas: Callable[[], Sequence[Any]],
+        in_flight_forwards: Sequence[Any],
+    ) -> Any:
+        """Run ``issue_dmas`` once every event in ``in_flight_forwards`` has
+        completed; return an event over the DMAs."""
+        if not self._enabled:
+            return CombinedFutureEvent(issue_dmas())
+        pending = [event for event in in_flight_forwards if not event.query()]
+        no_deferred_load = self._last_deferred is None or self._last_deferred.done()
+        if no_deferred_load and not pending:
+            return CombinedFutureEvent(issue_dmas())
+        self._last_deferred = self._executor.submit(
+            self._issue_after, pending, issue_dmas
+        )
+        return _FencedLoadEvent(self._last_deferred)
+
+    @staticmethod
+    def _issue_after(pending: Sequence[Any], issue_dmas: Callable[[], Sequence[Any]]):
+        # Poll rather than block, with the DMA timeout as the deadline, so a
+        # hung forward surfaces as an error instead of a stuck worker.
+        timeout_s = envs.SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S.get()
+        deadline = time.monotonic() + timeout_s
+        while not all(event.query() for event in pending):
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"forward in flight before a raiden load did not finish "
+                    f"within {timeout_s}s"
+                )
+            time.sleep(RaidenFutureEvent._POLL_INTERVAL_S)
+        return CombinedFutureEvent(issue_dmas())
+
+
 class RaidenKVTransfer:
     """Owns a raiden ``KVCacheManager`` over a TPU fused KV pool and issues
     page-granular D2H / H2D transfers.
@@ -149,6 +236,10 @@ class RaidenKVTransfer:
             host_blocks_to_allocate=num_host_pages,
             unsafe_skip_buffer_lock=True,
         )
+        # Loads may be issued from the ``RaidenLoadFence`` worker while
+        # write-backs are issued from the scheduler thread; serialize the calls
+        # into the manager.
+        self._dma_lock = threading.Lock()
         logger.info(
             "Raiden KV transfer ready: %d layers, %d host pages (page=%d tokens)",
             self.layer_num,
@@ -175,7 +266,8 @@ class RaidenKVTransfer:
         # raiden reads an empty page list as the whole layer buffer.
         if n == 0:
             return NOOP_EVENT
-        fut = self._mgr.d2h(device_page_ids, host_page_ids, [1] * n)
+        with self._dma_lock:
+            fut = self._mgr.d2h(device_page_ids, host_page_ids, [1] * n)
         return RaidenFutureEvent(fut)
 
     def load(
@@ -186,5 +278,6 @@ class RaidenKVTransfer:
         assert n == len(device_page_ids)
         if n == 0:
             return NOOP_EVENT
-        fut = self._mgr.h2d(host_page_ids, device_page_ids, [1] * n)
+        with self._dma_lock:
+            fut = self._mgr.h2d(host_page_ids, device_page_ids, [1] * n)
         return RaidenFutureEvent(fut)

@@ -2440,6 +2440,7 @@ class TestRaidenKVTransferEmptyPageList(CustomTestCase):
         empty page list as the whole layer buffer, so none may reach it."""
         transfer = object.__new__(RaidenKVTransfer)
         transfer._mgr = Mock()
+        transfer._dma_lock = threading.Lock()
         for method, mgr_call in (
             (transfer.backup, transfer._mgr.d2h),
             (transfer.load, transfer._mgr.h2d),

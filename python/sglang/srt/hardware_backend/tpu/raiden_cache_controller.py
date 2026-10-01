@@ -8,14 +8,13 @@ policy are inherited. Both directions are asynchronous: raiden issues the copies
 on its own background thread and returns a pollable future at once. The D2H
 write-back future is polled by ``HiRadixCache.writing_check``; the H2D load-back
 future goes into the whole-batch ``BatchDoneCounter``, which gates the consuming
-forward on it, so the load overlaps whatever the scheduler runs in between.
+forward on it. Load-back DMAs go through a ``RaidenLoadFence``, so they are
+issued only after the forward already in flight has finished.
 """
 
 from __future__ import annotations
 
-from sglang.srt.hardware_backend.tpu.raiden_transfer import (
-    NOOP_EVENT,
-)
+from sglang.srt.hardware_backend.tpu.raiden_transfer import NOOP_EVENT, RaidenLoadFence
 from sglang.srt.managers.cache_controller import (
     BatchDoneCounter,
     CacheOperation,
@@ -35,6 +34,7 @@ class TpuRaidenHiCacheController(HiCacheController):
         # whole-batch ``wait()`` resolves against the reload event.
         self.layer_done_counter = BatchDoneCounter()
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
+        self.load_fence = RaidenLoadFence()
 
     def reset(self):
         # Drain outstanding DMAs before the base clears the ack queues and
@@ -113,11 +113,14 @@ class TpuRaidenHiCacheController(HiCacheController):
         )
         self.load_queue.clear()
 
-        # H2D for all layers in one raiden call per pool; the future-event comes
-        # back before the DMA lands. The consuming forward's CompiledForwardShim
-        # wait() polls it through the whole-batch gate (poll-only; never Await),
-        # so the DMA overlaps whatever the scheduler runs before that forward.
-        finish_event = self._load_all_pools(host_indices, device_indices)
+        # H2D for all layers in one raiden call per pool, issued once the
+        # forward already in flight is done (it may still write pages this load
+        # was allocated). The consuming forward's CompiledForwardShim wait()
+        # polls the event through the whole-batch gate (poll-only; never Await).
+        finish_event = self.load_fence.issue(
+            lambda: [self._load_all_pools(host_indices, device_indices)],
+            self.in_flight_forward_events(),
+        )
         self.layer_done_counter.set_event(producer_id, finish_event)
         self.ack_load_queue.append(
             HiCacheAck(

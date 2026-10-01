@@ -628,6 +628,9 @@ class Scheduler(
                 cache_controller.load_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+                cache_controller.in_flight_forward_events = (
+                    self._in_flight_forward_events
+                )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -1707,7 +1710,12 @@ class Scheduler(
                 TPUAsyncCopyWorker,
             )
 
-            self.tpu_async_copy_worker = TPUAsyncCopyWorker()
+            self.tpu_async_copy_worker = TPUAsyncCopyWorker(
+                # The raiden load fence gates on copy_done (_in_flight_forward_events).
+                copy_draft_tail=self.enable_hierarchical_cache
+                and get_memory().hicache_io_backend == "raiden"
+                and envs.SGLANG_TPU_ENABLE_RAIDEN_LOAD_FENCE.get()
+            )
             logger.info("TPU async result-copy worker enabled")
 
         # CUDA-style forward/copy/schedule streams only buy overlap on backends
@@ -2209,6 +2217,23 @@ class Scheduler(
         # whatever result is still pending in the queue — including the
         # extend->decode boundary — so no grammar-specific overlap disable is needed.
         return disable_overlap_for_batch or need_grammar_sync
+
+    def _in_flight_forward_events(self) -> List:
+        """Completion events of launched forwards whose results are unprocessed.
+
+        Under overlap scheduling a forward may still write KV pages freed after
+        it launched. Each result's ``copy_done`` completes only after its
+        forward's outputs have landed on the host. Loads start before
+        ``launch_batch_sample_if_needed``, so a delayed-sample ``copy_done`` is
+        already recorded here.
+        """
+        if not self.enable_overlap:
+            return []
+        return [
+            result.copy_done
+            for _, result in self.result_queue
+            if result.copy_done is not None
+        ]
 
     def _advance_pending_grammar(self):
         """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet

@@ -8,23 +8,36 @@ landed, load-back keeps index tensors host-resident by rewriting the
 tree-owned PoolTransfer in place, and speculative-decoding draft sidecars ride
 the same rounds (draft DMA issued per transfer, reload ack gates on it, draft
 device pool wired to the whole-batch counter, host pool picked via the
-platform hook).
+platform hook). Load-back DMAs (hybrid and single-pool) wait, off the
+scheduler thread and in order, for the forwards still in flight.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import threading
+import time
 import unittest
+from collections import deque
+from types import SimpleNamespace
 from typing import List
 from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.raiden_cache_controller import (
+    TpuRaidenHiCacheController,
+)
 from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
     TpuRaidenHybridCacheController,
 )
-from sglang.srt.managers.cache_controller import BatchDoneCounter, LayerDoneCounter
+from sglang.srt.hardware_backend.tpu.raiden_transfer import RaidenLoadFence
+from sglang.srt.managers.cache_controller import BatchDoneCounter
+from sglang.srt.managers.cache_controller import CacheOperation as PlainCacheOperation
+from sglang.srt.managers.cache_controller import LayerDoneCounter
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -45,6 +58,29 @@ class _FakeFuture:
     def synchronize(self) -> None:
         self.synchronized = True
         self.ready = True
+
+
+class _ForwardEvent:
+    """Completion event of an in-flight forward; done once ``finish()`` runs."""
+
+    def __init__(self):
+        self.gate = threading.Event()
+        self.queried = False
+
+    def finish(self) -> None:
+        self.gate.set()
+
+    def query(self) -> bool:
+        self.queried = True
+        return self.gate.is_set()
+
+
+def _wait_until(condition, timeout_s: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("condition not met in time")
+        time.sleep(0.001)
 
 
 class _FakeHostPool:
@@ -101,12 +137,14 @@ def _make_controller() -> TpuRaidenHybridCacheController:
     ctrl.ack_write_queue = []
     ctrl.ack_load_queue = []
     ctrl.layer_done_counter = BatchDoneCounter()
+    ctrl.load_fence = RaidenLoadFence()
+    ctrl.in_flight_forward_events = list
     return ctrl
 
 
-def _op(n_kv: int = 8, n_swa: int = 4) -> CacheOperation:
+def _op(n_kv: int = 8, n_swa: int = 4, first_host: int = 0) -> CacheOperation:
     return CacheOperation(
-        torch.arange(n_kv, dtype=torch.int64),
+        torch.arange(first_host, first_host + n_kv, dtype=torch.int64),
         torch.arange(n_kv, dtype=torch.int64),
         node_id=1,
         pool_transfers=[
@@ -257,6 +295,152 @@ class TestHybridLoad(CustomTestCase):
         self.assertIsNotNone(tree_transfer.device_indices)
         self.assertEqual(tree_transfer.device_indices.device.type, "cpu")
         swa_alloc.assert_called_once_with(4)
+
+
+class TestLoadFence(CustomTestCase):
+    """Under overlap scheduling the previous forward still runs when a load
+    starts and may write pages freed to that load; its DMAs must not land first."""
+
+    def setUp(self):
+        self.forwards: List[_ForwardEvent] = []
+        self.ctrl = _make_controller()
+        self.ctrl.in_flight_forward_events = lambda: list(self.forwards)
+        self.full_pool = self.ctrl.mem_pool_host.anchor_entry.host_pool
+        self.swa_pool = self.ctrl.mem_pool_host.entry_map[PoolName.SWA].host_pool
+
+    def tearDown(self):
+        # Release any worker still polling a forward.
+        for forward in self.forwards:
+            forward.finish()
+
+    def test_load_dmas_wait_for_in_flight_forward(self):
+        forward = _ForwardEvent()
+        self.forwards.append(forward)
+        self.ctrl.load_queue.append(_op())
+        # Returns while the earlier forward still runs, without issuing a DMA
+        # that could land under that forward's writes.
+        producer_id = self.ctrl.start_loading()
+        time.sleep(0.02)
+        self.assertEqual(self.full_pool.loads, [])
+        self.assertEqual(self.swa_pool.loads, [])
+        (ack,) = self.ctrl.ack_load_queue
+        self.assertFalse(ack.finish_event.query())
+
+        forward.finish()
+        _wait_until(lambda: len(self.full_pool.loads) == len(self.swa_pool.loads) == 1)
+        # Issued but not landed: the forward gate stays closed.
+        self.assertFalse(ack.finish_event.query())
+        self.full_pool.load_futures[0].ready = True
+        self.assertFalse(ack.finish_event.query())
+        self.swa_pool.load_futures[0].ready = True
+        self.assertTrue(ack.finish_event.query())
+        self.ctrl.layer_done_counter.set_consumer(producer_id)
+        self.ctrl.layer_done_counter.wait()
+
+    def test_load_issues_inline_when_no_forward_is_in_flight(self):
+        finished = _ForwardEvent()
+        finished.finish()
+        self.forwards.append(finished)
+        self.ctrl.load_queue.append(_op())
+        self.ctrl.start_loading()
+        # Issued on the scheduler thread, not deferred.
+        self.assertEqual(len(self.full_pool.loads), 1)
+
+    def test_load_behind_a_deferred_load_keeps_order(self):
+        forward = _ForwardEvent()
+        self.forwards.append(forward)
+        self.ctrl.load_queue.append(_op(first_host=0))
+        self.ctrl.start_loading()
+        # Loads are issued in submission order: one behind a deferred load is
+        # deferred too, even when no forward is in flight for it.
+        self.forwards.clear()
+        self.ctrl.load_queue.append(_op(first_host=100))
+        self.ctrl.start_loading()
+        time.sleep(0.02)
+        self.assertEqual(self.full_pool.loads, [])
+
+        forward.finish()
+        _wait_until(lambda: len(self.full_pool.loads) == 2)
+        self.assertEqual([int(load[1][0]) for load in self.full_pool.loads], [0, 100])
+
+    def test_hung_forward_raises_at_poll(self):
+        self.forwards.append(_ForwardEvent())
+        self.ctrl.load_queue.append(_op())
+        with envs.SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S.override(0.05):
+            self.ctrl.start_loading()
+            (ack,) = self.ctrl.ack_load_queue
+            # The worker's deadline error surfaces at the forward gate's poll.
+            with self.assertRaises(TimeoutError):
+                _wait_until(ack.finish_event.query)
+        self.assertEqual(self.full_pool.loads, [])
+
+    def test_deferred_issue_error_raises_at_poll(self):
+        def failing_issue():
+            raise RuntimeError("h2d rejected")
+
+        forward = _ForwardEvent()
+        event = self.ctrl.load_fence.issue(failing_issue, [forward])
+        forward.finish()
+        with self.assertRaisesRegex(RuntimeError, "h2d rejected"):
+            _wait_until(event.query)
+        with self.assertRaisesRegex(RuntimeError, "h2d rejected"):
+            event.synchronize()
+
+    def test_disabled_fence_issues_inline_without_polling(self):
+        forward = _ForwardEvent()
+        self.forwards.append(forward)
+        with envs.SGLANG_TPU_ENABLE_RAIDEN_LOAD_FENCE.override(False):
+            self.ctrl.load_fence = RaidenLoadFence()
+        self.ctrl.load_queue.append(_op())
+        self.ctrl.start_loading()
+        self.assertFalse(forward.queried)
+        self.assertEqual(len(self.full_pool.loads), 1)
+
+    def test_single_pool_load_dmas_wait_for_in_flight_forward(self):
+        forward = _ForwardEvent()
+        self.forwards.append(forward)
+        ctrl = object.__new__(TpuRaidenHiCacheController)
+        ctrl.mem_pool_host = _FakeHostPool()
+        ctrl.mem_pool_device = object()
+        ctrl.load_queue = [
+            PlainCacheOperation(
+                torch.arange(4, dtype=torch.int64),
+                torch.arange(4, dtype=torch.int64),
+                node_id=1,
+            )
+        ]
+        ctrl.ack_load_queue = []
+        ctrl.layer_done_counter = BatchDoneCounter()
+        ctrl.load_fence = RaidenLoadFence()
+        ctrl.in_flight_forward_events = lambda: list(self.forwards)
+
+        ctrl.start_loading()
+        time.sleep(0.02)
+        self.assertEqual(ctrl.mem_pool_host.loads, [])
+        (ack,) = ctrl.ack_load_queue
+        self.assertFalse(ack.finish_event.query())
+
+        forward.finish()
+        ack.finish_event.synchronize()
+        self.assertEqual(len(ctrl.mem_pool_host.loads), 1)
+        self.assertTrue(ack.finish_event.query())
+
+    def test_scheduler_reports_unprocessed_result_copies(self):
+        # Under overlap the queued result's forward may still run; without
+        # overlap nothing is in flight when a load starts.
+        copy_done = _ForwardEvent()
+        scheduler = SimpleNamespace(
+            enable_overlap=True,
+            result_queue=deque(
+                [
+                    (None, SimpleNamespace(copy_done=copy_done)),
+                    (None, SimpleNamespace(copy_done=None)),
+                ]
+            ),
+        )
+        self.assertEqual(Scheduler._in_flight_forward_events(scheduler), [copy_done])
+        scheduler.enable_overlap = False
+        self.assertEqual(Scheduler._in_flight_forward_events(scheduler), [])
 
 
 class TestAssemblerPlatformHook(CustomTestCase):
