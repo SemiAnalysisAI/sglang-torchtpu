@@ -1183,6 +1183,37 @@ class TestMakeDummyForwardBatch(_PolicyTestCase):
 
 
 class TestDpIdleDecodeMaterializationScope(_SpecPolicyTestCase):
+    def test_plain_idle_decode_matches_warmup_cache_location_dtype(self):
+        for dtype in (torch.int32, torch.int64):
+            with self.subTest(allocator_dtype=dtype):
+                policy = _make_policy()
+                policy.model_runner.token_to_kv_pool_allocator.free_pages = (
+                    torch.arange(4, dtype=dtype)
+                )
+                seen = []
+                policy.model_runner.forward = lambda batch: seen.append(
+                    (batch.forward_mode, batch.out_cache_loc.dtype)
+                )
+                policy._install_dp_idle_as_decode()
+                warmup = policy._make_dummy_forward_batch(
+                    num_tokens=4, bs=4, mode=ForwardMode.DECODE
+                )
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.IDLE,
+                    global_num_tokens_cpu=[0, 1],
+                    # ScheduleBatch.prepare_for_idle uses int64 regardless of
+                    # the allocator dtype used by active peers and warmup.
+                    out_cache_loc=torch.empty(0, dtype=torch.int64),
+                )
+
+                with _dp_attention(True):
+                    policy.model_runner.forward(batch)
+
+                self.assertEqual(
+                    seen, [(ForwardMode.DECODE, warmup.out_cache_loc.dtype)]
+                )
+                self.assertEqual(batch.out_cache_loc.shape, (0,))
+
     def test_prepare_materializes_zero_row_spec_batch(self):
         policy = _make_spec_policy()
         spec_info = EagleDraftInput(
@@ -2740,10 +2771,11 @@ class TestSpecDraftDecodePadding(_SpecPolicyTestCase):
             spec_info=spec_info,
             global_num_tokens_cpu=[0, 300],
             input_ids=torch.empty((0,), dtype=torch.int64),
-            seq_lens=torch.empty((0,), dtype=torch.int32),
-            out_cache_loc=torch.empty((0,), dtype=torch.int32),
-            req_pool_indices=torch.empty((0,), dtype=torch.int32),
-            req_pool_indices_cpu=torch.empty((0,), dtype=torch.int32),
+            seq_lens=torch.empty((0,), dtype=torch.int64),
+            # Match ScheduleBatch.prepare_for_idle, not the allocator's dtype.
+            out_cache_loc=torch.empty((0,), dtype=torch.int64),
+            req_pool_indices=torch.empty((0,), dtype=torch.int64),
+            req_pool_indices_cpu=torch.empty((0,), dtype=torch.int64),
             seq_lens_cpu=None,
         )
         with _dp_attention(True):
@@ -2753,6 +2785,12 @@ class TestSpecDraftDecodePadding(_SpecPolicyTestCase):
         self.assertEqual(forward_batch.batch_size, 1)
         self.assertEqual(forward_batch.seq_lens.tolist(), [300])
         self.assertEqual(forward_batch.extend_seq_lens.tolist(), [300])
+        self.assertEqual(forward_batch.out_cache_loc.dtype, torch.int32)
+
+        for name in ("extend_seq_lens", "extend_prefix_lens", "extend_start_loc"):
+            self.assertEqual(getattr(forward_batch, name).dtype, torch.int32, name)
+        for name in ("seq_lens", "req_pool_indices", "req_pool_indices_cpu"):
+            self.assertEqual(getattr(forward_batch, name).dtype, torch.int64, name)
 
 
 class TestDpSyncNumTokens(_SpecPolicyTestCase):
