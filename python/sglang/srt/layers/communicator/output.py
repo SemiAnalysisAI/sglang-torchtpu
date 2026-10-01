@@ -21,17 +21,30 @@ import torch
 from sglang.srt.distributed import GroupCoordinator
 
 
-class UnreducedOutput(msgspec.Struct, frozen=True):
+class UnreducedOutput:
     """A layer output that still owes its sum, left for the next layer's input.
     Hand it to the next layer, or pass it through reduce_output() before reading
     it any other way. The producer says what is owed: one all-reduce over
     ``group`` that keeps the layout, or ``reduce_and_redistribute``."""
 
-    partial: torch.Tensor
-    group: Optional[GroupCoordinator] = None
-    # Under attention DP: the reduction that also brings ``partial`` back to this
-    # rank's tokens (a reduce-scatter, or an all-reduce then a scatter).
-    reduce_and_redistribute: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    # A plain class, not a msgspec.Struct: it is built inside the forward, which
+    # TPU compiles whole, and dynamo cannot instantiate a Struct. Not a
+    # NamedTuple either: callers tell tuples of tensors apart with isinstance.
+    __slots__ = ("partial", "group", "reduce_and_redistribute")
+
+    def __init__(
+        self,
+        partial: torch.Tensor,
+        group: Optional[GroupCoordinator] = None,
+        # Under attention DP: the reduction that also brings ``partial`` back to
+        # this rank's tokens (a reduce-scatter, or an all-reduce then a scatter).
+        reduce_and_redistribute: Optional[
+            Callable[[torch.Tensor], torch.Tensor]
+        ] = None,
+    ):
+        self.partial = partial
+        self.group = group
+        self.reduce_and_redistribute = reduce_and_redistribute
 
 
 class HandoffOutput(msgspec.Struct, frozen=True):
