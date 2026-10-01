@@ -9,6 +9,7 @@ import subprocess
 import sys
 import textwrap
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.hardware_backend.tpu import pallas_export
@@ -20,6 +21,43 @@ register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit")
 
 
 class TestPallasExportEnvironment(CustomTestCase):
+    def test_export_devices_follow_runtime_assignment(self):
+        for device_ids in ([0, 1, 4, 5, 6, 7, 2, 3], [6, 7, 2, 3, 0, 1, 4, 5]):
+            with (
+                self.subTest(device_ids=device_ids),
+                patch("torch.distributed.is_initialized", return_value=True),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "torch_tpu._internal.distributed.device_mesh": SimpleNamespace(
+                            get_device_assignment=lambda: device_ids
+                        )
+                    },
+                ),
+                patch.object(
+                    pallas_export, "get_pallas_tpu_device_kind", return_value="TPU7x"
+                ),
+            ):
+                devices = pallas_export.get_torchtpu_export_devices(len(device_ids))
+                self.assertEqual([device.id for device in devices], device_ids)
+
+    def test_export_rejects_missing_or_duplicate_runtime_assignment(self):
+        for device_ids in ([], [0, 0], [0]):
+            with (
+                self.subTest(device_ids=device_ids),
+                patch("torch.distributed.is_initialized", return_value=True),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "torch_tpu._internal.distributed.device_mesh": SimpleNamespace(
+                            get_device_assignment=lambda: device_ids
+                        )
+                    },
+                ),
+                self.assertRaisesRegex(RuntimeError, "distinct world devices"),
+            ):
+                pallas_export.get_torchtpu_export_devices(2)
+
     def setUp(self):
         env_patcher = patch.dict(os.environ, {}, clear=False)
         env_patcher.start()
@@ -440,6 +478,39 @@ class TestPallasExportEnvironment(CustomTestCase):
         )
         result = json.loads(completed.stdout.strip().splitlines()[-1])
         self.assertEqual(result["result"], [float(value) for value in range(1, 9)])
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
+        "requires JAX and TorchTPU",
+    )
+    def test_partitioned_shape_supports_multiple_mesh_axes(self):
+        from types import SimpleNamespace
+
+        from jax.sharding import PartitionSpec as P
+
+        from sglang.srt.hardware_backend.tpu.pallas_jax_op import (
+            _convert_partitioned_shape,
+        )
+
+        mesh = SimpleNamespace(shape={"chip": 4, "core": 2})
+        partition_spec = P(("chip", "core"), None)
+
+        global_shape = _convert_partitioned_shape(
+            (16, 32),
+            mesh,
+            partition_spec,
+            lambda size, axis_size: size * axis_size,
+        )
+        self.assertEqual(global_shape, (128, 32))
+        self.assertEqual(
+            _convert_partitioned_shape(
+                global_shape,
+                mesh,
+                partition_spec,
+                lambda size, axis_size: size // axis_size,
+            ),
+            (16, 32),
+        )
 
 
 if __name__ == "__main__":
