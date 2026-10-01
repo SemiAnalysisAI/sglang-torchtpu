@@ -119,6 +119,10 @@ class TestCompileSitesAreDisabledOnTpu(CustomTestCase):
             f"""
             import functools, importlib
 
+            # Production imports the quantization package first; importing
+            # vocab_parallel_embedding cold trips upstream's import cycle
+            # through kitchen_int8_config.
+            importlib.import_module("sglang.multimodal_gen.runtime.layers.quantization")
             for module_name, qualname in {sites!r}:
                 module = importlib.import_module(module_name)
                 fn = functools.reduce(getattr, qualname.split("."), module)
