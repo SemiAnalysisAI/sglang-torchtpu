@@ -2561,5 +2561,24 @@ class TestALayerThatIsOneStage(CustomTestCase):
             )
 
 
+class TestStagesUnderCompile(CustomTestCase):
+    def test_reading_a_stage_does_not_invalidate_a_compiled_graph(self):
+        """A stage first created on read changed the communicator's attributes
+        after warmup traced it, so the TPU server's frozen compile recompiled
+        and died on the first request that reused the earliest bucket."""
+        torch._dynamo.reset()
+        communicator = build(layer_facts(1, 3), parallel_of(attn_dp=1, attn_tp=1))
+
+        @torch.compile(backend="eager", fullgraph=True)
+        def forward(x):
+            return communicator.attn.norm(x)
+
+        x = torch.ones(2)
+        forward(x)
+        communicator.attn, communicator.ffn
+        with torch.compiler.set_stance("fail_on_recompile"):
+            forward(x)
+
+
 if __name__ == "__main__":
     unittest.main()

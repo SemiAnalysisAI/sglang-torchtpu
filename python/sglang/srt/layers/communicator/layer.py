@@ -15,7 +15,7 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from functools import cached_property, partial
+from functools import partial
 from typing import Callable, NamedTuple, Optional, Protocol, Tuple, Union
 
 import torch
@@ -263,6 +263,10 @@ class LayerCommunicator:
         self.allow_deferred_ffn_reduction = allow_deferred_ffn_reduction
         self._residual = residual
         self.fusions = fusions
+        # Built eagerly, not as cached_property: a lazy first write to __dict__
+        # invalidates dynamo's guard on the graph traced before it (TPU fail_on_recompile).
+        self.attn = StageCommunicator(self, "attention", "input_layernorm")
+        self.ffn = StageCommunicator(self, "ffn", "post_attention_layernorm")
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -368,16 +372,6 @@ class LayerCommunicator:
             ffn_output_move_completes_sum=out.output_move_completes_sum,
             ffn_sum_is_movable=out_edge.produced.group is not None,
         )
-
-    @cached_property
-    def attn(self) -> StageCommunicator:
-        """The layer's attention stage."""
-        return StageCommunicator(self, "attention", "input_layernorm")
-
-    @cached_property
-    def ffn(self) -> StageCommunicator:
-        """The layer's FFN stage."""
-        return StageCommunicator(self, "ffn", "post_attention_layernorm")
 
     @property
     def input_rows(self) -> Layout:
