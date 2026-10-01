@@ -676,15 +676,16 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             ignored_argnames=self._ignored_argnames(),
         )
 
+        def rank_tensors() -> tuple[torch.Tensor, ...]:
+            return get_attention_rank_tensors(torch.device(self.model_runner.device))
+
         @functools.wraps(fn)
         def call(*args: Any, **kwargs: Any) -> Any:
             backend = get_forward_context().attn_backend
             return compiled(
                 backend.forward_metadata,
                 *args,
-                attention_rank_tensors=get_attention_rank_tensors(
-                    torch.device(self.model_runner.device)
-                ),
+                attention_rank_tensors=rank_tensors(),
                 **kwargs,
             )
 
@@ -693,6 +694,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             return compiled.warmup_async(
                 backend.forward_metadata,
                 *args,
+                attention_rank_tensors=rank_tensors(),
                 **kwargs,
             )
 

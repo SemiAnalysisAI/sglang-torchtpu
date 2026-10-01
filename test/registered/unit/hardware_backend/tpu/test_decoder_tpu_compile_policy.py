@@ -278,6 +278,44 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         )
         self.assertIs(model_runner.token_to_kv_pool, runner_kv_pool)
 
+    def test_call_and_async_warmup_trace_with_the_same_rank_tensors(self):
+        """The async warmup traces the forward too, so it must pass the rank
+        tensors the call path passes; without them every precompile fails."""
+        model_runner = _model_runner()
+        policy = DecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model_runner.model
+        )
+        compiled = MagicMock()
+        compile_module_name = (
+            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
+        )
+        compile_module = ModuleType(compile_module_name)
+        compile_module.direct_compile = MagicMock(return_value=compiled)
+        rank_tensors = (torch.tensor(0), torch.tensor(1))
+        policy_module = (
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
+        )
+
+        with (
+            patch.dict(sys.modules, {compile_module_name: compile_module}),
+            patch(
+                f"{policy_module}.get_forward_context",
+                return_value=SimpleNamespace(
+                    attn_backend=SimpleNamespace(forward_metadata=None)
+                ),
+            ),
+            patch(
+                f"{policy_module}.get_attention_rank_tensors",
+                return_value=rank_tensors,
+            ),
+        ):
+            call, warmup_async = policy._direct_compile(model_runner.model.forward)
+            call("input_ids")
+            warmup_async("input_ids")
+
+        for recorded in (compiled.call_args, compiled.warmup_async.call_args):
+            self.assertIs(recorded.kwargs["attention_rank_tensors"], rank_tensors)
+
     def test_custom_annotated_policy_forwards_extra_tensor_attrs(self):
         class CustomPolicy(DecoderTpuCompilePolicy):
             model_extra_tensor_attrs = (

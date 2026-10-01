@@ -1267,7 +1267,7 @@ class TestDirectCompileDpRanks(unittest.TestCase):
             patch.object(dp_attention, "_RANK_TENSORS", cache),
             forward_context(ForwardContext(attn_backend=backend)),
         ):
-            compiled = policy._direct_compile(model.forward)
+            compiled, _ = policy._direct_compile(model.forward)
             # Reuse one executable while changing both scalar rank buffers.
             # Constants baked during tracing would return the first rank's result.
             for tp_rank, dp_rank in ((0, 0), (0, 1), (1, 0), (1, 1)):
