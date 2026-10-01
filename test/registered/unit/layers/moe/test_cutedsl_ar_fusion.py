@@ -16,7 +16,6 @@ from sglang.srt.layers.communicator import (
     UnreducedOutput,
     reduce_output,
 )
-from sglang.srt.layers.communicator.layer import StageCommunicator
 from sglang.srt.layers.communicator.ops import _consumer_step, _read_input
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
@@ -49,8 +48,6 @@ def _communicator():
     comm.input_layernorm = RMSNorm(8, eps=1e-6)
     comm.post_attention_layernorm = RMSNorm(8, eps=1e-6)
     comm.enable_fused_ar_quant = False
-    comm.attn = StageCommunicator(comm, "attention", "input_layernorm")
-    comm.ffn = StageCommunicator(comm, "ffn", "post_attention_layernorm")
     comm._attn_input_fusions = comm._select_attn_input_fusions()
     comm._ffn_exit_fusions = comm._select_ffn_exit_fusions()
     # Only the ordinary batches' attention input half, with these entries.
