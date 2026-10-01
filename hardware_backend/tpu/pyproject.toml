@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+[build-system]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-torchtpu"
+version = "0.0.0.dev0"
+description = "Out-of-tree TPU platform plugin for SGLang, backed by torch_tpu."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+]
+
+# Depends on the *distribution name*, not a source. During the transition the
+# fork's own `python/` tree provides it; after cutover an upstream wheel does.
+# Deliberately unpinned until cutover -- see plugin-refactor-proposal.md section 5.6.
+dependencies = ["sglang"]
+
+# NOT published to PyPI during the transition: `_legacy` re-exports resolve
+# against the fork's `sglang.srt.hardware_backend.tpu`, which stock sglang
+# does not ship. Publishing would hand users an ImportError.
+[project.entry-points."sglang.srt.platforms"]
+tpu_oot = "sglang_torchtpu:activate"
+
+[project.entry-points."sglang.srt.plugins"]
+tpu_oot_hooks = "sglang_torchtpu.hooks:register"
+
+[tool.setuptools.packages.find]
+include = ["sglang_torchtpu*"]
