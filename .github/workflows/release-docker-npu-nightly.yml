@@ -17,6 +17,8 @@ concurrency:
 jobs:
   build:
     name: build ${{ matrix.platform }}-${{ matrix.device_type }}
+    # [Do Not Upstream] NPU images are not built or published from this fork.
+    if: github.repository != 'sgl-project/sglang-torchtpu'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
