@@ -75,7 +75,10 @@ class TestHostKVCache(CustomTestCase):
                 "page_first_direct",
                 "page_head",
             ):
-                with self.subTest(rows_per_token=rows_per_token, layout=layout):
+                with (
+                    self.subTest(rows_per_token=rows_per_token, layout=layout),
+                    host_memory_budget_scope(1 << 40),  # 1 TiB
+                ):
                     host_pool = MHATokenToKVPoolHost(
                         device_pool=device_pool,
                         host_to_device_ratio=2.0,

@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_hybrid_swa_group,
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -300,15 +301,18 @@ def _build_unified_swa_pool(page_size: int = 4):
 
 def _build_unified_host_pair(bundle):
     pool = bundle.token_to_kv_pool
-    return UnifiedPageEnvelopeHostPool.build_hybrid_swa_pool_pair(
-        device_pools=(pool.full_kv_pool, pool.swa_kv_pool),
-        host_to_device_ratio=1.0,
-        host_size=0,
-        page_size=pool.page_size,
-        layout="layer_first",
-        pin_memory=False,
-        allocator_type="default",
-    )
+    # The host pool keeps a fixed 10 GiB RAM reserve; low-memory CI runners
+    # fall below it even for this tiny pool.
+    with host_memory_budget_scope(1 << 40):  # 1 TiB
+        return UnifiedPageEnvelopeHostPool.build_hybrid_swa_pool_pair(
+            device_pools=(pool.full_kv_pool, pool.swa_kv_pool),
+            host_to_device_ratio=1.0,
+            host_size=0,
+            page_size=pool.page_size,
+            layout="layer_first",
+            pin_memory=False,
+            allocator_type="default",
+        )
 
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
