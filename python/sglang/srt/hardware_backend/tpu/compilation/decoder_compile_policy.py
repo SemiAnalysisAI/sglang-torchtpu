@@ -17,6 +17,10 @@ from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang.srt.hardware_backend.tpu.compilation.attention_rank_inputs import (
+    get_attention_rank_tensors,
+    use_attention_rank_tensors,
+)
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
@@ -650,6 +654,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             positions: torch.Tensor,
             forward_batch: Any,
             *args: Any,
+            attention_rank_tensors: tuple[torch.Tensor, ...],
             **kwargs: Any,
         ) -> Any:
             backend = get_forward_context().attn_backend
@@ -657,7 +662,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             # Attention reads metadata through the backend during tracing.
             backend.forward_metadata = attention_metadata
             try:
-                return fn(input_ids, positions, forward_batch, *args, **kwargs)
+                with use_attention_rank_tensors(attention_rank_tensors):
+                    return fn(input_ids, positions, forward_batch, *args, **kwargs)
             finally:
                 backend.forward_metadata = previous_metadata
 
@@ -676,6 +682,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             return compiled(
                 backend.forward_metadata,
                 *args,
+                attention_rank_tensors=get_attention_rank_tensors(
+                    torch.device(self.model_runner.device)
+                ),
                 **kwargs,
             )
 
@@ -872,6 +881,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         forward_batch.forward_mode = ForwardMode.DECODE
+        # Scheduler idle locations are int64; active decode and warmup use
+        # the allocator dtype. Normalize before padding materializes KV slots.
+        forward_batch.out_cache_loc = forward_batch.out_cache_loc.to(
+            dtype=self._dummy_out_cache_loc_dtype(ForwardMode.DECODE)
+        )
 
     def materialize_dp_idle_extend(
         self, forward_batch: ForwardBatch, num_tokens: int
@@ -893,7 +907,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             [num_tokens], dtype=torch.int32, device=device
         )
         forward_batch.extend_prefix_lens = torch.zeros(
-            1, dtype=seq_dtype, device=device
+            1, dtype=torch.int32, device=device
         )
         forward_batch.extend_start_loc = torch.zeros(
             1, dtype=torch.int32, device=device
@@ -917,7 +931,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if isinstance(forward_batch.out_cache_loc, torch.Tensor):
             forward_batch.out_cache_loc = torch.zeros(
                 num_tokens,
-                dtype=forward_batch.out_cache_loc.dtype,
+                # Scheduler idle batches carry empty int64 locations even when
+                # the live allocator and precompiled extend graph use int32.
+                dtype=self._dummy_out_cache_loc_dtype(forward_batch.forward_mode),
                 device=device,
             )
         if isinstance(forward_batch.req_pool_indices, torch.Tensor):
