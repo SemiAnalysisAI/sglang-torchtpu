@@ -200,6 +200,12 @@ def _create_dflash_worker_for_tpu(
     worker._tp_sync = SpecTpSync(SimpleNamespace(world_size=1, rank_in_group=0))
     # plain DFlash: no candidate selector.
     worker.selector = None
+    # No LiLiCorr reranker, and the draft does not own an attention group.
+    worker.lilicorr = None
+    worker._lilicorr_sampling_enabled = False
+    worker._lilicorr_anchor = None
+    worker._warned_lilicorr_eager = False
+    worker.draft_owns_attention = False
     worker._selector_sample = None
     worker._draft_probs_buf = None
     # This fixture bypasses DFlashWorkerV2.__init__; mirror its DP-attention state.
