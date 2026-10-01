@@ -16,9 +16,8 @@
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import cached_property, partial
-from typing import Callable, Optional, Protocol, Tuple, Union
+from typing import Callable, NamedTuple, Optional, Protocol, Tuple, Union
 
-import msgspec
 import torch
 
 from sglang.srt.distributed import GroupCoordinator
@@ -1147,10 +1146,13 @@ class FfnExitFusion(Enum):
     NEXT_INPUT = auto()
 
 
-class FfnCompletion(msgspec.Struct, frozen=True):
+class FfnCompletion(NamedTuple):
     """One FFN's reduction decision. The flags are published while the FFN runs;
     ``complete(hidden_states, residual)`` then either wraps the output for the
     next layer's input to complete, or runs this layer's postprocess step."""
+
+    # A NamedTuple, not a msgspec.Struct: it is built inside the forward, which
+    # TPU compiles whole, and dynamo cannot instantiate a Struct.
 
     defer_moe_finalize: bool
     fuse_mlp_allreduce: bool
