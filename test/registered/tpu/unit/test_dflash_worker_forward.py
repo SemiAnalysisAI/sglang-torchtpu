@@ -67,8 +67,8 @@ class _ForceTpuContext:
         spec_utils._is_tpu = True
         spec_utils._use_torch_native = True
         self.par_override = get_parallel().override(
-            world_size=1,
-            world_rank=0,
+            launch_world_size=1,
+            launch_world_rank=0,
             tp_size=1,
             tp_rank=0,
             pp_size=1,
@@ -196,7 +196,6 @@ def _create_dflash_worker_for_tpu(
     worker.page_size = 16
     worker.device = dev
     worker.gpu_id = 0
-    worker.ps = SimpleNamespace(tp_rank=0, world_size=1)
     # world size 1: every sync is a pass-through.
     worker._tp_sync = SpecTpSync(SimpleNamespace(world_size=1, rank_in_group=0))
     # plain DFlash: no candidate selector.
