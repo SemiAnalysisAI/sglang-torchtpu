@@ -769,13 +769,13 @@ class PortArgs:
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
-            if server_args.nnodes == 1 and server_args.dist_init_addr is None:
+            if cfg.nnodes == 1 and cfg.dist_init_addr is None:
                 derived_port = server_args.port + ZMQ_TCP_PORT_DELTA
                 if derived_port > 65535:
                     derived_port = server_args.port - ZMQ_TCP_PORT_DELTA
                 na = NetworkAddress("127.0.0.1", derived_port)
             else:
-                na = NetworkAddress.parse(server_args.dist_init_addr)
+                na = NetworkAddress.parse(cfg.dist_init_addr)
 
             dist_init_host = na.host
             dist_init_port = na.port

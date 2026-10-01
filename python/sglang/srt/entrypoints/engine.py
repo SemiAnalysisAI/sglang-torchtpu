@@ -1106,6 +1106,13 @@ class Engine(EngineScoreMixin, EngineBase):
         if parsers.reasoning_parser == "auto" or parsers.tool_call_parser == "auto":
             resolve_auto_parsers(server_args)
 
+        if resolving_view(server_args).device == "tpu":
+            from sglang.srt.hardware_backend.tpu.node_normalization import (
+                prepare_tpu_environment,
+            )
+
+            prepare_tpu_environment(server_args)
+
         # This publish replaces whatever was published before it, so the
         # rollback below restores that rather than clearing the process: a
         # caller that catches the launch error still has the context it had.

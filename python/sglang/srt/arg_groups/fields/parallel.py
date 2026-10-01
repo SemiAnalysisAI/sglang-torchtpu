@@ -45,6 +45,13 @@ class Parallel(msgspec.Struct):
     tpu_worker_hostnames: A[Optional[str], Arg(no_cli=True)] = None
     torch_tpu_slicebuilder_addresses: A[Optional[str], Arg(no_cli=True)] = None
     torch_tpu_topology: A[Optional[str], Arg(no_cli=True)] = None
+    tpu_node_normalization: A[
+        bool,
+        Arg(
+            help="Normalize multi-host TPU node ranks to physical coordinates before launching workers. Disable to retain the original node order.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = True
     tp_size: A[
         int,
         Arg(
