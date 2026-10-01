@@ -17,11 +17,14 @@ __all__ = ["first_available"]
 def first_available(obj: Any, *names: str) -> Optional[Callable]:
     """Return the first bound attribute of ``obj`` among ``names``, else None.
 
-    Used where upstream renamed a method and the plugin must work either side of
-    the rename. Current users:
+    For use where upstream renamed a method and the plugin must work either side
+    of the rename.
 
-    * ``get_dsa_kv_pool_cls`` / ``get_nsa_kv_pool_cls`` -- upstream spells it
-      ``dsa``; the fork's in-tree platform still defines ``nsa``.
+    **No current users.** ``get_dsa_kv_pool_cls`` / ``get_nsa_kv_pool_cls`` looked
+    like such a rename and is not one: both spellings are raising stubs, because
+    TPU has no DSA pool at all, so ``TpuOOTPlatform`` refuses outright instead of
+    resolving between them. The helper is kept because the first real rename is a
+    question of when, not whether -- delete it if a wave passes without one.
     """
     for name in names:
         attr = getattr(obj, name, None)

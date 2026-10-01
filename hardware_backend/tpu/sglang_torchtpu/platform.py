@@ -24,8 +24,6 @@ from typing import Callable, Optional
 from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 from sglang.srt.platforms.device_mixin import PlatformEnum
 
-from sglang_torchtpu.compat import first_available
-
 # Speculative algorithms the fork validates and tests on TPU. DSPARK is in
 # flight (fork PR #707) and is deliberately absent: a capability that lies is
 # worse than a missing one.
@@ -57,21 +55,26 @@ class TpuOOTPlatform(TpuSRTPlatform):
     # ---- methods the OOT gates call that the in-tree platform lacks ----
 
     def get_dsa_kv_pool_cls(self) -> type:
-        """Upstream's spelling of the fork's ``get_nsa_kv_pool_cls``.
+        """Refuse DSA pool construction with a message that names TPU.
 
-        Reached from ``kv_cache_configurator._build_oot_dsa_kv_pool``. The base
-        class raises ``NotImplementedError``, so without this override every DSA
-        / sparse-attention model fails at pool construction under OOT.
+        Reached from ``kv_cache_configurator._build_oot_dsa_kv_pool`` (gate at
+        ``kv_cache_configurator.py:1318``), an arm that could not fire while the
+        platform declared ``PlatformEnum.TPU``.
+
+        There is nothing to return: the fork ships no DSA/NSA pool for TPU --
+        ``TpuSRTPlatform.get_nsa_kv_pool_cls`` is itself ``raise
+        NotImplementedError("NSA is not supported on TPU.")``. So this is not the
+        rename it looks like, and delegating to either spelling only re-raises.
+        What the override buys is the diagnostic: without it the failure is a bare
+        ``NotImplementedError`` from ``SRTPlatform`` with no indication that the
+        model is simply unsupported here.
         """
-        getter = first_available(
-            super(), "get_dsa_kv_pool_cls", "get_nsa_kv_pool_cls"
+        raise NotImplementedError(
+            "DSA / sparse attention (DeepSeek V3.2 family) has no KV pool "
+            "implementation on TPU; neither get_dsa_kv_pool_cls nor the fork's "
+            "get_nsa_kv_pool_cls resolves to a pool class. Run this model on a "
+            "platform that supports DSA."
         )
-        if getter is None:  # pragma: no cover - defensive
-            raise NotImplementedError(
-                "Neither get_dsa_kv_pool_cls nor get_nsa_kv_pool_cls is defined "
-                "on the in-tree TPU platform."
-            )
-        return getter()
 
     def get_full_graph_backend_cls(self) -> Optional[type]:
         """TPU drives whole-graph compilation through its own graph runner.

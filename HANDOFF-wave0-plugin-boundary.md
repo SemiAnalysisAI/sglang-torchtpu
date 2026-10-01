@@ -100,41 +100,77 @@ by ~1,100 upstream files.
 
 ## 5. What is left, in order
 
-### 5.1 Contract test (CPU, no TPU needed) — do this first
-`hardware_backend/tpu/tests/test_platform_contract.py`, registered with `register_cpu_ci`.
+§5.1-5.3 are **done** (see §5.6 for what they turned up). §5.4 and §5.5 still need hardware.
 
-Assert, for `TpuOOTPlatform`:
-- `is_out_of_tree()` is True **and** `is_tpu()` is True;
-- for every platform method called within an `is_out_of_tree()` gate in `python/sglang/srt`, the
-  resolved implementation is not the base class's raising stub, i.e.
-  `getattr(type(p), name) is not getattr(SRTPlatform, name)` for the raising ones;
-- `get_dsa_kv_pool_cls()` returns the same class as `get_nsa_kv_pool_cls()`;
-- the speculative capability table matches `arg_groups/speculative_hook.py` (topk=1 only, no
-  rejection sampling) and `speculative/draft_utils.py` (the two `pallas_tpu_rpa_*` backends).
+### 5.1 Contract test — DONE
+`test/registered/unit/plugins/test_tpu_oot_platform_contract.py`, `register_cpu_ci(suite="base-a-test-cpu")`.
 
-This is the gate for "the platform satisfies every method an OOT gate calls" and it is the thing
-that catches the next sync breaking us.
+Not `hardware_backend/tpu/tests/` as originally planned: `test/run_suite.py` discovers registered
+tests by globbing `test/registered/**`, so a `register_cpu_ci` marker anywhere else is collected by
+no job and the gate would have been silently empty. That empty directory is gone.
 
-### 5.2 Gate audit tool — `tools/plugin/gate_audit.py`
-Scan `python/sglang/srt` for `is_out_of_tree()`, classify each gate as pure-OOT or
-`or is_tpu()`-guarded, extract the `current_platform.<method>(` calls in the following window, and
-emit the inventory the contract test consumes. Run it after every upstream sync; it is how §3's
-divergence list stays current.
+30 cases, all green locally. Each of the load-bearing ones was mutation-checked — the fix reverted,
+the test confirmed red, the fix restored — because a contract test that cannot fail is worse than none.
 
-### 5.3 Lint — `tools/plugin/check_tpu_branches.py`
-Reject, in CI: a new `is_tpu()` / `_is_tpu` branch in `python/sglang/srt` outside the TPU
-directories, and a new TPU file created anywhere but `hardware_backend/tpu/`. Grandfather everything
-that exists today via a baseline count or an allowlist; the number must only go down.
+### 5.2 Gate audit tool — DONE
+`tools/plugin/gate_audit.py`. AST, not grep: it classifies each gate pure-OOT vs `or is_tpu()`-guarded,
+tracks negation (`if not (is_out_of_tree() or is_tpu())` takes the *other* arm), and resolves one hop
+through same-class `self._helper()` calls, which is the only way `get_dsa_kv_pool_cls` is reachable at all.
 
-### 5.4 CI wiring
+It reports **23 gates in 14 files: 14 pure-OOT, 8 `or is_tpu()`-guarded, 1 unscoped.** The "27" in §4
+was grep counting four comment lines; the 8 guarded match exactly, which is the number that matters.
+
+### 5.3 Lint — DONE
+`tools/plugin/check_tpu_branches.py`, wired as the `check-tpu-branches` pre-commit hook.
+
+Per-file ceilings in `tools/plugin/tpu_debt_baseline.json`, so a removal in one module cannot pay for
+an addition in another. Baseline today: **320 `is_tpu` references in 71 shared-core files, and 22 TPU
+modules outside the in-tree package.** Imports and the symbol's own definition are not counted; "tpu"
+is matched as a path word, so `auxiliary_output.py` is not a TPU module.
+
+The filename rule is narrower than first stated — only `python/sglang/**`, not the whole repo. Workflows,
+Dockerfiles, bazel patches and docs legitimately carry `tpu` in their names and will keep being added;
+a lint that cries wolf on those gets disabled within a week.
+
+### 5.4 CI wiring — TODO, needs your hardware
 Mode A is what runs today. Add **mode B**: `pip install -e python/ -e hardware_backend/tpu/` with
-`SGLANG_PLATFORM=tpu_oot`, running the existing TPU suites. **This is the step that needs your
-hardware.** Mode B green on the full TPU suite is the definition of done for wave 0.
+`SGLANG_PLATFORM=tpu_oot`, running the existing TPU suites. Mode B green on the full TPU suite is the
+definition of done for wave 0.
 
-### 5.5 Close the divergences in §3
+### 5.5 Close the divergences in §3 and §5.6 — TODO
 Then, and only then, make `tpu_oot` the default and rename the in-tree entry point to `tpu_intree`.
 
----
+### 5.6 What the audit turned up that §3 and §4 did not
+
+**`get_dsa_kv_pool_cls` was a no-op dressed as a fix, now fixed.** §4 says the fork defines
+`get_nsa_kv_pool_cls` and the base raises, implying a rename to bridge. It is not a rename:
+`TpuSRTPlatform.get_nsa_kv_pool_cls` is itself `raise NotImplementedError("NSA is not supported on
+TPU.")`. The shipped `first_available(super(), "get_dsa_kv_pool_cls", "get_nsa_kv_pool_cls")` also
+picked the *first* name, which is the base class's raising stub — so the override changed nothing and
+DSA models would still have died with a bare `NotImplementedError`. TPU has no DSA pool at all, so the
+method now refuses outright with a message naming TPU. `compat.first_available` has no users left; its
+docstring no longer claims one.
+
+**Three gate-reachable methods nobody answers.** Recorded in `KNOWN_UNANSWERED` in the contract test,
+a list that may only shrink — two tests enforce that, one failing if an entry gets implemented and
+another if a gate stops reaching it.
+
+- `get_torch_profiler_activity` and `get_torch_profiler_activity_str` are `[Planned]` stubs on
+  `DeviceMixin` that **no platform in the tree implements**, reached from pure-OOT gates at
+  `utils/profile_utils.py:251` and `:332`. Torch-profiler startup raises under `tpu_oot`. This is a real
+  mode-B blocker and wants a `torch_tpu` ProfilerActivity decision made on hardware — the runtime logs
+  that native TPU profiling is off below torch 2.12, so it is not guessable from a CPU box.
+- `get_device_core_count` is defined on **no platform class anywhere**, yet `utils/common.py:1012` calls
+  it behind `is_out_of_tree() or is_tpu()`. That gate is already true for the in-tree platform, so this
+  is a live AttributeError on `main`, not something the flip introduces. Nobody has hit it because its
+  only callers are the triton and wave backends and batch-invariant ops, none of which TPU reaches.
+  It belongs upstream.
+
+**`get_piecewise_backend_cls` is fine as-is** and is the model for the above: it raises
+`"TPU piecewise backend not yet implemented"`. Under OOT, `compilation/backend.py:55` reaches it and
+fails loudly, where the in-tree path silently fell through to `CUDAPiecewiseBackend`. A refusal that
+names TPU is a decision; an inherited bare `raise NotImplementedError` is nobody having looked. That
+distinction is what the contract test actually enforces.
 
 ## 6. How to verify
 
@@ -153,8 +189,9 @@ In mode B, confirm at startup that `current_platform` is `TpuOOTPlatform` and th
 KV-pool construction (§3 item 1) and in anything DSA or sparse-attention, which is the
 `get_dsa_kv_pool_cls` path that previously could not be reached at all.
 
-**Nothing in mode B has been run.** The only verification performed is that every module compiles
-and that `activate()`'s advertised class path matches the class that exists.
+**Nothing in mode B has been run.** CPU-side verification is now real — 30 contract cases, the gate
+audit, and the debt ratchet, all green, all mutation-checked — but every statement about this platform
+driving actual TPU execution remains untested.
 
 ---
 

@@ -135,6 +135,14 @@ repos:
         language: system
         files: ^python/sglang/.*\.py$
         pass_filenames: false
+      - id: check-tpu-branches
+        name: TPU debt ratchet (is_tpu branches in shared core)
+        # Per-file ceilings in tools/plugin/tpu_debt_baseline.json; they may only
+        # go down. A genuinely unavoidable addition is landed by rerunning with
+        # --write-baseline, which puts the increase in the diff for review.
+        entry: python3 tools/plugin/check_tpu_branches.py --files
+        language: system
+        files: ^python/sglang/.*\.py$
       - id: rustfmt-sgl-model-gateway
         name: rustfmt sgl-model-gateway (nightly)
         entry: bash -c 'rustup component add --toolchain nightly rustfmt >/dev/null && cd sgl-model-gateway && cargo +nightly fmt -- --check'
