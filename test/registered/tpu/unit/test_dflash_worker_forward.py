@@ -314,7 +314,9 @@ def _create_dflash_worker_for_tpu(
         decode_cuda_graph_runner=None,
         ngram_embedding_manager=SimpleNamespace(enabled=False),
         server_args=SimpleNamespace(enable_lora=False),
-        ps=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
+        attn_dcp_size=1,
+        attn_dcp_rank=0,
+        tp_rank=0,
         compile_policy=_MockCompilePolicy(
             b_bucketer=Bucketer(name="Bs", buckets=[1, 2, 4, 8, 16])
         ),
@@ -377,7 +379,9 @@ def _create_dflash_worker_for_tpu(
         lora_manager=None,
         ngram_embedding_manager=SimpleNamespace(enabled=False),
         prefill_attention_backend_str="torch_native",
-        ps=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
+        attn_dcp_size=1,
+        attn_dcp_rank=0,
+        tp_rank=0,
         tp_group=None,
         model=draft_model,
         model_config=SimpleNamespace(
@@ -461,6 +465,8 @@ def _make_schedule_batch(
         mamba_track_indices=None,
         mamba_track_mask=None,
         mamba_track_seqlens=None,
+        mamba_track_seqlens_cpu=None,
+        mamba_prefill_track_mask_cpu=None,
         mamba_cow_src_indices=None,
         mamba_cow_dst_indices=None,
         mamba_clear_indices=None,
@@ -494,6 +500,7 @@ def _make_schedule_batch(
         encoder_lens_cpu=None,
         global_num_tokens=None,
         global_num_tokens_for_logprob=None,
+        dp_spec_prefill_coordination_applied=False,
         dllm_config=None,
         model_config=SimpleNamespace(is_matryoshka=False, hidden_size=2880),
     )
