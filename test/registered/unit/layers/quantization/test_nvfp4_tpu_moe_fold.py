@@ -1319,17 +1319,12 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
                 return_value=MoeRunnerBackend(backend),
             ),
             mock.patch(
-                "sglang.srt.distributed.get_world_group",
-                return_value=types.SimpleNamespace(world_size=world_size),
-            ),
-            mock.patch(
-                "sglang.srt.distributed.get_tp_group",
-                return_value=types.SimpleNamespace(world_size=world_size),
-            ),
-            mock.patch(
                 "sglang.srt.runtime_context.get_parallel",
                 return_value=types.SimpleNamespace(
-                    attn_dp_size=1, enable_dp_attention=False
+                    attn_dp_size=1,
+                    enable_dp_attention=False,
+                    tp_group=types.SimpleNamespace(world_size=world_size),
+                    world_group=types.SimpleNamespace(world_size=world_size),
                 ),
             ),
             mock.patch(
