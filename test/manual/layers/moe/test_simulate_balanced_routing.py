@@ -1,6 +1,5 @@
-"""Unit tests for the fused benchmark-only balanced-routing override in
-``sglang.srt.layers.moe.topk`` (``_simulate_balanced_routing`` /
-``_simulate_balanced_routing_kernel``).
+"""Unit tests for benchmark-only balanced-routing overrides in
+``sglang.srt.layers.moe.topk``.
 
 Verifies the single fused Triton kernel reproduces the
 ``_make_round_robin_expert_ids`` reference exactly (incl. the per-layer offset),
@@ -17,7 +16,10 @@ from typing import Optional, Tuple
 import torch
 from parameterized import parameterized
 
-from sglang.srt.layers.moe.topk import _simulate_balanced_routing
+from sglang.srt.layers.moe.topk import (
+    _simulate_balanced_routing,
+    _simulate_perfect_balanced_routing,
+)
 from sglang.test.test_utils import CustomTestCase
 
 E = 256  # num_experts
@@ -98,12 +100,10 @@ class TestSimulateBalancedRouting(CustomTestCase):
     @parameterized.expand([(1, 16), (2, 16), (4, 16), (300, 16), (300, 8)])
     def test_perfect_balanced_ranks(self, num_tokens: int, ep: int) -> None:
         ids, weights = _alloc(num_tokens, K)
-        _simulate_balanced_routing(
+        _simulate_perfect_balanced_routing(
             ids,
             weights,
             E,
-            random=False,
-            perfect_balanced=True,
             num_ranks=ep,
             layer_id=0,
         )
@@ -115,12 +115,10 @@ class TestSimulateBalancedRouting(CustomTestCase):
         routed_topk, total_topk, ep = 8, 9, 16
         ids, _ = _alloc(2, total_topk)
         weights = torch.zeros_like(ids, dtype=torch.float32)
-        _simulate_balanced_routing(
+        _simulate_perfect_balanced_routing(
             ids,
             weights,
             E,
-            random=False,
-            perfect_balanced=True,
             num_ranks=ep,
             num_routed_topk=routed_topk,
             layer_id=0,
