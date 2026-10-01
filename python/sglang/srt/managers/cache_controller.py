@@ -1504,7 +1504,10 @@ class TpuHiCacheController(HiCacheController):
         later commit write stale bytes over whoever reallocates them.
         """
         self.layer_done_counter.drain_commits()
-        return super().evict_device(device_indices)
+        # Upstream dropped HiCacheController.evict_device with HiRadixCache
+        # (#40787); the TPU HiRadixCache still frees pages through it.
+        self.mem_pool_device_allocator.free(device_indices)
+        return len(device_indices)
 
     def start_writing(self) -> None:
         if len(self.write_queue) == 0:
