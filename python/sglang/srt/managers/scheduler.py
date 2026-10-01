@@ -1714,7 +1714,6 @@ class Scheduler(
                 # The raiden load fence gates on copy_done (_in_flight_forward_events).
                 copy_draft_tail=self.enable_hierarchical_cache
                 and get_memory().hicache_io_backend == "raiden"
-                and envs.SGLANG_TPU_ENABLE_RAIDEN_LOAD_FENCE.get()
             )
             logger.info("TPU async result-copy worker enabled")
 

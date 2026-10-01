@@ -386,16 +386,6 @@ class TestLoadFence(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "h2d rejected"):
             event.synchronize()
 
-    def test_disabled_fence_issues_inline_without_polling(self):
-        forward = _ForwardEvent()
-        self.forwards.append(forward)
-        with envs.SGLANG_TPU_ENABLE_RAIDEN_LOAD_FENCE.override(False):
-            self.ctrl.load_fence = RaidenLoadFence()
-        self.ctrl.load_queue.append(_op())
-        self.ctrl.start_loading()
-        self.assertFalse(forward.queried)
-        self.assertEqual(len(self.full_pool.loads), 1)
-
     def test_single_pool_load_dmas_wait_for_in_flight_forward(self):
         forward = _ForwardEvent()
         self.forwards.append(forward)

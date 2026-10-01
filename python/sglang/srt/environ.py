@@ -1823,9 +1823,6 @@ class Envs:
     SGLANG_TPU_PROFILE_PYTHON_TRACER = EnvBool(False)
     # raiden KV-offload backend
     SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
-    # Hold raiden H2D loads until the forwards whose results are still
-    # unprocessed (overlap scheduling) finish. Disable only to A/B the fence.
-    SGLANG_TPU_ENABLE_RAIDEN_LOAD_FENCE = EnvBool(True)
     # Workaround for a TPU v7 warmup crash; disable to debug the root cause.
     SGLANG_TPU_ENABLE_CONTIGUOUS_FLOAT_LOGITS = EnvBool(True)
     # Read the RPA KV cache in the SEQ_ALONG_LANE layout (token index on the

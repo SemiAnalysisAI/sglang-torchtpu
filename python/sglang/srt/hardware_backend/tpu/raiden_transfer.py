@@ -157,7 +157,6 @@ class RaidenLoadFence:
     """
 
     def __init__(self):
-        self._enabled = envs.SGLANG_TPU_ENABLE_RAIDEN_LOAD_FENCE.get()
         # Spawns its thread on the first deferred load.
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="raiden-load-fence"
@@ -171,8 +170,6 @@ class RaidenLoadFence:
     ) -> Any:
         """Run ``issue_dmas`` once every event in ``in_flight_forwards`` has
         completed; return an event over the DMAs."""
-        if not self._enabled:
-            return CombinedFutureEvent(issue_dmas())
         pending = [event for event in in_flight_forwards if not event.query()]
         no_deferred_load = self._last_deferred is None or self._last_deferred.done()
         if no_deferred_load and not pending:
