@@ -1298,17 +1298,24 @@ class SchedulerDisaggregationPrefillMixin:
             return
         # Early-send issues the KV read before this step's forward is enqueued,
         # but under overlap scheduling the PRIOR step's prefill forward may still
-        # be writing these prefix pages on forward_stream. Record a completion
-        # event now so the transfer worker can wait on those writes before the
-        # RDMA read, instead of racing them.
-        # The completion event is consumed by the CUDA transfer workers,
-        # which read KV concurrently with the forward. Backends without such
-        # workers (TPU) start their reads only after the final chunk is
-        # finalized, when these writes have already landed.
-        if self.enable_overlap and _is_cuda:
-            ev = torch.cuda.Event()
-            ev.record(self.forward_stream)
-            req.disagg_kv_sender._early_send_wait_event = ev
+        # be writing these prefix pages on forward_stream. For a chunked request
+        # the prefix includes its own previous chunk, which is exactly the one
+        # in flight.
+        if self.enable_overlap:
+            if _is_cuda:
+                # Record a completion event so the CUDA transfer workers, which
+                # read KV concurrently with the forward, can wait on those
+                # writes before the RDMA read instead of racing them.
+                ev = torch.cuda.Event()
+                ev.record(self.forward_stream)
+                req.disagg_kv_sender._early_send_wait_event = ev
+            elif req.disagg_kv_sender.reads_on_send:
+                # No completion event here, and this sender reads offered pages
+                # at once (e.g. a raiden CHUNK the decode pulls immediately), so
+                # it would copy stale KV from the pages' previous owner (#984).
+                # process_batch_result_disagg_prefill sends the same pages after
+                # copy_done, once the forward that wrote them has finished.
+                return
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
     def send_kv_chunk(

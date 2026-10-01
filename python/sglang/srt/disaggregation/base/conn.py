@@ -139,6 +139,14 @@ class BaseKVManager(ABC):
 
 
 class BaseKVSender(ABC):
+    # True if the transport may start reading the pages handed to send() before
+    # the request's final chunk is sent (e.g. a consumer pull issued as soon as
+    # a chunk is offered). Under overlap scheduling, the prefill's early send of
+    # cached-prefix pages can name pages the previous forward is still writing,
+    # so on backends without a completion-event guard the scheduler skips that
+    # early send for such senders (see maybe_send_cached_prefix_chunk).
+    reads_on_send: bool = False
+
     @abstractmethod
     def __init__(
         self,

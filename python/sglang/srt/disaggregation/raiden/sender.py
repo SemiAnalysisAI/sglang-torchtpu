@@ -938,6 +938,9 @@ class RaidenKVSender(CommonKVSender):
     # A group-wide Failed is delivered only after every rank drained: raiden
     # cannot cancel a transfer, so a peer's pages must not be freed under it.
     group_failure_requires_drain = True
+    # A non-final send() offers its pages as a CHUNK the decode pulls at once,
+    # so they must already hold their KV when offered (issue #984).
+    reads_on_send = True
 
     def __init__(
         self,
