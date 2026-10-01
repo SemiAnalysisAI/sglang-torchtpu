@@ -116,6 +116,13 @@ def init_torch_distributed(
             dcp_size=ps.attn_dcp_size,
         )
 
+        if device == "tpu":
+            from sglang.srt.hardware_backend.tpu.compile_cache import (
+                add_tpu_rank_assignment_to_compile_cache_key,
+            )
+
+            add_tpu_rank_assignment_to_compile_cache_key()
+
         # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
         # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
         if get_exec().comm.pre_warm_nccl and (

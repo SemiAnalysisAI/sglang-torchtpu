@@ -16,6 +16,9 @@ warmup_buckets.py    # request-sender used by warmup.sh
 
 ## Usage
 
+For opt-in coordinate-ordered multi-host launches and cross-allocation artifact
+validation, see [the topology launcher guide](topology_launcher.md).
+
 The Python launcher (`python -m benchmark.tpu.launch_server --config ...`)
 preserves hardware metadata such as `TPU_TOPOLOGY`. For one-host-per-engine P/D,
 it removes cross-host rendezvous settings so each engine initializes locally.
