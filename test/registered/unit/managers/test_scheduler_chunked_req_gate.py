@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     CustomTestCase,
+    enter_scope,
     maybe_stub_sgl_kernel,
     published_topology,
 )
@@ -236,7 +237,7 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
 
     def _idle_prefill_scheduler(self):
         # is_fully_idle reads the pipeline width from the published config.
-        self.enterContext(published_topology())
+        enter_scope(self, published_topology())
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.tree_cache = MagicMock()
         scheduler.running_batch = SimpleNamespace(
