@@ -39,6 +39,7 @@ def _response_failed(task: asyncio.Task) -> bool:
 
 
 async def _post_prefill_and_decode(
+    *,
     session: aiohttp.ClientSession,
     prefill_url: str,
     prefill_req: dict,
@@ -214,11 +215,11 @@ class MiniLoadBalancer:
             )  # Add timeout for request reliability
         ) as session:
             prefill_response, decode_response = await _post_prefill_and_decode(
-                session,
-                f"{prefill_server}/{endpoint}",
-                prefill_req,
-                f"{decode_server}/{endpoint}",
-                decode_req,
+                session=session,
+                prefill_url=f"{prefill_server}/{endpoint}",
+                prefill_req=prefill_req,
+                decode_url=f"{decode_server}/{endpoint}",
+                decode_req=decode_req,
             )
             if prefill_response is None or decode_response is None:
                 # One side failed early and the other was cancelled.
@@ -331,11 +332,11 @@ class MiniLoadBalancer:
             # streaming response (and its 200 status) is committed. A side
             # still pending when the other fails is cancelled (None).
             prefill_response, decode_response = await _post_prefill_and_decode(
-                session,
-                f"{prefill_server}/{endpoint}",
-                modified_request,
-                f"{decode_server}/{endpoint}",
-                modified_request,
+                session=session,
+                prefill_url=f"{prefill_server}/{endpoint}",
+                prefill_req=modified_request,
+                decode_url=f"{decode_server}/{endpoint}",
+                decode_req=modified_request,
             )
             responses.extend(
                 r for r in (prefill_response, decode_response) if r is not None
