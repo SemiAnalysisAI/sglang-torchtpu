@@ -53,7 +53,6 @@ class TestDiffusionPlatformDispatch(CustomTestCase):
                 select_impl(triton_impl, cpu=cpu_impl, tpu=tpu_impl), tpu_impl
             )
 
-
     def test_selected_lazy_fallback_resolves_to_its_function(self):
         """Selection imports the fallback, so a compiled call never imports."""
         from sglang.kernels.ops.diffusion.common import fallback_torch
