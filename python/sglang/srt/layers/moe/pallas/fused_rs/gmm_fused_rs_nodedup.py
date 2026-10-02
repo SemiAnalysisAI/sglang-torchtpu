@@ -1008,7 +1008,7 @@ def kernel_main_fused_rs(
                 if step + num_w1_bufs < total_w1_steps:
                     ns = step + num_w1_bufs
                     start_w1_dma(ns % num_w1_bufs, expert_id, ns // num_k1, ns % num_k1)
-                if step == 0:
+                if step == 0 and can_cache_w1:
 
                     @pl.when(gm_id + 1 < local_num_gm)
                     def _():
@@ -1032,7 +1032,10 @@ def kernel_main_fused_rs(
 
                 @pl.when(jnp.logical_not(next_same))
                 def _():
-                    for _i in range(1, min(num_w1_bufs, total_w1_steps)):
+                    # Rotating W1 tiles still need buffer zero until GMM1 finishes.
+                    for _i in range(
+                        1 if can_cache_w1 else 0, min(num_w1_bufs, total_w1_steps)
+                    ):
                         start_w1_dma(_i, next_e, _i // num_k1, _i % num_k1)
 
             with jax.named_scope("interlude"):
