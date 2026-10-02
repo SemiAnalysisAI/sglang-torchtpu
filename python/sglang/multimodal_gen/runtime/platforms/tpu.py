@@ -140,6 +140,12 @@ class TpuPlatform(Platform):
         return False
 
     @classmethod
+    def prefers_functional_collectives(cls) -> bool:
+        # torch_tpu lowers the in-place all_to_all_single on a flat buffer with
+        # relayout copies that cost ~3x the exchange itself.
+        return True
+
+    @classmethod
     def supports_device_tensor_pickle(cls) -> bool:
         # Reducing a PrivateUse1 storage aborts in tensor_to_buffer.cc.
         return False

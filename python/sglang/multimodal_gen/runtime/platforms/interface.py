@@ -287,6 +287,15 @@ class Platform:
         return True
 
     @classmethod
+    def prefers_functional_collectives(cls) -> bool:
+        """Whether the Ulysses all-to-all uses functional collectives.
+
+        The in-place c10d call avoids the functional wrapper's per-call
+        overhead where that matters (CUDA eager).
+        """
+        return False
+
+    @classmethod
     def supports_device_tensor_pickle(cls) -> bool:
         return True
 

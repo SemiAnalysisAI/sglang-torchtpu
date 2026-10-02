@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
@@ -98,6 +99,10 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
+    if current_platform.prefers_functional_collectives():
+        # Equal splits along dim 0 match the flat exchange below.
+        output = ft_c.all_to_all_single(x.contiguous(), None, None, group=ulysses_pg)
+        return _maybe_wait(output).reshape(x_shape)
     x = x.flatten().contiguous()
     if role is None:
         output = torch.empty_like(x)
