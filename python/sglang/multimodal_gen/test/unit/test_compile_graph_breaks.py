@@ -2,6 +2,7 @@
 
 import torch
 
+from sglang.multimodal_gen.configs.models.dits.ltx_2 import LTX2Config
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.layers.layernorm import FP32LayerNorm
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -29,3 +30,15 @@ def test_req_delegates_sampling_params_without_a_break():
         return x * req.num_frames
 
     assert _compile(frames)(torch.ones(2)).tolist() == [5.0, 5.0]
+
+
+def test_model_config_extra_attrs_resolve_without_a_break():
+    config = LTX2Config()
+    config.arch_config.ltx_variant = "ltx_2"
+
+    def scale(x):
+        if getattr(config, "ltx_variant", "ltx_2") == "ltx_2_3":
+            return x * 2
+        return x + getattr(config, "missing_attr", 1)
+
+    assert _compile(scale)(torch.ones(2)).tolist() == [2.0, 2.0]
