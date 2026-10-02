@@ -132,10 +132,31 @@ The filename rule is narrower than first stated — only `python/sglang/**`, not
 Dockerfiles, bazel patches and docs legitimately carry `tpu` in their names and will keep being added;
 a lint that cries wolf on those gets disabled within a week.
 
-### 5.4 CI wiring — TODO, needs your hardware
-Mode A is what runs today. Add **mode B**: `pip install -e python/ -e hardware_backend/tpu/` with
-`SGLANG_PLATFORM=tpu_oot`, running the existing TPU suites. Mode B green on the full TPU suite is the
-definition of done for wave 0.
+### 5.4 CI wiring — DONE on this box, one environmental blocker left
+Mode B runs. `pip install -e hardware_backend/tpu/ --no-deps` (plain install would resolve
+`sglang` from PyPI and clobber the editable fork), then `SGLANG_PLATFORM=tpu_oot`.
+
+Platform resolution verified three ways: unset -> `TpuSRTPlatform`, `tpu` -> `TpuSRTPlatform`,
+`tpu_oot` -> `TpuOOTPlatform` (`is_tpu` and `is_out_of_tree` both True). **Installing the plugin
+does not change the default**, which is the whole point of the opt-in design.
+
+The existing TPU suites hardcoded `os.environ["SGLANG_PLATFORM"] = "tpu"` in four places, which
+pinned every run to mode A. Now `setdefault`, so mode B can drive the same suites. `ci_utils.py`
+compared `== "tpu"` for its cache-clearing; now `startswith("tpu")`.
+
+**Mode A and mode B reach byte-identical server startup** on Qwen3-0.6B: same KV cache
+(688576 tokens, K/V 18.39 GB each), same `max_total_num_tokens`, same memory pool. Both then die
+in the same place for the same environmental reason — see below. 48 TPU unit tests pass
+identically under both platforms; 14 Pallas attention kernel tests pass on hardware.
+
+**Blocker, environmental, not ours:** this box has torch_tpu `0.1.1.dev20260707090224` while
+`python/pyproject_tpu.toml` pins `dev20260813160135`.
+`hardware_backend/tpu/result_copy_worker.py:77` calls `self.device_module.device(...)`, and
+`TpuDeviceModule.device` exists in neither the installed build nor the newer cached wheel
+(`dev20260804175944`), so **e2e server tests cannot complete in either mode**. Fixing it needs
+the pinned wheel from the private registry, which 403s for the service account — a human
+`gcloud auth login` is the unblock. Until then mode B is verified up to the first forward pass,
+not through it.
 
 ### 5.5 Close the divergences in §3 and §5.6 — TODO
 Then, and only then, make `tpu_oot` the default and rename the in-tree entry point to `tpu_intree`.
@@ -171,6 +192,25 @@ another if a gate stops reaching it.
 fails loudly, where the in-tree path silently fell through to `CUDAPiecewiseBackend`. A refusal that
 names TPU is a decision; an inherited bare `raise NotImplementedError` is nobody having looked. That
 distinction is what the contract test actually enforces.
+
+**Divergence 2 was a hard blocker, and worse than described — now closed.** §3 called it a
+possible double initialisation. It is not: `model_runner.py:251` calls
+`current_platform.init_backend()` at **module import**, an arm the in-tree platform never took.
+That import also runs in the tokenizer and detokenizer processes, where `WORLD_SIZE` is unset, so
+the in-tree `init_backend` raises `"requires worker WORLD_SIZE"` and **no server starts at all**
+under `tpu_oot` — observed, mode B dying in 10s.
+
+Fixed in the plugin, not in core (wave-0 rule 3): `TpuOOTPlatform.init_backend()` returns early
+when `WORLD_SIZE` is unset. That is safe rather than merely quiet — `scheduler.py:6234` calls
+`initialize_torch_tpu_worker`, which calls `init_backend()` again inside the worker, and the base
+class's `_backend_initialized` guard makes that second call the one that does the work. The
+import-time call is redundant for TPU. Two regression tests cover it, the first verified red
+before the fix.
+
+**Divergence 1 is untested, not cleared.** Qwen3-0.6B is not a hybrid-SWA model, so the
+`_build_tpu_swa_kv_pool` vs `_build_oot_mha_kv_pool` routing bug never fires in this smoke test.
+The identical KV-pool numbers above exercise the MHA arm only. Closing divergence 1 still needs a
+hybrid-SWA model on hardware.
 
 ## 6. How to verify
 

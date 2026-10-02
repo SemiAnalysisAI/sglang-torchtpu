@@ -19,10 +19,14 @@ divergences in the package README are closed.
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import Callable, Optional
 
 from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 from sglang.srt.platforms.device_mixin import PlatformEnum
+
+logger = logging.getLogger(__name__)
 
 # Speculative algorithms the fork validates and tests on TPU. DSPARK is in
 # flight (fork PR #707) and is deliberately absent: a capability that lies is
@@ -51,6 +55,33 @@ class TpuOOTPlatform(TpuSRTPlatform):
         those sites are migrated.
         """
         return True
+
+    def init_backend(self) -> None:
+        """Defer backend init to the scheduler worker when WORLD_SIZE is unset.
+
+        `model_executor/model_runner.py:251` calls this at **module import** on
+        the OOT path -- an arm the in-tree platform never took. That import also
+        runs in the tokenizer and detokenizer processes, where WORLD_SIZE is
+        unset and TPU topology discovery is meaningless, and the base
+        implementation raises there ("requires worker WORLD_SIZE"). Without this
+        override, mode B cannot start a server at all.
+
+        Skipping is safe rather than merely quiet: `scheduler.py:6234` calls
+        `initialize_torch_tpu_worker`, which calls this again inside the
+        scheduler worker once the launch environment is in place, and the base
+        class's `_backend_initialized` guard makes that second call the one that
+        does the work. The import-time call is redundant for TPU, not load-bearing.
+
+        Remove this once the gate at model_runner.py:250 stops firing for TPU,
+        which is the other half of closing README divergence 2.
+        """
+        if os.environ.get("WORLD_SIZE") is None:
+            logger.debug(
+                "Deferring TPU backend init: WORLD_SIZE is unset, so this is not "
+                "a scheduler worker. initialize_torch_tpu_worker() will call it."
+            )
+            return
+        super().init_backend()
 
     # ---- methods the OOT gates call that the in-tree platform lacks ----
 

@@ -136,7 +136,10 @@ class TestTpuQwen306bSinglehostPrefixCache(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_PLATFORM"] = "tpu"
+        # setdefault, not assignment: CI mode B runs these same suites with
+        # SGLANG_PLATFORM=tpu_oot to exercise the out-of-tree platform, and an
+        # unconditional assignment here would silently pin every run to mode A.
+        os.environ.setdefault("SGLANG_PLATFORM", "tpu")
 
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [

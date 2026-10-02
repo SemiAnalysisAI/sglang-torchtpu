@@ -201,6 +201,29 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             "no is_out_of_tree() gate reaches these; drop them from KNOWN_UNANSWERED",
         )
 
+    # -- backend initialisation -------------------------------------------
+
+    def test_init_backend_defers_outside_a_scheduler_worker(self):
+        """model_runner.py:251 calls init_backend() at *module import* on the OOT
+        path. That import also runs in the tokenizer and detokenizer processes,
+        where WORLD_SIZE is unset; the in-tree implementation raises there
+        ("requires worker WORLD_SIZE") and no server can start under tpu_oot.
+        Observed before the fix: the mode-B smoke test died in 10s at import.
+        """
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WORLD_SIZE", None)
+            with patch.object(self.TpuSRTPlatform, "init_backend") as in_tree_init:
+                self.platform.init_backend()
+            in_tree_init.assert_not_called()
+
+    def test_init_backend_runs_inside_a_scheduler_worker(self):
+        """Deferring must not become skipping: initialize_torch_tpu_worker()
+        calls this again in the worker, and that call has to do the real work."""
+        with patch.dict(os.environ, {"WORLD_SIZE": "1"}):
+            with patch.object(self.TpuSRTPlatform, "init_backend") as in_tree_init:
+                self.platform.init_backend()
+            in_tree_init.assert_called_once()
+
     # -- DSA / sparse attention -------------------------------------------
 
     def test_dsa_kv_pool_cls_fails_with_a_tpu_specific_message(self):
