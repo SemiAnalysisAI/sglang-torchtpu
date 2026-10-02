@@ -477,7 +477,7 @@ def _tpu_splash_attention_op(
         out = kernel(q.contiguous(), k.contiguous(), v.contiguous())
 
     if need_pad_q:
-        out = out[:, :, :q_seq, :]
+        out = out[:, :, :q_seq, :].contiguous()
     return out
 
 
@@ -489,7 +489,8 @@ def _(
     scale: float,
     is_causal: bool = False,
 ) -> torch.Tensor:
-    return torch.empty_like(q)
+    # The kernels write a contiguous output whatever the query's strides.
+    return q.new_empty(q.shape)
 
 
 def tpu_attention(
