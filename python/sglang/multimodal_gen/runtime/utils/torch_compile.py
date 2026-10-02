@@ -104,7 +104,15 @@ def compile_matching_submodules(
             f"check {type(module).__name__}._compile_conditions"
         )
 
+    # Only for models whose ranks all run the same region graph.
+    wrap_region = (
+        current_platform.get_spmd_region_wrapper()
+        if getattr(module, "_compile_regions_spmd_safe", False)
+        else None
+    )
     for submodule in matches:
+        if wrap_region is not None:
+            submodule.forward = wrap_region(submodule.forward)
         submodule.compile(**compile_kwargs)
     return len(matches)
 

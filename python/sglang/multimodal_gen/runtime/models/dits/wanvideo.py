@@ -1020,6 +1020,9 @@ class WanTransformerBlock_VSA(nn.Module):
 class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
+    # Every SP rank runs each block on equal-length shards of the same layout,
+    # so all ranks compile the same block program.
+    _compile_regions_spmd_safe = True
     param_names_mapping = WanVideoConfig().param_names_mapping
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping

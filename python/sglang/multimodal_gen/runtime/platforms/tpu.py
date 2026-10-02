@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 
 import torch
 
@@ -151,6 +152,17 @@ class TpuPlatform(Platform):
 
     def get_device(self, local_rank: int) -> torch.device:
         return self.get_local_torch_device()
+
+    def get_spmd_region_wrapper(self) -> Callable | None:
+        # torch_tpu splits a compiled graph at every collective and re-lays out
+        # tensors at each split. Marking a region SPMD-safe keeps its
+        # collectives in one program (Wan2.2-A14B, Ulysses 4: 3.17 -> 3.07
+        # s/step). A whole-DiT program needs too much scratch, so only regions.
+        # The ranks must run identical programs: the fused collectives otherwise
+        # hang or exchange the wrong data.
+        from torch_tpu._internal.distributed.spmd_util import spmd_safe
+
+        return spmd_safe
 
     @classmethod
     def set_device(cls, device: torch.device) -> None:
