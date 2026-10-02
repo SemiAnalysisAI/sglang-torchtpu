@@ -5,6 +5,7 @@ mode also supports transferring artifacts between independent allocations.
 """
 
 import argparse
+import faulthandler
 import hashlib
 import importlib.metadata
 import json
@@ -27,6 +28,18 @@ register_tpu_ci(
     nightly=True,
     labels=["multihost", "collectives", "compile-cache"],
 )
+
+
+def coordinate_worker_with_traceback(*args):
+    from sglang.srt.hardware_backend.tpu.node_normalization import _coordinate_worker
+
+    faulthandler.dump_traceback_later(60, repeat=True)
+    print(f"coordinate probe {args[2]}:{args[0]} starting", flush=True)
+    _coordinate_worker(*args)
+    print(
+        f"coordinate probe {args[2]}:{args[0]} entering interpreter teardown",
+        flush=True,
+    )
 
 
 def worker():
@@ -226,7 +239,12 @@ class TestTopologyArtifactTransfer(unittest.TestCase):
                             dist_init_addr=f"{phase_config.hosts[0]}:{phase_config.master_port}",
                             tpu_node_normalization=normalize,
                         )
-                        normalization.prepare_tpu_environment(server_args)
+                        with patch.object(
+                            normalization,
+                            "_coordinate_worker",
+                            coordinate_worker_with_traceback,
+                        ):
+                            normalization.prepare_tpu_environment(server_args)
                         ordered_hosts = os.environ["TPU_WORKER_HOSTNAMES"].split(",")
                         order = [
                             phase_config.hosts.index(host) for host in ordered_hosts

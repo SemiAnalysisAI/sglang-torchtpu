@@ -2,6 +2,7 @@
 
 import argparse
 import itertools
+import json
 import os
 import random
 import socket
@@ -10,7 +11,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -197,6 +198,32 @@ class TestNodeNormalization(unittest.TestCase):
                 results = list(pool.map(host, (0, 1)))
         for order in results:
             self.assertEqual(order, [1, 0])
+
+    def test_discovery_errors_are_acknowledged_before_owner_releases_store(self):
+        for changes, expected_error in (
+            (
+                {"error": "TimeoutError: TPU coordinate discovery timed out"},
+                RuntimeError,
+            ),
+            ({"config": {}}, ValueError),
+            ({"rank": 0}, ValueError),
+        ):
+            with self.subTest(changes=changes):
+                records = [
+                    {"config": asdict(self.config), "rank": index, "error": None}
+                    for index in range(2)
+                ]
+                records[1].update(changes)
+                store = Mock()
+                store.get.side_effect = [json.dumps(record) for record in records]
+                with (
+                    patch("torch.distributed.TCPStore", return_value=store),
+                    patch.object(normalization, "query_node_rank", return_value=0),
+                    self.assertRaises(expected_error),
+                ):
+                    normalization.discover_host_order(self.config, 0, 10)
+                store.set.assert_any_call("done/0", "1")
+                store.wait.assert_called_once_with(["done/0", "done/1"])
 
 
 class TestAutomaticTopologyLaunch(unittest.TestCase):

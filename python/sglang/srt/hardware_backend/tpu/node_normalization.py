@@ -223,6 +223,11 @@ def discover_host_order(
     records = [
         json.loads(store.get(f"host/{index}")) for index in range(len(config.hosts))
     ]
+    # Acknowledge reads before validation too: the owner must not close the
+    # store while a peer is still retrieving the shared failure report.
+    store.set(f"done/{host_index}", "1")
+    if host_index == 0:
+        store.wait([f"done/{index}" for index in range(len(config.hosts))])
     errors = [entry["error"] for entry in records]
     if any(errors):
         raise RuntimeError(
@@ -230,13 +235,7 @@ def discover_host_order(
         )
     if any(entry["config"] != records[0]["config"] for entry in records):
         raise ValueError("Hosts disagree on the TPU launch configuration")
-    order = canonical_host_order([entry["rank"] for entry in records])
-    # Clients make no store requests after this acknowledgement. The owner can
-    # then release the store before server startup, without racing a slow peer.
-    store.set(f"done/{host_index}", "1")
-    if host_index == 0:
-        store.wait([f"done/{index}" for index in range(len(config.hosts))])
-    return order
+    return canonical_host_order([entry["rank"] for entry in records])
 
 
 def prepare_tpu_environment(server_args) -> None:

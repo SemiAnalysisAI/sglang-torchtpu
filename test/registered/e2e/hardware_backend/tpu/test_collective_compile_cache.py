@@ -5,7 +5,6 @@ import importlib.util
 import json
 import os
 import shlex
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.tpu.eval_support import RecipeLauncher
 
 register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit")
 
@@ -79,7 +79,7 @@ def worker(phase, source):
     print(json.dumps({"phase": phase, "rank": rank, "hits": hits}), flush=True)
     dist.barrier()
     dist.destroy_process_group()
-    faulthandler.cancel_dump_traceback_later()
+    print(f"{phase}: logical rank {rank} entering interpreter teardown", flush=True)
 
 
 class TestCollectiveCompileCache(unittest.TestCase):
@@ -121,9 +121,19 @@ class TestCollectiveCompileCache(unittest.TestCase):
                         f"{shlex.quote(__file__)} --worker {phase} {shlex.quote(str(source))}",
                     )
                 )
-                subprocess.run(
-                    ["bash", "-c", command], env=env, check=True, timeout=300
+                processes = RecipeLauncher(
+                    command=["bash", "-c", command],
+                    start_new_session=True,
+                    terminate_timeout=10,
+                    tag=phase,
                 )
+                with patch.dict(os.environ, env, clear=True):
+                    try:
+                        processes.start()
+                        result = processes.wait(timeout=300)
+                    finally:
+                        processes.shutdown()
+                self.assertEqual(result, 0, f"{phase} workers failed")
 
 
 if __name__ == "__main__":
