@@ -392,8 +392,10 @@ _WAN_TEMB_SLICES = BitExactFusionGate("Wan fused temb-table slices")
 def _eager_temb_table_slices(
     table: torch.Tensor, temb: torch.Tensor
 ) -> tuple[torch.Tensor, ...]:
-    parts = (table.unsqueeze(0) + temb.float()).chunk(6, dim=2)
-    return tuple(part.squeeze(2) for part in parts)
+    # One contiguous (B, S, D) tensor per slice, as the fused kernel writes.
+    # Chunk views of the (B, S, 6, D) sum would cross the compiled graph's
+    # collective splits, and torch_tpu re-lays such views out in every block.
+    return tuple(table[:, j] + temb[:, :, j].float() for j in range(6))
 
 
 def _wan_temb_table_slices(
@@ -1281,6 +1283,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     device=timestep_proj.device,
                 )
                 timestep_proj = torch.cat([timestep_proj, pad], dim=1)
+            # Every block reads this rank's slice; copy it once rather than
+            # pass an offset view into each block (contiguous() would keep the
+            # view, which starts at offset 0 only on rank 0).
             timestep_proj = timestep_proj.view(
                 batch_size,
                 self.sp_size,
@@ -1288,7 +1293,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 timestep_proj.shape[2],
                 timestep_proj.shape[3],
             )
-            timestep_proj = timestep_proj[:, sp_rank, :, :, :]
+            timestep_proj = timestep_proj[:, sp_rank, :, :, :].clone()
 
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat(
