@@ -223,9 +223,7 @@ class SchedulerPPMixin:
         if self._pp_wave is not None:
             with torch.profiler.record_function("pp_wave_send"):
                 if result is not None:
-                    self._pp_wave.note_stage_launches(
-                        self._pp_wave.forward_launches
-                    )
+                    self._pp_wave.note_forward()
                 self._pp_wave.end_iteration(
                     result.pp_hidden_states_proxy_tensors.tensors
                     if result is not None and not self.pp_group.is_last_rank

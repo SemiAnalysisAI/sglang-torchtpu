@@ -303,9 +303,21 @@ class PPWave:
         self.fillers = 0
         # Stage-local programs one forward of this stage issues (set by the
         # scheduler; counted with note_stage_launches after each forward).
+        # ``forward_launch_counter``, when set, reports the forward just run
+        # instead (its graph's measured count).
         self.forward_launches = 0
+        self.forward_launch_counter: Callable[[], int] | None = None
 
     # -- launches -------------------------------------------------------------
+    def note_forward(self) -> None:
+        """Count the stage-local programs of the forward this stage just ran."""
+        if self.slot_size == 0:
+            return
+        counter = self.forward_launch_counter
+        self.note_stage_launches(
+            counter() if counter is not None else self.forward_launches
+        )
+
     def note_stage_launches(self, n: int) -> None:
         """Count ``n`` stage-local multi-device programs (a forward's) issued
         since the last hand-off."""
