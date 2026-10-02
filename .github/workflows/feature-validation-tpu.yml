@@ -120,6 +120,15 @@ jobs:
       - name: Read only PR 943 artifact JobSets and their pods
         run: |
           set -euo pipefail
+          kubectl -n tpu-ci get localqueue tpu-nightly-2h -o json > /tmp/queue.json
+          jq '{name: .metadata.name, spec, status}' /tmp/queue.json
+          cluster_queue=$(jq -r '.spec.clusterQueue' /tmp/queue.json)
+          kubectl get clusterqueue "$cluster_queue" -o json |
+            jq '{name: .metadata.name, spec, status}'
+          kubectl -n tpu-ci get workloads -o json |
+            jq '[.items[] | select(.spec.queueName == "tpu-nightly-2h") | {name: .metadata.name, created: .metadata.creationTimestamp, owners: .metadata.ownerReferences, podSets: [.spec.podSets[] | {name, count, resources: [.template.spec.containers[].resources]}], status}]'
+          kubectl -n tpu-ci get pods -o json |
+            jq '[.items[] | select(.spec.nodeName == "gke-tpu-01063e2d-hvx4" or .spec.nodeName == "gke-tpu-01063e2d-qwq1" or .spec.nodeName == "gke-tpu-698336ef-9ls5" or .spec.nodeName == "gke-tpu-698336ef-tk7n") | {name: .metadata.name, created: .metadata.creationTimestamp, node: .spec.nodeName, owners: .metadata.ownerReferences, resources: [.spec.containers[].resources], phase: .status.phase, conditions: .status.conditions}]'
           kubectl get nodes -l cloud.google.com/gke-tpu-topology=2x2x2 -o json |
             jq '[.items[] | {name: .metadata.name, pool: .metadata.labels["ci-tpu-pool"], lane: .metadata.labels["ci-tpu-lane"], allocatable: .status.allocatable, conditions: .status.conditions}]'
           kubectl -n tpu-ci get jobsets -o json > /tmp/jobsets.json
