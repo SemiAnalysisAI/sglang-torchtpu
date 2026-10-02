@@ -15,6 +15,7 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.hardware_backend.tpu.kv_pool_host import TpuFusedMHATokenToKVPoolHost
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -46,11 +47,6 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
-
-# Upstream relocated MHATokenToKVPoolHost/MLATokenToKVPoolHost into the
-# mem_cache.pool_host package; TpuFusedMHATokenToKVPoolHost is the fork's own
-# class and still lives in memory_pool_host.
-from sglang.srt.mem_cache.memory_pool_host import TpuFusedMHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import (

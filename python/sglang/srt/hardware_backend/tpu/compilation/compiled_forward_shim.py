@@ -37,7 +37,9 @@ from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool_host import TpuFusedMHATokenToKVPoolHost
+    from sglang.srt.hardware_backend.tpu.kv_pool_host import (
+        TpuFusedMHATokenToKVPoolHost,
+    )
 
 logger = get_logger(__name__)
 
