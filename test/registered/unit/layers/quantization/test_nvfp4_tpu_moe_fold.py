@@ -243,16 +243,17 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
         tp_group = types.SimpleNamespace(world_size=4)
         world_group = types.SimpleNamespace(world_size=4)
-        parallel = types.SimpleNamespace(attn_dp_size=1, enable_dp_attention=False)
+        parallel = types.SimpleNamespace(
+            attn_dp_size=1,
+            enable_dp_attention=False,
+            tp_group=tp_group,
+            world_group=world_group,
+        )
         exec_ns = types.SimpleNamespace(
             moe=types.SimpleNamespace(enable_fused_moe_sum_all_reduce=False)
         )
         a2a_backend = types.SimpleNamespace(is_none=lambda: True)
         with (
-            mock.patch(
-                "sglang.srt.distributed.get_world_group", return_value=world_group
-            ),
-            mock.patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
             mock.patch(
                 "sglang.srt.runtime_context.get_parallel", return_value=parallel
             ),
@@ -341,16 +342,17 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
         tp_group = types.SimpleNamespace(world_size=4)
         world_group = types.SimpleNamespace(world_size=4)
-        parallel = types.SimpleNamespace(attn_dp_size=1, enable_dp_attention=False)
+        parallel = types.SimpleNamespace(
+            attn_dp_size=1,
+            enable_dp_attention=False,
+            tp_group=tp_group,
+            world_group=world_group,
+        )
         exec_ns = types.SimpleNamespace(
             moe=types.SimpleNamespace(enable_fused_moe_sum_all_reduce=False)
         )
         a2a_backend = types.SimpleNamespace(is_none=lambda: True)
         with (
-            mock.patch(
-                "sglang.srt.distributed.get_world_group", return_value=world_group
-            ),
-            mock.patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
             mock.patch(
                 "sglang.srt.runtime_context.get_parallel", return_value=parallel
             ),
@@ -1308,17 +1310,12 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
                 return_value=MoeRunnerBackend(backend),
             ),
             mock.patch(
-                "sglang.srt.distributed.get_world_group",
-                return_value=types.SimpleNamespace(world_size=world_size),
-            ),
-            mock.patch(
-                "sglang.srt.distributed.get_tp_group",
-                return_value=types.SimpleNamespace(world_size=world_size),
-            ),
-            mock.patch(
                 "sglang.srt.runtime_context.get_parallel",
                 return_value=types.SimpleNamespace(
-                    attn_dp_size=1, enable_dp_attention=False
+                    attn_dp_size=1,
+                    enable_dp_attention=False,
+                    tp_group=types.SimpleNamespace(world_size=world_size),
+                    world_group=types.SimpleNamespace(world_size=world_size),
                 ),
             ),
             mock.patch(

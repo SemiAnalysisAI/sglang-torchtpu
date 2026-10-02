@@ -310,9 +310,7 @@ def _dp_attn_compute_padding(
             f"{forward_batch.dp_padding_mode}."
         )
 
-    from sglang.srt.layers.dp_attention import get_attention_dp_rank
-
-    dp_rank = get_attention_dp_rank()
+    dp_rank = get_parallel().attn_dp_rank
     # This rank's real live token count (used below for decode/idle real_q/b).
     # global_num_tokens_cpu is padded.
     # original_global_num_tokens_cpu is the pre-padding counts.
@@ -475,6 +473,7 @@ def _attach_input_logprobs(
     logits_output.input_top_logprobs_idx = eager.input_top_logprobs_idx
     logits_output.input_token_ids_logprobs_val = eager.input_token_ids_logprobs_val
     logits_output.input_token_ids_logprobs_idx = eager.input_token_ids_logprobs_idx
+    logits_output.input_logprobs_copy_done = eager.input_logprobs_copy_done
 
 
 def _pad_tensor_on_host(

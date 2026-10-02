@@ -264,9 +264,9 @@ def fused_moe_rs_gather(
         return token_shard[:logical_shard_rows].contiguous()
 
     try:
-        from sglang.srt.distributed import get_tp_group
+        from sglang.srt.runtime_context import get_parallel
 
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         if tp_group is not None:
             return tp_group.all_gather(token_shard, dim=0)
     except (AssertionError, RuntimeError):
