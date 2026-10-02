@@ -151,6 +151,13 @@ class Platform:
         """Return backend-specific options for a diffusion module."""
         return None
 
+    def get_compile_cache_namespace(self, world_size: int, nnodes: int) -> str | None:
+        """Subdirectory that keeps the persistent compile cache per topology.
+
+        None shares one cache across launches of any size.
+        """
+        return None
+
     def get_dispatch_key_name(self) -> str:
         """Return the behavioral dispatch key used by :class:`CustomOp`.
 

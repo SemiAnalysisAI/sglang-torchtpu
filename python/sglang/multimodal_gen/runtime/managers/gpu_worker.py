@@ -301,6 +301,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         compile_cache_root = os.path.join(
             envs.SGLANG_DIFFUSION_CACHE_ROOT, "torch_compile_cache"
         )
+        namespace = current_platform.get_compile_cache_namespace(
+            self.server_args.num_gpus, self.server_args.nnodes
+        )
+        if namespace:
+            compile_cache_root = os.path.join(compile_cache_root, namespace)
         tmp_root = tempfile.gettempdir()
         sglang_defaults = third_party_cache_defaults()
         for env_name, sub in (

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 
 import torch
@@ -186,6 +187,18 @@ class TpuPlatform(Platform):
 
         _install_device_module_shims()
         torch.zeros(1, device="tpu")
+
+    def get_compile_cache_namespace(self, world_size: int, nnodes: int) -> str | None:
+        # torch_tpu stores XLA executables in AOTAutogradCache, whose key covers
+        # neither the device topology nor the XLA flags: an executable built by
+        # a 1-device launch loads in a 4-device one and its collectives never
+        # complete, and changed flags keep serving old executables.
+        flags = "\0".join(
+            os.environ.get(name, "")
+            for name in ("LIBTPU_INIT_ARGS", "XLA_FLAGS", "TORCH_TPU_INTERNAL_XLA_OPTIONS")
+        )
+        digest = hashlib.sha256(flags.encode()).hexdigest()[:12]
+        return f"tpu_{world_size}x{nnodes}_{digest}"
 
     def get_torch_distributed_backend_str(self) -> str:
         # tpu_dist needs one addressable PJRT device; a lone worker has many.
