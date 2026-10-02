@@ -41,6 +41,20 @@ device wait would block for good.
 
 Every launch runs the same compiled program: one buffer padded to the largest
 batch a forward can hand on.
+
+Stage-local launch slots. torch_tpu compiles every program holding a
+collective, a stage group's included, for the whole slice's device
+assignment, and a device starts its i-th such program only once every device
+of the slice has started its i-th, whichever program that is. A hand-off must
+therefore sit at the same launch index on every device. With ``slot_size``
+set, every device issues exactly ``slot_size`` stage-local multi-device
+programs between consecutive hand-offs: a stage reports the programs its
+forward launched (``note_stage_launches``) and the wave tops the slot up with
+a filler program over the stage group (a tiny all-reduce) right before the
+next hand-off. Stage-local programs of different stages may differ in content
+and order; only the count must match. Every forward is followed by at least
+one hand-off of its wave (the drain), so the counts are level when the wave
+goes quiet. Single-device programs do not count.
 """
 
 import logging
@@ -157,9 +171,15 @@ class PPWave:
         dtype: torch.dtype,
         device: torch.device,
         launcher: Callable[[torch.Tensor], torch.Tensor],
+        slot_size: int = 0,
+        slot_filler: Callable[[], None] | None = None,
     ) -> None:
         if size < 2:
             raise ValueError("the pipeline wave needs at least two stages")
+        if slot_size < 0 or (slot_size > 0 and slot_filler is None):
+            raise ValueError(
+                f"a launch slot of {slot_size} needs a filler program"
+            )
         self.rank = int(rank)
         self.size = int(size)
         self.last = self.size - 1
@@ -178,9 +198,37 @@ class PPWave:
         self.forwards = 0
         self.runs = 0
         self._has_batch = False
+        # Stage-local programs since the last hand-off (module docstring).
+        self.slot_size = int(slot_size)
+        self._slot_filler = slot_filler
+        self.slot_used = 0
+        self.fillers = 0
+        # Stage-local programs one forward of this stage issues (set by the
+        # scheduler; counted with note_stage_launches after each forward).
+        self.forward_launches = 0
 
     # -- launches -------------------------------------------------------------
+    def note_stage_launches(self, n: int) -> None:
+        """Count ``n`` stage-local multi-device programs (a forward's) issued
+        since the last hand-off."""
+        if self.slot_size == 0:
+            return
+        self.slot_used += int(n)
+        if self.slot_used > self.slot_size:
+            raise RuntimeError(
+                f"pipeline wave stage {self.rank}: {self.slot_used} stage-local "
+                f"launches between two hand-offs, above the slot of "
+                f"{self.slot_size}; raise SGLANG_TPU_PP_SLOT_LAUNCHES"
+            )
+
+    def _fill_slot(self) -> None:
+        for _ in range(self.slot_size - self.slot_used):
+            self._slot_filler()
+            self.fillers += 1
+        self.slot_used = 0
+
     def _launch(self, x: torch.Tensor) -> torch.Tensor:
+        self._fill_slot()
         out = self._launcher(x)
         self.launches += 1
         return out
@@ -230,12 +278,13 @@ class PPWave:
                 self.runs += 1
                 if self.runs <= 3 or self.runs % 500 == 0:
                     logger.info(
-                        "pipeline wave stage %d: drain %d complete, %d forwards "
-                        "and %d launches so far",
+                        "pipeline wave stage %d: drain %d complete, %d forwards, "
+                        "%d hand-offs and %d slot fillers so far",
                         self.rank,
                         self.runs,
                         self.forwards,
                         self._target(),
+                        self.fillers,
                     )
         if self.rank == 0:
             return
@@ -334,12 +383,14 @@ def build_pp_wave(
     hidden: int,
     dtype: torch.dtype,
     device: torch.device,
+    slot_size: int = 0,
 ) -> PPWave:
     """Create the stage's wave on the device and verify the hand-off routing.
 
     The permute is routed by mesh position, which follows physical device
     order; each column's cycle closes from the last stage back to the first,
-    and every device of the slice launches the same program.
+    and every device of the slice launches the same program. ``slot_size``
+    stage-local launches separate consecutive hand-offs (module docstring).
     """
     rank = int(pp_group.rank_in_group)
     size = int(pp_group.world_size)
@@ -351,9 +402,27 @@ def build_pp_wave(
             f"the pipeline wave needs the pipeline stages to cover the whole slice "
             f"(pp {size} stages of {columns} devices, world {world_size})"
         )
+    if slot_size > 0 and columns < 2:
+        raise ValueError(
+            "pipeline launch slots need a stage group of at least two devices"
+        )
     physical = physical_device_by_rank(world_group)
     perm = pipeline_permutation(physical=physical, size=size, columns=columns)
     op = build_pp_permute_op(perm)
+    filler = None
+    if slot_size > 0:
+        # Zeros stay zero under the in-place sum, so one buffer serves forever.
+        slot_buf = torch.zeros((8, 128), dtype=torch.float32, device=device)
+        stage_pg = stage_group.device_group
+
+        def filler() -> None:
+            from torch_tpu._internal.sync.sync import synchronize
+
+            # Flushed on both sides so it is one program of its own.
+            synchronize(None, wait=False)
+            torch.distributed.all_reduce(slot_buf, group=stage_pg)
+            synchronize([slot_buf], wait=False)
+
     wave = PPWave(
         rank=rank,
         size=size,
@@ -362,6 +431,8 @@ def build_pp_wave(
         dtype=dtype,
         device=device,
         launcher=lambda x: launch_now(op, x),
+        slot_size=slot_size,
+        slot_filler=filler,
     )
     ok = wave.probe(column=column, columns=columns)
     # Every device must agree on the routing, so the verdict is gathered.

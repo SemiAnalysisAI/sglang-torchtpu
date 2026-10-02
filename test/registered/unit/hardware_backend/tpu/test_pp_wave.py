@@ -211,6 +211,111 @@ class TestWaveProtocol(CustomTestCase):
         self.assertEqual(ici.count, [3, 3])
 
 
+class TestWaveLaunchSlots(CustomTestCase):
+    """torch_tpu runs every multi-device program on the whole slice's device
+    assignment, matched by launch count; every hand-off must sit at the same
+    launch index on every device, whatever the stages launch in between."""
+
+    def _run(self, size, schedule, forward_launches, slot):
+        ici = _FakeIci(size)
+        streams = [[] for _ in range(size)]
+        waves = []
+        for r in range(size):
+            base = ici.launcher(r)
+
+            def launcher(x, r=r, base=base):
+                streams[r].append("H")
+                return base(x)
+
+            wave = PPWave(
+                rank=r,
+                size=size,
+                rows=ROWS,
+                hidden=HIDDEN,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                launcher=launcher,
+                slot_size=slot,
+                slot_filler=lambda r=r: streams[r].append("f"),
+            )
+            wave.forward_launches = forward_launches[r]
+            waves.append(wave)
+        errors = []
+
+        def run(rank):
+            wave = waves[rank]
+            try:
+                for has_batch in schedule:
+                    wave.begin_iteration(has_batch)
+                    tensors = None
+                    if has_batch:
+                        wave.receive()
+                        streams[rank].extend("L" * wave.forward_launches)
+                        wave.note_stage_launches(wave.forward_launches)
+                        if rank < size - 1:
+                            out = torch.zeros((ROWS, HIDDEN))
+                            tensors = {"hidden_states": out, "residual": out}
+                    wave.end_iteration(tensors)
+            except Exception as exc:  # noqa: BLE001
+                errors.append((rank, exc))
+                with ici.cond:
+                    ici.failed = True
+                    ici.cond.notify_all()
+
+        threads = [threading.Thread(target=run, args=(r,)) for r in range(size)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        return streams, waves, errors
+
+    def test_hand_offs_sit_at_the_same_launch_index_on_every_stage(self):
+        size, slot = 4, 3
+        schedule = _drained(size, [True, True, False, True] + [False] * 5 + [True])
+        streams, waves, errors = self._run(size, schedule, [2, 1, 3, 0], slot)
+        self.assertEqual(errors, [])
+        hand_offs = [[i for i, p in enumerate(s) if p == "H"] for s in streams]
+        for r in range(1, size):
+            # Stage r runs up to r-1 hand-offs ahead; compare the common prefix.
+            n = min(len(hand_offs[0]), len(hand_offs[r]))
+            self.assertEqual(hand_offs[r][:n], hand_offs[0][:n], f"stage {r}")
+        # Drained: every stage issued the same programs count.
+        self.assertEqual(len({len(s) for s in streams}), 1, streams)
+        for s in streams:
+            self.assertEqual(s[-1], "H")
+        for wave in waves:
+            self.assertEqual(wave.slot_used, 0)
+
+    def test_a_forward_above_the_slot_is_an_error(self):
+        wave = PPWave(
+            rank=1,
+            size=3,
+            rows=ROWS,
+            hidden=HIDDEN,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            launcher=lambda x: x,
+            slot_size=2,
+            slot_filler=lambda: None,
+        )
+        wave.note_stage_launches(2)
+        with self.assertRaisesRegex(RuntimeError, "above the slot of 2"):
+            wave.note_stage_launches(1)
+
+    def test_a_slot_needs_a_filler(self):
+        with self.assertRaisesRegex(ValueError, "needs a filler"):
+            PPWave(
+                rank=0,
+                size=2,
+                rows=ROWS,
+                hidden=HIDDEN,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                launcher=lambda x: x,
+                slot_size=1,
+            )
+
+
 class TestWaveGuards(CustomTestCase):
     def test_rejects_rows_above_the_buffer(self):
         wave = _wave(0, 2)
