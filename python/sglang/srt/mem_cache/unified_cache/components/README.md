@@ -105,7 +105,7 @@ Find the longest cached prefix for a token sequence.
 
 **Algorithm detail:**
 1. Calls `create_match_validator(match_device_only=...)` once per component — returns a stateful closure (e.g., SWA tracks accumulated window length). In HiCache mode, matching tracks both the best device-only node and the best device-or-host node.
-2. Walks tree edges via `RadixKey.match()`; at each node, calls all validator closures — the match boundary is only advanced when **all** validators return `True`
+2. Walks tree edges via `RadixKey.match()`; at each node, calls all validator closures — the match boundary is only advanced when **all** validators return `True`. With `params.ignore_swa_kv_miss` (Python core, no HiCache), the SWA validator is skipped, so the match may end on an SWA tombstone; P/D decode uses this because it receives the request's SWA window fresh from prefill.
 3. If match ends mid-node, calls `_split_node` → triggers `redistribute_on_node_split()` per component
 4. Post-match (`_match_post_processor`):
    - Promotes matched path to MRU in each component's LRU via `node_has_component_data()` as filter

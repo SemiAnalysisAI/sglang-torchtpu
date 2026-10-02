@@ -831,7 +831,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
-        ) = self._match_prefix_helper(key)
+        ) = self._match_prefix_helper(key, params.ignore_swa_kv_miss)
         return self._match_post_processor(
             params,
             value,
@@ -843,7 +843,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def _match_prefix_helper(
-        self, key: RadixKey
+        self, key: RadixKey, ignore_swa_kv_miss: bool
     ) -> tuple[
         list[torch.Tensor],
         UnifiedTreeNode,
@@ -866,6 +866,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         full_kv_hit_length = 0
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
+        components = self.components
+        if ignore_swa_kv_miss:
+            assert not separate_device_match, "ignore_swa_kv_miss needs no HiCache"
+            components = [
+                c for c in components if c.component_type != ComponentType.SWA
+            ]
         if separate_device_match:
             validators = tuple(
                 comp.create_match_validator() for comp in self.components
@@ -877,7 +883,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         else:
             validators = tuple(
                 comp.create_match_validator(match_device_only=True)
-                for comp in self.components
+                for comp in components
             )
 
         def _all_valid(validators, node):
