@@ -130,6 +130,16 @@ class TestTpuPlatformSurface(unittest.TestCase):
     def test_layerwise_offload_disabled(self):
         self.assertFalse(TpuPlatform.enable_dit_layerwise_offload_by_default())
 
+    def test_compile_warmup_keeps_the_dit_resident(self):
+        for explicit, given, want in ((False, True, False), (True, True, True)):
+            with self.subTest(explicit=explicit):
+                args = MagicMock(offload_during_compile=given)
+                args.is_arg_explicitly_set.side_effect = lambda name: (
+                    explicit and name == "offload_during_compile"
+                )
+                TpuPlatform().apply_server_args_defaults(args)
+                self.assertEqual(args.offload_during_compile, want)
+
 
 @unittest.skipUnless(_HAS_TORCH_TPU, "torch.device('tpu') needs torch_tpu")
 class TestWorkerInitOnce(unittest.TestCase):
