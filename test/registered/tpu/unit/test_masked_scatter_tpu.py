@@ -1,17 +1,12 @@
-"""Correctness tests for the TPU ``aten::masked_scatter_`` fallback kernel.
+"""Correctness tests for native TorchTPU ``aten::masked_scatter_``.
 
-torch_tpu cannot lower ``masked_scatter_`` — its source-offset prefix scan runs
-in int64, which XLA:TPU can't materialize in vector registers ("Unsupported
-conversion vmreg/vreg to U64"). ``hardware_backend/tpu/patches.py`` registers a
-``PrivateUse1`` kernel that does the scan in int32 instead.
-
-These tests are differential: the TPU kernel's output must equal PyTorch's own
-CPU ``masked_scatter_`` (the ground truth) for every case, across dtypes, mask
-patterns, broadcasting, source lengths, and edge cases (plus a randomized
-fuzz). Requires a real TPU device; skipped otherwise.
+These tests compare native TPU lowering with CPU ``masked_scatter_`` across
+dtypes, mask patterns, broadcasting, source lengths, and edge cases. They
+retain coverage for the int64 prefix-scan lowering failure that previously
+required an SGLang fallback. Requires a real TPU device; skipped otherwise.
 
 Run standalone with
-``python -m unittest test.registered.tpu.test_masked_scatter_tpu`` on a TPU host.
+``python -m unittest test.registered.tpu.unit.test_masked_scatter_tpu`` on a TPU host.
 """
 
 from sglang.test.ci.ci_register import register_tpu_ci
@@ -31,7 +26,6 @@ class TestMaskedScatterTpu(CustomTestCase):
         try:
             import torch_tpu  # noqa: F401
 
-            from sglang.srt.hardware_backend.tpu import patches
             from sglang.srt.hardware_backend.tpu.env_override import (
                 apply_tpu_env_overrides,
             )
@@ -43,7 +37,6 @@ class TestMaskedScatterTpu(CustomTestCase):
 
             cls.dev = "tpu"
             torch.zeros(1, device=cls.dev)  # probe: a real TPU is present
-            patches._register_aten_fallbacks()  # installs the kernel under test
         except Exception as e:  # no torch_tpu / no device -> skip, don't fail
             raise unittest.SkipTest(f"TPU not available: {e}")
 

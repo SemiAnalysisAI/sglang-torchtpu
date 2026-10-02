@@ -323,26 +323,6 @@ def _register_aten_fallbacks() -> None:
     def _count_nonzero_dim_intlist(self, dim):
         return (self != 0).to(torch.int64).sum(dim=dim)
 
-    # TODO: Remove the fallback after https://github.com/google-pytorch/torch_tpu/issues/2491 is resolved.
-    @torch.library.register_kernel("aten::masked_scatter_", "PrivateUse1")
-    def _masked_scatter_(self, mask, source):
-        src_flat = source.to(self.dtype).reshape(-1)
-        if src_flat.numel() == 0:
-            if mask.to(torch.bool).any():
-                raise RuntimeError(
-                    "Number of elements of source < number of ones in mask"
-                )
-            return self
-        flat_mask = mask.to(torch.bool).broadcast_to(self.shape).reshape(-1)
-        idx = (torch.cumsum(flat_mask.to(torch.int32), 0, dtype=torch.int32) - 1).clamp(
-            min=0
-        )
-        out = torch.where(flat_mask, src_flat[idx], self.reshape(-1)).reshape(
-            self.shape
-        )
-        self.copy_(out)
-        return self
-
     # aten::upsample_bicubic2d -- no TPU kernel; run the CPU kernel and copy
     # back. Vision towers use it to resize position embeddings per image grid
     # (MoonViT's Learnable2DInterpPosEmb in Kimi-VL), so inputs are small (tens
@@ -359,7 +339,7 @@ def _register_aten_fallbacks() -> None:
 
     logger.info(
         "Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, "
-        "masked_scatter_, upsample_bicubic2d"
+        "upsample_bicubic2d"
     )
 
 
