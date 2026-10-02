@@ -14,12 +14,17 @@ from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu.eval_support import RecipeLauncher
-from sglang.test.tpu.native_debug import trace_slow_workers
+from sglang.test.tpu.native_debug import (
+    log_runtime_environment,
+    runtime_diagnostic_environment,
+    trace_slow_workers,
+)
 
 register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit")
 
 
 def worker(phase, source):
+    log_runtime_environment(f"{phase}: before PJRT")
     faulthandler.dump_traceback_later(90, repeat=True)
     print(f"{phase}: physical rank {os.environ['RANK']} initializing", flush=True)
     import torch
@@ -30,6 +35,7 @@ def worker(phase, source):
     # Bind PJRT to the launcher's physical rank before permuting logical ranks.
     torch.ones((1,), device="tpu").cpu()
     print(f"{phase}: physical rank {os.environ['RANK']} PJRT ready", flush=True)
+    log_runtime_environment(f"{phase}: after PJRT")
     world = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"]) ^ (1 if phase.startswith("swap") else 0)
     dist.init_process_group(
@@ -100,6 +106,7 @@ class TestCollectiveCompileCache(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="tpu-collective-cache-") as cache:
             env = {
                 **os.environ,
+                **runtime_diagnostic_environment(),
                 "TORCHINDUCTOR_CACHE_DIR": cache,
                 "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS": "false",
                 "OMP_NUM_THREADS": "1",

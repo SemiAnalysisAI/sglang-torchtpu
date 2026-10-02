@@ -20,7 +20,11 @@ from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu.eval_support import RecipeLauncher
-from sglang.test.tpu.native_debug import trace_slow_workers
+from sglang.test.tpu.native_debug import (
+    log_runtime_environment,
+    runtime_diagnostic_environment,
+    trace_slow_workers,
+)
 
 # Exec mode runs the unittest on every host; no model or server is needed.
 register_tpu_ci(
@@ -37,6 +41,7 @@ def coordinate_worker_with_traceback(*args):
     faulthandler.dump_traceback_later(60, repeat=True)
     print(f"coordinate probe {args[2]}:{args[0]} starting", flush=True)
     _coordinate_worker(*args)
+    log_runtime_environment("coordinate worker: before interpreter teardown")
     print(
         f"coordinate probe {args[2]}:{args[0]} entering interpreter teardown",
         flush=True,
@@ -44,6 +49,7 @@ def coordinate_worker_with_traceback(*args):
 
 
 def worker():
+    log_runtime_environment("artifact worker: before PJRT")
     import torch
     import torch.distributed as dist
     from torch_tpu._internal.compile import tpu_torch_compile as native
@@ -66,6 +72,7 @@ def worker():
     dist.init_process_group("tpu_dist", timeout=timedelta(seconds=120))
     control = dist.new_group(backend="gloo", timeout=timedelta(seconds=120))
     rank, world = dist.get_rank(), dist.get_world_size()
+    log_runtime_environment("artifact worker: after PJRT")
     add_tpu_rank_assignment_to_compile_cache_key()
     contract = {
         "tag": torch.compiler.config.cache_key_tag,
@@ -201,6 +208,7 @@ class TestTopologyArtifactTransfer(unittest.TestCase):
             artifacts = root / "artifacts"
             environment = {
                 **os.environ,
+                **runtime_diagnostic_environment(),
                 "OMP_NUM_THREADS": "1",
                 "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS": "false",
                 "TORCH_TPU_TIER2_COMPILATION_CACHE": "false",
