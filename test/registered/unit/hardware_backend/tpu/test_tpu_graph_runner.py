@@ -40,7 +40,7 @@ from sglang.srt.model_executor.tpu_graph_runner import (
 )
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope
 
 DECODER_POLICY_PRECOMPILE = (
     "sglang.srt.hardware_backend.tpu.compilation."
@@ -132,11 +132,12 @@ class TestTpuGraphRunner(CustomTestCase):
         )
         self.mock_register = register_patcher.start()
         self.addCleanup(register_patcher.stop)
-        self.mock_cache_key = self.enterContext(
+        self.mock_cache_key = enter_scope(
+            self,
             patch(
                 "sglang.srt.model_executor.tpu_graph_runner."
                 "add_tpu_rank_assignment_to_compile_cache_key"
-            )
+            ),
         )
         # Stub the in-process precompile so the test doesn't need a real
         # attn_backend / model_runner.device. Decoder policy warmup behavior

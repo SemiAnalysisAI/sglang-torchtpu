@@ -16,6 +16,7 @@ from unittest.mock import Mock, patch
 
 from sglang.srt.hardware_backend.tpu import node_normalization as normalization
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import enter_scope
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -210,7 +211,8 @@ class TestAutomaticTopologyLaunch(unittest.TestCase):
             dist_init_addr="source:29500",
             nccl_port=29600,
         )
-        self.enterContext(
+        enter_scope(
+            self,
             patch.dict(
                 os.environ,
                 {
@@ -221,15 +223,16 @@ class TestAutomaticTopologyLaunch(unittest.TestCase):
                     "TORCH_TPU_BASE_PORT": "8070",
                     "SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE": "",
                 },
-            )
+            ),
         )
         os.environ.pop("SGLANG_TPU_TOPOLOGY_BOOTSTRAP_PORT", None)
-        self.resolve = self.enterContext(
+        self.resolve = enter_scope(
+            self,
             patch.object(
                 normalization,
                 "discover_host_order",
                 return_value=[1, 0],
-            )
+            ),
         )
 
     def test_automatic_launch_declares_ranks_once_and_dp_ports_follow(self):

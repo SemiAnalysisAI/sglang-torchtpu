@@ -1,5 +1,6 @@
 """Fresh-process AOT cache hits must preserve logical all-gather ordering."""
 
+import faulthandler
 import importlib.util
 import json
 import os
@@ -18,6 +19,8 @@ register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit")
 
 
 def worker(phase, source):
+    faulthandler.dump_traceback_later(90, repeat=True)
+    print(f"{phase}: physical rank {os.environ['RANK']} initializing", flush=True)
     import torch
     import torch.distributed as dist
     import torch_tpu  # noqa: F401
@@ -25,6 +28,7 @@ def worker(phase, source):
 
     # Bind PJRT to the launcher's physical rank before permuting logical ranks.
     torch.ones((1,), device="tpu").cpu()
+    print(f"{phase}: physical rank {os.environ['RANK']} PJRT ready", flush=True)
     world = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"]) ^ (1 if phase.startswith("swap") else 0)
     dist.init_process_group(
@@ -33,10 +37,12 @@ def worker(phase, source):
         world_size=world,
         timeout=timedelta(seconds=120),
     )
+    print(f"{phase}: logical rank {rank} process group ready", flush=True)
     spec = importlib.util.spec_from_file_location("cache_under_test", source)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.add_tpu_rank_assignment_to_compile_cache_key()
+    print(f"{phase}: logical rank {rank} cache guard ready", flush=True)
     tag = torch.compiler.config.cache_key_tag
     module.add_tpu_rank_assignment_to_compile_cache_key()
     assert torch.compiler.config.cache_key_tag == tag, (
@@ -73,6 +79,7 @@ def worker(phase, source):
     print(json.dumps({"phase": phase, "rank": rank, "hits": hits}), flush=True)
     dist.barrier()
     dist.destroy_process_group()
+    faulthandler.cancel_dump_traceback_later()
 
 
 class TestCollectiveCompileCache(unittest.TestCase):

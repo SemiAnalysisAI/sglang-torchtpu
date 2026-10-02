@@ -10,25 +10,26 @@ import torch.compiler.config as compiler_config
 
 from sglang.srt.hardware_backend.tpu import compile_cache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import enter_scope
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestCollectiveCompileCache(unittest.TestCase):
     def setUp(self):
-        self.enterContext(patch.dict(os.environ, TORCH_TPU_TOPOLOGY="2,2,1,1"))
-        self.enterContext(compiler_config.patch(cache_key_tag=""))
-        self.world_size = self.enterContext(
-            patch("torch.distributed.get_world_size", return_value=4)
+        enter_scope(self, patch.dict(os.environ, TORCH_TPU_TOPOLOGY="2,2,1,1"))
+        enter_scope(self, compiler_config.patch(cache_key_tag=""))
+        self.world_size = enter_scope(
+            self, patch("torch.distributed.get_world_size", return_value=4)
         )
-        self.rank = self.enterContext(
-            patch("torch.distributed.get_rank", return_value=0)
+        self.rank = enter_scope(
+            self, patch("torch.distributed.get_rank", return_value=0)
         )
         device_mesh = ModuleType("torch_tpu._internal.distributed.device_mesh")
         self.assignment = device_mesh.get_device_assignment = Mock(
             return_value=[0, 1, 2, 3]
         )
-        self.enterContext(patch.dict(sys.modules, {device_mesh.__name__: device_mesh}))
+        enter_scope(self, patch.dict(sys.modules, {device_mesh.__name__: device_mesh}))
 
     def install(self, existing="user|pallas-sources"):
         compiler_config.cache_key_tag = existing
