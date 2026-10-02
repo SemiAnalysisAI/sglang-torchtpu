@@ -52,6 +52,7 @@ from sglang.srt.managers.cache_controller import CacheOperation as PlainCacheOpe
 from sglang.srt.managers.cache_controller import LayerDoneCounter
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -716,6 +717,29 @@ class TestForwardKvWrites(CustomTestCase):
         )
         self.assertEqual(pages.full.tolist(), [105, 106])
         self.assertEqual(pages.swa.tolist(), [5, 6])
+
+    def test_swa_ring_writes_are_unknown(self):
+        # The per-request SWA ring leaves the full-to-SWA mapping unwritten.
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            reqs=[_req(row=1, committed=6, allocated=7)],
+            beam_tail=None,
+            encoder_lens_cpu=None,
+        )
+        for ring, swa in ((False, [5, 6]), (True, None)):
+            with self.subTest(ring=ring):
+                allocator = MagicMock(spec=SWATokenToKVPoolAllocator)
+                allocator.page_size = 1
+                allocator.swa_req_ring = ring
+                allocator.translate_loc_from_full_to_swa = lambda slots: slots - 100
+                scheduler = SimpleNamespace(
+                    token_to_kv_pool_allocator=allocator,
+                    req_to_token_pool=SimpleNamespace(req_to_token=self.req_to_token),
+                    is_hybrid_swa=True,
+                )
+                pages = Scheduler._collect_kv_write_pages(scheduler, batch)
+                self.assertEqual(pages.full.tolist(), [105, 106])
+                self.assertEqual(None if pages.swa is None else pages.swa.tolist(), swa)
 
     def test_unmodelled_batches_are_unknown(self):
         self.assertIsNone(

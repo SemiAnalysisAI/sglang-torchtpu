@@ -27,7 +27,8 @@ class KVPages(msgspec.Struct, frozen=True):
     """Page ids, int64 on CPU, in the full KV pool and in the SWA pool."""
 
     full: torch.Tensor
-    # None when the model has no SWA pool.
+    # None when the model has no SWA pool or the SWA pages are unknown; a
+    # load's SWA pages then overlap.
     swa: Optional[torch.Tensor] = None
 
 

@@ -2245,14 +2245,19 @@ class Scheduler(
         from sglang.srt.hardware_backend.tpu.inflight_kv_writes import (
             collect_forward_kv_writes,
         )
+        from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 
         allocator = self.token_to_kv_pool_allocator
         return collect_forward_kv_writes(
             batch=batch,
             req_to_token=self.req_to_token_pool.req_to_token,
             page_size=allocator.page_size,
+            # The per-request SWA ring leaves the full-to-SWA mapping unwritten,
+            # so its SWA writes stay unknown.
             translate_full_to_swa=(
-                allocator.translate_loc_from_full_to_swa if self.is_hybrid_swa else None
+                allocator.translate_loc_from_full_to_swa
+                if self.is_hybrid_swa and not is_swa_req_ring(allocator)
+                else None
             ),
         )
 
