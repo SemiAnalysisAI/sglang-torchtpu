@@ -80,6 +80,10 @@ def _gloo_worker(rank, world, init_method):
                 torch.testing.assert_close(exchanged, reference, rtol=0, atol=0)
                 restored = usp._usp_output_all_to_all(exchanged, head_dim=head_dim)
                 torch.testing.assert_close(restored, shard, rtol=0, atol=0)
+            # Attention kernels that write [b, h, s, d] hand back a transposed view.
+            heads_major = expected.transpose(1, 2).contiguous().transpose(1, 2)
+            restored = usp._usp_output_all_to_all(heads_major, head_dim=2)
+            torch.testing.assert_close(restored, local, rtol=0, atol=0)
             qkv = usp._usp_input_all_to_all_qkv(local, local + 10, local + 20)
             for index, actual in enumerate(qkv):
                 torch.testing.assert_close(
