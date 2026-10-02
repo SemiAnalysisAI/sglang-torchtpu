@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu.eval_support import RecipeLauncher
+from sglang.test.tpu.native_debug import trace_slow_workers
 
 register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit")
 
@@ -130,7 +131,8 @@ class TestCollectiveCompileCache(unittest.TestCase):
                 with patch.dict(os.environ, env, clear=True):
                     try:
                         processes.start()
-                        result = processes.wait(timeout=300)
+                        with trace_slow_workers():
+                            result = processes.wait(timeout=300)
                     finally:
                         processes.shutdown()
                 self.assertEqual(result, 0, f"{phase} workers failed")

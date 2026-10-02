@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu.eval_support import RecipeLauncher
+from sglang.test.tpu.native_debug import trace_slow_workers
 
 # Exec mode runs the unittest on every host; no model or server is needed.
 register_tpu_ci(
@@ -239,10 +240,13 @@ class TestTopologyArtifactTransfer(unittest.TestCase):
                             dist_init_addr=f"{phase_config.hosts[0]}:{phase_config.master_port}",
                             tpu_node_normalization=normalize,
                         )
-                        with patch.object(
-                            normalization,
-                            "_coordinate_worker",
-                            coordinate_worker_with_traceback,
+                        with (
+                            trace_slow_workers(),
+                            patch.object(
+                                normalization,
+                                "_coordinate_worker",
+                                coordinate_worker_with_traceback,
+                            ),
                         ):
                             normalization.prepare_tpu_environment(server_args)
                         ordered_hosts = os.environ["TPU_WORKER_HOSTNAMES"].split(",")
