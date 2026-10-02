@@ -302,6 +302,71 @@ class TestWaveLaunchSlots(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "above the slot of 2"):
             wave.note_stage_launches(1)
 
+    def test_per_graph_counts_keep_hand_offs_aligned(self):
+        # Each stage's forwards issue different counts per graph (mode), as
+        # reported by the measured-table counter.
+        size, slot = 4, 3
+        per_forward = [[2, 1, 3], [1, 1, 2], [0, 3, 1], [2, 2, 2]]
+        schedule = _drained(size, [True, True, True, False, True] + [False] * 3)
+        ici = _FakeIci(size)
+        streams = [[] for _ in range(size)]
+        waves = []
+        for r in range(size):
+            base = ici.launcher(r)
+
+            def launcher(x, r=r, base=base):
+                streams[r].append("H")
+                return base(x)
+
+            wave = PPWave(
+                rank=r,
+                size=size,
+                rows=ROWS,
+                hidden=HIDDEN,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                launcher=launcher,
+                slot_size=slot,
+                slot_filler=lambda r=r: streams[r].append("f"),
+            )
+            waves.append(wave)
+        errors = []
+
+        def run(rank):
+            wave = waves[rank]
+            forwards = iter(per_forward[rank] * 4)
+            try:
+                for has_batch in schedule:
+                    wave.begin_iteration(has_batch)
+                    tensors = None
+                    if has_batch:
+                        wave.receive()
+                        n = next(forwards)
+                        streams[rank].extend("L" * n)
+                        wave.forward_launch_counter = lambda n=n: n
+                        wave.note_forward()
+                        if rank < size - 1:
+                            out = torch.zeros((ROWS, HIDDEN))
+                            tensors = {"hidden_states": out, "residual": out}
+                    wave.end_iteration(tensors)
+            except Exception as exc:  # noqa: BLE001
+                errors.append((rank, exc))
+                with ici.cond:
+                    ici.failed = True
+                    ici.cond.notify_all()
+
+        threads = [threading.Thread(target=run, args=(r,)) for r in range(size)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(errors, [])
+        hand_offs = [[i for i, p in enumerate(s) if p == "H"] for s in streams]
+        for r in range(1, size):
+            n = min(len(hand_offs[0]), len(hand_offs[r]))
+            self.assertEqual(hand_offs[r][:n], hand_offs[0][:n], f"stage {r}")
+        self.assertEqual(len({len(s) for s in streams}), 1, streams)
+
     def test_a_slot_needs_a_filler(self):
         with self.assertRaisesRegex(ValueError, "needs a filler"):
             PPWave(

@@ -702,10 +702,6 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         @functools.wraps(fn)
         def call(*args: Any, **kwargs: Any) -> Any:
             backend = get_forward_context().attn_backend
-            # Which graph ran: pipeline stages pad their launches by it.
-            self._last_launch_key = self._launch_key(
-                backend.forward_metadata, *args, **kwargs
-            )
             return compiled(
                 backend.forward_metadata,
                 *args,
@@ -714,16 +710,25 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         return call
 
-    def _launch_key(self, attention_metadata: Any, *args: Any, **kwargs: Any) -> Any:
-        """The compiled graph a forward call runs: its specialization key plus
-        whether context parallelism is active (CP and plain extend can share a
-        specialization key but issue different multi-device programs)."""
-        forward_batch = args[2] if len(args) > 2 else kwargs.get("forward_batch")
-        return (
-            *self._direct_compile_specialization_key(
-                attention_metadata, *args, **kwargs
+    def note_forward_graph(
+        self, input_ids: torch.Tensor | None, forward_batch: Any, kwargs: dict
+    ) -> None:
+        """Record which compiled graph the shim is about to run (pipeline
+        stages pad their launches by it): the specialization fields plus
+        whether context parallelism is active, since CP and plain extend can
+        share every other field but issue different multi-device programs."""
+        rows = input_ids if input_ids is not None else kwargs.get("input_embeds")
+        self._last_launch_key = (
+            forward_batch.forward_mode,
+            forward_batch.capture_hidden_mode,
+            forward_batch.batch_size,
+            None if rows is None else int(rows.shape[0]),
+            (
+                getattr(forward_batch, "logits_output_mode", None)
+                if self._compiles_logits_processor()
+                else None
             ),
-            forward_batch is not None and bool(is_cp_active(forward_batch)),
+            bool(is_cp_active(forward_batch)),
         )
 
     def get_direct_compile_kv_pool(self):
