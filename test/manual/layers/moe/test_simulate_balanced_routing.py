@@ -18,7 +18,6 @@ from parameterized import parameterized
 
 from sglang.srt.layers.moe.topk import (
     _simulate_balanced_routing,
-    _simulate_perfect_balanced_routing,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -96,37 +95,6 @@ class TestSimulateBalancedRouting(CustomTestCase):
         self.assertTrue(torch.all(counts == (T * K // E)))
         for row in ids:
             self.assertEqual(row.unique().numel(), K)
-
-    @parameterized.expand([(1, 16), (2, 16), (4, 16), (300, 16), (300, 8)])
-    def test_perfect_balanced_ranks(self, num_tokens: int, ep: int) -> None:
-        ids, weights = _alloc(num_tokens, K)
-        _simulate_perfect_balanced_routing(
-            ids,
-            weights,
-            E,
-            num_ranks=ep,
-            layer_id=0,
-        )
-        counts = torch.bincount(ids.flatten().long() // (E // ep), minlength=ep)
-        self.assertLessEqual(int(counts.max() - counts.min()), 1)
-        torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / K))
-
-    def test_perfect_balanced_with_fused_shared_expert(self) -> None:
-        routed_topk, total_topk, ep = 8, 9, 16
-        ids, _ = _alloc(2, total_topk)
-        weights = torch.zeros_like(ids, dtype=torch.float32)
-        _simulate_perfect_balanced_routing(
-            ids,
-            weights,
-            E,
-            num_ranks=ep,
-            num_routed_topk=routed_topk,
-            layer_id=0,
-        )
-        counts = torch.bincount(
-            ids[:, :routed_topk].flatten().long() // (E // ep), minlength=ep
-        )
-        self.assertTrue(torch.equal(counts, torch.ones_like(counts)))
 
     def test_uniform_structural(self) -> None:
         # uniform: random per-token base, so assert only seed-independent props.

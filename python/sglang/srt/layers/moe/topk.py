@@ -572,6 +572,10 @@ def _simulate_perfect_balanced_routing(
     topk_weights.fill_(1.0 / k)
 
 
+def _tpu_perfect_balanced_routing_enabled() -> bool:
+    return _is_tpu and envs.SGLANG_TPU_SIMULATE_PERFECT_BALANCED_EXPERTS.get()
+
+
 # -------------------------------- TopK ---------------------------------------
 
 
@@ -2555,9 +2559,7 @@ def select_experts(
 
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
-    simulate_perfect_balanced_experts = (
-        envs.SGLANG_TPU_SIMULATE_PERFECT_BALANCED_EXPERTS.get()
-    )
+    simulate_perfect_balanced_experts = _tpu_perfect_balanced_routing_enabled()
     if (
         simulate_uniform_experts
         + simulate_round_robin_experts
@@ -2870,7 +2872,7 @@ def precomputed_topk_postprocess_is_noop(
         and expert_location_dispatch_info is None
         and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
         and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
-        and not envs.SGLANG_TPU_SIMULATE_PERFECT_BALANCED_EXPERTS.get()
+        and not _tpu_perfect_balanced_routing_enabled()
     )
 
 
