@@ -12,6 +12,7 @@ import msgspec
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang.srt.hardware_backend.tpu.xplane import rebase_to_wall_clock
 
 logger = get_logger(__name__)
 
@@ -29,8 +30,9 @@ def start_tpu_profile(
     ``with_cpu`` selects the host plane.
 
     With ``session_dir`` set, ``output_dir`` is only a staging area: on stop the
-    trace moves into ``session_dir`` as ``<host><file_suffix>.xplane.pb``.
-    XProf loads every file in a session folder as one multi-host trace, so an engine's ranks publishing into the same
+    trace moves into ``session_dir`` as ``<host><file_suffix>.xplane.pb``,
+    rebased onto the wall clock. XProf loads every file in a session folder as
+    one multi-host trace, so an engine's ranks publishing into the same
     ``session_dir`` with distinct suffixes show up on one timeline.
 
     Goes through _impl.start_trace rather than torch_tpu's own profile()
@@ -68,7 +70,7 @@ def stop_tpu_profile(trace: Optional[_TpuTrace]) -> Optional[Path]:
 
 
 def _publish_trace(trace: _TpuTrace) -> Optional[Path]:
-    """Move a staged trace into its session folder."""
+    """Move a staged trace into its session folder, rebased onto wall clock."""
     staged = sorted(trace.output_dir.glob("plugins/profile/*/*.xplane.pb"))
     if len(staged) != 1:
         logger.warning(
@@ -84,10 +86,19 @@ def _publish_trace(trace: _TpuTrace) -> Optional[Path]:
     host = src.name.removesuffix(".xplane.pb")
     dst = trace.session_dir / f"{host}{trace.file_suffix}.xplane.pb"
     try:
+        data, start_ns = rebase_to_wall_clock(src.read_bytes())
+        if start_ns is None:
+            logger.warning(
+                "[TPU profiler] %s has no profile_start_time; publishing it "
+                "unrebased, so it will not line up with other ranks.",
+                src,
+            )
         trace.session_dir.mkdir(parents=True, exist_ok=True)
-        # A rename within one filesystem, so XProf never sees a partial file.
-        os.replace(src, dst)
-    except OSError as e:
+        # XProf may be watching the folder; never let it see a partial file.
+        tmp = dst.with_name(f".{dst.name}.tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, dst)
+    except (OSError, ValueError, IndexError) as e:
         logger.warning(
             "[TPU profiler] could not publish %s to %s (%s); the per-rank trace "
             "is still at %s.",

@@ -257,6 +257,19 @@ class TestPublishIntoSharedSession(CustomTestCase):
             # XProf lists any leftover plugins/profile folder as another run.
             self.assertFalse((root / ".staging").exists())
 
+    def test_published_file_is_rebased(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "sglang.srt.hardware_backend.tpu.profiler.rebase_to_wall_clock",
+                return_value=(b"rebased", 1),
+            ) as rebase,
+        ):
+            published = self._capture(Path(tmp), "TP-0")
+
+            rebase.assert_called_once_with(_XSPACE)
+            self.assertEqual(published.read_bytes(), b"rebased")
+
     def test_failed_move_stays_in_staging(self):
         # A failed publish must not lose the capture or take down the scheduler.
         with (
@@ -274,6 +287,23 @@ class TestPublishIntoSharedSession(CustomTestCase):
             self.assertEqual(len(staged), 1)
             session = root / "plugins" / "profile" / "DECODE"
             self.assertEqual(list(session.glob("*.xplane.pb")), [])
+
+    def test_unreadable_trace_stays_in_staging(self):
+        # A trace the rebase cannot parse is kept, not published half-rewritten.
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "sglang.srt.hardware_backend.tpu.profiler.rebase_to_wall_clock",
+                side_effect=ValueError("truncated protobuf message"),
+            ),
+        ):
+            root = Path(tmp)
+            published = self._capture(root, "TP-0")
+
+            self.assertIsNone(published)
+            staged = list((root / ".staging").glob("*/plugins/profile/*/*.xplane.pb"))
+            self.assertEqual(len(staged), 1)
+            self.assertFalse((root / "plugins" / "profile" / "DECODE").exists())
 
     def test_without_session_dir_the_trace_stays_put(self):
         with (
