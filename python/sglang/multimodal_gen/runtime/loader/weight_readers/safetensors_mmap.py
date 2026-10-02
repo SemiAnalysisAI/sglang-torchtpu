@@ -58,8 +58,11 @@ class SafetensorsMmapReader:
                         continue
                     yield name, tensor
                 continue
-            with safe_open(path, framework="pt", device=device) as handle:
+            # safetensors cannot place tensors on a TPU; read on the host and move.
+            open_device = "cpu" if device.partition(":")[0] == "tpu" else device
+            with safe_open(path, framework="pt", device=open_device) as handle:
                 for name in handle.keys():  # noqa: SIM118
                     if key_filter is not None and not key_filter(name):
                         continue
-                    yield name, handle.get_tensor(name)
+                    tensor = handle.get_tensor(name)
+                    yield name, tensor if open_device == device else tensor.to(device)

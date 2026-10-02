@@ -66,3 +66,35 @@ class TestSelection:
             weight_readers.envs, "SGLANG_USE_RUNAI_MODEL_STREAMER", True
         )
         assert select_weight_reader().name == "runai_streamer"
+
+
+class TestSafetensorsDevicePlacement:
+    def test_a_tpu_target_reads_on_the_host_and_moves(self, monkeypatch, tmp_path):
+        import torch
+        from safetensors.torch import save_file
+
+        from sglang.multimodal_gen.runtime.loader.weight_readers import (
+            safetensors_mmap,
+        )
+
+        path = tmp_path / "w.safetensors"
+        save_file({"w": torch.arange(4.0)}, str(path))
+        opened, moved = [], []
+        real_open = safetensors_mmap.safe_open
+
+        def recording_open(file, framework, device):
+            opened.append(device)
+            return real_open(file, framework=framework, device=device)
+
+        monkeypatch.setattr(safetensors_mmap, "safe_open", recording_open)
+        monkeypatch.setattr(
+            torch.Tensor, "to", lambda self, device: moved.append(device) or self
+        )
+        weights = dict(
+            SafetensorsMmapReader().iter_weights(
+                [str(path)], device="tpu:0", to_cpu=False, show_progress=False
+            )
+        )
+        assert opened == ["cpu"]
+        assert moved == ["tpu:0"]
+        assert weights["w"].tolist() == [0.0, 1.0, 2.0, 3.0]
