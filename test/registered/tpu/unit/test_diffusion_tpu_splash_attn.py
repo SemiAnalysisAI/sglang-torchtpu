@@ -231,6 +231,37 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
         self.assertEqual(got.shape, want.shape)
         self.assertLess((got.float() - want).abs().max().item(), 2e-2)
 
+    def test_torch_compile_output_layout(self):
+        # Dynamo traces the op through its fake impl, whose strides must match
+        # the kernel's contiguous output for the layer's reshape to lower.
+        import torch_tpu._internal.compile  # noqa: F401
+
+        from sglang.multimodal_gen.runtime.layers.attention.backends.tpu_splash_attn import (
+            TpuSplashAttentionImpl,
+        )
+
+        impl = TpuSplashAttentionImpl(
+            num_heads=4, head_size=128, causal=False, softmax_scale=128**-0.5
+        )
+
+        def attn(q, k, v):
+            out = impl.forward(q, k, v, None)
+            return out.reshape(out.shape[0], out.shape[1], -1)
+
+        # Custom kernel, and make_splash_mha with a padded query.
+        for seq in (4608, 1000):
+            with self.subTest(seq=seq):
+                q, k, v = _inputs(1, 4, seq, seq)
+                want = _reference(q, k, v, 128**-0.5, False).transpose(1, 2)
+                compiled = torch.compile(attn, backend="tpu", dynamic=False)
+                # Contiguous [B, S, H, D], as the layer's projections produce.
+                got = compiled(
+                    *(t.transpose(1, 2).contiguous().to("tpu") for t in (q, k, v))
+                ).to("cpu")
+                self.assertEqual(got.shape, (1, seq, 4 * 128))
+                err = (got.float() - want.reshape(1, seq, -1)).abs().max().item()
+                self.assertLess(err, 2e-2)
+
     def test_float32_falls_back_to_sdpa(self):
         from sglang.multimodal_gen.runtime.layers.attention.backends.tpu_splash_attn import (
             tpu_attention,
