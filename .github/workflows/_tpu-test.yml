@@ -39,8 +39,8 @@ on:
         required: false
         type: number
         default: 1
-      host_pid:
-        description: "Share the node PID namespace for TPU session-lifecycle tests"
+      vbar_tcp:
+        description: "Connect to node-local vBAR over TCP instead of the plugin's Unix socket"
         required: false
         type: boolean
         default: false
@@ -151,7 +151,7 @@ jobs:
             --files '${{ inputs.files }}' \
             --exec '${{ inputs.exec_cmd }}' \
             --hosts '${{ inputs.hosts }}' \
-            ${{ inputs.host_pid && '--host-pid' || '' }} \
+            ${{ inputs.vbar_tcp && '--vbar-tcp' || '' }} \
             --lane '${{ inputs.lane }}' \
             --pools "${pools}" \
             --pd-prefill-hosts '${{ inputs.pd_prefill_hosts }}' \
