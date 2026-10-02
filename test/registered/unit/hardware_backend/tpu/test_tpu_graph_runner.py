@@ -727,7 +727,8 @@ class TestDraftPrecompileOrdering(CustomTestCase):
         worker = object.__new__(EagleDraftWorker)
         worker.speculative_num_steps = 3
         worker.server_args = SimpleNamespace(tpu_compile_tracer="dynamo")
-        worker.draft_tp_context = lambda _group: contextlib.nullcontext()
+        worker.draft_tp_context = lambda _group, **_kwargs: contextlib.nullcontext()
+        worker.draft_owns_attention = False
         worker.draft_runner = SimpleNamespace(
             tp_group=object(),
             canary_manager=None,
@@ -767,6 +768,10 @@ class TestDraftPrecompileOrdering(CustomTestCase):
             patch(
                 "sglang.srt.speculative.eagle_worker_v2._is_tpu",
                 True,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.draft_pp_context",
+                side_effect=contextlib.nullcontext,
             ),
         ):
             worker.init_cuda_graphs()

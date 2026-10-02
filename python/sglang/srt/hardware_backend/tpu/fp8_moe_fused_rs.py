@@ -132,7 +132,6 @@ def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
 
 
 def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> bool:
-    from sglang.srt.distributed import get_tp_group
     from sglang.srt.layers.moe import get_moe_a2a_backend
     from sglang.srt.runtime_context import get_exec, get_parallel
 
@@ -143,7 +142,7 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
     unsupported_reason = fp8_fused_rs_unsupported_reason(
         num_experts=layer.num_experts,
         ep_size=ep_size,
-        tp_size=get_tp_group().world_size,
+        tp_size=get_parallel().tp_group.world_size,
         pp_size=parallel.pp_size,
         world_size=world_size,
         reduction_compatible=layer.allow_backend_reduction,
