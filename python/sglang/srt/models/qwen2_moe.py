@@ -34,6 +34,8 @@ from sglang.kernels.ops.elementwise.elementwise import (
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_pp_indices,
+    moe_expert_parallel_all_reduce,
+    moe_tensor_model_parallel_all_reduce,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -59,6 +61,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     reduce_moe_output,
+    should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -368,7 +371,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         or get_moe_a2a_backend().is_flashinfer_megamoe()
                         or get_moe_a2a_backend().is_megamoe()
                     )
-                    else {}
+                    else dict(
+                        tp_rank=get_parallel().moe_tp_rank,
+                        tp_size=get_parallel().moe_tp_size,
+                    )
                 ),
             )
         else:
@@ -884,7 +890,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
             else:
                 final_hidden_states += shared_output
-        final_hidden_states = reduce_moe_output(final_hidden_states)
+        if (
+            self.tp_size > 1
+            and not should_skip_post_experts_all_reduce(
+                is_tp_path=True,
+            )
+            and not get_moe_a2a_backend().is_flashinfer()
+        ):
+            if get_parallel().moe_ep_size > 1:
+                final_hidden_states = moe_expert_parallel_all_reduce(
+                    final_hidden_states
+                )
+            if get_parallel().moe_tp_size > 1:
+                final_hidden_states = moe_tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
 
         # Debug removed - was causing issues during CUDA graph capture
 
