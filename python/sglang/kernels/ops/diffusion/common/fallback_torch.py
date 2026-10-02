@@ -61,6 +61,36 @@ def apply_rotary_embedding_native(
     return torch.stack((o1, o2), dim=-1).flatten(-2)
 
 
+def _pair_swap_matrix(dim: int, dtype: torch.dtype, device) -> Tensor:
+    """R with (x @ R)[2i] = -x[2i + 1] and (x @ R)[2i + 1] = x[2i]."""
+    idx = torch.arange(0, dim, 2, device=device)
+    rot = torch.zeros(dim, dim, dtype=dtype, device=device)
+    rot[idx + 1, idx] = -1
+    rot[idx, idx + 1] = 1
+    return rot
+
+
+def apply_rotary_embedding_pair_swap(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
+) -> torch.Tensor:
+    """``apply_rotary_embedding_native`` without stride-2 access to the last dim.
+
+    Rotates adjacent pairs as ``x * cos + (x @ R) * sin``; R is a signed pair
+    swap, so a half-precision matmul is exact and the result matches the
+    strided form bit for bit. Strided lane slices cost relayout copies on TPU.
+    float32 keeps the strided form: a TPU float32 matmul may round through bf16.
+    """
+    if x.dtype == torch.float32:
+        return apply_rotary_embedding_native(x, cos, sin, interleaved)
+    if interleaved and cos.shape[-1] == x.shape[-1]:
+        cos = cos[..., ::2]
+        sin = sin[..., ::2]
+    cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2).to(x.dtype)
+    sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2).to(x.dtype)
+    rot = _pair_swap_matrix(x.shape[-1], x.dtype, x.device)
+    return x * cos + torch.matmul(x, rot) * sin
+
+
 def norm_infer_native(
     x: Tensor,
     weight: Optional[Tensor],

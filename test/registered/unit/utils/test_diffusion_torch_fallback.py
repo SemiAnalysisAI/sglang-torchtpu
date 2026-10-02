@@ -171,6 +171,29 @@ class TestDiffusionTorchFallback(unittest.TestCase):
         )
         torch.testing.assert_close(interleaved.cpu(), reference.cpu())
 
+    def test_pair_swap_rotary_embedding_matches_the_strided_form_exactly(self):
+        from sglang.kernels.ops.diffusion.common.fallback_torch import (
+            apply_rotary_embedding_native,
+            apply_rotary_embedding_pair_swap,
+        )
+
+        torch.manual_seed(0)
+        for dtype in (torch.bfloat16, torch.float16, torch.float32):
+            for interleaved in (False, True):
+                with self.subTest(dtype=dtype, interleaved=interleaved):
+                    x = torch.randn(33, 4, 128, dtype=dtype, device=self.device)
+                    angles = torch.randn(33, 64, device=self.device)
+                    cos, sin = angles.cos(), angles.sin()
+                    if interleaved:
+                        cos = cos.repeat_interleave(2, dim=-1)
+                        sin = sin.repeat_interleave(2, dim=-1)
+                    self.assertTrue(
+                        torch.equal(
+                            apply_rotary_embedding_pair_swap(x, cos, sin, interleaved),
+                            apply_rotary_embedding_native(x, cos, sin, interleaved),
+                        )
+                    )
+
     def test_one_pass_rms_norm_matches_reference(self):
         x = torch.randn(8, 128, device=self.device, dtype=torch.float32)
         weight = torch.randn(128, device=self.device, dtype=torch.float32)
