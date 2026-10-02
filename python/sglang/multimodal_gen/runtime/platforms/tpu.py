@@ -54,8 +54,9 @@ def _install_device_module_shims() -> None:
 def _expand_query_broadcast_mask(query, attn_mask):
     """Expand a mask's size-1 query dim to the query length on TPU.
 
-    torch_tpu 0.1.1.dev20260924 SDPA returns NaN for masks that broadcast over
-    queries, e.g. [B, 1, 1, S] key padding; 0.1.1.dev20260817 is correct.
+    torch_tpu SDPA returns NaN for masks that broadcast over queries, e.g.
+    [B, 1, 1, S] key padding (0.1.1.dev20260924 and
+    0.1.1+release.2026.9.22; 0.1.1.dev20260817 is correct).
     Remove once the pinned torch_tpu handles query-broadcast masks.
     """
     if (
