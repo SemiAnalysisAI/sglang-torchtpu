@@ -207,10 +207,39 @@ class's `_backend_initialized` guard makes that second call the one that does th
 import-time call is redundant for TPU. Two regression tests cover it, the first verified red
 before the fix.
 
-**Divergence 1 is untested, not cleared.** Qwen3-0.6B is not a hybrid-SWA model, so the
-`_build_tpu_swa_kv_pool` vs `_build_oot_mha_kv_pool` routing bug never fires in this smoke test.
-The identical KV-pool numbers above exercise the MHA arm only. Closing divergence 1 still needs a
-hybrid-SWA model on hardware.
+**Divergence 1 is CONFIRMED on hardware, and still open.** Reproduced 2026-10-02 with
+`openai/gpt-oss-20b` (`Hybrid SWA model detected. architectures=['GptOssForCausalLM']`), identical
+args, only `SGLANG_PLATFORM` changed:
+
+| | mode A (`PlatformEnum.TPU`) | mode B (`PlatformEnum.OOT`) |
+|---|---|---|
+| Full KV | 1478848 tok, K 16.92 GB, V 16.92 GB | — |
+| SWA KV | 1182720 tok, K 13.54 GB, V 13.54 GB | — |
+| flat KV | — | 1477824 tok, K 33.83 GB, V 33.83 GB |
+
+Mode A builds the two sub-pools of `_build_tpu_swa_kv_pool`. Mode B builds **one flat pool** --
+the generic OOT arm at `kv_cache_configurator.py:1318` wins over the TPU arm at `:1352`, so the
+SWA sub-pool disappears and every layer gets a full-length pool (K/V 33.83 GB vs 16.92 GB). This
+is a correctness bug, not just waste: SWA layers lose their windowed pool.
+
+This is the blocker for making `tpu_oot` the default. The fix is **not** to call
+`_build_tpu_swa_kv_pool` from the OOT arm -- that arm serves every OOT platform, not only TPU. It
+needs SWA handled generically through a platform hook, then the TPU arm deleted. That is a core
+change with blast radius on other OOT backends, so it is left for a decision rather than taken
+here.
+
+Note the qwen3-0.6b runs above cannot show this: that model is `hybrid_swa=False` (verified), so
+their matching pool numbers exercise the MHA arm only.
+
+**Separately, gpt-oss-20b cannot serve on this box in either mode.** After pool construction both
+modes die identically in the MXFP4 MoE Pallas compile (`unquant.py:1301 forward_tpu` ->
+`fused_moe_call` -> `BackendCompilerFailed`). Unrelated to the platform; it does not affect the
+pool comparison above, which happens first.
+
+**One e2e test fails in both modes:** `test_4_concurrent_batch` (prefix cache), 3/3 on repeat runs
+in plain mode A, asserting a cold-cache batch and a warm cached-prefix rerun produce identical
+text under `fp8_e4m3` KV. Identical in both modes, so not the OOT flip. It is **not attributed**:
+the pre-upgrade stack could not launch a server at all, so there is no before/after on this box.
 
 ## 6. How to verify
 
