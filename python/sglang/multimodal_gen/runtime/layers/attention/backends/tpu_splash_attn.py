@@ -533,7 +533,8 @@ def tpu_attention(
         return _tpu_splash_attention_op(query, key, value, scale, is_causal=is_causal)
 
     log_key = (q_seq, kv_seq, is_causal, reason)
-    if log_key not in _logged_sdpa_fallbacks:
+    # Logging breaks a torch.compile graph; eager runs report the fallback.
+    if not torch.compiler.is_compiling() and log_key not in _logged_sdpa_fallbacks:
         _logged_sdpa_fallbacks.add(log_key)
         logger.info(
             "TPU splash attention: q_seq=%d kv_seq=%d causal=%s -> sdpa (%s)",
