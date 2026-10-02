@@ -120,6 +120,12 @@ jobs:
       - name: Read only PR 943 artifact JobSets and their pods
         run: |
           set -euo pipefail
+          kubectl -n kube-system get pods --field-selector spec.nodeName=gke-tpu-9735f215-nsmg -o json > /tmp/node-pods.json
+          jq '[.items[] | select(.metadata.name | test("tpu|vbar")) | {name: .metadata.name, node: .spec.nodeName, containers: [.spec.containers[] | {name, image}], status: .status.containerStatuses}]' /tmp/node-pods.json
+          jq -r '.items[] | select(.metadata.name | test("tpu|vbar")) | .metadata.name' /tmp/node-pods.json |
+            while read -r pod; do
+              kubectl -n kube-system logs "$pod" --all-containers --timestamps --since-time=2026-10-02T18:20:00Z --tail=500 || true
+            done
           kubectl -n tpu-ci get localqueue tpu-nightly-2h -o json > /tmp/queue.json
           jq '{name: .metadata.name, spec, status}' /tmp/queue.json
           cluster_queue=$(jq -r '.spec.clusterQueue' /tmp/queue.json)
