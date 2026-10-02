@@ -90,8 +90,9 @@ class TPUAsyncCopyWorker:
             self.device_module.stream(self.stream),
         ):
             # EAGLE draft-extend runs after verify and writes draft KV; copying
-            # one of its outputs makes copy_done cover it. Other spec algorithms'
-            # trailing draft writes are not covered. The returned copy stays
+            # one of its outputs makes copy_done cover it. The KV writes DFLASH,
+            # DSPARK, and NGRAM issue after their results are not covered; the
+            # scheduler rejects them with raiden. The returned copy stays
             # referenced by the submission future.
             draft_tail = None
             draft_input = result.next_draft_input

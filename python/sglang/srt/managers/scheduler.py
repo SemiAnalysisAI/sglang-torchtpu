@@ -1685,6 +1685,23 @@ class Scheduler(
                 and get_memory().hicache_io_backend == "raiden"
             )
             logger.info("TPU async result-copy worker enabled")
+        if (
+            self.tpu_async_copy_worker is not None
+            and self.enable_overlap
+            and self.enable_hierarchical_cache
+            and get_memory().hicache_io_backend == "raiden"
+            and (
+                self.spec_algorithm.is_dflash_family() or self.spec_algorithm.is_ngram()
+            )
+        ):
+            # The raiden load fence waits on copy_done, which the async copy
+            # worker records before these algorithms' KV writes that follow the
+            # result tensors.
+            raise ValueError(
+                f"{self.spec_algorithm.name} speculative decoding is not supported "
+                "with the raiden HiCache backend and the TPU async copy worker "
+                "under overlap scheduling."
+            )
 
         # CUDA-style forward/copy/schedule streams only buy overlap on backends
         # with real multi-stream execution. Single-queue backends (see
