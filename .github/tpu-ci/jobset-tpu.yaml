@@ -56,6 +56,7 @@ spec:
                 app: tpu-ci
             spec:
               restartPolicy: Never
+              hostPID: ${HOST_PID}
 ${SERVICE_ACCOUNT}
               nodeSelector:
                 cloud.google.com/gke-tpu-accelerator: tpu7x

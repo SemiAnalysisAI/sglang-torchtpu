@@ -489,6 +489,7 @@ jobs:
       display_name: test_topology_artifact_transfer
       lane: nightly
       hosts: 2
+      host_pid: true
       exec_cmd: env JAX_PLATFORMS=cpu TORCH_TPU_TOPOLOGY=2,2,2,2 python3 test/registered/e2e/hardware_backend/tpu/test_topology_artifact_transfer.py -v
       files: test/registered/e2e/hardware_backend/tpu/test_topology_artifact_transfer.py
       run_name: ${{ fromJSON(needs.discover-tests.outputs.topology_artifact_transfer)[0].run_name }}

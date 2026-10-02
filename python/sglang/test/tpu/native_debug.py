@@ -69,7 +69,11 @@ def log_runtime_environment(phase):
         if value:
             try:
                 parsed = urlsplit(value if "://" in value else "//" + value)
-                value = {"host": parsed.hostname, "port": parsed.port}
+                value = (
+                    {"scheme": "unix", "path": parsed.path}
+                    if parsed.scheme == "unix"
+                    else {"host": parsed.hostname, "port": parsed.port}
+                )
             except ValueError:
                 value = "<set; invalid URL>"
         environment[key] = value
@@ -102,11 +106,11 @@ def trace_slow_workers():
                 try:
                     connections = [
                         {
-                            "local": tuple(c.laddr),
-                            "remote": tuple(c.raddr),
+                            "local": c.laddr,
+                            "remote": c.raddr,
                             "status": c.status,
                         }
-                        for c in process.net_connections(kind="tcp")
+                        for c in process.net_connections(kind="all")
                     ]
                     print(
                         json.dumps(

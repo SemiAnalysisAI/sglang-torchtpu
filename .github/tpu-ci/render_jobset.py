@@ -141,6 +141,7 @@ def main():
     # Plain words only -- the command is inlined into the pod script unquoted.
     ap.add_argument("--exec", dest="exec_cmd", default="")
     ap.add_argument("--hosts", type=int, default=1)
+    ap.add_argument("--host-pid", action="store_true")
     # Which lane's pools to use. pr-gate and nightly both own 1- and 2-host slices, so a
     # host count alone no longer identifies a pool (see topology.yaml).
     ap.add_argument("--lane", default="pr-gate")
@@ -173,6 +174,8 @@ def main():
         help="Print the CI poll budget (s) for --suite and exit (no rendering).",
     )
     a = ap.parse_args()
+    if a.host_pid and (a.pd_prefill_hosts or a.pd_decode_hosts):
+        ap.error("--host-pid is only supported for single-slice jobs")
 
     partitioned = a.partition_id != -1 or a.partition_size != 0
     if partitioned and not (
@@ -365,6 +368,7 @@ def main():
         "ACTIVE_DEADLINE": str(active_deadline),
         "EXEC_CMD": a.exec_cmd,
         "HOSTS": str(hosts),
+        "HOST_PID": str(a.host_pid).lower(),
         "TOPOLOGY": sl["topology"],
         "POOL_AFFINITY": POOL_AFFINITY_TMPL.format(pools=", ".join(pools)),
         "POOL_LIST": " ".join(pools),
