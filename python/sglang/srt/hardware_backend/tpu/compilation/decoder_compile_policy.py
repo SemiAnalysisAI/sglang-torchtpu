@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
 import time
 from collections.abc import Callable
 from typing import Any, ClassVar, Literal
@@ -83,13 +84,15 @@ def max_extend_tokens(*, context_len: int) -> int:
     )
 
 
-def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None:
+def _materialize_out(
+    out: Any, attn_backend: Any, token_to_kv_pool: Any, wait: bool = True
+) -> None:
     """Sync returned tensors and backend-marked KV side effects.
 
     attn_backend / token_to_kv_pool come from the model_runner: upstream moved
     both off ForwardBatch (attn_backend now flows through ForwardContext, and the
     KV pool is held by the attention backend / model_runner), so warmup reads them
-    from the runner rather than the batch.
+    from the runner rather than the batch. ``wait=False`` only enqueues.
     """
     tensors: list[torch.Tensor] = []
 
@@ -118,7 +121,7 @@ def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None
         return
     from torch_tpu._internal.sync.sync import synchronize as tpu_sync
 
-    tpu_sync(tensors, wait=True)
+    tpu_sync(tensors, wait=wait)
 
 
 def _get_hbm_usage_mb() -> tuple[float, float] | None:
@@ -1003,6 +1006,57 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             "[decoder compile policy] precompile done in %.1fs.",
             time.perf_counter() - overall,
         )
+        fillers = getattr(self, "_pp_warmup_fillers", None)
+        if fillers:
+            logger.info(
+                "[decoder compile policy] pipeline stage %d launch leveling: "
+                "%d fillers over %d warmup forwards %s",
+                self.model_runner.pp_group.rank_in_group,
+                sum(fillers),
+                len(fillers),
+                fillers,
+            )
+
+    def _pp_launch_leveler(self) -> Callable[[], int] | None:
+        """Per-warmup-forward launch leveling across pipeline stages, or None.
+
+        torch_tpu starts a device's i-th multi-device program only once every
+        device of the slice started its i-th, and stages run different
+        programs, so a stage's warmup read could wait on launches its peers
+        never issue. On by default for pipeline stages of several devices;
+        SGLANG_TPU_PP_LEVEL_WARMUP=0 turns it off.
+        """
+        if hasattr(self, "_pp_leveler"):
+            return self._pp_leveler
+        self._pp_leveler = None
+        self._pp_warmup_fillers: list[int] = []
+        pp_group = self.model_runner.pp_group
+        if (
+            pp_group is None
+            or pp_group.world_size == 1
+            or os.environ.get("SGLANG_TPU_PP_LEVEL_WARMUP", "1") == "0"
+        ):
+            return None
+        from sglang.srt.distributed import get_tp_group, get_world_group
+        from sglang.srt.hardware_backend.tpu.pp_wave import (
+            level_stage_launches,
+            make_stage_filler,
+        )
+
+        stage_group = get_tp_group()
+        if stage_group.world_size < 2:
+            return None
+        filler = make_stage_filler(stage_group, torch.device(self.model_runner.device))
+        world_group = get_world_group()
+        pp_rank, pp_size = int(pp_group.rank_in_group), int(pp_group.world_size)
+        self._pp_leveler = lambda: level_stage_launches(
+            stage_group=stage_group,
+            world_group=world_group,
+            filler=filler,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+        )
+        return self._pp_leveler
 
     def _assert_cp_family_compiled(self) -> None:
         """Raise if prefill context parallelism is on but warmup compiled no
@@ -1301,11 +1355,22 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             started = time.perf_counter()
             out = entry.forward(*args, **kwargs)
             # Materialize lazy outputs and backend-marked side effects.
+            leveler = self._pp_launch_leveler()
             _materialize_out(
                 out,
                 forward_attn_backend,
                 self.model_runner.token_to_kv_pool,
+                wait=leveler is None,
             )
+            if leveler is not None:
+                # Pipeline stages run different programs per warmup forward;
+                # level the slice's launch counts before this stage waits.
+                self._pp_warmup_fillers.append(leveler())
+                _materialize_out(
+                    out,
+                    forward_attn_backend,
+                    self.model_runner.token_to_kv_pool,
+                )
 
         if profile_prefix is not None:
             return (time.perf_counter() - started) * 1000

@@ -151,6 +151,79 @@ def launch_now(op: Any, x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def make_stage_filler(stage_group: Any, device: torch.device) -> Callable[[], Any]:
+    """A filler program: a tiny all-reduce over the stage group, flushed on
+    both sides so it is one multi-device program of its own. Returns its
+    output, whose readiness tells when the program ran."""
+    from torch_tpu._internal.sync.sync import synchronize
+
+    stage_pg = stage_group.device_group
+
+    def filler() -> torch.Tensor:
+        synchronize(None, wait=False)
+        x = torch.zeros((8, 128), dtype=torch.float32, device=device)
+        torch.distributed.all_reduce(x, group=stage_pg)
+        synchronize([x], wait=False)
+        return x
+
+    return filler
+
+
+def level_stage_launches(
+    *,
+    stage_group: Any,
+    world_group: Any,
+    filler: Callable[[], Any],
+    pp_rank: int,
+    pp_size: int,
+    poll_s: float = 0.002,
+    report_s: float = 60.0,
+) -> int:
+    """Bring every device of the slice to the same multi-device launch count
+    without knowing the counts; returns the fillers this stage issued.
+
+    A device's latest launch completes only once every device has issued at
+    least as many, so the stages whose latest launch is ready are exactly
+    the stages at the lowest count (a stage still computing reads as not
+    ready and simply waits a round). Each round every rank shares its
+    readiness over the host channel and the lowest stages add one filler,
+    until every stage is ready. A stage acts only when all its devices are
+    ready, so its devices issue the same fillers. Must be called at the same
+    point on every rank, with no device wait pending.
+    """
+    import time
+
+    from torch_tpu._internal.sync.sync import is_ready
+
+    columns = int(stage_group.world_size)
+    last = filler()  # Uniform: every stage's latest launch is now its own.
+    fillers = 0
+    start = time.monotonic()
+    next_report = start + report_s
+    while True:
+        flags = world_group.all_gather_object(bool(is_ready(last)))
+        stage_ready = [
+            all(flags[s * columns : (s + 1) * columns]) for s in range(pp_size)
+        ]
+        if all(stage_ready):
+            return fillers
+        if stage_ready[pp_rank]:
+            last = filler()
+            fillers += 1
+        else:
+            time.sleep(poll_s)
+        if time.monotonic() > next_report:
+            next_report += report_s
+            logger.warning(
+                "pipeline launch leveling stage %d: %d fillers after %.0fs, "
+                "stage readiness %s",
+                pp_rank,
+                fillers,
+                time.monotonic() - start,
+                stage_ready,
+            )
+
+
 class PPWave:
     """Per-stage bookkeeping of the hand-off wave; see the module docstring.
 
@@ -409,20 +482,22 @@ def build_pp_wave(
     physical = physical_device_by_rank(world_group)
     perm = pipeline_permutation(physical=physical, size=size, columns=columns)
     op = build_pp_permute_op(perm)
-    filler = None
-    if slot_size > 0:
-        # Zeros stay zero under the in-place sum, so one buffer serves forever.
-        slot_buf = torch.zeros((8, 128), dtype=torch.float32, device=device)
-        stage_pg = stage_group.device_group
-
-        def filler() -> None:
-            from torch_tpu._internal.sync.sync import synchronize
-
-            # Flushed on both sides so it is one program of its own.
-            synchronize(None, wait=False)
-            torch.distributed.all_reduce(slot_buf, group=stage_pg)
-            synchronize([slot_buf], wait=False)
-
+    filler = make_stage_filler(stage_group, device) if slot_size > 0 else None
+    if columns > 1:
+        # Start-up (model load, warmup) may leave the stages at different
+        # launch counts; the first hand-off must sit at one index everywhere.
+        levelled = level_stage_launches(
+            stage_group=stage_group,
+            world_group=world_group,
+            filler=make_stage_filler(stage_group, device),
+            pp_rank=rank,
+            pp_size=size,
+        )
+        logger.info(
+            "pipeline wave stage %d: %d fillers levelled the start-up launches",
+            rank,
+            levelled,
+        )
     wave = PPWave(
         rank=rank,
         size=size,

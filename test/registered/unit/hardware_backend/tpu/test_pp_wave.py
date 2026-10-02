@@ -422,5 +422,122 @@ class TestWaveGuards(CustomTestCase):
             pipeline_permutation(physical=(0, 1, 2), size=2, columns=2)
 
 
+class _CountMatchedSlice:
+    """Devices that start their k-th multi-device program only once every
+    device issued k: a program's output is ready iff every count reached it.
+    With ``latency``, an output reads not ready on its first query (still
+    computing)."""
+
+    def __init__(self, counts, latency=False):
+        self.counts = list(counts)
+        self.latency = latency
+        self.queried = set()
+        self.lock = threading.Lock()
+
+    def filler(self, rank):
+        def launch():
+            with self.lock:
+                self.counts[rank] += 1
+                return (rank, self.counts[rank])
+
+        return launch
+
+    def is_ready(self, token):
+        with self.lock:
+            if self.latency and token not in self.queried:
+                self.queried.add(token)
+                return False
+            return all(c >= token[1] for c in self.counts)
+
+
+class _HostGroup:
+    def __init__(self, n):
+        self.buf = [None] * n
+        self.barrier = threading.Barrier(n, timeout=10)
+
+    def member(self, rank):
+        group = self
+
+        class _Member:
+            def all_gather_object(self, obj):
+                group.buf[rank] = obj
+                group.barrier.wait()
+                out = list(group.buf)
+                group.barrier.wait()
+                return out
+
+        return _Member()
+
+
+class TestLaunchLeveling(CustomTestCase):
+    def _level(self, stage_counts, columns, latency=False):
+        import sys
+        import types
+        from unittest import mock
+
+        from sglang.srt.hardware_backend.tpu.pp_wave import level_stage_launches
+
+        size = len(stage_counts)
+        n = size * columns
+        dev = _CountMatchedSlice(
+            [stage_counts[r // columns] for r in range(n)], latency=latency
+        )
+        sync = types.ModuleType("torch_tpu._internal.sync.sync")
+        sync.is_ready = dev.is_ready
+        mods = {
+            "torch_tpu": types.ModuleType("torch_tpu"),
+            "torch_tpu._internal": types.ModuleType("torch_tpu._internal"),
+            "torch_tpu._internal.sync": types.ModuleType("torch_tpu._internal.sync"),
+            "torch_tpu._internal.sync.sync": sync,
+        }
+        host = _HostGroup(n)
+        stage_group = types.SimpleNamespace(world_size=columns)
+        fillers = [None] * n
+        errors = []
+
+        def run(rank):
+            try:
+                fillers[rank] = level_stage_launches(
+                    stage_group=stage_group,
+                    world_group=host.member(rank),
+                    filler=dev.filler(rank),
+                    pp_rank=rank // columns,
+                    pp_size=size,
+                    poll_s=0.0,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append((rank, exc))
+
+        with mock.patch.dict(sys.modules, mods):
+            threads = [threading.Thread(target=run, args=(r,)) for r in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+        return dev.counts, fillers, errors
+
+    def test_the_lowest_stages_fill_up_to_the_highest_count(self):
+        counts, fillers, errors = self._level([5, 3, 3, 7], columns=2)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(set(counts)), 1, counts)
+        # One uniform filler, then exactly the gap to the highest stage.
+        self.assertEqual(counts[0], 7 + 1)
+        self.assertEqual(fillers, [2, 2, 4, 4, 4, 4, 0, 0])
+
+    def test_converges_when_launches_are_still_computing(self):
+        counts, fillers, errors = self._level([2, 6, 4], columns=2, latency=True)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(set(counts)), 1, counts)
+        # A stage's devices always issue the same fillers.
+        for s in range(3):
+            self.assertEqual(fillers[2 * s], fillers[2 * s + 1])
+
+    def test_level_counts_issue_no_filler(self):
+        counts, fillers, errors = self._level([4, 4], columns=2)
+        self.assertEqual(errors, [])
+        self.assertEqual(fillers, [0, 0, 0, 0])
+        self.assertEqual(counts, [5, 5, 5, 5])
+
+
 if __name__ == "__main__":
     unittest.main()
