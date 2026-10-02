@@ -169,6 +169,31 @@ def make_stage_filler(stage_group: Any, device: torch.device) -> Callable[[], An
     return filler
 
 
+def ready_probe(x: torch.Tensor) -> Callable[[], bool]:
+    """A non-blocking check that the program producing ``x`` has run.
+
+    ``sync.is_ready`` where torch_tpu has it; otherwise a daemon thread
+    blocks reading ``x`` back and the check reports whether the read
+    returned. (The experimental ``TpuEvent.query`` crashed on the torch_tpu
+    this was validated on.) The read always returns once the slice is
+    levelled, so the thread does not outlive the leveling.
+    """
+    try:
+        from torch_tpu._internal.sync.sync import is_ready
+    except ImportError:
+        import threading
+
+        done = threading.Event()
+
+        def read() -> None:
+            x.cpu()
+            done.set()
+
+        threading.Thread(target=read, daemon=True, name="pp-ready-probe").start()
+        return done.is_set
+    return lambda: bool(is_ready(x))
+
+
 def level_stage_launches(
     *,
     stage_group: Any,
@@ -176,7 +201,7 @@ def level_stage_launches(
     filler: Callable[[], Any],
     pp_rank: int,
     pp_size: int,
-    poll_s: float = 0.002,
+    poll_s: float = 0.005,
     report_s: float = 60.0,
 ) -> int:
     """Bring every device of the slice to the same multi-device launch count
@@ -193,25 +218,25 @@ def level_stage_launches(
     """
     import time
 
-    from torch_tpu._internal.sync.sync import is_ready
-
     columns = int(stage_group.world_size)
-    last = filler()  # Uniform: every stage's latest launch is now its own.
+    # Uniform: every stage's latest launch is now its own.
+    ready = ready_probe(filler())
     fillers = 0
     start = time.monotonic()
     next_report = start + report_s
     while True:
-        flags = world_group.all_gather_object(bool(is_ready(last)))
+        flags = world_group.all_gather_object(ready())
         stage_ready = [
             all(flags[s * columns : (s + 1) * columns]) for s in range(pp_size)
         ]
         if all(stage_ready):
             return fillers
         if stage_ready[pp_rank]:
-            last = filler()
+            ready = ready_probe(filler())
             fillers += 1
-        else:
-            time.sleep(poll_s)
+        # Let fresh launches finish so the next round's readiness is not
+        # stale; a stale "not ready" only costs extra (harmless) fillers.
+        time.sleep(poll_s)
         if time.monotonic() > next_report:
             next_report += report_s
             logger.warning(
