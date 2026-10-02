@@ -9,7 +9,9 @@ tree-owned PoolTransfer in place, a transfer with SWA pages but no Full pages
 leaves the Full pool's KV untouched, and speculative-decoding draft sidecars
 ride the same rounds (draft DMA issued per transfer, reload ack gates on it,
 draft device pool wired to the whole-batch counter, host pool picked via the
-platform hook).
+platform hook). Load-back DMAs (hybrid and
+single-pool) wait, off the scheduler thread and in order, for the forwards
+still in flight that may write their pages.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -17,21 +19,39 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import threading
+import time
 import unittest
+from collections import deque
+from types import SimpleNamespace
 from typing import List
 from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.inflight_kv_writes import (
+    KVPages,
+    collect_forward_kv_writes,
+)
 from sglang.srt.hardware_backend.tpu.kv_pool_host import (
     RAIDEN_LAYOUT,
     TpuRaidenHostKVCache,
 )
+from sglang.srt.hardware_backend.tpu.raiden_cache_controller import (
+    TpuRaidenHiCacheController,
+)
 from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
     TpuRaidenHybridCacheController,
 )
-from sglang.srt.hardware_backend.tpu.raiden_transfer import RaidenKVTransfer
-from sglang.srt.managers.cache_controller import BatchDoneCounter, LayerDoneCounter
+from sglang.srt.hardware_backend.tpu.raiden_transfer import (
+    RaidenKVTransfer,
+    RaidenLoadFence,
+)
+from sglang.srt.managers.cache_controller import BatchDoneCounter
+from sglang.srt.managers.cache_controller import CacheOperation as PlainCacheOperation
+from sglang.srt.managers.cache_controller import LayerDoneCounter
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -39,6 +59,8 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils.common import Range
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -53,6 +75,29 @@ class _FakeFuture:
     def synchronize(self) -> None:
         self.synchronized = True
         self.ready = True
+
+
+class _ForwardEvent:
+    """Completion event of an in-flight forward; done once ``finish()`` runs."""
+
+    def __init__(self):
+        self.gate = threading.Event()
+        self.queried = False
+
+    def finish(self) -> None:
+        self.gate.set()
+
+    def query(self) -> bool:
+        self.queried = True
+        return self.gate.is_set()
+
+
+def _wait_until(condition, timeout_s: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("condition not met in time")
+        time.sleep(0.001)
 
 
 class _FakeHostPool:
@@ -110,12 +155,15 @@ def _make_controller() -> TpuRaidenHybridCacheController:
     ctrl.ack_write_queue = []
     ctrl.ack_load_queue = []
     ctrl.layer_done_counter = BatchDoneCounter()
+    ctrl.load_fence = RaidenLoadFence()
+    ctrl.in_flight_forwards = list
+    ctrl.page_size = 1
     return ctrl
 
 
-def _op(n_kv: int = 8, n_swa: int = 4) -> CacheOperation:
+def _op(n_kv: int = 8, n_swa: int = 4, first_host: int = 0) -> CacheOperation:
     return CacheOperation(
-        torch.arange(n_kv, dtype=torch.int64),
+        torch.arange(first_host, first_host + n_kv, dtype=torch.int64),
         torch.arange(n_kv, dtype=torch.int64),
         node_id=1,
         pool_transfers=[
@@ -319,6 +367,7 @@ def _raiden_host_pool(mgr: _FakeRaidenManager, page_size: int):
     pool.lock = threading.RLock()
     pool.transfer = object.__new__(RaidenKVTransfer)
     pool.transfer._mgr = mgr
+    pool.transfer._dma_lock = threading.Lock()
     pool.clear()
     return pool
 
@@ -385,6 +434,308 @@ class TestHybridTransferWithoutFullPages(CustomTestCase):
             self.swa_mgr.host[:, host_page], self.swa_mgr.device[:, 2]
         )
         torch.testing.assert_close(self.full_mgr.host, full_host)
+
+
+class TestLoadFence(CustomTestCase):
+    """Under overlap scheduling the previous forward still runs when a load
+    starts and may write pages freed to that load; its DMAs must not land first."""
+
+    def setUp(self):
+        self.forwards: List[_ForwardEvent] = []
+        self.ctrl = _make_controller()
+        # Pages unknown (None): every in-flight forward blocks a load.
+        self.ctrl.in_flight_forwards = lambda: [(f, None) for f in self.forwards]
+        self.full_pool = self.ctrl.mem_pool_host.anchor_entry.host_pool
+        self.swa_pool = self.ctrl.mem_pool_host.entry_map[PoolName.SWA].host_pool
+
+    def tearDown(self):
+        # Release any worker still polling a forward.
+        for forward in self.forwards:
+            forward.finish()
+
+    def test_load_dmas_wait_for_in_flight_forward(self):
+        forward = _ForwardEvent()
+        self.forwards.append(forward)
+        self.ctrl.load_queue.append(_op())
+        # Returns while the earlier forward still runs, without issuing a DMA
+        # that could land under that forward's writes.
+        producer_id = self.ctrl.start_loading()
+        time.sleep(0.02)
+        self.assertEqual(self.full_pool.loads, [])
+        self.assertEqual(self.swa_pool.loads, [])
+        (ack,) = self.ctrl.ack_load_queue
+        self.assertFalse(ack.finish_event.query())
+
+        forward.finish()
+        _wait_until(lambda: len(self.full_pool.loads) == len(self.swa_pool.loads) == 1)
+        # Issued but not landed: the forward gate stays closed.
+        self.assertFalse(ack.finish_event.query())
+        self.full_pool.load_futures[0].ready = True
+        self.assertFalse(ack.finish_event.query())
+        self.swa_pool.load_futures[0].ready = True
+        self.assertTrue(ack.finish_event.query())
+        self.ctrl.layer_done_counter.set_consumer(producer_id)
+        self.ctrl.layer_done_counter.wait()
+
+    def test_load_issues_inline_when_no_forward_is_in_flight(self):
+        finished = _ForwardEvent()
+        finished.finish()
+        self.forwards.append(finished)
+        self.ctrl.load_queue.append(_op())
+        self.ctrl.start_loading()
+        # Issued on the scheduler thread, not deferred.
+        self.assertEqual(len(self.full_pool.loads), 1)
+
+    def test_load_behind_a_deferred_load_keeps_order(self):
+        forward = _ForwardEvent()
+        self.forwards.append(forward)
+        self.ctrl.load_queue.append(_op(first_host=0))
+        self.ctrl.start_loading()
+        # Loads are issued in submission order: one behind a deferred load is
+        # deferred too, even when no forward is in flight for it.
+        self.forwards.clear()
+        self.ctrl.load_queue.append(_op(first_host=100))
+        self.ctrl.start_loading()
+        time.sleep(0.02)
+        self.assertEqual(self.full_pool.loads, [])
+
+        forward.finish()
+        _wait_until(lambda: len(self.full_pool.loads) == 2)
+        self.assertEqual([int(load[1][0]) for load in self.full_pool.loads], [0, 100])
+
+    def test_hung_forward_raises_at_poll(self):
+        self.forwards.append(_ForwardEvent())
+        self.ctrl.load_queue.append(_op())
+        with envs.SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S.override(0.05):
+            self.ctrl.start_loading()
+            (ack,) = self.ctrl.ack_load_queue
+            # The worker's deadline error surfaces at the forward gate's poll.
+            with self.assertRaises(TimeoutError):
+                _wait_until(ack.finish_event.query)
+        self.assertEqual(self.full_pool.loads, [])
+
+    def test_deferred_issue_error_raises_at_poll(self):
+        def failing_issue():
+            raise RuntimeError("h2d rejected")
+
+        forward = _ForwardEvent()
+        event = self.ctrl.load_fence.issue(failing_issue, [(forward, None)], None)
+        forward.finish()
+        with self.assertRaisesRegex(RuntimeError, "h2d rejected"):
+            _wait_until(event.query)
+        with self.assertRaisesRegex(RuntimeError, "h2d rejected"):
+            event.synchronize()
+
+    def test_single_pool_load_dmas_wait_for_in_flight_forward(self):
+        forward = _ForwardEvent()
+        self.forwards.append(forward)
+        ctrl = object.__new__(TpuRaidenHiCacheController)
+        ctrl.mem_pool_host = _FakeHostPool()
+        ctrl.mem_pool_device = object()
+        ctrl.load_queue = [
+            PlainCacheOperation(
+                torch.arange(4, dtype=torch.int64),
+                torch.arange(4, dtype=torch.int64),
+                node_id=1,
+            )
+        ]
+        ctrl.ack_load_queue = []
+        ctrl.layer_done_counter = BatchDoneCounter()
+        ctrl.load_fence = RaidenLoadFence()
+        ctrl.page_size = 1
+        ctrl.in_flight_forwards = lambda: [(f, None) for f in self.forwards]
+
+        ctrl.start_loading()
+        time.sleep(0.02)
+        self.assertEqual(ctrl.mem_pool_host.loads, [])
+        (ack,) = ctrl.ack_load_queue
+        self.assertFalse(ack.finish_event.query())
+
+        forward.finish()
+        ack.finish_event.synchronize()
+        self.assertEqual(len(ctrl.mem_pool_host.loads), 1)
+        self.assertTrue(ack.finish_event.query())
+
+    def test_scheduler_reports_unprocessed_results_with_write_pages(self):
+        # Under overlap the queued result's forward may still run; without
+        # overlap nothing is in flight when a load starts. A result without
+        # recorded pages reports None, which blocks every load.
+        recorded, unrecorded = _ForwardEvent(), _ForwardEvent()
+        pages = KVPages(full=torch.tensor([3]))
+        scheduler = SimpleNamespace(
+            enable_overlap=True,
+            result_queue=deque(
+                [
+                    (
+                        None,
+                        GenerationBatchResult(copy_done=recorded, kv_write_pages=pages),
+                    ),
+                    (None, SimpleNamespace(copy_done=unrecorded)),
+                    (None, SimpleNamespace(copy_done=None)),
+                ]
+            ),
+        )
+        self.assertEqual(
+            Scheduler._in_flight_forwards(scheduler),
+            [(recorded, pages), (unrecorded, None)],
+        )
+        scheduler.enable_overlap = False
+        self.assertEqual(Scheduler._in_flight_forwards(scheduler), [])
+
+
+def _pages(full, swa=None) -> KVPages:
+    return KVPages(
+        full=torch.tensor(full, dtype=torch.int64),
+        swa=None if swa is None else torch.tensor(swa, dtype=torch.int64),
+    )
+
+
+class TestPageAwareLoadFence(CustomTestCase):
+    """A load waits only for in-flight forwards that may write one of its pages,
+    in either index space; unknown pages on either side count as overlap."""
+
+    def setUp(self):
+        self.forwards: List[_ForwardEvent] = []
+
+    def tearDown(self):
+        for forward in self.forwards:
+            forward.finish()
+
+    def _issued_inline(self, writes: KVPages) -> bool:
+        forward = _ForwardEvent()
+        self.forwards.append(forward)
+        ctrl = _make_controller()
+        ctrl.in_flight_forwards = lambda: [(forward, writes)]
+        # Full slots 0-7 and SWA slots 0-3; page_size 1.
+        ctrl.load_queue.append(_op())
+        ctrl.start_loading()
+        return len(ctrl.mem_pool_host.anchor_entry.host_pool.loads) == 1
+
+    def test_load_disjoint_from_in_flight_writes_issues_inline(self):
+        self.assertTrue(self._issued_inline(_pages([8, 100], swa=[4])))
+
+    def test_load_waits_on_overlap_or_unknown_pages(self):
+        cases = {
+            "full page shared": _pages([7, 100], swa=[50]),
+            "swa page shared": _pages([100], swa=[3]),
+            "forward swa writes unknown": _pages([100]),
+            "forward writes unknown": None,
+        }
+        for name, writes in cases.items():
+            with self.subTest(name):
+                self.assertFalse(self._issued_inline(writes))
+
+    def test_load_pages_by_index_space(self):
+        # A draft pool indexed like KV adds full pages; a pool in neither space
+        # makes the load's pages unknown.
+        draft = PoolTransfer(
+            name=PoolName.DRAFT,
+            host_indices=torch.arange(2, dtype=torch.int64),
+            device_indices=torch.tensor([60, 61]),
+            indices_from_pool=PoolName.KV,
+        )
+        mamba = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=torch.arange(1, dtype=torch.int64),
+            device_indices=torch.tensor([0]),
+        )
+        ctrl = _make_controller()
+        for name in (PoolName.DRAFT, PoolName.MAMBA):
+            ctrl.mem_pool_host.entry_map[name] = _FakeEntry(
+                name, _FakeHostPool(), device_pool=object()
+            )
+        op = _op()
+        op.pool_transfers.append(draft)
+        pages = ctrl._load_pages(op)
+        self.assertEqual(pages.full.tolist(), list(range(8)) + [60, 61])
+        self.assertEqual(pages.swa.tolist(), [0, 1, 2, 3])
+        op.pool_transfers.append(mamba)
+        self.assertIsNone(ctrl._load_pages(op))
+
+
+def _req(*, row, committed=0, allocated=0, extend=None):
+    return SimpleNamespace(
+        kv=SimpleNamespace(
+            req_pool_idx=row, kv_committed_len=committed, kv_allocated_len=allocated
+        ),
+        extend_range=None if extend is None else Range(*extend),
+    )
+
+
+class TestForwardKvWrites(CustomTestCase):
+    """The pages a launched forward may write: missing one lets a load overwrite
+    KV the forward then clobbers; including the read-only prefix defers loads
+    for nothing."""
+
+    def setUp(self):
+        # Slot of (row r, position p) is 100 * r + p.
+        self.req_to_token = (
+            torch.arange(3).unsqueeze(1) * 100 + torch.arange(16).unsqueeze(0)
+        ).to(torch.int32)
+
+    def _collect(self, mode, reqs, *, page_size=1, translate=None, **batch_fields):
+        batch = SimpleNamespace(
+            forward_mode=mode, reqs=reqs, beam_tail=None, encoder_lens_cpu=None
+        )
+        for name, value in batch_fields.items():
+            setattr(batch, name, value)
+        return collect_forward_kv_writes(
+            batch=batch,
+            req_to_token=self.req_to_token,
+            page_size=page_size,
+            translate_full_to_swa=translate,
+        )
+
+    def test_decode_writes_from_new_token_through_reserve(self):
+        # The new token is already committed; a speculative decode also writes
+        # the reserve allocated past it.
+        pages = self._collect(
+            ForwardMode.DECODE,
+            [
+                _req(row=1, committed=6, allocated=9),
+                _req(row=2, committed=3, allocated=3),
+            ],
+        )
+        self.assertEqual(pages.full.tolist(), [105, 106, 107, 108, 202])
+        self.assertIsNone(pages.swa)
+
+    def test_extend_writes_extend_range_through_allocation(self):
+        pages = self._collect(
+            ForwardMode.EXTEND,
+            [_req(row=0, allocated=10, extend=(4, 8)), _req(row=2, extend=(0, 3))],
+            page_size=4,
+        )
+        # Slots 4-9 and 200-202, as 4-slot pages.
+        self.assertEqual(pages.full.tolist(), [1, 2, 50])
+
+    def test_swa_pages_come_from_translated_slots(self):
+        pages = self._collect(
+            ForwardMode.DECODE,
+            [_req(row=1, committed=6, allocated=7)],
+            translate=lambda slots: slots - 100,
+        )
+        self.assertEqual(pages.full.tolist(), [105, 106])
+        self.assertEqual(pages.swa.tolist(), [5, 6])
+
+    def test_unmodelled_batches_are_unknown(self):
+        self.assertIsNone(
+            self._collect(ForwardMode.TARGET_VERIFY, [_req(row=0, extend=(0, 4))])
+        )
+        self.assertIsNone(self._collect(ForwardMode.EXTEND, [_req(row=0)]))
+        # Rows beyond batch.reqs, and encoder KV below the extend start.
+        self.assertIsNone(
+            self._collect(
+                ForwardMode.DECODE,
+                [_req(row=0, committed=1, allocated=1)],
+                beam_tail=object(),
+            )
+        )
+        self.assertIsNone(
+            self._collect(
+                ForwardMode.EXTEND, [_req(row=0, extend=(4, 8))], encoder_lens_cpu=[4]
+            )
+        )
+        self.assertEqual(self._collect(ForwardMode.IDLE, []).full.numel(), 0)
 
 
 class TestAssemblerPlatformHook(CustomTestCase):

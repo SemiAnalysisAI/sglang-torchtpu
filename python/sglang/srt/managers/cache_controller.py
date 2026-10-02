@@ -444,6 +444,11 @@ class HiCacheController:
         # Set by the scheduler to the forward stream; gates load-back H2D
         # behind in-flight forwards (see start_loading).
         self.load_fence_stream = None
+        # Set by the scheduler: (completion event, KV pages it may write) for
+        # each forward launched but not yet processed (overlap scheduling).
+        # Gates load-back on backends whose H2D copies are not stream-ordered
+        # (raiden).
+        self.in_flight_forwards: Callable[[], List] = list
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)

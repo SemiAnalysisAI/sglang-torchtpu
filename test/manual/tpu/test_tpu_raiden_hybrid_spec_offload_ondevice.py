@@ -29,6 +29,7 @@ from sglang.srt.hardware_backend.tpu.kv_pool_host import TpuRaidenHostKVCache
 from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
     TpuRaidenHybridCacheController,
 )
+from sglang.srt.hardware_backend.tpu.raiden_transfer import RaidenLoadFence
 from sglang.srt.managers.cache_controller import BatchDoneCounter
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import CacheOperation
@@ -121,6 +122,9 @@ def _make_controller(anchor, swa, draft):
     controller.io_backend = "raiden"
     controller.mem_pool_host = _Group(anchor, [swa, draft])
     controller.layer_done_counter = BatchDoneCounter()
+    controller.load_fence = RaidenLoadFence()
+    controller.in_flight_forwards = list
+    controller.page_size = PAGE_SIZE
     controller.write_queue = []
     controller.load_queue = []
     controller.ack_write_queue = []

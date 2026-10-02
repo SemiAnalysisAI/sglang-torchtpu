@@ -62,6 +62,8 @@ from torch.distributed import barrier
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
 
+    from sglang.srt.hardware_backend.tpu.inflight_kv_writes import KVPages
+
 try:
     from sglang.kernels.ops.mamba.triton_ops import (
         initialize_mamba_selective_state_update_backend,
@@ -613,6 +615,7 @@ class Scheduler(
                     self.token_to_kv_pool_allocator.set_host_transfer_move_gate(
                         lambda c=cache_controller: not c.has_inflight_device_transfers()
                     )
+                cache_controller.in_flight_forwards = self._in_flight_forwards
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -1676,8 +1679,34 @@ class Scheduler(
                 TPUAsyncCopyWorker,
             )
 
-            self.tpu_async_copy_worker = TPUAsyncCopyWorker()
+            self.tpu_async_copy_worker = TPUAsyncCopyWorker(
+                # The raiden load fence gates on copy_done (_in_flight_forwards).
+                copy_draft_tail=self.enable_hierarchical_cache
+                and get_memory().hicache_io_backend == "raiden"
+            )
             logger.info("TPU async result-copy worker enabled")
+        # The raiden load fence checks loads against the pages each forward in
+        # flight may write (_in_flight_forwards).
+        self.record_kv_write_pages = (
+            self.device == "tpu"
+            and self.enable_overlap
+            and self.enable_hierarchical_cache
+            and get_memory().hicache_io_backend == "raiden"
+        )
+        if (
+            self.record_kv_write_pages
+            and self.tpu_async_copy_worker is not None
+            and (
+                self.spec_algorithm.is_dflash_family() or self.spec_algorithm.is_ngram()
+            )
+        ):
+            # The fence waits on copy_done, which the async copy worker records
+            # before these algorithms' KV writes that follow the result tensors.
+            raise ValueError(
+                f"{self.spec_algorithm.name} speculative decoding is not supported "
+                "with the raiden HiCache backend and the TPU async copy worker "
+                "under overlap scheduling."
+            )
 
         # CUDA-style forward/copy/schedule streams only buy overlap on backends
         # with real multi-stream execution. Single-queue backends (see
@@ -2185,6 +2214,47 @@ class Scheduler(
         # whatever result is still pending in the queue — including the
         # extend->decode boundary — so no grammar-specific overlap disable is needed.
         return disable_overlap_for_batch or need_grammar_sync
+
+    def _in_flight_forwards(self) -> List[Tuple[Any, Optional["KVPages"]]]:
+        """``(copy_done, KV pages it may write)`` for each launched forward whose
+        result is unprocessed; the pages are None when not recorded.
+
+        Under overlap scheduling a forward may still write KV pages freed after
+        it launched. Each result's ``copy_done`` completes only after its
+        forward's outputs have landed on the host. Loads start before
+        ``launch_batch_sample_if_needed``, so a delayed-sample ``copy_done`` is
+        already recorded here.
+        """
+        if not self.enable_overlap:
+            return []
+        return [
+            (
+                result.copy_done,
+                (
+                    result.kv_write_pages
+                    if isinstance(result, GenerationBatchResult)
+                    else None
+                ),
+            )
+            for _, result in self.result_queue
+            if result.copy_done is not None
+        ]
+
+    def _collect_kv_write_pages(self, batch: ScheduleBatch) -> Optional["KVPages"]:
+        """KV pages the forward just launched for ``batch`` may write."""
+        from sglang.srt.hardware_backend.tpu.inflight_kv_writes import (
+            collect_forward_kv_writes,
+        )
+
+        allocator = self.token_to_kv_pool_allocator
+        return collect_forward_kv_writes(
+            batch=batch,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            page_size=allocator.page_size,
+            translate_full_to_swa=(
+                allocator.translate_loc_from_full_to_swa if self.is_hybrid_swa else None
+            ),
+        )
 
     def _advance_pending_grammar(self):
         """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet
@@ -4623,6 +4693,10 @@ class Scheduler(
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
+                        if self.record_kv_write_pages:
+                            batch_result.kv_write_pages = self._collect_kv_write_pages(
+                                batch
+                            )
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(
                                 batch, future_indices, batch_result

@@ -14,7 +14,8 @@ replaces the single-pool path: raiden issues every copy on its own background
 thread and returns poll-only future-events, which serve as the acks and feed a
 ``BatchDoneCounter`` gating the whole forward instead of a per-layer
 ``LayerDoneCounter``; index tensors stay host-resident throughout
-(``SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1``).
+(``SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1``). Loads go through a ``RaidenLoadFence``
+so their DMAs never land on a page the in-flight forward may still write.
 """
 
 from __future__ import annotations
@@ -24,10 +25,15 @@ from typing import Any, Callable, List, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.inflight_kv_writes import (
+    KVPages,
+    token_slots_to_pages,
+)
 from sglang.srt.hardware_backend.tpu.raiden_transfer import (
     NOOP_EVENT,
     CombinedFutureEvent,
     RaidenFutureEvent,
+    RaidenLoadFence,
 )
 from sglang.srt.managers.cache_controller import BatchDoneCounter, HiCacheAck
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
@@ -52,6 +58,7 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         # whole-batch ``wait()`` resolves against the reload event.
         self.layer_done_counter = BatchDoneCounter()
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
+        self.load_fence = RaidenLoadFence()
 
     # ----- draft registration guards -----------------------------------------
 
@@ -179,6 +186,32 @@ class TpuRaidenHybridCacheController(HybridCacheController):
                 )
         return events
 
+    def _load_pages(self, op: CacheOperation) -> Optional[KVPages]:
+        """Device pages ``_issue_pool_dmas(op, load=True)`` writes, per index
+        space; None if a pool is in neither the full nor the SWA space."""
+        full_slots, swa_slots = [op.device_indices], []
+        for transfer in op.pool_transfers or []:
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is None or entry is self.mem_pool_host.anchor_entry:
+                continue
+            space = transfer.indices_from_pool or transfer.name
+            if transfer.device_indices is None or space not in (
+                PoolName.KV,
+                PoolName.SWA,
+            ):
+                return None
+            (swa_slots if space == PoolName.SWA else full_slots).append(
+                transfer.device_indices
+            )
+        return KVPages(
+            full=token_slots_to_pages(torch.cat(full_slots), self.page_size),
+            swa=(
+                token_slots_to_pages(torch.cat(swa_slots), self.page_size)
+                if swa_slots
+                else None
+            ),
+        )
+
     def start_writing(self) -> None:
         if not self.write_queue:
             return
@@ -204,11 +237,15 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         op = CacheOperation.merge_ops(self.load_queue)
         self.load_queue.clear()
 
-        # All pools' H2d; each future-event comes back before its DMA lands.
-        # The consuming forward's CompiledForwardShim wait() polls the combined
-        # event through the whole-batch gate (poll-only; never Await), so the
-        # DMAs overlap whatever the scheduler runs before that forward.
-        finish_event = CombinedFutureEvent(self._issue_pool_dmas(op, load=True))
+        # All pools' H2D, held back while the forward in flight may still write
+        # a page this load was allocated. The consuming forward's
+        # CompiledForwardShim wait() polls the event through the whole-batch
+        # gate (poll-only; never Await).
+        finish_event = self.load_fence.issue(
+            lambda: self._issue_pool_dmas(op, load=True),
+            self.in_flight_forwards(),
+            self._load_pages(op),
+        )
         self.layer_done_counter.set_event(producer_id, finish_event)
         self.ack_load_queue.append(
             HiCacheAck(

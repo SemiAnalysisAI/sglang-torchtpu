@@ -24,6 +24,7 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.common import async_d2h as _async_d2h
 
 if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.tpu.inflight_kv_writes import KVPages
     from sglang.srt.hardware_backend.tpu.result_copy_worker import TpuAsyncCopyEvent
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -74,6 +75,8 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[Union[torch.cuda.Event, TpuAsyncCopyEvent]] = None
+    # TPU raiden HiCache: KV pages this forward may write, recorded at launch.
+    kv_write_pages: Optional[KVPages] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
