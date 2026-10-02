@@ -86,6 +86,15 @@ class SRTPlatform(DeviceMixin):
 
         return get_mha_host_pool_cls(device_pool)
 
+    def validate_hicache_args(self, server_args) -> None:
+        """Reject HiCache settings this platform's io backends cannot serve.
+
+        Called while resolving server args, once the attention backends are
+        final. Default: nothing. Platforms that add their own
+        ``--hicache-io-backend`` values override this to validate them.
+        """
+        pass
+
     def get_mamba_pool_cls(self) -> type:
         """Return the recurrent (GDN / mamba) state pool class for this platform."""
         from sglang.srt.mem_cache.memory_pool import MambaPool

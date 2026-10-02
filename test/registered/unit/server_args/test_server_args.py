@@ -88,6 +88,7 @@ from sglang.srt.entrypoints.sidecar import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu import tpu_platform
+from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
@@ -2227,6 +2228,11 @@ class TestHiCacheArgs(CustomTestCase):
         args._model_config.is_hybrid_swa = is_hybrid_swa
         return args
 
+    def _handle_hicache_on_tpu(self, args: ServerArgs):
+        # The TPU io-backend checks are the TPU platform's validate_hicache_args.
+        with patch("sglang.srt.platforms.current_platform", TpuSRTPlatform()):
+            handle_hicache(args)
+
     def test_torch_tpu_io_backend_rejects_hybrid_swa(self):
         # The torch_tpu host pool mirrors only the full-attention pool; a
         # hybrid sliding-window model's SWA sub-pool has its own page-id space
@@ -2234,18 +2240,18 @@ class TestHiCacheArgs(CustomTestCase):
         # instead of failing deep inside pool construction.
         args = self._make_tpu_offload_args("torch_tpu", is_hybrid_swa=True)
         with self.assertRaisesRegex(ValueError, "hybrid sliding-window"):
-            handle_hicache(args)
+            self._handle_hicache_on_tpu(args)
 
     def test_raiden_io_backend_accepts_hybrid_swa(self):
         # raiden builds one host pool + engine per SWAKVPool sub-pool, so the
         # hybrid combination is admitted.
         args = self._make_tpu_offload_args("raiden", is_hybrid_swa=True)
-        handle_hicache(args)
+        self._handle_hicache_on_tpu(args)
         self.assertEqual(args.hicache_io_backend, "raiden")
 
     def test_tpu_io_backend_accepts_non_hybrid(self):
         args = self._make_tpu_offload_args("raiden", is_hybrid_swa=False)
-        handle_hicache(args)
+        self._handle_hicache_on_tpu(args)
         self.assertEqual(args.hicache_io_backend, "raiden")
 
     def test_tpu_io_backend_follows_kv_pool(self):
@@ -2280,11 +2286,11 @@ class TestHiCacheArgs(CustomTestCase):
                     lambda: seq_along_lane,
                 ):
                     if message is None:
-                        handle_hicache(args)
+                        self._handle_hicache_on_tpu(args)
                         self.assertEqual(args.hicache_io_backend, io_backend)
                     else:
                         with self.assertRaisesRegex(ValueError, message):
-                            handle_hicache(args)
+                            self._handle_hicache_on_tpu(args)
 
         with (
             patch.object(
