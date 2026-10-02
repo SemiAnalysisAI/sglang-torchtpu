@@ -805,12 +805,30 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         return distributed_top_k_candidate_width_for_model(self.model_runner.model)
 
+    def _warmup_top_k_width(self) -> int | None:
+        """The distributed TopK width the warmup grid is built for.
+
+        Under pipeline parallelism every stage warms the last stage's grid:
+        torch_tpu starts a device's i-th multi-device program only once every
+        device of the slice has started its i-th, so all stages must run as
+        many warmup forwards. A non-last stage's compile key ignores the
+        logits mode, so its extra entries rerun a cached graph. Gathered once
+        over the host channel, before any warmup forward.
+        """
+        pp_group = self.model_runner.pp_group
+        if pp_group is None or pp_group.world_size == 1:
+            return self._distributed_top_k_width()
+        if not hasattr(self, "_pp_warmup_top_k_width"):
+            widths = pp_group.all_gather_object(self._distributed_top_k_width())
+            self._pp_warmup_top_k_width = widths[-1]
+        return self._pp_warmup_top_k_width
+
     def _warmup_logits_output_modes(
         self, batch_size: int
     ) -> tuple[LogitsOutputMode, ...]:
         """Return every logits mode reachable at this physical batch size."""
 
-        if self._distributed_top_k_width() is None:
+        if self._warmup_top_k_width() is None:
             return (LogitsOutputMode.FULL_VOCAB,)
         spec_algorithm = getattr(self.model_runner, "spec_algorithm", None)
         if spec_algorithm is not None and not spec_algorithm.is_none():
