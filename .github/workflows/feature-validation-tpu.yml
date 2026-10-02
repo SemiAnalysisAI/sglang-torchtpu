@@ -31,6 +31,7 @@ on:
         type: choice
         options:
           - all
+          - runtime-diagnostics
           - mh
           - diffusion-mh-collectives
           - topology-artifact-transfer
@@ -98,10 +99,48 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  runtime-diagnostics:
+    if: ${{ inputs.only == 'runtime-diagnostics' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc-v2
+          service_account: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: tpu-cluster
+          location: us-central1-c
+          project_id: sglang-torchtpu
+      - name: Read only PR 943 artifact JobSets and their pods
+        run: |
+          set -euo pipefail
+          kubectl get nodes -l cloud.google.com/gke-tpu-topology=2x2x2 -o json |
+            jq '[.items[] | {name: .metadata.name, pool: .metadata.labels["ci-tpu-pool"], lane: .metadata.labels["ci-tpu-lane"], allocatable: .status.allocatable, conditions: .status.conditions}]'
+          kubectl -n tpu-ci get jobsets -o json > /tmp/jobsets.json
+          jq '[.items[] | select(.metadata.name | startswith("tpu-ci-d104e3450890-")) | {name: .metadata.name, uid: .metadata.uid, created: .metadata.creationTimestamp, labels: .metadata.labels, status}]' /tmp/jobsets.json
+          jq -r '.items[] | select(.metadata.name | startswith("tpu-ci-d104e3450890-")) | [.metadata.name, .metadata.uid] | @tsv' /tmp/jobsets.json |
+            while read -r jobset uid; do
+              kubectl -n tpu-ci get workloads -l "kueue.x-k8s.io/job-uid=$uid" -o json |
+                jq '[.items[] | {name: .metadata.name, status}]'
+              kubectl -n tpu-ci get pods -l "jobset.sigs.k8s.io/jobset-name=$jobset" -o json > /tmp/pods.json
+              jq '[.items[] | {name: .metadata.name, node: .spec.nodeName, created: .metadata.creationTimestamp, status: .status, nodeSelector: .spec.nodeSelector, affinity: .spec.affinity}]' /tmp/pods.json
+              jq -r '.items[].metadata.name' /tmp/pods.json | while read -r pod; do
+                kubectl -n tpu-ci get events --field-selector "involvedObject.name=$pod" -o json |
+                  jq '[.items[] | {reason, message, firstTimestamp, lastTimestamp}]'
+                kubectl -n tpu-ci logs "$pod" --all-containers --timestamps --tail=100 || true
+              done
+            done
+
   # Standalone runs build their own image; the nightly passes one in so every
   # stage of the run tests a single build.
   build:
-    if: ${{ (inputs.image || '') == '' }}
+    if: ${{ inputs.only != 'runtime-diagnostics' && (inputs.image || '') == '' }}
     uses: ./.github/workflows/_tpu-build.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
