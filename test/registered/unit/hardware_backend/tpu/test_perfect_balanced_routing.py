@@ -5,7 +5,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.moe.topk import (
-    _simulate_perfect_balanced_routing,
+    _simulate_tpu_perfect_balanced_routing,
     _tpu_perfect_balanced_routing_enabled,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -37,13 +37,13 @@ def test_tpu_flag_is_enabled_on_tpu():
         assert _tpu_perfect_balanced_routing_enabled()
 
 
-def test_perfect_balanced_routing_spreads_assignments_across_ranks():
+def test_tpu_perfect_balanced_routing_spreads_assignments_across_ranks():
     num_experts, topk, ep_size = 256, 8, 16
     for num_tokens in (1, 2, 4, 300):
         ids = torch.full((num_tokens, topk), -1, dtype=torch.int32)
         weights = torch.zeros((num_tokens, topk), dtype=torch.float32)
 
-        _simulate_perfect_balanced_routing(
+        _simulate_tpu_perfect_balanced_routing(
             ids,
             weights,
             num_experts,
@@ -58,12 +58,12 @@ def test_perfect_balanced_routing_spreads_assignments_across_ranks():
         torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / topk))
 
 
-def test_perfect_balanced_routing_uses_routed_topk_as_assignment_stride():
+def test_tpu_perfect_balanced_routing_uses_routed_topk_as_assignment_stride():
     num_experts, routed_topk, total_topk, ep_size = 256, 8, 9, 16
     ids = torch.full((2, total_topk), -1, dtype=torch.int32)
     weights = torch.zeros((2, total_topk), dtype=torch.float32)
 
-    _simulate_perfect_balanced_routing(
+    _simulate_tpu_perfect_balanced_routing(
         ids,
         weights,
         num_experts,

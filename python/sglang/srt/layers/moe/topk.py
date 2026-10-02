@@ -534,7 +534,7 @@ def _simulate_balanced_routing(
     )
 
 
-def _simulate_perfect_balanced_routing(
+def _simulate_tpu_perfect_balanced_routing(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     num_experts: int,
@@ -2559,11 +2559,11 @@ def select_experts(
 
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
-    simulate_perfect_balanced_experts = _tpu_perfect_balanced_routing_enabled()
+    simulate_tpu_perfect_balanced_experts = _tpu_perfect_balanced_routing_enabled()
     if (
         simulate_uniform_experts
         + simulate_round_robin_experts
-        + simulate_perfect_balanced_experts
+        + simulate_tpu_perfect_balanced_experts
         > 1
     ):
         raise ValueError(
@@ -2574,7 +2574,7 @@ def select_experts(
     routing_overridden = (
         simulate_uniform_experts
         or simulate_round_robin_experts
-        or simulate_perfect_balanced_experts
+        or simulate_tpu_perfect_balanced_experts
     )
 
     (
@@ -2803,8 +2803,8 @@ def select_experts(
             # its routing must remain identical across those replicas.
             token_shard_rank, num_token_shards = 0, 1
 
-        if simulate_perfect_balanced_experts:
-            _simulate_perfect_balanced_routing(
+        if simulate_tpu_perfect_balanced_experts:
+            _simulate_tpu_perfect_balanced_routing(
                 topk_ids,
                 topk_weights,
                 router_logits.shape[1],
