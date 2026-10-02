@@ -68,31 +68,15 @@ class TestTpuPlatformSurface(unittest.TestCase):
     def test_p2p_is_unsupported(self):
         self.assertFalse(TpuPlatform.supports_distributed_p2p())
 
-    def test_spatial_shard_decode_is_refused_without_p2p(self):
+    def test_spatial_shard_decode_does_not_need_p2p(self):
         from sglang.multimodal_gen.configs.models.vaes import base as vae_base
         from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
 
-        platform = MagicMock()
-        platform.supports_distributed_p2p.return_value = False
-        with patch.object(vae_base, "current_platform", platform):
-            self.assertFalse(
-                vae_base.should_use_spatial_shard_parallel_decode(
-                    WanVAEConfig(), world_size=2
-                )
+        self.assertTrue(
+            vae_base.should_use_spatial_shard_parallel_decode(
+                WanVAEConfig(), world_size=2
             )
-
-    def test_spatial_shard_decode_survives_where_p2p_works(self):
-        from sglang.multimodal_gen.configs.models.vaes import base as vae_base
-        from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
-
-        platform = MagicMock()
-        platform.supports_distributed_p2p.return_value = True
-        with patch.object(vae_base, "current_platform", platform):
-            self.assertTrue(
-                vae_base.should_use_spatial_shard_parallel_decode(
-                    WanVAEConfig(), world_size=2
-                )
-            )
+        )
 
     def test_platform_defaults_leave_other_backends_alone(self):
         from sglang.multimodal_gen.runtime.platforms.interface import Platform
