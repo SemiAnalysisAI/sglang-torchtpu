@@ -209,5 +209,47 @@ class TestAutoProfileCompletion(CustomTestCase):
             self.assertFalse((Path(tmp) / ".xprof-done").exists())
 
 
+class TestTpuSessionLayout(CustomTestCase):
+    def test_ranks_share_one_session_under_distinct_names(self):
+        # Separate per-rank directories are separate XProf runs, one chip each;
+        # a collective can only be read across chips from one session.
+        layouts = []
+        for tp_rank in (0, 1):
+            with (
+                self.subTest(tp_rank=tp_rank),
+                tempfile.TemporaryDirectory() as tmp,
+                patch(
+                    "sglang.srt.managers.scheduler_components.profiler_manager._is_tpu",
+                    True,
+                ),
+                patch(
+                    "sglang.srt.hardware_backend.tpu.profiler.start_tpu_profile"
+                ) as start,
+            ):
+                mgr = _make_manager(tmp, auto_profile=True, auto_profile_steps=1)
+                mgr.ps.tp_rank = tp_rank
+                mgr.profile_id = "auto-1"
+
+                mgr._start_profile(ForwardMode.DECODE)
+
+                kwargs = start.call_args.kwargs
+                run = Path(tmp) / "profile-auto-1"
+                layouts.append(
+                    (
+                        kwargs["session_dir"].relative_to(run),
+                        kwargs["output_dir"].relative_to(run),
+                        kwargs["file_suffix"],
+                    )
+                )
+
+        self.assertEqual(
+            layouts,
+            [
+                (Path("plugins/profile/DECODE"), Path(".staging/DECODE-TP-0"), "-TP-0"),
+                (Path("plugins/profile/DECODE"), Path(".staging/DECODE-TP-1"), "-TP-1"),
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

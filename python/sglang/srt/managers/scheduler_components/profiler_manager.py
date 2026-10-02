@@ -233,7 +233,10 @@ class SchedulerProfilerManager:
         if merge_profiles and _is_tpu:
             return ProfileReqOutput(
                 success=False,
-                message="merge_profiles is not supported for TPU profiling.",
+                message=(
+                    "merge_profiles is not supported for TPU profiling: every "
+                    "rank's trace already lands in one XProf session."
+                ),
             )
 
         self.profile_by_stage = profile_by_stage
@@ -317,18 +320,22 @@ class SchedulerProfilerManager:
             if _is_tpu:
                 from sglang.srt.hardware_backend.tpu.profiler import start_tpu_profile
 
-                subdir_parts = [self.profile_prefix or "profile"]
+                run_parts = [self.profile_prefix or "profile"]
                 if self.profile_id:
-                    subdir_parts.append(str(self.profile_id))
-                if stage is not None:
-                    subdir_parts.append(stage.name)
-                # xprof names the trace file after the host, so ranks sharing a
-                # host need separate directories or they overwrite each other.
-                subdir_parts.extend(self._rank_parts())
+                    run_parts.append(str(self.profile_id))
+                run_dir = self.torch_profiler_output_dir / "-".join(run_parts)
+                session = stage.name if stage is not None else "ALL"
+                rank_tag = "-".join(self._rank_parts())
+                # Each process traces only its own chip. Every rank publishes
+                # into one XProf session so the engine reads as one timeline;
+                # xprof names the file after the host, so the rank tag keeps
+                # co-hosted ranks from overwriting each other.
                 # "TPU" -> TPU-only. "TPU"+"CPU" -> CPU and TPU.
                 self.tpu_profiler = start_tpu_profile(
-                    output_dir=self.torch_profiler_output_dir / "-".join(subdir_parts),
+                    output_dir=run_dir / ".staging" / f"{session}-{rank_tag}",
                     with_cpu="CPU" in activities,
+                    session_dir=run_dir / "plugins" / "profile" / session,
+                    file_suffix=f"-{rank_tag}",
                 )
             self.profile_in_progress = True
         elif "RPD" in activities:  # for ROCM
