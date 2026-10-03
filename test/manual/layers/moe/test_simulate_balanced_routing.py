@@ -1,5 +1,6 @@
-"""Unit tests for benchmark-only balanced-routing overrides in
-``sglang.srt.layers.moe.topk``.
+"""Unit tests for the fused benchmark-only balanced-routing override in
+``sglang.srt.layers.moe.topk`` (``_simulate_balanced_routing`` /
+``_simulate_balanced_routing_kernel``).
 
 Verifies the single fused Triton kernel reproduces the
 ``_make_round_robin_expert_ids`` reference exactly (incl. the per-layer offset),
@@ -16,9 +17,7 @@ from typing import Optional, Tuple
 import torch
 from parameterized import parameterized
 
-from sglang.srt.layers.moe.topk import (
-    _simulate_balanced_routing,
-)
+from sglang.srt.layers.moe.topk import _simulate_balanced_routing
 from sglang.test.test_utils import CustomTestCase
 
 E = 256  # num_experts
