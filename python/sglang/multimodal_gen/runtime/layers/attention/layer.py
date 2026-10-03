@@ -1329,6 +1329,17 @@ class USPAttention(nn.Module):
                     out = _usp_output_all_to_all(out, head_dim=2)
                 return out
 
+            if meta_only_pad and meta_pad_end == q.shape[1]:
+                # Padding only at the gathered tail: attend over the real key
+                # prefix with the selected backend; no mask to build.
+                out = self.attn_impl.forward(
+                    q, k[:, :meta_pad_start], v[:, :meta_pad_start], ctx_attn_metadata
+                )
+                out[:, meta_pad_start:] = 0
+                if sp_size > 1:
+                    out = _usp_output_all_to_all(out, head_dim=2)
+                return out
+
             # If NCCL timeout/deadlock occurs here, check whether
             # attn_mask is inconsistent across SP ranks (None on some, Tensor on
             # others), which causes all_gather participant mismatch. Upstream
