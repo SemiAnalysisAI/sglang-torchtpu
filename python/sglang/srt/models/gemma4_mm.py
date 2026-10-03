@@ -84,6 +84,13 @@ def _encode(vision_tower, pixel_values, position_ids):
     return vision_tower(pixel_values, position_ids)
 
 
+def _features_out(features: torch.Tensor) -> torch.Tensor:
+    # The TPU embed path places multimodal rows on the host unless told otherwise.
+    if _is_tpu and not envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.get():
+        return features.to("cpu")
+    return features
+
+
 cached_get_processor = lru_cache(get_processor)
 
 
@@ -489,7 +496,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     )
 
         if all_embeds:
-            return torch.cat(all_embeds, dim=0)
+            return _features_out(torch.cat(all_embeds, dim=0))
         else:
             return torch.empty(
                 0,
@@ -552,7 +559,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     )
 
         if all_embeds:
-            return torch.cat(all_embeds, dim=0)
+            return _features_out(torch.cat(all_embeds, dim=0))
         else:
             return torch.empty(
                 0,
@@ -598,7 +605,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 all_embeds.append(enc[~mask])
 
         if all_embeds:
-            return torch.cat(all_embeds, dim=0)
+            return _features_out(torch.cat(all_embeds, dim=0))
         else:
             return torch.empty(
                 0,
