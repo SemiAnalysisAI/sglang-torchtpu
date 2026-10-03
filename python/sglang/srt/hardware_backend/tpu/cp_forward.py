@@ -17,7 +17,7 @@ agree by running identical admission code over identical state.
 from __future__ import annotations
 
 import functools
-from typing import Any, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 import numpy as np
 import torch
@@ -270,6 +270,9 @@ def all_gather_and_write_kv(
     write_segments: torch.Tensor,
     write_num_segments: torch.Tensor,
     group: Any,
+    quantize: (
+        Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]] | None
+    ) = None,
 ) -> None:
     """All-gather this layer's local K/V over the context-parallel group and
     write the gathered rows into ``kv_cache`` along ``write_segments``.
@@ -279,14 +282,29 @@ def all_gather_and_write_kv(
     own rows too; the attention kernel rewrites them with identical bytes
     afterwards. Runs are DMAed into the layer buffer in place: an XLA scatter
     here would re-lay out the whole pool around it on every layer.
+
+    For an fp8 pool ``k``/``v`` are the compute-dtype tensors and ``quantize``
+    maps the gathered K/V to the pool dtype.
     """
-    rows = fused_kv_rows(k, v, kv_cache).contiguous()
-    target = kv_cache
-    if kv_cache.dtype in _FP8_DTYPES:
-        target = kv_cache.view(torch.uint8)
-    gathered = rows.new_empty((group.world_size * rows.shape[0], *rows.shape[1:]))
-    group.all_gather_into_tensor(gathered, rows)
-    write_rows_torch(write_num_segments, write_segments, gathered, target)
+    if quantize is None and kv_cache.dtype in (*_FP8_DTYPES, torch.uint8):
+        raise ValueError(
+            f"A {kv_cache.dtype} KV pool needs `quantize` to write gathered K/V rows."
+        )
+    if quantize is not None:
+        # Gathered in the compute dtype: an 8-bit all-gather here writes wrong rows.
+        # TODO(yinlin09): gather the fp8 rows directly
+        # once an 8-bit all-gather inside the compiled forward writes correct rows.
+        k_all = k.new_empty((group.world_size * k.shape[0], *k.shape[1:]))
+        v_all = v.new_empty((group.world_size * v.shape[0], *v.shape[1:]))
+        group.all_gather_into_tensor(k_all, k.contiguous())
+        group.all_gather_into_tensor(v_all, v.contiguous())
+        k, v = quantize(k_all, v_all)
+        gathered = fused_kv_rows(k, v, kv_cache).contiguous().view(kv_cache.dtype)
+    else:
+        rows = fused_kv_rows(k, v, kv_cache).contiguous()
+        gathered = rows.new_empty((group.world_size * rows.shape[0], *rows.shape[1:]))
+        group.all_gather_into_tensor(gathered, rows)
+    write_rows_torch(write_num_segments, write_segments, gathered, kv_cache)
 
 
 # ---------------------------------------------------------------------------

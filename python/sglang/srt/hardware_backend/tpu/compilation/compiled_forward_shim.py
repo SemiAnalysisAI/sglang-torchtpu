@@ -165,6 +165,7 @@ def _localize_cp_inputs(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     cp_layout: Any,
+    embeds_tokens: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[Any, ...]]:
     """Present this rank's zigzag rows to a context-parallel graph call.
 
@@ -180,15 +181,18 @@ def _localize_cp_inputs(
     # them local like every other token-indexed input; leaving them global is a
     # serve-time recompile, which `fail_on_recompile` turns into a crash on the
     # first request.
-    if kwargs.get("input_embeds") is not None:
+    supplied_embeds = kwargs.get("input_embeds") is not None
+    if supplied_embeds:
         kwargs["input_embeds"] = cp_local_embeds(
             input_embeds=kwargs["input_embeds"], layout=cp_layout
         )
-        # A caller that supplies embeddings has no lookup to run; the ids only
-        # size the local rows.
-        input_ids = local_ids
     else:
         args = _cp_localize_embeds_in_args(args=args, cp_layout=cp_layout)
+    if supplied_embeds or not embeds_tokens:
+        # Later stages take their activations from the proxy, and a caller that
+        # supplies embeddings has no lookup to run; the ids only size the rows.
+        input_ids = local_ids
+    else:
         # The embedding takes the global ids and keeps the rank's rows.
         kwargs["cp_local_rows"] = cp_layout.local_rows
     forward_batch.input_ids = local_ids
@@ -902,8 +906,7 @@ class CompiledForwardShim:
         self._model_label = model_label
 
     def _is_first_pp_stage(self) -> bool:
-        pp_group = self.policy.model_runner.pp_group
-        return pp_group is not None and bool(pp_group.is_first_rank)
+        return bool(self.policy.model_runner.pp_group.is_first_rank)
 
     def wait_for_hicache_reload(self) -> None:
         """Wait for the current HiCache reload outside compiled regions."""
@@ -1017,18 +1020,6 @@ class CompiledForwardShim:
             )
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds
-        pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
-        if pp_proxy_tensors is not None:
-            if self._is_first_pp_stage():
-                # The first stage embeds its own input; its graph takes no proxy.
-                kwargs.pop("pp_proxy_tensors")
-            else:
-                kwargs["pp_proxy_tensors"] = _fit_pp_proxy_rows(
-                    pp_proxy_tensors, input_ids, forward_batch
-                )
-        elif any(isinstance(value, PPProxyTensors) for value in args):
-            if not self._is_first_pp_stage():
-                args = _fit_pp_proxy_in_args(args, input_ids, forward_batch)
         # Pin is_prefill_only for the compiled forward. An idle batch computes
         # it as True (all() over zero requests) while real batches are False;
         # the compiled forward reads the value, so it must be identical across
@@ -1091,6 +1082,24 @@ class CompiledForwardShim:
                     args=args,
                     kwargs=kwargs,
                     cp_layout=cp_layout,
+                    embeds_tokens=self._is_first_pp_stage(),
+                )
+        # A proxy holds the previous stage's local rows; fit it after localizing.
+        pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
+        if pp_proxy_tensors is not None:
+            if self._is_first_pp_stage():
+                # The first stage embeds its own input; its graph takes no proxy.
+                kwargs.pop("pp_proxy_tensors")
+            else:
+                kwargs["pp_proxy_tensors"] = _fit_pp_proxy_rows(
+                    proxy=pp_proxy_tensors,
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                )
+        elif any(isinstance(value, PPProxyTensors) for value in args):
+            if not self._is_first_pp_stage():
+                args = _fit_pp_proxy_in_args(
+                    args=args, input_ids=input_ids, forward_batch=forward_batch
                 )
         try:
             out = fn(input_ids, positions, forward_batch, *args, **kwargs)

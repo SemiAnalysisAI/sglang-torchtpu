@@ -166,6 +166,11 @@ class SRTPlatform(DeviceMixin):
         """
         return False
 
+    def supports_moe_dp_pipeline_stages(self) -> bool:
+        """Whether a pipeline stage may replicate its experts over its own
+        devices (--moe-dp-size > 1 with --pp-size > 1)."""
+        return False
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------

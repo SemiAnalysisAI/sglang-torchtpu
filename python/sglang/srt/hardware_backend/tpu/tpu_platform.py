@@ -205,14 +205,18 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
     """Reject server configurations pipeline parallelism on TPU cannot run,
     and pin the scheduler order the stage hand-off needs.
 
-    Every pipeline stage is one process on one device. Activations move over
+    Every device is one process, and a stage is one device or one
+    context-parallel group of devices. Activations move over
     ICI as one collective-permute launched by every stage in lockstep, so a
     stage's forward waits on launches the other stages issue at the top of
     their next iteration. The scheduler must therefore receive and forward
     the last stage's outputs before it launches a forward, not after: that is
     the async-batch-depth 1 order (depth 0 does the ring exchange after the
-    forward and the two waits form a cycle). Tensor parallelism inside a stage
-    would need the stages to share a second device collective and is rejected.
+    forward and the two waits form a cycle). A stage may span several devices
+    only as a prefill context-parallel group (--tp-size equal to
+    --attn-cp-size): its collectives then run over the stage's own devices
+    (this needs a torch_tpu that compiles a collective for its device group
+    only), while the hand-off stays the one collective every stage launches.
     """
     from sglang.srt.arg_groups.overrides import (
         declare_resolution,
@@ -236,12 +240,27 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
         declare_resolution(
             server_args, "tpu.apply_server_args_defaults", pp_async_batch_depth=1
         )
-    if cfg.tp_size > 1:
+    if cfg.tp_size > 1 and cfg.attn_cp_size != cfg.tp_size:
         raise NotImplementedError(
-            "Pipeline parallelism on TPU requires --tp-size 1 "
-            f"(got --tp-size {cfg.tp_size} with --pp-size {pp}): "
-            "tensor parallelism inside a pipeline stage is not supported."
+            "Pipeline parallelism on TPU requires --tp-size 1 or --attn-cp-size "
+            f"equal to --tp-size (got --tp-size {cfg.tp_size} with --attn-cp-size "
+            f"{cfg.attn_cp_size} and --pp-size {pp})."
         )
+    if cfg.attn_cp_size > 1:
+        if cfg.kv_cache_dtype in ("fp8_e4m3", "fp8_e5m2"):
+            raise NotImplementedError(
+                "Pipeline stages made of a context-parallel group support only a "
+                "bf16 KV cache (--kv-cache-dtype bfloat16), got --kv-cache-dtype "
+                f"{cfg.kv_cache_dtype}."
+            )
+        if cfg.kv_cache_dtype == "auto":
+            logger.info(
+                "Pipeline stages made of a context-parallel group run with "
+                "--kv-cache-dtype bfloat16."
+            )
+            declare_resolution(
+                server_args, "tpu.apply_server_args_defaults", kv_cache_dtype="bfloat16"
+            )
     if cfg.speculative_algorithm is not None:
         raise NotImplementedError(
             "Speculative decoding "
@@ -628,6 +647,9 @@ class TpuSRTPlatform(SRTPlatform):
 
     def support_piecewise_cuda_graph(self) -> bool:
         return False
+
+    def supports_moe_dp_pipeline_stages(self) -> bool:
+        return True
 
     def supports_overlap_streams(self) -> bool:
         # torch_tpu serialises all device work on a single implicit PJRT queue:

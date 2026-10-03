@@ -330,7 +330,7 @@ def _proxy(rows: int):
     )
 
 
-def _shim(pp_group=None):
+def _shim(pp_group):
     def forward(input_ids, positions, forward_batch, pp_proxy_tensors=None):
         pass
 
@@ -428,12 +428,36 @@ class TestShimProxyCheck(CustomTestCase):
         shim(fb.input_ids, None, fb, pp_proxy_tensors=_proxy(32))
         self.assertNotIn("pp_proxy_tensors", compiled.call_args.kwargs)
 
-    def test_on_a_single_stage_the_proxy_is_checked_and_forwarded(self):
-        shim, compiled = _shim()
-        fb = _forward_batch(64)
-        proxy = _proxy(64)
-        shim(fb.input_ids, None, fb, pp_proxy_tensors=proxy)
-        self.assertIs(compiled.call_args.kwargs["pp_proxy_tensors"], proxy)
+    def _cp_layout(self, local_rows: int):
+        return SimpleNamespace(
+            host=SimpleNamespace(cp_size=2, local_rows_padded=local_rows),
+            local_rows=torch.arange(local_rows),
+        )
+
+    def test_first_stage_embeds_the_global_ids_and_keeps_its_rows(self):
+        shim, compiled = _shim(_pp_group(first=True, last=False))
+        shim._attn_cp_size = 2
+        fb = _forward_batch(48)
+        fb.positions = torch.arange(48)
+        fb._tpu_cp_layout = self._cp_layout(32)
+        shim(fb.input_ids, fb.positions, fb)
+        args, kwargs = compiled.call_args
+        self.assertEqual(args[0].shape[0], 64)  # global ids padded to cp x local rows
+        self.assertEqual(kwargs["cp_local_rows"].shape[0], 32)
+
+    def test_later_stages_take_local_rows_and_fit_the_proxy_to_them(self):
+        shim, compiled = _shim(_pp_group(first=False, last=False))
+        shim._attn_cp_size = 2
+        fb = _forward_batch(48)
+        fb.positions = torch.arange(48)
+        fb._tpu_cp_layout = self._cp_layout(32)
+        shim(fb.input_ids, fb.positions, fb, pp_proxy_tensors=_proxy(64))
+        args, kwargs = compiled.call_args
+        self.assertEqual(args[0].shape[0], 32)
+        self.assertNotIn("cp_local_rows", kwargs)
+        self.assertEqual(
+            kwargs["pp_proxy_tensors"].tensors["hidden_states"].shape[0], 32
+        )
 
     def test_default_none_proxy_is_still_dropped(self):
         shim, compiled = _shim(_pp_group(first=False, last=False))

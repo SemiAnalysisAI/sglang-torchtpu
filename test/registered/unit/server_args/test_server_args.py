@@ -1501,6 +1501,29 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
 
+    def test_pipeline_stage_moe_dp_needs_platform_support(self):
+        from sglang.srt.platforms import current_platform
+
+        stage_args = dict(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            attn_cp_size=2,
+            tp_size=2,
+            moe_dp_size=2,
+            pp_size=4,
+        )
+
+        with patch.object(
+            current_platform, "supports_moe_dp_pipeline_stages", return_value=True
+        ):
+            handle_context_parallelism(self._new_cp_args(**stage_args))
+
+        with patch.object(
+            current_platform, "supports_moe_dp_pipeline_stages", return_value=False
+        ):
+            with self.assertRaisesRegex(AssertionError, "PP is not supported"):
+                handle_context_parallelism(self._new_cp_args(**stage_args))
+
 
 class TestFlashinferA2ADispatchType(CustomTestCase):
     def setUp(self):

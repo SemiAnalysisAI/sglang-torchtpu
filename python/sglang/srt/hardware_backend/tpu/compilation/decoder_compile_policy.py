@@ -584,7 +584,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 if self._cp_strategy is not None:
                     install_cp_logits_forward(logits_processor)
 
-        if self._cp_strategy is not None and not is_draft_worker:
+        if (
+            self._cp_strategy is not None
+            and not is_draft_worker
+            and self.model_runner.pp_group.is_first_rank
+        ):
             compile_fn = wrap_cp_embedding_forward(
                 compile_fn, self.model_runner.model.get_input_embeddings()
             )

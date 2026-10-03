@@ -182,9 +182,10 @@ Supported: chunked prefill, `--kv-cache-dtype fp8_e4m3`, `--max-total-tokens`
 holds one prefill chunk per pipeline slot on top of `--swa-full-tokens-ratio`).
 Rejected at launch with `--pp-size > 1` on TPU: eager mode (without
 `--enable-torch-compile`),
-`--tp-size > 1` (a pipeline stage is one device), speculative decoding, and
-`--enable-dynamic-chunking`. Input (prompt) logprobs are rejected per request.
-`--ep-size` and `--dp-size` have not been run with pipeline parallelism on
+`--tp-size > 1` (a stage is one device, or one context-parallel group as
+below), speculative decoding, and `--enable-dynamic-chunking`. Input (prompt)
+logprobs are rejected per request.
+`--dp-size` has not been run with pipeline parallelism on
 TPU. Overlap scheduling is switched off by pipeline parallelism itself. A
 stage waiting for the previous stage looks idle to the watchdog, so pass
 `--watchdog-timeout` at least `pp_size` times the longest microbatch.
@@ -194,6 +195,21 @@ torch.compile warmup doesn't yet cover all compile-shape buckets:
 
 ```bash
 MODEL=Qwen/Qwen3-32B ./warmup.sh
+```
+
+### Context-parallel stages (PP4 x PCP2)
+
+Requires `--tp-size` equal to `--attn-cp-size`, a bf16 KV cache, and a
+torch_tpu that compiles a stage's collectives for the stage's devices only.
+
+```bash
+MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
+TP_SIZE=2 PP_SIZE=4 PP_MAX_MICRO_BATCH_SIZE=4 KV_CACHE_DTYPE=bfloat16 \
+PAGE_SIZE=128 CONTEXT_LEN=32768 CONC=32 \
+CHUNKED_PREFILL_SIZE=16384 MAX_PREFILL_TOKENS=16384 \
+MEM_FRACTION_STATIC=0.30 TORCH_COMPILE_MAX_BS=32 \
+EXTRA_ARGS="--attn-cp-size 2 --enable-prefill-cp --cp-strategy zigzag --moe-dp-size 2 --sampling-backend pytorch --watchdog-timeout 3600" \
+./launch_server.sh
 ```
 
 ### Prefill chunk sizing

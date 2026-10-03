@@ -1272,11 +1272,20 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # scales come from the same ``k_scale_float``/``v_scale_float`` the GPU
         # backends use; they default to 1.0 when the checkpoint carries no KV
         # scales (e.g. a bf16-weight model run with --kv-cache-dtype fp8_e4m3).
+        quantize_kv = None
         if self.kv_cache_quant_dtype is not None:
             k_scale = layer.k_scale_float if layer.k_scale_float is not None else 1.0
             v_scale = layer.v_scale_float if layer.v_scale_float is not None else 1.0
-            k = _quantize_kv_to_fp8(k, k_scale, self.kv_cache_quant_dtype)
-            v = _quantize_kv_to_fp8(v, v_scale, self.kv_cache_quant_dtype)
+            quant_dtype = self.kv_cache_quant_dtype
+
+            def quantize_kv(k_in, v_in):
+                return (
+                    _quantize_kv_to_fp8(k_in, k_scale, quant_dtype),
+                    _quantize_kv_to_fp8(v_in, v_scale, quant_dtype),
+                )
+
+            k_compute, v_compute = k, v
+            k, v = quantize_kv(k, v)
         else:
             k_scale = None
             v_scale = None
@@ -1292,11 +1301,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         if cp_write_segments is not None:
             all_gather_and_write_kv(
                 kv_cache=kv_cache,
-                k=k,
-                v=v,
+                k=k if quantize_kv is None else k_compute,
+                v=v if quantize_kv is None else v_compute,
                 write_segments=cp_write_segments,
                 write_num_segments=cp_write_num_segments,
                 group=get_parallel().attn_cp_group,
+                quantize=quantize_kv,
             )
 
         draft_kv_lens = getattr(forward_batch.spec_info, "rpa_draft_kv_lens", None)
