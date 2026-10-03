@@ -27,6 +27,15 @@ HIDDEN_SIZE = 512
 INTERMEDIATE_SIZE = 512
 
 
+def _parallel_ns(**overrides) -> types.SimpleNamespace:
+    """The `runtime_context.get_parallel()` fields the fused-RS gate reads."""
+    defaults = dict(
+        attn_dp_size=1, enable_dp_attention=False, pp_size=1, attn_cp_size=1
+    )
+    defaults.update(overrides)
+    return types.SimpleNamespace(**defaults)
+
+
 def _make_block512_layer(
     include_unused_params: bool = True, group_size: int = BLOCK_SIZE
 ) -> torch.nn.Module:
@@ -243,12 +252,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
         tp_group = types.SimpleNamespace(world_size=4)
         world_group = types.SimpleNamespace(world_size=4)
-        parallel = types.SimpleNamespace(
-            attn_dp_size=1,
-            enable_dp_attention=False,
-            tp_group=tp_group,
-            world_group=world_group,
-        )
+        parallel = _parallel_ns(tp_group=tp_group, world_group=world_group)
         exec_ns = types.SimpleNamespace(
             moe=types.SimpleNamespace(enable_fused_moe_sum_all_reduce=False)
         )
@@ -342,12 +346,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
         tp_group = types.SimpleNamespace(world_size=4)
         world_group = types.SimpleNamespace(world_size=4)
-        parallel = types.SimpleNamespace(
-            attn_dp_size=1,
-            enable_dp_attention=False,
-            tp_group=tp_group,
-            world_group=world_group,
-        )
+        parallel = _parallel_ns(tp_group=tp_group, world_group=world_group)
         exec_ns = types.SimpleNamespace(
             moe=types.SimpleNamespace(enable_fused_moe_sum_all_reduce=False)
         )
@@ -386,6 +385,58 @@ class TestNvfp4Block512Contract(CustomTestCase):
                     "no_combine matches the model's post-expert-norm contract",
                 ],
             )
+
+    def test_pipeline_and_prefill_cp_decline_fused_rs(self):
+        """Prefill CP leaves the TP and world sizes alone, so only its own entry
+        catches it; PP is also caught by the world-size check."""
+        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+            unmet_tpu_nvfp4_fused_rs_requirements,
+        )
+
+        layer = types.SimpleNamespace(
+            moe_ep_size=4,
+            allow_backend_reduction=True,
+            num_fused_shared_experts=0,
+            moe_runner_config=types.SimpleNamespace(
+                is_gated=True,
+                activation="silu",
+                apply_router_weight_on_input=False,
+            ),
+        )
+
+        def unmet(world_size, **parallel):
+            parallel = _parallel_ns(
+                tp_group=types.SimpleNamespace(world_size=4),
+                world_group=types.SimpleNamespace(world_size=world_size),
+                **parallel,
+            )
+            with (
+                mock.patch(
+                    "sglang.srt.runtime_context.get_parallel", return_value=parallel
+                ),
+                mock.patch(
+                    "sglang.srt.runtime_context.get_exec",
+                    return_value=types.SimpleNamespace(
+                        moe=types.SimpleNamespace(enable_fused_moe_sum_all_reduce=False)
+                    ),
+                ),
+                mock.patch(
+                    "sglang.srt.layers.moe.get_moe_a2a_backend",
+                    return_value=types.SimpleNamespace(is_none=lambda: True),
+                ),
+            ):
+                return unmet_tpu_nvfp4_fused_rs_requirements(
+                    layer, group_size=BLOCK_SIZE, no_combine=False
+                )
+
+        self.assertEqual(
+            unmet(world_size=4, attn_cp_size=8),
+            ["prefill context parallelism disabled"],
+        )
+        self.assertEqual(
+            unmet(world_size=8, pp_size=2),
+            ["pipeline parallelism disabled", "moe_ep_size == tp_size == world_size"],
+        )
 
     def test_non_rs_no_combine_passes_masked_routing_to_pallas(self):
         from sglang.srt.hardware_backend.tpu import fp4_moe
@@ -1311,9 +1362,7 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
             ),
             mock.patch(
                 "sglang.srt.runtime_context.get_parallel",
-                return_value=types.SimpleNamespace(
-                    attn_dp_size=1,
-                    enable_dp_attention=False,
+                return_value=_parallel_ns(
                     tp_group=types.SimpleNamespace(world_size=world_size),
                     world_group=types.SimpleNamespace(world_size=world_size),
                 ),

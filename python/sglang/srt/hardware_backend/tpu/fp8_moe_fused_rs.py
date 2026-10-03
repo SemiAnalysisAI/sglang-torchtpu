@@ -21,6 +21,7 @@ from sglang.srt.hardware_backend.tpu.fused_rs_sequence_parallel import (
     prepare_tpu_fused_rs_post_expert_norm,
 )
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+from sglang.srt.utils import print_info_once
 
 
 def supports_fp8_fused_rs(
@@ -41,6 +42,7 @@ def supports_fp8_fused_rs(
     standard_dispatcher: bool,
     enable_dp_attention: bool,
     enable_fused_moe_sum_all_reduce: bool,
+    attn_cp_size: int,
 ) -> bool:
     """Return whether the runtime layout matches the validated fused-RS path."""
     return (
@@ -61,6 +63,7 @@ def supports_fp8_fused_rs(
             standard_dispatcher=standard_dispatcher,
             enable_dp_attention=enable_dp_attention,
             enable_fused_moe_sum_all_reduce=enable_fused_moe_sum_all_reduce,
+            attn_cp_size=attn_cp_size,
         )
         is None
     )
@@ -84,10 +87,19 @@ def fp8_fused_rs_unsupported_reason(
     standard_dispatcher: bool,
     enable_dp_attention: bool,
     enable_fused_moe_sum_all_reduce: bool,
+    attn_cp_size: int,
 ) -> str | None:
     """Return the first reason the fused-RS backend cannot be selected."""
     if ep_size <= 1:
         return f"expert parallel size must be greater than 1, got {ep_size}"
+    if attn_cp_size != 1:
+        # The layer communicator already gathers the context-parallel token
+        # shards before the MoE (MOE_FULL); the fused-RS token gather over
+        # the attention-TP group would sit on top of it.
+        return (
+            "prefill context parallelism is not supported, got "
+            f"attn_cp_size={attn_cp_size}"
+        )
     if num_experts > 256:
         return (
             "BF16 routing materialization supports at most 256 experts, got "
@@ -158,9 +170,15 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
         enable_fused_moe_sum_all_reduce=(
             get_exec().moe.enable_fused_moe_sum_all_reduce
         ),
+        attn_cp_size=parallel.attn_cp_size,
     )
     if unsupported_reason is not None:
         layer.__dict__["_tpu_fused_rs_unsupported_reason"] = unsupported_reason
+        if parallel.tp_rank == 0:
+            print_info_once(
+                f"TPU FP8 fused-RS MoE backend not selected ({unsupported_reason}); "
+                "the MoE runs through the plain FP8 fused_moe path."
+            )
         return False
     layer.__dict__.pop("_tpu_fused_rs_unsupported_reason", None)
 

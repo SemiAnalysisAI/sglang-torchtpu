@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import torch.compiler.config as compiler_config
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -243,6 +244,11 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             speculative_algorithm=None,
             speculative_eagle_topk=None,
             speculative_use_rejection_sampling=False,
+            attn_cp_size=1,
+            enable_prefill_cp=False,
+            cp_strategy=None,
+            moe_dp_size=1,
+            tpu_compile_tracer="dynamo",
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -460,6 +466,64 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
     def test_piecewise_backend_raises(self):
         with self.assertRaises(NotImplementedError):
             self.platform.get_piecewise_backend_cls()
+
+
+class TestPrefillContextParallelValidation(TestTpuPlatformServerDefaults):
+    """apply_server_args_defaults gates the prefill context-parallel path."""
+
+    def _cp_args(self, **overrides):
+        fields = dict(
+            tp_size=8,
+            attn_cp_size=8,
+            enable_prefill_cp=True,
+            cp_strategy="zigzag",
+            enable_torch_compile=True,
+            sampling_backend="pytorch",
+        )
+        fields.update(overrides)
+        return self._args(**fields)
+
+    def test_accepts_the_zigzag_rpa_v3_configuration(self):
+        with patch.dict(os.environ, {"SGLANG_TPU_REQ_TO_TOKEN_ON_HOST": "0"}):
+            args = self._cp_args(sampling_backend=None)
+            self._apply(args)
+            self.assertEqual(
+                self._resolved(args, "attention_backend"), "pallas_tpu_rpa_v3"
+            )
+            self.assertEqual(self._resolved(args, "sampling_backend"), "pytorch")
+            self.assertTrue(envs.SGLANG_TPU_REQ_TO_TOKEN_ON_HOST.get())
+
+    def test_replicated_experts_match_the_cp_size(self):
+        with patch.dict(os.environ, {}, clear=False):
+            self._apply(self._cp_args(moe_dp_size=8))
+
+    def test_attn_cp_size_one_is_untouched(self):
+        args = self._args(tp_size=8, attn_cp_size=1, enable_prefill_cp=False)
+        self._apply(args)
+        self.assertEqual(self._resolved(args, "sampling_backend"), "tpu")
+
+    def test_rejections_name_the_missing_piece(self):
+        cases = [
+            (dict(enable_prefill_cp=False), "requires --enable-prefill-cp"),
+            (dict(cp_strategy="interleave"), "requires --cp-strategy zigzag"),
+            (
+                dict(attention_backend="pallas_tpu_rpa_batched"),
+                "requires --attention-backend pallas_tpu_rpa_v3",
+            ),
+            (dict(speculative_algorithm="EAGLE3"), "speculative decoding"),
+            (dict(enable_dp_attention=True, dp_size=8), "DP attention"),
+            (dict(moe_dp_size=2), "requires --moe-dp-size 1"),
+            (dict(enable_torch_compile=False), "requires --enable-torch-compile"),
+            (dict(tpu_compile_tracer="direct"), "requires --tpu-compile-tracer dynamo"),
+            (dict(sampling_backend="tpu"), "requires --sampling-backend pytorch"),
+        ]
+        for overrides, message in cases:
+            with (
+                self.subTest(overrides=overrides),
+                patch.dict(os.environ, {}, clear=False),
+            ):
+                with self.assertRaisesRegex(NotImplementedError, message):
+                    self._apply(self._cp_args(**overrides))
 
 
 if __name__ == "__main__":

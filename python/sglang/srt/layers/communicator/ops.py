@@ -54,6 +54,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    _cp_rank_slot_rows,
     attn_rank0_scale,
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -685,9 +686,16 @@ def _redistribute_output_from_moe_cp(
     # Extract this rank's actual (non-padded) tokens from its chunk.
     max_tokens_per_rank = max(rows)
     actual_local_tokens = rows[moe_cp_rank]
-    return hidden_states.narrow(
-        0, moe_cp_rank * max_tokens_per_rank, actual_local_tokens
-    ).contiguous()
+    # The slot offset comes from the rank tensor, a runtime operand rather
+    # than a rank constant baked into the traced program.
+    return hidden_states.index_select(
+        0,
+        _cp_rank_slot_rows(
+            slot_rows=max_tokens_per_rank,
+            num_rows=actual_local_tokens,
+            device=hidden_states.device,
+        ),
+    )
 
 
 def _reduce_and_redistribute_output_step(

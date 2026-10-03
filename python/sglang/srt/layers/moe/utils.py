@@ -754,7 +754,12 @@ def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
     This is a property of the MoE configuration. Whether the MoE block or a later
     step runs a sum that is still owed is decided separately.
     """
-    if get_parallel().dwdp_size > 1:
+    parallel = get_parallel()
+    if parallel.dwdp_size > 1:
+        return True
+    # Experts replicated on every device of the TP group hold each token's
+    # full output.
+    if is_tp_path and parallel.tp_size > 1 and parallel.moe_dp_size == parallel.tp_size:
         return True
     if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
         # The combine reduce-scatters back to the local tokens.

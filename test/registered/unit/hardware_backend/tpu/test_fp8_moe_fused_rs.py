@@ -53,6 +53,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
             "standard_dispatcher": True,
             "enable_dp_attention": False,
             "enable_fused_moe_sum_all_reduce": False,
+            "attn_cp_size": 1,
         }
         config.update(overrides)
         return config
@@ -90,6 +91,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
             {"standard_dispatcher": False},
             {"enable_dp_attention": True},
             {"enable_fused_moe_sum_all_reduce": True},
+            {"attn_cp_size": 2},
         )
         for overrides in unsupported:
             with self.subTest(overrides=overrides):
@@ -113,6 +115,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
             "standard_dispatcher": True,
             "enable_dp_attention": False,
             "enable_fused_moe_sum_all_reduce": False,
+            "attn_cp_size": 1,
         }
         self.assertEqual(
             fp8_fused_rs_unsupported_reason(**config),
@@ -192,12 +195,12 @@ class TestFp8MoeFusedRs(CustomTestCase):
         self.assertFalse(fused.call_args.kwargs["fp8_direct_write"])
 
     def test_skips_only_ep_reduction_for_reduced_expert_output(self):
-        # Upstream's dwdp gate reads the published parallel context, which
-        # unit tests don't have; pin dwdp_size=1 (the no-dwdp default). The
-        # other checks on this path are context-free on TPU.
+        # The dwdp and replicated-expert gates read the published parallel
+        # context, which unit tests don't have; pin a no-dwdp, expert-parallel
+        # layout. The other checks on this path are context-free on TPU.
         with patch(
             "sglang.srt.layers.moe.utils.get_parallel",
-            return_value=SimpleNamespace(dwdp_size=1),
+            return_value=SimpleNamespace(dwdp_size=1, tp_size=8, moe_dp_size=1),
         ):
             self.assertTrue(
                 should_skip_post_experts_all_reduce(

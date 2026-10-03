@@ -120,6 +120,16 @@ def is_dsa_enable_prefill_cp():
     if is_hip() or is_musa():
         return False
 
+    return _model_uses_dsa()
+
+
+@torch.compiler.assume_constant_result
+def _model_uses_dsa() -> bool:
+    """Whether the loaded model is a DeepSeek sparse-attention architecture.
+
+    A compiled forward evaluates this once at trace time: the answer is fixed
+    for the process, and the config view it reads is not traceable.
+    """
     # Generic prefill CP derives activation from the runtime topology and model
     # architecture.
     from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4

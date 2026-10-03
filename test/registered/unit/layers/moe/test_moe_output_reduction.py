@@ -48,7 +48,7 @@ def moe_config(
             moe_utils,
             "get_parallel",
             return_value=types.SimpleNamespace(
-                tp_size=tp_size, tp_rank=tp_rank, dwdp_size=dwdp_size
+                tp_size=tp_size, tp_rank=tp_rank, dwdp_size=dwdp_size, moe_dp_size=1
             ),
         ),
         patch.object(moe_utils, "get_moe_a2a_backend", return_value=a2a(backend)),

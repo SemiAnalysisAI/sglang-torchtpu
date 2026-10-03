@@ -1302,6 +1302,79 @@ class TestDpIdleDecodeMaterializationScope(_SpecPolicyTestCase):
         self.assertEqual(forward_batch.input_ids.tolist(), [0])
 
 
+_CP_STRATEGY_PATH = (
+    "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy.get_cp_strategy"
+)
+
+
+def _cp_strategy(cp_size=2, cp_rank=0):
+    return SimpleNamespace(cp_size=cp_size, cp_rank=cp_rank)
+
+
+class TestContextParallelWarmupFamily(_PolicyTestCase):
+    """The context-parallel extend family must survive both the order the
+    policy is constructed in and any ``_precompile_extend`` override."""
+
+    def test_cp_strategy_is_resolved_after_construction(self):
+        """The strategy initializes lazily off the global parallel context,
+        which may be installed after the policy is built. A value captured at
+        __init__ would stay None for the process's whole life, disabling the CP
+        warmup family, the CP batch bucketing and the CP embedding wrapper at
+        once, with nothing logged."""
+        with patch(_CP_STRATEGY_PATH, return_value=None):
+            policy = _make_policy()
+            self.assertIsNone(policy._cp_strategy)
+        strategy = _cp_strategy()
+        with patch(_CP_STRATEGY_PATH, return_value=strategy):
+            self.assertIs(policy._cp_strategy, strategy)
+
+    def test_extend_warms_a_cp_family_when_context_parallelism_is_on(self):
+        policy = _make_policy(token_buckets=(8, 64), bs_buckets=(1, 4))
+        policy._run_one = MagicMock()
+        with patch(_CP_STRATEGY_PATH, return_value=_cp_strategy()):
+            _run_cases(policy, ForwardMode.EXTEND)
+        variants = [c.kwargs["variant"] for c in policy._run_one.call_args_list]
+        self.assertIn("cp", variants)
+
+    def test_vl_extend_override_keeps_the_cp_family(self):
+        """The VL policy builds its own variant grid, and a grid built from
+        scratch drops the CP family by omission -- the server then boots, serves
+        the shapes the tracer happened to touch, and dies on the first one it
+        did not."""
+        mr = _model_runner()
+        mr.model.get_image_feature = lambda *a, **k: None
+        policy = Qwen3VLDecoderTpuCompilePolicy(
+            model_runner=mr,
+            t_bucketer=Bucketer(name="Token", buckets=[8, 64]),
+            b_bucketer=Bucketer(name="Bs", buckets=[1, 4]),
+            owner=mr.model,
+        )
+        policy._run_one = MagicMock()
+        policy._precompile_mm_embed_placement = MagicMock()
+        with patch(_CP_STRATEGY_PATH, return_value=_cp_strategy()):
+            _run_cases(policy, ForwardMode.EXTEND)
+        variants = [c.kwargs["variant"] for c in policy._run_one.call_args_list]
+        self.assertIn("cp", variants)
+
+    def test_precompile_rejects_an_override_that_drops_the_cp_family(self):
+        """Guards every future override: dropping the family is otherwise
+        silent until a serve-time recompile, which fail_on_recompile makes
+        fatal mid-run."""
+        policy = _make_policy()
+        policy._precompile_extend = MagicMock()
+        policy._precompile_decode = MagicMock()
+        with patch(_CP_STRATEGY_PATH, return_value=_cp_strategy()):
+            with self.assertRaisesRegex(RuntimeError, "context-parallel extend"):
+                policy.precompile()
+
+    def test_precompile_is_quiet_without_context_parallelism(self):
+        policy = _make_policy()
+        policy._precompile_extend = MagicMock()
+        policy._precompile_decode = MagicMock()
+        with patch(_CP_STRATEGY_PATH, return_value=None):
+            policy.precompile()
+
+
 class TestPrecompileLoops(_PolicyTestCase):
     """``precompile`` fires one forward per TPU precompile variant:
     EXTEND covers token buckets at the fixed batch cap, and DECODE varies bs
