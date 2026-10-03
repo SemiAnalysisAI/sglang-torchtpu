@@ -391,8 +391,10 @@ class VisionTpuCompilePolicy(CompilePolicy):
         self._sync_warmup(self.compiled_fn(*inputs))
 
     @staticmethod
-    def _sync_warmup(result: torch.Tensor) -> None:
-        tpu_sync([result], wait=True)
+    def _sync_warmup(result: torch.Tensor | tuple[torch.Tensor, ...]) -> None:
+        # A boundary may return several tensors (features and a mask): land each.
+        tensors = list(result) if isinstance(result, (tuple, list)) else [result]
+        tpu_sync(tensors, wait=True)
 
     def make_warmup_inputs(self, patch_count: int) -> tuple[Any, ...]:
         """Compiled-fn argument tuple, for the default warmup_once.
