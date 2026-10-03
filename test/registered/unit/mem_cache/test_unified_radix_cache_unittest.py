@@ -1944,6 +1944,59 @@ class UnifiedRadixCacheSuite:
         )
         cache.sanity_check()
 
+    def test_swa_unfinished_req_protects_insert_below_live_window(self):
+        # P/D decode holds SWA only from page_floor(s - W), the window prefill
+        # sends. With W = 4 * page - 1 and s % page == W % page, the page-aligned
+        # key holds less than a live window, so a fresh match would stop short
+        # and the request would later free slots the tree owns.
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        ps = self.cfg.page_size
+        if ps == 1:
+            self.skipTest("requires page_size > 1")
+        window = 4 * ps - 1
+        seq_len = 5 * ps + window % ps
+        swa_start = (seq_len - window) // ps * ps
+        cache, allocator, req_to_token_pool = build_fixture(
+            replace(self.cfg, sliding_window_size=window)
+        )
+        full_avail = allocator.full_attn_allocator.available_size()
+        swa_avail = allocator.swa_attn_allocator.available_size()
+
+        req = self._make_req(req_to_token_pool)
+        tokens = array("q", range(1, seq_len + 1))
+        req.origin_input_ids = tokens
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, seq_len)
+        kv_indices = self._alloc(allocator, seq_len)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, seq_len)), kv_indices)
+        req.kv.kv_committed_len = seq_len
+        req.kv.kv_allocated_len = seq_len
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock_receipt = DecLockRefParams()
+        req.extra_key = None
+        allocator.free_swa(kv_indices[:swa_start])
+        req.kv.set_evicted_seqlen(ComponentType.SWA, swa_start)
+
+        cache.cache_unfinished_req(req)
+
+        key_len = seq_len - (1 if self.cfg.is_eagle else 0)
+        self.assertEqual(req.kv.cache_protected_len, key_len // ps * ps)
+        release_kv_cache(req, cache)
+        cache.sanity_check()
+        # Every slot the request held is now owned by the tree exactly once.
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size()
+            + cache.full_evictable_size(),
+            full_avail,
+        )
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size() + cache.swa_evictable_size(),
+            swa_avail,
+        )
+
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.skipTest("requires SWA without Mamba")

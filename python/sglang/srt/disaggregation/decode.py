@@ -618,14 +618,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if window_size is None or window_size <= 0:
             return seq_len
 
+        # Match the window prefill sends: any longer tail would leave a page
+        # that the decode radix cache inserts but nothing writes.
         page_size = self.token_to_kv_pool_allocator.page_size
-        if get_disagg().disaggregation_decode_enable_radix_cache:
-            # Keep enough SWA before the page-aligned radix-cache insert
-            # boundary for the cached key to contain a complete window.
-            # `seq_len - 1` is the last committed position.
-            window_start = max(0, seq_len - 1 - max(window_size, page_size))
-        else:
-            window_start = max(0, seq_len - window_size)
+        window_start = max(0, seq_len - window_size)
         window_start = (window_start // page_size) * page_size
         return seq_len - window_start
 

@@ -128,28 +128,28 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
     """Test lock_ref balance across decode transfer scenarios."""
 
-    def test_swa_tail_len_keeps_page_aligned_matchable_window(self):
-        enter_override(
-            self,
-            get_context().override_server_args(
-                disaggregation_decode_enable_radix_cache=True
-            ),
-        )
+    def test_swa_tail_len_matches_the_window_prefill_sends(self):
+        # Prefill sends SWA from page_floor(s - W); any longer tail would leave
+        # a page decode caches but nothing writes.
+        window, page = 127, 64
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue.scheduler = SimpleNamespace(
-            sliding_window_size=127,
+            sliding_window_size=window,
             server_args=SimpleNamespace(),
         )
-        queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=page)
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
-
-        tail_len = queue._swa_tail_len(895)
-
-        self.assertEqual(tail_len, 191)
-        swa_start = 895 - tail_len
-        radix_key_len = (895 // 64) * 64
-        self.assertGreaterEqual(radix_key_len - swa_start, 127)
+        for radix in (False, True):
+            with get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=radix
+            ):
+                for seq_len in range(1, 4 * page + window):
+                    with self.subTest(radix=radix, seq=seq_len):
+                        received_start = max(0, seq_len - window) // page * page
+                        self.assertEqual(
+                            seq_len - queue._swa_tail_len(seq_len), received_start
+                        )
 
     def test_swa_admission_counts_evictable_capacity(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
