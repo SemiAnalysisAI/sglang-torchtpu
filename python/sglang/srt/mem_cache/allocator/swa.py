@@ -435,8 +435,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # TPU mappings live on CPU. Slice after the copy so request-dependent
         # lengths do not accumulate native TPU slice compilations in host RAM.
-        mapping_full_indices = (
-            alloc_full_indices.cpu() if _is_tpu else alloc_full_indices
+        mapping_full_indices = alloc_full_indices.to(
+            self.full_to_swa_index_mapping.device
         )
         self.set_full_to_swa_mapping(
             mapping_full_indices[-swa_tail_len:], alloc_swa_indices
