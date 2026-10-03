@@ -113,6 +113,9 @@ _H3072_I3072_FP8_XLARGE = (
     2,
 )  # M >= 131072 (tile_m=256 wins at very large M) — autotuned 48.6ms
 _H4096_I4096_BF16 = (128, 2048, 2048, 2048, 2048, 2, 2)
+# H=I=4096, E=256, EP16, 512 tokens / top-k 8. Four buffers improve DMA
+# overlap within a 48 MiB weight-scratch budget, retaining the full-K dot order.
+_H4096_I4096_BF16_EP16_VERIFY = (128, 4096, 512, 4096, 512, 4, 4)
 _H3072_I3072_BF16 = (128, 1024, 1024, 1024, 1024, 2, 2)
 
 # FP4 (rhs_quant_block_size=16): weights are half FP8 → enough VMEM for
@@ -500,6 +503,9 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
             # Validated: tile_n2=2048 with num_w2_bufs=2 to eliminate W2 stall.
             # Caching disabled (num_bufs(2) < total_steps(4)).
             "k-4096_n-8192_g-32+k-4096_n-4096_g-32": _all_m(_H4096_I4096_BF16),
+            "k-4096_n-8192_g-16+k-4096_n-4096_g-16": {
+                "4096_silu": _H4096_I4096_BF16_EP16_VERIFY,
+            },
             # H3072-I3072: H=3072, I=3072, E=256, EP=8 → g=32
             # Smaller tiles for VMEM fit (bf16 uses 2× weight bytes vs fp8).
             "k-3072_n-6144_g-32+k-3072_n-3072_g-32": _all_m(_H3072_I3072_BF16),

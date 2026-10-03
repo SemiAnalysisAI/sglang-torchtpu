@@ -340,6 +340,7 @@ def kernel_main_fused_rs(
     w1_gs_gate_ref,  # (E,) GMM1 gate global_scale
     w1_gs_up_ref,  # (E,) GMM1 up global_scale
     w2_gs_ref,  # (E,) GMM2 global_scale
+    total_recv_count_ref,  # (1,) int32 — optional precomputed remote row count
     # In (7)
     hidden_states_ref,
     w1_ref,
@@ -403,6 +404,7 @@ def kernel_main_fused_rs(
     top_k: int,
     pack_indices: bool = True,
     fp8_direct_write: bool = False,
+    use_in_kernel_recv_count: bool = True,
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
 
@@ -421,41 +423,44 @@ def kernel_main_fused_rs(
     my_id = my_rank
     max_num_gm = max_num_gm_ref[0]
 
-    # Derive the receive count directly from the same scalar-prefetched routing refs
-    # used by metadata construction and direct writes.
-    with jax.named_scope("routing_scalar_prologue"):
-        group_offset = group_offset_ref[0]
-        local_start = group_start_ref[0]
+    if use_in_kernel_recv_count:
+        # Derive the count from the same routing refs used by direct writes.
+        # Callers can vectorize this scan before the kernel for larger M.
+        with jax.named_scope("routing_scalar_prologue"):
+            group_offset = group_offset_ref[0]
+            local_start = group_start_ref[0]
 
-        def _sum_local_group_size(local_group_id, count):
-            return count + lhs_group_sizes_ref[group_offset + local_group_id]
+            def _sum_local_group_size(local_group_id, count):
+                return count + lhs_group_sizes_ref[group_offset + local_group_id]
 
-        local_end = local_start + lax.fori_loop(
-            0,
-            dims.size_group,
-            _sum_local_group_size,
-            jnp.int32(0),
-        )
-
-        def _count_remote_receive(assignment_row, count):
-            gathered_index = lhs_indices_ref[assignment_row]
-            if pack_indices:
-                gathered_index = gathered_index // top_k
-            destination_chip = gathered_index // chunk_size
-            row_is_local = jnp.logical_and(
-                assignment_row >= local_start, assignment_row < local_end
+            local_end = local_start + lax.fori_loop(
+                0,
+                dims.size_group,
+                _sum_local_group_size,
+                jnp.int32(0),
             )
-            is_remote_receive = jnp.logical_and(
-                destination_chip == my_id, jnp.logical_not(row_is_local)
-            )
-            return count + is_remote_receive.astype(jnp.int32)
 
-        total_recv = lax.fori_loop(
-            0,
-            dims.size_m,
-            _count_remote_receive,
-            jnp.int32(0),
-        )
+            def _count_remote_receive(assignment_row, count):
+                gathered_index = lhs_indices_ref[assignment_row]
+                if pack_indices:
+                    gathered_index = gathered_index // top_k
+                destination_chip = gathered_index // chunk_size
+                row_is_local = jnp.logical_and(
+                    assignment_row >= local_start, assignment_row < local_end
+                )
+                is_remote_receive = jnp.logical_and(
+                    destination_chip == my_id, jnp.logical_not(row_is_local)
+                )
+                return count + is_remote_receive.astype(jnp.int32)
+
+            total_recv = lax.fori_loop(
+                0,
+                dims.size_m,
+                _count_remote_receive,
+                jnp.int32(0),
+            )
+    else:
+        total_recv = total_recv_count_ref[0]
 
     @jax.named_scope("sync_barrier_signal")
     def sync_barrier_signal():
@@ -1278,6 +1283,7 @@ def kernel_main_fused_rs_fp8(
     w1_gs_gate_ref,
     w1_gs_up_ref,
     w2_gs_ref,
+    total_recv_count_ref,
     hidden_states_ref,
     w1_ref,
     w2_ref,
@@ -1336,6 +1342,7 @@ def kernel_main_fused_rs_fp8(
     ep_axis_name: str,
     top_k: int,
     pack_indices: bool = True,
+    use_in_kernel_recv_count: bool = True,
 ):
     """FP8 direct-write wrapper with output refs ordered for pallas_call."""
     return kernel_main_fused_rs(
@@ -1348,6 +1355,7 @@ def kernel_main_fused_rs_fp8(
         w1_gs_gate_ref,
         w1_gs_up_ref,
         w2_gs_ref,
+        total_recv_count_ref,
         hidden_states_ref,
         w1_ref,
         w2_ref,
@@ -1406,6 +1414,7 @@ def kernel_main_fused_rs_fp8(
         top_k=top_k,
         pack_indices=pack_indices,
         fp8_direct_write=True,
+        use_in_kernel_recv_count=use_in_kernel_recv_count,
     )
 
 
@@ -1452,11 +1461,16 @@ def gmm_v2_fused_rs(
     caller_tile_m: int | None = None,
     top_k: int,
     fp8_direct_write: bool = False,
+    precomputed_total_recv_count: jax.Array | None = None,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
     Output: (chunk_size * top_k, size_n2) per chip — raw expert contributions.
     Post-kernel reduction applies topk_weights and sums over top_k dim.
+
+    precomputed_total_recv_count is an optional int32[1] count of routed rows
+    destined for this logical token shard but owned by another expert shard.
+    It must use the same routing as this call; otherwise ICI waits are invalid.
     """
     size_group, size_k1, size_n1 = w1.shape
     _, size_k2, size_n2 = w2.shape
@@ -1897,6 +1911,13 @@ def gmm_v2_fused_rs(
         primary_idx_ref = lhs_indices
         secondary_idx_ref = topk_indices
 
+    use_in_kernel_recv_count = precomputed_total_recv_count is None
+    total_recv_count_input = (
+        jnp.zeros((1,), dtype=jnp.int32)
+        if use_in_kernel_recv_count
+        else precomputed_total_recv_count.astype(jnp.int32).reshape(1)
+    )
+
     pallas_inputs = (
         group_sizes,
         group_offset,
@@ -1907,6 +1928,7 @@ def gmm_v2_fused_rs(
         _w1_gs_gate,
         _w1_gs_up,
         _w2_gs,
+        total_recv_count_input,
         hidden_3d,
         w1,
         w2,
@@ -1939,6 +1961,7 @@ def gmm_v2_fused_rs(
         ep_axis_name=ep_axis_name,
         top_k=top_k,
         pack_indices=pack_indices,
+        use_in_kernel_recv_count=use_in_kernel_recv_count,
     )
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states_3d
@@ -1962,7 +1985,7 @@ def gmm_v2_fused_rs(
             functools.partial(kernel_main_fused_rs_fp8, **kernel_kwargs),
             out_shape=(out_buf_init, out_scale_init),
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=9,
+                num_scalar_prefetch=10,
                 in_specs=in_specs,
                 out_specs=[
                     pl.BlockSpec(memory_space=pltpu.HBM),
@@ -1980,7 +2003,7 @@ def gmm_v2_fused_rs(
         functools.partial(kernel_main_fused_rs, **kernel_kwargs),
         out_shape=out_buf_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=9,
+            num_scalar_prefetch=10,
             in_specs=in_specs,
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=scratch_shapes,
