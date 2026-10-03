@@ -1,7 +1,9 @@
 """Registered coverage for TPU perfect-balanced expert simulation."""
 
+import sys
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.srt.layers.moe.topk import (
@@ -77,3 +79,7 @@ def test_tpu_perfect_balanced_routing_uses_routed_topk_as_assignment_stride():
         minlength=ep_size,
     )
     assert torch.equal(counts, torch.ones_like(counts))
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
