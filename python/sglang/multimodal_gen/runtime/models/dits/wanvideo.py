@@ -120,6 +120,10 @@ class _WanGELUMLP(MLP):
                 bias,
                 use_fused_bias_gelu=nvfp4_bias_gelu_active(self),
             )
+        # XLA would fuse the activation into fc_out as a matmul prologue, which
+        # is slower than leaving it in fc_in's epilogue (Wan2.2-A14B FFN on one
+        # TPU core: 6.41 -> 5.76 ms, same output).
+        x = current_platform.fusion_barrier(x)
         x, _ = self.fc_out(x)
         return x
 

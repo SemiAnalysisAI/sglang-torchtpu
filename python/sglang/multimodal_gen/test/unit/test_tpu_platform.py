@@ -10,7 +10,10 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.multimodal_gen.runtime.platforms import tpu_platform_plugin
-from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms.interface import (
+    AttentionBackendEnum,
+    Platform,
+)
 from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
 
 _HAS_TORCH_TPU = hasattr(torch, "tpu")
@@ -225,6 +228,22 @@ class TestTorchTpuIntegration(unittest.TestCase):
         torch.tpu.empty_cache()
         if not torch.tpu.is_initialized():
             self.assertEqual(torch.tpu.memory_allocated(), 0)
+
+
+class TestFusionBarrier(unittest.TestCase):
+    def test_default_platform_returns_the_input(self):
+        x = torch.arange(4.0)
+        self.assertIs(Platform.fusion_barrier(x), x)
+
+    def test_host_tensors_skip_the_op(self):
+        x = torch.arange(4.0)
+        self.assertIs(TpuPlatform.fusion_barrier(x), x)
+
+    def test_op_is_an_identity_off_device(self):
+        x = torch.arange(6.0).view(2, 3).t()
+        out = torch.ops.sglang.tpu_fusion_barrier(x)
+        self.assertTrue(torch.equal(out, x))
+        self.assertNotEqual(out.data_ptr(), x.data_ptr())
 
 
 if __name__ == "__main__":

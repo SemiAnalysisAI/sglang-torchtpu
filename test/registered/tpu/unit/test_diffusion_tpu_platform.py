@@ -65,6 +65,27 @@ class TestWorkerBootstrap(CustomTestCase):
             self.assertEqual(restored.requires_grad, requires_grad)
 
 
+class TestFusionBarrierOnDevice(CustomTestCase):
+    def test_values_pass_through_in_a_compiled_graph(self):
+        import torch_tpu._internal.compile  # noqa: F401
+
+        TpuPlatform.set_device(TpuPlatform.get_local_torch_device())
+
+        def mlp_act(t):
+            h = torch.nn.functional.gelu(t, approximate="tanh")
+            return TpuPlatform.fusion_barrier(h) * 2
+
+        x = (torch.randn(256, 512) * 3).bfloat16().to("tpu")
+        self.assertTrue(
+            torch.equal(TpuPlatform.fusion_barrier(x).cpu(), x.cpu()),
+            "the barrier changed values in eager mode",
+        )
+        compiled = torch.compile(mlp_act, backend="tpu", dynamic=False, fullgraph=True)
+        torch.testing.assert_close(
+            compiled(x).cpu(), mlp_act(x).cpu(), rtol=1.6e-2, atol=1e-2
+        )
+
+
 class TestFloat64IsRealOnDevice(CustomTestCase):
     """The measurements behind `TpuPlatform.is_float64_supported() -> True`."""
 
