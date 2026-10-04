@@ -212,8 +212,11 @@ jobs:
       contents: read
       id-token: write
 
-  # The 5 PM slot, not the nightly. 26B measured 8909 s in CI including
-  # bring-up (98 min of eval on the dev pod); 31B is the slower of the two.
+  # The 5 PM slot, not the nightly. 26B measured 8915 s in CI including
+  # bring-up. The single-host JobSet deadline is 1.5 x est_time, and the
+  # admission budget is what the 6 h runner cap leaves after it, so est_time
+  # 9000 keeps 100 min of queue wait; 14400 left none and the leg failed
+  # before its pod existed.
   accuracy-gemma4-mmmupro:
     needs: [build, plan]
     if: >-
@@ -238,7 +241,7 @@ jobs:
       run_name: ${{ matrix.run_name }}
       nightly: true
       weights_pvc: model-weights
-      timeout_per_file: 14400
+      timeout_per_file: 10800
     permissions:
       contents: read
       id-token: write
