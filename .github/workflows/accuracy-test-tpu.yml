@@ -67,10 +67,11 @@ on:
 
 concurrency:
   # Only governs standalone runs (a called workflow rides the caller's group).
-  # Keyed on ref so runs for different branches proceed in parallel; same ref
-  # still serializes, so a re-dispatch cannot race the previous run's scores.
+  # Keyed on ref and model so different branches, and different models on one
+  # branch, proceed in parallel; the same model on the same ref still
+  # serializes, so a re-dispatch cannot race the previous run's scores.
   # Each schedule slot gets its own group: a late Kimi run must not hold 5 PM back.
-  group: tpu-accuracy-${{ github.event.schedule || inputs.ref || github.ref }}
+  group: tpu-accuracy-${{ github.event.schedule || inputs.ref || github.ref }}-${{ inputs.model || 'all' }}
   cancel-in-progress: false
 
 jobs:
