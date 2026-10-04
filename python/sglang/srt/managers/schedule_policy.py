@@ -165,6 +165,7 @@ def _match_prefix_result(
     *,
     cow_mamba: bool = False,
     include_req: bool = False,
+    ignore_swa_kv_miss: bool = False,
 ):
     # unified_kv SWA lives in a per-request ring that's not content-stable and is
     # never stored in the radix tree, so a reused prefix carries stale SWA. Cap
@@ -183,6 +184,7 @@ def _match_prefix_result(
             ),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
+            ignore_swa_kv_miss=ignore_swa_kv_miss,
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():

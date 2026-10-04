@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodePrefixMatch,
 )
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     InsertParams,
@@ -150,6 +151,74 @@ class TestDecodeLockRefScenarios(CustomTestCase):
                         self.assertEqual(
                             seq_len - queue._swa_tail_len(seq_len), received_start
                         )
+
+    def _swa_tail_queue(self, window_size, page_size):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
+        queue.scheduler = SimpleNamespace(sliding_window_size=window_size)
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=page_size)
+        return queue
+
+    def test_swa_tombstone_reuse_requires_rematchable_tail(self):
+        enter_override(
+            self,
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=True
+            ),
+        )
+        fill_lens = range(4096, 4608)
+
+        def rejected(window, *, eagle=False, hicache=False, tail_prealloc=True):
+            queue = self._swa_tail_queue(window, 512)
+            queue._uses_swa_tail_prealloc.return_value = tail_prealloc
+            queue.tree_cache = SimpleNamespace(
+                tree_core=SimpleNamespace(is_eagle=eagle, enable_hicache=hicache)
+            )
+            return [
+                n
+                for n in fill_lens
+                if not queue._can_ignore_swa_kv_miss(
+                    SimpleNamespace(origin_input_ids=[0] * n, output_ids=[])
+                )
+            ]
+
+        self.assertEqual(rejected(1535), [])
+        # The fresh tail holds less than a window before the insert boundary.
+        self.assertEqual(rejected(1000), list(range(4585, 4608)))
+        self.assertEqual(rejected(1535, eagle=True), [4096])
+        self.assertEqual(rejected(1535, hicache=True), list(fill_lens))
+        self.assertEqual(rejected(1535, tail_prealloc=False), list(fill_lens))
+
+    def test_decode_admission_forwards_ignore_swa_kv_miss(self):
+        class Stop(Exception):
+            pass
+
+        captured = {}
+
+        def capture(params):
+            captured["params"] = params
+            raise Stop
+
+        tree_cache = MagicMock()
+        tree_cache.swa_reprefill_tail_tokens.return_value = 0
+        tree_cache.match_prefix.side_effect = capture
+        req = SimpleNamespace(extra_key=None, cache_salt=None)
+        with self.assertRaises(Stop):
+            match_prefix_for_req(
+                tree_cache, req, array("q", [1, 2]), ignore_swa_kv_miss=True
+            )
+        self.assertTrue(captured["params"].ignore_swa_kv_miss)
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.tree_cache = MagicMock()
+        queue._can_ignore_swa_kv_miss = MagicMock(return_value=True)
+        match = MagicMock(side_effect=Stop)
+        with patch("sglang.srt.disaggregation.decode.match_prefix_for_req", match):
+            with self.assertRaises(Stop):
+                queue._match_prefix_and_lock(
+                    SimpleNamespace(origin_input_ids=array("q", [1, 2]))
+                )
+        self.assertIs(match.call_args.kwargs["ignore_swa_kv_miss"], True)
 
     def test_swa_admission_counts_evictable_capacity(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)

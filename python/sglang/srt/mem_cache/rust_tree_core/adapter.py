@@ -55,7 +55,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.runtime_context import get_exec, mamba_cache_chunk_size
-from sglang.srt.utils import assert_int64_array
+from sglang.srt.utils import assert_int64_array, print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -573,6 +573,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         return self._binding.all_mamba_values_flatten()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        if params.ignore_swa_kv_miss:
+            print_warning_once(
+                "ignore_swa_kv_miss is ignored by the Rust tree core; "
+                "decode radix cache only reuses multi-turn continuations."
+            )
         key = params.key
         result = self._binding.match_prefix(
             self._bindings.MatchParamsBinding(

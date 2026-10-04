@@ -871,6 +871,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             self.pending_reqs.append(decode_req)
 
+    def _can_ignore_swa_kv_miss(self, req: Req) -> bool:
+        if (
+            not self._uses_swa_tail_prealloc()
+            or self.tree_cache.tree_core.enable_hicache
+        ):
+            return False
+        fill_len = self._pre_alloc_fill_len(req)
+        key_len = fill_len - 1 if self.tree_cache.tree_core.is_eagle else fill_len
+        page_size = self.token_to_kv_pool_allocator.page_size
+        insert_boundary = (key_len // page_size) * page_size
+        tail_start = fill_len - self._swa_tail_len(fill_len)
+        # Reuse stops at the tail start and the SWA window arrives fresh. The tail
+        # must still hold a full window before the page-aligned insert boundary,
+        # or the strict re-match in cache_unfinished_req falls short of the reuse.
+        return insert_boundary - tail_start >= self.scheduler.sliding_window_size
+
     def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
         """
         Match a request against the decode-side radix cache, lock the matched
@@ -882,6 +898,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req.origin_input_ids,
             cow_mamba=self.tree_cache.supports_mamba(),
             include_req=True,
+            ignore_swa_kv_miss=self._can_ignore_swa_kv_miss(req),
         )
         # Keep aggregated scheduling semantics while preserving the SWA lock
         # boundary needed for the matching dec_lock_ref; the full receipt
