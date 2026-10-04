@@ -2738,6 +2738,37 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         self.assertEqual(fb.extend_prefix_lens.tolist(), [0] * 4)
         self.assertEqual(fb.extend_num_tokens, 16)
 
+    def test_draft_warmup_leaves_global_num_token_non_padded_unset(self):
+        """The live DFlash draft batch sets the local ``num_token_non_padded``
+        and never the global tensor. direct_compile pins each input's type at
+        trace time, so a warmup batch carrying the global tensor makes the
+        first live draft forward fail with a type change (gpt-oss-120b DFlash
+        e2e).
+        """
+        policy, _ = self._make_dflash_policy(
+            hidden_size=32, draft_token_num=4, is_draft_worker=True
+        )
+        policy_module = (
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
+        )
+        with (
+            patch(f"{policy_module}.enable_num_token_non_padded", return_value=True),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.is_dsa_enable_prefill_cp",
+                return_value=False,
+            ),
+            patch("sglang.srt.layers.cp.utils.is_mla_cp_enabled", return_value=False),
+        ):
+            fb = policy._make_dummy_forward_batch(
+                num_tokens=16,
+                bs=4,
+                mode=ForwardMode.TARGET_VERIFY,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                spec_info=policy.make_null_spec_info(),
+            )
+        self.assertIsNone(fb.global_num_token_non_padded)
+        self.assertIsNotNone(fb.num_token_non_padded)
+
     def test_block_embed_warmup_reused_under_serving_grad_mode(self):
         torch._dynamo.reset()
         self.addCleanup(torch._dynamo.reset)
