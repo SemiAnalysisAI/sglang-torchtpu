@@ -184,7 +184,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # One suite per benchmark and checkpoint, each with a 90-minute budget.
+        # One suite per benchmark and checkpoint, each with a two-hour budget:
+        # ~21 min of bring-up (16 of them decoder precompile), then 31B GPQA
+        # measured ~77 min of eval at 64 threads and 26B AIME ~70 min.
         include:
           - suite: nightly-tpu-accuracy-gemma4-31b-aime
             run_name: accuracy-gemma4-31b-aime
@@ -205,12 +207,13 @@ jobs:
       run_name: ${{ matrix.run_name }}
       nightly: true
       weights_pvc: model-weights
-      timeout_per_file: 5400
+      timeout_per_file: 7200
     permissions:
       contents: read
       id-token: write
 
-  # The 5 PM slot, not the nightly: 77 min (31B) and 98 min (26B) measured.
+  # The 5 PM slot, not the nightly. 26B measured 8909 s in CI including
+  # bring-up (98 min of eval on the dev pod); 31B is the slower of the two.
   accuracy-gemma4-mmmupro:
     needs: [build, plan]
     if: >-
@@ -235,7 +238,7 @@ jobs:
       run_name: ${{ matrix.run_name }}
       nightly: true
       weights_pvc: model-weights
-      timeout_per_file: 9000
+      timeout_per_file: 14400
     permissions:
       contents: read
       id-token: write
