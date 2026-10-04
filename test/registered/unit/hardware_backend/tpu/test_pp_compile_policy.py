@@ -122,11 +122,12 @@ class TestResolvedExtendCeiling(CustomTestCase):
 class TestWarmupProxy(CustomTestCase):
     def setUp(self):
         super().setUp()
-        dp = patch.object(
-            decoder_compile_policy, "is_dp_attention_enabled", return_value=False
-        )
-        dp.start()
-        self.addCleanup(dp.stop)
+        # Both predicates read the published parallel config, which these
+        # tests do not publish.
+        for name in ("is_dp_attention_enabled", "enable_num_token_non_padded"):
+            predicate = patch.object(decoder_compile_policy, name, return_value=False)
+            predicate.start()
+            self.addCleanup(predicate.stop)
 
     def test_non_first_stage_warms_up_with_a_zero_proxy_at_the_bucket(self):
         policy = _policy(_model_runner(_pp_group(first=False, last=False)))
