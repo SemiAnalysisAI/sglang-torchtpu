@@ -29,8 +29,9 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import run_model_config
 from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 
+# Anchored on run 37162012638: 1734 s to healthy, then 160 requests at ~13.6 s.
 register_tpu_ci(
-    est_time=3600,
+    est_time=7200,
     suite="nightly-tpu-perf-kimi-k26",
     nightly=True,
     labels=["singlehost", "kimi-k2.6", "perf"],
