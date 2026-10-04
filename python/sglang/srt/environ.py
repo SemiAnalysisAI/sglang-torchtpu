@@ -523,6 +523,7 @@ class Envs:
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
+    SGLANG_TPU_SIMULATE_PERFECT_BALANCED_EXPERTS = EnvBool(False)
 
     # ===================================================================
     # DSpark speculative decoding
