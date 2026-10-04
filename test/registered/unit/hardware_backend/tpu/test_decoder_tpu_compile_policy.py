@@ -1226,6 +1226,40 @@ class TestMakeDummyForwardBatch(_PolicyTestCase):
         self.assertIsNone(fb.extend_num_tokens)
         self.assertIsNone(fb.extend_logprob_start_lens_cpu)
 
+    def test_warmup_carries_num_token_non_padded_when_serving_does(self):
+        """Real EP batches carry ``num_token_non_padded`` (init_new plus
+        ModelRunner.forward) and the compiled MoE path guards on its presence,
+        so a warmup batch without it recompiles on the first real decode and
+        dies under fail_on_recompile (two-host tp16/ep16 R1-0528 and V3.1).
+        """
+        policy = _make_policy()
+        policy_module = (
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
+        )
+
+        with (
+            patch(f"{policy_module}.enable_num_token_non_padded", return_value=True),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.is_dsa_enable_prefill_cp",
+                return_value=False,
+            ),
+            patch("sglang.srt.layers.cp.utils.is_mla_cp_enabled", return_value=False),
+        ):
+            fb = policy._make_dummy_forward_batch(
+                num_tokens=8, bs=8, mode=ForwardMode.DECODE
+            )
+        self.assertEqual(fb.global_num_token_non_padded_cpu, 8)
+        self.assertEqual(fb.global_num_token_non_padded.item(), 8)
+        # Replicated (not attn-TP sharded) warmup keeps the full count.
+        self.assertEqual(fb.num_token_non_padded.item(), 8)
+
+        with patch(f"{policy_module}.enable_num_token_non_padded", return_value=False):
+            fb = policy._make_dummy_forward_batch(
+                num_tokens=8, bs=8, mode=ForwardMode.DECODE
+            )
+        self.assertIsNone(fb.global_num_token_non_padded)
+        self.assertIsNone(fb.num_token_non_padded)
+
     def test_plain_warmup_uses_serving_sampling_info(self):
         policy = _make_policy()
 
