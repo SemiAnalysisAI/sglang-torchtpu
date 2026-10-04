@@ -222,12 +222,13 @@ ${WEIGHTS_VOLUME}
                         wait "$spid"; src=$?
                         # 137 is ALSO how normal teardown manifests: rank-0 finishes its
                         # test files and exits first, this worker's scheduler dies on the
-                        # severed request-broadcast socket ("Connection reset by peer"),
-                        # and sglang's crash handler SIGKILLs its own process tree.
-                        # Distinguish teardown from a real crash by that disconnect
-                        # signature; rank-0's exit code still gates every real failure,
-                        # so this can never mask a red run.
-                        if [ "$src" = 137 ] && grep -q "Connection reset by peer" /tmp/server.log; then
+                        # severed request-broadcast socket, and sglang's crash handler
+                        # SIGKILLs its own process tree. gloo words the disconnect as
+                        # "Connection reset by peer" (RST) or "Connection closed by peer"
+                        # (FIN) depending on how the leader's socket went down; both are
+                        # teardown. rank-0's exit code still gates every real failure, so
+                        # this can never mask a red run.
+                        if [ "$src" = 137 ] && grep -qE "Connection (reset|closed) by peer" /tmp/server.log; then
                           echo "worker rank=$RANK: leader closed (teardown); success"; exit 0
                         fi
                         case "$src" in
