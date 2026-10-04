@@ -38,7 +38,9 @@ register_tpu_ci(
 
 LAUNCH_CONFIG_MODULE = "recipe/configs/kimi_k26/perf.py"
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
-HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "2400"))
+# 555 GB of int4 experts streamed in 630 to 1160 s on the shared Filestore, then
+# the tp8 decoder precompile; the JobSet itself allows 3600 s plus est_time.
+HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "3600"))
 
 # 8192 in + 1024 out, the same shape the other models on this lane are measured
 # at, so they sit on one axis of the Workload dropdown.
