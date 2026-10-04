@@ -3640,6 +3640,67 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
         )
         self.assertEqual([len(backend.calls) for backend in step_backends], [2, 2, 2])
 
+    def test_fused_draft_warmup_leaves_num_token_non_padded_unset(self):
+        """The live fused draft loop runs on an init_new batch that never
+        passes ModelRunner.forward, so its local ``num_token_non_padded`` is
+        None even when serving enables the field. direct_compile pins each
+        input's type at trace time, so a warmup batch carrying the tensor
+        makes the first live draft step fail with a type change.
+        """
+        mr = _spec_model_runner(is_draft_worker=True)
+        policy = _make_spec_policy(mr, token_buckets=(8,), bs_buckets=(4,))
+        step_backends = [_FakeAttnBackend() for _ in range(3)]
+
+        class FakeDraftBackend:
+            attn_backends = step_backends
+
+            def init_forward_metadata(self, forward_batch):
+                for backend in self.attn_backends:
+                    backend.init_forward_metadata(forward_batch)
+
+        seen = []
+
+        def fused_draft_forward(forward_batch):
+            seen.append(
+                (
+                    forward_batch.global_num_token_non_padded_cpu,
+                    forward_batch.num_token_non_padded,
+                )
+            )
+            return torch.zeros(forward_batch.batch_size)
+
+        policy_module = (
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
+        )
+        with (
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
+            patch(f"{policy_module}.enable_num_token_non_padded", return_value=True),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.is_dsa_enable_prefill_cp",
+                return_value=False,
+            ),
+            patch("sglang.srt.layers.cp.utils.is_mla_cp_enabled", return_value=False),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "spec_decode_compile_policy_eagle3._materialize_out"
+            ),
+        ):
+            policy._precompile_fused_draft_decode(
+                FakeDraftBackend(), fused_draft_forward
+            )
+
+        # The global scalar mirrors init_new; the local field stays unset.
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], 4 * policy.speculative_eagle_topk)
+        self.assertIsNone(seen[0][1])
+
 
 # Speculative verification padding fixtures.
 BS = 2
