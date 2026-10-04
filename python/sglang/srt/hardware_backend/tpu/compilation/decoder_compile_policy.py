@@ -41,7 +41,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     LogitsOutputMode,
     PPProxyTensors,
-    enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -1327,7 +1326,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             self._make_top_k_warmup_sampling_info(bs) if spec_info is None else None
         )
 
-        batch = ForwardBatch(
+        return ForwardBatch(
             forward_mode=mode,
             batch_size=bs,
             input_ids=layout.input_ids,
@@ -1358,24 +1357,6 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             spec_algorithm=getattr(self.model_runner, "spec_algorithm", None),
             mm_inputs=self._dummy_mm_inputs(bs),
         )
-        if enable_num_token_non_padded():
-            # Serving sets these in init_new and ModelRunner.forward; the MoE
-            # path guards on the field being present, so warmup must carry it.
-            from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-            from sglang.srt.layers.cp.utils import is_mla_cp_enabled
-
-            batch.global_num_token_non_padded = torch.tensor(
-                num_tokens, dtype=torch.int32, device=layout.input_ids.device
-            )
-            batch.global_num_token_non_padded_cpu = num_tokens
-            batch.set_local_num_token_non_padded(
-                sharded=(
-                    batch.attn_tp_sequence_sharded
-                    and not is_dsa_enable_prefill_cp()
-                    and not is_mla_cp_enabled()
-                ),
-            )
-        return batch
 
     def _make_top_k_warmup_sampling_info(self, bs: int) -> SamplingBatchInfo:
         """Mirror an eligible serving batch for the common static TopK width.
