@@ -160,7 +160,9 @@ A tensor-parallel consumer receives every source page split by kv-head:
 each rank's engine lands its own head slice of every token, and rank 0
 plans the one transfer that fills all ranks. A slice must be whole 32-bit
 packs of the fused page, so BF16 KV takes any head count per rank and FP8
-KV needs an even head count per rank.
+KV needs an even head count per rank. The rank-4 RPA-seq pool
+(`[blocks, 2 * kv_heads, head_dim, page]`) keeps a head's K and V rows
+adjacent, so each rank's slice is one contiguous run per page.
 
 This path requires a tpu-sync with PP pool resharding: per-layer pool
 pairing, sender-local pool indices on the wire, registered transfer ranks,
@@ -202,4 +204,5 @@ source pages remain reserved until the unclaimed registration expires
 (`SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S`, 60 seconds by default).
 
 The pipeline unit tests are in
-`test/registered/unit/hardware_backend/tpu/test_raiden_pipeline.py`.
+`test/registered/unit/hardware_backend/tpu/test_raiden_pipeline.py` and
+`test_raiden_pipeline_rank4.py`.

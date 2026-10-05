@@ -28,6 +28,7 @@ from sglang_tpu.disaggregation.raiden.host_pool import (
 from sglang_tpu.disaggregation.raiden.reshard_schedule import (
     ReshardGeometry,
     head_bytes,
+    head_slice_params,
 )
 from sglang_tpu.disaggregation.raiden.serde import (
     MessageTag,
@@ -42,6 +43,23 @@ _REGISTRATION_CANCELLED = "Request block registration was cancelled"
 _MISSING_REGISTRATION = "Missing producer block registration"
 _EARLY_COMPLETION = "Only an empty producer registration may complete before"
 
+# Two per-layer KV page layouts can cross a pipeline transfer:
+#   rank 5, the fused pool:   [num_blocks, page_size, kv_heads_packed, kv_packing, head_dim]
+#   rank 4, the RPA-seq pool: [num_blocks, 2 * kv_heads, head_dim_lanes, page_size]
+# The rank-4 pool keeps each head's K and V rows adjacent and puts the token
+# index on the lane axis, so one kv-head is a single contiguous run of a page.
+_FUSED_KV_RANK = 5
+_HEAD_MAJOR_KV_RANK = 4
+
+
+def _kv_rank(tensor) -> int:
+    rank = len(tensor.shape)
+    if rank not in (_FUSED_KV_RANK, _HEAD_MAJOR_KV_RANK):
+        raise ValueError(
+            "Raiden pipeline transfer requires rank-5 fused or rank-4 RPA-seq KV"
+        )
+    return rank
+
 
 def pool_manifest(groups: Any) -> list[dict]:
     """Name each local full-attention or sliding-window tensor by model layer."""
@@ -53,8 +71,7 @@ def pool_manifest(groups: Any) -> list[dict]:
         if len(tensors) != len(layer_ids):
             raise ValueError(f"Raiden {kind} pools need one global layer ID per tensor")
         for tensor, layer in zip(tensors, layer_ids):
-            if len(tensor.shape) != 5:
-                raise ValueError("Raiden pipeline transfer requires rank-5 fused KV")
+            _kv_rank(tensor)
             size = math.prod(int(n) for n in tensor.shape[1:]) * tensor.element_size()
             pools.append(
                 dict(
@@ -79,6 +96,8 @@ def pool_manifest(groups: Any) -> list[dict]:
         raise ValueError(
             "Raiden pipeline transfer needs full-attention KV in every stage"
         )
+    if len({_kv_rank(tensor) for tensor in [*groups.full, *groups.swa]}) != 1:
+        raise ValueError("Raiden pipeline KV layers must share one page layout")
     tags = [pool["tag"] for pool in pools]
     if len(tags) != len(set(tags)):
         raise ValueError("Raiden pipeline transfer requires distinct global layer IDs")
@@ -105,17 +124,24 @@ def layout_fingerprint(pools: Sequence[dict], tensors: Sequence[Any], getter) ->
     subsets; the per-rank head count is left out so a tensor-parallel consumer
     matches its producer."""
     classes = {}
+    schema = "sglang-fused-kv-v2"
     for pool, tensor in zip(pools, tensors):
         layout = materialized_storage_layout(tensor, getter)
         if layout is None:
             raise ValueError("Raiden pipeline KV must have a materialized TPU layout")
         major, tiles, bits = layout
-        signature = dict(
-            page_shape=[
+        if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
+            # Axis 1, the per-rank 2 * kv_heads, is left out.
+            schema = "sglang-rpa-seq-kv-v1"
+            page_shape = [int(tensor.shape[2]), int(tensor.shape[3])]
+        else:
+            page_shape = [
                 int(tensor.shape[1]),
                 int(tensor.shape[3]),
                 int(tensor.shape[4]),
-            ],
+            ]
+        signature = dict(
+            page_shape=page_shape,
             dtype=pool["dtype_tag"],
             minor_to_major=[int(n) for n in major],
             tiles=[[int(n) for n in tile] for tile in tiles],
@@ -125,9 +151,7 @@ def layout_fingerprint(pools: Sequence[dict], tensors: Sequence[Any], getter) ->
         if kind in classes and classes[kind] != signature:
             raise ValueError(f"Raiden {kind} layers have differing page layouts")
         classes[kind] = signature
-    value = json.dumps(
-        dict(schema="sglang-fused-kv-v2", classes=classes), sort_keys=True
-    )
+    value = json.dumps(dict(schema=schema, classes=classes), sort_keys=True)
     return hashlib.sha256(value.encode()).hexdigest()
 
 
@@ -175,6 +199,17 @@ def head_slice_spans(
     result = []
     for pool, tensor in zip(pools, tensors):
         blocks = swa if pool["tag"].startswith("swa.") else full
+        if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
+            result.append(
+                _head_major_slice_spans(
+                    pool=pool,
+                    tensor=tensor,
+                    blocks=blocks,
+                    dst_attn_tp=dst_attn_tp,
+                    total_kv_heads=total_kv_heads,
+                )
+            )
+            continue
         geometry = ReshardGeometry(
             src_tp=1,
             dst_tp=dst_attn_tp,
@@ -243,6 +278,50 @@ def destination_blocks(
         dst_device_block_ids=blocks,
         dst_block_counts=counts,
         dst_skip_bytes=skips,
+    )
+
+
+def _head_major_slice_spans(
+    *, pool: dict, tensor: Any, blocks: list[int], dst_attn_tp: int, total_kv_heads: int
+) -> Any:
+    """Per-rank kv-head slices of rank-4 RPA-seq pages: one span per page and rank.
+
+    ``num_heads`` heads from ``head`` are the contiguous bytes
+    ``[head * run, (head + num_heads) * run)`` of a page, with
+    ``run = 2 * head_dim_lanes * page_size * element_size``; the destination
+    page stores only that rank's heads.
+    """
+    run = 2 * int(tensor.shape[2]) * int(tensor.shape[3]) * tensor.element_size()
+    spans = []
+    for rank in range(dst_attn_tp):
+        src_head, num_heads, dst_head, _, dst_heads_per_rank = head_slice_params(
+            src_tp=1,
+            dst_tp=dst_attn_tp,
+            src_rank=0,
+            dst_rank=rank,
+            total_kv_heads=total_kv_heads,
+        )
+        spans.extend(
+            SimpleNamespace(
+                src_block_ordinal=index,
+                src_offset_bytes=src_head * run,
+                dst_block_index=0,
+                dst_offset_bytes=(index * dst_heads_per_rank + dst_head) * run,
+                size_bytes=num_heads * run,
+                src_stride_bytes=0,
+                dst_stride_bytes=0,
+                count=1,
+                dst_unit_ordinal=rank,
+            )
+            for index in range(len(blocks))
+        )
+    return SimpleNamespace(
+        tag=pool["tag"],
+        block_ids=list(blocks),
+        # Ranks that share a kv-head each receive it.
+        declared_bytes=sum(span.size_bytes * span.count for span in spans),
+        dst_space_version=1,
+        spans=spans,
     )
 
 
