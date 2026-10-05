@@ -93,6 +93,7 @@ class TestAccuracyRecipes(unittest.TestCase):
         "recipe/configs/gpt_oss_20b/accuracy.py",
         "recipe/configs/gemma4_31b/accuracy.py",
         "recipe/configs/gemma4_26b_a4b/accuracy.py",
+        "recipe/configs/gemma4_26b_a4b/aime.py",
         "recipe/configs/gpt_oss_120b/accuracy_aime.py",
         "recipe/configs/gpt_oss_120b/accuracy_gpqa.py",
         "recipe/configs/gpt_oss_120b/accuracy_gsm8k.py",

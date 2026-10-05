@@ -13,13 +13,18 @@ register_tpu_ci(
     labels=["singlehost", "gemma4-26b-a4b", "accuracy"],
 )
 
-CONFIG_MODULE = "recipe/configs/gemma4_26b_a4b/accuracy.py"
+CONFIG_MODULE = "recipe/configs/gemma4_26b_a4b/aime.py"
 MODEL_PATH = GEMMA4_26B_A4B["served_model_name"]
+# 64k thinking budget: at 32k, 4% of the answers hit the cap and scored 0.
+AIME_MODEL = {
+    **GEMMA4_26B_A4B,
+    "sampling": {**GEMMA4_26B_A4B["sampling"], "max_tokens": 65536, "num_threads": 32},
+}
 
 GATE = {
     "dataset": "aime26",
     "label": "aime26",
-    "runner": make_runner(GEMMA4_26B_A4B, "aime26", n_repeats=4),
+    "runner": make_runner(AIME_MODEL, "aime26", n_repeats=4),
     "report_only": True,
 }
 
@@ -27,7 +32,7 @@ GATE = {
 def build_model_config():
     """Assemble this benchmark's gate against the model's shared identity."""
     return make_model_config(
-        GEMMA4_26B_A4B,
+        AIME_MODEL,
         test_name="gemma4-26b-a4b-aime",
         series_id="accuracy-gemma4-26b-a4b-aime",
         gate=GATE,
@@ -54,7 +59,7 @@ class TestGemma26BA4BAIMEConfiguration(unittest.TestCase):
 
     def test_gate_fits_the_server_its_recipe_starts(self):
         self.assertEqual(
-            gate_server_failures(CONFIG_MODULE, GEMMA4_26B_A4B["sampling"]), []
+            gate_server_failures(CONFIG_MODULE, AIME_MODEL["sampling"]), []
         )
 
 
