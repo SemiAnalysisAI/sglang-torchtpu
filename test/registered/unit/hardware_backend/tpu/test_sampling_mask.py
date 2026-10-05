@@ -71,7 +71,7 @@ def _filter_on_tpu(probs, top_ks, top_ps, min_ps, need_top_k, need_top_p, need_m
     return filtered.cpu().numpy()
 
 
-@unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+@unittest.skipUnless(torch.accelerator.is_available(), "requires TPU")
 class TestFilterProbsOpMatchesSortReference(CustomTestCase):
     def _assert_matches_reference(
         self, probs, top_ks, top_ps, min_ps, need_top_k, need_top_p, need_min_p
@@ -172,7 +172,7 @@ class TestFilterProbsOpMatchesSortReference(CustomTestCase):
         )
 
 
-@unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+@unittest.skipUnless(torch.accelerator.is_available(), "requires TPU")
 class TestGatheredBlockFilterEquivalence(CustomTestCase):
     """Validates the widened fast path: top-p/min-p evaluated inside the
     `tpu_top_k`-gathered descending [bs, k] block (need_top_k=False) keeps
@@ -240,7 +240,7 @@ class TestGatheredBlockFilterEquivalence(CustomTestCase):
                 self.assertEqual(ids.cpu().tolist(), expected.indices.tolist())
 
 
-@unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+@unittest.skipUnless(torch.accelerator.is_available(), "requires TPU")
 class TestEagleVerifyRenorm(CustomTestCase):
     """EAGLE verify renormalizes top-k, then top-p on the top-k-renormalized
     distribution. Each stage must keep the sort reference's support."""
