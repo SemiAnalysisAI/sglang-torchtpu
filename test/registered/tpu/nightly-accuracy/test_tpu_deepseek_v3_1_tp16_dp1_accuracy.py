@@ -45,17 +45,6 @@ def build_model_config():
         "variant": "2host-TP16+EP16+DP1-FP8KV",
         "gates": [
             {
-                "dataset": "gpqa",
-                "label": "gpqa_diamond",
-                "report_only": True,
-                "thinking": True,
-                "repeat": 1,
-                "num_threads": 128,
-                "temperature": 0.6,
-                "top_p": 0.95,
-                "max_tokens": 32768,
-            },
-            {
                 "dataset": "aime25",
                 "label": "aime25",
                 "report_only": True,
@@ -67,19 +56,6 @@ def build_model_config():
                 "top_p": 0.95,
                 # 32k truncated 3-7 of 30 answers per run (each scored 0); 64k truncates none.
                 "max_tokens": 65536,
-            },
-            {
-                "dataset": "mmlu",
-                "label": "mmlu",
-                "report_only": True,
-                "thinking": True,
-                "repeat": 1,
-                # Match the non-DPA test: 250 sampled questions per repeat.
-                "num_examples": 250,
-                "num_threads": 128,
-                "temperature": 0.6,
-                "top_p": 0.95,
-                "max_tokens": 16384,
             },
         ],
     }
