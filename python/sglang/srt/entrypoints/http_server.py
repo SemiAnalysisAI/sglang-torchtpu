@@ -2878,6 +2878,7 @@ def launch_server(
     run_detokenizer_process_func: Callable = run_detokenizer_process,
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
+    engine_class: type[Engine] = Engine,
 ):
     """
     Launch SRT (SGLang Runtime) Server.
@@ -2902,7 +2903,7 @@ def launch_server(
         scheduler_init_result,
         subprocess_watchdog,
         _weight_cache_daemon_procs,
-    ) = Engine._launch_subprocesses(
+    ) = engine_class._launch_subprocesses(
         server_args=server_args,
         init_tokenizer_manager_func=init_tokenizer_manager_func,
         run_scheduler_process_func=run_scheduler_process_func,
