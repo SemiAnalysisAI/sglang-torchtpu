@@ -8,8 +8,8 @@ NOT YET VALIDATED AT tp8. The int4 experts measured 40.9 GB per rank at tp16, so
 graph share what is left. If bring-up dies in the precompile, lower CONCURRENCY
 (that is the pool) before mem_fraction_static -- the weights still have to fit.
 
-Text only: MoonViT is in the checkpoint, but the sweep sends no images, so no
-vision prefill shape is compiled.
+Text only: MoonViT is in the checkpoint, but the sweep sends no images, so the
+vision bucket ladder is switched off below rather than warmed at startup.
 """
 
 from copy import deepcopy
@@ -53,3 +53,5 @@ CONFIG["server_args"].update(
         "weight_loader_drop_cache_after_load": True,
     }
 )
+# Empty skips the MoonViT patch ladder (57 warmups, ~14 min); the sweep sends no images.
+CONFIG["runtime_env"].update({"SGLANG_TPU_VIT_PRECOMPILE_SIZES": ""})

@@ -45,11 +45,8 @@ on:
 
 concurrency:
   # Only governs standalone dispatches (a called workflow rides the caller's
-  # group). Keyed on ref so runs for different branches proceed in parallel; the
-  # nightly lane has 3 single-host slices to absorb them. Same ref still
-  # serializes, so a re-dispatch cannot race the previous run's numbers into the
-  # same window.
-  group: tpu-perf-${{ inputs.ref || github.ref }}
+  # group). Keyed on ref and model: one group per selection.
+  group: tpu-perf-${{ inputs.ref || github.ref }}-${{ inputs.model || 'all' }}
   cancel-in-progress: false
 
 jobs:
@@ -98,7 +95,7 @@ jobs:
           || (inputs.model == 'deepseek-v3-1' && fromJSON('[
           {"suite": "nightly-tpu-perf-deepseek-v3-1", "run_name": "perf-deepseek-v3-1", "timeout": 3600, "weights_pvc": "deepseek-v3-1-rox"}]'))
           || (inputs.model == 'kimi-k26' && fromJSON('[
-          {"suite": "nightly-tpu-perf-kimi-k26", "run_name": "perf-kimi-k26", "timeout": 3600, "weights_pvc": "model-weights"}]'))
+          {"suite": "nightly-tpu-perf-kimi-k26", "run_name": "perf-kimi-k26", "timeout": 7200, "weights_pvc": "model-weights"}]'))
           || (inputs.model == 'gemma4-31b' && fromJSON('[
           {"suite": "nightly-tpu-perf-gemma4-31b", "run_name": "perf-gemma4-31b", "timeout": 3600, "weights_pvc": "model-weights"}]'))
           || (inputs.model == 'gemma4-26b-a4b' && fromJSON('[
@@ -112,7 +109,7 @@ jobs:
           {"suite": "nightly-tpu-perf-gpt-oss-120b-dflash-c64", "run_name": "perf-gpt-oss-120b-dflash-c64", "timeout": 3000, "weights_pvc": "model-weights"},
           {"suite": "nightly-tpu-perf-deepseek-r1-0528", "run_name": "perf-deepseek-r1-0528", "timeout": 3600, "weights_pvc": "model-weights"},
           {"suite": "nightly-tpu-perf-deepseek-v3-1", "run_name": "perf-deepseek-v3-1", "timeout": 3600, "weights_pvc": "deepseek-v3-1-rox"},
-          {"suite": "nightly-tpu-perf-kimi-k26", "run_name": "perf-kimi-k26", "timeout": 3600, "weights_pvc": "model-weights"},
+          {"suite": "nightly-tpu-perf-kimi-k26", "run_name": "perf-kimi-k26", "timeout": 7200, "weights_pvc": "model-weights"},
           {"suite": "nightly-tpu-perf-gemma4-31b", "run_name": "perf-gemma4-31b", "timeout": 3600, "weights_pvc": "model-weights"},
           {"suite": "nightly-tpu-perf-gemma4-26b-a4b", "run_name": "perf-gemma4-26b-a4b", "timeout": 3600, "weights_pvc": "model-weights"},
           {"suite": "nightly-tpu-perf-qwen3-5-397b", "run_name": "perf-qwen3-5-397b", "timeout": 3600, "weights_pvc": "model-weights"}]') }}

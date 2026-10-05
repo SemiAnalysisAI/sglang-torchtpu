@@ -1016,6 +1016,22 @@ def calculate_tiling(
     base_rhs_size_bytes = (
         dims.size_k * dims.size_n * rhs_bits // 8 * base_rhs_bytes_multiplier
     )
+    if lhs_cfgs.quant_dtype is None and rhs_cfgs.quant_dtype is not None:
+        # Weight-only kernels unpack one RHS tile to the LHS dtype before the dot;
+        # charge that temporary and the per-buffer scales, not just the packed bytes.
+        unpacked_rhs_bytes = (
+            dims.size_k * dims.size_n * lhs_bits // 8 * base_rhs_bytes_multiplier
+        )
+        base_rhs_size_bytes += pl.cdiv(unpacked_rhs_bytes, num_rhs_buffers)
+        if rhs_cfgs.has_scale:
+            scale_bits = jax.dtypes.itemsize_bits(rhs_cfgs.scale_dtype)
+            base_rhs_size_bytes += (
+                pl.cdiv(dims.size_k, rhs_cfgs.quant_block_size)
+                * pl.cdiv(dims.size_n, rhs_cfgs.scale_block_n)
+                * scale_bits
+                // 8
+                * base_rhs_bytes_multiplier
+            )
 
     scratch_reserve_bytes = 0
     if fuse_act:

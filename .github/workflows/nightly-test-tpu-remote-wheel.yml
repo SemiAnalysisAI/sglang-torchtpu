@@ -243,6 +243,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      actions: read
 
   perf:
     needs: override-wheel
