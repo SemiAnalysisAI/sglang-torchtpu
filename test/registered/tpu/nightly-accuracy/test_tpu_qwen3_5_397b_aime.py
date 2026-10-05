@@ -38,6 +38,9 @@ class TestQwen35AIME(AccuracyTestCase):
 
     config_module = CONFIG_MODULE
     model_path = "/weights/Qwen3.5-397B-A17B-FP8"
+    # One host at tp8 precompiles bigger per-core shapes than two at tp16:
+    # the FP8 bring-up outlived the 1800 s default (run 37245212756).
+    health_timeout = 3600
     tag = "qwen3-5-aime-e2e"
 
     @classmethod
