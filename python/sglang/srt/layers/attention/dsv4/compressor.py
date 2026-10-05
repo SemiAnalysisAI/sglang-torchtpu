@@ -27,9 +27,10 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
+from sglang.srt.utils import add_prefix, is_npu, is_tpu, set_weight_attrs
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -411,13 +412,18 @@ class Compressor(BaseFusedOp):
     def _apply_ape_hotfix(self):
         self.ape_converted = True
 
-        if _is_npu:
+        if _is_npu or _is_tpu:
             return
 
         if self.overlap:
             ape = torch.chunk(self.ape.data, 2, dim=-1)
             ape = torch.cat([ape[0], ape[1]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
+
+    def _torch_compile_forward(self, num_tokens: int):
+        if _is_tpu or _is_npu:
+            return None
+        return super()._torch_compile_forward(num_tokens)
 
     def apply_ape_hotfix(self):
         assert not self.ape_converted
@@ -510,3 +516,16 @@ class Compressor(BaseFusedOp):
             )
 
         return get_attn_backend().forward_compress(self, x, forward_batch)
+
+    def forward_tpu(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend: Optional[AttentionBackend] = None,
+    ) -> Optional[torch.Tensor]:
+        if forward_batch.forward_mode.is_idle():
+            assert x.shape[0] == 0
+            return x.new_empty(0, self.head_dim)
+
+        backend = attn_backend if attn_backend is not None else get_attn_backend()
+        return backend.forward_compress(self, x, forward_batch)

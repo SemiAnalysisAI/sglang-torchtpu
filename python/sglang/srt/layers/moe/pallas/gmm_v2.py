@@ -67,6 +67,15 @@ def situ_and_mul(
     return gate_act * up
 
 
+def silu_and_mul_with_clamp(
+    gate: jax.Array, up: jax.Array, *, limit: float = 10.0
+) -> jax.Array:
+    """Clamped SwiGLU activation used in DeepSeek-V4."""
+    gate = jnp.minimum(gate, limit)
+    up = jnp.clip(up, min=-limit, max=limit)
+    return jax.nn.silu(gate) * up
+
+
 _MXFP4_BLOCK_SIZE = 32
 
 
@@ -81,8 +90,8 @@ def apply_act_fn(acc: jax.Array, tile_n: int, fuse_act: str | None):
       acc: The accumulator array, with the last dimension being 2 * tile_n.
       tile_n: The size of the 'n' dimension for a single projection (gate or up).
       fuse_act: The name of the activation function to apply. Supported values are
-        "silu", "gelu", "swigluoai", and "situ:{beta}:{linear_beta|none}". If
-        None, no activation is applied.
+        "silu", "silu_and_mul_with_clamp", "gelu", "swigluoai", and
+        "situ:{beta}:{linear_beta|none}". If None, no activation is applied.
 
     Returns:
       The result of applying the activation function.
@@ -98,6 +107,8 @@ def apply_act_fn(acc: jax.Array, tile_n: int, fuse_act: str | None):
     match fuse_act:
         case "silu":
             return jax.nn.silu(acc_gate) * acc_up
+        case "silu_and_mul_with_clamp":
+            return silu_and_mul_with_clamp(acc_gate, acc_up)
         case "gelu":
             return jax.nn.gelu(acc_gate) * acc_up
         case "swigluoai":

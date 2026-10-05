@@ -388,6 +388,12 @@ def apply_tpu_fp8_moe(
     # test_fp8_moe_scale_layout.py.
     from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 
+    swiglu_limit = getattr(
+        getattr(layer, "moe_runner_config", None), "swiglu_limit", None
+    )
+    if swiglu_limit is not None and activation == "silu":
+        activation = "silu_and_mul_with_clamp"
+
     # TODO(torch_tpu): try native torch._scaled_grouped_mm for channelwise
     # scales and torch._scaled_grouped_mm_v2 for block scales once torch_tpu
     # registers those ops. Until then, keep MoE on the same backend-dispatched

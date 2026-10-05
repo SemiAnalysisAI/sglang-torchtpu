@@ -344,6 +344,7 @@ def _fuse_act_name(activation_name):
         return activation_name
     mapping = {
         "silu": "silu",
+        "silu_and_mul_with_clamp": "silu_and_mul_with_clamp",
         "gelu": "gelu",
         "swiglu_oai": "swigluoai",
         "swigluoai": "swigluoai",
@@ -351,7 +352,7 @@ def _fuse_act_name(activation_name):
     if activation_name not in mapping:
         raise NotImplementedError(
             f"Unsupported activation '{activation_name}' for the Pallas "
-            "fused-MoE op. Supported: silu, gelu, swiglu_oai."
+            "fused-MoE op. Supported: silu, silu_and_mul_with_clamp, gelu, swiglu_oai."
         )
     return mapping[activation_name]
 

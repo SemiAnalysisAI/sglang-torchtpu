@@ -106,7 +106,7 @@ def fp8_fused_rs_unsupported_reason(
         return "DP attention and hybrid DP/TP attention are not supported"
     if not gated:
         return "the MoE activation must be gated"
-    if activation != "silu":
+    if activation not in ("silu", "silu_and_mul_with_clamp"):
         return f"the MoE activation must be silu, got {activation}"
     if apply_router_weight_on_input:
         return "applying router weights on the expert input is not supported"
@@ -193,6 +193,11 @@ def _apply_fp8_fused_rs(
     activation: str,
     post_expert_norm_weight: torch.Tensor | None = None,
 ) -> StandardCombineInput:
+    swiglu_limit = getattr(
+        getattr(layer, "moe_runner_config", None), "swiglu_limit", None
+    )
+    if swiglu_limit is not None and activation == "silu":
+        activation = "silu_and_mul_with_clamp"
     prepared_input = prepare_fused_moe_sequence_parallel_input(layer, dispatch_output)
     dispatch_output = prepared_input.dispatch_output
     keep_output_shard = prepared_input.plan.keep_output_shard
