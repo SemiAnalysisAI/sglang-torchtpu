@@ -722,6 +722,9 @@ class Envs:
     SGLANG_RAIDEN_DYNAMIC_HOST_STAGING = EnvBoolWithAlias(
         True, deprecated_name="TPU_RAIDEN_DYNAMIC_HOST_STAGING"
     )
+    # Raiden: a decode starts a room's next read as soon as the prefill
+    # announces it, instead of on the next scheduler poll.
+    SGLANG_RAIDEN_LISTENER_START_READ = EnvBool(False)
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
     )

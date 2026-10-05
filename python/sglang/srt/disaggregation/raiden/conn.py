@@ -105,6 +105,7 @@ class RaidenKVManager(
     # The legacy transport unless set_kv_caches builds a pipeline transfer.
     _pipeline = None
     _pipeline_enabled = False
+    _listener_start_read = False
 
     def __init__(
         self,
@@ -255,6 +256,7 @@ class RaidenKVManager(
             # Detects a prefill that stopped answering and fails its rooms.
             self._start_heartbeat_checker_thread()
             self._decode = DecodeState()
+            self._listener_start_read = envs.SGLANG_RAIDEN_LISTENER_START_READ.get()
 
         # Native I/O tracking stays on the manager: it survives room cleanup.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -910,12 +912,15 @@ class RaidenKVManager(
     def is_failed(self, room: int) -> bool:
         """Whether any transfer of the room -- whole, sliding-window, or one of
         its chunks -- has failed."""
-        rid, swa_rid, chunk_prefix = str(room), self._swa_req_id(room), f"{room}#"
         with self._state_lock:
-            return any(
-                key == rid or key == swa_rid or key.startswith(chunk_prefix)
-                for key in self._failed
-            )
+            return self._is_failed_locked(room)
+
+    def _is_failed_locked(self, room: int) -> bool:
+        rid, swa_rid, chunk_prefix = str(room), self._swa_req_id(room), f"{room}#"
+        return any(
+            key == rid or key == swa_rid or key.startswith(chunk_prefix)
+            for key in self._failed
+        )
 
     def room_has_active_io(self, room: int) -> bool:
         """Whether raiden still holds a transfer of the room: an unsettled

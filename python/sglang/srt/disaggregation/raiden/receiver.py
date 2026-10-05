@@ -84,6 +84,8 @@ class RaidenReceiverMixin:
                     endpoint,
                 )
             )
+        if self._listener_start_read and self.chunked_transfer:
+            self._start_chunked_pull(room)
 
     def _on_blocks(self, msg: List[bytes]) -> None:
         req = Blocks.from_frames(msg)
@@ -147,6 +149,8 @@ class RaidenReceiverMixin:
                         )
                     )
                 self._decode.final_seen.add(room)
+        if self._listener_start_read and self.chunked_transfer:
+            self._start_chunked_pull(room)
 
     # ----- decode side -------------------------------------------------------
 
@@ -293,9 +297,9 @@ class RaidenReceiverMixin:
             f"but a host staging slot holds {max_blocks}. Raise {override_env} "
             "if this request size is expected."
         )
-        self.record_failure(room, reason)
         with self._state_lock:
-            self._failed.add(str(room))
+            if room in self._decode.local_blocks:
+                self._fail_room_locked(room, reason)
         logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
 
     def _start_read_or_fail(
@@ -312,8 +316,9 @@ class RaidenReceiverMixin:
     ) -> bool:
         """Issue one admitted read; if the engine raises, fail the room.
 
-        Runs inside the scheduler's poll, so an escaping exception would take
-        down every request on this decode worker. Raiden raises from
+        Runs inside the scheduler's poll, where an escaping exception would
+        take down every request on this decode worker, or on the listener
+        thread, where the admitted read would never settle. Raiden raises from
         ``start_read`` only before it registers the read, so it will never
         report ``req_id`` -- nor the reads in ``unissued``, which this failure
         keeps from being issued. They are settled here so the admission is
@@ -386,6 +391,9 @@ class RaidenReceiverMixin:
                     return started
                 if any(rid in self._pulling for rid in reads):
                     return started
+                if room in self._aborted or self._is_failed_locked(room):
+                    # The room failed; its pages are no longer this read's.
+                    return started
                 local = self._decode.local_blocks[room]
                 total = self._decode.remote_total.get(room, 0)
                 req_id, uuid, pages, blocks, endpoint = queue[0]
@@ -434,9 +442,6 @@ class RaidenReceiverMixin:
                     swa_cost = self._staging_cost(
                         swa_pages, self._swa_engine_max_blocks
                     )
-                if room in self._aborted:
-                    # The room failed; its pages are no longer this read's.
-                    return started
                 if self._announcement_expired_locked(room, req_id):
                     return started
                 if not self._pulling.admit(req_id, cost, swa_cost):
