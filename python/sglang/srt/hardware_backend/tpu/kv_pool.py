@@ -195,9 +195,14 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
 
     def _synchronize_device(self) -> None:
         device = getattr(self, "device", None)
-        if device is not None and torch.device(device).type != "tpu":
-            return
-        if getattr(self, "kv_buffer", None) and self.kv_buffer[0].device.type != "tpu":
+        if device is not None:
+            device_type = torch.device(device).type
+        elif getattr(self, "kv_buffer", None):
+            device_type = self.kv_buffer[0].device.type
+        else:
+            device_type = None
+
+        if device_type == "cpu" or device_type is None:
             return
         torch.accelerator.synchronize()
 
