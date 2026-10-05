@@ -1,0 +1,61 @@
+"""Qwen3.5-397B-A17B-FP8 TPU AIME 2026 score, mean of four passes, on one host."""
+
+import unittest
+
+from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.tpu import QWEN3_5_397B, make_model_config, make_runner
+from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase, gate_server_failures
+
+register_tpu_ci(
+    est_time=9000,
+    suite="nightly-tpu-accuracy-qwen3-5-397b-aime",
+    nightly=True,
+    labels=["singlehost", "qwen3.5-397b", "accuracy"],
+)
+
+CONFIG_MODULE = QWEN3_5_397B["config_module"]
+
+GATE = {
+    "dataset": "aime26",
+    "label": "aime26",
+    "runner": make_runner(QWEN3_5_397B, "aime26", n_repeats=4),
+    "report_only": True,
+}
+
+
+def build_model_config():
+    """Assemble this benchmark's gate against the model's shared identity."""
+    return make_model_config(
+        QWEN3_5_397B,
+        test_name="qwen3-5-397b-aime",
+        series_id="accuracy-qwen3-5-397b-aime",
+        gate=GATE,
+    )
+
+
+class TestQwen35AIME(AccuracyTestCase):
+    """Score Qwen3.5-397B-FP8 aime26 on the server its recipe starts."""
+
+    config_module = CONFIG_MODULE
+    model_path = "/weights/Qwen3.5-397B-A17B-FP8"
+    tag = "qwen3-5-aime-e2e"
+
+    @classmethod
+    def build_model_config(cls):
+        return build_model_config()
+
+    def test_accuracy(self):
+        self.run_evaluations()
+
+
+class TestQwen35AIMEConfiguration(unittest.TestCase):
+    """Host-side configuration tests, runnable without TPU hardware."""
+
+    def test_gate_fits_the_server_its_recipe_starts(self):
+        self.assertEqual(
+            gate_server_failures(CONFIG_MODULE, QWEN3_5_397B["sampling"]), []
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

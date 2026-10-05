@@ -270,6 +270,38 @@ jobs:
       contents: read
       id-token: write
 
+  # Dispatch and full-set only: the 1 AM nightly's 1-host lane already runs
+  # nine legs on three slices, and a fourth wave would outlive the admission
+  # budget. FP8 checkpoint on one host, same server as the MMMU-Pro leg.
+  accuracy-qwen3-5:
+    needs: [build, plan]
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","full-set","qwen3-5-397b"]'), needs.plan.outputs.model) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: nightly-tpu-accuracy-qwen3-5-397b-gpqa
+            run_name: accuracy-qwen3-5-397b-gpqa
+          - suite: nightly-tpu-accuracy-qwen3-5-397b-aime
+            run_name: accuracy-qwen3-5-397b-aime
+    name: ${{ matrix.suite }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      suite: ${{ matrix.suite }}
+      run_name: ${{ matrix.run_name }}
+      nightly: true
+      weights_pvc: model-weights
+      timeout_per_file: 10800
+    permissions:
+      contents: read
+      id-token: write
+
   # Scheduled and manually dispatched accuracy share the same multihost suite.
   discover-multihost:
     needs: [build, plan]
