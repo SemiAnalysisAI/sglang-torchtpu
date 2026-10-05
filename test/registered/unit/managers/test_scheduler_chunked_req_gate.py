@@ -315,9 +315,7 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         scheduler.token_to_kv_pool_allocator.clear.assert_called_once_with()
 
     @patch("sglang.srt.managers.scheduler.release_kv_cache")
-    def test_drain_skips_release_when_overlap_retire_already_released(
-        self, release_kv
-    ):
+    def test_drain_skips_release_when_overlap_retire_already_released(self, release_kv):
         # Under overlap, the parked request's in-flight chunk result retires it
         # (and releases its KV) before the sender drains.
         sender = MagicMock()
