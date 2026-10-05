@@ -1,4 +1,4 @@
-"""Early parts of the Raiden pipeline transfer.
+"""Early parts and stage groups of the Raiden pipeline transfer.
 
 Two producer stages and one decode rank exchange their real control messages
 through an in-memory bus; a fake controller "lands" a coordinated transfer by
@@ -85,6 +85,14 @@ class Controller:
                 req_id = kwargs["req_id"]
                 sources = {u.data_replica_idx for u in kwargs["src_units"]}
                 assert set(controller.registered[req_id]) == sources, req_id
+                if ".s" in req_id:
+                    group = int(req_id.split(".s")[1])
+                    for p in controller.producers:
+                        if pl.stage_group(p.rank, p.stage_group_size) == group:
+                            p.engine.sent.append(req_id)
+                    for d in controller.decodes:
+                        d.engine.received.append(req_id)
+                    return True
                 for p in controller.producers:
                     p.engine.sent.append(req_id)
                 for d in controller.decodes:
@@ -134,7 +142,7 @@ class Manager:
         assert len(msg) == n
 
 
-def make(mode, pp_rank, pp_size, controller, bus, name, heads):
+def make(mode, pp_rank, pp_size, controller, bus, name, heads, stage_parts=False):
     t = object.__new__(pl.PipelineTransfer)
     mgr = Manager(mode, pp_rank, pp_size, bus, name)
     groups = SimpleNamespace(
@@ -155,10 +163,10 @@ def make(mode, pp_rank, pp_size, controller, bus, name, heads):
     t.rank = pp_rank
     t.workers = pp_size
     t.client_type = controller.client
-    t.clients = {}
     t._init_overlap_state()
     t.early_parts = True
     t.part_min_pages = 4
+    t.stage_parts = stage_parts and t.producer
     t.executor = SyncExecutor()
     t.hbm_mem_type = 2
     t.sent, t.replies, t.release_requests, t.receives = {}, {}, {}, {}
@@ -206,7 +214,7 @@ class SyncExecutor:
         return f
 
 
-def build_world():
+def build_world(stage_parts):
     bus = {"queue": []}
     controller = Controller()
     stages = [
@@ -218,6 +226,7 @@ def build_world():
             bus,
             f"p{r}",
             heads=4,
+            stage_parts=stage_parts,
         )
         for r in range(2)
     ]
@@ -244,7 +253,25 @@ def build_world():
 
 @pytest.fixture
 def world():
-    return build_world()
+    return build_world(stage_parts=False)
+
+
+@pytest.fixture
+def staged():
+    return build_world(stage_parts=True)
+
+
+class Fence(concurrent.futures.Future):
+    """A make_fence() future; ``ready = True`` completes the probe copy."""
+
+    @property
+    def ready(self):
+        return self.done()
+
+    @ready.setter
+    def ready(self, value):
+        if value and not self.done():
+            self.set_result(None)
 
 
 def prefill_pages(stage, blocks, swa=None):
@@ -440,6 +467,304 @@ def test_rank_above_zero_fails_a_part_that_never_lands(world, monkeypatch):
     world.pump()
     d.maybe_start_pull(ROOM)
     assert d.receives[ROOM].parts[0]["accepted"]
+    poll(d)
+    assert str(ROOM) not in d.manager._failed
+    now = time.monotonic() + 2 * d.manager._timeout_s + 1
+    monkeypatch.setattr(pl.time, "monotonic", lambda: now)
+    poll(d)
+    assert str(ROOM) in d.manager._failed
+
+
+def test_stage_parts_move_each_stage_when_its_forward_completes(staged):
+    w = staged
+    dst_full, dst_swa = list(range(100, 112)), [200, 201]
+    w.decode.register_decode(ROOM, dst_full, dst_swa, None, w.infos)
+    w.pump()
+    fences = [Fence(), Fence()]
+    for s, fence in zip(w.stages, fences):
+        s.stage_ready(ROOM, list(range(10, 21)), [30, 31], fence)
+        poll(s)
+    w.pump()
+    assert not w.controller.transfers  # no fence has completed
+    fences[0].ready = True
+    poll(w.stages[0])
+    w.pump()
+    assert w.decode.maybe_start_pull(ROOM) is False  # stage 1 still computing
+    (t0,) = w.controller.transfers
+    assert t0["req_id"] == f"{ROOM}.s0"
+    assert [u.data_replica_idx for u in t0["src_units"]] == [0]
+    assert set(t0["transfer_pool_tags"]) == set(
+        w.stages[0].pools[i]["tag"] for i in range(2)
+    )
+    assert t0["dst_device_block_ids"] == dst_full[:11] + dst_swa
+    fences[1].ready = True
+    poll(w.stages[1])
+    w.pump()
+    assert w.decode.maybe_start_pull(ROOM) is True
+    poll(w.decode)
+    assert str(ROOM) not in w.decode.manager._completed_recv  # no metadata yet
+    for s in w.stages:
+        prefill_pages(s, list(range(10, 21)), swa=[30, 31])
+        assert s.finalize_send(ROOM, None)
+    w.pump()
+    for actor in (*w.stages, w.decode):
+        poll(actor)
+    assert str(ROOM) in w.decode.manager._completed_recv
+    for s in w.stages:
+        assert str(ROOM) in s.manager._completed_send and not s.active(ROOM)
+
+
+def test_stage_part_registers_at_finalize_when_fence_is_late(staged):
+    w = staged
+    w.decode.register_decode(ROOM, list(range(100, 112)), [200], None, w.infos)
+    w.pump()
+    for s in w.stages:
+        s.stage_ready(ROOM, list(range(10, 15)), [30], Fence())
+        prefill_pages(s, list(range(10, 15)), swa=[30])
+        s.finalize_send(ROOM, None)
+    w.pump()
+    assert w.decode.maybe_start_pull(ROOM)
+    assert sorted(t["req_id"] for t in w.controller.transfers) == [
+        f"{ROOM}.s0",
+        f"{ROOM}.s1",
+    ]
+    for actor in (*w.stages, w.decode):
+        poll(actor)
+    assert str(ROOM) in w.decode.manager._completed_recv
+
+
+def test_stage_parts_after_early_parts(staged):
+    w = staged
+    dst_full = list(range(100, 112))
+    w.decode.register_decode(ROOM, dst_full, [200], None, w.infos)
+    w.pump()
+    for s in w.stages:
+        start = prefill_pages(s, list(range(10, 18)))
+        s.offer_part(ROOM, start, list(range(10, 18)))
+        fence = Fence()
+        fence.ready = True
+        s.stage_ready(ROOM, list(range(10, 21)), [30], fence)
+        s.offer_part(ROOM, 8, [18, 19, 20, 21])  # late offer: ignored
+        poll(s)
+    w.pump()
+    assert w.decode.maybe_start_pull(ROOM)
+    ids = sorted(t["req_id"] for t in w.controller.transfers)
+    assert ids == [f"{ROOM}.p0", f"{ROOM}.s0", f"{ROOM}.s1"]
+    s0 = next(t for t in w.controller.transfers if t["req_id"] == f"{ROOM}.s0")
+    assert s0["dst_device_block_ids"] == dst_full[8:11] + [200]
+    for s in w.stages:
+        prefill_pages(s, list(range(10, 21)), swa=[30])
+        s.finalize_send(ROOM, None)
+    w.pump()
+    for actor in (*w.stages, w.decode):
+        poll(actor)
+    assert str(ROOM) in w.decode.manager._completed_recv
+
+
+def test_abort_cancels_unclaimed_stage_part(staged):
+    w = staged
+    w.decode.register_decode(ROOM, list(range(100, 112)), [200], None, w.infos)
+    w.pump()
+    s = w.stages[0]
+    fence = Fence()
+    fence.ready = True
+    s.stage_ready(ROOM, list(range(10, 15)), [30], fence)
+    assert s.active(ROOM)
+    s.manager._aborted.add(ROOM)
+    poll(s)
+    assert f"{ROOM}.s0" in w.controller.cancelled
+    assert not s.active(ROOM) and ROOM in s.failed
+
+
+def test_rejected_stage_transfer_fails_the_room_not_the_scheduler(staged):
+    w = staged
+    w.decode.register_decode(ROOM, list(range(100, 112)), [200], None, w.infos)
+    w.pump()
+
+    def reject(**kwargs):
+        raise RuntimeError(
+            "INVALID_ARGUMENT: Source transfer_rank values must be contiguous from zero"
+        )
+
+    w.decode.client_type = lambda address: SimpleNamespace(coordinate_transfer=reject)
+    for s in w.stages:
+        fence = Fence()
+        fence.ready = True
+        s.stage_ready(ROOM, list(range(10, 15)), [30], fence)
+        poll(s)
+    w.pump()
+    w.decode.maybe_start_pull(ROOM)
+    poll(w.decode)  # must not raise
+    assert str(ROOM) in w.decode.manager._failed
+    assert "contiguous from zero" in w.decode.manager.failure_records[ROOM]
+    # The controller arms receivers before senders, so the room keeps its
+    # pages until the native deadline.
+    assert w.decode.active(ROOM)
+
+
+def test_failed_fence_waits_for_finalize(staged):
+    w = staged
+    w.decode.register_decode(ROOM, list(range(100, 112)), [200], None, w.infos)
+    w.pump()
+    s = w.stages[0]
+    fence = Fence()
+    fence.set_exception(RuntimeError("probe copy failed"))
+    s.stage_ready(ROOM, list(range(10, 15)), [30], fence)
+    poll(s)
+    assert not s.stage[ROOM]["registered"]
+    prefill_pages(s, list(range(10, 15)), swa=[30])
+    assert s.finalize_send(ROOM, None)
+    assert s.stage[ROOM]["registered"]
+
+
+def test_stage_group_moves_its_stages_as_one_transfer(staged):
+    w = staged
+    for s in w.stages:
+        s.stage_group_size = 2
+    dst_full = list(range(100, 112))
+    w.decode.register_decode(ROOM, dst_full, [200], None, w.infos)
+    w.pump()
+    fences = [Fence(), Fence()]
+    for s, fence in zip(w.stages, fences):
+        s.stage_ready(ROOM, list(range(10, 15)), [30], fence)
+    fences[0].ready = True
+    w.stages[0].advance_stages()
+    w.pump()
+    assert w.decode.maybe_start_pull(ROOM) is False
+    assert not w.controller.transfers  # the group waits for stage 1
+    fences[1].ready = True
+    w.stages[1].advance_stages()
+    w.pump()
+    assert w.decode.maybe_start_pull(ROOM) is True
+    (t,) = w.controller.transfers
+    assert t["req_id"] == f"{ROOM}.s0"
+    assert sorted(u.data_replica_idx for u in t["src_units"]) == [0, 1]
+    assert len(t["transfer_pool_tags"]) == 4  # both stages' layers
+    for s in w.stages:
+        prefill_pages(s, list(range(10, 15)), swa=[30])
+        s.finalize_send(ROOM, None)
+    w.pump()
+    for actor in (*w.stages, w.decode):
+        poll(actor)
+    assert str(ROOM) in w.decode.manager._completed_recv
+    for s in w.stages:
+        assert str(ROOM) in s.manager._completed_send
+
+
+def test_each_group_transfer_holds_its_own_staging(staged):
+    """Two stage groups need two staging slots; with room for one, the second
+    group waits until the first lands instead of over-committing staging."""
+    w = staged
+    w.decode.admission = StagingAdmission(w.decode.max_blocks)  # one transfer
+    controller = w.controller
+    held = []
+
+    def deferred(**kwargs):
+        held.append(kwargs["req_id"])
+        controller.transfers.append(kwargs)
+        return True  # accepted; landing is reported later
+
+    w.decode.client_type = lambda address: SimpleNamespace(coordinate_transfer=deferred)
+    w.decode.register_decode(ROOM, list(range(100, 112)), [200], None, w.infos)
+    w.pump()
+    for s in w.stages:
+        fence = Fence()
+        fence.ready = True
+        s.stage_ready(ROOM, list(range(10, 15)), [30], fence)
+        s.advance_stages()
+    w.pump()
+    w.decode.maybe_start_pull(ROOM)
+    assert held == [f"{ROOM}.s0"]  # group 1 waits for staging
+    poll(w.decode)
+    assert held == [f"{ROOM}.s0"]
+    w.decode.engine.received = [f"{ROOM}.s0"]
+    poll(w.decode)  # group 0 landed: its slot frees, group 1 starts
+    assert held == [f"{ROOM}.s0", f"{ROOM}.s1"]
+    for s in w.stages:
+        prefill_pages(s, list(range(10, 15)), swa=[30])
+        s.finalize_send(ROOM, None)
+    w.pump()
+    w.decode.engine.received = [f"{ROOM}.s1"]
+    poll(w.decode)
+    assert str(ROOM) in w.decode.manager._completed_recv
+    assert w.decode.admission.pages() == 0
+
+
+def test_group_landing_before_this_rank_starts_it_is_kept(staged):
+    """On an attention-TP rank > 0, rank 0 starts the groups: one can land
+    while this rank still waits on staging for an earlier group. The landing
+    must count, and the room's place in the staging line must not outlive it."""
+    w = staged
+    d = w.decode
+    d.manager.attn_tp_rank = 1  # never coordinates; only records landings
+    d.admission = StagingAdmission(d.max_blocks)  # one transfer
+    d.admission.admit("other", d.max_blocks)  # staging busy elsewhere
+    d.register_decode(ROOM, list(range(100, 112)), [200], None, w.infos)
+    w.pump()
+    for s in w.stages:
+        fence = Fence()
+        fence.ready = True
+        s.stage_ready(ROOM, list(range(10, 15)), [30], fence)
+        s.advance_stages()
+    w.pump()
+    assert d.maybe_start_pull(ROOM) is False  # group 0 waits for staging
+    assert d.admission.waiting == (ROOM, "g", 0)
+    d.engine.received = [f"{ROOM}.s1"]  # rank 0 ran group 1 already
+    poll(d)
+    d.admission.release("other")
+    d.engine.received = [f"{ROOM}.s0"]
+    poll(d)
+    for s in w.stages:
+        prefill_pages(s, list(range(10, 15)), swa=[30])
+        s.finalize_send(ROOM, None)
+    w.pump()
+    poll(d)
+    assert str(ROOM) in d.manager._completed_recv
+    assert d.admission.pages() == 0
+    assert d.admission.waiting is None
+
+
+def test_settled_room_gives_up_its_place_in_the_staging_line(staged):
+    w = staged
+    d = w.decode
+    d.manager.attn_tp_rank = 1
+    d.admission = StagingAdmission(d.max_blocks)
+    d.admission.admit("other", d.max_blocks)
+    d.register_decode(ROOM, list(range(100, 112)), [200], None, w.infos)
+    w.pump()
+    for s in w.stages:
+        fence = Fence()
+        fence.ready = True
+        s.stage_ready(ROOM, list(range(10, 15)), [30], fence)
+        s.advance_stages()
+    w.pump()
+    d.maybe_start_pull(ROOM)
+    assert d.admission.waiting == (ROOM, "g", 0)
+    d.engine.received = [f"{ROOM}.s0", f"{ROOM}.s1"]
+    for s in w.stages:
+        prefill_pages(s, list(range(10, 15)), swa=[30])
+        s.finalize_send(ROOM, None)
+    w.pump()
+    poll(d)
+    assert str(ROOM) in d.manager._completed_recv
+    assert d.admission.waiting is None  # the next room can be admitted
+    d.admission.release("other")
+    assert d.admission.admit("next", d.max_blocks)
+
+
+def test_rank_above_zero_fails_a_group_that_never_lands(staged, monkeypatch):
+    w = staged
+    d = w.decode
+    d.manager.attn_tp_rank = 1
+    d.register_decode(ROOM, list(range(100, 112)), [200], None, w.infos)
+    w.pump()
+    for s in w.stages:
+        fence = Fence()
+        fence.ready = True
+        s.stage_ready(ROOM, list(range(10, 15)), [30], fence)
+        s.advance_stages()
+    w.pump()
+    assert d.maybe_start_pull(ROOM) is True
     poll(d)
     assert str(ROOM) not in d.manager._failed
     now = time.monotonic() + 2 * d.manager._timeout_s + 1

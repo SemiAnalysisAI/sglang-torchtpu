@@ -328,9 +328,15 @@ def _head_major_slice_spans(
 
 # Early parts carry pages that are final before a request's prefill ends -- its
 # cached prefix, finished chunks -- as their own native transfers, "<room>.p<i>".
-# The coordinated closing transfer keeps the plain room id.
+# Stage groups close a request per group of consecutive stages, "<room>.s<g>",
+# as soon as those stages' forwards of the final chunk have completed. The
+# coordinated closing transfer keeps the plain room id.
 def part_req_id(room: int, part: int) -> str:
     return f"{room}.p{part}"
+
+
+def stage_req_id(room: int, group: int) -> str:
+    return f"{room}.s{group}"
 
 
 def _derived_uuid(req_id: str) -> int:
@@ -343,10 +349,26 @@ def part_uuid(room: int, part: int) -> int:
     return _derived_uuid(part_req_id(room, part))
 
 
-def parse_req_id(rid: str) -> tuple[int, int | None]:
-    """(room, part) of a native transfer id: None for the closing transfer."""
+def stage_uuid(room: int, group: int) -> int:
+    return _derived_uuid(stage_req_id(room, group))
+
+
+def parse_req_id(rid: str) -> tuple[int, Any]:
+    """(room, key) of a native transfer id: None for the closing transfer, an
+    int for an early part, ("s", group) for a stage group."""
+    room, _, group = rid.partition(".s")
+    if group:
+        return int(room), ("s", int(group))
     room, _, part = rid.partition(".p")
     return int(room), (int(part) if part else None)
+
+
+def stage_group(rank: int, group_size: int) -> int:
+    return rank // group_size
+
+
+def group_ranks(group: int, group_size: int, pp_size: int) -> list[int]:
+    return list(range(group * group_size, min((group + 1) * group_size, pp_size)))
 
 
 def part_spans(
@@ -381,11 +403,15 @@ def part_destination_blocks(
     start: int,
     count: int,
     source_swa_count: int | None,
+    only_tags: set[str] | None = None,
 ) -> dict:
     """Destination pages of one transfer: full-attention pages [start, start +
-    count) and, when source_swa_count is given, the window."""
+    count) and, when source_swa_count is given, the window; only_tags limits
+    it to the layers of one stage group."""
     tags, blocks, counts, skips = [], [], [], []
     for pool in pools:
+        if only_tags is not None and pool["tag"] not in only_tags:
+            continue
         is_swa = pool["tag"].startswith("swa.")
         if is_swa and source_swa_count is None:
             continue
@@ -408,7 +434,7 @@ def part_destination_blocks(
 
 
 def _new_transfer_state() -> dict:
-    """Decode-side state of one early part."""
+    """Decode-side state of one early part or stage group."""
     return dict(sources={}, future=None, accepted=False, done=False, next_attempt=0.0)
 
 
@@ -500,11 +526,16 @@ class Receive(msgspec.Struct):
     endpoints: tuple[str, ...] = ()
     next_attempt: float = 0.0
     armed_until: float = 0.0
-    # Early parts by index: _new_transfer_state().
+    # Early parts by index and stage groups by group: _new_transfer_state().
     parts: dict[int, dict] = {}
+    groups: dict[int, dict] = {}
     expected_parts: int | None = None
-    # Staging reservations held: the room for the closing transfer and
-    # (room, "p", index) per early part.
+    # Stage metadata by source stage, and the stages whose first-token
+    # metadata arrived.
+    stage: dict[int, dict] = {}
+    aux_ranks: set[int] = set()
+    # Staging reservations held: the room for the closing transfer,
+    # (room, "p", index) per early part and (room, "g", group) per group.
     admitted_keys: set = set()
 
 
@@ -536,10 +567,10 @@ class PipelineTransfer:
         self.rank = manager.pp_rank * manager.attn_tp_size + manager.attn_tp_rank
         self.workers = manager.pp_size * manager.attn_tp_size
         self.client_type = ReshardClient
-        self.clients = {}
         self._init_overlap_state()
         self.executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="raiden-pipeline-transfer"
+            max_workers=1 if self.producer else self.coord_workers,
+            thread_name_prefix="raiden-pipeline-transfer",
         )
         self.sent = {}
         self.replies = {}
@@ -580,11 +611,26 @@ class PipelineTransfer:
         self._log_ready(staging=staging, fingerprint=fingerprint)
 
     def _init_overlap_state(self) -> None:
-        """Early-part configuration and state, off by default."""
+        """Early-part and stage-group configuration and state, both off by default."""
         self.early_parts = envs.SGLANG_RAIDEN_PIPELINE_EARLY_PARTS.get()
         self.part_min_pages = max(1, envs.SGLANG_RAIDEN_PIPELINE_PART_PAGES.get())
-        # Producer: a room's early parts.
+        self.stage_parts = (
+            envs.SGLANG_RAIDEN_PIPELINE_STAGE_PARTS.get() and self.producer
+        )
+        self.stage_group_size = max(1, envs.SGLANG_RAIDEN_PIPELINE_STAGE_GROUP.get())
+        self.coord_workers = max(1, envs.SGLANG_RAIDEN_PIPELINE_COORD_WORKERS.get())
+        # A ReshardClient owns one socket, so each coordinating thread has its own.
+        self._thread_clients = threading.local()
+        # Producer: a room's early parts, and this stage's closing part.
         self.early: dict[int, dict] = {}
+        self.stage: dict[int, dict] = {}
+        self.fence_executor = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="raiden-stage-fence"
+            )
+            if self.stage_parts
+            else None
+        )
 
     def _check_support(self, raiden_service_pb2, groups) -> None:
         """Reject topologies and native builds the pipeline transfer cannot serve."""
@@ -810,7 +856,12 @@ class PipelineTransfer:
         self._validate_room(room)
         mgr = self.manager
         with self.lock:
-            if mgr.is_aborted(room) or room in self.sent or room in self.failed:
+            if (
+                mgr.is_aborted(room)
+                or room in self.sent
+                or room in self.stage
+                or room in self.failed
+            ):
                 return
             state = self.early.setdefault(room, dict(offered=0, pending=None, parts=[]))
             p_start, p_blocks = state["pending"] or (start, [])
@@ -922,13 +973,132 @@ class PipelineTransfer:
         )
         self._announce(room, part, payload, b"", "replied")
 
+    # ----- producer: stage groups ------------------------------------------
+
+    def make_fence(self, output: Any) -> concurrent.futures.Future:
+        """A completion fence for the forward that produced ``output``.
+
+        One element of the output is copied to the host on a worker thread; the
+        copy can only finish once the producing execution, which also wrote
+        this stage's KV, has completed. torch_tpu's materialization query is
+        true as soon as the output buffer exists, so it cannot fence the writes.
+        """
+        probe = output.reshape(-1)[:1]
+        return self.fence_executor.submit(probe.cpu)
+
+    def stage_ready(
+        self, room: int, full: list[int], swa: list[int], fence: Any
+    ) -> None:
+        """This stage launched the room's final chunk: full/swa are its page
+        ids here and fence the make_fence() future of that forward."""
+        if not self.stage_parts:
+            return
+        self._validate_room(room)
+        mgr = self.manager
+        with self.lock:
+            if mgr.is_aborted(room) or room in self.stage or room in self.failed:
+                return
+            self.stage[room] = self._new_stage_entry(full, swa, fence)
+            self._advance_stage(room)
+
+    def advance_stages(self) -> None:
+        """Register every stage part whose fence has completed. The scheduler
+        calls this on each launch: a request reaches the transfer queue's poll
+        only after its result point, which is too late."""
+        if not self.stage_parts:
+            return
+        with self.lock:
+            for room, entry in list(self.stage.items()):
+                if not entry["ready"] and room not in self.failed:
+                    self._advance_stage(room)
+
+    def _new_stage_entry(self, full, swa, fence) -> dict:
+        return dict(
+            full=[int(b) for b in full],
+            swa=[int(b) for b in swa],
+            fence=fence,
+            ready=False,
+            registered=False,
+            replied=set(),
+            aux=None,
+            aux_replied=set(),
+            done=False,
+            expires=time.monotonic() + self.manager._timeout_s,
+        )
+
+    def _advance_stage(self, room) -> None:
+        entry = self.stage[room]
+        if not entry["ready"]:
+            fence = entry["fence"]
+            # A probe that failed never fences: the part waits for finalize.
+            if fence is not None and (not fence.done() or fence.exception()):
+                return
+            entry["fence"] = None
+            entry["ready"] = True
+            state = self.early.get(room)
+            start = state["offered"] if state else 0
+            if entry["full"] and start >= len(entry["full"]):
+                # The closing transfer keeps one full-attention page.
+                start = len(entry["full"]) - 1
+            entry["start"] = start
+            entry["parts"] = len(state["parts"]) if state else 0
+            if state:
+                # Pages still gathering for an early part move with this one.
+                state["pending"] = None
+        self._reply_stage(room)
+
+    def _reply_stage(self, room) -> None:
+        entry = self.stage[room]
+        if not entry["ready"] or not self.replies.get(room) or room in self.failed:
+            return
+        mgr = self.manager
+        group = stage_group(mgr.pp_rank, self.stage_group_size)
+        if not entry["registered"]:
+            full = entry["full"][entry["start"] :]
+            if not self._register_blocks(
+                room,
+                req_id=stage_req_id(room, group),
+                uuid=stage_uuid(room, group),
+                full=full,
+                swa=entry["swa"],
+                with_swa=True,
+            ):
+                return
+            entry["registered"] = True
+        payload = self._source_metadata(
+            stage=True,
+            group=group,
+            group_ranks=group_ranks(group, self.stage_group_size, mgr.pp_size),
+            start=entry["start"],
+            full=len(entry["full"]) - entry["start"],
+            swa=len(entry["swa"]),
+            parts=entry["parts"],
+        )
+        self._announce(room, entry, payload, b"", "replied")
+        if entry["aux"] is not None:
+            aux_meta = json.dumps(
+                dict(rank=mgr.pp_rank, pp_size=mgr.pp_size, aux_only=True)
+            ).encode()
+            self._announce(room, entry, aux_meta, entry["aux"], "aux_replied")
+
     def _early_settled(self, room) -> bool:
         state = self.early.get(room)
         return state is None or all(part["done"] for part in state["parts"])
 
     def _expire_parts(self) -> None:
-        """Cancel unclaimed early parts of aborted, failed or expired rooms."""
+        """Cancel unclaimed early and stage parts of aborted, failed or expired rooms."""
+        mgr = self.manager
         now = time.monotonic()
+        group = stage_group(mgr.pp_rank, self.stage_group_size)
+        for room, entry in self.stage.items():
+            if not entry["done"] and self._cancel_unclaimed(
+                room,
+                entry,
+                expired=now >= entry["expires"],
+                req_id=stage_req_id(room, group),
+                uuid=stage_uuid(room, group),
+            ):
+                entry["fence"] = None
         for room, state in self.early.items():
             for part in state["parts"]:
                 if not part["done"]:
@@ -975,28 +1145,41 @@ class PipelineTransfer:
                         mgr.kv_args.aux_data_ptrs, mgr.kv_args.aux_item_lens, aux_index
                     )
                 )
-                state = self.early.get(room)
-                start = state["offered"] if state else 0
-                if full and start >= len(full):
-                    # Keep the full-attention page the decode's completion is
-                    # keyed on in the closing transfer.
-                    start = len(full) - 1
-                # The pages register with the consumer's head geometry, so
-                # registration waits for the first consumer request.
-                self.sent[room] = dict(
-                    full=full[start:],
-                    start=start,
-                    parts=len(state["parts"]) if state else 0,
-                    swa=swa,
-                    aux=aux,
-                    expires=time.monotonic() + mgr._timeout_s,
-                    registered=False,
-                    replied=set(),
-                )
+                if self.stage_parts:
+                    entry = self.stage.get(room)
+                    if entry is None:
+                        entry = self.stage[room] = self._new_stage_entry(
+                            full, swa, None
+                        )
+                    # The forward has certainly completed at the result point.
+                    entry["fence"] = None
+                    entry["aux"] = aux
+                else:
+                    state = self.early.get(room)
+                    start = state["offered"] if state else 0
+                    if full and start >= len(full):
+                        # Keep the full-attention page the decode's completion
+                        # is keyed on in the closing transfer.
+                        start = len(full) - 1
+                    # The pages register with the consumer's head geometry, so
+                    # registration waits for the first consumer request.
+                    self.sent[room] = dict(
+                        full=full[start:],
+                        start=start,
+                        parts=len(state["parts"]) if state else 0,
+                        swa=swa,
+                        aux=aux,
+                        expires=time.monotonic() + mgr._timeout_s,
+                        registered=False,
+                        replied=set(),
+                    )
                 mgr.update_status(room, KVPoll.Transferring)
             # Registration calls the controller, so it runs outside the
             # manager's state lock.
-            self._reply(room)
+            if self.stage_parts:
+                self._advance_stage(room)
+            else:
+                self._reply(room)
             return room not in self.failed
 
     def _fail_room(self, room, reason: str) -> None:
@@ -1105,13 +1288,20 @@ class PipelineTransfer:
                 raise ValueError(
                     "Raiden decode must use DP or the same pipeline stage count"
                 )
+            if meta.get("aux_only"):
+                # A stage-groups room's first-token metadata, from the last stage.
+                self._write_aux(request, msg[3])
+                request.aux_ranks.add(rank)
+                return
             if mgr.pp_size > 1 and set(meta["pool_tags"]) != {
                 pool["tag"] for pool in self.pools
             }:
                 raise ValueError(
                     "Matching pipelines must own the same layers per stage"
                 )
-            if meta.get("part") is not None:
+            if meta.get("stage"):
+                request.stage[rank] = meta
+            elif meta.get("part") is not None:
                 part = request.parts.setdefault(
                     int(meta["part"]), _new_transfer_state()
                 )
@@ -1148,6 +1338,8 @@ class PipelineTransfer:
         self.replies.setdefault(room, {})[msg[2].decode()] = json.loads(msg[3])
         for part in self.early.get(room, {}).get("parts", []):
             self._reply_part(room, part)
+        if room in self.stage:
+            self._reply_stage(room)
         self._reply(room)
 
     def maybe_start_pull(self, room):
@@ -1160,6 +1352,8 @@ class PipelineTransfer:
                 return False
             if not self._start_parts(room, request):
                 return False
+            if request.stage:
+                return self._start_stages(room, request)
             if set(request.sources) != request.ranks:
                 return False
             if request.accepted or request.future is not None:
@@ -1220,7 +1414,8 @@ class PipelineTransfer:
                 request.accepted = True
                 return True
             request.future = self.executor.submit(
-                self._client(address).coordinate_transfer,
+                self._coordinate,
+                address,
                 src_units=[
                     SimpleNamespace(**(sources[0]["unit"] | {"data_replica_idx": rank}))
                     for rank in range(int(sources[0]["pp_size"]))
@@ -1240,7 +1435,7 @@ class PipelineTransfer:
     def _admit(self, room, request, key: tuple = ()) -> bool:
         """Reserve host staging for one native transfer of the room. Raiden
         seats every transfer in its own staging slot, so a room moving early
-        parts holds one reservation per transfer."""
+        parts or several stage groups holds one reservation per transfer."""
         key = (room, *key) if key else room
         if key in request.admitted_keys:
             return True
@@ -1296,7 +1491,8 @@ class PipelineTransfer:
                 part["accepted"] = True
                 continue
             part["future"] = self.executor.submit(
-                self._client(address).coordinate_transfer,
+                self._coordinate,
+                address,
                 src_units=[
                     SimpleNamespace(**(sources[0]["unit"] | {"data_replica_idx": rank}))
                     for rank in range(int(sources[0]["pp_size"]))
@@ -1320,10 +1516,91 @@ class PipelineTransfer:
             )
         return True
 
-    def _client(self, address: str):
-        if address not in self.clients:
-            self.clients[address] = self.client_type(address)
-        return self.clients[address]
+    def _coordinate(self, address: str, **kwargs):
+        """coordinate_transfer on this worker thread's own client."""
+        clients = self._thread_clients.__dict__.setdefault("by_address", {})
+        if address not in clients:
+            clients[address] = self.client_type(address)
+        return clients[address].coordinate_transfer(**kwargs)
+
+    def _start_stages(self, room, request) -> bool:
+        """Start each stage group's transfer once all of its stages have
+        announced. True once every stage has announced."""
+        mgr = self.manager
+        parts = {int(meta["parts"]) for meta in request.stage.values()}
+        if len(parts) != 1:
+            raise ValueError("Raiden pipeline stages disagree on early part count")
+        request.expected_parts = parts.pop()
+        by_group: dict[int, list[dict]] = {}
+        for meta in request.stage.values():
+            by_group.setdefault(int(meta["group"]), []).append(meta)
+        for group, metas in sorted(by_group.items()):
+            ranks = sorted(int(meta["rank"]) for meta in metas)
+            if ranks != sorted(int(r) for r in metas[0]["group_ranks"]):
+                continue  # a stage of this group is still computing
+            state = request.groups.setdefault(group, _new_transfer_state())
+            if state["accepted"] or state["future"] is not None:
+                continue
+            if state["done"]:
+                # Rank 0 started it for this attention-TP rank, and it landed.
+                state["accepted"] = True
+                continue
+            if time.monotonic() < state["next_attempt"]:
+                continue
+            geometries = {
+                (int(m["start"]), int(m["full"]), int(m["swa"])) for m in metas
+            }
+            if len(geometries) != 1:
+                raise ValueError("Raiden pipeline stages of a group disagree on pages")
+            start, count, swa_count = geometries.pop()
+            if not self._admit(room, request, ("g", group)):
+                return False
+            if mgr.attn_tp_rank != 0:
+                state["accepted"] = True
+                continue
+            meta = metas[0]
+            state["future"] = self.executor.submit(
+                self._coordinate,
+                meta["controller"],
+                src_units=[
+                    SimpleNamespace(**(meta["unit"] | {"data_replica_idx": rank}))
+                    for rank in ranks
+                ],
+                dst_units=self.dst_units,
+                req_id=stage_req_id(room, group),
+                uuid=stage_uuid(room, group),
+                use_block_chunks=True,
+                is_sender=True,
+                dst_mem_type=self.hbm_mem_type,
+                src_controller_address=meta["controller"],
+                dst_controller_address=self.controller,
+                **part_destination_blocks(
+                    self.pools,
+                    request.full,
+                    request.swa,
+                    start=start,
+                    count=count,
+                    source_swa_count=swa_count,
+                    only_tags=set().union(*(set(m["pool_tags"]) for m in metas)),
+                ),
+            )
+        if set(request.stage) != request.ranks:
+            return False
+        mgr.update_status(room, KVPoll.Transferring)
+        return True
+
+    def _stages_landed(self, request) -> bool:
+        """Every group landed, the last stage's metadata arrived and the early
+        parts landed."""
+        if not request.stage or set(request.stage) != request.ranks:
+            return False
+        groups = {int(meta["group"]) for meta in request.stage.values()}
+        return (
+            set(request.groups) == groups
+            and all(state["done"] for state in request.groups.values())
+            and max(request.ranks) in request.aux_ranks
+            and (not request.parts or self._parts_landed(request))
+        )
 
     def _parts_landed(self, request) -> bool:
         return request.expected_parts is not None and all(
@@ -1332,8 +1609,10 @@ class PipelineTransfer:
 
     def _receive_settled(self, request) -> bool:
         """No coordination of the room is outstanding and its parts landed."""
-        return request.future is None and (
-            not request.parts or self._parts_landed(request)
+        return (
+            request.future is None
+            and all(state["future"] is None for state in request.groups.values())
+            and (not request.parts or self._parts_landed(request))
         )
 
     def _try_release(self, room):
@@ -1365,9 +1644,12 @@ class PipelineTransfer:
         with self.lock:
             if self.producer:
                 parts = self.early.get(room, {}).get("parts", [])
+                entry = self.stage.get(room)
                 return (
-                    room in self.sent and room not in self.done_send | self.failed
-                ) or any(part["registered"] and not part["done"] for part in parts)
+                    (room in self.sent and room not in self.done_send | self.failed)
+                    or any(part["registered"] and not part["done"] for part in parts)
+                    or (entry is not None and entry["registered"] and not entry["done"])
+                )
             request = self.receives.get(room)
             return request is not None and (
                 request.future is not None
@@ -1380,9 +1662,30 @@ class PipelineTransfer:
                         and not state["done"]
                         and room not in self.failed
                     )
-                    for state in request.parts.values()
+                    for state in [*request.parts.values(), *request.groups.values()]
                 )
             )
+
+    def _stage_landed(self, room: int, group: int) -> None:
+        if self.producer:
+            entry = self.stage.get(room)
+            if (
+                entry is not None
+                and not entry["done"]
+                and group == stage_group(self.manager.pp_rank, self.stage_group_size)
+            ):
+                entry["done"] = True
+                self.client.complete_request_blocks(
+                    stage_req_id(room, group), stage_uuid(room, group), self.unit
+                )
+            return
+        request = self.receives.get(room)
+        if request is not None:
+            # Rank 0 starts a group for every attention-TP rank, so it can land
+            # here before this rank has reached it in _start_stages.
+            request.groups.setdefault(group, _new_transfer_state())["done"] = True
+            self._release_admission(room, request, ("g", group))
+            self.admission.forget((room, "g", group))
 
     def _part_landed(self, room: int, index: int) -> None:
         if self.producer:
@@ -1395,8 +1698,7 @@ class PipelineTransfer:
             return
         request = self.receives.get(room)
         if request is not None:
-            # Rank 0 starts a part for every attention-TP rank, so it can land
-            # here before every stage has announced it to this rank.
+            # As for groups: it can land before every stage announced it here.
             request.parts.setdefault(index, _new_transfer_state())["done"] = True
             self._release_admission(room, request, ("p", index))
             # Landed before this rank admitted it: it no longer waits in line.
@@ -1415,7 +1717,7 @@ class PipelineTransfer:
             request.next_attempt = time.monotonic() + 0.05
 
     def _settle_transfer(self, room, request, state: dict, *, key: tuple, req_id: str):
-        """_settle_coordination for one early part."""
+        """_settle_coordination for one early part or stage group."""
         future, state["future"] = state["future"], None
         retry = self._settle_future(room, request, future, req_id=req_id)
         if retry is None:
@@ -1475,13 +1777,15 @@ class PipelineTransfer:
         mgr = self.manager
         for transfers, done in ((sent, self.done_send), (received, self.done_recv)):
             for t in transfers:
-                room, part = parse_req_id(mgr._norm_req_id(t.req_id))
-                if part is None:
+                room, key = parse_req_id(mgr._norm_req_id(t.req_id))
+                if key is None:
                     done.add(room)
                     if room in self.receives:
                         self.receives[room].armed_until = 0.0
+                elif isinstance(key, tuple):
+                    self._stage_landed(room, key[1])
                 else:
-                    self._part_landed(room, part)
+                    self._part_landed(room, key)
         for t in failed:
             room, _ = parse_req_id(mgr._norm_req_id(t.req_id))
             self.failed.add(room)
@@ -1491,6 +1795,11 @@ class PipelineTransfer:
     def _poll_producer(self) -> None:
         mgr = self.manager
         self._expire_parts()
+        for room, entry in list(self.stage.items()):
+            if not entry["ready"] and room not in self.failed:
+                self._advance_stage(room)
+            if entry["done"] and entry["aux"] is not None:
+                self.done_send.add(room)
         for room in (self.done_send | self.failed) - self.retired:
             if room in self.sent:
                 self.client.complete_request_blocks(str(room), room, self.unit)
@@ -1513,6 +1822,15 @@ class PipelineTransfer:
         mgr = self.manager
         if request.future is not None and request.future.done():
             self._settle_coordination(room, request)
+        for group, state in request.groups.items():
+            if state["future"] is not None and state["future"].done():
+                self._settle_transfer(
+                    room,
+                    request,
+                    state,
+                    key=("g", group),
+                    req_id=stage_req_id(room, group),
+                )
         for index, state in request.parts.items():
             if state["future"] is not None and state["future"].done():
                 self._settle_transfer(
@@ -1522,7 +1840,12 @@ class PipelineTransfer:
                     key=("p", index),
                     req_id=part_req_id(room, index),
                 )
-        transfers = list(request.parts.values())
+        if request.stage:
+            if room not in self.failed:
+                self._start_stages(room, request)
+            if self._stages_landed(request):
+                self.done_recv.add(room)
+        transfers = [*request.parts.values(), *request.groups.values()]
         if (
             (request.accepted or any(state["accepted"] for state in transfers))
             and mgr.attn_tp_rank != 0
@@ -1554,6 +1877,7 @@ class PipelineTransfer:
     def _forget(self, room):
         self.sent.pop(room, None)
         self.early.pop(room, None)
+        self.stage.pop(room, None)
         self.replies.pop(room, None)
         self.release_requests.pop(room, None)
         request = self.receives.pop(room, None)

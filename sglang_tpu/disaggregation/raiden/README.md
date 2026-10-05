@@ -181,14 +181,23 @@ namespaces after the prefill finishes. Full-attention and window page lists
 remain independent, and a cached decode prefix is clipped from each layer's
 transfer.
 
-An opt-in mode on the prefill overlaps part of the hand-off with the prefill:
+Two opt-in modes overlap the hand-off with the prefill; both are set on the
+prefill (`SGLANG_RAIDEN_PIPELINE_COORD_WORKERS` on the decode):
 
 | Env var | Default | Meaning |
 |---|---|---|
 | `SGLANG_RAIDEN_PIPELINE_EARLY_PARTS` | `0` | full-attention pages final before the prefill ends (a cached prefix, finished chunks) move as their own transfers (`<room>.p<i>`) while the pipeline computes |
 | `SGLANG_RAIDEN_PIPELINE_PART_PAGES` | `16` | minimum pages per early part; fewer ride the closing transfer |
+| `SGLANG_RAIDEN_PIPELINE_STAGE_PARTS` | `0` | each group of stages moves its layers (`<room>.s<g>`) once its forwards of the final chunk complete, instead of after the last stage samples; the first token follows from the last stage |
+| `SGLANG_RAIDEN_PIPELINE_STAGE_GROUP` | `1` | consecutive stages per group transfer |
+| `SGLANG_RAIDEN_PIPELINE_COORD_WORKERS` | `1` | decode threads coordinating transfers, one controller client each |
 
-Each early part holds its own decode staging reservation.
+A stage group is fenced on a host copy of one element of its forward's
+output: torch_tpu reports a tensor materialized once its buffer exists, before
+the execution that writes the KV completes. Stage groups other than the first
+name non-contiguous source ranks, which needs a tpu-sync planner that accepts
+any subset of a controller's registered transfer ranks. Each early part and
+stage group holds its own decode staging reservation.
 
 Each worker owns one Raiden engine. Pipeline stages share one controller hosted
 by stage zero; independent attention-DP workers each own one. Pool geometry and
