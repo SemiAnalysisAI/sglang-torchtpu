@@ -4245,9 +4245,7 @@ class DeepseekV4Model(nn.Module):
         if use_stream_pool:
             device_module = torch.get_device_module()
             num_alt_streams = 5 if (_is_cuda or _is_npu) else 2
-            self.alt_streams = [
-                device_module.Stream() for _ in range(num_alt_streams)
-            ]
+            self.alt_streams = [device_module.Stream() for _ in range(num_alt_streams)]
         else:
             self.alt_streams = None
         # Routed-MoE input pre-quant, separate from the attention/indexer and

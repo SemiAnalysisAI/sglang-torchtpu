@@ -1258,6 +1258,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # kvc.sliding_window_size is None on a runner without SWA layers.
         self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)
         self._spec_infl = 1.0
+        self._is_tpu_dsv4 = get_exec().kernel.dsv4_attn_backend == "tpu_dsv4" or (
+            _is_tpu
+            and get_exec().kernel.dsv4_attn_backend is None
+            and self.kv_cache_dtype_str in ("auto", "bf16", "bfloat16")
+        )
 
         # The unified pool ignores --kv-cache-dtype; V4 resolves "auto" to fp8_e4m3
         # (overrides.py _deepseek_v4_kv_cache_dtype), so only bfloat16 is explicit.
@@ -1424,7 +1429,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if (
             self._unified
             or _is_npu
-            or _is_tpu
+            or getattr(self, "_is_tpu_dsv4", False)
             or get_exec().kernel.dsv4_attn_backend == "trtllm"
         ):
             return self.kv_bytes
@@ -1445,7 +1450,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_bytes_per_swa_token(self) -> float:
         """Bytes one SWA slot costs across the stage. c4_state_pool_size = swa_tokens
         // page_size * ring, so c4 compress state is priced per SWA slot too."""
-        if _is_tpu:
+        if getattr(self, "_is_tpu_dsv4", False):
             return 1024.0 * self.num_layers_total
         if self.encoder_replay:
             # Target SWA lives in the request window; only the draft owns paged SWA
@@ -1482,7 +1487,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         swa_ratio = (
             0 if self._unified or self.swa_cap_tokens is not None else self.swa_ratio
         )
-        if _is_tpu:
+        if getattr(self, "_is_tpu_dsv4", False):
             # TPU uses 4D uint8 Pallas layouts:
             # - SWA: 1024 B/token (raw bf16)
             # - CSA (C4): 640 B/compressed token (512 B NoPE + 128 B RoPE)
@@ -1572,7 +1577,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         num_req_slots = self._get_num_req_slots(max_running_requests)
         ring_size = self.ring_sizes[128]
 
-        if _is_tpu:
+        if getattr(self, "_is_tpu_dsv4", False):
             ring_tokens = max(ring_size, 256)
             state_rows = 8 + num_req_slots * ring_tokens + 8192
             return state_rows * (2 * self.attn_head_dim * 4) * num_layers
@@ -1616,7 +1621,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if num_layers == 0:
             return 0
 
-        if _is_tpu:
+        if getattr(self, "_is_tpu_dsv4", False):
             num_req_slots = self._get_num_req_slots(max_running_requests)
             ring_tokens = max(self.ring_sizes[4], 32)
             state_rows = 4 + num_req_slots * ring_tokens + 8192

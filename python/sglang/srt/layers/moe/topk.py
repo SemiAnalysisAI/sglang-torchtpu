@@ -971,8 +971,6 @@ def fused_topk_torch_native(
         )
     if apply_routed_scaling_factor_on_output and routed_scaling_factor is not None:
         topk_weights = topk_weights * routed_scaling_factor
-    if _is_tpu:
-        return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     return topk_weights, topk_ids
 
 
