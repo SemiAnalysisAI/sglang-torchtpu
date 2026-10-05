@@ -193,6 +193,14 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = True
 
+    def _synchronize_device(self) -> None:
+        device = getattr(self, "device", None)
+        if device is not None and torch.device(device).type != "tpu":
+            return
+        if getattr(self, "kv_buffer", None) and self.kv_buffer[0].device.type != "tpu":
+            return
+        torch.accelerator.synchronize()
+
     def get_state(self) -> list[torch.Tensor]:
         """Return the fused KV buffers used by forward execution."""
         return self.kv_buffer
@@ -287,13 +295,13 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         """
         backup = self._raiden_backup()
         if backup is not None:
-            torch.accelerator.synchronize()
+            self._synchronize_device()
             handle = backup.try_save(indices)
             if handle is not None:
                 return handle
         # Indices might be on host and need to be copied to device.
         indices = indices.to(device=self.kv_buffer[0].device, dtype=torch.long)
-        torch.accelerator.synchronize()
+        self._synchronize_device()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -305,7 +313,7 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
                     "cpu", non_blocking=True
                 )
                 kv_cache_cpu[-1].append(kv_cpu)
-        torch.accelerator.synchronize()
+        self._synchronize_device()
         return kv_cache_cpu
 
     def load_cpu_copy(
@@ -325,9 +333,9 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         )
 
         if isinstance(kv_cache_cpu, RaidenKVBackupHandle):
-            torch.accelerator.synchronize()
+            self._synchronize_device()
             self._raiden_backup().restore(kv_cache_cpu, indices)
-            torch.accelerator.synchronize()
+            self._synchronize_device()
             return
 
         indices = indices.to(device="cpu", dtype=torch.long)
@@ -350,7 +358,7 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         part_page_pos = part_pos[block_pos][~full_rows].to(device)
         part_offsets = offsets[~full_rows].to(device)
 
-        torch.accelerator.synchronize()
+        self._synchronize_device()
         for layer_id in range(self.layer_num):
             rows = torch.cat(kv_cache_cpu[layer_id], dim=0)
             assert rows.shape[0] == indices.numel()
@@ -367,7 +375,7 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
                     device, non_blocking=True
                 )
                 write_pages_torch(part_blocks, pages, dst)
-        torch.accelerator.synchronize()
+        self._synchronize_device()
 
     def filter_cpu_copy(self, kv_cache_cpu, row_mask: torch.Tensor):
         """Keep only the rows of a `get_cpu_copy` payload selected by ``row_mask``.
@@ -562,13 +570,13 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
         """Copy selected token lanes to the fused pool's host-row format."""
         backup = self._raiden_backup()
         if backup is not None:
-            torch.accelerator.synchronize()
+            self._synchronize_device()
             handle = backup.try_save(indices)
             if handle is not None:
                 return handle
 
         indices = indices.to(device="cpu", dtype=torch.long)
-        torch.accelerator.synchronize()
+        self._synchronize_device()
         if indices.numel() == 0:
             return [[] for _ in range(self.layer_num)]
 
@@ -594,7 +602,7 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
                 )
             pending_pages.append(layer_pages)
 
-        torch.accelerator.synchronize()
+        self._synchronize_device()
         return [
             [pages[block_pos, ..., offsets] for pages, block_pos, offsets in chunks]
             for chunks in pending_pages
@@ -610,9 +618,9 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
         )
 
         if isinstance(kv_cache_cpu, RaidenKVBackupHandle):
-            torch.accelerator.synchronize()
+            self._synchronize_device()
             self._raiden_backup().restore(kv_cache_cpu, indices)
-            torch.accelerator.synchronize()
+            self._synchronize_device()
             return
 
         indices = indices.to(device="cpu", dtype=torch.long)
@@ -634,7 +642,7 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
         part_page_pos = part_pos[block_pos][~full_rows].to(device)
         part_offsets = offsets[~full_rows].to(device)
 
-        torch.accelerator.synchronize()
+        self._synchronize_device()
         for layer_id in range(self.layer_num):
             rows = torch.cat(kv_cache_cpu[layer_id], dim=0)
             assert rows.shape[0] == indices.numel()
@@ -651,7 +659,7 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
                     device, non_blocking=True
                 )
                 write_pages_torch(part_blocks, pages, dst)
-        torch.accelerator.synchronize()
+        self._synchronize_device()
 
 
 class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
