@@ -1091,6 +1091,19 @@ class LogitsProcessor(nn.Module):
             _trace_e2e_logits("pre_lm_head_sync_returned")
 
         _trace_e2e_logits("lm_head_enter", hidden_shape=tuple(hidden_states.shape))
+        # Eager on TPU, each row count compiles its own program (40-100 s on a
+        # 262k vocab): bucket rows to a power of two, sliced back at the return.
+        rows = hidden_states.shape[0]
+        bucket_rows = (
+            _is_tpu
+            and not torch.compiler.is_compiling()
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and hidden_states.ndim == 2
+        )
+        if bucket_rows:
+            from sglang.srt.hardware_backend.tpu.row_pad import pad_rows, row_bucket
+
+            hidden_states = pad_rows(hidden_states, row_bucket(rows))
         lora_batch_layout = (
             LoRABatchLayout.TP_GLOBAL
             if self.do_tensor_parallel_all_gather_dp_attn
@@ -1170,9 +1183,30 @@ class LogitsProcessor(nn.Module):
                     logits / self.final_logit_softcapping
                 )
 
+        if bucket_rows and logits.shape[0] != rows:
+            logits = logits[:rows]
         return logits
 
     def _compute_lm_head(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        embedding_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if _is_tpu and hidden_states.ndim == 2 and not torch.compiler.is_compiling():
+            from sglang.srt.hardware_backend.tpu.row_pad import pad_rows, row_bucket
+
+            # Eager on TPU, each row count compiles its own program; bucket rows.
+            rows = hidden_states.shape[0]
+            bucket = row_bucket(rows)
+            if bucket != rows:
+                padded = pad_rows(hidden_states, bucket)
+                return self._compute_lm_head_rows(padded, lm_head, embedding_bias)[
+                    :rows
+                ]
+        return self._compute_lm_head_rows(hidden_states, lm_head, embedding_bias)
+
+    def _compute_lm_head_rows(
         self,
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
