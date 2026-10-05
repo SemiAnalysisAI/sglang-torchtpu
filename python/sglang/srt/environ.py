@@ -751,6 +751,10 @@ class Envs:
     SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S = EnvFloatWithAlias(
         60.0, deprecated_name="SGLANG_RAIDEN_TIMEOUT_S"
     )
+    # Pipeline prefill: move pages final before the prefill ends (cached prefix,
+    # finished chunks) as early transfers of at least PART_PAGES pages each.
+    SGLANG_RAIDEN_PIPELINE_EARLY_PARTS = EnvBool(False)
+    SGLANG_RAIDEN_PIPELINE_PART_PAGES = EnvInt(16)
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
     )

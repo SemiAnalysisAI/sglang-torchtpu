@@ -176,9 +176,19 @@ RPCs ([tpu-sync main 6b3e8206](https://github.com/google/tpu-sync/commit/6b3e820
 a transfer coordinates every source stage, and on asyncio's default
 executor concurrent transfers queue behind each other.
 Each engine registers the full-attention and sliding-window layers it owns
-as `fa.lN` and `swa.lN`. A single native transfer moves both namespaces after
-the prefill finishes. Full-attention and window page lists remain independent,
-and a cached decode prefix is clipped from each layer's transfer.
+as `fa.lN` and `swa.lN`. By default a single native transfer moves both
+namespaces after the prefill finishes. Full-attention and window page lists
+remain independent, and a cached decode prefix is clipped from each layer's
+transfer.
+
+An opt-in mode on the prefill overlaps part of the hand-off with the prefill:
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `SGLANG_RAIDEN_PIPELINE_EARLY_PARTS` | `0` | full-attention pages final before the prefill ends (a cached prefix, finished chunks) move as their own transfers (`<room>.p<i>`) while the pipeline computes |
+| `SGLANG_RAIDEN_PIPELINE_PART_PAGES` | `16` | minimum pages per early part; fewer ride the closing transfer |
+
+Each early part holds its own decode staging reservation.
 
 Each worker owns one Raiden engine. Pipeline stages share one controller hosted
 by stage zero; independent attention-DP workers each own one. Pool geometry and
@@ -204,5 +214,5 @@ source pages remain reserved until the unclaimed registration expires
 (`SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S`, 60 seconds by default).
 
 The pipeline unit tests are in
-`test/registered/unit/hardware_backend/tpu/test_raiden_pipeline.py` and
-`test_raiden_pipeline_rank4.py`.
+`test/registered/unit/hardware_backend/tpu/test_raiden_pipeline.py`,
+`test_raiden_pipeline_overlap.py` and `test_raiden_pipeline_rank4.py`.

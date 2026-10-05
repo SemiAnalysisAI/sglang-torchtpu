@@ -1150,6 +1150,10 @@ class RaidenKVSender(CommonKVSender):
             self.kv_mgr.offer_chunk(
                 self.bootstrap_room, start, blocks, self.num_kv_indices
             )
+        elif not self._last_chunk and self.kv_mgr._pipeline is not None:
+            # A pipeline stage moves pages already final (a cached prefix,
+            # finished chunks) as early parts.
+            self.kv_mgr._pipeline.offer_part(self.bootstrap_room, start, blocks)
         if self._last_chunk and not self._started:
             self._started = True
             # finalize_send turns the room Transferring itself, under the
