@@ -270,9 +270,13 @@ def build_pcp_batched_metadata(
     prefix_lens_np = prefix_lens.cpu().numpy()
 
     # Determine chunk size C across requests
-    # In uniform chunking, C is the chunk length per zigzag block
-    c_sizes = [max(1, int(l) // two_p) for l in extend_lens]
-    c_per_req = c_sizes[0] if len(c_sizes) > 0 else 1
+    # In uniform chunking, C is the chunk length per zigzag block.
+    # Align each zigzag block to page_size so DMA transfers and page allocations are page-aligned.
+    c_sizes = [
+        max(page_size, ((int(l) // two_p + page_size - 1) // page_size) * page_size)
+        for l in extend_lens
+    ]
+    c_per_req = c_sizes[0] if len(c_sizes) > 0 else page_size
 
     # 1. pcp_cu_q_lens: 2 blocks per request on this rank
     # Head chunk (r) and tail chunk (2P - 1 - r)

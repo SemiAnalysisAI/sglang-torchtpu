@@ -48,6 +48,7 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
+    is_enable_moe_cp_allgather,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layernorm import RMSNorm
@@ -818,6 +819,24 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if defer_finalize and num_tokens == 0:
             raise RuntimeError("Qwen deferred finalize does not support M=0")
 
+        cp_gather = (
+            get_parallel().attn_cp_size > 1
+            and is_enable_moe_cp_allgather()
+            and num_tokens > 0
+        )
+        if cp_gather:
+            local_tokens = num_tokens
+            cp_size = get_parallel().attn_cp_size
+            cp_rank = get_parallel().attn_cp_rank
+            gathered = torch.empty(
+                (local_tokens * cp_size, hidden_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            get_parallel().attn_cp_group.all_gather_into_tensor(gathered, hidden_states)
+            hidden_states = gathered
+            num_tokens = hidden_states.shape[0]
+
         if self._use_mega_moe:
             return self._forward_mega_moe(hidden_states, forward_batch)
 
@@ -906,7 +925,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     final_hidden_states
                 )
 
-        # Debug removed - was causing issues during CUDA graph capture
+        if cp_gather:
+            final_hidden_states = final_hidden_states[
+                cp_rank * local_tokens : (cp_rank + 1) * local_tokens
+            ]
+            num_tokens = local_tokens
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 

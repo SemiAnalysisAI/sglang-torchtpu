@@ -268,11 +268,7 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
     def _is_cp_decode(self, forward_batch) -> bool:
-        req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
-        if req_pool_indices is None:
-            return False
-        reqs = req_pool_indices.tolist()
-        return len(reqs) > 0 and all(r in self._cp_reqs for r in reqs)
+        return True
 
     def forward_decode(
         self,
@@ -289,7 +285,6 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         if (
             get_parallel().attn_cp_size > 1
             and not forward_batch.forward_mode.is_idle()
-            and self._is_cp_decode(forward_batch)
         ):
             return self._forward_cp_decode(q, k, v, layer, forward_batch, **kwargs)
         return super().forward_decode(

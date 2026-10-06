@@ -107,24 +107,12 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     kind = ContextParallelStrategyKind.ZIGZAG
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
-        from sglang.srt.utils.common import is_tpu
-
-        min_tokens = self.cp_size * 2 * 256 if is_tpu() else self.cp_size * 2
-        if self.cp_size <= 1 or num_tokens < min_tokens:
+        if self.cp_size <= 1:
             return False
         forward_mode = getattr(forward_batch, "forward_mode", None)
         if forward_mode is not None and not forward_mode.is_context_parallel_extend():
             return False
-
-        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-        if extend_lens is None:
-            return True
-        if is_tpu():
-            return all(
-                int(length) >= min_tokens and int(length) % min_tokens == 0
-                for length in extend_lens
-            )
-        return all(int(length) >= min_tokens for length in extend_lens)
+        return True
 
     def build_metadata(
         self,
