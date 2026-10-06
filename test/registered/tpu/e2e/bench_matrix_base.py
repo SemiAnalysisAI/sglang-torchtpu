@@ -38,6 +38,7 @@ is trustworthy at all:
 
 import json
 import os
+import re
 import subprocess
 import time
 import unittest
@@ -105,6 +106,10 @@ MODEL_DISPLAY_NAMES = {
     "qwen3_coder_480b": "Qwen3-Coder-480B",
 }
 SPEC_RECIPES = {"1host_pc_spec_kvoff", "pd_2p2d_pc_spec_kvoff"}
+# Recipes whose legs must finish with zero failed requests (bench_serving
+# exits 0 with failed requests, so test_every_leg_completed alone lets them
+# through). Opt-in so existing cells keep their current verdicts.
+REQUEST_ERROR_GATED_RECIPES = {"pd_1p1d_pc"}
 
 
 def _direction(field: str) -> str:
@@ -205,12 +210,15 @@ def _reachable_prefix_hit_rate(config, dp_size):
 def _matrix_spec_metrics_url(bench_recipe: str, base_url: str) -> str:
     """Where the spec gauges live: the engine that decodes.
 
-    For P/D that is the decode leader (hosts[2] of the slice), never the
-    mini-LB -- the LB serves no /metrics, and a request-level probe through
-    it is not a reliable oracle on this P/D setup. For 1-host recipes the
-    one server is the decode.
+    For P/D that is the decode leader -- the first host after the prefill
+    engines, whose count the recipe name encodes (pd_<P>p<D>d_...: hosts[2]
+    for 2p2d, hosts[1] for 1p1d) -- never the mini-LB: the LB serves no
+    /metrics, and a request-level probe through it is not a reliable oracle
+    on this P/D setup. For 1-host recipes the one server is the decode.
     """
-    if bench_recipe.startswith("pd_"):
+    match = re.match(r"pd_(\d+)p\d+d_", bench_recipe)
+    if match:
+        decode_index = int(match.group(1))
         # Engine leaders follow PHYSICAL host order (serve_group.sh's
         # rendezvous writes the map on this pod), not pod-index order.
         try:
@@ -220,9 +228,9 @@ def _matrix_spec_metrics_url(bench_recipe: str, base_url: str) -> str:
             hosts = [
                 h for h in os.environ.get("TPU_WORKER_HOSTNAMES", "").split(",") if h
             ]
-        if len(hosts) >= 3:
+        if len(hosts) > decode_index:
             port = os.environ.get("PD_DECODE_PORT", "30002")
-            return f"http://{hosts[2]}:{port}"
+            return f"http://{hosts[decode_index]}:{port}"
     return base_url
 
 
@@ -251,6 +259,7 @@ def build_bench_test(
     profile: str,
     sweep_timeout_default: int,
     gate_prefix_hits: bool,
+    gate_request_errors: bool = False,
     spec_metrics_url_fn=None,
     spec_contract: dict | None = None,
     metric_namespace: str | None = None,
@@ -278,6 +287,9 @@ def build_bench_test(
                          file's timeout room for health + result egress.
     gate_prefix_hits     gate hit rate against the reachable floor (multi-turn
                          workloads); the rate is always *recorded*.
+    gate_request_errors  fail any leg with a failed request (derived
+                         failed_requests > 0, from bench_serving's per-request
+                         errors); the count is always *recorded*.
     spec_metrics_url_fn  base_url -> metrics endpoint of the DECODING engine;
                          non-None declares the recipe claims spec decoding
                          and adds the accept-length gate.
@@ -395,6 +407,29 @@ def build_bench_test(
             self.assertEqual(bad, [], f"legs did not complete: {bad}")
             missing = [leg["tag"] for leg in legs if not leg.get("metrics")]
             self.assertEqual(missing, [], f"legs produced no metrics: {missing}")
+
+        if gate_request_errors:
+
+            def test_no_failed_requests(self):
+                """Every request of every leg must succeed. A failed round
+                (rejected over-long prompt, P/D transfer abort, timeout) is
+                dropped from the latency stats, so a leg can look fast exactly
+                because its hardest requests failed."""
+                for leg in self._legs():
+                    derived = leg.get("derived") or {}
+                    self.assertIn(
+                        "failed_requests",
+                        derived,
+                        f"{leg['tag']}: no per-request outcomes recorded (was "
+                        "the bench run with --output-details?)",
+                    )
+                    self.assertEqual(
+                        derived["failed_requests"],
+                        0,
+                        f"{leg['tag']}: {derived['failed_requests']} of "
+                        f"{derived.get('requests')} requests failed (see the "
+                        "leg's errors in its .jsonl)",
+                    )
 
         def test_prefix_cache_hit_rate_reported(self):
             """Every leg must RECORD a hit rate (the metrics endpoint is part
@@ -734,6 +769,7 @@ def build_matrix_test(*, bench_model: str, bench_recipe: str, workload: str):
         # A single-turn 8k1k session never re-sees its prefix, so the hit-rate
         # gate only applies to the multi-turn agentic workload.
         gate_prefix_hits=workload == "agentic",
+        gate_request_errors=bench_recipe in REQUEST_ERROR_GATED_RECIPES,
         spec_metrics_url_fn=(
             (lambda base_url: _matrix_spec_metrics_url(bench_recipe, base_url))
             if spec_expected
