@@ -359,10 +359,17 @@ def apply_tpu_fp8_moe(
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)
-    # Padded tokens might have expert index of -1, override the expert
-    # selection to expert 0.
+    ep_size = get_parallel().moe_ep_size
+    ep_rank = get_parallel().moe_ep_rank
+    global_num_experts = layer.num_local_experts * ep_size if ep_size > 1 else 0
+    expert_group_offset = ep_rank * layer.num_local_experts if ep_size > 1 else 0
+    skip_pad_experts = ep_size > 1 and envs.SGLANG_TPU_FP8_MOE_SKIP_PAD_EXPERT.get()
+    # A high sentinel sorts AFTER valid experts and contributes zero to the
+    # one-hot group counts. Leaving -1 here would sort padding before expert 0
+    # while omitting it from those counts, shifting every GMM row window.
+    pad_expert = global_num_experts if skip_pad_experts else 0
     valid = topk_ids >= 0
-    topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
+    topk_ids = torch.where(valid, topk_ids, torch.full_like(topk_ids, pad_expert))
     topk_weights = topk_weights * valid.to(topk_weights.dtype)
     if layer.num_fused_shared_experts:
         raise NotImplementedError(
@@ -371,14 +378,6 @@ def apply_tpu_fp8_moe(
 
     w1_scale = layer.w13_weight_scale_inv if block_quant else layer.w13_weight_scale
     w2_scale = layer.w2_weight_scale_inv if block_quant else layer.w2_weight_scale
-
-    global_num_experts = 0
-    expert_group_offset = 0
-    ep_size = get_parallel().moe_ep_size
-    ep_rank = get_parallel().moe_ep_rank
-    if ep_size > 1:
-        global_num_experts = layer.num_local_experts * ep_size
-        expert_group_offset = ep_rank * layer.num_local_experts
 
     # Imported here, not at module scope: the Pallas chain pulls in JAX, which
     # the hosted CPU CI agents do not have. Keeping it local lets the weight
@@ -409,5 +408,6 @@ def apply_tpu_fp8_moe(
         no_combine=no_combine,
         global_num_experts=global_num_experts,
         expert_group_offset=expert_group_offset,
+        skip_pad_experts=skip_pad_experts,
     )
     return StandardCombineInput(hidden_states=output)

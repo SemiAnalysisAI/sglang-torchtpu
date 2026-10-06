@@ -1814,6 +1814,29 @@ class Envs:
     # which the dense matmul path is taken. Suggset to start with 1024 or 2048
     # and tune from there.
     SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
+    # FP8 EP: exclude bucket/alignment padding from expert groups instead of
+    # streaming expert 0 for zero-weight rows. Opt-in until server validation.
+    SGLANG_TPU_FP8_MOE_SKIP_PAD_EXPERT = EnvBool(False)
+    # BS1 GLM FP8 dispatch; native combine, threshold 3 and skip-pad required.
+    SGLANG_TPU_FP8_MOE_BS1_ROUTING = EnvBool(False)
+    # Experimental GLM channelwise-FP8 decode front; unsupported paths fall back.
+    SGLANG_TPU_GLM_FP8_MLA_FRONT = EnvBool(False)
+    # BS1 FP32 sigmoid routing: preserve native top-k, fuse score gather/norm.
+    SGLANG_TPU_GLM_ROUTING_GATHER = EnvBool(False)
+    # GLM TP16 direct tracer: cache FP32 RMS6144 weights after each weight load.
+    SGLANG_TPU_GLM_RMSNORM_FP32_WEIGHTS = EnvBool(False)
+    # Pass MLA front scales as flat views to avoid repeated physical relayouts.
+    SGLANG_TPU_GLM_FP8_MLA_FLAT_SCALES = EnvBool(False)
+    # Experimental GLM tiny-route FP8 GMM: use two RHS DMA buffers.
+    SGLANG_TPU_GLM_GMM_TWO_RHS_BUFFERS = EnvBool(False)
+    # GLM BS1: fused gate/up + down with DMA lookahead; restart to change.
+    SGLANG_TPU_GLM_FUSED_EXPERTS = EnvBool(False)
+    # GLM BS1 decode: native RMS prefix plus fused epilogue/shared-input quant.
+    SGLANG_TPU_GLM_NORM_SHARED_QUANT = EnvBool(False)
+    # GLM MLA front: consume the existing logical KC view without a relayout.
+    SGLANG_TPU_GLM_FP8_MLA_KC_LOGICAL = EnvBool(False)
+    # GLM BS1 BF16 absorbed-value BMM plus output-projection FP8 input quantization.
+    SGLANG_TPU_GLM_ATTENTION_OUTPUT_QUANT = EnvBool(False)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)

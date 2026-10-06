@@ -3,7 +3,23 @@
 # Copyright 2025 Google LLC
 """TPU FP8 dense linear helpers."""
 
+import math
+from typing import NamedTuple
+
 import torch
+
+
+class TpuFp8PrequantizedInput(NamedTuple):
+    """Row-quantized input with explicit logical shape before scaled-mm padding.
+
+    Only TPU dense FP8 consumers accept this type. Keeping the logical shape
+    and output dtype avoids inferring either from a padded FP8 tensor.
+    """
+
+    q: torch.Tensor
+    scale: torch.Tensor
+    logical_shape: tuple[int, ...]
+    output_dtype: torch.dtype
 
 
 def _pad_rows_to_scaled_mm_alignment(x: torch.Tensor) -> tuple[torch.Tensor, int]:
@@ -32,7 +48,7 @@ def _quantize_activation_per_row(
 
 
 def apply_tpu_fp8_linear(
-    x: torch.Tensor,
+    x: torch.Tensor | TpuFp8PrequantizedInput,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None = None,
@@ -50,10 +66,12 @@ def apply_tpu_fp8_linear(
             "TPU dense FP8 linear only supports per-tensor or per-output-channel "
             f"weight scales; got {tuple(weight_scale.shape)}."
         )
-    if x.shape[-1] != weight.shape[0]:
+    prequantized = isinstance(x, TpuFp8PrequantizedInput)
+    logical_shape = x.logical_shape if prequantized else x.shape
+    if len(logical_shape) < 1 or logical_shape[-1] != weight.shape[0]:
         raise ValueError(
-            f"Input hidden dim {x.shape[-1]} must match weight hidden dim "
-            f"{weight.shape[0]}."
+            f"Input shape {logical_shape} must have at least one dimension "
+            f"and hidden dim {weight.shape[0]}."
         )
     if weight.shape[0] % 16 != 0 or weight.shape[1] % 16 != 0:
         raise ValueError(
@@ -61,11 +79,29 @@ def apply_tpu_fp8_linear(
             f"got weight shape {tuple(weight.shape)}."
         )
 
-    out_shape = (*x.shape[:-1], weight.shape[1])
-    x_2d = x.reshape(-1, x.shape[-1])
-    num_tokens = x_2d.shape[0]
-    x_2d, pad = _pad_rows_to_scaled_mm_alignment(x_2d)
-    x_q, x_scale = _quantize_activation_per_row(x_2d, weight.dtype)
+    out_shape = (*logical_shape[:-1], weight.shape[1])
+    if prequantized:
+        num_tokens = math.prod(logical_shape[:-1])
+        padded_tokens = (num_tokens + 15) // 16 * 16
+        if (
+            tuple(x.q.shape) != (padded_tokens, weight.shape[0])
+            or x.q.dtype != weight.dtype
+            or x.q.device != weight.device
+            or tuple(x.scale.shape) != (padded_tokens, 1)
+            or x.scale.dtype != torch.float32
+            or x.scale.device != x.q.device
+            or x.output_dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        ):
+            raise ValueError("Invalid prequantized TPU dense FP8 input metadata.")
+        x_q, x_scale = x.q, x.scale
+        output_dtype = x.output_dtype
+        pad = padded_tokens - num_tokens
+    else:
+        x_2d = x.reshape(-1, x.shape[-1])
+        num_tokens = x_2d.shape[0]
+        x_2d, pad = _pad_rows_to_scaled_mm_alignment(x_2d)
+        x_q, x_scale = _quantize_activation_per_row(x_2d, weight.dtype)
+        output_dtype = x.dtype
 
     # TODO(torch_tpu#1820): pass rowwise x_scale and channelwise weight_scale
     # directly to torch._scaled_mm once torch_tpu supports those scale shapes.
@@ -73,7 +109,7 @@ def apply_tpu_fp8_linear(
     # supports ragged-M scaled_mm for decode. For now, use upstream SGLang's
     # unfused-DQ fallback: compute the raw FP8 dot in f32, then apply
     # row/column scales outside the matmul.
-    one = torch.ones(1, dtype=torch.float32, device=x.device)
+    one = torch.ones(1, dtype=torch.float32, device=x_q.device)
     out = torch._scaled_mm(
         x_q,
         weight,
@@ -84,7 +120,7 @@ def apply_tpu_fp8_linear(
     out = out * x_scale * weight_scale.reshape(1, -1).float()
     if pad:
         out = torch.narrow(out, 0, 0, num_tokens)
-    out = out.to(x.dtype).reshape(out_shape)
+    out = out.to(output_dtype).reshape(out_shape)
     if bias is not None:
         out = out + bias
     return out

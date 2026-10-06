@@ -590,6 +590,12 @@ class TopK(BaseFusedOp):
             scoring_func=scoring_func,
             allow_routed_experts_capture=allow_routed_experts_capture,
         )
+        if _is_tpu and envs.SGLANG_TPU_GLM_ROUTING_GATHER.get():
+            from sglang.srt.hardware_backend.tpu.glm_routing_gather import (
+                register_glm_routing_gather_op,
+            )
+
+            register_glm_routing_gather_op()
 
     def _apply_waterfill(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:
         if self.enable_waterfill and self.waterfill_balancer is None:
@@ -1546,7 +1552,27 @@ def biased_grouped_topk_impl(
         dim=-1,
         sorted=(True if num_fused_shared_experts > 0 else False),
     )
-    topk_weights = scores.gather(1, topk_ids)
+    fused_gather_normalize = False
+    if _is_tpu and envs.SGLANG_TPU_GLM_ROUTING_GATHER.get():
+        from sglang.srt.hardware_backend.tpu.glm_routing_gather import (
+            can_use_glm_routing_gather,
+            glm_routing_gather_normalize,
+        )
+
+        fused_gather_normalize = can_use_glm_routing_gather(
+            scores,
+            correction_bias,
+            topk=topk,
+            renormalize=renormalize,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            num_fused_shared_experts=num_fused_shared_experts,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        )
+    if fused_gather_normalize:
+        topk_weights = glm_routing_gather_normalize(scores, topk_ids)
+    else:
+        topk_weights = scores.gather(1, topk_ids)
 
     if num_fused_shared_experts:
         topk_ids[:, -1] = torch.randint(
@@ -1561,7 +1587,7 @@ def biased_grouped_topk_impl(
                 topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
             )
 
-    if renormalize:
+    if renormalize and not fused_gather_normalize:
         # fp32 like the reference gate (the epsilon is not representable in
         # fp16); the sum dtype and the division's type promotion upcast inside
         # the existing kernels, so no extra cast launch is needed

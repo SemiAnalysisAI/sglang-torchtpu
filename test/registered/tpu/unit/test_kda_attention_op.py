@@ -77,7 +77,7 @@ class TestKDAAttentionOp(unittest.TestCase):
             ],
             self.heads,
             self.dim,
-            -5.0
+            -5.0,
         )
         output = self.op(*args, self.heads, self.dim, -5.0)
         self.check_result(args, output, expected)
@@ -108,7 +108,7 @@ class TestKDAAttentionOp(unittest.TestCase):
             ],
             self.heads,
             self.dim,
-            -5.0
+            -5.0,
         )
         compiled = torch.compile(self.op, backend="tpu", fullgraph=True)
         output = compiled(*args, self.heads, self.dim, -5.0)

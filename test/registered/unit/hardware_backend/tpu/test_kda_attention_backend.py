@@ -33,17 +33,25 @@ class TestKDAAttentionBackend(unittest.TestCase):
             is_draft_worker=False,
             req_to_token_pool=self.pool,
             token_to_kv_pool=None,
-            server_args=SimpleNamespace(enable_unified_memory=False),
+            server_args=SimpleNamespace(enable_mis=False),
         )
         self.op = Mock()
-        with patch(
-            "sglang.srt.hardware_backend.tpu.attention_kda.build_kda_op",
-            return_value=self.op,
-        ) as kda_builder, patch(
-            "sglang.srt.hardware_backend.tpu.attention_gdn_pallas.build_gdn_pallas_op"
-        ) as gdn_builder, patch(
-            "sglang.srt.layers.attention.hybrid_linear_attn_backend.get_spec",
-            return_value=SimpleNamespace(speculative_eagle_topk=None),
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.attention_kda.build_kda_op",
+                return_value=self.op,
+            ) as kda_builder,
+            patch(
+                "sglang.srt.hardware_backend.tpu.attention_gdn_pallas.build_gdn_pallas_op"
+            ) as gdn_builder,
+            patch(
+                "sglang.srt.layers.attention.hybrid_linear_attn_backend.get_spec",
+                return_value=SimpleNamespace(speculative_eagle_topk=None),
+            ),
+            patch(
+                "sglang.srt.layers.attention.hybrid_linear_attn_backend.get_memory",
+                return_value=SimpleNamespace(enable_unified_memory=False),
+            ),
         ):
             self.backend = TpuKDAAttnBackend(runner)
         kda_builder.assert_called_once_with()
@@ -52,6 +60,7 @@ class TestKDAAttentionBackend(unittest.TestCase):
             SimpleNamespace(
                 token_to_kv_pool=None,
                 req_to_token_pool=self.pool,
+                kv_index_translator=None,
                 needs_cpu_seq_lens=False,
             ),
             self.backend,
@@ -122,11 +131,12 @@ class TestKDAAttentionBackend(unittest.TestCase):
                 )
                 expected = torch.arange(tokens * 8).reshape(tokens, 2, 4).float()
                 self.op.return_value = expected
-                with patch(
-                    "sglang.srt.layers.radix_linear_attention._is_tpu", True
-                ), patch(
-                    "sglang.srt.layers.radix_linear_attention.get_attn_backend",
-                    return_value=self.hybrid_backend,
+                with (
+                    patch("sglang.srt.layers.radix_linear_attention._is_tpu", True),
+                    patch(
+                        "sglang.srt.layers.radix_linear_attention.get_attn_backend",
+                        return_value=self.hybrid_backend,
+                    ),
                 ):
                     output = layer(batch, qkv, a, b)
                 self.assertIs(output, expected)

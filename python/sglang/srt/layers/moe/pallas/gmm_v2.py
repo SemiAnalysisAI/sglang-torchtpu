@@ -33,6 +33,7 @@ from jax.experimental.pallas import tpu as pltpu
 from sglang.srt.environ import envs
 
 _FP32_MOE_SCALES = envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.get()
+_GLM_GMM_TWO_RHS_BUFFERS = envs.SGLANG_TPU_GLM_GMM_TWO_RHS_BUFFERS.get()
 
 
 def _scale_quantized_partial(partial, lhs_scale, rhs_scale, *, scales_dtype):
@@ -290,6 +291,41 @@ class GmmConfigs:
 TileFn = Callable[[Dimensions, InputConfigs, InputConfigs, int, str | None], TileSizes]
 
 
+def _rhs_buffer_count(cfgs: GmmConfigs) -> int:
+    """Use the qualified GLM tiny-route pipeline without changing its tiling."""
+    if not _GLM_GMM_TWO_RHS_BUFFERS or _FP32_MOE_SCALES:
+        return 3
+    dims, tiles = cfgs.dims, cfgs.tiles
+    lhs, rhs = cfgs.lhs_cfgs, cfgs.rhs_cfgs
+    qualified = (
+        dims.size_m == 16
+        and dims.size_group == 16
+        and dims.size_lhs_group == 256
+        and dims.size_lhs_sublane == 16
+        and tiles.tile_m == 16
+        and tiles.tile_k == dims.size_k
+        and (dims.size_k, dims.size_n, cfgs.fuse_act, tiles.tile_n)
+        in ((6144, 2048, "silu", 1024), (2048, 6144, None, 6144))
+        and lhs.dtype == jnp.bfloat16
+        and lhs.quant_dtype == jnp.float8_e4m3fn
+        and lhs.quant_block_size == 512
+        and rhs.dtype == jnp.float8_e4m3fn
+        and rhs.quant_dtype == jnp.float8_e4m3fn
+        and rhs.packing == 4
+        and rhs.has_scale
+        and not rhs.has_bias
+        and rhs.num_quant_blocks == 1
+        and rhs.quant_block_size == dims.size_k
+        and rhs.scale_block_n == 1
+        and rhs.scale_size_n == dims.size_n * (2 if cfgs.fuse_act else 1)
+        and rhs.scale_dtype == jnp.bfloat16
+        and cfgs.out_dtype == jnp.bfloat16
+        and cfgs.acc_dtype == jnp.bfloat16
+        and not cfgs.zero_init
+    )
+    return 2 if qualified else 3
+
+
 class IndexMaps:
     """Index maps for GMM kernel."""
 
@@ -370,7 +406,7 @@ def create_rhs_spec(index_map: IndexMaps, cfgs: GmmConfigs) -> RhsRef:
     rhs_weight_spec = pl.BlockSpec(
         (None, cfgs.tiles.tile_k // cfgs.rhs_cfgs.packing, cfgs.tiles.tile_n),
         index_map.rhs_weight_index_map,
-        pipeline_mode=pl.Buffered(buffer_count=3),
+        pipeline_mode=pl.Buffered(buffer_count=_rhs_buffer_count(cfgs)),
     )
 
     rhs_scale_spec = rhs_bias_spec = None

@@ -834,7 +834,20 @@ class RMSNorm(BaseFusedOp):
         if self.cast_x_before_out_mul:
             x = self.weight * x.to(orig_dtype)
         else:
-            x = (x * self.weight).to(orig_dtype)
+            # The opt-in GLM TPU post-load hook retains the BF16 parameter and
+            # refreshes this FP32 buffer in place after weight updates. Limit
+            # the changed operand layout to qualified one-row BF16 inputs.
+            weight = getattr(self, "_tpu_weight_fp32", None)
+            if (
+                weight is None
+                or x.ndim != 2
+                or x.shape[0] != 1
+                or orig_dtype != torch.bfloat16
+                or weight.dtype != torch.float32
+                or weight.device != x.device
+            ):
+                weight = self.weight
+            x = (x * weight).to(orig_dtype)
 
         if residual is None:
             return x

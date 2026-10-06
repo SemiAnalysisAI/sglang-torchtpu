@@ -99,6 +99,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
+    enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
@@ -1613,6 +1614,24 @@ class ModelRunner:
         forward_batch.attn_tp_sequence_sharded = self.attn_tp_sequence_sharded(
             forward_batch._forward_num_tokens()
         )
+        # Warmup calls the compiled forward directly, so _prepare_eager_forward_batch
+        # never runs. Stamp num_token_non_padded here, or with moe_ep_size > 1 every
+        # precompiled graph guards on it being None -- which no real forward satisfies,
+        # so each shape recompiles on first use and dies once fail_on_recompile arms.
+        # Left alone when a caller already supplied it (cuda-graph capture buffers).
+        if enable_num_token_non_padded() and forward_batch.num_token_non_padded is None:
+            num_tokens = forward_batch._forward_num_tokens()
+            forward_batch.global_num_token_non_padded = torch.tensor(
+                num_tokens, dtype=torch.int32, device=self.device
+            )
+            forward_batch.global_num_token_non_padded_cpu = num_tokens
+            forward_batch.set_local_num_token_non_padded(
+                sharded=(
+                    forward_batch.attn_tp_sequence_sharded
+                    and not is_dsa_enable_prefill_cp()
+                    and not is_mla_cp_enabled()
+                ),
+            )
         return forward_batch
 
     def attn_tp_sequence_sharded(self, num_tokens: int) -> bool:

@@ -65,6 +65,9 @@ logger = logging.getLogger(__name__)
 # single op covers every (topk, activation, dtype, shape) combination the
 # model will encounter.
 _PALLAS_MOE_OP = None
+# Process-static like GMM's arithmetic/buffering flags. Restart to change
+# this setting; a previously cached JAX trace keeps its selected branch.
+_GLM_FUSED_EXPERTS = envs.SGLANG_TPU_GLM_FUSED_EXPERTS.get()
 
 # ---- JAX kernel body -------------------------------------------------------
 #
@@ -318,6 +321,8 @@ def _fused_moe_jax(
     use_sc_gather=0,
     w_quant_bits=0,  # 4 => w1/w2 are checkpoint-packed int4 words (W4A16)
     permute_dense_threshold=0,
+    skip_pad_experts=False,
+    bs1_fused_routing=False,
 ):
     """Production fused-MoE kernel body. Exported by ``_build_fused_moe_op``.
 
@@ -331,6 +336,7 @@ def _fused_moe_jax(
 
     from sglang.srt.layers.moe.pallas.gmm_v2 import (
         TileSizes,
+        _FP32_MOE_SCALES,
         apply_act_fn,
         calculate_tiling,
         gmm_v2,
@@ -340,6 +346,37 @@ def _fused_moe_jax(
     m, hidden_size = hidden_states.shape
     num_experts = w1.shape[0]
     out_dtype = hidden_states.dtype
+    use_group_offset = global_num_experts > num_experts
+    # The opt-in path is validated for FP8 expert parallelism. Other callers
+    # retain expert-zero padding until their combine paths are validated.
+    skip_pad_experts = skip_pad_experts and use_group_offset
+    use_bs1_routing = False
+    if bs1_fused_routing:
+        from sglang.srt.hardware_backend.tpu.fp8_moe_bs1_routing import (
+            dispatch_bs1,
+            supports_bs1_routing,
+        )
+
+        use_bs1_routing = supports_bs1_routing(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            topk=topk,
+            activation_name=activation_name,
+            no_combine=no_combine,
+            global_num_experts=global_num_experts,
+            expert_group_offset=expert_group_offset,
+            use_sc_gather=use_sc_gather,
+            w_quant_bits=w_quant_bits,
+            permute_dense_threshold=permute_dense_threshold,
+            skip_pad_experts=skip_pad_experts,
+        )
 
     # uint8 rhs = packed FP4 (2 float4 codes/byte along K); gmm_v2 unpacks to
     # float4_e2m1fn in-kernel when told packed_fp4=True (real K = shape[1] * 2).
@@ -362,69 +399,74 @@ def _fused_moe_jax(
     # the *input* tokens here keeps the permute/gather operating on an
     # already-aligned, fixed-bucket shape and removes the post-gather
     # ``jnp.pad`` + ``group_sizes`` scatter that XLA was offloading to the
-    # SparseCore (and crashing on). Pad tokens route to expert 0 with zero
-    # weight, so they contribute nothing to any real token and are sliced off
-    # at the very end.
+    # SparseCore (and crashing on). Pad tokens normally route to expert 0 with
+    # zero weight. The EP opt-in uses a high sentinel: it sorts after every
+    # valid expert and one_hot excludes it from group_sizes, so neither GEMM
+    # streams an expert just to process padding.
     m_orig = m
     m_pad = _padded_token_count(m, topk, lhs_sublane_tiling(hidden_states.dtype))
     if m_pad != m:
         hidden_states = jnp.pad(hidden_states, ((0, m_pad - m), (0, 0)))
-        topk_ids = jnp.pad(topk_ids, ((0, m_pad - m), (0, 0)))  # pad -> expert 0
+        topk_ids = jnp.pad(
+            topk_ids,
+            ((0, m_pad - m), (0, 0)),
+            constant_values=global_num_experts if skip_pad_experts else 0,
+        )
         topk_weights = jnp.pad(
             topk_weights, ((0, m_pad - m), (0, 0))
         )  # pad -> weight 0
         m = m_pad
 
-    # Routing: build a permutation that puts rows of hidden_states in
-    # expert-major order so a single grouped-matmul covers GMM1 / GMM2.
-    topk_ids_flat = topk_ids.reshape(-1).astype(jnp.int32)  # [m*topk]
-    # argsort is stable enough on TPU for our usage; the gmm kernel
-    # only cares about contiguous expert runs.
-    argsort_idx = jnp.argsort(topk_ids_flat)
-    # Row-of-original-token for each sorted slot.
-    token_indices = jnp.repeat(jnp.arange(m, dtype=jnp.int32), topk)
-    sorted_token_ids = token_indices[argsort_idx]
-
-    # gmm_v2 only reads and writes the rows of expert groups at or after
-    # ``group_offset``, so this rank's routed-row window is all the permute has
-    # to produce. Computed here (not at the ``group_sizes`` site below) so the
-    # gather can start as soon as the sort is done.
-    use_group_offset = global_num_experts > num_experts
     row_start = row_end = None
-    if use_group_offset:
-        row_start, row_end = _shard_row_window(
-            topk_ids_flat, expert_group_offset, num_experts
+    if use_bs1_routing:
+        # The existing padding above is sliced away before this fused front;
+        # the custom kernel writes the same sixteen-row GMM input directly.
+        x_sorted, group_sizes, bs1_inverse = dispatch_bs1(
+            hidden_states[:m_orig], topk_ids[:m_orig]
         )
-
-    # Decide whether to use the dense permute/un-permute paths based on the
-    # number of rows (m) and the number of routed rows (m*topk).
-    use_dense_permute = m < permute_dense_threshold
-    use_dense_unpermute = (m * topk) < permute_dense_threshold and not no_combine
-
-    if use_dense_permute:
-        permute_matrix = jax.nn.one_hot(sorted_token_ids, m, dtype=hidden_states.dtype)
-        x_sorted = jax.lax.dot_general(
-            permute_matrix,
-            hidden_states,
-            (((1,), (0,)), ((), ())),
-            preferred_element_type=hidden_states.dtype,
-        )
-    elif use_sc_gather:
-        from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_v2 import (
-            ragged_gather_v2,
-        )
-
-        n_sorted = sorted_token_ids.shape[0]
-        gather_start = jnp.array([0], dtype=jnp.int32)
-        gather_end = jnp.array([n_sorted], dtype=jnp.int32)
-        x_sorted = ragged_gather_v2(
-            hidden_states,
-            sorted_token_ids,
-            gather_start,
-            gather_end,
-        )
+        use_dense_unpermute = False
     else:
-        x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
+        # Routing: put rows in expert-major order for the grouped matmuls.
+        topk_ids_flat = topk_ids.reshape(-1).astype(jnp.int32)  # [m*topk]
+        argsort_idx = jnp.argsort(topk_ids_flat)
+        token_indices = jnp.repeat(jnp.arange(m, dtype=jnp.int32), topk)
+        sorted_token_ids = token_indices[argsort_idx]
+
+        # The shard window lets gather start as soon as the sort is done.
+        if use_group_offset:
+            row_start, row_end = _shard_row_window(
+                topk_ids_flat, expert_group_offset, num_experts
+            )
+
+        use_dense_permute = m < permute_dense_threshold
+        use_dense_unpermute = (m * topk) < permute_dense_threshold and not no_combine
+
+        if use_dense_permute:
+            permute_matrix = jax.nn.one_hot(
+                sorted_token_ids, m, dtype=hidden_states.dtype
+            )
+            x_sorted = jax.lax.dot_general(
+                permute_matrix,
+                hidden_states,
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=hidden_states.dtype,
+            )
+        elif use_sc_gather:
+            from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_v2 import (
+                ragged_gather_v2,
+            )
+
+            n_sorted = sorted_token_ids.shape[0]
+            gather_start = jnp.array([0], dtype=jnp.int32)
+            gather_end = jnp.array([n_sorted], dtype=jnp.int32)
+            x_sorted = ragged_gather_v2(
+                hidden_states,
+                sorted_token_ids,
+                gather_start,
+                gather_end,
+            )
+        else:
+            x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
     # GMM1: gate/up projection. For per-column/per-tensor scales (and MXFP4), the
     # gated activation is fused in-kernel: ``fuse_act`` makes gmm_v2 split the
     # [.., 2*n] accumulator and write only [.., n] = act(gate) * up, avoiding a
@@ -471,9 +513,10 @@ def _fused_moe_jax(
 
     route_num_experts = global_num_experts if use_group_offset else num_experts
     # one_hot+sum is cheaper on TPU than bincount.
-    group_sizes = jax.nn.one_hot(topk_ids_flat, route_num_experts, dtype=jnp.int32).sum(
-        axis=0
-    )
+    if not use_bs1_routing:
+        group_sizes = jax.nn.one_hot(
+            topk_ids_flat, route_num_experts, dtype=jnp.int32
+        ).sum(axis=0)
     group_offset = (
         jnp.array([expert_group_offset], dtype=jnp.int32) if use_group_offset else None
     )
@@ -489,63 +532,107 @@ def _fused_moe_jax(
     else:
         zero_init = True
 
-    gmm1_out = gmm_v2(
-        lhs=x_sorted,
-        rhs=w1,
-        group_sizes=group_sizes,
-        rhs_scale=w1_scale,
-        rhs_bias=w1_bias,
-        group_offset=group_offset,
-        zero_initialize=zero_init,
-        preferred_element_type=out_dtype,
-        # MXFP4 keeps the fuse_act-aware default tiling (tile_n is per-projection
-        # when fused); compact FP8 pins an unfused tile.
-        tile_info=gmm1_tiling,
-        fuse_act=gmm1_fuse_act,
-        packed_fp4=w1_packed,
-        maybe_quantize_lhs=maybe_quantize_lhs,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
-    if clamp_limit is not None:
-        gate, up = jnp.split(gmm1_out, 2, axis=-1)
-        gate = jnp.minimum(gate, clamp_limit)
-        up = jnp.clip(up, -clamp_limit, clamp_limit)
-        gmm1_out = (jax.nn.silu(gate.astype(jnp.float32)) * up).astype(out_dtype)
-    elif unfused_gmm1:
-        gmm1_out = apply_act_fn(
-            gmm1_out, int(gmm1_out.shape[-1] // 2), _fuse_act_name(activation_name)
+    use_fused_experts = False
+    if _GLM_FUSED_EXPERTS and use_bs1_routing:
+        from sglang.srt.hardware_backend.tpu.glm_fp8_fused_experts import (
+            fused_sorted_experts,
+            supports_glm_fused_experts,
         )
-    # gmm1_out: [m*topk, n_intermediate]
 
-    # same padding
-    if w2_scale is not None and (
-        gmm1_out.shape[1] % 128 != 0 or hidden_size % 128 != 0
-    ):
-        raise NotImplementedError(
-            f"Quantized MoE with non-lane-aligned dims (intermediate "
-            f"{gmm1_out.shape[1]}, hidden {hidden_size}) is unsupported: "
-            "pad weights AND scales jointly at load time."
+        use_fused_experts = supports_glm_fused_experts(
+            use_bs1_routing, fp32_scales=_FP32_MOE_SCALES
         )
-    gmm2_tiling = _dividing_tile_k(
-        _gmm2_tile_source(gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed)
-    )
-    gmm2_out = gmm_v2(
-        lhs=gmm1_out,
-        rhs=w2,
-        group_sizes=group_sizes,
-        rhs_scale=w2_scale,
-        rhs_bias=w2_bias,
-        group_offset=group_offset,
-        zero_initialize=zero_init,
-        preferred_element_type=out_dtype,
-        tile_info=gmm2_tiling,
-        packed_fp4=w2_packed,
-        maybe_quantize_lhs=maybe_quantize_lhs,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )[
-        :,
-        :hidden_size,
-    ]  # [m*topk, k]
+
+    if use_fused_experts:
+        gmm2_out = fused_sorted_experts(
+            x_sorted, w1, w2, group_sizes, w1_scale, w2_scale,
+            offset=expert_group_offset,
+        )
+    else:
+        gmm1_out = gmm_v2(
+            lhs=x_sorted,
+            rhs=w1,
+            group_sizes=group_sizes,
+            rhs_scale=w1_scale,
+            rhs_bias=w1_bias,
+            group_offset=group_offset,
+            zero_initialize=zero_init,
+            preferred_element_type=out_dtype,
+            # MXFP4 keeps the fuse_act-aware default tiling (tile_n is per-projection
+            # when fused); compact FP8 pins an unfused tile.
+            tile_info=gmm1_tiling,
+            fuse_act=gmm1_fuse_act,
+            packed_fp4=w1_packed,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+        if clamp_limit is not None:
+            gate, up = jnp.split(gmm1_out, 2, axis=-1)
+            gate = jnp.minimum(gate, clamp_limit)
+            up = jnp.clip(up, -clamp_limit, clamp_limit)
+            gmm1_out = (jax.nn.silu(gate.astype(jnp.float32)) * up).astype(out_dtype)
+        elif unfused_gmm1:
+            gmm1_out = apply_act_fn(
+                gmm1_out, int(gmm1_out.shape[-1] // 2), _fuse_act_name(activation_name)
+            )
+        # gmm1_out: [m*topk, n_intermediate]
+
+        # same padding
+        if w2_scale is not None and (
+            gmm1_out.shape[1] % 128 != 0 or hidden_size % 128 != 0
+        ):
+            raise NotImplementedError(
+                f"Quantized MoE with non-lane-aligned dims (intermediate "
+                f"{gmm1_out.shape[1]}, hidden {hidden_size}) is unsupported: "
+                "pad weights AND scales jointly at load time."
+            )
+        gmm2_tiling = _dividing_tile_k(
+            _gmm2_tile_source(gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed)
+        )
+        gmm2_out = gmm_v2(
+            lhs=gmm1_out,
+            rhs=w2,
+            group_sizes=group_sizes,
+            rhs_scale=w2_scale,
+            rhs_bias=w2_bias,
+            group_offset=group_offset,
+            zero_initialize=zero_init,
+            preferred_element_type=out_dtype,
+            tile_info=gmm2_tiling,
+            packed_fp4=w2_packed,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )[
+            :,
+            :hidden_size,
+        ]  # [m*topk, k]
+
+    if use_bs1_routing:
+        # Preserve the native padded gather/reduction and its rounding. A
+        # Pallas combine matched standalone tests but changed model outputs.
+        from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_reduce_v2 import (
+            ragged_gather_reduce,
+        )
+
+        inverse = jnp.concatenate((bs1_inverse, jnp.arange(8, 16, dtype=jnp.int32)))
+        valid = (topk_ids >= expert_group_offset) & (
+            topk_ids < expert_group_offset + num_experts
+        )
+        return ragged_gather_reduce(
+            gmm2_out,
+            inverse,
+            topk_weights.reshape(-1),
+            valid.reshape(-1),
+            topk,
+        )[:m_orig]
+
+    if skip_pad_experts and (use_dense_unpermute or not use_sc_gather):
+        # These consumers read all rows, including the new unused tail. Mask
+        # before multiplying by zero weights: 0 * an unwritten NaN is NaN.
+        # The SC combine and no_combine paths already mask via row_start/end.
+        sorted_rows = jnp.arange(gmm2_out.shape[0], dtype=jnp.int32)
+        local_rows = (row_start <= sorted_rows) & (sorted_rows < row_end)
+        gmm2_out = jnp.where(local_rows[:, None], gmm2_out, 0)
 
     # Un-permute back to token-major order. Models that apply a post-expert
     # norm ask the runner for no_combine output so they can RMSNorm each top-k
@@ -668,6 +755,8 @@ def _build_fused_moe_op():
         use_sc_gather: int = 0,
         w_quant_bits: int = 0,
         permute_dense_threshold: int = 0,
+        skip_pad_experts: bool = False,
+        bs1_fused_routing: bool = False,
     ) -> jax.Array:
         return _fused_moe_jax(
             hidden_states,
@@ -687,6 +776,8 @@ def _build_fused_moe_op():
             use_sc_gather,
             w_quant_bits,
             permute_dense_threshold,
+            skip_pad_experts,
+            bs1_fused_routing,
         )
 
     custom_op = jax_op(op_name, _wrapped)
@@ -709,6 +800,8 @@ def _build_fused_moe_op():
         use_sc_gather: int = 0,
         w_quant_bits: int = 0,
         permute_dense_threshold: int = 0,
+        skip_pad_experts: bool = False,
+        bs1_fused_routing: bool = False,
     ):
         if no_combine:
             return hidden_states.new_empty(
@@ -742,6 +835,7 @@ def fused_moe_call(
     global_num_experts: int = 0,
     expert_group_offset: int = 0,
     w_quant_bits: int = 0,
+    skip_pad_experts: bool = False,
 ) -> torch.Tensor:
     """Invoke the Pallas fused-MoE op.
 
@@ -775,4 +869,6 @@ def fused_moe_call(
         int(envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()),
         w_quant_bits,
         int(envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD.get()),
+        skip_pad_experts,
+        envs.SGLANG_TPU_FP8_MOE_BS1_ROUTING.get(),
     )

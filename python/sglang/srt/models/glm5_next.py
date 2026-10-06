@@ -105,9 +105,9 @@ from sglang.srt.utils.common import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    is_tpu,
     log_info_on_rank0,
     make_layers,
-    is_tpu,
     set_weight_attrs,
 )
 

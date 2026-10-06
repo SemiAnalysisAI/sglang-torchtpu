@@ -880,8 +880,12 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         cache=None,
+        *,
+        norm_override: Optional[Callable] = None,
     ):
         if self._sp_variant is not None and get_forward().sp_active:
+            if norm_override is not None:
+                raise ValueError("A norm override requires the ordinary MLP communicator")
             return self._sp_variant.prepare_mlp(
                 hidden_states, residual, forward_batch, cache
             )
@@ -892,7 +896,11 @@ class LayerCommunicator:
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
-            layernorm=self.post_attention_layernorm,
+            layernorm=(
+                self.post_attention_layernorm
+                if norm_override is None
+                else norm_override
+            ),
             context=self._context,
         )
 

@@ -67,6 +67,12 @@ class _PhysicalAttentionBackend:
 
 
 class TestRadixLinearAttentionPadding(CustomTestCase):
+    def setUp(self):
+        # Pin the eager CPU path; the TPU bypass test re-patches this to True.
+        tpu_patch = patch.object(radix_linear_attention, "_is_tpu", False)
+        tpu_patch.start()
+        self.addCleanup(tpu_patch.stop)
+
     def test_tpu_extend_keeps_physical_rows_for_kernel_padding_mask(self):
         layer = radix_linear_attention.RadixLinearAttention(
             layer_id=0,
@@ -83,10 +89,13 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
             num_token_non_padded_cpu=3,
             out_cache_loc=cache_loc,
         )
-        with patch.object(radix_linear_attention, "_is_tpu", True), patch.object(
-            radix_linear_attention,
-            "get_attn_backend",
-            return_value=_PhysicalAttentionBackend(),
+        with (
+            patch.object(radix_linear_attention, "_is_tpu", True),
+            patch.object(
+                radix_linear_attention,
+                "get_attn_backend",
+                return_value=_PhysicalAttentionBackend(),
+            ),
         ):
             output = layer(
                 batch, torch.zeros(5, 8), torch.zeros(5, 2), torch.zeros(5, 2)

@@ -344,9 +344,11 @@ class WeightUpdater:
         ]
         if load_format == "direct":
             _model_load_weights_direct(self.get_model(), named_tensors)
+            _refresh_derived_weight_caches(self.get_model())
         elif load_format in self.custom_weight_loaders:
             custom_loader = dynamic_import(load_format)
             custom_loader(self.get_model(), named_tensors)
+            _refresh_derived_weight_caches(self.get_model())
         elif load_format is None:
             self.get_model().load_weights(named_tensors)
         else:
@@ -406,6 +408,15 @@ class WeightUpdater:
         except Exception as e:
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
+
+
+def _refresh_derived_weight_caches(model):
+    # Normal model.load_weights routes refresh through the model's existing
+    # post-load hook. Direct/custom tensor loaders bypass that lifecycle; only
+    # refresh derived copies here, without repacking projection weights again.
+    refresh = getattr(model, "refresh_derived_weight_caches", None)
+    if refresh is not None:
+        refresh()
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

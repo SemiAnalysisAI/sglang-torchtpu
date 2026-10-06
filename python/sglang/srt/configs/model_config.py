@@ -186,6 +186,10 @@ def is_deepseek_dsa(config) -> bool:
             _hf_arch(config) == "GlmMoeDsaForCausalLM"
             and _hf_attr(config, "tpu_dense_dsa_max_context") is not None
         )
+        # The TPU Flash model (glm5_next_tpu) evaluates DSA densely.
+        and not (
+            _hf_arch(config) == "Glm5NextForConditionalGeneration" and is_tpu()
+        )
     )
 
 

@@ -1,0 +1,12 @@
+{
+  "format": "Little-endian BF16 bits; first 2048 values are QA input, next 2048 are RMSNorm weights",
+  "bytes": 8192,
+  "sha256": "f39162c8ff06c1e7546fb91424310a6f2ca75bd1a56e1001eb1db37a8ee2809e",
+  "source": "GLM-5.3 native attention front, layer 4, TP rank 0, position 50; captured input/output replay matched native server",
+  "purpose": "Native[6144,2624] FP8 projection followed by QA RMS exposes a 1-ULP variance reduction difference at normalizedQA[649]",
+  "native_variance": 0.001505738589912653,
+  "original_fused_variance": 0.0015057384734973311,
+  "native_selected_front_output": 0.01470947265625,
+  "original_fused_selected_front_output": 0.0162353515625,
+  "fixture_contains": "Two 2048-element BF16 vectors only; projection and absorption matrices are generated synthetically by the test"
+}

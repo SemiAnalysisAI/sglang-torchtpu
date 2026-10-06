@@ -58,7 +58,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_musa,
     _is_tpu,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_forward, get_lora, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -299,6 +299,43 @@ class DeepseekMLAForwardMixin:
         # True between the alt-stream fork and its consumption in the born
         # block; also suppresses the duplicate split/rope on that path.
         self._q8kv8_qprep_overlap_pending = False
+        if _is_tpu and envs.SGLANG_TPU_GLM_FP8_MLA_FRONT.get():
+            from sglang.srt.hardware_backend.tpu.glm_fp8_mla_front_dispatch import (
+                can_use_glm_fp8_mla_front,
+                run_glm_fp8_mla_front,
+            )
+
+            if can_use_glm_fp8_mla_front(
+                self,
+                hidden_states,
+                positions,
+                forward_batch,
+                parallel=get_parallel(),
+                input_scattered=get_attn_tp_context().input_scattered,
+                lora_enabled=get_lora().enable_lora,
+                experimental_lora=_SGLANG_EXPERIMENTAL_LORA_OPTI,
+                llama_4_scaling=llama_4_scaling,
+            ):
+                # fetch_qkv_latent below is lazy. This branch replaces that
+                # projection and preserves the existing attention/cache owner.
+                q_nope_out, q_pe, k_nope, k_pe = run_glm_fp8_mla_front(
+                    self, hidden_states, positions
+                )
+                k_nope, k_pe = prepare_kv_for_attention(
+                    self, forward_batch, k_nope, k_pe, defer_materialization=False
+                )
+                return (
+                    q_pe,
+                    k_pe,
+                    q_nope_out,
+                    k_nope,
+                    forward_batch,
+                    zero_allocator,
+                    positions,
+                    None,
+                    llama_4_scaling,
+                    None,
+                )
         attention_output_gate = (
             self.prepare_attention_output_gate(hidden_states)
             if hasattr(self, "prepare_attention_output_gate")
@@ -815,7 +852,31 @@ class DeepseekMLAForwardMixin:
 
             _kvb_v = kv_b_lora_v_prepare(self, attn_output)
 
-        if getattr(self, "_kimi_split_gguf_kv_b", False):
+        use_output_quant = False
+        if _is_tpu and getattr(self, "_tpu_glm_attention_output_quant", False):
+            from sglang.srt.hardware_backend.tpu.glm_attention_output_quant import (
+                can_use_glm_attention_output_quant,
+                prepare_glm_attention_output_quant,
+            )
+
+            use_output_quant = can_use_glm_attention_output_quant(
+                self,
+                attn_output,
+                forward_batch,
+                parallel=get_parallel(),
+                sp_active=get_forward().sp_active,
+                input_scattered=get_attn_tp_context().input_scattered,
+                lora_enabled=get_lora().enable_lora,
+                experimental_lora=_SGLANG_EXPERIMENTAL_LORA_OPTI,
+                kv_b_lora_active=is_kv_b_lora_active(self),
+                attention_output_gate=attention_output_gate,
+                llama_4_scaling=llama_4_scaling,
+                fusion_plan=fusion_plan,
+            )
+
+        if use_output_quant:
+            attn_bmm_output = prepare_glm_attention_output_quant(self, attn_output)
+        elif getattr(self, "_kimi_split_gguf_kv_b", False):
             from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
 
             v_type = int(self.v_b_qweight_type.weight_type)

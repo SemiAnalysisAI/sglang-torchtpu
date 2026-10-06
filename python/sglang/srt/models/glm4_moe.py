@@ -102,6 +102,7 @@ from sglang.srt.utils import (
     is_hip,
     is_non_idle_and_non_empty,
     is_npu,
+    is_tpu,
     log_info_on_rank0,
     make_layers,
 )
@@ -1502,6 +1503,38 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
                     f"The GLM dense DSA reference path requires --context-length <= {dense_limit}"
                 )
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        self._tpu_glm_rmsnorm_fp32_weights = (
+            is_tpu()
+            and envs.SGLANG_TPU_GLM_RMSNORM_FP32_WEIGHTS.get()
+            and getattr(config, "model_type", None) == "glm_moe_dsa"
+            and config.hidden_size == 6144
+            and dense_limit is not None
+            and get_parallel().attn_tp_size == 16
+            and get_server_args().tpu_compile_tracer == "direct"
+        )
+        if is_tpu() and get_server_args().tpu_compile_tracer == "direct":
+            from sglang.srt.compilation.support_torch_compile import (
+                support_torch_compile,
+            )
+            from sglang.srt.hardware_backend.tpu.compilation.glm_moe_dsa_compile_policy import (
+                GlmMoeDsaTpuCompilePolicy,
+            )
+
+            # The direct tracer needs explicit paths for derived MLA tensors
+            # and routing helper aliases. Keep the Dynamo boundary unchanged.
+            support_torch_compile(self, policy=GlmMoeDsaTpuCompilePolicy)
+
+    def refresh_derived_weight_caches(self):
+        if self._tpu_glm_rmsnorm_fp32_weights:
+            from sglang.srt.hardware_backend.tpu.glm_rmsnorm_weights import (
+                refresh_glm_rmsnorm_weights,
+            )
+
+            refresh_glm_rmsnorm_weights(self)
+
+    def post_load_weights(self, is_nextn=False, weight_names=None):
+        super().post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        self.refresh_derived_weight_caches()
 
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):

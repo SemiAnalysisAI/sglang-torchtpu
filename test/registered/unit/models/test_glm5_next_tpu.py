@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
-from sglang.srt.configs.hybrid_arch import kimi_linear_config
+from sglang.srt.configs.hybrid_arch import glm5_next_config
 from sglang.srt.disaggregation.utils import get_dsa_seed_metadata_dim
 from sglang.srt.models.deepseek_v2 import MoEGate
 from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLM
@@ -92,9 +92,10 @@ class TestGlm5NextTpu(unittest.TestCase):
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_idle=lambda: False, is_decode=lambda: True)
         )
-        with patch.object(
-            attn.attn, "forward", return_value=torch.ones(1, 2, 4)
-        ), patch("sglang.srt.layers.linear.get_tp_group", return_value=None):
+        with (
+            patch.object(attn.attn, "forward", return_value=torch.ones(1, 2, 4)),
+            patch("sglang.srt.layers.linear.get_tp_group", return_value=None),
+        ):
             output = attn(torch.ones(1, config.hidden_size), batch)
         self.assertEqual(output.shape, (1, config.hidden_size))
 
@@ -113,7 +114,7 @@ class TestGlm5NextTpu(unittest.TestCase):
                 },
             }
         )
-        text = kimi_linear_config(SimpleNamespace(hf_config=cfg))
+        text = glm5_next_config(SimpleNamespace(hf_config=cfg, is_draft_model=False))
         self.assertIs(text, cfg.text_config)
         self.assertEqual(text.linear_layer_ids, [0, 1, 2])
         self.assertEqual(text.full_attention_layer_ids, [3])
