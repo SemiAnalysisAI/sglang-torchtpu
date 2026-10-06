@@ -575,6 +575,11 @@ def rpa_kernel(
             kv_alloc = final_allocs[1]
             kv_ref_flat = kv_alloc.window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
             kv_ref_flat[...] = jnp.zeros_like(kv_ref_flat)
+            # Q rows past a block's q_sz keep stale VMEM. A NaN there turns the
+            # same rows of later blocks to NaN through 0 * NaN in l/acc.
+            q_window = final_allocs[0].window_ref
+            q_ref_flat = q_window.bitcast(jnp.uint32).reshape(-1, num_lanes)
+            q_ref_flat[...] = jnp.zeros_like(q_ref_flat)
 
             def execute_schedule_chunk(start_step, num_steps):
                 # All reads are aligned to 128 and some extra steps are copied in the
