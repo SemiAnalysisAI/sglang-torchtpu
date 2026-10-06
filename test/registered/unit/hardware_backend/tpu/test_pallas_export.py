@@ -51,7 +51,13 @@ class TestPallasExportEnvironment(CustomTestCase):
             patch("torch_tpu._internal.pallas.jax_op") as register,
         ):
             pp_wave.build_pp_wave(
-                group, rows=8, hidden=16, dtype=torch.float32, device="cpu"
+                group,
+                stage_group=SimpleNamespace(rank_in_group=0, world_size=1, ranks=(2,)),
+                world_group=group,
+                rows=8,
+                hidden=16,
+                dtype=torch.float32,
+                device="cpu",
             )
             self.assertEqual(list(pp_wave._OPS), [(2, 0, 0, 3, 3, 1, 1, 2)])
             register.assert_called_once()

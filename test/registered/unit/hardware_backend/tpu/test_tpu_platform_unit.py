@@ -57,6 +57,9 @@ class TestTpuPlatformIdentity(CustomTestCase):
         self.assertFalse(self.platform.support_cuda_graph())
         self.assertFalse(self.platform.support_piecewise_cuda_graph())
 
+    def test_pipeline_stages_may_replicate_experts(self):
+        self.assertTrue(self.platform.supports_moe_dp_pipeline_stages())
+
     def test_dispatch_key(self):
         self.assertEqual(self.platform.get_dispatch_key_name(), "tpu")
 

@@ -166,12 +166,22 @@ class SRTPlatform(DeviceMixin):
         """
         return False
 
+    def supports_moe_dp_pipeline_stages(self) -> bool:
+        """Whether a pipeline stage may replicate its experts over its own
+        devices (--moe-dp-size > 1 with --pp-size > 1)."""
+        return False
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
 
     def init_backend(self) -> None:
         """One-time backend initialization.  Called in each worker."""
+        pass
+
+    def prepare_model_parallel_groups(self) -> None:
+        """Called on every rank once the model-parallel groups are built,
+        before their first collective."""
         pass
 
     # ------------------------------------------------------------------

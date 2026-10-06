@@ -223,9 +223,11 @@ def profile_and_install_cost_model(scheduler):
             policy._run_one(**kwargs)
             elapsed = min(policy._run_one(**kwargs) for _ in range(2))
             samples.append((tokens, prefix, elapsed))
-    reports = [None] * get_parallel().pp_size
+    # The devices of a multi-device stage must admit the same chunks, so every
+    # rank fits the model from every rank's samples, not only its pipeline's.
+    reports = [None] * scheduler.world_group.world_size
     torch.distributed.all_gather_object(
-        reports, (samples, schedule), group=scheduler.pp_group.cpu_group
+        reports, (samples, schedule), group=scheduler.world_group.cpu_group
     )
     schedules = [report[1] for report in reports if report[1] is not None]
     cost = StepCostModel.fit(

@@ -880,7 +880,7 @@ class TestContextParallelInputs(CustomTestCase):
     @staticmethod
     def _shim():
         compiled = MagicMock(return_value="out")
-        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        shim = CompiledForwardShim(compiled, policy=_policy(model=None))
         shim._attn_cp_size = 2
         return shim, compiled
 

@@ -163,8 +163,13 @@ def get_write_rows_op():
 
     from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
 
+    # Tensors only: since google-pytorch/torch_tpu e443560b1 custom_jax_kernel
+    # passes a keyword default such as `interpret` to its jit as a traced value.
+    def _write_rows(num_segments, segments, rows, kv):
+        return write_rows(num_segments, segments, rows, kv)
+
     jax_kernel = _torch_pallas.custom_jax_kernel(
-        write_rows,
+        _write_rows,
         name="jax_kv_write_rows",
         donate_argnums=(3,),
         input_output_aliases={3: 0},
