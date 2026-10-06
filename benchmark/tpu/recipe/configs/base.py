@@ -57,7 +57,6 @@ _FP8_BASE_CONFIG["runtime_env"].update(
         # regressed these serving shapes).
         "LIBTPU_INIT_ARGS": " ".join(
             [
-                "--xla_tpu_scoped_vmem_limit_kib=65536",
                 "--xla_tpu_enable_async_collective_fusion=true",
                 "--xla_tpu_overlap_compute_collective_tc=true",
                 "--xla_tpu_enable_async_collective_fusion_multiple_steps=true",
