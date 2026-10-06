@@ -176,6 +176,10 @@ def _parse_histograms(text: str) -> Dict[str, Dict[str, Dict]]:
             series["buckets"][le] = series["buckets"].get(le, 0.0) + number
         else:
             series[suffix[1:]] += number
+            if suffix == "_count":
+                # How many label sets (TP ranks, for the per-rank KV transfer
+                # families) were summed into this series.
+                series["label_sets"] = series.get("label_sets", 0) + 1
     return out
 
 
@@ -247,6 +251,7 @@ def _diff_histograms(pre: Dict, post: Dict) -> Dict[str, Dict[str, Dict]]:
                 "p50": _quantile(bounds, counts, 0.50),
                 "p90": _quantile(bounds, counts, 0.90),
                 "p99": _quantile(bounds, counts, 0.99),
+                "label_sets": after.get("label_sets", 1),
             }
             if finite:
                 record["top_bucket"] = finite[-1][0]
@@ -461,6 +466,9 @@ def _check(delta: Dict, pre: Dict, post: Dict, args) -> List[str]:
 
     # P/D: headline transfer numbers as flat fields (the dashboard dump only
     # takes top-level numbers); the full distributions stay in "histograms".
+    # Every TP rank sends (and observes) its own shard of each request's KV, so
+    # latency/MB/speed are per-rank-shard values; kv_transfers and
+    # kv_transfer_request_mb_mean are normalized to whole requests.
     histograms = delta.get("histograms") or {}
     for family, prefix in (
         ("sglang:kv_transfer_latency_ms", "kv_transfer_latency_ms"),
@@ -473,8 +481,14 @@ def _check(delta: Dict, pre: Dict, post: Dict, args) -> List[str]:
         for stat in ("mean", "p50", "p99"):
             if series.get(stat) is not None:
                 delta["derived"][f"{prefix}_{stat}"] = round(series[stat], 3)
+        ranks = max(1, int(series.get("label_sets") or 1))
         if family == "sglang:kv_transfer_latency_ms":
-            delta["derived"]["kv_transfers"] = series["count"]
+            delta["derived"]["kv_transfer_ranks"] = ranks
+            delta["derived"]["kv_transfers"] = series["count"] / ranks
+        elif family == "sglang:kv_transfer_total_mb":
+            delta["derived"]["kv_transfer_request_mb_mean"] = round(
+                series["mean"] * ranks, 3
+            )
     for family, series_map in histograms.items():
         for series_key, series in series_map.items():
             over = series.get("above_top_bucket") or 0

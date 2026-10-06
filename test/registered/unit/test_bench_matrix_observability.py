@@ -100,9 +100,11 @@ class TestMetricsProbeHistograms(CustomTestCase):
         self.assertEqual(latency["count"], 8.0)
         self.assertEqual(latency["sum"], 500.0)
         self.assertEqual(latency["buckets"], {"10.0": 2.0, "100.0": 6.0, "+Inf": 8.0})
+        self.assertEqual(latency["label_sets"], 2)
         stages = hist["sglang:per_stage_req_latency_seconds"]
         self.assertEqual(set(stages), {"prefill_forward", "decode_waiting"})
         self.assertEqual(stages["prefill_forward"]["count"], 5.0)
+        self.assertEqual(stages["prefill_forward"]["label_sets"], 1)
         # The counter parser is unchanged by histogram lines.
         self.assertEqual(
             probe._parse_prometheus(text), {"sglang:num_requests_total": 12.0}
@@ -188,22 +190,35 @@ class TestMetricsProbeHistograms(CustomTestCase):
         self.assertEqual(decode["role"], "decode")
 
     def test_transfer_headline_and_top_bucket_warning(self):
-        def latency(count, total, over):
+        # Two TP ranks, each observing its own shard of 4 requests.
+        def transfer(count, total, over, mb_total):
             return {
                 "sglang:kv_transfer_latency_ms": {
                     "all": {
                         "buckets": {"5000.0": count - over, "+Inf": count},
                         "sum": total,
                         "count": count,
+                        "label_sets": 2,
                     }
-                }
+                },
+                "sglang:kv_transfer_total_mb": {
+                    "all": {
+                        "buckets": {"+Inf": count},
+                        "sum": mb_total,
+                        "count": count,
+                        "label_sets": 2,
+                    }
+                },
             }
 
-        pre = self._snap(100.0, 0.0, latency(0.0, 0.0, 0.0))
-        post = self._snap(1100.0, 900.0, latency(4.0, 26000.0, 1.0))
+        pre = self._snap(100.0, 0.0, transfer(0.0, 0.0, 0.0, 0.0))
+        post = self._snap(1100.0, 900.0, transfer(8.0, 52000.0, 2.0, 800.0))
         delta = probe._diff(pre, post, self._args("prefill"))
+        self.assertEqual(delta["derived"]["kv_transfer_ranks"], 2)
         self.assertEqual(delta["derived"]["kv_transfers"], 4.0)
         self.assertEqual(delta["derived"]["kv_transfer_latency_ms_mean"], 6500.0)
+        self.assertEqual(delta["derived"]["kv_transfer_mb_mean"], 100.0)
+        self.assertEqual(delta["derived"]["kv_transfer_request_mb_mean"], 200.0)
         self.assertEqual(delta["derived"]["prefix_cache_hit_rate"], 0.9)
         self.assertTrue(any("exceeded the top bucket" in w for w in delta["warnings"]))
 

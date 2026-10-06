@@ -507,12 +507,16 @@ def _markdown_server_breakdown(legs: List[Dict]) -> List[str]:
             mean_s = _hist(source, stage_family, stage).get("mean")
             stage_cells.append(_fmt(None if mean_s is None else mean_s * 1000, ".0f"))
         queue = _hist(prefill_h, "sglang:queue_time_seconds").get("mean")
+        # Each TP rank observes its own shard of every transfer.
+        ranks = max(1, int(latency.get("label_sets") or 1))
+        transfers = latency.get("count")
+        request_gb = size.get("mean")
         rows.append(
             f"| {leg['mode']} | {leg['concurrency']} | {leg['num_long_sessions']} "
-            f"| {_fmt(latency.get('count'), '.0f')} "
+            f"| {_fmt(None if transfers is None else transfers / ranks, '.0f')} "
             f"| {_fmt(latency.get('mean'), '.0f')}/{_fmt(latency.get('p50'), '.0f')}"
             f"/{_fmt(latency.get('p99'), '.0f')} "
-            f"| {_fmt(size.get('mean'), '.0f')} "
+            f"| {_fmt(None if request_gb is None else request_gb * ranks / 1024, '.2f')} "
             f"| {_fmt(speed.get('mean'), '.2f')} "
             f"| {_fmt(None if queue is None else queue * 1000, '.0f')} "
             f"| " + " | ".join(stage_cells) + " |"
@@ -522,8 +526,8 @@ def _markdown_server_breakdown(legs: List[Dict]) -> List[str]:
     out = [
         "### Server-side breakdown",
         "",
-        "| mode | conc | long reqs | KV xfers | xfer ms mean/p50/p99 | xfer MB "
-        "mean | xfer GB/s mean | queue ms | "
+        "| mode | conc | long reqs | KV xfers | xfer ms mean/p50/p99 | xfer GB/req "
+        "mean | xfer GB/s/rank mean | queue ms | "
         + " | ".join(f"{name} ms" for name, _, _ in _STAGE_COLUMNS)
         + " |",
         "|---|---:|---:|---:|---:|---:|---:|---:|" + "---:|" * len(_STAGE_COLUMNS),
@@ -532,7 +536,8 @@ def _markdown_server_breakdown(legs: List[Dict]) -> List[str]:
         "_Per-leg deltas of the servers' Prometheus histograms; p50/p99 are "
         "bucket-interpolated. KV transfer and prefill stages come from the "
         "prefill engine, decode stages from the decode engine; stage columns "
-        "are means._",
+        "are means. Each TP rank sends its own KV shard: xfer ms and GB/s are "
+        "per rank shard, KV xfers and GB/req are per request._",
         "",
     ]
     if not any_transfer:
@@ -652,7 +657,7 @@ def _markdown(summary: Dict) -> str:
     )
     if shape.get("long_ramp_is_time_boxed"):
         lines.append(
-            f"- :warning: the 1M sessions ramped at "
+            f"- :warning: the long sessions ramped at "
             f"{shape['long_ramp_tokens']} tok/round instead of "
             f"{shape['turn_input_tokens']} (time-boxed run)."
         )
