@@ -34,8 +34,8 @@ from sglang.test.tpu.evals.startup_timing import startup_timing_runner
 
 # One cold bring-up: weight load + the full derived bucket grid with no compile
 # cache. Drives the JobSet poll budget, so an under-estimate kills the run.
-# Measured on tpu7x (TP8, weights in /dev/shm): ~160s to ready, of which ~50s
-# weight load and ~88s precompile; 900 leaves room for a slower PVC load.
+# Measured on tpu7x: ~160s to ready with weights in /dev/shm (~50s load, ~88s
+# precompile); 289s for the whole test in CI, where the PVC load takes ~150s.
 # Not auto-refreshed: update_est_time.py omits tpu.
 register_tpu_ci(
     est_time=900,

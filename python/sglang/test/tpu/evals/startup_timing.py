@@ -21,7 +21,7 @@ phases it reports. On TPU that window is dominated by the shape-bucket
 precompile, measured end to end. ``cuda_graph`` is NOT used: TPU installs both
 the EXTEND and DECODE policies from the decode-capture hook, which returns
 once every compile has been *submitted* -- the async join that waits for them to
-finish (~15-20% of the total) happens after it and is not counted. Per-step
+finish (~12s of ~87s on gpt-oss-120b) happens after it and is not counted. Per-step
 durations are also dumped, but their SUM is not wall time -- native compilation
 overlaps across shapes -- so it is informational.
 
