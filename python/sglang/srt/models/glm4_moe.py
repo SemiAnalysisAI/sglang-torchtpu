@@ -1460,6 +1460,8 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
 
     def __init__(self, config, quant_config=None, prefix=""):
+        # TODO(sglang-torchtpu#1072): replace with sparse DSA on TPU;
+        # dense MLA is exact only while the context fits index_topk.
         dense_limit = getattr(config, "tpu_dense_dsa_max_context", None)
         if dense_limit is not None:
             if not 0 < dense_limit <= config.index_topk:
