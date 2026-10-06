@@ -78,7 +78,8 @@ LAUNCH_ENV = {
     # Prefix caching is the substrate HiCache is built on, and launch_server.sh
     # defaults it OFF.
     "DISABLE_RADIX_CACHE": "0",
-    "KV_OFFLOAD": "1",
+    # DIAGNOSTIC (#1065): offload off, fused-RS still auto-selected.
+    "KV_OFFLOAD": "0",
     "HICACHE_IO_BACKEND": "raiden",
     "HICACHE_RATIO": str(HICACHE_RATIO),
     # Write through on every prefill so the probe is already on host by the time the
@@ -105,19 +106,6 @@ MODEL_CONFIG = {
     # config the accuracy lane does not serve, so plotting it next to that lane's
     # would compare two different servers.
     "gates": [
-        # First, on a cache it flushes and fully owns -- GSM8K would otherwise leave
-        # the pool full and the eviction arithmetic would no longer hold.
-        {
-            "dataset": "prefix_cache_kv_offload",
-            "label": "prefix-cache-kv-offload",
-            "runner": kv_offload_runner(
-                test_name="qwen3-coder-480b-prefix-cache-kv-offload",
-                device_pool_tokens=DEVICE_POOL_TOKENS,
-                page_size=PAGE_SIZE,
-                probe_tokens=PROBE_TOKENS,
-                hicache_ratio=HICACHE_RATIO,
-            ),
-        },
         {
             "dataset": "gsm8k",
             "label": "gsm8k",
