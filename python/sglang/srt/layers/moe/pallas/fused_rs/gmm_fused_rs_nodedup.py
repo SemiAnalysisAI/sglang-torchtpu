@@ -597,145 +597,148 @@ def kernel_main_fused_rs(
     w1_dma_n = tile_n1 * 2 if act_fn else tile_n1
 
     # --- Weight DMA helpers ---
-    @jax.named_scope("start_w1_dma")
-    def start_w1_dma(buf_id, expert_id, n_id, k_id=0):
+    # DIAGNOSTIC (#1065): each wait rebuilds the exact descriptors its start
+    # issued, instead of a same-size VMEM stand-in.
+    def _w1_copies(buf_id, expert_id, n_id, k_id):
+        copies = []
         if act_fn and num_n1 > 1:
             # Fix: with fuse_act, w1 is [all_gate | all_up] along N.
             # Load tile_n1 from gate + tile_n1 from up into buf as [gate|up].
             _gate_offset = n_id * tile_n1
             _up_offset = out_n1 + n_id * tile_n1
             # Gate half -> first tile_n1 cols of buf
-            pltpu.make_async_copy(
-                src_ref=w1_packed.at[
-                    expert_id, pl.ds(k_id * pk1, pk1), pl.ds(_gate_offset, tile_n1)
-                ],
-                dst_ref=w1_buf_ref.at[buf_id, :, :tile_n1],
-                sem=w1_sem_ref.at[buf_id],
-            ).start()
+            copies.append(
+                pltpu.make_async_copy(
+                    src_ref=w1_packed.at[
+                        expert_id, pl.ds(k_id * pk1, pk1), pl.ds(_gate_offset, tile_n1)
+                    ],
+                    dst_ref=w1_buf_ref.at[buf_id, :, :tile_n1],
+                    sem=w1_sem_ref.at[buf_id],
+                )
+            )
             # Up half -> last tile_n1 cols of buf
-            pltpu.make_async_copy(
-                src_ref=w1_packed.at[
-                    expert_id, pl.ds(k_id * pk1, pk1), pl.ds(_up_offset, tile_n1)
-                ],
-                dst_ref=w1_buf_ref.at[buf_id, :, tile_n1:],
-                sem=w1_sem_ref.at[buf_id],
-            ).start()
+            copies.append(
+                pltpu.make_async_copy(
+                    src_ref=w1_packed.at[
+                        expert_id, pl.ds(k_id * pk1, pk1), pl.ds(_up_offset, tile_n1)
+                    ],
+                    dst_ref=w1_buf_ref.at[buf_id, :, tile_n1:],
+                    sem=w1_sem_ref.at[buf_id],
+                )
+            )
         else:
-            pltpu.make_async_copy(
-                src_ref=w1_packed.at[
-                    expert_id, pl.ds(k_id * pk1, pk1), pl.ds(n_id * w1_dma_n, w1_dma_n)
-                ],
-                dst_ref=w1_buf_ref.at[buf_id],
-                sem=w1_sem_ref.at[buf_id],
-            ).start()
+            copies.append(
+                pltpu.make_async_copy(
+                    src_ref=w1_packed.at[
+                        expert_id, pl.ds(k_id * pk1, pk1), pl.ds(n_id * w1_dma_n, w1_dma_n)
+                    ],
+                    dst_ref=w1_buf_ref.at[buf_id],
+                    sem=w1_sem_ref.at[buf_id],
+                )
+            )
         if has_scale:
             if act_fn and num_n1 > 1:
                 _gate_offset_s = n_id * tile_n1
                 _up_offset_s = out_n1 + n_id * tile_n1
-                pltpu.make_async_copy(
-                    src_ref=w1_scale_ref.at[
-                        expert_id,
-                        pl.ds(k_id * nqb1, nqb1),
-                        :,
-                        pl.ds(_gate_offset_s, tile_n1),
-                    ],
-                    dst_ref=w1_scale_buf_ref.at[buf_id, :, :, :tile_n1],
-                    sem=w1_sem_ref.at[buf_id],
-                ).start()
-                pltpu.make_async_copy(
-                    src_ref=w1_scale_ref.at[
-                        expert_id,
-                        pl.ds(k_id * nqb1, nqb1),
-                        :,
-                        pl.ds(_up_offset_s, tile_n1),
-                    ],
-                    dst_ref=w1_scale_buf_ref.at[buf_id, :, :, tile_n1:],
-                    sem=w1_sem_ref.at[buf_id],
-                ).start()
+                copies.append(
+                    pltpu.make_async_copy(
+                        src_ref=w1_scale_ref.at[
+                            expert_id,
+                            pl.ds(k_id * nqb1, nqb1),
+                            :,
+                            pl.ds(_gate_offset_s, tile_n1),
+                        ],
+                        dst_ref=w1_scale_buf_ref.at[buf_id, :, :, :tile_n1],
+                        sem=w1_sem_ref.at[buf_id],
+                    )
+                )
+                copies.append(
+                    pltpu.make_async_copy(
+                        src_ref=w1_scale_ref.at[
+                            expert_id,
+                            pl.ds(k_id * nqb1, nqb1),
+                            :,
+                            pl.ds(_up_offset_s, tile_n1),
+                        ],
+                        dst_ref=w1_scale_buf_ref.at[buf_id, :, :, tile_n1:],
+                        sem=w1_sem_ref.at[buf_id],
+                    )
+                )
             else:
-                pltpu.make_async_copy(
-                    src_ref=w1_scale_ref.at[
-                        expert_id,
-                        pl.ds(k_id * nqb1, nqb1),
-                        :,
-                        pl.ds(n_id * w1_dma_n, w1_dma_n),
-                    ],
-                    dst_ref=w1_scale_buf_ref.at[buf_id],
-                    sem=w1_sem_ref.at[buf_id],
-                ).start()
+                copies.append(
+                    pltpu.make_async_copy(
+                        src_ref=w1_scale_ref.at[
+                            expert_id,
+                            pl.ds(k_id * nqb1, nqb1),
+                            :,
+                            pl.ds(n_id * w1_dma_n, w1_dma_n),
+                        ],
+                        dst_ref=w1_scale_buf_ref.at[buf_id],
+                        sem=w1_sem_ref.at[buf_id],
+                    )
+                )
         if has_bias:
+            copies.append(
+                pltpu.make_async_copy(
+                    src_ref=w1_bias_ref.at[expert_id, :, pl.ds(n_id * w1_dma_n, w1_dma_n)],
+                    dst_ref=w1_bias_buf_ref,
+                    sem=w1_sem_ref.at[buf_id],
+                )
+            )
+        return copies
+
+    def _w2_copies(buf_id, expert_id, n_id, k_id):
+        copies = [
             pltpu.make_async_copy(
-                src_ref=w1_bias_ref.at[expert_id, :, pl.ds(n_id * w1_dma_n, w1_dma_n)],
-                dst_ref=w1_bias_buf_ref,
-                sem=w1_sem_ref.at[buf_id],
-            ).start()
+                src_ref=w2_packed.at[
+                    expert_id, pl.ds(k_id * pk2, pk2), pl.ds(n_id * tile_n2, tile_n2)
+                ],
+                dst_ref=w2_buf_ref.at[buf_id],
+                sem=w2_sem_ref.at[buf_id],
+            )
+        ]
+        if has_scale:
+            copies.append(
+                pltpu.make_async_copy(
+                    src_ref=w2_scale_ref.at[
+                        expert_id,
+                        pl.ds(k_id * nqb2, nqb2),
+                        :,
+                        pl.ds(n_id * tile_n2, tile_n2),
+                    ],
+                    dst_ref=w2_scale_buf_ref.at[buf_id],
+                    sem=w2_sem_ref.at[buf_id],
+                )
+            )
+        if has_bias:
+            copies.append(
+                pltpu.make_async_copy(
+                    src_ref=w2_bias_ref.at[expert_id, :, pl.ds(n_id * tile_n2, tile_n2)],
+                    dst_ref=w2_bias_buf_ref,
+                    sem=w2_sem_ref.at[buf_id],
+                )
+            )
+        return copies
+
+    @jax.named_scope("start_w1_dma")
+    def start_w1_dma(buf_id, expert_id, n_id, k_id=0):
+        for copy in _w1_copies(buf_id, expert_id, n_id, k_id):
+            copy.start()
 
     @jax.named_scope("start_w2_dma")
     def start_w2_dma(buf_id, expert_id, n_id, k_id=0):
-        pltpu.make_async_copy(
-            src_ref=w2_packed.at[
-                expert_id, pl.ds(k_id * pk2, pk2), pl.ds(n_id * tile_n2, tile_n2)
-            ],
-            dst_ref=w2_buf_ref.at[buf_id],
-            sem=w2_sem_ref.at[buf_id],
-        ).start()
-        if has_scale:
-            pltpu.make_async_copy(
-                src_ref=w2_scale_ref.at[
-                    expert_id,
-                    pl.ds(k_id * nqb2, nqb2),
-                    :,
-                    pl.ds(n_id * tile_n2, tile_n2),
-                ],
-                dst_ref=w2_scale_buf_ref.at[buf_id],
-                sem=w2_sem_ref.at[buf_id],
-            ).start()
-        if has_bias:
-            pltpu.make_async_copy(
-                src_ref=w2_bias_ref.at[expert_id, :, pl.ds(n_id * tile_n2, tile_n2)],
-                dst_ref=w2_bias_buf_ref,
-                sem=w2_sem_ref.at[buf_id],
-            ).start()
+        for copy in _w2_copies(buf_id, expert_id, n_id, k_id):
+            copy.start()
 
     @jax.named_scope("wait_w1_dma")
-    def wait_w1_dma(buf_id):
-        pltpu.make_async_copy(
-            src_ref=w1_buf_ref.at[buf_id],
-            dst_ref=w1_buf_ref.at[buf_id],
-            sem=w1_sem_ref.at[buf_id],
-        ).wait()
-        if has_scale:
-            pltpu.make_async_copy(
-                src_ref=w1_scale_buf_ref.at[buf_id],
-                dst_ref=w1_scale_buf_ref.at[buf_id],
-                sem=w1_sem_ref.at[buf_id],
-            ).wait()
-        if has_bias:
-            pltpu.make_async_copy(
-                src_ref=w1_bias_buf_ref,
-                dst_ref=w1_bias_buf_ref,
-                sem=w1_sem_ref.at[buf_id],
-            ).wait()
+    def wait_w1_dma(buf_id, expert_id, n_id, k_id):
+        for copy in _w1_copies(buf_id, expert_id, n_id, k_id):
+            copy.wait()
 
     @jax.named_scope("wait_w2_dma")
-    def wait_w2_dma(buf_id):
-        pltpu.make_async_copy(
-            src_ref=w2_buf_ref.at[buf_id],
-            dst_ref=w2_buf_ref.at[buf_id],
-            sem=w2_sem_ref.at[buf_id],
-        ).wait()
-        if has_scale:
-            pltpu.make_async_copy(
-                src_ref=w2_scale_buf_ref.at[buf_id],
-                dst_ref=w2_scale_buf_ref.at[buf_id],
-                sem=w2_sem_ref.at[buf_id],
-            ).wait()
-        if has_bias:
-            pltpu.make_async_copy(
-                src_ref=w2_bias_buf_ref,
-                dst_ref=w2_bias_buf_ref,
-                sem=w2_sem_ref.at[buf_id],
-            ).wait()
+    def wait_w2_dma(buf_id, expert_id, n_id, k_id):
+        for copy in _w2_copies(buf_id, expert_id, n_id, k_id):
+            copy.wait()
 
     # --- GMM compute helpers ---
     @jax.named_scope("compute_gmm1_tile")
@@ -998,7 +1001,7 @@ def kernel_main_fused_rs(
                 # (same expert + all tiles fit in buffers).
                 @pl.when(jnp.logical_not(is_same_w1))
                 def _():
-                    wait_w1_dma(buf_id)
+                    wait_w1_dma(buf_id, expert_id, _n1, _k1)
 
                 # Consume this rotating slot on the MXU BEFORE refilling it.
                 # ns % num_w1_bufs == buf_id, so starting the next DMA first
@@ -1068,7 +1071,7 @@ def kernel_main_fused_rs(
                 # Skip wait if W2 was cached (same expert as prev + buffers fit all).
                 @pl.when(jnp.logical_not(is_same_w2))
                 def _():
-                    wait_w2_dma(buf_id)
+                    wait_w2_dma(buf_id, expert_id, _n2, _k2)
 
                 # See GMM1 loop: consume the slot before refilling it (WAR).
                 _dispatch(compute_gmm2_tile, buf_id, _n2, _k2, gm_id)
