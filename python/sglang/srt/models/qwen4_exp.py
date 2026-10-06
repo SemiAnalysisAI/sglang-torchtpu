@@ -1830,6 +1830,10 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
 
 
 class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+    # Keep decode / verify on the embed routine: the PLE prefetch and the
+    # pinned-host n-gram embedding have not been validated inside the graph.
+    decode_embeds_in_language_model = False
+
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 

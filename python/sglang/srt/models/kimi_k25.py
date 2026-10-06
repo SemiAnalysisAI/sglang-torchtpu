@@ -820,11 +820,11 @@ def mm_projection_auto(
 class KimiK25ForConditionalGeneration(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
-    # On TPU, decode hands the compiled language model raw input_ids so the
+    # On TPU, decode / verify hands the compiled language model raw input_ids so the
     # token embedding runs inside the graph instead of as eager programs in
     # front of every step. Prefill keeps general_mm_embed_routine, which is
     # where image embeddings are spliced. The TPU decoder compile policy reads
-    # this to warm the input_ids decode variant.
+    # this to warm the input_ids decode / verify variants.
     decode_embeds_in_language_model: bool = _is_tpu
 
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
@@ -1043,11 +1043,11 @@ class KimiK25ForConditionalGeneration(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
-        if (
-            self.decode_embeds_in_language_model
-            and forward_batch.forward_mode.is_decode()
+        if self.decode_embeds_in_language_model and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
         ):
-            # One new token per sequence, never an image: embed in-graph.
+            # Sampled or drafted text tokens, never an image: embed in-graph.
             return self.language_model(
                 input_ids=input_ids,
                 positions=positions,
