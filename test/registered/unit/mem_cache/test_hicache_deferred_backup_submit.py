@@ -159,6 +159,7 @@ class _FakeScheduler:
         self.gracefully_exit = False
         self._engine_paused = False
         self.enable_unified_memory = False
+        self.kv_free_fence = None
         self.is_generation = False
         self.running_batch = None
         self.last_batch = None
@@ -426,6 +427,7 @@ class TestEnableDeferredBackupFlush(CustomTestCase):
     def _sched(self, **overrides):
         fields = dict(
             enable_hierarchical_cache=True,
+            enable_unified_memory=False,
             spec_algorithm=mock.Mock(is_none=mock.Mock(return_value=True)),
             tree_cache=mock.Mock(
                 enable_deferred_backup_flush=mock.Mock(return_value=True)
@@ -444,7 +446,7 @@ class TestEnableDeferredBackupFlush(CustomTestCase):
         with envs.SGLANG_OPT_HICACHE_SUBMIT_BACKUPS_AFTER_LAUNCH.override(True):
             self.assertTrue(Scheduler._enable_deferred_backup_flush(self._sched()))
 
-    def test_spec_decoding_and_unsupported_caches_stay_eager(self):
+    def test_spec_decoding_unified_memory_and_unsupported_caches_stay_eager(self):
         from sglang.srt.environ import envs
 
         with envs.SGLANG_OPT_HICACHE_SUBMIT_BACKUPS_AFTER_LAUNCH.override(True):
@@ -452,6 +454,9 @@ class TestEnableDeferredBackupFlush(CustomTestCase):
                 spec_algorithm=mock.Mock(is_none=mock.Mock(return_value=False))
             )
             self.assertFalse(Scheduler._enable_deferred_backup_flush(spec))
+            unified = self._sched(enable_unified_memory=True)
+            self.assertFalse(Scheduler._enable_deferred_backup_flush(unified))
+            unified.tree_cache.enable_deferred_backup_flush.assert_not_called()
             unsupported = self._sched(
                 tree_cache=mock.Mock(
                     enable_deferred_backup_flush=mock.Mock(return_value=False)

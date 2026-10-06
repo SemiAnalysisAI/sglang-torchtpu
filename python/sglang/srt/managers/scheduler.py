@@ -2220,6 +2220,9 @@ class Scheduler(
         enabled = bool(
             self.enable_hierarchical_cache
             and self.spec_algorithm.is_none()
+            # Queued backups pin device rows; holding them across scheduling
+            # would block unified-memory compaction every step.
+            and not self.enable_unified_memory
             and self.tree_cache.enable_deferred_backup_flush()
         )
         if enabled:
@@ -2229,7 +2232,8 @@ class Scheduler(
         else:
             logger.warning(
                 "SGLANG_OPT_HICACHE_SUBMIT_BACKUPS_AFTER_LAUNCH is ignored: it needs "
-                "HiCache write-through on UnifiedRadixCache without spec decoding."
+                "HiCache write-through on UnifiedRadixCache without spec decoding "
+                "or unified memory."
             )
         return enabled
 

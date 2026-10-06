@@ -478,6 +478,7 @@ class TestOverlapLoopOrder(CustomTestCase):
             prepare_for_forward=Mock(side_effect=lambda b, **kw: b)
         )
         scheduler._apply_war_barrier = Mock()
+        scheduler._enable_deferred_backup_flush = Mock(return_value=False)
         scheduler.on_idle = Mock()
         scheduler.launch_batch_sample_if_needed = Mock()
         scheduler.run_batch = order.run_batch
