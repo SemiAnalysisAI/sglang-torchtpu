@@ -918,6 +918,64 @@ class TestInstallExtendCap(_PolicyTestCase):
 
 
 class TestQwen3VLDecoderPolicy(_PolicyTestCase):
+    def test_prefill_gathers_from_padded_hidden_with_real_metadata(self):
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        for capture in (CaptureHiddenMode.NULL, CaptureHiddenMode.LAST):
+            with self.subTest(capture=capture):
+                batch = self._forward_batch()
+                batch.forward_mode = ForwardMode.EXTEND
+                batch.capture_hidden_mode = capture
+                batch.return_logprob = False
+                batch.extend_seq_lens = torch.tensor([2, 1, 0, 0])
+                batch.extend_seq_lens_cpu = [2, 1, 0, 0]
+                hidden = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+                aux = [hidden + 100]
+                result, result_aux = policy.finalize_forward_batch((hidden, aux), batch)
+                self.assertIs(result, hidden)
+                self.assertIs(result_aux[0], aux[0])
+                last_index = torch.cumsum(batch.extend_seq_lens, dim=0) - 1
+                torch.testing.assert_close(result[last_index], hidden[[1, 2]])
+                torch.testing.assert_close(result_aux[0][last_index], aux[0][[1, 2]])
+
+    def test_empty_prefill_request_preserves_negative_index_semantics(self):
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        batch = self._forward_batch()
+        batch.forward_mode = ForwardMode.EXTEND
+        batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        batch.extend_seq_lens_cpu = [0, 3]
+        hidden = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+        result = policy.finalize_forward_batch(hidden, batch)
+        torch.testing.assert_close(result[-1], hidden[2])
+
+    def test_dp_prefill_keeps_existing_output_shape(self):
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        batch = self._forward_batch()
+        batch.forward_mode = ForwardMode.EXTEND
+        batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        batch.extend_seq_lens_cpu = [2, 1]
+        hidden = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+        with patch(_DECODER_POLICY + "is_dp_attention_enabled", return_value=True):
+            result = policy.finalize_forward_batch(hidden, batch)
+        torch.testing.assert_close(result, hidden[:3])
+
+    def test_full_capture_logprobs_and_decode_keep_real_token_shapes(self):
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        for mode, capture, logprob in (
+            (ForwardMode.EXTEND, CaptureHiddenMode.FULL, False),
+            (ForwardMode.EXTEND, CaptureHiddenMode.NULL, True),
+            (ForwardMode.TARGET_VERIFY, CaptureHiddenMode.LAST, False),
+            (ForwardMode.DECODE, CaptureHiddenMode.NULL, False),
+            (ForwardMode.DRAFT_EXTEND_V2, CaptureHiddenMode.LAST, False),
+        ):
+            with self.subTest(mode=mode, capture=capture, logprob=logprob):
+                batch = self._forward_batch()
+                batch.forward_mode = mode
+                batch.capture_hidden_mode = capture
+                batch.return_logprob = logprob
+                hidden = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+                result = policy.finalize_forward_batch(hidden, batch)
+                torch.testing.assert_close(result, hidden[:3])
+
     def _forward_batch(self):
         return SimpleNamespace(
             _tpu_real_q=3,
