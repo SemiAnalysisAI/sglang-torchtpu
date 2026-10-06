@@ -157,7 +157,7 @@ class TpuPlatform(Platform):
         if not cls._worker_initialized:
             cls._init_worker_process()
             cls._worker_initialized = True
-        torch.tpu.set_device(device)
+        torch.accelerator.set_device_index(device)
 
     @classmethod
     def _init_worker_process(cls) -> None:
