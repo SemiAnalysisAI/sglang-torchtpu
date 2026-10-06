@@ -224,7 +224,13 @@ MODEL_PROFILES = {
         max_total_tokens=262144,
         device_pool_tokens_hint=262144,
         gsm8k_threshold=0.80,
-        extra_server_args=("--tpu-fp8-runtime", "channelwise"),
+        # DIAGNOSTIC (#718): bypass the fp8 fused-RS MoE kernel on prefill.
+        extra_server_args=(
+            "--tpu-fp8-runtime",
+            "channelwise",
+            "--moe-runner-backend",
+            "pallas_tpu",
+        ),
         extra_launch_env={
             "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
             # Keep every prefill forward inside the 256-token compile graph.
