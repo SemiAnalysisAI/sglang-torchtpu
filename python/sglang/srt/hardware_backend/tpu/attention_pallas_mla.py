@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
     _quantize_kv_to_fp8,
 )
@@ -242,6 +243,117 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
     ) -> torch.Tensor:
         return self._forward_mla(q, k, layer, forward_batch, **kwargs)
 
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        self.forward_metadata.dsa_token_slots = self._build_dsa_token_slots(
+            forward_batch
+        )
+        if envs.SGLANG_TPU_DSA_INDEXER_KERNEL.get():
+            from sglang.srt.hardware_backend.tpu.dsa_indexer_tpu import (
+                register_dsa_indexer_ops,
+            )
+
+            register_dsa_indexer_ops()
+
+    def _build_dsa_token_slots(self, forward_batch: ForwardBatch):
+        """i32 [bs, max_context]: token slot of position s of each request, on device.
+
+        Built here, like the page table, because req_to_token is host-resident
+        on TPU and cannot be indexed inside the compiled forward.
+        """
+        from sglang.srt.hardware_backend.tpu.kv_pool import (
+            TpuFusedDSAMLATokenToKVPool,
+        )
+
+        if not isinstance(self.token_to_kv_pool, TpuFusedDSAMLATokenToKVPool):
+            return None
+        if not forward_batch.forward_mode.is_decode():
+            return None
+        # Only the token-exact gather and the torch indexer read the slots.
+        if (
+            envs.SGLANG_TPU_DSA_PAGE_LEVEL.get()
+            and envs.SGLANG_TPU_DSA_INDEXER_KERNEL.get()
+        ):
+            return None
+        req_to_token = self.req_to_token_pool.req_to_token
+        if req_to_token.device.type == "cpu":
+            req = forward_batch.req_pool_indices_cpu.to(torch.int64)
+        else:
+            req = forward_batch.req_pool_indices.to(torch.int64)
+        slots = req_to_token[req].to(torch.int32)
+        return self._value_metadata(
+            name="dsa_token_slots", value=slots, device=forward_batch.seq_lens.device
+        )
+
+    def _forward_dsa_decode(
+        self,
+        ql_nope,
+        q_pe,
+        new_kv_c,
+        new_k_pe,
+        kv_cache,
+        layer: "RadixAttention",
+        forward_batch: ForwardBatch,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Token-exact DSA decode: attend only the indexer's top-k positions.
+
+        The MLA kernel still owns the cache write; it runs over the tail page
+        only. The selected latent rows (which include the new token, since
+        the indexer scores its own key) are then gathered and attended here.
+        """
+        md = self.forward_metadata
+        if envs.SGLANG_TPU_DSA_PAGE_LEVEL.get():
+            page_lens, pages = _dsa_page_level_metadata(
+                topk_indices, md.kv_lens, md.page_indices, self.page_size
+            )
+            return self._op(
+                ql_nope,
+                q_pe,
+                new_kv_c,
+                new_k_pe,
+                kv_cache,
+                page_lens,
+                pages,
+                md.cu_q_lens,
+                md.cu_kv_lens,
+                md.distribution,
+                float(layer.scaling),
+                None,
+                None,
+            )
+        tail_lens, tail_pages = _dsa_tail_page_metadata(
+            md.kv_lens, md.page_indices, self.page_size
+        )
+        self._op(
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            kv_cache,
+            tail_lens,
+            tail_pages,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.distribution,
+            float(layer.scaling),
+            None,
+            None,
+        )
+        slots = md.dsa_token_slots.gather(1, topk_indices.clamp(min=0).to(torch.int64))
+        # Gather from the contiguous padded rows, then trim: indexing the
+        # trimmed (strided) view materializes the whole layer cache first.
+        buf = self.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
+        rows = buf.view(-1, buf.shape[-1]).index_select(0, slots.reshape(-1))
+        rows = rows[:, : self.token_to_kv_pool.kv_cache_dim].view(
+            slots.shape[0], slots.shape[1], -1
+        )
+        q = torch.cat([ql_nope, q_pe], dim=-1)
+        out = dsa_sparse_attention(
+            q, rows, topk_indices, float(layer.scaling), ql_nope.shape[-1]
+        )
+        return out.to(ql_nope.dtype)
+
     def _forward_mla(
         self,
         q: torch.Tensor,
@@ -298,6 +410,22 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         # Backend-cached pool: upstream moved token_to_kv_pool off ForwardBatch.
         kv_cache = self.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
 
+        topk_indices = kwargs.get("topk_indices")
+        if topk_indices is not None and forward_batch.forward_mode.is_decode():
+            if self.kv_cache_quant_dtype is not None:
+                raise NotImplementedError("TPU DSA decode needs a bf16 KV cache")
+            out = self._forward_dsa_decode(
+                ql_nope,
+                q_pe,
+                new_kv_c,
+                new_k_pe,
+                kv_cache,
+                layer,
+                forward_batch,
+                topk_indices,
+            )
+            return out.reshape(num_tokens, layer.tp_q_head_num * kv_lora_rank)
+
         out = self._op(
             ql_nope,
             q_pe,
@@ -317,3 +445,69 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         # o_latent [T, H, kv_lora_rank] -> [T, H * kv_lora_rank]; the model
         # views it back to 3D and folds W_UV.
         return out.reshape(num_tokens, layer.tp_q_head_num * kv_lora_rank)
+
+
+def _dsa_page_level_metadata(topk_indices, kv_lens, page_indices, page_size):
+    """Page table of only the pages holding top-k positions, newest page last.
+
+    Ported from sglang-jax ``sparse_mla_page_level``: the dense MLA kernel then
+    attends whole selected pages (a superset of the top-k) and its in-place
+    write of the new latent lands on the true slot of the last listed page.
+    """
+    num_seqs = kv_lens.shape[0]
+    if topk_indices.shape[0] != num_seqs:
+        raise ValueError("page-level DSA decode expects one query per sequence")
+    table = page_indices.view(num_seqs, -1)
+    pages_per_seq = table.shape[1]
+    page_ids = torch.arange(pages_per_seq, device=table.device)
+    newest = (kv_lens.to(torch.int64) - 1).clamp(min=0)
+    new_page = newest // page_size
+    picked = torch.where(
+        topk_indices >= 0, topk_indices.to(torch.int64) // page_size, pages_per_seq
+    )
+    hit = torch.zeros(
+        (num_seqs, pages_per_seq + 1), dtype=torch.int32, device=table.device
+    ).scatter(1, picked, 1)[:, :pages_per_seq]
+    hit = hit.bool() & (page_ids[None, :] != new_page[:, None])
+    num_hit = hit.sum(dim=1)
+    hit_pages = torch.where(hit, page_ids[None, :], pages_per_seq).sort(dim=1).values
+    local = torch.where(
+        page_ids[None, :] < num_hit[:, None], hit_pages, new_page[:, None]
+    ).clamp(max=pages_per_seq - 1)
+    lens = torch.where(
+        kv_lens > 0,
+        (num_hit * page_size + newest % page_size + 1).to(kv_lens.dtype),
+        kv_lens,
+    )
+    return lens, table.gather(1, local).reshape(-1).contiguous()
+
+
+def _dsa_tail_page_metadata(kv_lens, page_indices, page_size):
+    """Metadata that points each sequence at only the page holding its newest token.
+
+    The MLA kernel then writes the new latent in place (donated cache) and
+    touches at most one page; its attention output is not used.
+    """
+    num_seqs = kv_lens.shape[0]
+    table = page_indices.view(num_seqs, -1)
+    last = (kv_lens.to(torch.int64) - 1).clamp(min=0)
+    tail_page = table.gather(1, (last // page_size).unsqueeze(1))
+    table = torch.cat([tail_page, table[:, 1:]], dim=1)
+    tail_lens = torch.where(
+        kv_lens > 0, (last % page_size + 1).to(kv_lens.dtype), kv_lens
+    )
+    return tail_lens, table.reshape(-1).contiguous()
+
+
+def dsa_sparse_attention(q, latent_rows, topk_indices, sm_scale, kv_lora_rank):
+    """Attention of each query over its own selected latent rows.
+
+    q [B, H, kv_lora_rank + rope], latent_rows [B, K, kv_lora_rank + rope],
+    topk_indices [B, K] (-1 = not selected). Returns [B, H, kv_lora_rank] fp32.
+    """
+    scores = torch.einsum("bhd,bkd->bhk", q.float(), latent_rows.float()) * sm_scale
+    selected = (topk_indices >= 0).unsqueeze(1)
+    # Finite floor, not -inf: padded rows select nothing and must not give NaN.
+    scores = torch.where(selected, scores, torch.full_like(scores, -1e30))
+    probs = torch.softmax(scores, dim=-1)
+    return torch.einsum("bhk,bkd->bhd", probs, latent_rows[..., :kv_lora_rank].float())

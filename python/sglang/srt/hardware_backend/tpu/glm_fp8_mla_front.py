@@ -15,7 +15,7 @@ from threading import Lock
 
 from sglang.srt.environ import envs
 
-_FRONT_OP = None
+_FRONT_OPS = {}
 _FRONT_OP_LOCK = Lock()
 
 
@@ -37,6 +37,7 @@ def _pallas_attention_front(
     absorb=True,
     interpret=False,
     kc_logical=False,
+    emit_q_lora=False,
 ):
     import jax
     import jax.numpy as jnp
@@ -85,6 +86,7 @@ def _pallas_attention_front(
         q_rope_out,
         kv_latent_out,
         k_rope_out,
+        *q_lora_out,
     ):
         def fp8_linear(
             value, weight, scale, transposed_weight=False, output_width=None
@@ -204,6 +206,8 @@ def _pallas_attention_front(
         q_rope_out[...] = rotate(q_rope)
         kv_latent_out[...] = kv.reshape(1, 1, 512)
         k_rope_out[...] = rotate(k_rope)
+        if emit_q_lora:
+            q_lora_out[0][...] = qa
 
     def full_spec(value):
         return pl.BlockSpec(value.shape, lambda i, pos: (0,) * value.ndim)
@@ -223,7 +227,7 @@ def _pallas_attention_front(
         (1, 4, 64),
         (1, 1, 512),
         (1, 1, 64),
-    )
+    ) + (((1, 2048),) if emit_q_lora else ())
     return pl.pallas_call(
         kernel,
         out_shape=tuple(
@@ -255,17 +259,17 @@ def _pallas_attention_front(
             f"glm_attention_front_kc_kn_absorb{int(absorb)}"
             if kc_logical
             else f"glm_attention_front_absorb{int(absorb)}"
-        ),
+        )
+        + ("_qlora" if emit_q_lora else ""),
     )(positions, *inputs, cos_sin_cache)
 
 
-def _get_front_op():
-    global _FRONT_OP
-    if _FRONT_OP is not None:
-        return _FRONT_OP
+def _get_front_op(emit_q_lora=False):
+    if emit_q_lora in _FRONT_OPS:
+        return _FRONT_OPS[emit_q_lora]
     with _FRONT_OP_LOCK:
-        if _FRONT_OP is not None:
-            return _FRONT_OP
+        if emit_q_lora in _FRONT_OPS:
+            return _FRONT_OPS[emit_q_lora]
         import jax
 
         from sglang.srt.hardware_backend.tpu.pallas_jax_op import cpu_export_jax_op
@@ -299,9 +303,14 @@ def _get_front_op():
                 q_eps=q_eps,
                 kv_eps=kv_eps,
                 kc_logical=kc_logical,
+                emit_q_lora=emit_q_lora,
             )
 
-        op = cpu_export_jax_op("sglang_tpu::glm_fp8_mla_front", front)
+        # A separate op name keeps the 4-output op's exported program unchanged.
+        op = cpu_export_jax_op(
+            "sglang_tpu::glm_fp8_mla_front" + ("_q_lora" if emit_q_lora else ""),
+            front,
+        )
 
         def fake_front(
             x,
@@ -318,21 +327,21 @@ def _get_front_op():
             kv_eps,
             kc_logical=False,
         ):
-            return tuple(
-                x.new_empty(shape)
-                for shape in ((1, 4, 512), (1, 4, 64), (1, 1, 512), (1, 1, 64))
-            )
+            shapes = ((1, 4, 512), (1, 4, 64), (1, 1, 512), (1, 1, 64))
+            if emit_q_lora:
+                shapes += ((1, 2048),)
+            return tuple(x.new_empty(shape) for shape in shapes)
 
         # The dispatch fixes these shapes. Avoid re-exporting the entire
         # Pallas program when Dynamo only needs its output metadata.
         op.register_fake(fake_front)
-        _FRONT_OP = op
-        return _FRONT_OP
+        _FRONT_OPS[emit_q_lora] = op
+        return op
 
 
-def register_glm_fp8_mla_front_op():
+def register_glm_fp8_mla_front_op(emit_q_lora=False):
     """Register from the opt-in TPU constructor before Dynamo tracing starts."""
-    _get_front_op()
+    _get_front_op(emit_q_lora)
 
 
 def glm_fp8_mla_front(
@@ -350,8 +359,12 @@ def glm_fp8_mla_front(
     kv_eps,
     *,
     kc_logical=False,
+    emit_q_lora=False,
 ):
     """Return Qlatent, Qrope, KVlatent and Krope in native MLA layouts.
+
+    With ``emit_q_lora`` a fifth output is the normalized Q-A latent [1, 2048],
+    which the DSA indexer consumes.
 
     A uses its prepared Torch[K,N] shape. KC uses [heads,latent,nope] by
     default, or the existing logical [heads,nope,latent] view when enabled.
@@ -367,7 +380,7 @@ def glm_fp8_mla_front(
         qkv_a_scale = qkv_a_scale.reshape(-1)
         qb_scale = qb_scale.reshape(-1)
 
-    return _get_front_op()(
+    return _get_front_op(emit_q_lora)(
         x,
         qkv_a_weight.t().contiguous(),
         qkv_a_scale,

@@ -48,7 +48,6 @@ def can_use_glm_attention_output_quant(
             and not forward_batch.spec_algorithm.is_none()
         )
         or attn.is_nextn
-        or attn.use_dsa
         or attn.current_attention_backend != "pallas_tpu_mla"
         or attn.use_deep_gemm_bmm
         or getattr(attn, "_kimi_split_gguf_kv_b", False)
@@ -68,8 +67,7 @@ def can_use_glm_attention_output_quant(
         or parallel.attn_cp_size != 1
         or parallel.dcp_enabled
         or parallel.dcp_replicate_q_proj
-        or (attn.num_local_heads, attn.kv_lora_rank, attn.v_head_dim)
-        != (4, 512, 256)
+        or (attn.num_local_heads, attn.kv_lora_rank, attn.v_head_dim) != (4, 512, 256)
     ):
         return False
 
@@ -130,7 +128,9 @@ def prepare_glm_attention_output_quant(attn, attention):
     from sglang.srt.hardware_backend.tpu.fp8_linear import TpuFp8PrequantizedInput
 
     if _WV_QUANT_OP is None:
-        raise RuntimeError("GLM attention-output quantization must register before tracing")
+        raise RuntimeError(
+            "GLM attention-output quantization must register before tracing"
+        )
     quantized, scale = _WV_QUANT_OP(attention, attn.w_vc.transpose(-1, -2))
     return TpuFp8PrequantizedInput(
         quantized, scale.reshape(16, 1), (1, 1024), torch.bfloat16

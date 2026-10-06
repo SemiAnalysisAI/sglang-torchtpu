@@ -526,6 +526,22 @@ class TpuSRTPlatform(SRTPlatform):
     def get_nsa_kv_pool_cls(self) -> type:
         raise NotImplementedError("NSA is not supported on TPU.")
 
+    def get_dsa_kv_pool_cls(self) -> type:
+        # DSA (GLM-5.x) on pallas_tpu_mla: the fused MLA pool plus the
+        # lightning-indexer key cache.
+        from sglang.srt.runtime_context import get_exec
+
+        backend = get_exec().kernel.attention_backend
+        if backend != "pallas_tpu_mla":
+            raise NotImplementedError(
+                f"DSA on TPU requires --attention-backend pallas_tpu_mla, got {backend}."
+            )
+        from sglang.srt.hardware_backend.tpu.kv_pool import (
+            TpuFusedDSAMLATokenToKVPool,
+        )
+
+        return TpuFusedDSAMLATokenToKVPool
+
     def get_paged_allocator_cls(self) -> type:
         from sglang.srt.hardware_backend.tpu.allocator_tpu import (
             TpuPagedTokenToKVPoolAllocator,

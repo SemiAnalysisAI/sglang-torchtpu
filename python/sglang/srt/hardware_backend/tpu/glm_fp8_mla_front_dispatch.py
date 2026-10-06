@@ -25,7 +25,6 @@ def can_use_glm_fp8_mla_front(
     """
     if (
         not getattr(attn, "_tpu_glm_dense_dsa", False)
-        or attn.use_dsa
         or attn.is_nextn
         or not forward_batch.forward_mode.is_decode()
         or tuple(hidden_states.shape) != (1, 6144)
@@ -148,7 +147,7 @@ def can_use_glm_fp8_mla_front(
     return True
 
 
-def run_glm_fp8_mla_front(attn, hidden_states, positions):
+def run_glm_fp8_mla_front(attn, hidden_states, positions, *, emit_q_lora=False):
     from sglang.srt.hardware_backend.tpu.glm_fp8_mla_front import glm_fp8_mla_front
 
     a = attn.fused_qkv_a_proj_with_mqa
@@ -176,4 +175,5 @@ def run_glm_fp8_mla_front(attn, hidden_states, positions):
         attn.q_a_layernorm.variance_epsilon,
         attn.kv_a_layernorm.variance_epsilon,
         kc_logical=kc_logical,
+        emit_q_lora=emit_q_lora,
     )

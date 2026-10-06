@@ -106,6 +106,8 @@ class PallasForwardMetadata:
     # Owned scalar i32: -1=native fallback, 0=static base, 1024/2048=promotion.
     # Backends without runtime tile selection leave this unset.
     prefill_kv_tile_hint: torch.Tensor | None = None
+    # i32[bs, pages_per_seq * page_size]  DSA decode: KV slot of each position.
+    dsa_token_slots: torch.Tensor | None = None
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:

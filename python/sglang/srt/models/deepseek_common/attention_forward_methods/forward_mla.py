@@ -318,9 +318,32 @@ class DeepseekMLAForwardMixin:
             ):
                 # fetch_qkv_latent below is lazy. This branch replaces that
                 # projection and preserves the existing attention/cache owner.
+                run_indexer = self.use_dsa and self.should_run_indexer(
+                    prev_topk_indices
+                )
                 q_nope_out, q_pe, k_nope, k_pe = run_glm_fp8_mla_front(
                     self, hidden_states, positions
                 )
+                topk_indices = None
+                if run_indexer:
+                    # TODO(Bob-Chen222): take q_lora from the fused front (emit_q_lora);
+                    # its 5-output op segfaults in the torch_tpu bridge today.
+                    q_lora = self.q_a_layernorm(
+                        self.fused_qkv_a_proj_with_mqa(hidden_states)[0][
+                            ..., : self.q_lora_rank
+                        ]
+                    )
+                    topk_indices = self.indexer(
+                        x=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        layer_id=self.layer_id,
+                    )
+                elif self.use_dsa:
+                    topk_indices = maybe_capture_indexer_topk(
+                        self.layer_id, prev_topk_indices
+                    )
                 k_nope, k_pe = prepare_kv_for_attention(
                     self, forward_batch, k_nope, k_pe, defer_materialization=False
                 )
@@ -332,7 +355,7 @@ class DeepseekMLAForwardMixin:
                     forward_batch,
                     zero_allocator,
                     positions,
-                    None,
+                    topk_indices,
                     llama_4_scaling,
                     None,
                 )

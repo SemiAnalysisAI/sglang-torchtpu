@@ -1377,10 +1377,16 @@ class KVCacheConfigurator:
                 is_dsa_model=is_dsa_model,
             )
         elif self.use_mla_backend and is_dsa_model and not self.mambaish_config:
-            token_to_kv_pool = self._build_dsa_kv_pool(
-                max_total_num_tokens=sizes.max_total_num_tokens,
-                max_running_requests=req_to_token_pool.req_to_token.shape[0],
-            )
+            if current_platform.is_tpu():
+                # The platform DSA pool: TPU paged latent layout + index-K cache.
+                token_to_kv_pool = self._build_oot_dsa_kv_pool(
+                    max_total_num_tokens=sizes.max_total_num_tokens,
+                )
+            else:
+                token_to_kv_pool = self._build_dsa_kv_pool(
+                    max_total_num_tokens=sizes.max_total_num_tokens,
+                    max_running_requests=req_to_token_pool.req_to_token.shape[0],
+                )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
@@ -1520,8 +1526,27 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
+            **self._oot_dsa_skip_topk_kwargs(PoolCls),
         )
         return token_to_kv_pool
+
+    def _oot_dsa_skip_topk_kwargs(self, PoolCls) -> dict:
+        # Platform DSA pools that elide index-K for layers reusing top-k take
+        # the same per-layer flags as the in-tree DSATokenToKVPool.
+        import inspect
+
+        if "skip_topk_layers" not in inspect.signature(PoolCls).parameters:
+            return {}
+        if not _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
+            return {}
+        return {
+            "skip_topk_layers": [
+                dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                for layer_id in range(
+                    self.layer_info.start_layer, self.layer_info.end_layer
+                )
+            ]
+        }
 
     def _build_oot_mla_kv_pool(
         self, *, max_total_num_tokens: int, is_dsa_model: bool

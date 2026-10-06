@@ -1837,6 +1837,16 @@ class Envs:
     SGLANG_TPU_GLM_FP8_MLA_KC_LOGICAL = EnvBool(False)
     # GLM BS1 BF16 absorbed-value BMM plus output-projection FP8 input quantization.
     SGLANG_TPU_GLM_ATTENTION_OUTPUT_QUANT = EnvBool(False)
+    # DSA decode top-k via the fused Pallas streamindex kernel instead of torch ops.
+    SGLANG_TPU_DSA_INDEXER_KERNEL = EnvBool(False)
+    # DSA decode attends whole pages touched by the top-k through the dense MLA
+    # kernel (sglang-jax's decode default); off = token-exact torch reference.
+    SGLANG_TPU_DSA_PAGE_LEVEL = EnvBool(True)
+    # DSA top-k selection: auto (SparseCore radix select for long rows), sc or xla.
+    SGLANG_TPU_DSA_TOPK_BACKEND = EnvStr("auto")
+    # >0: decode selects this many whole pages by max token score instead of top-k
+    # tokens (needs SGLANG_TPU_DSA_PAGE_LEVEL and the indexer kernel); 0 = token top-k.
+    SGLANG_TPU_DSA_PAGE_TOPK = EnvInt(0)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)

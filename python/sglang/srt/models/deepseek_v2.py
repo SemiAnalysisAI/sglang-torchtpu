@@ -194,6 +194,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_platform,
+    get_server_args,
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -1796,15 +1797,21 @@ class DeepseekV2AttentionMLA(
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
         self.use_dsa = is_deepseek_dsa(config)
+        # GLM TPU fast paths cover dense (bounded context) and DSA attention.
         self._tpu_glm_dense_dsa = (
             _is_tpu
             and getattr(config, "model_type", None) == "glm_moe_dsa"
-            and getattr(config, "tpu_dense_dsa_max_context", None) is not None
-            and not self.use_dsa
+            and (
+                getattr(config, "tpu_dense_dsa_max_context", None) is not None
+                or self.use_dsa
+            )
             and not is_nextn
         )
-        self._tpu_glm_dense_dsa_max_context = getattr(
-            config, "tpu_dense_dsa_max_context", None
+        # Largest position the fused front's RoPE table must cover.
+        self._tpu_glm_dense_dsa_max_context = (
+            get_server_args().context_length
+            if self.use_dsa
+            else getattr(config, "tpu_dense_dsa_max_context", None)
         )
         if self._tpu_glm_dense_dsa and envs.SGLANG_TPU_GLM_FP8_MLA_FRONT.get():
             from sglang.srt.hardware_backend.tpu.glm_fp8_mla_front import (
@@ -1814,8 +1821,7 @@ class DeepseekV2AttentionMLA(
             # Register before direct/Dynamo tracing reaches the decode branch.
             register_glm_fp8_mla_front_op()
         self._tpu_glm_attention_output_quant = (
-            self._tpu_glm_dense_dsa
-            and envs.SGLANG_TPU_GLM_ATTENTION_OUTPUT_QUANT.get()
+            self._tpu_glm_dense_dsa and envs.SGLANG_TPU_GLM_ATTENTION_OUTPUT_QUANT.get()
         )
         if self._tpu_glm_attention_output_quant:
             from sglang.srt.hardware_backend.tpu.glm_attention_output_quant import (

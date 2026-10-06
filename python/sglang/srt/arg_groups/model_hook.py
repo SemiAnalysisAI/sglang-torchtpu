@@ -41,6 +41,7 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     get_quantization_config,
     is_mps,
+    is_tpu,
     parse_connector_type,
 )
 
@@ -267,7 +268,7 @@ def handle_model_specific_adjustments(server_args: Any):
             _validate_dsa_tbo_index_sharing(server_args, hf_config)
 
             if (
-                not get_platform().is_npu and not get_platform().is_xpu
+                not get_platform().is_npu and not get_platform().is_xpu and not is_tpu()
             ):  # CUDA or ROCm GPU
                 if cfg.enable_prefill_cp:
                     # The DSA CP field declarations moved to the override

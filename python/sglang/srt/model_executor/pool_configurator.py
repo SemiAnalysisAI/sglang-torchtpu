@@ -56,11 +56,13 @@ from sglang.srt.utils.common import (
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
+    is_tpu,
     spec_decode_alloc_len_per_request,
 )
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 
 @dataclass
@@ -560,6 +562,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         element_size = torch._utils._element_size(
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
+        if _is_tpu:
+            # TpuFusedDSAMLATokenToKVPool stores bf16 index keys, no scales.
+            indexer_size_per_token = index_head_dim
+            element_size = torch._utils._element_size(torch.bfloat16)
         if _is_npu:
             from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 

@@ -904,3 +904,105 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
             "TpuFusedMLATokenToKVPool.set_mla_kv_buffer was called; the Pallas "
             "MLA kernel owns cache writes (see set_kv_buffer)."
         )
+
+
+class TpuFusedDSAMLATokenToKVPool(TpuFusedMLATokenToKVPool):
+    """TPU fused MLA pool plus the DSA lightning-indexer key cache.
+
+    Adds one bf16 ``[num_pages * page_size, index_head_dim]`` buffer per layer
+    that computes its own top-k ("full" layer). Rows are token slots in the
+    same order as the latent pool's logical view, so a slot id addresses both.
+    Layers that reuse the previous full layer's indices get no buffer (``skip_topk_layers``: one bool per local layer, as the
+    in-tree DSA pool takes it). The indexer writes keys out of band
+    (``set_index_k``); the
+    Pallas MLA kernel never sees these buffers.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        kv_cache_dim: Optional[int] = None,
+        index_head_dim: int = 128,
+        skip_topk_layers: Optional[list] = None,
+    ):
+        self.index_head_dim = index_head_dim
+        # bf16 keys: the indexer only ranks, and Hadamard rotation (needed for
+        # FP8 keys) is orthogonal, so bf16 needs neither rotation nor scales.
+        self.index_k_dtype = torch.bfloat16
+        self._skip_topk_layers = list(skip_topk_layers or [])
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+        )
+
+    def _create_buffers(self):
+        super()._create_buffers()
+        rows = self.num_pages * self.page_size
+        self.index_k_buffer = [
+            None
+            if i < len(self._skip_topk_layers) and self._skip_topk_layers[i]
+            else torch.zeros(
+                (rows, self.index_head_dim),
+                dtype=self.index_k_dtype,
+                device=self.device,
+            )
+            for i in range(self.layer_num)
+        ]
+        logger.info(
+            "Allocating TPU DSA index-K buffers: %d of %d layers, shape %s, %s",
+            sum(b is not None for b in self.index_k_buffer),
+            self.layer_num,
+            (rows, self.index_head_dim),
+            self.index_k_dtype,
+        )
+
+    def _clear_buffers(self):
+        super()._clear_buffers()
+        del self.index_k_buffer
+
+    def get_state(self) -> list[torch.Tensor]:
+        """Latent KV buffers, then the index-K buffers of full-indexer layers."""
+        return [*self.kv_buffer, *(b for b in self.index_k_buffer if b is not None)]
+
+    def set_state(self, state: list[torch.Tensor]) -> None:
+        num_kv = len(self.kv_buffer)
+        self.kv_buffer = list(state[:num_kv])
+        index_k = iter(state[num_kv:])
+        self.index_k_buffer = [
+            None if b is None else next(index_k) for b in self.index_k_buffer
+        ]
+
+    def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
+        buf = self.index_k_buffer[layer_id - self.start_layer]
+        if buf is None:
+            raise RuntimeError(
+                f"layer {layer_id} reuses top-k indices and has no index-K cache"
+            )
+        return buf
+
+    def set_index_k(self, layer_id: int, loc: torch.Tensor, k: torch.Tensor):
+        buf = self.get_index_k_buffer(layer_id)
+        buf.index_copy_(0, loc.to(torch.int64), k.to(buf.dtype))
+
+    def get_kv_size_bytes(self):
+        index_bytes = sum(
+            get_tensor_size_bytes(b) for b in self.index_k_buffer if b is not None
+        )
+        return super().get_kv_size_bytes() + index_bytes

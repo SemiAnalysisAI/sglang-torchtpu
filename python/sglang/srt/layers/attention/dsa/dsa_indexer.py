@@ -57,6 +57,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_tpu,
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -64,6 +65,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+_is_tpu = is_tpu()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
@@ -247,7 +249,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.use_dsa_indexer_fusion = (
-            _is_cuda
+            (_is_cuda or _is_tpu)
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
         )
@@ -1453,6 +1455,23 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # The indexer has no pure-torch reference path; it only runs on
         # platforms with a dedicated forward below.
         raise NotImplementedError("Indexer has no native (pure-torch) path")
+
+    def forward_tpu(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        from sglang.srt.hardware_backend.tpu.dsa_indexer_tpu import (
+            indexer_forward_tpu,
+        )
+
+        return indexer_forward_tpu(
+            self, x, q_lora, positions, forward_batch, layer_id, return_indices
+        )
 
     def forward_xpu(
         self,

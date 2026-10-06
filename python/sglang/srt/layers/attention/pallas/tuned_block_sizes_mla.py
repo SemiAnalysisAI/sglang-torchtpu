@@ -148,6 +148,16 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         # tp=8 4096/8192-token chunks: copies of the 2048 row, untuned.
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 4096): (8, 128),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 8192): (8, 128),
+        # GLM-5.3 TP16 (4 q heads/rank), bf16 KV; measured v7x 2026-10-06, chained-call device time.
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 64, 1): (
+            32,
+            1,
+            1,
+        ),  # 16 us vs fallback 39 us @ kv 8192
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 64, 8192): (
+            16,
+            1024,
+        ),  # 1.84 ms vs fallback 70.7 ms @ kv 8192; (32, 1024) OOMs VMEM
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 1): (32, 1, 8),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 2): (32, 1, 8),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 4): (32, 1, 8),
@@ -339,69 +349,296 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 256, 8192): (1, 512),
         ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 256, 16384): (1, 512),
         # ===== GLM-5.2/5.3 (64 q heads total, kv_lora=512, rope=64, page=128, bf16 KV). heads/shard = 64/attention_tp: 4=tp16, 8=tp8 or tp16+dp2, 16/32/64=DPA. Tuned 2026-10-01 on one v7x core at kv_len=2048 (= ctx cap = index_topk); optima verified identical at kv_len=8192. heads=16 shapes are left to the existing DeepSeek-V3 rows (same key, already tuned). heads=64 coverage partial. =====
-        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (16, 1, 1),  # 0.257 ms vs fallback 0.271
-        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (16, 1, 8),  # 0.690 ms vs fallback 0.848
-        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 16): (16, 1, 4),  # 0.311 ms vs fallback 0.336
-        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (16, 1, 2),  # 0.262 ms vs fallback 0.282
-        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 256): (8, 1, 16),  # 1.099 ms vs fallback 1.419
-        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 32): (8, 1, 8),  # 0.358 ms vs fallback 0.394
-        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (16, 1, 4),  # 0.264 ms vs fallback 0.287
-        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 64): (8, 1, 16),  # 0.479 ms vs fallback 0.560
-        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 8): (4, 1, 8),  # 0.285 ms vs fallback 0.302
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1024): (4, 256),  # 0.373 ms vs fallback 1.545
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (4, 128),  # 0.289 ms vs fallback 0.395
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2048): (4, 256),  # 0.541 ms vs fallback 3.787
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 256): (16, 128),  # 0.297 ms vs fallback 0.535
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 32): (8, 32),  # 0.283 ms vs fallback 0.321
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 512): (4, 256),  # 0.328 ms vs fallback 0.881
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 64): (4, 64),  # 0.290 ms vs fallback 0.371
-        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 1): (8, 1, 1),  # 0.256 ms vs fallback 0.271
-        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 128): (16, 1, 4),  # 0.697 ms vs fallback 0.868
-        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 16): (8, 1, 4),  # 0.332 ms vs fallback 0.348
-        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 2): (4, 1, 2),  # 0.255 ms vs fallback 0.256
-        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 256): (16, 1, 8),  # 1.093 ms vs fallback 1.417
-        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 32): (8, 1, 16),  # 0.373 ms vs fallback 0.421
-        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 4): (8, 1, 4),  # 0.262 ms vs fallback 0.278
-        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 64): (8, 1, 16),  # 0.494 ms vs fallback 0.570
-        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 8): (4, 1, 8),  # 0.300 ms vs fallback 0.320
-        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 1024): (16, 256),  # 0.403 ms vs fallback 1.606
-        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 128): (4, 128),  # 0.295 ms vs fallback 0.400
-        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 2048): (4, 256),  # 0.610 ms vs fallback 3.961
-        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 256): (8, 64),  # 0.311 ms vs fallback 0.527
-        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 32): (32, 32),  # 0.288 ms vs fallback 0.329
-        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 512): (8, 256),  # 0.345 ms vs fallback 0.828
-        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 64): (8, 32),  # 0.284 ms vs fallback 0.352
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 2): (16, 1, 1),  # 0.261 ms vs fallback 0.271
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 4): (8, 1, 2),  # 0.269 ms vs fallback 0.291
-        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 1): (64, 1, 1),  # 0.284 ms vs fallback 0.303
-        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 128): (16, 1, 4),  # 0.754 ms vs fallback 0.904
-        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 16): (8, 1, 16),  # 0.346 ms vs fallback 0.358
-        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 2): (8, 1, 2),  # 0.283 ms vs fallback 0.286
-        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 256): (16, 1, 8),  # 1.196 ms vs fallback 1.456
-        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 32): (16, 1, 4),  # 0.397 ms vs fallback 0.446
-        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 4): (8, 1, 4),  # 0.293 ms vs fallback 0.304
-        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 64): (8, 1, 16),  # 0.530 ms vs fallback 0.606
-        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 8): (16, 1, 2),  # 0.301 ms vs fallback 0.316
-        ("mixed", "bfloat16", "bfloat16", 32, 512, 64, 128, 1024): (8, 128),  # 0.656 ms vs fallback 2.054
-        ("mixed", "bfloat16", "bfloat16", 32, 512, 64, 128, 128): (4, 128),  # 0.322 ms vs fallback 0.444
-        ("mixed", "bfloat16", "bfloat16", 32, 512, 64, 128, 2048): (8, 128),  # 1.182 ms vs fallback 4.978
-        ("mixed", "bfloat16", "bfloat16", 32, 512, 64, 128, 256): (4, 64),  # 0.361 ms vs fallback 0.639
-        ("mixed", "bfloat16", "bfloat16", 32, 512, 64, 128, 32): (4, 32),  # 0.283 ms vs fallback 0.331
-        ("mixed", "bfloat16", "bfloat16", 32, 512, 64, 128, 512): (16, 64),  # 0.471 ms vs fallback 1.079
-        ("mixed", "bfloat16", "bfloat16", 32, 512, 64, 128, 64): (16, 64),  # 0.297 ms vs fallback 0.357
-        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 1): (32, 1, 1),  # 0.246 ms vs fallback 0.258
-        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 128): (16, 1, 4),  # 0.752 ms vs fallback 0.895
-        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 16): (16, 1, 2),  # 0.322 ms vs fallback 0.338
-        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 2): (4, 1, 2),  # 0.261 ms vs fallback 0.258
-        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 256): (16, 1, 4),  # 1.217 ms vs fallback 1.593
-        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 32): (16, 1, 8),  # 0.376 ms vs fallback 0.424
-        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 4): (16, 1, 2),  # 0.265 ms vs fallback 0.276
-        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 64): (8, 1, 16),  # 0.508 ms vs fallback 0.579
-        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 8): (8, 1, 4),  # 0.296 ms vs fallback 0.304
-        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 128): (4, 64),  # 0.364 ms vs fallback 0.541
-        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 256): (4, 64),  # 0.448 ms vs fallback 0.785
-        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 32): (16, 32),  # 0.297 ms vs fallback 0.366
-        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 64): (8, 32),  # 0.323 ms vs fallback 0.407
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (
+            16,
+            1,
+            1,
+        ),  # 0.257 ms vs fallback 0.271
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (
+            16,
+            1,
+            8,
+        ),  # 0.690 ms vs fallback 0.848
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 16): (
+            16,
+            1,
+            4,
+        ),  # 0.311 ms vs fallback 0.336
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (
+            16,
+            1,
+            2,
+        ),  # 0.262 ms vs fallback 0.282
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 256): (
+            8,
+            1,
+            16,
+        ),  # 1.099 ms vs fallback 1.419
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 32): (
+            8,
+            1,
+            8,
+        ),  # 0.358 ms vs fallback 0.394
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (
+            16,
+            1,
+            4,
+        ),  # 0.264 ms vs fallback 0.287
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 64): (
+            8,
+            1,
+            16,
+        ),  # 0.479 ms vs fallback 0.560
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 8): (
+            4,
+            1,
+            8,
+        ),  # 0.285 ms vs fallback 0.302
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1024): (
+            4,
+            256,
+        ),  # 0.373 ms vs fallback 1.545
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (
+            4,
+            128,
+        ),  # 0.289 ms vs fallback 0.395
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2048): (
+            4,
+            256,
+        ),  # 0.541 ms vs fallback 3.787
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 256): (
+            16,
+            128,
+        ),  # 0.297 ms vs fallback 0.535
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 32): (
+            8,
+            32,
+        ),  # 0.283 ms vs fallback 0.321
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 512): (
+            4,
+            256,
+        ),  # 0.328 ms vs fallback 0.881
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 64): (
+            4,
+            64,
+        ),  # 0.290 ms vs fallback 0.371
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 1): (
+            8,
+            1,
+            1,
+        ),  # 0.256 ms vs fallback 0.271
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 128): (
+            16,
+            1,
+            4,
+        ),  # 0.697 ms vs fallback 0.868
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 16): (
+            8,
+            1,
+            4,
+        ),  # 0.332 ms vs fallback 0.348
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 2): (
+            4,
+            1,
+            2,
+        ),  # 0.255 ms vs fallback 0.256
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 256): (
+            16,
+            1,
+            8,
+        ),  # 1.093 ms vs fallback 1.417
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 32): (
+            8,
+            1,
+            16,
+        ),  # 0.373 ms vs fallback 0.421
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 4): (
+            8,
+            1,
+            4,
+        ),  # 0.262 ms vs fallback 0.278
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 64): (
+            8,
+            1,
+            16,
+        ),  # 0.494 ms vs fallback 0.570
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 8): (
+            4,
+            1,
+            8,
+        ),  # 0.300 ms vs fallback 0.320
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 1024): (
+            16,
+            256,
+        ),  # 0.403 ms vs fallback 1.606
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 128): (
+            4,
+            128,
+        ),  # 0.295 ms vs fallback 0.400
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 2048): (
+            4,
+            256,
+        ),  # 0.610 ms vs fallback 3.961
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 256): (
+            8,
+            64,
+        ),  # 0.311 ms vs fallback 0.527
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 32): (
+            32,
+            32,
+        ),  # 0.288 ms vs fallback 0.329
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 512): (
+            8,
+            256,
+        ),  # 0.345 ms vs fallback 0.828
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 64): (
+            8,
+            32,
+        ),  # 0.284 ms vs fallback 0.352
+        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 2): (
+            16,
+            1,
+            1,
+        ),  # 0.261 ms vs fallback 0.271
+        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 4): (
+            8,
+            1,
+            2,
+        ),  # 0.269 ms vs fallback 0.291
+        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 1): (
+            64,
+            1,
+            1,
+        ),  # 0.284 ms vs fallback 0.303
+        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 128): (
+            16,
+            1,
+            4,
+        ),  # 0.754 ms vs fallback 0.904
+        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 16): (
+            8,
+            1,
+            16,
+        ),  # 0.346 ms vs fallback 0.358
+        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 2): (
+            8,
+            1,
+            2,
+        ),  # 0.283 ms vs fallback 0.286
+        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 256): (
+            16,
+            1,
+            8,
+        ),  # 1.196 ms vs fallback 1.456
+        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 32): (
+            16,
+            1,
+            4,
+        ),  # 0.397 ms vs fallback 0.446
+        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 4): (
+            8,
+            1,
+            4,
+        ),  # 0.293 ms vs fallback 0.304
+        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 64): (
+            8,
+            1,
+            16,
+        ),  # 0.530 ms vs fallback 0.606
+        ("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, 8): (
+            16,
+            1,
+            2,
+        ),  # 0.301 ms vs fallback 0.316
+        ("mixed", "bfloat16", "bfloat16", 32, 512, 64, 128, 1024): (
+            8,
+            128,
+        ),  # 0.656 ms vs fallback 2.054
+        ("mixed", "bfloat16", "bfloat16", 32, 512, 64, 128, 128): (
+            4,
+            128,
+        ),  # 0.322 ms vs fallback 0.444
+        ("mixed", "bfloat16", "bfloat16", 32, 512, 64, 128, 2048): (
+            8,
+            128,
+        ),  # 1.182 ms vs fallback 4.978
+        ("mixed", "bfloat16", "bfloat16", 32, 512, 64, 128, 256): (
+            4,
+            64,
+        ),  # 0.361 ms vs fallback 0.639
+        ("mixed", "bfloat16", "bfloat16", 32, 512, 64, 128, 32): (
+            4,
+            32,
+        ),  # 0.283 ms vs fallback 0.331
+        ("mixed", "bfloat16", "bfloat16", 32, 512, 64, 128, 512): (
+            16,
+            64,
+        ),  # 0.471 ms vs fallback 1.079
+        ("mixed", "bfloat16", "bfloat16", 32, 512, 64, 128, 64): (
+            16,
+            64,
+        ),  # 0.297 ms vs fallback 0.357
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 1): (
+            32,
+            1,
+            1,
+        ),  # 0.246 ms vs fallback 0.258
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 128): (
+            16,
+            1,
+            4,
+        ),  # 0.752 ms vs fallback 0.895
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 16): (
+            16,
+            1,
+            2,
+        ),  # 0.322 ms vs fallback 0.338
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 2): (
+            4,
+            1,
+            2,
+        ),  # 0.261 ms vs fallback 0.258
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 256): (
+            16,
+            1,
+            4,
+        ),  # 1.217 ms vs fallback 1.593
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 32): (
+            16,
+            1,
+            8,
+        ),  # 0.376 ms vs fallback 0.424
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 4): (
+            16,
+            1,
+            2,
+        ),  # 0.265 ms vs fallback 0.276
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 64): (
+            8,
+            1,
+            16,
+        ),  # 0.508 ms vs fallback 0.579
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 8): (
+            8,
+            1,
+            4,
+        ),  # 0.296 ms vs fallback 0.304
+        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 128): (
+            4,
+            64,
+        ),  # 0.364 ms vs fallback 0.541
+        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 256): (
+            4,
+            64,
+        ),  # 0.448 ms vs fallback 0.785
+        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 32): (
+            16,
+            32,
+        ),  # 0.297 ms vs fallback 0.366
+        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 64): (
+            8,
+            32,
+        ),  # 0.323 ms vs fallback 0.407
     },
 }
 
