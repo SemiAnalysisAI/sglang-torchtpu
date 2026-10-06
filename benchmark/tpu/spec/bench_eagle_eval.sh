@@ -78,8 +78,7 @@ export SGLANG_PLATFORM=tpu
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 unset TPU_VISIBLE_CHIPS TPU_CHIPS_PER_HOST_BOUNDS TPU_HOST_BOUNDS 2>/dev/null || true
 
-export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:---xla_tpu_scoped_vmem_limit_kib=32768 \
-  --xla_tpu_enable_async_collective_fusion=true \
+export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:---xla_tpu_enable_async_collective_fusion=true \
   --xla_tpu_overlap_compute_collective_tc=true \
   --xla_tpu_enable_async_collective_fusion_multiple_steps=true \
   --xla_tpu_enable_latency_hiding_scheduler=true}"
