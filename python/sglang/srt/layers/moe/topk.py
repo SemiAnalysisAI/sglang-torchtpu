@@ -2866,7 +2866,7 @@ def precomputed_topk_postprocess_is_noop(
     distribution recorder (which the builder below still runs).
     """
     return (
-        _is_cuda
+        (_is_cuda or _is_tpu)
         and topk_config.num_fused_shared_experts == 0
         and num_token_non_padded is None
         and expert_location_dispatch_info is None

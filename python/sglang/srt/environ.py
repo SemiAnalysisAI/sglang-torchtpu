@@ -1904,6 +1904,8 @@ class Envs:
     # which the dense matmul path is taken. Suggset to start with 1024 or 2048
     # and tune from there.
     SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
+    # Run the Kimi-K3 decode router GEMV and sigmoid top-k as one Pallas kernel.
+    SGLANG_TPU_K3_FUSED_GATE = EnvBool(False)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)

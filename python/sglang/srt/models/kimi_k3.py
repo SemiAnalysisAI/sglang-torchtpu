@@ -440,6 +440,10 @@ class KimiK3MoE(nn.Module):
         # loading by _merge_front_weights().
         self._front_w: Optional[torch.Tensor] = None
         self._front_sizes: Optional[List[int]] = None
+        # TPU fused router: [K, N] gate weight and [1, N] fp32 bias, set post-load
+        # by _bind_tpu_router().
+        self._tpu_gate_kn: Optional[torch.Tensor] = None
+        self._tpu_route_bias: Optional[torch.Tensor] = None
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
         self._front_is_ep_pair = False
@@ -504,7 +508,9 @@ class KimiK3MoE(nn.Module):
             # keep K3's FP32 router and pass precomputed top-k instead.
             output_format=(
                 TopKOutputFormat.STANDARD
-                if quant_config is None
+                # TPU resolves None to STANDARD anyway; pin it so the fused gate binds.
+                if _is_tpu
+                or quant_config is None
                 or (
                     config.hidden_act == "situ"
                     and (
@@ -722,10 +728,75 @@ class KimiK3MoE(nn.Module):
         for prop in (
             "_eligible_for_fused_front",
             "_front_fp32",
+            "_routing_config_ok",
             "_routing_contract_ok",
             "_ep_front_eligible",
         ):
             self.__dict__.pop(prop, None)
+
+    def _bind_tpu_router(self) -> None:
+        """TPU: route decode batches through the fused gate GEMV + top-k kernel."""
+        if not envs.SGLANG_TPU_K3_FUSED_GATE.get() or not self._routing_config_ok:
+            return
+        from sglang.srt.layers.moe.pallas.router_topk import (
+            gate_route_supported,
+            get_gate_route_op,
+        )
+
+        weight = self.gate.weight
+        # The kernel rounds the logits like a bf16 F.linear; an fp32 router
+        # (router_fp32) keeps the unfused path.
+        if weight.dtype != torch.bfloat16 or not gate_route_supported(
+            weight.shape[1], weight.shape[0]
+        ):
+            return
+        weight_kn = weight.detach().t().contiguous()
+        # The gate keeps an [N, K] view of the same buffer for prefill.
+        self.gate.weight.data = weight_kn.t()
+        self._tpu_gate_kn = weight_kn
+        cfg = self.topk.topk_config
+        # The same bias the unfused select_experts path adds.
+        self._tpu_route_bias = (
+            cfg.correction_bias.detach().to(torch.float32).reshape(1, -1)
+        )
+        get_gate_route_op(cfg.top_k, **self._tpu_route_kwargs)
+
+    @cached_property
+    def _tpu_route_kwargs(self) -> dict:
+        from sglang.srt.layers.moe.topk import _RENORMALIZE_SUM_EPSILON
+
+        cfg = self.topk.topk_config
+        # biased_grouped_topk_impl scales only renormalized weights.
+        on_output = cfg.renormalize and cfg.apply_routed_scaling_factor_on_output
+        return dict(
+            renormalize=cfg.renormalize,
+            scale=float(cfg.routed_scaling_factor) if on_output else 1.0,
+            eps=_RENORMALIZE_SUM_EPSILON,
+        )
+
+    def _tpu_gate_route(self, hidden_states: torch.Tensor):
+        """Fused TPU router, or None when the batch is not covered."""
+        from sglang.srt.layers.moe.pallas.router_topk import (
+            GATE_ROUTE_MAX_ROWS,
+            gate_route_tpu,
+        )
+
+        rows = hidden_states.shape[0]
+        if (
+            rows == 0
+            or rows > GATE_ROUTE_MAX_ROWS
+            or hidden_states.dtype != torch.bfloat16
+        ):
+            return None
+        cfg = self.topk.topk_config
+        w, i = gate_route_tpu(
+            hidden_states,
+            self._tpu_gate_kn,
+            self._tpu_route_bias,
+            k=cfg.top_k,
+            **self._tpu_route_kwargs,
+        )
+        return build_precomputed_topk_output(w, i, cfg, self.layer_idx)
 
     @cached_property
     def _routed_needs_reduce(self):
@@ -858,8 +929,17 @@ class KimiK3MoE(nn.Module):
     def _routing_contract_ok(self) -> bool:
         """Whether a kernel may emit (weights, ids) itself and bypass
         select_experts. Shared by the fused router and the merged front."""
-        if self._eligible_for_fused_front:
+        if self._eligible_for_fused_front or not self._routing_config_ok:
             return False
+        try:
+            from sglang.kernels.ops.moe import moe_front
+        except Exception:
+            return False
+        return moe_front.available()
+
+    @cached_property
+    def _routing_config_ok(self) -> bool:
+        """Routing config a sigmoid bias-ranked ungrouped top-k kernel covers."""
         cfg = self.topk.topk_config
         if cfg.output_format is not TopKOutputFormat.STANDARD:
             return False
@@ -885,13 +965,7 @@ class KimiK3MoE(nn.Module):
         # if that ever stops holding rather than silently dropping the remap.
         if not precomputed_topk_postprocess_is_noop(cfg):
             return False
-        if get_exec().deterministic.enable_deterministic_inference:
-            return False
-        try:
-            from sglang.kernels.ops.moe import moe_front
-        except Exception:
-            return False
-        return moe_front.available()
+        return not get_exec().deterministic.enable_deterministic_inference
 
     @cached_property
     def _ep_front_eligible(self) -> bool:
@@ -1168,7 +1242,9 @@ class KimiK3MoE(nn.Module):
         topk_output = None
         if routed_input is not None:
             topk_output, routed_input = routed_input
-        else:
+        elif self._tpu_gate_kn is not None:
+            topk_output = self._tpu_gate_route(hidden_states)
+        if topk_output is None:
             # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
             # or tiny_gemm_bf16); non-CUDA falls back to F.linear (bf16). The
             # fp32 logits reach the radix router from moe_fused_gate.
@@ -3470,6 +3546,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                 bias = layer.mlp.gate.e_score_correction_bias
                 if bias.dtype != torch.float32:
                     bias.data = bias.data.to(torch.float32)
+                if _is_tpu:
+                    layer.mlp._bind_tpu_router()
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
