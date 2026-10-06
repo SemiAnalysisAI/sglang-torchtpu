@@ -452,6 +452,11 @@ class KimiK3MoE(nn.Module):
         # loading by _merge_front_weights().
         self._front_w: Optional[torch.Tensor] = None
         self._front_sizes: Optional[List[int]] = None
+        # TPU merged GEMVs, [K, N]: [latent down | shared gate_up] and
+        # [latent up shard ; shared down]. Set post-load.
+        self._tpu_front_kn: Optional[torch.Tensor] = None
+        self._tpu_tail_kn: Optional[torch.Tensor] = None
+        self._shard_latent_up = False
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
         self._front_is_ep_pair = False
@@ -654,13 +659,41 @@ class KimiK3MoE(nn.Module):
                 if config.latent_moe_use_norm
                 else None
             )
-            self.routed_expert_up_proj = ReplicatedLinear(
-                self.moe_hidden_size,
-                hidden_size,
-                bias=False,
-                quant_config=latent_quant_config,
-                prefix=f"{prefix}.routed_expert_up_proj",
+            # TPU: each rank reads 1/tp of the up-proj; its partial sum is
+            # reduced together with the TP-partial shared-expert output.
+            self._shard_latent_up = bool(
+                _is_tpu
+                and envs.SGLANG_TPU_ENABLE_K3_SHARD_LATENT_UP.get()
+                and self.tp_size > 1
+                and self._routed_needs_reduce
+                and self.shared_experts is not None
+                and not self.shared_experts._dense_attn_tp
+                and not self._shared_experts_tp1
+                and not self._shared_experts_tp_comm
+                and latent_quant_config is None
+                and self.moe_hidden_size % self.tp_size == 0
             )
+            if self._shard_latent_up:
+                self.routed_expert_up_proj = RowParallelLinear(
+                    self.moe_hidden_size,
+                    hidden_size,
+                    bias=False,
+                    quant_config=None,
+                    reduce_results=False,
+                    prefix=f"{prefix}.routed_expert_up_proj",
+                )
+                # Static column range of this rank's latent shard; the TPU
+                # compile cache is already keyed per rank.
+                self._latent_up_shard = self.moe_hidden_size // self.tp_size
+                self._latent_up_start = get_parallel().tp_rank * self._latent_up_shard
+            else:
+                self.routed_expert_up_proj = ReplicatedLinear(
+                    self.moe_hidden_size,
+                    hidden_size,
+                    bias=False,
+                    quant_config=latent_quant_config,
+                    prefix=f"{prefix}.routed_expert_up_proj",
+                )
         else:
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
@@ -738,6 +771,63 @@ class KimiK3MoE(nn.Module):
             "_ep_front_eligible",
         ):
             self.__dict__.pop(prop, None)
+
+    def _bind_tpu_merged_gemvs(self) -> None:
+        """TPU: fold the shared expert into the latent GEMVs (two fewer GEMVs
+        and one fewer add per layer); needs the row-sharded latent up-proj."""
+        if not envs.SGLANG_TPU_ENABLE_K3_MERGED_GEMV.get() or not self._shard_latent_up:
+            return
+        shared = self.shared_experts
+        front = [self.routed_expert_down_proj, shared.gate_up_proj]
+        tail = [self.routed_expert_up_proj, shared.down_proj]
+        if not all(
+            isinstance(m.quant_method, UnquantizedLinearMethod)
+            and m.weight.dtype == torch.bfloat16
+            for m in front + tail
+        ):
+            return
+        self._tpu_front_kn = torch.cat([m.weight.detach().t() for m in front], dim=1)
+        self._tpu_tail_kn = torch.cat([m.weight.detach().t() for m in tail], dim=0)
+        # Re-point the modules at [N, K] views so the originals are freed and
+        # reloads write through. The views must not be KN-rebound (that would
+        # copy them back out), and any earlier KN binding is now stale.
+        for merged, mods, dim in (
+            (self._tpu_front_kn, front, 1),
+            (self._tpu_tail_kn, tail, 0),
+        ):
+            offset = 0
+            for m in mods:
+                width = m.weight.shape[1 - dim]
+                m.weight.data = merged.narrow(dim, offset, width).t()
+                m.allow_kn_weight = False
+                m.weight_kn = None
+                offset += width
+
+    def _latent_up_input(self, latent: torch.Tensor) -> torch.Tensor:
+        """This rank's input columns of the row-sharded latent up-proj."""
+        if not self._shard_latent_up:
+            return latent
+        start = self._latent_up_start
+        return latent[:, start : start + self._latent_up_shard]
+
+    def _forward_tpu_merged(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output,
+        *,
+        prefix_sum: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        front = torch.matmul(hidden_states, self._tpu_front_kn)
+        routed_input, gate_up = front.split(
+            [self.moe_hidden_size, front.shape[1] - self.moe_hidden_size], dim=1
+        )
+        expert_output = self.experts(routed_input, topk_output)
+        latent = self._latent_up_input(self._reduce_latent(expert_output))
+        tail_input = torch.cat([latent, self.shared_experts.act_fn(gate_up)], dim=1)
+        out = tensor_model_parallel_all_reduce(
+            torch.matmul(tail_input, self._tpu_tail_kn)
+        )
+        return out if prefix_sum is None else out + prefix_sum
 
     @cached_property
     def _routed_needs_reduce(self):
@@ -1186,6 +1276,10 @@ class KimiK3MoE(nn.Module):
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
+        if self._tpu_front_kn is not None and hidden_states.shape[0] > 0:
+            return self._forward_tpu_merged(
+                hidden_states, topk_output, prefix_sum=prefix_sum
+            )
         if not (_is_npu and self._sbo_shared_overlap):
             issue_shared()
 
@@ -1226,9 +1320,13 @@ class KimiK3MoE(nn.Module):
             out = hidden_states.new_empty((0, hidden_states.shape[1]))
         else:
             latent = self._reduce_latent(expert_output)
-            # up_proj is replicated, so the routed output is now fully reduced.
-            out, _ = self.routed_expert_up_proj(latent)
+            # A replicated up_proj leaves the routed output fully reduced.
+            out, _ = self.routed_expert_up_proj(self._latent_up_input(latent))
         wait_and_finalize_shared_experts()
+        if self._shard_latent_up and shared_output is not None:
+            # One all-reduce covers both TP-partial sums.
+            out = tensor_model_parallel_all_reduce(out + shared_output)
+            return out if prefix_sum is None else out + prefix_sum
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
             # ones need the partial-sum reduction.
@@ -3488,6 +3586,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                 bias = layer.mlp.gate.e_score_correction_bias
                 if bias.dtype != torch.float32:
                     bias.data = bias.data.to(torch.float32)
+                if _is_tpu:
+                    layer.mlp._bind_tpu_merged_gemvs()
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()

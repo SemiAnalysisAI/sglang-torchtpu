@@ -1907,6 +1907,12 @@ class Envs:
     # Store opted-in unquantized linear weights [in, out]-contiguous on TPU
     # (the parameter stays an [out, in] view); models opt layers in.
     SGLANG_TPU_ENABLE_LINEAR_KN_WEIGHT = EnvBool(False)
+    # Row-shard the Kimi-K3 latent up-proj on TPU; its partial sum rides the
+    # shared-expert all-reduce.
+    SGLANG_TPU_ENABLE_K3_SHARD_LATENT_UP = EnvBool(False)
+    # Fold the Kimi-K3 shared expert into the latent down/up GEMVs on TPU
+    # (needs SGLANG_TPU_ENABLE_K3_SHARD_LATENT_UP).
+    SGLANG_TPU_ENABLE_K3_MERGED_GEMV = EnvBool(False)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)

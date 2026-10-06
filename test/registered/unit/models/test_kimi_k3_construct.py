@@ -4,9 +4,11 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from torch import nn
 
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.environ import envs
+from sglang.srt.layers.linear import ReplicatedLinear, RowParallelLinear
 from sglang.srt.layers.quantization import unquant
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models import kimi_k3
@@ -148,6 +150,78 @@ class TestKimiK3ConstructOnTpu(CustomTestCase):
         ref_mla = ref.model.layers[3].self_attn
         torch.testing.assert_close(mla.w_kc, ref_mla.w_kc, rtol=0, atol=0)
         torch.testing.assert_close(mla.w_vc, ref_mla.w_vc, rtol=0, atol=0)
+
+    def test_latent_up_and_merged_gemv_gated_off(self):
+        """TP1 (or flags off) keeps the replicated up-proj and unmerged GEMVs."""
+        for flags in (False, True):
+            with (
+                envs.SGLANG_TPU_ENABLE_K3_SHARD_LATENT_UP.override(flags),
+                envs.SGLANG_TPU_ENABLE_K3_MERGED_GEMV.override(flags),
+            ):
+                model = KimiK3LinearForCausalLM(
+                    config=_tiny_config(), quant_config=None
+                )
+                model.post_load_weights()
+            for moe in _moes(model):
+                self.assertFalse(moe._shard_latent_up)
+                self.assertIsInstance(moe.routed_expert_up_proj, ReplicatedLinear)
+                self.assertIsNone(moe._tpu_front_kn)
+
+    def test_latent_up_shard_matches_row_parallel_loader(self):
+        """The static latent slice is the column block RowParallelLinear loads."""
+        w = torch.randn(32, 16)
+        for rank in range(4):
+            proj = RowParallelLinear(
+                16, 32, bias=False, reduce_results=False, tp_rank=rank, tp_size=4
+            )
+            proj.weight_loader(proj.weight, w)
+            shard = 16 // 4
+            torch.testing.assert_close(
+                proj.weight.data, w[:, rank * shard : (rank + 1) * shard]
+            )
+
+    @torch.no_grad()
+    def test_shard_and_merged_tail_match_reference(self):
+        """At TP1 the sharded tail and the merged GEMVs reproduce the
+        replicated up-proj + separate shared-expert output."""
+        torch.manual_seed(0)
+        model = KimiK3LinearForCausalLM(config=_tiny_config(), quant_config=None)
+        moe = _moes(model)[0].to(torch.bfloat16)
+        for p in moe.parameters():
+            p.normal_(std=0.05)
+        _stub_routing(moe)
+        x = torch.randn(4, 512, dtype=torch.bfloat16)
+        ref = moe(x)
+        moe._shard_latent_up = True
+        moe._latent_up_start, moe._latent_up_shard = 0, moe.moe_hidden_size
+        torch.testing.assert_close(moe(x), ref, rtol=0, atol=0)
+        with envs.SGLANG_TPU_ENABLE_K3_MERGED_GEMV.override(True):
+            moe._bind_tpu_merged_gemvs()
+        self.assertIsNotNone(moe._tpu_front_kn)
+        self.assertEqual(
+            moe.routed_expert_down_proj.weight.data_ptr(), moe._tpu_front_kn.data_ptr()
+        )
+        # Tail accumulates [latent | shared] in one GEMV: one bf16 rounding.
+        torch.testing.assert_close(moe(x), ref, rtol=2e-2, atol=2e-2)
+
+
+class _Experts(nn.Module):
+    def forward(self, x, topk_output):
+        return torch.tanh(x.float()).to(x.dtype)
+
+
+class _Null(nn.Module):
+    def forward(self, *args):
+        return None
+
+
+def _moes(model):
+    return [l.mlp for l in model.model.layers if isinstance(l.mlp, KimiK3MoE)]
+
+
+def _stub_routing(moe):
+    """Routed experts as a pointwise map: the test covers the latent glue."""
+    moe.experts, moe.gate, moe.topk = _Experts(), _Null(), _Null()
 
 
 if __name__ == "__main__":
