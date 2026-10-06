@@ -301,6 +301,7 @@ def apply_tpu_nvfp4_moe(
     apply_router_weight_on_input: bool,
     no_combine: bool = False,
     use_fused_rs: bool = False,
+    swiglu_limit: float | None = None,
 ):
     """Run TPU NVFP4 MoE through the Pallas grouped-GEMM backend.
 
@@ -313,15 +314,15 @@ def apply_tpu_nvfp4_moe(
             "apply_router_weight_on_input is not supported on TPU yet."
         )
 
-    swiglu_limit = getattr(
-        getattr(layer, "moe_runner_config", None), "swiglu_limit", None
-    )
-    if swiglu_limit is not None and activation == "silu":
-        activation = "silu_and_mul_with_clamp"
-
     if use_fused_rs:
         from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
             fused_moe_rs_gather,
+        )
+
+        rs_activation = (
+            f"silu_and_mul_with_clamp:{swiglu_limit}"
+            if swiglu_limit is not None and activation == "silu"
+            else activation
         )
 
         prepared_input = prepare_fused_moe_sequence_parallel_input(
@@ -393,7 +394,7 @@ def apply_tpu_nvfp4_moe(
                 post_expert_norm_weight=post_expert_norm_weight,
                 group_offset=layer._tpu_fused_rs_group_offset,
                 topk=int(topk_ids.shape[-1]),
-                activation=activation,
+                activation=rs_activation,
                 has_post_expert_norm=has_post_expert_norm,
                 # Blocks 16-128 use W4A16; block-256/512 already quantize the
                 # GMM activation. A direct FP8 write would add another loss.
@@ -427,5 +428,6 @@ def apply_tpu_nvfp4_moe(
         w1_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
         no_combine=no_combine,
+        swiglu_limit=swiglu_limit,
     )
     return StandardCombineInput(hidden_states=output)

@@ -76,7 +76,11 @@ def get_fused_rs_tuned_block_sizes(
         rhs_quant_block_size=block_size,
     )
     joint_key = f"{model_key1}+{model_key2}"
-    act_key = "silu" if fuse_act == "silu_and_mul_with_clamp" else fuse_act
+    act_key = (
+        "silu"
+        if fuse_act is not None and fuse_act.startswith("silu_and_mul_with_clamp")
+        else fuse_act
+    )
     m_key = f"{m}_{act_key}"
 
     if fp8_direct_write:

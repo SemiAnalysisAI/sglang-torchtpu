@@ -109,6 +109,9 @@ def apply_act_fn(acc: jax.Array, tile_n: int, fuse_act: str | None):
             return jax.nn.silu(acc_gate) * acc_up
         case "silu_and_mul_with_clamp":
             return silu_and_mul_with_clamp(acc_gate, acc_up)
+        case str() if fuse_act.startswith("silu_and_mul_with_clamp:"):
+            _, limit = fuse_act.split(":")
+            return silu_and_mul_with_clamp(acc_gate, acc_up, limit=float(limit))
         case "gelu":
             return jax.nn.gelu(acc_gate) * acc_up
         case "swigluoai":
@@ -1250,10 +1253,13 @@ def validate_inputs(
             f"size_n {size_n} should be divisible by 2 when fuse_act is not None"
             " since we need to split n dimension for gate and up projection"
         )
-        assert fuse_act in ("gelu", "silu", "swigluoai") or fuse_act.startswith(
-            "situ:"
+        assert (
+            fuse_act in ("gelu", "silu", "silu_and_mul_with_clamp", "swigluoai")
+            or fuse_act.startswith("silu_and_mul_with_clamp:")
+            or fuse_act.startswith("situ:")
         ), (
             f"Unsupported fuse_act {fuse_act}. Supported values are 'gelu', 'silu',"
+            " 'silu_and_mul_with_clamp', 'silu_and_mul_with_clamp:{limit}',"
             " 'swigluoai', and 'situ:{beta}:{linear_beta|none}'."
         )
         size_n //= 2

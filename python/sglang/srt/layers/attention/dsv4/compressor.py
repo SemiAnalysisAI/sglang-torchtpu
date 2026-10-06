@@ -420,11 +420,6 @@ class Compressor(BaseFusedOp):
             ape = torch.cat([ape[0], ape[1]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
 
-    def _torch_compile_forward(self, num_tokens: int):
-        if _is_tpu or _is_npu:
-            return None
-        return super()._torch_compile_forward(num_tokens)
-
     def apply_ape_hotfix(self):
         assert not self.ape_converted
         self._apply_ape_hotfix()

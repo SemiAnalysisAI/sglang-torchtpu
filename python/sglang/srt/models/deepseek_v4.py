@@ -2900,21 +2900,25 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if _is_tpu:
             n = self.hc_mult
-            scaled = mixes.float() * hc_scale.float() + hc_base.float()
-            pre_raw, post_raw, comb_raw = scaled.split([n, n, n * n], dim=-1)
+            flat = mixes.squeeze(1).float()
+            scale = hc_scale.float()
+            base = hc_base.float()
+            pre_raw = flat[:, :n] * scale[0] + base[:n]
+            post_raw = flat[:, n : 2 * n] * scale[1] + base[n : 2 * n]
+            comb_raw = (flat[:, 2 * n :] * scale[2] + base[2 * n :]).view(-1, n, n)
             pre = torch.sigmoid(pre_raw) + self.hc_eps
             post = 2.0 * torch.sigmoid(post_raw)
-            comb = torch.exp(comb_raw.unflatten(-1, (n, n)))
+            row_max = comb_raw.amax(dim=-1, keepdim=True)
+            comb = torch.exp(comb_raw - row_max)
             for _ in range(self.hc_sinkhorn_iters):
                 comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
                 comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
-            pre_sq = pre.squeeze(1)
             y = (
-                (x_flat.unflatten(-1, (n, -1)).float() * pre_sq.unsqueeze(-1))
+                (x_flat.unflatten(-1, (n, -1)).float() * pre.unsqueeze(-1))
                 .sum(dim=-2)
                 .to(dtype)
             )
-            return y, post.squeeze(1), comb.squeeze(1), False
+            return y, post, comb, False
 
         pre, post, comb = _get_mhc_ops().hc_split_sinkhorn(
             mixes,
@@ -4242,12 +4246,13 @@ class DeepseekV4Model(nn.Module):
             )
             or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
         )
-        if use_stream_pool:
-            device_module = torch.get_device_module()
-            num_alt_streams = 5 if (_is_cuda or _is_npu) else 2
-            self.alt_streams = [device_module.Stream() for _ in range(num_alt_streams)]
-        else:
-            self.alt_streams = None
+        device_module = torch.get_device_module()
+        num_alt_streams = 5 if (_is_cuda or _is_npu) else 2
+        self.alt_streams = (
+            [device_module.Stream() for _ in range(num_alt_streams)]
+            if use_stream_pool
+            else None
+        )
         # Routed-MoE input pre-quant, separate from the attention/indexer and
         # shared-expert streams.
         self.moe_routed_quant_stream = (

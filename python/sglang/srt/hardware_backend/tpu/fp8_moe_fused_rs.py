@@ -177,11 +177,13 @@ def apply_fp8_fused_rs(
     layer: torch.nn.Module,
     dispatch_output,
     activation: str,
+    swiglu_limit: float | None = None,
 ) -> StandardCombineInput:
     return _apply_fp8_fused_rs(
         layer=layer,
         dispatch_output=dispatch_output,
         activation=activation,
+        swiglu_limit=swiglu_limit,
         post_expert_norm_weight=get_tpu_fused_rs_post_expert_norm_weight(layer),
     )
 
@@ -191,13 +193,11 @@ def _apply_fp8_fused_rs(
     layer: torch.nn.Module,
     dispatch_output,
     activation: str,
+    swiglu_limit: float | None = None,
     post_expert_norm_weight: torch.Tensor | None = None,
 ) -> StandardCombineInput:
-    swiglu_limit = getattr(
-        getattr(layer, "moe_runner_config", None), "swiglu_limit", None
-    )
     if swiglu_limit is not None and activation == "silu":
-        activation = "silu_and_mul_with_clamp"
+        activation = f"silu_and_mul_with_clamp:{swiglu_limit}"
     prepared_input = prepare_fused_moe_sequence_parallel_input(layer, dispatch_output)
     dispatch_output = prepared_input.dispatch_output
     keep_output_shard = prepared_input.plan.keep_output_shard
