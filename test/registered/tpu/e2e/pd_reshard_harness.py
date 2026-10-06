@@ -230,6 +230,8 @@ MODEL_PROFILES = {
             "channelwise",
             "--moe-runner-backend",
             "pallas_tpu",
+            # #943 moves serving off pod -0-0, which the router targets.
+            "--no-tpu-node-normalization",
         ),
         extra_launch_env={
             "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
