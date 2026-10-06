@@ -372,6 +372,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 kvc.model_config.head_dim,
                 kvc.pool_page_size,
                 group_size=getattr(kvc, "kv_group_size", 32),
+                layout=getattr(kvc, "kv_full_layout", None) or "merged",
             )
         # args to config cell size
         model_config = kvc.model_config
@@ -714,17 +715,21 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 cache_bytes_per_token,
             )
 
+            # The full pool may use the token-blocked page; the SWA pool is a
+            # ring over the window and keeps the merged page.
             self._full_per_token = cache_bytes_per_token(
                 model_config.get_num_kv_heads(tp_size),
                 model_config.head_dim,
                 kvc.pool_page_size,
                 group_size=getattr(kvc, "kv_group_size", 32),
+                layout=getattr(kvc, "kv_full_layout", None) or "merged",
             )
             self._swa_per_token = cache_bytes_per_token(
                 model_config.get_swa_num_kv_heads(tp_size),
                 model_config.swa_head_dim,
                 kvc.pool_page_size,
                 group_size=getattr(kvc, "kv_group_size", 32),
+                layout=getattr(kvc, "kv_swa_layout", None) or "merged",
             )
         elif model_config.attention_arch == AttentionArch.MLA:
             # MLA pool sizing uses latent dimensions rather than MHA heads.

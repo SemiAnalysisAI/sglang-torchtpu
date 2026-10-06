@@ -1252,6 +1252,8 @@ class TestMixedKVFormats(CustomTestCase):
                     )
                     mr.pool_page_size = page_size
                     mr.kv_group_size = 32
+                    mr.kv_full_layout = "merged"
+                    mr.kv_swa_layout = "merged"
                     mr.spec_algorithm.is_eagle.return_value = True
                     mr.spec_aux_config.eagle_draft_num_layers = 1
                     mr.spec_aux_config.eagle_draft_swa_num_layers = int(hybrid)
@@ -1358,6 +1360,8 @@ class TestMixedKVFormats(CustomTestCase):
                 mr.kv_cache_dtype = torch.int8
                 mr.pool_page_size = page_size
                 mr.kv_group_size = group_size
+                mr.kv_full_layout = "merged"
+                mr.kv_swa_layout = "merged"
                 mr.spec_algorithm.is_eagle.return_value = True
                 mr.spec_aux_config.eagle_draft_num_layers = 1
                 mr.spec_aux_config.eagle_draft_swa_num_layers = 1
