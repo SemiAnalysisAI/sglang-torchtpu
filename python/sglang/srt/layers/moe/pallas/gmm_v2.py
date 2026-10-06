@@ -1,7 +1,8 @@
 # Uses the latest torchtpu-vllm gmm_v2 kernel
 #   (https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/kernels/megablox/gmm_v2.py).
 # This cut adds in-kernel fused activation (``fuse_act``: silu / gelu /
-# swigluoai) and fused gate+up weight support over the prior sglang-jax vendor.
+# swigluoai / situ) and fused gate+up weight support over the prior sglang-jax
+# vendor.
 # The Pallas fused-MoE bridge (``fused_moe_op.py``) passes ``fuse_act`` so the
 # GMM1 gated activation runs in-kernel instead of as a separate JAX pass.
 # The ``swigluoai`` activation in particular is required for GPT-OSS.
@@ -56,6 +57,19 @@ def swigluoai(
     return (up + 1.0) * glu
 
 
+def situ_and_mul(
+    gate: jax.Array, up: jax.Array, *, beta: float, linear_beta: float | None
+) -> jax.Array:
+    """SiTU gated activation used by Kimi-K3 (see SituAndMul in activation.py)."""
+    gate_act = beta * jnp.tanh(gate / beta) * jax.nn.sigmoid(gate)
+    if linear_beta is not None:
+        up = linear_beta * jnp.tanh(up / linear_beta)
+    return gate_act * up
+
+
+_MXFP4_BLOCK_SIZE = 32
+
+
 def apply_act_fn(acc: jax.Array, tile_n: int, fuse_act: str | None):
     """Applies a fused activation function to the accumulator.
 
@@ -67,7 +81,8 @@ def apply_act_fn(acc: jax.Array, tile_n: int, fuse_act: str | None):
       acc: The accumulator array, with the last dimension being 2 * tile_n.
       tile_n: The size of the 'n' dimension for a single projection (gate or up).
       fuse_act: The name of the activation function to apply. Supported values are
-        "silu", "gelu", and "swigluoai". If None, no activation is applied.
+        "silu", "gelu", "swigluoai", and "situ:{beta}:{linear_beta|none}". If
+        None, no activation is applied.
 
     Returns:
       The result of applying the activation function.
@@ -87,6 +102,12 @@ def apply_act_fn(acc: jax.Array, tile_n: int, fuse_act: str | None):
             return jax.nn.gelu(acc_gate) * acc_up
         case "swigluoai":
             return swigluoai(acc_gate, acc_up)
+        case str() if fuse_act.startswith("situ:"):
+            _, beta, linear_beta = fuse_act.split(":")
+            linear_beta = None if linear_beta == "none" else float(linear_beta)
+            return situ_and_mul(
+                acc_gate, acc_up, beta=float(beta), linear_beta=linear_beta
+            )
         case _:
             raise NotImplementedError(f"Unsupported activation function: {fuse_act}")
 
@@ -1218,9 +1239,11 @@ def validate_inputs(
             f"size_n {size_n} should be divisible by 2 when fuse_act is not None"
             " since we need to split n dimension for gate and up projection"
         )
-        assert fuse_act in ("gelu", "silu", "swigluoai"), (
+        assert fuse_act in ("gelu", "silu", "swigluoai") or fuse_act.startswith(
+            "situ:"
+        ), (
             f"Unsupported fuse_act {fuse_act}. Supported values are 'gelu', 'silu',"
-            " and 'swigluoai'."
+            " 'swigluoai', and 'situ:{beta}:{linear_beta|none}'."
         )
         size_n //= 2
 
@@ -1351,6 +1374,20 @@ def make_gmm_configs(
         scale_block_n = 1
         rhs_packing = 1
 
+    lhs_quant_block_size = 512
+    if packed_fp4 and block_size not in (_MXFP4_BLOCK_SIZE, lhs_quant_block_size):
+        raise NotImplementedError(
+            "Packed FP4 GMM requires quantization block size 32 (MXFP4) or 512 "
+            f"(NVFP4), got {block_size}."
+        )
+
+    # FP4 scale blocks narrower than the lhs block run W4A16; wider ones run W4A8.
+    fp4_w4a16 = packed_fp4 and block_size < lhs_quant_block_size
+    if fp4_w4a16 and scale_block_n == 1:
+        # 32-wide MXFP4 blocks would split the matmul into short-K products;
+        # dequantize in VMEM and run one tile_k matmul instead.
+        dequantize_rhs = True
+
     rhs_cfgs = InputConfigs(
         quant_dtype=rhs_quant_dtype,
         quant_block_size=block_size,
@@ -1387,20 +1424,19 @@ def make_gmm_configs(
             )
 
     if dequantize_rhs:
-        if rhs_quant_dtype != jnp.int4.dtype or not has_scale or scale_block_n != 1:
+        if (
+            rhs_quant_dtype not in (jnp.int4.dtype, jnp.float4_e2m1fn.dtype)
+            or not has_scale
+            or scale_block_n != 1
+        ):
             raise ValueError(
-                "VMEM dequantization requires per-channel group-scaled INT4 weights"
+                "VMEM dequantization requires per-channel group-scaled INT4 or FP4 "
+                "weights"
             )
         maybe_quantize_lhs = False
 
-    lhs_quant_block_size = 512
-    if packed_fp4 and block_size != lhs_quant_block_size:
-        raise NotImplementedError(
-            f"Packed FP4 GMM requires quantization block size 512, got {block_size}."
-        )
-
     lhs_q_dtype = None
-    if maybe_quantize_lhs and rhs_quant_dtype is not None:
+    if maybe_quantize_lhs and rhs_quant_dtype is not None and not fp4_w4a16:
         # Choose lhs quantization dtype based on TPU hardware support.
         is_rhs_float = jnp.issubdtype(rhs_quant_dtype, jnp.floating)
         tpu_info = pltpu.get_tpu_info()
@@ -1417,7 +1453,7 @@ def make_gmm_configs(
             raise NotImplementedError("INT4-to-FP8 requires TPU FP8 compute support")
         lhs_q_dtype = jnp.float8_e4m3fn.dtype
 
-    if packed_fp4 and lhs_q_dtype != jnp.float8_e4m3fn.dtype:
+    if packed_fp4 and not fp4_w4a16 and lhs_q_dtype != jnp.float8_e4m3fn.dtype:
         raise NotImplementedError(
             "Packed FP4 GMM requires TPU FP8 activation quantization support."
         )
@@ -1590,6 +1626,7 @@ def gmm_v2(
         maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
         dequantize_rhs: Dequantize INT4 groups in VMEM before BF16 matmul;
             keeps activations unquantized and avoids short-K group products.
+            Always on for packed FP4 with 32-wide (MXFP4) blocks.
         zero_initialize: Whether to initialize unvisited output elements to zero.
         fuse_act: Activation function to fuse with GMM, None if no fusion.
 

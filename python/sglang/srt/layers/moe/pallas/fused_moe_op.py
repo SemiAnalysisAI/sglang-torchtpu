@@ -41,7 +41,8 @@ Activation
 ----------
 Only ``"silu"`` (SwiGLU: ``silu(gate) * up``) is exercised today, which
 is what Qwen3-MoE uses. ``"gelu"`` is supported for parity with the
-mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS.
+mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS, and
+``"situ:{beta}:{linear_beta|none}"`` (built by ``fused_moe_call``) for Kimi-K3.
 """
 
 # NOTE: do *not* add ``from __future__ import annotations`` here —
@@ -336,9 +337,11 @@ def _fuse_act_name(activation_name):
     The gated activation now runs *in-kernel* in GMM1 (gmm_v2 splits the
     ``2*n`` gate/up accumulator and applies ``act(gate) * up`` before writing
     only ``n`` columns to HBM). ``gmm_v2.apply_act_fn`` accepts
-    ``silu`` / ``gelu`` / ``swigluoai``; SGLang spells the GPT-OSS one
-    ``swiglu_oai``.
+    ``silu`` / ``gelu`` / ``swigluoai`` / ``situ:{beta}:{linear_beta|none}``;
+    SGLang spells the GPT-OSS one ``swiglu_oai``.
     """
+    if activation_name.startswith("situ:"):
+        return activation_name
     mapping = {
         "silu": "silu",
         "gelu": "gelu",
@@ -398,9 +401,7 @@ def _fused_moe_jax(
 
     # uint8 rhs = packed FP4 (2 float4 codes/byte along K); gmm_v2 unpacks to
     # float4_e2m1fn in-kernel when told packed_fp4=True (real K = shape[1] * 2).
-    # This governs *any* packed-float4 rhs: today only NVFP4 emits uint8, but the
-    # MXFP4-native path (not yet wired) would flow through here too — correct
-    # (block size is data-driven from the scale), just untested.
+    # Block size (32 MXFP4, 512 NVFP4) is data-driven from the scale.
     w1_packed = w1.dtype == jnp.uint8
     w2_packed = w2.dtype == jnp.uint8
 
@@ -822,6 +823,8 @@ def fused_moe_call(
     w_quant_bits: int = 0,
     w1_channel_scale: Optional[torch.Tensor] = None,
     w2_channel_scale: Optional[torch.Tensor] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """Invoke the Pallas fused-MoE op.
 
@@ -836,6 +839,12 @@ def fused_moe_call(
     or the un-combined per-expert ``[num_tokens, topk, hidden_size]``
     when ``no_combine`` is True.
     """
+    if activation == "situ":
+        # SiTU (beta, linear_beta) are the runner's gemm1 (alpha, clamp_limit).
+        if gemm1_alpha is None:
+            raise ValueError("SiTU fused MoE requires gemm1_alpha (SiTU beta).")
+        linear_beta = "none" if gemm1_clamp_limit is None else gemm1_clamp_limit
+        activation = f"situ:{gemm1_alpha}:{linear_beta}"
     op = _build_fused_moe_op()
     # Routed rows for this (bucket-padded) call; static per compiled graph.
     routed_rows = int(hidden_states.shape[0]) * int(topk)
