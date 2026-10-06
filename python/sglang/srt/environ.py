@@ -1860,6 +1860,12 @@ class Envs:
     SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE = EnvBool(False)
     # Preserve FP32 expert scales and apply GMM partial scales in FP32.
     SGLANG_TPU_FP8_MOE_FP32_SCALES = EnvBool(False)
+    # INT4 MoE kernel mode. Unset: W4A16 group dots. "vmem-bf16": dequantize in
+    # VMEM, one bf16 dot per tile. "vmem-fp8": fp8 weight tiles and activations.
+    SGLANG_TPU_INT4_MOE_MODE = EnvStr(None)
+    # Store INT4 MoE group scales as f32 instead of bf16 (66 MB per layer per
+    # device on Kimi-K2.6). vmem-fp8 always uses f32.
+    SGLANG_TPU_INT4_MOE_FP32_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
@@ -1889,6 +1895,9 @@ class Envs:
     SGLANG_TPU_VIT_NUM_PRECOMPILE_BUCKETS = EnvInt(None)
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
+    # MoE: gather on the TensorCore below this many routed rows (tokens x topk);
+    # 0 = SparseCore always. Measured crossover is 1024 (Kimi, R1, Qwen3-480B).
+    SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS = EnvInt(0)
     # MoE: use onehot dense matmul for small permute and unpermute/combine
     # paths instead of gather. When set to 0, this is disabled. When set
     # to a positive integer, this is the threshold for tokens per rank below
