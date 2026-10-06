@@ -1904,6 +1904,9 @@ class Envs:
     # which the dense matmul path is taken. Suggset to start with 1024 or 2048
     # and tune from there.
     SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
+    # Store opted-in unquantized linear weights [in, out]-contiguous on TPU
+    # (the parameter stays an [out, in] view); models opt layers in.
+    SGLANG_TPU_ENABLE_LINEAR_KN_WEIGHT = EnvBool(False)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)

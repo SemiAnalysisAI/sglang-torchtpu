@@ -6,6 +6,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
+from sglang.srt.environ import envs
+from sglang.srt.layers.quantization import unquant
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models import kimi_k3
 from sglang.srt.models.kimi_k3 import (
     KimiK3DeltaAttention,
@@ -92,6 +95,44 @@ class TestKimiK3ConstructOnTpu(CustomTestCase):
         for kda in kdas:
             self.assertIsNone(kda._bfa_w)
             self.assertFalse(kda._kda_fused_decode_ready)
+
+    @torch.no_grad()
+    def test_kn_weight_opt_in_and_post_load_order(self):
+        """Decoder linears opt in except q_b_proj; post-load run after the
+        KN bind (sharded-state loader order) derives the same MLA weights."""
+        torch.manual_seed(0)
+        ref = KimiK3LinearForCausalLM(config=_tiny_config(), quant_config=None)
+        for p in ref.parameters():
+            p.normal_()
+        model = KimiK3LinearForCausalLM(config=_tiny_config(), quant_config=None)
+        model.load_state_dict(ref.state_dict())
+        linears = {
+            name: m
+            for name, m in model.model.named_modules()
+            if isinstance(getattr(m, "quant_method", None), UnquantizedLinearMethod)
+        }
+        self.assertTrue(linears)
+        for name, m in linears.items():
+            self.assertEqual(m.allow_kn_weight, not name.endswith("q_b_proj"), name)
+        self.assertFalse(hasattr(model.lm_head, "allow_kn_weight"))
+
+        with (
+            patch.object(unquant, "_is_tpu", True),
+            patch.object(unquant, "_is_cpu", False),
+            envs.SGLANG_TPU_ENABLE_LINEAR_KN_WEIGHT.override(True),
+        ):
+            for m in linears.values():
+                m.quant_method.process_weights_after_loading(m)
+        model.post_load_weights()
+        ref.post_load_weights()
+        for name, m in linears.items():
+            # 3-D conv weights and q_b_proj stay [out, in]-contiguous.
+            expect_kn = m.allow_kn_weight and m.weight.dim() == 2
+            self.assertEqual(getattr(m, "weight_kn", None) is not None, expect_kn, name)
+        mla = model.model.layers[3].self_attn
+        ref_mla = ref.model.layers[3].self_attn
+        torch.testing.assert_close(mla.w_kc, ref_mla.w_kc, rtol=0, atol=0)
+        torch.testing.assert_close(mla.w_vc, ref_mla.w_vc, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

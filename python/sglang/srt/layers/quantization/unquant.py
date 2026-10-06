@@ -433,6 +433,22 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         return F.embedding(input_, layer.weight)
 
 
+def _bind_tpu_kn_weight(layer: torch.nn.Module) -> None:
+    """Move ``layer.weight`` into [in, out]-contiguous storage.
+
+    TPU streams a [K, N] weight faster than it contracts W[N, K] (~18% on
+    Kimi-K3 decode GEMVs). The parameter keeps its [out, in] shape as a
+    transposed view of that storage, so weight loaders, reloads, post-load
+    hooks and LoRA still see the checkpoint layout and write through to it.
+    apply() reads the contiguous ``weight_kn``. Idempotent.
+    """
+    weight_kn = layer.weight.data.t()
+    if not weight_kn.is_contiguous():
+        weight_kn = weight_kn.contiguous()
+        layer.weight.data = weight_kn.t()
+    layer.weight_kn = weight_kn
+
+
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
@@ -461,6 +477,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+        elif (
+            _is_tpu
+            and envs.SGLANG_TPU_ENABLE_LINEAR_KN_WEIGHT.get()
+            and getattr(layer, "allow_kn_weight", False)
+            and layer.weight.dim() == 2
+        ):
+            _bind_tpu_kn_weight(layer)
 
     def apply(
         self,
@@ -468,6 +491,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if _is_tpu and getattr(layer, "weight_kn", None) is not None:
+            output = torch.matmul(x, layer.weight_kn)
+            return output if bias is None else output + bias
+
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:

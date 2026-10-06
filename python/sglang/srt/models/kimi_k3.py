@@ -71,6 +71,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -179,6 +180,17 @@ def _get_k3_dense_weight(module: nn.Module) -> torch.Tensor:
         module.quant_method.weight_block_size,
         module.params_dtype,
     )
+
+
+def _opt_in_tpu_kn_weights(model: nn.Module) -> None:
+    """Opt the decoder's unquantized linears into the TPU [in, out] weight
+    layout (SGLANG_TPU_ENABLE_LINEAR_KN_WEIGHT); modules that already set
+    allow_kn_weight keep their choice."""
+    for module in model.modules():
+        if isinstance(
+            getattr(module, "quant_method", None), UnquantizedLinearMethod
+        ) and not hasattr(module, "allow_kn_weight"):
+            module.allow_kn_weight = True
 
 
 def _k3_bf16_gemm(
@@ -2181,6 +2193,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             reduce_results=not self.all_reduce_fusion,
             alt_stream=alt_stream,
         )
+        if getattr(self, "q_b_proj", None) is not None:
+            # The per-head q split wants W[out, in]; a KN q_b_proj costs a full
+            # weight relayout copy per decode step on TPU.
+            self.q_b_proj.allow_kn_weight = False
         if split_gguf_kv_b:
             del self.fused_qkv_a_proj_with_mqa
             del self.kv_b_proj
@@ -3123,6 +3139,8 @@ class KimiK3LinearForCausalLM(nn.Module):
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
+        if _is_tpu:
+            _opt_in_tpu_kn_weights(self.model)
         self.pp_group = get_parallel().pp_group
         if self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
