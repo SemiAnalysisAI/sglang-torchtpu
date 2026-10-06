@@ -100,6 +100,8 @@ def _make_model_runner(
     mr.end_layer = num_layers
     mr.dp_size = 1
     mr.page_size = page_size
+    mr.pool_page_size = page_size
+    mr.kv_full_layout = None
     mr.mambaish_config = mambaish_config
     mr.is_hybrid_swa = is_hybrid_swa
     mr.sliding_window_size = sliding_window_size
@@ -1191,6 +1193,96 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
 
 class TestMixedKVFormats(CustomTestCase):
+    def test_mxint8_draft_layout_and_replication(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            _dflash_draft_cell_size,
+            _mxint8_draft_per_token,
+        )
+
+        mr = _make_model_runner(self)
+        mr.server_args = SimpleNamespace(
+            tpu_mxint8_group_size=32, tpu_mxint8_full_kv_layout="blocked"
+        )
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_aux_config.dflash_draft_num_layers = 2
+        mr.spec_aux_config.dflash_draft_cell_size_per_token = 768
+        mr.spec_aux_config.dflash_draft_kv_geometry = (3, 64)
+        # H3D64 has 384 payload rows and 12 real scale rows. Blocked pages
+        # reserve 64 exponent rows across 1/2/4 token blocks; merged uses 32.
+        for page_size, dcp_size, expected in (
+            (128, 1, 448),
+            (256, 1, 416),
+            (512, 1, 400),
+            (128, 2, 416),
+        ):
+            with self.subTest(page_size=page_size, dcp_size=dcp_size):
+                mr.pool_page_size = page_size
+                with (
+                    get_parallel().override(
+                        tp_size=2,
+                        attn_tp_size=2,
+                        attn_dcp_size=dcp_size,
+                        moe_tp_size=2,
+                    ),
+                    get_spec().override(speculative_draft_kv_cache_dtype="mxint8"),
+                ):
+                    self.assertEqual(_mxint8_draft_per_token(mr, 3, 64), expected)
+                    self.assertEqual(
+                        _mxint8_draft_per_token(mr, 3, 64, is_swa=True), 416
+                    )
+                    self.assertEqual(
+                        _dflash_draft_cell_size(mr), 2 * expected * dcp_size
+                    )
+        mr.spec_aux_config.dflash_draft_kv_geometry = None
+        with get_spec().override(speculative_draft_kv_cache_dtype="mxint8"):
+            with self.assertRaisesRegex(
+                ValueError, "resolved DFLASH draft KV geometry"
+            ):
+                _dflash_draft_cell_size(mr)
+
+    def test_dflash_resolver_preserves_draft_geometry(self):
+        from sglang.srt.model_executor.model_runner_components import (
+            spec_aux_hidden_state as aux,
+        )
+
+        _make_model_runner(self)
+        draft = SimpleNamespace(
+            hf_config=SimpleNamespace(),
+            get_num_kv_heads=MagicMock(return_value=3),
+            head_dim=64,
+        )
+        parsed = SimpleNamespace(
+            require_num_layers=lambda: 2,
+            num_target_layers=8,
+            resolve_target_layer_ids=lambda **_: [1, 5],
+        )
+        algorithm = SimpleNamespace(
+            is_dflash_family=lambda: True, is_dspark=lambda: False
+        )
+        config = aux.SpecAuxHiddenStateConfig()
+        with (
+            patch.object(aux.ModelConfig, "from_server_args", return_value=draft),
+            patch.object(aux, "_resolve_dflash_draft_cell_size", return_value=768),
+            patch(
+                "sglang.srt.speculative.dflash_utils.parse_dflash_draft_config",
+                return_value=parsed,
+            ),
+            get_parallel().override(tp_size=2, attn_tp_size=2, moe_tp_size=2),
+        ):
+            aux._resolve_dflash_aux_hidden_state(
+                config=config,
+                server_args=SimpleNamespace(),
+                model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(),
+                    hf_text_config=SimpleNamespace(num_hidden_layers=8),
+                ),
+                spec_algorithm=algorithm,
+                is_draft_worker=False,
+            )
+        self.assertEqual(config.dflash_draft_kv_geometry, (3, 64))
+        self.assertEqual(config.dflash_draft_cell_size_per_token, 768)
+        draft.get_num_kv_heads.assert_called_once_with(2)
+
     def test_ordinary_formats_preserve_per_token_accounting(self):
         for dtype_str, dtype, per_token in (
             ("auto", torch.bfloat16, 1024),
@@ -1421,6 +1513,7 @@ class TestMixedKVFormats(CustomTestCase):
                 mr.spec_algorithm.is_dflash_family.return_value = True
                 mr.spec_aux_config.dflash_draft_num_layers = 1
                 mr.spec_aux_config.dflash_draft_cell_size_per_token = 1024
+                mr.spec_aux_config.dflash_draft_kv_geometry = (4, 128)
                 with (
                     mock_cpu_env(),
                     get_spec().override(
