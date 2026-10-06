@@ -12,6 +12,7 @@ Adapted from vllm-torchtpu ``kernels/router_topk.py``.
 # type objects rather than stringified annotations at registration time.
 
 import functools
+
 import jax
 import jax.numpy as jnp
 import torch
