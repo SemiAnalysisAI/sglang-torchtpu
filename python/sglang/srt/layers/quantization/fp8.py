@@ -3104,6 +3104,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 block_quant=self.block_quant,
                 apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
                 no_combine=moe_runner_config.no_combine,
+                swiglu_limit=moe_runner_config.swiglu_limit,
             )
         if _is_npu and self.is_fp4_expert:
             from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo

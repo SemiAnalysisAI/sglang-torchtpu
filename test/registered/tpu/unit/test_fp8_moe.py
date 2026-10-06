@@ -152,6 +152,7 @@ class TestTpuFp8MoE(CustomTestCase):
             activation="silu",
             apply_router_weight_on_input=False,
             no_combine=False,
+            swiglu_limit=None,
         )
         method.block_quant = False
         hidden_states = torch.randn(2, 8, dtype=torch.bfloat16)
@@ -216,6 +217,7 @@ class TestTpuFp8MoE(CustomTestCase):
             activation="silu",
             apply_router_weight_on_input=False,
             no_combine=False,
+            swiglu_limit=None,
         )
         method.block_quant = False
         hidden_states = torch.randn(2, 8, dtype=torch.bfloat16)
@@ -261,6 +263,57 @@ class TestTpuFp8MoE(CustomTestCase):
         torch.testing.assert_close(
             captured["topk_ids"],
             torch.tensor([[4, 5], [0, 7]], dtype=torch.int32),
+        )
+
+    def test_fp8_moe_forwards_swiglu_limit_as_clamped_activation(self):
+        """A checkpoint's swiglu_limit must reach the kernel as a clamped
+        activation; dropping it runs the experts unclamped with no error."""
+        method = object.__new__(Fp8MoEMethod)
+        method.moe_runner_config = SimpleNamespace(
+            activation="silu",
+            apply_router_weight_on_input=False,
+            no_combine=False,
+            swiglu_limit=7,
+        )
+        method.block_quant = False
+        hidden_states = torch.randn(2, 8, dtype=torch.bfloat16)
+        layer = SimpleNamespace(
+            num_fused_shared_experts=0,
+            w13_weight=torch.empty(2, 8, 16, dtype=torch.float8_e4m3fn),
+            w2_weight=torch.empty(2, 8, 8, dtype=torch.float8_e4m3fn),
+            w13_weight_scale=torch.ones(2, 1, 1, 16, dtype=torch.float32),
+            w2_weight_scale=torch.ones(2, 1, 1, 8, dtype=torch.float32),
+        )
+        dispatch_output = SimpleNamespace(
+            hidden_states=hidden_states,
+            topk_output=(
+                torch.tensor([[0.75, 0.25], [1.0, 0.5]], dtype=torch.bfloat16),
+                torch.tensor([[0, 1], [1, 0]], dtype=torch.int64),
+                None,
+            ),
+        )
+        with (
+            patch.object(fp8_mod, "_is_tpu", True),
+            patch.object(
+                tpu_fp8_moe,
+                "get_parallel",
+                return_value=SimpleNamespace(moe_ep_size=1, moe_ep_rank=0),
+            ),
+            patch.object(
+                fused_moe_op_module,
+                "fused_moe_call",
+                side_effect=lambda **kw: torch.zeros_like(kw["hidden_states"]),
+            ) as fused_moe,
+        ):
+            method.apply(layer, dispatch_output)
+
+            method.moe_runner_config.activation = "gelu"
+            with self.assertRaises(ValueError):
+                method.apply(layer, dispatch_output)
+
+        fused_moe.assert_called_once()
+        self.assertEqual(
+            fused_moe.call_args.kwargs["activation"], "silu_and_mul_clamp:7.0"
         )
 
     def test_fp8_moe_runs_eager_and_compiled(self):

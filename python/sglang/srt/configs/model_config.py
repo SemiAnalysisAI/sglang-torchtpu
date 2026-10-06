@@ -205,6 +205,18 @@ def is_deepseek_dsa(config) -> bool:
             "HYV4ForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
+        # TODO(sglang-torchtpu#1072): remove once sparse DSA runs on TPU.
+        and not _hf_attr(config, "tpu_dense_dsa")
+    )
+
+
+def dsa_context_fits_index_topk(config, context_length: Optional[int]) -> bool:
+    index_topk = _hf_attr(config, "index_topk")
+    return (
+        _hf_arch(config) == "GlmMoeDsaForCausalLM"
+        and index_topk is not None
+        and context_length is not None
+        and context_length <= index_topk
     )
 
 
@@ -493,6 +505,14 @@ class ModelConfig:
             )
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        # TODO(sglang-torchtpu#1072): TPU has no sparse DSA, so serve GLM dense;
+        # within index_topk the indexer selects every causal key and MLA is exact.
+        if (
+            get_platform().is_tpu
+            and not is_draft_model
+            and dsa_context_fits_index_topk(self.hf_config, context_length)
+        ):
+            self.hf_config.tpu_dense_dsa = True
         self.requires_mm_token_modalities = requires_mm_token_modalities(
             self.hf_config.architectures, self.hf_text_config
         )
