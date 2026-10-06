@@ -27,5 +27,5 @@ exec env \
   DISABLE_RADIX_CACHE=1 \
   DISABLE_OVERLAP_SCHEDULE=1 \
   ENABLE_PROFILER_ENDPOINT=0 \
-  EXTRA_ARGS="--json-model-override-args {\"tpu_dense_dsa_max_context\":2048} --watchdog-timeout 1800 --disable-shared-experts-fusion ${EXTRA_ARGS:-}" \
+  EXTRA_ARGS="--watchdog-timeout 1800 --disable-shared-experts-fusion ${EXTRA_ARGS:-}" \
   bash launch_server.sh

@@ -83,12 +83,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_model,
-    get_parallel,
-    get_stream,
-)
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -1458,22 +1453,6 @@ class Glm4MoeForCausalLM(nn.Module):
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
-
-    def __init__(self, config, quant_config=None, prefix=""):
-        # TODO(sglang-torchtpu#1072): replace with sparse DSA on TPU;
-        # dense MLA is exact only while the context fits index_topk.
-        dense_limit = getattr(config, "tpu_dense_dsa_max_context", None)
-        if dense_limit is not None:
-            if not 0 < dense_limit <= config.index_topk:
-                raise ValueError(
-                    "The dense DSA context must fit the checkpoint's index_topk"
-                )
-            context_length = get_model().context_length
-            if context_length is None or context_length > dense_limit:
-                raise ValueError(
-                    f"The GLM dense DSA reference path requires --context-length <= {dense_limit}"
-                )
-        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
