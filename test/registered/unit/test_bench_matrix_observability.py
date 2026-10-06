@@ -209,6 +209,13 @@ class TestMetricsProbeHistograms(CustomTestCase):
                         "label_sets": 2,
                     }
                 },
+                "sglang:per_stage_req_latency_seconds": {
+                    "prefill_transfer_kv_cache": {
+                        "buckets": {"+Inf": count},
+                        "sum": 0.03 * count,
+                        "count": count,
+                    }
+                },
             }
 
         pre = self._snap(100.0, 0.0, transfer(0.0, 0.0, 0.0, 0.0))
@@ -217,6 +224,8 @@ class TestMetricsProbeHistograms(CustomTestCase):
         self.assertEqual(delta["derived"]["kv_transfer_ranks"], 2)
         self.assertEqual(delta["derived"]["kv_transfers"], 4.0)
         self.assertEqual(delta["derived"]["kv_transfer_latency_ms_mean"], 6500.0)
+        # The window above includes the forward; the exposed part is the stage.
+        self.assertEqual(delta["derived"]["kv_transfer_exposed_ms_mean"], 30.0)
         self.assertEqual(delta["derived"]["kv_transfer_mb_mean"], 100.0)
         self.assertEqual(delta["derived"]["kv_transfer_request_mb_mean"], 200.0)
         self.assertEqual(delta["derived"]["prefix_cache_hit_rate"], 0.9)
@@ -319,7 +328,10 @@ class TestSummarizeBreakdowns(CustomTestCase):
                         "derived": {},
                         "warnings": [],
                         "histograms": {
-                            "sglang:kv_transfer_latency_ms": {"all": transfer}
+                            "sglang:kv_transfer_latency_ms": {"all": transfer},
+                            "sglang:per_stage_req_latency_seconds": {
+                                "prefill_transfer_kv_cache": dict(transfer, mean=0.03)
+                            },
                         },
                     },
                     f,
@@ -366,7 +378,8 @@ class TestSummarizeBreakdowns(CustomTestCase):
             with open(out_md) as f:
                 md = f.read()
             self.assertIn("### Server-side breakdown", md)
-            self.assertIn("| 100/90/200 |", md)  # xfer ms mean/p50/p99
+            # xfer window ms mean/p50/p99, then exposed xfer ms
+            self.assertIn("| 100/90/200 | 30 |", md)
             self.assertIn("| 250 |", md)  # decode wait mean, ms
             self.assertIn("### Latency by context length", md)
             self.assertIn("### Long sessions, turn by turn", md)

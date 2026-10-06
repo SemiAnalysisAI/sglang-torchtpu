@@ -473,13 +473,18 @@ def _hist(histograms: Dict, family: str, series: str = "all") -> Dict:
     return ((histograms or {}).get(family) or {}).get(series) or {}
 
 
+# The prefill's wait for its KV transfer AFTER its forward: the stage starts
+# when the request enters the transfer queue and (on TPU raiden) ends at the
+# transfer's finish. This is the transfer time a request is actually exposed
+# to, unlike sglang:kv_transfer_latency_ms (see _markdown_server_breakdown).
+_EXPOSED_TRANSFER_STAGE = "prefill_transfer_kv_cache"
+
 # (column header, engine, stage) for the server-side stage table. Prefill
 # stages are on the prefill engine (or a colocated server); decode_* stages
 # exist only on a P/D decode engine.
 _STAGE_COLUMNS = (
     ("prefill wait", "prefill", "prefill_waiting"),
     ("prefill fwd", "prefill", "prefill_forward"),
-    ("prefill xfer", "prefill", "prefill_transfer_kv_cache"),
     ("decode bootstrap", "decode", "decode_bootstrap"),
     ("decode wait", "decode", "decode_waiting"),
     ("decode xfer", "decode", "decode_transferred"),
@@ -488,7 +493,13 @@ _STAGE_COLUMNS = (
 
 def _markdown_server_breakdown(legs: List[Dict]) -> List[str]:
     """Where a request's time went, server side: KV transfer distribution and
-    mean per-stage latency. Rendered only when some leg has the histograms."""
+    mean per-stage latency. Rendered only when some leg has the histograms.
+
+    sglang:kv_transfer_latency_ms is a transfer WINDOW: it runs from the
+    first KV send to the transfer's finish. With cached-prefix early send (on
+    by default) the first send goes out before the prefill forward, so on a
+    prefix hit the window includes the forward and tracks prefill time, not
+    the link. The exposed column is the part left after the forward."""
     stage_family = "sglang:per_stage_req_latency_seconds"
     rows = []
     any_transfer = False
@@ -501,6 +512,7 @@ def _markdown_server_breakdown(legs: List[Dict]) -> List[str]:
         size = _hist(prefill_h, "sglang:kv_transfer_total_mb")
         speed = _hist(prefill_h, "sglang:kv_transfer_speed_gb_s")
         any_transfer = any_transfer or bool(latency)
+        exposed_s = _hist(prefill_h, stage_family, _EXPOSED_TRANSFER_STAGE).get("mean")
         stage_cells = []
         for _, engine, stage in _STAGE_COLUMNS:
             source = decode_h if engine == "decode" else prefill_h
@@ -516,6 +528,7 @@ def _markdown_server_breakdown(legs: List[Dict]) -> List[str]:
             f"| {_fmt(None if transfers is None else transfers / ranks, '.0f')} "
             f"| {_fmt(latency.get('mean'), '.0f')}/{_fmt(latency.get('p50'), '.0f')}"
             f"/{_fmt(latency.get('p99'), '.0f')} "
+            f"| {_fmt(None if exposed_s is None else exposed_s * 1000, '.0f')} "
             f"| {_fmt(None if request_gb is None else request_gb * ranks / 1024, '.2f')} "
             f"| {_fmt(speed.get('mean'), '.2f')} "
             f"| {_fmt(None if queue is None else queue * 1000, '.0f')} "
@@ -526,11 +539,11 @@ def _markdown_server_breakdown(legs: List[Dict]) -> List[str]:
     out = [
         "### Server-side breakdown",
         "",
-        "| mode | conc | long reqs | KV xfers | xfer ms mean/p50/p99 | xfer GB/req "
-        "mean | xfer GB/s/rank mean | queue ms | "
+        "| mode | conc | long reqs | KV xfers | xfer window ms mean/p50/p99 "
+        "| exposed xfer ms | xfer GB/req mean | window GB/s/rank mean | queue ms | "
         + " | ".join(f"{name} ms" for name, _, _ in _STAGE_COLUMNS)
         + " |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|" + "---:|" * len(_STAGE_COLUMNS),
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|" + "---:|" * len(_STAGE_COLUMNS),
         *rows,
         "",
         "_Per-leg deltas of the servers' Prometheus histograms; p50/p99 are "
@@ -538,6 +551,13 @@ def _markdown_server_breakdown(legs: List[Dict]) -> List[str]:
         "prefill engine, decode stages from the decode engine; stage columns "
         "are means. Each TP rank sends its own KV shard: xfer ms and GB/s are "
         "per rank shard, KV xfers and GB/req are per request._",
+        "",
+        "_xfer window = first KV send to transfer done (`kv_transfer_latency_ms`). "
+        "The cached prefix is sent before the prefill forward, so on prefix hits "
+        "the window includes the forward, and window GB/s understates the link. "
+        "exposed xfer = the prefill's wait for the transfer after its forward "
+        "(`prefill_transfer_kv_cache` stage): the transfer time a request "
+        "actually pays._",
         "",
     ]
     if not any_transfer:

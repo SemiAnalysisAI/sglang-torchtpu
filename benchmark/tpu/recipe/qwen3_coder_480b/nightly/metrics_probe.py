@@ -489,6 +489,19 @@ def _check(delta: Dict, pre: Dict, post: Dict, args) -> List[str]:
             delta["derived"]["kv_transfer_request_mb_mean"] = round(
                 series["mean"] * ranks, 3
             )
+    # kv_transfer_latency_ms is a window from the first KV send, which (with
+    # cached-prefix early send) precedes the prefill forward on prefix hits.
+    # The transfer time a request actually waits for is the prefill's
+    # prefill_transfer_kv_cache stage: transfer-queue entry, after the forward,
+    # to the transfer's finish.
+    if "kv_transfers" in delta["derived"]:
+        exposed = (histograms.get("sglang:per_stage_req_latency_seconds") or {}).get(
+            "prefill_transfer_kv_cache"
+        ) or {}
+        if exposed.get("mean") is not None:
+            delta["derived"]["kv_transfer_exposed_ms_mean"] = round(
+                exposed["mean"] * 1000, 3
+            )
     for family, series_map in histograms.items():
         for series_key, series in series_map.items():
             over = series.get("above_top_bucket") or 0
