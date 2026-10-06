@@ -221,6 +221,51 @@ class TestStop(CustomTestCase):
         self.assertEqual(logs.records[0].levelname, "INFO")
         self.assertIn(str(xplane), logs.output[0])
 
+    def test_check_failure_does_not_fail_stop(self):
+        profiler = MagicMock()
+        trace = tpu_profiler._TpuTrace(
+            output_dir=Path("/unused"), profiler=profiler, started_at=time.time()
+        )
+        with (
+            patch.object(tpu_profiler, "_find_xplane", side_effect=OSError("boom")),
+            self.assertLogs(tpu_profiler.logger, "WARNING") as logs,
+        ):
+            stop_tpu_profile(trace)  # must not raise
+
+        profiler.stop.assert_called_once_with()
+        self.assertIn("could not check the xplane", logs.output[0])
+
+    def test_same_second_overwrite_warns(self):
+        # profile_by_stage: EXTEND and DECODE stop in the same second, so the
+        # plugin writes both to the same path and the second one wins.
+        tmpdir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        xplane = tmpdir / "plugins/profile/2026_01_01_00_00_00/host.xplane.pb"
+        xplane.parent.mkdir(parents=True)
+
+        def write_xplane():
+            xplane.write_bytes(_xspace(_plane("/device:TPU:0", 2)))
+
+        def capture():
+            profiler = MagicMock()
+            profiler.stop.side_effect = write_xplane
+            stop_tpu_profile(
+                tpu_profiler._TpuTrace(
+                    output_dir=tmpdir, profiler=profiler, started_at=time.time() - 1
+                )
+            )
+
+        with (
+            patch.object(tpu_profiler, "_last_xplane", None),
+            _xplane_env(tmpdir),
+            self.assertLogs(tpu_profiler.logger, "INFO") as logs,
+        ):
+            capture()
+            capture()
+
+        levels = [r.levelname for r in logs.records]
+        self.assertEqual(levels, ["INFO", "WARNING", "INFO"])
+        self.assertIn("previous capture's xplane", logs.output[1])
+
 
 class TestRealTorchProfilerOnCpu(CustomTestCase):
     """End to end through the real torch.profiler on a CPU-only torch.

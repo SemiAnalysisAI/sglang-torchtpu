@@ -30,6 +30,8 @@ _XPLANE_OUTPUT_DIR_ENV_VARS = (
     "TORCH_TPU_PROFILER_OUTPUT_DIR",
 )
 _TPU_DEVICE_PLANE_PREFIX = b"/device:TPU:"
+# The xplane the previous capture in this process reported.
+_last_xplane: Path | None = None
 
 
 def start_tpu_profile(*, output_dir: Path, with_cpu: bool = True) -> _TpuTrace:
@@ -67,7 +69,10 @@ def stop_tpu_profile(trace: _TpuTrace) -> None:
     # The plugin synchronizes the TPU devices, then writes the xplane; the
     # Kineto trace is exported by on_trace_ready.
     trace.profiler.stop()
-    _check_xplane(trace.started_at)
+    try:
+        _check_xplane(trace.started_at)
+    except Exception:  # a diagnostic must never fail /stop_profile
+        logger.warning("[TPU profiler] could not check the xplane", exc_info=True)
 
 
 class _TpuTrace(msgspec.Struct, frozen=True):
@@ -122,7 +127,17 @@ def _find_xplane(started_at: float) -> Path | None:
 
 def _check_xplane(started_at: float) -> None:
     """Log where the xplane went, or an error if the capture came back empty."""
+    global _last_xplane
     xplane = _find_xplane(started_at)
+    if xplane is not None and xplane == _last_xplane:
+        # The file name only has the host and a 1-second timestamp directory,
+        # e.g. profile_by_stage's EXTEND and DECODE stopping in the same second.
+        logger.warning(
+            "[TPU profiler] %s was rewritten by this capture: the previous "
+            "capture's xplane, which had the same path, is lost.",
+            xplane,
+        )
+    _last_xplane = xplane
     if xplane is None:
         logger.error(
             "[TPU profiler] no .xplane.pb was written under %s. The capture "
