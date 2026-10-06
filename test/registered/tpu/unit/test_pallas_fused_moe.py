@@ -163,7 +163,7 @@ class TestFusedMoEJaxKernelVsReference(unittest.TestCase):
         ids = jnp.array([[0, 1], [2, 3], [1, 2]], dtype=jnp.int32)
         weights = jnp.full((3, 2), 0.5, dtype=jnp.bfloat16)
         out = _call_production_kernel(
-            hidden, w1, w2, weights, ids, activation="silu_clamped:10.0"
+            hidden, w1, w2, weights, ids, activation="silu_and_mul_clamp:10.0"
         )
         expected = jnp.broadcast_to(
             jnp.array([-100.0, -200.0 / (1.0 + jnp.exp(20.0))] * 64), (3, 128)

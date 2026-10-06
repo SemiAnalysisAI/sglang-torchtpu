@@ -437,7 +437,7 @@ def _fused_moe_jax(
     # rhs scales, so the activation is applied in JAX below.
     clamp_limit = (
         float(activation_name.split(":", 1)[1])
-        if activation_name.startswith("silu_clamped:")
+        if activation_name.startswith("silu_and_mul_clamp:")
         else None
     )
     unfused_gmm1 = compact_block_scales or bool(w_quant_bits) or clamp_limit is not None

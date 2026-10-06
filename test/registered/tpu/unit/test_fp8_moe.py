@@ -312,7 +312,9 @@ class TestTpuFp8MoE(CustomTestCase):
                 method.apply(layer, dispatch_output)
 
         fused_moe.assert_called_once()
-        self.assertEqual(fused_moe.call_args.kwargs["activation"], "silu_clamped:7.0")
+        self.assertEqual(
+            fused_moe.call_args.kwargs["activation"], "silu_and_mul_clamp:7.0"
+        )
 
     def test_fp8_moe_runs_eager_and_compiled(self):
         device = torch.device("tpu")

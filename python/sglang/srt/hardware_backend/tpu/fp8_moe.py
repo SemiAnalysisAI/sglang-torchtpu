@@ -395,7 +395,7 @@ def apply_tpu_fp8_moe(
     if swiglu_limit is not None:
         if activation != "silu":
             raise ValueError("TPU clamped MoE requires silu activation")
-        activation = f"silu_clamped:{float(swiglu_limit)}"
+        activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
     output = fused_moe_call(
         hidden_states=x,
         w1=layer.w13_weight,
