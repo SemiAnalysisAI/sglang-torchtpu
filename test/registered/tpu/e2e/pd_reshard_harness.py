@@ -224,7 +224,12 @@ MODEL_PROFILES = {
         max_total_tokens=262144,
         device_pool_tokens_hint=262144,
         gsm8k_threshold=0.80,
-        extra_server_args=("--tpu-fp8-runtime", "channelwise"),
+        # DIAGNOSTIC: #943 moves serving off pod -0-0, which the router targets.
+        extra_server_args=(
+            "--tpu-fp8-runtime",
+            "channelwise",
+            "--no-tpu-node-normalization",
+        ),
         extra_launch_env={
             "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
             # Keep every prefill forward inside the 256-token compile graph.
