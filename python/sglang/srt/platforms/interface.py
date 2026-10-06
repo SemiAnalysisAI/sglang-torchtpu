@@ -176,6 +176,17 @@ class SRTPlatform(DeviceMixin):
         """
         return False
 
+    def supports_decode_context_parallel(self) -> bool:
+        """Whether this platform runs decode context parallelism; CUDA, HIP and
+        NPU are accepted by initialize_model_parallel directly."""
+        return False
+
+    def dcp_shards_every_kv_pool(self) -> bool:
+        """Whether decode context parallelism widens every KV allocator (SWA
+        included) by attn_dcp_size and shards every layer's K/V heads across
+        attn_tp_size // attn_dcp_size, not only the full-attention paged pool."""
+        return False
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------

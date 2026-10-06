@@ -68,6 +68,15 @@ _PREFILL_CP_SPARSE_CORE_OVERRIDES = (
     "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
 )
 
+_DECODE_CP_SPARSE_CORE_OVERRIDES = (
+    # TODO(yinlin09): drop once libtpu is fixed. With decode context parallelism
+    # the SparseCore all-gather offload returns a wrong first token after long
+    # prompts (libtpu 0.0.47, 8192-token prefill bucket); every validated DCP run
+    # also kept the SparseCore gather offload off.
+    "--xla_tpu_offload_gather_to_sparsecore=false",
+    "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
+)
+
 # Smallest KV pool (in tokens) observed safe with the default prefetch depth
 # on the largest supported dense stack (36-layer gpt-oss at TP=8): 4096 pages
 # of 64 tokens. Pools at or above this never deadlocked; below it the first
@@ -172,5 +181,24 @@ def apply_prefill_cp_sparse_core_override(*, attn_cp_size: int) -> None:
             "TPU env_override: prefill context parallelism (--attn-cp-size %d); "
             "turning off SparseCore offloads (%s)",
             attn_cp_size,
+            " ".join(appended),
+        )
+
+
+def apply_decode_cp_sparse_core_override(*, dcp_size: int) -> None:
+    """Turn off the SparseCore offloads that break decode context parallelism.
+
+    Called with the resolved ``--dcp-size`` before workers spawn, so they
+    inherit the flags; without decode context parallelism the offloads keep
+    the libtpu defaults.
+    """
+    if dcp_size <= 1:
+        return
+    appended = _override_libtpu_flags(_DECODE_CP_SPARSE_CORE_OVERRIDES)
+    if appended:
+        logger.info(
+            "TPU env_override: decode context parallelism (--dcp-size %d); "
+            "turning off SparseCore offloads (%s)",
+            dcp_size,
             " ".join(appended),
         )

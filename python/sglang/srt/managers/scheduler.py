@@ -2555,6 +2555,11 @@ class Scheduler(
         )
 
     def init_pool_stats_observer(self) -> None:
+        widening = (
+            get_parallel().attn_dcp_size
+            if current_platform.dcp_shards_every_kv_pool()
+            else 1
+        )
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -2564,8 +2569,18 @@ class Scheduler(
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_ssm=self.is_hybrid_ssm,
             enable_hisparse=self.enable_hisparse,
-            full_tokens_per_layer=self.full_tokens_per_layer,
-            swa_tokens_per_layer=self.swa_tokens_per_layer,
+            # Pool counters count allocator locations, which TPU DCP widens by
+            # attn_dcp_size.
+            full_tokens_per_layer=(
+                self.full_tokens_per_layer * widening
+                if self.full_tokens_per_layer is not None
+                else None
+            ),
+            swa_tokens_per_layer=(
+                self.swa_tokens_per_layer * widening
+                if self.swa_tokens_per_layer is not None
+                else None
+            ),
             # Match the allocator and radix counters' logical units.
             max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
         )
@@ -4198,7 +4213,12 @@ class Scheduler(
             }
 
         adder = adder_cls(
-            self.page_size,
+            # TPU DCP cuts prefill chunks at whole widened pages.
+            (
+                self.page_size * get_parallel().attn_dcp_size
+                if current_platform.dcp_shards_every_kv_pool()
+                else self.page_size
+            ),
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             running_batch,

@@ -126,7 +126,9 @@ def _make_model_runner(
     mc.swa_head_dim = swa_head_dim or head_dim
     mc.swa_v_head_dim = swa_v_head_dim or v_head_dim
     mc.get_num_kv_heads = lambda tp_size, dcp_size=1: num_kv_heads
-    mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
+    mc.get_swa_num_kv_heads = lambda tp_size, dcp_size=1: (
+        swa_num_kv_heads or num_kv_heads
+    )
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     mc.hf_config.model_type = "llama"
     mc.hf_config.get_text_config = lambda: mc.hf_config
@@ -351,6 +353,34 @@ class TestHybridSWAConfigurator(CustomTestCase):
         used = _actual_memory_used(mr, config)
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
+
+    def test_dcp_leaves_non_tpu_geometry_unchanged(self):
+        """Only TPU widens the hybrid-SWA pool under DCP; another platform keeps
+        its per-rank KV heads and the physical page of the SWA admission floor."""
+        from sglang.srt.model_executor import pool_configurator
+
+        def geometry(dcp_size):
+            mr = self._make_swa_runner(page_size=16)
+            mc = mr.model_config
+            mc.get_num_kv_heads = lambda tp_size, dcp_size=1: 8 // (tp_size // dcp_size)
+            mc.get_swa_num_kv_heads = mc.get_num_kv_heads
+            with (
+                mock_cpu_env(tp_size=8),
+                get_parallel().override(attn_dcp_size=dcp_size),
+                patch.object(
+                    pool_configurator.current_platform,
+                    "dcp_shards_every_kv_pool",
+                    return_value=False,
+                ),
+                patch.object(
+                    pool_configurator.MemoryPoolConfigurator, "validate_swa_pool_size"
+                ) as floor,
+            ):
+                cfg = pool_configurator.create_memory_pool_configurator(mr)
+                cfg.calculate_pool_sizes(10_000_000, 16)
+            return cfg._full_per_token, cfg._swa_per_token, floor.call_args
+
+        self.assertEqual(geometry(2), geometry(1))
 
     def test_draft_does_not_inherit_target_shared_byte_budget(self):
         """A separate draft pool must not allocate the target's byte envelope again."""
