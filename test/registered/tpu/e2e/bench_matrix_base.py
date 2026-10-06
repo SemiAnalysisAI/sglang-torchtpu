@@ -68,10 +68,11 @@ MATRIX_SWEEP_SCRIPT = os.path.join(
 BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
 
 # --- The matrix cells' slice of the time-budget chain (see config.sh's "THE
-# TIME-BUDGET CHAIN"). TIMEOUT_PER_FILE_BUDGET is what every cell's
-# MULTIHOST_LAUNCH declares literally as timeout_per_file (the CI scanner
-# reads it via AST, so the files cannot compute it); the matrix ratchet
-# asserts the literals match this constant and that the chain holds.
+# TIME-BUDGET CHAIN"). TIMEOUT_PER_FILE_BUDGET is what every regular cell's
+# MULTIHOST_LAUNCH declares literally as timeout_per_file (tail cells declare
+# TAIL_TIMEOUT_PER_FILE_BUDGET, below; the CI scanner reads it via AST, so the
+# files cannot compute it); the matrix ratchet asserts the literals match
+# these constants and that the chain holds.
 TIMEOUT_PER_FILE_BUDGET = 8100
 # Re-checking a server the JobSet already gated healthy.
 HEALTH_RECHECK_BUDGET = 600
@@ -80,6 +81,29 @@ RESULT_EGRESS_MARGIN = 300
 SWEEP_TIMEOUT_DEFAULT = (
     TIMEOUT_PER_FILE_BUDGET - HEALTH_RECHECK_BUDGET - RESULT_EGRESS_MARGIN
 )
+# Light cells that discovery places LAST on a slice another group already
+# fills (MULTIHOST_LAUNCH "placement": "tail"; see render_external_jobset.py).
+# Their smaller budget bounds how long a hang can hold the shared slice; the
+# chain (worst-case sweep <= sweep timeout < file budget) is the same.
+TAIL_RECIPES = {"pd_1p1d_pc"}
+TAIL_TIMEOUT_PER_FILE_BUDGET = 5400
+TAIL_SWEEP_TIMEOUT_DEFAULT = (
+    TAIL_TIMEOUT_PER_FILE_BUDGET - HEALTH_RECHECK_BUDGET - RESULT_EGRESS_MARGIN
+)
+
+
+def timeout_per_file_budget(bench_recipe: str) -> int:
+    """The timeout_per_file literal a cell of this recipe must declare."""
+    if bench_recipe in TAIL_RECIPES:
+        return TAIL_TIMEOUT_PER_FILE_BUDGET
+    return TIMEOUT_PER_FILE_BUDGET
+
+
+def sweep_timeout_default(bench_recipe: str) -> int:
+    if bench_recipe in TAIL_RECIPES:
+        return TAIL_SWEEP_TIMEOUT_DEFAULT
+    return SWEEP_TIMEOUT_DEFAULT
+
 
 HEALTH_TIMEOUT = int(os.environ.get("HEALTH_TIMEOUT", str(HEALTH_RECHECK_BUDGET)))
 # Fraction of the REACHABLE prefix-cache hit rate a gated leg must reach. The
@@ -765,7 +789,7 @@ def build_matrix_test(*, bench_model: str, bench_recipe: str, workload: str):
         },
         run_root_default=f"/tmp/bench-{bench_model}-{bench_recipe}-{workload}",
         profile=os.environ.get("BENCH_PROFILE", "ci"),
-        sweep_timeout_default=SWEEP_TIMEOUT_DEFAULT,
+        sweep_timeout_default=sweep_timeout_default(bench_recipe),
         # A single-turn 8k1k session never re-sees its prefix, so the hit-rate
         # gate only applies to the multi-turn agentic workload.
         gate_prefix_hits=workload == "agentic",

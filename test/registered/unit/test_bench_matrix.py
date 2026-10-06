@@ -155,7 +155,10 @@ class TestBenchMatrix(CustomTestCase):
 
     def test_discovery_buckets_one_group_per_slice(self):
         """The even-split contract: 4 single-host groups over the four 2x2x2
-        slices, 2 pd groups over the two 2x2x4 slices, none serialized."""
+        slices, 2 pd groups over the two 2x2x4 slices, none serialized. A
+        light tail group (MULTIHOST_LAUNCH "placement": "tail") may share a
+        slice, but only AFTER that slice's regular group, so a hang upstream
+        costs only the tail group its run."""
         spec = importlib.util.spec_from_file_location(
             "render_external_jobset",
             os.path.join(
@@ -179,19 +182,36 @@ class TestBenchMatrix(CustomTestCase):
                 for g in sl["groups"]
                 if g.get("launch_script", "").startswith("recipe/bench_matrix/")
             ]
+            regular = [g for g in ours if g["placement"] != "tail"]
             self.assertLessEqual(
-                len(ours),
+                len(regular),
                 1,
-                f"{sl['name']}: {len(ours)} bench_matrix groups serialize on "
-                f"one slice -- the matrix is sized to fill each slice exactly "
-                f"once ({[g['name'] for g in ours]})",
+                f"{sl['name']}: {len(regular)} regular bench_matrix groups "
+                f"serialize on one slice -- the matrix is sized to fill each "
+                f"slice exactly once ({[g['name'] for g in regular]})",
+            )
+            # P/D, exec and self-launch groups share these slices and carry no
+            # placement; they count as regular.
+            placements = [g.get("placement", "regular") for g in sl["groups"]]
+            self.assertEqual(
+                placements,
+                sorted(placements, key=lambda p: p == "tail"),
+                f"{sl['name']}: a tail group must run after every regular "
+                f"group on its slice ({[g['name'] for g in sl['groups']]})",
             )
             per_suite.setdefault(sl["suite"], 0)
             per_suite[sl["suite"]] += len(ours)
             for g in ours:
+                recipe, _ = _recipe_suite(os.path.basename(g["files"].split()[0]))
+                self.assertEqual(
+                    g["placement"] == "tail",
+                    recipe in bench_base.TAIL_RECIPES,
+                    f"{g['name']}: placement must be 'tail' exactly for "
+                    "bench_matrix_base.TAIL_RECIPES",
+                )
                 self.assertEqual(
                     g["timeout_per_file"],
-                    bench_base.TIMEOUT_PER_FILE_BUDGET,
+                    bench_base.timeout_per_file_budget(recipe),
                     f"{g['name']}: discovery must carry the files' declared "
                     "timeout_per_file (the JobSet deadline is sized from it)",
                 )
@@ -275,20 +295,32 @@ class TestBenchMatrix(CustomTestCase):
         base's constants, config.sh's profile) that nothing else cross-checks;
         this is what turns "we changed one number" into a red test instead of
         a silently truncated benchmark."""
-        # Every cell's literal must equal the base's budget constant.
+        # Every cell's literal must equal the base's budget constant for its
+        # recipe (tail cells carry the smaller tail budget).
         for path in self._cell_files():
             _, launch, _ = _scan_file(path)
+            recipe, _ = _recipe_suite(os.path.basename(path))
             self.assertEqual(
                 launch.get("timeout_per_file"),
-                bench_base.TIMEOUT_PER_FILE_BUDGET,
+                bench_base.timeout_per_file_budget(recipe),
                 f"{path}: timeout_per_file literal drifted from "
-                "bench_matrix_base.TIMEOUT_PER_FILE_BUDGET",
+                "bench_matrix_base.timeout_per_file_budget()",
+            )
+            self.assertEqual(
+                launch.get("placement") == "tail",
+                recipe in bench_base.TAIL_RECIPES,
+                f"{path}: MULTIHOST_LAUNCH placement must be 'tail' exactly "
+                "for bench_matrix_base.TAIL_RECIPES",
             )
         # The sweep budget plus the health recheck must fit the file budget.
-        self.assertLess(
-            bench_base.SWEEP_TIMEOUT_DEFAULT + bench_base.HEALTH_RECHECK_BUDGET,
-            bench_base.TIMEOUT_PER_FILE_BUDGET,
-        )
+        for sweep, budget in (
+            (bench_base.SWEEP_TIMEOUT_DEFAULT, bench_base.TIMEOUT_PER_FILE_BUDGET),
+            (
+                bench_base.TAIL_SWEEP_TIMEOUT_DEFAULT,
+                bench_base.TAIL_TIMEOUT_PER_FILE_BUDGET,
+            ),
+        ):
+            self.assertLess(sweep + bench_base.HEALTH_RECHECK_BUDGET, budget)
         # config.sh's ci profile: attempted legs x leg cap must fit the sweep
         # budget (legs with long > bs are skipped and cost nothing). Checked
         # for the matrix's largest grid and for every standalone cell, which
@@ -325,12 +357,13 @@ class TestBenchMatrix(CustomTestCase):
                 if l <= b
             ]
             worst_case = len(attempted) * int(leg_cap)
+            sweep_timeout = bench_base.sweep_timeout_default(recipe)
             self.assertLessEqual(
                 worst_case,
-                bench_base.SWEEP_TIMEOUT_DEFAULT,
+                sweep_timeout,
                 f"{model}/{recipe}/{workload}: {len(attempted)} attempted ci "
                 f"legs x MAX_LEG_SECONDS={leg_cap} = {worst_case}s exceeds "
-                f"SWEEP_TIMEOUT {bench_base.SWEEP_TIMEOUT_DEFAULT}s",
+                f"SWEEP_TIMEOUT {sweep_timeout}s",
             )
 
 

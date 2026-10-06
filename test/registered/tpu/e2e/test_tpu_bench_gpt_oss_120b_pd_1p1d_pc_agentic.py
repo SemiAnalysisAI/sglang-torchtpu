@@ -29,15 +29,19 @@ from bench_matrix_base import build_matrix_test
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(
-    est_time=5400,
+    est_time=1800,
     suite="external-nightly-2x2x2",
     nightly=True,
 )
 
+# A light cell (~14 min sweep): discovery runs it LAST on a 2x2x2 slice that
+# another matrix group already fills, with the smaller tail budget
+# (bench_matrix_base.TAIL_TIMEOUT_PER_FILE_BUDGET).
 MULTIHOST_LAUNCH = {
     "launch_script": "recipe/bench_matrix/gpt_oss_120b_pd_1p1d_pc.sh",
     "weights": "gpt-oss-120b",
-    "timeout_per_file": 8100,
+    "timeout_per_file": 5400,
+    "placement": "tail",
 }
 
 TestBenchGptOss120bPd1p1dPcAgentic = build_matrix_test(

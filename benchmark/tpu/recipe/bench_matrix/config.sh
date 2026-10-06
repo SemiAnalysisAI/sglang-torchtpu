@@ -51,7 +51,9 @@ PYTHON=${PYTHON:-python3}
 #   worst-case sweep  <=  SWEEP_TIMEOUT  <  TIMEOUT_PER_FILE  <  JobSet deadline
 #
 # where worst-case sweep = (number of attempted legs) x MAX_LEG_SECONDS.
-# TIMEOUT_PER_FILE (8100) is declared literally in every test file's
+# TIMEOUT_PER_FILE (8100; 5400 for the light "tail" cells such as
+# pd_1p1d_pc, which run last on a slice another group fills) is declared
+# literally in every test file's
 # MULTIHOST_LAUNCH (the CI scanner reads it via AST, so it cannot be computed
 # there); test/registered/unit/test_bench_matrix.py ASSERTS the whole
 # chain, so a change to any link that breaks another fails CI instead of
