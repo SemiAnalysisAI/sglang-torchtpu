@@ -34,6 +34,7 @@ def _args(**overrides):
         tp_size=1,
         pp_size=1,
         dp_size=1,
+        dcp_size=1,
         enable_dp_attention=False,
         enable_dp_lm_head=False,
         enable_dynamic_chunking=False,

@@ -2535,8 +2535,18 @@ class Scheduler(
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_ssm=self.is_hybrid_ssm,
             enable_hisparse=self.enable_hisparse,
-            full_tokens_per_layer=self.full_tokens_per_layer,
-            swa_tokens_per_layer=self.swa_tokens_per_layer,
+            # Pool counters count allocator locations, which DCP widens by
+            # attn_dcp_size.
+            full_tokens_per_layer=(
+                self.full_tokens_per_layer * get_parallel().attn_dcp_size
+                if self.full_tokens_per_layer is not None
+                else None
+            ),
+            swa_tokens_per_layer=(
+                self.swa_tokens_per_layer * get_parallel().attn_dcp_size
+                if self.swa_tokens_per_layer is not None
+                else None
+            ),
             # Match the allocator and radix counters' logical units.
             max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
             get_last_batch=lambda: self.last_batch,
@@ -4142,7 +4152,7 @@ class Scheduler(
             }
 
         adder = adder_cls(
-            self.page_size,
+            self.page_size * get_parallel().attn_dcp_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             running_batch,

@@ -1780,6 +1780,13 @@ class KVCacheConfigurator:
         # pass v_head_dim here: the fused KV buffer stores V padded to head_dim
         # and the kernel DMAs at that width.) When the counts match (e.g.
         # GPT-OSS) this is a no-op.
+        # DCP ranks replicate KV, so the SWA heads shard across
+        # attn_tp_size // attn_dcp_size groups, as get_num_kv_heads does for
+        # the full sub-pool below. A draft model never joins the DCP group, so
+        # it shards over the whole attn TP group.
+        swa_dcp_size = get_parallel().attn_dcp_size
+        if swa_dcp_size > 1 and self.model_config.is_draft_model:
+            swa_dcp_size = 1
         swa_head_num = max(
             1,
             getattr(
@@ -1787,7 +1794,7 @@ class KVCacheConfigurator:
                 "swa_num_key_value_heads",
                 self.model_config.hf_text_config.num_key_value_heads,
             )
-            // get_parallel().attn_tp_size,
+            // (get_parallel().attn_tp_size // swa_dcp_size),
         )
         mxint8_subpool_kwargs = {}
         if self.kv_cache_dtype_str == "mxint8":
@@ -2271,10 +2278,16 @@ class KVCacheConfigurator:
                 # arms below -- the sub-pools are TPU-fused but the allocator
                 # just bookkeeps token slots and the full<->swa mapping
                 # (queried by pallas_backend in _build_metadata).
+                # Under DCP the allocator is virtual: it hands out locations in
+                # a space widened by attn_dcp_size, where a location's physical
+                # slot is loc // attn_dcp_size and its physical page is
+                # loc // (page_size * attn_dcp_size) -- the same page id on
+                # every rank of the DCP group, while the pool keeps the
+                # physical size and page (pool_page_size).
                 AllocatorCls = current_platform.get_paged_allocator_cls()
                 token_to_kv_pool_allocator = AllocatorCls(
-                    sizes.max_total_num_tokens,
-                    page_size=get_schedule().page_size,
+                    sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
+                    page_size=get_schedule().page_size * get_parallel().attn_dcp_size,
                     dtype=self.kv_cache_dtype,
                     device=self.device,
                     kvcache=token_to_kv_pool,
@@ -2332,6 +2345,13 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
                 elif self.is_hybrid_swa and sizes.full_max_total_num_tokens == 0:
+                    if get_parallel().attn_dcp_size > 1:
+                        raise ValueError(
+                            "--decode-context-parallel-size > 1 is not supported "
+                            "for an all-SWA model: PureSWATokenToKVPoolAllocator "
+                            "hands out physical slots, while DCP reads and writes "
+                            "the KV cache through the widened location space."
+                        )
                     token_to_kv_pool_allocator = PureSWATokenToKVPoolAllocator(
                         sizes.swa_max_total_num_tokens,
                         page_size=get_schedule().page_size,
@@ -2341,10 +2361,15 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
                 elif self.is_hybrid_swa:
+                    # Both sub-allocators live in the same DCP-widened location
+                    # space as the non-SWA arms above: physical slot is
+                    # loc // attn_dcp_size, physical page is
+                    # loc // (page_size * attn_dcp_size).
                     token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
-                        sizes.full_max_total_num_tokens,
-                        sizes.swa_max_total_num_tokens,
-                        page_size=get_schedule().page_size,
+                        sizes.full_max_total_num_tokens * get_parallel().attn_dcp_size,
+                        sizes.swa_max_total_num_tokens * get_parallel().attn_dcp_size,
+                        page_size=get_schedule().page_size
+                        * get_parallel().attn_dcp_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=token_to_kv_pool,
