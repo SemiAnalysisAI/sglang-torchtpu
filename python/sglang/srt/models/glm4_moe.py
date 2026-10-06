@@ -85,8 +85,8 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
 from sglang.srt.runtime_context import (
     get_exec,
+    get_model,
     get_parallel,
-    get_server_args,
     get_stream,
 )
 from sglang.srt.utils import (
@@ -1462,12 +1462,12 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     def __init__(self, config, quant_config=None, prefix=""):
         dense_limit = getattr(config, "tpu_dense_dsa_max_context", None)
         if dense_limit is not None:
-            args = get_server_args()
             if not 0 < dense_limit <= config.index_topk:
                 raise ValueError(
                     "The dense DSA context must fit the checkpoint's index_topk"
                 )
-            if args.context_length is None or args.context_length > dense_limit:
+            context_length = get_model().context_length
+            if context_length is None or context_length > dense_limit:
                 raise ValueError(
                     f"The GLM dense DSA reference path requires --context-length <= {dense_limit}"
                 )
