@@ -4343,6 +4343,19 @@ class Scheduler(
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
+            if (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                and current_platform.is_tpu()
+                and envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
+                and adder.host_load_indices
+            ):
+                from sglang.srt.hardware_backend.tpu.prefill_early_send import (
+                    tpu_hicache_load_page_ids,
+                )
+
+                new_batch.hicache_load_page_ids = tpu_hicache_load_page_ids(
+                    scheduler=self, load_indices=adder.host_load_indices
+                )
 
         new_batch.prepare_for_extend()
 
@@ -4611,7 +4624,9 @@ class Scheduler(
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:
-                self.maybe_send_cached_prefix_chunk(req)
+                self.maybe_send_cached_prefix_chunk(
+                    req, hicache_load_page_ids=batch.hicache_load_page_ids
+                )
 
         # Run forward
         if self.is_generation:

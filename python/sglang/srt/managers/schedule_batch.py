@@ -2385,6 +2385,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
+    # Allocator page IDs (DCP-widened) that this batch's HiCache load-backs fill,
+    # recorded for TPU PD prefill early send, which runs before the forward waits.
+    hicache_load_page_ids: Optional[torch.Tensor] = None
 
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
