@@ -645,9 +645,16 @@ def _fused_moe_jax(
             from sglang.srt.layers.moe.pallas.sparse_core.dense_gather_reduce import (
                 dense_gather_reduce,
             )
-            from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_reduce_v2 import (
-                ragged_gather_reduce,
-            )
+
+            # Read at trace time.
+            if envs.SGLANG_TPU_USE_SC_GATHER_REDUCE_V3.get():
+                from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_reduce_v3 import (
+                    ragged_gather_reduce,
+                )
+            else:
+                from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_reduce_v2 import (
+                    ragged_gather_reduce,
+                )
 
             if use_group_offset:
                 combined = ragged_gather_reduce(

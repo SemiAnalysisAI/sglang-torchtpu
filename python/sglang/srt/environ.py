@@ -1898,6 +1898,9 @@ class Envs:
     # MoE: gather on the TensorCore below this many routed rows (tokens x topk);
     # 0 = SparseCore always. Measured crossover is 1024 (Kimi, R1, Qwen3-480B).
     SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS = EnvInt(0)
+    # MoE: combine expert-parallel outputs on the SparseCore with the
+    # destination-major gather-reduce v3 instead of v2.
+    SGLANG_TPU_USE_SC_GATHER_REDUCE_V3 = EnvBool(False)
     # MoE: use onehot dense matmul for small permute and unpermute/combine
     # paths instead of gather. When set to 0, this is disabled. When set
     # to a positive integer, this is the threshold for tokens per rank below
