@@ -484,11 +484,6 @@ class MoEGate(nn.Module):
                 dtype=(
                     torch.float32
                     if getattr(config, "router_fp32", False)
-                    # GLM checkpoints declare an FP32 router; honored on TPU only.
-                    or (
-                        _is_tpu
-                        and getattr(config, "moe_router_dtype", None) == "float32"
-                    )
                     else torch.get_default_dtype()
                 ),
             )
