@@ -12,7 +12,7 @@ import numpy as np
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=300, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=420, suite="stage-a-test-tpu-unit")
 
 # This is a standalone raw-JAX kernel test, not a TorchTPU runtime process.
 # SGLang platform discovery selects CPU-only JAX for export, so select the
@@ -452,13 +452,16 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
     def test_single_kv_head_geometries(self):
         """Per-rank shapes with one KV head and bf16 KV: 4 q heads at head_dim
         128 (a 4-KV-head model at TP8) and 8 q heads at head_dim 64 (gpt-oss)."""
+        decode_seqs = tuple((n - 1, 1) for n in (6, 7, 300, 2049))
         cases = (
-            ("extend_5", ((0, 5),), 8, False),
-            ("extend_1000", ((0, 1000),), 1024, False),
-            ("decode", tuple((n - 1, 1) for n in (6, 7, 300, 2049)), 8, True),
+            ("extend_5", ((0, 5),), 8, False, False),
+            ("extend_1000", ((0, 1000),), 1024, False, False),
+            ("decode", decode_seqs, 8, True, False),
+            # 4 q heads fill only part of a sink row period.
+            ("decode_sinks", decode_seqs, 8, True, True),
         )
         for num_q_heads, head_dim in ((4, 128), (8, 64)):
-            for name, seqs, padded_tokens, decode in cases:
+            for name, seqs, padded_tokens, decode, use_sink in cases:
                 with self.subTest(q_heads=num_q_heads, head_dim=head_dim, case=name):
                     self._check(
                         seqs=seqs,
@@ -467,6 +470,7 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
                         num_kv_heads=1,
                         head_dim=head_dim,
                         decode=decode,
+                        use_sink=use_sink,
                     )
 
     def test_decode_batch_with_sinks_and_window(self):
@@ -481,6 +485,23 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
                     use_sink=True,
                     sliding_window=128,
                     seq_along_lane=seq_along_lane,
+                )
+
+    def test_decode_sinks_over_several_kv_blocks(self):
+        """Eight KV heads shrink the decode k block to one page, so a long
+        sequence's running max moves across k blocks before the sink."""
+        kv_lens = (1, 255, 257, 600, 1300, 2049, 3333)
+        for sliding_window in (None, 128):
+            with self.subTest(sliding_window=sliding_window):
+                self._check(
+                    seqs=tuple((kv_len - 1, 1) for kv_len in kv_lens),
+                    padded_tokens=16,
+                    num_q_heads=16,
+                    num_kv_heads=8,
+                    head_dim=128,
+                    decode=True,
+                    use_sink=True,
+                    sliding_window=sliding_window,
                 )
 
     def test_seq_along_lane_packed_extend(self):
