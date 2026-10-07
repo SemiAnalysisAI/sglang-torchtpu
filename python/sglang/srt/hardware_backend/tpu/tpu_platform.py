@@ -609,12 +609,6 @@ class TpuSRTPlatform(SRTPlatform):
                 "Initialize it from the scheduler worker bootstrap."
             )
 
-        from sglang.srt.hardware_backend.tpu.compile_cache import (
-            add_pallas_kernel_sources_to_compile_cache_key,
-        )
-
-        add_pallas_kernel_sources_to_compile_cache_key()
-
         # Keep c10d_functional collectives inside the compiled graph. torch_tpu
         # defaults to materializing collective tensors by forcing graph breaks, which
         # crashes under torch.compile(fullgraph=True) at TP>1. Setting this to 0/false
@@ -646,6 +640,13 @@ class TpuSRTPlatform(SRTPlatform):
         # the inherited launch environment here; any TorchTPU-dependent
         # topology discovery is therefore confined to the worker.
         _prepare_tpu_env(int(world_size), resolve_single_host_topology=True)
+
+        from sglang.srt.hardware_backend.tpu.compile_cache import (
+            add_tpu_kernel_inputs_to_compile_cache_key,
+        )
+
+        # After _prepare_tpu_env: the key must see the final LIBTPU_INIT_ARGS.
+        add_tpu_kernel_inputs_to_compile_cache_key()
 
         import torch_tpu  # noqa: F401
 
