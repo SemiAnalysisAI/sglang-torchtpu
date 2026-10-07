@@ -48,7 +48,6 @@ from torch.distributed import ProcessGroup
 
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from ..utils.distributed import RankGenerator
@@ -950,16 +949,6 @@ def get_classifier_free_guidance_world_size() -> int:
 def get_classifier_free_guidance_rank() -> int:
     """Return my rank for the classifier_free_guidance parallel group."""
     return get_cfg_group().rank_in_group
-
-
-def requires_uniform_cfg_seq_len(do_classifier_free_guidance: bool = True) -> bool:
-    """Return True when positive and negative CFG ranks must execute identical sequence shapes."""
-    return (
-        bool(do_classifier_free_guidance)
-        and current_platform.requires_uniform_spmd_shapes()
-        and model_parallel_is_initialized()
-        and get_classifier_free_guidance_world_size() > 1
-    )
 
 
 def get_data_parallel_world_size() -> int:

@@ -238,22 +238,6 @@ class Platform:
         return True
 
     @classmethod
-    def requires_group_barrier(cls) -> bool:
-        return False
-
-    @classmethod
-    def requires_uniform_spmd_shapes(cls) -> bool:
-        return False
-
-    @classmethod
-    def decode_output_on_host(cls) -> bool:
-        return False
-
-    @classmethod
-    def supports_varlen_attn_mask_meta(cls) -> bool:
-        return True
-
-    @classmethod
     def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
         return None
 

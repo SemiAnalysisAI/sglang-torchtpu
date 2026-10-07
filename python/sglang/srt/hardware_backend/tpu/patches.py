@@ -295,12 +295,12 @@ _aten_fallbacks_registered = False
 
 
 def _register_aten_fallbacks() -> None:
-    """Register Python fallbacks for ATen ops missing or inaccurate in torch_tpu.
+    """Register Python fallbacks for ATen ops not yet implemented in torch_tpu.
 
     These should eventually move into torch_tpu's C++ kernel set (see
     torch_tpu/ops/* for the registration pattern). Kept here as a stopgap
     until those land — each fallback is a pure-torch equivalent of the
-    missing or buggy op.
+    missing op.
     """
     global _aten_fallbacks_registered
     if _aten_fallbacks_registered:
@@ -334,48 +334,6 @@ def _register_aten_fallbacks() -> None:
         self.copy_(out)
         return self
 
-    # TODO: Remove after torch_tpu fixes integer/bool aten::cumsum prefix-sum
-    # lowering (torch_tpu casts integer cumsum through fp32, losing exactness
-    # above 2^24 and corrupting int64/int32/bool prefix sums).
-    def _cumsum_exact(src, dim, dtype):
-        target = (
-            dtype
-            if dtype is not None
-            else (
-                src.dtype
-                if src.is_floating_point() or src.is_complex()
-                else torch.int64
-            )
-        )
-        if target.is_floating_point or target.is_complex:
-            out = torch.empty(src.shape, dtype=target, device=src.device)
-            torch.ops.aten.cumsum.out(src, dim, dtype=target, out=out)
-            return out
-        out = src.to(target)
-        if out.dim() == 0:
-            return out
-        d = dim if dim >= 0 else dim + out.dim()
-        length, step = out.shape[d], 1
-        while step < length:
-            out = torch.cat(
-                [
-                    out.narrow(d, 0, step),
-                    out.narrow(d, step, length - step)
-                    + out.narrow(d, 0, length - step),
-                ],
-                dim=d,
-            )
-            step <<= 1
-        return out
-
-    @torch.library.register_kernel("aten::cumsum", "PrivateUse1")
-    def _cumsum(self, dim, dtype=None):
-        return _cumsum_exact(self, dim, dtype)
-
-    @torch.library.register_kernel("aten::cumsum_", "PrivateUse1")
-    def _cumsum_(self, dim, dtype=None):
-        return self.copy_(_cumsum_exact(self, dim, dtype))
-
     # aten::upsample_bicubic2d -- no TPU kernel; run the CPU kernel and copy
     # back. Vision towers use it to resize position embeddings per image grid
     # (MoonViT's Learnable2DInterpPosEmb in Kimi-VL), so inputs are small (tens
@@ -392,7 +350,7 @@ def _register_aten_fallbacks() -> None:
 
     logger.info(
         "Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, "
-        "masked_scatter_, cumsum, cumsum_, upsample_bicubic2d"
+        "masked_scatter_, upsample_bicubic2d"
     )
 
 

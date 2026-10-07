@@ -141,30 +141,6 @@ class TpuPlatform(Platform):
         return False
 
     @classmethod
-    def requires_group_barrier(cls) -> bool:
-        # Unscoped dist.barrier() issues a device all_reduce on tpu_dist, which
-        # deadlocks when only rank 0 ran device ops in a MAIN_RANK_ONLY stage.
-        return True
-
-    @classmethod
-    def requires_uniform_spmd_shapes(cls) -> bool:
-        # PJRT compiles a single SPMD HLO across all workers; divergent sequence
-        # lengths or mask presence across CFG/SP ranks cause collective hangs.
-        return True
-
-    @classmethod
-    def decode_output_on_host(cls) -> bool:
-        # Output transport materializes on rank 0 only; moving frames to host on
-        # all ranks at the end of DecodingStage keeps SPMD execution aligned.
-        return True
-
-    @classmethod
-    def supports_varlen_attn_mask_meta(cls) -> bool:
-        # Varlen FA metadata packs dynamic nonzero indices for CUDA FA; TPU uses
-        # TORCH_SDPA and cannot compile data-dependent nonzero shapes across CFG.
-        return False
-
-    @classmethod
     def inference_mode(cls):
         # torch_tpu's lazy tensors do not support torch.inference_mode.
         return torch.no_grad()
@@ -184,7 +160,6 @@ class TpuPlatform(Platform):
         from sglang.srt.hardware_backend.tpu.patches import (
             _patch_set_device_tolerate_mismatch,
             _prepare_tpu_env,
-            _register_aten_fallbacks,
         )
 
         # srt's activate() selects CPU-only JAX for TorchTPU processes; the
@@ -204,11 +179,6 @@ class TpuPlatform(Platform):
 
         # PJRT owns the chiplet binding; local_rank is only a label.
         _patch_set_device_tolerate_mismatch()
-
-        # Ops torch_tpu cannot lower abort the process rather than raising, so
-        # the whole srt fallback set is installed, not just the ones diffusion
-        # is known to reach today.
-        _register_aten_fallbacks()
 
         _install_device_module_shims()
         torch.zeros(1, device="tpu")

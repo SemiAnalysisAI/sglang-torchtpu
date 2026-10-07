@@ -38,7 +38,6 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
 from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
     apply_qwen_vl_text_rope,
     build_qwen_vl_text_rope,
-    dispatch_rope_index_to_host_on_tpu,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.common import add_prefix
@@ -728,7 +727,6 @@ class Qwen3VLModel(nn.Module):
     def get_decoder(self):
         return self.language_model
 
-    @dispatch_rope_index_to_host_on_tpu
     def get_rope_index(
         self,
         input_ids: Optional[torch.LongTensor] = None,

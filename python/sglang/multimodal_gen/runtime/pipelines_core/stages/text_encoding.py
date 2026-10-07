@@ -20,9 +20,6 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_encoder_data_parallel_group,
     get_local_torch_device,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    requires_uniform_cfg_seq_len,
-)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -462,32 +459,6 @@ class TextEncodingStage(ConditionEncodingStage):
                 neg_embeds_masks_list,
                 neg_seq_lens_list,
             )
-            if requires_uniform_cfg_seq_len(batch.do_classifier_free_guidance):
-                for i in range(
-                    min(len(batch.prompt_embeds), len(batch.negative_prompt_embeds))
-                ):
-                    pos, neg = batch.prompt_embeds[i], batch.negative_prompt_embeds[i]
-                    t_len = max(pos.shape[1], neg.shape[1])
-                    if pos.shape[1] < t_len:
-                        batch.prompt_embeds[i] = torch.nn.functional.pad(
-                            pos, (0, 0, 0, t_len - pos.shape[1])
-                        )
-                    if neg.shape[1] < t_len:
-                        batch.negative_prompt_embeds[i] = torch.nn.functional.pad(
-                            neg, (0, 0, 0, t_len - neg.shape[1])
-                        )
-                    for m_list in (
-                        batch.prompt_embeds_mask,
-                        batch.prompt_attention_mask,
-                        batch.negative_prompt_embeds_mask,
-                        batch.negative_attention_mask,
-                    ):
-                        if m_list and i < len(m_list) and m_list[i] is not None:
-                            m = m_list[i]
-                            if m.shape[1] < t_len:
-                                m_list[i] = torch.nn.functional.pad(
-                                    m, (0, t_len - m.shape[1]), value=0
-                                )
 
         return batch
 

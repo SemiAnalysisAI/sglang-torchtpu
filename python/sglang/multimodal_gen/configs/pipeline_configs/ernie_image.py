@@ -15,9 +15,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     pad_text_embeddings_with_mask,
     shard_rotary_emb_for_sp,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    requires_uniform_cfg_seq_len,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -169,8 +166,6 @@ class ErnieImagePipelineConfig(ImagePipelineConfig):
         txt_seq_lens: list[int],
         text_seq_len: int,
         device,
-        *,
-        keep_full_len_mask: bool | None = None,
     ):
         """Return a `[batch, text_seq_len]` mask over real (non-padded) text tokens.
 
@@ -180,14 +175,7 @@ class ErnieImagePipelineConfig(ImagePipelineConfig):
         we need a mask to keep attention off the padding. Returns None when every
         request already fills the full padded length (no mask needed).
         """
-        if keep_full_len_mask is None:
-            keep_full_len_mask = requires_uniform_cfg_seq_len(
-                batch.do_classifier_free_guidance
-            )
-        if (
-            all(seq_len == text_seq_len for seq_len in txt_seq_lens)
-            and not keep_full_len_mask
-        ):
+        if all(seq_len == text_seq_len for seq_len in txt_seq_lens):
             return None
 
         positions = torch.arange(text_seq_len, device=device)
@@ -215,15 +203,8 @@ class ErnieImagePipelineConfig(ImagePipelineConfig):
         txt_seq_lens = self.require_text_seq_lens(
             batch, 0, negative=negative, expected_batch_size=batch_size
         )
-        uniform_cfg_seq_len = requires_uniform_cfg_seq_len(
-            batch.do_classifier_free_guidance
-        )
         encoder_hidden_states_mask = self._prepare_encoder_hidden_states_mask(
-            batch,
-            txt_seq_lens,
-            text_seq_len,
-            device,
-            keep_full_len_mask=uniform_cfg_seq_len,
+            batch, txt_seq_lens, text_seq_len, device
         )
 
         if rotary_emb is None:
@@ -234,11 +215,8 @@ class ErnieImagePipelineConfig(ImagePipelineConfig):
                 "encoder_hidden_states_mask": encoder_hidden_states_mask,
             }
 
-        rope_seq_lens = (
-            [text_seq_len] * batch_size if uniform_cfg_seq_len else txt_seq_lens
-        )
         freqs_cis = self.get_freqs_cis(
-            img_shapes, rope_seq_lens, rotary_emb, device, dtype
+            img_shapes, txt_seq_lens, rotary_emb, device, dtype
         )
 
         if isinstance(freqs_cis, tuple):

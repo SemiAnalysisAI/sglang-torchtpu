@@ -19,7 +19,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -66,10 +65,7 @@ class ParallelExecutor(PipelineExecutor):
                             run_stage,
                             use_nvtx,
                         )
-                    if current_platform.requires_group_barrier():
-                        group.barrier()
-                    else:
-                        torch.distributed.barrier()
+                    torch.distributed.barrier()
 
                 elif paradigm == StageParallelismType.CFG_PARALLEL:
                     local_batch = batch
