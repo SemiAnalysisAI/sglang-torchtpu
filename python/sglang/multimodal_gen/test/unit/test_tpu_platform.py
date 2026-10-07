@@ -131,14 +131,28 @@ class TestTpuPlatformSurface(unittest.TestCase):
         self.assertFalse(TpuPlatform.enable_dit_layerwise_offload_by_default())
 
     def test_compile_warmup_keeps_the_dit_resident(self):
-        for explicit, given, want in ((False, True, False), (True, True, True)):
-            with self.subTest(explicit=explicit):
-                args = MagicMock(offload_during_compile=given)
-                args.is_arg_explicitly_set.side_effect = lambda name: (
-                    explicit and name == "offload_during_compile"
-                )
-                TpuPlatform().apply_server_args_defaults(args)
-                self.assertEqual(args.offload_during_compile, want)
+        from sglang.multimodal_gen.configs.pipeline_configs.base import (
+            PipelineConfig,
+        )
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+        from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+        def server_args(**kwargs):
+            # ServerArgs.__post_init__ applies the platform defaults.
+            with (
+                patch.object(
+                    PipelineConfig, "from_kwargs", return_value=PipelineConfig()
+                ),
+                patch.object(
+                    current_platform,
+                    "apply_server_args_defaults",
+                    TpuPlatform().apply_server_args_defaults,
+                ),
+            ):
+                return ServerArgs.from_kwargs(model_path="/fake", **kwargs)
+
+        self.assertFalse(server_args().offload_during_compile)
+        self.assertTrue(server_args(offload_during_compile=True).offload_during_compile)
 
 
 @unittest.skipUnless(_HAS_TORCH_TPU, "torch.device('tpu') needs torch_tpu")

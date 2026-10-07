@@ -216,8 +216,9 @@ class TpuPlatform(Platform):
 
     @classmethod
     def supports_vae_torch_compile(cls) -> bool:
-        # The torch_tpu backend fails to compile the diffusers AutoencoderKL
-        # decoder (torch-tpu 0.1.1+release.2026.9.22).
+        # Off for every VAE: the torch_tpu backend fails to compile the diffusers
+        # AutoencoderKL decoder (torch-tpu 0.1.1+release.2026.9.22), and the other
+        # VAEs are untested under it.
         return False
 
     @classmethod
