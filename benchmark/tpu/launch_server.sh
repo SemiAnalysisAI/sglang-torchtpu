@@ -83,6 +83,7 @@
 #   MAX_PREFILL_TOKENS=            # defaults to CHUNKED_PREFILL_SIZE
 #   MAX_TOTAL_TOKENS=              # passed through if set
 #   ATTENTION_BACKEND=pallas_tpu_rpa_v3
+#   GRAMMAR_BACKEND=none           # xgrammar enables constrained decoding / tool_choice
 #   DISABLE_OVERLAP_SCHEDULE=     # 1 passes --disable-overlap-schedule
 #   TPU_COMPILE_TOKENS=            # optional token bucket override
 #   TPU_COMPILE_BS=                # optional bs bucket override
@@ -354,6 +355,7 @@ ISL=${ISL:-8192}
 OSL=${OSL:-1024}
 CONTEXT_LEN=${CONTEXT_LEN:-$((ISL + OSL + 20))}
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-pallas_tpu_rpa_v3}
+GRAMMAR_BACKEND=${GRAMMAR_BACKEND:-none}
 # Pin the runtime prefill cap so TPU's derived token bucket grid is stable.
 CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-4096}
 MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-$CHUNKED_PREFILL_SIZE}
@@ -468,7 +470,7 @@ args=(
     --device tpu
     --attention-backend "$ATTENTION_BACKEND"
     --tp-size "$TP_SIZE"
-    --grammar-backend none
+    --grammar-backend "$GRAMMAR_BACKEND"
     --host "$HOST"
     --port "$PORT"
     --max-running-requests "$MAX_RUNNING"
