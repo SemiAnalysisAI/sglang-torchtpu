@@ -56,6 +56,26 @@ class GatherTest(jtu.JaxTestCase):
 
         self.assertArraysEqual(actual, desired)
 
+    @parameterized.product(
+        in_size=[1, 3, 21, 255],
+        hidden_size=[3584, 7168],
+        dtype=[jnp.int4, jnp.int8, jnp.bfloat16],
+    )
+    def test_sc_gather_rows_not_a_multiple_of_packing(
+        self, in_size, hidden_size, dtype
+    ):
+        # Top-16 fused-MoE permute: m tokens -> 16 * m sorted rows, m odd.
+        key = jax.random.key(1)
+        x = jax.random.normal(key, (in_size, hidden_size), jnp.float32).astype(dtype)
+        out_size = 16 * in_size
+        indices = jax.random.randint(key, (out_size,), 0, in_size, jnp.int32)
+
+        actual = ragged_gather_v2(
+            x, indices, jnp.array([0], jnp.int32), jnp.array([out_size], jnp.int32)
+        )
+
+        self.assertArraysEqual(actual, x[indices])
+
     def test_benchmark(self):
         benchmark_shapes = [
             # in_size, out_size, hidden_size

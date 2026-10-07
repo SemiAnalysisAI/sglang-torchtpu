@@ -231,6 +231,11 @@ def ragged_gather_v2(
     out_size = indices.size
 
     packing = 32 // dtype_bits
+    # The kernel bitcasts x to int32, `packing` rows per word; indices never
+    # reach the pad rows.
+    row_pad = -x.shape[0] % packing
+    if row_pad:
+        x = jnp.pad(x, ((0, row_pad), (0, 0)))
     col_size = calculate_col_size(hidden_size, packing)
 
     aligned_hidden_size = ((hidden_size + col_size - 1) // col_size) * col_size
