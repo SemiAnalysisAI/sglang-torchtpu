@@ -758,7 +758,11 @@ class KimiK3MoE(nn.Module):
         # The same bias the unfused select_experts path adds, read from the
         # gate: TPU materialization may have replaced the parameter TopK holds.
         self._tpu_route_bias = (
-            self.gate.e_score_correction_bias.detach().to(torch.float32).reshape(1, -1)
+            self.gate.e_score_correction_bias.detach()
+            .to(torch.float32)
+            .reshape(1, -1)
+            # Own storage: torch_tpu re-copies a view graph input every call.
+            .clone()
         )
         get_gate_route_op(cfg.top_k, **self._tpu_route_kwargs)
 
