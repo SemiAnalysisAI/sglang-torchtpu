@@ -13,6 +13,10 @@ import torch.nn.functional as F
 import tqdm
 
 from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang.srt.hardware_backend.tpu.compilation.attention_rank_inputs import (
+    get_attention_rank_tensors,
+    use_attention_rank_tensors,
+)
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
     _REAL_Q_KEY,
@@ -25,6 +29,9 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     _get_hbm_usage_mb,
     _hbm_delta_str,
     _materialize_out,
+)
+from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+    install_recompilation_checker,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
@@ -261,6 +268,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             attention_metadata: Any,
             forward_batch: ForwardBatch,
             *args: Any,
+            attention_rank_tensors: tuple[torch.Tensor, ...],
             **kwargs: Any,
         ) -> Any:
             backend = get_forward_context().attn_backend
@@ -277,7 +285,8 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             backbone.forward = self._draft_eager_backbone_forward
             logits_processor.forward = self._draft_eager_logits_forward
             try:
-                return fn(forward_batch, *args, **kwargs)
+                with use_attention_rank_tensors(attention_rank_tensors):
+                    return fn(forward_batch, *args, **kwargs)
             finally:
                 logits_processor.forward = previous_logits_forward
                 backbone.forward = previous_backbone_forward
@@ -308,7 +317,14 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         @functools.wraps(fn)
         def call(*args: Any, **kwargs: Any) -> Any:
             backend = get_forward_context().attn_backend
-            return compiled(backend.forward_metadata, *args, **kwargs)
+            return compiled(
+                backend.forward_metadata,
+                *args,
+                attention_rank_tensors=get_attention_rank_tensors(
+                    torch.device(self.model_runner.device)
+                ),
+                **kwargs,
+            )
 
         return call
 
@@ -780,10 +796,12 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             "[spec compile policy] DRAFT precompile done in %.1fs.",
             time.perf_counter() - overall,
         )
-        # The checker snapped its baseline at graph-runner init, before this
-        # deferred precompile; re-snapshot so the graphs compiled here aren't
-        # reported as serving-time recompiles on the first draft forward.
-        self.snapshot_recompilation_baseline()
+        # Include draft warmup in the shared target/draft baseline. Later TPU
+        # speculative-op and KV-offload warmup refresh it when they finish.
+        install_recompilation_checker(
+            policies=(self,),
+            model_label=f"draft {type(self.model_runner.model).__name__}",
+        )
 
     def _precompile_shapes(
         self, desc: str, items: list[Any], run: Callable[[Any], str]
@@ -922,6 +940,9 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             # The live draft path has consumed this seed before entering the
             # fused loop. Match its state so Dynamo reuses the warmup graph.
             forward_batch.input_ids = None
+            # The live fused loop bypasses ModelRunner.forward, so its batch carries
+            # None here; direct_compile pins each input's type at trace time.
+            forward_batch.num_token_non_padded = None
             with torch.no_grad():
                 out = fused_draft_forward(forward_batch)
                 _materialize_out(
@@ -1292,6 +1313,10 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             max(real_bs, self._dp_peer_draft_extend_rows(forward_batch))
         )
         pad_tokens = pad_b * self.draft_token_num
+        # Padding must not disguise missing active-row query counts.
+        query_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if query_lens_cpu is None or len(query_lens_cpu) < real_bs:
+            forward_batch.extend_seq_lens_cpu = None
         if pad_b != real_bs:
             # Draft extend has a fixed width, so it needs no token bucket.
             # This also grows its owned token- and request-axis tensors.
@@ -1300,9 +1325,8 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 num_tokens=pad_tokens,
                 bs=pad_b,
             )
-            # _pad_inputs_to_size skips the extend metadata tensors, but the
-            # compiled graph was traced with them at the bucket length. Zero
-            # rows are safe: padded requests' outputs are discarded.
+            # Pad any remaining extend metadata to the compiled batch size.
+            # Outputs for padded requests are discarded.
             for field in ("extend_seq_lens", "extend_prefix_lens", "extend_start_loc"):
                 value = getattr(forward_batch, field, None)
                 if isinstance(value, torch.Tensor) and value.shape[0] < pad_b:
@@ -1315,10 +1339,9 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             # prefix unpadding.
             setattr(forward_batch, _REAL_B_KEY, real_bs)
 
-        # ForwardBatch.init_new may carry CPU extend metadata padded for the
-        # previous prefill cap. Draft extend bypasses model.prepare_forward_batch
-        # after attention metadata is marked ready, so normalize it here even
-        # when the live batch already lands exactly on a batch bucket.
+        # Prefill may leave CPU metadata padded to a different batch size.
+        # Draft extend skips model.prepare_forward_batch, so resize these lists
+        # here even when the current batch already matches a bucket.
         for field in (
             "extend_seq_lens_cpu",
             "extend_prefix_lens_cpu",
@@ -1326,6 +1349,8 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         ):
             value = getattr(forward_batch, field, None)
             if value is None:
+                if field == "extend_seq_lens_cpu":
+                    continue
                 value = []
             elif isinstance(value, torch.Tensor):
                 value = value.tolist()
@@ -1453,10 +1478,18 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         sampling_info.top_ps = padding.top_ps
         state = padding.state
         logical_bs = state.logical_batch_size
+        # The scheduler copies predict and accept_lens to the host from the
+        # result-copy thread, after the next step is already queued. Copying a
+        # slice first needs a device program to make it contiguous, which would
+        # then wait behind that whole step; materialize both here instead.
         return (
             (
-                predict[: state.logical_num_tokens] if predict is not None else None,
-                accept_lens[:logical_bs] if accept_lens is not None else None,
+                (
+                    predict[: state.logical_num_tokens].clone()
+                    if predict is not None
+                    else None
+                ),
+                accept_lens[:logical_bs].clone() if accept_lens is not None else None,
                 accept_index[:logical_bs] if accept_index is not None else None,
             ),
             (

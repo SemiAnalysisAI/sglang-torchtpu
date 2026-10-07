@@ -78,6 +78,14 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     """
 
     HEAD_DIM_ALIGNMENT = 128
+    # HiCache io backends (--hicache-io-backend) that can offload this pool to
+    # host; hicache_hook refuses the rest at startup. raiden copies whole pages
+    # by their dim-0 block id, so it serves any block-major pool exposing
+    # get_fused_kv_buffer; torch_tpu's host pool stores this 5D row verbatim.
+    # A subclass that changes the buffer layout must restate this. Listing an
+    # io backend asserts it moves all of the pool's KV state: a pool that keeps
+    # quantization scales outside get_fused_kv_buffer must not list it.
+    kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
 
     def __init__(
         self,
@@ -137,7 +145,9 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim if v_head_dim is not None else head_dim
+            else v_head_dim
+            if v_head_dim is not None
+            else head_dim
         )
         # Asymmetric K/V head dims (e.g. MiMo / DeepSeek-style qk=192, v=128):
         # the fused KV buffer stores a single shared head_dim, so V is padded up
@@ -182,6 +192,19 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         # single contiguous row per slot of width ``num_kv_heads_x2 * head_dim``.
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = True
+
+    def _synchronize_device(self) -> None:
+        device = getattr(self, "device", None)
+        if device is not None:
+            device_type = torch.device(device).type
+        elif getattr(self, "kv_buffer", None):
+            device_type = self.kv_buffer[0].device.type
+        else:
+            device_type = None
+
+        if device_type == "cpu" or device_type is None:
+            return
+        torch.accelerator.synchronize()
 
     def get_state(self) -> list[torch.Tensor]:
         """Return the fused KV buffers used by forward execution."""
@@ -258,10 +281,15 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
                 maybe_build_backup,
             )
 
-            self._raiden_backup_obj = maybe_build_backup(self)
+            # A staged backup restores whole pages verbatim, while
+            # SWAKVPool.load_cpu_copy row-filters its SWA member's payload
+            # whenever the resume allocation maps fewer window tokens than the
+            # save did. That member takes the row path instead.
+            swa_member = self.allocation_label == "SWA"
+            self._raiden_backup_obj = None if swa_member else maybe_build_backup(self)
         return self._raiden_backup_obj
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         """Copy the KV rows at ``indices`` out to host.
 
         Overrides the base version, which stores K and V in two separate
@@ -272,13 +300,13 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         """
         backup = self._raiden_backup()
         if backup is not None:
-            self.device_module.synchronize()
+            self._synchronize_device()
             handle = backup.try_save(indices)
             if handle is not None:
                 return handle
         # Indices might be on host and need to be copied to device.
         indices = indices.to(device=self.kv_buffer[0].device, dtype=torch.long)
-        self.device_module.synchronize()
+        self._synchronize_device()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -290,10 +318,12 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
                     "cpu", non_blocking=True
                 )
                 kv_cache_cpu[-1].append(kv_cpu)
-        self.device_module.synchronize()
+        self._synchronize_device()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         """Copy the KV rows at ``indices`` from host to device.
 
         Inverse of `get_cpu_copy`. A raiden-staged payload DMAs straight
@@ -308,9 +338,9 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         )
 
         if isinstance(kv_cache_cpu, RaidenKVBackupHandle):
-            self.device_module.synchronize()
+            self._synchronize_device()
             self._raiden_backup().restore(kv_cache_cpu, indices)
-            self.device_module.synchronize()
+            self._synchronize_device()
             return
 
         indices = indices.to(device="cpu", dtype=torch.long)
@@ -333,7 +363,7 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         part_page_pos = part_pos[block_pos][~full_rows].to(device)
         part_offsets = offsets[~full_rows].to(device)
 
-        self.device_module.synchronize()
+        self._synchronize_device()
         for layer_id in range(self.layer_num):
             rows = torch.cat(kv_cache_cpu[layer_id], dim=0)
             assert rows.shape[0] == indices.numel()
@@ -350,7 +380,7 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
                     device, non_blocking=True
                 )
                 write_pages_torch(part_blocks, pages, dst)
-        self.device_module.synchronize()
+        self._synchronize_device()
 
     def filter_cpu_copy(self, kv_cache_cpu, row_mask: torch.Tensor):
         """Keep only the rows of a `get_cpu_copy` payload selected by ``row_mask``.
@@ -479,6 +509,10 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     between token indices and their page/lane coordinates.
     """
 
+    # raiden's page copy is layout-agnostic, and torch_tpu's host pool reads
+    # its page shape from get_fused_kv_buffer, so it mirrors this layout too.
+    kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
+
     def _head_dim_lanes(self) -> int:
         # Under TorchTPU, JAX is initialised CPU-only so Pallas can export
         # without a competing TPU client; `tpu_info_for_cpu_export` swaps in the
@@ -537,17 +571,17 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
             n_blocks * page_size, kv_heads_x2, hd_words * packing
         )
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         """Copy selected token lanes to the fused pool's host-row format."""
         backup = self._raiden_backup()
         if backup is not None:
-            self.device_module.synchronize()
+            self._synchronize_device()
             handle = backup.try_save(indices)
             if handle is not None:
                 return handle
 
         indices = indices.to(device="cpu", dtype=torch.long)
-        self.device_module.synchronize()
+        self._synchronize_device()
         if indices.numel() == 0:
             return [[] for _ in range(self.layer_num)]
 
@@ -573,13 +607,15 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
                 )
             pending_pages.append(layer_pages)
 
-        self.device_module.synchronize()
+        self._synchronize_device()
         return [
             [pages[block_pos, ..., offsets] for pages, block_pos, offsets in chunks]
             for chunks in pending_pages
         ]
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         """Restore host rows with page-bounded device writes."""
         from sglang.srt.hardware_backend.tpu.kv_page_write import write_pages_torch
         from sglang.srt.hardware_backend.tpu.raiden_kv_backup import (
@@ -587,9 +623,9 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
         )
 
         if isinstance(kv_cache_cpu, RaidenKVBackupHandle):
-            self.device_module.synchronize()
+            self._synchronize_device()
             self._raiden_backup().restore(kv_cache_cpu, indices)
-            self.device_module.synchronize()
+            self._synchronize_device()
             return
 
         indices = indices.to(device="cpu", dtype=torch.long)
@@ -611,7 +647,7 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
         part_page_pos = part_pos[block_pos][~full_rows].to(device)
         part_offsets = offsets[~full_rows].to(device)
 
-        self.device_module.synchronize()
+        self._synchronize_device()
         for layer_id in range(self.layer_num):
             rows = torch.cat(kv_cache_cpu[layer_id], dim=0)
             assert rows.shape[0] == indices.numel()
@@ -628,7 +664,7 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
                     device, non_blocking=True
                 )
                 write_pages_torch(part_blocks, pages, dst)
-        self.device_module.synchronize()
+        self._synchronize_device()
 
 
 class TpuFusedMLATokenToKVPool(MLATokenToKVPool):

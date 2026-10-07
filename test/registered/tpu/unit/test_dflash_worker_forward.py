@@ -16,6 +16,10 @@ import torch.nn as nn
 import sglang.srt.speculative.dflash_worker_v2 as dflash_worker_mod
 import sglang.srt.speculative.spec_utils as spec_utils
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
+from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dflash import (
+    DFlashSpecDecodeCompilePolicyMixin,
+    _DFlashVerifyPadding,
+)
 from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -32,6 +36,7 @@ from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+from sglang.srt.speculative.spec_info import SpecPaddingState
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
 from sglang.test.test_utils import CustomTestCase
 
@@ -62,8 +67,8 @@ class _ForceTpuContext:
         spec_utils._is_tpu = True
         spec_utils._use_torch_native = True
         self.par_override = get_parallel().override(
-            world_size=1,
-            world_rank=0,
+            launch_world_size=1,
+            launch_world_rank=0,
             tp_size=1,
             tp_rank=0,
             pp_size=1,
@@ -96,6 +101,27 @@ class _MockAttnBackend:
 
     def init_forward_metadata(self, forward_batch):
         pass
+
+
+class _MockCompilePolicy:
+    """Compile policy stub carrying the real deferred-unpadding hooks.
+
+    The mocked target forward never pads, so `padding_state` stays None and
+    `prepare_spec_verify` degrades to the logical path -- but binding the real
+    methods keeps this test honest if their contract changes.
+    """
+
+    should_defer_verify_output_unpadding = (
+        DFlashSpecDecodeCompilePolicyMixin.should_defer_verify_output_unpadding
+    )
+    prepare_spec_verify = DFlashSpecDecodeCompilePolicyMixin.prepare_spec_verify
+    finalize_dflash_verify = DFlashSpecDecodeCompilePolicyMixin.finalize_dflash_verify
+
+    def __init__(self, b_bucketer):
+        self.b_bucketer = b_bucketer
+
+    def finalize_forward_batch(self, outputs, forward_batch):
+        return outputs
 
 
 class _DFlashLayerAttn(nn.Module):
@@ -170,13 +196,21 @@ def _create_dflash_worker_for_tpu(
     worker.page_size = 16
     worker.device = dev
     worker.gpu_id = 0
-    worker.ps = SimpleNamespace(tp_rank=0, world_size=1)
     # world size 1: every sync is a pass-through.
     worker._tp_sync = SpecTpSync(SimpleNamespace(world_size=1, rank_in_group=0))
     # plain DFlash: no candidate selector.
     worker.selector = None
+    # No LiLiCorr reranker, and the draft does not own an attention group.
+    worker.lilicorr = None
+    worker._lilicorr_sampling_enabled = False
+    worker._lilicorr_anchor = None
+    worker._warned_lilicorr_eager = False
+    worker.draft_owns_attention = False
     worker._selector_sample = None
     worker._draft_probs_buf = None
+    # This fixture bypasses DFlashWorkerV2.__init__; mirror its DP-attention state.
+    worker._full_embed_gpu = None
+    worker.draft_tp_context = dflash_worker_mod.empty_context
     worker.nccl_port = 0
     worker._need_mamba_verify_commit = False
     worker._warned_sampling_fallback = False
@@ -185,6 +219,7 @@ def _create_dflash_worker_for_tpu(
     worker._mask_token_id = mask_token_id
     worker._mask_token_id_override = mask_token_id
     worker._noise_embed_scale = 1.0
+    worker._embed_module = None
 
     worker._block_pos_offsets = torch.arange(block_size, dtype=torch.int64, device=dev)
     worker._draft_block_ids_buf = None
@@ -270,6 +305,7 @@ def _create_dflash_worker_for_tpu(
             vocab_size=vocab_size,
             model_is_mrope=False,
             is_matryoshka=False,
+            requires_mm_token_modalities=False,
             hidden_size=hidden_size,
         ),
         prefill_attention_backend_str="torch_native",
@@ -278,8 +314,10 @@ def _create_dflash_worker_for_tpu(
         decode_cuda_graph_runner=None,
         ngram_embedding_manager=SimpleNamespace(enabled=False),
         server_args=SimpleNamespace(enable_lora=False),
-        ps=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
-        compile_policy=SimpleNamespace(
+        attn_dcp_size=1,
+        attn_dcp_rank=0,
+        tp_rank=0,
+        compile_policy=_MockCompilePolicy(
             b_bucketer=Bucketer(name="Bs", buckets=[1, 2, 4, 8, 16])
         ),
         device=dev,
@@ -341,10 +379,14 @@ def _create_dflash_worker_for_tpu(
         lora_manager=None,
         ngram_embedding_manager=SimpleNamespace(enabled=False),
         prefill_attention_backend_str="torch_native",
-        ps=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
+        attn_dcp_size=1,
+        attn_dcp_rank=0,
+        tp_rank=0,
+        tp_group=None,
         model=draft_model,
         model_config=SimpleNamespace(
             vocab_size=vocab_size,
+            requires_mm_token_modalities=False,
             hf_config=SimpleNamespace(
                 hidden_size=hidden_size,
                 num_attention_heads=num_attention_heads,
@@ -419,9 +461,12 @@ def _make_schedule_batch(
         extend_input_logprob_token_ids=None,
         orig_seq_lens=None,
         out_cache_loc_dsv4=None,
+        engram_history=None,
         mamba_track_indices=None,
         mamba_track_mask=None,
         mamba_track_seqlens=None,
+        mamba_track_seqlens_cpu=None,
+        mamba_prefill_track_mask_cpu=None,
         mamba_cow_src_indices=None,
         mamba_cow_dst_indices=None,
         mamba_clear_indices=None,
@@ -443,6 +488,7 @@ def _make_schedule_batch(
         can_run_dp_breakable_cuda_graph=False,
         can_run_decode_cuda_graph=False,
         can_run_dp_prefill_cuda_graph=False,
+        dp_prefill_cuda_graph_max_prefix_len=None,
         return_hidden_states_mode=CaptureHiddenMode.NULL,
         global_forward_mode=forward_mode,
         is_prefill_only=False,
@@ -454,6 +500,7 @@ def _make_schedule_batch(
         encoder_lens_cpu=None,
         global_num_tokens=None,
         global_num_tokens_for_logprob=None,
+        dp_spec_prefill_coordination_applied=False,
         dllm_config=None,
         model_config=SimpleNamespace(is_matryoshka=False, hidden_size=2880),
     )
@@ -735,6 +782,86 @@ class TestDFlashWorkerForwardTpu(CustomTestCase):
         self.assertIsInstance(idle_res.next_draft_input, DFlashDraftInputV2)
         self.assertEqual(idle_res.next_draft_input.bonus_tokens.numel(), 0)
         self.assertEqual(idle_res.next_draft_input.new_seq_lens.numel(), 0)
+
+
+class TestDFlashDeferredVerifyUnpadding(CustomTestCase):
+    """finalize_dflash_verify must unpad the deferred target outputs.
+
+    Deferring the verify unpadding leaves next_token_logits and hidden_states at
+    the padded row count. A later hidden.view(bs, block_size, -1) folds those
+    ghost rows into the feature dim instead of failing, so the draft projection
+    sees a feature width that is a multiple of the real one.
+    """
+
+    def test_logits_and_hidden_are_trimmed_to_logical_tokens(self):
+        block_size, logical_bs, physical_bs, features = 6, 2, 8, 16
+        logical_tokens = logical_bs * block_size
+        physical_tokens = physical_bs * block_size
+
+        batch = SimpleNamespace(
+            seq_lens=torch.arange(logical_bs, dtype=torch.int64),
+            sampling_info=None,
+        )
+        verify_input = SimpleNamespace(keep_outputs_padded=True)
+        padding = _DFlashVerifyPadding(
+            state=SpecPaddingState(
+                logical_batch_size=logical_bs,
+                physical_batch_size=physical_bs,
+                logical_num_tokens=logical_tokens,
+                physical_num_tokens=physical_tokens,
+            ),
+            batch=batch,
+            verify_input=verify_input,
+            seq_lens=batch.seq_lens,
+            temperatures=None,
+            top_ks=None,
+            top_ps=None,
+        )
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.zeros((physical_tokens, 32)),
+            hidden_states=torch.zeros((physical_tokens, features)),
+        )
+        results = (torch.zeros((physical_bs,), dtype=torch.int32),) * 5 + (None,)
+
+        trimmed = DFlashSpecDecodeCompilePolicyMixin.finalize_dflash_verify(
+            _MockCompilePolicy(b_bucketer=None), padding, results, logits_output
+        )
+
+        self.assertEqual(logits_output.next_token_logits.shape[0], logical_tokens)
+        self.assertEqual(logits_output.hidden_states.shape[0], logical_tokens)
+        # Feature dim must survive untouched: folding ghost rows into it is the
+        # exact failure this guards.
+        self.assertEqual(logits_output.hidden_states.shape[1], features)
+        for t in trimmed[:5]:
+            self.assertEqual(t.shape[0], logical_bs)
+        self.assertIsNone(trimmed[5])
+        self.assertFalse(verify_input.keep_outputs_padded)
+
+    def test_rows_matching_neither_shape_raise(self):
+        """Logits matching neither recorded shape must raise, not trim blindly.
+
+        Trimming against a stale padding record would hand accept a silently
+        wrong row count instead of failing.
+        """
+        block_size, logical_bs, physical_bs = 6, 2, 8
+        verify_input = SimpleNamespace(
+            keep_outputs_padded=True,
+            padding_state=SpecPaddingState(
+                logical_batch_size=logical_bs,
+                physical_batch_size=physical_bs,
+                logical_num_tokens=logical_bs * block_size,
+                physical_num_tokens=physical_bs * block_size,
+            ),
+        )
+        stale_logits = torch.zeros((physical_bs * block_size - 1, 32))
+
+        with self.assertRaises(ValueError):
+            DFlashSpecDecodeCompilePolicyMixin.prepare_spec_verify(
+                _MockCompilePolicy(b_bucketer=None),
+                SimpleNamespace(sampling_info=None),
+                verify_input,
+                stale_logits,
+            )
 
 
 if __name__ == "__main__":

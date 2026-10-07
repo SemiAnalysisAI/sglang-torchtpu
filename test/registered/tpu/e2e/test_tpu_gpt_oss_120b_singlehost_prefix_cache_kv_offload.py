@@ -18,7 +18,7 @@ import os
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
-from sglang.test.tpu.kv_offload_probe import kv_offload_runner
+from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
 
 # Bring-up plus the offload probe's ~26k tokens of filler prefill plus 200 GSM8K
 # examples. Above the 3600 the spec-decoding lane uses, by the probe's cost.
@@ -57,10 +57,10 @@ LAUNCH_ENV = {
     "PAGE_SIZE": str(PAGE_SIZE),
     "TPU_COMPILE_TOKENS": "512 2048 4096",
     "TPU_COMPILE_BS": "1 2 4 8 16 32 64",
-    # raiden requires the RPA v3 backend (the only TPU backend with the HiCache
-    # reload-commit hook) and the fused page-first layout, and server_args rejects any
-    # other combination. Both are already the recipe's default -- pinned here so a
-    # recipe change cannot silently take the offload path away from this gate.
+    # gpt-oss needs RPA v3 (attention sinks), and raiden needs the fused
+    # page-first layout; server_args rejects other offload combinations. Both
+    # are already the recipe's default -- pinned here so a recipe change cannot
+    # silently take the offload path away from this gate.
     "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
     "HICACHE_MEM_LAYOUT": "page_first_fused",
     # Prefix caching is the substrate HiCache is built on, and launch_server.sh
@@ -77,7 +77,7 @@ LAUNCH_ENV = {
     "ENABLE_CACHE_REPORT": "1",
     "ENABLE_PROFILER_ENDPOINT": "0",
     "EXTRA_ARGS": (
-        "--reasoning-parser gpt-oss " f"--served-model-name {SERVED_MODEL_NAME}"
+        f"--reasoning-parser gpt-oss --served-model-name {SERVED_MODEL_NAME}"
     ),
 }
 

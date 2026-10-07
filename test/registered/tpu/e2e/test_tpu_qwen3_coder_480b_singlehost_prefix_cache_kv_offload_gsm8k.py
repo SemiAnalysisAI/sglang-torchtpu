@@ -18,7 +18,7 @@ import os
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
-from sglang.test.tpu.kv_offload_probe import kv_offload_runner
+from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
 
 # Bring-up plus the offload probe's ~26k tokens of filler prefill plus 200 GSM8K
 # examples. Above the 3600 the spec-decoding lane uses, by the probe's cost.
@@ -70,9 +70,9 @@ LAUNCH_ENV = {
     "CHUNK": "512",
     "TPU_COMPILE_TOKENS": "512",
     "TPU_COMPILE_BS": "1 2 4 8",
-    # The recipe serves this model on pallas_tpu_rpa_batched, which raiden rejects:
-    # RPA v3 is the only TPU backend carrying the HiCache reload-commit hook and the
-    # fused KV pool. Overridden here, together with the layout it forces.
+    # The recipe serves this model on pallas_tpu_rpa_batched, which has not been
+    # validated with raiden KV offload; RPA v3 has. Overridden here, together with
+    # the layout offload requires.
     "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
     "HICACHE_MEM_LAYOUT": "page_first_fused",
     # Prefix caching is the substrate HiCache is built on, and launch_server.sh

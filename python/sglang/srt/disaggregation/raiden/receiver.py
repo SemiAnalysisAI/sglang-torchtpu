@@ -10,8 +10,9 @@ not instantiated on its own and deliberately defines no ``__init__``.
 
 from __future__ import annotations
 
+import secrets
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -63,7 +64,11 @@ class RaidenReceiverMixin:
         blocks = req.blocks
         endpoint = req.endpoint
         with self._state_lock:
-            if room in self._aborted:
+            if (
+                room in self._aborted
+                or room in self._decode.final_seen
+                or req_id in self._decode.announced_at
+            ):
                 return
             self._decode.announced_at[req_id] = self._monotonic()
             self._decode.remote_total[room] = total_pages
@@ -79,6 +84,10 @@ class RaidenReceiverMixin:
                     endpoint,
                 )
             )
+        # The listener handles control messages in order, so start_read must
+        # stay cheap.
+        if self._listener_start_read and self.chunked_transfer:
+            self._start_chunked_pull(room)
 
     def _on_blocks(self, msg: List[bytes]) -> None:
         req = Blocks.from_frames(msg)
@@ -91,7 +100,7 @@ class RaidenReceiverMixin:
 
         aux_index = None
         with self._state_lock:
-            if room in self._aborted:
+            if room in self._aborted or room in self._decode.final_seen:
                 return
             self._decode.remote_blocks[room] = remote_blocks
             self._decode.remote_endpoint[room] = endpoint
@@ -117,8 +126,7 @@ class RaidenReceiverMixin:
                 total = len(remote_blocks)
                 if self._decode.remote_total.get(room, total) != total:
                     logger.warning(
-                        "RaidenKVManager rank%d room %s announced %d pages but "
-                        "sent %d",
+                        "RaidenKVManager rank%d room %s announced %d pages but sent %d",
                         self.attn_tp_rank,
                         room,
                         self._decode.remote_total[room],
@@ -143,6 +151,8 @@ class RaidenReceiverMixin:
                         )
                     )
                 self._decode.final_seen.add(room)
+        if self._listener_start_read and self.chunked_transfer:
+            self._start_chunked_pull(room)
 
     # ----- decode side -------------------------------------------------------
 
@@ -154,6 +164,11 @@ class RaidenReceiverMixin:
         aux_index: Optional[int],
         bootstrap_infos: List[dict],
     ) -> None:
+        if self._pipeline is not None:
+            self._pipeline.register_decode(
+                room, local_blocks, local_swa_blocks, aux_index, bootstrap_infos
+            )
+            return
         if len(bootstrap_infos) != 1:
             # Asymmetric attention TP (decode attn TP < prefill attn TP): one
             # decode rank is fed by several prefill ranks, each pushing its
@@ -165,7 +180,7 @@ class RaidenReceiverMixin:
                     "Raiden asymmetric attention TP (got "
                     f"{len(bootstrap_infos)} prefill sources for one decode "
                     "rank) needs per-transfer host staging; do not set "
-                    "TPU_RAIDEN_DYNAMIC_HOST_STAGING=0."
+                    "SGLANG_RAIDEN_DYNAMIC_HOST_STAGING=0."
                 )
             if not local_blocks:
                 # Full prefix-cache hit: decode already holds every page,
@@ -284,10 +299,44 @@ class RaidenReceiverMixin:
             f"but a host staging slot holds {max_blocks}. Raise {override_env} "
             "if this request size is expected."
         )
-        self.record_failure(room, reason)
         with self._state_lock:
-            self._failed.add(str(room))
+            if room in self._decode.local_blocks:
+                self._fail_room_locked(room, reason)
         logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+
+    def _start_read_or_fail(
+        self,
+        *,
+        room: int,
+        engine: Any,
+        req_id: str,
+        uuid: int,
+        endpoint: str,
+        remote: List[int],
+        local: List[int],
+        unissued: Tuple[str, ...] = (),
+    ) -> bool:
+        """Issue one admitted read; if the engine raises, fail the room.
+
+        Runs inside the scheduler's poll, where an escaping exception would
+        take down every request on this decode worker, or on the listener
+        thread, where the admitted read would never settle. Raiden raises from
+        ``start_read`` only before it registers the read, so it will never
+        report ``req_id`` -- nor the reads in ``unissued``, which this failure
+        keeps from being issued. They are settled here so the admission is
+        released, and the room concludes once its other reads settle.
+        """
+        try:
+            engine.start_read(req_id, uuid, endpoint, remote, local)
+            return True
+        except Exception as e:
+            reason = f"Raiden receive failed: start_read {req_id} raised: {e}"
+            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+            with self._state_lock:
+                self._native_failed.update((req_id, *unissued))
+                self._fail_room_locked(room, reason)
+                self._release_pull_slots_locked()
+            return False
 
     def _announcement_expired_locked(self, room: int, req_id: str) -> bool:
         """Fails ``room`` when its read ``req_id`` waited for a staging slot
@@ -321,6 +370,8 @@ class RaidenReceiverMixin:
         Returns True once at least one read is in flight for the room. A False
         return is a retry: the caller polls again on the next scheduler pass.
         """
+        if self._pipeline is not None:
+            return self._pipeline.maybe_start_pull(room)
         if self.chunked_transfer:
             return self._start_chunked_pull(room)
         return self._start_whole_pull(room)
@@ -341,6 +392,9 @@ class RaidenReceiverMixin:
                 if not queue or room not in self._decode.local_blocks:
                     return started
                 if any(rid in self._pulling for rid in reads):
+                    return started
+                if room in self._aborted or self._is_failed_locked(room):
+                    # The room failed; its pages are no longer this read's.
                     return started
                 local = self._decode.local_blocks[room]
                 total = self._decode.remote_total.get(room, 0)
@@ -390,9 +444,6 @@ class RaidenReceiverMixin:
                     swa_cost = self._staging_cost(
                         swa_pages, self._swa_engine_max_blocks
                     )
-                if room in self._aborted:
-                    # The room failed; its pages are no longer this read's.
-                    return started
                 if self._announcement_expired_locked(room, req_id):
                     return started
                 if not self._pulling.admit(req_id, cost, swa_cost):
@@ -405,11 +456,28 @@ class RaidenReceiverMixin:
                 remote_slice = [blk for blk, _ in pairs]
                 local_slice = [loc for _, loc in pairs]
                 self._decode.chunk_reads.setdefault(room, []).append(req_id)
-            engine.start_read(req_id, uuid, endpoint, remote_slice, local_slice)
-            if closing:
-                self._swa_engine.start_read(
-                    self._swa_req_id(room), room, swa_endpoint, remote_swa, local_swa
-                )
+            swa_rid = self._swa_req_id(room) if closing else None
+            if not self._start_read_or_fail(
+                room=room,
+                engine=engine,
+                req_id=req_id,
+                uuid=uuid,
+                endpoint=endpoint,
+                remote=remote_slice,
+                local=local_slice,
+                unissued=(swa_rid,) if swa_rid is not None else (),
+            ):
+                return False
+            if swa_rid is not None and not self._start_read_or_fail(
+                room=room,
+                engine=self._swa_engine,
+                req_id=swa_rid,
+                uuid=room,
+                endpoint=swa_endpoint,
+                remote=remote_swa,
+                local=local_swa,
+            ):
+                return False
         self._reject_oversized_pull(room, *oversized)
         return False
 
@@ -500,11 +568,28 @@ class RaidenReceiverMixin:
             # Status moves with the admission, under the same lock an abort
             # takes: a Transferring write can never follow the abort's Failed.
             self.update_status(room, KVPoll.Transferring)
-        engine.start_read(str(room), room, endpoint, remote, local)
-        if self._swa_engine is not None:
-            self._swa_engine.start_read(
-                self._swa_req_id(room), room, swa_endpoint, remote_swa, local_swa
-            )
+        swa_rid = self._swa_req_id(room) if self._swa_engine is not None else None
+        if not self._start_read_or_fail(
+            room=room,
+            engine=engine,
+            req_id=str(room),
+            uuid=room,
+            endpoint=endpoint,
+            remote=remote,
+            local=local,
+            unissued=(swa_rid,) if swa_rid is not None else (),
+        ):
+            return False
+        if swa_rid is not None and not self._start_read_or_fail(
+            room=room,
+            engine=self._swa_engine,
+            req_id=swa_rid,
+            uuid=room,
+            endpoint=swa_endpoint,
+            remote=remote_swa,
+            local=local_swa,
+        ):
+            return False
         return True
 
     # ----- asymmetric-TP resharding (producer-push) -------------------------
@@ -579,7 +664,12 @@ class RaidenReceiverMixin:
         blocks = req.blocks
         src_rank = req.src_rank
         with self._state_lock:
-            if room not in self._decode.reshard_meta or room in self._aborted:
+            if (
+                room not in self._decode.reshard_meta
+                or room in self._aborted
+                or room in self._decode.final_seen
+                or room in self._decode.reshard_registered
+            ):
                 return
             per_source = self._decode.reshard_chunk_sources.setdefault(
                 room, {}
@@ -664,9 +754,9 @@ class RaidenReceiverMixin:
             (p_rank, sources_map[p_rank][1][lo:hi]) for p_rank in sorted(sources_map)
         ]
         dst = local_blocks[window.local_offset : window.local_offset + window.length]
-        with self._state_lock:
-            self._uuid_seq += 1
-            uuid = (self._uuid_seq << 20) | (self._local_rank & 0xFFFFF)
+        # Independent decoders share a prefill. Use positive IDs that
+        # fit the reshard RPC's signed int64 field.
+        uuid = secrets.randbelow((1 << 63) - 1) + 1
         req_id = f"{room}#{index}"
         req = build_receiver_request(
             pb2,
@@ -696,12 +786,17 @@ class RaidenReceiverMixin:
         ready = False
         aux_index = None
         with self._state_lock:
-            if room not in self._decode.reshard_meta or room in self._aborted:
+            if (
+                room not in self._decode.reshard_meta
+                or room in self._aborted
+                or room in self._decode.final_seen
+                or room in self._decode.reshard_registered
+            ):
                 return
             self._decode.reshard_sources[room][src_rank] = prefill_blocks
-            self._decode.reshard_swa_sources.setdefault(room, {})[
-                src_rank
-            ] = prefill_swa_blocks
+            self._decode.reshard_swa_sources.setdefault(room, {})[src_rank] = (
+                prefill_swa_blocks
+            )
             aux_index = self._decode.reshard_meta[room].get("aux_index")
             src_attn_tp = self._decode.reshard_meta[room]["src_attn_tp"]
             have = {nid % src_attn_tp for nid in self._decode.reshard_sources[room]}

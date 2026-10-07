@@ -1,13 +1,10 @@
-"""Experimental scaffold for the unwired native MXFP4 fused-MoE path.
+"""Manual check: packed MXFP4 fused MoE vs a BF16-dequantized reference.
 
-``process_mxfp4_moe_weights_native`` creates packed FP4 weights and block
-scales, but ``fused_moe_call`` does not yet expand the packed weights to their
-logical K dimension. This test therefore currently fails during GMM input
-validation before reaching its numerical comparison. Production uses BF16
-dequantization through ``prepare_tpu_mxfp4_moe_weights`` instead.
-
-Keep this test manual until the packed path is wired into the fused kernel.
-It requires torch_tpu and a TPU device.
+Uses GPT-OSS's interleaved, biased layout on the packed path, which production
+does not take (GPT-OSS stays on BF16 dequantization in
+``prepare_tpu_mxfp4_moe_weights``); the registered
+``test_fused_moe_situ_mxfp4`` covers the production packed path.
+Requires torch_tpu and a TPU device.
 """
 
 from __future__ import annotations
@@ -52,9 +49,9 @@ def _quantize_to_hf_mxfp4(
     * ``packed_blocks``: ``(*leading, num_blocks, 16)`` uint8 — 2 FP4 per byte
     * ``scales_e8m0``  : ``(*leading, num_blocks)``     uint8 — e8m0 (biased exp + 127)
     """
-    assert (
-        x_float.shape[-1] % block_size == 0
-    ), f"last axis {x_float.shape[-1]} not multiple of block_size {block_size}"
+    assert x_float.shape[-1] % block_size == 0, (
+        f"last axis {x_float.shape[-1]} not multiple of block_size {block_size}"
+    )
     *leading, K = x_float.shape
     num_blocks = K // block_size
 
@@ -101,13 +98,13 @@ def _dequant_hf_mxfp4(
     """
     *leading, K_packed = packed_blocks.shape
     num_blocks = scales_e8m0.shape[-1]
-    assert scales_e8m0.shape[:-1] == tuple(
-        leading
-    ), f"scale leading dims {scales_e8m0.shape[:-1]} != packed {tuple(leading)}"
+    assert scales_e8m0.shape[:-1] == tuple(leading), (
+        f"scale leading dims {scales_e8m0.shape[:-1]} != packed {tuple(leading)}"
+    )
     block_size = (K_packed * 2) // num_blocks  # = MXFP4_BLOCK_SIZE = 32
-    assert (
-        block_size == MXFP4_BLOCK_SIZE
-    ), f"derived block_size={block_size}, expected {MXFP4_BLOCK_SIZE}"
+    assert block_size == MXFP4_BLOCK_SIZE, (
+        f"derived block_size={block_size}, expected {MXFP4_BLOCK_SIZE}"
+    )
     block_bytes = block_size // 2  # = 16
 
     # Reshape to expose blocks: (*leading, num_blocks, block_bytes)
@@ -129,9 +126,7 @@ def _dequant_hf_mxfp4(
     # Apply e8m0 scale.
     scale_fp32 = torch.exp2(
         scales_e8m0.to(torch.int32).to(torch.float32) - 127.0
-    ).unsqueeze(
-        -1
-    )  # (..., num_blocks, 1)
+    ).unsqueeze(-1)  # (..., num_blocks, 1)
     dequant = signed_vals * scale_fp32  # (..., num_blocks, block_size) fp32
     return dequant.reshape(*leading, num_blocks * block_size).to(dtype)
 
@@ -335,7 +330,7 @@ class TestNativeMxfp4FusedMoE(unittest.TestCase):
 
         native_out = self._run_native(layer, hs, topk_ids, topk_w)
         ref_out = self._run_bf16_reference(layer, hs, topk_ids, topk_w)
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
 
         self.assertEqual(native_out.shape, ref_out.shape)
         self.assertTrue(torch.isfinite(native_out).all().item(), "native NaN/Inf")

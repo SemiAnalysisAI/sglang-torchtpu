@@ -30,7 +30,7 @@ class TestWorkerBootstrap(CustomTestCase):
 
         x = torch.ones((8, 128), device="tpu", dtype=torch.bfloat16)
         y = (x + x).sum()
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
         self.assertEqual(y.item(), 2 * 8 * 128)
 
         self.assertGreater(TpuPlatform.get_device_total_memory(), 0)
@@ -39,7 +39,7 @@ class TestWorkerBootstrap(CustomTestCase):
     def test_device_tensors_survive_a_pickle_round_trip(self):
         import pickle
 
-        from sglang.multimodal_gen.runtime.utils import distributed as dist_utils
+        from sglang.multimodal_gen.runtime.distributed import utils as dist_utils
 
         TpuPlatform.set_device(TpuPlatform.get_local_torch_device())
         contiguous = torch.arange(12, dtype=torch.float32, device="tpu") * 2.0
@@ -55,7 +55,7 @@ class TestWorkerBootstrap(CustomTestCase):
     def test_requires_grad_survives_the_round_trip(self):
         import pickle
 
-        from sglang.multimodal_gen.runtime.utils import distributed as dist_utils
+        from sglang.multimodal_gen.runtime.distributed import utils as dist_utils
 
         TpuPlatform.set_device(TpuPlatform.get_local_torch_device())
         for requires_grad in (False, True):

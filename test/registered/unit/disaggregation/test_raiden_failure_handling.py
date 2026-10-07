@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.raiden.conn import (
     RaidenKVManager,
@@ -25,6 +25,17 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 ROOM = 7
 OTHER_ROOM = 8
+
+
+def _polled(sent=(), received=(), failed=(), completed_ns=None):
+    """Fake poll_stats_with_details() result for the given req ids."""
+
+    def settled(ids):
+        return [SimpleNamespace(req_id=r, completed_ns=completed_ns) for r in ids]
+
+    return SimpleNamespace(
+        sent=settled(sent), received=settled(received), failed=settled(failed)
+    )
 
 
 def _abort_frame(room):
@@ -44,6 +55,7 @@ def _prefill_manager():
     mgr._status_lock = threading.Lock()
     mgr._announce_lock = threading.Lock()
     mgr._completed_send = set()
+    mgr._send_done_at = {}
     mgr._completed_recv = set()
     mgr._failed = set()
     mgr._native_failed = set()
@@ -56,8 +68,10 @@ def _prefill_manager():
     mgr._pulling_cleared = set()
     mgr._cleared_plans = {}
     mgr._stale_plans = []
+    mgr._engine_poll_failing_since = {}
     mgr.chunked_transfer = False
     mgr._send_reads = {}
+    mgr._superseded_sender_reads = set()
     mgr._timeout_s = 120.0
     mgr._reshard_pushes_pending = {}
     mgr._message_handlers = {
@@ -385,9 +399,13 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
             ),
             _failed=set(),
             _native_failed=set(),
+            _pipeline=None,
             sender_has_active_io=lambda room: False,
         )
         mgr._fail_room_locked = types.MethodType(RaidenKVManager._fail_room_locked, mgr)
+        mgr._decode_asked_locked = types.MethodType(
+            RaidenKVManager._decode_asked_locked, mgr
+        )
         mgr.fail_decode_silence = types.MethodType(
             RaidenKVManager.fail_decode_silence, mgr
         )
@@ -645,9 +663,12 @@ class TestGroupFailureDrainGate(unittest.TestCase):
             if reduce_count == 2:
                 tensor.fill_(int(KVPoll.Failed))
 
-        with patch("sglang.srt.disaggregation.utils.dist") as dist, patch(
-            "sglang.srt.disaggregation.utils._poll_with_failure_injection",
-            return_value=[int(KVPoll.Success)],
+        with (
+            patch("sglang.srt.disaggregation.utils.dist") as dist,
+            patch(
+                "sglang.srt.disaggregation.utils._poll_with_failure_injection",
+                return_value=[int(KVPoll.Success)],
+            ),
         ):
             dist.all_reduce = all_reduce
             polls = poll_and_all_reduce_attn_cp_tp_group([poller], cp_group, tp_group)
@@ -685,12 +706,16 @@ class TestGroupFailureDrainGate(unittest.TestCase):
             if reduce_count == 2:
                 tensor.fill_(int(KVPoll.Failed))
 
-        with patch("sglang.srt.disaggregation.utils.dist") as dist, patch(
-            "sglang.srt.disaggregation.utils._poll_with_failure_injection",
-            return_value=[int(KVPoll.Success)],
-        ), patch(
-            "sglang.srt.disaggregation.utils._apply_metadata_gate",
-            side_effect=lambda *args: events.append("metadata"),
+        with (
+            patch("sglang.srt.disaggregation.utils.dist") as dist,
+            patch(
+                "sglang.srt.disaggregation.utils._poll_with_failure_injection",
+                return_value=[int(KVPoll.Success)],
+            ),
+            patch(
+                "sglang.srt.disaggregation.utils._apply_metadata_gate",
+                side_effect=lambda *args: events.append("metadata"),
+            ),
         ):
             dist.all_reduce = all_reduce
             polls = poll_and_all_reduce(
@@ -875,6 +900,100 @@ class TestSenderLeaseSettlement(unittest.TestCase):
         self.assertNotIn(ROOM, mgr._send_reads)
 
 
+class TestPollStatsFailure(unittest.TestCase):
+    def test_raising_poll_is_retried_instead_of_killing_the_scheduler(self):
+        """A poll_stats raise must not escape the scheduler's poll; raiden
+        raises before taking any completion, so the next poll delivers it."""
+        mgr = _prefill_manager()
+        mgr._engine = Mock()
+        mgr.attn_tp_rank = 0
+        mgr._engine.poll_stats_with_details.side_effect = [
+            RuntimeError("injected complete_read"),
+            _polled([str(ROOM)], [], []),
+        ]
+        mgr._send_reads[ROOM] = {str(ROOM)}
+
+        mgr._drain_engine()
+        self.assertTrue(mgr.sender_has_active_io(ROOM))
+
+        mgr._drain_engine()
+        self.assertTrue(mgr.is_send_done(ROOM))
+        self.assertFalse(mgr.sender_has_active_io(ROOM))
+
+    def test_polls_failing_past_the_transfer_deadline_raise(self):
+        # No transfer can settle once polls fail for a whole deadline; a
+        # success in between starts the count over.
+        mgr = _prefill_manager()
+        mgr._engine = Mock()
+        mgr.attn_tp_rank = 0
+        broken = RuntimeError("injected complete_read")
+        mgr._engine.poll_stats_with_details.side_effect = [
+            broken,
+            _polled([], [], []),
+            broken,
+            broken,
+        ]
+        mgr._monotonic = Mock(side_effect=[0.0, 200.0, 321.0])
+
+        mgr._drain_engine()
+        mgr._drain_engine()
+        mgr._drain_engine()
+        with self.assertRaisesRegex(RuntimeError, "transfer deadline"):
+            mgr._drain_engine()
+
+
+class TestSendFinishTime(unittest.TestCase):
+    """A room's send finish time comes from raiden, not from the poll."""
+
+    def _manager(self, completed_ns):
+        mgr = _prefill_manager()
+        mgr._engine = Mock()
+        mgr.attn_tp_rank = 0
+        mgr.is_dummy_cp_rank = False
+        mgr.request_status[ROOM] = KVPoll.Transferring
+        mgr._send_reads[ROOM] = {str(ROOM)}
+        mgr._engine.poll_stats_with_details.return_value = _polled(
+            [str(ROOM)], completed_ns=completed_ns
+        )
+        return mgr
+
+    def _sender(self, mgr, started_at):
+        sender = RaidenKVSender.__new__(RaidenKVSender)
+        sender.kv_mgr = mgr
+        sender.bootstrap_room = ROOM
+        sender.conclude_state = None
+        sender.init_time = time.time()
+        sender._transfer_start_time = started_at
+        sender._transfer_metric = KVTransferMetric()
+        return sender
+
+    def test_sender_keeps_raidens_finish_time_past_clear(self):
+        mgr = self._manager(completed_ns=1_500_000_000)
+        sender = self._sender(mgr, started_at=1.0)
+
+        self.assertEqual(sender.poll(), KVPoll.Success)
+        self.assertAlmostEqual(sender._transfer_metric.transfer_latency_s, 0.5)
+
+        # clear() runs before the stage is stamped; the sender keeps the time.
+        sender.clear()
+        self.assertEqual(mgr._send_done_at, {})
+        self.assertEqual(sender.transfer_finish_time, 1.5)
+
+    def test_hybrid_room_finishes_with_its_later_engine(self):
+        mgr = self._manager(completed_ns=2_000_000_000)
+        mgr._swa_engine = Mock()
+        mgr._swa_engine.poll_stats_with_details.return_value = _polled()
+        mgr._drain_engine()
+        self.assertIsNone(mgr.send_done_time(ROOM))
+
+        mgr._engine.poll_stats_with_details.return_value = _polled()
+        mgr._swa_engine.poll_stats_with_details.return_value = _polled(
+            [f"swa:{ROOM}"], completed_ns=3_000_000_000
+        )
+        mgr._drain_engine()
+        self.assertEqual(mgr.send_done_time(ROOM), 3.0)
+
+
 class TestFailureWaitsForActiveIo(unittest.TestCase):
     def test_failed_room_is_not_concluded_while_its_read_is_in_flight(self):
         from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
@@ -884,6 +1003,7 @@ class TestFailureWaitsForActiveIo(unittest.TestCase):
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
+        mgr._pipeline = None
         mgr._pulling = StagingAdmission(4)
         mgr._pulling.admit(str(ROOM), 1)
         mgr._swa_req_id = lambda room: f"swa:{room}"
@@ -1158,8 +1278,8 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         class PausingStatus(dict):
             paused = False
 
-            def __getitem__(self, room):
-                value = super().__getitem__(room)
+            def get(self, room, default=None):
+                value = super().get(room, default)
                 if threading.current_thread().name == "waiting" and not self.paused:
                     self.paused = True
                     inspected_waiting.set()
@@ -1198,8 +1318,8 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         class PausingStatus(dict):
             paused = False
 
-            def __getitem__(self, room):
-                value = super().__getitem__(room)
+            def get(self, room, default=None):
+                value = super().get(room, default)
                 if threading.current_thread().name == "waiting" and not self.paused:
                     self.paused = True
                     inspected_waiting.set()

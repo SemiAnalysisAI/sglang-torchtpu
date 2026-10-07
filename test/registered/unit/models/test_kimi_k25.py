@@ -76,7 +76,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 class _MoonViT3dTower:
@@ -489,6 +489,7 @@ def test_kimi_k25_encoder_dp_selects_packed_moonvit_contract():
     model = KimiK25ForConditionalGeneration.__new__(KimiK25ForConditionalGeneration)
     nn.Module.__init__(model)
     model.use_data_parallel = True
+    model.replicate_vision_tower = False
     model.vision_tower = _MoonViT3dTower()
     model.mm_projector = _Projector()
     items = [_image_item(torch.randn(4, 2), [[1, 2, 2]])]
@@ -727,7 +728,7 @@ def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
     processor._tokenizer = _Tokenizer()
     embeddings = {Modality.IMAGE: torch.arange(20, dtype=torch.float32).reshape(5, 4)}
 
-    output = processor.get_mm_data(
+    output = processor.get_validated_mm_data(
         [1, 99, 2, 99, 3],
         embeddings,
         img_grid_thw=torch.tensor([[1, 2, 6], [1, 2, 4]]),

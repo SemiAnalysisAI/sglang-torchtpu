@@ -113,7 +113,8 @@ class _StubDraftModel(nn.Module):
     def __init__(self, rotary_emb: nn.Module) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
-            nn.Module() for _ in range(LAYERS)  # containers for self_attn
+            nn.Module()
+            for _ in range(LAYERS)  # containers for self_attn
         )
         for layer in self.layers:
             layer.self_attn = _StubAttention(rotary_emb)
@@ -287,7 +288,7 @@ class TestDflashDraftKvWrite(CustomTestCase):
             ctx_positions=positions,
             ctx_cache_loc=cache_loc,
         )
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
         to_cpu = lambda pool: [  # noqa: E731
             pool.get_fused_kv_buffer(i).to("cpu", torch.float32) for i in range(LAYERS)
         ]
@@ -421,11 +422,11 @@ class TestDflashDraftKvWrite(CustomTestCase):
             ):
                 for _ in range(4):  # compile the artifact, then warm it
                     run()
-                torch.tpu.synchronize()
+                torch.accelerator.synchronize()
                 start = time.perf_counter()
                 for _ in range(20):
                     run()
-                torch.tpu.synchronize()
+                torch.accelerator.synchronize()
                 timings[label] = (time.perf_counter() - start) / 20 * 1e3
             print(
                 f"{name:>14} {num_tokens:>7} {timings['fused']:>8.3f}m"

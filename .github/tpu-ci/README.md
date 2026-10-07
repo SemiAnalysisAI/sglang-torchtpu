@@ -85,15 +85,27 @@ own launch in a module-level `MULTIHOST_LAUNCH` dict:
 
 ```python
 MULTIHOST_LAUNCH = {"hosts": 2, "launch_script": "recipe/qwen3_30b_a3b_fp8_mh.sh",
-                    "weights_pvc": "model-weights-rox"}   # weights_pvc optional
+                    "weights_pvc": "model-weights"}   # weights_pvc optional
 ```
 
-`launch_script` is a recipe under `benchmark/tpu/recipe/` that sets `MODEL`/`EP_SIZE`/…
-and execs `launch_server.sh`. `discover_multihost.py` scans the files registered to a
-suite, **groups** those with an identical `(launch_script, weights_pvc, hosts)`, and
-emits one group per unique setup. Each group → **one** JobSet: launch the server once,
-rank 0 runs every file in the group against it. So files with the same setup **share a
-launched server** (no redundant bring-up); different setups get their own server.
+The shared PVC name is defined in `.github/tpu-ci/weights.yaml`:
+`model-weights` selects the shared model weights. Use this literal key in
+`register_tpu_ci(weights_pvc="model-weights")`, `MULTIHOST_LAUNCH`, standalone
+launcher defaults, and workflow inputs. CI discovery reads ordinary literals;
+the JobSet renderer resolves the key for both ordinary and P/D jobs.
+
+`render_jobset.py --weights-pvc` also accepts a literal PVC name for custom
+claims; an empty value mounts no weights. The container mount remains `/weights`
+(test-side lookup can be overridden with `SGLANG_TPU_WEIGHTS_ROOT`). Provisioning
+manifests must still name the actual cluster resources; changing `weights.yaml`
+selects a claim, it does not create one.
+
+`launch_script` is relative to `benchmark/tpu/`: a shell recipe, or a `.py`
+recipe config the JobSet hands to `benchmark/tpu/launch_server.py`, which
+resolves each host's rank from the JobSet topology. `discover_multihost.py`
+emits one JobSet per registered test file, even when several name the same
+recipe -- which is how the two Kimi MMMU-Pro shards get independent slices with
+identical serving settings.
 
 To add a **single-host** suite: `register_*_ci(..., suite="…")`, add it to `run_suite.py`,
 and call `_tpu-test` with that `suite`. To add a **multi-host** test: drop a file with a
@@ -116,16 +128,24 @@ single feature-validation leg) and an `update-dashboard` publish opt-in (see
 
 ```
 build (once)
-  ├─▶ [1] feature validation   feature-validation-tpu.yml
-  ├─▶ [2] accuracy             accuracy-test-tpu.yml
-  └─▶ [3] perf                 perf-test-tpu.yml
-      all three in parallel: slice contention is Kueue's job (the nightly
+  ├─▶ feature validation   feature-validation-tpu.yml
+  └─▶ perf                 perf-test-tpu.yml
+      both in parallel: slice contention is Kueue's job (the nightly
       lane's quota queues the jobs), and a red stage costs the others nothing
 ```
 
-Each stage is a reusable workflow the nightly calls with the shared image, and ALSO its
-own `workflow_dispatch` trigger (with its own build) for running one stage — or one
-test — without a full nightly. Inside stage [1]:
+The accuracy stage (`accuracy-test-tpu.yml`) runs on its own 10 AM / 5 PM PT schedule
+instead: with it the nightly needed about twice the slice time the 6 h runner cap allows.
+Each slot fills the lane its MMMU-Pro legs leave idle:
+
+| Slot | 1-host lane | 2-host lane |
+|---|---|---|
+| `day-10am` | single-host accuracy (gpt-oss, Gemma 4) | Kimi-K2.6 MMMU shards |
+| `day-5pm` | Gemma 4 / Qwen3.5 MMMU-Pro | DeepSeek R1 / V3.1 accuracy, kv-offload-resharding P/D gates |
+
+Each stage is a reusable workflow (the nightly calls feature validation and perf with the
+shared image), and ALSO its own `workflow_dispatch` trigger (with its own build) for running one stage — or one
+test — without a full nightly. Inside feature validation:
 
 ```
   ├─▶ single-host           (hosts=1)  one job per nightly-tpu-4-v7 test
@@ -248,10 +268,10 @@ _TODO._
 | `.github/workflows/_tpu-build.yml` | Reusable: build once → output digest |
 | `.github/workflows/_tpu-test.yml` | Reusable: render JobSet (suite or group) → wait for Kueue admission → stream logs → gate on JobSet condition |
 | `.github/workflows/pr-test-tpu.yml` | `on: pull_request` (path-or-`tpu`-label gated); decide → build → single-host test |
-| `.github/workflows/nightly-test-tpu.yml` | `on: schedule` + dispatch; build once → stages [1] feature validation, [2] accuracy, [3] perf in parallel |
-| `.github/workflows/feature-validation-tpu.yml` | Stage [1], also dispatchable alone: single-host matrix (one job per test) + static P/D gates + discover → multi-host matrix over groups |
-| `.github/workflows/accuracy-test-tpu.yml` | Stage [2], also dispatchable alone: one job per benchmark via run_suite (suites `nightly-tpu-accuracy-<model>-<benchmark>`); ondemand multihost accuracy models (dispatch-only) |
-| `.github/workflows/perf-test-tpu.yml` | Stage [3], also dispatchable alone: one job per model via run_suite |
+| `.github/workflows/nightly-test-tpu.yml` | `on: schedule` + dispatch; build once → feature validation and perf stages in parallel |
+| `.github/workflows/feature-validation-tpu.yml` | Feature-validation stage, also dispatchable alone: single-host matrix (one job per test) + static P/D gates + discover → multi-host matrix over groups |
+| `.github/workflows/accuracy-test-tpu.yml` | Accuracy stage, on its own 10 AM / 5 PM schedule and dispatchable alone: one job per benchmark via run_suite (suites `nightly-tpu-accuracy-<model>-<benchmark>`); ondemand multihost accuracy models (dispatch-only) |
+| `.github/workflows/perf-test-tpu.yml` | Perf stage, also dispatchable alone: one job per model via run_suite |
 | `.github/tpu-ci/dashboard_aliases.json` | Series-id rename registry: old-id → new-id, applied by keel at render time (pr-gate lint) |
 
 ## Cluster infra
@@ -445,13 +465,24 @@ Topology-Aware Scheduling instead.
 
 - **PR gate (single-host, run_suite)** — validated GREEN on the 2x2x1 slice.
 - **Multi-host (2x2x2, tp=16)** — validated GREEN: Qwen3-30B-A3B-FP8 MoE (EP=8) serving
-  from the **ReadOnlyMany** Hyperdisk (now the shared `model-weights-rox`; both hosts mount concurrently),
+  from the original **ReadOnlyMany** Hyperdisk (both hosts mount concurrently),
   rank-0 asserting on real inference.
-- **Hyperdisk ML weights** — `model-weights-rox` is a hydrated RWO disk (all models on one 5Ti disk) converted to
-  `READ_ONLY_MANY` (GKE ≥1.30.2 auto-converts on first ROX mount; cluster is 1.35.x).
-  Lifecycle (hydrate → convert → append-later) is documented in
-  `pvc-model-weights-rox.yaml.tmpl`; note ROX conversion is one-way, so adding a model
-  goes through a snapshot → new RWO disk → re-convert cycle.
+- **Filestore weights** — `model-weights-filestore` mounts the existing 10Ti
+  NFSv3 share `10.93.193.130:/weights` read-only at `/weights`.
+
+Apply the claim before running CI from this revision:
+
+```bash
+gcloud container clusters get-credentials tpu-cluster \
+  --project sglang-torchtpu --zone us-central1-c
+kubectl apply -f .github/tpu-ci/pvc-model-weights-filestore.yaml
+kubectl -n tpu-ci wait pvc/model-weights-filestore \
+  --for=jsonpath='{.status.phase}'=Bound --timeout=60s
+```
+
+Keep `model-weights-rox` until existing jobs finish and the new CI runs pass.
+Resize through Filestore, then update the PV capacity; this static NFS claim
+cannot resize the instance through PVC expansion.
 
 ### ⚠️ Model note: Qwen3-0.6B is single-host only
 

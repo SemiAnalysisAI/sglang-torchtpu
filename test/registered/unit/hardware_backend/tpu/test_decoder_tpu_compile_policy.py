@@ -29,6 +29,7 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     _materialize_out,
     _unpad_decoder_outputs,
 )
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dflash import (
     DFlashSpecDecoderTpuCompilePolicy,
     _kv_appender_specialization_key,
@@ -50,6 +51,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     LogitsOutputMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.srt.runtime_context import get_context, get_disagg, get_parallel, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -157,6 +160,8 @@ def _model_runner(device="cpu"):
         model_config=SimpleNamespace(model_is_mrope=False),
         is_draft_worker=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
+        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        prepare_dummy_forward_batch=lambda forward_batch: forward_batch,
     )
 
 
@@ -234,7 +239,14 @@ def _target_and_padding(policy):
 
 
 def _run_cases(policy, mode):
-    with get_parallel().override(tp_rank=1):
+    with get_parallel().override(
+        tp_size=2,
+        tp_rank=1,
+        attn_tp_size=2,
+        attn_tp_rank=1,
+        moe_tp_size=2,
+        moe_tp_rank=1,
+    ):
         if mode == ForwardMode.EXTEND:
             policy._precompile_extend()
         else:
@@ -242,6 +254,69 @@ def _run_cases(policy, mode):
 
 
 class TestDirectCompileExtraModelState(CustomTestCase):
+    def test_custom_policy_forwards_kv_pool_without_replacing_runner_pool(self):
+        compile_kv_pool = object()
+
+        class CustomPolicy(DecoderTpuCompilePolicy):
+            def get_direct_compile_kv_pool(self):
+                return compile_kv_pool
+
+        model_runner = _model_runner()
+        runner_kv_pool = model_runner.token_to_kv_pool
+        policy = CustomPolicy(model_runner=model_runner, owner=model_runner.model)
+        compile_module_name = (
+            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
+        )
+        compile_module = ModuleType(compile_module_name)
+        compile_module.direct_compile = MagicMock(return_value=MagicMock())
+
+        with patch.dict(sys.modules, {compile_module_name: compile_module}):
+            policy._direct_compile(model_runner.model.forward)
+
+        compile_module.direct_compile.assert_called_once()
+        self.assertIs(
+            compile_module.direct_compile.call_args.kwargs["kv_pool"], compile_kv_pool
+        )
+        self.assertIs(model_runner.token_to_kv_pool, runner_kv_pool)
+
+    def test_call_and_async_warmup_trace_with_the_same_rank_tensors(self):
+        """The async warmup traces the forward too, so it must pass the rank
+        tensors the call path passes; without them every precompile fails."""
+        model_runner = _model_runner()
+        policy = DecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model_runner.model
+        )
+        compiled = MagicMock()
+        compile_module_name = (
+            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
+        )
+        compile_module = ModuleType(compile_module_name)
+        compile_module.direct_compile = MagicMock(return_value=compiled)
+        rank_tensors = (torch.tensor(0), torch.tensor(1))
+        policy_module = (
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
+        )
+
+        with (
+            patch.dict(sys.modules, {compile_module_name: compile_module}),
+            patch(
+                f"{policy_module}.get_forward_context",
+                return_value=SimpleNamespace(
+                    attn_backend=SimpleNamespace(forward_metadata=None)
+                ),
+            ),
+            patch(
+                f"{policy_module}.get_attention_rank_tensors",
+                return_value=rank_tensors,
+            ),
+        ):
+            call, warmup_async = policy._direct_compile(model_runner.model.forward)
+            call("input_ids")
+            warmup_async("input_ids")
+
+        for recorded in (compiled.call_args, compiled.warmup_async.call_args):
+            self.assertIs(recorded.kwargs["attention_rank_tensors"], rank_tensors)
+
     def test_custom_annotated_policy_forwards_extra_tensor_attrs(self):
         class CustomPolicy(DecoderTpuCompilePolicy):
             model_extra_tensor_attrs = (
@@ -258,7 +333,9 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         model_runner = SimpleNamespace(
             model=model,
             token_to_kv_pool=kv_pool,
+            device="cpu",
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         )
         policy = policy_cls(
             model_runner=model_runner,
@@ -272,7 +349,19 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         compile_module.direct_compile = MagicMock(return_value=MagicMock())
 
         with patch.dict(sys.modules, {compile_module_name: compile_module}):
-            policy._direct_compile(model.forward)
+            call, warmup_async = policy._direct_compile(model.forward)
+
+        trace_forward = compile_module.direct_compile.call_args.args[0]
+        compiled = compile_module.direct_compile.return_value
+        compiled.side_effect = trace_forward
+        compiled.warmup_async.side_effect = trace_forward
+        backend = SimpleNamespace(forward_metadata=object())
+        inputs = (torch.ones(2), None, None)
+        with forward_context(ForwardContext(attn_backend=backend)):
+            for invoke in (call, warmup_async):
+                with self.subTest(invoke=invoke.__name__):
+                    self.assertIs(invoke(*inputs), model.forward.return_value)
+        self.assertEqual(model.forward.call_count, 2)
 
         compile_module.direct_compile.assert_called_once()
         kwargs = compile_module.direct_compile.call_args.kwargs
@@ -282,6 +371,9 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             CustomPolicy.model_extra_tensor_attrs,
         )
         self.assertIs(kwargs["kv_pool"], kv_pool)
+        self.assertEqual(
+            kwargs["specialization_key"], policy._direct_compile_specialization_key
+        )
         self.assertIn(
             "forward_batch.extend_input_logprob_token_ids_gpu",
             kwargs["ignored_argnames"],
@@ -364,6 +456,29 @@ class TestEagle3DirectCompile(_SpecPolicyTestCase):
 
 
 class TestLogitsOutputMode(_PolicyTestCase):
+    def test_compiled_logits_ignore_logical_mode_after_tpu_dp_padding(self):
+        policy = _make_distributed_top_k_policy()
+        forward_batch = policy._make_dummy_forward_batch(
+            num_tokens=64, bs=64, mode=ForwardMode.EXTEND
+        )
+
+        def consume_mode(value, batch):
+            metadata = LogitsMetadata.from_forward_batch(batch)
+            return value + int(metadata.forward_mode)
+
+        with patch("sglang.srt.layers.logits_processor._is_tpu", True):
+            torch._dynamo.reset()
+            self.addCleanup(torch._dynamo.reset)
+            compiled = torch.compile(consume_mode, backend="eager", fullgraph=True)
+            value = torch.zeros(1)
+            compiled(value, forward_batch)
+
+            forward_batch._original_forward_mode = ForwardMode.IDLE
+            with torch._dynamo.config.patch(error_on_recompile=True):
+                result = compiled(value, forward_batch)
+
+        self.assertEqual(result.item(), int(ForwardMode.EXTEND))
+
     def test_specialization_key_uses_selected_logits_mode(self):
         policy = _make_policy()
         forward_batch = SimpleNamespace(
@@ -519,16 +634,18 @@ class TestInstallExtendCap(_PolicyTestCase):
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
         )
-        # install() takes the compile grid from the bags; prefill_max_requests stays on the instance.
+        # install() reads the compile grid and prefill cap from the published config.
         self.publish_config(
             chunked_prefill_size=None,
             max_prefill_tokens=2048,
             torch_compile_max_bs=64,
+            prefill_max_requests=prefill_max_requests,
         )
         model_runner = SimpleNamespace(
             model=model,
             forward=MagicMock(),
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 prefill_max_requests=prefill_max_requests,
@@ -584,6 +701,7 @@ class TestInstallExtendCap(_PolicyTestCase):
             model=model,
             forward=MagicMock(),
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             # The context limit applies to each request, while the flattened
             # token dimension covers the aggregate prefill batch.
             model_config=SimpleNamespace(context_len=4096),
@@ -635,6 +753,7 @@ class TestInstallExtendCap(_PolicyTestCase):
             model=model,
             forward=MagicMock(),
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 prefill_max_requests=16,
@@ -695,6 +814,7 @@ class TestInstallExtendCap(_PolicyTestCase):
             model=model,
             forward=MagicMock(),
             is_draft_worker=True,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 prefill_max_requests=16,
@@ -752,6 +872,7 @@ class TestInstallExtendCap(_PolicyTestCase):
             model=model,
             forward=MagicMock(),
             is_draft_worker=True,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 prefill_max_requests=16,
@@ -866,7 +987,9 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
             model.get_image_feature = lambda *args, **kwargs: None
         return Qwen3VLDecoderTpuCompilePolicy(model_runner=SimpleNamespace(model=model))
 
-    def test_rejects_dp_attention_at_multimodal_install(self):
+    def test_rejects_dp_attention_for_a_wrapper_that_does_not_serve_it(self):
+        # A wrapper whose image steps or logits run eager collectives hangs
+        # under DP attention; fail at install as before.
         policy = self._policy_for(multimodal=True)
 
         with (
@@ -875,11 +998,34 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
                 "is_dp_attention_enabled",
                 return_value=True,
             ),
-            self.assertRaisesRegex(
-                NotImplementedError, "does not support DP attention"
-            ),
+            patch.object(
+                DecoderTpuCompilePolicy, "install", return_value=True
+            ) as base_install,
         ):
-            policy.install()
+            with self.assertRaises(NotImplementedError):
+                policy.install()
+
+        base_install.assert_not_called()
+
+    def test_allows_dp_attention_for_a_wrapper_that_serves_it(self):
+        # Kimi opts in: one input_embeds program per image step on every rank
+        # and a compiled logits processor.
+        policy = self._policy_for(multimodal=True)
+        policy.model_runner.model.serves_dp_attention = True
+
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "is_dp_attention_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                DecoderTpuCompilePolicy, "install", return_value=True
+            ) as base_install,
+        ):
+            self.assertTrue(policy.install())
+
+        base_install.assert_called_once()
 
     def test_allows_dp_attention_at_text_only_install(self):
         # This policy is also attached to the text-only backbone, where none of
@@ -1105,6 +1251,40 @@ class TestMakeDummyForwardBatch(_PolicyTestCase):
         self.assertIsNone(fb.extend_num_tokens)
         self.assertIsNone(fb.extend_logprob_start_lens_cpu)
 
+    def test_warmup_carries_num_token_non_padded_when_serving_does(self):
+        """Real EP batches carry ``num_token_non_padded`` (init_new plus
+        ModelRunner.forward) and the compiled MoE path guards on its presence,
+        so a warmup batch without it recompiles on the first real decode and
+        dies under fail_on_recompile (two-host tp16/ep16 R1-0528 and V3.1).
+        """
+        policy = _make_policy()
+        policy_module = (
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
+        )
+
+        with (
+            patch(f"{policy_module}.enable_num_token_non_padded", return_value=True),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.is_dsa_enable_prefill_cp",
+                return_value=False,
+            ),
+            patch("sglang.srt.layers.cp.utils.is_mla_cp_enabled", return_value=False),
+        ):
+            fb = policy._make_dummy_forward_batch(
+                num_tokens=8, bs=8, mode=ForwardMode.DECODE
+            )
+        self.assertEqual(fb.global_num_token_non_padded_cpu, 8)
+        self.assertEqual(fb.global_num_token_non_padded.item(), 8)
+        # Replicated (not attn-TP sharded) warmup keeps the full count.
+        self.assertEqual(fb.num_token_non_padded.item(), 8)
+
+        with patch(f"{policy_module}.enable_num_token_non_padded", return_value=False):
+            fb = policy._make_dummy_forward_batch(
+                num_tokens=8, bs=8, mode=ForwardMode.DECODE
+            )
+        self.assertIsNone(fb.global_num_token_non_padded)
+        self.assertIsNone(fb.num_token_non_padded)
+
     def test_plain_warmup_uses_serving_sampling_info(self):
         policy = _make_policy()
 
@@ -1121,6 +1301,37 @@ class TestMakeDummyForwardBatch(_PolicyTestCase):
 
 
 class TestDpIdleDecodeMaterializationScope(_SpecPolicyTestCase):
+    def test_plain_idle_decode_matches_warmup_cache_location_dtype(self):
+        for dtype in (torch.int32, torch.int64):
+            with self.subTest(allocator_dtype=dtype):
+                policy = _make_policy()
+                policy.model_runner.token_to_kv_pool_allocator.free_pages = (
+                    torch.arange(4, dtype=dtype)
+                )
+                seen = []
+                policy.model_runner.forward = lambda batch: seen.append(
+                    (batch.forward_mode, batch.out_cache_loc.dtype)
+                )
+                policy._install_dp_idle_as_decode()
+                warmup = policy._make_dummy_forward_batch(
+                    num_tokens=4, bs=4, mode=ForwardMode.DECODE
+                )
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.IDLE,
+                    global_num_tokens_cpu=[0, 1],
+                    # ScheduleBatch.prepare_for_idle uses int64 regardless of
+                    # the allocator dtype used by active peers and warmup.
+                    out_cache_loc=torch.empty(0, dtype=torch.int64),
+                )
+
+                with _dp_attention(True):
+                    policy.model_runner.forward(batch)
+
+                self.assertEqual(
+                    seen, [(ForwardMode.DECODE, warmup.out_cache_loc.dtype)]
+                )
+                self.assertEqual(batch.out_cache_loc.shape, (0,))
+
     def test_prepare_materializes_zero_row_spec_batch(self):
         policy = _make_spec_policy()
         spec_info = EagleDraftInput(
@@ -1155,6 +1366,55 @@ class TestPrecompileLoops(_PolicyTestCase):
     EXTEND covers token buckets at the fixed batch cap, and DECODE varies bs
     (tokens == bs)."""
 
+    def test_compile_timings_include_waits_without_counting_other_queued_work(self):
+        for async_warmup in (False, True):
+            with self.subTest(async_warmup=async_warmup):
+                policy = _make_policy()
+                policy.model_runner.draft_model_idx = None
+                policy.compile_timing_recorder = CompileTimingRecorder()
+                clock = [100.0]
+
+                def run_one(**kwargs):
+                    clock[0] += 2.0
+
+                    def execute():
+                        clock[0] += 3.0
+
+                    if async_warmup:
+                        return PendingCall(execute)
+                    execute()
+                    return None
+
+                with (
+                    patch.object(policy, "_run_one", side_effect=run_one),
+                    patch(
+                        "sglang.srt.hardware_backend.tpu.compilation."
+                        "decoder_compile_policy.time.perf_counter",
+                        side_effect=lambda: clock[0],
+                    ),
+                    get_parallel().override(
+                        tp_size=2,
+                        tp_rank=1,
+                        attn_tp_size=2,
+                        attn_tp_rank=1,
+                        moe_tp_size=2,
+                        moe_tp_rank=1,
+                    ),
+                ):
+                    pending = policy._precompile_decode()
+                    if async_warmup:
+                        self.assertEqual(policy.compile_timing_recorder.snapshot(), [])
+                        self.assertEqual(len(pending), 2)
+                    clock[0] += 1000.0
+                    for call in pending:
+                        call.wait()
+
+                steps = policy.compile_timing_recorder.snapshot()
+                self.assertEqual([step["batch_size"] for step in steps], [1, 4])
+                self.assertEqual(
+                    [step["duration_seconds"] for step in steps], [5.0, 5.0]
+                )
+
     def test_extend_iterates_token_buckets_at_fixed_batch_cap(self):
         mr = _model_runner()
         policy = _make_policy(mr, token_buckets=(8, 64, 256), bs_buckets=(1, 4))
@@ -1174,7 +1434,14 @@ class TestPrecompileLoops(_PolicyTestCase):
         policy = _make_policy(_model_runner(), token_buckets=(8,), bs_buckets=(1, 4))
         policy._run_one = MagicMock()
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy._precompile_extend()
 
         modes = {
@@ -1188,7 +1455,14 @@ class TestPrecompileLoops(_PolicyTestCase):
         policy._run_one = MagicMock()
 
         with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True):
-            with get_parallel().override(tp_rank=1):
+            with get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ):
                 policy._precompile_extend()
 
         modes = {
@@ -1259,7 +1533,14 @@ class TestPrecompileLoops(_PolicyTestCase):
         policy.extend_bs = 16
         policy._run_one = MagicMock()
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy._precompile_extend()
 
         # 2 token buckets x 2 conventions: the input_embeds one a VL request
@@ -1280,23 +1561,7 @@ class TestPrecompileLoops(_PolicyTestCase):
         one left them to compile lazily at serving time, where the first
         unseen batch width tripped fail_on_recompile and killed the server."""
 
-        mr = _model_runner()
-        mr.model.get_image_feature = MagicMock()
-        mr.model.get_input_embeddings = MagicMock()
-        policy = Qwen3VLDecoderTpuCompilePolicy(
-            model_runner=mr,
-            b_bucketer=Bucketer(name="Bs", buckets=[64, 128]),
-            owner=mr.model,
-        )
-        policy._run_one = MagicMock()
-
-        with get_parallel().override(tp_rank=1):
-            policy._precompile_decode()
-
-        warmed = {
-            (call.kwargs["bs"], call.kwargs["variant"])
-            for call in policy._run_one.call_args_list
-        }
+        warmed = self._warmed_decode_variants(decode_embeds_in_language_model=False)
         self.assertEqual(
             warmed,
             {
@@ -1307,10 +1572,45 @@ class TestPrecompileLoops(_PolicyTestCase):
             },
         )
 
+    def test_qwen3_vl_decode_embedding_in_graph_warms_one_convention(self):
+        """With the embedding in the language model, "text_only" already is the
+        serving call (input_ids + mrope positions). "text_ids" would warm 1-D
+        positions an mrope decode never passes: one unused graph per bucket."""
+        warmed = self._warmed_decode_variants(decode_embeds_in_language_model=True)
+        self.assertEqual(warmed, {(64, "text_only"), (128, "text_only")})
+
+    def _warmed_decode_variants(self, *, decode_embeds_in_language_model):
+        mr = _model_runner()
+        mr.model.get_image_feature = MagicMock()
+        mr.model.get_input_embeddings = MagicMock()
+        mr.model.decode_embeds_in_language_model = decode_embeds_in_language_model
+        policy = Qwen3VLDecoderTpuCompilePolicy(
+            model_runner=mr,
+            b_bucketer=Bucketer(name="Bs", buckets=[64, 128]),
+            owner=mr.model,
+        )
+        policy._run_one = MagicMock()
+
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
+            policy._precompile_decode()
+
+        return {
+            (call.kwargs["bs"], call.kwargs["variant"])
+            for call in policy._run_one.call_args_list
+        }
+
     def test_qwen3_vl_warmup_crosses_logits_modes(self):
         mr = _model_runner()
         mr.model.get_image_feature = MagicMock()
         mr.model.get_input_embeddings = MagicMock(return_value=torch.nn.Embedding(2, 4))
+        mr.model.decode_embeds_in_language_model = False
         _enable_distributed_top_k(mr)
         policy = Qwen3VLDecoderTpuCompilePolicy(
             model_runner=mr,
@@ -1320,7 +1620,14 @@ class TestPrecompileLoops(_PolicyTestCase):
         )
         policy._run_one = MagicMock()
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy._precompile_extend()
             policy._precompile_decode()
 
@@ -1362,7 +1669,14 @@ class TestPrecompileLoops(_PolicyTestCase):
             patch(
                 "sglang.srt.hardware_backend.tpu.mm_embed_tpu.apply_host_mm_embeds"
             ) as warmed,
-            get_parallel().override(tp_rank=1),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
         ):
             policy._precompile_extend()
 
@@ -1400,7 +1714,14 @@ class TestPrecompileLoops(_PolicyTestCase):
     def test_precompile_combines_extend_and_decode(self):
         mr = _model_runner()
         policy = _make_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy.precompile()
         # EXTEND: (8,4), (64,4) = 2. DECODE: (1,1), (4,4) = 2.
         self.assertEqual(mr.model.forward.call_count, 4)
@@ -1411,8 +1732,43 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
     serving uses: ``prepare_forward_batch`` → ``init_forward_metadata``
     → compiled ``forward``."""
 
+    def test_pipeline_profile_executes_outer_model_synchronously(self):
+        mr = _model_runner()
+        policy = _make_policy(mr)
+        policy.tracer = "direct"
+        policy.owner = SimpleNamespace(forward=MagicMock())
+        with (
+            patch.object(envs.SGLANG_DIRECT_COMPILE_ASYNC, "get", return_value=True),
+            patch.object(policy, "_supports_async_warmup", return_value=True),
+            patch(
+                "sglang.srt.hardware_backend.tpu.pp_profile.set_profile_inputs",
+                side_effect=lambda policy, batch, args, kwargs, tokens, prefix: (
+                    args,
+                    kwargs,
+                ),
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "decoder_compile_policy.time.perf_counter",
+                side_effect=[10.0, 10.25],
+            ),
+        ):
+            elapsed_ms = policy._run_one(
+                num_tokens=64, bs=4, mode=ForwardMode.EXTEND, profile_prefix=0
+            )
+        self.assertEqual(elapsed_ms, 250.0)
+        mr.model.forward.assert_called_once()
+        policy.owner.forward.assert_not_called()
+        policy.owner.forward.warmup_async.assert_not_called()
+
     def test_run_one_calls_prepare_then_metadata_then_forward(self):
         mr = _model_runner()
+
+        def mark_sequence_sharded(forward_batch):
+            forward_batch.attn_tp_sequence_sharded = True
+            return forward_batch
+
+        mr.prepare_dummy_forward_batch = MagicMock(side_effect=mark_sequence_sharded)
         policy = _make_policy(mr)
         policy._run_one(num_tokens=64, bs=4, mode=ForwardMode.EXTEND)
         # prepare_forward_batch runs first so model-specific prep hooks
@@ -1425,6 +1781,8 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
         self.assertEqual(args[0].shape, (64,))
         self.assertEqual(args[1].shape, (64,))
         self.assertEqual(args[2].batch_size, 4)
+        self.assertTrue(args[2].attn_tp_sequence_sharded)
+        mr.prepare_dummy_forward_batch.assert_called_once_with(args[2])
 
     def test_run_one_uses_no_grad_not_inference_mode(self):
         mr = _model_runner()
@@ -1496,6 +1854,16 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
         self.assertEqual(pool.get_fused_kv_buffer.call_args_list[0].args, (2,))
         self.assertEqual(pool.get_fused_kv_buffer.call_args_list[1].args, (3,))
 
+        for result in (kv0, (kv0, {"aux": kv1})):
+            with self.subTest(result_type=type(result).__name__):
+                with (
+                    patch.dict(sys.modules, stubs),
+                    patch("torch_tpu._internal.sync.sync.synchronize") as sync,
+                ):
+                    _materialize_out(result, SimpleNamespace(), None)
+                expected = [kv0] if isinstance(result, torch.Tensor) else [kv0, kv1]
+                sync.assert_called_once_with(expected, wait=True)
+
 
 def _spec_model_runner(device="cpu", is_draft_worker=False):
     """ModelRunner stand-in; the spec config comes from get_spec(), not from here.
@@ -1529,7 +1897,9 @@ def _spec_model_runner(device="cpu", is_draft_worker=False):
         ),
         dtype=torch.bfloat16,
         is_draft_worker=is_draft_worker,
+        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+        prepare_dummy_forward_batch=lambda forward_batch: forward_batch,
     )
 
 
@@ -1628,7 +1998,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         )
         policy.extend_bs = 16
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy._precompile_draft_prefill_extend()
 
         self.assertEqual(mr.attn_backend.calls, [(1024, 16), (4096, 16)])
@@ -1648,7 +2025,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
                 target_is_multimodal=target_is_multimodal,
             )
             policy.extend_bs = 16
-            with get_parallel().override(tp_rank=1):
+            with get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ):
                 policy._precompile_draft_prefill_extend()
             seen.append(len(mr.attn_backend.calls))
 
@@ -1680,7 +2064,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         )
         policy.extend_bs = 16
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy._precompile_extend_full()
 
         self.assertEqual(
@@ -1692,7 +2083,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         mr = _spec_model_runner()
         policy = _make_spec_policy(mr, token_buckets=(8,), bs_buckets=(4,))
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy._precompile_extend_full()
 
         batches = [call.args[2] for call in mr.model.forward.call_args_list]
@@ -1714,7 +2112,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         # precompile() spans two modules: the base EXTEND/DECODE warmup lives in
         # decoder_compile_policy (via super()), the spec TARGET_VERIFY/EXTEND(FULL)
         # in spec_decode_compile_policy. One topology override serves both.
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy.precompile()
         # EXTEND (8,4),(64,4)=2  DECODE (1,1),(4,4)=2
         # TARGET_VERIFY buckets bs: (4,1),(16,4)=2. EXTEND(FULL) covers two
@@ -1726,7 +2131,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
     def test_draft_worker_skips_precompile(self):
         mr = _spec_model_runner(is_draft_worker=True)
         policy = _make_spec_policy(mr)
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy.precompile()
         self.assertEqual(mr.model.forward.call_count, 0)
         self.assertEqual(mr.attn_backend.calls, [])
@@ -1740,7 +2152,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         draft_backend = SimpleNamespace(attn_backends=decode_backends)
         draft_extend_backend = _FakeAttnBackend()
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy.precompile_draft(draft_backend, draft_extend_backend)
 
         self.assertEqual(mr.attn_backend.calls, [(8, 4), (64, 4)])
@@ -1762,6 +2181,39 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
             [CaptureHiddenMode.LAST] * 6 + [CaptureHiddenMode.FULL] * 2,
         )
 
+    def test_draft_precompile_installs_the_checker_after_its_last_forward(self):
+        """Draft warmup finishes before installing and baselining its checker."""
+        mr = _spec_model_runner(is_draft_worker=True)
+        self.publish_config(page_size=8)
+        policy = _make_spec_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
+        draft_backend = SimpleNamespace(attn_backends=[_FakeAttnBackend()] * 2)
+        forwards_at_install = []
+
+        def install(**kwargs):
+            forwards_at_install.append(mr.model.forward.call_count)
+            self.assertEqual(kwargs["policies"], (policy,))
+            self.assertTrue(kwargs["model_label"].startswith("draft "))
+
+        with (
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "spec_decode_compile_policy_eagle3.install_recompilation_checker",
+                side_effect=install,
+            ),
+        ):
+            policy.precompile_draft(draft_backend, _FakeAttnBackend())
+
+        self.assertEqual(forwards_at_install, [mr.model.forward.call_count])
+        self.assertGreater(mr.model.forward.call_count, 0)
+
     def test_draft_precompile_skips_shapes_larger_than_local_request_pool(self):
         mr = _spec_model_runner(is_draft_worker=True)
         mr.req_to_token_pool.size = 4
@@ -1770,7 +2222,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         policy._precompile_draft_decode = MagicMock()
         draft_extend_backend = _FakeAttnBackend()
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy.precompile_draft(SimpleNamespace(), draft_extend_backend)
 
         self.assertEqual(draft_extend_backend.calls, [(4, 1), (16, 4)])
@@ -1909,6 +2368,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         target_hidden_size=32,
         draft_token_num=4,
         is_draft_worker=True,
+        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         tracer="dynamo",
     ):
         model = SimpleNamespace(
@@ -1931,7 +2391,9 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             ),
             model_config=SimpleNamespace(hidden_size=hidden_size, model_is_mrope=False),
             is_draft_worker=is_draft_worker,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            prepare_dummy_forward_batch=lambda forward_batch: forward_batch,
         )
         # _infer_dflash_block_size reads get_spec() at construction; publish the block size.
         self.publish_config(speculative_num_draft_tokens=draft_token_num)
@@ -2166,22 +2628,33 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         )
         mock_append_kernel = MagicMock()
         policy._compiled_kv_appender = mock_append_kernel
+        mock_block_embedder = MagicMock()
+        policy._compiled_block_embedder = mock_block_embedder
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
+            embed_draft_block_ids=MagicMock(),
         )
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy.precompile_draft(
                 draft_attn_backend=_FakeAttnBackend(), dflash_worker=worker
             )
 
-        # Worker method was replaced with compiled policy method.
+        # Worker methods were replaced with the compiled seams.
         self.assertEqual(
             worker.append_target_hidden_to_draft_kv_by_loc_tpu,
             policy.append_target_hidden_to_draft_kv_by_loc_tpu,
         )
+        self.assertEqual(worker.embed_draft_block_ids, mock_block_embedder)
 
         # Extend call with 10 tokens pads to token bucket 16.
         target_hidden = torch.ones(10, 32)
@@ -2205,7 +2678,14 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         policy, _ = self._make_dflash_policy()
         with (
             self.assertRaisesRegex(ValueError, "cannot be None"),
-            get_parallel().override(tp_rank=1),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
         ):
             policy.precompile_draft(dflash_worker=None)
 
@@ -2295,21 +2775,99 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         self.assertEqual(fb.extend_prefix_lens.tolist(), [0] * 4)
         self.assertEqual(fb.extend_num_tokens, 16)
 
+    def test_draft_warmup_leaves_global_num_token_non_padded_unset(self):
+        """The live DFlash draft batch sets the local ``num_token_non_padded``
+        and never the global tensor. direct_compile pins each input's type at
+        trace time, so a warmup batch carrying the global tensor makes the
+        first live draft forward fail with a type change (gpt-oss-120b DFlash
+        e2e).
+        """
+        policy, _ = self._make_dflash_policy(
+            hidden_size=32, draft_token_num=4, is_draft_worker=True
+        )
+        policy_module = (
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
+        )
+        with (
+            patch(f"{policy_module}.enable_num_token_non_padded", return_value=True),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.is_dsa_enable_prefill_cp",
+                return_value=False,
+            ),
+            patch("sglang.srt.layers.cp.utils.is_mla_cp_enabled", return_value=False),
+        ):
+            fb = policy._make_dummy_forward_batch(
+                num_tokens=16,
+                bs=4,
+                mode=ForwardMode.TARGET_VERIFY,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                spec_info=policy.make_null_spec_info(),
+            )
+        self.assertIsNone(fb.global_num_token_non_padded)
+        self.assertIsNotNone(fb.num_token_non_padded)
+
+    def test_block_embed_warmup_reused_under_serving_grad_mode(self):
+        torch._dynamo.reset()
+        self.addCleanup(torch._dynamo.reset)
+        policy, _ = self._make_dflash_policy(bs_buckets=(1, 4, 64), draft_token_num=6)
+        policy.backend = "eager"
+        policy.dynamic = False
+        embedding = torch.nn.Embedding(16, 8)
+
+        def embed_draft_block_ids(*, block_ids):
+            return embedding(block_ids).flatten(0, 1)
+
+        worker = SimpleNamespace(
+            embed_draft_block_ids=embed_draft_block_ids,
+            ensure_embed_module=lambda: embedding,
+        )
+        with (
+            torch.enable_grad(),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
+        ):
+            policy._precompile_embed_draft_block_ids(worker)
+            self.assertTrue(torch.is_grad_enabled())
+
+        # Startup runs with gradients enabled; the scheduler disables them.
+        # Every warmed bucket must remain usable once recompiles are forbidden.
+        with torch.no_grad(), torch.compiler.set_stance("fail_on_recompile"):
+            for bs in (1, 4, 64):
+                block_ids = torch.arange(bs * 6).reshape(bs, 6) % 16
+                actual = worker.embed_draft_block_ids(block_ids=block_ids)
+                torch.testing.assert_close(actual, embedding(block_ids).flatten(0, 1))
+
     def test_precompile_draft_pd_prefill_mode_skips_verify(self):
         policy, mr = self._make_dflash_policy(
             token_buckets=(16, 64), bs_buckets=(1, 4), draft_token_num=4
         )
         mock_append_kernel = MagicMock()
         policy._compiled_kv_appender = mock_append_kernel
+        mock_block_embedder = MagicMock()
+        policy._compiled_block_embedder = mock_block_embedder
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
+            embed_draft_block_ids=MagicMock(),
         )
 
         # precompile_draft branches on get_disagg().disaggregation_mode.
         with (
-            get_parallel().override(tp_rank=1),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
             get_disagg().override(disaggregation_mode="prefill"),
         ):
             policy.precompile_draft(
@@ -2319,6 +2877,8 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         # In prefill mode: draft model forward is skipped (0 calls), only extend KV append runs (2 token buckets).
         self.assertEqual(mr.model.forward.call_count, 0)
         self.assertEqual(mock_append_kernel.call_count, 2)
+        # Block embed warmup is not mode-gated: one call per bs bucket.
+        self.assertEqual(mock_block_embedder.call_count, 2)
 
     def test_precompile_draft_pd_decode_mode_skips_extend(self):
         policy, mr = self._make_dflash_policy(
@@ -2326,14 +2886,24 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         )
         mock_append_kernel = MagicMock()
         policy._compiled_kv_appender = mock_append_kernel
+        mock_block_embedder = MagicMock()
+        policy._compiled_block_embedder = mock_block_embedder
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
+            embed_draft_block_ids=MagicMock(),
         )
 
         with (
-            get_parallel().override(tp_rank=1),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
             get_disagg().override(disaggregation_mode="decode"),
         ):
             policy.precompile_draft(
@@ -2343,6 +2913,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         # In decode mode: draft model forward runs (2 bs buckets), only verify KV append runs (2 bs buckets).
         self.assertEqual(mr.model.forward.call_count, 2)
         self.assertEqual(mock_append_kernel.call_count, 2)
+        self.assertEqual(mock_block_embedder.call_count, 2)
 
     def test_dflash_build_disagg_draft_input(self):
         from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -2368,11 +2939,19 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             bs_buckets=(1, 4),
             draft_token_num=4,
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         )
 
         # precompile() reads get_disagg().disaggregation_mode per call; scope each half.
         with (
-            get_parallel().override(tp_rank=1),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
             get_disagg().override(disaggregation_mode="prefill"),
         ):
             policy.precompile()
@@ -2384,10 +2963,18 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             bs_buckets=(1, 4),
             draft_token_num=4,
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         )
 
         with (
-            get_parallel().override(tp_rank=1),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
             get_disagg().override(disaggregation_mode="decode"),
         ):
             policy_dec.precompile()
@@ -2516,10 +3103,11 @@ class TestSpecDraftDecodePadding(_SpecPolicyTestCase):
             spec_info=spec_info,
             global_num_tokens_cpu=[0, 300],
             input_ids=torch.empty((0,), dtype=torch.int64),
-            seq_lens=torch.empty((0,), dtype=torch.int32),
-            out_cache_loc=torch.empty((0,), dtype=torch.int32),
-            req_pool_indices=torch.empty((0,), dtype=torch.int32),
-            req_pool_indices_cpu=torch.empty((0,), dtype=torch.int32),
+            seq_lens=torch.empty((0,), dtype=torch.int64),
+            # Match ScheduleBatch.prepare_for_idle, not the allocator's dtype.
+            out_cache_loc=torch.empty((0,), dtype=torch.int64),
+            req_pool_indices=torch.empty((0,), dtype=torch.int64),
+            req_pool_indices_cpu=torch.empty((0,), dtype=torch.int64),
             seq_lens_cpu=None,
         )
         with _dp_attention(True):
@@ -2529,6 +3117,12 @@ class TestSpecDraftDecodePadding(_SpecPolicyTestCase):
         self.assertEqual(forward_batch.batch_size, 1)
         self.assertEqual(forward_batch.seq_lens.tolist(), [300])
         self.assertEqual(forward_batch.extend_seq_lens.tolist(), [300])
+        self.assertEqual(forward_batch.out_cache_loc.dtype, torch.int32)
+
+        for name in ("extend_seq_lens", "extend_prefix_lens", "extend_start_loc"):
+            self.assertEqual(getattr(forward_batch, name).dtype, torch.int32, name)
+        for name in ("seq_lens", "req_pool_indices", "req_pool_indices_cpu"):
+            self.assertEqual(getattr(forward_batch, name).dtype, torch.int64, name)
 
 
 class TestDpSyncNumTokens(_SpecPolicyTestCase):
@@ -2636,6 +3230,9 @@ class TestSpecDraftExtendPadding(_SpecPolicyTestCase):
 
         self.assertEqual(forward_batch.batch_size, 4)
         self.assertEqual(forward_batch.extend_seq_lens.tolist(), [4, 4, 4, 0])
+        self.assertEqual(
+            forward_batch.extend_seq_lens_cpu, forward_batch.extend_seq_lens.tolist()
+        )
         self.assertEqual(forward_batch.extend_prefix_lens.tolist(), [8, 7, 6, 0])
         self.assertEqual(forward_batch.extend_start_loc.tolist(), [0, 4, 8, 0])
 
@@ -3003,6 +3600,7 @@ class TestSpecForwardBatchPreparation(_SpecPolicyTestCase):
             spec_info=draft_extend_input,
             input_ids=draft_extend_input.input_ids,
             seq_lens=draft_extend_input.seq_lens,
+            extend_seq_lens_cpu=None,
             batch_size=2,
             _pad_inputs_to_size=fake_pad_inputs_to_size,
         )
@@ -3030,7 +3628,14 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
         draft_attn_backend = SimpleNamespace(attn_backends=step_backends)
         draft_extend_attn_backend = _FakeAttnBackend()
 
-        with get_parallel().override(tp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+        ):
             policy.precompile_draft(draft_attn_backend, draft_extend_attn_backend)
 
         # EXTEND(LAST) 2 token buckets at the bs cap (text-only target, so no
@@ -3078,16 +3683,91 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
             )
             return torch.zeros(forward_batch.batch_size)
 
-        with get_parallel().override(tp_rank=1):
+        with (
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "spec_decode_compile_policy_eagle3._materialize_out"
+            ) as materialize,
+        ):
             policy._precompile_fused_draft_decode(
                 FakeDraftBackend(), fused_draft_forward
             )
+        self.assertEqual(materialize.call_count, 2)
 
         self.assertEqual(
             seen_shapes,
             [(1, 3, 1, None, True), (4, 12, 4, None, True)],
         )
         self.assertEqual([len(backend.calls) for backend in step_backends], [2, 2, 2])
+
+    def test_fused_draft_warmup_leaves_num_token_non_padded_unset(self):
+        """The live fused draft loop runs on an init_new batch that never
+        passes ModelRunner.forward, so its local ``num_token_non_padded`` is
+        None even when serving enables the field. direct_compile pins each
+        input's type at trace time, so a warmup batch carrying the tensor
+        makes the first live draft step fail with a type change.
+        """
+        mr = _spec_model_runner(is_draft_worker=True)
+        policy = _make_spec_policy(mr, token_buckets=(8,), bs_buckets=(4,))
+        step_backends = [_FakeAttnBackend() for _ in range(3)]
+
+        class FakeDraftBackend:
+            attn_backends = step_backends
+
+            def init_forward_metadata(self, forward_batch):
+                for backend in self.attn_backends:
+                    backend.init_forward_metadata(forward_batch)
+
+        seen = []
+
+        def fused_draft_forward(forward_batch):
+            seen.append(
+                (
+                    forward_batch.global_num_token_non_padded_cpu,
+                    forward_batch.num_token_non_padded,
+                )
+            )
+            return torch.zeros(forward_batch.batch_size)
+
+        policy_module = (
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
+        )
+        with (
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
+            patch(f"{policy_module}.enable_num_token_non_padded", return_value=True),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.is_dsa_enable_prefill_cp",
+                return_value=False,
+            ),
+            patch("sglang.srt.layers.cp.utils.is_mla_cp_enabled", return_value=False),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "spec_decode_compile_policy_eagle3._materialize_out"
+            ),
+        ):
+            policy._precompile_fused_draft_decode(
+                FakeDraftBackend(), fused_draft_forward
+            )
+
+        # The global scalar mirrors init_new; the local field stays unset.
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], 4 * policy.speculative_eagle_topk)
+        self.assertIsNone(seen[0][1])
 
 
 # Speculative verification padding fixtures.
@@ -3105,6 +3785,7 @@ def _policy():
     model_runner = SimpleNamespace(
         model=SimpleNamespace(forward=None, prepare_forward_batch=None),
         is_draft_worker=False,
+        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         model_config=SimpleNamespace(hidden_size=16, model_is_mrope=False),
     )
     with _target_model_config():
@@ -3114,6 +3795,31 @@ def _policy():
             b_bucketer=Bucketer(name="Bs", buckets=[1, BUCKET_BS]),
             owner=model_runner.model,
         )
+
+
+def _cpu_top_k_renorm(probs, top_ks, need_top_k_sampling=True):
+    """CPU stand-in for the TPU filter: keep values >= the k-th largest."""
+    if not need_top_k_sampling:
+        return probs
+    ks = top_ks.clamp(1, probs.shape[-1]).long().reshape(-1, 1)
+    kth = probs.sort(dim=-1, descending=True).values.gather(-1, ks - 1)
+    kept = torch.where(probs >= kth, probs, torch.zeros_like(probs))
+    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _cpu_top_p_renorm(probs, top_ps):
+    """CPU stand-in for the TPU filter: keep values >= the first value whose
+    prefix mass reaches p; an unreachable p keeps the whole row."""
+    ordered = probs.sort(dim=-1, descending=True).values
+    reached = ordered.cumsum(dim=-1) >= top_ps.to(probs.dtype).reshape(-1, 1)
+    first = reached.to(torch.int64).argmax(dim=-1, keepdim=True)
+    cutoff = torch.where(
+        reached.any(dim=-1, keepdim=True),
+        ordered.gather(-1, first),
+        torch.zeros_like(first, dtype=probs.dtype),
+    )
+    kept = torch.where(probs >= cutoff, probs, torch.zeros_like(probs))
+    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
 @contextlib.contextmanager
@@ -3144,10 +3850,16 @@ def _serving_stubs():
             eager_scaling_penalties,
         ),
         patch("sglang.srt.speculative.eagle_utils._is_tpu", True),
+        # The TPU renorm filter only accepts TPU tensors.
         patch(
-            "sglang.srt.distributed.get_tp_group",
-            return_value=SimpleNamespace(world_size=1),
+            "sglang.srt.speculative.eagle_utils.top_k_renorm_prob_func",
+            _cpu_top_k_renorm,
         ),
+        patch(
+            "sglang.srt.speculative.eagle_utils.top_p_renorm_prob_func",
+            _cpu_top_p_renorm,
+        ),
+        get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
         patch(
             "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
             return_value=False,
@@ -3484,6 +4196,12 @@ class TestSpecVerifyPaddingRecord(_SpecPolicyTestCase):
         self.assertEqual(accept_index.shape, (BS, DRAFT_TOKEN_NUM))
         self.assertEqual(new_seq_lens.shape, (BS,))
         self.assertEqual(bonus_tokens.shape, (BS,))
+        # The host copies of these run later on the result-copy thread; they
+        # must own their storage so no slice needs materializing then.
+        self.assertIsNone(predict._base)
+        self.assertIsNone(accept_lens._base)
+        self.assertEqual(predict.tolist(), list(range(LOGICAL_TOKENS)))
+        self.assertEqual(accept_lens.tolist(), list(range(BS)))
 
     def test_skips_when_the_forward_did_not_defer(self):
         batch = _make_batch(temperature=0.7)

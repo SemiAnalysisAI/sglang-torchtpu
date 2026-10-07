@@ -1,13 +1,14 @@
 """Unit tests for the TPU raiden hybrid (full + SWA) KV-offload path.
 
-Covers the hardware-agnostic contracts with fake pools/futures (no TPU, no
-raiden): the hybrid assembler consults the platform host-pool hook (the bug
-that routed TPU hybrid models to the CUDA host pool), each transfer issues one
-all-layer DMA per pool and its ack completes only when every pool's DMA has
-landed, load-back keeps index tensors host-resident by rewriting the
-tree-owned PoolTransfer in place, and speculative-decoding draft sidecars ride
-the same rounds (draft DMA issued per transfer, reload ack gates on it, draft
-device pool wired to the whole-batch counter, host pool picked via the
+Covers the hardware-agnostic contracts with fake pools/futures and a CPU model
+of raiden (no TPU): the hybrid assembler consults the platform host-pool hook
+(the bug that routed TPU hybrid models to the CUDA host pool), each transfer
+issues one all-layer DMA per pool and its ack completes only when every pool's
+DMA has landed, load-back keeps index tensors host-resident by rewriting the
+tree-owned PoolTransfer in place, a transfer with SWA pages but no Full pages
+leaves the Full pool's KV untouched, and speculative-decoding draft sidecars
+ride the same rounds (draft DMA issued per transfer, reload ack gates on it,
+draft device pool wired to the whole-batch counter, host pool picked via the
 platform hook).
 """
 
@@ -15,15 +16,22 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import threading
 import unittest
 from typing import List
 from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.kv_free_fence import KVFreeFence
+from sglang.srt.hardware_backend.tpu.kv_pool_host import (
+    RAIDEN_LAYOUT,
+    TpuRaidenHostKVCache,
+)
 from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
     TpuRaidenHybridCacheController,
 )
+from sglang.srt.hardware_backend.tpu.raiden_transfer import RaidenKVTransfer
 from sglang.srt.managers.cache_controller import BatchDoneCounter, LayerDoneCounter
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
@@ -31,6 +39,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     CacheOperation,
     HybridCacheController,
 )
+from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -78,11 +87,13 @@ class _FakeEntry:
         self.name = name
         self.host_pool = host_pool
         self.device_pool = device_pool
+        self.device_indices_from_anchor_fn = None
 
 
 class _FakeGroup:
     def __init__(self, anchor: _FakeEntry, extra: List[_FakeEntry]):
         self.anchor_entry = anchor
+        self.entries = [anchor, *extra]
         self.entry_map = {anchor.name: anchor}
         for entry in extra:
             self.entry_map[entry.name] = entry
@@ -126,6 +137,9 @@ class TestPlainKvController(CustomTestCase):
 
         def init_base(controller, *args, **kwargs):
             controller.mem_pool_device = device_pool
+            controller.mem_pool_host = _FakeGroup(
+                _FakeEntry(PoolName.KV, _FakeHostPool(), device_pool), []
+            )
             controller.layer_done_counter = object.__new__(LayerDoneCounter)
 
         with (
@@ -259,6 +273,125 @@ class TestHybridLoad(CustomTestCase):
         swa_alloc.assert_called_once_with(4)
 
 
+class _FakeReadyFuture:
+    def is_ready(self) -> bool:
+        return True
+
+    def ok(self) -> bool:
+        return True
+
+
+class _FakeRaidenManager:
+    """CPU model of raiden's ``d2h`` / ``h2d`` over one sub-pool's layers.
+
+    A non-empty page list copies those pages in every layer. An empty list
+    selects raiden's whole-buffer mode: each layer's entire device buffer is
+    copied to (``d2h``) or from (``h2d``) the start of its host buffer.
+    """
+
+    def __init__(self, layers: int, device_pages: int, host_pages: int):
+        self.device = torch.arange(layers * device_pages * 2.0).view(
+            layers, device_pages, 2
+        )
+        self.host = -1 - torch.arange(layers * host_pages * 2.0).view(
+            layers, host_pages, 2
+        )
+
+    def d2h(self, device_pages, host_pages, block_counts):
+        if not device_pages:
+            self.host[:, : self.device.shape[1]] = self.device
+        else:
+            self.host[:, host_pages] = self.device[:, device_pages]
+        return _FakeReadyFuture()
+
+    def h2d(self, host_pages, device_pages, block_counts):
+        if not host_pages:
+            self.device[:] = self.host[:, : self.device.shape[1]]
+        else:
+            self.device[:, device_pages] = self.host[:, host_pages]
+        return _FakeReadyFuture()
+
+
+def _raiden_host_pool(mgr: _FakeRaidenManager, page_size: int):
+    """A real raiden host pool and transfer driving ``mgr``."""
+    pool = object.__new__(TpuRaidenHostKVCache)
+    pool.page_size = page_size
+    pool.page_num = mgr.host.shape[1]
+    pool.size = pool.page_num * page_size
+    pool.layout = RAIDEN_LAYOUT
+    pool.device = "cpu"
+    pool.size_per_token = 1
+    pool.lock = threading.RLock()
+    pool.transfer = object.__new__(RaidenKVTransfer)
+    pool.transfer._mgr = mgr
+    pool.clear()
+    return pool
+
+
+class TestHybridTransferWithoutFullPages(CustomTestCase):
+    """A hybrid transfer can carry SWA pages but no Full pages, under either
+    write policy: load-back when a node's Full KV is still on device but its
+    SWA KV was evicted, backup when its Full KV is already on host. The
+    controller still issues the Full pool's DMA, and raiden must not see the
+    empty page list as the whole buffer."""
+
+    PAGE_SIZE = 2
+
+    def setUp(self):
+        self.full_mgr = _FakeRaidenManager(layers=2, device_pages=4, host_pages=8)
+        self.swa_mgr = _FakeRaidenManager(layers=2, device_pages=4, host_pages=8)
+        self.ctrl = _make_controller()
+        self.ctrl.mem_pool_host = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=_raiden_host_pool(self.full_mgr, self.PAGE_SIZE),
+                    device_pool=None,
+                    layer_mapper=lambda layer_id: layer_id,
+                    is_primary_index_anchor=True,
+                ),
+                PoolEntry(
+                    name=PoolName.SWA,
+                    host_pool=_raiden_host_pool(self.swa_mgr, self.PAGE_SIZE),
+                    device_pool=None,
+                    layer_mapper=lambda layer_id: layer_id,
+                ),
+            ]
+        )
+        self.ctrl.mem_pool_device_allocator = MagicMock(kv_free_fence=None)
+        self.ctrl.device = "cpu"
+
+    def _tokens(self, pages: List[int]) -> torch.Tensor:
+        pages = torch.tensor(pages, dtype=torch.int64)
+        return (pages[:, None] * self.PAGE_SIZE + torch.arange(self.PAGE_SIZE)).view(-1)
+
+    def test_swa_only_load_leaves_full_device_kv_intact(self):
+        full_device = self.full_mgr.device.clone()
+        swa = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=self._tokens([5]),
+            device_indices=self._tokens([1]),
+        )
+        self.ctrl.load(host_indices=self._tokens([]), node_id=1, extra_pools=[swa])
+        self.ctrl.start_loading()
+        self.ctrl.ack_load_queue[0].finish_event.synchronize()
+
+        torch.testing.assert_close(self.swa_mgr.device[:, 1], self.swa_mgr.host[:, 5])
+        torch.testing.assert_close(self.full_mgr.device, full_device)
+
+    def test_swa_only_backup_leaves_full_host_kv_intact(self):
+        full_host = self.full_mgr.host.clone()
+        swa = PoolTransfer(name=PoolName.SWA, device_indices=self._tokens([2]))
+        self.ctrl.write(device_indices=self._tokens([]), node_id=1, extra_pools=[swa])
+        self.ctrl.ack_write_queue[0].finish_event.synchronize()
+
+        (host_page,) = (swa.host_indices[:: self.PAGE_SIZE] // self.PAGE_SIZE).tolist()
+        torch.testing.assert_close(
+            self.swa_mgr.host[:, host_page], self.swa_mgr.device[:, 2]
+        )
+        torch.testing.assert_close(self.full_mgr.host, full_host)
+
+
 class TestAssemblerPlatformHook(CustomTestCase):
     def test_build_kv_host_pool_consults_platform_hook(self):
         # The hybrid assembler previously hard-coded the CUDA host-pool picker,
@@ -374,6 +507,39 @@ class TestDraftCounterRegistration(CustomTestCase):
         # controller init; re-registering per entry would be wrong.
         ctrl, entry = self._register(PoolName.SWA)
         entry.device_pool.register_layer_transfer_counter.assert_not_called()
+
+
+class TestKVFreeFenceCoverage(CustomTestCase):
+    def test_pool_not_indexed_by_kv_pages_is_rejected(self):
+        """A load into a Mamba state slot bypasses the KV free fence, so a
+        forward still writing the freed slot could overwrite the loaded state."""
+        mamba = _FakeEntry(PoolName.MAMBA, _FakeHostPool(), device_pool=MagicMock())
+        with self.assertRaises(NotImplementedError):
+            _make_controller().register_host_pool_entry(mamba)
+
+        def init_base(controller, *args, **kwargs):
+            controller.mem_pool_host = _FakeGroup(
+                _FakeEntry(PoolName.KV, _FakeHostPool(), MagicMock()), [mamba]
+            )
+
+        with patch.object(HybridCacheController, "__init__", init_base):
+            with self.assertRaises(NotImplementedError):
+                TpuRaidenHybridCacheController()
+
+    def test_load_allocated_outside_dma_write_target_is_rejected(self):
+        """A load path that allocates its DMA targets outside
+        dma_write_target() can be given pages an in-flight forward still writes."""
+        ctrl = _make_controller()
+        allocator = MagicMock()
+        allocator.full_attn_allocator.alloc.return_value = torch.arange(8)
+        allocator.kv_free_fence = KVFreeFence(synchronize_device=MagicMock())
+        ctrl.mem_pool_device_allocator = allocator
+        with self.assertRaises(AssertionError):
+            ctrl.load(host_indices=torch.arange(8))
+        allocator.full_attn_allocator.alloc.assert_not_called()
+
+        with allocator.kv_free_fence.dma_write_target():
+            self.assertIsNotNone(ctrl.load(host_indices=torch.arange(8)))
 
 
 class TestDraftSidecarPlatformHook(CustomTestCase):

@@ -7,11 +7,10 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state import get_tp_group
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
-from sglang.srt.layers.dp_attention import world_dp_gather_enabled
+from sglang.srt.layers.dp_attention import dp_gather_width, world_dp_gather_enabled
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.recv_skipper import (
@@ -42,7 +41,6 @@ from sglang.srt.utils.common import is_tpu, require_mlp_tp_gather
 _is_tpu = is_tpu()
 
 if TYPE_CHECKING:
-    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -60,17 +58,18 @@ def _resolve_elastic_world_dp_size(
         return dp_size
 
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
-    from sglang.srt.layers.dp_attention import get_attention_dp_size
 
-    live_dp_size = get_attention_dp_size()
+    live_dp_size = dp_gather_width()
     effective_ep_size = ElasticEPStateManager.get_effective_ep_size()
+    # Query live membership because elastic joins can expand WORLD.
     world_size = torch.distributed.get_world_size(group)
 
     if live_dp_size != effective_ep_size:
         raise RuntimeError(
             "[Elastic EP] WORLD MLP sync dp_size is out of sync: "
             f"rank={torch.distributed.get_rank(group)} "
-            f"live_dp_size={live_dp_size} effective_ep_size={effective_ep_size} "
+            f"live_dp_size={live_dp_size} "
+            f"effective_ep_size={effective_ep_size} "
             f"world_size={world_size} server_args_dp_size={dp_size} "
             f"local_num_tokens={local_num_tokens} "
             f"local_forward_mode={local_forward_mode}"
@@ -97,8 +96,10 @@ class MLPSyncBatchInfo:
     can_run_decode_cuda_graph: bool
     can_run_prefill_cuda_graph: bool
     is_extend_in_batch: bool
+    is_tpu_mm_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    prefill_cuda_graph_max_prefix_len: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -118,6 +119,8 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
+                self.prefill_cuda_graph_max_prefix_len,
+                int(self.is_tpu_mm_extend_in_batch),
             ],
             device=device,
             dtype=dtype,
@@ -133,6 +136,8 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
+                0,  # prefill_cuda_graph_max_prefix_len
+                0,  # is_tpu_mm_extend_in_batch
             ],
             device=device,
             dtype=dtype,
@@ -181,7 +186,7 @@ class MLPSyncBatchInfo:
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
         else:
-            torch.distributed.all_gather_into_tensor(
+            all_gather_single(
                 global_info_tensor.flatten(),
                 local_info_tensor,
                 group=group,
@@ -192,9 +197,9 @@ class MLPSyncBatchInfo:
         )
         num_ranks_in_tp_info = tp_info.shape[0]
         if device == "cpu":
-            tp_active_ranks = get_tp_group().active_ranks_cpu
+            tp_active_ranks = get_parallel().tp_group.active_ranks_cpu
         else:
-            tp_active_ranks = get_tp_group().active_ranks
+            tp_active_ranks = get_parallel().tp_group.active_ranks
         if tp_active_ranks.shape[0] < num_ranks_in_tp_info:
             tp_active_ranks = torch.ones(
                 num_ranks_in_tp_info,
@@ -214,6 +219,8 @@ class MLPSyncBatchInfo:
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
+        self.prefill_cuda_graph_max_prefix_len = int(tp0_info_cpu[:, 7].max())
+        self.is_tpu_mm_extend_in_batch = bool(tp0_info_cpu[:, 8].max())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -226,7 +233,6 @@ def _update_gather_batch(
     require_mlp_tp_gather: bool,
     skip_global_metadata=False,
 ):
-    # TODO: handle the case when moe_dense_tp_size != 1
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
@@ -235,14 +241,29 @@ def _update_gather_batch(
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
+    if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+        # Fresh counts have not yet been adjusted by the coordination plan.
+        batch.dp_spec_prefill_coordination_applied = False
+        info = mlp_sync_info.tp0_info_cpu
+        batch.dp_spec_prefill_coordination_metadata = (
+            mlp_sync_info.global_num_tokens,
+            mlp_sync_info.global_num_tokens_for_logprob,
+            info[:, 3],
+        )
     if not skip_global_metadata:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
+        batch.is_tpu_mm_extend_in_batch = getattr(
+            mlp_sync_info, "is_tpu_mm_extend_in_batch", False
+        )
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
 
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
     batch.can_run_dp_prefill_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
+    batch.dp_prefill_cuda_graph_max_prefix_len = (
+        mlp_sync_info.prefill_cuda_graph_max_prefix_len
+    )
 
 
 def should_skip_scheduler_all_gather(dp_size: int) -> bool:
@@ -284,9 +305,9 @@ def _local_prefill_cuda_graph_vote(
     model_config,
 ) -> bool:
     """This rank's vote for the prefill graph (min-reduced across dp
-    ranks). Extend/mixed batches vote their own replayability; a decode
-    batch eligible for the decode->extend conversion votes as its 1-token-
-    extend view, so the vote and the post-sync conversion always agree."""
+    ranks). Extend and mixed batches share the runner's rank-local replay
+    policy. A decode batch eligible for the decode->extend conversion votes as
+    its 1-token-extend view, so the vote and post-sync conversion agree."""
     if local_batch is None or local_batch.forward_mode.is_idle():
         return True
     if not coordinated_prefill:
@@ -311,6 +332,10 @@ def _local_prefill_cuda_graph_vote(
         and not local_batch.return_logprob
         # Grammar FSMs advance through the decode result path only.
         and not local_batch.has_grammar
+        # A converted batch takes the prefill result path, which commits beam
+        # requests per-req rather than through the batch decode fold; member
+        # rows also have no req of their own for the reqs-aligned extend lists.
+        and all(r.beam_group is None for r in local_batch.reqs)
         # Small-bucket BCG replays amplify the a2a EP logits drift (#30898)
         # into an accuracy loss.
         and get_moe_a2a_backend().is_none()
@@ -331,6 +356,8 @@ def _local_prefill_cuda_graph_vote(
 
     if prefill_graph_runner is None:
         return True
+    if not isinstance(prefill_graph_runner, PrefillCudaGraphRunner):
+        return False
     return prefill_graph_runner.can_replay_locally(
         batch_size=local_batch.batch_size(),
         num_tokens=num_tokens,
@@ -341,16 +368,33 @@ def _local_prefill_cuda_graph_vote(
         capture_hidden_mode=None,
         return_logprob=return_logprob,
         lora_ineligible=prefill_graph_runner.enable_lora,
+        is_mixed=mode == ForwardMode.MIXED,
+        batch_max_context_len=(
+            int(local_batch.seq_lens_cpu.max().item())
+            if prefill_graph_runner.max_context_size is not None
+            and local_batch.seq_lens_cpu is not None
+            and local_batch.seq_lens_cpu.numel() > 0
+            else None
+        ),
+    )
+
+
+def _batch_has_mm_inputs(batch: ScheduleBatch) -> bool:
+    """Same predicate as ForwardBatch.contains_mm_inputs, on the schedule batch."""
+    return any(
+        mm is not None
+        and (
+            mm.contains_image_inputs()
+            or mm.contains_video_inputs()
+            or mm.contains_audio_inputs()
+        )
+        for mm in (batch.multimodal_inputs or ())
     )
 
 
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     model_runner: ModelRunner,
-    dp_size: int,
-    attn_tp_size: int,
-    attn_cp_size: int,
-    tp_group: GroupCoordinator,
     get_idle_batch: Callable[[], ScheduleBatch],
     disable_cuda_graph: bool,
     require_mlp_tp_gather: bool,
@@ -358,6 +402,10 @@ def prepare_mlp_sync_batch_raw(
     offload_tags: set[str],
     dwdp: bool = False,
 ):
+    parallel = get_parallel()
+    dp_size = parallel.dp_size
+    attn_tp_size = parallel.attn_tp_size
+    tp_group = parallel.tp_group
     # Check if other DP workers have running batches
     if (
         local_batch is None
@@ -388,11 +436,17 @@ def prepare_mlp_sync_batch_raw(
         local_batch=local_batch, disable_cuda_graph=disable_cuda_graph
     )
     breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
-    coordinated_prefill = breakable_prefill or check_cuda_graph_backend(
-        Phase.PREFILL, Backend.FULL
-    )
+    full_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.FULL)
+    coordinated_prefill = breakable_prefill or full_prefill
     prefill_graph_runner = (
         model_runner.prefill_cuda_graph_runner if coordinated_prefill else None
+    )
+    prefill_cuda_graph_max_prefix_len = (
+        max(local_batch.prefix_lens, default=0)
+        if full_prefill
+        and local_batch is not None
+        and local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        else 0
     )
     can_run_prefill_cuda_graph = _local_prefill_cuda_graph_vote(
         local_batch=local_batch,
@@ -404,15 +458,16 @@ def prepare_mlp_sync_batch_raw(
     )
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
+    # Gathered so every DP rank takes the same input_embeds program on image steps.
+    is_tpu_mm_extend_in_batch = is_extend_in_batch and _batch_has_mm_inputs(local_batch)
     if local_batch is not None:
         local_batch.is_extend_in_batch = is_extend_in_batch
+        local_batch.is_tpu_mm_extend_in_batch = is_tpu_mm_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
     use_world_group = world_dp_gather_enabled()
     if use_world_group:
-        from sglang.srt.distributed.parallel_state import get_world_group
-
-        world = get_world_group()
+        world = parallel.world_group
         group = torch.distributed.group.WORLD
         device = world.device
     elif (
@@ -442,14 +497,16 @@ def prepare_mlp_sync_batch_raw(
     mlp_sync_info = MLPSyncBatchInfo(
         dp_size=dp_size,
         tp_size=attn_tp_size,
-        cp_size=attn_cp_size,
+        cp_size=parallel.attn_cp_size,
         num_tokens=num_tokens,
         num_tokens_for_logprob=num_tokens_for_logprob,
         can_run_decode_cuda_graph=can_run_decode_cuda_graph,
         can_run_prefill_cuda_graph=can_run_prefill_cuda_graph,
         is_extend_in_batch=is_extend_in_batch,
+        is_tpu_mm_extend_in_batch=is_tpu_mm_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
+        prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
     )
 
     if dp_size == 1:
@@ -468,7 +525,6 @@ def prepare_mlp_sync_batch_raw(
                 mlp_sync_info.tp0_info_cpu[:, 4:6],
             )
         )
-
     # Decide whether to emit idle batch
     if skip_all_gather:
         # Skip idle batch when attn-dp=1 (and always under DWDP: ranks run independently)
@@ -510,12 +566,10 @@ def prepare_mlp_sync_batch_raw(
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerDPAttnAdapter:
     model_runner: ModelRunner
-    tp_group: GroupCoordinator
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
     offload_tags: set[str]
-    ps: ParallelState
     model_config: ModelConfig
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
@@ -525,10 +579,6 @@ class SchedulerDPAttnAdapter:
         return prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
-            dp_size=get_parallel().dp_size,
-            attn_tp_size=self.ps.attn_tp_size,
-            attn_cp_size=self.ps.attn_cp_size,
-            tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=cuda_graph_fully_disabled(),
             require_mlp_tp_gather=require_mlp_tp_gather(),
@@ -561,6 +611,9 @@ class SchedulerDPAttnAdapter:
         extend view when a peer rank runs extend this step, so the step stays
         mode-homogeneous and every rank replays the extend graphs instead of
         all falling to eager."""
+        if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+            # Keep verification rows in their native mode on heterogeneous steps.
+            return batch
         if batch is None or not batch.forward_mode.is_decode():
             return batch
         # Global triggers from the gather. This rank's own eligibility (spec/

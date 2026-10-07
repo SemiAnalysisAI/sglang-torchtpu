@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from collections.abc import Sequence
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
@@ -108,6 +109,14 @@ def _unwrap_dynamic_compile_fns() -> None:
             )
 
 
+def build_slicebuilder_addresses(
+    hosts: Sequence[str], base_port: int, devices_per_host: int
+) -> str:
+    return ",".join(
+        f"{host}:{base_port + i}" for host in hosts for i in range(devices_per_host)
+    )
+
+
 def _set_torch_tpu_topology_env_multihost(
     hosts: list[str],
     base_port: int,
@@ -119,8 +128,8 @@ def _set_torch_tpu_topology_env_multihost(
     One slicebuilder endpoint per device across ALL hosts; topology is the
     ``TPU_TOPOLOGY`` chip grid with an extra dim appended on v7x (>1 core/chip).
     """
-    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
-        f"{host}:{base_port + i}" for host in hosts for i in range(devices_per_host)
+    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = build_slicebuilder_addresses(
+        hosts, base_port, devices_per_host
     )
 
     if not tpu_topology:
@@ -716,6 +725,153 @@ def _patch_tpu_torch_pallas_register_positional() -> None:
     tpu_torch_pallas.call_custom_kernel = call_custom_kernel
 
 
+_future_map_direct_handoff_patched = False
+
+
+def _patch_future_map_direct_handoff() -> None:
+    """Route FutureMap.stash/publish through the TPU direct handoff, so an
+    unchanged EAGLE3 top-k-1 decode batch skips the store/gather round trip.
+    The resolve side is already hooked via resolve_device_accept_seq_lens_tpu."""
+    global _future_map_direct_handoff_patched
+    if _future_map_direct_handoff_patched:
+        return
+    _future_map_direct_handoff_patched = True
+
+    from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
+        flush_direct_handoff_tpu,
+        publish_tpu,
+        stash_tpu,
+    )
+    from sglang.srt.managers.overlap_utils import FutureMap
+
+    orig_stash = FutureMap.stash
+    orig_publish = FutureMap.publish
+    orig_stash_bonus_tokens = FutureMap.stash_bonus_tokens
+    orig_resolve_mixed_spec_tails = FutureMap.resolve_mixed_spec_tails
+    FutureMap.tpu_direct_handoff = None
+    FutureMap.tpu_published_seq_lens = None
+
+    def stash(self, future_indices, payload):
+        if not stash_tpu(self, future_indices, payload):
+            orig_stash(self, future_indices, payload)
+
+    def publish(self, future_indices, new_seq_lens, confidence=None):
+        orig_publish(self, future_indices, new_seq_lens, confidence)
+        publish_tpu(self, future_indices, new_seq_lens)
+
+    # Every other buffer reader or writer must see the pending rows stored first.
+    def stash_bonus_tokens(self, indices, bonus_tokens):
+        flush_direct_handoff_tpu(self)
+        orig_stash_bonus_tokens(self, indices, bonus_tokens)
+
+    def resolve_mixed_spec_tails(self, batch):
+        # The mixed input resolve reads output_tokens_buf right after this.
+        flush_direct_handoff_tpu(self)
+        orig_resolve_mixed_spec_tails(self, batch)
+
+    FutureMap.stash = stash
+    FutureMap.publish = publish
+    FutureMap.stash_bonus_tokens = stash_bonus_tokens
+    FutureMap.resolve_mixed_spec_tails = resolve_mixed_spec_tails
+
+
+_raiden_is_load_back_event_done_patched = False
+
+
+def _patch_raiden_is_load_back_event_done() -> None:
+    """Route ``UnifiedRadixCache.is_load_back_event_done`` to the raiden controller.
+
+    The PD decode restore loop polls this method, which reads a per-layer
+    ``finish_event`` from the done counter's slot. Raiden stores the combined
+    future-event itself in a ``BatchDoneCounter`` slot, and the answer must
+    agree across ranks before ``loading_check`` runs its collectives. Other
+    controllers keep the original method.
+    """
+    global _raiden_is_load_back_event_done_patched
+    if _raiden_is_load_back_event_done_patched:
+        return
+    _raiden_is_load_back_event_done_patched = True
+
+    from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
+        TpuRaidenHybridCacheController,
+    )
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    orig_is_load_back_event_done = UnifiedRadixCache.is_load_back_event_done
+
+    def is_load_back_event_done(self, consumer_index):
+        controller = self.cache_controller
+        if not isinstance(controller, TpuRaidenHybridCacheController):
+            return orig_is_load_back_event_done(self, consumer_index)
+        if not controller.is_load_back_event_done(consumer_index, self._all_reduce):
+            return False
+        if consumer_index >= 0:
+            self.loading_check()
+        return True
+
+    UnifiedRadixCache.is_load_back_event_done = is_load_back_event_done
+
+
+_prefill_transfer_finish_from_raiden_patched = False
+
+
+def _patch_prefill_transfer_finish_from_raiden() -> None:
+    """End the ``prefill_transfer_kv_cache`` stage at raiden's transfer finish
+    time instead of the (later) scheduler poll time.
+
+    Other backends, and raiden sends without a finish time, keep the poll time.
+    """
+    global _prefill_transfer_finish_from_raiden_patched
+    if _prefill_transfer_finish_from_raiden_patched:
+        return
+    _prefill_transfer_finish_from_raiden_patched = True
+
+    from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+    from sglang.srt.disaggregation.raiden.sender import RaidenKVSender
+    from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
+
+    # Each polled request's time stats -> its sender, during the poll only.
+    polled_senders = {}
+    orig_poll = (
+        SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue
+    )
+    orig_set_finish = SchedulerReqTimeStats.set_prefill_kv_transfer_finish_time
+
+    def process_disagg_prefill_inflight_queue(self, *args, **kwargs):
+        for req in self.disagg_prefill_inflight_queue:
+            polled_senders[id(req.time_stats)] = req.disagg_kv_sender
+        try:
+            return orig_poll(self, *args, **kwargs)
+        finally:
+            polled_senders.clear()
+
+    def set_prefill_kv_transfer_finish_time(self, ts=None):
+        sender = polled_senders.get(id(self))
+        if ts is None and isinstance(sender, RaidenKVSender):
+            finish = sender.transfer_finish_time
+            if finish is not None:
+                # Never before the stage start: a fast transfer can finish first.
+                ts = max(finish, self.prefill_transfer_queue_entry_time)
+        orig_set_finish(self, ts)
+
+    SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue = (
+        process_disagg_prefill_inflight_queue
+    )
+    SchedulerReqTimeStats.set_prefill_kv_transfer_finish_time = (
+        set_prefill_kv_transfer_finish_time
+    )
+
+
+def _patch_pd_decode_swa_hicache() -> None:
+    """Allow PD decode prefix cache + RAM offload on sliding-window models.
+
+    Only full-attention KV goes to RAM. See ``pd_decode_swa_hicache``.
+    """
+    from sglang.srt.hardware_backend.tpu import pd_decode_swa_hicache
+
+    pd_decode_swa_hicache.install()
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
@@ -732,3 +888,7 @@ def apply_tpu_patches() -> None:
     _patch_support_triton_for_tpu()
     _register_aten_fallbacks()
     _patch_tpu_torch_pallas_register_positional()
+    _patch_future_map_direct_handoff()
+    _patch_raiden_is_load_back_event_done()
+    _patch_prefill_transfer_finish_from_raiden()
+    _patch_pd_decode_swa_hicache()

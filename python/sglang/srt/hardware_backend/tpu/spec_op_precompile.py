@@ -9,6 +9,12 @@ from collections.abc import Sequence
 import torch
 
 from sglang.srt.compilation.compiled_op import get_compiled_ops
+from sglang.srt.hardware_backend.tpu import (  # noqa: F401
+    eagle_utils_tpu as _eagle_utils_tpu,
+)
+from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+    snapshot_recompilation_baseline,
+)
 from sglang.srt.hardware_backend.tpu.spec_op_warmup import SpecOpWarmupContext
 from sglang.srt.speculative import dflash_utils as _dflash_utils  # noqa: F401
 from sglang.srt.speculative import eagle_utils as _eagle_utils  # noqa: F401
@@ -55,10 +61,12 @@ def precompile_spec_v2_ops(
                 args = registered_op.make_warmup_args(context)
                 registered_op.op(*args)
     if device.type == "tpu":
-        torch.get_device_module(device).synchronize()
+        torch.accelerator.synchronize()
     logger.info(
         "[spec op precompile] precompiled %d ops for shapes %s in %.1fs",
         len(registered_ops),
         shapes,
         time.perf_counter() - start,
     )
+    if device.type == "tpu":
+        snapshot_recompilation_baseline()

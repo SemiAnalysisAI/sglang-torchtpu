@@ -4,12 +4,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from torch._dynamo.testing import CompileCounter
 
 import sglang.srt.layers.radix_linear_attention as radix_linear_attention
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeAttentionBackend:
@@ -65,7 +67,49 @@ class _PhysicalAttentionBackend:
         return torch.full((1, 5, 2, 4), 9.0)
 
 
+class _BucketAttentionBackend:
+    def forward(self, *, mixed_qkv, **kwargs):
+        return mixed_qkv.reshape(1, -1, 2, 4)
+
+
 class TestRadixLinearAttentionPadding(CustomTestCase):
+    def test_tpu_compiled_prefill_keeps_bucket_shape(self):
+        """Changing logical prompt length must reuse the padded TPU graph."""
+        layer = radix_linear_attention.RadixLinearAttention(0, 1, 1, 2, 4, 4, 4)
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=torch.zeros(5, dtype=torch.int64),
+            req_pool_indices=torch.zeros(1, dtype=torch.int64),
+            seq_lens=torch.tensor([3]),
+            seq_lens_sum=3,
+            out_cache_loc=torch.arange(5),
+        )
+        backend = _BucketAttentionBackend()
+        counter = CompileCounter()
+        compiled = torch.compile(layer.forward, backend=counter, fullgraph=True)
+        with (
+            patch.object(radix_linear_attention, "_is_tpu", True),
+            patch.object(
+                radix_linear_attention,
+                "get_tc_piecewise_forward_context",
+                new=lambda: None,
+            ),
+            patch.object(
+                radix_linear_attention, "get_attn_backend", new=lambda: backend
+            ),
+        ):
+            for logical_tokens in (5, 3, 1):
+                batch.global_num_token_non_padded_cpu = logical_tokens
+                output = compiled(
+                    forward_batch=batch,
+                    mixed_qkv=torch.zeros((5, 8)),
+                    a=torch.zeros((5, 2)),
+                    b=torch.zeros((5, 2)),
+                )
+                torch.testing.assert_close(output, torch.zeros((1, 5, 2, 4)))
+        self.assertEqual(counter.frame_count, 1)
+
     def test_eager_padded_input_is_sliced_and_output_shape_is_restored(self):
         layer = radix_linear_attention.RadixLinearAttention(
             layer_id=0,
@@ -79,7 +123,7 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         original_out_cache_loc = torch.arange(5)
         forward_batch = SimpleNamespace(
             forward_mode=_ExtendMode(),
-            num_token_non_padded_cpu=3,
+            global_num_token_non_padded_cpu=3,
             out_cache_loc=original_out_cache_loc,
         )
 
@@ -119,7 +163,7 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         original_out_cache_loc = torch.arange(5)
         forward_batch = SimpleNamespace(
             forward_mode=_TargetVerifyMode(),
-            num_token_non_padded_cpu=3,
+            global_num_token_non_padded_cpu=3,
             out_cache_loc=original_out_cache_loc,
         )
 
@@ -158,7 +202,7 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         original_out_cache_loc = torch.arange(5)
         forward_batch = SimpleNamespace(
             forward_mode=_ExtendMode(),
-            num_token_non_padded_cpu=3,
+            global_num_token_non_padded_cpu=3,
             out_cache_loc=original_out_cache_loc,
         )
 
@@ -189,7 +233,7 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
             with self.subTest(padded_num_tokens=padded_num_tokens):
                 original_out_cache_loc = torch.arange(padded_num_tokens)
                 forward_batch = SimpleNamespace(
-                    num_token_non_padded_cpu=3,
+                    global_num_token_non_padded_cpu=3,
                     out_cache_loc=original_out_cache_loc,
                 )
                 context = SimpleNamespace(

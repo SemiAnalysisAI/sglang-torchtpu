@@ -11,7 +11,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_spec,
 )
-from sglang.srt.speculative.spec_utils import gather_spec_extras_func
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
 
 _is_tpu = is_tpu()
@@ -101,6 +100,8 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     if batch.prefill_input_ids_cpu is not None:
         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
         if batch.mix_running_indices is not None:
+            if batch.enable_overlap and not batch.spec_algorithm.is_none():
+                future_map.resolve_mixed_spec_tails(batch)
             decode_gpu = future_map.output_tokens_buf[batch.mix_running_indices]
             if _DEBUG_ASSERT:
                 _assert_nonneg_and_invalidate(
@@ -150,7 +151,6 @@ CONFIDENCE_RELAY_RING_DEPTH: int = CONFIDENCE_RELAY_RING_LAG + 1
 
 
 class ResolvedConfidence(msgspec.Struct):
-
     confidence: torch.Tensor
     generation: torch.Tensor
 
@@ -194,7 +194,6 @@ class RelayPayload:
 
 
 class ConfidenceRelay(msgspec.Struct):
-
     device: torch.device
     req_pool_size: int
     pool: Any
@@ -294,6 +293,8 @@ class FutureMap:
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
         self.needs_confidence_relay = needs_confidence_relay
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
+        # Kept for the mixed-tail late binding (reserved-slot gather).
+        self.req_to_token = req_to_token_pool.req_to_token
 
         # On backends that bake a buffer WRITE offset as an HLO constant-shaped
         # scatter (e.g. TPU/XLA), route future-buffer writes through `_store`
@@ -462,6 +463,10 @@ class FutureMap:
         if not _is_tpu:
             indices.record_stream(torch.get_device_module(self.device).current_stream())
         if self.need_topk:
+            # Function-local: spec_utils imports schedule_batch, which imports
+            # this module.
+            from sglang.srt.speculative.spec_utils import gather_spec_extras_func
+
             hidden_states_buf = (
                 self.hidden_states_buf if self.need_hidden_states else None
             )
@@ -518,6 +523,57 @@ class FutureMap:
         else:
             buf[indices] = values
 
+    def stash_bonus_tokens(
+        self, indices: torch.Tensor, bonus_tokens: torch.Tensor
+    ) -> None:
+        """Write only output_tokens_buf rows; for relays carrying no draft
+        extras (stash() would lazy-init the spec bufs from the payload)."""
+        self._store(self.output_tokens_buf, indices, bonus_tokens)
+
+    def resolve_mixed_spec_tails(self, batch: ScheduleBatch) -> None:
+        """Late-bind a spec mixed batch's decode tails (overlap): schedule-time
+        lengths lag the in-flight step's accept count, so rebuild the tail rows
+        from the published committed lengths behind the publish fence."""
+        idx = batch.mix_running_indices
+        n = int(idx.shape[0])
+        if n == 0:
+            return
+        if self.publish_ready is not None:
+            if _is_hip:
+                self.publish_ready.synchronize()
+            else:
+                self.publish_ready.wait()
+        fresh = self.new_seq_lens_buf[idx]
+        seq_lens = batch.seq_lens.clone()
+        seq_lens[-n:] = fresh + 1
+        batch.seq_lens = seq_lens
+        out_cache_loc = batch.out_cache_loc.clone()
+        out_cache_loc[-n:] = self.req_to_token[idx.long(), fresh.long()].to(
+            out_cache_loc.dtype
+        )
+        batch.out_cache_loc = out_cache_loc
+
+        if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
+            fresh_cpu = fresh.cpu()  # bootstrap / non-CUDA
+        else:
+            self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
+            with torch.get_device_module(self.device).stream(
+                self.fwd_prepare_d2h_stream
+            ):
+                self.new_seq_lens_cpu_pinned.copy_(
+                    self.new_seq_lens_buf, non_blocking=True
+                )
+            self.fwd_prepare_d2h_stream.synchronize()
+            fresh_cpu = self.new_seq_lens_cpu_pinned[batch.mix_running_indices_cpu]
+        if batch.seq_lens_cpu is not None:
+            seq_lens_cpu = batch.seq_lens_cpu.clone()
+            seq_lens_cpu[-n:] = fresh_cpu + 1
+            batch.seq_lens_cpu = seq_lens_cpu
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        batch.prefix_lens = batch.prefix_lens[:-n] + [
+            int(x) for x in fresh_cpu.tolist()
+        ]
+
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
@@ -543,6 +599,16 @@ class FutureMap:
         if _is_tpu and resolve_device_accept_seq_lens_tpu(self, batch):
             return
         batch.seq_lens = self.new_seq_lens_buf[fi]
+
+        if (
+            _is_tpu
+            and self.spec_algo.is_dflash_family()
+            and draft_input.tpu_host_seq_lens_is_committed
+        ):
+            # DFLASH pre-gathered its verify window from the committed base, so
+            # the host mirror prepare_for_decode seeded must survive: reading the
+            # published length back would reintroduce the sync this avoids.
+            return
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
@@ -622,7 +688,6 @@ class FutureMap:
             indices,
             payload.bonus_tokens.to(self.output_tokens_buf.dtype),
         )
-
         if self.need_topk:
             self._store(
                 self.topk_p_buf, indices, payload.topk_p.to(self.topk_p_buf.dtype)

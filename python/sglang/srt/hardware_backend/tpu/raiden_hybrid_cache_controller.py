@@ -20,7 +20,7 @@ thread and returns poll-only future-events, which serve as the acks and feed a
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Any, Callable, List, Optional
 
 import torch
 
@@ -38,6 +38,19 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 
 logger = logging.getLogger(__name__)
 
+# Pools indexed by KV allocator pages, which the KV free fence keeps from loads
+# while a forward may still write them; any other pool's slots are unfenced.
+_KV_PAGE_POOLS = frozenset(
+    (PoolName.KV, PoolName.SWA, PoolName.DRAFT, PoolName.DRAFT_SWA)
+)
+
+
+def _check_kv_page_pool(name: PoolName) -> None:
+    if name not in _KV_PAGE_POOLS:
+        raise NotImplementedError(
+            f"The TPU raiden hybrid HiCache path does not offload the {name.value} pool."
+        )
+
 
 class TpuRaidenHybridCacheController(HybridCacheController):
     """Hybrid (multi-pool) HiCache controller whose transfers go through
@@ -45,6 +58,8 @@ class TpuRaidenHybridCacheController(HybridCacheController):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        for entry in self.mem_pool_host.entries:
+            _check_kv_page_pool(entry.name)
         # raiden gates the whole forward at once (no per-layer device streams).
         # Swap the per-layer LayerDoneCounter for a BatchDoneCounter and
         # re-register it on the device pool wrapper (SWAKVPool holds the
@@ -72,6 +87,7 @@ class TpuRaidenHybridCacheController(HybridCacheController):
     # ----- sidecar registration ----------------------------------------------
 
     def register_host_pool_entry(self, entry) -> None:
+        _check_kv_page_pool(entry.name)
         super().register_host_pool_entry(entry)
         # Draft sidecar KV is consumed by the draft model's forward, whose
         # CompiledForwardShim gates on the draft pool's own transfer counter.
@@ -107,6 +123,10 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
+        # The fence keeps in-flight forward writes off only the pages allocated
+        # inside dma_write_target(); this DMA's targets are allocated below.
+        fence = self.mem_pool_device_allocator.kv_free_fence
+        assert fence is None or fence.in_dma_write_target
         device_indices = super().load(
             host_indices=host_indices,
             priority=priority,
@@ -221,3 +241,28 @@ class TpuRaidenHybridCacheController(HybridCacheController):
             )
         )
         return producer_id
+
+    def is_load_back_event_done(
+        self, consumer_index: int, all_reduce: Callable[[torch.Tensor, Any], None]
+    ) -> bool:
+        """Return True once the load-back in ``consumer_index`` landed on all ranks.
+
+        The controller-level counterpart of the cache's
+        ``is_load_back_event_done``: it only answers the question and has no
+        side effects. The cache runs ``loading_check`` after a True answer.
+
+        Each ``BatchDoneCounter`` slot holds the load's combined future-event
+        itself, or ``None`` before the slot's first load. A raiden DMA can
+        finish at different times on different ranks, while the cache's
+        ``loading_check`` issues collectives. ``all_reduce`` combines the local
+        results over the cache's rank groups, so every rank makes the same
+        decision and enters those collectives together.
+        """
+        if consumer_index < 0:
+            return True
+        event = self.layer_done_counter.events[consumer_index]
+        done = torch.tensor(
+            int(event is None or event.query()), dtype=torch.int, device="cpu"
+        )
+        all_reduce(done, torch.distributed.ReduceOp.MIN)
+        return bool(done.item())

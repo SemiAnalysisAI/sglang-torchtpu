@@ -13,7 +13,7 @@
 #           within its register budget.
 #   fused — Triton 2-kernel pipeline with full H-parallelism; the fallback
 #           everywhere the fast kernel does not apply.
-# aggregate_stream_torch is the eager reference (tests and the
+# aggregate_stream_torch is the eager reference (tests, TPU and the
 # H % _BLOCK_H != 0 shape fallback of aggregate_stream).
 
 from typing import Optional
@@ -24,7 +24,9 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_hip, is_npu, is_tpu
+
+_is_tpu = is_tpu()
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
@@ -43,7 +45,7 @@ def _use_fast(hidden_size: int) -> bool:
     """The TMA kernel needs SM100+ except SM12x (tcgen05, cp.async.bulk)
     and its H=7168 template; everything else takes the triton pipeline."""
     global _FAST_SUPPORTED
-    if is_npu():
+    if is_npu() or _is_tpu:
         return False
     if _FAST_SUPPORTED is None:
         _FAST_SUPPORTED = _supports_attn_res_tma(torch.cuda.get_device_capability())
@@ -57,7 +59,7 @@ def _use_hip_fused(hidden_size: int, nvb: int) -> bool:
         return False
     global _HIP_SHAPE_GATE
     if _HIP_SHAPE_GATE is None:
-        from sglang.kernels.ops.kimi_k3.attn_res_hip import supports_attn_res_hip
+        from sglang.kernels.ops.attention.attn_res_hip import supports_attn_res_hip
 
         _HIP_SHAPE_GATE = supports_attn_res_hip
     return _HIP_SHAPE_GATE(hidden_size, nvb)
@@ -97,7 +99,7 @@ def _aggregate_fast(
     config (GB300 benchmark winner across nvb). With write_bank_row the kernel
     also snapshots the prefix row into bank[:, nvb, :] (bit-exact, zero extra
     reads — the row streams through the score pass anyway)."""
-    from sglang.kernels.ops.kimi_k3.attn_res import attn_res_fused_tma
+    from sglang.kernels.ops.attention.attn_res import attn_res_fused_tma
 
     # The kernel applies one eps to both the score norm and the output norm.
     assert score_norm.variance_epsilon == out_norm.variance_epsilon
@@ -217,6 +219,8 @@ def _mix_fused(
     T, H = prefix_sum.shape
     if T == 0:
         return prefix_sum
+    if _is_tpu:
+        return aggregate_stream_torch(prefix_sum, bank, nvb, score_proj, score_norm)
     cw = get_cw(score_proj, score_norm)
     if is_npu():
         from sgl_kernel_npu.kimi_k3.attn_residual import mix_fused
@@ -294,7 +298,7 @@ def _aggregate_hip(
     mixing share one read, and the pending residual add, the bank snapshot and
     the output RMSNorm all fold into the same launch. out_norm None returns the
     pre-norm mixture instead. Returns (result, prefix)."""
-    from sglang.kernels.ops.kimi_k3.attn_res_hip import attn_res_hip
+    from sglang.kernels.ops.attention.attn_res_hip import attn_res_hip
 
     cw = get_cw(score_proj, score_norm)
     prefix = prefix_sum if addend is None else torch.empty_like(prefix_sum)
@@ -558,7 +562,7 @@ class AttnResidual:
         bank = self.block_residual[rows]
         cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
         assert score_norm.variance_epsilon == out_norm.variance_epsilon
-        from sglang.srt.layers import k3_sp_collective
+        from sglang.srt.layers.communication import k3_sp_collective
 
         normed = k3_sp_collective.attn_res_all_gather(
             prefix,
@@ -595,7 +599,7 @@ class AttnResidual:
         bank = self.block_residual[rows]
         cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
         assert score_norm.variance_epsilon == out_norm.variance_epsilon
-        from sglang.srt.layers import k3_sp_collective
+        from sglang.srt.layers.communication import k3_sp_collective
 
         return k3_sp_collective.reduce_scatter_attn_res(
             hidden_states,

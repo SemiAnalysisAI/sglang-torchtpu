@@ -43,9 +43,9 @@ HW_MAPPING = {
 PER_COMMIT_SUITES = {
     HWBackend.CPU: [
         "base-a-test-cpu",
-        "base-b-test-cpu",
-        "base-b-tp-test-cpu",
-        "base-c-test-cpu",
+        "stage-a-test-cpu-intel",
+        "stage-a-tp-test-cpu-intel",
+        "stage-b-test-cpu-intel",
         "base-b-test-cpu-arm64",
     ],
     HWBackend.AMD: [
@@ -84,10 +84,20 @@ PER_COMMIT_SUITES = {
         "base-b-test-1-gpu-large",
         "base-b-test-2-gpu-large",
         "base-b-test-4-gpu-b200",
+        "base-b-kernel-unit-test-1-gpu-small",
         "base-b-kernel-unit-test-1-gpu-large",
         "base-b-kernel-unit-test-4-gpu-b200",
         "base-b-kernel-unit-test-8-gpu-h200",
         "base-b-kernel-benchmark-test-1-gpu-large",
+        # Diffusion keeps case-level pytest partitioning behind registered
+        # bridge files while sharing this discovery and dispatch entry point.
+        "base-b-test-diffusion-1-gpu-h100",
+        "base-b-test-diffusion-1-gpu-5090",
+        "base-b-test-diffusion-1-gpu-b200",
+        "base-b-test-diffusion-2-gpu-h100",
+        "base-b-test-diffusion-bcg-1-gpu-h100",
+        "base-b-test-diffusion-component-2-gpu-h100",
+        "base-b-test-diffusion-unit-1-gpu-h100",
         "base-c-test-4-gpu-h100",
         "base-c-test-4-gpu-b200",
         "base-c-test-4-gpu-gb300",
@@ -103,21 +113,18 @@ PER_COMMIT_SUITES = {
         "extra-b-test-4-gpu-h100",
         "extra-b-test-4-gpu-b200",
         "extra-b-test-8-gpu-h200",
+        "extra-b-test-8-gpu-b300",
     ],
     HWBackend.NPU: [
-        "base-a-test-1-npu-a2",
+        "base-a-test-npu",
         "base-b-test-1-npu-a3",
         "base-b-test-2-npu-a3",
         "base-b-test-4-npu-a3",
         "base-b-test-8-npu-a3",
         "base-b-test-16-npu-a3",
         "base-c-test-acc-2-npu-a3",
-        "base-c-test-acc-4-npu-a3",
-        "base-c-test-acc-8-npu-a3",
         "base-c-test-acc-16-npu-a3",
         "base-c-test-perf-2-npu-a3",
-        "base-c-test-perf-4-npu-a3",
-        "base-c-test-perf-8-npu-a3",
         "base-c-test-perf-16-npu-a3",
     ],
     HWBackend.TPU: [
@@ -159,6 +166,7 @@ NIGHTLY_SUITES = {
         "nightly-amd-accuracy-8-gpu-mi35x-kimi-k3",
         "nightly-amd-8-gpu-mi35x-qwen38-mxfp4",
         "nightly-amd-8-gpu-mi35x-glm52-fp8",
+        "nightly-amd-8-gpu-mi35x-glm53-flash",
         "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
@@ -172,37 +180,61 @@ NIGHTLY_SUITES = {
     ],
     HWBackend.CPU: [],
     HWBackend.NPU: [
-        "nightly-1-npu-a2",
         "nightly-1-npu-a3",
         "nightly-2-npu-a3",
         "nightly-4-npu-a3",
         "nightly-8-npu-a3",
         "nightly-16-npu-a3",
         "nightly-acc-2-npu-a3",
-        "nightly-acc-4-npu-a3",
         "nightly-acc-8-npu-a3",
         "nightly-acc-16-npu-a3",
+        "nightly-acc-4-npu-a5",
         "nightly-perf-2-npu-a3",
         "nightly-perf-4-npu-a3",
-        "nightly-perf-8-npu-a3",
         "nightly-perf-16-npu-a3",
+        "nightly-perf-16-npu-a3-cann910",
+        "nightly-acc-16-npu-a3-cann910",
+        "full-4-npu-a2",
         "full-1-npu-a3",
         "full-2-npu-a3",
         "full-4-npu-a3",
         "full-8-npu-a3",
         "full-16-npu-a3",
+        "full-acc-2-npu-a3",
+        "full-acc-4-npu-a3",
+        "full-acc-16-npu-a3",
+        "full-perf-2-npu-a3",
+        "full-perf-4-npu-a3",
+        "full-perf-8-npu-a3",
+        "full-perf-16-npu-a3",
     ],
     HWBackend.TPU: [
         "nightly-tpu-4-v7",
         "nightly-tpu-multihost",
+        "nightly-tpu-multihost-accuracy",
         # One suite per perf model, so the nightly can fan them out as separate
         # jobs on separate slices instead of one sequential single-host job.
         "nightly-tpu-perf-gpt-oss-120b",
         "nightly-tpu-perf-gpt-oss-120b-c64",
         "nightly-tpu-perf-gpt-oss-120b-eagle3-c64",
         "nightly-tpu-perf-gpt-oss-120b-dflash-c64",
+        "nightly-tpu-perf-gpt-oss-20b",
+        "nightly-tpu-perf-deepseek-r1-0528",
+        "nightly-tpu-perf-deepseek-v3-1",
+        "nightly-tpu-perf-kimi-k26",
+        "nightly-tpu-perf-gemma4-31b",
+        "nightly-tpu-perf-gemma4-26b-a4b",
+        "nightly-tpu-perf-qwen3-5-397b",
         "nightly-perf-tpu",
         # One suite per quality eval so each gets an independent TPU slice.
+        "nightly-tpu-accuracy-gpt-oss-20b",
+        "nightly-tpu-accuracy-gemma4-31b-aime",
+        "nightly-tpu-accuracy-gemma4-31b-gpqa",
+        "nightly-tpu-accuracy-gemma4-31b-mmmupro",
+        "nightly-tpu-accuracy-gemma4-26b-a4b-aime",
+        "nightly-tpu-accuracy-gemma4-26b-a4b-gpqa",
+        "nightly-tpu-accuracy-gemma4-26b-a4b-mmmupro",
+        "nightly-tpu-accuracy-qwen3-5-397b-mmmupro",
         "nightly-tpu-accuracy-gpt-oss-120b-aime",
         "nightly-tpu-accuracy-gpt-oss-120b-gpqa",
         "nightly-tpu-accuracy-gpt-oss-120b-gsm8k",
@@ -212,6 +244,7 @@ NIGHTLY_SUITES = {
         "nightly-xpu-1-gpu",
         "nightly-xpu-2-gpu",
         "nightly-xpu-4-gpu",
+        "nightly-xpu-8-gpu",
     ],
 }
 
@@ -219,12 +252,20 @@ NIGHTLY_SUITES = {
 OTHER_SUITES = {
     HWBackend.CPU: [
         "default",
+        # `stage="weekly"`, dispatched by weekly-test-cpu.yml.
+        "weekly-test-cpu",
     ],
     HWBackend.CUDA: [
         "stress",
         # `stage="weekly"` -- same shape. The three dicts group names for
-        # readability only; validation reads their union.
+        # readability only; validation reads their union. One entry per row of
+        # the matrix in weekly-test-nvidia.yml.
+        "weekly-test-1-gpu-large",
+        "weekly-test-2-gpu-large",
+        "weekly-test-4-gpu-h100",
+        "weekly-test-4-gpu-b200",
         "weekly-test-8-gpu-h200",
+        "weekly-test-8-gpu-b200",
     ],
 }
 
@@ -457,7 +498,7 @@ def main():
         required=True,
         help=(
             "Test suite to run. Accepts a comma-separated list of suites "
-            "(e.g. 'base-b-test-cpu,base-c-test-cpu'); their tests are unioned "
+            "(e.g. 'stage-a-test-cpu-intel,stage-b-test-cpu-intel'); their tests are unioned "
             "into one pool before partitioning."
         ),
     )

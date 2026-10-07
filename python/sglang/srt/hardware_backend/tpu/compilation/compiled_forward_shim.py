@@ -24,8 +24,16 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
+from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+    snapshot_recompilation_baseline,
+)
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    PPProxyTensors,
+)
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.utils.common import next_power_of_2
 
@@ -44,6 +52,33 @@ _TOKEN_FIELDS = (
     "input_embeds",
     # Draft extend inherits the target's real-length embeds, so re-pad them.
     "mm_input_embeds",
+    "mrope_positions",
+)
+
+# Token dim of each field above. MROPE positions are (3, num_tokens). Every
+# other field has tokens on dim 0.
+_TOKEN_FIELD_DIM = {"mrope_positions": -1}
+
+# Token fields that prefill pads on the host instead of on the TPU.
+#
+# Padding on the TPU compiles a new XLA program for each distinct input
+# length. Prefill lengths are arbitrary, so that would trigger one
+# compilation for each unique input length seen while serving. These fields
+# are small integer tensors, so it is cheap to copy them to the host, pad
+# there, and copy the bucket-sized result back.
+# Embeddings and hidden states are too large for that and stay on the TPU.
+#
+# Guideline for adding a field here:
+#   1. Preferred: keep the tensor on host until reaching the padding here,
+#      pad it, and copy it to the TPU once. No copy back to the host is
+#      needed.
+#   2. Fallback: when that would require changing shared sglang code, let
+#      the tensor reach the TPU as usual and add the extra TPU-to-host copy
+#      here for padding. Do this only for tensors that are not too large.
+# Every field below uses the fallback today, because shared code copies them
+# to the TPU before this step.
+_HOST_PAD_TOKEN_FIELDS = frozenset(
+    ("input_ids", "positions", "out_cache_loc", "mrope_positions")
 )
 
 # Fields whose batch dim gets padded to the bs bucket.
@@ -99,6 +134,56 @@ def _matches_default(value: Any, default: Any) -> bool:
     if default is None:
         return value is None
     return type(value) is type(default) and value == default
+
+
+def _fit_pp_proxy_rows(proxy: Any, input_ids: Any, forward_batch: Any) -> Any:
+    """Bring a pipeline proxy to the padded batch's token axis.
+
+    The ICI wave delivers the previous stage's activations at its fixed buffer
+    size (the largest token bucket), so a longer proxy is trimmed to this
+    stage's padded token count; a shorter one means the two stages padded to
+    different buckets and is rejected.
+    """
+    reference = input_ids if input_ids is not None else forward_batch.input_ids
+    if reference is None:
+        return proxy
+    expected = int(reference.shape[0])
+    tensors = {}
+    trimmed = False
+    for name, tensor in proxy.tensors.items():
+        if isinstance(tensor, torch.Tensor):
+            rows = int(tensor.shape[0])
+            if rows < expected:
+                raise ValueError(
+                    f"pp_proxy_tensors[{name!r}] has {rows} rows but the padded "
+                    f"batch has {expected} input tokens; the previous pipeline "
+                    "stage and this one padded to different token buckets."
+                )
+            if rows > expected:
+                tensor = tensor[:expected]
+                trimmed = True
+        tensors[name] = tensor
+    return type(proxy)(tensors) if trimmed else proxy
+
+
+def _fit_pp_proxy_in_args(
+    args: tuple[Any, ...], input_ids: Any, forward_batch: Any
+) -> tuple[Any, ...]:
+    """Trim a pipeline proxy that arrived as a positional argument.
+
+    Most models hand the proxy to the compiled decoder as the
+    ``pp_proxy_tensors`` keyword, which the kwarg lookup above covers; several
+    (glm4_moe, kimi_k3, minimax_m3, sarvam_moe, ...) pass it positionally. A
+    proxy that slips past the lookup reaches direct_compile at the wave's full
+    row count, which the specialization key does not cover.
+    """
+    for index, value in enumerate(args):
+        if isinstance(value, PPProxyTensors):
+            fitted = _fit_pp_proxy_rows(value, input_ids, forward_batch)
+            if fitted is not value:
+                return args[:index] + (fitted,) + args[index + 1 :]
+            break
+    return args
 
 
 def _zero_pad_dim0(t: torch.Tensor, target_size: int) -> torch.Tensor:
@@ -226,9 +311,7 @@ def _dp_attn_compute_padding(
             f"{forward_batch.dp_padding_mode}."
         )
 
-    from sglang.srt.layers.dp_attention import get_attention_dp_rank
-
-    dp_rank = get_attention_dp_rank()
+    dp_rank = get_parallel().attn_dp_rank
     # This rank's real live token count (used below for decode/idle real_q/b).
     # global_num_tokens_cpu is padded.
     # original_global_num_tokens_cpu is the pre-padding counts.
@@ -391,6 +474,33 @@ def _attach_input_logprobs(
     logits_output.input_top_logprobs_idx = eager.input_top_logprobs_idx
     logits_output.input_token_ids_logprobs_val = eager.input_token_ids_logprobs_val
     logits_output.input_token_ids_logprobs_idx = eager.input_token_ids_logprobs_idx
+    logits_output.input_logprobs_copy_done = eager.input_logprobs_copy_done
+
+
+def _pad_tensor_on_host(
+    t: torch.Tensor, target_size: int, *, dim: int = 0
+) -> torch.Tensor:
+    """Pad a small tensor along dim to target_size on the host."""
+    if t.shape[dim] >= target_size:
+        return t
+    padded_shape = list(t.shape)
+    padded_shape[dim] = target_size
+    padded = torch.zeros(padded_shape, dtype=t.dtype, device="cpu")
+    padded.narrow(dim, 0, t.shape[dim]).copy_(t.to("cpu"))
+    return padded.to(t.device)
+
+
+def _pad_tensor(
+    t: torch.Tensor, target_size: int, *, dim: int = 0, on_host: bool = False
+) -> torch.Tensor:
+    """Pad a tensor along dim to target_size."""
+    if t.shape[dim] >= target_size:
+        return t
+    if on_host and t.device.type == "tpu":
+        return _pad_tensor_on_host(t, target_size, dim=dim)
+    dim = dim % t.ndim
+    padding = (0,) * (2 * (t.ndim - dim - 1)) + (0, target_size - t.shape[dim])
+    return F.pad(t, padding)
 
 
 def _pad_forward_batch_inputs(
@@ -439,9 +549,9 @@ def _pad_forward_batch_inputs(
     elif is_draft_extend_v2 and forward_batch.spec_info is not None:
         pad_b = b_bucketer.next_bucket(real_b)
         num_tokens_per_req = forward_batch.spec_info.num_tokens_per_req
-        assert (
-            num_tokens_per_req > 0
-        ), f"DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, got {num_tokens_per_req}"
+        assert num_tokens_per_req > 0, (
+            f"DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, got {num_tokens_per_req}"
+        )
         pad_t = pad_b * num_tokens_per_req
         real_q_out, real_b_out = real_q, real_b
     else:
@@ -456,17 +566,23 @@ def _pad_forward_batch_inputs(
         pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
         real_q_out, real_b_out = real_q, real_b
 
+    # Opt-in host padding applies only to prefill with arbitrary token counts.
+    # Decode and target verify have a small, fixed set of token counts. The
+    # TPU pad compiles each of those once, and avoids a blocking copy on
+    # every generation step.
+    mode = forward_batch.forward_mode
+    host_pad = (
+        envs.SGLANG_TPU_HOST_PADDING.get()
+        and mode.is_extend()
+        and not mode.is_target_verify()
+    )
     for field in _TOKEN_FIELDS:
         val = getattr(forward_batch, field, None)
-        if isinstance(val, torch.Tensor) and val.shape[0] < pad_t:
-            setattr(forward_batch, field, _zero_pad_dim0(val, pad_t))
-
-    # MROPE positions are (3, num_tokens); pad along the token dim.
-    mrope_pos = getattr(forward_batch, "mrope_positions", None)
-    if isinstance(mrope_pos, torch.Tensor) and mrope_pos.shape[-1] < pad_t:
-        forward_batch.mrope_positions = F.pad(
-            mrope_pos, (0, pad_t - mrope_pos.shape[-1])
-        )
+        dim = _TOKEN_FIELD_DIM.get(field, 0)
+        if isinstance(val, torch.Tensor) and val.shape[dim] < pad_t:
+            on_host = host_pad and field in _HOST_PAD_TOKEN_FIELDS
+            val = _pad_tensor(val, pad_t, dim=dim, on_host=on_host)
+            setattr(forward_batch, field, val)
 
     if is_draft_extend_v2:
         out_cache_loc = forward_batch.out_cache_loc
@@ -484,6 +600,14 @@ def _pad_forward_batch_inputs(
     # to extend). Non-extend batches keep the upstream None.
     for field in _BS_CPU_LIST_FIELDS:
         val = getattr(forward_batch, field, None)
+        if field == "extend_seq_lens_cpu" and (val is None or len(val) < real_b):
+            # The attention backend prefers this mirror over the device query
+            # lengths whenever it covers the batch, so padding a missing or
+            # stale one out to pad_b would hand the draft/extend path zeros or
+            # an earlier batch's counts for real requests. Clearing it keeps
+            # _extend_query_lens on the device lengths instead.
+            forward_batch.extend_seq_lens_cpu = None
+            continue
         if val is None:
             if not (forward_batch.forward_mode.is_extend() or is_draft_extend_v2):
                 continue
@@ -528,12 +652,9 @@ def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) 
     """
     for field in _TOKEN_FIELDS:
         value = getattr(forward_batch, field, None)
-        if isinstance(value, torch.Tensor) and value.shape[0] > real_q:
-            setattr(forward_batch, field, value[:real_q])
-
-    mrope_positions = getattr(forward_batch, "mrope_positions", None)
-    if isinstance(mrope_positions, torch.Tensor) and mrope_positions.shape[-1] > real_q:
-        forward_batch.mrope_positions = mrope_positions[..., :real_q]
+        dim = _TOKEN_FIELD_DIM.get(field, 0)
+        if isinstance(value, torch.Tensor) and value.shape[dim] > real_q:
+            setattr(forward_batch, field, value.narrow(dim, 0, real_q))
 
     for field in _BS_FIELDS:
         value = getattr(forward_batch, field, None)
@@ -616,6 +737,7 @@ def precompile_kv_offload(host_pool: TpuFusedMHATokenToKVPoolHost) -> None:
         max_blocks,
         time.perf_counter() - start,
     )
+    snapshot_recompilation_baseline()
 
 
 class CompiledForwardShim:
@@ -625,8 +747,10 @@ class CompiledForwardShim:
         self,
         compiled_fn: Callable[..., Any],
         policy: DecoderCompilePolicy,
+        warmup_async_fn: Callable[..., Any] | None = None,
     ) -> None:
         self.fn = compiled_fn
+        self.warmup_async_fn = warmup_async_fn
         self.policy = policy
         self._recompilation_checker = None
         self._model_label = ""
@@ -634,6 +758,11 @@ class CompiledForwardShim:
         # it is frozen for this shim's lifetime. Caching it also keeps the
         # disabled path at a single attribute read per forward.
         self._prompt_logprob_enabled = envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+        runner = policy.model_runner
+        # Draft models read the multimodal embeds inside their forward.
+        self._draft_worker = bool(
+            runner is not None and getattr(runner, "is_draft_worker", False)
+        )
         signature = getattr(compiled_fn, "__signature__", None)
         if signature is not None:
             self.__signature__ = signature
@@ -685,6 +814,10 @@ class CompiledForwardShim:
         self._recompilation_checker = checker
         self._model_label = model_label
 
+    def _is_first_pp_stage(self) -> bool:
+        pp_group = self.policy.model_runner.pp_group
+        return pp_group is not None and bool(pp_group.is_first_rank)
+
     def wait_for_hicache_reload(self) -> None:
         """Wait for the current HiCache reload outside compiled regions."""
         model_runner = self.policy.model_runner
@@ -695,6 +828,21 @@ class CompiledForwardShim:
 
     def __call__(
         self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        forward_batch: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        return self._call(self.fn, input_ids, positions, forward_batch, *args, **kwargs)
+
+    def warmup_async(self, *args: Any, **kwargs: Any) -> Any:
+        """Queue direct compilation and defer execution until ``wait``."""
+        return self._call(self.warmup_async_fn, *args, **kwargs)
+
+    def _call(
+        self,
+        fn: Callable[..., Any],
         input_ids: torch.Tensor | None,
         positions: torch.Tensor | None,
         forward_batch: Any,
@@ -719,6 +867,51 @@ class CompiledForwardShim:
                     and _matches_default(v, self._default_kwargs[k])
                 )
             }
+        # The fused draft loop inlines this call into its own Dynamo graph.
+        # Reading the checker there would put it in that graph's guards, so
+        # attaching it later would recompile the graph this very tool exists to
+        # protect. Compiles from inside it surface on the next eager forward.
+        if torch.compiler.is_compiling():
+            return self._forward(
+                fn, input_ids, positions, forward_batch, *args, **kwargs
+            )
+
+        checker = self._recompilation_checker
+        if checker is None:
+            return self._forward(
+                fn, input_ids, positions, forward_batch, *args, **kwargs
+            )
+        # Read at entry: the padded shapes are what the graph compiled for.
+        pad_q = int(forward_batch.input_ids.shape[0])
+        pad_b = int(forward_batch.seq_lens.shape[0])
+        try:
+            return self._forward(
+                fn, input_ids, positions, forward_batch, *args, **kwargs
+            )
+        finally:
+            checker.check(
+                context_fn=lambda: self._describe_forward(
+                    forward_batch, pad_q=pad_q, pad_b=pad_b
+                )
+            )
+
+    def _describe_forward(self, forward_batch: Any, *, pad_q: int, pad_b: int) -> str:
+        # Dynamic keys, unset on eagle3 draft extend (as in _unpad_decoder_outputs).
+        real_q = getattr(forward_batch, _REAL_Q_KEY, None)
+        real_b = getattr(forward_batch, _REAL_B_KEY, None)
+        real = f" real=q{real_q},b{real_b}" if real_q is not None else ""
+        mode = forward_batch.forward_mode.name
+        return f"{self._model_label} {mode}{real} pad=q{pad_q},b{pad_b}"
+
+    def _forward(
+        self,
+        fn: Callable[..., Any],
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        forward_batch: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
         # EAGLE3 draft extend: EagleDraftExtendInput also rides DRAFT_EXTEND_V2,
         # which is_extend() excludes.
         if (
@@ -737,6 +930,18 @@ class CompiledForwardShim:
             )
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds
+        pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
+        if pp_proxy_tensors is not None:
+            if self._is_first_pp_stage():
+                # The first stage embeds its own input; its graph takes no proxy.
+                kwargs.pop("pp_proxy_tensors")
+            else:
+                kwargs["pp_proxy_tensors"] = _fit_pp_proxy_rows(
+                    pp_proxy_tensors, input_ids, forward_batch
+                )
+        elif any(isinstance(value, PPProxyTensors) for value in args):
+            if not self._is_first_pp_stage():
+                args = _fit_pp_proxy_in_args(args, input_ids, forward_batch)
         # Pin is_prefill_only for the compiled forward. An idle batch computes
         # it as True (all() over zero requests) while real batches are False;
         # the compiled forward reads the value, so it must be identical across
@@ -775,15 +980,71 @@ class CompiledForwardShim:
                 forward_batch.seq_lens.shape[0]
             )
         saved.update(_pin_fields(forward_batch, _PINNED_LOGPROB_FIELDS))
+        if not self._prompt_logprob_enabled and hasattr(
+            forward_batch, "extend_logprob_start_lens_cpu"
+        ):
+            # Only the eager input-logprob gather reads these; keep them out of the guards.
+            saved.update(
+                _pin_fields(forward_batch, {"extend_logprob_start_lens_cpu": None})
+            )
+        # Keep the multimodal embeds out of a target graph's guards; re-attached below.
+        mm_embeds = (
+            None
+            if self._draft_worker
+            else getattr(forward_batch, "mm_input_embeds", None)
+        )
+        if mm_embeds is not None:
+            saved["mm_input_embeds"] = mm_embeds
+            forward_batch.mm_input_embeds = None
         try:
-            out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
-            spec_info = forward_batch.spec_info
-            if spec_info is None or not spec_info.keep_outputs_padded:
-                out = self.policy.finalize_forward_batch(out, forward_batch)
+            out = fn(input_ids, positions, forward_batch, *args, **kwargs)
+            if isinstance(out, PendingCall):
+                finalize_fields = {key: getattr(forward_batch, key) for key in saved}
+                finalize_fields["is_prefill_only"] = forward_batch.is_prefill_only
+
+                def finalize_pending(result: Any) -> Any:
+                    previous = _pin_fields(forward_batch, finalize_fields)
+                    try:
+                        return self._finalize_forward(result, forward_batch)
+                    finally:
+                        _restore_fields(forward_batch, previous)
+
+                out = out.then(finalize_pending)
+            else:
+                out = self._finalize_forward(out, forward_batch)
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
             _restore_fields(forward_batch, saved)
+        if mm_embeds is not None:
+            real_q = getattr(forward_batch, _REAL_Q_KEY, None)
+            if real_q is not None and mm_embeds.shape[0] > real_q:
+                mm_embeds = mm_embeds[:real_q]
+            forward_batch.mm_input_embeds = mm_embeds
 
+        def finish(result: Any) -> Any:
+            # Re-attach the embeds the graph did not see; a hidden-state boundary
+            # leaves them on the batch for the wrapper's eager tail.
+            if (
+                mm_embeds is not None
+                and isinstance(result, LogitsProcessorOutput)
+                and result.mm_input_embeds is None
+            ):
+                result.mm_input_embeds = mm_embeds
+            return self._finish_forward(result, forward_batch, wants_input_logprob)
+
+        if isinstance(out, PendingCall):
+            return out.then(finish)
+        return finish(out)
+
+    def _finalize_forward(self, out: Any, forward_batch: Any) -> Any:
+        spec_info = forward_batch.spec_info
+        if spec_info is None or not spec_info.keep_outputs_padded:
+            out = self.policy.finalize_forward_batch(out, forward_batch)
+        return out
+
+    def _finish_forward(
+        self, out: Any, forward_batch: Any, wants_input_logprob: bool = False
+    ) -> Any:
         # After the restore: LogitsMetadata.from_forward_batch branches on
         # capture_hidden_mode, so the gather must see the caller's value.
         if wants_input_logprob:
@@ -791,14 +1052,6 @@ class CompiledForwardShim:
                 logits_output=out,
                 forward_batch=forward_batch,
                 model=self.policy.model_runner.model,
-            )
-
-        # Check for serving-time XLA recompilation (once per forward call).
-        # Gated by SGLANG_TPU_CHECK_RECOMPILATION=1 (off by default).
-        if self._recompilation_checker is not None:
-            fm = getattr(forward_batch, "forward_mode", "N/A")
-            self._recompilation_checker.check(
-                f"{self._model_label} {fm.name if hasattr(fm, 'name') else fm}"
             )
 
         return out
@@ -875,6 +1128,24 @@ def build_bucketers(
     else:
         token_bucketer = PowerBucketer(
             name="TokenBucketer", min_val=64, max_val=max_t, power=2
+        )
+
+    from sglang.srt.hardware_backend.tpu.pp_chunks import uses_dynamic_chunks
+
+    if uses_dynamic_chunks():
+        from sglang.srt.hardware_backend.tpu.pp_chunks import (
+            chunk_buckets,
+            chunk_granularity,
+        )
+
+        granularity = chunk_granularity(get_schedule().page_size, max_t, True)
+        token_bucketer = Bucketer(
+            name="TokenBucketer",
+            buckets=sorted(
+                set(
+                    token_bucketer.buckets + chunk_buckets(max_t, granularity) + [max_t]
+                )
+            ),
         )
 
     # tpu_compile_bs is reconciled in resolution; read the resolved leaf.

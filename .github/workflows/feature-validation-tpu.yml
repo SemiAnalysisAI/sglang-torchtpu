@@ -1,4 +1,4 @@
-# TPU feature validation -- stage [1] of the nightly (nightly-test-tpu.yml calls
+# TPU feature validation -- the nightly's feature stage (nightly-test-tpu.yml calls
 # this workflow with a prebuilt image), and its own dispatchable trigger for
 # running the stage, or a single test, without a full nightly:
 #   gh workflow run feature-validation-tpu.yml [-f only=<job>] [-f ref=<branch>]
@@ -32,6 +32,7 @@ on:
           - all
           - mh
           - diffusion-mh-collectives
+          - node-normalization
           - pd-mh-gpt-120b
           - pd-mh-gpt-120b-pc-offload
           - pd-mh-gpt-120b-spec
@@ -39,9 +40,12 @@ on:
           - pd-mh-gpt-120b-pc-offload-spec-reshard
           - pd-mh-gpt-120b-kvoff-reshard
           - pd-mh-qwen3-480b-kvoff-reshard
+          - pd-mh-qwen3-vl-8b-spec
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
           - pd-sh-gpt-120b-decode-radix
+          - pd-sh-gpt-120b-offload
+          - pd-sh-gpt-120b-offload-spec
           - sh
       test_filter:
         description: "Substring of a test file path; runs only matching tests"
@@ -111,8 +115,11 @@ jobs:
       pd_singlehost: ${{ steps.tests.outputs.pd_singlehost }}
       pd_singlehost_spec: ${{ steps.tests.outputs.pd_singlehost_spec }}
       pd_singlehost_decode_radix: ${{ steps.tests.outputs.pd_singlehost_decode_radix }}
+      pd_singlehost_offload: ${{ steps.tests.outputs.pd_singlehost_offload }}
+      pd_singlehost_offload_spec: ${{ steps.tests.outputs.pd_singlehost_offload_spec }}
       pd_multihost: ${{ steps.tests.outputs.pd_multihost }}
       diffusion_mh_collectives: ${{ steps.tests.outputs.diffusion_mh_collectives }}
+      node_normalization: ${{ steps.tests.outputs.node_normalization }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -146,8 +153,11 @@ jobs:
           echo "pd_singlehost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py)" >> "$GITHUB_OUTPUT"
           echo "pd_singlehost_spec=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py)" >> "$GITHUB_OUTPUT"
           echo "pd_singlehost_decode_radix=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_singlehost_offload=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_singlehost_offload_spec=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py)" >> "$GITHUB_OUTPUT"
           echo "pd_multihost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py)" >> "$GITHUB_OUTPUT"
           echo "diffusion_mh_collectives=$($discover_files --entry test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py)" >> "$GITHUB_OUTPUT"
+          echo "node_normalization=$($discover_files --entry test/registered/e2e/hardware_backend/tpu/test_node_normalization.py)" >> "$GITHUB_OUTPUT"
 
   single-host:
     needs: [build, discover-tests]
@@ -170,9 +180,7 @@ jobs:
       test_file: ${{ matrix.test.file }}
       nightly: true
       run_name: ${{ matrix.test.run_name }}
-      # The spec-decoding gsm8k gates serve gpt-oss-120b / qwen3-coder-480b from
-      # the ROX weights disk at /weights; harmless for tests that don't use it.
-      weights_pvc: model-weights-rox
+      weights_pvc: ${{ matrix.test.weights_pvc || 'model-weights' }}
     permissions:
       contents: read
       id-token: write
@@ -211,17 +219,19 @@ jobs:
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py
-      weights_pvc: model-weights-rox
+      weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_pc_offload)[0].run_name }}
     permissions:
       contents: read
       id-token: write
 
+  # Not part of `all`: accuracy-test-tpu.yml's 5 PM slot runs this and the qwen3
+  # kvoff-reshard gate, which hold both 2-host slices for over an hour each.
   pd-mh-gpt-120b-kvoff-reshard:
     needs: [build, discover-tests]
     if: >-
       ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && contains(fromJSON('["all","pd-mh-gpt-120b-kvoff-reshard"]'), inputs.only || 'all')
+          && inputs.only == 'pd-mh-gpt-120b-kvoff-reshard'
           && contains('test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py', inputs.test_filter) }}
     name: ${{ fromJSON(needs.discover-tests.outputs.pd_kvoff_reshard)[0].name }}
     uses: ./.github/workflows/_tpu-test.yml
@@ -236,7 +246,7 @@ jobs:
       exec_cmd: env MODEL_PROFILE=gpt_oss_120b python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py
-      weights_pvc: model-weights-rox
+      weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_kvoff_reshard)[0].run_name }}
     permissions:
       contents: read
@@ -248,7 +258,7 @@ jobs:
     needs: [build, discover-tests]
     if: >-
       ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && contains(fromJSON('["all","pd-mh-qwen3-480b-kvoff-reshard"]'), inputs.only || 'all')
+          && inputs.only == 'pd-mh-qwen3-480b-kvoff-reshard'
           && contains('test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py', inputs.test_filter) }}
     name: ${{ fromJSON(needs.discover-tests.outputs.pd_kvoff_reshard_qwen)[0].name }}
     uses: ./.github/workflows/_tpu-test.yml
@@ -263,7 +273,7 @@ jobs:
       exec_cmd: env MODEL_PROFILE=qwen3_coder_480b python3 test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py
-      weights_pvc: model-weights-rox
+      weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_kvoff_reshard_qwen)[0].run_name }}
     permissions:
       contents: read
@@ -290,7 +300,7 @@ jobs:
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py integration
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py
-      weights_pvc: model-weights-rox
+      weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost)[0].run_name }}
     permissions:
       contents: read
@@ -316,7 +326,7 @@ jobs:
       pd_decode_hosts: 1
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py integration
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py
-      weights_pvc: model-weights-rox
+      weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_spec)[0].run_name }}
     permissions:
       contents: read
@@ -341,8 +351,60 @@ jobs:
       pd_decode_hosts: 1
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py integration
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py
-      weights_pvc: model-weights-rox
+      weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_decode_radix)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # RAM KV offload on both engines: a conversation pushed out of HBM comes
+  # back from host RAM on prefill and decode with the device-resident output.
+  pd-sh-gpt-120b-offload:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","pd-sh-gpt-120b-offload"]'), inputs.only || 'all')
+          && contains('test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py', inputs.test_filter) }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_offload)[0].name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_gpt_oss_120b_pd_singlehost_kv_offload
+      lane: nightly
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py integration
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py
+      weights_pvc: model-weights
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_offload)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # RAM KV offload on both engines with EAGLE3: a conversation pushed out of
+  # HBM comes back from host RAM on prefill and decode with spec still active.
+  pd-sh-gpt-120b-offload-spec:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","pd-sh-gpt-120b-offload-spec"]'), inputs.only || 'all')
+          && contains('test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py', inputs.test_filter) }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_offload_spec)[0].name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec
+      lane: nightly
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py integration
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py
+      weights_pvc: model-weights
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_offload_spec)[0].run_name }}
     permissions:
       contents: read
       id-token: write
@@ -367,7 +429,7 @@ jobs:
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py integration
       # Used for dashboard and timing records.
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py
-      weights_pvc: model-weights-rox
+      weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_multihost)[0].run_name }}
     permissions:
       contents: read
@@ -392,8 +454,34 @@ jobs:
       pd_decode_hosts: 2
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py integration
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py
-      weights_pvc: model-weights-rox
+      weights_pvc: model-weights
       run_name: pd-mh-gpt-120b-spec
+    permissions:
+      contents: read
+      id-token: write
+
+  # Qwen3-VL-8B 2P+2D gate: the prefill owns the ViT, so the handoff carries
+  # image-derived KV into an EAGLE3 draft/verify decode loop. Scores MMMU-Pro.
+  pd-mh-qwen3-vl-8b-spec:
+    needs: build
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","pd-mh-qwen3-vl-8b-spec"]'), inputs.only || 'all')
+          && contains('test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py', inputs.test_filter) }}
+    name: pd-mh-qwen3-vl-8b-spec
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_qwen3_vl_8b_pd_multihost_eagle3
+      lane: nightly
+      hosts: 2
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py integration
+      files: test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py
+      weights_pvc: model-weights
+      run_name: pd-mh-qwen3-vl-8b-spec
     permissions:
       contents: read
       id-token: write
@@ -417,7 +505,7 @@ jobs:
       pd_decode_hosts: 2
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py integration
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py
-      weights_pvc: model-weights-rox
+      weights_pvc: model-weights
       run_name: pd-mh-gpt-120b-pc-offload-spec
     permissions:
       contents: read
@@ -443,6 +531,27 @@ jobs:
       # Names the dashboard row and the TIMINGS record.
       files: test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py
       run_name: ${{ fromJSON(needs.discover-tests.outputs.diffusion_mh_collectives)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  node-normalization:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","node-normalization"]'), inputs.only || 'all')
+          && contains('test/registered/e2e/hardware_backend/tpu/test_node_normalization.py', inputs.test_filter) }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.node_normalization)[0].name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_node_normalization
+      lane: nightly
+      hosts: 2
+      exec_cmd: env JAX_PLATFORMS=cpu TORCH_TPU_TOPOLOGY=2,2,2,2 python3 test/registered/e2e/hardware_backend/tpu/test_node_normalization.py -v
+      files: test/registered/e2e/hardware_backend/tpu/test_node_normalization.py
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.node_normalization)[0].run_name }}
     permissions:
       contents: read
       id-token: write
@@ -473,7 +582,7 @@ jobs:
       pd_decode_hosts: 2
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py integration
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py
-      weights_pvc: model-weights-rox
+      weights_pvc: model-weights
       run_name: pd-mh-gpt-120b-pcoff-spec-rs
     permissions:
       contents: read

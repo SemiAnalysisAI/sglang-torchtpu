@@ -12,7 +12,6 @@ from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -49,8 +48,10 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAtten
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import is_xpu, make_layers
+from sglang.srt.utils import is_tpu, is_xpu, make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
+
+_is_tpu = is_tpu()
 
 
 def _get_kda_local_num_heads(num_heads: int, tp_size: int) -> int:
@@ -523,8 +524,8 @@ class KimiDeltaAttention(nn.Module):
             forget_gate = forget_gate.unflatten(
                 -1, (-1, self.head_dim)
             )  # [T, H*K] -> [T, H, K]
-            if not forward_batch.forward_mode.is_target_verify():
-                # Only chunk_kda (extend) wants pre-activated beta; the verify
+            if not _is_tpu:
+                # Only chunk_kda (extend) wants pre-activated beta; the TPU fused
                 # kernel sigmoids it in-kernel like decode.
                 beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
@@ -653,7 +654,7 @@ class KimiLinearModel(nn.Module):
 
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
 
         if self.pp_group.is_first_rank:
@@ -687,9 +688,9 @@ class KimiLinearModel(nn.Module):
             self.norm = PPMissingLayer()
 
         world_size = get_parallel().tp_size
-        assert (
-            config.num_attention_heads % world_size == 0
-        ), "num_attention_heads must be divisible by world_size"
+        assert config.num_attention_heads % world_size == 0, (
+            "num_attention_heads must be divisible by world_size"
+        )
 
     def forward(
         self,
@@ -699,7 +700,7 @@ class KimiLinearModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if get_pp_group().is_first_rank:
+        if get_parallel().pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -718,6 +719,12 @@ class KimiLinearModel(nn.Module):
             device=device,
         )
         aux_hidden_states = []
+        if (
+            self.dspark_layers_to_capture is not None
+            and not self.pp_group.is_first_rank
+            and "dspark_hidden_states" in pp_proxy_tensors.tensors
+        ):
+            aux_hidden_states.append(pp_proxy_tensors["dspark_hidden_states"])
         for i in range(self.start_layer, self.end_layer):
             ctx = get_global_expert_distribution_recorder().with_current_layer(i)
             with ctx:
@@ -738,12 +745,12 @@ class KimiLinearModel(nn.Module):
                 )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            proxy_tensors = {"hidden_states": hidden_states, "residual": residual}
+            if aux_hidden_states:
+                proxy_tensors["dspark_hidden_states"] = torch.cat(
+                    aux_hidden_states, dim=-1
+                )
+            return PPProxyTensors(proxy_tensors)
         else:
             if hidden_states.shape[0] != 0:
                 if residual is None:
@@ -771,7 +778,7 @@ class KimiLinearForCausalLM(nn.Module):
         )
         self.start_layer = self.model.start_layer
         self.end_layer = self.model.end_layer
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         if self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
                 self.config.vocab_size,
@@ -788,11 +795,13 @@ class KimiLinearForCausalLM(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    def get_pp_proxy_dspark_hidden_size(self) -> int:
+        layers = self.model.dspark_layers_to_capture or []
+        return self.config.hidden_size * sum(
+            layer < self.model.start_layer for layer in layers
+        )
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
-        if self.pp_group.world_size > 1:
-            raise NotImplementedError("DSPARK aux hidden capture requires PP=1.")
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."

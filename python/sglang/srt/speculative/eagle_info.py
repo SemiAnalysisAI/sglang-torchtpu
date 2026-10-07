@@ -1,13 +1,12 @@
 import copy
 import logging
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.distributed import get_attn_tp_group, get_tp_group
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
@@ -19,7 +18,7 @@ from sglang.srt.mem_cache.allocation import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_utils import (
     top_k_renorm_prob_func,
@@ -68,7 +67,9 @@ def _draft_runner_of(worker):
 @dataclass
 class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
-    custom_mask: torch.Tensor
+    # Keep this dataclass argument required despite SpecInput's None default;
+    # otherwise the required positions field would follow a defaulted field.
+    custom_mask: torch.Tensor = field()
     positions: torch.Tensor
     retrieve_index: torch.Tensor
     retrieve_next_token: torch.Tensor
@@ -420,7 +421,9 @@ class EagleVerifyInput(SpecInput):
             # non-determinism in softmax/top_k/top_p, causing different
             # sampled tokens. Broadcast from rank 0 to ensure consistency.
             tp_group = (
-                get_attn_tp_group() if is_dp_attention_enabled() else get_tp_group()
+                get_parallel().attn_tp_group
+                if is_dp_attention_enabled()
+                else get_parallel().tp_group
             )
             if tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)
@@ -464,9 +467,7 @@ class EagleVerifyInput(SpecInput):
                     try:
                         req.grammar.accept_token(id)
                     except ValueError as e:
-                        logger.info(
-                            f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                        )
+                        logger.info(f"{i=}, {req=}\n{accept_index=}\n{predict=}\n")
                         raise e
                     req.update_finish_state()
                 if req.finished():
@@ -765,6 +766,14 @@ class EagleDraftInput(SpecInput):
             return None
         return _draft_runner_of(worker).model_config.dtype
 
+    def pad_batch(
+        self,
+        pad_tensor_to_size: Callable[..., torch.Tensor],
+        batch_size: int,
+    ) -> None:
+        if self.draft_probs is not None:
+            self.draft_probs = pad_tensor_to_size(self.draft_probs, batch_size)
+
     @classmethod
     def create_idle_input(
         cls,
@@ -916,8 +925,8 @@ class EagleDraftExtendInput(SpecInput):
 
     # Flat per-req index of each request's last accepted window row
     # (i * window + front + num_correct_drafts[i]). When set, the logits
-    # processor runs lm_head only on these rows. None under gathered-buffer
-    # (DP) modes, whose logprob buffer sizing assumes all-row logits.
+    # processor runs lm_head and LAST hidden capture only on these rows; FULL
+    # hidden capture remains unpruned.
     select_index: Optional[torch.Tensor] = None
 
     # None for draft-extend's idle batch; attention backends fall back to
@@ -927,21 +936,18 @@ class EagleDraftExtendInput(SpecInput):
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
 
-    def last_accepted_indices(self) -> torch.Tensor:
-        """Return the final accepted row for every request in this batch shape."""
-        assert self.num_tokens_per_req > 0
-        num_requests = self.num_accept_tokens.shape[0]
-        row_starts = torch.arange(
-            0,
-            num_requests * self.num_tokens_per_req,
-            self.num_tokens_per_req,
-            dtype=torch.int64,
-            device=self.num_accept_tokens.device,
-        )
-        # Compile-policy padding uses zero accept counts. Select the first row
-        # for those inert requests so padded indices remain in bounds.
-        accept_offsets = self.num_accept_tokens.to(torch.int64).clamp_min(1) - 1
-        return row_starts + accept_offsets
+    def pad_batch(
+        self,
+        pad_tensor_to_size: Callable[..., torch.Tensor],
+        batch_size: int,
+    ) -> None:
+        if self.num_correct_drafts is not None:
+            self.num_correct_drafts = pad_tensor_to_size(
+                self.num_correct_drafts, batch_size
+            )
+            self.num_accept_tokens = pad_tensor_to_size(
+                self.num_accept_tokens, batch_size
+            )
 
     @classmethod
     def hidden_size_for(cls, worker) -> Optional[int]:

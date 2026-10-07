@@ -3,7 +3,7 @@
 Requires a TPU + a built tpu_sync extension + torch_tpu. NOT a CI unit test
 (see test_tpu_raiden_offload_unit.py for the host-only logic). Run with:
 
-    PYTHONPATH=/path/to/sglang-torchtpu/python:/path/to/tpu-raiden \
+    PYTHONPATH=/path/to/sglang-torchtpu/python:/path/to/tpu-sync \
         python3 test/manual/tpu/test_tpu_raiden_roundtrip_ondevice.py
 
 IMPORTANT — why this test never writes the KV buffer with eager ops:
@@ -67,13 +67,13 @@ def test_raiden_dma_roundtrip():
 
     _poll(transfer.backup([1, 2], [0, 1]), "D2h")  # device 1,2 -> host 0,1
     _poll(transfer.load([0, 1], [4, 5]), "H2d")  # host 0,1 -> device 4,5
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
 
     got4 = float(data[4, 0, 0, 0, 0].cpu())
     got5 = float(data[5, 0, 0, 0, 0].cpu())
-    assert (
-        abs(got4 - 101.0) < 1e-2 and abs(got5 - 102.0) < 1e-2
-    ), f"round-trip mismatch: pages 4,5 = {got4},{got5} (expected 101,102)"
+    assert abs(got4 - 101.0) < 1e-2 and abs(got5 - 102.0) < 1e-2, (
+        f"round-trip mismatch: pages 4,5 = {got4},{got5} (expected 101,102)"
+    )
     print(f"  pages 4,5 after D2h->H2d = {got4},{got5} OK")
 
 
@@ -114,7 +114,7 @@ def test_host_pool_wiring():
         "host backup",
     )
     _poll(host.load_all_layer(pool, host_indices, device_indices), "host load")
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     print("  alloc/backup/load executed + completed OK")
 
     free_before = host.available_size()
@@ -124,7 +124,7 @@ def test_host_pool_wiring():
 
 
 if __name__ == "__main__":
-    print(f"TPU chips: {torch.tpu.device_count()}")
+    print(f"TPU chips: {torch.accelerator.device_count()}")
     test_raiden_dma_roundtrip()
     test_host_pool_wiring()
     print("\nALL ON-DEVICE RAIDEN TESTS PASSED")

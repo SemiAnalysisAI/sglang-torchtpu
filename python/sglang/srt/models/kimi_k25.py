@@ -1,4 +1,5 @@
 import logging
+from array import array
 from copy import deepcopy
 from typing import Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
@@ -142,7 +143,6 @@ def apply_rope(
 
 
 class MoonViTEncoderLayer(nn.Module):
-
     def __init__(
         self,
         num_heads: int,
@@ -358,7 +358,6 @@ def get_1d_sincos_pos_embed(embed_dim, t_size, cls_token=False):
 
 
 class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
-
     def __init__(
         self,
         height: int,
@@ -513,7 +512,6 @@ class Rope2DPosEmbRepeated(nn.Module):
 
 
 class MoonVision3dPatchEmbed(nn.Module):
-
     def __init__(
         self,
         out_dim: int,
@@ -525,14 +523,14 @@ class MoonVision3dPatchEmbed(nn.Module):
         pos_emb_type: str = "divided_fixed",
     ):
         super().__init__()
-        assert isinstance(
-            patch_size, int | Sequence
-        ), f"Invalid patch_size type: {type(patch_size)}"
+        assert isinstance(patch_size, int | Sequence), (
+            f"Invalid patch_size type: {type(patch_size)}"
+        )
         if isinstance(patch_size, int):
             patch_size = (patch_size, patch_size)
-        assert (
-            len(patch_size) == 2
-        ), f"Expected patch_size to be a tuple of 2, got {patch_size}"
+        assert len(patch_size) == 2, (
+            f"Expected patch_size to be a tuple of 2, got {patch_size}"
+        )
         self.patch_size = patch_size
 
         self.proj = Conv2dLayer(
@@ -580,9 +578,9 @@ class MoonViT3dEncoder(nn.Module):
     ) -> None:
         super().__init__()
 
-        assert (
-            video_attn_type == "spatial_temporal"
-        ), f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
+        assert video_attn_type == "spatial_temporal", (
+            f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
+        )
         self.video_attn_type = video_attn_type
         self.rope_2d = Rope2DPosEmbRepeated(
             block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512
@@ -822,9 +820,18 @@ def mm_projection_auto(
 class KimiK25ForConditionalGeneration(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
-    # Decode goes through general_mm_embed_routine's precomputed input_embeds;
-    # the TPU decoder compile policy reads this to trace the same call shape.
-    decode_embeds_in_language_model: bool = False
+    # On TPU, decode / verify hands the compiled language model raw input_ids so the
+    # token embedding runs inside the graph instead of as eager programs in
+    # front of every step. Prefill keeps general_mm_embed_routine, which is
+    # where image embeddings are spliced. The TPU decoder compile policy reads
+    # this to warm the input_ids decode / verify variants.
+    decode_embeds_in_language_model: bool = _is_tpu
+    # Text-only prefill takes the same direct path; the routine's eager embeds
+    # are sized by real tokens and disagree with the DP-padded bucket.
+    text_prefill_in_language_model: bool = _is_tpu
+    # Image steps take one input_embeds program on every rank, the logits
+    # processor is compiled, and the vision tower runs collective-free.
+    serves_dp_attention: bool = _is_tpu
 
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
     # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
@@ -854,10 +861,13 @@ class KimiK25ForConditionalGeneration(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
+        # Under DP attention only the image-owning group runs the encoder, and a
+        # TPU program with a collective needs every chip: build it collective-free.
+        self.replicate_vision_tower = _is_tpu and is_dp_attention_enabled()
         # Create vision tower
         self.vision_tower = MoonViT3dPretrainedModel(
             config.vision_config,
-            use_data_parallel=self.use_data_parallel,
+            use_data_parallel=self.use_data_parallel or self.replicate_vision_tower,
             quant_config=(
                 quant_config if isinstance(quant_config, ModelSlimConfig) else None
             ),
@@ -885,9 +895,8 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
-        # TPU: annotate the inner DeepSeek-V3 decoder (mirrors Qwen3-VL) so the
-        # data-dependent multimodal merge and logits stay out of the graph.
-        # Inert unless --enable-torch-compile.
+        # Compile the language model with its logits processor: eager logits
+        # collectives deadlock under DP attention. Vision and embed merge stay eager.
         if _is_tpu and self.language_model is not None:
             from sglang.srt.compilation.support_torch_compile import (
                 support_torch_compile,
@@ -897,7 +906,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
             )
 
             support_torch_compile(
-                self.language_model.model,
+                self.language_model,
                 policy=Qwen3VLDecoderTpuCompilePolicy,
             )
 
@@ -906,6 +915,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
         # Alias .model to .language_model so this class satisfies the piecewise
         # CUDA graph gate, which checks `hasattr(model, "model")`.
         return self.language_model
+
+    @property
+    def logits_processor(self):
+        # Looked up on model_runner.model by the TPU policy and sampler.
+        return getattr(self.language_model, "logits_processor", None)
+
+    def get_output_embeddings(self):
+        return getattr(self.language_model, "lm_head", None)
 
     def __setattr__(self, name, value):
         # Skip redundant self.model.model assignment in runner to avoid duplicate
@@ -960,7 +977,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 features, device=device, dtype=target_dtype
             )
 
-        if self.use_data_parallel:
+        if self.use_data_parallel and not self.replicate_vision_tower:
             image_embeds = run_dp_sharded_mrope_vision_model(
                 self.vision_tower,
                 None,
@@ -982,7 +999,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         image_embeds = self.vision_tower(pixel_values, grid_thws)
         return mm_projection_auto(self.mm_projector, image_embeds)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -1042,6 +1059,31 @@ class KimiK25ForConditionalGeneration(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        if self.decode_embeds_in_language_model and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+            or (
+                self.text_prefill_in_language_model
+                and not forward_batch.contains_mm_inputs()
+                # A DP peer's image step puts every rank on the input_embeds path.
+                and not forward_batch.is_tpu_mm_extend_in_batch
+            )
+        ):
+            # Embed in-graph. Positional: the warmed text variants guard on this
+            # call shape.
+            return self.language_model(
+                input_ids,
+                positions,
+                forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+
+        # An explicit pp_proxy_tensors=None is a different guarded call shape.
+        extra = (
+            {"pp_proxy_tensors": pp_proxy_tensors}
+            if pp_proxy_tensors is not None
+            else {}
+        )
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -1050,7 +1092,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 Modality.IMAGE: self.get_image_feature,
             },
             positions=positions,
-            pp_proxy_tensors=pp_proxy_tensors,
+            **extra,
         )
 
         return hidden_states

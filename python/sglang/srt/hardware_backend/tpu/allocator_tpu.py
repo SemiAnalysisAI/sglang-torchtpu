@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.kv_free_fence import HeldPages
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.utils import get_num_new_pages
 
@@ -125,22 +126,45 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int32, device="cpu"
         )
-        self.release_pages = torch.empty((0,), dtype=torch.int32, device="cpu")
         # None outside a free_group_begin()/free_group_end() pair, as in the parent.
         self.free_group = None
-        self.free_page_reps_group = []
+        self.free_page_ids_group = []
+        self.staged_pages: list[torch.Tensor] = []
+        self.num_staged_pages = 0
+        # Pages freed while a forward was in flight; see kv_free_fence.py.
+        self.held_pages = HeldPages()
+
+    def available_size(self):
+        return super().available_size() + self.held_pages.num_pages * self.page_size
+
+    def _ensure_free_pages(self, num_pages: int) -> bool:
+        """Make ``free_pages`` hold at least ``num_pages``, taking held pages
+        when short."""
+        if num_pages > len(self.free_pages):
+            self.merge_and_sort_free()
+        short = num_pages - len(self.free_pages)
+        if short <= 0:
+            return True
+        if short > self.held_pages.num_pages:
+            return False
+        if self.kv_free_fence.in_dma_write_target:
+            # A DMA is not ordered after the forward that may still write these.
+            self.kv_free_fence.wait_for_in_flight()
+            self.merge_and_sort_free()
+        else:
+            # Device compute runs in launch order, so this forward writes last.
+            self.free_pages = torch.cat(
+                (self.held_pages.borrow(short), self.free_pages)
+            )
+        return num_pages <= len(self.free_pages)
 
     def alloc(self, need_size: int):
         # Page-aligned bulk allocation, returns contiguous device indices.
-        assert (
-            need_size % self.page_size == 0
-        ), "The allocation size should be page-aligned"
+        assert need_size % self.page_size == 0, (
+            "The allocation size should be page-aligned"
+        )
         num_pages = need_size // self.page_size
-        if self.need_sort and num_pages > len(self.free_pages):
-            # Pools are host-resident; keep release_pages on CPU (the parent
-            # defaults to self.device, which is the accelerator here).
-            self.merge_and_sort_free(device="cpu")
-        if num_pages > len(self.free_pages):
+        if not self._ensure_free_pages(num_pages):
             return None
 
         out_pages = self.free_pages[:num_pages]
@@ -178,12 +202,7 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         else:
             num_new_pages_item = num_new_pages
 
-        if self.need_sort and num_new_pages_item > len(self.free_pages):
-            # Pools are host-resident; keep release_pages on CPU (the parent
-            # defaults to self.device, which is the accelerator here).
-            self.merge_and_sort_free(device="cpu")
-
-        if num_new_pages_item > len(self.free_pages):
+        if not self._ensure_free_pages(num_new_pages_item):
             return None
 
         # Compute the per-token page indices entirely on host, then do a
@@ -235,11 +254,7 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         need_new_pages = (seq_lens_cpu % self.page_size == 1).to(torch.int32)
         num_new_pages = int(need_new_pages.sum())
 
-        if num_new_pages > len(self.free_pages):
-            # Pools are host-resident; keep release_pages on CPU (the parent
-            # defaults to self.device, which is the accelerator here).
-            self.merge_and_sort_free(device="cpu")
-        if num_new_pages > len(self.free_pages):
+        if not self._ensure_free_pages(num_new_pages):
             return None
 
         bs = int(seq_lens.shape[0])
@@ -275,6 +290,22 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             assert len(torch.unique(out_indices)) == len(out_indices)
 
         return out_indices.int()
+
+    def _release_page_ids(self, *page_ids: torch.Tensor) -> None:
+        """Keep every page-id release path on the host pool's int32 dtype."""
+        normalized = tuple(
+            page_id.to(device="cpu", dtype=torch.int32) for page_id in page_ids
+        )
+        tag = None if self.kv_free_fence is None else self.kv_free_fence.hold_tag()
+        if tag is None:
+            super()._release_page_ids(*normalized)
+        else:
+            self.held_pages.push(tag, torch.cat(normalized))
+
+    def release_held_pages(self, completed: int) -> None:
+        released = self.held_pages.pop_released(completed)
+        if released:
+            super()._release_page_ids(*released)
 
     def free(self, free_index: torch.Tensor) -> None:
         # Page pools are host-resident int32 tensors. Scheduler locations can

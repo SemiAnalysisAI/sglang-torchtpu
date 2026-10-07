@@ -4,9 +4,6 @@ from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 
-from sglang.srt.distributed import (
-    get_tp_group,
-)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -75,11 +72,10 @@ class StandardDispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
     topk_output: TopKOutput
-    # SGLANG_OPT_MOE_QUANT_ONCE: optional pre-quantized (q, scale) pair for
-    # ``hidden_states`` (per-token-group-128 fp8, q rows possibly padded to a
-    # multiple of 4). Consumed by the standard->triton fused runner so it can
-    # skip its own activation quant; ``hidden_states`` itself stays bf16.
-    hidden_states_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # Pre-quantized activation for ``hidden_states``, which itself stays bf16:
+    # either a (q, scale) pair (per-token-group-128 fp8, q rows padded to a
+    # multiple of 4) or an ``Mxfp8RoutedInputPreQuant``.
+    hidden_states_pre_quant: Optional[Tuple] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -123,6 +119,7 @@ class StandardDispatcher(BaseDispatcher):
         #   (mask_tpu_moe_non_local_experts); keeping the mapping out of the
         #   dispatcher also keeps lazily-created module state out of the
         #   compiled graph, whose guards precompiled TPU programs depend on
+        # - flashinfer_megamoe routes by global expert ID inside the mega kernel
         self.skip_local_expert_mapping = (
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()
@@ -130,6 +127,7 @@ class StandardDispatcher(BaseDispatcher):
             or backend.is_experimental_sgl_trtllm()
             or backend.is_flashinfer_trtllm_routed()
             or backend.is_hpc_ops()
+            or backend.is_flashinfer_megamoe()
             or self.enable_flashinfer_mxfp4_moe
             or _is_tpu
         )
@@ -164,7 +162,7 @@ class StandardDispatcher(BaseDispatcher):
 
             # Quantize before comm, swizzle after.
             with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 if hidden_states.shape[0] > 0:
                     x, x_sf = fp4_quantize_flashinfer(
@@ -178,7 +176,7 @@ class StandardDispatcher(BaseDispatcher):
                     x_sf = torch.zeros(
                         0, x_col // 16, dtype=torch.uint8, device=hidden_states.device
                     )
-            topk_weights, topk_ids, x, x_sf = get_tp_group().all_gatherv(
+            topk_weights, topk_ids, x, x_sf = get_parallel().tp_group.all_gatherv(
                 [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
             )
             # TODO: fuse into cutlass moe
@@ -206,8 +204,9 @@ class StandardDispatcher(BaseDispatcher):
                     (self.num_experts,), -1, dtype=torch.int32, device=device
                 )
                 self.local_expert_mapping[
-                    self.moe_ep_rank
-                    * self.num_local_routed_experts : (self.moe_ep_rank + 1)
+                    self.moe_ep_rank * self.num_local_routed_experts : (
+                        self.moe_ep_rank + 1
+                    )
                     * self.num_local_routed_experts
                 ] = torch.arange(
                     0, self.num_local_routed_experts, dtype=torch.int32, device=device
@@ -261,10 +260,10 @@ class StandardDispatcher(BaseDispatcher):
         (hidden_states,) = combine_input
         if should_use_flashinfer_cutlass_moe_fp4_allgather():
             hidden_states, global_hidden_states = (
-                get_local_dp_buffer(get_tp_group()),
+                get_local_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
-            get_tp_group().reduce_scatterv(
+            get_parallel().tp_group.reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),

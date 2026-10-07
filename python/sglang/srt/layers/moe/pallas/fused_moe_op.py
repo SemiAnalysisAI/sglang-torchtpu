@@ -41,7 +41,8 @@ Activation
 ----------
 Only ``"silu"`` (SwiGLU: ``silu(gate) * up``) is exercised today, which
 is what Qwen3-MoE uses. ``"gelu"`` is supported for parity with the
-mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS.
+mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS, and
+``"situ:{beta}:{linear_beta|none}"`` (built by ``fused_moe_call``) for Kimi-K3.
 """
 
 # NOTE: do *not* add ``from __future__ import annotations`` here —
@@ -235,6 +236,53 @@ def _gmm2_tile_source(lhs, w2, w2_scale, num_experts, *, w2_packed):
     return _lookup_tile_info(lhs, w2, w2_scale, num_experts, packed_fp4=True)
 
 
+# 3 pipelined rhs buffers + unpack staging tile + scales/lhs/acc/out.
+_PACKED_RHS_VMEM_DIVISOR = 5
+
+
+def _vmem_safe_packed_tile_n(base_tile_info):
+    """Shrink ``tile_n`` for a packed sub-byte rhs so the unpack staging tile fits.
+
+    ``calculate_tiling`` budgets the rhs from its stored bit width; the W4A16
+    unpack needs about one more buffer, which overflowed VMEM at Kimi's GMM1
+    (62.77 MB vs a 57.60 MB limit). No-op for bf16, FP8 and packed FP4.
+    """
+    import dataclasses
+
+    import jax
+    import jax.numpy as jnp
+
+    from sglang.srt.layers.moe.pallas.gmm_v2 import (
+        TileSizes,
+        _largest_aligned_divisor_at_most,
+    )
+
+    def wrapped(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act=None):
+        if isinstance(base_tile_info, TileSizes):
+            tiles = base_tile_info
+        else:
+            tiles = base_tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+        # Only pre-packed INT4 has the unpack staging tile; fp8 also reports
+        # packing 4 (32-bit words) but needs none.
+        if rhs_cfgs.quant_dtype != jnp.int4.dtype:
+            return tiles
+
+        rhs_bits = jax.dtypes.itemsize_bits(rhs_cfgs.dtype)
+        budget = vmem_limit_bytes // _PACKED_RHS_VMEM_DIVISOR
+        tile_n = tiles.tile_n
+        while tile_n > 128 and tiles.tile_k * tile_n * rhs_bits // 8 > budget:
+            try:
+                tile_n = _largest_aligned_divisor_at_most(dims.size_n, tile_n // 2, 128)
+            except ValueError:
+                # Nothing smaller divides size_n; keep the kernel's choice.
+                return tiles
+        if tile_n == tiles.tile_n:
+            return tiles
+        return dataclasses.replace(tiles, tile_n=tile_n)
+
+    return wrapped
+
+
 def _dividing_tile_k(base_tile_info):
     """Wrap a gmm_v2 ``tile_info`` so the resolved ``tile_k`` always divides
     ``size_k`` (mirrors the kernel's N-gate, which has no K equivalent) and
@@ -263,6 +311,12 @@ def _dividing_tile_k(base_tile_info):
         else:
             tiles = base_tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
         quant_block_size = rhs_cfgs.quant_block_size if rhs_cfgs.has_scale else None
+        if getattr(rhs_cfgs, "requantize_in_vmem", False):
+            quant_block_size = min(lhs_cfgs.quant_block_size, dims.size_k)
+            # Activation amax spans the whole K=512 group; tile_k cannot split it.
+            tiles = dataclasses.replace(
+                tiles, tile_k=max(tiles.tile_k, quant_block_size)
+            )
         if dims.size_k % tiles.tile_k != 0 or not _quant_block_compatible(
             tiles.tile_k, quant_block_size
         ):
@@ -283,9 +337,11 @@ def _fuse_act_name(activation_name):
     The gated activation now runs *in-kernel* in GMM1 (gmm_v2 splits the
     ``2*n`` gate/up accumulator and applies ``act(gate) * up`` before writing
     only ``n`` columns to HBM). ``gmm_v2.apply_act_fn`` accepts
-    ``silu`` / ``gelu`` / ``swigluoai``; SGLang spells the GPT-OSS one
-    ``swiglu_oai``.
+    ``silu`` / ``gelu`` / ``swigluoai`` / ``situ:{beta}:{linear_beta|none}``;
+    SGLang spells the GPT-OSS one ``swiglu_oai``.
     """
+    if activation_name.startswith("situ:"):
+        return activation_name
     mapping = {
         "silu": "silu",
         "gelu": "gelu",
@@ -318,6 +374,8 @@ def _fused_moe_jax(
     use_sc_gather=0,
     w_quant_bits=0,  # 4 => w1/w2 are checkpoint-packed int4 words (W4A16)
     permute_dense_threshold=0,
+    w1_channel_scale=None,
+    w2_channel_scale=None,
 ):
     """Production fused-MoE kernel body. Exported by ``_build_fused_moe_op``.
 
@@ -343,28 +401,45 @@ def _fused_moe_jax(
 
     # uint8 rhs = packed FP4 (2 float4 codes/byte along K); gmm_v2 unpacks to
     # float4_e2m1fn in-kernel when told packed_fp4=True (real K = shape[1] * 2).
-    # This governs *any* packed-float4 rhs: today only NVFP4 emits uint8, but the
-    # MXFP4-native path (not yet wired) would flow through here too — correct
-    # (block size is data-driven from the scale), just untested.
+    # Block size (32 MXFP4, 512 NVFP4) is data-driven from the scale.
     w1_packed = w1.dtype == jnp.uint8
     w2_packed = w2.dtype == jnp.uint8
 
     rhs_quant_dtype = None
     maybe_quantize_lhs = True
+    dequantize_int4_in_vmem = False
+    use_vmem_fp8 = w1_channel_scale is not None or w2_channel_scale is not None
+    if use_vmem_fp8 and (
+        w_quant_bits != 4
+        or w1_channel_scale is None
+        or w2_channel_scale is None
+        or w1_bias is not None
+        or w2_bias is not None
+    ):
+        raise ValueError(
+            "VMEM FP8 requires two channel-scale tensors, INT4 weights and no biases"
+        )
     if w_quant_bits:
         assert w_quant_bits == 4, f"unsupported w_quant_bits={w_quant_bits}"
-        # W4A16: checkpoint-packed int4 rhs (8 per int32), bf16 activations.
+        # vmem-bf16: dequantize groups in VMEM, one dot per tile; default:
+        # scale after each 32-K group product.
+        from sglang.srt.layers.moe.tpu_moe_utils import (
+            INT4_MOE_MODE_VMEM_BF16,
+            resolve_int4_moe_mode,
+        )
+
+        dequantize_int4_in_vmem = (
+            not use_vmem_fp8 and resolve_int4_moe_mode() == INT4_MOE_MODE_VMEM_BF16
+        )
         rhs_quant_dtype = jnp.int4
-        maybe_quantize_lhs = False
+        maybe_quantize_lhs = use_vmem_fp8
 
     # gmm_v2 needs the routed-row count ``m*topk`` to be a multiple of its LHS
     # sublane tiling (16 for the bf16 activations this path runs on). Padding
     # the *input* tokens here keeps the permute/gather operating on an
     # already-aligned, fixed-bucket shape and removes the post-gather
     # ``jnp.pad`` + ``group_sizes`` scatter that XLA was offloading to the
-    # SparseCore (and crashing on). Pad tokens route to expert 0 with zero
-    # weight, so they contribute nothing to any real token and are sliced off
-    # at the very end.
+    # SparseCore (and crashing on). Padding has zero weight.
     m_orig = m
     m_pad = _padded_token_count(m, topk, lhs_sublane_tiling(hidden_states.dtype))
     if m_pad != m:
@@ -415,18 +490,8 @@ def _fused_moe_jax(
         )
 
         n_sorted = sorted_token_ids.shape[0]
-        if use_group_offset:
-            # ``start``/``end`` bound only the Pallas grid; rows outside stay
-            # uninitialized and the GMM never reads them (it skips groups before
-            # ``group_offset``, and gmm_v2 masks its store with a select, so an
-            # unwritten row cannot poison a sum). At EP8 this is ~8x less HBM
-            # traffic in the permute. Matches tpu-inference, which passes the
-            # same shard window to this same kernel.
-            gather_start = row_start.reshape(1)
-            gather_end = row_end.reshape(1)
-        else:
-            gather_start = jnp.array([0], dtype=jnp.int32)
-            gather_end = jnp.array([n_sorted], dtype=jnp.int32)
+        gather_start = jnp.array([0], dtype=jnp.int32)
+        gather_end = jnp.array([n_sorted], dtype=jnp.int32)
         x_sorted = ragged_gather_v2(
             hidden_states,
             sorted_token_ids,
@@ -445,7 +510,12 @@ def _fused_moe_jax(
     compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
     # W4A16 runs GMM1 unfused: the fused gate/up split mis-applies multi-block
     # rhs scales, so the activation is applied in JAX below.
-    unfused_gmm1 = compact_block_scales or bool(w_quant_bits)
+    clamp_limit = (
+        float(activation_name.split(":", 1)[1])
+        if activation_name.startswith("silu_and_mul_clamp:")
+        else None
+    )
+    unfused_gmm1 = compact_block_scales or bool(w_quant_bits) or clamp_limit is not None
     gmm1_fuse_act = None if unfused_gmm1 else _fuse_act_name(activation_name)
 
     gmm1_tile_info = None
@@ -458,7 +528,9 @@ def _fused_moe_jax(
 
     # Weights arrive lane-aligned from the loader (bf16: pad activations to
     # match; quantized: unpadded-at-load dims are unsupported)
-    gmm1_tiling = _dividing_tile_k(gmm1_tile_info or calculate_tiling)
+    gmm1_tiling = _dividing_tile_k(
+        _vmem_safe_packed_tile_n(gmm1_tile_info or calculate_tiling)
+    )
     if w1_scale is None:
         assert w1.shape[1] % 128 == 0, (
             f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight K "
@@ -500,6 +572,7 @@ def _fused_moe_jax(
         group_sizes=group_sizes,
         rhs_scale=w1_scale,
         rhs_bias=w1_bias,
+        rhs_channel_scale=w1_channel_scale,
         group_offset=group_offset,
         zero_initialize=zero_init,
         preferred_element_type=out_dtype,
@@ -510,8 +583,14 @@ def _fused_moe_jax(
         packed_fp4=w1_packed,
         maybe_quantize_lhs=maybe_quantize_lhs,
         rhs_quant_dtype=rhs_quant_dtype,
+        dequantize_rhs=dequantize_int4_in_vmem,
     )
-    if unfused_gmm1:
+    if clamp_limit is not None:
+        gate, up = jnp.split(gmm1_out, 2, axis=-1)
+        gate = jnp.minimum(gate, clamp_limit)
+        up = jnp.clip(up, -clamp_limit, clamp_limit)
+        gmm1_out = (jax.nn.silu(gate.astype(jnp.float32)) * up).astype(out_dtype)
+    elif unfused_gmm1:
         gmm1_out = apply_act_fn(
             gmm1_out, int(gmm1_out.shape[-1] // 2), _fuse_act_name(activation_name)
         )
@@ -527,7 +606,9 @@ def _fused_moe_jax(
             "pad weights AND scales jointly at load time."
         )
     gmm2_tiling = _dividing_tile_k(
-        _gmm2_tile_source(gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed)
+        _vmem_safe_packed_tile_n(
+            _gmm2_tile_source(gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed)
+        )
     )
     gmm2_out = gmm_v2(
         lhs=gmm1_out,
@@ -535,6 +616,7 @@ def _fused_moe_jax(
         group_sizes=group_sizes,
         rhs_scale=w2_scale,
         rhs_bias=w2_bias,
+        rhs_channel_scale=w2_channel_scale,
         group_offset=group_offset,
         zero_initialize=zero_init,
         preferred_element_type=out_dtype,
@@ -542,6 +624,7 @@ def _fused_moe_jax(
         packed_fp4=w2_packed,
         maybe_quantize_lhs=maybe_quantize_lhs,
         rhs_quant_dtype=rhs_quant_dtype,
+        dequantize_rhs=dequantize_int4_in_vmem,
     )[
         :,
         :hidden_size,
@@ -668,6 +751,8 @@ def _build_fused_moe_op():
         use_sc_gather: int = 0,
         w_quant_bits: int = 0,
         permute_dense_threshold: int = 0,
+        w1_channel_scale: Optional[jax.Array] = None,
+        w2_channel_scale: Optional[jax.Array] = None,
     ) -> jax.Array:
         return _fused_moe_jax(
             hidden_states,
@@ -687,6 +772,8 @@ def _build_fused_moe_op():
             use_sc_gather,
             w_quant_bits,
             permute_dense_threshold,
+            w1_channel_scale,
+            w2_channel_scale,
         )
 
     custom_op = jax_op(op_name, _wrapped)
@@ -709,6 +796,8 @@ def _build_fused_moe_op():
         use_sc_gather: int = 0,
         w_quant_bits: int = 0,
         permute_dense_threshold: int = 0,
+        w1_channel_scale: Optional[torch.Tensor] = None,
+        w2_channel_scale: Optional[torch.Tensor] = None,
     ):
         if no_combine:
             return hidden_states.new_empty(
@@ -742,6 +831,10 @@ def fused_moe_call(
     global_num_experts: int = 0,
     expert_group_offset: int = 0,
     w_quant_bits: int = 0,
+    w1_channel_scale: Optional[torch.Tensor] = None,
+    w2_channel_scale: Optional[torch.Tensor] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """Invoke the Pallas fused-MoE op.
 
@@ -756,7 +849,19 @@ def fused_moe_call(
     or the un-combined per-expert ``[num_tokens, topk, hidden_size]``
     when ``no_combine`` is True.
     """
+    if activation == "situ":
+        # SiTU (beta, linear_beta) are the runner's gemm1 (alpha, clamp_limit).
+        if gemm1_alpha is None:
+            raise ValueError("SiTU fused MoE requires gemm1_alpha (SiTU beta).")
+        linear_beta = "none" if gemm1_clamp_limit is None else gemm1_clamp_limit
+        activation = f"situ:{gemm1_alpha}:{linear_beta}"
     op = _build_fused_moe_op()
+    # Routed rows for this (bucket-padded) call; static per compiled graph.
+    routed_rows = int(hidden_states.shape[0]) * int(topk)
+    use_sc_gather = int(
+        envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()
+        and routed_rows >= envs.SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS.get()
+    )
     return op(
         hidden_states,
         w1,
@@ -772,7 +877,9 @@ def fused_moe_call(
         no_combine,
         global_num_experts,
         expert_group_offset,
-        int(envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()),
+        use_sc_gather,
         w_quant_bits,
         int(envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD.get()),
+        w1_channel_scale,
+        w2_channel_scale,
     )

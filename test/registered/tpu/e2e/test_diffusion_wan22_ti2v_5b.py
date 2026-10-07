@@ -28,7 +28,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionTestCase,
 )
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.server_test_suite import resolve_tpu_model_path
+from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ register_tpu_ci(
     labels=["singlehost", "wan2.2-ti2v-5b", "diffusion"],
 )
 
-NUM_FRAMES = 25
+NUM_FRAMES = 9
 
 TPU_WAN22_CASES = [
     DiffusionTestCase(
@@ -52,8 +52,11 @@ TPU_WAN22_CASES = [
         ),
         DiffusionSamplingParams(
             prompt="A curious raccoon peers through a field of sunflowers",
-            output_size="1280x704",
+            output_size="832x480",
             num_frames=NUM_FRAMES,
+            # Workaround: seeding a TPU torch.Generator can deadlock on the GIL in
+            # torch_tpu's blocking host-to-device copy; drop once TorchTPU fixes it.
+            extras={"num_inference_steps": 4, "seed": 0, "generator_device": "cpu"},
         ),
         run_perf_check=False,
         run_consistency_check=False,

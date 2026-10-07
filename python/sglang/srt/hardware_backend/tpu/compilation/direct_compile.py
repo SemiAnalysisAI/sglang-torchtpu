@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import time
 from collections.abc import Callable, Hashable, Sequence
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
@@ -22,6 +23,10 @@ from torch_tpu._internal.compile import tpu_torch_compile
 
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
     PallasForwardMetadata,
+)
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
+from sglang.srt.hardware_backend.tpu.compilation.pp_proxy_pytree import (
+    register_pp_proxy_pytree,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -123,6 +128,8 @@ class KVPool(Protocol):
 tree_util.register_dataclass(ForwardBatch)
 tree_util.register_dataclass(PallasForwardMetadata)
 tree_util.register_dataclass(LogitsProcessorOutput)
+# Pipeline stages exchange PPProxyTensors as the compiled input and output.
+register_pp_proxy_pytree(tree_util)
 
 
 def direct_compile(
@@ -133,6 +140,7 @@ def direct_compile(
     model_extra_tensor_attrs: Sequence[str] = (),
     kv_pool: KVPool | None = None,
     ignored_argnames: tuple[str, ...] = (),
+    prune_unused_inputs: bool = False,
 ) -> CompiledFunction:
     """Compile and dispatch ``fn`` directly, without torch.compile's
     Dynamo or AOTAutograd.
@@ -142,6 +150,9 @@ def direct_compile(
     Any non-Tensor values are baked directly into the graph; all Tensor
     values are graph inputs.
     Then, it lowers it to MLIR and then compiles it with XLA/PJRT.
+
+    ``CompiledFunction.warmup_async`` submits native asynchronous compilation.
+    Its returned ``PendingCall`` executes the warmup when ``wait`` is called.
 
     This API is specialized for SGLang inference. A more general API adds
     complexity and can be added when needed.
@@ -172,6 +183,12 @@ def direct_compile(
     `model_extra_tensor_attrs` to tell `direct_compile` where to find those.
     `direct_compile` assumes that the values of Tensors on the model do not
     change during inference.
+
+    `prune_unused_inputs` excludes model tensors unused by a specialization
+    from its executable and runtime arguments. It defaults to False, which
+    retains all model tensors and skips pruning's MLIR inspection and extra
+    lowerings. This option is fixed when constructing the compiled function; explicit
+    function inputs and KV-pool state are never pruned.
 
     `kv_pool` exposes every KV-cache Tensor through `get_state`; all of
     them are assumed to be mutated during inference and are copied back
@@ -208,6 +225,7 @@ def direct_compile(
         model_extra_tensor_attrs=model_extra_tensor_attrs,
         kv_pool=kv_pool,
         ignored_argnames=ignored_argnames,
+        prune_unused_inputs=prune_unused_inputs,
     )
     return functools.update_wrapper(compiled, fn)
 
@@ -228,6 +246,7 @@ class CompiledFunction:
         model_extra_tensor_attrs: Sequence[str] = (),
         kv_pool: KVPool | None = None,
         ignored_argnames: tuple[str, ...] = (),
+        prune_unused_inputs: bool = False,
     ) -> None:
         self.fn = fn
         self.specialization_key = specialization_key
@@ -243,8 +262,23 @@ class CompiledFunction:
             raise ValueError("model_extra_tensor_attrs contains duplicate paths")
         self._kv_pool = kv_pool
         self._ignored_argnames = ignored_argnames
+        self._prune_unused_inputs = prune_unused_inputs
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        artifact = self._get_artifact(args, kwargs)
+        return artifact((args, kwargs))
+
+    def warmup_async(self, *args: Any, **kwargs: Any) -> PendingCall:
+        artifact = self._get_artifact(args, kwargs, async_compile=True)
+        return PendingCall(lambda: artifact((args, kwargs)))
+
+    def _get_artifact(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        async_compile: bool = False,
+    ) -> _CompiledArtifact:
         key = self.specialization_key(*args, **kwargs)
         artifact = self.cache.get(key)
         if artifact is None:
@@ -255,12 +289,19 @@ class CompiledFunction:
                     "'fail_on_recompile'. direct_compile specialization key: "
                     f"{key!r}"
                 )
-            artifact = self._compile(args, kwargs)
+            logger.info(
+                "[direct_compile] new specialization %r (async=%s)", key, async_compile
+            )
+            artifact = self._compile(args, kwargs, async_compile=async_compile)
             self.cache[key] = artifact
-        return artifact((args, kwargs))
+        return artifact
 
     def _compile(
-        self, args: tuple[Any, ...], kwargs: dict[str, Any]
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        async_compile: bool = False,
     ) -> _CompiledArtifact:
         """Compile one specialization into a PJRT executable."""
 
@@ -424,6 +465,27 @@ class CompiledFunction:
                 "direct_compile requires TPU tensor outputs or KV-pool mutations"
             )
 
+        if self._prune_unused_inputs:
+            # Only immutable model state can be dropped. Keep every explicit input
+            # (and its runtime shape check), KV input/output, and callback output.
+            # Compute liveness after collecting all three kinds of graph roots.
+            with dynamo_timed("direct_compile_prune_model_inputs"):
+                live_model_indices = _live_model_input_indices(
+                    result_tensors, graph_inputs, model_input_count
+                )
+            retained_indices = (
+                *live_model_indices,
+                *range(model_input_count, len(graph_inputs)),
+            )
+            model_inputs = [model_inputs[index] for index in live_model_indices]
+            graph_inputs = [graph_inputs[index] for index in retained_indices]
+            flat_inputs = [flat_inputs[index] for index in retained_indices]
+            logger.info(
+                "[direct_compile] retained %d/%d model inputs",
+                len(model_inputs),
+                model_input_count,
+            )
+
         # Step 4: Finish lowering to MLIR, then compile it.
         logger.info(
             "[direct_compile] lowering %d inputs, %d outputs, %d mutations, "
@@ -433,20 +495,38 @@ class CompiledFunction:
             len(kv_pool_inputs),
             len(inserted_callbacks),
         )
-        with dynamo_timed("direct_compile_traverse_and_compile"):
-            # Placeholders do not retain the physical layout of their buffers.
-            argument_layouts = []
-            for tensor in flat_inputs:
-                layout = None
-                if tensor.device.type == "tpu":
-                    layout = tpu_torch_compile.get_device_layout_if_materialized(tensor)
-                argument_layouts.append(layout[0] if layout is not None else [])
-            compile_result = tpu_torch_compile.traverse_and_compile(
-                result_tensors, graph_inputs, argument_layouts=argument_layouts
+        # Placeholders do not retain the physical layout of their buffers.
+        argument_layouts = []
+        for tensor in flat_inputs:
+            layout = None
+            if tensor.device.type == "tpu":
+                layout = tpu_torch_compile.get_device_layout_if_materialized(tensor)
+            argument_layouts.append(layout[0] if layout is not None else [])
+        pending_compile = None
+        executable = None
+        start = time.perf_counter()
+        if async_compile:
+            with dynamo_timed("direct_compile_async_submit"):
+                pending_compile = tpu_torch_compile.async_traverse_and_compile(
+                    result_tensors, graph_inputs, argument_layouts=argument_layouts
+                )
+            logger.info(
+                "[direct_compile] native async submission %.3fs (ready=%s)",
+                time.perf_counter() - start,
+                pending_compile.is_ready(),
             )
-        logger.info("[direct_compile] compilation finished")
+        else:
+            with dynamo_timed("direct_compile_traverse_and_compile"):
+                compile_result = tpu_torch_compile.traverse_and_compile(
+                    result_tensors, graph_inputs, argument_layouts=argument_layouts
+                )
+            executable = compile_result.executable
+            logger.info(
+                "[direct_compile] synchronous compilation %.3fs",
+                time.perf_counter() - start,
+            )
         return _CompiledArtifact(
-            executable=compile_result.executable,
+            executable=executable,
             model_inputs=tuple(model_inputs),
             kv_pool=self._kv_pool,
             tensor_inputs_key_paths=tuple(tensor_inputs_key_paths),
@@ -456,10 +536,11 @@ class CompiledFunction:
             output_treespec=output_treespec,
             output_count=len(output_leaves),
             callbacks=tuple(entry.callback for entry in inserted_callbacks),
+            pending_compile=pending_compile,
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class _CompiledArtifact:
     """Wrap a TorchTPU PJRT executable with input/output/mutation handling."""
 
@@ -471,15 +552,38 @@ class _CompiledArtifact:
     output_treespec: Any
     output_count: int
     callbacks: tuple[Callable[[torch.Tensor], None], ...] = ()
+    pending_compile: Any | None = None
 
     def __call__(self, call: tuple[tuple[Any, ...], dict[str, Any]]) -> Any:
+        if self.pending_compile is not None:
+            start = time.perf_counter()
+            self.executable = self.pending_compile.get()
+            self.pending_compile = None
+            logger.info(
+                "[direct_compile] native async resolution %.3fs",
+                time.perf_counter() - start,
+            )
         kv_pool_inputs = self.kv_pool.get_state() if self.kv_pool is not None else []
         inputs = [*self.model_inputs, *kv_pool_inputs]
         # Resolve explicit inputs by path, similar to Dynamo sources.
         for path, traced_shape in zip(
             self.tensor_inputs_key_paths, self.tensor_inputs_traced_shapes
         ):
-            value = _get_path(call, path)
+            try:
+                value = _get_path(call, path)
+            except (IndexError, KeyError, AttributeError) as exc:
+                # The raw error names only the failing subscript, not which
+                # input it belongs to, and the traceback stops inside the
+                # generic walker. A caller that reshapes the call between
+                # tracing and replay cannot act on that.
+                raise ValueError(
+                    "A direct_compile tensor input disappeared at runtime: "
+                    f"{tree_util.keystr(path)}, traced as {traced_shape}, is no "
+                    f"longer reachable ({type(exc).__name__}: {exc}). Runtime "
+                    f"call: {len(call[0])} positional, kwargs {sorted(call[1])}. "
+                    "Traced tensor inputs: "
+                    f"{[tree_util.keystr(p) for p in self.tensor_inputs_key_paths]}"
+                ) from exc
             if not _is_tpu_tensor(value):
                 raise TypeError(
                     "A direct_compile tensor input changed type at runtime: "
@@ -518,6 +622,70 @@ class _CompiledArtifact:
         return tree_util.tree_unflatten(
             self.output_treespec, outputs[: self.output_count]
         )
+
+
+def _live_model_input_indices(
+    result_tensors: list[torch.Tensor],
+    graph_inputs: list[torch.Tensor],
+    model_input_count: int,
+) -> tuple[int, ...]:
+    """Find model arguments used by the deferred graph, once per specialization.
+
+    TorchTPU's traversal accepts a superset of the graph's inputs, retaining
+    unused model weights/buffers as executable arguments. Its MLIR exporter
+    preserves that argument order, so argument uses identify pruning candidates.
+    Validate those candidates against the original deferred graph: lowering can
+    discard operands that traversal still requires. Recompile through the normal
+    compile cache; neither the model computation nor the MLIR is rewritten.
+    """
+    if model_input_count == 0:
+        return ()
+
+    from jax._src.interpreters import mlir
+    from jaxlib.mlir import ir
+    from jaxlib.mlir.dialects import stablehlo
+
+    lowered = tpu_torch_compile.build_mlir(result_tensors, graph_inputs)
+    # TorchTPU and JAXlib can embed different MLIR/CHLO versions. Native
+    # bytecode is not a portable interchange format (e.g. top_k's is_stable
+    # property changed its encoding). TorchTPU's versioned export legalizes
+    # CHLO before serializing; deserialize it into JAXlib's own dialect version.
+    bytecode = tpu_torch_compile.serialize_mlir_portable_artifact(lowered)
+    del lowered
+    with mlir.make_ir_context() as context:
+        module = stablehlo.deserialize_portable_artifact(context, bytecode)
+        entry = ir.SymbolTable(module.operation)["main"]
+        arguments = entry.regions[0].blocks[0].arguments
+        if len(arguments) != len(graph_inputs):
+            raise RuntimeError(
+                "TorchTPU MLIR input count changed during model-input pruning: "
+                f"expected {len(graph_inputs)}, got {len(arguments)}"
+            )
+        live_model_indices = tuple(
+            index for index in range(model_input_count) if any(arguments[index].uses)
+        )
+
+    if len(live_model_indices) == model_input_count:
+        return live_model_indices
+
+    compact_inputs = [graph_inputs[index] for index in live_model_indices]
+    compact_inputs.extend(graph_inputs[model_input_count:])
+    try:
+        # For example, integer isnan lowers to a constant but its deferred node
+        # still references the integer input. Validate before traverse_and_compile,
+        # whose argument validation can abort the process on a missing dependency.
+        lowered = tpu_torch_compile.build_mlir(result_tensors, compact_inputs)
+    except RuntimeError as error:
+        if "identified an argument that was not provided" not in str(error):
+            raise
+        logger.info(
+            "[direct_compile] retaining all %d model inputs: deferred traversal "
+            "requires an input discarded by MLIR lowering",
+            model_input_count,
+        )
+        return tuple(range(model_input_count))
+    del lowered
+    return live_model_indices
 
 
 def _get_path(value: Any, path: tree_util.KeyPath) -> Any:

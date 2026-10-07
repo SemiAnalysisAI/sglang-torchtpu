@@ -8,7 +8,7 @@ import os
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
-from sglang.test.tpu.kv_offload_probe import kv_offload_runner
+from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
 
 # Expected runtime includes model download, compilation, and the eviction probe.
 register_tpu_ci(
@@ -52,7 +52,7 @@ LAUNCH_ENV = {
     "ENABLE_CACHE_REPORT": "1",
     "ENABLE_PROFILER_ENDPOINT": "0",
     "EXTRA_ARGS": (
-        "--reasoning-parser gpt-oss " f"--served-model-name {SERVED_MODEL_NAME}"
+        f"--reasoning-parser gpt-oss --served-model-name {SERVED_MODEL_NAME}"
     ),
 }
 
