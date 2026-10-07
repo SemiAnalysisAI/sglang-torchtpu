@@ -34,14 +34,14 @@ def dense_layer(*, reduce_scatter):
         prepare_attn=lambda h, r, fb, **_: (h, h if r is None else r),
         prepare_mlp=lambda h, r, fb: (h, r),
         # A dense layer never leaves its sum to the next layer.
-        _select_ffn_completion=lambda fb: comm.FfnCompletion(
+        _select_ffn_completion=lambda fb, **_: comm.FfnCompletion(
             defer_moe_finalize=False,
             fuse_mlp_allreduce=False,
             mlp_reduce_scatter=reduce_scatter,
             complete=complete,
         ),
     )
-    communicator.ffn_exit = lambda fb: comm.FfnExit(communicator, fb)
+    communicator.ffn_exit = lambda fb, **kw: comm.FfnExit(communicator, fb, **kw)
     object.__setattr__(layer, "layer_communicator", communicator)
     object.__setattr__(layer, "use_moe", False)
     object.__setattr__(layer, "mlp", mlp)
