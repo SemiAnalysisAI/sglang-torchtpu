@@ -110,6 +110,9 @@ def compile_matching_submodules(
         if getattr(module, "_compile_regions_spmd_safe", False)
         else None
     )
+    if wrap_region is not None:
+        # A graph break would silently drop the region's annotation.
+        compile_kwargs = {**compile_kwargs, "fullgraph": True}
     for submodule in matches:
         if wrap_region is not None:
             submodule.forward = wrap_region(submodule.forward)

@@ -156,12 +156,20 @@ class TpuPlatform(Platform):
     def get_spmd_region_wrapper(self) -> Callable | None:
         # torch_tpu splits a compiled graph at every collective and re-lays out
         # tensors at each split. Marking a region SPMD-safe keeps its
-        # collectives in one program (Wan2.2-A14B, Ulysses 4: 3.17 -> 3.07
-        # s/step). A whole-DiT program needs too much scratch, so only regions.
-        # The ranks must run identical programs: the fused collectives otherwise
-        # hang or exchange the wrong data.
+        # collectives in one program. A whole-DiT program needs too much
+        # scratch, so only regions. The ranks must run identical programs: the
+        # fused collectives otherwise hang or exchange the wrong data.
+        import torch.compiler.config as compiler_config
         from torch_tpu._internal.distributed.spmd_util import spmd_safe
 
+        # The region annotation is not part of the compile cache key; keep
+        # persisted executables of the two region policies apart.
+        tag = "spmd-safe-regions-v1"
+        existing_tag = str(compiler_config.cache_key_tag or "")
+        if tag not in existing_tag.split("|"):
+            compiler_config.cache_key_tag = (
+                f"{existing_tag}|{tag}" if existing_tag else tag
+            )
         return spmd_safe
 
     @classmethod
