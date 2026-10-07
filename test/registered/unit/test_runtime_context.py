@@ -1623,6 +1623,31 @@ class TestForwardFlags(_IsolatedServerArgs):
             with get_parallel().override(tp_size=8, attn_dp_size=2, moe_ep_size=2):
                 self.assertFalse(should_use_dp_reduce_scatterv())
 
+    def test_replicated_experts_owe_no_post_experts_tp_sum(self):
+        """Experts replicated on every TP rank (moe_dp_size == tp_size) already
+        hold each token's full output; a TP all-reduce would multiply it."""
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.utils import post_experts_output_is_complete
+
+        reset_context()
+        for moe_dp_size, is_tp_path, complete in (
+            (4, True, True),
+            (2, True, False),
+            (4, False, False),
+        ):
+            parallel = SimpleNamespace(tp_size=4, moe_dp_size=moe_dp_size, dwdp_size=1)
+            with (
+                self.subTest(moe_dp_size=moe_dp_size, is_tp_path=is_tp_path),
+                patch(
+                    "sglang.srt.layers.moe.utils.get_parallel", return_value=parallel
+                ),
+            ):
+                self.assertEqual(
+                    post_experts_output_is_complete(is_tp_path=is_tp_path),
+                    complete,
+                )
+
 
 class TestPublishLifecycle(_IsolatedServerArgs):
     """Publish installs the resolved server_args and seeds the capture tier."""

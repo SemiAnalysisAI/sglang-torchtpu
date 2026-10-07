@@ -8,13 +8,20 @@ register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 import types
 import unittest
 from typing import Optional
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.hardware_backend.tpu import pp_attention_capacity
+from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
+    BaseTpuPallasRpaAttnBackend,
+)
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
     PallasForwardMetadata,
     TpuPallasRpaBatchedAttnBackend,
 )
+from sglang.srt.hardware_backend.tpu.cp_forward import TpuCpBatchLayout
+from sglang.srt.hardware_backend.tpu.cp_layout import build_tpu_cp_layout
 from sglang.srt.hardware_backend.tpu.host_metadata_cache import HostMetadataCache
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -41,6 +48,7 @@ class _BackendUnderTest(TpuPallasRpaBatchedAttnBackend):
         self._distribution_cache = {}
         self.decode_query_size = 1
         self._host_metadata_cache = HostMetadataCache()
+        self._host_page_cols = None
         self._is_hybrid_swa = False
         self.token_to_kv_pool = None
 
@@ -266,6 +274,109 @@ class TestBatchedRpaNonEmptyBatchSize(CustomTestCase):
         )
         with self.assertRaises(ValueError):
             self._backend()._non_empty_batch_size(fb)
+
+
+class TestBatchedRpaCpScheduleGuard(CustomTestCase):
+    """A context-parallel extend checks the schedule of the rows the kernel runs."""
+
+    # Rank 1 of 4 owns zigzag blocks 1 and 6: (q, kv) rows (5, 10), (5, 35) for
+    # the 40-token request, (3, 106), (3, 121) behind the 100-token prefix; at
+    # (query, KV) tiles of (8, 16) they need 1 + 3 + 7 + 8 = 19 block pairs.
+    TILES = (8, 16)
+
+    def _backend(self, pp_runner=None):
+        backend = _BackendUnderTest(
+            16, _build_req_to_token(num_reqs=4, max_context_len=256)
+        )
+        backend._pp_schedule_runner = pp_runner
+        backend._cp_schedule_runner = object()
+        return backend
+
+    def _cp_batch(self):
+        host = build_tpu_cp_layout(
+            extend_lens=[40, 24],
+            prefix_lens=[0, 100],
+            cp_size=4,
+            cp_rank=1,
+            pad_b=4,
+            local_rows_padded=32,
+        )
+        fb = _make_forward_batch(
+            seq_lens=torch.tensor([40, 124, 0, 0], dtype=torch.int32),
+            req_pool_indices=torch.arange(4, dtype=torch.int64),
+            forward_mode=ForwardMode.EXTEND,
+        )
+        fb._tpu_cp_layout = TpuCpBatchLayout(
+            host=host, local_rows=torch.zeros(32, dtype=torch.int64)
+        )
+        return fb
+
+    def test_cp_rows_are_checked_at_the_local_kernel_shape(self):
+        backend = self._backend()
+        with (
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=types.SimpleNamespace(attn_tp_size=1),
+            ),
+            patch.object(
+                pp_attention_capacity,
+                "capacity_for_batch",
+                return_value=(19, *self.TILES),
+            ) as capacity,
+            patch.object(BaseTpuPallasRpaAttnBackend, "init_forward_metadata") as build,
+        ):
+            backend.init_forward_metadata(self._cp_batch())
+        capacity.assert_called_once_with(
+            backend._cp_schedule_runner,
+            backend,
+            mode="mixed",
+            num_seqs=8,
+            total_q_tokens=32,
+            attn_tp_size=1,
+        )
+        build.assert_called_once()
+
+    def test_oversized_cp_batch_is_rejected_before_metadata(self):
+        with (
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=types.SimpleNamespace(attn_tp_size=1),
+            ),
+            patch.object(
+                pp_attention_capacity,
+                "capacity_for_batch",
+                return_value=(18, *self.TILES),
+            ),
+            patch.object(BaseTpuPallasRpaAttnBackend, "init_forward_metadata") as build,
+            self.assertRaisesRegex(ValueError, "needs 19 query/KV block pairs"),
+        ):
+            self._backend().init_forward_metadata(self._cp_batch())
+        build.assert_not_called()
+
+    def test_pipeline_global_check_skips_only_cp_batches(self):
+        backend = self._backend(pp_runner=object())
+        plain = _make_forward_batch(
+            seq_lens=torch.tensor([40, 124], dtype=torch.int32),
+            req_pool_indices=torch.arange(2, dtype=torch.int64),
+            forward_mode=ForwardMode.EXTEND,
+        )
+        with (
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=types.SimpleNamespace(attn_tp_size=1),
+            ),
+            patch.object(
+                pp_attention_capacity,
+                "capacity_for_batch",
+                return_value=(19, *self.TILES),
+            ),
+            patch.object(pp_attention_capacity, "check_batch_schedule") as pp_check,
+            patch.object(BaseTpuPallasRpaAttnBackend, "init_forward_metadata"),
+        ):
+            backend.init_forward_metadata(self._cp_batch())
+            pp_check.assert_not_called()
+            backend.init_forward_metadata(plain)
+        pp_check.assert_called_once_with(backend._pp_schedule_runner, backend, plain)
 
 
 if __name__ == "__main__":

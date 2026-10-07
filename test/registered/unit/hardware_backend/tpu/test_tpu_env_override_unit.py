@@ -18,6 +18,7 @@ from sglang.srt.hardware_backend.tpu.env_override import (
     _VMEM_PREFETCH_MIN_LAYERS,
     _VMEM_PREFETCH_OVERRIDES,
     _VMEM_PREFETCH_SAFE_MIN_TOKENS,
+    apply_prefill_cp_sparse_core_override,
     apply_small_kv_pool_vmem_prefetch_override,
     apply_tpu_env_overrides,
 )
@@ -85,6 +86,21 @@ class TestLibtpuInitArgsOverrides(CustomTestCase):
         self.assertIn(user_flag, args)
         for flag in _VMEM_PREFETCH_OVERRIDES:
             self.assertIn(flag, args)
+
+
+class TestPrefillCpSparseCoreOverride(CustomTestCase):
+    def test_user_value_for_same_flag_name_wins(self):
+        # A user re-enabling one SparseCore offload under prefill CP keeps it;
+        # the other offload is still turned off.
+        user_flag = "--xla_tpu_offload_gather_to_sparsecore=true"
+        with patch.dict(os.environ, {"LIBTPU_INIT_ARGS": user_flag}):
+            apply_prefill_cp_sparse_core_override(attn_cp_size=8)
+            args = os.environ["LIBTPU_INIT_ARGS"].split()
+        self.assertIn(user_flag, args)
+        self.assertNotIn("--xla_tpu_offload_gather_to_sparsecore=false", args)
+        self.assertIn(
+            "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false", args
+        )
 
 
 if __name__ == "__main__":

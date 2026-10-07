@@ -379,7 +379,7 @@ class EagerRunner(BaseRunner):
                         forward_batch,
                         **kwargs,
                     )
-            elif cp_active:
+            elif cp_active and not _is_tpu:
                 ret = self._execute_extend_cp(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(

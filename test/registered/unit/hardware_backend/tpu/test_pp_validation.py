@@ -42,6 +42,7 @@ def _args(**overrides):
         speculative_eagle_topk=None,
         speculative_use_rejection_sampling=False,
         pp_async_batch_depth=0,
+        attn_cp_size=1,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
