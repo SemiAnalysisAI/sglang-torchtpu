@@ -359,9 +359,11 @@ def _fuse_act_name(activation_name):
     return mapping[activation_name]
 
 
-# Largest routed-row count for the dense rank permute: its compares are
-# [rows, rows], so it only pays off at decode-sized batches.
-_RANK_PERMUTE_MAX_ROWS = 256
+# Largest routed-row count for the rank permute, whose compares are
+# [rows, rows]. On tpu7x under EP (Kimi-K3 MXFP4 top-16, Qwen3-Coder and
+# Qwen3.5 FP8 top-8/10) it beats the sort route by 6-48 us per layer up to
+# 2048 rows; the margin falls to ~10 us at 4096.
+_RANK_PERMUTE_MAX_ROWS = 2048
 
 
 class _DenseRoute(NamedTuple):
