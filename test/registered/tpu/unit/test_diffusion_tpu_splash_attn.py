@@ -15,6 +15,7 @@ register_tpu_ci(est_time=600, suite="stage-a-test-tpu-unit")
 
 import importlib.util
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -188,16 +189,17 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
             torch.randn(sum(lens), 2, 128, dtype=torch.bfloat16) for _ in range(3)
         )
         cu = torch.tensor([0, lens[0], sum(lens)], dtype=torch.int32)
-        cached = dict(tpu_splash_attn._splash_kernel_cache)
-        got = impl.forward_varlen(
-            q.to("tpu"),
-            k.to("tpu"),
-            v.to("tpu"),
-            cu_seqlens=cu.to("tpu"),
-            max_seqlen=max(lens),
-            cu_seqlens_host=(0, lens[0], sum(lens)),
-        ).to("cpu")
-        self.assertEqual(tpu_splash_attn._splash_kernel_cache, cached)
+        with patch.object(
+            tpu_splash_attn, "tpu_attention", side_effect=AssertionError("kernel")
+        ):
+            got = impl.forward_varlen(
+                q.to("tpu"),
+                k.to("tpu"),
+                v.to("tpu"),
+                cu_seqlens=cu.to("tpu"),
+                max_seqlen=max(lens),
+                cu_seqlens_host=(0, lens[0], sum(lens)),
+            ).to("cpu")
         start = 0
         for n in lens:
             seg = slice(start, start + n)
@@ -275,7 +277,7 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
 
 
 class TestTpuSplashDispatch(CustomTestCase):
-    """Pure logic — no TPU required."""
+    """Kernel selection logic; runs without a TPU."""
 
     def test_custom_kernel_selection(self):
         from sglang.multimodal_gen.runtime.layers.attention.backends.tpu_splash_attn import (
@@ -296,6 +298,68 @@ class TestTpuSplashDispatch(CustomTestCase):
             block_kv = _cross_attn_block_kv(kv_seq)
             self.assertEqual(kv_seq % block_kv, 0)
             self.assertLessEqual(block_kv, 1024)
+
+    def test_splash_mha_blocks(self):
+        from sglang.multimodal_gen.runtime.layers.attention.backends.tpu_splash_attn import (
+            _splash_mha_block_sizes,
+        )
+
+        self.assertEqual(_splash_mha_block_sizes(4096, 1536, False), (2048, 512))
+        self.assertEqual(_splash_mha_block_sizes(4096, 4096, True), (1024, 1024))
+        self.assertEqual(_splash_mha_block_sizes(1000, 1000, True), (512, 512))
+        self.assertEqual(_splash_mha_block_sizes(200, 4128, False), (256, 256))
+
+    def test_kernel_source_keys_the_compile_cache_once(self):
+        import torch.compiler.config as compiler_config
+
+        from sglang.multimodal_gen.runtime.layers.attention.backends import (
+            tpu_splash_attn,
+        )
+
+        with patch.object(compiler_config, "cache_key_tag", "user-tag"):
+            tpu_splash_attn._add_kernel_source_to_compile_cache_key()
+            tpu_splash_attn._add_kernel_source_to_compile_cache_key()
+            tags = compiler_config.cache_key_tag.split("|")
+        self.assertEqual(tags[0], "user-tag")
+        self.assertEqual(len(tags), 2)
+        self.assertTrue(tags[1].startswith("diffusion-tpu-splash-attn:"))
+
+    def test_sdpa_fallback_reasons(self):
+        from sglang.multimodal_gen.runtime.layers.attention.backends import (
+            tpu_splash_attn,
+        )
+
+        def reason(q_shape, kv_shape, *, is_causal=False, dtype=torch.bfloat16):
+            q = torch.empty(q_shape, dtype=dtype, device="meta")
+            k = torch.empty(kv_shape, dtype=dtype, device="meta")
+            return tpu_splash_attn._sdpa_fallback_reason(q, k, k, is_causal)
+
+        with patch.object(
+            tpu_splash_attn, "_check_splash_available", return_value=True
+        ):
+            self.assertIsNone(reason((1, 4, 4608, 128), (1, 4, 4608, 128)))
+            self.assertIsNone(reason((1, 4, 4096, 128), (1, 2, 512, 128)))
+            self.assertEqual(reason((1, 4, 300, 128), (1, 4, 77, 128)), "short")
+            self.assertEqual(reason((1, 4, 4096, 128), (1, 4, 1000, 128)), "short")
+            self.assertEqual(
+                reason((1, 4, 1000, 128), (1, 4, 2000, 128), is_causal=True),
+                "ragged causal",
+            )
+            self.assertEqual(
+                reason((1, 4, 4608, 64), (1, 4, 4608, 64)), "head_dim=64/64"
+            )
+            self.assertEqual(reason((1, 3, 4608, 128), (1, 2, 4608, 128)), "heads=3/2")
+            self.assertEqual(
+                reason((1, 4, 4608, 128), (1, 4, 4608, 128), dtype=torch.float32),
+                "dtype=torch.float32/torch.float32/torch.float32",
+            )
+            self.assertEqual(reason((1, 4, 0, 128), (1, 4, 4608, 128)), "empty")
+        with patch.object(
+            tpu_splash_attn, "_check_splash_available", return_value=False
+        ):
+            self.assertEqual(
+                reason((1, 4, 4608, 128), (1, 4, 4608, 128)), "pallas unavailable"
+            )
 
 
 if __name__ == "__main__":
