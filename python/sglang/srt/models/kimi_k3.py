@@ -755,9 +755,10 @@ class KimiK3MoE(nn.Module):
         self.gate.weight.data = weight_kn.t()
         self._tpu_gate_kn = weight_kn
         cfg = self.topk.topk_config
-        # The same bias the unfused select_experts path adds.
+        # The same bias the unfused select_experts path adds, read from the
+        # gate: TPU materialization may have replaced the parameter TopK holds.
         self._tpu_route_bias = (
-            cfg.correction_bias.detach().to(torch.float32).reshape(1, -1)
+            self.gate.e_score_correction_bias.detach().to(torch.float32).reshape(1, -1)
         )
         get_gate_route_op(cfg.top_k, **self._tpu_route_kwargs)
 
