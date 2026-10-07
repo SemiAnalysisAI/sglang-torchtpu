@@ -1987,6 +1987,12 @@ class Envs:
     # Turn off EP-local expert reads (models that opt in read only their EP
     # rank's routed experts with --weight-loader-disable-mmap).
     SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS = EnvBool(False)
+    # GLM-5.3-Flash KDA: per-token lax.scan reference instead of the chunked
+    # Pallas GDN v3 kernel in KDA mode.
+    SGLANG_TPU_KDA_USE_REFERENCE_SCAN = EnvBool(False)
+    # Perf-only GLM-5.3-Flash escape hatch: attend densely up to this context even
+    # past index_topk, which no longer matches DSA's top-k selection.
+    SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT = EnvInt(None)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)

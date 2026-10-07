@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang_tpu.attention_kda import TpuKDAAttnBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -35,27 +36,58 @@ class TestKDAAttentionBackend(unittest.TestCase):
             token_to_kv_pool=None,
             server_args=SimpleNamespace(enable_unified_memory=False),
         )
+        self.runner = runner
         self.op = Mock()
-        with patch(
-            "sglang_tpu.attention_kda.build_kda_op",
-            return_value=self.op,
-        ) as kda_builder, patch(
-            "sglang_tpu.attention_gdn_pallas.build_gdn_pallas_op"
-        ) as gdn_builder, patch(
-            "sglang.srt.layers.attention.hybrid_linear_attn_backend.get_spec",
-            return_value=SimpleNamespace(speculative_eagle_topk=None),
-        ):
-            self.backend = TpuKDAAttnBackend(runner)
-        kda_builder.assert_called_once_with()
-        gdn_builder.assert_not_called()
+        self.backend = self.make_backend(use_scan=True)
         self.hybrid_backend = HybridLinearAttnBackend(
             SimpleNamespace(
                 token_to_kv_pool=None,
                 req_to_token_pool=self.pool,
+                kv_index_translator=None,
                 needs_cpu_seq_lens=False,
             ),
             self.backend,
             full_attn_layers=[],
+        )
+
+    def make_backend(self, use_scan):
+        with (
+            envs.SGLANG_TPU_KDA_USE_REFERENCE_SCAN.override(use_scan),
+            patch(
+                "sglang_tpu.attention_kda.build_kda_op",
+                return_value=self.op,
+            ) as kda_builder,
+            patch(
+                "sglang_tpu.attention_gdn_pallas.build_gdn_pallas_op",
+                return_value=self.op,
+            ) as gdn_builder,
+            patch(
+                "sglang.srt.layers.attention.hybrid_linear_attn_backend.get_spec",
+                return_value=SimpleNamespace(speculative_eagle_topk=None),
+            ),
+            patch(
+                "sglang.srt.layers.attention.hybrid_linear_attn_backend.get_memory",
+                return_value=SimpleNamespace(enable_unified_memory=False),
+            ),
+        ):
+            backend = TpuKDAAttnBackend(self.runner)
+        (kda_builder if use_scan else gdn_builder).assert_called_once_with()
+        (gdn_builder if use_scan else kda_builder).assert_not_called()
+        return backend
+
+    def make_layer(self):
+        return RadixLinearAttention(
+            layer_id=7,
+            num_q_heads=2,
+            num_k_heads=2,
+            num_v_heads=2,
+            head_q_dim=4,
+            head_k_dim=4,
+            head_v_dim=4,
+            conv_weights=torch.ones(24, 4),
+            A_log=torch.zeros(1, 1, 2, 1),
+            dt_bias=torch.zeros(8),
+            lower_bound=-5.0,
         )
 
     def batch(self, mode):
@@ -98,19 +130,7 @@ class TestKDAAttentionBackend(unittest.TestCase):
         self.assertEqual(self.backend._distribution.tolist(), [2, 2, 2])
 
     def test_radix_dispatch_preserves_token_axis_and_owned_state(self):
-        layer = RadixLinearAttention(
-            layer_id=7,
-            num_q_heads=2,
-            num_k_heads=2,
-            num_v_heads=2,
-            head_q_dim=4,
-            head_k_dim=4,
-            head_v_dim=4,
-            conv_weights=torch.ones(24, 4),
-            A_log=torch.zeros(2),
-            dt_bias=torch.zeros(8),
-            lower_bound=-5.0,
-        )
+        layer = self.make_layer()
         for mode, tokens in ((ForwardMode.EXTEND, 6), (ForwardMode.DECODE, 3)):
             with self.subTest(mode=mode):
                 batch = self.batch(mode)
@@ -141,6 +161,32 @@ class TestKDAAttentionBackend(unittest.TestCase):
                 self.assertEqual(args[9].tolist(), [2, 1, 0])
                 self.assertEqual(args[-3:], (2, 4, -5.0))
                 self.pool.mamba2_layer_cache.assert_called_with(7)
+
+    def test_pallas_kernel_receives_kda_layout(self):
+        backend = self.make_backend(use_scan=False)
+        layer = self.make_layer()
+        for mode, tokens in ((ForwardMode.EXTEND, 6), (ForwardMode.DECODE, 3)):
+            with self.subTest(mode=mode):
+                backend.init_forward_metadata(self.batch(mode))
+                qkv, a, b = (
+                    torch.ones(tokens, 24),
+                    torch.ones(1, tokens, 8),
+                    torch.ones(1, tokens, 2),
+                )
+                self.op.return_value = torch.arange(tokens * 8).reshape(tokens, 8)
+                output = backend._run(layer, qkv, a, b)
+                self.assertEqual(output.shape, (tokens, 2, 4))
+                args = self.op.call_args.args
+                self.assertIs(args[0], qkv)
+                self.assertEqual(args[1].shape, (tokens, 2))
+                self.assertEqual(args[2].shape, (tokens, 8))
+                self.assertIs(args[3], self.cache.conv[0])
+                self.assertIs(args[4], self.cache.temporal)
+                self.assertEqual(args[5].shape, (24, 1, 4))
+                self.assertEqual(args[7].shape, (2,))
+                self.assertEqual(args[8].shape, (2, 4))
+                self.assertIs(args[11], backend._distribution)
+                self.assertEqual(args[13:], (2, 2, 4, 4, 4, True, -5.0))
 
 
 if __name__ == "__main__":

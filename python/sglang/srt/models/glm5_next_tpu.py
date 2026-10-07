@@ -7,6 +7,7 @@ tokens DSA selects the entire causal prefix, which can be evaluated exactly usin
 ordinary attention. KDA uses the JAX recurrence in hardware_backend/tpu.
 """
 
+import logging
 from typing import Optional
 
 import torch
@@ -15,6 +16,7 @@ from torch.nn import functional as F
 
 from sglang.srt.configs.glm5_next import Glm5NextTextConfig
 from sglang.srt.distributed import divide
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -42,6 +44,8 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2MLP, DeepseekV2MoE
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils.common import set_weight_attrs
+
+logger = logging.getLogger(__name__)
 
 
 class TpuRMSNormGated(nn.Module):
@@ -454,6 +458,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.config = config.get_text_config()
         c = self.config
         dense_limit = c.index_topk
+        unsafe_limit = envs.SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT.get()
+        if unsafe_limit is not None and unsafe_limit > dense_limit:
+            logger.warning(
+                "GLM-5.3-Flash attends densely up to %d tokens, past index_topk=%d; "
+                "outputs beyond index_topk do not match DSA",
+                unsafe_limit,
+                dense_limit,
+            )
+            dense_limit = unsafe_limit
         if not args.language_model_only:
             raise ValueError("GLM-5.3-Flash TPU requires --language-model-only")
         if getattr(c, "index_kpool", 1) > 1 and not getattr(
