@@ -1221,18 +1221,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             return
 
-        # Match prefix. SWA insertion retains one extra window before the
-        # page-aligned boundary, so the normal match remains safe to repoint.
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
-        new_indices = match_result.device_indices
-        new_last_node = match_result.last_device_node
+        # Protect the whole inserted path. With disaggregated decode caching,
+        # SWA slots may exist only for the prompt's tail; EAGLE page alignment
+        # can leave less than a live window inside the inserted range. A fresh
+        # match may then stop short, letting the request free tree-owned slots.
+        # Read canonical indices from the final insert path instead.
+        new_last_node = result.last_device_node
+        new_indices = self.tree_core.collect_full_device_indices(
+            new_last_node, self.root_node_handle()
+        )
         new_prefix_len = result.prefix_len
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
             f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
         )
-        assert new_prefix_len <= len(new_indices), (
-            f"{new_prefix_len=}, {len(new_indices)=}"
-        )
+        assert (
+            new_prefix_len <= len(new_indices) and len(new_indices) == page_aligned_len
+        ), f"{new_prefix_len=}, {len(new_indices)=}, {page_aligned_len=}"
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
@@ -1330,11 +1334,13 @@ class UnifiedRadixCache(BasePrefixCache):
     def _drain_device_frees(
         self, device_frees: dict[ComponentType, list[torch.Tensor]]
     ) -> None:
+        release_time = self.tree_core.take_device_frees_release_time()
         # Free per component device slots, consuming each entry as it frees.
-        for ct in list(device_frees):
-            self._apply_cache_action(
-                FreeComponentDeviceSlot(device_frees.pop(ct), component_type=ct)
-            )
+        with self.token_to_kv_pool_allocator.freeing_released_values(release_time):
+            for ct in list(device_frees):
+                self._apply_cache_action(
+                    FreeComponentDeviceSlot(device_frees.pop(ct), component_type=ct)
+                )
 
     def _drain_host_frees(
         self, host_frees: dict[ComponentType, list[torch.Tensor]]
@@ -3384,6 +3390,15 @@ class UnifiedRadixCache(BasePrefixCache):
         """Prepare KV cache loading from host to device.
         Returns (device_indices, last_node), or None when buffer-mode
         admission must retry without committing a load."""
+        # Pages allocated here are DMA targets, so an in-flight forward must
+        # not still write them.
+        with self.token_to_kv_pool_allocator.dma_write_target():
+            return self._init_load_back(params)
+
+    def _init_load_back(
+        self,
+        params: InitLoadBackParams,
+    ) -> Optional[tuple[torch.Tensor, NodeId]]:
         if self.buffer_pipeline is not None:
             return self.buffer_pipeline.init_load_back(params)
         best_match_node_id = params.best_match_node

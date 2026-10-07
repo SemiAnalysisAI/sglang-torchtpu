@@ -7,6 +7,7 @@ plain unittest.TestCase beside its evaluation.
 """
 
 import os
+import sys
 import unittest
 from typing import Any, ClassVar
 
@@ -46,6 +47,10 @@ def gate_server_failures(config_module: str, *sampling: dict[str, Any]) -> list[
     admits queues them behind each other for the length of the eval. Takes the
     gate itself, or the catalog sampling when a runner owns the request.
     """
+    # benchmark/ is a checkout directory, not a package: import it from the repo root.
+    root = str(TPULauncherTestCase.repo_root)
+    if root not in sys.path:
+        sys.path.insert(0, root)
     from benchmark.tpu.launch_server import load_recipe
 
     args = load_recipe(config_module)["server_args"]

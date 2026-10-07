@@ -34,7 +34,7 @@ from sglang.test.test_utils import CustomTestCase
 register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit")
 
 _COMPILE_RESULT = SimpleNamespace(executable="executable")
-_TPU_AVAILABLE = hasattr(torch, "tpu") and torch.tpu.is_available()
+_TPU_AVAILABLE = hasattr(torch, "accelerator") and torch.accelerator.is_available()
 
 
 def _make_artifact(traced_shapes):
@@ -265,7 +265,7 @@ class TestDirectCompile(CustomTestCase):
                 self.assertEqual(torch.tpu._get_cache_hits(), hits_before + 1)
                 self.assertEqual(torch.tpu._get_cache_misses(), misses_before)
 
-    @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+    @unittest.skipUnless(torch.accelerator.is_available(), "requires TPU")
     def test_native_async_grid_preserves_model_kv_and_callbacks(self):
         model = _ModelWithObjectTensorState().to("tpu")
         model.object_state.value = model.object_state.value.to("tpu")
@@ -1242,7 +1242,7 @@ class TestAttentionRankTensorScope(unittest.TestCase):
             self.assertIs(dp_attention._RANK_TENSORS, original)
 
 
-@unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+@unittest.skipUnless(torch.accelerator.is_available(), "requires TPU")
 class TestDirectCompileDpRanks(unittest.TestCase):
     def test_rank_selectors_are_runtime_inputs(self):
         model = _RankModel()

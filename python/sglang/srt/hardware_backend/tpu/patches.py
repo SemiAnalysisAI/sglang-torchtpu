@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from collections.abc import Sequence
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
@@ -108,6 +109,14 @@ def _unwrap_dynamic_compile_fns() -> None:
             )
 
 
+def build_slicebuilder_addresses(
+    hosts: Sequence[str], base_port: int, devices_per_host: int
+) -> str:
+    return ",".join(
+        f"{host}:{base_port + i}" for host in hosts for i in range(devices_per_host)
+    )
+
+
 def _set_torch_tpu_topology_env_multihost(
     hosts: list[str],
     base_port: int,
@@ -119,8 +128,8 @@ def _set_torch_tpu_topology_env_multihost(
     One slicebuilder endpoint per device across ALL hosts; topology is the
     ``TPU_TOPOLOGY`` chip grid with an extra dim appended on v7x (>1 core/chip).
     """
-    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
-        f"{host}:{base_port + i}" for host in hosts for i in range(devices_per_host)
+    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = build_slicebuilder_addresses(
+        hosts, base_port, devices_per_host
     )
 
     if not tpu_topology:
@@ -853,6 +862,16 @@ def _patch_prefill_transfer_finish_from_raiden() -> None:
     )
 
 
+def _patch_pd_decode_swa_hicache() -> None:
+    """Allow PD decode prefix cache + RAM offload on sliding-window models.
+
+    Only full-attention KV goes to RAM. See ``pd_decode_swa_hicache``.
+    """
+    from sglang.srt.hardware_backend.tpu import pd_decode_swa_hicache
+
+    pd_decode_swa_hicache.install()
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
@@ -872,3 +891,4 @@ def apply_tpu_patches() -> None:
     _patch_future_map_direct_handoff()
     _patch_raiden_is_load_back_event_done()
     _patch_prefill_transfer_finish_from_raiden()
+    _patch_pd_decode_swa_hicache()

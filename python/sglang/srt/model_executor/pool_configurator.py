@@ -137,42 +137,46 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
             raise ValueError("MXINT8 requires a resolved DFLASH draft KV memory budget")
         return 0
     if _draft_kv_cache_format(kvc) == "mxint8":
-        from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
-            ROW_ALIGNMENT,
-        )
-
-        # The estimator reports raw INT8 payload bytes. Exponent-byte rows share
-        # the payload's INT8 page and pad to a whole 32-row tile.
-        group_size = getattr(
-            getattr(kvc, "server_args", None), "tpu_mxint8_group_size", 32
-        )
-        if group_size not in (16, 32, 64):
-            raise ValueError("MXINT8 group_size must be 16, 32, or 64")
+        geometry = kvc.spec_aux_config.dflash_draft_kv_geometry
         layers = int(kvc.spec_aux_config.dflash_draft_num_layers)
-        if layers <= 0 or int(cell_size) % (layers * group_size):
-            raise ValueError(
-                f"MXINT8 draft budget requires group-{group_size} per-layer geometry"
-            )
-        rows = int(cell_size) // layers // group_size
-        cell_size += layers * ceil_align(rows, ROW_ALIGNMENT)
+        if geometry is None or layers <= 0:
+            raise ValueError("MXINT8 requires resolved DFLASH draft KV geometry")
+        cell_size = layers * _mxint8_draft_per_token(kvc, *geometry)
     return int(cell_size) * get_parallel().attn_dcp_size
 
 
-def _mxint8_draft_per_token(kvc, head_num: int, head_dim: int) -> int:
-    """EAGLE shares geometry, but its runner can select a different KV format."""
+def _mxint8_draft_per_token(
+    kvc, head_num: int, head_dim: int, *, is_swa: bool = False
+) -> int:
+    """Physical bytes/token of a draft layer, before DCP capacity replication."""
     from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
         cache_bytes_per_token,
     )
 
     draft_format = _draft_kv_cache_format(kvc)
     if draft_format == "mxint8":
+        # A non-MXINT8 target clears kv_full_layout, but its draft still resolves
+        # the requested layout. SWA storage stays merged at either capacity.
+        layout = (
+            "merged"
+            if is_swa
+            else (
+                getattr(kvc, "kv_full_layout", None)
+                or getattr(
+                    getattr(kvc, "server_args", None),
+                    "tpu_mxint8_full_kv_layout",
+                    "merged",
+                )
+            )
+        )
         return cache_bytes_per_token(
             head_num,
             head_dim,
-            kvc.pool_page_size,
+            kvc.pool_page_size * get_parallel().attn_dcp_size,
             group_size=getattr(
                 getattr(kvc, "server_args", None), "tpu_mxint8_group_size", 32
             ),
+            layout=layout,
         )
     if draft_format in ("auto", "bf16", "bfloat16"):
         # Auto may discover FP8 model quantization later; BF16 is the safe bound.
@@ -325,12 +329,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     )
                     self._cell_size += draft_kv_size + draft_indexer_size
                 elif self._uses_mxint8:
-                    self._cell_size += draft_num_layers * _mxint8_draft_per_token(
-                        kvc,
-                        kvc.model_config.get_num_kv_heads(
-                            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-                        ),
-                        kvc.model_config.head_dim,
+                    self._cell_size += (
+                        draft_num_layers
+                        * get_parallel().attn_dcp_size
+                        * _mxint8_draft_per_token(
+                            kvc,
+                            # Draft heads shard over TP, not target TP / DCP.
+                            kvc.model_config.get_num_kv_heads(
+                                get_parallel().attn_tp_size
+                            ),
+                            kvc.model_config.head_dim,
+                        )
                     )
                 else:
                     self._cell_size = int(
@@ -372,6 +381,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 kvc.model_config.head_dim,
                 kvc.pool_page_size,
                 group_size=getattr(kvc, "kv_group_size", 32),
+                layout=getattr(kvc, "kv_full_layout", None) or "merged",
             )
         # args to config cell size
         model_config = kvc.model_config
@@ -714,17 +724,21 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 cache_bytes_per_token,
             )
 
+            # The full pool may use the token-blocked page; the SWA pool is a
+            # ring over the window and keeps the merged page.
             self._full_per_token = cache_bytes_per_token(
                 model_config.get_num_kv_heads(tp_size),
                 model_config.head_dim,
                 kvc.pool_page_size,
                 group_size=getattr(kvc, "kv_group_size", 32),
+                layout=getattr(kvc, "kv_full_layout", None) or "merged",
             )
             self._swa_per_token = cache_bytes_per_token(
                 model_config.get_swa_num_kv_heads(tp_size),
                 model_config.swa_head_dim,
                 kvc.pool_page_size,
                 group_size=getattr(kvc, "kv_group_size", 32),
+                layout=getattr(kvc, "kv_swa_layout", None) or "merged",
             )
         elif model_config.attention_arch == AttentionArch.MLA:
             # MLA pool sizing uses latent dimensions rather than MHA heads.
@@ -784,13 +798,18 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             and not kvc.is_draft_worker
             and (kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone())
         ):
-            self._draft_full_per_token = _mxint8_draft_per_token(
-                kvc, model_config.get_num_kv_heads(tp_size), model_config.head_dim
+            self._draft_full_per_token = get_parallel().attn_dcp_size * (
+                _mxint8_draft_per_token(
+                    kvc, model_config.get_num_kv_heads(tp_size), model_config.head_dim
+                )
             )
-            self._draft_swa_per_token = _mxint8_draft_per_token(
-                kvc,
-                model_config.get_swa_num_kv_heads(tp_size),
-                model_config.swa_head_dim,
+            self._draft_swa_per_token = get_parallel().attn_dcp_size * (
+                _mxint8_draft_per_token(
+                    kvc,
+                    model_config.get_swa_num_kv_heads(tp_size),
+                    model_config.swa_head_dim,
+                    is_swa=True,
+                )
             )
 
         # Draft KV tensors use full, SWA, or full-capacity SWA geometry.

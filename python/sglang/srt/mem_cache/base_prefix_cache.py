@@ -71,6 +71,12 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    # Let the device match extend over cached Full KV even where the SWA KV is
+    # missing (an SWA tombstone). Only for callers that supply the request's
+    # SWA window themselves, such as P/D decode, which receives it fresh from
+    # prefill. Python UnifiedTreeCore only.
+    ignore_swa_kv_miss: bool = False
+
 
 @dataclasses.dataclass
 class InsertParams:

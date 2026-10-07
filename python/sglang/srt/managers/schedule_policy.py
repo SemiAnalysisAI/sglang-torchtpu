@@ -65,6 +65,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
+    MatchResult,
     zero_match_result,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
@@ -107,6 +108,9 @@ IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD = int(
 IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
     os.environ.get("IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD", "32")
 )
+
+# Most waiting requests prefix-matched in one scheduling step.
+MAX_PREFIX_MATCHED_WAITING_REQS = 128
 
 
 IGNORE_EOS_RESERVE_TOKENS = 1
@@ -154,17 +158,15 @@ def estimate_prefill_extend_tile_metrics(
     }
 
 
-def match_prefix_for_req(
+def _match_prefix_result(
     tree_cache: BasePrefixCache,
     req: Req,
-    token_ids: Optional[array[int]] = None,
+    token_ids: array[int],
     *,
     cow_mamba: bool = False,
     include_req: bool = False,
+    ignore_swa_kv_miss: bool = False,
 ):
-    if token_ids is None:
-        token_ids = req.origin_input_ids + req.output_ids
-
     # unified_kv SWA lives in a per-request ring that's not content-stable and is
     # never stored in the radix tree, so a reused prefix carries stale SWA. Cap
     # the match by the trailing sliding window so it gets re-prefilled, rewriting
@@ -182,12 +184,52 @@ def match_prefix_for_req(
             ),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
+            ignore_swa_kv_miss=ignore_swa_kv_miss,
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
         match_result = zero_match_result(
             tree_cache, match_result, extra_key=req.extra_key
         )
+    return match_result
+
+
+def _capped_prefix_len(match_result: MatchResult, req: Req, num_tokens: int) -> int:
+    return min(
+        len(match_result.device_indices) + match_result.host_hit_length,
+        req._compute_max_prefix_len(num_tokens),
+    )
+
+
+def matched_prefix_len(tree_cache: BasePrefixCache, req: Req) -> int:
+    """Cached tokens admission would reuse for ``req`` (device and host hits,
+    capped like ``num_matched_prefix_tokens``), without writing to ``req``."""
+    token_ids = req.origin_input_ids + req.output_ids
+    match_result = _match_prefix_result(tree_cache, req, token_ids)
+    return _capped_prefix_len(
+        match_result=match_result, req=req, num_tokens=len(token_ids)
+    )
+
+
+def match_prefix_for_req(
+    tree_cache: BasePrefixCache,
+    req: Req,
+    token_ids: Optional[array[int]] = None,
+    *,
+    cow_mamba: bool = False,
+    include_req: bool = False,
+    ignore_swa_kv_miss: bool = False,
+):
+    if token_ids is None:
+        token_ids = req.origin_input_ids + req.output_ids
+    match_result = _match_prefix_result(
+        tree_cache,
+        req,
+        token_ids,
+        cow_mamba=cow_mamba,
+        include_req=include_req,
+        ignore_swa_kv_miss=ignore_swa_kv_miss,
+    )
     (
         req.prefix_indices,
         req.last_node,
@@ -205,9 +247,8 @@ def match_prefix_for_req(
         match_result.swa_host_hit_length,
         match_result.mamba_host_hit_length,
     )
-    max_len = req._compute_max_prefix_len(len(token_ids))
-    req.num_matched_prefix_tokens = min(
-        len(req.prefix_indices) + req.host_hit_length, max_len
+    req.num_matched_prefix_tokens = _capped_prefix_len(
+        match_result=match_result, req=req, num_tokens=len(token_ids)
     )
     req.swa_branching_seqlen = match_result.swa_branching_seqlen
     if match_result.mamba_branching_seqlen is not None:
@@ -335,7 +376,7 @@ class SchedulePolicy:
                 CacheAwarePolicy.LPM,
                 CacheAwarePolicy.HRRN,
             )
-            and len(waiting_queue) > 128
+            and len(waiting_queue) > MAX_PREFIX_MATCHED_WAITING_REQS
         ):
             # Turn off the expensive prefix matching and sorting when the #queue is large.
             return CacheAgnosticPolicy.FCFS
@@ -662,6 +703,8 @@ class PrefillAdder:
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []
+        # Device KV indices of the HiCache load-backs queued by add_one_req.
+        self.host_load_indices: List[torch.Tensor] = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
@@ -1349,7 +1392,11 @@ class PrefillAdder:
         return self.budget_state()
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        chunk_tokens_cap: Optional[int] = None,
     ):
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
@@ -1384,6 +1431,7 @@ class PrefillAdder:
                 host_hit_length=req.host_hit_length,
                 swa_host_hit_length=req.swa_host_hit_length,
                 truncation_align_size=truncation_align_size,
+                chunk_tokens_cap=chunk_tokens_cap,
                 has_chunked_req=has_chunked_req,
             )
             if isinstance(admission, AddReqResult):
@@ -1416,6 +1464,8 @@ class PrefillAdder:
                 if loaded is None:
                     return AddReqResult.OTHER
                 new_indices, req.last_node = loaded
+                if len(new_indices) > 0:
+                    self.host_load_indices.append(new_indices)
                 req.host_loaded_length = len(new_indices)
                 if 0 < req.host_loaded_length < promised_host_hit:
                     raise RuntimeError(
@@ -1451,6 +1501,7 @@ class PrefillAdder:
                         host_hit_length=0,
                         swa_host_hit_length=0,
                         truncation_align_size=truncation_align_size,
+                        chunk_tokens_cap=chunk_tokens_cap,
                         has_chunked_req=has_chunked_req,
                     )
                     if isinstance(admission, AddReqResult):
@@ -1468,6 +1519,9 @@ class PrefillAdder:
 
             self._commit_prefill_admission(req, admission, mamba_gap_reserve)
 
+        if chunk_tokens_cap is not None and self.new_chunked_req is req:
+            # The scheduler tracks one partial request, so a capped one ends the batch.
+            self.rem_chunk_tokens = 0
         # This verdict controls the next candidate, not the committed request.
         return self.budget_state()
 
@@ -1479,6 +1533,7 @@ class PrefillAdder:
         host_hit_length: int,
         swa_host_hit_length: int,
         truncation_align_size: Optional[int],
+        chunk_tokens_cap: Optional[int] = None,
         has_chunked_req: bool = False,
     ) -> _PrefillAdmission | AddReqResult:
         """Select a prefill shape without allocating or publishing cached KV."""
@@ -1497,6 +1552,9 @@ class PrefillAdder:
         )
         if not can_admit:
             return AddReqResult.NO_TOKEN
+        if chunk_tokens_cap is not None and chunk_tokens_limit is not None:
+            # Per-request cap from dynamic chunking, below the batch budget.
+            chunk_tokens_limit = min(chunk_tokens_limit, chunk_tokens_cap)
 
         # Without chunking, allow the first request even above the input cap.
         if (

@@ -523,6 +523,7 @@ class Envs:
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
+    SGLANG_TPU_SIMULATE_PERFECT_BALANCED_EXPERTS = EnvBool(False)
 
     # ===================================================================
     # DSpark speculative decoding
@@ -716,6 +717,14 @@ class Envs:
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
     # Raiden: a DP or TP decode receives KV from a pipeline-parallel prefill.
     SGLANG_RAIDEN_PIPELINE_TRANSFER = EnvBool(False)
+    # Raiden: stage each transfer (and reshard plan) in its own host-pool pages
+    # instead of fixed max-length slots; asymmetric attention TP needs it.
+    SGLANG_RAIDEN_DYNAMIC_HOST_STAGING = EnvBoolWithAlias(
+        True, deprecated_name="TPU_RAIDEN_DYNAMIC_HOST_STAGING"
+    )
+    # Raiden: a decode starts a room's next read as soon as the prefill
+    # announces it; 0 starts reads only on the next scheduler poll.
+    SGLANG_RAIDEN_LISTENER_START_READ = EnvBool(True)
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
     )
@@ -1854,6 +1863,12 @@ class Envs:
     SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE = EnvBool(False)
     # Preserve FP32 expert scales and apply GMM partial scales in FP32.
     SGLANG_TPU_FP8_MOE_FP32_SCALES = EnvBool(False)
+    # INT4 MoE kernel mode. Unset: W4A16 group dots. "vmem-bf16": dequantize in
+    # VMEM, one bf16 dot per tile. "vmem-fp8": fp8 weight tiles and activations.
+    SGLANG_TPU_INT4_MOE_MODE = EnvStr(None)
+    # Store INT4 MoE group scales as f32 instead of bf16 (66 MB per layer per
+    # device on Kimi-K2.6). vmem-fp8 always uses f32.
+    SGLANG_TPU_INT4_MOE_FP32_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
@@ -1883,6 +1898,9 @@ class Envs:
     SGLANG_TPU_VIT_NUM_PRECOMPILE_BUCKETS = EnvInt(None)
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
+    # MoE: gather on the TensorCore below this many routed rows (tokens x topk);
+    # 0 = SparseCore always. Measured crossover is 1024 (Kimi, R1, Qwen3-480B).
+    SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS = EnvInt(0)
     # MoE: use onehot dense matmul for small permute and unpermute/combine
     # paths instead of gather. When set to 0, this is disabled. When set
     # to a positive integer, this is the threshold for tokens per rank below

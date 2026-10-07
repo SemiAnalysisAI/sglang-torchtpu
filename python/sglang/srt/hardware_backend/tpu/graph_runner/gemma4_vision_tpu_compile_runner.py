@@ -168,11 +168,7 @@ class Gemma4VisionTpuCompilePolicy(VisionTpuCompilePolicy):
             real_pooled_len = ctx.padding.real_seq_len // ctx.padding.merge_sq
             pooled = pooled[:, :real_pooled_len]
             pooler_mask = pooler_mask[:, :real_pooled_len]
-        # Land on the host while the shape is still static: every consumer from
-        # here on is variable-length. Mirrors ViTTpuCompileRunner.
-        if not envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.get():
-            pooled = pooled.to("cpu")
-            pooler_mask = pooler_mask.to("cpu")
+        # Stays on device: the projector runs next with device weights.
         return pooled, pooler_mask
 
     def run(

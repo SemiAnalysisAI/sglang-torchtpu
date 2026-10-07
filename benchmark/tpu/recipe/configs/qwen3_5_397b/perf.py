@@ -72,7 +72,6 @@ CONFIG["runtime_env"].update(
         # The three sparse-core COLLECTIVE offload disables are kept.
         "LIBTPU_INIT_ARGS": " ".join(
             [
-                "--xla_tpu_scoped_vmem_limit_kib=32768",
                 "--xla_tpu_enable_async_collective_fusion=true",
                 "--xla_tpu_overlap_compute_collective_tc=true",
                 "--xla_tpu_enable_async_collective_fusion_multiple_steps=true",

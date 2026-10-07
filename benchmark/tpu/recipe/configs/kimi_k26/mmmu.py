@@ -41,7 +41,9 @@ CONFIG["server_args"].update(
         "max_prefill_tokens": PREFILL_TOKENS,
         "tpu_compile_tokens": [4096],
         "tpu_compile_bs": [1, 16, 32, 64, 128],
-        "mem_fraction_static": 0.88,
+        # 0.88 left 6.9 GB per core after a 45.8 GB pool and the extend precompile
+        # could not load an 827 MB program (run 37242007042, main's W4A16 path).
+        "mem_fraction_static": 0.85,
         "trust_remote_code": True,
         "skip_server_warmup": True,
         "scheduler_recv_interval": 8,
@@ -50,6 +52,12 @@ CONFIG["server_args"].update(
 )
 CONFIG["runtime_env"].update(
     {
+        # int4 experts dequantized in VMEM; the W4A16 path serves ~1 tok/s per
+        # request at this load. f32 scales as in the validated run.
+        "SGLANG_TPU_INT4_MOE_MODE": "vmem-bf16",
+        "SGLANG_TPU_INT4_MOE_FP32_SCALES": "1",
+        # MoE permute on the TensorCore below 1024 routed rows; measured crossover.
+        "SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS": "1024",
         "SGLANG_TPU_MM_EMBED_ON_DEVICE": "1",
         "SGLANG_ENABLE_EMBED_REPLICATION": "1",
         # Square patch-count buckets warmed at startup.

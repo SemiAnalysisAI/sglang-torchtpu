@@ -123,6 +123,9 @@ class UnifiedTreeNode:
         ]
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
+        # Last insert or lock release on this node: a forward formed after
+        # it cannot write the node's device values.
+        self.last_release_time = self.creation_time
         self.hash_value = None
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[list[str]] = None
@@ -487,6 +490,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
         self._tracked_unbacked_tokens = 0
         self._is_tracking_unbacked_tokens = False
+        self._device_frees_release_time: Optional[float] = None
 
         self.root_node = self._new_node()
         self.root_node.priority = -sys.maxsize
@@ -724,6 +728,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._assert_receipt_anchor(node, params)
         # After an SWA early release (dec_swa_lock_only), SWA and the
         # lower-priority components it dropped are already released.
+        self._stamp_release(node)
         self._release_components(node, params, skip_swa_and_below=skip_swa)
         self._update_evictable_leaf_sets(node)
         # TODO: delta is not aggregated from components; no caller uses it yet.
@@ -740,6 +745,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def dec_full_pin(self, node_id: NodeId) -> None:
         node = self.node_by_id(node_id)
+        self._stamp_release(node)
         self.components_by_type[BASE_COMPONENT_TYPE].release_component_lock(
             node=node, params=None
         )
@@ -756,6 +762,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._assert_receipt_anchor(node, params)
         if node is self.root_node or component_type in params.skipped_lock_components:
             return result
+        self._stamp_release(node)
         self.components_by_type[component_type].release_window_lock(
             node,
             params.get_lock_uuid(component_type),
@@ -779,6 +786,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         swa_component = self.components_by_type.get(ComponentType.SWA)
         if swa_component is None:
             return result
+        self._stamp_release(node)
         swa_component.release_window_lock(
             node,
             params.get_lock_uuid(ComponentType.SWA),
@@ -795,6 +803,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if comp.eviction_priority(is_leaf=False) < swa_priority:
                 comp.release_component_lock(node, params)
         return result
+
+    @staticmethod
+    def _stamp_release(node: UnifiedTreeNode) -> None:
+        """Stamp node's root path, which covers every node a release or
+        insert through it can touch."""
+        now = get_and_increase_time_counter()
+        while node is not None:
+            node.last_release_time = now
+            node = node.parent
+
+    def take_device_frees_release_time(self) -> Optional[float]:
+        release_time = self._device_frees_release_time
+        self._device_frees_release_time = None
+        return release_time
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         node = self.node_by_id(node_id)
@@ -831,7 +853,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
-        ) = self._match_prefix_helper(key)
+        ) = self._match_prefix_helper(key, params.ignore_swa_kv_miss)
         return self._match_post_processor(
             params,
             value,
@@ -843,7 +865,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def _match_prefix_helper(
-        self, key: RadixKey
+        self, key: RadixKey, ignore_swa_kv_miss: bool
     ) -> tuple[
         list[torch.Tensor],
         UnifiedTreeNode,
@@ -866,6 +888,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         full_kv_hit_length = 0
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
+        components = self.components
+        if ignore_swa_kv_miss:
+            assert not separate_device_match, "ignore_swa_kv_miss needs no HiCache"
+            components = [
+                c for c in components if c.component_type != ComponentType.SWA
+            ]
         if separate_device_match:
             validators = tuple(
                 comp.create_match_validator() for comp in self.components
@@ -877,7 +905,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         else:
             validators = tuple(
                 comp.create_match_validator(match_device_only=True)
-                for comp in self.components
+                for comp in components
             )
 
         def _all_valid(validators, node):
@@ -1380,6 +1408,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _insert_tail_step(self, state: _InsertWalkState) -> None:
         """Refresh the LRUs and append terminal backup actions."""
+        # The insert may have put request-owned pages on any node of the path.
+        self._stamp_release(state.target_node)
         if state.target_node is not self.root_node:
             for component in self.components:
                 if component.component_type == BASE_COMPONENT_TYPE:
@@ -1403,6 +1433,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.hit_count = child.hit_count
         new_node.external_cache_stored = child.external_cache_stored
         new_node.creation_time = child.creation_time
+        new_node.last_release_time = child.last_release_time
         if self.tlru_bookkeeping:
             # A split adds no depth to the branch: the new parent sits at
             # split_len tokens and inherits the branch's high-water mark, while
@@ -2016,6 +2047,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         device_freed, host_freed = comp.evict_component(
             node, target=target, device_frees=device_frees, host_frees=host_frees
         )
+        if device_freed > 0 and (
+            self._device_frees_release_time is None
+            or node.last_release_time > self._device_frees_release_time
+        ):
+            self._device_frees_release_time = node.last_release_time
         if tracker is not None:
             if EvictLayer.DEVICE in target:
                 tracker[comp.component_type] += device_freed

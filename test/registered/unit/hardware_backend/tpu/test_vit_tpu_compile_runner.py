@@ -285,6 +285,22 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         self.assertEqual([step["num_tokens"] for step in steps], [196, 324, 4900])
         self.assertEqual([step["duration_seconds"] for step in steps], [1, 2, 3])
 
+    def test_warmup_syncs_every_tensor_of_a_tuple_result(self):
+        # A (features, mask) boundary hands warmup a tuple; sync each tensor in it.
+        policy = _FakeVisionPolicy()
+        policy.owner = SimpleNamespace()
+        pooled, mask = torch.zeros(2), torch.ones(2)
+        policy.compiled_fn = MagicMock(return_value=(pooled, mask))
+
+        with patch.object(vit_runner, "tpu_sync") as sync:
+            policy.warmup_once(4)
+
+        (tensors,), kwargs = sync.call_args
+        self.assertEqual(len(tensors), 2)
+        self.assertIs(tensors[0], pooled)
+        self.assertIs(tensors[1], mask)
+        self.assertTrue(kwargs["wait"])
+
     def test_qwen3_vl_warmup_covers_the_whole_pass_not_just_the_compiled_region(self):
         """Warmup must enter at the encoder, ahead of patch_embed.
 

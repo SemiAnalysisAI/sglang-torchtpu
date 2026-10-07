@@ -112,6 +112,7 @@ _is_tpu = is_tpu()
 if _is_tpu:
     from sglang.srt.hardware_backend.tpu.prefill_early_send import (
         tpu_clip_cached_prefix_send_end,
+        tpu_clip_hicache_load_send_end,
         tpu_update_inflight_kv_write_pages,
     )
 
@@ -765,11 +766,15 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                if self.kv_free_fence is not None:
+                    self.kv_free_fence.on_batch_formed()
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
+                if self.kv_free_fence is not None:
+                    self.kv_free_fence.on_forward_launched(batch_result)
             else:
                 batch_result = None
                 self._sched_idled = True
@@ -1320,7 +1325,9 @@ class SchedulerDisaggregationPrefillMixin:
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
-    def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+    def maybe_send_cached_prefix_chunk(
+        self: Scheduler, req: Req, hicache_load_page_ids: Optional[torch.Tensor]
+    ) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
 
@@ -1348,6 +1355,16 @@ class SchedulerDisaggregationPrefillMixin:
             # not a complete physical DCP page. The regular final send covers
             # the full range; only skip this optional early-send optimization.
             return
+        if _is_tpu:
+            # This batch's HiCache loads land after this send, before its forward.
+            cached_end = tpu_clip_hicache_load_send_end(
+                scheduler=self,
+                req=req,
+                candidate_send_end=cached_end,
+                hicache_load_page_ids=hicache_load_page_ids,
+            )
+            if cached_end <= req.start_send_idx:
+                return
         if self.enable_overlap and _is_tpu:
             # TPU cannot send pages the in-flight forward might write, since
             # those pages might be partially updated.

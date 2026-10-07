@@ -1944,6 +1944,59 @@ class UnifiedRadixCacheSuite:
         )
         cache.sanity_check()
 
+    def test_swa_unfinished_req_protects_insert_below_live_window(self):
+        # P/D decode holds SWA only from page_floor(s - W), the window prefill
+        # sends. With W = 4 * page - 1 and s % page == W % page, the page-aligned
+        # key holds less than a live window, so a fresh match would stop short
+        # and the request would later free slots the tree owns.
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        ps = self.cfg.page_size
+        if ps == 1:
+            self.skipTest("requires page_size > 1")
+        window = 4 * ps - 1
+        seq_len = 5 * ps + window % ps
+        swa_start = (seq_len - window) // ps * ps
+        cache, allocator, req_to_token_pool = build_fixture(
+            replace(self.cfg, sliding_window_size=window)
+        )
+        full_avail = allocator.full_attn_allocator.available_size()
+        swa_avail = allocator.swa_attn_allocator.available_size()
+
+        req = self._make_req(req_to_token_pool)
+        tokens = array("q", range(1, seq_len + 1))
+        req.origin_input_ids = tokens
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, seq_len)
+        kv_indices = self._alloc(allocator, seq_len)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, seq_len)), kv_indices)
+        req.kv.kv_committed_len = seq_len
+        req.kv.kv_allocated_len = seq_len
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock_receipt = DecLockRefParams()
+        req.extra_key = None
+        allocator.free_swa(kv_indices[:swa_start])
+        req.kv.set_evicted_seqlen(ComponentType.SWA, swa_start)
+
+        cache.cache_unfinished_req(req)
+
+        key_len = seq_len - (1 if self.cfg.is_eagle else 0)
+        self.assertEqual(req.kv.cache_protected_len, key_len // ps * ps)
+        release_kv_cache(req, cache)
+        cache.sanity_check()
+        # Every slot the request held is now owned by the tree exactly once.
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size()
+            + cache.full_evictable_size(),
+            full_avail,
+        )
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size() + cache.swa_evictable_size(),
+            swa_avail,
+        )
+
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.skipTest("requires SWA without Mamba")
@@ -2258,6 +2311,103 @@ class UnifiedRadixCacheSuite:
             torch.equal(_device_value(cache, node, ComponentType.FULL), value)
         )
         self.assertIsNone(_device_value(cache, node, ComponentType.SWA))
+        cache.sanity_check()
+
+    def test_ignore_swa_kv_miss_reuses_full_kv_behind_tombstone(self):
+        # A shared prefix that ends where SWA is tombstoned misses by default;
+        # with ignore_swa_kv_miss it reuses the Full KV up to the divergence.
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        if _selected_tree_core_test_backend() == "rust":
+            self.skipTest("ignore_swa_kv_miss is Python UnifiedTreeCore only")
+        cache, allocator, _ = build_fixture(self.cfg)
+        tokens = self._make_seq(1, 3)
+        value = self._alloc(allocator, len(tokens))
+        if value is None:
+            self.skipTest("insufficient pool for this config")
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=value,
+                prev_prefix_len=0,
+                component_evicted_seqlens={ComponentType.SWA: len(tokens)},
+            )
+        )
+        shared = 2 * self.cfg.page_size
+        query = array("q", tokens[:shared] + self._make_seq(10**6, 1))
+
+        default = cache.match_prefix(MatchPrefixParams(key=RadixKey(query)))
+        relaxed = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(query), ignore_swa_kv_miss=True)
+        )
+
+        self.assertEqual(len(default.device_indices), 0)
+        self.assertTrue(torch.equal(relaxed.device_indices, value[:shared]))
+        cache.sanity_check()
+
+    def test_ignore_swa_kv_miss_survives_decode_insert(self):
+        # P/D decode admission: reuse Full KV behind an SWA tombstone, keep only
+        # the Full lock, then insert the request with its freshly transferred SWA
+        # tail. cache_unfinished_req's strict re-match must still cover the reused
+        # prefix; a gate misprediction trips its assert instead of missing reuse.
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        if _selected_tree_core_test_backend() == "rust":
+            self.skipTest("ignore_swa_kv_miss is Python UnifiedTreeCore only")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps, window = self.cfg.page_size, self.cfg.sliding_window_size
+
+        def tail_start(n):  # DecodePreallocQueue._swa_tail_len, radix branch
+            return (max(0, n - 1 - max(window, ps)) // ps) * ps
+
+        window_pages = -(-max(window, ps) // ps)
+        seq_a = self._make_seq(1, 3 * window_pages + 2)
+        value_a = self._alloc(allocator, len(seq_a))
+        if value_a is None:
+            self.skipTest("insufficient pool for this config")
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", seq_a)),
+                value=value_a,
+                prev_prefix_len=0,
+                component_evicted_seqlens={ComponentType.SWA: tail_start(len(seq_a))},
+            )
+        )
+        shared = 2 * ps
+        seq_b = seq_a[:shared] + self._make_seq(10**6, 3 * window_pages + 1)
+        b_len = len(seq_b)
+        self.assertLessEqual(shared, tail_start(len(seq_a)))
+        self.assertLessEqual(shared, tail_start(b_len))
+
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq_b)), ignore_swa_kv_miss=True)
+        )
+        self.assertEqual(len(match.device_indices), shared)
+        req = self._make_req(req_to_token_pool)
+        self._apply_match_to_req(req, match)
+        req.lock_receipt = cache.inc_lock_ref(req.last_node).to_dec_params()
+        cache.dec_swa_lock_only(req.last_node, req.lock_receipt)
+        req.swa_prefix_lock_released = True
+
+        fresh = self._alloc(allocator, b_len - shared)
+        if fresh is None:
+            self.skipTest("insufficient pool for this config")
+        row = torch.cat([match.device_indices, fresh[: b_len - shared]])
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, b_len)), row)
+        req.origin_input_ids = array("q", seq_b)
+        req.output_ids = array("q", [0])
+        req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+        req.kv.kv_committed_len = b_len
+        req.kv.cache_protected_len = shared
+        req.set_extend_range(shared, b_len)
+        req.kv.set_evicted_seqlen(ComponentType.SWA, tail_start(b_len))
+        req.extra_key = None
+
+        cache.cache_unfinished_req(req)
+
+        self.assertEqual(len(req.prefix_indices), (b_len // ps) * ps)
+        self.assertTrue(torch.equal(req.prefix_indices[:shared], value_a[:shared]))
+        cache.dec_lock_ref(req.last_node, req.lock_receipt)
         cache.sanity_check()
 
     def test_leaf_transition_swa_evict_spares_locked_full(self):

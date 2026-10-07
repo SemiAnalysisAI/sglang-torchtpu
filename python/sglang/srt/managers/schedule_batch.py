@@ -2385,6 +2385,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
+    # Allocator page IDs (DCP-widened) that this batch's HiCache load-backs fill,
+    # recorded for TPU PD prefill early send, which runs before the forward waits.
+    hicache_load_page_ids: Optional[torch.Tensor] = None
 
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -2470,6 +2473,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
+    # Some DP rank's extend carries multimodal inputs (gathered in the MLP sync).
+    is_tpu_mm_extend_in_batch: bool = False
     can_run_decode_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
@@ -3842,6 +3847,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=self.dp_prefill_cuda_graph_max_prefix_len,
             is_extend_in_batch=self.is_extend_in_batch,
+            is_tpu_mm_extend_in_batch=self.is_tpu_mm_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,

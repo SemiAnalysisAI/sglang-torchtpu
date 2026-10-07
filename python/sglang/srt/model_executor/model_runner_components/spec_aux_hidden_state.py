@@ -44,6 +44,8 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_target_layer_ids: Any = None
     # DFLASH draft KV bytes/token; None when unresolved.
     dflash_draft_cell_size_per_token: int | None = None
+    # Preserve heads/dim for layout-aware MXINT8 sizing; raw payload bytes lose it.
+    dflash_draft_kv_geometry: tuple[int, int] | None = None
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -209,6 +211,11 @@ def _resolve_dflash_aux_hidden_state(
             draft_model_config=draft_model_config,
             draft_num_layers=int(draft_num_layers),
         )
+        if config.dflash_draft_cell_size_per_token is not None:
+            config.dflash_draft_kv_geometry = (
+                draft_model_config.get_num_kv_heads(get_parallel().tp_size),
+                draft_model_config.head_dim,
+            )
 
 
 def _resolve_dflash_draft_cell_size(

@@ -64,9 +64,54 @@ def merged_cache_shape(
     return num_blocks, merged_rows(head_num, head_dim, group_size), page_size
 
 
-def cache_bytes_per_token(
+# Page layouts: "merged" keeps payload rows then tile-padded exponent rows in a
+# [pages, R, tokens] page; "blocked" stores a page as S/128 token blocks of
+# payload rows followed by one fully used 32-row exponent tile in a
+# [pages, R, 128] page (row r*4 + j of the tile = scale row r, token block j).
+KV_LAYOUTS = ("merged", "blocked")
+DEFAULT_KV_LAYOUT = "merged"
+TOKEN_BLOCK = 128
+BLOCKS_PER_WORD = 4
+MAX_BLOCKED_PAGE_SIZE = TOKEN_BLOCK * BLOCKS_PER_WORD
+
+
+def validate_kv_layout(layout: str, page_size: int | None = None) -> None:
+    if layout not in KV_LAYOUTS:
+        raise ValueError(
+            f"MXINT8 KV layout must be one of {KV_LAYOUTS}, got {layout!r}"
+        )
+    if layout == "blocked" and page_size is not None:
+        if (
+            page_size < TOKEN_BLOCK
+            or page_size & (page_size - 1)
+            or page_size > MAX_BLOCKED_PAGE_SIZE
+        ):
+            raise ValueError(
+                "MXINT8 blocked layout requires a power-of-two page_size between "
+                f"{TOKEN_BLOCK} and {MAX_BLOCKED_PAGE_SIZE}"
+            )
+
+
+def blocked_page_rows(
     head_num: int, head_dim: int, page_size: int, group_size: int = GROUP_SIZE
+) -> int:
+    _validate_geometry(head_num, head_dim, page_size, group_size)
+    validate_kv_layout("blocked", page_size)
+    tile_rows = _align(BLOCKS_PER_WORD * scale_rows(head_num, head_dim, group_size))
+    return page_size // TOKEN_BLOCK * payload_rows(head_num, head_dim) + tile_rows
+
+
+def cache_bytes_per_token(
+    head_num: int,
+    head_dim: int,
+    page_size: int,
+    group_size: int = GROUP_SIZE,
+    layout: str = DEFAULT_KV_LAYOUT,
 ) -> int:
     """Physical bytes per layer, excluding the extra dummy page's token count."""
     _validate_geometry(head_num, head_dim, page_size, group_size)
+    validate_kv_layout(layout, page_size)
+    if layout == "blocked":
+        rows = blocked_page_rows(head_num, head_dim, page_size, group_size)
+        return rows * TOKEN_BLOCK // page_size
     return merged_rows(head_num, head_dim, group_size)

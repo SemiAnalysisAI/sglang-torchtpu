@@ -723,7 +723,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 prepare_tpu_mxfp4_moe_weights,
             )
 
-            prepare_tpu_mxfp4_moe_weights(layer)
+            prepare_tpu_mxfp4_moe_weights(layer, with_bias=self.with_bias)
             return
         if self.use_flashinfer:
             # Per-expert buffers are local (create_weights uses num_local_experts);
@@ -1606,12 +1606,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # TODO(qinghan): once the packed-FP4 fast path lands, gate this on a
         # config flag instead of unconditionally taking the BF16 triage path.
         if is_tpu():
-            # TODO(qinghan): support native packed-MXFP4 here
             from sglang.srt.layers.quantization.unquant import (
                 UnquantizedFusedMoEMethod,
             )
 
-            return UnquantizedFusedMoEMethod.forward_tpu(self, layer, dispatch_output)
+            # Scales are None on the BF16 path, packed-FP4 block scales otherwise.
+            return UnquantizedFusedMoEMethod.forward_tpu(
+                self,
+                layer,
+                dispatch_output,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+            )
 
         if self.use_deep_gemm:
             # Handles standard AND deepep_ll/deepep_normal dispatch formats via

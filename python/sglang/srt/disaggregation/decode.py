@@ -618,14 +618,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if window_size is None or window_size <= 0:
             return seq_len
 
+        # Match the window prefill sends: any longer tail would leave a page
+        # that the decode radix cache inserts but nothing writes.
         page_size = self.token_to_kv_pool_allocator.page_size
-        if get_disagg().disaggregation_decode_enable_radix_cache:
-            # Keep enough SWA before the page-aligned radix-cache insert
-            # boundary for the cached key to contain a complete window.
-            # `seq_len - 1` is the last committed position.
-            window_start = max(0, seq_len - 1 - max(window_size, page_size))
-        else:
-            window_start = max(0, seq_len - window_size)
+        window_start = max(0, seq_len - window_size)
         window_start = (window_start // page_size) * page_size
         return seq_len - window_start
 
@@ -875,6 +871,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             self.pending_reqs.append(decode_req)
 
+    def _can_ignore_swa_kv_miss(self, req: Req) -> bool:
+        if (
+            not self._uses_swa_tail_prealloc()
+            or self.tree_cache.tree_core.enable_hicache
+        ):
+            return False
+        fill_len = self._pre_alloc_fill_len(req)
+        key_len = fill_len - 1 if self.tree_cache.tree_core.is_eagle else fill_len
+        page_size = self.token_to_kv_pool_allocator.page_size
+        insert_boundary = (key_len // page_size) * page_size
+        tail_start = fill_len - self._swa_tail_len(fill_len)
+        # Reuse stops at the tail start and the SWA window arrives fresh. The tail
+        # must still hold a full window before the page-aligned insert boundary,
+        # or the strict re-match in cache_unfinished_req falls short of the reuse.
+        return insert_boundary - tail_start >= self.scheduler.sliding_window_size
+
     def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
         """
         Match a request against the decode-side radix cache, lock the matched
@@ -886,6 +898,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req.origin_input_ids,
             cow_mamba=self.tree_cache.supports_mamba(),
             include_req=True,
+            ignore_swa_kv_miss=self._can_ignore_swa_kv_miss(req),
         )
         # Keep aggregated scheduling semantics while preserving the SWA lock
         # boundary needed for the matching dec_lock_ref; the full receipt
@@ -3031,6 +3044,8 @@ class SchedulerDisaggregationDecodeMixin:
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch
             )
+            if batch and self.kv_free_fence is not None:
+                self.kv_free_fence.on_batch_formed()
 
             if disable_overlap_for_batch and self.last_batch:
                 pop_and_process()
@@ -3040,6 +3055,8 @@ class SchedulerDisaggregationDecodeMixin:
                 batch_result = self.run_batch(batch)
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
+                if self.kv_free_fence is not None:
+                    self.kv_free_fence.on_forward_launched(batch_result)
             else:
                 batch_result = None
                 self._sched_idled = True

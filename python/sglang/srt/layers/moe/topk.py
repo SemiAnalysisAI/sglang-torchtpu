@@ -534,6 +534,48 @@ def _simulate_balanced_routing(
     )
 
 
+def _simulate_tpu_perfect_balanced_routing(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+    *,
+    num_ranks: int,
+    num_routed_topk: Optional[int] = None,
+    layer_id: Optional[int] = None,
+    token_shard_rank: int = 0,
+    num_token_shards: int = 1,
+) -> None:
+    """Portable rank-first benchmark routing for TPU."""
+    num_tokens, k = topk_ids.shape
+    if num_tokens == 0 or k == 0:
+        return
+    assert 0 <= token_shard_rank < num_token_shards
+    if num_ranks <= 0 or num_experts % num_ranks:
+        num_ranks = 1
+    experts_per_rank = max(num_experts // num_ranks, 1)
+    assignment_stride = k if num_routed_topk is None else num_routed_topk
+    global_tokens = (
+        torch.arange(num_tokens, device=topk_ids.device, dtype=topk_ids.dtype)
+        * num_token_shards
+        + token_shard_rank
+    )
+    slots = torch.arange(k, device=topk_ids.device, dtype=topk_ids.dtype)
+    deal = (
+        global_tokens.unsqueeze(1) * assignment_stride
+        + slots.unsqueeze(0)
+        + (0 if layer_id is None else layer_id)
+    )
+    simulated_ids = (deal % num_ranks) * experts_per_rank + (
+        deal // num_ranks
+    ) % experts_per_rank
+    topk_ids.copy_(simulated_ids)
+    topk_weights.fill_(1.0 / k)
+
+
+def _tpu_perfect_balanced_routing_enabled() -> bool:
+    return _is_tpu and envs.SGLANG_TPU_SIMULATE_PERFECT_BALANCED_EXPERTS.get()
+
+
 # -------------------------------- TopK ---------------------------------------
 
 
@@ -2517,12 +2559,23 @@ def select_experts(
 
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
-    if simulate_uniform_experts and simulate_round_robin_experts:
+    simulate_tpu_perfect_balanced_experts = _tpu_perfect_balanced_routing_enabled()
+    if (
+        simulate_uniform_experts
+        + simulate_round_robin_experts
+        + simulate_tpu_perfect_balanced_experts
+        > 1
+    ):
         raise ValueError(
-            "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
-            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS, "
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS, and "
+            "SGLANG_TPU_SIMULATE_PERFECT_BALANCED_EXPERTS are mutually exclusive"
         )
-    routing_overridden = simulate_uniform_experts or simulate_round_robin_experts
+    routing_overridden = (
+        simulate_uniform_experts
+        or simulate_round_robin_experts
+        or simulate_tpu_perfect_balanced_experts
+    )
 
     (
         router_logits,
@@ -2738,10 +2791,9 @@ def select_experts(
         )
 
     if routing_overridden:
-        # Benchmark-only: override gating with a balanced expert assignment (so
-        # dummy/random benchmark tokens don't skew MoE load) via a single fused
-        # Triton kernel — one launch instead of the ~5-7 small elementwise ops it
-        # replaces, to minimize timing perturbation. Do NOT use in production.
+        # Benchmark-only: override gating so dummy/random benchmark tokens don't
+        # skew MoE load. Uniform and round-robin use the fused Triton path;
+        # TPU-specific perfect balance uses portable torch operations.
         if is_moe_input_scattered_across_dp_ranks():
             parallel = get_parallel()
             token_shard_rank = parallel.attn_dp_rank
@@ -2751,15 +2803,27 @@ def select_experts(
             # its routing must remain identical across those replicas.
             token_shard_rank, num_token_shards = 0, 1
 
-        _simulate_balanced_routing(
-            topk_ids,
-            topk_weights,
-            router_logits.shape[1],
-            random=simulate_uniform_experts,
-            layer_id=layer_id,
-            token_shard_rank=token_shard_rank,
-            num_token_shards=num_token_shards,
-        )
+        if simulate_tpu_perfect_balanced_experts:
+            _simulate_tpu_perfect_balanced_routing(
+                topk_ids,
+                topk_weights,
+                router_logits.shape[1],
+                num_ranks=get_parallel().moe_ep_size,
+                num_routed_topk=num_routed_topk,
+                layer_id=layer_id,
+                token_shard_rank=token_shard_rank,
+                num_token_shards=num_token_shards,
+            )
+        else:
+            _simulate_balanced_routing(
+                topk_ids,
+                topk_weights,
+                router_logits.shape[1],
+                random=simulate_uniform_experts,
+                layer_id=layer_id,
+                token_shard_rank=token_shard_rank,
+                num_token_shards=num_token_shards,
+            )
         # The override rewrote every row, including the router-masked ones.
         padded_rows_masked = False
 
@@ -2808,6 +2872,7 @@ def precomputed_topk_postprocess_is_noop(
         and expert_location_dispatch_info is None
         and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
         and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+        and not _tpu_perfect_balanced_routing_enabled()
     )
 
 

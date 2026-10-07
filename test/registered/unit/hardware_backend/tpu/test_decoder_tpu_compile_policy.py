@@ -987,7 +987,9 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
             model.get_image_feature = lambda *args, **kwargs: None
         return Qwen3VLDecoderTpuCompilePolicy(model_runner=SimpleNamespace(model=model))
 
-    def test_rejects_dp_attention_at_multimodal_install(self):
+    def test_rejects_dp_attention_for_a_wrapper_that_does_not_serve_it(self):
+        # A wrapper whose image steps or logits run eager collectives hangs
+        # under DP attention; fail at install as before.
         policy = self._policy_for(multimodal=True)
 
         with (
@@ -996,11 +998,34 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
                 "is_dp_attention_enabled",
                 return_value=True,
             ),
-            self.assertRaisesRegex(
-                NotImplementedError, "does not support DP attention"
-            ),
+            patch.object(
+                DecoderTpuCompilePolicy, "install", return_value=True
+            ) as base_install,
         ):
-            policy.install()
+            with self.assertRaises(NotImplementedError):
+                policy.install()
+
+        base_install.assert_not_called()
+
+    def test_allows_dp_attention_for_a_wrapper_that_serves_it(self):
+        # Kimi opts in: one input_embeds program per image step on every rank
+        # and a compiled logits processor.
+        policy = self._policy_for(multimodal=True)
+        policy.model_runner.model.serves_dp_attention = True
+
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "is_dp_attention_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                DecoderTpuCompilePolicy, "install", return_value=True
+            ) as base_install,
+        ):
+            self.assertTrue(policy.install())
+
+        base_install.assert_called_once()
 
     def test_allows_dp_attention_at_text_only_install(self):
         # This policy is also attached to the text-only backbone, where none of
@@ -1225,6 +1250,40 @@ class TestMakeDummyForwardBatch(_PolicyTestCase):
         self.assertIsNone(fb.extend_prefix_lens)
         self.assertIsNone(fb.extend_num_tokens)
         self.assertIsNone(fb.extend_logprob_start_lens_cpu)
+
+    def test_warmup_carries_num_token_non_padded_when_serving_does(self):
+        """Real EP batches carry ``num_token_non_padded`` (init_new plus
+        ModelRunner.forward) and the compiled MoE path guards on its presence,
+        so a warmup batch without it recompiles on the first real decode and
+        dies under fail_on_recompile (two-host tp16/ep16 R1-0528 and V3.1).
+        """
+        policy = _make_policy()
+        policy_module = (
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
+        )
+
+        with (
+            patch(f"{policy_module}.enable_num_token_non_padded", return_value=True),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.is_dsa_enable_prefill_cp",
+                return_value=False,
+            ),
+            patch("sglang.srt.layers.cp.utils.is_mla_cp_enabled", return_value=False),
+        ):
+            fb = policy._make_dummy_forward_batch(
+                num_tokens=8, bs=8, mode=ForwardMode.DECODE
+            )
+        self.assertEqual(fb.global_num_token_non_padded_cpu, 8)
+        self.assertEqual(fb.global_num_token_non_padded.item(), 8)
+        # Replicated (not attn-TP sharded) warmup keeps the full count.
+        self.assertEqual(fb.num_token_non_padded.item(), 8)
+
+        with patch(f"{policy_module}.enable_num_token_non_padded", return_value=False):
+            fb = policy._make_dummy_forward_batch(
+                num_tokens=8, bs=8, mode=ForwardMode.DECODE
+            )
+        self.assertIsNone(fb.global_num_token_non_padded)
+        self.assertIsNone(fb.num_token_non_padded)
 
     def test_plain_warmup_uses_serving_sampling_info(self):
         policy = _make_policy()
@@ -1502,9 +1561,29 @@ class TestPrecompileLoops(_PolicyTestCase):
         one left them to compile lazily at serving time, where the first
         unseen batch width tripped fail_on_recompile and killed the server."""
 
+        warmed = self._warmed_decode_variants(decode_embeds_in_language_model=False)
+        self.assertEqual(
+            warmed,
+            {
+                (64, "text_only"),
+                (128, "text_only"),
+                (64, "text_ids"),
+                (128, "text_ids"),
+            },
+        )
+
+    def test_qwen3_vl_decode_embedding_in_graph_warms_one_convention(self):
+        """With the embedding in the language model, "text_only" already is the
+        serving call (input_ids + mrope positions). "text_ids" would warm 1-D
+        positions an mrope decode never passes: one unused graph per bucket."""
+        warmed = self._warmed_decode_variants(decode_embeds_in_language_model=True)
+        self.assertEqual(warmed, {(64, "text_only"), (128, "text_only")})
+
+    def _warmed_decode_variants(self, *, decode_embeds_in_language_model):
         mr = _model_runner()
         mr.model.get_image_feature = MagicMock()
         mr.model.get_input_embeddings = MagicMock()
+        mr.model.decode_embeds_in_language_model = decode_embeds_in_language_model
         policy = Qwen3VLDecoderTpuCompilePolicy(
             model_runner=mr,
             b_bucketer=Bucketer(name="Bs", buckets=[64, 128]),
@@ -1522,24 +1601,16 @@ class TestPrecompileLoops(_PolicyTestCase):
         ):
             policy._precompile_decode()
 
-        warmed = {
+        return {
             (call.kwargs["bs"], call.kwargs["variant"])
             for call in policy._run_one.call_args_list
         }
-        self.assertEqual(
-            warmed,
-            {
-                (64, "text_only"),
-                (128, "text_only"),
-                (64, "text_ids"),
-                (128, "text_ids"),
-            },
-        )
 
     def test_qwen3_vl_warmup_crosses_logits_modes(self):
         mr = _model_runner()
         mr.model.get_image_feature = MagicMock()
         mr.model.get_input_embeddings = MagicMock(return_value=torch.nn.Embedding(2, 4))
+        mr.model.decode_embeds_in_language_model = False
         _enable_distributed_top_k(mr)
         policy = Qwen3VLDecoderTpuCompilePolicy(
             model_runner=mr,
@@ -2704,6 +2775,37 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         self.assertEqual(fb.extend_prefix_lens.tolist(), [0] * 4)
         self.assertEqual(fb.extend_num_tokens, 16)
 
+    def test_draft_warmup_leaves_global_num_token_non_padded_unset(self):
+        """The live DFlash draft batch sets the local ``num_token_non_padded``
+        and never the global tensor. direct_compile pins each input's type at
+        trace time, so a warmup batch carrying the global tensor makes the
+        first live draft forward fail with a type change (gpt-oss-120b DFlash
+        e2e).
+        """
+        policy, _ = self._make_dflash_policy(
+            hidden_size=32, draft_token_num=4, is_draft_worker=True
+        )
+        policy_module = (
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
+        )
+        with (
+            patch(f"{policy_module}.enable_num_token_non_padded", return_value=True),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.is_dsa_enable_prefill_cp",
+                return_value=False,
+            ),
+            patch("sglang.srt.layers.cp.utils.is_mla_cp_enabled", return_value=False),
+        ):
+            fb = policy._make_dummy_forward_batch(
+                num_tokens=16,
+                bs=4,
+                mode=ForwardMode.TARGET_VERIFY,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                spec_info=policy.make_null_spec_info(),
+            )
+        self.assertIsNone(fb.global_num_token_non_padded)
+        self.assertIsNotNone(fb.num_token_non_padded)
+
     def test_block_embed_warmup_reused_under_serving_grad_mode(self):
         torch._dynamo.reset()
         self.addCleanup(torch._dynamo.reset)
@@ -3605,6 +3707,67 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
             [(1, 3, 1, None, True), (4, 12, 4, None, True)],
         )
         self.assertEqual([len(backend.calls) for backend in step_backends], [2, 2, 2])
+
+    def test_fused_draft_warmup_leaves_num_token_non_padded_unset(self):
+        """The live fused draft loop runs on an init_new batch that never
+        passes ModelRunner.forward, so its local ``num_token_non_padded`` is
+        None even when serving enables the field. direct_compile pins each
+        input's type at trace time, so a warmup batch carrying the tensor
+        makes the first live draft step fail with a type change.
+        """
+        mr = _spec_model_runner(is_draft_worker=True)
+        policy = _make_spec_policy(mr, token_buckets=(8,), bs_buckets=(4,))
+        step_backends = [_FakeAttnBackend() for _ in range(3)]
+
+        class FakeDraftBackend:
+            attn_backends = step_backends
+
+            def init_forward_metadata(self, forward_batch):
+                for backend in self.attn_backends:
+                    backend.init_forward_metadata(forward_batch)
+
+        seen = []
+
+        def fused_draft_forward(forward_batch):
+            seen.append(
+                (
+                    forward_batch.global_num_token_non_padded_cpu,
+                    forward_batch.num_token_non_padded,
+                )
+            )
+            return torch.zeros(forward_batch.batch_size)
+
+        policy_module = (
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
+        )
+        with (
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
+            patch(f"{policy_module}.enable_num_token_non_padded", return_value=True),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.is_dsa_enable_prefill_cp",
+                return_value=False,
+            ),
+            patch("sglang.srt.layers.cp.utils.is_mla_cp_enabled", return_value=False),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "spec_decode_compile_policy_eagle3._materialize_out"
+            ),
+        ):
+            policy._precompile_fused_draft_decode(
+                FakeDraftBackend(), fused_draft_forward
+            )
+
+        # The global scalar mirrors init_new; the local field stays unset.
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], 4 * policy.speculative_eagle_topk)
+        self.assertIsNone(seen[0][1])
 
 
 # Speculative verification padding fixtures.

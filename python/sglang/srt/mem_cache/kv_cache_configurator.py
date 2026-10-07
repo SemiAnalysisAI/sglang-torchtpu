@@ -285,6 +285,9 @@ class KVCacheConfigurator:
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
     kv_group_size: int | None = None
+    # MXINT8 page layout of the full-context pool; the SWA pool (a ring over the
+    # window) always uses "merged" since the blocked layout buys it no capacity.
+    kv_full_layout: str | None = None
     speculative_draft_attention_backend: str | None = None
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
@@ -295,8 +298,16 @@ class KVCacheConfigurator:
     def __post_init__(self) -> None:
         if self.kv_cache_dtype_str != "mxint8":
             self.kv_group_size = None
-        elif getattr(self, "kv_group_size", None) is None:
-            self.kv_group_size = getattr(self.server_args, "tpu_mxint8_group_size", 32)
+            self.kv_full_layout = None
+        else:
+            if getattr(self, "kv_group_size", None) is None:
+                self.kv_group_size = getattr(
+                    self.server_args, "tpu_mxint8_group_size", 32
+                )
+            if getattr(self, "kv_full_layout", None) is None:
+                self.kv_full_layout = getattr(
+                    self.server_args, "tpu_mxint8_full_kv_layout", "merged"
+                )
         self._validate_mxint8()
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
@@ -334,12 +345,18 @@ class KVCacheConfigurator:
     def _tpu_mha_pool_class(self):
         return current_platform.get_mha_kv_pool_cls()
 
+    @property
+    def kv_swa_layout(self) -> str | None:
+        return "merged" if self.kv_cache_dtype_str == "mxint8" else None
+
     def _mxint8_pool_kwargs(self) -> dict:
-        return (
-            {"kv_cache_dtype_str": "mxint8", "kv_group_size": self.kv_group_size}
-            if self.kv_cache_dtype_str == "mxint8"
-            else {}
-        )
+        if self.kv_cache_dtype_str != "mxint8":
+            return {}
+        return {
+            "kv_cache_dtype_str": "mxint8",
+            "kv_group_size": self.kv_group_size,
+            "kv_layout": self.kv_full_layout,
+        }
 
     def hybrid_swa_token_capacity(
         self,
@@ -1792,6 +1809,7 @@ class KVCacheConfigurator:
                 },
                 "swa_kv_pool_kwargs": {
                     **common,
+                    "kv_layout": self.kv_swa_layout,
                     "head_num": swa_head_num,
                     "head_dim": self.model_config.swa_head_dim,
                     "v_head_dim": self.model_config.swa_v_head_dim,

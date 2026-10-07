@@ -436,7 +436,8 @@ class Gemma4VisionPatchEmbedder(nn.Module):
     def _position_embeddings(
         self, patch_positions: torch.Tensor, padding_positions: torch.Tensor
     ) -> torch.Tensor:
-        clamped_positions = patch_positions.clamp(min=0)
+        # one_hot takes int64 only; the compile runner's warmup ids are int32.
+        clamped_positions = patch_positions.clamp(min=0).long()
         one_hot = F.one_hot(clamped_positions, num_classes=self.position_embedding_size)
         one_hot = one_hot.permute(0, 2, 1, 3).to(self.position_embedding_table)
         position_embeddings = one_hot @ self.position_embedding_table

@@ -150,6 +150,28 @@ class TestFusedMoEJaxKernelVsReference(unittest.TestCase):
     independent of the torch_tpu bridge.
     """
 
+    def test_glm_clamped_swiglu(self):
+        # Exact projections straddle both clamps. A negative gate must remain
+        # negative (only its upper bound is clamped); up is clamped on both sides.
+        hidden = jnp.ones((3, 128), dtype=jnp.bfloat16)
+        gate = jnp.tile(jnp.array([20.0, -20.0]), 64)
+        up = jnp.tile(jnp.array([-20.0, 20.0]), 64)
+        w1 = jnp.broadcast_to(jnp.concatenate([gate, up]) / 128, (4, 128, 256)).astype(
+            jnp.bfloat16
+        )
+        w2 = jnp.broadcast_to(jnp.eye(128), (4, 128, 128)).astype(jnp.bfloat16)
+        ids = jnp.array([[0, 1], [2, 3], [1, 2]], dtype=jnp.int32)
+        weights = jnp.full((3, 2), 0.5, dtype=jnp.bfloat16)
+        out = _call_production_kernel(
+            hidden, w1, w2, weights, ids, activation="silu_and_mul_clamp:10.0"
+        )
+        expected = jnp.broadcast_to(
+            jnp.array([-100.0, -200.0 / (1.0 + jnp.exp(20.0))] * 64), (3, 128)
+        )
+        self.assertLess(
+            float(jnp.max(jnp.abs(out.astype(jnp.float32) - expected))), 0.001
+        )
+
     def _run_and_diff(self, *, m, k, n, g, topk, activation, seed, tol, force_ids=None):
         hidden, w1, w2, w_tk, ids = _make_inputs(m, k, n, g, topk, seed)
         if force_ids is not None:

@@ -729,6 +729,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # call site can hand layer.w13_weight / layer.w2_weight straight
         # to fused_moe_call with no per-step transpose.
         if _is_tpu:
+            # gmm_v2 tiles the intermediate dim in 128 lanes: zero-pad gate, up and w2
+            # (e.g. 704 -> 768). Exact without bias: act(0) * 0 = 0 and the w2 pad is 0.
+            inter = layer.w2_weight.shape[-1]
+            pad = (-inter) % 128
+            if pad and getattr(layer, "w13_weight_bias", None) is None:
+                from sglang.srt.layers.quantization.mxfp4_tpu_util import (
+                    _pad_gate_up_halves_axis1,
+                    _pad_last_axis,
+                )
+
+                w13 = _pad_gate_up_halves_axis1(layer.w13_weight.data, inter, pad)
+                copy_or_rebind_param(layer, "w13_weight", w13)
+                w2 = _pad_last_axis(layer.w2_weight.data, pad)
+                copy_or_rebind_param(layer, "w2_weight", w2)
             for name in ("w13_weight", "w2_weight"):
                 old = getattr(layer, name).data
                 new = old.transpose(1, 2).contiguous()
@@ -1295,6 +1309,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
+        *,
+        w1_scale: Optional[torch.Tensor] = None,
+        w2_scale: Optional[torch.Tensor] = None,
     ) -> CombineInput:
         from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -1341,6 +1358,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
             w1_bias=getattr(layer, "w13_weight_bias", None),
             w2_bias=getattr(layer, "w2_weight_bias", None),
             topk_weights=kernel_topk_weights,
@@ -1350,6 +1369,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             no_combine=no_combine,
             global_num_experts=global_num_experts,
             expert_group_offset=expert_group_offset,
+            gemm1_alpha=moe_runner_config.gemm1_alpha,
+            gemm1_clamp_limit=moe_runner_config.gemm1_clamp_limit,
         )
         if no_combine:
             # The kernel masks non-local groups, but invalid IDs mapped to

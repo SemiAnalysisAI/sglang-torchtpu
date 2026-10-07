@@ -8,9 +8,8 @@ and registers to a suite via register_tpu_ci(suite=..., nightly=...). This scans
 test/registered/**.py (AST only -- no imports/TPU), keeps files registered to --suite
 (and nightly when --nightly), then emits each file as its own matrix row so GitHub reports its status directly.
 
-`schedule` names the lane that runs the file -- "nightly" unless the file belongs to
-one of accuracy-test-tpu.yml's own cron slots. A workflow selects on this value, so a
-new file runs where it says it runs rather than where its name happens to sort.
+`schedule` is "nightly" for every nightly file; accuracy-test-tpu.yml decides which of its
+daily slots runs each accuracy file.
 
 Prints a JSON array for the CI matrix:
     [{"name","launch_script","weights_pvc","hosts","files","schedule"}]  (files = space-separated)

@@ -711,7 +711,7 @@ class TestAllocatorOnTpuDevice(CustomTestCase):
         # A prior run must not hide the regression by warming these lengths.
         torch.tpu._clear_cache()
         self._check_swa_tail_allocation(allocator, 512, 256)
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
         misses = torch.tpu._get_cache_misses()
 
         for length in range(1025, 1041):
@@ -720,7 +720,7 @@ class TestAllocatorOnTpuDevice(CustomTestCase):
             tail_length = 256 + length % allocator.page_size
             self._check_swa_tail_allocation(allocator, length, tail_length)
 
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
         self.assertEqual(torch.tpu._get_cache_misses(), misses)
 
     def test_decode_device_matches_cpu(self):

@@ -124,6 +124,10 @@
 
 # ---- TPU area owners (fork-only, TPU-specific paths only). Keep below the upstream block; last match wins. ----
 
+# TPU backend folder (whole tree). Kept above the narrower blocks below so their
+# more specific owner lists still win on last match.
+/python/sglang/srt/hardware_backend/tpu  @alexnails @Bob-Chen222 @hlFu @yliu120 @angelayi @colin2328 @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu
+
 # TPU kernels (Pallas attention / MoE / quantized matmul / KV write)
 /python/sglang/srt/layers/attention/pallas                             @alexnails @Bob-Chen222 @hlFu @yliu120 @angelayi @colin2328 @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta
 /python/sglang/srt/layers/moe/pallas                                   @alexnails @Bob-Chen222 @hlFu @yliu120 @angelayi @colin2328 @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta
