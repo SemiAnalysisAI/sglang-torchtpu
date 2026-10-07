@@ -36,6 +36,7 @@ jobs:
       pull-requests: read
     outputs:
       run: ${{ steps.gate.outputs.run }}
+      kernel: ${{ steps.gate.outputs.kernel }}
     steps:
       - name: Fetch latest PR state
         id: pr
@@ -90,6 +91,17 @@ jobs:
               - '.github/workflows/feature-validation-tpu.yml'
               - '.github/workflows/accuracy-test-tpu.yml'
               - '.github/workflows/perf-test-tpu.yml'
+            # Kernel-vs-reference suite: kernels, their tests, and the image
+            # toolchain (a jax/libtpu bump changes kernels without a source diff).
+            kernel:
+              - 'python/sglang/srt/layers/attention/pallas/**'
+              - 'python/sglang/srt/layers/moe/pallas/**'
+              - 'python/sglang/srt/hardware_backend/tpu/kernels/**'
+              - 'python/sglang/test/tpu/moe_reference.py'
+              - 'test/registered/tpu/kernel/**'
+              - 'python/pyproject_tpu.toml'
+              - 'docker/tpu.Dockerfile'
+              - 'docker/tpu-base.Dockerfile'
       - name: Gate on readiness and TPU relevance
         id: gate
         run: |
@@ -100,6 +112,7 @@ jobs:
           elif [[ "${{ steps.paths.outputs.tpu }}" == "true" || \
                   "${{ contains(fromJson(steps.pr.outputs.labels), 'tpu') }}" == "true" ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "kernel=${{ steps.paths.outputs.kernel }}" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
@@ -137,6 +150,19 @@ jobs:
       contents: read
       id-token: write
 
+  kernel:
+    name: kernel-test
+    needs: [decide, build]
+    if: needs.decide.outputs.kernel == 'true'
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      image: ${{ needs.build.outputs.digest }}
+      suite: stage-a-test-tpu-kernel
+    permissions:
+      contents: read
+      id-token: write
+
   e2e:
     name: e2e-test
     needs: build
@@ -154,7 +180,7 @@ jobs:
   # If tests are skipped (non-TPU PR), this finishes green immediately.
   # If tests are run, it blocks until all TPU stages finish and fails if any fail.
   pr-test-tpu-finish:
-    needs: [decide, build, unit, e2e]
+    needs: [decide, build, unit, kernel, e2e]
     if: always()
     runs-on: ubuntu-latest
     steps:
