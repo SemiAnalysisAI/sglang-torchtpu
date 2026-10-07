@@ -26,19 +26,27 @@ class _SdpaImpl:
 
 
 class TestTailPadKeyPrefix(unittest.TestCase):
-    def test_pad_keys_are_excluded(self):
+    real, pad = 13, 3
+
+    def _forward(self, backend):
         attn = USPAttention.__new__(USPAttention)
         attn.skip_sequence_parallel = False
         attn.sp_attention_mode = "ulysses"
         attn.sp_attention_mode_is_auto = False
         attn.is_cross_attention = False
-        attn.backend = AttentionBackendEnum.TORCH_SDPA
+        # Read by the gathered-mask SDPA fallback.
+        attn.allow_cudnn_sdp = False
+        attn.softmax_scale = None
+        attn.backend = backend
         attn.attn_impl = _SdpaImpl()
 
         torch.manual_seed(0)
-        real, pad = 13, 3
-        q, k, v = (torch.randn(1, real + pad, 2, 8) for _ in range(3))
-        meta = {"pad_start": real, "pad_end": real + pad, "local_pad": pad}
+        q, k, v = (torch.randn(1, self.real + self.pad, 2, 8) for _ in range(3))
+        meta = {
+            "pad_start": self.real,
+            "pad_end": self.real + self.pad,
+            "local_pad": self.pad,
+        }
         with (
             patch(
                 f"{_LAYER}.get_forward_context",
@@ -58,14 +66,23 @@ class TestTailPadKeyPrefix(unittest.TestCase):
         ):
             out = attn.forward(q, k, v, attn_mask_meta=meta)
 
-        self.assertEqual(attn.attn_impl.kv_lens, [real])
         want = F.scaled_dot_product_attention(
-            q[:, :real].transpose(1, 2),
-            k[:, :real].transpose(1, 2),
-            v[:, :real].transpose(1, 2),
+            q[:, : self.real].transpose(1, 2),
+            k[:, : self.real].transpose(1, 2),
+            v[:, : self.real].transpose(1, 2),
         ).transpose(1, 2)
-        torch.testing.assert_close(out[:, :real], want)
-        self.assertTrue(torch.all(out[:, real:] == 0))
+        torch.testing.assert_close(out[:, : self.real], want)
+        return attn.attn_impl.kv_lens, out
+
+    def test_selected_backend_attends_over_the_real_key_prefix(self):
+        kv_lens, out = self._forward(AttentionBackendEnum.TORCH_SDPA)
+        self.assertEqual(kv_lens, [self.real])
+        self.assertTrue(torch.all(out[:, self.real :] == 0))
+
+    def test_sparse_backend_keeps_the_masked_fallback(self):
+        # Sparse kernels need K/V as long as Q: the gathered-mask SDPA serves them.
+        kv_lens, _ = self._forward(AttentionBackendEnum.SLIDING_TILE_ATTN)
+        self.assertEqual(kv_lens, [])
 
 
 if __name__ == "__main__":

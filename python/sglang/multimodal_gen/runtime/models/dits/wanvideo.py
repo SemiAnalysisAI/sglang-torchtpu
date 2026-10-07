@@ -438,6 +438,17 @@ def _wan_temb_table_slices(
     return _eager_temb_table_slices(table, temb)
 
 
+def _sp_padding_unsupported(
+    attention: str, attn_mask_meta: dict
+) -> NotImplementedError:
+    return NotImplementedError(
+        f"{attention} cannot mask sequence-parallel padding "
+        f"({attn_mask_meta['pad_start']} tokens padded to "
+        f"{attn_mask_meta['pad_end']}); use a sequence-parallel size that divides "
+        "the token count."
+    )
+
+
 class WanTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -739,10 +750,7 @@ class WanTransformerBlock(nn.Module):
             # Keys past the sequence-parallel tail pad are not real tokens.
             attn_output = self.attn1(query, key, value, attn_mask_meta=attn_mask_meta)
         else:
-            raise NotImplementedError(
-                f"{type(self.attn1).__name__} cannot mask sequence-parallel padding; "
-                "use a sequence-parallel size that divides the token count."
-            )
+            raise _sp_padding_unsupported(type(self.attn1).__name__, attn_mask_meta)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -927,10 +935,7 @@ class WanTransformerBlock_VSA(nn.Module):
         attn_mask_meta: dict | None = None,
     ) -> torch.Tensor:
         if attn_mask_meta is not None:
-            raise NotImplementedError(
-                "Video sparse attention cannot mask sequence-parallel padding; "
-                "use a sequence-parallel size that divides the token count."
-            )
+            raise _sp_padding_unsupported("Video sparse attention", attn_mask_meta)
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
