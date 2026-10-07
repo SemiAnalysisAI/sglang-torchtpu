@@ -7,8 +7,10 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.diffusion.common import fallback_torch
 from sglang.kernels.ops.diffusion.common.fallback_torch import (
     apply_rotary_embedding_native,
+    apply_rotary_embedding_pair_swap,
     fuse_scale_shift_kernel_native,
     norm_infer_native,
     rms_norm_fn_native,
@@ -171,28 +173,58 @@ class TestDiffusionTorchFallback(unittest.TestCase):
         )
         torch.testing.assert_close(interleaved.cpu(), reference.cpu())
 
-    def test_pair_swap_rotary_embedding_matches_the_strided_form_exactly(self):
-        from sglang.kernels.ops.diffusion.common.fallback_torch import (
-            apply_rotary_embedding_native,
-            apply_rotary_embedding_pair_swap,
-        )
+    def _rope_inputs(self, dtype, head_dim, interleaved):
+        x = torch.randn(33, 4, head_dim, dtype=dtype, device=self.device)
+        angles = torch.randn(33, head_dim // 2, device=self.device)
+        cos, sin = angles.cos(), angles.sin()
+        if interleaved:
+            cos = cos.repeat_interleave(2, dim=-1)
+            sin = sin.repeat_interleave(2, dim=-1)
+        return x, cos, sin
 
+    def test_bf16_pair_swap_rotary_embedding_matches_the_strided_form(self):
         torch.manual_seed(0)
-        for dtype in (torch.bfloat16, torch.float16, torch.float32):
+        for head_dim in (64, 128):
             for interleaved in (False, True):
-                with self.subTest(dtype=dtype, interleaved=interleaved):
-                    x = torch.randn(33, 4, 128, dtype=dtype, device=self.device)
-                    angles = torch.randn(33, 64, device=self.device)
-                    cos, sin = angles.cos(), angles.sin()
-                    if interleaved:
-                        cos = cos.repeat_interleave(2, dim=-1)
-                        sin = sin.repeat_interleave(2, dim=-1)
+                with (
+                    self.subTest(head_dim=head_dim, interleaved=interleaved),
+                    patch.object(
+                        fallback_torch,
+                        "_pair_swap_matrix",
+                        wraps=fallback_torch._pair_swap_matrix,
+                    ) as pair_swap_matrix,
+                ):
+                    x, cos, sin = self._rope_inputs(
+                        torch.bfloat16, head_dim, interleaved
+                    )
                     self.assertTrue(
                         torch.equal(
                             apply_rotary_embedding_pair_swap(x, cos, sin, interleaved),
                             apply_rotary_embedding_native(x, cos, sin, interleaved),
                         )
                     )
+                    pair_swap_matrix.assert_called_once()
+
+    def test_pair_swap_rotary_embedding_keeps_the_strided_form_off_bf16(self):
+        # TPU float16/float32 matmuls are not exact, so only bf16 takes the swap.
+        torch.manual_seed(0)
+        with patch.object(
+            fallback_torch,
+            "_pair_swap_matrix",
+            side_effect=AssertionError("took the matmul path"),
+        ):
+            for dtype in (torch.float16, torch.float32):
+                for interleaved in (False, True):
+                    with self.subTest(dtype=dtype, interleaved=interleaved):
+                        x, cos, sin = self._rope_inputs(dtype, 128, interleaved)
+                        self.assertTrue(
+                            torch.equal(
+                                apply_rotary_embedding_pair_swap(
+                                    x, cos, sin, interleaved
+                                ),
+                                apply_rotary_embedding_native(x, cos, sin, interleaved),
+                            )
+                        )
 
     def test_one_pass_rms_norm_matches_reference(self):
         x = torch.randn(8, 128, device=self.device, dtype=torch.float32)

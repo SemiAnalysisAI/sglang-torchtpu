@@ -75,12 +75,14 @@ def apply_rotary_embedding_pair_swap(
 ) -> torch.Tensor:
     """``apply_rotary_embedding_native`` without stride-2 access to the last dim.
 
-    Rotates adjacent pairs as ``x * cos + (x @ R) * sin``; R is a signed pair
-    swap, so a half-precision matmul is exact and the result matches the
-    strided form bit for bit. Strided lane slices cost relayout copies on TPU.
-    float32 keeps the strided form: a TPU float32 matmul may round through bf16.
+    Strided lane slices cost relayout copies on TPU. Rotates adjacent pairs as
+    ``x * cos + (x @ R) * sin`` with R a signed pair swap. In bfloat16 each
+    output of ``x @ R`` is a single +-1 product accumulated in float32, so it is
+    exact and the result matches the strided form bit for bit on finite inputs.
+    TPU float16 and float32 matmuls are not exact; other dtypes keep the
+    strided form.
     """
-    if x.dtype == torch.float32:
+    if x.dtype != torch.bfloat16:
         return apply_rotary_embedding_native(x, cos, sin, interleaved)
     if interleaved and cos.shape[-1] == x.shape[-1]:
         cos = cos[..., ::2]
