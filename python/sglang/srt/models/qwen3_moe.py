@@ -954,7 +954,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+        # TPU fused-RS experts return the summed output.
+        experts = getattr(self.mlp, "experts", None)
+        with self.layer_communicator.ffn_exit(
+            forward_batch,
+            ffn_output_complete=getattr(experts, "handles_moe_reduction", False),
+        ) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
         hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 

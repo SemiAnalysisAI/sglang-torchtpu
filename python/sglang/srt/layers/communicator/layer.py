@@ -855,7 +855,9 @@ class LayerCommunicator:
         group on a sparse layer, the TP group a dense MLP reduces over."""
         return _sum_group(self._batch_steps(forward_batch).ffn_output.group)
 
-    def _select_ffn_completion(self, forward_batch: ForwardBatch) -> "FfnCompletion":
+    def _select_ffn_completion(
+        self, forward_batch: ForwardBatch, *, ffn_output_complete: bool = False
+    ) -> "FfnCompletion":
         """Decide once, before the FFN runs, what it skips and what completes its
         output: the next layer's input, or this layer's postprocess step."""
         dp_step = self._postprocess_dp_step(forward_batch)
@@ -867,6 +869,18 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             dp_step=dp_step,
         )
+        if ffn_output_complete:
+            # A later all-reduce or reduce-scatter would sum the output again.
+            if mlp_reduce_scatter:
+                raise NotImplementedError(
+                    "a reduce-scatter after an FFN that sums its own output"
+                )
+            return FfnCompletion(
+                defer_moe_finalize=False,
+                fuse_mlp_allreduce=False,
+                mlp_reduce_scatter=False,
+                complete=complete_now,
+            )
         steps = self._batch_steps(forward_batch)
         if not steps.ffn_output.leaves_for_next_layer:
             return FfnCompletion(
@@ -959,10 +973,14 @@ class LayerCommunicator:
         the mixer, then call ``finish``."""
         return MixerExit(self, forward_batch)
 
-    def ffn_exit(self, forward_batch: ForwardBatch) -> "FfnExit":
+    def ffn_exit(
+        self, forward_batch: ForwardBatch, *, ffn_output_complete: bool = False
+    ) -> "FfnExit":
         """Decide once how this layer's FFN output reduction completes. Use the
-        result as a context manager around the FFN call, then call ``finish``."""
-        return FfnExit(self, forward_batch)
+        result as a context manager around the FFN call, then call ``finish``.
+        ``ffn_output_complete``: the FFN returns its output already summed (TPU
+        fused-RS experts), so no later step may sum it again."""
+        return FfnExit(self, forward_batch, ffn_output_complete=ffn_output_complete)
 
     def _branch_rows(
         self, forward_batch: ForwardBatch
@@ -1221,10 +1239,18 @@ class FfnExit:
         "_scope",
     )
 
-    def __init__(self, communicator: LayerCommunicator, forward_batch: ForwardBatch):
+    def __init__(
+        self,
+        communicator: LayerCommunicator,
+        forward_batch: ForwardBatch,
+        *,
+        ffn_output_complete: bool = False,
+    ):
         self.communicator = communicator
         self.forward_batch = forward_batch
-        completion = communicator._select_ffn_completion(forward_batch)
+        completion = communicator._select_ffn_completion(
+            forward_batch, ffn_output_complete=ffn_output_complete
+        )
         self.defer_moe_finalize = completion.defer_moe_finalize
         self.fuse_mlp_allreduce = completion.fuse_mlp_allreduce
         self.mlp_reduce_scatter = completion.mlp_reduce_scatter

@@ -219,6 +219,26 @@ class TestFfnExit(CustomTestCase):
         communicator._complete_ffn_output_now.assert_called_once()
         torch.testing.assert_close(hidden_states, self.hidden_states * 2 + 1)
 
+    def test_an_ffn_that_sums_its_own_output_runs_postprocess(self):
+        """TPU fused-RS experts return the summed output; deferring the sum
+        would add it a second time."""
+        communicator = make_communicator(fuse=True, reduce_scatter=False)
+        with communicator.ffn_exit(
+            self.forward_batch, ffn_output_complete=True
+        ) as ffn_exit:
+            seen = published_flags()
+            hidden_states = self.hidden_states * 2
+        hidden_states, _ = ffn_exit.finish(hidden_states, self.residual)
+
+        self.assertEqual(seen, (False, False))
+        self.assertNotIsInstance(hidden_states, UnreducedOutput)
+        communicator._complete_ffn_output_now.assert_called_once()
+
+    def test_an_ffn_that_sums_its_own_output_refuses_a_reduce_scatter(self):
+        communicator = make_communicator(fuse=False, reduce_scatter=True)
+        with self.assertRaises(NotImplementedError):
+            communicator.ffn_exit(self.forward_batch, ffn_output_complete=True)
+
     def test_finish_applies_the_decision_the_ffn_saw(self):
         """finish() applies the decision published to the FFN, even when the
         decision methods would answer differently by then."""
