@@ -343,6 +343,49 @@ def _register_aten_fallbacks() -> None:
         self.copy_(out)
         return self
 
+    # TODO: Remove once torch_tpu lowers int64 cumsum, which aborts with
+    # "Unsupported conversion from vmreg/vreg to U64". Integral inputs default
+    # to an int64 result, so bool/int cumsums without dtype= reach it too.
+    # Other result dtypes keep the native kernel.
+    def _cumsum(src, dim, dtype=None):
+        if dtype is None:
+            dtype = (
+                src.dtype
+                if src.is_floating_point() or src.is_complex()
+                else torch.int64
+            )
+        if dtype != torch.int64:
+            out = torch.empty(src.shape, dtype=dtype, device=src.device)
+            return torch.ops.aten.cumsum.out(src, dim, dtype=dtype, out=out)
+        out = src.to(torch.int64)
+        if out.dim() == 0:
+            return out
+        dim = dim % out.dim()
+        length, step = out.shape[dim], 1
+        # Doubling prefix scan: log2(length) adds of shifted copies.
+        while step < length:
+            head = out.narrow(dim, 0, step)
+            tail = out.narrow(dim, step, length - step)
+            out = torch.cat([head, tail + out.narrow(dim, 0, length - step)], dim)
+            step <<= 1
+        return out
+
+    @torch.library.register_kernel("aten::cumsum", "PrivateUse1")
+    def _cumsum_kernel(self, dim, dtype=None):
+        return _cumsum(self, dim, dtype)
+
+    @torch.library.register_kernel("aten::cumsum_", "PrivateUse1")
+    def _cumsum_inplace(self, dim, dtype=None):
+        return self.copy_(_cumsum(self, dim, dtype))
+
+    # aten::logaddexp -- no TPU kernel; the ring-attention LSE merges use it.
+    @torch.library.register_kernel("aten::logaddexp", "PrivateUse1")
+    def _logaddexp(self, other):
+        peak = torch.maximum(self, other)
+        # Both -inf: keep the result -inf instead of NaN from inf - inf.
+        peak = torch.where(torch.isinf(peak), torch.zeros_like(peak), peak)
+        return peak + torch.log(torch.exp(self - peak) + torch.exp(other - peak))
+
     # aten::upsample_bicubic2d -- no TPU kernel; run the CPU kernel and copy
     # back. Vision towers use it to resize position embeddings per image grid
     # (MoonViT's Learnable2DInterpPosEmb in Kimi-VL), so inputs are small (tens
@@ -359,7 +402,7 @@ def _register_aten_fallbacks() -> None:
 
     logger.info(
         "Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, "
-        "masked_scatter_, upsample_bicubic2d"
+        "masked_scatter_, cumsum (int64), logaddexp, upsample_bicubic2d"
     )
 
 

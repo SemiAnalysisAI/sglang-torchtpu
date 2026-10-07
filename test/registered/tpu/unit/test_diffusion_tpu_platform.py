@@ -36,6 +36,12 @@ class TestWorkerBootstrap(CustomTestCase):
         self.assertGreater(TpuPlatform.get_device_total_memory(), 0)
         self.assertGreater(TpuPlatform.get_current_memory_usage(), 0.0)
 
+    def test_worker_installs_the_aten_fallbacks(self):
+        # Qwen-VL position ids: an int64 cumsum, which aborts natively.
+        TpuPlatform.set_device(TpuPlatform.get_local_torch_device())
+        mask = torch.tensor([[1, 1, 0, 1]], device="tpu")
+        self.assertEqual((mask.long().cumsum(-1) - 1).cpu().tolist(), [[0, 1, 1, 2]])
+
     def test_device_tensors_survive_a_pickle_round_trip(self):
         import pickle
 
