@@ -1,7 +1,7 @@
+import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
@@ -22,57 +22,67 @@ def _shard(fn, latents, *, rank, world_size=4, **batch_kwargs):
     return batch
 
 
-@pytest.mark.parametrize(("frames", "padded"), [(16, False), (17, True)])
-def test_video_sharding_records_global_padding_on_every_rank(frames, padded):
-    config = LTX2PipelineConfig()
-    tokens_per_frame = 4 * 4
-    height = width = 4 * config.vae_scale_factor
-    latents = torch.zeros(1, frames * tokens_per_frame, 8)
-    for rank in range(4):
-        batch = _shard(
-            config.shard_latents_for_sp,
-            latents,
-            rank=rank,
-            height=height,
-            width=width,
-        )
-        assert batch.sp_video_padded is padded
-
-
-@pytest.mark.parametrize(("frames", "padded"), [(128, False), (126, True)])
-def test_audio_sharding_records_global_padding_on_every_rank(frames, padded):
-    config = LTX2PipelineConfig()
-    for rank in range(4):
-        batch = _shard(
-            config.shard_audio_latents_for_sp,
-            torch.zeros(1, frames, 8),
-            rank=rank,
-        )
-        assert batch.sp_audio_padded is padded
-
-
-def test_unpadded_sp_shards_skip_the_self_attention_mask():
-    batch = SimpleNamespace(sp_video_valid_token_count=8, sp_video_padded=False)
-    mask = LTX2DenoisingStage._build_ltx2_sp_self_attention_mask(
-        batch, modality="video", seq_len=8, batch_size=2, device=torch.device("cpu")
+def _video_self_attention_mask(batch, *, seq_len, batch_size):
+    return LTX2DenoisingStage._build_ltx2_sp_self_attention_mask(
+        batch,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        key="sp_video_valid_token_count",
+        padded_key="sp_video_padded",
+        device=torch.device("cpu"),
     )
-    assert mask is None
 
 
-def test_padded_sp_shards_keep_the_mask_on_full_ranks():
-    # A full rank still builds its all-true mask when another rank is padded,
-    # so every rank takes the masked path.
-    full = SimpleNamespace(sp_video_valid_token_count=8, sp_video_padded=True)
-    tail = SimpleNamespace(sp_video_valid_token_count=5, sp_video_padded=True)
-    masks = [
-        LTX2DenoisingStage._build_ltx2_sp_self_attention_mask(
-            batch,
-            modality="video",
-            seq_len=8,
-            batch_size=1,
-            device=torch.device("cpu"),
+class TestLtx2SpPaddingMask(unittest.TestCase):
+    def test_video_sharding_records_global_padding_on_every_rank(self):
+        config = LTX2PipelineConfig()
+        tokens_per_frame = 4 * 4
+        height = width = 4 * config.vae_scale_factor
+        for frames, padded in ((16, False), (17, True)):
+            latents = torch.zeros(1, frames * tokens_per_frame, 8)
+            for rank in range(4):
+                with self.subTest(frames=frames, rank=rank):
+                    batch = _shard(
+                        config.shard_latents_for_sp,
+                        latents,
+                        rank=rank,
+                        height=height,
+                        width=width,
+                    )
+                    self.assertIs(batch.sp_video_padded, padded)
+
+    def test_audio_sharding_records_global_padding_on_every_rank(self):
+        config = LTX2PipelineConfig()
+        for frames, padded in ((128, False), (126, True)):
+            for rank in range(4):
+                with self.subTest(frames=frames, rank=rank):
+                    batch = _shard(
+                        config.shard_audio_latents_for_sp,
+                        torch.zeros(1, frames, 8),
+                        rank=rank,
+                    )
+                    self.assertIs(batch.sp_audio_padded, padded)
+
+    def test_unpadded_sp_shards_skip_the_self_attention_mask(self):
+        batch = SimpleNamespace(sp_video_valid_token_count=8, sp_video_padded=False)
+        self.assertIsNone(_video_self_attention_mask(batch, seq_len=8, batch_size=2))
+
+    def test_padded_sp_shards_keep_the_mask_on_full_ranks(self):
+        # A full rank still builds its all-true mask when another rank is padded,
+        # so every rank takes the masked path.
+        full = SimpleNamespace(sp_video_valid_token_count=8, sp_video_padded=True)
+        tail = SimpleNamespace(sp_video_valid_token_count=5, sp_video_padded=True)
+        self.assertTrue(_video_self_attention_mask(full, seq_len=8, batch_size=1).all())
+        self.assertEqual(
+            _video_self_attention_mask(tail, seq_len=8, batch_size=1).tolist(),
+            [[True] * 5 + [False] * 3],
         )
-        for batch in (full, tail)
-    ]
-    assert masks[0].all()
-    assert masks[1].tolist() == [[True] * 5 + [False] * 3]
+
+    def test_shards_without_the_padding_flag_keep_the_mask(self):
+        batch = SimpleNamespace(sp_video_valid_token_count=8)
+        mask = _video_self_attention_mask(batch, seq_len=8, batch_size=1)
+        self.assertTrue(mask.all())
+
+
+if __name__ == "__main__":
+    unittest.main()

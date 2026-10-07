@@ -978,20 +978,21 @@ class LTX2DenoisingStage(DenoisingStage):
         cls,
         batch: Req,
         *,
-        modality: str,
         seq_len: int,
         batch_size: int,
+        key: str,
+        padded_key: str,
         device: torch.device,
     ) -> torch.Tensor | None:
         # Without SP padding on any rank, every rank skips the all-true mask
         # and takes the same unmasked attention path.
-        if not getattr(batch, f"sp_{modality}_padded", True):
+        if not getattr(batch, padded_key, True):
             return None
         return cls._build_ltx2_sp_padding_mask(
             batch,
             seq_len=seq_len,
             batch_size=batch_size,
-            key=f"sp_{modality}_valid_token_count",
+            key=key,
             device=device,
         )
 
@@ -1184,16 +1185,18 @@ class LTX2DenoisingStage(DenoisingStage):
         else:
             video_self_attention_mask = self._build_ltx2_sp_self_attention_mask(
                 batch,
-                modality="video",
                 seq_len=int(latent_model_input.shape[1]),
                 batch_size=batch_size,
+                key="sp_video_valid_token_count",
+                padded_key="sp_video_padded",
                 device=latent_model_input.device,
             )
             audio_self_attention_mask = self._build_ltx2_sp_self_attention_mask(
                 batch,
-                modality="audio",
                 seq_len=audio_num_frames_latent,
                 batch_size=batch_size,
+                key="sp_audio_valid_token_count",
+                padded_key="sp_audio_padded",
                 device=audio_latent_model_input.device,
             )
             a2v_cross_attention_mask = audio_self_attention_mask
