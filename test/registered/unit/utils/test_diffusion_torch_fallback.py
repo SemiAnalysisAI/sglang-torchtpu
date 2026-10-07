@@ -226,6 +226,23 @@ class TestDiffusionTorchFallback(unittest.TestCase):
                             )
                         )
 
+    def test_pair_swap_matrix_is_built_once_in_eager_and_traced_when_compiling(self):
+        fallback_torch._PAIR_SWAP_MATRICES.clear()
+        x = torch.arange(8.0).bfloat16()
+        rot = fallback_torch._pair_swap_matrix(8, torch.bfloat16, "cpu")
+        self.assertIs(fallback_torch._pair_swap_matrix(8, torch.bfloat16, "cpu"), rot)
+        swapped = torch.tensor([-1.0, 0, -3, 2, -5, 4, -7, 6]).bfloat16()
+        self.assertTrue(torch.equal(x @ rot, swapped))
+
+        fallback_torch._PAIR_SWAP_MATRICES.clear()
+        compiled = torch.compile(
+            lambda t: t @ fallback_torch._pair_swap_matrix(8, t.dtype, t.device),
+            backend="eager",
+            fullgraph=True,
+        )
+        self.assertTrue(torch.equal(compiled(x), swapped))
+        self.assertEqual(fallback_torch._PAIR_SWAP_MATRICES, {})
+
     def test_one_pass_rms_norm_matches_reference(self):
         x = torch.randn(8, 128, device=self.device, dtype=torch.float32)
         weight = torch.randn(128, device=self.device, dtype=torch.float32)

@@ -61,13 +61,26 @@ def apply_rotary_embedding_native(
     return torch.stack((o1, o2), dim=-1).flatten(-2)
 
 
-def _pair_swap_matrix(dim: int, dtype: torch.dtype, device) -> Tensor:
-    """R with (x @ R)[2i] = -x[2i + 1] and (x @ R)[2i + 1] = x[2i]."""
+def _build_pair_swap_matrix(dim: int, dtype: torch.dtype, device) -> Tensor:
     idx = torch.arange(0, dim, 2, device=device)
     rot = torch.zeros(dim, dim, dtype=dtype, device=device)
     rot[idx + 1, idx] = -1
     rot[idx, idx + 1] = 1
     return rot
+
+
+_PAIR_SWAP_MATRICES: dict[tuple, Tensor] = {}
+
+
+def _pair_swap_matrix(dim: int, dtype: torch.dtype, device) -> Tensor:
+    """R with (x @ R)[2i] = -x[2i + 1] and (x @ R)[2i + 1] = x[2i]."""
+    # A compiled graph folds the construction; eager builds it once.
+    if torch.compiler.is_compiling():
+        return _build_pair_swap_matrix(dim, dtype, device)
+    key = (dim, dtype, torch.device(device))
+    if key not in _PAIR_SWAP_MATRICES:
+        _PAIR_SWAP_MATRICES[key] = _build_pair_swap_matrix(dim, dtype, device)
+    return _PAIR_SWAP_MATRICES[key]
 
 
 def apply_rotary_embedding_pair_swap(
