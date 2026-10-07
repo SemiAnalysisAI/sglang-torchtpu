@@ -456,12 +456,6 @@ class DeepseekV2MLP(nn.Module):
                     [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
                 )
                 x = self.act_fn(gate_up)
-            elif not _is_cuda and not _is_xpu:
-                limit = float(self.swiglu_limit)
-                gate, up = gate_up.float().chunk(2, dim=-1)
-                x = (
-                    F.silu(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit)
-                ).to(gate_up.dtype)
             else:
                 M, N = gate_up.shape
                 x = gate_up.new_empty((M, N // 2))

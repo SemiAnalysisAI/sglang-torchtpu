@@ -246,13 +246,14 @@ def _get_mhc_ops() -> MhcOps:
         )
 
     from sglang.kernels.ops.layernorm.mhc import (
+        _hc_split_sinkhorn_torch,
         hc_split_sinkhorn,
         mhc_fused_post_pre,
         npu_hc_pre,
     )
 
     return MhcOps(
-        hc_split_sinkhorn=hc_split_sinkhorn,
+        hc_split_sinkhorn=_hc_split_sinkhorn_torch if _is_tpu else hc_split_sinkhorn,
         mhc_fused_post_pre=mhc_fused_post_pre,
         npu_hc_pre=npu_hc_pre,
         mhc_pre=None,
@@ -2898,28 +2899,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
-        if _is_tpu:
-            n = self.hc_mult
-            flat = mixes.squeeze(1).float()
-            scale = hc_scale.float()
-            base = hc_base.float()
-            pre_raw = flat[:, :n] * scale[0] + base[:n]
-            post_raw = flat[:, n : 2 * n] * scale[1] + base[n : 2 * n]
-            comb_raw = (flat[:, 2 * n :] * scale[2] + base[2 * n :]).view(-1, n, n)
-            pre = torch.sigmoid(pre_raw) + self.hc_eps
-            post = 2.0 * torch.sigmoid(post_raw)
-            row_max = comb_raw.amax(dim=-1, keepdim=True)
-            comb = torch.exp(comb_raw - row_max)
-            for _ in range(self.hc_sinkhorn_iters):
-                comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
-                comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
-            y = (
-                (x_flat.unflatten(-1, (n, -1)).float() * pre.unsqueeze(-1))
-                .sum(dim=-2)
-                .to(dtype)
-            )
-            return y, post, comb, False
-
         pre, post, comb = _get_mhc_ops().hc_split_sinkhorn(
             mixes,
             hc_scale,
@@ -2928,6 +2907,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
+        if _is_tpu:
+            y = (
+                (
+                    x_flat.unflatten(-1, (self.hc_mult, -1)).float()
+                    * pre.squeeze(1).unsqueeze(-1)
+                )
+                .sum(dim=-2)
+                .to(dtype)
+            )
+            return y, post.squeeze(1), comb.squeeze(1), False
+
         from sglang.kernels.ops.layernorm.mhc import hc_combine
 
         # y is the post-norm activation fed into the MoE. Allocate it in the

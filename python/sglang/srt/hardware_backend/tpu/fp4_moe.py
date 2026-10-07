@@ -158,7 +158,7 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
         ("gated MoE", runner_config.is_gated),
         (
             "silu activation",
-            runner_config.activation in ("silu", "silu_and_mul_with_clamp"),
+            runner_config.activation in ("silu", "silu_and_mul_clamp"),
         ),
         (
             "router weight not applied on input",
@@ -314,15 +314,14 @@ def apply_tpu_nvfp4_moe(
             "apply_router_weight_on_input is not supported on TPU yet."
         )
 
+    if swiglu_limit is not None:
+        if activation != "silu":
+            raise ValueError("TPU clamped MoE requires silu activation")
+        activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
+
     if use_fused_rs:
         from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
             fused_moe_rs_gather,
-        )
-
-        rs_activation = (
-            f"silu_and_mul_with_clamp:{swiglu_limit}"
-            if swiglu_limit is not None and activation == "silu"
-            else activation
         )
 
         prepared_input = prepare_fused_moe_sequence_parallel_input(
@@ -394,7 +393,7 @@ def apply_tpu_nvfp4_moe(
                 post_expert_norm_weight=post_expert_norm_weight,
                 group_offset=layer._tpu_fused_rs_group_offset,
                 topk=int(topk_ids.shape[-1]),
-                activation=rs_activation,
+                activation=activation,
                 has_post_expert_norm=has_post_expert_norm,
                 # Blocks 16-128 use W4A16; block-256/512 already quantize the
                 # GMM activation. A direct FP8 write would add another loss.
@@ -428,6 +427,5 @@ def apply_tpu_nvfp4_moe(
         w1_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
         no_combine=no_combine,
-        swiglu_limit=swiglu_limit,
     )
     return StandardCombineInput(hidden_states=output)

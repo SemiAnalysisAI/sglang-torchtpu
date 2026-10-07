@@ -78,7 +78,7 @@ def get_fused_rs_tuned_block_sizes(
     joint_key = f"{model_key1}+{model_key2}"
     act_key = (
         "silu"
-        if fuse_act is not None and fuse_act.startswith("silu_and_mul_with_clamp")
+        if fuse_act is not None and fuse_act.startswith("silu_and_mul_clamp")
         else fuse_act
     )
     m_key = f"{m}_{act_key}"

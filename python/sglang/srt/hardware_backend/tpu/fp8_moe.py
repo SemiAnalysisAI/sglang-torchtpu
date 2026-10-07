@@ -409,6 +409,5 @@ def apply_tpu_fp8_moe(
         no_combine=no_combine,
         global_num_experts=global_num_experts,
         expert_group_offset=expert_group_offset,
-        swiglu_limit=swiglu_limit,
     )
     return StandardCombineInput(hidden_states=output)

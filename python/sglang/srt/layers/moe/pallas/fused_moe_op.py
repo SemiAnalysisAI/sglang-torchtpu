@@ -340,11 +340,11 @@ def _fuse_act_name(activation_name):
     ``silu`` / ``gelu`` / ``swigluoai`` / ``situ:{beta}:{linear_beta|none}``;
     SGLang spells the GPT-OSS one ``swiglu_oai``.
     """
-    if activation_name.startswith(("situ:", "silu_and_mul_with_clamp:")):
+    if activation_name.startswith(("situ:", "silu_and_mul_clamp:")):
         return activation_name
     mapping = {
         "silu": "silu",
-        "silu_and_mul_with_clamp": "silu_and_mul_with_clamp",
+        "silu_and_mul_clamp": "silu_and_mul_clamp",
         "gelu": "gelu",
         "swiglu_oai": "swigluoai",
         "swigluoai": "swigluoai",
@@ -352,7 +352,7 @@ def _fuse_act_name(activation_name):
     if activation_name not in mapping:
         raise NotImplementedError(
             f"Unsupported activation '{activation_name}' for the Pallas "
-            "fused-MoE op. Supported: silu, silu_and_mul_with_clamp, gelu, swiglu_oai."
+            "fused-MoE op. Supported: silu, silu_and_mul_clamp, gelu, swiglu_oai."
         )
     return mapping[activation_name]
 
@@ -836,7 +836,6 @@ def fused_moe_call(
     w2_channel_scale: Optional[torch.Tensor] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_clamp_limit: Optional[float] = None,
-    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """Invoke the Pallas fused-MoE op.
 
@@ -857,8 +856,6 @@ def fused_moe_call(
             raise ValueError("SiTU fused MoE requires gemm1_alpha (SiTU beta).")
         linear_beta = "none" if gemm1_clamp_limit is None else gemm1_clamp_limit
         activation = f"situ:{gemm1_alpha}:{linear_beta}"
-    elif swiglu_limit is not None and activation == "silu":
-        activation = f"silu_and_mul_with_clamp:{swiglu_limit}"
     op = _build_fused_moe_op()
     # Routed rows for this (bucket-padded) call; static per compiled graph.
     routed_rows = int(hidden_states.shape[0]) * int(topk)
