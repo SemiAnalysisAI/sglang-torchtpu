@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -231,19 +232,44 @@ class TestTorchTpuIntegration(unittest.TestCase):
 
 
 class TestFusionBarrier(unittest.TestCase):
+    # CPU-only torch rejects torch.device("tpu"); only .device.type is read.
+    _TPU_TENSOR = SimpleNamespace(device=SimpleNamespace(type="tpu"))
+
     def test_default_platform_returns_the_input(self):
         x = torch.arange(4.0)
         self.assertIs(Platform.fusion_barrier(x), x)
 
-    def test_host_tensors_skip_the_op(self):
+    def test_host_tensors_pass_through(self):
         x = torch.arange(4.0)
+        with patch.object(torch.compiler, "is_compiling", return_value=True):
+            self.assertIs(TpuPlatform.fusion_barrier(x), x)
+
+    def test_eager_tpu_tensors_pass_through(self):
+        x = self._TPU_TENSOR
         self.assertIs(TpuPlatform.fusion_barrier(x), x)
 
-    def test_op_is_an_identity_off_device(self):
-        x = torch.arange(6.0).view(2, 3).t()
-        out = torch.ops.sglang.tpu_fusion_barrier(x)
-        self.assertTrue(torch.equal(out, x))
-        self.assertNotEqual(out.data_ptr(), x.data_ptr())
+    def test_compiled_tpu_tensors_take_the_torch_tpu_barrier(self):
+        x = self._TPU_TENSOR
+        public = MagicMock(return_value=["public"])
+        raw = MagicMock(return_value=["raw"])
+        for tpu_module, want in (
+            (
+                SimpleNamespace(ops=SimpleNamespace(optimization_barrier=public)),
+                "public",
+            ),
+            (SimpleNamespace(), "raw"),
+        ):
+            with (
+                self.subTest(want=want),
+                patch.object(torch, "tpu", tpu_module, create=True),
+                patch.object(
+                    torch.ops, "tpu", SimpleNamespace(optimization_barrier=raw)
+                ),
+                patch.object(torch.compiler, "is_compiling", return_value=True),
+            ):
+                self.assertEqual(TpuPlatform.fusion_barrier(x), want)
+        public.assert_called_once_with([x])
+        raw.assert_called_once_with([x])
 
 
 if __name__ == "__main__":

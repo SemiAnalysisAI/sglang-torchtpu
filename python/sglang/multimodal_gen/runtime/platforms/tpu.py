@@ -58,31 +58,6 @@ if hasattr(torch, "tpu"):
 
 _total_memory_cache: dict[int, int] = {}
 
-_fusion_barrier_kernel = None
-
-
-# Registered for every device: CPU-only torch rejects a "tpu" device type, and
-# this module is imported off-device by the platform tests.
-@torch.library.custom_op("sglang::tpu_fusion_barrier", mutates_args=())
-def _tpu_fusion_barrier(x: torch.Tensor) -> torch.Tensor:
-    """XLA optimization barrier: an identity that no fusion spans."""
-    global _fusion_barrier_kernel
-    if x.device.type != "tpu":
-        return x.clone()
-    if _fusion_barrier_kernel is None:
-        import jax
-        from torch_tpu._internal.pallas.pallas import custom_jax_kernel
-
-        _fusion_barrier_kernel = custom_jax_kernel(
-            jax.lax.optimization_barrier, warn_deprecated=False
-        )
-    return _fusion_barrier_kernel(x.contiguous())
-
-
-@_tpu_fusion_barrier.register_fake
-def _(x: torch.Tensor) -> torch.Tensor:
-    return torch.empty_like(x, memory_format=torch.contiguous_format)
-
 
 class TpuPlatform(Platform):
     _enum = PlatformEnum.TPU
@@ -240,6 +215,11 @@ class TpuPlatform(Platform):
 
     @classmethod
     def fusion_barrier(cls, x: torch.Tensor) -> torch.Tensor:
-        if x.device.type != "tpu":
+        # Only a compiled XLA program fuses; in eager the barrier would copy x.
+        if x.device.type != "tpu" or not torch.compiler.is_compiling():
             return x
-        return _tpu_fusion_barrier(x)
+        barrier = getattr(getattr(torch.tpu, "ops", None), "optimization_barrier", None)
+        if barrier is None:
+            # torch_tpu releases before torch.tpu.ops expose only the raw op.
+            barrier = torch.ops.tpu.optimization_barrier
+        return barrier([x])[0]
