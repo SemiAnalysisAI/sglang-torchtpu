@@ -676,9 +676,11 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._max_ensure_retries = 1
         queue._ensure_retry_interval = 0
         queue._ensure_retry_count = {"127.0.0.1:11500": 0}
-        queue._ensure_last_attempt_time = {}
-        queue.kv_manager = MagicMock()
-        queue.kv_manager.try_ensure_parallel_info.return_value = False
+        queue._ensure_last_attempt_time = {"127.0.0.1:11500": 0.0}
+        failed_fetch = Future()
+        failed_fetch.set_result(False)
+        queue._ensure_inflight = {"127.0.0.1:11500": failed_fetch}
+        queue.kv_manager = SimpleNamespace(prefill_info_table={})
 
         cleared_req = SimpleNamespace(
             req=SimpleNamespace(rid="cleared"), kv_receiver=None
@@ -689,6 +691,93 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         self.assertEqual(ready, {})
         self.assertEqual(remaining, [])
+
+    @staticmethod
+    def _ensure_info_queue(executor, max_retries=15, prefill_info_table=None):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue._max_ensure_retries = max_retries
+        queue._ensure_retry_interval = 0
+        queue._ensure_retry_count = {}
+        queue._ensure_last_attempt_time = {}
+        queue._ensure_inflight = {}
+        queue.kv_manager = SimpleNamespace(
+            prefill_info_table={} if prefill_info_table is None else prefill_info_table,
+            try_ensure_parallel_info=MagicMock(),
+            _ensure_prefill_recompute_executor=lambda: executor,
+        )
+        return queue
+
+    def test_ensure_prefill_info_does_not_block_on_a_hung_fetch(self):
+        # A prefill that accepts the connection but never answers must not stall
+        # the scheduler: the fetch runs off-thread and the reqs wait meanwhile.
+        addr = "127.0.0.1:11500"
+        fetch = Future()
+        executor = MagicMock()
+        executor.submit.return_value = fetch
+        queue = self._ensure_info_queue(executor)
+        req = SimpleNamespace(req=SimpleNamespace(rid="r"), kv_receiver=MagicMock())
+
+        for _ in range(3):
+            ready, remaining = queue._ensure_prefill_info({addr: [req]})
+            self.assertEqual(ready, {})
+            self.assertEqual(remaining, [req])
+        executor.submit.assert_called_once_with(
+            queue.kv_manager.try_ensure_parallel_info, addr
+        )
+
+        fetch.set_result(True)
+        ready, remaining = queue._ensure_prefill_info({addr: [req]})
+        self.assertEqual(ready, {addr: [req]})
+        self.assertEqual(remaining, [])
+        self.assertEqual(queue._ensure_inflight, {})
+
+    def test_ensure_prefill_info_uses_cached_info_without_a_fetch(self):
+        addr = "127.0.0.1:11500"
+        executor = MagicMock()
+        queue = self._ensure_info_queue(executor, prefill_info_table={addr: object()})
+        req = SimpleNamespace(req=SimpleNamespace(rid="r"), kv_receiver=MagicMock())
+
+        ready, remaining = queue._ensure_prefill_info({addr: [req]})
+
+        self.assertEqual(ready, {addr: [req]})
+        self.assertEqual(remaining, [])
+        executor.submit.assert_not_called()
+
+    def test_ensure_prefill_info_aborts_after_failed_fetches(self):
+        addr = "127.0.0.1:11500"
+        executor = MagicMock()
+
+        def failed_fetch(*_):
+            fetch = Future()
+            fetch.set_result(False)
+            return fetch
+
+        executor.submit.side_effect = failed_fetch
+        queue = self._ensure_info_queue(executor, max_retries=2)
+        receiver = MagicMock()
+        req = SimpleNamespace(req=SimpleNamespace(rid="r"), kv_receiver=receiver)
+
+        # Each attempt takes two passes: submit, then collect the failed result.
+        for _ in range(3):
+            ready, remaining = queue._ensure_prefill_info({addr: [req]})
+            self.assertEqual((ready, remaining), ({}, [req]))
+        receiver.abort.assert_not_called()
+
+        ready, remaining = queue._ensure_prefill_info({addr: [req]})
+        self.assertEqual((ready, remaining), ({}, []))
+        receiver.abort.assert_called_once_with()
+        self.assertEqual(executor.submit.call_count, 2)
+
+    def test_ensure_prefill_info_reraises_config_mismatch(self):
+        addr = "127.0.0.1:11500"
+        fetch = Future()
+        fetch.set_exception(RuntimeError("Page size mismatch"))
+        queue = self._ensure_info_queue(MagicMock())
+        queue._ensure_inflight = {addr: fetch}
+        req = SimpleNamespace(req=SimpleNamespace(rid="r"), kv_receiver=MagicMock())
+
+        with self.assertRaisesRegex(RuntimeError, "Page size mismatch"):
+            queue._ensure_prefill_info({addr: [req]})
 
     def test_prefetches_prefill_dp_rank_query(self):
         addr = "127.0.0.1:11500"

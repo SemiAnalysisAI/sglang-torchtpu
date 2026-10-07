@@ -443,6 +443,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
+        # In-flight prefill parallel-info fetches, by bootstrap addr. The fetch is
+        # a blocking HTTP GET, so it runs off the scheduler thread.
+        self._ensure_inflight: Dict[str, Future[bool]] = {}
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -1195,16 +1198,34 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         now = time.monotonic()
         for bootstrap_addr, reqs in addr_to_reqs.items():
-            last_attempt = self._ensure_last_attempt_time.get(bootstrap_addr)
-            if last_attempt is not None and (
-                now - last_attempt < self._ensure_retry_interval
-            ):
+            fetch = self._ensure_inflight.get(bootstrap_addr)
+            if fetch is None:
+                if bootstrap_addr not in self.kv_manager.prefill_info_table:
+                    last_attempt = self._ensure_last_attempt_time.get(bootstrap_addr)
+                    if last_attempt is None or (
+                        now - last_attempt >= self._ensure_retry_interval
+                    ):
+                        # A prefill that accepts the connection but never answers
+                        # would otherwise stall every decode batch for the timeout.
+                        self._ensure_last_attempt_time[bootstrap_addr] = now
+                        self._ensure_inflight[bootstrap_addr] = (
+                            self.kv_manager._ensure_prefill_recompute_executor().submit(
+                                self.kv_manager.try_ensure_parallel_info,
+                                bootstrap_addr,
+                            )
+                        )
+                    remaining.extend(reqs)
+                    continue
+                fetched = True
+            elif not fetch.done():
                 remaining.extend(reqs)
                 continue
+            else:
+                del self._ensure_inflight[bootstrap_addr]
+                # Re-raises a prefill/decode config mismatch on this thread.
+                fetched = fetch.result()
 
-            self._ensure_last_attempt_time[bootstrap_addr] = now
-
-            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
+            if fetched:
                 if bootstrap_addr in self._ensure_retry_count:
                     del self._ensure_retry_count[bootstrap_addr]
                 if bootstrap_addr in self._ensure_last_attempt_time:
