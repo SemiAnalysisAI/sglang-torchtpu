@@ -216,7 +216,10 @@ class TestMovaDecodingStageParallelism(unittest.TestCase):
         )
         stage = object.__new__(mova.MOVADecodingStage)
         for cfg_parallel, parallel_decode, decode_world_size, expected in cases:
-            stage.video_vae = SimpleNamespace(use_parallel_decode=parallel_decode)
+            stage.video_vae = SimpleNamespace(
+                use_parallel_decode=parallel_decode,
+                parallel_decode_mode="spatial_shard",
+            )
             with (
                 self.subTest(
                     cfg_parallel=cfg_parallel,
@@ -238,6 +241,39 @@ class TestMovaDecodingStageParallelism(unittest.TestCase):
                 ),
             ):
                 self.assertEqual(stage.parallelism_type, expected)
+
+
+class TestDecodeUsesEveryRank(unittest.TestCase):
+    def test_auto_decode_without_p2p_uses_every_rank_only_for_opted_in_vaes(self):
+        def vae(mode, opted_in):
+            return SimpleNamespace(
+                use_parallel_decode=True,
+                parallel_decode_mode=mode,
+                config=SimpleNamespace(
+                    auto_parallel_decode_shards_without_p2p=lambda: opted_in
+                ),
+            )
+
+        cases = (
+            (False, vae("auto", True), True),
+            (False, vae("auto", False), False),
+            (False, vae("spatial_shard", False), True),
+            (False, vae("tiled", False), True),
+            (True, vae("auto", False), True),
+        )
+        for p2p, stub, expected in cases:
+            platform = SimpleNamespace(supports_distributed_p2p=lambda p2p=p2p: p2p)
+            with (
+                self.subTest(p2p=p2p, mode=stub.parallel_decode_mode),
+                patch.object(decoding, "current_platform", platform),
+                patch.object(
+                    decoding, "model_parallel_is_initialized", return_value=True
+                ),
+                patch.object(
+                    decoding, "get_decode_parallel_world_size", return_value=2
+                ),
+            ):
+                self.assertEqual(decoding.decode_uses_every_rank(stub), expected)
 
 
 if __name__ == "__main__":

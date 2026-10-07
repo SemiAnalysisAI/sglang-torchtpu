@@ -227,7 +227,10 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
                 self.assertTrue(config.use_parallel_decode)
                 self.assertEqual(config.parallel_decode_mode, "auto")
 
-    def test_auto_parallel_decode_policy_is_conservative(self):
+    @patch("sglang.multimodal_gen.configs.models.vaes.base.current_platform")
+    def test_auto_parallel_decode_policy_is_conservative(self, platform):
+        # With p2p halos; test_tpu_platform covers auto mode without p2p.
+        platform.supports_distributed_p2p.return_value = True
         self.assertFalse(is_spatial_shard_parallel_decode_mode("auto"))
         self.assertFalse(should_use_spatial_shard_parallel_decode(VAEConfig()))
         self.assertFalse(should_use_spatial_shard_parallel_decode(QwenImageVAEConfig()))

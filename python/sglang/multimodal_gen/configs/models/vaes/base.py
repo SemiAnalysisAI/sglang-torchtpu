@@ -10,6 +10,7 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 
 AUTO_PARALLEL_DECODE_MODE = "auto"
@@ -53,6 +54,13 @@ def should_use_spatial_shard_parallel_decode(
         return False
 
     if not config.auto_parallel_decode_prefers_spatial_shard():
+        return False
+
+    # Without p2p the conv halos travel by all-gather.
+    if not (
+        current_platform.supports_distributed_p2p()
+        or config.auto_parallel_decode_shards_without_p2p()
+    ):
         return False
 
     if z is None:
@@ -103,6 +111,14 @@ class VAEConfig(ModelConfig):
         pass
 
     def auto_parallel_decode_prefers_spatial_shard(self) -> bool:
+        return False
+
+    def auto_parallel_decode_shards_without_p2p(self) -> bool:
+        """Whether auto mode shards the height on platforms without p2p.
+
+        Their conv halos travel by all-gather, which pays off only for VAEs
+        measured to gain from it; the others decode on one rank there.
+        """
         return False
 
     def should_use_auto_spatial_shard_parallel_decode(

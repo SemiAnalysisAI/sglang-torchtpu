@@ -7,6 +7,7 @@ The multi-rank cases run each rank on a thread over an in-process decode group
 import unittest
 
 from sglang.multimodal_gen.test.unit.test_decoding_stage_parallelism import (  # noqa: F401
+    TestDecodeUsesEveryRank,
     TestMovaDecodingStageParallelism,
 )
 from sglang.multimodal_gen.test.unit.test_vae_spatial_parallel_decode import (  # noqa: F401
