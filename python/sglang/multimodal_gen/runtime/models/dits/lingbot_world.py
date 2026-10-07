@@ -875,7 +875,6 @@ class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                 )
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
-        self.cnt += 1
 
         if sequence_shard_enabled:
             hidden_states = sequence_model_parallel_all_gather(
