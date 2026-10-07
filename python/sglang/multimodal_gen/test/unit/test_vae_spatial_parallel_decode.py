@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     disable_spatial_parallel_decode,
     split_for_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.models.vaes import wanvae
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage import (
     QwenImageAttentionBlock,
@@ -53,7 +54,6 @@ from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import (
     LTX2VideoDecoder3d,
     _enable_ltx_decoder_spatial_parallel,
 )
-from sglang.multimodal_gen.runtime.models.vaes import wanvae
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
     WanCausalConv3d,
     WanDecoder3d,
@@ -97,7 +97,8 @@ class _ThreadedDecodeGroup:
         self.world_size = world_size
         self.ranks = list(range(world_size))
         self.device_group = None
-        self.barrier = threading.Barrier(world_size)
+        # A rank-divergent collective sequence fails instead of hanging.
+        self.barrier = threading.Barrier(world_size, timeout=60)
         self._slots = [None] * world_size
 
     def _exchange(self, tensor):
@@ -186,9 +187,7 @@ def _encode_wan_video(encoder, x: torch.Tensor) -> torch.Tensor:
     )
     outputs = []
     with forward_context(feat_cache_arg=[None] * num_convs, feat_idx_arg=0):
-        for start, end in [(0, 1)] + [
-            (s, s + 4) for s in range(1, x.shape[2], 4)
-        ]:
+        for start, end in [(0, 1)] + [(s, s + 4) for s in range(1, x.shape[2], 4)]:
             feat_idx.set(0)
             outputs.append(encoder(x[:, :, start:end]))
     return torch.cat(outputs, dim=2)
@@ -454,9 +453,7 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         with (
             _collectives_only_decode_group(world_size) as group,
             patch.object(wanvae.dist, "is_initialized", return_value=True),
-            patch.object(
-                wanvae, "get_decode_parallel_world_size", lambda: world_size
-            ),
+            patch.object(wanvae, "get_decode_parallel_world_size", lambda: world_size),
             patch.object(
                 wanvae, "get_decode_parallel_rank", lambda: _thread_rank.value
             ),
@@ -489,7 +486,7 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         torch.manual_seed(0)
         world_size = 3
         reference = build(False)
-        # 5 blocks of 8 rows split 2/2/1, so the shards are uneven.
+        # 10 blocks of 4 rows split 4/3/3, so the shards are uneven.
         x = torch.randn(1, 3, 5, 40, 8)
         with torch.no_grad():
             expected = _encode_wan_video(reference, x)
@@ -497,9 +494,7 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         with (
             _collectives_only_decode_group(world_size) as group,
             patch.object(wanvae.dist, "is_initialized", return_value=True),
-            patch.object(
-                wanvae, "get_decode_parallel_world_size", lambda: world_size
-            ),
+            patch.object(wanvae, "get_decode_parallel_world_size", lambda: world_size),
             patch.object(
                 wanvae, "get_decode_parallel_rank", lambda: _thread_rank.value
             ),

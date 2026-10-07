@@ -600,16 +600,16 @@ def split_for_parallel_encode(
     unsharded encoder. Returns None when the height does not split that way.
     """
     block = 2**downsample_count
-    height = x.shape[-2]
-    if height % block or height // block < world_size:
+    blocks, leftover_rows = divmod(x.shape[-2], block)
+    if leftover_rows or blocks < world_size:
         return None
-    # Same partition as torch.tensor_split, which the gathers assume.
-    sizes = [
-        len(chunk) for chunk in torch.arange(height // block).tensor_split(world_size)
-    ]
+    # The torch.tensor_split partition WanAttentionBlock re-chunks to
+    # (chunk_height_for_parallel_decode), so ranks keep their rows across it.
+    base, extra = divmod(blocks, world_size)
+    sizes = [base + (i < extra) for i in range(world_size)]
     start = sum(sizes[:rank]) * block
     x = x[..., start : start + sizes[rank] * block, :].contiguous()
-    return x, height // block
+    return x, blocks
 
 
 @contextmanager
