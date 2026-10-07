@@ -10,7 +10,9 @@ All patches are idempotent.
 from __future__ import annotations
 
 import importlib
+import inspect
 import os
+import textwrap
 from collections.abc import Sequence
 
 from sglang.srt.environ import envs
@@ -872,6 +874,35 @@ def _patch_pd_decode_swa_hicache() -> None:
     pd_decode_swa_hicache.install()
 
 
+def _patch_jax_pallas_fori_lowering() -> None:
+    """Drop the empty remainder loop Mosaic emits for dynamic-bound fori_loop.
+
+    Dynamic trip counts lower with ``unroll=1``, so the main ``scf.for`` covers
+    the whole range and the remainder ``scf.for`` runs zero iterations but is
+    still emitted. Same patch as vllm-torchtpu env_override.py; no-op once JAX
+    stops emitting it.
+    """
+    try:
+        from jax._src.pallas.mosaic import lowering
+    except ImportError:
+        return
+    if lowering.__dict__.get("_sglang_fori_patch_applied"):
+        return
+    needle = "elif has_dynamic_remainder:"
+    try:
+        src = textwrap.dedent(inspect.getsource(lowering._lower_jaxpr_to_for_loop))
+    except (AttributeError, OSError, TypeError):
+        return
+    if needle not in src:
+        logger.info("Pallas fori_loop remainder patch not needed for this JAX.")
+        return
+    patched_src = src.replace(needle, "elif has_dynamic_remainder and unroll != 1:", 1)
+    namespace: dict = {}
+    exec(compile(patched_src, lowering.__file__, "exec"), lowering.__dict__, namespace)
+    lowering._lower_jaxpr_to_for_loop = namespace["_lower_jaxpr_to_for_loop"]
+    lowering._sglang_fori_patch_applied = True
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
@@ -892,3 +923,4 @@ def apply_tpu_patches() -> None:
     _patch_raiden_is_load_back_event_done()
     _patch_prefill_transfer_finish_from_raiden()
     _patch_pd_decode_swa_hicache()
+    _patch_jax_pallas_fori_lowering()

@@ -1878,6 +1878,15 @@ class Envs:
     # Backends snapshot this flag at initialization; tile hints are tensor inputs.
     SGLANG_TPU_WORKLOAD_AWARE_KV_TILES = EnvBool(False)
     SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
+    # Opt-in libtpu flags appended to LIBTPU_INIT_ARGS at startup (see
+    # hardware_backend/tpu/env_override.py); a flag already in
+    # LIBTPU_INIT_ARGS wins. Stop XLA from combining chunked all-reduces.
+    SGLANG_TPU_DISABLE_ALL_REDUCE_COMBINER = EnvBool(False)
+    # Let libtpu negotiate SMEM size (large RPA scheduling metadata).
+    SGLANG_TPU_ENABLE_DYNAMIC_SMEM_NEGOTIATION = EnvBool(False)
+    # Keep all-gathers below the per-core VMEM size on the TensorCore instead
+    # of SparseCore; threshold from TPU_ACCELERATOR_TYPE.
+    SGLANG_TPU_ENABLE_SC_ALL_GATHER_OFFLOAD_THRESHOLD = EnvBool(False)
     # Physical TPU v7 TP8 measurements favor distributed TopK from batch 64.
     # Deployments can override this cutoff after measuring their topology.
     SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = EnvInt(64)

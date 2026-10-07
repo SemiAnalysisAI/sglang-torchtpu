@@ -12,9 +12,13 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import os
 import unittest
+from contextlib import ExitStack
 from unittest.mock import patch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.env_override import (
+    _ALL_REDUCE_COMBINER_OVERRIDES,
+    _DYNAMIC_SMEM_OVERRIDES,
     _VMEM_PREFETCH_MIN_LAYERS,
     _VMEM_PREFETCH_OVERRIDES,
     _VMEM_PREFETCH_SAFE_MIN_TOKENS,
@@ -85,6 +89,59 @@ class TestLibtpuInitArgsOverrides(CustomTestCase):
         self.assertIn(user_flag, args)
         for flag in _VMEM_PREFETCH_OVERRIDES:
             self.assertIn(flag, args)
+
+
+_SC_ALL_GATHER_FLAG = "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"
+_OPT_IN_ENVS = (
+    envs.SGLANG_TPU_DISABLE_ALL_REDUCE_COMBINER,
+    envs.SGLANG_TPU_ENABLE_DYNAMIC_SMEM_NEGOTIATION,
+    envs.SGLANG_TPU_ENABLE_SC_ALL_GATHER_OFFLOAD_THRESHOLD,
+)
+
+
+class TestOptInLibtpuFlags(CustomTestCase):
+    def _apply(self, enabled: bool, initial: str = "", tpu_type: str = "tpu7x-8"):
+        with ExitStack() as stack:
+            for env in _OPT_IN_ENVS:
+                stack.enter_context(env.override(enabled))
+            stack.enter_context(
+                patch.dict(
+                    os.environ,
+                    {"LIBTPU_INIT_ARGS": initial, "TPU_ACCELERATOR_TYPE": tpu_type},
+                )
+            )
+            apply_tpu_env_overrides()
+            return os.environ["LIBTPU_INIT_ARGS"].split()
+
+    def test_flags_off_by_default(self):
+        args = self._apply(False)
+        for flag in _ALL_REDUCE_COMBINER_OVERRIDES + _DYNAMIC_SMEM_OVERRIDES:
+            self.assertNotIn(flag, args)
+        self.assertFalse(any(a.startswith(_SC_ALL_GATHER_FLAG) for a in args))
+
+    def test_opt_in_appends_flags(self):
+        args = self._apply(True)
+        for flag in _ALL_REDUCE_COMBINER_OVERRIDES + _DYNAMIC_SMEM_OVERRIDES:
+            self.assertIn(flag, args)
+        self.assertIn(f"{_SC_ALL_GATHER_FLAG}={64 << 20}", args)
+
+    def test_sc_all_gather_threshold_follows_chip(self):
+        args = self._apply(True, tpu_type="v6e-8")
+        self.assertIn(f"{_SC_ALL_GATHER_FLAG}={128 << 20}", args)
+        args = self._apply(True, tpu_type="unknown-chip")
+        self.assertFalse(any(a.startswith(_SC_ALL_GATHER_FLAG) for a in args))
+
+    def test_user_value_wins_over_opt_in(self):
+        user_flags = (
+            f"--xla_jf_crs_combiner_threshold_in_bytes=1024 {_SC_ALL_GATHER_FLAG}=1"
+        )
+        args = self._apply(True, initial=user_flags)
+        self.assertIn("--xla_jf_crs_combiner_threshold_in_bytes=1024", args)
+        self.assertNotIn(_ALL_REDUCE_COMBINER_OVERRIDES[0], args)
+        self.assertEqual(
+            [a for a in args if a.startswith(_SC_ALL_GATHER_FLAG)],
+            [f"{_SC_ALL_GATHER_FLAG}=1"],
+        )
 
 
 if __name__ == "__main__":

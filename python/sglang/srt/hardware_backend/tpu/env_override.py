@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 
 logger = get_logger(__name__)
@@ -43,6 +44,30 @@ _ASSOCIATIVE_SCAN_OVERRIDES = (
     # wrong values when the scanned length is not a multiple of 1024.
     "--xla_tpu_use_associative_scan_emitter=false",
 )
+
+# Opt-in perf flags (see the SGLANG_TPU_* gates in environ.py). Off by default:
+# they change collective scheduling and SMEM sizing for every compiled program.
+_ALL_REDUCE_COMBINER_OVERRIDES = (
+    # Keep chunked all-reduces separate instead of letting XLA's all-reduce
+    # combiner fuse them into one, which serializes compute and communication.
+    "--xla_jf_crs_combiner_threshold_in_bytes=0",
+)
+
+_DYNAMIC_SMEM_OVERRIDES = (
+    # Let libtpu size SMEM to fit the ragged-paged-attention scheduling
+    # metadata; matches vllm-torchtpu.
+    "--xla_tpu_use_dynamic_smem_negotiation=true",
+)
+
+# Per-TensorCore VMEM by TPU_ACCELERATOR_TYPE prefix (vllm-torchtpu
+# env_override.py). All-gathers below this size stay on the TensorCore.
+_SPARSE_CORE_ALL_GATHER_OFFLOAD_MIN_BYTES = {
+    "v5p": 64 << 20,
+    "v5litepod": 128 << 20,
+    "v6e": 128 << 20,
+    "tpu7x": 64 << 20,
+    "v7x": 64 << 20,
+}
 
 _VMEM_PREFETCH_OVERRIDES = (
     # TODO: drop once the XLA:TPU memory-space-assignment scheduling issue is
@@ -89,6 +114,33 @@ def _override_libtpu_flags(flags: tuple[str, ...]) -> list[str]:
     return to_append
 
 
+def _sparse_core_all_gather_overrides() -> tuple[str, ...]:
+    tpu_type = os.environ.get("TPU_ACCELERATOR_TYPE", "").strip().lower()
+    for prefix, num_bytes in _SPARSE_CORE_ALL_GATHER_OFFLOAD_MIN_BYTES.items():
+        if tpu_type.startswith(prefix):
+            return (
+                "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes="
+                f"{num_bytes}",
+            )
+    logger.warning(
+        "SGLANG_TPU_ENABLE_SC_ALL_GATHER_OFFLOAD_THRESHOLD ignored: unknown "
+        "TPU_ACCELERATOR_TYPE %r",
+        tpu_type,
+    )
+    return ()
+
+
+def _opt_in_libtpu_overrides() -> tuple[str, ...]:
+    flags: tuple[str, ...] = ()
+    if envs.SGLANG_TPU_DISABLE_ALL_REDUCE_COMBINER.get():
+        flags += _ALL_REDUCE_COMBINER_OVERRIDES
+    if envs.SGLANG_TPU_ENABLE_DYNAMIC_SMEM_NEGOTIATION.get():
+        flags += _DYNAMIC_SMEM_OVERRIDES
+    if envs.SGLANG_TPU_ENABLE_SC_ALL_GATHER_OFFLOAD_THRESHOLD.get():
+        flags += _sparse_core_all_gather_overrides()
+    return flags
+
+
 def _set_renamed_compilation_cache_envs() -> list[str]:
     added = []
     for old_name, new_name in _COMPILATION_CACHE_ENV_RENAMES:
@@ -108,7 +160,9 @@ def apply_tpu_env_overrides() -> None:
         )
 
     appended = _override_libtpu_flags(
-        _SPARSE_CORE_OFFLOAD_OVERRIDES + _ASSOCIATIVE_SCAN_OVERRIDES
+        _SPARSE_CORE_OFFLOAD_OVERRIDES
+        + _ASSOCIATIVE_SCAN_OVERRIDES
+        + _opt_in_libtpu_overrides()
     )
     if appended:
         logger.info(
