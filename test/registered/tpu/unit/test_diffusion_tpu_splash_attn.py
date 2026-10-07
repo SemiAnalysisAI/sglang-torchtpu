@@ -88,7 +88,7 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
         print(f"{self._testMethodName}: max abs err {err:.3e} (sdpa {sdpa_err:.3e})")
         self.assertLess(err, tol, f"max abs error {err:.3e}, sdpa {sdpa_err:.3e}")
 
-    # Custom kernel: kv_seq >= 2048.
+    # Custom kernel: non-causal, q_seq >= 256, kv_seq >= 512.
     def test_custom_aligned(self):
         self._check(1, 4, 4608, 4608)
 
@@ -115,16 +115,34 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
     def test_custom_negative_scores(self):
         self._check(1, 2, 4128, 4128, negative_scores=True)
 
-    # make_splash_mha, long query against short aligned KV.
+    # Text cross-attention on the custom kernel: long query, short KV.
     def test_cross_attention_aligned_kv(self):
         self._check(1, 4, 4096, 512)
+
+    def test_cross_attention_ragged_query(self):
+        # No block size divides 4100 query rows; the edge block is masked.
+        self._check(1, 4, 4100, 512)
+
+    def test_cross_attention_unaligned_kv(self):
+        # 600 keys: a ragged last KV block.
+        self._check(1, 2, 18900, 600, negative_scores=True)
+
+    def test_cross_attention_long_query(self):
+        # Short KV leaves VMEM for the largest query block.
+        self._check(1, 2, 37800, 512)
+
+    # make_splash_mha, long query against fewer than 512 aligned keys.
+    def test_splash_mha_cross_attention(self):
+        for kv_seq in (256, 384):
+            with self.subTest(kv_seq=kv_seq):
+                self._check(1, 2, 4096, kv_seq)
 
     def test_cross_attention_kv_not_multiple_of_1024(self):
         self._check(1, 2, 4096, 1536, negative_scores=True)
 
-    # make_splash_mha, medium and causal shapes.
-    def test_medium_padded_kv_is_masked(self):
-        # 1000 pads to 1024: 24 zero keys that must stay masked.
+    # Medium shapes (custom kernel) and causal (make_splash_mha).
+    def test_medium_ragged_kv(self):
+        # 1000 keys: a ragged last KV block.
         self._check(1, 4, 1000, 1000, negative_scores=True)
 
     def test_medium_aligned(self):
@@ -135,7 +153,7 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
         self._check(1, 2, 200, 4128, negative_scores=True)
 
     def test_long_query_unaligned_kv(self):
-        # 1024 < kv < 2048, not 128-aligned: KV padded to 1536, masked.
+        # 1024 < kv < 2048, not 128-aligned: a ragged last KV block.
         self._check(1, 2, 4096, 1500, negative_scores=True)
 
     def test_causal_padded(self):
@@ -146,7 +164,7 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
         self._check(1, 4, 300, 77)
 
     def test_unaligned_short_kv(self):
-        self._check(1, 2, 4096, 1000)
+        self._check(1, 2, 4096, 300)
 
     def test_gqa(self):
         from sglang.multimodal_gen.runtime.layers.attention.backends.tpu_splash_attn import (
@@ -167,7 +185,7 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
             tpu_attention,
         )
 
-        q, k, v = _inputs(1, 4, 4096, 512)
+        q, k, v = _inputs(1, 4, 4096, 256)
         k, v = k[:, :2], v[:, :2]
         scale = 128**-0.5
         want = _reference(
@@ -251,17 +269,17 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
             return out.reshape(out.shape[0], out.shape[1], -1)
 
         # Custom kernel, and make_splash_mha with a padded query.
-        for seq in (4608, 1000):
-            with self.subTest(seq=seq):
-                q, k, v = _inputs(1, 4, seq, seq)
+        for q_seq, kv_seq in ((4608, 4608), (200, 4128)):
+            with self.subTest(q_seq=q_seq, kv_seq=kv_seq):
+                q, k, v = _inputs(1, 4, q_seq, kv_seq)
                 want = _reference(q, k, v, 128**-0.5, False).transpose(1, 2)
                 compiled = torch.compile(attn, backend="tpu", dynamic=False)
                 # Contiguous [B, S, H, D], as the layer's projections produce.
                 got = compiled(
                     *(t.transpose(1, 2).contiguous().to("tpu") for t in (q, k, v))
                 ).to("cpu")
-                self.assertEqual(got.shape, (1, seq, 4 * 128))
-                err = (got.float() - want.reshape(1, seq, -1)).abs().max().item()
+                self.assertEqual(got.shape, (1, q_seq, 4 * 128))
+                err = (got.float() - want.reshape(1, q_seq, -1)).abs().max().item()
                 self.assertLess(err, 2e-2)
 
     def test_float32_falls_back_to_sdpa(self):
@@ -286,7 +304,9 @@ class TestTpuSplashDispatch(CustomTestCase):
 
         self.assertTrue(_use_custom_kernel(75600, 75600, False))
         self.assertTrue(_use_custom_kernel(880, 3520, False))
-        self.assertFalse(_use_custom_kernel(75600, 512, False))
+        self.assertTrue(_use_custom_kernel(18900, 512, False))
+        self.assertFalse(_use_custom_kernel(75600, 256, False))
+        self.assertFalse(_use_custom_kernel(200, 4128, False))
         self.assertFalse(_use_custom_kernel(4096, 4096, True))
 
     def test_cross_attn_block_kv_divides_kv(self):
@@ -299,12 +319,23 @@ class TestTpuSplashDispatch(CustomTestCase):
             self.assertEqual(kv_seq % block_kv, 0)
             self.assertLessEqual(block_kv, 1024)
 
+    def test_short_kv_query_blocks_are_capped(self):
+        from sglang.multimodal_gen.runtime.layers.attention.backends.tpu_splash_attn import (
+            autotune_block_sizes,
+        )
+
+        for q_seq, kv_seq in ((75600, 512), (37800, 512), (55800, 1024)):
+            self.assertLessEqual(autotune_block_sizes(q_seq, kv_seq)[0], 9472)
+        # Long KV: the VMEM model binds first.
+        self.assertEqual(autotune_block_sizes(75600, 75600), (6400, 2048, 2048))
+
     def test_splash_mha_blocks(self):
         from sglang.multimodal_gen.runtime.layers.attention.backends.tpu_splash_attn import (
             _splash_mha_block_sizes,
         )
 
-        self.assertEqual(_splash_mha_block_sizes(4096, 1536, False), (2048, 512))
+        self.assertEqual(_splash_mha_block_sizes(4096, 384, False), (2048, 128))
+        self.assertEqual(_splash_mha_block_sizes(4096, 256, False), (2048, 256))
         self.assertEqual(_splash_mha_block_sizes(4096, 4096, True), (1024, 1024))
         self.assertEqual(_splash_mha_block_sizes(1000, 1000, True), (512, 512))
         self.assertEqual(_splash_mha_block_sizes(200, 4128, False), (256, 256))
@@ -340,7 +371,8 @@ class TestTpuSplashDispatch(CustomTestCase):
             self.assertIsNone(reason((1, 4, 4608, 128), (1, 4, 4608, 128)))
             self.assertIsNone(reason((1, 4, 4096, 128), (1, 2, 512, 128)))
             self.assertEqual(reason((1, 4, 300, 128), (1, 4, 77, 128)), "short")
-            self.assertEqual(reason((1, 4, 4096, 128), (1, 4, 1000, 128)), "short")
+            self.assertEqual(reason((1, 4, 4096, 128), (1, 4, 300, 128)), "short")
+            self.assertIsNone(reason((1, 4, 18900, 128), (1, 4, 600, 128)))
             self.assertEqual(
                 reason((1, 4, 1000, 128), (1, 4, 2000, 128), is_causal=True),
                 "ragged causal",
