@@ -124,6 +124,7 @@ class TestWanTI2VHelpers(unittest.TestCase):
                 raw_latent_shape=(1, 16, 3, 4, 4),
                 latents=torch.empty(1, 16, latent_frames, 4, 4),
             )
+            # Vary the SP rank: it must not change the timesteps a rank builds.
             with patch(
                 "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_ti2v.get_sp_parallel_rank",
                 return_value=rank,
