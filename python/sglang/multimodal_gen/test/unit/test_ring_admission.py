@@ -12,10 +12,18 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
     FlashAttentionBackend,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
+    SDPABackend,
+    SDPAImpl,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.tpu_splash_attn import (
+    TpuSplashAttentionBackend,
+    TpuSplashAttentionImpl,
+)
 from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
 from sglang.multimodal_gen.runtime.server_args.server_args import (
     RING_CAPABLE_ATTENTION_BACKENDS,
+    TPU_RING_CAPABLE_ATTENTION_BACKENDS,
 )
 
 
@@ -52,6 +60,20 @@ class TestRingAdmission(unittest.TestCase):
             )
 
         self.assertEqual(attention.backend, SDPABackend.get_enum())
+
+
+class TestTpuSplashRingCapability(unittest.TestCase):
+    def test_declares_ring_support(self):
+        self.assertTrue(TpuSplashAttentionBackend.supports_ring_rotation())
+        self.assertEqual(
+            TPU_RING_CAPABLE_ATTENTION_BACKENDS,
+            (TpuSplashAttentionBackend.get_enum().name.lower(),),
+        )
+
+    def test_only_the_tpu_impl_resumes_in_kernel(self):
+        self.assertTrue(TpuSplashAttentionImpl.supports_ring_resume())
+        self.assertFalse(SDPAImpl.supports_ring_resume())
+        self.assertFalse(FlashAttentionBackend.get_impl_cls().supports_ring_resume())
 
 
 if __name__ == "__main__":
