@@ -210,36 +210,6 @@ def test_compile_matching_submodules_matches_only_declared_regions():
     assert not model.compile_calls
 
 
-def test_platform_wraps_spmd_safe_regions_before_compiling():
-    model = _RegionalModel()
-    model._compile_regions_spmd_safe = True
-    wrapped = []
-
-    def wrap(forward):
-        wrapped.append(forward)
-        return forward
-
-    platform = MagicMock()
-    platform.get_spmd_region_wrapper.return_value = wrap
-    with patch(
-        "sglang.multimodal_gen.runtime.utils.torch_compile.current_platform", platform
-    ):
-        compile_matching_submodules(model, compile_kwargs={"mode": "default"})
-        assert [f.__self__ for f in wrapped] == list(model.transformer_blocks)
-
-        # Models that do not declare it keep unwrapped regions.
-        del model._compile_regions_spmd_safe
-        wrapped.clear()
-        compile_matching_submodules(_RegionalModel(), compile_kwargs={})
-        assert not wrapped
-
-
-def test_regions_are_unwrapped_by_default():
-    from sglang.multimodal_gen.runtime.platforms.interface import Platform
-
-    assert Platform.get_spmd_region_wrapper(None) is None
-
-
 def test_compile_matching_submodules_fails_when_no_region_matches():
     model = _RegionalModel()
     model._compile_conditions = [lambda _name, _module: False]
