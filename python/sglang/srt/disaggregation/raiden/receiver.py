@@ -84,6 +84,8 @@ class RaidenReceiverMixin:
                     endpoint,
                 )
             )
+        # The listener handles control messages in order, so start_read must
+        # stay cheap.
         if self._listener_start_read and self.chunked_transfer:
             self._start_chunked_pull(room)
 

@@ -534,6 +534,8 @@ class TestRaidenDecodeBookkeeping(RaidenRendezvousTestCase):
         reads from already-settled/freed prefill KV memory (issue #656)."""
         prefill, decode = self._prefill(), self._decode()
         decode.chunked_transfer = True
+        # Inspects the queue, so reads must wait for the poll.
+        decode._listener_start_read = False
         room = 7204
         local_blocks = [101, 102, 103, 104]
 
@@ -611,6 +613,8 @@ class TestRaidenDecodeBookkeeping(RaidenRendezvousTestCase):
         """A CHUNK delivered twice must queue one read, not a second pull of
         the same pages."""
         _, decode, chunk_frames, _ = self._announced_chunked_room(7205)
+        # Inspects the queue, so reads must wait for the poll.
+        decode._listener_start_read = False
 
         decode._dispatch(chunk_frames)
         decode._dispatch(chunk_frames)
