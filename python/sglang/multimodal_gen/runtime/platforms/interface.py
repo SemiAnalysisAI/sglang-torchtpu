@@ -151,12 +151,13 @@ class Platform:
         """Return backend-specific options for a diffusion module."""
         return None
 
-    def get_compile_cache_namespace(self, world_size: int, nnodes: int) -> str | None:
-        """Subdirectory that keeps the persistent compile cache per topology.
+    def configure_compile_cache(self) -> None:
+        """Configure torch.compile caching for this worker.
 
-        None shares one cache across launches of any size.
+        Called once per worker after distributed initialization, before any
+        compilation.
         """
-        return None
+        pass
 
     def get_dispatch_key_name(self) -> str:
         """Return the behavioral dispatch key used by :class:`CustomOp`.

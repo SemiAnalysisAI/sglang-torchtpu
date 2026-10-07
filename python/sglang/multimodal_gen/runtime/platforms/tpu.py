@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 
 import torch
@@ -44,6 +43,22 @@ def _memory_stat(key: str) -> int:
     if not torch.tpu.is_initialized():
         return 0
     return int(torch.accelerator.memory_stats().get(key, 0))
+
+
+def _add_compiler_flags_to_compile_cache_key() -> None:
+    import hashlib
+
+    import torch.compiler.config as compiler_config
+
+    flags = "\0".join(
+        os.environ.get(name, "")
+        for name in ("LIBTPU_INIT_ARGS", "XLA_FLAGS", "TORCH_TPU_INTERNAL_XLA_OPTIONS")
+    )
+    tag = f"tpu-compiler-flags-v1:{hashlib.sha256(flags.encode()).hexdigest()[:16]}"
+    # '|'-joined and idempotent, like srt's compile_cache tags.
+    existing_tag = str(compiler_config.cache_key_tag or "")
+    if tag not in existing_tag.split("|"):
+        compiler_config.cache_key_tag = f"{existing_tag}|{tag}" if existing_tag else tag
 
 
 def _install_device_module_shims() -> None:
@@ -188,17 +203,18 @@ class TpuPlatform(Platform):
         _install_device_module_shims()
         torch.zeros(1, device="tpu")
 
-    def get_compile_cache_namespace(self, world_size: int, nnodes: int) -> str | None:
-        # torch_tpu stores XLA executables in AOTAutogradCache, whose key covers
-        # neither the device topology nor the XLA flags: an executable built by
-        # a 1-device launch loads in a 4-device one and its collectives never
-        # complete, and changed flags keep serving old executables.
-        flags = "\0".join(
-            os.environ.get(name, "")
-            for name in ("LIBTPU_INIT_ARGS", "XLA_FLAGS", "TORCH_TPU_INTERNAL_XLA_OPTIONS")
+    def configure_compile_cache(self) -> None:
+        # torch_tpu persists XLA executables in AOTAutogradCache, whose key sees
+        # neither the device assignment behind collectives, opaque Pallas kernel
+        # sources nor the XLA flags: a stale hit can hang or ignore new flags.
+        from sglang.srt.hardware_backend.tpu.compile_cache import (
+            add_pallas_kernel_sources_to_compile_cache_key,
+            add_tpu_rank_assignment_to_compile_cache_key,
         )
-        digest = hashlib.sha256(flags.encode()).hexdigest()[:12]
-        return f"tpu_{world_size}x{nnodes}_{digest}"
+
+        add_tpu_rank_assignment_to_compile_cache_key()
+        add_pallas_kernel_sources_to_compile_cache_key()
+        _add_compiler_flags_to_compile_cache_key()
 
     def get_torch_distributed_backend_str(self) -> str:
         # tpu_dist needs one addressable PJRT device; a lone worker has many.

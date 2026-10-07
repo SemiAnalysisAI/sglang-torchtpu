@@ -301,11 +301,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         compile_cache_root = os.path.join(
             envs.SGLANG_DIFFUSION_CACHE_ROOT, "torch_compile_cache"
         )
-        namespace = current_platform.get_compile_cache_namespace(
-            self.server_args.num_gpus, self.server_args.nnodes
-        )
-        if namespace:
-            compile_cache_root = os.path.join(compile_cache_root, namespace)
         tmp_root = tempfile.gettempdir()
         sglang_defaults = third_party_cache_defaults()
         for env_name, sub in (
@@ -403,6 +398,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             distributed_init_method=rendezvous_addr.to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
         )
+        current_platform.configure_compile_cache()
 
         from sglang.srt.runtime_context import get_context, publish
         from sglang.srt.server_args import ServerArgs as SrtServerArgs
