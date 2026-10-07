@@ -98,6 +98,7 @@ jobs:
               - 'python/sglang/srt/layers/moe/pallas/**'
               - 'python/sglang/srt/hardware_backend/tpu/kernels/**'
               - 'python/sglang/test/tpu/moe_reference.py'
+              - 'python/sglang/test/kernels/tpu_mla_rpa_v2.py'
               - 'test/registered/tpu/kernel/**'
               - 'python/pyproject_tpu.toml'
               - 'docker/tpu.Dockerfile'
