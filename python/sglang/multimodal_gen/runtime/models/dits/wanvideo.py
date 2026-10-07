@@ -1283,9 +1283,6 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     device=timestep_proj.device,
                 )
                 timestep_proj = torch.cat([timestep_proj, pad], dim=1)
-            # Every block reads this rank's slice; copy it once rather than
-            # pass an offset view into each block (contiguous() would keep the
-            # view, which starts at offset 0 only on rank 0).
             timestep_proj = timestep_proj.view(
                 batch_size,
                 self.sp_size,
@@ -1293,7 +1290,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 timestep_proj.shape[2],
                 timestep_proj.shape[3],
             )
-            timestep_proj = timestep_proj[:, sp_rank, :, :, :].clone()
+            timestep_proj = timestep_proj[:, sp_rank, :, :, :]
 
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat(
