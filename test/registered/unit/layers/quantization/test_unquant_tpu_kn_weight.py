@@ -15,12 +15,12 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _layer(bias=False, allow=True):
-    layer = ReplicatedLinear(64, 96, bias=bias, params_dtype=torch.float32)
+def _layer(bias=False, allow=True, out=160):
+    layer = ReplicatedLinear(64, out, bias=bias, params_dtype=torch.float32)
     with torch.no_grad():
-        layer.weight.copy_(torch.randn(96, 64))
+        layer.weight.copy_(torch.randn(out, 64))
         if bias:
-            layer.bias.copy_(torch.randn(96))
+            layer.bias.copy_(torch.randn(out))
     if allow is not None:
         layer.allow_kn_weight = allow
     return layer
@@ -51,14 +51,16 @@ class TestUnquantTpuKnWeight(CustomTestCase):
         self.assertEqual(layer.weight.data_ptr(), before)
 
     def test_gated_off(self):
-        for kwargs, allow in [
-            (dict(flag=False), True),
-            (dict(tpu=False), True),
-            (dict(), None),  # layer not opted in
-            (dict(), False),
+        for kwargs, allow, out in [
+            (dict(flag=False), True, 160),
+            (dict(tpu=False), True, 160),
+            (dict(), None, 160),  # layer not opted in
+            (dict(), False, 160),
+            (dict(), True, 96),  # sub-lane output
+            (dict(), True, 1),  # one-row weight: its transpose is a view
         ]:
-            with self.subTest(kwargs=kwargs, allow=allow):
-                layer = _layer(allow=allow)
+            with self.subTest(kwargs=kwargs, allow=allow, out=out):
+                layer = _layer(allow=allow, out=out)
                 before = layer.weight.data_ptr()
                 _process(layer, **kwargs)
                 self._assert_unchanged(layer, before)
@@ -72,21 +74,25 @@ class TestUnquantTpuKnWeight(CustomTestCase):
                 ref = F.linear(x, layer.weight.clone(), layer.bias)
                 _process(layer)
                 # Consumers keep seeing [out, in]; storage is [in, out].
-                self.assertEqual(tuple(layer.weight.shape), (96, 64))
+                self.assertEqual(tuple(layer.weight.shape), (160, 64))
                 self.assertTrue(layer.weight_kn.is_contiguous())
-                self.assertEqual(tuple(layer.weight_kn.shape), (64, 96))
+                self.assertIsNone(layer.weight_kn._base)
+                self.assertEqual(tuple(layer.weight_kn.shape), (64, 160))
                 self.assertEqual(layer.weight_kn.data_ptr(), layer.weight.data_ptr())
                 torch.testing.assert_close(_apply(layer, x), ref)
 
     @torch.no_grad()
-    def test_reload_writes_through_and_process_is_idempotent(self):
+    def test_reload_writes_through_and_reprocess_owns_storage(self):
         layer = _layer()
         _process(layer)
-        storage = layer.weight_kn.data_ptr()
-        new_w = torch.randn(96, 64)
+        new_w = torch.randn(160, 64)
         layer.weight_loader(layer.weight, new_w)
+        torch.testing.assert_close(layer.weight_kn, new_w.t())
+        # The reload path reprocesses; weight_kn must not become a view of
+        # the already-transposed storage.
         _process(layer)
-        self.assertEqual(layer.weight_kn.data_ptr(), storage)
+        self.assertIsNone(layer.weight_kn._base)
+        self.assertEqual(layer.weight_kn.data_ptr(), layer.weight.data_ptr())
         x = torch.randn(3, 64)
         torch.testing.assert_close(_apply(layer, x), F.linear(x, new_w))
 

@@ -125,10 +125,25 @@ class TestKimiK3ConstructOnTpu(CustomTestCase):
                 m.quant_method.process_weights_after_loading(m)
         model.post_load_weights()
         ref.post_load_weights()
+        bound = 0
         for name, m in linears.items():
-            # 3-D conv weights and q_b_proj stay [out, in]-contiguous.
-            expect_kn = m.allow_kn_weight and m.weight.dim() == 2
-            self.assertEqual(getattr(m, "weight_kn", None) is not None, expect_kn, name)
+            # 3-D conv weights, q_b_proj and sub-lane outputs (the one-row
+            # attn-res score projections) stay [out, in]-contiguous.
+            expect_kn = (
+                m.allow_kn_weight
+                and m.weight.dim() == 2
+                and m.weight.shape[0] >= unquant._TPU_KN_MIN_OUT_FEATURES
+            )
+            weight_kn = getattr(m, "weight_kn", None)
+            self.assertEqual(weight_kn is not None, expect_kn, name)
+            if expect_kn:
+                # A view would be re-materialized on every TPU graph call.
+                self.assertIsNone(weight_kn._base, name)
+                bound += 1
+        self.assertGreater(bound, 0)
+        self.assertIsNone(
+            getattr(model.model.layers[0].self_attention_res_proj, "weight_kn", None)
+        )
         mla = model.model.layers[3].self_attn
         ref_mla = ref.model.layers[3].self_attn
         torch.testing.assert_close(mla.w_kc, ref_mla.w_kc, rtol=0, atol=0)

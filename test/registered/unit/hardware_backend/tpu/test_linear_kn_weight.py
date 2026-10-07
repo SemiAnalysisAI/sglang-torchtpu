@@ -55,9 +55,26 @@ class TestLinearKnWeightTpu(unittest.TestCase):
         new_w = torch.randn(768, 512).to(torch.bfloat16)
         layer.weight_loader(layer.weight, new_w.to("tpu"))
         x = torch.randn(4, 512).to(torch.bfloat16)
-        out, _ = layer(x.to("tpu"))
         ref = F.linear(x.to("tpu"), new_w.to("tpu")).cpu()
+        out, _ = layer(x.to("tpu"))
         torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
+        # Reprocessing after a reload keeps weight_kn a base tensor: torch_tpu
+        # re-materializes a view on every compiled call.
+        with envs.SGLANG_TPU_ENABLE_LINEAR_KN_WEIGHT.override(True):
+            layer.quant_method.process_weights_after_loading(layer)
+        self.assertIsNone(layer.weight_kn._base)
+        out, _ = layer(x.to("tpu"))
+        torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
+
+    @torch.no_grad()
+    def test_sub_lane_output_stays_nk(self):
+        # attn-res score projections are [1, H]: their transpose is a view.
+        for n in (1, 12):
+            with self.subTest(n=n):
+                layer = self._layer(512, n, False)
+                with envs.SGLANG_TPU_ENABLE_LINEAR_KN_WEIGHT.override(True):
+                    layer.quant_method.process_weights_after_loading(layer)
+                self.assertIsNone(getattr(layer, "weight_kn", None))
 
 
 if __name__ == "__main__":

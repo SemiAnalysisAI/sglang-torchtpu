@@ -433,6 +433,10 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         return F.embedding(input_, layer.weight)
 
 
+# Narrower KN weights are not bound: [K, N] pads N to a full TPU lane tile.
+_TPU_KN_MIN_OUT_FEATURES = 128
+
+
 def _bind_tpu_kn_weight(layer: torch.nn.Module) -> None:
     """Move ``layer.weight`` into [in, out]-contiguous storage.
 
@@ -440,12 +444,15 @@ def _bind_tpu_kn_weight(layer: torch.nn.Module) -> None:
     Kimi-K3 decode GEMVs). The parameter keeps its [out, in] shape as a
     transposed view of that storage, so weight loaders, reloads, post-load
     hooks and LoRA still see the checkpoint layout and write through to it.
-    apply() reads the contiguous ``weight_kn``. Idempotent.
+    apply() reads the contiguous ``weight_kn``.
+
+    ``weight_kn`` must own its storage: torch_tpu has no strided views, so a
+    view reaching a compiled graph is re-materialized by a copy program on
+    every call. A transpose can already be contiguous (a repeat call, or a
+    one-row weight), hence clone() rather than contiguous().
     """
-    weight_kn = layer.weight.data.t()
-    if not weight_kn.is_contiguous():
-        weight_kn = weight_kn.contiguous()
-        layer.weight.data = weight_kn.t()
+    weight_kn = layer.weight.data.t().clone(memory_format=torch.contiguous_format)
+    layer.weight.data = weight_kn.t()
     layer.weight_kn = weight_kn
 
 
@@ -482,6 +489,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and envs.SGLANG_TPU_ENABLE_LINEAR_KN_WEIGHT.get()
             and getattr(layer, "allow_kn_weight", False)
             and layer.weight.dim() == 2
+            and layer.weight.shape[0] >= _TPU_KN_MIN_OUT_FEATURES
         ):
             _bind_tpu_kn_weight(layer)
 
