@@ -30,41 +30,39 @@ class TestTpuPlatformPlugin(unittest.TestCase):
             self.assertIsNone(tpu_platform_plugin())
 
 
-class TestSplashBackendAdmission(unittest.TestCase):
-    """Any layer that admits TORCH_SDPA must also admit the splash backend.
+class TestSplashBackendSelection(unittest.TestCase):
+    def setUp(self):
+        from sglang.multimodal_gen.runtime.layers.attention import selector
 
-    This is what lets a model opt in with ``--attention-backend
-    tpu_splash_attn`` without editing its ``supported_attention_backends``.
-    """
+        selector._cached_get_attn_backend.cache_clear()
+        self.addCleanup(selector._cached_get_attn_backend.cache_clear)
 
-    def test_admitted_wherever_sdpa_is(self):
+    def test_explicit_selection_overrides_the_layer_preference_set(self):
+        from sglang.multimodal_gen.runtime.layers.attention.backends.tpu_splash_attn import (
+            TpuSplashAttentionBackend,
+        )
         from sglang.multimodal_gen.runtime.layers.attention.selector import (
-            _is_backend_supported,
+            get_attn_backend,
         )
 
-        self.assertTrue(
-            _is_backend_supported(
-                AttentionBackendEnum.TPU_SPLASH_ATTN,
-                {AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+        with patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform", TpuPlatform()
+        ):
+            backend = get_attn_backend(
+                128,
+                torch.bfloat16,
+                supported_attention_backends={
+                    AttentionBackendEnum.FA,
+                    AttentionBackendEnum.TORCH_SDPA,
+                },
+                selected_attention_backend=AttentionBackendEnum.TPU_SPLASH_ATTN,
             )
-        )
-
-    def test_not_admitted_where_sdpa_is_not(self):
-        from sglang.multimodal_gen.runtime.layers.attention.selector import (
-            _is_backend_supported,
-        )
-
-        self.assertFalse(
-            _is_backend_supported(
-                AttentionBackendEnum.TPU_SPLASH_ATTN,
-                {AttentionBackendEnum.SLA_ATTN},
-            )
-        )
+        self.assertIs(backend, TpuSplashAttentionBackend)
 
     def test_selectable_by_cli_name(self):
         # server_args resolves --attention-backend via the enum name.
         self.assertIs(
-            AttentionBackendEnum["TPU_SPLASH_ATTN".upper()],
+            AttentionBackendEnum["TPU_SPLASH_ATTN"],
             AttentionBackendEnum.TPU_SPLASH_ATTN,
         )
         self.assertEqual(str(AttentionBackendEnum.TPU_SPLASH_ATTN), "tpu_splash_attn")
@@ -177,71 +175,6 @@ class TestTpuPlatformSurface(unittest.TestCase):
 
     def test_layerwise_offload_disabled(self):
         self.assertFalse(TpuPlatform.enable_dit_layerwise_offload_by_default())
-
-
-class TestSdpaQueryBroadcastMask(unittest.TestCase):
-    """torch_tpu SDPA returns NaN for masks that broadcast over queries."""
-
-    @staticmethod
-    def _tpu_query(*shape):
-        query = MagicMock()
-        query.device.type = "tpu"
-        query.shape = torch.Size(shape)
-        return query
-
-    def test_key_padding_mask_is_expanded_over_queries(self):
-        from sglang.multimodal_gen.runtime.platforms.tpu import (
-            _expand_query_broadcast_mask,
-        )
-
-        mask = torch.zeros(2, 1, 1, 8)
-        out = _expand_query_broadcast_mask(self._tpu_query(2, 4, 5, 64), mask)
-        self.assertEqual(out.shape, (2, 1, 5, 8))
-        # expand() is a view: no copy of the mask.
-        self.assertEqual(out.data_ptr(), mask.data_ptr())
-
-    def test_other_masks_are_untouched(self):
-        from sglang.multimodal_gen.runtime.platforms.tpu import (
-            _expand_query_broadcast_mask,
-        )
-
-        full = torch.zeros(2, 1, 5, 8)
-        self.assertIs(
-            _expand_query_broadcast_mask(self._tpu_query(2, 4, 5, 64), full), full
-        )
-        # Single-query attention needs no expansion.
-        row = torch.zeros(2, 1, 1, 8)
-        self.assertIs(
-            _expand_query_broadcast_mask(self._tpu_query(2, 4, 1, 64), row), row
-        )
-        self.assertIsNone(
-            _expand_query_broadcast_mask(self._tpu_query(2, 4, 5, 64), None)
-        )
-        # Non-TPU tensors are never touched.
-        cpu_query = torch.zeros(2, 4, 5, 64)
-        self.assertIs(_expand_query_broadcast_mask(cpu_query, row), row)
-
-    def test_patch_is_idempotent_and_preserves_results(self):
-        from sglang.multimodal_gen.runtime.platforms import tpu as tpu_mod
-
-        original = torch.nn.functional.scaled_dot_product_attention
-        try:
-            tpu_mod._patch_sdpa_query_broadcast_mask()
-            patched = torch.nn.functional.scaled_dot_product_attention
-            tpu_mod._patch_sdpa_query_broadcast_mask()
-            self.assertIs(torch.nn.functional.scaled_dot_product_attention, patched)
-
-            q, k, v = (torch.randn(1, 2, 5, 8) for _ in range(3))
-            mask = torch.zeros(1, 1, 1, 5)
-            mask[..., :2] = float("-inf")
-            torch.testing.assert_close(
-                patched(q, k, v, attn_mask=mask), original(q, k, v, attn_mask=mask)
-            )
-            torch.testing.assert_close(
-                patched(q, k, v, mask, 0.0, False), original(q, k, v, mask, 0.0, False)
-            )
-        finally:
-            torch.nn.functional.scaled_dot_product_attention = original
 
 
 @unittest.skipUnless(_HAS_TORCH_TPU, "torch.device('tpu') needs torch_tpu")

@@ -371,11 +371,6 @@ def _is_backend_supported(
             AttentionBackendEnum.FA in supported_attention_backends
             and AttentionBackendEnum.TORCH_SDPA in supported_attention_backends
         )
-    if selected_backend == AttentionBackendEnum.TPU_SPLASH_ATTN:
-        # TpuSplashAttentionBackend subclasses SDPABackend and falls back to it
-        # for shapes the Pallas kernels do not cover (head sizes, dtypes,
-        # dropout, ragged causal), so it is admitted wherever TORCH_SDPA is.
-        return AttentionBackendEnum.TORCH_SDPA in supported_attention_backends
     return False
 
 

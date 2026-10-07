@@ -51,42 +51,6 @@ def _install_device_module_shims() -> None:
             setattr(torch.tpu, name, fn)
 
 
-def _expand_query_broadcast_mask(query, attn_mask):
-    """Expand a mask's size-1 query dim to the query length on TPU.
-
-    torch_tpu SDPA returns NaN for masks that broadcast over queries, e.g.
-    [B, 1, 1, S] key padding (0.1.1.dev20260924 and
-    0.1.1+release.2026.9.22; 0.1.1.dev20260817 is correct).
-    Remove once the pinned torch_tpu handles query-broadcast masks.
-    """
-    if (
-        attn_mask is not None
-        and query.device.type == "tpu"
-        and attn_mask.dim() >= 2
-        and attn_mask.shape[-2] == 1
-        and query.shape[-2] > 1
-    ):
-        attn_mask = attn_mask.expand(
-            *attn_mask.shape[:-2], query.shape[-2], attn_mask.shape[-1]
-        )
-    return attn_mask
-
-
-def _patch_sdpa_query_broadcast_mask() -> None:
-    # Module-level aliases bound before worker init keep the unpatched
-    # function; hunyuan3d_vae's is the only one and passes no mask.
-    sdpa = torch.nn.functional.scaled_dot_product_attention
-    if getattr(sdpa, "_sglang_tpu_mask_patch", False):
-        return
-
-    def scaled_dot_product_attention(query, key, value, attn_mask=None, *a, **kw):
-        attn_mask = _expand_query_broadcast_mask(query, attn_mask)
-        return sdpa(query, key, value, attn_mask, *a, **kw)
-
-    scaled_dot_product_attention._sglang_tpu_mask_patch = True
-    torch.nn.functional.scaled_dot_product_attention = scaled_dot_product_attention
-
-
 # The launcher and benchmarks reach these through torch.get_device_module()
 # without entering the worker hook. Every shim is is_initialized()-guarded.
 if hasattr(torch, "tpu"):
@@ -217,7 +181,6 @@ class TpuPlatform(Platform):
         _patch_set_device_tolerate_mismatch()
 
         _install_device_module_shims()
-        _patch_sdpa_query_broadcast_mask()
         torch.zeros(1, device="tpu")
 
     def get_torch_distributed_backend_str(self) -> str:
