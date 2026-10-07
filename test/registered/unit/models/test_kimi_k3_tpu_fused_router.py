@@ -20,10 +20,12 @@ from sglang.test.test_utils import CustomTestCase
 
 
 def _owner(config_ok=True, dtype=torch.bfloat16, hidden=256):
-    cfg = SimpleNamespace(top_k=4, correction_bias=torch.randn(16))
+    bias = torch.randn(16)
+    cfg = SimpleNamespace(top_k=4, correction_bias=bias)
     return SimpleNamespace(
         gate=SimpleNamespace(
-            weight=torch.nn.Parameter(torch.randn(16, hidden).to(dtype))
+            weight=torch.nn.Parameter(torch.randn(16, hidden).to(dtype)),
+            e_score_correction_bias=torch.nn.Parameter(bias, requires_grad=False),
         ),
         topk=SimpleNamespace(topk_config=cfg),
         _routing_config_ok=config_ok,
@@ -69,6 +71,11 @@ class TestK3FusedRouterGating(CustomTestCase):
         torch.testing.assert_close(owner.gate.weight, before, rtol=0, atol=0)
         self.assertEqual(owner.gate.weight.data_ptr(), owner._tpu_gate_kn.data_ptr())
         self.assertEqual(owner._tpu_route_bias.shape, (1, 16))
+        # Taken from the gate parameter, as its own storage (not a view).
+        torch.testing.assert_close(
+            owner._tpu_route_bias[0], owner.gate.e_score_correction_bias.float()
+        )
+        self.assertIsNone(owner._tpu_route_bias._base)
         self.mod.get_gate_route_op.assert_called_once_with(
             4, renormalize=True, scale=2.5, eps=1e-20
         )
