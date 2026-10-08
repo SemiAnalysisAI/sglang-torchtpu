@@ -1,6 +1,6 @@
 """Test-only fault and latency injection for the raiden KV transfer.
 
-Off unless ``SGLANG_TEST_RAIDEN_FAULTS`` names a preset of
+Off unless ``SGLANG_TEST_RAIDEN_FAULT_INJECTION`` names a preset of
 ``fault_injection.json`` on a prefill or decode server. That file holds the
 presets, each a share of requests that meets a failure and a share that meets
 a delay, and the tpu-sync hooks the faults are spread over.
@@ -250,14 +250,14 @@ _injector: Optional[RaidenFaultInjector] = None
 def start(*, role: str, ranks: int) -> None:
     """Set up this process's injector when a preset is selected."""
     global _injector
-    name = envs.SGLANG_TEST_RAIDEN_FAULTS.get()
+    name = envs.SGLANG_TEST_RAIDEN_FAULT_INJECTION.get()
     if not name or _injector is not None:
         return
     config = load_config()
     if name not in config.presets:
         raise ValueError(
-            f"SGLANG_TEST_RAIDEN_FAULTS={name!r} is not a preset of {CONFIG_PATH}, "
-            f"use one of {sorted(config.presets)}"
+            f"SGLANG_TEST_RAIDEN_FAULT_INJECTION={name!r} is not a preset of "
+            f"{CONFIG_PATH}, use one of {sorted(config.presets)}"
         )
     # TPU-only import: tpu-sync is absent on hosts without the TPU stack.
     from tpu_sync.api.torch import fault_injection as native

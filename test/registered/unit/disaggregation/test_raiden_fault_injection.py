@@ -191,13 +191,13 @@ class TestStart(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_unset_selects_nothing(self):
-        with envs.SGLANG_TEST_RAIDEN_FAULTS.override(None):
+        with envs.SGLANG_TEST_RAIDEN_FAULT_INJECTION.override(None):
             fault_injection.start(role="decode", ranks=RANKS)
         self.assertFalse(fault_injection.active())
         fault_injection.note_read(room=1, layers=LAYERS_PER_READ)
 
     def test_unknown_preset_is_refused(self):
-        with envs.SGLANG_TEST_RAIDEN_FAULTS.override("delay_5"):
+        with envs.SGLANG_TEST_RAIDEN_FAULT_INJECTION.override("delay_5"):
             with self.assertRaises(ValueError):
                 fault_injection.start(role="decode", ranks=RANKS)
 
@@ -215,7 +215,7 @@ class TestStart(unittest.TestCase):
             "tpu_sync.api.torch.fault_injection": module,
         }
         with patch.dict(sys.modules, modules):
-            with envs.SGLANG_TEST_RAIDEN_FAULTS.override("delay_5s"):
+            with envs.SGLANG_TEST_RAIDEN_FAULT_INJECTION.override("delay_5s"):
                 fault_injection.start(role="prefill", ranks=RANKS)
         self.assertTrue(fault_injection.active())
         for room in range(fault_injection._WARMUP_REQUESTS):
