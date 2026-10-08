@@ -30,6 +30,12 @@ class ScheduleBatchDisaggregationDecodeMixin:
         """
 
         self.forward_mode = ForwardMode.PREBUILT
+        input_device = self.device
+        if _is_tpu:
+            from sglang.srt.platforms import current_platform
+
+            input_device = current_platform.get_batch_input_device(self)
+            self.tpu_input_device = input_device
         reqs = self.reqs
         # PREBUILT never enters a model forward. Keep the legacy scalar metadata,
         # but do not flatten and copy every transferred prompt to the GPU only to
@@ -91,11 +97,17 @@ class ScheduleBatchDisaggregationDecodeMixin:
             req_pool_indices, dtype=torch.int64, device=self.device
         )
         self.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=input_device)
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        self.orig_seq_lens = torch.tensor(
-            seq_lens, dtype=torch.int32, device=self.device
-        )
+        if _is_tpu:
+            self.tpu_orig_seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32)
+            self.orig_seq_lens = self.tpu_orig_seq_lens_cpu.to(
+                input_device, non_blocking=True
+            )
+        else:
+            self.orig_seq_lens = torch.tensor(
+                seq_lens, dtype=torch.int32, device=input_device
+            )
         self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)
 

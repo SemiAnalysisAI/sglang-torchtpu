@@ -307,6 +307,13 @@ def alloc_paged_token_slots_extend(
 
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
     extra_alloc_kwargs = {}
+    if (
+        _is_tpu
+        and batch is not None
+        and getattr(batch, "tpu_input_device", None) == "cpu"
+        and torch.device(batch.device).type != "cpu"
+    ):
+        extra_alloc_kwargs["output_device"] = "cpu"
     kv_shard_rotation_bases = None
     if page_interleave_shard_size(allocator) > 1:
         kv_shard_rotation_bases = _kv_shard_rotation_bases(
@@ -486,8 +493,11 @@ def alloc_for_extend(
     extend_lens_cpu = torch.tensor(
         batch.extend_lens, dtype=torch.int64, pin_memory=pin_memory
     )
-    prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
-    extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
+    input_device = batch.device
+    if _is_tpu:
+        input_device = getattr(batch, "tpu_input_device", None) or batch.device
+    prefix_lens_device = prefix_lens_cpu.to(input_device, non_blocking=True)
+    extend_lens_device = extend_lens_cpu.to(input_device, non_blocking=True)
 
     # Allocate req slots (raises RuntimeError if the pool is exhausted)
     req_pool_indices = alloc_req_slots(
@@ -671,6 +681,13 @@ def alloc_paged_token_slots_decode(
     # returns a DSV4OutCacheLoc bundle; hasattr-gated so others stay unchanged.
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
     extra_alloc_kwargs = {}
+    if (
+        _is_tpu
+        and batch is not None
+        and getattr(batch, "tpu_input_device", None) == "cpu"
+        and torch.device(batch.device).type != "cpu"
+    ):
+        extra_alloc_kwargs["output_device"] = "cpu"
     if is_dsv4:
         c128_num_pages = allocator.c128_num_pages_needed(
             (seq_lens_cpu - 1).clamp(min=0), seq_lens_cpu

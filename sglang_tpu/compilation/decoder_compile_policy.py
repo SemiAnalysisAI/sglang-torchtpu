@@ -19,7 +19,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active, prepare_cp_forward
 from sglang.srt.layers.dp_attention import dp_gather_width, is_dp_attention_enabled
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -50,8 +50,10 @@ from sglang_tpu.compilation.attention_rank_inputs import (
 )
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.compiled_forward_shim import (
+    _BS_FIELDS,
     _REAL_B_KEY,
     _REAL_Q_KEY,
+    _TOKEN_FIELDS,
     CompiledForwardShim,
     _extend_batch_cap,
     _pad_forward_batch_inputs,
@@ -941,6 +943,34 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 self.b_bucketer,
                 extend_bs=self.extend_bs,
             )
+        # These are the explicitly host-staged model inputs. Scheduler relay
+        # keys and device-produced tokens are never moved back to CPU.
+        for name in (
+            *_TOKEN_FIELDS,
+            *_BS_FIELDS,
+            "global_num_tokens_gpu",
+            "global_num_tokens_for_logprob_gpu",
+        ):
+            if name == "req_pool_indices_cpu":
+                continue
+            value = getattr(forward_batch, name, None)
+            if isinstance(value, torch.Tensor) and value.device.type == "cpu":
+                setattr(
+                    forward_batch,
+                    name,
+                    # torch_tpu retains the CPU backing tensor in PJRT's
+                    # on_done_with_host_buffer callback until H2D completes.
+                    value.to(self.model_runner.device, non_blocking=True),
+                )
+        mixed_tokens = getattr(forward_batch, "tpu_mixed_input_tokens", None)
+        if mixed_tokens is not None:
+            # Tensor offsets keep the prompt length as data, not an XLA shape.
+            tail_start = real_q - mixed_tokens.numel()
+            indices = torch.arange(tail_start, real_q, dtype=torch.int64).to(
+                forward_batch.input_ids.device, non_blocking=True
+            )
+            forward_batch.input_ids.index_copy_(0, indices, mixed_tokens)
+            forward_batch.tpu_mixed_input_tokens = None
         setattr(forward_batch, _REAL_Q_KEY, real_q)
         setattr(forward_batch, _REAL_B_KEY, real_b)
         spec_info = forward_batch.spec_info
@@ -1684,6 +1714,76 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             )
         return super().install()
 
+    def _has_eager_outer_logits(self) -> bool:
+        runner = getattr(self, "model_runner", None)
+        if runner is None:
+            return False
+        model = runner.model
+        spec = getattr(runner, "spec_algorithm", None)
+        return (
+            self.owner is not None
+            and self._uses_input_embeds(self.owner)
+            and self.owner is getattr(model, "model", None)
+            and getattr(getattr(runner, "model_config", None), "is_generation", False)
+            and model.pp_group.is_last_rank
+            and spec is not None
+            and spec.is_none()
+        )
+
+    def _precompile_eager_logits(self, mode: ForwardMode) -> None:
+        """The VL compile boundary ends before the outer logits processor.
+
+        Prefill gathers real request-final rows from a token bucket. Decode
+        trims a batch bucket. Warm both physical and logical shapes, including
+        the strided metadata views produced by restoring a padded batch.
+        """
+        if not self._has_eager_outer_logits():
+            return
+        start = time.perf_counter()
+        runner = self.model_runner
+        model = runner.model
+        if mode == ForwardMode.DECODE:
+            shapes = [
+                (self.b_bucketer.next_bucket(bs), bs, bs)
+                for bs in range(1, self.b_bucketer.max_val + 1)
+            ]
+        else:
+            shapes = [
+                (q, bs, cap)
+                for q, cap, _ in self._extend_compile_cases()
+                for bs in range(1, cap + 1)
+            ]
+        shapes = sorted(set(shapes))
+        with torch.no_grad():
+            for num_tokens, bs, cap in shapes:
+                # Match materialized decoder outputs, not lazy device zeros.
+                hidden = torch.zeros(
+                    (num_tokens, runner.model_config.hidden_size),
+                    dtype=runner.dtype,
+                ).to(runner.device)
+                if mode == ForwardMode.DECODE:
+                    hidden = self._trim_q(hidden, bs)
+                    lengths = None
+                else:
+                    lengths = torch.ones(cap, dtype=torch.int32).to(runner.device)
+                    if bs < cap:
+                        lengths = lengths[:bs]
+                out = model.logits_processor(
+                    None,
+                    hidden,
+                    model.lm_head,
+                    LogitsMetadata(forward_mode=mode, extend_seq_lens=lengths),
+                )
+                # These logits have logical rows, unlike whole-model compiled
+                # outputs whose padded-row views the scheduler warmup covers.
+                torch.argmax(out.next_token_logits, dim=-1).cpu()
+        logger.info(
+            "[decoder compile policy] VL outer logits: warmed %d %s shapes in %.1fs",
+            len(shapes),
+            mode.name,
+            time.perf_counter() - start,
+        )
+
     @property
     def _num_deepstack(self) -> int:
         model = getattr(self.model_runner, "model", None)
@@ -1758,12 +1858,25 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         return t if t.shape[0] == real_q else t[:real_q]
 
     def finalize_forward_batch(self, outputs: Any, forward_batch: Any) -> Any:
-        """Slice the inner VL decoder output before outer logits processing."""
+        """Restore logical metadata, keeping ordinary prefill hidden rows bucketed."""
         real_q = getattr(forward_batch, _REAL_Q_KEY, None)
         out = super().finalize_forward_batch(outputs, forward_batch)
         if real_q is None:
             return out
         if isinstance(out, torch.Tensor):
+            if (
+                self._has_eager_outer_logits()
+                and forward_batch.forward_mode
+                in (ForwardMode.EXTEND, ForwardMode.MIXED)
+                and forward_batch.capture_hidden_mode == CaptureHiddenMode.NULL
+                and not forward_batch.return_logprob
+            ):
+                # The outer logits processor gathers only each real request's
+                # last row using the restored extend lengths. A preliminary
+                # slice would specialize that gather on every prompt length.
+                # Keep the token bucket; logical batch metadata is already
+                # restored above, so no ghost logits reach the sampler.
+                return out
             return self._trim_q(out, real_q)
         if isinstance(out, PPProxyTensors):
             # Intermediate pipeline stages must transmit the padded proxy. The
@@ -1861,6 +1974,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                     f"in {elapsed:.1f}s{hbm_str}"
                 )
         self._precompile_mm_embed_placement()
+        self._precompile_eager_logits(ForwardMode.EXTEND)
         return pending
 
     def _precompile_mm_embed_placement(self) -> None:
@@ -1883,6 +1997,10 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         start = time.perf_counter()
         with torch.no_grad():
             for num_tokens in buckets:
+                # embed_mm_inputs clamps image placeholder IDs before lookup.
+                torch.zeros(num_tokens, dtype=torch.int64).to(device).clamp_(
+                    min=0, max=embed_tokens.num_embeddings - 1
+                ).cpu()
                 apply_host_mm_embeds(
                     input_embeds=torch.zeros(
                         (num_tokens, hidden), dtype=dtype, device=device
@@ -1968,6 +2086,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                     f"{status} VL DECODE (bs={bs}, variant={variant}, "
                     f"logits={logits_output_mode.name}) in {elapsed:.1f}s{hbm_str}"
                 )
+        self._precompile_eager_logits(ForwardMode.DECODE)
         return pending
 
     def _make_warmup_inputs(

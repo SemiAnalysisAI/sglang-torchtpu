@@ -29,6 +29,7 @@ from jax.experimental.pallas.ops.tpu.paged_attention.paged_attention_kernel impo
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang_tpu.kernels.flash_attention import (
+    BlockSizes,
     SegmentIds,
     flash_attention,
 )
@@ -485,6 +486,12 @@ def _get_vision_flash_op(sm_scale: float):
             segment_ids=SegmentIds(q=seg_ids, kv=seg_ids),
             causal=False,
             sm_scale=sm_scale,
+            # The default single-step kernel tiles the entire KV sequence.
+            # Large vision buckets exceed TPU VMEM with the segment mask;
+            # fixed tiles bound scratch memory independently of image size.
+            block_sizes=BlockSizes(
+                block_q=128, block_k_major=128, block_k=128, block_b=1
+            ),
             vmem_limit_bytes=None,
         )
 

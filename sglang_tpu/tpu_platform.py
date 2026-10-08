@@ -935,6 +935,47 @@ class TpuSRTPlatform(SRTPlatform):
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
 
+    def get_batch_input_device(self, batch) -> str:
+        """Place eligible TPU inputs on CPU until decoder padding/materialization."""
+        from sglang_tpu.allocator_tpu import (
+            TpuPagedTokenToKVPoolAllocator,
+        )
+        from sglang.srt.layers.cp.utils import get_cp_strategy
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+        from sglang.srt.runtime_context import get_exec, get_flags
+
+        allocator = batch.token_to_kv_pool_allocator
+        host_allocator = type(allocator) is TpuPagedTokenToKVPoolAllocator or (
+            type(allocator) is SWATokenToKVPoolAllocator
+            and type(allocator.full_attn_allocator) is TpuPagedTokenToKVPoolAllocator
+            and type(allocator.swa_attn_allocator) is TpuPagedTokenToKVPoolAllocator
+            and allocator.full_to_swa_index_mapping.device.type == "cpu"
+        )
+        # Start with the ordinary host-table path. Speculative acceptance,
+        # beam expansion and embedding overrides consume tensors before padding
+        # and retain their device contract.
+        if (
+            get_flags().capture.enable_torch_compile
+            and batch.spec_algorithm.is_none()
+            and batch.dllm_config is None
+            and not batch.model_config.is_encoder_decoder
+            and not getattr(batch.model_config, "use_ngram_embedding", False)
+            and not any(
+                getattr(req, "beam_group", None) is not None
+                or getattr(req, "positional_embed_overrides", None) is not None
+                for req in batch.reqs
+            )
+            and batch.hisparse_coordinator is None
+            and not get_exec().mamba.enable_mamba_extra_buffer
+            and not get_exec().overlap.enable_two_batch_overlap
+            and get_cp_strategy() is None
+            and batch.req_to_token_pool.req_to_token.device.type == "cpu"
+            and host_allocator
+            and batch.token_to_kv_pool_allocator.page_size > 1
+        ):
+            return "cpu"
+        return batch.device
+
     def supports_torch_compile(self) -> bool:
         return True
 

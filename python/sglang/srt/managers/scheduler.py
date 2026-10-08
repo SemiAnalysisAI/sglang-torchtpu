@@ -672,6 +672,7 @@ class Scheduler(
         # Init overlap schedule
         self.init_overlap()
         self.maybe_init_kv_free_fence()
+        self.maybe_precompile_tpu_serving_ops()
 
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
@@ -1815,6 +1816,22 @@ class Scheduler(
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
             fence_hicache_backups(self.tree_cache.cache_controller, self.kv_free_fence)
+
+    def maybe_precompile_tpu_serving_ops(self) -> None:
+        if not current_platform.is_tpu():
+            return
+        from sglang_tpu.serving_op_precompile import (
+            precompile_serving_ops,
+        )
+
+        precompile_serving_ops(
+            compile_policy=self.tp_worker.model_runner.compile_policy,
+            future_map=self.future_map,
+            spec_algorithm=self.spec_algorithm,
+            max_running_requests=self.max_running_requests,
+            vocab_size=self.model_config.vocab_size,
+            enable_mixed_chunk=get_schedule().enable_mixed_chunk,
+        )
 
     def precompile_tpu_spec_ops(self) -> None:
         from sglang_tpu.compilation.spec_decode_compile_policy import (

@@ -17,6 +17,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
+import importlib.util
 import math
 import unittest
 
@@ -101,6 +102,49 @@ class TestVisionFlashOpWrapper(CustomTestCase):
         # fresh segment) did not bleed into real tokens' softmax.
         out, ref = self._run([10, 90], h=4, d=32, seed=3)
         torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch_tpu"), "Requires TPU")
+class TestVisionFlashOpKernel(CustomTestCase):
+    def test_segment_attention_across_key_tiles(self):
+        import torch_tpu  # noqa: F401
+
+        from sglang_tpu.attention_pallas import (
+            _get_vision_flash_op,
+        )
+
+        # 22016 is the padded width of the 21904-patch vision bucket that
+        # exceeded 32 MiB VMEM in the full-KV, single-step kernel. Unequal
+        # segments cross tile boundaries and check that image masks survive
+        # the online softmax accumulation.
+        for width in (512, 22016):
+            with self.subTest(width=width):
+                torch.manual_seed(width)
+                q, k, v = [
+                    torch.randn(1, 2, width, 72, dtype=torch.bfloat16) for _ in range(3)
+                ]
+                seg = torch.empty(1, width, dtype=torch.int32)
+                ref = torch.empty_like(q)
+                start = 0
+                image = 0
+                while start < width:
+                    end = min(width, start + (97, 131, 257)[image % 3])
+                    seg[:, start:end] = image
+                    sl = slice(start, end)
+                    scores = (
+                        q[:, :, sl].float()
+                        @ k[:, :, sl].float().transpose(-1, -2)
+                        / math.sqrt(72)
+                    )
+                    ref[:, :, sl] = (scores.softmax(-1) @ v[:, :, sl].float()).to(
+                        q.dtype
+                    )
+                    start = end
+                    image += 1
+                actual = _get_vision_flash_op(1.0 / math.sqrt(72))(
+                    q.to("tpu"), k.to("tpu"), v.to("tpu"), seg.to("tpu")
+                ).cpu()
+                torch.testing.assert_close(actual, ref, atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":

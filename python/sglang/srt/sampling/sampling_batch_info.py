@@ -16,6 +16,7 @@ from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.utils import is_tpu
 from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+_is_tpu = is_tpu()
 
 
 def _rows_to_device_indices(
@@ -123,6 +125,8 @@ class SamplingBatchInfo:
 
         reqs = batch.reqs
         device = batch.device
+        host_params = _is_tpu and getattr(batch, "tpu_input_device", None) == "cpu"
+        parameter_device = "cpu" if host_params else device
         _pin = is_pin_memory_available(device)
         # Match the [B, 1] device allocation produced by merging/filtering.
         # A device-side view of [B] gives TorchTPU a different compiled input.
@@ -133,24 +137,24 @@ class SamplingBatchInfo:
                 pin_memory=_pin,
             )
             .view(-1, 1)
-            .to(device, non_blocking=True)
+            .to(parameter_device, non_blocking=True)
         )
         top_ps = torch.tensor(
             [r.sampling_params.top_p for r in reqs],
             dtype=torch.float,
             pin_memory=_pin,
-        ).to(device, non_blocking=True)
+        ).to(parameter_device, non_blocking=True)
         top_k_values = [r.sampling_params.top_k for r in reqs]
         top_ks = torch.tensor(
             top_k_values,
             dtype=torch.int32,
             pin_memory=_pin,
-        ).to(device, non_blocking=True)
+        ).to(parameter_device, non_blocking=True)
         min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs],
             dtype=torch.float,
             pin_memory=_pin,
-        ).to(device, non_blocking=True)
+        ).to(parameter_device, non_blocking=True)
         sampling_seed = (
             torch.tensor(
                 [
@@ -163,7 +167,7 @@ class SamplingBatchInfo:
                 ],
                 dtype=torch.int64,
                 pin_memory=_pin,
-            ).to(device, non_blocking=True)
+            ).to(parameter_device, non_blocking=True)
             if enable_deterministic
             else None
         )
@@ -292,6 +296,12 @@ class SamplingBatchInfo:
             ),
             sampling_mask_top_ks=sampling_mask_top_ks,
         )
+        if host_params:
+            from sglang_tpu.sampling_params import (
+                initialize_sampling_params,
+            )
+
+            initialize_sampling_params(ret)
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
 
@@ -438,13 +448,24 @@ class SamplingBatchInfo:
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices)
 
-        for item in [
-            "temperatures",
-            "top_ps",
-            "top_ks",
-            "min_ps",
-            "sampling_seed",
-        ]:
+        params_filtered = False
+        if _is_tpu:
+            from sglang_tpu.sampling_params import (
+                filter_sampling_params,
+            )
+
+            params_filtered = filter_sampling_params(self, keep_indices)
+        for item in (
+            []
+            if params_filtered
+            else [
+                "temperatures",
+                "top_ps",
+                "top_ks",
+                "min_ps",
+                "sampling_seed",
+            ]
+        ):
             value = getattr(self, item, None)
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
@@ -568,13 +589,24 @@ class SamplingBatchInfo:
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
-        for item in [
-            "temperatures",
-            "top_ps",
-            "top_ks",
-            "min_ps",
-            "sampling_seed",
-        ]:
+        params_merged = False
+        if _is_tpu:
+            from sglang_tpu.sampling_params import (
+                merge_sampling_params,
+            )
+
+            params_merged = merge_sampling_params(self, other)
+        for item in (
+            []
+            if params_merged
+            else [
+                "temperatures",
+                "top_ps",
+                "top_ks",
+                "min_ps",
+                "sampling_seed",
+            ]
+        ):
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
             if self_val is not None and other_val is not None:
