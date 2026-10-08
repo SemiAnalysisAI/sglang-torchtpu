@@ -164,6 +164,7 @@ class TpuPlatform(Platform):
         from sglang.srt.hardware_backend.tpu.patches import (
             _patch_set_device_tolerate_mismatch,
             _prepare_tpu_env,
+            _register_aten_fallbacks,
         )
 
         # srt's activate() selects CPU-only JAX for TorchTPU processes; the
@@ -183,6 +184,8 @@ class TpuPlatform(Platform):
 
         # PJRT owns the chiplet binding; local_rank is only a label.
         _patch_set_device_tolerate_mismatch()
+        # srt's kernels for ATen ops torch_tpu lacks (e.g. logaddexp).
+        _register_aten_fallbacks()
 
         _install_device_module_shims()
         torch.zeros(1, device="tpu")
