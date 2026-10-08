@@ -356,6 +356,11 @@ class RaidenKVManager(
         self._kv_caches = list(kv_caches.full)
         self._swa_kv_caches = list(kv_caches.swa)
         if self._pipeline_enabled:
+            if getattr(self, "is_dummy_cp_rank", False):
+                # Prefill CP rank 0 holds the whole sequence and is the only
+                # source the decode pulls from; the sender skips the others.
+                self.chunked_transfer = False
+                return
             from sglang_tpu.disaggregation.raiden.pipeline import PipelineTransfer
 
             pipeline = PipelineTransfer(self, kv_caches)
