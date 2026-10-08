@@ -333,6 +333,14 @@ class RaidenSenderMixin:
             self._maybe_reply(room)
         return True
 
+    def on_forward_launched(self, scheduler, mb_id: int, batch, result) -> None:
+        if self._pipeline is not None:
+            self._pipeline.final_chunks.launched(scheduler, mb_id, batch, result)
+
+    def on_outputs_copied(self, mb_id: int, next_token_ids) -> None:
+        if self._pipeline is not None:
+            self._pipeline.final_chunks.tokens_copied(mb_id, next_token_ids)
+
     def _decode_asked_locked(self, room: int) -> bool:
         """Whether the decode asked to pull the room, cleared it to push, or
         requested its pipeline transfer."""
@@ -1093,6 +1101,14 @@ class RaidenKVSender(CommonKVSender):
     # A group-wide Failed is delivered only after every rank drained: raiden
     # cannot cancel a transfer, so a peer's pages must not be freed under it.
     group_failure_requires_drain = True
+
+    @property
+    def pages_exposed_before_result(self) -> bool:
+        # A transfer may read the pages before the result point, which then
+        # keeps them out of the radix cache: stage groups and early close
+        # register a pipeline stage's pages at the final chunk's launch.
+        pipeline = self.kv_mgr._pipeline
+        return pipeline is not None and (pipeline.stage_parts or pipeline.early_close)
 
     def __init__(
         self,
