@@ -384,6 +384,7 @@ def batched_rpa_pcp_forward(
     base_meta,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Executes the two-phase PCP forward pass on Batched RPA.
 
@@ -432,6 +433,18 @@ def batched_rpa_pcp_forward(
 
     q_op = q_logical
 
+    sliding_window = getattr(layer, "sliding_window_size", None)
+    if sliding_window is not None and sliding_window <= 0:
+        sliding_window = None
+    elif sliding_window is not None:
+        sliding_window += 1
+
+    is_swa_layer = sliding_window is not None
+    if is_swa_layer and getattr(base_meta, "swa_page_indices", None) is not None:
+        raw_pages = base_meta.swa_page_indices
+    else:
+        raw_pages = base_meta.page_indices
+
     # 1. Cache Phase (Ring Attention over ICI)
     context_out = None
     context_lse = None
@@ -449,10 +462,10 @@ def batched_rpa_pcp_forward(
             pcp_meta.q_positions,
             pcp_meta.kv_new_lens,
             cp_rank_tensor,
-            base_meta.page_indices,
+            raw_pages,
             cache_update_kv,
             float(layer.scaling),
-            None,
+            sliding_window,
             layer.logit_cap if getattr(layer, "logit_cap", 0) else None,
             k_scale,
             v_scale,
@@ -486,8 +499,8 @@ def batched_rpa_pcp_forward(
     # For the 2-chunk zigzag schedule, each request consists of 2 virtual sequences
     # (head chunk and tail chunk) on this rank.
     curr_kv_lens = pcp_meta.pcp_cache_lens.repeat_interleave(2) + pcp_meta.kv_new_lens
-    pages_per_seq = base_meta.page_indices.shape[0] // num_reqs
-    pages_2d = base_meta.page_indices.view(num_reqs, pages_per_seq)
+    pages_per_seq = raw_pages.shape[0] // num_reqs
+    pages_2d = raw_pages.view(num_reqs, pages_per_seq)
     owned_pages = pages_2d[:, cp_rank::cp_size]
     pad_len = pages_per_seq - owned_pages.shape[1]
     if pad_len > 0:
@@ -513,7 +526,7 @@ def batched_rpa_pcp_forward(
         pcp_meta.new_kv_page_indices,
         curr_update_kv,
         float(layer.scaling),
-        None,
+        sliding_window,
         layer.logit_cap if getattr(layer, "logit_cap", 0) else None,
         k_scale,
         v_scale,
@@ -526,9 +539,17 @@ def batched_rpa_pcp_forward(
 
     # 3. Softmax State Merge
     if context_out is not None and context_lse is not None:
-        out, _ = merge_attn_states(context_out, context_lse, curr_out, curr_lse)
+        out, lse = merge_attn_states(context_out, context_lse, curr_out, curr_lse)
     else:
         out = curr_out
+        lse = curr_lse
+
+    # Fold in attention sinks if present (e.g. GPT-OSS-120B)
+    if sinks is None:
+        sinks = getattr(layer, "sinks", None)
+    if sinks is not None:
+        out = out * torch.sigmoid(lse - sinks.to(torch.float32))[..., None]
+        out = out.to(q.dtype)
 
     if pad_size > 0:
         out = torch.cat([out, out.new_zeros(pad_size, *out.shape[1:])], dim=0)
@@ -573,9 +594,21 @@ def batched_rpa_dcp_forward(
         device, cp_rank, ref_tensor=base_meta.kv_lens
     )
 
+    sliding_window = getattr(layer, "sliding_window_size", None)
+    if sliding_window is not None and sliding_window <= 0:
+        sliding_window = None
+    elif sliding_window is not None:
+        sliding_window += 1
+
+    is_swa_layer = sliding_window is not None
+    if is_swa_layer and getattr(base_meta, "swa_page_indices", None) is not None:
+        raw_pages = base_meta.swa_page_indices
+    else:
+        raw_pages = base_meta.page_indices
+
     num_reqs = base_meta.kv_lens.shape[0]
-    pages_per_seq = base_meta.page_indices.shape[0] // num_reqs
-    pages_2d = base_meta.page_indices.view(num_reqs, pages_per_seq)
+    pages_per_seq = raw_pages.shape[0] // num_reqs
+    pages_2d = raw_pages.view(num_reqs, pages_per_seq)
 
     # Local striped pages for this rank:
     owned_pages = pages_2d[:, cp_rank::cp_size]
@@ -609,7 +642,7 @@ def batched_rpa_dcp_forward(
         None,
         cache_update_kv,
         float(layer.scaling),
-        None,
+        sliding_window,
         layer.logit_cap if getattr(layer, "logit_cap", 0) else None,
         k_scale,
         v_scale,
@@ -636,7 +669,7 @@ def batched_rpa_dcp_forward(
         None,
         curr_update_kv,
         float(layer.scaling),
-        None,
+        sliding_window,
         layer.logit_cap if getattr(layer, "logit_cap", 0) else None,
         k_scale,
         v_scale,

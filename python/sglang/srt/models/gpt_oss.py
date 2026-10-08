@@ -37,6 +37,7 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
+    is_enable_moe_cp_allgather,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -325,6 +326,25 @@ class GptOssSparseMoeBlock(nn.Module):
         num_tokens = hidden_states.shape[0]
         hidden_dim_unpadded = self.hidden_size
         is_prepadded = hidden_states.shape[-1] != hidden_dim_unpadded
+
+        cp_gather = (
+            get_parallel().attn_cp_size > 1
+            and is_enable_moe_cp_allgather()
+            and num_tokens > 0
+        )
+        if cp_gather:
+            local_tokens = num_tokens
+            cp_size = get_parallel().attn_cp_size
+            cp_rank = get_parallel().attn_cp_rank
+            gathered = torch.empty(
+                (local_tokens * cp_size, hidden_states.shape[-1]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            get_parallel().attn_cp_group.all_gather_into_tensor(gathered, hidden_states)
+            hidden_states = gathered
+            num_tokens = hidden_states.shape[0]
+
         if is_prepadded:
             router_input = hidden_states[..., :hidden_dim_unpadded]
         else:
@@ -338,6 +358,12 @@ class GptOssSparseMoeBlock(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
 
         final_hidden_states = reduce_moe_output(final_hidden_states)
+
+        if cp_gather:
+            final_hidden_states = final_hidden_states[
+                cp_rank * local_tokens : (cp_rank + 1) * local_tokens
+            ]
+            num_tokens = local_tokens
 
         # When input was pre-padded, FusedMoE.forward_impl captured the
         # padded width as `origin_hidden_states_dim` and skipped its own
