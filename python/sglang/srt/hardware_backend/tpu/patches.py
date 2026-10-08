@@ -12,6 +12,10 @@ from __future__ import annotations
 import importlib
 import os
 from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
@@ -872,12 +876,171 @@ def _patch_pd_decode_swa_hicache() -> None:
     pd_decode_swa_hicache.install()
 
 
+class _TpuDeviceContext:
+    """Context-manager that changes the selected TPU device."""
+
+    def __init__(self, device: torch.device | int | str | None):
+        import torch
+
+        if isinstance(device, torch.device):
+            self.idx = device.index
+        elif isinstance(device, str):
+            try:
+                self.idx = torch.device(device).index
+            except Exception:
+                self.idx = None
+        else:
+            self.idx = device
+        self.prev = None
+
+    def __enter__(self):
+        import torch
+
+        if self.idx is not None and (not isinstance(self.idx, int) or self.idx >= 0):
+            try:
+                self.prev = torch.accelerator.current_device_index()
+                torch.accelerator.set_device_index(self.idx)
+            except Exception:
+                pass
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        import torch
+
+        if self.prev is not None:
+            try:
+                torch.accelerator.set_device_index(self.prev)
+            except Exception:
+                pass
+
+
+_BRIDGE_APPLIED = False
+_GET_DEVICE_MODULE_HOOKED = False
+
+
+def bridge_tpu_device_module(tpu_mod: Any = None) -> Any:
+    """Ensure ``torch.tpu`` implements the full device module contract.
+
+    Delegates core runtime operations (synchronize, device queries, memory)
+    to canonical ``torch.accelerator.*`` methods, satisfying PyTorch's
+    ``get_device_module`` protocol.
+    """
+    global _BRIDGE_APPLIED
+    import torch
+
+    if tpu_mod is None:
+        tpu_mod = getattr(torch, "tpu", None)
+
+    if tpu_mod is None:
+        return None
+
+    bridge_methods: dict[str, Any] = {
+        "synchronize": lambda device=None: torch.accelerator.synchronize(device),
+        "is_available": lambda: torch.accelerator.is_available(),
+        "device_count": lambda: torch.accelerator.device_count(),
+        "current_device": lambda: torch.accelerator.current_device_index(),
+        "current_device_index": lambda: torch.accelerator.current_device_index(),
+        "set_device": lambda dev: torch.accelerator.set_device_index(dev),
+        "set_device_index": lambda dev: torch.accelerator.set_device_index(dev),
+        "empty_cache": lambda: getattr(
+            torch.accelerator, "empty_cache", lambda: None
+        )(),
+        "memory_allocated": lambda dev=None: getattr(
+            torch.accelerator, "memory_allocated", lambda d=None: 0
+        )(dev),
+        "max_memory_allocated": lambda dev=None: getattr(
+            torch.accelerator, "max_memory_allocated", lambda d=None: 0
+        )(dev),
+        "memory_reserved": lambda dev=None: getattr(
+            torch.accelerator, "memory_reserved", lambda d=None: 0
+        )(dev),
+        "max_memory_reserved": lambda dev=None: getattr(
+            torch.accelerator, "max_memory_reserved", lambda d=None: 0
+        )(dev),
+        "reset_peak_memory_stats": lambda dev=None: getattr(
+            torch.accelerator, "reset_peak_memory_stats", lambda d=None: None
+        )(dev),
+        "is_current_stream_capturing": lambda: False,
+    }
+
+    for name, fn in bridge_methods.items():
+        try:
+            setattr(tpu_mod, name, fn)
+        except Exception:
+            logger.debug("Failed to set %s on tpu device module", name, exc_info=True)
+
+    if not hasattr(tpu_mod, "device"):
+        setattr(tpu_mod, "device", _TpuDeviceContext)
+
+    if hasattr(torch.accelerator, "current_stream"):
+        setattr(
+            tpu_mod,
+            "current_stream",
+            lambda dev=None: torch.accelerator.current_stream(dev),
+        )
+    if hasattr(torch.accelerator, "set_stream"):
+        setattr(
+            tpu_mod,
+            "set_stream",
+            lambda stream: torch.accelerator.set_stream(stream),
+        )
+
+    if not hasattr(tpu_mod, "get_device_name"):
+        setattr(tpu_mod, "get_device_name", lambda dev=0: "tpu")
+    if not hasattr(tpu_mod, "get_device_properties"):
+        setattr(tpu_mod, "get_device_properties", lambda dev=0: None)
+
+    _hook_get_device_module()
+    _BRIDGE_APPLIED = True
+    return tpu_mod
+
+
+def _hook_get_device_module() -> None:
+    """Wrap ``torch.get_device_module`` to ensure TPU returns the bridged module."""
+    global _GET_DEVICE_MODULE_HOOKED
+    import torch
+
+    if _GET_DEVICE_MODULE_HOOKED:
+        return
+
+    orig_fn = getattr(torch, "get_device_module", None)
+    if orig_fn is None:
+        return
+
+    def _bridged_get_device_module(device: torch.device | str | None = None) -> Any:
+        import torch
+
+        mod = orig_fn(device)
+        is_tpu_dev = False
+        if device is not None:
+            dev_type = getattr(torch.device(device), "type", str(device))
+            is_tpu_dev = dev_type == "tpu"
+        else:
+            is_tpu_dev = hasattr(torch, "tpu") and (mod is getattr(torch, "tpu", None))
+
+        if is_tpu_dev and mod is not None:
+            return bridge_tpu_device_module(mod)
+        return mod
+
+    _bridged_get_device_module.__name__ = getattr(
+        orig_fn, "__name__", "get_device_module"
+    )
+    _bridged_get_device_module.__doc__ = getattr(orig_fn, "__doc__", "")
+    torch.get_device_module = _bridged_get_device_module
+    _GET_DEVICE_MODULE_HOOKED = True
+
+
+def _bridge_tpu_device_module() -> None:
+    bridge_tpu_device_module()
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
     Distributed environment preparation is a separate launch step and must
     complete before this function imports JAX- or TorchTPU-backed modules.
     """
+    _bridge_tpu_device_module()
     _configure_eager_mode()
     _register_tpu_compile_backend()
     _register_tpu_sampler_backend()

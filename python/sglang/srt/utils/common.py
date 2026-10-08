@@ -606,6 +606,14 @@ def get_device_module():
         return torch.xpu
     if is_musa():
         return torch.musa
+    if is_tpu():
+        from sglang.srt.hardware_backend.tpu.patches import (
+            bridge_tpu_device_module,
+        )
+
+        mod = bridge_tpu_device_module()
+        if mod is not None:
+            return mod
     return torch.get_device_module()
 
 
