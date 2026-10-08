@@ -249,9 +249,7 @@ class TestDecodeUsesEveryRank(unittest.TestCase):
             return SimpleNamespace(
                 use_parallel_decode=True,
                 parallel_decode_mode=mode,
-                config=SimpleNamespace(
-                    auto_parallel_decode_shards_without_p2p=lambda: opted_in
-                ),
+                auto_parallel_decode_shards_without_p2p=opted_in,
             )
 
         cases = (
@@ -274,6 +272,40 @@ class TestDecodeUsesEveryRank(unittest.TestCase):
                 ),
             ):
                 self.assertEqual(decoding.decode_uses_every_rank(stub), expected)
+
+    def test_vae_policy_survives_an_arch_config_on_the_module(self):
+        # AutoencoderKLQwenImage replaces .config with its arch config; the
+        # policy comes from the VAEConfig given to ParallelTiledVAE.
+        from sglang.multimodal_gen.configs.models.vaes.qwenimage import (
+            QwenImageVAEConfig,
+        )
+        from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
+        from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+
+        class _ArchConfigVAE(ParallelTiledVAE):
+            def __init__(self, config):
+                super().__init__(config)
+                self.config = config.arch_config
+
+            def _encode(self, x):
+                return x
+
+            def _decode(self, z):
+                return z
+
+        platform = SimpleNamespace(supports_distributed_p2p=lambda: False)
+        with (
+            patch.object(decoding, "current_platform", platform),
+            patch.object(decoding, "model_parallel_is_initialized", return_value=True),
+            patch.object(decoding, "get_decode_parallel_world_size", return_value=2),
+        ):
+            for config, expected in (
+                (QwenImageVAEConfig(), False),
+                (WanVAEConfig(), True),
+            ):
+                with self.subTest(vae=type(config).__name__):
+                    vae = _ArchConfigVAE(config)
+                    self.assertEqual(decoding.decode_uses_every_rank(vae), expected)
 
 
 if __name__ == "__main__":

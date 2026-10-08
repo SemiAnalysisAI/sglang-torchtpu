@@ -60,10 +60,11 @@ def decode_uses_every_rank(vae) -> bool:
     if vae is None or not vae.use_parallel_decode:
         return False
     # Without p2p, auto mode shards only VAEs that opt in; the rest decode on
-    # one rank (should_use_spatial_shard_parallel_decode).
+    # one rank (should_use_spatial_shard_parallel_decode). Read from the VAE:
+    # some replace .config with their arch config.
     if not current_platform.supports_distributed_p2p() and (
         is_auto_parallel_decode_mode(vae.parallel_decode_mode)
-        and not vae.config.auto_parallel_decode_shards_without_p2p()
+        and not getattr(vae, "auto_parallel_decode_shards_without_p2p", False)
     ):
         return False
     return model_parallel_is_initialized() and get_decode_parallel_world_size() > 1
