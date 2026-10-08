@@ -1993,6 +1993,8 @@ class Envs:
     # Perf-only GLM-5.3-Flash escape hatch: attend densely up to this context even
     # past index_topk, which no longer matches DSA's top-k selection.
     SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT = EnvInt(None)
+    # GLM-5.3-Flash: one fused Pallas kernel per mHC site instead of the torch reference.
+    SGLANG_TPU_GLM_FLASH_FUSED_MHC = EnvBool(True)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)

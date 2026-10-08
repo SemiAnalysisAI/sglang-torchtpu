@@ -434,13 +434,60 @@ class Glm5NextModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.start_layer, self.end_layer = 0, config.num_hidden_layers
+        self.fused_mhc = envs.SGLANG_TPU_GLM_FLASH_FUSED_MHC.get()
+        if self.fused_mhc:
+            from sglang_tpu.glm_mhc import register_glm_mhc_ops
+
+            register_glm_mhc_ops()
 
     def forward(self, input_ids, forward_batch, input_embeds=None):
         x = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+        if self.fused_mhc:
+            return self._forward_fused_mhc(x, forward_batch)
         x = x.unsqueeze(-2).expand(-1, self.config.hc_mult, -1)
         for layer in self.layers:
             x = layer(x, forward_batch)
         return self.norm(x.mean(-2))
+
+    def prepare_fused_mhc(self):
+        """Pack each site's hc_base and hc_scale into the kernel's [1, VEC_WIDTH] row."""
+        from sglang_tpu.kernels.glm_mhc import VEC_WIDTH
+
+        for layer in self.layers:
+            for site in ("attn", "ffn"):
+                base = getattr(layer, f"hc_{site}_base").detach().float()
+                scale = getattr(layer, f"hc_{site}_scale").detach().float()
+                vec = torch.zeros(1, VEC_WIDTH, dtype=torch.float32, device=base.device)
+                vec[0, : base.numel()] = base
+                vec[0, base.numel() : base.numel() + 3] = scale
+                layer.register_buffer(f"hc_{site}_vec", vec, persistent=False)
+
+    def _forward_fused_mhc(self, x, forward_batch):
+        """Same math as Glm5NextDecoderLayer.forward, with each hc_post fused
+        into the following hc_pre: streams are [T, hc * hidden]."""
+        from sglang_tpu.glm_mhc import glm_mhc_ops
+
+        pre_op, seam_op, post_op = glm_mhc_ops()
+        c = self.config
+        h = c.hc_mult
+        site = (h, c.hc_sinkhorn_iters, float(c.rms_norm_eps), float(c.hc_eps))
+        res = x.unsqueeze(-2).expand(-1, h, -1).reshape(x.shape[0], -1)
+        first = self.layers[0]
+        layer_in, post, comb = pre_op(res, first.hc_attn_fn, first.hc_attn_vec, *site)
+        for i, layer in enumerate(self.layers):
+            out = layer.self_attn(layer.input_layernorm(layer_in), forward_batch)
+            res, layer_in, post, comb = seam_op(
+                out, res, post, comb, layer.hc_ffn_fn, layer.hc_ffn_vec, *site
+            )
+            out = layer.mlp(layer.post_attention_layernorm(layer_in), forward_batch)
+            if i + 1 < len(self.layers):
+                nxt = self.layers[i + 1]
+                res, layer_in, post, comb = seam_op(
+                    out, res, post, comb, nxt.hc_attn_fn, nxt.hc_attn_vec, *site
+                )
+            else:
+                res = post_op(out, res, post, comb, h)
+        return self.norm(res.view(-1, h, c.hidden_size).mean(-2))
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
@@ -582,6 +629,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
             attn = layer.self_attn
             if isinstance(attn, Glm5NextLinearAttention):
                 attn.attn.conv_weights = attn.qkv_conv1d.weight.squeeze(1)
+        if self.model.fused_mhc:
+            self.model.prepare_fused_mhc()
 
 
 # Replaces the upstream glm5_next implementation on TPU.
