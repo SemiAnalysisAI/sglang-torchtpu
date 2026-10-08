@@ -3094,6 +3094,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer=layer,
                     dispatch_output=dispatch_output,
                     activation=moe_runner_config.activation,
+                    swiglu_limit=moe_runner_config.swiglu_limit,
                 )
             from sglang.srt.hardware_backend.tpu.fp8_moe import apply_tpu_fp8_moe
 

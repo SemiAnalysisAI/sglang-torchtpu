@@ -1495,6 +1495,23 @@ class KVCacheConfigurator:
 
             pool_cls = DSV4NPUTokenToKVPool
             kv_layout_kwargs = {}
+        elif current_platform.is_tpu():
+            num_swa_only = sum(1 for r in compression_ratios if r == 0)
+            num_c4 = sum(1 for r in compression_ratios if r == 4)
+            num_c128 = sum(1 for r in compression_ratios if r == 128)
+            logger.info(
+                f"[DSV4-TPU Stage 1 Verified] Model & weights loaded, "
+                f"layers={len(compression_ratios)} (swa_only={num_swa_only}, c4={num_c4}, c128={num_c128}, "
+                f"kv_sources={len(kv_source_layers)}), "
+                f"pool_sizes=(full={full_max_total_num_tokens}, swa={swa_max_total_num_tokens}, "
+                f"c4={c4_max_total_num_tokens}, c128={c128_max_total_num_tokens}, "
+                f"c4_state={c4_state_pool_size}, c128_state={c128_state_pool_size}, "
+                f"max_reqs={max_running_requests}, page_size={swa_page_size})"
+            )
+            raise NotImplementedError(
+                "[DSV4-TPU Stage 1 Verified] Model config, weight loading, and DSV4PoolConfigurator "
+                "succeeded. Next step (Iteration 2): implement DSV4TPUTokenToKVPool."
+            )
         else:
             pool_cls = DeepSeekV4TokenToKVPool
             kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
