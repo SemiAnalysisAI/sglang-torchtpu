@@ -126,6 +126,29 @@ def _valid_rows_mask(row_start, row_end, unsort_idx):
     return (row_start <= unsort_idx) & (unsort_idx < row_end)
 
 
+def _drop_invalid_slots(
+    hidden_states, topk_ids, topk_weights, num_route_experts, zero_dropped_tokens
+):
+    """Route slots with an id outside ``[0, num_route_experts)`` to
+    ``num_route_experts`` with zero weight (TopK marks padded tokens -1).
+
+    That id sorts after every real row, has no group in ``group_sizes`` and
+    lies outside the EP row window, so no GMM computes the slot.
+    ``zero_dropped_tokens`` zeroes tokens with no live slot for the one-hot
+    permute matmul, which reads every row (``0 * NaN`` would reach real rows).
+    """
+    import jax.numpy as jnp
+
+    topk_ids = topk_ids.astype(jnp.int32)
+    dropped = (topk_ids < 0) | (topk_ids >= num_route_experts)
+    topk_ids = jnp.where(dropped, num_route_experts, topk_ids)
+    topk_weights = jnp.where(dropped, 0, topk_weights)
+    if zero_dropped_tokens:
+        token_dropped = jnp.all(dropped, axis=1, keepdims=True)
+        hidden_states = jnp.where(token_dropped, 0, hidden_states)
+    return hidden_states, topk_ids, topk_weights
+
+
 def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups, packed_fp4=False):
     """Pick a ``TileSizes`` for this gmm_v2 call.
 
@@ -445,11 +468,20 @@ def _fused_moe_jax(
     m_pad = _padded_token_count(m, topk, lhs_sublane_tiling(hidden_states.dtype))
     if m_pad != m:
         hidden_states = jnp.pad(hidden_states, ((0, m_pad - m), (0, 0)))
-        topk_ids = jnp.pad(topk_ids, ((0, m_pad - m), (0, 0)))  # pad -> expert 0
+        topk_ids = jnp.pad(
+            topk_ids, ((0, m_pad - m), (0, 0)), constant_values=-1
+        )  # pad -> dropped
         topk_weights = jnp.pad(
             topk_weights, ((0, m_pad - m), (0, 0))
         )  # pad -> weight 0
         m = m_pad
+    hidden_states, topk_ids, topk_weights = _drop_invalid_slots(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        max(global_num_experts, num_experts),
+        zero_dropped_tokens=m < permute_dense_threshold,
+    )
 
     # Routing: build a permutation that puts rows of hidden_states in
     # expert-major order so a single grouped-matmul covers GMM1 / GMM2.
@@ -556,13 +588,19 @@ def _fused_moe_jax(
         jnp.array([expert_group_offset], dtype=jnp.int32) if use_group_offset else None
     )
 
-    # The TensorCore path requires zero-initializing, while the SparseCore
-    # path does not since it skips masked rows entirely — rows the GMM
-    # never wrote are never read. no_combine gathers every row back, so it
-    # zero-initializes on both paths. The dense un-permute multiplies every
+    # The TensorCore path requires zero-initializing, while the masked EP
+    # SparseCore combine does not since it skips masked rows entirely — rows
+    # the GMM never wrote are never read. The all-local SparseCore combine
+    # reads every row, dropped slots included, and no_combine gathers every
+    # row back, so both zero-initialize. The dense un-permute multiplies every
     # row (unwritten ones by weight 0), so unwritten rows must be zeros,
     # not garbage — 0 * NaN would poison the sum.
-    if use_sc_gather and not no_combine and not use_dense_unpermute:
+    if (
+        use_sc_gather
+        and use_group_offset
+        and not no_combine
+        and not use_dense_unpermute
+    ):
         zero_init = False
     else:
         zero_init = True
@@ -845,6 +883,9 @@ def fused_moe_call(
       * ``w2``: ``[num_experts, intermediate, hidden_size]``
       * ``topk_weights``: ``[num_tokens, topk]``  (routing scores, dtype of x)
       * ``topk_ids``: ``[num_tokens, topk]``  (int32 expert ids)
+
+    Slots with a negative or out-of-range id (TopK's padded tokens) are
+    dropped: they contribute zero, and a token with no live slot outputs zeros.
 
     Returns ``[num_tokens, hidden_size]`` in ``hidden_states.dtype``,
     or the un-combined per-expert ``[num_tokens, topk, hidden_size]``
