@@ -146,7 +146,16 @@ def _topk_ids_logical_to_physical_dynamic(
             torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device)
             % num_valid
         )
-    topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
+    # Index the map as one flat gather rather than `map[rows, cols]`. The two
+    # forms are equivalent, but the 2-D advanced index lowers badly on TPU: on
+    # Qwen3-30B-A3B (48 layers, EP8) it cost ~137 ms per decode step, 12x the
+    # whole step, while the flat gather costs nothing measurable.
+    physical_map = info.partial_logical_to_all_physical_map
+    num_replicas = physical_map.shape[1]
+    flat_index = topk_ids.to(torch.int64) * num_replicas + chosen_dispatch_index.to(
+        torch.int64
+    )
+    topk_ids = physical_map.reshape(-1)[flat_index]
     if topk_ids.dtype != original_dtype:
         topk_ids = topk_ids.to(original_dtype)
 

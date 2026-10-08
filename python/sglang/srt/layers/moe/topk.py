@@ -2912,6 +2912,15 @@ def build_precomputed_topk_output(
     Only valid when :func:`precomputed_topk_postprocess_is_noop` holds.
     """
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+    # The logical->physical remap, under the same gate `select_experts` uses: a
+    # router that precomputes its own ids still has to go through it, or EPLB's
+    # placement never reaches expert dispatch. Recording happens AFTER, because
+    # `select_experts` hands the recorder post-remap ids and the accumulator
+    # converts physical counts back to logical.
+    if _eplb_remap_enabled():
+        topk_ids = topk_ids_logical_to_physical(
+            topk_ids, ExpertLocationDispatchInfo.init_new(layer_id)
+        )
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
     # router_logits is only read by the BYPASSED formats and by the
     # shared-expert append (excluded above); STANDARD consumers take ids/weights.

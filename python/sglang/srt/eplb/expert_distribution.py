@@ -220,6 +220,17 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._recording = False
         self._disable_all = False
         self._record_current_pass = False
+        # `is_current_stream_capturing` is a CUDA-graph API. Device modules for
+        # other accelerators do not carry it -- on TPU `get_device_module()`
+        # resolves it to None -- and `_on_hook` runs inside the compiled decoder,
+        # so calling None there is a compile error on every rank, not just a
+        # runtime one. Resolve it once here, where the device is already chosen.
+        stream_capture_check = getattr(
+            torch.get_device_module(), "is_current_stream_capturing", None
+        )
+        self._stream_capture_check = (
+            stream_capture_check if callable(stream_capture_check) else None
+        )
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
@@ -322,7 +333,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         if megamoe_prefill_only_recorder_enabled() and not self._record_current_pass:
             return
         if not (
-            self._recording or torch.get_device_module().is_current_stream_capturing()
+            self._recording
+            or (
+                self._stream_capture_check is not None
+                and self._stream_capture_check()
+            )
         ):
             return
         gatherer = self._single_pass_gatherers[
@@ -989,7 +1004,13 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
         if self._first_dump:
             self._first_dump = False
-            torch.get_device_module().empty_cache()
+            # `empty_cache` is a CUDA caching-allocator API that
+            # `get_device_module()` does not carry on every backend (torch_tpu
+            # raises AttributeError). Every rank runs the dump, so an unguarded
+            # call takes down the whole server.
+            empty_cache = getattr(torch.get_device_module(), "empty_cache", None)
+            if callable(empty_cache):
+                empty_cache()
 
         torch.distributed.all_reduce(
             logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
@@ -997,7 +1018,10 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
         output = dict(
             rank=self._rank,
-            logical_count=logical_count_of_buffered_step,
+            # To host before `torch.save`: saving an accelerator tensor makes
+            # serialization call `storage.cpu()` deep inside `_save`, which hangs
+            # on TPU -- the file is created and nothing is written.
+            logical_count=logical_count_of_buffered_step.cpu(),
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
 
@@ -1027,10 +1051,12 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device="cuda",
+                device=get_device_namespace().device,
             )
         else:
-            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
+            avg_rate_tensor = torch.empty(
+                1, dtype=torch.float32, device=get_device_namespace().device
+            )
         torch.distributed.broadcast(avg_rate_tensor, src=0)
         return avg_rate_tensor.item()
 

@@ -545,11 +545,17 @@ def _compute_logical_to_all_physical_map(
     ]
 
     # Find out the candidate physical experts for each logical expert on each layer
+    # Read the map to host once: `physical_to_logical_map` lives on the
+    # accelerator (init_by_mapping moves it there), so indexing it per element
+    # costs one device-to-host sync each -- num_layers * num_physical_experts of
+    # them, 83k for Kimi K3 at 93 layers x 896 experts, which stalled
+    # `ModelRunner.initialize()` for ~30 minutes before any weight loaded.
+    physical_to_logical_map_list = physical_to_logical_map.tolist()
     for layer_id in range(num_layers):
         for physical_expert_id in range(num_physical_experts):
-            logical_expert_id = physical_to_logical_map[
-                layer_id, physical_expert_id
-            ].item()
+            logical_expert_id = physical_to_logical_map_list[layer_id][
+                physical_expert_id
+            ]
             logical_to_all_physical_map[layer_id][logical_expert_id].append(
                 physical_expert_id
             )

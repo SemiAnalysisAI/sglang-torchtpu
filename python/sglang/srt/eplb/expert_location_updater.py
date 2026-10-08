@@ -56,7 +56,11 @@ class ExpertLocationUpdater:
         """
         if self._first_execution:
             self._first_execution = False
-            torch.get_device_module().empty_cache()
+            # Same CUDA-only caching-allocator API as the dump path; absent on
+            # backends without one, where there is nothing to free.
+            empty_cache = getattr(torch.get_device_module(), "empty_cache", None)
+            if callable(empty_cache):
+                empty_cache()
 
         old_expert_location_metadata = get_global_expert_location_metadata()
         assert old_expert_location_metadata is not None
