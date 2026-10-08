@@ -593,6 +593,7 @@ def batched_rpa_dcp_forward(
 
     # 1. Cache Phase (CACHE_ONLY)
     cache_update_kv = torch.zeros_like(base_meta.kv_lens, dtype=torch.int32)
+    cache_kv_new_lens = torch.zeros_like(seq_lens, dtype=torch.int32)
     context_out, context_lse = cp_op(
         q,
         k,
@@ -603,7 +604,7 @@ def batched_rpa_dcp_forward(
         base_meta.cu_q_lens,
         base_meta.distribution,
         q_positions,
-        kv_new_lens,
+        cache_kv_new_lens,
         cp_rank_tensor,
         None,
         cache_update_kv,
@@ -646,11 +647,16 @@ def batched_rpa_dcp_forward(
     )
 
     # 3. DCP State Merge
-    all_context_lse = cp_group.all_gather(context_lse.to(torch.float32), dim=0)
+    context_lse_safe = torch.nan_to_num(
+        context_lse.to(torch.float32), nan=-float("inf")
+    )
+    curr_lse_safe = torch.nan_to_num(curr_lse.to(torch.float32), nan=-float("inf"))
+
+    all_context_lse = cp_group.all_gather(context_lse_safe, dim=0)
     all_context_lse_3d = all_context_lse.view(cp_size, -1, *context_lse.shape[1:])
 
     stacked_lses = torch.cat(
-        [curr_lse.to(torch.float32).unsqueeze(0), all_context_lse_3d], dim=0
+        [curr_lse_safe.unsqueeze(0), all_context_lse_3d], dim=0
     )
     global_max_lse = torch.amax(stacked_lses, dim=0)
     global_max_lse_safe = torch.where(
@@ -666,17 +672,17 @@ def batched_rpa_dcp_forward(
     curr_out_safe = torch.nan_to_num(curr_out.to(torch.float32), nan=0.0)
 
     scale_context = torch.where(
-        torch.isinf(context_lse),
-        torch.zeros_like(context_lse),
-        torch.exp(context_lse.to(torch.float32) - global_max_lse_safe),
+        torch.isinf(context_lse_safe),
+        torch.zeros_like(context_lse_safe),
+        torch.exp(context_lse_safe - global_max_lse_safe),
     ).unsqueeze(-1)
     scaled_context_out = context_out_safe * scale_context
     sum_scaled_context = cp_group.all_reduce(scaled_context_out)
 
     scale_curr = torch.where(
-        torch.isinf(curr_lse),
-        torch.zeros_like(curr_lse),
-        torch.exp(curr_lse.to(torch.float32) - global_max_lse_safe),
+        torch.isinf(curr_lse_safe),
+        torch.zeros_like(curr_lse_safe),
+        torch.exp(curr_lse_safe - global_max_lse_safe),
     ).unsqueeze(-1)
     scaled_curr_out = curr_out_safe * scale_curr
 

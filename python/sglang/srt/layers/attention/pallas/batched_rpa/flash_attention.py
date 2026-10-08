@@ -88,14 +88,22 @@ def flash_attention_qk_softmax(
 
     for b_idx in range(cfgs.block.batch_size):
         m_curr_b = m_curr[b_idx]
-        m_next_b = jnp.maximum(m_prev, m_curr_b)
-        alpha_b = jnp.exp(m_prev - m_next_b)
+        has_valid_k = m_curr_b > cfgs.model.mask_value
+        m_next_b = jnp.where(has_valid_k, jnp.maximum(m_prev, m_curr_b), m_prev)
+        alpha_b = jnp.where(has_valid_k, jnp.exp(m_prev - m_next_b), 1.0)
         alpha_list.append(alpha_b)
         m_next_list.append(m_next_b)
         m_prev = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
 
     m_next = jnp.stack(m_next_list, axis=0)
-    p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
+    m_next_safe = jnp.where(jnp.isneginf(m_next), 0.0, m_next)
+    p = jnp.exp(qk - utils.broadcast_minor(m_next_safe, qk.shape))
+    if custom_mask is not None:
+        p_masked = []
+        for b_idx in range(cfgs.block.batch_size):
+            mask_b = custom_mask[b_idx]
+            p_masked.append(jnp.where(mask_b, p[b_idx], 0.0))
+        p = jnp.stack(p_masked, axis=0)
     p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
 
     l_next_list = []
