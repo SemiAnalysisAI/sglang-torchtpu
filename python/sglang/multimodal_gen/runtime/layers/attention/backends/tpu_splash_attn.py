@@ -67,7 +67,9 @@ def _check_splash_available() -> bool:
             raise RuntimeError(f"kernels are tuned for TPU v7x only, not {device_kind}")
         _SPLASH_AVAILABLE = True
     except Exception as exc:
-        logger.warning("TPU Pallas splash attention unavailable (%s); using SDPA.", exc)
+        logger.warning(
+            "TPU Pallas splash attention unavailable (%s); using XLA attention.", exc
+        )
         _SPLASH_AVAILABLE = False
     return _SPLASH_AVAILABLE
 
@@ -433,12 +435,14 @@ def _flash_attention_ring(q, k, v, kv_info, out_prev, lse_prev, scale):
 
     ``q`` is ``[B, H, S, D]``; ``k``/``v`` stack shards ``[N, H_kv, S_kv, D]``
     (``N >= B``), and ``kv_info`` = int32 ``[row offset, real keys]`` picks KV
-    rows ``offset .. offset + B * H_kv`` of the batch-flattened stack. With
+    rows ``offset .. offset + B * H_kv`` of the batch-flattened stack (``None``:
+    ``k``/``v`` are ``[B, H_kv, S_kv, D]`` and every key counts). With
     ``out_prev``/``lse_prev`` the softmax resumes from earlier shards. Returns
     the output and base-2 log-sum-exp ``[B, H, NUM_SUBLANES, S]`` float32.
     """
     batch, heads, q_seq, head_dim = q.shape
     resume = out_prev is not None
+    runtime_kv = kv_info is not None
     call = _flash_call(
         q_seq,
         k.shape[2],
@@ -450,7 +454,7 @@ def _flash_attention_ring(q, k, v, kv_info, out_prev, lse_prev, scale):
         out_dtype=q.dtype,
         return_lse=True,
         resume=resume,
-        runtime_kv=True,
+        runtime_kv=runtime_kv,
     )
 
     # The offset may address any batch row of the stack, so batch folds into
@@ -458,8 +462,9 @@ def _flash_attention_ring(q, k, v, kv_info, out_prev, lse_prev, scale):
     def flat(t):
         return t.reshape(-1, *t.shape[2:])
 
+    info = (kv_info,) if runtime_kv else ()
     prev = (flat(out_prev), flat(lse_prev)) if resume else ()
-    out, lse = call(kv_info, flat(q), flat(k), flat(v), *prev)
+    out, lse = call(*info, flat(q), flat(k), flat(v), *prev)
     return out.reshape(q.shape), lse.reshape(batch, heads, NUM_SUBLANES, q_seq)
 
 
@@ -560,7 +565,7 @@ def _register_ops() -> None:
             q: jax.Array,
             k: jax.Array,
             v: jax.Array,
-            kv_info: jax.Array,
+            kv_info: jax.Array | None,
             out_prev: jax.Array | None,
             lse_prev: jax.Array | None,
             scale: float,
@@ -682,6 +687,10 @@ def _ring_kernel_fallback_reason(
     return _sdpa_fallback_reason(query, key, value, False)
 
 
+# float32 score bytes per query chunk of the reference attention.
+_REFERENCE_SCORE_BYTES = 256 << 20
+
+
 def _attention_with_lse_reference(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -691,23 +700,37 @@ def _attention_with_lse_reference(
     real_keys: torch.Tensor | int | None = None,
     is_causal: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """float32 ``[B, H, S, D]`` attention and its natural-log LSE ``[B, H, S]``."""
+    """float32 ``[B, H, S, D]`` attention and its natural-log LSE ``[B, H, S]``.
+
+    Query rows run in chunks, so the float32 scores stay bounded.
+    """
     if query.shape[1] != key.shape[1]:
         repeat = query.shape[1] // key.shape[1]
         key = key.repeat_interleave(repeat, dim=1)
         value = value.repeat_interleave(repeat, dim=1)
-    scores = torch.matmul(query.float(), key.float().transpose(-1, -2)) * scale
-    q_seq, kv_seq = scores.shape[-2:]
+    batch, heads, q_seq, _ = query.shape
+    kv_seq = key.shape[2]
+    key_t, value = key.float().transpose(-1, -2), value.float()
+    cols = torch.arange(kv_seq, device=query.device)
     if real_keys is not None:
-        cols = torch.arange(kv_seq, device=scores.device)
-        scores = scores.masked_fill(cols >= real_keys, float("-inf"))
-    if is_causal:
-        causal = torch.ones(q_seq, kv_seq, dtype=torch.bool, device=scores.device)
-        scores = scores.masked_fill(~causal.tril(), float("-inf"))
-    lse = torch.logsumexp(scores, dim=-1)
-    # Rows without a real key: output 0, log-sum-exp -inf.
-    probs = torch.exp(scores - lse[..., None]).nan_to_num(0.0)
-    return torch.matmul(probs, value.float()), lse
+        real = cols < real_keys
+        # Keys past the real count may hold NaN; they must add nothing.
+        value = torch.where(real[:, None], value, 0.0)
+    chunk = max(1, _REFERENCE_SCORE_BYTES // (4 * batch * heads * max(kv_seq, 1)))
+    outs, lses = [], []
+    for start in range(0, q_seq, chunk):
+        scores = torch.matmul(query[:, :, start : start + chunk].float(), key_t) * scale
+        if real_keys is not None:
+            scores = scores.masked_fill(~real, float("-inf"))
+        if is_causal:
+            rows = torch.arange(start, start + scores.shape[2], device=query.device)
+            scores = scores.masked_fill(cols > rows[:, None], float("-inf"))
+        lse = torch.logsumexp(scores, dim=-1)
+        # Rows without a real key: output 0, log-sum-exp -inf.
+        probs = torch.exp(scores - lse[..., None]).nan_to_num(0.0)
+        outs.append(torch.matmul(probs, value))
+        lses.append(lse)
+    return torch.cat(outs, dim=2), torch.cat(lses, dim=2)
 
 
 def _merge_attention(
@@ -737,12 +760,11 @@ def tpu_attention_with_lse(
     float32, the ``return_softmax_lse`` contract of the ring merge."""
     if not is_causal and _ring_kernel_fallback_reason(query, key, value) is None:
         _register_ops()
-        kv_info = torch.tensor([0, key.shape[2]], dtype=torch.int32, device=key.device)
         out, lse2 = _FLASH_RING_OP(
             query.contiguous(),
             key.contiguous(),
             value.contiguous(),
-            kv_info,
+            None,
             None,
             None,
             scale,

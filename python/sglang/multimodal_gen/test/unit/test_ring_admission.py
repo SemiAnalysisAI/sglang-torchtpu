@@ -75,6 +75,44 @@ class TestTpuSplashRingCapability(unittest.TestCase):
         self.assertFalse(SDPAImpl.supports_ring_resume())
         self.assertFalse(FlashAttentionBackend.get_impl_cls().supports_ring_resume())
 
+    def test_auto_selected_ring_backend_serves_sdpa_layers(self):
+        # Without --attention-backend a TPU ring launch selects tpu_splash_attn
+        # implicitly; a DiT layer that lists TORCH_SDPA must still take it.
+        from sglang.multimodal_gen.configs.pipeline_configs.base import (
+            PipelineConfig,
+        )
+        from sglang.multimodal_gen.runtime.layers.attention import selector
+        from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+        from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
+        from sglang.multimodal_gen.runtime.server_args import server_args
+        from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
+
+        with patch.object(PipelineConfig, "from_kwargs", return_value=PipelineConfig()):
+            args = ServerArgs.from_dict({"model_path": "/fake"})
+        args.num_gpus, args.ring_degree = 8, 2
+        platforms = "sglang.multimodal_gen.runtime.platforms"
+        with patch(f"{platforms}.current_platform.is_tpu", return_value=True):
+            args._adjust_attention_backend()
+        self.assertEqual(args.attention_backend, "tpu_splash_attn")
+        self.assertFalse(args.is_arg_explicitly_set("attention_backend"))
+
+        selector._cached_get_attn_backend.cache_clear()
+        try:
+            with (
+                patch(f"{platforms}.current_platform", TpuPlatform()),
+                patch.object(server_args, "_global_server_args", args),
+            ):
+                backend = selector.get_attn_backend(
+                    128,
+                    torch.bfloat16,
+                    supported_attention_backends=set(
+                        BaseDiT._supported_attention_backends
+                    ),
+                )
+        finally:
+            selector._cached_get_attn_backend.cache_clear()
+        self.assertIs(backend, TpuSplashAttentionBackend)
+
 
 if __name__ == "__main__":
     unittest.main()

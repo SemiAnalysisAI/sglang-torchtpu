@@ -11,6 +11,7 @@ from sglang.multimodal_gen.test.unit.test_ring_admission import (  # noqa: F401
 )
 from sglang.multimodal_gen.test.unit.test_usp_allgather_ring import (  # noqa: F401
     TestAllGatherRingAttention,
+    TestRingKernelFallback,
 )
 from sglang.multimodal_gen.test.unit.test_usp_ring_tail_pad import (  # noqa: F401
     TestRingTailPadDispatch,
