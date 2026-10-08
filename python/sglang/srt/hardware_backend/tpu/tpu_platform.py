@@ -404,6 +404,11 @@ class TpuSRTPlatform(SRTPlatform):
                 )
             os.environ["SGLANG_TPU_REQ_TO_TOKEN_ON_HOST"] = "1"
 
+        # There is no CUDA coredump on TPU: on a crash the handler would trigger
+        # a no-op dump, then sleep SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS
+        # (60 s) with the dead server still up. An explicit setting still wins.
+        os.environ.setdefault("SGLANG_CUDA_COREDUMP_BEFORE_CRASH", "0")
+
         # The default TPU backend (Pallas RPA v3) expects a paged KV cache where
         # page_size is the HBM<->VMEM DMA chunk and the fused KV buffer's page
         # axis. SGLang's global page_size=1 default is valid for token-granular
