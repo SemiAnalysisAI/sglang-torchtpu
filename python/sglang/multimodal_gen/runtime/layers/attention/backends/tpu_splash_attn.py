@@ -345,10 +345,16 @@ def _splash_mha(q, k, v, scale, is_causal):
 
 def _add_kernel_source_to_compile_cache_key() -> None:
     # The kernels are opaque custom ops in FX graphs, so persisted
-    # torch.compile artifacts are keyed on this file's source.
+    # torch.compile artifacts are keyed on their source: this file and the
+    # srt modules that lower them.
     import torch.compiler.config as compiler_config
 
-    digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+    from sglang.srt.hardware_backend.tpu import pallas_export, pallas_jax_op
+
+    hasher = hashlib.sha256()
+    for source in (__file__, pallas_jax_op.__file__, pallas_export.__file__):
+        hasher.update(Path(source).read_bytes())
+    digest = hasher.hexdigest()[:16]
     tag = f"diffusion-tpu-splash-attn:{digest}"
     existing = str(compiler_config.cache_key_tag or "")
     if tag not in existing.split("|"):
