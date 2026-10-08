@@ -137,6 +137,7 @@ from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
     get_context,
@@ -3190,7 +3191,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, hostname: str = os.getenv("HOSTNAME", socket.gethostname())
     ):
         should_dump_pyspy = envs.SGLANG_PYSPY_DUMP_BEFORE_CRASH.get()
-        should_dump_cuda_coredump = envs.SGLANG_CUDA_COREDUMP_BEFORE_CRASH.get()
+        # Only CUDA can produce the coredump; elsewhere (e.g. TPU) the trigger is
+        # a no-op and the wait just keeps a dead server up for its full length.
+        should_dump_cuda_coredump = (
+            envs.SGLANG_CUDA_COREDUMP_BEFORE_CRASH.get() and current_platform.is_cuda()
+        )
         should_dump_diagnostics = should_dump_pyspy or should_dump_cuda_coredump
         if not self.crash_dump_folder and not should_dump_diagnostics:
             return
