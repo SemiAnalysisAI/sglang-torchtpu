@@ -1096,5 +1096,56 @@ class TestDraftPoolGroups(unittest.TestCase):
         self.assertEqual(groups.full_layer_ids, [0, 1, 0])
 
 
+class TestPrefillContextParallel(unittest.TestCase):
+    """CP rank 0 of each pipeline stage is the stage's only source."""
+
+    PB2 = SimpleNamespace(
+        StartTransferRequest=SimpleNamespace(
+            DESCRIPTOR=SimpleNamespace(fields_by_name={"wire_pool_indices": None})
+        )
+    )
+
+    def _check(self, *, producer, attn_cp_size, attn_cp_rank=0, pp_size=4):
+        pipe = PipelineTransfer.__new__(PipelineTransfer)
+        pipe.producer = producer
+        pipe.manager = SimpleNamespace(
+            attn_cp_size=attn_cp_size,
+            attn_cp_rank=attn_cp_rank,
+            attn_tp_size=1,
+            pp_size=pp_size,
+        )
+        pipe._check_support(self.PB2)
+
+    def test_cp_rank_zero_of_a_pipeline_stage_is_a_source(self):
+        self._check(producer=True, attn_cp_size=4)
+
+    def test_other_cp_ranks_are_not_sources(self):
+        with self.assertRaisesRegex(ValueError, "only from prefill CP rank 0"):
+            self._check(producer=True, attn_cp_size=2, attn_cp_rank=1)
+
+    def test_decode_cp_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "CP=1 on the decode"):
+            self._check(producer=False, attn_cp_size=2, pp_size=1)
+
+    def test_dummy_cp_rank_builds_no_transfer(self):
+        manager = RaidenKVManager.__new__(RaidenKVManager)
+        manager._pipeline_enabled = True
+        manager._pipeline = None
+        manager.is_dummy_cp_rank = True
+        with patch(
+            "sglang_tpu.disaggregation.raiden.pipeline.PipelineTransfer"
+        ) as transfer:
+            manager.set_kv_caches(
+                SimpleNamespace(
+                    **vars(groups(full=(0,), swa=())),
+                    state=(),
+                    committed_state_row=None,
+                )
+            )
+        transfer.assert_not_called()
+        self.assertIsNone(manager._pipeline)
+        self.assertFalse(manager.chunked_transfer)
+
+
 if __name__ == "__main__":
     unittest.main()
