@@ -187,6 +187,11 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
         if cfgs.serve.write_last_q_block:
             # visit every new-KV block. The extra blocks are fully masked
             # out by `generate_mask`, so only their cache write runs.
+            start_k_idx = jnp.where(
+                (q_idx == num_q - 1) & update_kv_cache,
+                kv_cache_len // cfgs.bkv_sz,
+                start_k_idx,
+            )
             end_k_idx = jnp.where(
                 (q_idx == num_q - 1) & update_kv_cache, num_k, end_k_idx
             )
