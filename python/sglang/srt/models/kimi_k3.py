@@ -1758,6 +1758,9 @@ class KimiK3DeltaAttention(nn.Module):
         self.o_norm = FusedRMSNormGated(
             self.head_dim, eps=rms_norm_eps, activation="sigmoid"
         )
+        # Column block of g in the fused [q, k, v, g] output, which the TPU Pallas
+        # o_norm reads in place; set post-load by _prepare_tpu_onorm.
+        self._tpu_onorm_g_block: Optional[int] = None
         self.o_proj = RowParallelLinear(
             projection_size,
             self.hidden_size,
@@ -1889,6 +1892,19 @@ class KimiK3DeltaAttention(nn.Module):
             attn.head_k_dim,
         )
         return packed.to(attn.conv_weights.device)
+
+    def _prepare_tpu_onorm(self) -> None:
+        """TPU: the Pallas gated o_norm (SGLANG_TPU_ENABLE_K3_FUSED_ONORM)."""
+        from sglang.srt.hardware_backend.tpu.kda_layout import onorm_g_block
+
+        self._tpu_onorm_g_block = onorm_g_block(
+            use_full_rank_gate=self.use_full_rank_gate,
+            head_dim=self.head_dim,
+            activation=self.o_norm.activation,
+            # Only the full-rank layout has the [q, k, v, g] split; quantized
+            # low-rank layers have no split_sizes at all.
+            split_sizes=self.split_sizes if self.use_full_rank_gate else None,
+        )
 
     def _merge_kda_inproj_weights_hip(self) -> bool:
         """ROCm only: append the [f_a | b] tail to the wide [q,k,v,g] buffer so
@@ -2177,6 +2193,15 @@ class KimiK3DeltaAttention(nn.Module):
             fused_onorm = self.attn._k3_onorm_consumed
         if defer_f_b:
             self.attn._k3_deferred_f_b = False
+        if not fused_onorm and self._tpu_onorm_g_block is not None:
+            from sglang.srt.hardware_backend.tpu.kda_layout import gated_onorm
+
+            # mixed_qkv is the whole fused [q, k, v, g] output on TPU.
+            normed = gated_onorm(
+                core_attn_out, mixed_qkv, self.o_norm, self._tpu_onorm_g_block
+            )
+            if normed is not None:
+                core_attn_out, fused_onorm = normed, True
         if not fused_onorm:
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
             core_attn_out = self.o_norm(core_attn_out, norm_gate)
@@ -3517,6 +3542,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 layer.self_attn._merge_bfa_weights()
                 if _is_tpu:
                     layer.self_attn._bind_tpu_attn_weights()
+                    layer.self_attn._prepare_tpu_onorm()
                 layer.self_attn._prepare_fused_decode()
         if _is_tpu and self.config.linear_layer_ids:
             # The TPU KDA kernel reads copies of the conv weight, dt_bias and

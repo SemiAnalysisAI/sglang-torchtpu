@@ -1937,6 +1937,10 @@ class Envs:
     # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
     # (likely 0.0.48).
     SGLANG_TPU_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE = EnvBool(True)
+    # Run the Kimi-K3 KDA gated output RMSNorm as one Pallas kernel for batches
+    # of up to 64 tokens (hardware_backend/tpu/kda_layout.ONORM_MAX_TOKENS).
+    # Same fp32 math as the XLA chain; a bf16 output can differ by one ulp.
+    SGLANG_TPU_ENABLE_K3_FUSED_ONORM = EnvBool(False)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
