@@ -6,6 +6,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    _unsupported_derived_weight_cache_error,
+)
 from sglang.srt.models import kimi_k3
 from sglang.srt.models.kimi_k3 import (
     KimiK3DeltaAttention,
@@ -62,6 +65,28 @@ def _tiny_config() -> KimiLinearConfig:
 
 @unittest.skipIf(torch.cuda.is_available(), "builds on CPU with the TPU flag set")
 class TestKimiK3ConstructOnTpu(CustomTestCase):
+    def test_post_load_binds_kernel_layout_and_rejects_weight_updates(self):
+        """The KDA kernel reads a [K, 1, dim] copy of the conv weight, so online
+        updates, which could skip the post-load rebind, are rejected."""
+        model = KimiK3LinearForCausalLM(config=_tiny_config(), quant_config=None)
+        kdas = [
+            layer.self_attn
+            for layer in model.model.layers
+            if isinstance(layer.self_attn, KimiK3DeltaAttention)
+        ]
+        with torch.no_grad():
+            for kda in kdas:
+                weight = kda.qkv_conv1d.weight  # [dim, 1, K]
+                weight.copy_(torch.randn(weight.shape))
+        model.post_load_weights()
+        for kda in kdas:
+            want = kda.qkv_conv1d.weight.permute(2, 1, 0)
+            self.assertTrue(kda.attn.conv_weights.is_contiguous())
+            self.assertTrue(torch.equal(kda.attn.conv_weights, want))
+        self.assertIn(
+            "Kimi-K3 on TPU", _unsupported_derived_weight_cache_error(model) or ""
+        )
+
     @classmethod
     def setUpClass(cls):
         init_single_process_dist()

@@ -356,9 +356,9 @@ def fused_conv1d_gdn(
     qkv: jax.Array,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
     b: jax.Array,  # [batch_size, n_v]
     a: jax.Array,  # [batch_size, n_v]; [batch_size, n_v * d_k] for KDA
-    conv_state: jax.Array | None,  # [num_seqs + 1, kernel_size - 1, dim_size]
+    conv_state: jax.Array | None,  # [num_seqs + 1, kernel_size - 1, (1,) dim_size]
     recurrent_state: jax.Array | None,  # [num_seqs + 1, nv, dk, dv]
-    conv_weight: jax.Array,  # [kernel_size - 1, dim_size]
+    conv_weight: jax.Array,  # [dim_size, 1, kernel_size] or [kernel_size, 1, dim_size]
     conv_bias: jax.Array | None,  # [dim_size]
     a_log: jax.Array,  # [n_v]
     dt_bias: jax.Array,  # [n_v] for GDN, [n_v, d_k] for KDA
@@ -395,15 +395,18 @@ def fused_conv1d_gdn(
         b: b tensor (for beta) of shape [batch_size, n_v].
         a: a tensor (for g) of shape [batch_size, n_v].
         conv_state: Convolution state cache tensor of shape [num_seqs + 1,
-            kernel_size - 1, dim_size] containing the last (kernel_size - 1) tokens
-            from the last sequence invocation. The first slot is a null block used for
-            padded or invalid tokens. It may contain garbage data if it is a first
-            invocation of a sequence. None when `state_source` carries the states.
+            kernel_size - 1, dim_size], or the kernel-native rank-4 [num_seqs + 1,
+            kernel_size - 1, 1, dim_size] that skips a pool relayout, containing
+            the last (kernel_size - 1) tokens from the last sequence invocation.
+            The first slot is a null block used for padded or invalid tokens. It
+            may contain garbage data if it is a first invocation of a sequence.
+            None when `state_source` carries the states.
         recurrent_state: Recurrent state cache tensor of shape [num_seqs + 1, n_v,
             d_k, d_v]. The first slot is a null block used for padded or invalid
             tokens. It may contain garbage data if it is a first invocation of a
             sequence. None when `state_source` carries the states.
-        conv_weight: Convolution weight tensor of shape [kernel_size - 1, dim_size].
+        conv_weight: Convolution weight tensor of shape [dim_size, 1, kernel_size]
+            or the kernel-native [kernel_size, 1, dim_size].
         conv_bias: Optional convolution bias tensor of shape [dim_size].
         a_log: a_log tensor of shape [n_v].
         dt_bias: dt_bias tensor of shape [n_v]; [n_v, d_k] under KDA, whose
@@ -506,7 +509,9 @@ def fused_conv1d_gdn(
 
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
-    assert conv_weight.shape == (dim, 1, kernel_size)
+    # [kernel_size, 1, dim] is the kernel layout; callers may pre-transpose.
+    conv_weight_kd = dim != kernel_size and conv_weight.shape == (kernel_size, 1, dim)
+    assert conv_weight_kd or conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
         assert conv_bias.shape == (dim,)
     assert query_start_loc.shape == (num_seqs + 1,)
@@ -601,7 +606,9 @@ def fused_conv1d_gdn(
     if not pooled:
         conv_state_shape = conv_state.shape
         conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
-    conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
+    if not conv_weight_kd:
+        conv_weight = conv_weight.swapaxes(0, 2)
+    conv_weight = conv_weight.astype(jnp.float32)
     conv_bias = conv_bias.astype(jnp.float32) if conv_bias is not None else None
 
     # Step 4: Wrap inputs for the kernel.

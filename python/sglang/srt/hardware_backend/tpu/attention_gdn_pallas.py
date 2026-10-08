@@ -364,7 +364,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
     ) -> torch.Tensor:
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        conv_state = layer_cache.conv[0]  # [size+1, K-1, dim]
+        conv_state = layer_cache.conv[0]  # [size+1, K-1, 1, dim]
         recurrent_state = layer_cache.temporal  # [size+1, n_v, d_k, d_v]
 
         state_indices = self._state_indices
