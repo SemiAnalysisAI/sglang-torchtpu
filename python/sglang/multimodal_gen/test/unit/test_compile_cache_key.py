@@ -12,7 +12,12 @@ from sglang.multimodal_gen.runtime.managers import gpu_worker
 from sglang.multimodal_gen.runtime.platforms.interface import Platform
 from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
 
-_FLAGS = ("LIBTPU_INIT_ARGS", "XLA_FLAGS", "TORCH_TPU_INTERNAL_XLA_OPTIONS")
+_FLAGS = (
+    "LIBTPU_INIT_ARGS",
+    "XLA_FLAGS",
+    "TORCH_TPU_INTERNAL_XLA_OPTIONS",
+    "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
+)
 
 
 class TestCompileCacheHook(unittest.TestCase):

@@ -52,7 +52,13 @@ def _add_compiler_flags_to_compile_cache_key() -> None:
 
     flags = "\0".join(
         os.environ.get(name, "")
-        for name in ("LIBTPU_INIT_ARGS", "XLA_FLAGS", "TORCH_TPU_INTERNAL_XLA_OPTIONS")
+        for name in (
+            "LIBTPU_INIT_ARGS",
+            "XLA_FLAGS",
+            "TORCH_TPU_INTERNAL_XLA_OPTIONS",
+            # Read at compile time: where torch_tpu splits graphs at collectives.
+            "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
+        )
     )
     tag = f"tpu-compiler-flags-v1:{hashlib.sha256(flags.encode()).hexdigest()[:16]}"
     # '|'-joined and idempotent, like srt's compile_cache tags.
