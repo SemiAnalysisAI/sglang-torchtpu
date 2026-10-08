@@ -1852,11 +1852,12 @@ class KimiK3DeltaAttention(nn.Module):
         self._bfa_fa_size, self._bfa_b_size = sizes
 
     def _bind_tpu_attn_weights(self) -> None:
-        # TPU weight materialization re-creates these parameters after __init__
-        # bound them; rebind once post-load, never inside the compiled forward.
-        self.attn.conv_weights = self.qkv_conv1d.weight.squeeze(1)
+        # Bound post-load, not inside the compiled forward. The conv weight is
+        # the [dim, 1, K] parameter itself: torch_tpu would re-materialize a
+        # view of it on every call. A_log is an [n_v] copy, one reason
+        # post_load_weights rejects online weight updates on TPU.
+        self.attn.conv_weights = self.qkv_conv1d.weight
         self.attn.bias = self.qkv_conv1d.bias
-        # The kernel takes A_log as [n_v].
         self.attn.A_log = nn.Parameter(
             self.A_log.detach().reshape(-1).clone(), requires_grad=False
         )
@@ -3486,6 +3487,18 @@ class KimiK3LinearForCausalLM(nn.Module):
                 if _is_tpu:
                     layer.self_attn._bind_tpu_attn_weights()
                 layer.self_attn._prepare_fused_decode()
+        if _is_tpu and self.config.linear_layer_ids:
+            # The TPU KDA kernel reads weight copies made by
+            # _bind_tpu_attn_weights; writes that skip post-load
+            # (load_format="direct", custom loaders) would leave them stale.
+            # The updater's derived-cache guard rejects every update path.
+            # Published on the model from the config so every PP stage rejects
+            # alike, with or without KDA layers.
+            self._derived_weight_cache_error = (
+                "Online weight updates are not supported for Kimi-K3 on TPU: the "
+                "KDA kernel reads weight copies built at load time. "
+                "Restart the server to change weights."
+            )
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(

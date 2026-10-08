@@ -18,9 +18,9 @@ _N_V, _D_K, _D_V, _K, _T = 2, 4, 4, 4, 3
 _DIM = 2 * _N_V * _D_K + _N_V * _D_V
 
 
-def _run(lower_bound):
+def _run(lower_bound, conv_weights=None):
     conv_state, rec_state = (
-        torch.zeros(4, _K - 1, _DIM),
+        torch.zeros(4, _K - 1, 1, _DIM),
         torch.zeros(4, _N_V, _D_K, _D_V),
     )
     cache = SimpleNamespace(conv=[conv_state], temporal=rec_state)
@@ -31,7 +31,7 @@ def _run(lower_bound):
         num_v_heads=_N_V,
         head_k_dim=_D_K,
         head_v_dim=_D_V,
-        conv_weights=torch.zeros(_DIM, _K),
+        conv_weights=torch.zeros(_DIM, _K) if conv_weights is None else conv_weights,
         bias=None,
         A_log=torch.zeros(_N_V),
         dt_bias=torch.zeros(_N_V * _D_K),
@@ -69,6 +69,13 @@ class TestTpuKDAAttnBackend(CustomTestCase):
         self.assertEqual(tuple(args[8].shape), (_N_V, _D_K))
         # The model squeezes dim 0 after o_norm; a one-token decode must keep T.
         self.assertEqual(tuple(out.shape), (1, _T, _N_V, _D_V))
+
+    def test_depthwise_conv_weight_passes_through(self):
+        # Kimi-K3 binds its depthwise [dim, 1, K] parameter: passed as is.
+        weight = torch.zeros(_DIM, 1, _K)
+        args, _, _ = _run(-5.0, conv_weights=weight)
+        self.assertIs(args[5], weight)
+        self.assertEqual(args[17], _K)
 
 
 if __name__ == "__main__":

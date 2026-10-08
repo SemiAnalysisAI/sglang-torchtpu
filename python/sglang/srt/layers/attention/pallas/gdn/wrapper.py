@@ -356,7 +356,7 @@ def fused_conv1d_gdn(
     qkv: jax.Array,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
     b: jax.Array,  # [batch_size, n_v]
     a: jax.Array,  # [batch_size, n_v]; [batch_size, n_v * d_k] for KDA
-    conv_state: jax.Array | None,  # [num_seqs + 1, kernel_size - 1, dim_size]
+    conv_state: jax.Array | None,  # [num_seqs + 1, kernel_size - 1, (1,) dim_size]
     recurrent_state: jax.Array | None,  # [num_seqs + 1, nv, dk, dv]
     conv_weight: jax.Array,  # [kernel_size - 1, dim_size]
     conv_bias: jax.Array | None,  # [dim_size]
@@ -395,10 +395,12 @@ def fused_conv1d_gdn(
         b: b tensor (for beta) of shape [batch_size, n_v].
         a: a tensor (for g) of shape [batch_size, n_v].
         conv_state: Convolution state cache tensor of shape [num_seqs + 1,
-            kernel_size - 1, dim_size] containing the last (kernel_size - 1) tokens
-            from the last sequence invocation. The first slot is a null block used for
-            padded or invalid tokens. It may contain garbage data if it is a first
-            invocation of a sequence. None when `state_source` carries the states.
+            kernel_size - 1, dim_size], or the kernel-native rank-4 [num_seqs + 1,
+            kernel_size - 1, 1, dim_size] that skips a pool relayout, containing
+            the last (kernel_size - 1) tokens from the last sequence invocation.
+            The first slot is a null block used for padded or invalid tokens. It
+            may contain garbage data if it is a first invocation of a sequence.
+            None when `state_source` carries the states.
         recurrent_state: Recurrent state cache tensor of shape [num_seqs + 1, n_v,
             d_k, d_v]. The first slot is a null block used for padded or invalid
             tokens. It may contain garbage data if it is a first invocation of a

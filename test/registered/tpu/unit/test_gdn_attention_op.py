@@ -255,6 +255,8 @@ class TestGDNAttentionOp(CustomTestCase):
 
     def _kda_case(self):
         # KDA runs without GQA: n_kq == n_v, per-channel gate and dt_bias.
+        # Conv state in the rank-4 [slots, K-1, 1, dim] layout the TPU pool
+        # allocates.
         n_v, d_k, d_v, K = 4, self.D_K, self.D_V, self.K
         lengths = [1, 1, 64]
         rng = np.random.default_rng(1)
@@ -268,7 +270,7 @@ class TestGDNAttentionOp(CustomTestCase):
             rn(num_tokens, conv_dim),
             rn(num_tokens, n_v),
             rn(num_tokens, n_v * d_k),
-            np.zeros((num_blocks, K - 1, conv_dim), np.float32),
+            np.zeros((num_blocks, K - 1, 1, conv_dim), np.float32),
             np.zeros((num_blocks, n_v, d_k, d_v), np.float32),
             rn(conv_dim, 1, K),
             rn(conv_dim),
@@ -296,6 +298,7 @@ class TestGDNAttentionOp(CustomTestCase):
         out_np = out.cpu().numpy()
         self.assertEqual(out_np.shape, (args[0].shape[0], n_v * d_v))
         self.assertTrue(np.isfinite(out_np).all(), "output has NaN/Inf")
+        self.assertEqual(tuple(t[3].shape), args[3].shape)
         self.assertTrue((t[3].cpu().numpy() != 0).any(), "conv_state not written")
         self.assertTrue((t[4].cpu().numpy() != 0).any(), "recurrent_state not written")
 
