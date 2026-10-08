@@ -37,6 +37,15 @@ class TestWorkerBootstrap(CustomTestCase):
         self.assertGreater(TpuPlatform.get_current_memory_usage(), 0.0)
 
     def test_worker_installs_the_aten_fallbacks(self):
+        # Ring attention merges replicated-token partials with logaddexp, which
+        # torch_tpu has no kernel for.
+        TpuPlatform.set_device(TpuPlatform.get_local_torch_device())
+        a = torch.tensor([0.5, float("-inf"), float("-inf"), 3.0])
+        b = torch.tensor([-1.0, 2.0, float("-inf"), 3.0])
+        got = torch.logaddexp(a.to("tpu"), b.to("tpu")).cpu()
+        torch.testing.assert_close(got, torch.logaddexp(a, b))
+
+    def test_worker_installs_the_int64_cumsum_fallback(self):
         # Qwen-VL position ids: an int64 cumsum, which aborts natively.
         TpuPlatform.set_device(TpuPlatform.get_local_torch_device())
         mask = torch.tensor([[1, 1, 0, 1]], device="tpu")

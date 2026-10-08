@@ -185,7 +185,7 @@ class TpuPlatform(Platform):
 
         # PJRT owns the chiplet binding; local_rank is only a label.
         _patch_set_device_tolerate_mismatch()
-        # Ops torch_tpu cannot lower abort the process instead of raising.
+        # srt's kernels for ATen ops torch_tpu lacks (e.g. logaddexp).
         _register_aten_fallbacks()
         # Qwen-VL rope indices and ERNIE's prompt enhancer take int64 cumsums.
         _register_int64_cumsum_fallback()
