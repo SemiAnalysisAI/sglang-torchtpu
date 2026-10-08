@@ -658,10 +658,6 @@ class RpaConfigs:
                     "Context Parallel does not support AttentionScope.FULL"
                     " where cache is sharded but current tokens is sequential"
                 )
-            if self.model.sliding_window is not None:
-                raise ValueError(
-                    "Context Parallel does not support sliding window right now"
-                )
 
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             bkv_sz = self.block.bkv_sz
