@@ -186,6 +186,75 @@ class TestWanStepCounter(unittest.TestCase):
         self.assertEqual(model.cnt, 0)
         self.assertEqual(len(graphs), graphs_after_first_step)
 
+    def test_lingbot_world_counts_steps_only_for_teacache(self):
+        from sglang.multimodal_gen.configs.models.dits.lingbot_world import (
+            LingBotWorldArchConfig,
+            LingBotWorldVideoConfig,
+        )
+        from sglang.multimodal_gen.configs.pipeline_configs.base import (
+            PipelineConfig,
+        )
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            set_forward_context,
+        )
+        from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
+            LingBotWorldTransformer3DModel,
+        )
+        from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
+            WanTransformer3DModel,
+        )
+        from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+        # Wan's TeaCache step check, which reads the counter, is borrowed.
+        self.assertIs(
+            LingBotWorldTransformer3DModel.should_skip_forward_for_cached_states,
+            WanTransformer3DModel.should_skip_forward_for_cached_states,
+        )
+        with patch.object(PipelineConfig, "from_kwargs", return_value=PipelineConfig()):
+            server_args = ServerArgs.from_kwargs(model_path="/fake")
+        arch_config = LingBotWorldArchConfig(
+            num_attention_heads=2,
+            attention_head_dim=12,
+            in_channels=4,
+            out_channels=4,
+            text_dim=16,
+            freq_dim=16,
+            ffn_dim=32,
+            num_layers=0,
+        )
+        with patch(
+            "sglang.multimodal_gen.runtime.server_args.server_args._global_server_args",
+            server_args,
+        ):
+            model = LingBotWorldTransformer3DModel(
+                LingBotWorldVideoConfig(arch_config=arch_config), hf_config={}
+            ).eval()
+        model.norm_out = _ScaleShift()
+        for enable_teacache, expected in ((False, 0), (True, 3)):
+            model.cnt = 0
+            req = Req(sampling_params=SamplingParams(enable_teacache=enable_teacache))
+            with (
+                self.subTest(enable_teacache=enable_teacache),
+                # The cache itself is out of scope: never skip, never store.
+                patch.object(
+                    LingBotWorldTransformer3DModel,
+                    "should_skip_forward_for_cached_states",
+                    return_value=False,
+                ),
+                patch.object(LingBotWorldTransformer3DModel, "maybe_cache_states"),
+                torch.no_grad(),
+            ):
+                for step, t in enumerate((999, 500, 0)):
+                    with set_forward_context(
+                        current_timestep=step, attn_metadata=None, forward_batch=req
+                    ):
+                        model(
+                            torch.randn(1, 4, 1, 4, 4),
+                            torch.randn(1, 8, 16),
+                            torch.tensor([t]),
+                        )
+                self.assertEqual(model.cnt, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
