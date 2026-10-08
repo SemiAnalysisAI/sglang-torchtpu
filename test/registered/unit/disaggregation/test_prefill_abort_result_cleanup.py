@@ -4,7 +4,6 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
@@ -62,7 +61,7 @@ class _Req:
         return self.kv.kv_committed_len
 
 
-class _Scheduler(SchedulerDisaggregationPrefillMixin):
+class _Scheduler(Scheduler):
     def __init__(self):
         self.batch_result_processor = SimpleNamespace(
             snapshot_auxiliary_output_starts=Mock(return_value=[]),
@@ -84,17 +83,13 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
 
 
 class _ChunkedAbortScheduler(_Scheduler):
-    """Adds the scheduler's own chunked-abort path to the prefill fake."""
-
-    process_pending_chunked_abort = Scheduler.process_pending_chunked_abort
-    _drain_deferred_chunked_sender_aborts = (
-        Scheduler._drain_deferred_chunked_sender_aborts
-    )
-    _release_aborted_request = Scheduler._release_aborted_request
+    """Sets up chunked-abort state on the scheduler fake."""
 
     def __init__(self, req):
         super().__init__()
         self.disaggregation_mode = DisaggregationMode.PREFILL
+        self.attn_tp_cpu_group = None
+        self.attn_cp_cpu_group = None
         self.chunked_req = req
         # abort_request defers a mid chunked-prefill abort to the next step.
         self._pending_chunked_abort_req = req

@@ -1365,6 +1365,7 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        # The drain votes by list position, so entries must match across TP/CP.
         self._deferred_chunked_sender_aborts: list[Req] = []
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
@@ -3755,7 +3756,7 @@ class Scheduler(
             defer_page_release = (
                 getattr(req.disagg_kv_sender, "group_failure_requires_drain", False)
                 and hasattr(req.disagg_kv_sender, "drained")
-                and not req.disagg_kv_sender.drained()
+                and not self._group_drained([req.disagg_kv_sender])[0]
             )
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
@@ -3781,19 +3782,33 @@ class Scheduler(
         pending = self._deferred_chunked_sender_aborts
         if not pending:
             return
-        still_held = []
         for req in pending:
-            sender = req.disagg_kv_sender
-            # Poll through the public transfer interface: Raiden drains native
-            # completions here, while any future drain-aware backend can own
-            # its progress mechanism without exposing manager internals.
-            sender.poll()
-            if not sender.drained():
+            req.disagg_kv_sender.poll()
+        # Every rank must free in the same step, or its next admitted batch can
+        # differ from its peers. Abort seals the sender before the drain vote.
+        drained = self._group_drained([req.disagg_kv_sender for req in pending])
+        still_held = []
+        for req, req_drained in zip(pending, drained, strict=True):
+            if not req_drained:
                 still_held.append(req)
                 continue
-            sender.clear()
+            req.disagg_kv_sender.clear()
             release_kv_cache(req, self.tree_cache, is_insert=False)
         self._deferred_chunked_sender_aborts = still_held
+
+    def _group_drained(self, senders) -> List[bool]:
+        """Return each sender's drain state agreed across attention TP/CP."""
+        bits = torch.tensor(
+            [1 if sender.drained() else 0 for sender in senders],
+            dtype=torch.uint8,
+            device="cpu",
+        )
+        for group in (self.attn_tp_cpu_group, self.attn_cp_cpu_group):
+            if group is not None and torch.distributed.get_world_size(group) > 1:
+                torch.distributed.all_reduce(
+                    bits, op=torch.distributed.ReduceOp.MIN, group=group
+                )
+        return [bool(bit) for bit in bits.tolist()]
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
