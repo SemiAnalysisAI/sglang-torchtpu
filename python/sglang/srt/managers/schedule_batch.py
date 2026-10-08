@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -143,7 +144,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import flatten_nested_list
+from sglang.srt.utils import flatten_nested_list, is_tpu
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 if TYPE_CHECKING:
@@ -166,6 +167,7 @@ _MM_HASH_MASK = (1 << 64) - 1
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+_is_tpu = is_tpu()
 
 
 ReturnHiddenStatesMode = Union[bool, Literal["last"]]
@@ -2396,7 +2398,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     launch_ts: Optional[float] = None
     after_idle_gap: bool = False
 
-    # === GPU tensors crossing to ForwardBatch (clone targets for stream isolation) ===
+    # TPU host-created inputs may stay on CPU until backend padding.
+    # None preserves the normal device contract (including PREBUILT/IDLE).
+    tpu_input_device: Optional[str] = None
+    # Original lengths remain authoritative on CPU even after a device-only merge.
+    tpu_orig_seq_lens_cpu: Optional[torch.Tensor] = None
+    # Device-produced mixed decode tails are injected after prompt bucketing.
+    tpu_mixed_input_tokens: Optional[torch.Tensor] = None
+
+    # === Tensors crossing to ForwardBatch (clone targets for stream isolation) ===
     # Batched arguments to model runner
     input_ids: torch.Tensor = None  # shape: [b], int64
     # Staging consumed by resolve_forward_inputs (prefill H2D / mixed gather).
@@ -2726,6 +2736,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
+        input_device = self.device
+        if _is_tpu:
+            input_device = current_platform.get_batch_input_device(self)
+            self.tpu_input_device = input_device
 
         if self.is_dllm():
             # For DLLM, we use a separate forward mode
@@ -2754,12 +2768,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # resolve_forward_inputs.
         pinned_input_ids = flatten_arrays_to_pinned_cpu(input_ids, _pin)
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
-            self.device, non_blocking=True
+            input_device, non_blocking=True
         )
         seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         orig_seq_lens_tensor = torch.tensor(
             orig_seq_lens, dtype=torch.int32, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        )
+        if _is_tpu:
+            self.tpu_orig_seq_lens_cpu = orig_seq_lens_tensor
+        orig_seq_lens_tensor = orig_seq_lens_tensor.to(input_device, non_blocking=True)
 
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens
@@ -2947,7 +2964,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
             torch.tensor(input_embeds, pin_memory=_pin).to(
-                self.device, non_blocking=True
+                input_device, non_blocking=True
             )
             if input_embeds
             else None
@@ -3142,6 +3159,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.SPLIT_PREFILL
 
     def mix_with_running(self, running_batch: ScheduleBatch):
+        if _is_tpu:
+            self._align_tpu_input_devices(running_batch)
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
 
@@ -3590,6 +3609,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Beam member rows ride this decode batch: append them to the row
         # tensors before allocation so alloc_for_decode covers them too.
         strip_beam_tail(self)
+        if _is_tpu:
+            self._refresh_tpu_input_device()
+            self.tpu_mixed_input_tokens = None
         append_beam_tail(self)
 
         if self.sampling_info.penalizer_orchestrator.is_required:
@@ -3613,6 +3635,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = self.seq_lens + 1
         self.seq_lens_cpu = self.seq_lens_cpu + 1
         self.orig_seq_lens = self.orig_seq_lens + 1
+        if _is_tpu and self.tpu_orig_seq_lens_cpu is not None:
+            self.tpu_orig_seq_lens_cpu = self.tpu_orig_seq_lens_cpu + 1
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 
@@ -3700,16 +3724,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.reqs = [self.reqs[i] for i in keep_indices]
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
-        self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
-        self.seq_lens = self.seq_lens[keep_indices_device]
-        self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
+        self.req_pool_indices = (
+            self.req_pool_indices_cpu.to(self.device, non_blocking=True)
+            if _is_tpu and self.tpu_input_device == "cpu"
+            else self.req_pool_indices[keep_indices_device]
+        )
+        self.seq_lens = self.seq_lens[
+            (
+                keep_indices
+                if _is_tpu and self.seq_lens.device.type == "cpu"
+                else keep_indices_device
+            )
+        ]
+        self.orig_seq_lens = self.orig_seq_lens[
+            (
+                keep_indices
+                if _is_tpu and self.orig_seq_lens.device.type == "cpu"
+                else keep_indices_device
+            )
+        ]
+        if _is_tpu and self.tpu_orig_seq_lens_cpu is not None:
+            self.tpu_orig_seq_lens_cpu = self.tpu_orig_seq_lens_cpu[keep_indices]
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 
         if self.input_ids is not None:
-            self.input_ids = self.input_ids[keep_indices_device]
+            self.input_ids = self.input_ids[
+                (
+                    keep_indices
+                    if _is_tpu and self.input_ids.device.type == "cpu"
+                    else keep_indices_device
+                )
+            ]
         # Optional under no-verify-sync; resolve_seq_lens repopulates before forward.
         if self.seq_lens_cpu is not None:
             self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
@@ -3746,7 +3794,47 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_indices_cpu=keep_indices,
             )
 
+    def _refresh_tpu_input_device(self):
+        """Recover host staging after the last incompatible request leaves.
+
+        CPU mirrors preserve original-length semantics; no live device value
+        needs to be read back during this transition.
+        """
+        placement = current_platform.get_batch_input_device(self)
+        if placement == (self.tpu_input_device or self.device):
+            return
+        if self.tpu_orig_seq_lens_cpu is None:
+            # A batch constructed outside the host-mirror path keeps its contract.
+            return
+        self.seq_lens = self.seq_lens_cpu.to(placement, non_blocking=True)
+        self.orig_seq_lens = self.tpu_orig_seq_lens_cpu.to(placement, non_blocking=True)
+        self.tpu_input_device = placement
+
+    def _align_tpu_input_devices(self, other: ScheduleBatch):
+        """Merging a staged batch with a device-only batch restores device inputs.
+
+        Never copy live device values back to the host to merge them.
+        """
+        if (self.tpu_input_device or self.device) == (
+            other.tpu_input_device or other.device
+        ):
+            return
+        for batch in (self, other):
+            for name in (
+                "input_ids",
+                "input_embeds",
+                "seq_lens",
+                "orig_seq_lens",
+                "out_cache_loc",
+            ):
+                value = getattr(batch, name, None)
+                if isinstance(value, torch.Tensor) and value.device.type == "cpu":
+                    setattr(batch, name, value.to(batch.device, non_blocking=True))
+            batch.tpu_input_device = batch.device
+
     def merge_batch(self, other: ScheduleBatch):
+        if _is_tpu:
+            self._align_tpu_input_devices(other)
         strip_beam_tail(self)
         strip_beam_tail(other)
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -3758,14 +3846,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
             self.encoder_lens_cpu = self.encoder_lens_cpu + other.encoder_lens_cpu
-        self.req_pool_indices = torch.cat(
-            [self.req_pool_indices, other.req_pool_indices]
-        )
         self.req_pool_indices_cpu = torch.cat(
             [self.req_pool_indices_cpu, other.req_pool_indices_cpu]
         )
+        self.req_pool_indices = (
+            self.req_pool_indices_cpu.to(self.device, non_blocking=True)
+            if _is_tpu and self.tpu_input_device == "cpu"
+            else torch.cat([self.req_pool_indices, other.req_pool_indices])
+        )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
+        if _is_tpu:
+            self.tpu_orig_seq_lens_cpu = (
+                torch.cat([self.tpu_orig_seq_lens_cpu, other.tpu_orig_seq_lens_cpu])
+                if self.tpu_orig_seq_lens_cpu is not None
+                and other.tpu_orig_seq_lens_cpu is not None
+                else None
+            )
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
@@ -3824,6 +3921,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # original.
         return ScheduleBatch(
             reqs=self.reqs[:],
+            tpu_input_device=self.tpu_input_device if _is_tpu else None,
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,

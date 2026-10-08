@@ -678,6 +678,7 @@ class Scheduler(
         # Init overlap schedule
         self.init_overlap()
         self.maybe_init_kv_free_fence()
+        self.maybe_precompile_tpu_serving_ops()
         if current_platform.is_tpu() and self.draft_worker is not None:
             self.precompile_tpu_spec_ops()
 
@@ -1798,6 +1799,22 @@ class Scheduler(
                 self.token_to_kv_pool_allocator,
                 synchronize_device=self.device_module.synchronize,
             )
+
+    def maybe_precompile_tpu_serving_ops(self) -> None:
+        if not current_platform.is_tpu():
+            return
+        from sglang.srt.hardware_backend.tpu.serving_op_precompile import (
+            precompile_serving_ops,
+        )
+
+        precompile_serving_ops(
+            compile_policy=self.tp_worker.model_runner.compile_policy,
+            future_map=self.future_map,
+            spec_algorithm=self.spec_algorithm,
+            max_running_requests=self.max_running_requests,
+            vocab_size=self.model_config.vocab_size,
+            enable_mixed_chunk=get_schedule().enable_mixed_chunk,
+        )
 
     def precompile_tpu_spec_ops(self) -> None:
         from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (

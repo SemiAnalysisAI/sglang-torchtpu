@@ -523,6 +523,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # "Borrowed" into a dedicated "Forward-resolved snapshot" group.
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
+    # TPU mixed tails stay on device until bucketed input_ids have been uploaded.
+    tpu_mixed_input_tokens: Optional[torch.Tensor] = None
 
     # The write loc before `rebind_write_loc` replaced it with kernel-facing
     # ids; a backend re-derives from it into its capture-stable buffer.
@@ -957,12 +959,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
+        input_device = model_runner.device
+        if _is_tpu:
+            input_device = getattr(batch, "tpu_input_device", None) or input_device
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
             input_ids=batch.input_ids,
-            req_pool_indices=batch.req_pool_indices,
+            req_pool_indices=(
+                batch.req_pool_indices_cpu
+                if _is_tpu and input_device == "cpu"
+                else batch.req_pool_indices
+            ),
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
@@ -974,6 +983,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 else None
             ),
             orig_seq_lens=batch.orig_seq_lens,
+            tpu_mixed_input_tokens=(
+                getattr(batch, "tpu_mixed_input_tokens", None) if _is_tpu else None
+            ),
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             engram_history=batch.engram_history,
             mamba_track_indices=batch.mamba_track_indices,
@@ -1112,10 +1124,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 pin_memory = is_pin_memory_available(device)
                 ret.extend_seq_lens = torch.tensor(
                     extend_seq_lens, dtype=torch.int32, pin_memory=pin_memory
-                ).to(device, non_blocking=True)
+                ).to(input_device, non_blocking=True)
                 ret.extend_prefix_lens = torch.tensor(
                     extend_prefix_lens, dtype=torch.int32, pin_memory=pin_memory
-                ).to(device, non_blocking=True)
+                ).to(input_device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = list(extend_prefix_lens)
                 ret.extend_seq_lens_cpu = list(extend_seq_lens)
             else:
@@ -1436,6 +1448,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _compute_mrope_positions_decode(
         self, model_runner: ModelRunner, batch: ScheduleBatch
     ):
+        input_device = model_runner.device
+        if _is_tpu:
+            input_device = getattr(batch, "tpu_input_device", None) or input_device
         seq_lens_cpu = self.seq_lens_cpu
         batch_size = seq_lens_cpu.shape[0]
         mm_inputs = batch.multimodal_inputs
@@ -1466,7 +1481,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             for i, mm in enumerate(mm_inputs):
                 deltas_list[i] = mm.mrope_position_delta.item() if mm is not None else 0
             deltas = torch.tensor(
-                deltas_list, dtype=torch.int64, device=model_runner.device
+                deltas_list,
+                dtype=torch.int64,
+                device=input_device,
             )
             positions_1d = (deltas - 1) + seq_lens_int64
             self.mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
@@ -1495,13 +1512,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dim=1,
         ).to(
             dtype=torch.int64,
-            device=model_runner.device,
+            device=input_device,
             non_blocking=True,
         )
 
     def _compute_mrope_positions_extend(
         self, model_runner: ModelRunner, batch: ScheduleBatch
     ):
+        input_device = model_runner.device
+        if _is_tpu:
+            input_device = getattr(batch, "tpu_input_device", None) or input_device
         seq_lens_cpu = self.seq_lens_cpu
         batch_size = seq_lens_cpu.shape[0]
         mm_inputs = batch.multimodal_inputs
@@ -1554,7 +1574,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.mrope_positions = torch.cat(
             mrope_positions_list,
             dim=1,
-        ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
+        ).to(
+            dtype=torch.int64,
+            device=input_device,
+            non_blocking=True,
+        )
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
         if value == 0:

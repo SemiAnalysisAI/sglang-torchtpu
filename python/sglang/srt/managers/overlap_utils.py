@@ -98,7 +98,12 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     - Decode/spec_v2: gather from FutureMap (last iter's sampled token).
     """
     if batch.prefill_input_ids_cpu is not None:
-        prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
+        # Eligible TPU prompts wait for backend bucket padding, including mixed
+        # prompts whose device-produced decode tail is injected after upload.
+        input_device = batch.device
+        if _is_tpu:
+            input_device = getattr(batch, "tpu_input_device", None) or batch.device
+        prefill_gpu = batch.prefill_input_ids_cpu.to(input_device, non_blocking=True)
         if batch.mix_running_indices is not None:
             if batch.enable_overlap and not batch.spec_algorithm.is_none():
                 future_map.resolve_mixed_spec_tails(batch)
@@ -109,7 +114,15 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
                     future_map.output_tokens_buf,
                     batch.mix_running_indices,
                 )
-            batch.input_ids = torch.cat([prefill_gpu, decode_gpu])
+            if _is_tpu and input_device == "cpu":
+                # Arbitrary prompt lengths are padded on the host. Keep relay
+                # tokens on device and write them at runtime offsets afterward.
+                batch.input_ids = torch.cat(
+                    [prefill_gpu, prefill_gpu.new_zeros(decode_gpu.numel())]
+                )
+                batch.tpu_mixed_input_tokens = decode_gpu
+            else:
+                batch.input_ids = torch.cat([prefill_gpu, decode_gpu])
         else:
             batch.input_ids = prefill_gpu
         batch.prefill_input_ids_cpu = None
@@ -514,9 +527,10 @@ class FutureMap:
         static across steps (offset is a runtime tensor value, not a shape).
         Ported from fork PR #78; elsewhere keep the cheaper setitem.
         """
-        # Cast to the buffer dtype before storing (main #134: the sampler now
-        # returns int64 token ids that must land in the buffer's dtype).
-        if values.dtype != buf.dtype:
+        # TPU host-staged metadata must reach the relay device before storing.
+        if _is_tpu and values.device != buf.device:
+            values = values.to(device=buf.device, dtype=buf.dtype, non_blocking=True)
+        elif values.dtype != buf.dtype:
             values = values.to(buf.dtype)
         if self._use_dynamic_index:
             buf.index_copy_(0, indices, values)

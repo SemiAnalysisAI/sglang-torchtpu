@@ -310,8 +310,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,  # last_loc for full layers
         extend_num_tokens: int,
         out_indices_cpu: Optional[torch.Tensor] = None,
+        *,
+        output_device: Optional[str] = None,
     ):
         assert self.page_size > 1
+        # TPU can retain allocation metadata on the host until model padding.
+        # Other backends and callers retain the existing device-output contract.
+        output_kwargs = {}
+        if output_device is not None:
+            assert _is_tpu
+            output_kwargs["output_device"] = output_device
 
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
@@ -329,11 +337,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 last_loc,
                 extend_num_tokens,
                 num_new_pages=num_new_pages,
+                **output_kwargs,
             )
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
-        full_alloc_kwargs = {"num_new_pages": num_new_pages}
+        full_alloc_kwargs = {"num_new_pages": num_new_pages, **output_kwargs}
         if out_indices_cpu is not None:
             # TPU speculative decoding preallocates this host output buffer.
             # Only the full-attention locations are returned to the caller;
@@ -358,6 +367,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_last_loc,
             extend_num_tokens,
             num_new_pages=num_new_pages,
+            **output_kwargs,
         )
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
@@ -450,21 +460,27 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,  # last_loc for full layers
+        *,
+        output_device: Optional[str] = None,
     ):
         assert self.page_size > 1
+        output_kwargs = {}
+        if output_device is not None:
+            assert _is_tpu
+            output_kwargs["output_device"] = output_device
         if self._swa_req_ring:
             # See alloc_extend: slot-addressed ring, so full-attention KV only.
             return self.full_attn_allocator.alloc_decode(
-                seq_lens, seq_lens_cpu, last_loc
+                seq_lens, seq_lens_cpu, last_loc, **output_kwargs
             )
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
         alloc_full_indices = self.full_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc
+            seq_lens, seq_lens_cpu, last_loc, **output_kwargs
         )
         alloc_swa_indices = self.swa_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, swa_last_loc
+            seq_lens, seq_lens_cpu, swa_last_loc, **output_kwargs
         )
 
         if alloc_full_indices is None or alloc_swa_indices is None:

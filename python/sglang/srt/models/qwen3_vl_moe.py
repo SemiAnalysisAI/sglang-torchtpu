@@ -33,6 +33,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeModel
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import is_tpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -176,6 +177,20 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             return hidden_states
 
         return hidden_states, aux_hidden_states
+
+
+if is_tpu():
+    from sglang.srt.compilation.support_torch_compile import support_torch_compile
+    from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+        Qwen3VLDecoderTpuCompilePolicy,
+    )
+
+    # This backbone is a sibling of the annotated dense Qwen3LLMModel. Without
+    # its own policy, vision precompile suppresses the fallback for the decoder.
+    support_torch_compile(
+        Qwen3MoeLLMModel,
+        policy=Qwen3VLDecoderTpuCompilePolicy,
+    )
 
 
 def load_fused_expert_weights(

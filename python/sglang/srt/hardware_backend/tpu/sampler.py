@@ -381,6 +381,15 @@ class TpuSampler(Sampler):
 
         # No global TopK: sample from the full-vocabulary logits instead.
         if not logits_output.has_next_token_global_top_k:
+            if (
+                sampling_info.sampling_seed is not None
+                and not sampling_info.is_all_greedy
+            ):
+                # The logical batch may retain host lengths/positions while the
+                # compiled forward consumed a separate padded device copy.
+                positions = positions.to(
+                    logits_output.next_token_logits.device, non_blocking=True
+                )
             return super().forward(
                 logits_output,
                 sampling_info,

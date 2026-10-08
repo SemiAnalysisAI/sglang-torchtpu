@@ -187,6 +187,8 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         extend_num_tokens: int,
         num_new_pages: int = None,
         out_indices_cpu: torch.Tensor = None,
+        *,
+        output_device: str | torch.device | None = None,
     ):
         if self.debug_mode:
             assert torch.all(
@@ -229,7 +231,9 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             out_indices_cpu,
             self.page_size,
         )
-        out_indices = out_indices_cpu.to(self.device, non_blocking=True)
+        out_indices = out_indices_cpu.to(
+            output_device or self.device, non_blocking=True
+        )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
@@ -242,6 +246,8 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
+        *,
+        output_device: str | torch.device | None = None,
     ):
         if self.debug_mode:
             assert torch.all(
@@ -277,7 +283,9 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             out_indices_cpu = (last_loc + 1) * (1 - need_new_pages) + (
                 per_req_new_page * self.page_size * need_new_pages
             )
-            out_indices = out_indices_cpu.to(self.device, non_blocking=True)
+            out_indices = out_indices_cpu.to(
+                output_device or self.device, non_blocking=True
+            )
         else:
             # Device formula on fixed-shape (bs,) inputs (bs is bucketed).
             per_req_new_page_dev = per_req_new_page.to(self.device, non_blocking=True)
