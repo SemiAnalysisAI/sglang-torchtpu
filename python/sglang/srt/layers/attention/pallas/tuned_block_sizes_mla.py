@@ -340,6 +340,38 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ),  # Capped from 32 to prevent VMEM OOM when dbs=4
         ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 256, 8192): (1, 512),
         ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 256, 16384): (1, 512),
+        # ===== 4 q heads per shard, page 128: Kimi-K3 TP32 (3 -> 4),
+        # DeepSeek-V3/R1 TP32, Kimi-K2.6 TP16 =====
+        # v7x, 3 and 4 heads: each entry minimizes the worst-case slowdown vs
+        # the best block per workload. Decode over kv 512-8192: <= 1.16x up to
+        # bs 16, <= 1.33x above. Mixed over fresh, 4k-prefix and 4/8-sequence
+        # prefills: <= 1.38x.
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (16, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (16, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (8, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 8): (8, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 16): (8, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 32): (8, 1, 8),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 64): (8, 1, 8),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (8, 1, 8),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 256): (8, 1, 8),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 512): (8, 1, 8),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 1024): (8, 1, 8),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (8, 16),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (8, 16),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (8, 16),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 8): (8, 16),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 16): (8, 16),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 32): (8, 32),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 64): (8, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (8, 128),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 256): (4, 256),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 512): (4, 256),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1024): (4, 512),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2048): (4, 512),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 4096): (4, 512),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 8192): (8, 1024),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 16384): (8, 1024),
     },
 }
 
