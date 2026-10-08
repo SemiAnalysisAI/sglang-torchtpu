@@ -1,18 +1,18 @@
 {
   "presets": {
-    "delay_5s": {
+    "delay_5_percent_req_max_5_sec": {
       "description": "5% of requests meet a delay of 0 to 5 s, no failure",
       "fails_per_request": 0.0,
       "delays_per_request": 0.05,
       "max_delay_ms": 5000
     },
-    "delay_60s": {
+    "delay_5_percent_req_max_60_sec": {
       "description": "5% of requests meet a delay of 0 to 60 s, no failure",
       "fails_per_request": 0.0,
       "delays_per_request": 0.05,
       "max_delay_ms": 60000
     },
-    "fail_delay_5s": {
+    "fail_5_percent_req_delay_5_percent_req_max_5_sec": {
       "description": "5% of requests meet a fatal transfer error and 5% a delay of 0 to 5 s",
       "fails_per_request": 0.05,
       "delays_per_request": 0.05,

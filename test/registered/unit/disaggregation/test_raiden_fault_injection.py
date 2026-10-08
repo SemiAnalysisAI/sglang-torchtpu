@@ -18,6 +18,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 CONFIG = load_config()
+DELAY_5_SEC = "delay_5_percent_req_max_5_sec"
+DELAY_60_SEC = "delay_5_percent_req_max_60_sec"
+FAIL_DELAY_5_SEC = "fail_5_percent_req_delay_5_percent_req_max_5_sec"
 ROLES = ("prefill", "decode")
 RANKS = 8
 READS_PER_REQUEST = 3.5
@@ -50,7 +53,7 @@ def _rules(preset, role):
     )
 
 
-def _injector(native, preset="fail_delay_5s", role="decode"):
+def _injector(native, preset=FAIL_DELAY_5_SEC, role="decode"):
     return RaidenFaultInjector(
         native=native,
         name=preset,
@@ -117,14 +120,14 @@ class TestBuildRules(unittest.TestCase):
         with a longer delay must not delay that step."""
         hooks = {
             preset: {rule["hook"] for role in ROLES for rule in _rules(preset, role)}
-            for preset in ("delay_5s", "delay_60s")
+            for preset in (DELAY_5_SEC, DELAY_60_SEC)
         }
         self.assertTrue(TIME_LIMITED_HOOKS)
-        self.assertFalse(hooks["delay_60s"] & TIME_LIMITED_HOOKS)
-        self.assertTrue(TIME_LIMITED_HOOKS <= hooks["delay_5s"])
+        self.assertFalse(hooks[DELAY_60_SEC] & TIME_LIMITED_HOOKS)
+        self.assertTrue(TIME_LIMITED_HOOKS <= hooks[DELAY_5_SEC])
 
     def test_delay_presets_install_no_failure(self):
-        for preset in ("delay_5s", "delay_60s"):
+        for preset in (DELAY_5_SEC, DELAY_60_SEC):
             for role in ROLES:
                 rules = _rules(preset, role)
                 self.assertEqual({r["action"] for r in rules}, {"delay"})
@@ -197,7 +200,7 @@ class TestStart(unittest.TestCase):
         fault_injection.note_read(room=1, layers=LAYERS_PER_READ)
 
     def test_unknown_preset_is_refused(self):
-        with envs.SGLANG_TEST_RAIDEN_FAULT_INJECTION.override("delay_5"):
+        with envs.SGLANG_TEST_RAIDEN_FAULT_INJECTION.override("delay_5_percent"):
             with self.assertRaises(ValueError):
                 fault_injection.start(role="decode", ranks=RANKS)
 
@@ -215,7 +218,7 @@ class TestStart(unittest.TestCase):
             "tpu_sync.api.torch.fault_injection": module,
         }
         with patch.dict(sys.modules, modules):
-            with envs.SGLANG_TEST_RAIDEN_FAULT_INJECTION.override("delay_5s"):
+            with envs.SGLANG_TEST_RAIDEN_FAULT_INJECTION.override(DELAY_5_SEC):
                 fault_injection.start(role="prefill", ranks=RANKS)
         self.assertTrue(fault_injection.active())
         for room in range(fault_injection._WARMUP_REQUESTS):
