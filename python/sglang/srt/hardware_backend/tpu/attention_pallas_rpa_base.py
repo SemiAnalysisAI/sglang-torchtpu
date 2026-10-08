@@ -104,6 +104,9 @@ class PallasForwardMetadata:
     # Static query rows per DECODE sequence for this forward (1 = ordinary
     # decode); above 1 the active rows take the kernel's DECODE range.
     decode_query_size: int = 1
+    # Kernel passes ``distribution`` can populate ("all" | "decode" | "mixed"),
+    # chosen with it in _build_metadata. Only the MLA v2 kernel reads it.
+    segments: str = "all"
     # Owned scalar i32: -1=native fallback, 0=static base, 1024/2048=promotion.
     # Backends without runtime tile selection leave this unset.
     prefill_kv_tile_hint: torch.Tensor | None = None
@@ -613,6 +616,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             ]
         )
 
+    def _kernel_segments(self, forward_batch: ForwardBatch, is_decode: bool) -> str:
+        """Kernel passes the ``distribution`` built from ``is_decode`` can
+        populate. A static kernel arg, so it may only depend on values fixed
+        per compiled graph."""
+        return "all"
+
     def _build_metadata(
         self,
         forward_batch: ForwardBatch,
@@ -637,11 +646,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         page_size = self.page_size
         device = forward_batch.seq_lens.device
         decode_query_size = self._forward_decode_query_size(forward_batch)
+        is_decode = forward_batch.forward_mode.is_decode() or decode_query_size > 1
         distribution = self._get_cached_rpa_distribution(
-            forward_batch.forward_mode.is_decode() or decode_query_size > 1,
-            non_empty_bs,
-            device,
+            is_decode, non_empty_bs, device
         )
+        segments = self._kernel_segments(forward_batch, is_decode)
         bs = int(forward_batch.seq_lens.shape[0])
         req_to_token = self.req_to_token_pool.req_to_token
         pages_per_seq = _get_pages_per_seq(self.max_context_len, page_size)
@@ -660,6 +669,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 distribution,
                 non_empty_bs,
                 decode_query_size,
+                segments,
             )
 
         # -------------------------------------------------------------- #
@@ -765,6 +775,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             active_num_tokens=_make_active_num_tokens(cu_q_lens, non_empty_bs),
             swa_page_indices=swa_page_indices,
             decode_query_size=decode_query_size,
+            segments=segments,
         )
 
     def _get_query_metadata(
@@ -826,6 +837,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         distribution: torch.Tensor,
         non_empty_bs: int,
         decode_query_size: int = 1,
+        segments: str = "all",
     ) -> PallasForwardMetadata:
         """Build metadata on the CPU and reuse cached device copies when possible.
 
@@ -933,6 +945,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             active_num_tokens=active_num_tokens,
             swa_page_indices=swa_page_indices,
             decode_query_size=decode_query_size,
+            segments=segments,
         )
 
     def _extend_query_lens(self, forward_batch, bs: int) -> tuple[int, ...]:
