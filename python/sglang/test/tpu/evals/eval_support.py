@@ -769,6 +769,28 @@ def make_runner(model: dict[str, Any], eval_name: str, *, n_repeats: int = 1):
     )
 
 
+# The nightly MMMU-Pro rows: a fixed sample, so every night scores the same set.
+MMMU_PRO_NIGHTLY_ROWS = 250
+
+
+def make_mmmu_sample_runner(
+    model: dict[str, Any], *, count: int = MMMU_PRO_NIGHTLY_ROWS
+):
+    """Score a fixed MMMU-Pro sample through sgl-eval with this model's card sampling."""
+    from sglang.test.tpu.evals.mmmu_full import run_sample
+
+    def run(base_url: str) -> dict[str, Any]:
+        return run_sample(
+            base_url,
+            count=count,
+            seed=0,
+            model=model["served_model_name"],
+            **model["sampling"],
+        )
+
+    return run
+
+
 def make_model_config(
     model: dict[str, Any],
     *,

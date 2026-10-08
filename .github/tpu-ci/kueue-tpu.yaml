@@ -136,11 +136,11 @@ spec:
         - name: tpu7x-2x2x1-nightly
           resources:
             - name: "google.com/tpu"
-              nominalQuota: 12
+              nominalQuota: 8
             - name: "cpu"
-              nominalQuota: 12
+              nominalQuota: 8
             - name: "memory"
-              nominalQuota: 96Gi
+              nominalQuota: 64Gi
 ---
 # One slice. A second = new pool + new flavor + one more entry here; no workflow change.
 apiVersion: kueue.x-k8s.io/v1beta2

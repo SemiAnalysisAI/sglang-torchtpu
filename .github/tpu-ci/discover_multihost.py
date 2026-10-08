@@ -17,6 +17,7 @@ Prints a JSON array for the CI matrix:
 
 import argparse
 import ast
+import functools
 import glob
 import json
 import os
@@ -32,13 +33,29 @@ def _literal(node):
         return None
 
 
-def _scan(root, suite, nightly_only):
-    found = {}
+@functools.lru_cache(maxsize=None)
+def _tpu_registered_trees(root):
+    """(path, AST) of every file that can register a TPU test, parsed once.
+
+    ci_register recognizes a TPU test only by the literal `register_tpu_ci` call,
+    so the rest of the tree (~94% of it) is skipped unparsed.
+    """
+    trees = []
     for path in glob.glob(f"{root}/**/*.py", recursive=True):
+        with open(path) as f:
+            text = f.read()
+        if "register_tpu_ci" not in text:
+            continue
         try:
-            tree = ast.parse(open(path).read())
+            trees.append((path, ast.parse(text)))
         except SyntaxError:
             continue
+    return tuple(trees)
+
+
+def _scan(root, suite, nightly_only):
+    found = {}
+    for path, tree in _tpu_registered_trees(root):
         launch, registered = None, False
         for node in ast.walk(tree):
             if (

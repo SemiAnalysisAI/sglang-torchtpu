@@ -1,4 +1,4 @@
-"""Qwen3.5-397B-A17B-FP8 TPU MMMU-Pro nightly score, all 1,730 standard-10 questions.
+"""Qwen3.5-397B-A17B-FP8 TPU MMMU-Pro nightly score on a fixed 250-question sample.
 
 sgl-eval's own loader and grader, thinking on, with the model card's sampling.
 """
@@ -6,11 +6,11 @@ sgl-eval's own loader and grader, thinking on, with the model card's sampling.
 import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import QWEN3_5_397B, make_model_config, make_runner
+from sglang.test.tpu import QWEN3_5_397B, make_mmmu_sample_runner, make_model_config
 from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase, gate_server_failures
 
 register_tpu_ci(
-    est_time=9000,
+    est_time=3600,
     suite="nightly-tpu-accuracy-qwen3-5-397b-mmmupro",
     nightly=True,
     labels=["singlehost", "qwen3.5-397b", "accuracy"],
@@ -22,7 +22,7 @@ GATE = {
     "dataset": "mmmu_pro",
     "label": "mmmu_pro",
     "report_only": True,
-    "runner": make_runner(QWEN3_5_397B, "mmmu_pro"),
+    "runner": make_mmmu_sample_runner(QWEN3_5_397B),
 }
 
 

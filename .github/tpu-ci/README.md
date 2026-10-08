@@ -32,7 +32,7 @@ PR / nightly ─▶ GitHub-hosted runner
                  │    ├─ ci-tpu7x-2x2x1          (pr-gate,    2 nodes = 2 slices)
                  │    └─ ci-tpu7x-2x2x2-prgate   (pr-gate-2h, 1 slice = 2 hosts)
                  └─ nightly lane
-                      ├─ ci-tpu7x-2x2x1-nightly  (nightly-1h, 3 nodes = 3 slices)
+                      ├─ ci-tpu7x-2x2x1-nightly  (nightly-1h, 2 nodes = 2 slices)
                       ├─ ci-tpu7x-2x2x2          (nightly,    1 slice = 2 hosts)
                       └─ ci-tpu7x-2x2x4-nightly  (nightly-4h, 1 slice = 4 hosts)
 ```
@@ -140,8 +140,8 @@ Each slot fills the lane its MMMU-Pro legs leave idle:
 
 | Slot | 1-host lane | 2-host lane |
 |---|---|---|
-| `day-10am` | single-host accuracy (gpt-oss, Gemma 4) | Kimi-K2.6 MMMU shards |
-| `day-5pm` | Gemma 4 / Qwen3.5 MMMU-Pro | DeepSeek R1 / V3.1 accuracy, kv-offload-resharding P/D gates |
+| `day-10am` | gpt-oss-120b; Gemma 4 AIME/GPQA | Kimi-K2.6 MMMU shards |
+| `day-5pm` | gpt-oss-20b; Gemma 4 / Qwen3.5 MMMU-Pro (250-question sample); Qwen3.5 GPQA/AIME26 | DeepSeek R1 / V3.1 accuracy, kv-offload-resharding P/D gates |
 
 Each stage is a reusable workflow (the nightly calls feature validation and perf with the
 shared image), and ALSO its own `workflow_dispatch` trigger (with its own build) for running one stage — or one
@@ -164,7 +164,7 @@ slice's quota is free:
 
 | leg | LocalQueue | flavor | quota | concurrent |
 |------|-----------|--------|-------|-----------|
-| `hosts=1` | `tpu-nightly-1h` | `tpu7x-2x2x1-nightly` | 12 chips | 3 |
+| `hosts=1` | `tpu-nightly-1h` | `tpu7x-2x2x1-nightly` | 8 chips | 2 |
 | `hosts=2` | `tpu-nightly-2h` | `tpu7x-2x2x2-nightly` | 8 chips | 1 per slice |
 | `hosts=4` | `tpu-nightly-4h` | `tpu7x-2x2x4-nightly` | 16 chips | 1 per slice |
 
@@ -295,7 +295,7 @@ used — no error, so check the `pools for lane=… hosts=…` line in the job l
 |------|---------------|---------------|----------|-------|-------|
 | `ci-tpu7x-2x2x1` | `pr-gate` | `pr-gate` | 2x2x1 | 2 | 8 |
 | `ci-tpu7x-2x2x2-prgate` | `pr-gate-2h` | `pr-gate` | 2x2x2 | 2 | 8 |
-| `ci-tpu7x-2x2x1-nightly` | `nightly-1h` | `nightly` | 2x2x1 | 3 | 12 |
+| `ci-tpu7x-2x2x1-nightly` | `nightly-1h` | `nightly` | 2x2x1 | 2 | 8 |
 | `ci-tpu7x-2x2x2` | `nightly` | `nightly` | 2x2x2 | 2 | 8 |
 | `ci-tpu7x-2x2x2-b` | `nightly-b` | `nightly` | 2x2x2 | 2 | 8 |
 | `ci-tpu7x-2x2x4-nightly` | `nightly-4h` | `nightly` | 2x2x4 | 4 | 16 |

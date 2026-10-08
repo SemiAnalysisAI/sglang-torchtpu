@@ -18,9 +18,9 @@ on:
   # Pacific time, DST-aware like the nightly. `plan` maps each cron to its tests,
   # so a changed cron must change there too.
   schedule:
-    - cron: "0 10 * * *"  # day-10am: Kimi MMMU on the 2-host slices, single-host accuracy on the 1-host ones
+    - cron: "0 10 * * *"  # day-10am: Kimi MMMU on 2-host; gpt-oss-120b + Gemma4 AIME/GPQA on 1-host
       timezone: "America/Los_Angeles"
-    - cron: "0 17 * * *"  # day-5pm: Gemma4/Qwen3.5 MMMU on 1-host, DeepSeek accuracy + long P/D gates on 2-host
+    - cron: "0 17 * * *"  # day-5pm: DeepSeek + long P/D gates on 2-host; gpt-oss-20b, Gemma4/Qwen3.5 MMMU, Qwen3.5 GPQA/AIME26 on 1-host
       timezone: "America/Los_Angeles"
   workflow_dispatch:
     inputs:
@@ -154,11 +154,13 @@ jobs:
       contents: read
       id-token: write
 
+  # The 5 PM slot: with two 1-host slices, its ~3 h run would push the 10 AM
+  # slot's last-admitted legs past the 6 h cap.
   accuracy-gpt-oss-20b:
     needs: [build, plan]
     if: >-
       ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","full-set","day-10am","gpt-oss-20b"]'), needs.plan.outputs.model) }}
+          && contains(fromJSON('["all","full-set","day-5pm","gpt-oss-20b"]'), needs.plan.outputs.model) }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -209,8 +211,8 @@ jobs:
       contents: read
       id-token: write
 
-  # The 5 PM slot. 26B measured 8915 s in CI with bring-up; the
-  # JobSet deadline is 1.5 x est_time and the admission wait is the 6 h cap's rest.
+  # The 5 PM slot: a fixed 250-question sample, ~20 min of bring-up plus ~15 min
+  # of eval.
   accuracy-gemma4-mmmupro:
     needs: [build, plan]
     if: >-
@@ -235,13 +237,13 @@ jobs:
       run_name: ${{ matrix.run_name }}
       nightly: true
       weights_pvc: model-weights
-      timeout_per_file: 10800
+      timeout_per_file: 5400
     permissions:
       contents: read
       id-token: write
 
   # The 5 PM slot with the Gemma4 MMMU-Pro legs. FP8 fits one host (bf16 needs
-  # two); the full set measured 2 h 22 min in CI.
+  # two); its bring-up measured 42-44 min, before the 250-question sample.
   accuracy-qwen3-5-mmmupro:
     needs: [build, plan]
     if: >-
@@ -258,7 +260,38 @@ jobs:
       run_name: accuracy-qwen3-5-397b-mmmupro
       nightly: true
       weights_pvc: model-weights
-      timeout_per_file: 10800
+      timeout_per_file: 5400
+    permissions:
+      contents: read
+      id-token: write
+
+  # The 5 PM slot: Qwen3.5 text legs on the same one-host FP8 recipe. GPQA x4
+  # measured 1 h 34 min and AIME26 x4 1 h 10 min in CI, bring-up included.
+  accuracy-qwen3-5:
+    needs: [build, plan]
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","full-set","qwen3-5-397b","day-5pm"]'), needs.plan.outputs.model) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: nightly-tpu-accuracy-qwen3-5-397b-gpqa
+            run_name: accuracy-qwen3-5-397b-gpqa
+          - suite: nightly-tpu-accuracy-qwen3-5-397b-aime
+            run_name: accuracy-qwen3-5-397b-aime
+    name: ${{ matrix.suite }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      suite: ${{ matrix.suite }}
+      run_name: ${{ matrix.run_name }}
+      nightly: true
+      weights_pvc: model-weights
+      timeout_per_file: 7200
     permissions:
       contents: read
       id-token: write

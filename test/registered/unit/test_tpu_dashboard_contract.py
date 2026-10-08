@@ -30,7 +30,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tpu.evals import model_config
 
-register_cpu_ci(est_time=260, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 REPO = Path(__file__).resolve().parents[3]
 TPU_TESTS = REPO / "test" / "registered" / "tpu"
@@ -63,6 +63,19 @@ def _discover(script: str, *args: str) -> list:
         check=True,
     )
     return json.loads(proc.stdout)
+
+
+def _discover_suite(suite: str) -> list:
+    """discover_tests.discover for one suite, in process.
+
+    The same function the workflows run; one process collects the tree once for
+    every suite instead of a subprocess per suite.
+    """
+    if str(TPU_CI) not in sys.path:
+        sys.path.insert(0, str(TPU_CI))
+    import discover_tests
+
+    return discover_tests.discover(suite, True, str(REPO / "test" / "registered"))
 
 
 def _nightly_registered() -> dict:
@@ -271,11 +284,11 @@ class TestJobMapsToOneTest(CustomTestCase):
             # A hosted runner has six hours, including startup and cleanup.
             runtime = 3600 + group["timeout_per_file"] + 600
             self.assertGreater(21600 - runtime - 900 - 600, 0, group["name"])
-        # The nightly no longer runs accuracy; single-host legs ride the 10 AM slot.
+        # The nightly no longer runs accuracy; the daytime slots own every leg.
         for job in workflow["jobs"].values():
             self.assertNotIn('"nightly"', job.get("if", ""))
         gpt = workflow["jobs"]["accuracy-gpt-oss-20b"]
-        self.assertIn('"day-10am"', gpt["if"])
+        self.assertIn('"day-5pm"', gpt["if"])
         self.assertEqual(gpt["with"]["suite"], "nightly-tpu-accuracy-gpt-oss-20b")
 
         def suites(job_name):
@@ -345,7 +358,7 @@ class TestJobMapsToOneTest(CustomTestCase):
             text = (WORKFLOWS / workflow).read_text(encoding="utf-8")
             self.assertIn(suite, text, f"{suite} is not in {workflow}'s matrix")
             # ...and render to exactly one file (one file, one suite, one job).
-            rows = _discover("discover_tests.py", "--suite", suite, "--nightly")
+            rows = _discover_suite(suite)
             self.assertEqual(
                 len(rows), 1, f"{suite} renders {len(rows)} jobs, contract is 1"
             )
@@ -536,6 +549,25 @@ class TestAliasRegistry(CustomTestCase):
                 self.live_ids,
                 f"alias {start} resolves to {current}, which no test claims",
             )
+
+
+class TestMMMUProNightlySample(CustomTestCase):
+    """The nightly MMMU-Pro sample must be the same rows every night.
+
+    The trend compares one night's score with the next, so a sample that drifted
+    between runs (an unseeded or set-ordered draw) would chart noise as change.
+    """
+
+    def test_sample_is_stable_and_spread(self):
+        from sglang.test.tpu.evals.mmmu_full import sample_rows
+
+        rows = list(range(1730))
+        picked = sample_rows(rows, 250, 0)
+        self.assertEqual(picked, sample_rows(rows, 250, 0))
+        self.assertEqual(len(set(picked)), 250)
+        self.assertEqual(picked, sorted(picked))
+        # Spread over the whole set, which is ordered by subject: not a prefix.
+        self.assertGreater(max(picked), 1500)
 
 
 class TestReservedKindValues(CustomTestCase):

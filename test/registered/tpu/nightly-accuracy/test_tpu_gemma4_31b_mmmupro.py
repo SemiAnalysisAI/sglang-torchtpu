@@ -1,13 +1,13 @@
-"""Gemma-4-31B TPU MMMU-Pro score, all 1,730 standard-10 questions."""
+"""Gemma-4-31B TPU MMMU-Pro score on a fixed 250-question sample."""
 
 import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import GEMMA4_31B, make_model_config, make_runner
+from sglang.test.tpu import GEMMA4_31B, make_mmmu_sample_runner, make_model_config
 from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase, gate_server_failures
 
 register_tpu_ci(
-    est_time=9000,
+    est_time=2700,
     suite="nightly-tpu-accuracy-gemma4-31b-mmmupro",
     nightly=True,
     labels=["singlehost", "gemma4-31b", "accuracy"],
@@ -20,7 +20,7 @@ GATE = {
     "dataset": "mmmu_pro",
     # sgl-eval's own grader: its own series, apart from the lenient manual re-grades.
     "label": "mmmu_pro_strict",
-    "runner": make_runner(GEMMA4_31B, "mmmu_pro"),
+    "runner": make_mmmu_sample_runner(GEMMA4_31B),
     "report_only": True,
 }
 
