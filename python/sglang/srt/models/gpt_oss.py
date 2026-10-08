@@ -270,7 +270,7 @@ class GptOssSparseMoeBlock(nn.Module):
             return self.forward_dwdp(hidden_states)
 
         if not get_moe_a2a_backend().is_deepep():
-            return self.forward_normal(hidden_states)
+            return self.forward_normal(hidden_states, forward_batch=forward_batch)
         else:
             raise NotImplementedError("forward_deepep branch not implemented yet")
 
@@ -314,6 +314,7 @@ class GptOssSparseMoeBlock(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         # `hidden_states` may arrive pre-padded along the last dim when the
         # preceding RMSNorm fused the MoE input pad (gated by
@@ -327,9 +328,15 @@ class GptOssSparseMoeBlock(nn.Module):
         hidden_dim_unpadded = self.hidden_size
         is_prepadded = hidden_states.shape[-1] != hidden_dim_unpadded
 
+        is_cp_extend = (
+            forward_batch is not None
+            and getattr(forward_batch, "forward_mode", None) is not None
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        )
         cp_gather = (
             get_parallel().attn_cp_size > 1
             and is_enable_moe_cp_allgather()
+            and is_cp_extend
             and num_tokens > 0
         )
         if cp_gather:
