@@ -1365,7 +1365,7 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        # The drain votes by list position, so entries must match across TP/CP.
+        # TPU drain votes use list positions, so entries must match across TP/CP.
         self._deferred_chunked_sender_aborts: list[Req] = []
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
@@ -3782,27 +3782,34 @@ class Scheduler(
         pending = self._deferred_chunked_sender_aborts
         if not pending:
             return
-        for req in pending:
-            req.disagg_kv_sender.poll()
-        # Every rank must free in the same step, or its next admitted batch can
-        # differ from its peers. Abort seals the sender before the drain vote.
-        drained = self._group_drained([req.disagg_kv_sender for req in pending])
+        drained = None
+        if current_platform.is_tpu():
+            for req in pending:
+                req.disagg_kv_sender.poll()
+            # TPU ranks must free in the same step to admit matching batches.
+            # Abort seals each sender before the group samples its drain state.
+            drained = self._group_drained([req.disagg_kv_sender for req in pending])
         still_held = []
-        for req, req_drained in zip(pending, drained, strict=True):
+        for i, req in enumerate(pending):
+            sender = req.disagg_kv_sender
+            if drained is None:
+                sender.poll()
+                req_drained = sender.drained()
+            else:
+                req_drained = drained[i]
             if not req_drained:
                 still_held.append(req)
                 continue
-            req.disagg_kv_sender.clear()
+            sender.clear()
             release_kv_cache(req, self.tree_cache, is_insert=False)
         self._deferred_chunked_sender_aborts = still_held
 
     def _group_drained(self, senders) -> List[bool]:
-        """Return each sender's drain state agreed across attention TP/CP."""
-        bits = torch.tensor(
-            [1 if sender.drained() else 0 for sender in senders],
-            dtype=torch.uint8,
-            device="cpu",
-        )
+        """Return drain state, coordinated across attention TP/CP on TPU."""
+        drained = [sender.drained() for sender in senders]
+        if not current_platform.is_tpu():
+            return drained
+        bits = torch.tensor(drained, dtype=torch.uint8, device="cpu")
         for group in (self.attn_tp_cpu_group, self.attn_cp_cpu_group):
             if group is not None and torch.distributed.get_world_size(group) > 1:
                 torch.distributed.all_reduce(

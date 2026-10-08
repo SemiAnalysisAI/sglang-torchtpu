@@ -252,6 +252,10 @@ def _run_chunked_abort_rank(rank: int, init_file: str) -> None:
             native_all_reduce(tensor, op=op, group=group)
 
         with (
+            patch(
+                "sglang.srt.managers.scheduler.current_platform",
+                SimpleNamespace(is_tpu=lambda: True),
+            ),
             patch("torch.distributed.all_reduce", side_effect=all_reduce),
             patch(
                 "sglang.srt.managers.scheduler.release_kv_cache", side_effect=release
@@ -380,6 +384,38 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         sender.abort.assert_called_once_with()
         release_kv.assert_not_called()
         self.assertEqual(scheduler._deferred_chunked_sender_aborts, [req])
+
+    def test_non_tpu_abort_and_drain_do_not_use_collectives(self):
+        sender = MagicMock(group_failure_requires_drain=True)
+        sender.drained.return_value = False
+        req = self._aborted_chunked_req(sender)
+        scheduler = self._scheduler(req)
+        scheduler.attn_tp_cpu_group = object()
+        scheduler.attn_cp_cpu_group = object()
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.current_platform",
+                SimpleNamespace(is_tpu=lambda: False),
+            ),
+            patch("torch.distributed.get_world_size", return_value=2) as world_size,
+            patch("torch.distributed.all_reduce") as all_reduce,
+            patch("sglang.srt.managers.scheduler.release_kv_cache") as free,
+            get_context().override_server_args(),
+        ):
+            scheduler.process_pending_chunked_abort()
+            free.assert_not_called()
+            self.assertEqual(scheduler._deferred_chunked_sender_aborts, [req])
+            sender.drained.return_value = True
+            scheduler.process_pending_chunked_abort()
+
+        sender.abort.assert_called_once_with()
+        sender.poll.assert_called_once_with()
+        sender.clear.assert_called_once_with()
+        free.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+        self.assertEqual(scheduler._deferred_chunked_sender_aborts, [])
+        world_size.assert_not_called()
+        all_reduce.assert_not_called()
 
     @unittest.skipUnless(dist.is_gloo_available(), "requires Gloo")
     def test_real_tp_cp_groups_release_requests_in_the_same_step(self):
