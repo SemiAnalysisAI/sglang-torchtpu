@@ -13,6 +13,8 @@
 #           within its register budget.
 #   fused — Triton 2-kernel pipeline with full H-parallelism; the fallback
 #           everywhere the fast kernel does not apply.
+#   tpu  -- opt-in (SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL) Pallas kernel for
+#           decode-sized batches: pending add, mix and out norm in one call.
 # aggregate_stream_torch is the eager reference (tests, TPU and the
 # H % _BLOCK_H != 0 shape fallback of aggregate_stream).
 
@@ -22,6 +24,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.utils import is_hip, is_npu, is_tpu
@@ -63,6 +66,24 @@ def _use_hip_fused(hidden_size: int, nvb: int) -> bool:
 
         _HIP_SHAPE_GATE = supports_attn_res_hip
     return _HIP_SHAPE_GATE(hidden_size, nvb)
+
+
+def _use_tpu_decode(
+    prefix_a: torch.Tensor,
+    prefix_b: Optional[torch.Tensor],
+    bank: torch.Tensor,
+    score_norm: RMSNorm,
+    out_norm: RMSNorm,
+) -> bool:
+    """This gate picks the opt-in TPU Pallas decode kernel; its shape gate lives
+    with the kernel."""
+    if not (_is_tpu and envs.SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL.get()):
+        return False
+    from sglang.srt.hardware_backend.tpu.kimi_attn_residual import (
+        supports_attn_res_decode,
+    )
+
+    return supports_attn_res_decode(prefix_a, prefix_b, bank, score_norm, out_norm)
 
 
 def get_cw(
@@ -319,6 +340,34 @@ def _aggregate_hip(
     return out, prefix
 
 
+def _aggregate_tpu_decode(
+    prefix_a: torch.Tensor,
+    prefix_b: Optional[torch.Tensor],
+    bank: torch.Tensor,
+    nvb: int,
+    score_proj: ReplicatedLinear,
+    score_norm: RMSNorm,
+    out_norm: RMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One TPU Pallas call for the pending add, mix and output norm. Returns
+    (normed, prefix) with prefix = prefix_a + prefix_b (prefix_a if None)."""
+    from sglang.srt.hardware_backend.tpu.kimi_attn_residual import (
+        attention_residual_decode_tpu,
+        get_norm_weight_f32,
+    )
+
+    return attention_residual_decode_tpu(
+        prefix_a,
+        prefix_b,
+        bank,
+        nvb,
+        get_cw(score_proj, score_norm),
+        score_norm.variance_epsilon,
+        get_norm_weight_f32(out_norm),
+        out_norm.variance_epsilon,
+    )
+
+
 def aggregate_stream_torch(
     prefix_sum: torch.Tensor,
     bank: torch.Tensor,
@@ -374,6 +423,11 @@ def _aggregate_fused_add(
     """Aggregation point with a pending upstream residual add: materialize
     prefix = prefix_a + prefix_b, then aggregate. Returns (normed, prefix).
     write_bank_row rides _aggregate (fast path only)."""
+    if _use_tpu_decode(prefix_a, prefix_b, bank, score_norm, out_norm):
+        assert not write_bank_row, "the TPU decode kernel has no fused bank write"
+        return _aggregate_tpu_decode(
+            prefix_a, prefix_b, bank, nvb, score_proj, score_norm, out_norm
+        )
     if _use_hip_fused(prefix_a.shape[1], nvb):
         # The hip kernel reads the prefix row anyway, so the add folds into it.
         return _aggregate_hip(
@@ -419,6 +473,11 @@ def _aggregate(
     """
     if prefix_sum.shape[0] == 0:
         return prefix_sum
+    if _use_tpu_decode(prefix_sum, None, bank, score_norm, out_norm):
+        assert not write_bank_row, "the TPU decode kernel has no fused bank write"
+        return _aggregate_tpu_decode(
+            prefix_sum, None, bank, nvb, score_proj, score_norm, out_norm
+        )[0]
     if _use_fast(prefix_sum.shape[1]):
         return _aggregate_fast(
             prefix_sum,

@@ -1888,6 +1888,10 @@ class Envs:
     # of the full-vocabulary torch sort. Disable to A/B the sampled
     # distribution against the reference path.
     SGLANG_TPU_ENABLE_BSEARCH_SAMPLING = EnvBool(True)
+    # Kimi-K3: run attention-residual aggregation for decode-sized batches as
+    # one Pallas kernel (pending add + mix + out norm) instead of the torch
+    # reference. Not bit-exact with it (f32 folded score vs bf16 norm + proj).
+    SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL = EnvBool(False)
 
     # Vision-encoder precompile ladder. Unset uses the computed square-grid
     # ladder; set-but-empty disables precompile entirely.
