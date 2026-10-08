@@ -66,15 +66,14 @@ class TestSpmdSafeRegions(unittest.TestCase):
             platform.get_spmd_region_wrapper.return_value = _wrap_region
             compile_matching_submodules(model, compile_kwargs=compile_kwargs)
 
-    def test_marked_regions_are_wrapped_then_compiled_as_one_graph(self):
+    def test_marked_regions_are_wrapped_then_compiled_as_requested(self):
         model = _RegionalModel(spmd_safe=True)
-        compile_kwargs = {"backend": "tpu", "fullgraph": False}
-        self._compile(model, compile_kwargs)
+        self._compile(model, {"backend": "tpu", "fullgraph": False})
         for block in model.blocks:
             ((forward, kwargs),) = block.compiled
             self.assertIs(forward.wrapped.__self__, block)
-            self.assertEqual(kwargs, {"backend": "tpu", "fullgraph": True})
-        self.assertEqual(compile_kwargs, {"backend": "tpu", "fullgraph": False})
+            # Not fullgraph: past the recompile limit a region runs eagerly.
+            self.assertEqual(kwargs, {"backend": "tpu", "fullgraph": False})
 
     def test_unmarked_regions_compile_as_requested(self):
         model = _RegionalModel(spmd_safe=False)

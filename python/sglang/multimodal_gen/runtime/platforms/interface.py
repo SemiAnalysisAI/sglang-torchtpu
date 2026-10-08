@@ -149,7 +149,8 @@ class Platform:
 
     def get_spmd_region_wrapper(self) -> Callable | None:
         """Decorator for --regional-compile regions that every rank runs with the
-        same graph (the model sets ``_compile_regions_spmd_safe``)."""
+        same graph (the model sets ``_compile_regions_spmd_safe``). The regions
+        should trace as one graph each."""
         return None
 
     def get_compile_options(self, module: torch.nn.Module) -> dict[str, object] | None:
