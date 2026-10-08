@@ -271,6 +271,32 @@ class TestFusionBarrier(unittest.TestCase):
         public.assert_called_once_with([x])
         raw.assert_called_once_with([x])
 
+    def test_wan_ffn_runs_the_barrier_between_the_activation_and_fc_out(self):
+        from sglang.multimodal_gen.runtime.models.dits import wanvideo
+
+        calls = []
+
+        def step(name, value):
+            calls.append(name)
+            return value
+
+        mlp = SimpleNamespace(
+            fc_in=lambda x: (step("fc_in", x), None),
+            fc_out=lambda x: (step("fc_out", x), None),
+            _apply_activation=lambda x, bias, use_fused_bias_gelu: step("act", x),
+        )
+        with (
+            patch.object(wanvideo, "fused_gelu_active", return_value=False),
+            patch.object(wanvideo, "nvfp4_bias_gelu_active", return_value=False),
+            patch.object(
+                wanvideo.current_platform,
+                "fusion_barrier",
+                side_effect=lambda x: step("barrier", x),
+            ),
+        ):
+            wanvideo._WanGELUMLP.forward(mlp, torch.ones(2))
+        self.assertEqual(calls, ["fc_in", "act", "barrier", "fc_out"])
+
 
 if __name__ == "__main__":
     unittest.main()
