@@ -6,6 +6,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
+from sglang.srt.hardware_backend.tpu.kda_layout import kda_packed_weights_shape
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     _unsupported_derived_weight_cache_error,
 )
@@ -66,9 +67,8 @@ def _tiny_config() -> KimiLinearConfig:
 @unittest.skipIf(torch.cuda.is_available(), "builds on CPU with the TPU flag set")
 class TestKimiK3ConstructOnTpu(CustomTestCase):
     def test_post_load_binds_kernel_layout_and_rejects_weight_updates(self):
-        """The KDA kernel reads its conv weight parameter as is and a copy of
-        A_log, so online updates, which could skip the post-load rebind, are
-        rejected."""
+        """The KDA kernel reads one packed copy of conv / dt_bias / A_log, so
+        online updates, which could skip the post-load rebind, are rejected."""
         model = KimiK3LinearForCausalLM(config=_tiny_config(), quant_config=None)
         kdas = [
             layer.self_attn
@@ -77,14 +77,36 @@ class TestKimiK3ConstructOnTpu(CustomTestCase):
         ]
         with torch.no_grad():
             for kda in kdas:
-                weight = kda.qkv_conv1d.weight  # [dim, 1, K]
-                weight.copy_(torch.randn(weight.shape))
+                for param in (kda.qkv_conv1d.weight, kda.dt_bias, kda.A_log):
+                    param.copy_(torch.randn(param.shape))
         model.post_load_weights()
         for kda in kdas:
-            self.assertIs(kda.attn.conv_weights, kda.qkv_conv1d.weight)
-        self.assertIn(
-            "Kimi-K3 on TPU", _unsupported_derived_weight_cache_error(model) or ""
-        )
+            attn = kda.attn
+            # forward_qkvbfg_fused passes the whole [q, k, v, g] projection.
+            self.assertTrue(attn.fused_qkvg)
+            self.assertIs(attn.conv_weights, kda.qkv_conv1d.weight)
+            conv = kda.qkv_conv1d.weight.permute(2, 1, 0)  # [K, 1, dim]
+
+            k, dim = conv.shape[0], conv.shape[-1]
+            n_v, d_k = attn.num_v_heads, attn.head_k_dim
+            packed = attn.packed_kernel_weights
+            self.assertEqual(
+                tuple(packed.shape), kda_packed_weights_shape(k, dim, n_v, d_k)
+            )
+            regions = (
+                ((slice(0, k), slice(0, dim)), conv[:, 0]),
+                ((slice(k, k + n_v), slice(0, d_k)), kda.dt_bias.reshape(n_v, d_k)),
+                ((k + n_v, slice(0, n_v)), kda.A_log.reshape(n_v)),
+            )
+            padding = torch.ones(packed.shape, dtype=torch.bool)
+            for index, want in regions:
+                self.assertTrue(torch.equal(packed[index], want))
+                padding[index] = False
+            self.assertTrue((packed[padding] == 0).all())
+
+        error = _unsupported_derived_weight_cache_error(model) or ""
+        self.assertIn("Kimi-K3 on TPU", error)
+        self.assertIn("dt_bias", error)
 
     @classmethod
     def setUpClass(cls):

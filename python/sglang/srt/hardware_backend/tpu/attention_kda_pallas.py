@@ -66,6 +66,12 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
             conv_weight.shape[-1],
             True,
             layer.lower_bound,
+            batched_only=self._is_decode,
+            prefill_only=not self._is_decode,
+            # Kimi-K3 passes its fused [q, k, v, g] projection as mixed_qkv.
+            fused_qkvg=getattr(layer, "fused_qkvg", False),
+            # Kimi-K3 packs conv / dt_bias / A_log into one f32 operand post-load.
+            packed_weights=getattr(layer, "packed_kernel_weights", None),
         )
         # Keep the batch axis: the model squeezes dim 0 after o_norm, which would
         # eat the token axis of a one-token decode.
