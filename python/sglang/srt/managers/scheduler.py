@@ -5190,22 +5190,14 @@ class Scheduler(
         if model_runner.device != "tpu":
             # Only enable this for tpu
             return
-        if not get_exec().graph.enable_torch_compile:
-            return
-        if (
-            get_spec().speculative_algorithm is not None
-            and envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.get()
-        ):
-            logger.info(
-                "[tpu] Warmup complete; leaving torch.compile recompiles enabled "
-                "for speculative decoding because "
-                "SGLANG_TPU_ALLOW_SPEC_RECOMPILE is enabled."
-            )
-            return
-        torch.compiler.set_stance("fail_on_recompile")
-        logger.info(
-            "[tpu] Warmup complete; froze torch.compile via "
-            "set_stance('fail_on_recompile')."
+        from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+            arm_fail_on_recompile,
+        )
+
+        arm_fail_on_recompile(
+            enable_torch_compile=get_exec().graph.enable_torch_compile,
+            speculative_algorithm=get_spec().speculative_algorithm,
+            enable_dp_attention=get_parallel().enable_dp_attention,
         )
 
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)

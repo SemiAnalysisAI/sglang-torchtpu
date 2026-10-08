@@ -1,12 +1,15 @@
 """End-to-end tests for the TPU compilation tracers."""
 
 import sys
+import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import (
@@ -41,6 +44,7 @@ class TestTpuQwen306bSinglehostCompileTracer(CustomTestCase):
         model=MODEL,
         overrides=None,
         expect_speculative_decoding=False,
+        env=None,
     ):
         config = deepcopy(CONFIG)
         if tracer == "direct":
@@ -50,12 +54,15 @@ class TestTpuQwen306bSinglehostCompileTracer(CustomTestCase):
         for name in ("model_path", "host", "port"):
             config["server_args"].pop(name, None)
 
+        log = tempfile.NamedTemporaryFile(mode="w+", suffix=".log")
+        self.addCleanup(log.close)
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=server_args_to_cli(config["server_args"]),
-            env=config["runtime_env"],
+            env={**config["runtime_env"], **(env or {})},
+            return_stdout_stderr=(log, log),
             device="tpu",
         )
         try:
@@ -87,15 +94,45 @@ class TestTpuQwen306bSinglehostCompileTracer(CustomTestCase):
             ).json()
             state = server_info["internal_states"][0]
             self.assertEqual(state["tpu_compile_tracer"], tracer)
-            return state
         finally:
             kill_process_tree(process.pid, wait_timeout=30)
+        return SimpleNamespace(
+            state=state, output=response.json(), log=Path(log.name).read_text()
+        )
 
     def test_dynamo_is_default(self):
         self._run_server("dynamo")
 
+    def test_dynamo_unsafe_guard_skip_matches_default(self):
+        recompile_logs = {"TORCH_LOGS": "recompiles"}
+        with envs.SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP.override(False):
+            default = self._run_server("dynamo", env=recompile_logs)
+        with envs.SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP.override(True):
+            unsafe = self._run_server("dynamo", env=recompile_logs)
+
+        self.assertIn("set_stance('fail_on_recompile').", default.log)
+        self.assertIn("skip_guard_eval_unsafe=True", unsafe.log)
+        # No recompile from the freeze on: an unfrozen one logs "Recompiling
+        # function" (TORCH_LOGS=recompiles); a frozen one raises "Detected
+        # recompile", or "Recompilation triggered" under skip_guard_eval_unsafe.
+        for run in (default, unsafe):
+            served = run.log[run.log.rfind("froze torch.compile") :]
+            for marker in (
+                "Recompiling function",
+                "Detected recompile",
+                "Recompilation triggered",
+            ):
+                self.assertNotIn(marker, served)
+        self.assertEqual(
+            unsafe.output["choices"][0]["text"], default.output["choices"][0]["text"]
+        )
+        self.assertEqual(
+            unsafe.state["torch_compile_dynamo_frames"],
+            default.state["torch_compile_dynamo_frames"],
+        )
+
     def test_direct_bypasses_dynamo_and_aot_autograd(self):
-        state = self._run_server("direct")
+        state = self._run_server("direct").state
         self.assertEqual(state["torch_compile_dynamo_frames"], 0)
         self.assertEqual(state["torch_compile_aot_autograd_graphs"], 0)
 
@@ -119,7 +156,7 @@ class TestTpuQwen306bSinglehostCompileTracer(CustomTestCase):
                 "tpu_compile_tokens": [64],
             },
             expect_speculative_decoding=True,
-        )
+        ).state
         self.assertEqual(state["torch_compile_dynamo_frames"], 0)
 
 
