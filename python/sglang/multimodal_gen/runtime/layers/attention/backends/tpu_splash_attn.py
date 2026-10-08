@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """TPU Pallas attention backend (``--attention-backend tpu_splash_attn``).
 
-Adapted from DiffusionServing's TPU attention kernels: a flash attention kernel
-with an online exp2 softmax and a v7x block-size model for long-KV attention,
-and JAX's ``make_splash_mha`` for short-KV and causal attention. Both run as
-``cpu_export_jax_op`` torch ops; block sizes, padding and query scaling are
-resolved inside the jitted JAX function from the static shapes.
+A flash attention kernel with an online exp2 softmax and a v7x block-size
+model for long-KV attention, and JAX's ``make_splash_mha`` for short-KV and
+causal attention. Both run as ``cpu_export_jax_op`` torch ops; block sizes,
+padding and query scaling are resolved inside the jitted JAX function from the
+static shapes.
 """
 
 import functools
