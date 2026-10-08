@@ -10,7 +10,10 @@ import unittest
 import torch
 
 from sglang.srt.hardware_backend.tpu.env_override import apply_tpu_env_overrides
-from sglang.srt.hardware_backend.tpu.patches import _register_aten_fallbacks
+from sglang.srt.hardware_backend.tpu.patches import (
+    _register_aten_fallbacks,
+    _register_int64_cumsum_fallback,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -20,6 +23,7 @@ class TestCumsumTpu(CustomTestCase):
     def setUpClass(cls):
         apply_tpu_env_overrides()
         _register_aten_fallbacks()
+        _register_int64_cumsum_fallback()
 
     def _check(self, ref, dim, **kwargs):
         got = torch.cumsum(ref.to("tpu"), dim, **kwargs).cpu()
@@ -61,12 +65,23 @@ class TestCumsumTpu(CustomTestCase):
         torch.testing.assert_close(got, torch.logaddexp(a, b), rtol=1e-5, atol=1e-5)
 
     def test_inplace_and_scalar(self):
-        x = torch.ones((2, 64), dtype=torch.int64, device="tpu")
-        x.cumsum_(dim=1)
-        torch.testing.assert_close(
-            x.cpu(), torch.arange(1, 65, dtype=torch.int64).expand(2, 64)
-        )
+        for dtype in (torch.int64, torch.int32):
+            with self.subTest(dtype=dtype):
+                x = torch.ones((2, 64), dtype=dtype, device="tpu")
+                x.cumsum_(dim=1)
+                self.assertEqual(x.dtype, dtype)
+                torch.testing.assert_close(
+                    x.cpu(), torch.arange(1, 65, dtype=dtype).expand(2, 64)
+                )
         self._check(torch.tensor(5), 0)
+
+    def test_result_does_not_alias_the_input(self):
+        for shape, dim in (((), 0), ((3, 1), 1)):
+            with self.subTest(shape=shape):
+                x = torch.full(shape, 4, dtype=torch.int64, device="tpu")
+                y = x.cumsum(dim)
+                y += 10
+                self.assertTrue(torch.all(x.cpu() == 4))
 
 
 if __name__ == "__main__":

@@ -165,6 +165,7 @@ class TpuPlatform(Platform):
             _patch_set_device_tolerate_mismatch,
             _prepare_tpu_env,
             _register_aten_fallbacks,
+            _register_int64_cumsum_fallback,
         )
 
         # srt's activate() selects CPU-only JAX for TorchTPU processes; the
@@ -186,6 +187,8 @@ class TpuPlatform(Platform):
         _patch_set_device_tolerate_mismatch()
         # Ops torch_tpu cannot lower abort the process instead of raising.
         _register_aten_fallbacks()
+        # Qwen-VL rope indices and ERNIE's prompt enhancer take int64 cumsums.
+        _register_int64_cumsum_fallback()
 
         _install_device_module_shims()
         torch.zeros(1, device="tpu")
