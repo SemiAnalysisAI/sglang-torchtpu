@@ -165,16 +165,17 @@ def can_keep_padded_prefill_hidden(forward_batch: ForwardBatch) -> bool:
 
     Only use at inner-decoder boundaries whose outer model selects prefill
     rows using the restored extend lengths. Slicing to each arbitrary prompt
-    length first creates a distinct eager TPU executable. FULL capture and
-    prompt logprobs retain their real-token output contract; decode/verify
-    consume every row and must still be trimmed.
+    length first creates a distinct eager TPU executable. FULL capture keeps
+    its real-token contract, including every extend with the prompt-logprob
+    opt-in: the shim pins capture to FULL until finalization. return_logprob
+    is pinned False here, so it cannot guard trimming. Decode/verify consume
+    every row and must still be trimmed.
     """
-    lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    lengths = forward_batch.extend_seq_lens_cpu
     return (
-        getattr(forward_batch, "forward_mode", None) == ForwardMode.EXTEND
-        and getattr(forward_batch, "capture_hidden_mode", None)
+        forward_batch.forward_mode == ForwardMode.EXTEND
+        and forward_batch.capture_hidden_mode
         in (CaptureHiddenMode.NULL, CaptureHiddenMode.LAST)
-        and not getattr(forward_batch, "return_logprob", False)
         and not is_dp_attention_enabled()
         # A zero-length request would gather -1. On padded hidden that means
         # a ghost row rather than the last real token. Keep legacy trimming

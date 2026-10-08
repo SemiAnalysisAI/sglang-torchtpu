@@ -1852,6 +1852,8 @@ class Envs:
     # graph's guard, so the mode is a property of the warmed variant rather than
     # of the request. Off keeps the extend graph and the serving path exactly as
     # they are today, and a request asking for prompt logprobs is rejected.
+    # FULL capture also retains per-length hidden slicing at inner-decoder
+    # boundaries, disabling the bucketed-hidden optimization for every extend.
     SGLANG_TPU_ENABLE_PROMPT_LOGPROB = EnvBool(False)
 
     # Build the RoPE cos/sin cache at the served context length instead of the
