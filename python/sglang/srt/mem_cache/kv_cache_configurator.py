@@ -882,10 +882,8 @@ class KVCacheConfigurator:
             # Asymmetric full/SWA head geometry (Inkling): SWA dims from the
             # hf text config, same as the 2-pool SWA wrapper.
             v_head_dim = self.model_config.hf_text_config.v_head_dim
-            swa_head_num = max(
-                1,
-                self.model_config.hf_text_config.swa_num_key_value_heads
-                // get_parallel().attn_tp_size,
+            swa_head_num = self.model_config.get_swa_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             )
             swa_head_dim = self.model_config.hf_text_config.swa_head_dim
             swa_v_head_dim = self.model_config.hf_text_config.swa_v_head_dim
@@ -991,10 +989,8 @@ class KVCacheConfigurator:
             # Asymmetric head dims between full and SWA (NPU compress path):
             # pull SWA-specific dims from the hf text config.
             v_head_dim = self.model_config.hf_text_config.v_head_dim
-            swa_head_num = max(
-                1,
-                self.model_config.hf_text_config.swa_num_key_value_heads
-                // get_parallel().attn_tp_size,
+            swa_head_num = self.model_config.get_swa_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             )
             swa_head_dim = self.model_config.hf_text_config.swa_head_dim
             swa_v_head_dim = self.model_config.hf_text_config.swa_v_head_dim
@@ -1620,10 +1616,8 @@ class KVCacheConfigurator:
         kwargs = {}
         if self.is_hybrid_swa_compress:
             kwargs = {
-                "swa_head_num": max(
-                    1,
-                    self.model_config.hf_text_config.swa_num_key_value_heads
-                    // get_parallel().attn_tp_size,
+                "swa_head_num": self.model_config.get_swa_num_kv_heads(
+                    get_parallel().attn_tp_size, get_parallel().attn_dcp_size
                 ),
                 "swa_head_dim": self.model_config.swa_head_dim,
                 "swa_v_head_dim": self.model_config.swa_v_head_dim,
@@ -1780,14 +1774,8 @@ class KVCacheConfigurator:
         # pass v_head_dim here: the fused KV buffer stores V padded to head_dim
         # and the kernel DMAs at that width.) When the counts match (e.g.
         # GPT-OSS) this is a no-op.
-        swa_head_num = max(
-            1,
-            getattr(
-                self.model_config.hf_text_config,
-                "swa_num_key_value_heads",
-                self.model_config.hf_text_config.num_key_value_heads,
-            )
-            // get_parallel().attn_tp_size,
+        swa_head_num = self.model_config.get_swa_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
         mxint8_subpool_kwargs = {}
         if self.kv_cache_dtype_str == "mxint8":
@@ -2002,10 +1990,8 @@ class KVCacheConfigurator:
         kwargs = {}
         if self.is_hybrid_swa_compress:
             kwargs = {
-                "swa_head_num": max(
-                    1,
-                    self.model_config.hf_text_config.swa_num_key_value_heads
-                    // get_parallel().attn_tp_size,
+                "swa_head_num": self.model_config.get_swa_num_kv_heads(
+                    get_parallel().attn_tp_size, get_parallel().attn_dcp_size
                 ),
                 "swa_head_dim": self.model_config.swa_head_dim,
                 "swa_v_head_dim": self.model_config.swa_v_head_dim,
