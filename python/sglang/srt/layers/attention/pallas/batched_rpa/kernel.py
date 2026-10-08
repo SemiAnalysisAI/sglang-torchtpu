@@ -83,19 +83,46 @@ def strided_load_bkv(
     )
 
 
+def add_attention_sink(l: jax.Array, m: jax.Array, sink_ref: jax.Ref) -> jax.Array:
+    """Adds exp(sink - m) to one lane's softmax denominator l: [KV, rows, 128].
+
+    The sink is one extra key per row with logit sink[head] and a zero value.
+    """
+    num_rows = l.shape[1]
+    num_kv_heads, period, num_lanes = sink_ref.shape
+    if num_rows <= period:
+        sink = sink_ref[:, :num_rows]
+    else:
+        assert num_rows % period == 0, (num_rows, period)
+        sink = jnp.broadcast_to(
+            sink_ref[...][:, None],
+            (num_kv_heads, num_rows // period, period, num_lanes),
+        ).reshape(l.shape)
+    l_sink = l.astype(jnp.float32) + jnp.exp(sink - m.astype(jnp.float32))
+    return l_sink.astype(l.dtype)
+
+
 def calculate_and_store_out(
     step_idx: jax.Array,
     schedule_ref: schedule.RpaSchedule,
     acc_list: list[jax.Array],
     l_list: list[jax.Array],
-    m_list: list[jax.Array],
+    m_list: list[jax.Array] | None,
     o_vref: jax.Ref,
     lse_o_vref: jax.Ref | None,
     *,
+    sink_ref: jax.Ref | None = None,
     cfgs: configs.RpaConfigs,
 ):
 
-    def _accum(b_idx: jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
+    def _accum(
+        b_idx: jax.Array,
+        batch_acc: jax.Array,
+        batch_l: jax.Array,
+        batch_m: jax.Array | None,
+    ):
+        if cfgs.model.has_attention_sink:
+            batch_l = add_attention_sink(batch_l, batch_m, sink_ref)
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
 
         if (
@@ -137,7 +164,7 @@ def calculate_and_store_out(
 
     if cfgs.fuse_accum:
         for b in range(cfgs.batch_size):
-            _accum(b, acc_list[b], l_list[b])
+            _accum(b, acc_list[b], l_list[b], None if m_list is None else m_list[b])
     else:
         # Adding a conditional causes a scheduling barrier. In prefill, we often
         # use small block sizes, so it's not worth executing the accumulation
@@ -148,9 +175,10 @@ def calculate_and_store_out(
             is_last_k = schedule_ref.is_last_k[step_idx, b] == 1
             acc_val = acc_list[b]
             l_val = l_list[b]
+            m_val = None if m_list is None else m_list[b]
             accum_named_call = jax.named_call(_accum, name=f"accum_{b}")
             jax.lax.cond(
-                is_last_k, accum_named_call, lambda *_: None, b, acc_val, l_val
+                is_last_k, accum_named_call, lambda *_: None, b, acc_val, l_val, m_val
             )
 
     if cfgs.serve.return_lse:
@@ -280,12 +308,22 @@ def fetch_stitch_metadata(
         k_idx = schedule_ref.k_idx[step, b_idx]
         k_id = jnp.where(is_valid, k_idx * cfgs.bkv_sz, 0)
         global_kv_cache_len = jnp.where(is_valid, global_kv_cache_lens_ref[s_idx], 0)
+        kv_new_len_val = jnp.where(is_valid, kv_new_lens_ref[s_idx], 0)
         if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
             kv_cache_len_val = global_kv_cache_len
+            if cfgs.mode != configs.RpaCase.DECODE:
+                req_idx = s_idx // 2
+                num_reqs = kv_new_lens_ref.shape[0] // 2
+                def _sum_body(k, acc):
+                    return acc + jnp.where(k < req_idx, kv_new_lens_ref[2 * k], 0)
+                kv_new_start_val = jnp.where(
+                    is_valid, jax.lax.fori_loop(0, num_reqs, _sum_body, 0), 0
+                )
+            else:
+                kv_new_start_val = jnp.where(is_valid, cu_q_lens_ref[s_idx], 0)
         else:
             kv_cache_len_val = cfgs.local_kv_cache_len(global_kv_cache_len, cp_rank)
-        kv_new_len_val = jnp.where(is_valid, kv_new_lens_ref[s_idx], 0)
-        kv_new_start_val = jnp.where(is_valid, cu_q_lens_ref[s_idx], 0)
+            kv_new_start_val = jnp.where(is_valid, cu_q_lens_ref[s_idx], 0)
 
         # KV stitch boundaries: where the cached tokens end and the newly arrived
         # tokens begin, which is what `stitch_utils.stitch_new_kv_lane` merges on.
@@ -657,6 +695,7 @@ def rpa_body(
     cp_rank_ref: jax.Ref,
     # Configs.
     cfgs: configs.RpaConfigs,
+    sink_ref: jax.Ref | None = None,
     # DMA-issue hooks. Both only start copies; the matching waits live in
     # `pipeline.py`
     start_next_fetch: Callable[[], None],
@@ -866,7 +905,7 @@ def rpa_body(
         )
         m_scratch_ref[:, q_slice] = m_carry
         l_scratch_ref[:, q_slice] = l_next[-1]
-        if cfgs.serve.return_lse:
+        if cfgs.serve.return_lse or cfgs.model.has_attention_sink:
             m_new_list.append(m_next)
         l_new_list.append(l_next)
 
@@ -897,8 +936,10 @@ def rpa_body(
     )
     acc_scratch_ref[:, prev_q_slice] = o_next[-1]
     acc_new_list.append(o_next)
-    if cfgs.serve.return_lse:
+    if cfgs.serve.return_lse or cfgs.model.has_attention_sink:
         m_next = jnp.concatenate(m_new_list, axis=2)
+    else:
+        m_next = None
     l_next = jnp.concatenate(l_new_list, axis=2)
     acc_next = jnp.concatenate(acc_new_list, axis=2)
 
@@ -911,6 +952,7 @@ def rpa_body(
         m_next,
         o_vref,
         lse_o_vref,
+        sink_ref=sink_ref,
         cfgs=cfgs,
     )
 
@@ -1008,6 +1050,8 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
     name += f"-b{cfgs.batch_size}-q{cfgs.bq_sz}-k{cfgs.bkv_sz}"
     if cfgs.model.sliding_window:
         name += f"-sw{cfgs.model.sliding_window}"
+    if cfgs.model.has_attention_sink:
+        name += "-sink"
     return name
 
 
@@ -1036,7 +1080,8 @@ def rpa_kernel(
     q_hbm: jax.Array,
     new_kv_hbm: jax.Array,
     kv_cache_hbm: jax.Array,
-    lse_hbm: jax.Array | None,
+    attention_sink: jax.Array | None = None,
+    lse_hbm: jax.Array | None = None,
     *,
     cfgs: configs.RpaConfigs,
     computer_cls: type[schedule.BaseMetadataComputer] = schedule.BaseMetadataComputer,
@@ -1072,6 +1117,8 @@ def rpa_kernel(
       kv_cache_hbm: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
         kv_packing, head_dim]. Stores existing kv cache data where k & vs are
         concatenated along num kv heads dim.
+      attention_sink: [num_kv_heads, period, 128] f32 or None. Per-row sink
+        logits from `wrapper.prepare_attention_sink`.
       lse_hbm: pre-allocated buffer for LSE output. None when return_lse=False.
       cfgs: Configuration of the kernel.
 
@@ -1097,6 +1144,7 @@ def rpa_kernel(
         q_hbm_ref: jax.Ref,
         new_kv_hbm_ref: jax.Ref,
         kv_cache_hbm_ref: jax.Ref,
+        sink_ref: jax.Ref | None,
         lse_hbm_ref: jax.Ref | None,
         # Outputs.
         o_hbm_ref: jax.Ref,
@@ -1260,6 +1308,7 @@ def rpa_kernel(
                         kv_new_lens_ref=kv_new_lens_ref,
                         cp_rank_ref=cp_rank_ref,
                         cfgs=cfgs,
+                        sink_ref=sink_ref,
                         start_next_fetch=start_next_fetch,
                         start_kv_writeback=start_kv_writeback,
                         ring=ring,
@@ -1304,13 +1353,16 @@ def rpa_kernel(
 
     out_shape = [q_hbm, kv_cache_hbm, lse_hbm if return_lse else None]
 
+    sink_leaves = (
+        0 if attention_sink is None else len(jax.tree_util.tree_leaves(attention_sink))
+    )
     schedule_leaves = len(jax.tree_util.tree_leaves(schedule_hbm))
     input_output_aliases = {
         num_active_scalers + schedule_leaves: 0,
         num_active_scalers + schedule_leaves + 2: 1,
     }
     if return_lse:
-        input_output_aliases[num_active_scalers + schedule_leaves + 3] = (
+        input_output_aliases[num_active_scalers + schedule_leaves + 3 + sink_leaves] = (
             2  # lse_hbm -> out[2]
         )
 
@@ -1324,6 +1376,11 @@ def rpa_kernel(
                 pl.BlockSpec(memory_space=pltpu.HBM),  # q_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM),  # new_kv_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM),  # kv_cache_hbm_ref
+                (
+                    None
+                    if attention_sink is None
+                    else pl.BlockSpec(memory_space=pltpu.VMEM)
+                ),  # sink_ref
                 pl.BlockSpec(memory_space=pltpu.HBM) if return_lse else None,
             ],
             out_specs=[
@@ -1354,5 +1411,6 @@ def rpa_kernel(
         q_hbm,
         new_kv_hbm,
         kv_cache_hbm,
+        attention_sink,
         lse_hbm if return_lse else None,
     )

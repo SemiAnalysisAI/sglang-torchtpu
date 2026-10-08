@@ -15,7 +15,7 @@ Supports:
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
@@ -28,16 +28,21 @@ if TYPE_CHECKING:
 
 _CP_OP_NAME = "sglang_tpu_pallas::ragged_paged_attention_batched_cp"
 _OP_CACHE: dict = {}
-_CP_RANK_TENSORS: dict[torch.device, torch.Tensor] = {}
+_CP_RANK_TENSORS: dict[tuple[torch.device, int], torch.Tensor] = {}
 
 
-def ensure_cp_rank_tensor(device: torch.device, cp_rank: int) -> torch.Tensor:
+def ensure_cp_rank_tensor(
+    device: torch.device, cp_rank: int, ref_tensor: torch.Tensor | None = None
+) -> torch.Tensor:
     """Create a persistent device tensor for cp_rank to avoid graph recompilations."""
+    if ref_tensor is not None and ref_tensor.numel() > 0:
+        return (ref_tensor[:1] * 0 + cp_rank).to(torch.int32)
     device = torch.device(device)
-    tensor = _CP_RANK_TENSORS.get(device)
+    key = (device, cp_rank)
+    tensor = _CP_RANK_TENSORS.get(key)
     if tensor is None:
         tensor = torch.tensor([cp_rank], dtype=torch.int32, device=device)
-        _CP_RANK_TENSORS[device] = tensor
+        _CP_RANK_TENSORS[key] = tensor
     return tensor
 
 
@@ -47,13 +52,14 @@ class PcpBatchedMetadata:
 
     pcp_cu_q_lens: torch.Tensor
     q_positions: torch.Tensor
-    new_kv_page_indices: torch.Tensor
+    new_kv_page_indices: Optional[torch.Tensor]
     update_kv_cache: torch.Tensor
     kv_new_lens: torch.Tensor
     striped_page_indices: torch.Tensor
     cache_pages: int
     num_reqs: int
     pcp_cache_lens: torch.Tensor
+    c_per_req: int = 1
 
 
 def build_batched_rpa_cp_op():
@@ -260,6 +266,8 @@ def build_pcp_batched_metadata(
     cp_size: int,
     cp_rank: int,
     device: torch.device,
+    forward_batch: Optional["ForwardBatch"] = None,
+    num_local_tokens: Optional[int] = None,
 ) -> PcpBatchedMetadata:
     """Builds PCP metadata for the 2-phase batched RPA kernel."""
     num_reqs = len(seq_lens)
@@ -269,61 +277,71 @@ def build_pcp_batched_metadata(
     extend_lens = (seq_lens - prefix_lens).cpu().numpy()
     prefix_lens_np = prefix_lens.cpu().numpy()
 
-    # Determine chunk size C across requests
-    # In uniform chunking, C is the chunk length per zigzag block.
-    # Align each zigzag block to page_size so DMA transfers and page allocations are page-aligned.
-    c_sizes = [
-        max(page_size, ((int(l) // two_p + page_size - 1) // page_size) * page_size)
-        for l in extend_lens
-    ]
-    c_per_req = c_sizes[0] if len(c_sizes) > 0 else page_size
+    meta = (
+        getattr(forward_batch, "attn_cp_metadata", None)
+        if forward_batch is not None
+        else None
+    )
+    if meta is not None and getattr(meta, "actual_seq_q_prev_list", None) is not None:
+        pcp_cu = [0]
+        q_pos_offsets = []
+        pcp_write = []
+        kv_new_lens = []
+        run = 0
+        for i in range(num_reqs):
+            c_head = meta.actual_seq_q_prev_list[i]
+            c_tail = meta.actual_seq_q_next_list[i]
+            toff_head = meta.kv_len_prev_list[i] - c_head
+            toff_tail = meta.kv_len_next_list[i] - c_tail
+            ext_len = int(extend_lens[i])
 
-    # 1. pcp_cu_q_lens: 2 blocks per request on this rank
-    # Head chunk (r) and tail chunk (2P - 1 - r)
-    pcp_cu = [0]
-    q_pos_offsets = []
-    pcp_write = []
-    run = 0
+            # Head chunk (sequence 2*i)
+            run += c_head
+            pcp_cu.append(run)
+            q_pos_offsets.append(toff_head)
+            pcp_write.append(False)  # Head chunk does not commit cache
+            kv_new_lens.append(ext_len)
 
-    for i in range(num_reqs):
-        c_len = c_sizes[i]
-        # Head chunk: rank r owns chunk r, starting at offset r * c_len
-        toff_head = prefix_lens_np[i] + cp_rank * c_len
-        run += c_len
-        pcp_cu.append(run)
-        q_pos_offsets.append(toff_head)
-        pcp_write.append(False)  # Head chunk does not commit cache
+            # Tail chunk (sequence 2*i + 1)
+            run += c_tail
+            pcp_cu.append(run)
+            q_pos_offsets.append(toff_tail)
+            pcp_write.append(True)  # Tail chunk commits cache
+            kv_new_lens.append(ext_len)
 
-        # Tail chunk: rank r owns chunk (2P - 1 - r), starting at offset (2P - 1 - r) * c_len
-        toff_tail = prefix_lens_np[i] + (two_p - 1 - cp_rank) * c_len
-        run += c_len
-        pcp_cu.append(run)
-        q_pos_offsets.append(toff_tail)
-        pcp_write.append(True)  # Tail chunk commits cache
+        c_per_req = (
+            meta.actual_seq_q_prev_list[0]
+            if len(meta.actual_seq_q_prev_list) > 0
+            else 1
+        )
+    else:
+        c_sizes = [max(1, int(l) // two_p) for l in extend_lens]
+        c_per_req = c_sizes[0] if len(c_sizes) > 0 else 1
+        pcp_cu = [0]
+        q_pos_offsets = []
+        pcp_write = []
+        kv_new_lens = []
+        run = 0
+        for i in range(num_reqs):
+            c_len = c_sizes[i]
+            toff_head = prefix_lens_np[i] + cp_rank * c_len
+            run += c_len
+            pcp_cu.append(run)
+            q_pos_offsets.append(toff_head)
+            pcp_write.append(False)
+            kv_new_lens.append(int(extend_lens[i]))
 
-    # 2. new_kv_page_indices (pcp_table):
-    # Maps all-gathered rank-major order to sequence order
-    req_pages = max(1, (c_per_req + page_size - 1) // page_size)
-    local_len = 2 * c_per_req * num_reqs
-    table = np.zeros((2 * num_reqs, two_p * req_pages), dtype=np.int32)
-    for i in range(num_reqs):
-        for c in range(two_p):
-            owner_rank = c if c < cp_size else two_p - 1 - c
-            chunk_in_rank = 0 if c < cp_size else c_per_req
-            base = (
-                owner_rank * local_len + 2 * c_per_req * i + chunk_in_rank
-            ) // page_size
-            cols = slice(c * req_pages, (c + 1) * req_pages)
-            table[2 * i, cols] = base + np.arange(req_pages)
-            table[2 * i + 1, cols] = base + np.arange(req_pages)
+            toff_tail = prefix_lens_np[i] + (two_p - 1 - cp_rank) * c_len
+            run += c_len
+            pcp_cu.append(run)
+            q_pos_offsets.append(toff_tail)
+            pcp_write.append(True)
+            kv_new_lens.append(int(extend_lens[i]))
 
     pcp_cu_t = torch.tensor(pcp_cu, dtype=torch.int32, device=device)
     q_pos_t = torch.tensor(q_pos_offsets, dtype=torch.int32, device=device)
     pcp_write_t = torch.tensor(pcp_write, dtype=torch.bool, device=device)
-    new_kv_pages_t = torch.tensor(table.reshape(-1), dtype=torch.int32, device=device)
-    kv_new_lens_t = torch.tensor(
-        [c_per_req * two_p] * (2 * num_reqs), dtype=torch.int32, device=device
-    )
+    kv_new_lens_t = torch.tensor(kv_new_lens, dtype=torch.int32, device=device)
 
     # Cache phase: page-striped page table
     pages_per_seq = page_indices.shape[0] // num_reqs
@@ -343,13 +361,14 @@ def build_pcp_batched_metadata(
     return PcpBatchedMetadata(
         pcp_cu_q_lens=pcp_cu_t,
         q_positions=q_pos_t,
-        new_kv_page_indices=new_kv_pages_t,
+        new_kv_page_indices=None,
         update_kv_cache=pcp_write_t,
         kv_new_lens=kv_new_lens_t,
         striped_page_indices=striped_page_indices,
         cache_pages=total_cache_pages,
         num_reqs=num_reqs,
         pcp_cache_lens=pcp_cache_lens_t,
+        c_per_req=c_per_req,
     )
 
 
@@ -375,19 +394,53 @@ def batched_rpa_pcp_forward(
     cp_size = get_parallel().attn_cp_size
     cp_rank = get_parallel().attn_cp_rank
     device = q.device
-    cp_rank_tensor = ensure_cp_rank_tensor(device, cp_rank)
+    cp_rank_tensor = ensure_cp_rank_tensor(
+        device, cp_rank, ref_tensor=base_meta.kv_lens
+    )
+    num_reqs = pcp_meta.num_reqs
+
+    from sglang.srt.layers.cp.utils import get_cp_strategy
+
+    strategy = get_cp_strategy()
+    meta = (
+        getattr(forward_batch, "attn_cp_metadata", None)
+        if forward_batch is not None
+        else None
+    )
+    if meta is not None and getattr(meta, "actual_seq_q_prev_list", None) is not None:
+        c_heads = list(meta.actual_seq_q_prev_list)
+        c_tails = list(meta.actual_seq_q_next_list)
+    else:
+        extend_lens = (
+            forward_batch.seq_lens
+            - getattr(
+                forward_batch,
+                "prefix_lens",
+                torch.zeros_like(forward_batch.seq_lens),
+            )
+        ).cpu().numpy()
+        c_sizes = [max(1, int(l) // (2 * cp_size)) for l in extend_lens]
+        c_heads = c_sizes
+        c_tails = c_sizes
+
+    logical_tokens = sum(c_heads) + sum(c_tails)
+    pad_size = q.shape[0] - logical_tokens
+    assert pad_size >= 0, f"q.shape[0]={q.shape[0]} < logical_tokens={logical_tokens}"
+    q_logical = q[:logical_tokens] if pad_size > 0 else q
+    k_logical = k[:logical_tokens] if pad_size > 0 else k
+    v_logical = v[:logical_tokens] if pad_size > 0 else v
+
+    q_op = q_logical
 
     # 1. Cache Phase (Ring Attention over ICI)
     context_out = None
     context_lse = None
     if pcp_meta.cache_pages > 0:
-        cache_update_kv = torch.zeros(
-            base_meta.kv_lens.shape[0], dtype=torch.int32, device=device
-        )
+        cache_update_kv = torch.zeros_like(base_meta.kv_lens, dtype=torch.int32)
         context_out, context_lse = cp_op(
-            q,
-            k,
-            v,
+            q_op,
+            k_logical,
+            v_logical,
             kv_cache,
             pcp_meta.pcp_cache_lens,
             pcp_meta.striped_page_indices,
@@ -410,14 +463,29 @@ def batched_rpa_pcp_forward(
         )
 
     # 2. Current Phase (All-Gather current chunk tokens)
-    # Gather keys and values across the PCP group
-    k_curr = get_parallel().attn_cp_group.all_gather(k, dim=0)
-    v_curr = get_parallel().attn_cp_group.all_gather(v, dim=0)
+    if (
+        strategy is not None
+        and getattr(forward_batch, "attn_cp_metadata", None) is not None
+    ):
+        k_reordered = strategy.gather_kv_cache(k.contiguous(), forward_batch).contiguous()
+        v_reordered = strategy.gather_kv_cache(v.contiguous(), forward_batch).contiguous()
+    else:
+        k_curr = get_parallel().attn_cp_group.all_gather(k, dim=0)
+        v_curr = get_parallel().attn_cp_group.all_gather(v, dim=0)
+        c_per_req = max(1, q.shape[0] // (2 * num_reqs))
+        k_curr_5d = k_curr.view(cp_size, num_reqs, 2, c_per_req, k.shape[1], k.shape[2])
+        head_k = k_curr_5d[:, :, 0].permute(1, 0, 2, 3, 4)
+        tail_k = k_curr_5d[:, :, 1].flip(0).permute(1, 0, 2, 3, 4)
+        k_reordered = torch.cat([head_k, tail_k], dim=1).reshape(-1, k.shape[1], k.shape[2])
+
+        v_curr_5d = v_curr.view(cp_size, num_reqs, 2, c_per_req, v.shape[1], v.shape[2])
+        head_v = v_curr_5d[:, :, 0].permute(1, 0, 2, 3, 4)
+        tail_v = v_curr_5d[:, :, 1].flip(0).permute(1, 0, 2, 3, 4)
+        v_reordered = torch.cat([head_v, tail_v], dim=1).reshape(-1, v.shape[1], v.shape[2])
 
     # For the 2-chunk zigzag schedule, each request consists of 2 virtual sequences
     # (head chunk and tail chunk) on this rank.
-    num_reqs = base_meta.kv_lens.shape[0]
-    curr_kv_lens = pcp_meta.pcp_cache_lens.repeat_interleave(2)
+    curr_kv_lens = pcp_meta.pcp_cache_lens.repeat_interleave(2) + pcp_meta.kv_new_lens
     pages_per_seq = base_meta.page_indices.shape[0] // num_reqs
     pages_2d = base_meta.page_indices.view(num_reqs, pages_per_seq)
     owned_pages = pages_2d[:, cp_rank::cp_size]
@@ -431,9 +499,9 @@ def batched_rpa_pcp_forward(
 
     curr_update_kv = pcp_meta.update_kv_cache.to(dtype=torch.int32, device=device)
     curr_out, curr_lse = cp_op(
-        q,
-        k_curr,
-        v_curr,
+        q_op,
+        k_reordered,
+        v_reordered,
         kv_cache,
         curr_kv_lens,
         curr_page_indices,
@@ -455,11 +523,16 @@ def batched_rpa_pcp_forward(
         True,
     )
 
+
     # 3. Softmax State Merge
     if context_out is not None and context_lse is not None:
         out, _ = merge_attn_states(context_out, context_lse, curr_out, curr_lse)
-        return out
-    return curr_out
+    else:
+        out = curr_out
+
+    if pad_size > 0:
+        out = torch.cat([out, out.new_zeros(pad_size, *out.shape[1:])], dim=0)
+    return out
 
 
 def batched_rpa_dcp_forward(
@@ -473,6 +546,7 @@ def batched_rpa_dcp_forward(
     base_meta,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Executes Decode Context Parallelism (DCP) on Batched RPA.
 
@@ -485,11 +559,19 @@ def batched_rpa_dcp_forward(
     3. Multi-Rank Softmax Merge:
        All-gathers context_lse, all-reduces scaled context_out, and merges with curr_out.
     """
-    cp_size = get_parallel().attn_cp_size
-    cp_rank = get_parallel().attn_cp_rank
-    cp_group = get_parallel().attn_cp_group
+    dcp_size = get_parallel().attn_dcp_size
+    if dcp_size > 1:
+        cp_size = dcp_size
+        cp_rank = get_parallel().attn_dcp_rank
+        cp_group = get_parallel().dcp_group
+    else:
+        cp_size = get_parallel().attn_cp_size
+        cp_rank = get_parallel().attn_cp_rank
+        cp_group = get_parallel().attn_cp_group
     device = q.device
-    cp_rank_tensor = ensure_cp_rank_tensor(device, cp_rank)
+    cp_rank_tensor = ensure_cp_rank_tensor(
+        device, cp_rank, ref_tensor=base_meta.kv_lens
+    )
 
     num_reqs = base_meta.kv_lens.shape[0]
     pages_per_seq = base_meta.page_indices.shape[0] // num_reqs
@@ -506,11 +588,11 @@ def batched_rpa_dcp_forward(
         striped_page_indices = owned_pages.reshape(-1)
 
     seq_lens = base_meta.kv_lens
-    q_positions = seq_lens - 1
-    kv_new_lens = torch.ones_like(seq_lens)
+    q_positions = (seq_lens - 1).to(torch.int32)
+    kv_new_lens = torch.ones_like(seq_lens, dtype=torch.int32)
 
     # 1. Cache Phase (CACHE_ONLY)
-    cache_update_kv = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+    cache_update_kv = torch.zeros_like(base_meta.kv_lens, dtype=torch.int32)
     context_out, context_lse = cp_op(
         q,
         k,
@@ -537,7 +619,7 @@ def batched_rpa_dcp_forward(
     )
 
     # 2. Current Phase (NEW_TOKENS_ONLY)
-    curr_update_kv = torch.ones(num_reqs, dtype=torch.int32, device=device)
+    curr_update_kv = torch.ones_like(base_meta.kv_lens, dtype=torch.int32)
     curr_out, curr_lse = cp_op(
         q,
         k,
@@ -600,4 +682,12 @@ def batched_rpa_dcp_forward(
 
     total_out = sum_scaled_context + scaled_curr_out
     merged_out = total_out / sum_exp_safe.unsqueeze(-1)
+
+    # Fold in attention sinks if present (e.g. GPT-OSS-120B)
+    if sinks is None:
+        sinks = getattr(layer, "sinks", None)
+    if sinks is not None:
+        merged_lse = torch.log(sum_exp_safe) + global_max_lse_safe
+        merged_out = merged_out * torch.sigmoid(merged_lse - sinks.to(torch.float32))[..., None]
+
     return merged_out.to(q.dtype)

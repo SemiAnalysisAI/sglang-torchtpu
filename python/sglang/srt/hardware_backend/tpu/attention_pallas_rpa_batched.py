@@ -97,7 +97,7 @@ def _invoke_batched_kernel(
     # the two arguments the shared shell passes for kernels that do are
     # discarded here. The base never widens decode for this kernel
     # (``supports_decode_query_size`` is off), so the width is always 1.
-    del cu_kv_lens, attention_sink, decode_query_size
+    del cu_kv_lens, decode_query_size
     return jax_rpa(
         queries,
         keys,
@@ -107,6 +107,7 @@ def _invoke_batched_kernel(
         page_indices,
         cu_q_lens,
         distribution,
+        attention_sink=attention_sink,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
@@ -129,7 +130,7 @@ RPA_BATCHED_SPEC = RpaKernelSpec(
     op_name="sglang_tpu_pallas::ragged_paged_attention_batched",
     import_kernel=_import_batched_kernel,
     invoke_kernel=_invoke_batched_kernel,
-    supports_attention_sink=False,
+    supports_attention_sink=True,
     uses_cu_kv_lens=False,
     extend_distribution_mask=(0, 0, 1),  # [0, 0, n] (MIXED-only)
     min_page_size=_MIN_PAGE_SIZE,
@@ -149,7 +150,7 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         self._cp_op = None
         self.pcp_forward_metadata = None
         self._cp_reqs: set[int] = set()
-        if get_parallel().attn_cp_size > 1:
+        if get_parallel().attn_cp_size > 1 or get_parallel().attn_dcp_size > 1:
             from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
                 build_batched_rpa_cp_op,
             )
@@ -177,6 +178,11 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
             prefix_lens = getattr(forward_batch, "prefix_lens", None)
             if prefix_lens is None:
                 prefix_lens = torch.zeros_like(forward_batch.seq_lens)
+            num_local_tokens = None
+            if getattr(forward_batch, "attn_cp_metadata", None) is not None:
+                per_rank = forward_batch.attn_cp_metadata.per_rank_actual_token
+                if per_rank is not None and len(per_rank) > cp_rank:
+                    num_local_tokens = per_rank[cp_rank]
             self.pcp_forward_metadata = build_pcp_batched_metadata(
                 seq_lens=forward_batch.seq_lens,
                 prefix_lens=prefix_lens,
@@ -185,6 +191,8 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
                 cp_size=cp_size,
                 cp_rank=cp_rank,
                 device=self.device,
+                forward_batch=forward_batch,
+                num_local_tokens=num_local_tokens,
             )
             req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
             if req_pool_indices is not None:
@@ -268,7 +276,11 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
     def _is_cp_decode(self, forward_batch) -> bool:
-        return True
+        req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
+        if req_pool_indices is None:
+            return False
+        reqs = req_pool_indices.tolist()
+        return len(reqs) > 0 and all(r in self._cp_reqs for r in reqs)
 
     def forward_decode(
         self,
@@ -282,9 +294,8 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
     ) -> torch.Tensor:
         from sglang.srt.runtime_context import get_parallel
 
-        if (
-            get_parallel().attn_cp_size > 1
-            and not forward_batch.forward_mode.is_idle()
+        if not forward_batch.forward_mode.is_idle() and (
+            get_parallel().attn_cp_size > 1 and self._is_cp_decode(forward_batch)
         ):
             return self._forward_cp_decode(q, k, v, layer, forward_batch, **kwargs)
         return super().forward_decode(
@@ -336,6 +347,7 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
             self.forward_metadata,
             k_scale=k_scale,
             v_scale=v_scale,
+            sinks=kwargs.get("sinks"),
         )
         out = out.reshape(num_tokens, layer.tp_q_head_num, -1)[..., : layer.v_head_dim]
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)

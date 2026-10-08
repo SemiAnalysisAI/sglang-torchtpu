@@ -96,6 +96,25 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
             **kwargs,
         )
 
+    def compute(
+        self,
+        cu_q_lens_ref: jax.Ref,
+        q_positions_ref: jax.Ref,
+        global_kv_cache_lens_ref: jax.Ref,
+        kv_new_lens_ref: jax.Ref,
+        update_kv_cache_ref: jax.Ref,
+        distribution_ref: jax.Ref,
+    ) -> schedule.LoopCarry:
+        self.kv_new_lens_ref = kv_new_lens_ref
+        return super().compute(
+            cu_q_lens_ref=cu_q_lens_ref,
+            q_positions_ref=q_positions_ref,
+            global_kv_cache_lens_ref=global_kv_cache_lens_ref,
+            kv_new_lens_ref=kv_new_lens_ref,
+            update_kv_cache_ref=update_kv_cache_ref,
+            distribution_ref=distribution_ref,
+        )
+
     @property
     def rank(self):
         return self.extra_refs[0][0] if self.extra_refs else 0
@@ -134,11 +153,19 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
         cfgs = self.cfgs
         if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
             kv_cache_len = global_kv_cache_len
+            if cfgs.mode != configs.RpaCase.DECODE:
+                req_idx = s_idx // 2
+                num_reqs = self.kv_new_lens_ref.shape[0] // 2
+                def _sum_body(k, acc):
+                    return acc + jnp.where(k < req_idx, self.kv_new_lens_ref[2 * k], 0)
+                kv_new_start = jax.lax.fori_loop(0, num_reqs, _sum_body, 0)
+            else:
+                kv_new_start = q_start
         else:
             kv_cache_len = cfgs.local_kv_cache_len(
                 global_kv_cache_len, self.schedule_rank
             )
-        kv_new_start = q_start
+            kv_new_start = q_start
         num_k = pl.cdiv(kv_cache_len + kv_new_len, cfgs.bkv_sz)
 
         q_src = q_start + q_idx * cfgs.bq_sz

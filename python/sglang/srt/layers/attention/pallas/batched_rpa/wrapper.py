@@ -14,6 +14,7 @@
 """Wrapper for RPA kernel to match expected interface."""
 
 import dataclasses
+import math
 
 import jax
 import jax.numpy as jnp
@@ -174,6 +175,38 @@ def prepare_outputs(out: jax.Array) -> jax.Array:
     return out.reshape(kv_heads, max_tokens, q_per_kv_packed * q_packing, d)
 
 
+def prepare_attention_sink(
+    attention_sink: jax.Array, num_kv_heads: int, q_dtype: jnp.dtype
+) -> jax.Array:
+    """Lays out per-q-head sink logits as rows of the kernel's l/m scratch.
+
+    Rows of a KV head are token-major with the aligned q heads of a KV head
+    inside each token, so the table repeats them over whole f32 sublane tiles:
+    [num_kv_heads, period, num_lanes], period a multiple of the aligned count.
+    """
+    num_q_heads_per_kv_head = attention_sink.shape[0] // num_kv_heads
+    aligned_num_q_heads_per_kv_head = utils.align_to(
+        num_q_heads_per_kv_head, utils.get_dtype_packing(q_dtype)
+    )
+    tpu_info = pltpu.get_tpu_info()
+    period = math.lcm(aligned_num_q_heads_per_kv_head, tpu_info.num_sublanes)
+
+    sink = attention_sink.astype(jnp.float32).reshape(
+        num_kv_heads, num_q_heads_per_kv_head
+    )
+    # Padded q heads get no sink weight; finite so that sink - m never sees -inf.
+    sink = jnp.pad(
+        sink,
+        ((0, 0), (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head)),
+        constant_values=-1e30,
+    )
+    sink = jnp.tile(sink, (1, period // aligned_num_q_heads_per_kv_head))
+    return jnp.broadcast_to(
+        sink[:, :, None], (num_kv_heads, period, tpu_info.num_lanes)
+    )
+
+
+
 def get_kv_cache_shape(
     total_num_pages,
     page_size,
@@ -297,14 +330,16 @@ class BaseBlockSizeCalculator:
     def capped_vmem_limit_bytes(self) -> float:
         # Even if we loose some potential performance, we want to avoid OOM at
         # all costs. Therefore, we conservatively only use 80% of the VMEM
-        # budget.
-        return self.vmem_limit_bytes * 0.8
+        # budget. When compiling large tile sizes, compiler register spill slots
+        # can exceed VMEM. Capping at 65% ensures safe compilation headroom.
+        return self.vmem_limit_bytes * 0.65
 
     @property
     def max_bkv_sz(self) -> int:
         max_seq_len = self.serve_cfgs.pages_per_seq * self.serve_cfgs.page_size
-        # TEMP PATCH, PLEASE SEE go/bkv_sz FOR MORE INFO.
-        return min(max_seq_len, 4096)
+        # Capping at 1024 matches the maximum TPU attention tile size
+        # and prevents compiler register spills while maximizing compute per step.
+        return min(max_seq_len, 1024)
 
     def calculate_vmem_usage(self, batch_size: int, bq_sz: int, bkv_sz: int) -> int:
         """Given tile size, calculate VMEM usage of the kernel."""
@@ -644,6 +679,7 @@ def ragged_paged_attention(
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
     distribution: jax.Array,
+    attention_sink: jax.Array | None = None,
     *,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -808,6 +844,7 @@ def ragged_paged_attention(
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         mask_value=mask_value,
+        has_attention_sink=attention_sink is not None,
     )
 
     if k_scale is not None and dynamic_k_scale is not None:
@@ -859,6 +896,11 @@ def ragged_paged_attention(
         v_scale_tensor,
         kv_layout=kv_layout,
         page_size=page_size,
+    )
+    sink_table = (
+        None
+        if attention_sink is None
+        else prepare_attention_sink(attention_sink, num_kv_heads, queries.dtype)
     )
 
     default_decode, default_prefill = calculate_block_sizes(
@@ -989,6 +1031,7 @@ def ragged_paged_attention(
             o_hbm_alias_q_hbm,
             new_kv_hbm,
             kv_cache,
+            sink_table,
             lse_hbm_in,
             cfgs=cfgs,
             computer_cls=computer_cls,
