@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
 from sglang.multimodal_gen.runtime.models.dits import wanvideo
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 _SP_SIZE = 4
 # (frames, height, width) of the latents; patch size (1, 2, 2).
@@ -28,8 +29,9 @@ class _Stop(Exception):
 
 
 class _RecordingSelfAttention(USPAttention):
-    def __init__(self):
+    def __init__(self, backend=AttentionBackendEnum.TORCH_SDPA):
         nn.Module.__init__(self)
+        self.backend = backend
         self.calls = []
 
     def forward(self, q, k, v, **kwargs):
@@ -40,8 +42,13 @@ class _RecordingSelfAttention(USPAttention):
 class _NonMaskingSelfAttention(nn.Module):
     """Stands in for SLA's MinimalA2AAttnOp, which takes no mask."""
 
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
     def forward(self, q, k, v):
-        raise AssertionError("a padded shard reached a non-masking attention op")
+        self.calls += 1
+        raise _Stop
 
 
 class _PassThroughNorm(nn.Module):
@@ -112,8 +119,10 @@ class TestWanSequenceShardPadding(unittest.TestCase):
         )
         self.addCleanup(server_args_module.set_global_server_args, previous)
 
-    def _self_attention_calls(self, latent_shape, rank):
-        self_attention = _RecordingSelfAttention()
+    def _self_attention_calls(self, latent_shape, rank, backend=None):
+        self_attention = (
+            _RecordingSelfAttention(backend) if backend else _RecordingSelfAttention()
+        )
         with _sp_rank(rank), self.assertRaises(_Stop):
             _run_until_self_attention(_tiny_wan(), latent_shape, self_attention)
         return self_attention.calls
@@ -131,33 +140,17 @@ class TestWanSequenceShardPadding(unittest.TestCase):
                 self.assertEqual((meta["pad_start"], meta["pad_end"]), (27, 28))
                 self.assertEqual(meta["local_pad"], int(rank == _SP_SIZE - 1))
 
-    def test_non_masking_self_attention_rejects_padded_shards(self):
-        with (
-            _sp_rank(1),
-            self.assertRaisesRegex(
-                NotImplementedError,
-                r"cannot mask sequence-parallel padding \(27 tokens padded to 28\)",
-            ),
-        ):
-            _run_until_self_attention(_tiny_wan(), _PADDED, _NonMaskingSelfAttention())
-
-    def test_video_sparse_attention_rejects_padded_shards(self):
-        # Rejected before any attribute is read, so no VSA backend is needed.
-        block = wanvideo.WanTransformerBlock_VSA.__new__(
-            wanvideo.WanTransformerBlock_VSA
+    def test_sparse_attention_keeps_attending_the_pad_keys(self):
+        # Sparse kernels cannot drop the pad keys without a dense fallback, so
+        # they get no metadata and run as before the padding was masked.
+        (call,) = self._self_attention_calls(
+            _PADDED, 1, backend=AttentionBackendEnum.SLIDING_TILE_ATTN
         )
-        nn.Module.__init__(block)
-        with self.assertRaisesRegex(
-            NotImplementedError,
-            r"Video sparse attention cannot mask sequence-parallel padding",
-        ):
-            block(
-                torch.zeros(1, 7, 16),
-                None,
-                None,
-                None,
-                attn_mask_meta={"pad_start": 27, "pad_end": 28},
-            )
+        self.assertEqual(call, {})
+        non_masking = _NonMaskingSelfAttention()
+        with _sp_rank(1), self.assertRaises(_Stop):
+            _run_until_self_attention(_tiny_wan(), _PADDED, non_masking)
+        self.assertEqual(non_masking.calls, 1)
 
 
 if __name__ == "__main__":

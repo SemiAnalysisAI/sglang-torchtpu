@@ -438,17 +438,6 @@ def _wan_temb_table_slices(
     return _eager_temb_table_slices(table, temb)
 
 
-def _sp_padding_unsupported(
-    attention: str, attn_mask_meta: dict
-) -> NotImplementedError:
-    return NotImplementedError(
-        f"{attention} cannot mask sequence-parallel padding "
-        f"({attn_mask_meta['pad_start']} tokens padded to "
-        f"{attn_mask_meta['pad_end']}); use a sequence-parallel size that divides "
-        "the token count."
-    )
-
-
 class WanTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -744,13 +733,17 @@ class WanTransformerBlock(nn.Module):
             query = torch.matmul(query, self.q_rot)
             key = torch.matmul(key, self.k_rot)
 
-        if attn_mask_meta is None:
-            attn_output = self.attn1(query, key, value)
-        elif isinstance(self.attn1, USPAttention):
+        if (
+            attn_mask_meta is not None
+            and isinstance(self.attn1, USPAttention)
+            and not self.attn1.backend.is_sparse
+        ):
             # Keys past the sequence-parallel tail pad are not real tokens.
             attn_output = self.attn1(query, key, value, attn_mask_meta=attn_mask_meta)
         else:
-            raise _sp_padding_unsupported(type(self.attn1).__name__, attn_mask_meta)
+            # Sparse attention (SLA, USP sparse backends) cannot drop the pad
+            # keys without a dense fallback; it attends to them, as before.
+            attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -934,8 +927,8 @@ class WanTransformerBlock_VSA(nn.Module):
         rope_cos_sin_cache: torch.Tensor | None = None,
         attn_mask_meta: dict | None = None,
     ) -> torch.Tensor:
-        if attn_mask_meta is not None:
-            raise _sp_padding_unsupported("Video sparse attention", attn_mask_meta)
+        # attn_mask_meta is unused: video sparse attention takes no mask, so
+        # sequence-parallel pad keys are attended, as before.
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape

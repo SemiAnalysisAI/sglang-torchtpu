@@ -34,6 +34,7 @@ class TestTailPadKeyPrefix(unittest.TestCase):
         attn.sp_attention_mode = "ulysses"
         attn.sp_attention_mode_is_auto = False
         attn.is_cross_attention = False
+        attn.causal = False
         # Read by the gathered-mask SDPA fallback.
         attn.allow_cudnn_sdp = False
         attn.softmax_scale = None

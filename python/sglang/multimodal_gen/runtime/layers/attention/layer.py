@@ -1333,6 +1333,7 @@ class USPAttention(nn.Module):
                 meta_only_pad
                 and meta_pad_end == q.shape[1]
                 and not self.backend.is_sparse
+                and not self.causal
             ):
                 # Padding only at the gathered tail: attend over the real key
                 # prefix with the selected backend; no mask to build. Sparse
