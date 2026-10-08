@@ -1801,6 +1801,10 @@ class KimiK3DeltaAttention(nn.Module):
         )
         # KDA safe gate: checkpoint trained with gate_lower_bound=-5.0
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
+        if _is_tpu and self.use_full_rank_gate:
+            # forward_qkvbfg_fused hands the TPU KDA op the whole [q, k, v, g]
+            # projection; the op reads q/k/v from its leading columns.
+            self.attn.fused_qkvg = True
         # Set by _prepare_fused_decode() once weights are loaded.
         self._kda_fused_decode_ready = False
         self._kda_hip_fused_decode_ready = False
@@ -1866,6 +1870,33 @@ class KimiK3DeltaAttention(nn.Module):
             self.A_log.detach().reshape(-1).clone(), requires_grad=False
         )
         self.attn.dt_bias = self.dt_bias
+        # Without a conv bias the kernel reads one packed f32 copy of conv /
+        # dt_bias / A_log instead, so dt_bias is copied too.
+        if self.attn.bias is None:
+            self.attn.packed_kernel_weights = self._pack_tpu_kda_weights()
+
+    def _pack_tpu_kda_weights(self) -> torch.Tensor:
+        """conv [K, dim], dt_bias [n_v, d_k] and A_log [n_v] in one f32 array (the
+        layout of kda_layout.kda_packed_weights_shape): XLA stages every small
+        kernel operand with its own copy."""
+        from sglang.srt.hardware_backend.tpu.kda_layout import (
+            kda_packed_weights_shape,
+        )
+
+        attn = self.attn
+        k, dim = attn.conv_weights.shape[0], attn.conv_weights.shape[-1]
+        n_v, d_k = attn.num_v_heads, attn.head_k_dim
+        rows, width = kda_packed_weights_shape(k, dim, n_v, d_k)
+        # Filled on the host and moved once: slice-assigning into a device tensor
+        # leaves a view chain that torch_tpu re-materializes before every forward.
+        packed = torch.zeros(rows, width, dtype=torch.float32)
+        with torch.no_grad():
+            packed[:k, :dim] = attn.conv_weights.reshape(k, dim).float().cpu()
+            packed[k : k + n_v, :d_k] = (
+                attn.dt_bias.detach().float().reshape(n_v, d_k).cpu()
+            )
+            packed[k + n_v, :n_v] = attn.A_log.detach().float().reshape(n_v).cpu()
+        return packed.to(attn.conv_weights.device)
 
     def _merge_kda_inproj_weights_hip(self) -> bool:
         """ROCm only: append the [f_a | b] tail to the wide [q,k,v,g] buffer so
@@ -2083,6 +2114,11 @@ class KimiK3DeltaAttention(nn.Module):
             else:
                 fused_states, _ = self.fused_qkvg_proj(hidden_states)
                 qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
+                if _is_tpu:
+                    # The TPU KDA op reads q/k/v as the leading columns of the
+                    # fused [q, k, v, g] output (attn.fused_qkvg); a split view
+                    # would be copied whole at the op boundary.
+                    qkv = fused_states
                 beta = self.b_proj(hidden_states)[0]
                 f_a = self.f_a_proj(hidden_states)[0]
                 forget_gate = f_a if defer_f_b else self.f_b_proj(f_a)[0]
@@ -3492,16 +3528,16 @@ class KimiK3LinearForCausalLM(nn.Module):
                     layer.self_attn._bind_tpu_attn_weights()
                 layer.self_attn._prepare_fused_decode()
         if _is_tpu and self.config.linear_layer_ids:
-            # The TPU KDA kernel reads copies of the conv weight and A_log made
-            # by _bind_tpu_attn_weights; writes that skip post-load
-            # (load_format="direct", custom loaders) would leave them stale.
-            # The updater's derived-cache guard rejects every update path.
-            # Published on the model from the config so every PP stage rejects
-            # alike, with or without KDA layers.
+            # The TPU KDA kernel reads copies of the conv weight, dt_bias and
+            # A_log made by _bind_tpu_attn_weights (packed_kernel_weights);
+            # writes that skip post-load (load_format="direct", custom loaders)
+            # would leave them stale. The updater's derived-cache guard rejects
+            # every update path. Published on the model from the config so every
+            # PP stage rejects alike, with or without KDA layers.
             self._derived_weight_cache_error = (
                 "Online weight updates are not supported for Kimi-K3 on TPU: the "
-                "KDA kernel reads conv weight / A_log copies built at load time. "
-                "Restart the server to change weights."
+                "KDA kernel reads conv weight / dt_bias / A_log copies built at "
+                "load time. Restart the server to change weights."
             )
 
         for layer in self.model.layers:

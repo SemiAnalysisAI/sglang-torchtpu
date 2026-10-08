@@ -125,6 +125,9 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    # KDA only: the small weights arrive as one f32 array (see
+    # memory_ref.unpack_kda_weights) instead of three kernel operands.
+    packed_weights: bool = False
 
     @property
     def chunk_size(self) -> int:

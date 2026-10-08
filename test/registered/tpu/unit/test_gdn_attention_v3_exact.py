@@ -6,13 +6,20 @@ The TPU state pool stores conv state in the kernel-native rank-4
 same bits (output, conv state, recurrent state) as with the rank-3 pool and the
 depthwise ``[dim, 1, K]`` weight, for GDN (Qwen3.5) and KDA (Kimi), on batches
 that read non-zero initial state.
+
+The decode/extend fast paths are held to the same bar against the default
+two-pass call: single-pass ``batched_only`` (bf16, unpadded) and
+``prefill_only``, packed KDA weights, and packed SMEM metadata. Decode padding
+rows, including the only row of an idle DP-attention rank's bucket, stay zero.
 """
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
+import dataclasses
 import unittest
+from unittest import mock
 
 from sglang.test.test_utils import CustomTestCase
 
@@ -29,10 +36,12 @@ def _has_jax_tpu() -> bool:
 
 
 if _has_jax_tpu():
+    import jax
     import jax.numpy as jnp
     import numpy as np
 
-    from sglang.srt.layers.attention.pallas.gdn import fused_conv1d_gdn
+    from sglang.srt.hardware_backend.tpu.kda_layout import kda_packed_weights_shape
+    from sglang.srt.layers.attention.pallas.gdn import fused_conv1d_gdn, memory_ref
     from sglang.srt.layers.attention.pallas.gdn.config import AttentionMode
 
 _K = 4
@@ -43,6 +52,8 @@ _BATCHES = [
     ("mixed", [1, 1, 1, 40], [3, 4, 4]),
     ("prefill", [24, 40], [0, 2, 2]),
 ]
+# Decode batch sizes: one row, a partial decode tile, full.
+_DECODE_SIZES = (1, 5, 8)
 
 
 def _case(kda: bool, lengths, distribution, seed=0):
@@ -116,6 +127,134 @@ class TestGDNKernelLayouts(CustomTestCase):
                         _call(arrays, static, conv_state=conv4, conv_weight=w_kd),
                         ref,
                     )
+
+
+def _packed_kda_weights(arrays, static):
+    k, n_v, d_k = static["kernel_size"], static["n_v"], static["d_k"]
+    w = arrays["conv_weight"][:, 0, :].T  # [K, dim]
+    packed = np.zeros(kda_packed_weights_shape(k, w.shape[1], n_v, d_k), np.float32)
+    packed[:k, : w.shape[1]] = w
+    packed[k : k + n_v, :d_k] = arrays["dt_bias"]
+    packed[k + n_v, :n_v] = arrays["a_log"]
+    return packed
+
+
+@unittest.skipUnless(_has_jax_tpu(), "Requires JAX with a TPU device")
+class TestGDNKernelFastPaths(CustomTestCase):
+    assert_same_bits = TestGDNKernelLayouts.assert_same_bits
+
+    def test_single_pass_variants_are_bit_identical(self):
+        for kda in (False, True):
+            for bs in _DECODE_SIZES:
+                with self.subTest(kda=kda, decode=bs):
+                    arrays, static = _case(kda, [1] * bs, [bs] * 3)
+                    self.assert_same_bits(
+                        _call(arrays, static, batched_only=True),
+                        _call(arrays, static),
+                    )
+            with self.subTest(kda=kda, batch="prefill"):
+                arrays, static = _case(kda, *_BATCHES[2][1:])
+                self.assert_same_bits(
+                    _call(arrays, static, prefill_only=True), _call(arrays, static)
+                )
+
+    def test_decode_padding_rows_are_zero(self):
+        """Rows past distribution[0] are bucket padding the kernel never walks.
+        They must still come back zero, as from the default call: residual,
+        MoE and collectives read them. Includes a one-row bucket with no real
+        row, which an idle DP-attention rank runs as decode."""
+        for kda in (False, True):
+            for bs, real in ((1, 0), (4, 0), (4, 1)):
+                with self.subTest(kda=kda, bucket=bs, real=real):
+                    arrays, static = _case(kda, [1] * bs, [real] * 3)
+                    got = _call(arrays, static, batched_only=True)
+                    np.testing.assert_array_equal(got[2][real:], 0.0)
+                    self.assert_same_bits(got, _call(arrays, static))
+
+    def test_mixed_dtype_decode_is_bit_identical(self):
+        """f32 b / a next to bf16 qkv take the f32 path on decode, as on the
+        default call, instead of failing the kernel's dtype check."""
+        for kda in (False, True):
+            with self.subTest(kda=kda):
+                arrays, static = _case(kda, [1] * 5, [5] * 3)
+                f32 = {k: arrays[k].astype(np.float32) for k in ("b", "a")}
+                self.assert_same_bits(
+                    _call(arrays, static, batched_only=True, **f32),
+                    _call(arrays, static, **f32),
+                )
+
+    def test_pack_metadata_keeps_every_set_field(self):
+        """Every set MetadataRef field round-trips through the packed operand,
+        so a field added later cannot be dropped; unset fields stay None."""
+        rng = np.random.default_rng(0)
+
+        def ints(*shape):
+            return jnp.asarray(rng.integers(0, 9, shape), jnp.int32)
+
+        fields = {}
+        for field in dataclasses.fields(memory_ref.MetadataRef):
+            if field.name == "num_tiles":
+                fields[field.name] = jnp.int32(3)
+            elif field.name.startswith("p_id_"):
+                fields[field.name] = memory_ref.SmemWrapper(ints(8), (1, 4))
+            elif field.name == "s_idx_has_initial_state":
+                fields[field.name] = ints(5) > 4
+            elif field.name == "s_idx_to_ckpt_indices":
+                fields[field.name] = ints(5, 3)
+            else:
+                fields[field.name] = ints(5)
+        metadata = memory_ref.MetadataRef(**fields)
+        packed, layout = memory_ref.pack_metadata(metadata)
+        self.assertEqual([entry[0] for entry in layout], list(fields))
+
+        view = memory_ref.unpack_metadata(packed, layout)
+        for name, want in fields.items():
+            got = getattr(view, name)
+            if isinstance(want, memory_ref.SmemWrapper):
+                indices = [(p, i) for p in range(2) for i in range(4)]
+                want = want.data.reshape(2, 4)
+            else:
+                indices = list(np.ndindex(want.shape))
+            for idx in indices:
+                self.assertEqual(int(got[idx]), int(want[idx]), (name, idx))
+
+        unset = dataclasses.replace(metadata, s_idx_to_ckpt_indices=None)
+        view = memory_ref.unpack_metadata(*memory_ref.pack_metadata(unset))
+        self.assertIsNone(view.s_idx_to_ckpt_indices)
+
+    def test_packed_kda_weights_are_bit_identical(self):
+        for name, lengths, dist in _BATCHES:
+            with self.subTest(batch=name):
+                arrays, static = _case(True, lengths, dist)
+                packed = _packed_kda_weights(arrays, static)
+                self.assert_same_bits(
+                    _call(arrays, static, packed_weights=packed),
+                    _call(arrays, static),
+                )
+
+    def test_packed_metadata_is_bit_identical(self):
+        # A fresh jit, so the unpacked trace does not hit the packed cache.
+        unpacked_kernel = jax.jit(
+            fused_conv1d_gdn.__wrapped__,
+            static_argnames=(
+                "n_kq",
+                "n_v",
+                "d_k",
+                "d_v",
+                "kernel_size",
+                "attention_mode",
+                "gate_lower_bound",
+            ),
+        )
+        for kda in (False, True):
+            for name, lengths, dist in _BATCHES:
+                with self.subTest(kda=kda, batch=name):
+                    arrays, static = _case(kda, lengths, dist)
+                    with mock.patch.object(
+                        memory_ref, "pack_metadata", lambda md: (md, None)
+                    ):
+                        ref = _call(arrays, static, kernel=unpacked_kernel)
+                    self.assert_same_bits(_call(arrays, static), ref)
 
 
 if __name__ == "__main__":
