@@ -147,15 +147,16 @@ class HashTopK(nn.Module):
 
         num_token = scores.shape[0]
 
+        topk_ids = torch.zeros(
+            (num_token, self.topk), dtype=torch.int32, device=scores.device
+        )
+        topk_weights = torch.zeros(
+            (num_token, self.topk), dtype=scores.dtype, device=scores.device
+        )
+
         if self.num_fused_shared_experts == 1:
-            topk_ids = torch.zeros(
-                (num_token, self.topk), dtype=torch.int32, device=scores.device
-            )
-            topk_weights = torch.zeros(
-                (num_token, self.topk), dtype=scores.dtype, device=scores.device
-            )
             topk_ids[:, :-1] = self.tid2eid[input_ids]
-            topk_weights[:, :-1] = scores.gather(1, topk_ids[:, :-1].to(torch.int64))
+            topk_weights[:, :-1] = scores.gather(1, topk_ids[:, :-1])
 
             if self.score_func != "softmax":
                 topk_weights[:, :-1] /= (
@@ -175,11 +176,13 @@ class HashTopK(nn.Module):
                 topk_weights[:, :-1].sum(dim=-1) / self.routed_scaling_factor
             )
         else:
-            topk_ids = self.tid2eid[input_ids].to(torch.int32)
-            topk_weights = scores.gather(1, topk_ids.to(torch.int64))
+            topk_ids[:, :] = self.tid2eid[input_ids]
+            topk_weights[:, :] = scores.gather(
+                1, topk_ids[:, :].to(torch.int64) if _is_tpu else topk_ids[:, :]
+            )
             if self.score_func != "softmax":
-                topk_weights = topk_weights / (
-                    topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
+                topk_weights[:, :] /= (
+                    topk_weights[:, :].sum(dim=-1, keepdim=True)
                     + _RENORMALIZE_SUM_EPSILON
                 )
 
