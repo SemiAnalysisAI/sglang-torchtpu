@@ -1673,8 +1673,7 @@ class Scheduler(
 
             self.tpu_async_copy_worker = TPUAsyncCopyWorker(
                 # The KV free fence releases pages once copy_done completes.
-                copy_draft_tail=self.enable_hierarchical_cache
-                and get_memory().hicache_io_backend == "raiden"
+                copy_draft_tail=self._needs_kv_free_fence()
             )
             logger.info("TPU async result-copy worker enabled")
 
@@ -1754,25 +1753,60 @@ class Scheduler(
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
-    def maybe_init_kv_free_fence(self):
-        """Hold KV pages freed under overlap back from raiden HiCache loads."""
-        if (
+    def _uses_raiden_hicache(self) -> bool:
+        return (
+            self.enable_hierarchical_cache
+            and get_memory().hicache_io_backend == "raiden"
+        )
+
+    def _needs_kv_free_fence(self) -> bool:
+        """Whether unordered DMAs can write pages an in-flight forward writes:
+        raiden HiCache loads, or KV arriving on a PD decode server."""
+        return (
             self.device == "tpu"
             and self.enable_overlap
-            and self.enable_hierarchical_cache
-            and get_memory().hicache_io_backend == "raiden"
-        ):
-            from sglang.srt.hardware_backend.tpu.kv_free_fence import (
-                install_kv_free_fence,
+            and (
+                self._uses_raiden_hicache()
+                or self.disaggregation_mode == DisaggregationMode.DECODE
             )
+        )
 
-            self.kv_free_fence = install_kv_free_fence(
-                self.token_to_kv_pool_allocator,
-                synchronize_device=self.device_module.synchronize,
-                spec_algorithm=self.spec_algorithm,
-                copies_draft_tail=self.tpu_async_copy_worker is not None
-                and self.tpu_async_copy_worker.copy_draft_tail,
+    def maybe_init_kv_free_fence(self):
+        """Hold KV pages freed under overlap back from DMA write targets."""
+        if not self._needs_kv_free_fence():
+            return
+        from sglang.srt.hardware_backend.tpu.kv_free_fence import (
+            install_kv_free_fence,
+            kv_free_fence_unsupported_reason,
+        )
+
+        fence_kwargs = dict(
+            spec_algorithm=self.spec_algorithm,
+            copies_draft_tail=self.tpu_async_copy_worker is not None
+            and self.tpu_async_copy_worker.copy_draft_tail,
+        )
+        reason = kv_free_fence_unsupported_reason(
+            self.token_to_kv_pool_allocator, **fence_kwargs
+        )
+        if reason is not None:
+            if self._uses_raiden_hicache():
+                raise ValueError(
+                    f"The raiden HiCache backend needs the KV free fence: {reason}"
+                )
+            # Unlike raiden HiCache, a PD decode server can serve unfenced.
+            # TODO(#1213): fail startup here once every PD decode
+            # configuration can be fenced.
+            logger.warning(
+                "KV arriving on this PD decode server is not fenced against "
+                "in-flight forwards: %s",
+                reason,
             )
+            return
+        self.kv_free_fence = install_kv_free_fence(
+            self.token_to_kv_pool_allocator,
+            synchronize_device=self.device_module.synchronize,
+            **fence_kwargs,
+        )
 
     def precompile_tpu_spec_ops(self) -> None:
         from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
