@@ -195,17 +195,23 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
                 num_local_tokens=num_local_tokens,
             )
             req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
-            if req_pool_indices is not None:
-                for r_idx in req_pool_indices.tolist():
-                    self._cp_reqs.add(r_idx)
+            if req_pool_indices is not None and hasattr(req_pool_indices, "tolist"):
+                try:
+                    for r_idx in req_pool_indices.tolist():
+                        self._cp_reqs.add(r_idx)
+                except Exception:
+                    pass
         else:
             self.pcp_forward_metadata = None
             forward_mode = getattr(forward_batch, "forward_mode", None)
             if forward_mode is not None and forward_mode.is_extend():
                 req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
-                if req_pool_indices is not None:
-                    for r_idx in req_pool_indices.tolist():
-                        self._cp_reqs.discard(r_idx)
+                if req_pool_indices is not None and hasattr(req_pool_indices, "tolist"):
+                    try:
+                        for r_idx in req_pool_indices.tolist():
+                            self._cp_reqs.discard(r_idx)
+                    except Exception:
+                        pass
 
     def forward_extend(
         self,
@@ -280,8 +286,14 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
         if req_pool_indices is None:
             return False
-        reqs = req_pool_indices.tolist()
-        return len(reqs) > 0 and all(r in self._cp_reqs for r in reqs)
+        try:
+            reqs = req_pool_indices.tolist()
+            return len(reqs) > 0 and all(r in self._cp_reqs for r in reqs)
+        except Exception:
+            # During torch.compile / direct_compile tracing, req_pool_indices is a
+            # placeholder/proxy tensor that cannot be materialized with .tolist().
+            # Under CP (attn_cp_size > 1 or attn_dcp_size > 1), trace the CP decode path.
+            return True
 
     def forward_decode(
         self,
@@ -296,7 +308,8 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         from sglang.srt.runtime_context import get_parallel
 
         if not forward_batch.forward_mode.is_idle() and (
-            get_parallel().attn_cp_size > 1 and self._is_cp_decode(forward_batch)
+            (get_parallel().attn_cp_size > 1 or get_parallel().attn_dcp_size > 1)
+            and self._is_cp_decode(forward_batch)
         ):
             return self._forward_cp_decode(q, k, v, layer, forward_batch, **kwargs)
         return super().forward_decode(
