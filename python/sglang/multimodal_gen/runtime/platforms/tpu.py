@@ -308,3 +308,14 @@ class TpuPlatform(Platform):
     @classmethod
     def enable_dit_layerwise_offload_by_default(cls) -> bool:
         return False
+
+    @classmethod
+    def fusion_barrier(cls, x: torch.Tensor) -> torch.Tensor:
+        # Only a compiled XLA program fuses; in eager the barrier would copy x.
+        if x.device.type != "tpu" or not torch.compiler.is_compiling():
+            return x
+        barrier = getattr(getattr(torch.tpu, "ops", None), "optimization_barrier", None)
+        if barrier is None:
+            # torch_tpu releases before torch.tpu.ops expose only the raw op.
+            barrier = torch.ops.tpu.optimization_barrier
+        return barrier([x])[0]

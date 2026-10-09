@@ -566,6 +566,15 @@ class Platform:
         """Apply platform-specific optimizations to VAE after loading."""
         return vae
 
+    @classmethod
+    def fusion_barrier(cls, x: torch.Tensor) -> torch.Tensor:
+        """Pass ``x`` through a point the graph compiler may not fuse across.
+
+        The values are unchanged; platforms without such a primitive return
+        ``x`` itself.
+        """
+        return x
+
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)
         return resolve_name(attention_cls_str)

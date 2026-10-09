@@ -119,6 +119,9 @@ class _WanGELUMLP(MLP):
                 bias,
                 use_fused_bias_gelu=nvfp4_bias_gelu_active(self),
             )
+        # Keep the activation in fc_in's epilogue: XLA would otherwise fuse it
+        # into fc_out as a slower matmul prologue.
+        x = current_platform.fusion_barrier(x)
         x, _ = self.fc_out(x)
         return x
 
