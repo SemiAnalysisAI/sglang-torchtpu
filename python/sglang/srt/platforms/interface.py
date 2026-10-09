@@ -207,6 +207,11 @@ class SRTPlatform(DeviceMixin):
         devices (--moe-dp-size > 1 with --pp-size > 1)."""
         return False
 
+    def keeps_swa_index_mapping_on_host(self) -> bool:
+        """Whether the SWA allocator's full-to-SWA index mapping is host-resident,
+        so SWA segment frees require host indices."""
+        return False
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
