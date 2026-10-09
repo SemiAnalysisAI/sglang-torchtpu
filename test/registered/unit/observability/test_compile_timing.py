@@ -31,6 +31,7 @@ def test_compile_timing_is_added_to_scheduler_startup_time() -> None:
     )
 
     startup_time = build_scheduler_startup_time(
+        distributed_init=2.0,
         target_load_weight=10.0,
         draft_load_weight=1.0,
         kv_cache_allocation=4.0,
@@ -41,6 +42,7 @@ def test_compile_timing_is_added_to_scheduler_startup_time() -> None:
         draft_compile_steps=draft.snapshot(),
     )
 
+    assert startup_time["distributed_init"] == 2.0
     assert "total_seconds" not in startup_time["compile"]
     assert [step["component"] for step in startup_time["compile"]["steps"]] == [
         "target",
@@ -63,20 +65,23 @@ def test_compile_timing_aggregation_uses_rank_critical_path() -> None:
     result = aggregate_scheduler_startup_times(
         [
             {
+                "distributed_init": 2.0,
                 "compile": {
                     "schema_version": 1,
                     "steps": [step, second_step],
-                }
+                },
             },
             {
+                "distributed_init": 5.0,
                 "compile": {
                     "schema_version": 1,
                     "steps": [slower_step, slower_second_step],
-                }
+                },
             },
         ]
     )
 
+    assert result["distributed_init"] == 5.0
     assert "total_seconds" not in result["compile"]
     assert [step["duration_seconds"] for step in result["compile"]["steps"]] == [
         4.0,
