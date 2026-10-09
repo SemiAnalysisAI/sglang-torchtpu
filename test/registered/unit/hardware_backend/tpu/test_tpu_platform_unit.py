@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import torch.compiler.config as compiler_config
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     default_cuda_graph_config,
@@ -241,6 +242,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             disaggregation_mode="null",
             disaggregation_transfer_backend="mooncake",
             optimistic_prefill_attempts=0,
+            attn_cp_size=1,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -452,6 +454,121 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         args = self._args(sampling_backend="pytorch")
         self._apply(args)
         self.assertEqual(self._resolved(args, "sampling_backend"), "pytorch")
+
+
+class TestPrefillContextParallelValidation(CustomTestCase):
+    """apply_server_args_defaults gates the prefill context-parallel path."""
+
+    _args = TestTpuPlatformServerDefaults._args
+    _apply = TestTpuPlatformServerDefaults._apply
+    _resolved = TestTpuPlatformServerDefaults._resolved
+
+    def _apply_cp(self, architectures=("Qwen3MoeForCausalLM",), **overrides):
+        fields = dict(
+            tp_size=8,
+            attn_cp_size=8,
+            enable_prefill_cp=True,
+            cp_strategy="zigzag",
+            moe_dp_size=8,
+            enable_torch_compile=True,
+            tpu_compile_tracer="dynamo",
+            model_path="model",
+            trust_remote_code=False,
+            revision=None,
+        )
+        fields.update(overrides)
+        args = self._args(**fields)
+        hf_config = SimpleNamespace(architectures=list(architectures))
+        with patch(
+            "sglang.srt.utils.hf_transformers.config.get_config",
+            return_value=hf_config,
+        ):
+            self._apply(args)
+        return args
+
+    def test_resolves_the_cp_backend_and_turns_off_sparse_core_gathers(self):
+        """On the current libtpu the context-parallel forward returns wrong tokens
+        or halts with SparseCore gathers; a user's own libtpu flag value stays."""
+        user_flag = "--xla_tpu_offload_gather_to_sparsecore=true"
+        env = {
+            "SGLANG_TPU_REQ_TO_TOKEN_ON_HOST": "0",
+            "SGLANG_TPU_FUSED_MOE_SC_GATHER": "1",
+            "LIBTPU_INIT_ARGS": user_flag,
+        }
+        with patch.dict(os.environ, env):
+            args = self._apply_cp()
+            self.assertEqual(
+                self._resolved(args, "attention_backend"), "pallas_tpu_rpa_batched"
+            )
+            self.assertEqual(self._resolved(args, "sampling_backend"), "pytorch")
+            self.assertTrue(envs.SGLANG_TPU_REQ_TO_TOKEN_ON_HOST.get())
+            self.assertFalse(envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get())
+            libtpu_args = os.environ["LIBTPU_INIT_ARGS"].split()
+        self.assertIn(user_flag, libtpu_args)
+        self.assertNotIn("--xla_tpu_offload_gather_to_sparsecore=false", libtpu_args)
+        self.assertIn(
+            "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
+            libtpu_args,
+        )
+
+    def test_without_context_parallelism_sparse_core_stays_on(self):
+        """The SparseCore workarounds would slow every other server down."""
+        with patch.dict(os.environ, {"LIBTPU_INIT_ARGS": ""}):
+            os.environ.pop("SGLANG_TPU_FUSED_MOE_SC_GATHER", None)
+            self._apply(self._args(tp_size=8))
+            self.assertEqual(os.environ["LIBTPU_INIT_ARGS"], "")
+            self.assertTrue(envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get())
+
+    def test_rejections_name_the_missing_piece(self):
+        cases = [
+            (dict(enable_prefill_cp=False), {}, "requires --enable-prefill-cp"),
+            (dict(cp_strategy="interleave"), {}, "requires --cp-strategy zigzag"),
+            (
+                dict(architectures=("Qwen3VLMoeForConditionalGeneration",)),
+                {},
+                "supports Qwen3MoeForCausalLM and GptOssForCausalLM",
+            ),
+            (
+                dict(attention_backend="pallas_tpu_rpa_v3"),
+                {},
+                "requires --attention-backend pallas_tpu_rpa_batched",
+            ),
+            (
+                {},
+                {"SGLANG_TPU_USE_SEQ_ALONG_LANE_KV": "1"},
+                "unset SGLANG_TPU_USE_SEQ_ALONG_LANE_KV",
+            ),
+            (
+                dict(architectures=("GptOssForCausalLM",), kv_cache_dtype="bfloat16"),
+                {},
+                "bf16 KV cache fails in warmup for gpt-oss",
+            ),
+            (dict(speculative_algorithm="EAGLE3"), {}, "speculative decoding"),
+            (dict(enable_dp_attention=True, dp_size=8), {}, "DP attention"),
+            (dict(moe_dp_size=1), {}, "requires --moe-dp-size 8"),
+            (dict(enable_torch_compile=False), {}, "requires --enable-torch-compile"),
+            (dict(tpu_compile_tracer="direct"), {}, "requires --tpu-compile-tracer"),
+            (dict(sampling_backend="tpu"), {}, "requires --sampling-backend pytorch"),
+            (
+                {},
+                {"SGLANG_TPU_ENABLE_PROMPT_LOGPROB": "1"},
+                r"input \(prompt\) logprobs",
+            ),
+        ]
+        for overrides, env, message in cases:
+            with self.subTest(message=message), patch.dict(os.environ, env):
+                with self.assertRaisesRegex(NotImplementedError, message):
+                    self._apply_cp(**overrides)
+
+    def test_gpt_oss_bf16_kv_runs_at_cp_two(self):
+        """The bf16 refusal covers only the CP sizes that fail."""
+        self._apply_cp(
+            architectures=("GptOssForCausalLM",),
+            kv_cache_dtype="bfloat16",
+            tp_size=2,
+            attn_cp_size=2,
+            moe_dp_size=2,
+        )
 
 
 class TestTpuPlatformFactoryMethods(CustomTestCase):

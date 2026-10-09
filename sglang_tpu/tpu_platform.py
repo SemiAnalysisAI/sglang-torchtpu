@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Optional, Type
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang_tpu._logging import get_logger
@@ -90,6 +91,139 @@ def _uses_seq_along_lane_kv() -> bool:
     )
 
     return uses_seq_along_lane_kv()
+
+
+# Text-only decoders with softmax attention in every layer and no tensor-parallel
+# shared expert: the layer types the context-parallel path covers.
+_PREFILL_CP_ARCHITECTURES = ("Qwen3MoeForCausalLM", "GptOssForCausalLM")
+
+
+def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
+    """Reject configurations the TPU prefill context-parallel path cannot run.
+
+    The path shards extend batches by zigzag blocks over the attention
+    context-parallel group (= the TP group), all-gathers K/V per layer into
+    every rank's own batched RPA pool and reduces the last-token rows before
+    the logits step; it exists only inside the compiled forward.
+    """
+    from sglang.srt.arg_groups.overrides import (
+        declare_resolution,
+        resolving_view,
+    )
+
+    cfg = resolving_view(server_args)
+    attn_cp_size = cfg.attn_cp_size
+    if attn_cp_size <= 1:
+        return
+    feature = f"Prefill context parallelism on TPU (--attn-cp-size {attn_cp_size})"
+    if not cfg.enable_prefill_cp:
+        raise NotImplementedError(f"{feature} requires --enable-prefill-cp.")
+    if cfg.cp_strategy != "zigzag":
+        raise NotImplementedError(
+            f"{feature} requires --cp-strategy zigzag, got {cfg.cp_strategy!r}."
+        )
+    from sglang.srt.utils.hf_transformers.config import get_config
+
+    hf_config = get_config(
+        cfg.model_path, trust_remote_code=cfg.trust_remote_code, revision=cfg.revision
+    )
+    architectures = list(hf_config.architectures or [])
+    if not set(architectures) & set(_PREFILL_CP_ARCHITECTURES):
+        raise NotImplementedError(
+            f"{feature} supports {' and '.join(_PREFILL_CP_ARCHITECTURES)} models, "
+            f"got {architectures}: multimodal, M-RoPE, linear-attention and "
+            "state-space models, and MoE layers with a tensor-parallel shared "
+            "expert, do not run on the context-parallel path."
+        )
+    # TODO(yinlin09): lift once gpt-oss with a bf16 KV cache gets through warmup
+    # above attention CP 2; on libtpu 0.0.47 a core halts at CP 4 and the first
+    # extend stalls at CP 8 (CP 2 and the fp8 cache run).
+    if (
+        "GptOssForCausalLM" in architectures
+        and cfg.kv_cache_dtype in ("bf16", "bfloat16")
+        and attn_cp_size > 2
+    ):
+        raise NotImplementedError(
+            f"{feature} with a bf16 KV cache fails in warmup for gpt-oss above "
+            "--attn-cp-size 2; keep the default fp8 KV cache or lower the CP size."
+        )
+    backend = cfg.attention_backend
+    if backend is None:
+        declare_resolution(
+            server_args,
+            "tpu.apply_server_args_defaults",
+            attention_backend="pallas_tpu_rpa_batched",
+        )
+    elif backend != "pallas_tpu_rpa_batched":
+        raise NotImplementedError(
+            f"{feature} requires --attention-backend pallas_tpu_rpa_batched, "
+            f"got {backend!r}."
+        )
+    if _uses_seq_along_lane_kv():
+        raise NotImplementedError(
+            f"{feature} writes K/V in the token-major fused layout; unset "
+            "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV."
+        )
+    if cfg.speculative_algorithm is not None:
+        raise NotImplementedError(f"{feature} does not support speculative decoding.")
+    if cfg.enable_dp_attention:
+        raise NotImplementedError(f"{feature} does not support DP attention.")
+    if cfg.moe_dp_size != attn_cp_size:
+        raise NotImplementedError(
+            f"{feature} requires --moe-dp-size {attn_cp_size} (replicated experts "
+            "on each rank's own tokens); expert-parallel MoE over the gathered "
+            f"tokens (--ep-size) is not supported, got {cfg.moe_dp_size}."
+        )
+    if not cfg.enable_torch_compile:
+        raise NotImplementedError(f"{feature} requires --enable-torch-compile.")
+    if cfg.tpu_compile_tracer != "dynamo":
+        raise NotImplementedError(
+            f"{feature} requires --tpu-compile-tracer dynamo, got "
+            f"{cfg.tpu_compile_tracer!r}."
+        )
+    if cfg.sampling_backend is None:
+        declare_resolution(
+            server_args, "tpu.apply_server_args_defaults", sampling_backend="pytorch"
+        )
+    elif cfg.sampling_backend != "pytorch":
+        raise NotImplementedError(
+            f"{feature} requires --sampling-backend pytorch (the logits step runs on "
+            f"the reduced last-token rows), got {cfg.sampling_backend!r}."
+        )
+    if envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get():
+        raise NotImplementedError(
+            f"{feature} does not support input (prompt) logprobs; unset "
+            "SGLANG_TPU_ENABLE_PROMPT_LOGPROB."
+        )
+    # The layout and the KV slot table are built from the host req_to_token.
+    _pin_req_to_token_on_host("prefill context parallelism")
+    # TODO(yinlin09): drop once libtpu is fixed. Next to the per-layer K/V
+    # all-gathers, the fused MoE's SparseCore gather gives wrong tokens (seen on
+    # libtpu 0.0.47; this forward's SparseCore regressions start with 0.0.46).
+    _pin_fused_moe_tensorcore_gather("prefill context parallelism")
+
+
+def _pin_req_to_token_on_host(reason: str) -> None:
+    """Force SGLANG_TPU_REQ_TO_TOKEN_ON_HOST on, warning if it was turned off."""
+    if not envs.SGLANG_TPU_REQ_TO_TOKEN_ON_HOST.get():
+        logger.warning(
+            "Overriding SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=0 -> 1: "
+            f"{reason} requires host-resident req_to_token."
+        )
+    envs.SGLANG_TPU_REQ_TO_TOKEN_ON_HOST.set(True)
+
+
+def _pin_fused_moe_tensorcore_gather(reason: str) -> None:
+    """Force SGLANG_TPU_FUSED_MOE_SC_GATHER off, warning if it was turned on."""
+    if (
+        envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.is_set()
+        and envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()
+    ):
+        logger.warning(
+            "Overriding SGLANG_TPU_FUSED_MOE_SC_GATHER=1 -> 0: "
+            f"{reason} gathers the fused-MoE rows on the TensorCore."
+        )
+    envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.set(False)
 
 
 def _mha_kv_pool_cls(backend: str | None) -> type:
@@ -332,6 +466,7 @@ class TpuSRTPlatform(SRTPlatform):
         _prepare_tpu_env(cfg.tp_size * cfg.pp_size, setup_slicebuilder=not cfg.use_ray)
 
         from sglang_tpu.env_override import (
+            apply_prefill_cp_sparse_core_override,
             apply_small_kv_pool_vmem_prefetch_override,
         )
 
@@ -344,6 +479,9 @@ class TpuSRTPlatform(SRTPlatform):
             declare_resolution(
                 server_args, "tpu.apply_server_args_defaults", dtype="bfloat16"
             )
+
+        _validate_prefill_context_parallel(server_args)
+        apply_prefill_cp_sparse_core_override(attn_cp_size=cfg.attn_cp_size)
 
         if cfg.attention_backend is None:
             declare_resolution(
@@ -392,13 +530,7 @@ class TpuSRTPlatform(SRTPlatform):
         # nodes' prefix indices on device and mix devices in the prefix cat. Pin
         # SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 for raiden.
         if cfg.hicache_io_backend == "raiden":
-            if os.environ.get("SGLANG_TPU_REQ_TO_TOKEN_ON_HOST") == "0":
-                logger.warning(
-                    "Overriding SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=0 -> 1: the "
-                    "raiden KV-offload backend requires host-resident "
-                    "req_to_token."
-                )
-            os.environ["SGLANG_TPU_REQ_TO_TOKEN_ON_HOST"] = "1"
+            _pin_req_to_token_on_host("the raiden KV-offload backend")
 
         # There is no CUDA coredump on TPU: on a crash the handler would trigger
         # a no-op dump, then sleep SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS
@@ -559,6 +691,15 @@ class TpuSRTPlatform(SRTPlatform):
 
     def get_nsa_kv_pool_cls(self) -> type:
         raise NotImplementedError("NSA is not supported on TPU.")
+
+    def get_zigzag_cp_strategy_cls(self) -> type:
+        from sglang_tpu.cp_strategy import TpuZigzagCPStrategy
+
+        return TpuZigzagCPStrategy
+
+    def runs_eager_extend_cp(self) -> bool:
+        # The compiled forward shards the context-parallel extend.
+        return False
 
     def get_paged_allocator_cls(self) -> type:
         from sglang_tpu.allocator_tpu import (
