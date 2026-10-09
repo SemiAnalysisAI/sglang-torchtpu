@@ -52,7 +52,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`tpu_splash_attn`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`TPU_SPLASH_ATTN`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>TPU only, opt-in; the TPU default is <code>torch_sdpa</code>. Pallas flash and splash attention kernels for bf16, head_dim 128; other shapes fall back to SDPA. Block sizes and VMEM limits are tuned and validated on TPU v7x only.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>TPU only, opt-in; the TPU default is <code>torch_sdpa</code>. Pallas flash and splash attention kernels for bf16, head_dim 128; other shapes fall back to SDPA. Block sizes and VMEM limits are tuned and validated on TPU v7x only. Supports ring sequence parallelism (<code>--ring-degree</code>) by all-gathering K/V.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sliding_tile_attn`</td>
