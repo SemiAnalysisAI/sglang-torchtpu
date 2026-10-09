@@ -290,6 +290,7 @@ class TestRaidenRetractionBackup(CustomTestCase):
         backup._transfer = _FakeTransfer(pool, pages)
         backup._page_size = page
         backup._free = list(range(pages))
+        backup._quarantine = []
         pool._raiden_backup_obj = backup
         return pool, backup
 
