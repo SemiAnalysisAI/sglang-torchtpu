@@ -144,10 +144,12 @@ class TestKimiK3AttnResTpuKernelSetup(CustomTestCase):
                 built = [c.args for c in kernel.get_norm_weight_f32.call_args_list]
                 expected = [(out_norm,) for _, _, out_norm in points] if flag else []
                 self.assertEqual(built, expected)
-                # The copies are load-time only: online updates are rejected.
-                reason = _unsupported_derived_weight_cache_error(model)
+                # The copies are load-time only: with the kernel on, the inner
+                # model publishes the updater's guard (other modules may too).
+                reason = getattr(model.model, "_derived_weight_cache_error", None)
                 if flag:
                     self.assertIn("SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL", reason)
+                    self.assertIsNotNone(_unsupported_derived_weight_cache_error(model))
                 else:
                     self.assertIsNone(reason)
 
