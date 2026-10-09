@@ -3,6 +3,7 @@
 """Unit tests for the TorchTPU CPU-only JAX export environment."""
 
 import importlib.util
+import inspect
 import json
 import os
 import subprocess
@@ -158,6 +159,45 @@ class TestPallasExportEnvironment(CustomTestCase):
             },
         )
         fake_custom_op.register_fake.assert_called_once()
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
+        "requires JAX and TorchTPU",
+    )
+    def test_kv_write_kernels_are_registered_as_functions_of_tensors(self):
+        """custom_jax_kernel binds a kernel's keyword defaults (`interpret`) and
+        a partial's keywords (`max_span_len`) and traces them inside its jit,
+        where the Pallas call rejects them; the KV-write kernels must reach it
+        through functions that take tensors only."""
+        import torch
+
+        from sglang_tpu import (
+            kv_fused_rope_write,
+            kv_page_write,
+            kv_row_write,
+        )
+
+        with (
+            patch("torch_tpu._internal.pallas.custom_jax_kernel") as register,
+            patch.object(torch.library, "custom_op"),
+            patch.object(kv_page_write, "_OP", None),
+            patch.object(kv_row_write, "_OP", None),
+        ):
+            kv_page_write.get_write_pages_op()
+            kv_row_write.get_write_rows_op()
+            kv_fused_rope_write.get_fused_rope_write_op.__wrapped__(2, 256)
+
+        positional = (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.VAR_POSITIONAL,
+        )
+        self.assertEqual(register.call_count, 3)
+        for call in register.call_args_list:
+            for param in inspect.signature(call.args[0]).parameters.values():
+                with self.subTest(kernel=call.kwargs["name"], param=param.name):
+                    self.assertIn(param.kind, positional)
+                    self.assertIs(param.default, inspect.Parameter.empty)
 
     @unittest.skipUnless(
         importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
