@@ -1004,7 +1004,9 @@ class TestPipelineInitialization(unittest.TestCase):
         # Stage 1 of PP4 x PCP2: its host rank counts the CP ranks (2), its
         # transfer rank does not (1). Receivers look a push's schedule up by
         # the pushing engine's node id, so the two must agree.
-        stage_group = SimpleNamespace(broadcast_object=lambda obj, src: obj)
+        # Stage 0 hosts the controller and broadcasts its addresses.
+        addresses = ("10.0.0.1:32000", "10.0.0.1:32001")
+        stage_group = SimpleNamespace(broadcast_object=lambda obj, src: addresses)
         with get_parallel().override(pp_group=stage_group):
             engine, unit = self._initialize(
                 disaggregation_mode=DisaggregationMode.PREFILL,
