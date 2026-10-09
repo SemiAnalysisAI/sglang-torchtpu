@@ -47,6 +47,7 @@ def _abort_frame(room):
 def _prefill_manager():
     """A prefill-mode RaidenKVManager with its room tables, no sockets or engine."""
     mgr = RaidenKVManager.__new__(RaidenKVManager)
+    mgr.attn_tp_rank = 0
     mgr._prefill = PrefillState(announce_pages=1)
     mgr._decode = None
     mgr.disaggregation_mode = DisaggregationMode.PREFILL
@@ -296,6 +297,7 @@ class TestReceiverFailurePaths(unittest.TestCase):
 
         engine.start_read.side_effect = blocking_start
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr.request_status = {ROOM: KVPoll.WaitingForInput}
@@ -1070,6 +1072,7 @@ class TestSendRevalidatesTheSocket(unittest.TestCase):
     def test_sender_that_lost_the_eviction_race_uses_a_fresh_socket(self):
         endpoint = "tcp://10.0.0.1:4444"
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._socket_lock = threading.Lock()
         old_sock, new_sock = Mock(), Mock()
         mgr._socket_cache = {endpoint: old_sock}
@@ -1118,6 +1121,7 @@ class TestConnectDefersStaleSocketClose(unittest.TestCase):
 
         endpoint = "tcp://10.0.0.1:4444"
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._socket_lock = threading.Lock()
         stale, monitor = FakeSocket(), FakeMonitor()
         mgr._socket_cache = {endpoint: stale}
@@ -1148,6 +1152,7 @@ class TestHeartbeatPrunesRoomTracker(unittest.TestCase):
         a prefill dies; without the heartbeat prune it grows for the process
         lifetime."""
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr.addr_to_rooms_tracker = {"10.0.0.1:8998": {ROOM, OTHER_ROOM}}
         mgr.request_status = {ROOM: KVPoll.Transferring}
 
@@ -1195,6 +1200,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
 
         endpoint = "tcp://10.0.0.1:4444"
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr.connection_lock = threading.Lock()
@@ -1235,6 +1241,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
 
     def test_heartbeat_failure_serializes_with_native_progress_publication(self):
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr.connection_lock = threading.Lock()
@@ -1289,6 +1296,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
                 return value
 
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._status_lock = threading.Lock()
         mgr.request_status = PausingStatus({ROOM: KVPoll.Bootstrapping})
 
@@ -1329,6 +1337,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
                 return value
 
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._status_lock = threading.Lock()
         mgr.request_status = PausingStatus({ROOM: KVPoll.Bootstrapping})
 

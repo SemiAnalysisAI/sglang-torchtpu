@@ -642,6 +642,7 @@ class TestPipelineLifetimes(unittest.TestCase):
         pipe.receives[7] = receive(rank=3)
         meta = pipe.receives[7].sources[3] | {"pool_tags": ["fa.l12", "swa.l13"]}
         manager = RaidenKVManager.__new__(RaidenKVManager)
+        manager.attn_tp_rank = 0
         manager._pipeline_enabled = True
         manager._pipeline_init_lock = threading.Lock()
         manager._pipeline = pipe
@@ -996,6 +997,7 @@ class TestPipelineInitialization(unittest.TestCase):
         from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
 
         manager = RaidenKVManager.__new__(RaidenKVManager)
+        manager.attn_tp_rank = 0
         manager._pipeline_enabled = True
         manager._pipeline_init_lock = threading.Lock()
         manager._pipeline_messages = []

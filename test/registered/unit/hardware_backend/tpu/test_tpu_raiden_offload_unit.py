@@ -379,6 +379,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_hybrid_swa_max_blocks_is_sized_from_sliding_window(self):
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
@@ -397,6 +398,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_hybrid_swa_max_blocks_override_is_independent(self):
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
@@ -426,6 +428,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         for finalize_first in (False, True):
             with self.subTest(finalize_first=finalize_first):
                 mgr = object.__new__(RaidenKVManager)
+                mgr.attn_tp_rank = 0
                 mgr._prefill = PrefillState(announce_pages=1)
                 mgr._decode = None
                 mgr._timeout_s = 120.0
@@ -478,6 +481,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         full_blocks = [3, 9]
         swa_blocks = [5, 7]
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = PrefillState(announce_pages=1)
         mgr._decode = None
         mgr._timeout_s = 120.0
@@ -532,6 +536,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_hybrid_swa_decode_starts_both_pulls_with_separate_pages(self):
         room = 29
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
@@ -661,6 +666,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_decode_defers_pull_until_the_pool_has_room(self):
         first, second = 29, 30
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
@@ -877,6 +883,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     @staticmethod
     def _reshard_decode_mgr():
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
@@ -1005,6 +1012,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
     @staticmethod
     def _prefill():
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = PrefillState(announce_pages=1)
         mgr._decode = None
         mgr._timeout_s = 120.0
@@ -2663,6 +2671,7 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
 
     def _make_receiver(self, local_blocks):
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr.chunked_transfer = False
