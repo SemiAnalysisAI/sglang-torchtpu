@@ -524,6 +524,8 @@ class PipelineTransfer:
     """One named-pool engine per worker, sharing its pipeline's reshard controller."""
 
     dcp_size = 1
+    replicas = 1
+    passive = False
 
     def __init__(self, manager, groups):
         from tpu_sync.api.torch.reshard_client import ReshardClient
@@ -539,11 +541,21 @@ class PipelineTransfer:
         self.lock = threading.RLock()
         self.pools = pool_manifest(groups)
         self.tensors = list(groups.full) + list(groups.swa)
-        # One worker per pipeline stage or attention-TP rank. Rank 0 hosts the
-        # shared controller and, on a tensor-parallel decode, plans every
-        # transfer for all ranks.
-        self.rank = manager.pp_rank * manager.attn_tp_size + manager.attn_tp_rank
-        self.workers = manager.pp_size * manager.attn_tp_size
+        # A source with more attention-TP ranks than kv heads holds each head on
+        # several ranks, and only the lowest of them writes it (head_slice_targets);
+        # the other replicas push nothing, so they take no part in the transfer.
+        heads = int(manager.kv_args.total_kv_head_num) if self.producer else 0
+        self.replicas = max(1, manager.attn_tp_size // heads) if heads else 1
+        self.passive = manager.attn_tp_rank % self.replicas != 0
+        self.transfer_tp = manager.attn_tp_size // self.replicas
+        # One worker per pipeline stage or writing attention-TP rank. Rank 0
+        # hosts the shared controller and, on a tensor-parallel decode, plans
+        # every transfer for all ranks.
+        self.rank = (
+            manager.pp_rank * self.transfer_tp
+            + manager.attn_tp_rank // self.replicas
+        )
+        self.workers = manager.pp_size * self.transfer_tp
         self.client_type = ReshardClient
         self.clients = {}
         self.executor = concurrent.futures.ThreadPoolExecutor(
@@ -578,6 +590,20 @@ class PipelineTransfer:
             )
             for rank in range(manager.attn_tp_size)
         ]
+        if self.passive:
+            # A replica only answers its consumer's request (_reply); it builds
+            # no engine and registers nothing.
+            self.max_blocks = 0
+            self.admission = StagingAdmission(0)
+            self.engine = None
+            logger.info(
+                "Raiden pipeline rank tp=%d/%d replicates kv heads of rank tp=%d; "
+                "it does not send",
+                manager.attn_tp_rank,
+                manager.attn_tp_size,
+                manager.attn_tp_rank - manager.attn_tp_rank % self.replicas,
+            )
+            return
         full_blocks = manager._max_request_blocks()
         swa_blocks = manager._swa_max_request_blocks() if groups.swa else 0
         self.max_blocks = max(full_blocks, swa_blocks)
@@ -634,7 +660,7 @@ class PipelineTransfer:
         manager = self.manager
         self.store = None
         addresses = None
-        if self.rank == 0:
+        if self.rank == 0 and not self.passive:
             self.store = ReshardStore(
                 RaidenId(
                     job_name="sglang",
@@ -874,7 +900,7 @@ class PipelineTransfer:
                     src_attn_tp=src_attn_tp,
                     src_rank=src_rank,
                 )
-            elif dst_attn_tp == src_attn_tp:
+            elif dst_attn_tp == src_attn_tp and self.replicas == 1:
                 # A source rank of the decode's width sends whole pages to the
                 # destination rank of its own index.
                 spans = source_spans(
@@ -913,7 +939,7 @@ class PipelineTransfer:
         consumers = self.replies.get(room)
         if item is None or not consumers or room in self.failed:
             return
-        if not item["registered"] and not self._register(room):
+        if not self.passive and not item["registered"] and not self._register(room):
             return
         mgr = self.manager
         metadata = dict(
@@ -926,6 +952,9 @@ class PipelineTransfer:
             full=len(item["full"]),
             swa=len(item["swa"]),
         )
+        if self.replicas > 1:
+            # The writing ranks of each stage, which the decode plans from.
+            metadata["transfer_tp"] = mgr.attn_tp_size // self.replicas
         payload = json.dumps(metadata).encode()
         for endpoint in consumers:
             if endpoint in item["replied"]:
@@ -935,6 +964,11 @@ class PipelineTransfer:
                 [MessageTag.PIPELINE_READY, str(room).encode(), payload, item["aux"]],
             )
             item["replied"].add(endpoint)
+        if self.passive:
+            # A replica has sent everything it will once its consumer heard
+            # from it: one consumer per source rank when the decode is no wider.
+            self.done_send.add(room)
+            self.retired.add(room)
 
     def register_decode(self, room, full, swa, aux_index, infos):
         self._validate_room(room)
@@ -1102,7 +1136,12 @@ class PipelineTransfer:
                 client.coordinate_transfer,
                 src_units=[
                     SimpleNamespace(**(sources[0]["unit"] | {"data_replica_idx": rank}))
-                    for rank in range(int(sources[0]["pp_size"]) * src_attn_tp)
+                    # Replicas of a kv head take no part, so the sources are
+                    # each stage's writing ranks.
+                    for rank in range(
+                        int(sources[0]["pp_size"])
+                        * int(sources[0].get("transfer_tp", src_attn_tp))
+                    )
                 ],
                 dst_units=self.dst_units,
                 req_id=str(room),
@@ -1181,7 +1220,11 @@ class PipelineTransfer:
         and failed rooms for the manager to record."""
         mgr = self.manager
         with self.lock:
-            status = mgr._poll_engine_status(name="pipeline", engine=self.engine)
+            status = (
+                None
+                if self.engine is None
+                else mgr._poll_engine_status(name="pipeline", engine=self.engine)
+            )
             if status is not None:
                 sent, received, failed = (
                     {int(mgr._norm_req_id(t.req_id)) for t in rooms} for rooms in status
