@@ -19,6 +19,7 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Callable,
     Dict,
     Generator,
@@ -68,6 +69,11 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import is_cuda_alike
 from sglang.utils import is_in_ci
+
+if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.tpu.ep_local_expert_reader import (
+        EpLocalExpertReader,
+    )
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup
@@ -1126,14 +1132,38 @@ def _drop_file_cache_after_load(path: str) -> None:
             os.close(fd)
 
 
+def _ep_local_expert_reader(
+    hf_weights_files: List[str],
+    disable_mmap: bool,
+    local_expert_range: Optional[Tuple[int, int]],
+) -> Optional["EpLocalExpertReader"]:
+    """TPU EP-local expert reader for ``local_expert_range``, or None to read whole
+    shards (no range, mmap on, or no checkpoint index)."""
+    if local_expert_range is None:
+        return None
+    from sglang.srt.hardware_backend.tpu.ep_local_expert_reader import (
+        EpLocalExpertReader,
+    )
+
+    return EpLocalExpertReader.maybe_create(
+        hf_weights_files, local_expert_range, disable_mmap=disable_mmap
+    )
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    local_expert_range: Optional[Tuple[int, int]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model safetensor files."""
+    """Iterate over the weights in the model safetensor files.
+
+    With ``disable_mmap`` and ``local_expert_range`` (see
+    ``hardware_backend/tpu/ep_local_expert_reader``), indexed shards are read
+    without the routed experts outside that range.
+    """
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -1143,6 +1173,9 @@ def safetensors_weights_iterator(
         prefetch_handle = _prefetch_all_checkpoints(
             sorted(hf_weights_files), num_threads=prefetch_num_threads
         )
+    ep_reader = _ep_local_expert_reader(
+        hf_weights_files, disable_mmap, local_expert_range
+    )
 
     for st_file in tqdm(
         hf_weights_files,
@@ -1151,7 +1184,11 @@ def safetensors_weights_iterator(
         bar_format=BAR_FORMAT,
         position=tqdm._get_free_pos(),
     ):
-        if disable_mmap:
+        if ep_reader is not None and ep_reader.handles(st_file):
+            result = ep_reader.read(st_file)
+            for name in sorted(result.keys()):
+                yield name, result[name]
+        elif disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
                 for name in sorted(result.keys()):
@@ -1164,6 +1201,8 @@ def safetensors_weights_iterator(
             _drop_file_cache_after_load(st_file)
     if prefetch_handle is not None:
         prefetch_handle.stop()
+    if ep_reader is not None:
+        ep_reader.verify()
 
 
 def fastsafetensors_weights_iterator(
@@ -1230,12 +1269,14 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    local_expert_range: Optional[Tuple[int, int]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
     At most (max_workers + 1) shard files are in-flight at any time:
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
+    ``local_expert_range``: as in ``safetensors_weights_iterator``.
     """
     prefetch_handle = None
     if prefetch and not disable_mmap:
@@ -1245,8 +1286,13 @@ def buffered_multi_thread_safetensors_weights_iterator(
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
+    ep_reader = _ep_local_expert_reader(
+        hf_weights_files, disable_mmap, local_expert_range
+    )
 
     def _load_file(st_file: str):
+        if ep_reader is not None and ep_reader.handles(st_file):
+            return ep_reader.read(st_file)
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
@@ -1293,6 +1339,8 @@ def buffered_multi_thread_safetensors_weights_iterator(
                 pbar.update(1)
     if prefetch_handle is not None:
         prefetch_handle.stop()
+    if ep_reader is not None:
+        ep_reader.verify()
 
 
 def _load_pt_file(bin_file: str) -> dict:
