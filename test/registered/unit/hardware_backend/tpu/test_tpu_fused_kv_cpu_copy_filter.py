@@ -291,6 +291,7 @@ class TestRaidenRetractionBackup(CustomTestCase):
         backup._page_size = page
         backup._free = list(range(pages))
         backup._quarantine = []
+        backup._num_retired = 0
         pool._raiden_backup_obj = backup
         return pool, backup
 

@@ -1,7 +1,8 @@
 """A failed raiden retraction-backup DMA falls back to the row path.
 
-The save must not raise into the scheduler or leak host pages, and pages of a
-timed-out DMA stay out of the free list until it lands. Runs on CPU with no TPU.
+The save must not raise into the scheduler. Pages of a timed-out DMA stay out
+of the free list until it lands, and pages of a DMA that ended in an error are
+never handed out again. Runs on CPU with no TPU.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -57,6 +58,7 @@ def _backup():
     backup._page_size = PAGE
     backup._free = list(range(HOST_PAGES))
     backup._quarantine = []
+    backup._num_retired = 0
     return backup
 
 
@@ -73,12 +75,16 @@ class TestRetractionBackupDmaErrors(CustomTestCase):
         handle.release()
         self.assertEqual(len(backup._free), HOST_PAGES)
 
-    def test_failed_dma_frees_pages(self):
+    def test_failed_dma_retires_pages(self):
         backup = _backup()
         backup._transfer.next_exc = RuntimeError("raiden DMA failed: boom")
         for _ in range(3):
             self.assertIsNone(backup.try_save(_rows(2)))
-        self.assertEqual(sorted(backup._free), list(range(HOST_PAGES)))
+        failed_pages = {p for pages, _ in backup._transfer.backups for p in pages}
+        self.assertEqual(len(failed_pages), 6)
+        self.assertFalse(failed_pages & set(backup._free))
+        self.assertEqual(len(backup._free), HOST_PAGES - 6)
+        self.assertEqual(backup._num_retired, 6)
         self.assertEqual(backup._quarantine, [])
 
     def test_timed_out_dma_quarantines_until_landed(self):
@@ -100,15 +106,18 @@ class TestRetractionBackupDmaErrors(CustomTestCase):
         self.assertEqual(sorted(backup._free), list(range(HOST_PAGES)))
         self.assertEqual(backup._quarantine, [])
 
-    def test_timed_out_dma_landing_with_error_is_reclaimed(self):
+    def test_timed_out_dma_landing_with_error_is_retired(self):
         backup = _backup()
         backup._transfer.next_exc = TimeoutError("raiden DMA did not complete")
         self.assertIsNone(backup.try_save(_rows(2)))
-        _, stuck_event = backup._transfer.backups[-1]
+        stuck_pages, stuck_event = backup._transfer.backups[-1]
         stuck_event.ready = True
         stuck_event.error = "late failure"
         backup._alloc_pages(0)
-        self.assertEqual(sorted(backup._free), list(range(HOST_PAGES)))
+        self.assertEqual(backup._quarantine, [])
+        self.assertFalse(set(stuck_pages) & set(backup._free))
+        self.assertEqual(len(backup._free), HOST_PAGES - 2)
+        self.assertEqual(backup._num_retired, 2)
 
     def test_pool_falls_back_to_row_path(self):
         pool = TpuFusedMHATokenToKVPool(
@@ -127,7 +136,7 @@ class TestRetractionBackupDmaErrors(CustomTestCase):
             payload = pool.get_cpu_copy(_rows(2, first_page=1))
         self.assertIsInstance(payload, list)
         self.assertEqual(len(payload), pool.layer_num)
-        self.assertEqual(len(backup._free), HOST_PAGES)
+        self.assertEqual(backup._num_retired, 2)
 
 
 if __name__ == "__main__":

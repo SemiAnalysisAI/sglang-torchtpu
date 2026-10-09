@@ -100,6 +100,19 @@ class RaidenKVBackup:
         # Host pages of backup DMAs abandoned past their deadline, held until
         # the DMA lands so a later save is never handed a page still written.
         self._quarantine: List[Tuple[object, List[int]]] = []
+        self._num_retired = 0
+
+    def _retire(self, pages: List[int]) -> None:
+        # A DMA future can report an error while copies it already issued
+        # are still writing (tpu-sync drops them when dispatch fails
+        # partway), so these pages are never handed out again.
+        self._num_retired += len(pages)
+        logger.warning(
+            "raiden retraction backup: retired %d host pages after a failed "
+            "DMA (%d retired in total)",
+            len(pages),
+            self._num_retired,
+        )
 
     def _reclaim_quarantine(self) -> None:
         pending = []
@@ -107,7 +120,8 @@ class RaidenKVBackup:
             try:
                 done = event.query()
             except RuntimeError:
-                done = True  # landed with an error; no longer a DMA target
+                self._retire(pages)
+                continue
             if done:
                 self._free.extend(pages)
             else:
@@ -157,7 +171,7 @@ class RaidenKVBackup:
             )
             return None
         except RuntimeError as e:
-            self._free_pages(host_pages)
+            self._retire(host_pages)
             logger.warning(
                 "raiden retraction backup DMA failed (%s); falling back to "
                 "the row path for this request",
