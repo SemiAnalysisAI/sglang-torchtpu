@@ -205,23 +205,32 @@ MAX_TOKENS = int(E("GSM8K_MAX_TOKENS", "1024"))
 SPEC_ACCEPT_LENGTH_THRESHOLD = float(E("SPEC_ACCEPT_LENGTH_THRESHOLD", "1.90"))
 HEALTH_TIMEOUT = float(E("HEALTH_TIMEOUT", "3600"))
 
+# Defaults of the env-tunable probe and multi-turn knobs. The CPU tests check
+# these, not the knobs: model_config_main also runs them in integration mode,
+# under whatever overrides the job sets.
+DEFAULT_OFFLOAD_PROBE_TOKENS = 126000
+DEFAULT_MT_SESSIONS = 3
+DEFAULT_MT_TURNS = 15
+DEFAULT_MT_MIN_HIT_RATE = 0.85
+DEFAULT_MT_MIN_ACCEPT_LENGTH = 1.0
+
 # The offload probe's size in words (~1 token each). ~126k is the largest round
 # size whose probe and fillers still fit the context with decode headroom.
-OFFLOAD_PROBE_TOKENS = int(E("OFFLOAD_PROBE_TOKENS", "126000"))
+OFFLOAD_PROBE_TOKENS = int(E("OFFLOAD_PROBE_TOKENS", str(DEFAULT_OFFLOAD_PROBE_TOKENS)))
 # Covers the probe's 16 decoded tokens plus EAGLE's reserved draft slots.
 DECODE_HEADROOM_TOKENS = 64
 
-MT_SESSIONS = int(E("MT_SESSIONS", "3"))
-MT_TURNS = int(E("MT_TURNS", "15"))
 # Each turn appends the previous reply and a new user block, so a session's
 # prompt grows by exactly MT_TURN_TOKENS per turn (to 122816 at turn 15).
 MT_TURN_TOKENS = 8192
 MT_OUTPUT_TOKENS = 64
 # The default plan's ideal hit rate is 0.874 (every turn hits the previous
 # turn's page-aligned prompt).
-MT_MIN_HIT_RATE = float(E("MT_MIN_HIT_RATE", "0.85"))
+MT_MIN_HIT_RATE = float(E("MT_MIN_HIT_RATE", str(DEFAULT_MT_MIN_HIT_RATE)))
 # Tokens per verify forward. Exactly 1.0 means no draft was ever accepted.
-MT_MIN_ACCEPT_LENGTH = float(E("MT_MIN_ACCEPT_LENGTH", "1.0"))
+MT_MIN_ACCEPT_LENGTH = float(
+    E("MT_MIN_ACCEPT_LENGTH", str(DEFAULT_MT_MIN_ACCEPT_LENGTH))
+)
 
 FLUSH_TIMEOUT_S = 300
 REQUEST_TIMEOUT_S = 1800
@@ -1002,10 +1011,12 @@ class MultiTurnPlan(NamedTuple):
     context_len: int = CONTEXT_LEN
 
 
-def default_multi_turn_plan() -> MultiTurnPlan:
+def default_multi_turn_plan(env: Optional[Mapping[str, str]] = None) -> MultiTurnPlan:
+    """MT_SESSIONS x MT_TURNS from the environment, else the defaults."""
+    values = os.environ if env is None else env
     return MultiTurnPlan(
-        sessions=MT_SESSIONS,
-        turns=MT_TURNS,
+        sessions=int(values.get("MT_SESSIONS") or DEFAULT_MT_SESSIONS),
+        turns=int(values.get("MT_TURNS") or DEFAULT_MT_TURNS),
         user_tokens=MT_TURN_TOKENS - MT_OUTPUT_TOKENS,
         output_tokens=MT_OUTPUT_TOKENS,
     )
@@ -1474,9 +1485,14 @@ def multi_turn_failures(
     return failures
 
 
-def multi_turn_runner(prefill_url: str, decode_url: str, kv_cache_dtype: str):
+def multi_turn_runner(
+    prefill_url: str,
+    decode_url: str,
+    kv_cache_dtype: str,
+    env: Optional[Mapping[str, str]] = None,
+):
     """Interleaved long-context sessions with exact per-turn prefix-hit gates."""
-    plan = default_multi_turn_plan()
+    plan = default_multi_turn_plan(env)
 
     def run(base_url: str) -> Dict[str, Any]:
         failures = multi_turn_plan_failures(plan)
@@ -1547,9 +1563,11 @@ def multi_turn_runner(prefill_url: str, decode_url: str, kv_cache_dtype: str):
     return run
 
 
-def build_model_config(prefill_url: str, decode_url: str) -> Dict[str, Any]:
+def build_model_config(
+    prefill_url: str, decode_url: str, env: Optional[Mapping[str, str]] = None
+) -> Dict[str, Any]:
     """The gates run in list order: GSM8K first keeps its accept length clean."""
-    kv_cache_dtype = resolve_kv_cache_dtype()
+    kv_cache_dtype = resolve_kv_cache_dtype(env)
     return {
         "model": SERVED_MODEL_NAME,
         "test_name": TEST_NAME,
@@ -1582,7 +1600,9 @@ def build_model_config(prefill_url: str, decode_url: str) -> Dict[str, Any]:
             {
                 "dataset": "multi_turn_long_context",
                 "label": "multi-turn-long-context",
-                "runner": multi_turn_runner(prefill_url, decode_url, kv_cache_dtype),
+                "runner": multi_turn_runner(
+                    prefill_url, decode_url, kv_cache_dtype, env
+                ),
             },
         ],
     }
@@ -1796,8 +1816,10 @@ class TestPdGptOss120bMxint8Configuration(unittest.TestCase):
         self.assertIsNone(startup_failure_hint("/nonexistent/pd.log", "mxint8"))
 
     def test_default_multi_turn_plan_fits_and_outgrows_the_device_pool(self) -> None:
-        plan = default_multi_turn_plan()
-        self.assertEqual(multi_turn_plan_failures(plan), [])
+        plan = default_multi_turn_plan(env={})
+        self.assertEqual(
+            multi_turn_plan_failures(plan, min_hit_rate=DEFAULT_MT_MIN_HIT_RATE), []
+        )
         self.assertEqual(turn_prompt_tokens(plan, plan.turns), 122816)
         self.assertLessEqual(
             turn_prompt_tokens(plan, plan.turns) + plan.output_tokens, CONTEXT_LEN
@@ -1807,7 +1829,7 @@ class TestPdGptOss120bMxint8Configuration(unittest.TestCase):
         self.assertFalse(requires_host_hits(plan._replace(turns=4), MAX_TOTAL_TOKENS))
 
     def test_expected_cached_tokens_is_the_previous_prompt_page_aligned(self) -> None:
-        plan = default_multi_turn_plan()
+        plan = default_multi_turn_plan(env={})
         for turn in range(2, plan.turns + 1):
             previous = turn_prompt_tokens(plan, turn - 1)
             # Prompts end mid-page (8192k - 64), so the radix match does not
@@ -1822,23 +1844,25 @@ class TestPdGptOss120bMxint8Configuration(unittest.TestCase):
             )
 
     def test_hit_rate_floor_is_reachable_with_per_turn_slack(self) -> None:
-        plan = default_multi_turn_plan()
+        plan = default_multi_turn_plan(env={})
         self.assertAlmostEqual(theoretical_hit_rate(plan), 0.874, places=3)
         # The per-turn gate allows one page less than ideal on every returning
         # turn; even then the aggregate floor holds.
         prompts = sum(turn_prompt_tokens(plan, k) for k in range(1, plan.turns + 1))
         worst = theoretical_hit_rate(plan) - (plan.turns - 1) * PAGE_SIZE / prompts
-        self.assertGreaterEqual(worst, MT_MIN_HIT_RATE)
+        self.assertGreaterEqual(worst, DEFAULT_MT_MIN_HIT_RATE)
 
     def test_multi_turn_plan_rejects_overlong_and_degenerate_plans(self) -> None:
-        plan = default_multi_turn_plan()
+        plan = default_multi_turn_plan(env={})
         self.assertTrue(multi_turn_plan_failures(plan._replace(turns=16)))
         self.assertTrue(multi_turn_plan_failures(plan._replace(turns=1)))
         self.assertTrue(multi_turn_plan_failures(plan._replace(sessions=0)))
         # A shortened plan cannot reach the default floor; it must say so up
         # front rather than fail after serving every turn.
         short = plan._replace(turns=4)
-        (failure,) = multi_turn_plan_failures(short)
+        (failure,) = multi_turn_plan_failures(
+            short, min_hit_rate=DEFAULT_MT_MIN_HIT_RATE
+        )
         self.assertIn("MT_MIN_HIT_RATE", failure)
         self.assertEqual(multi_turn_plan_failures(short, min_hit_rate=0.5), [])
 
@@ -1986,6 +2010,7 @@ class TestPdGptOss120bMxint8Configuration(unittest.TestCase):
             error=None,
             # PLAN's three turns reach at most a 0.497 hit rate.
             min_hit_rate=0.45,
+            min_accept_length=DEFAULT_MT_MIN_ACCEPT_LENGTH,
         )
         kwargs.update(overrides)
         return multi_turn_failures(**kwargs)
@@ -2113,10 +2138,12 @@ class TestPdGptOss120bMxint8Configuration(unittest.TestCase):
 
     @unittest.skipIf(SGLANG_IMPORT_ERROR is not None, "needs the sglang test package")
     def test_offload_probe_fits_the_context_and_the_host_pool(self) -> None:
-        self.assertLessEqual(OFFLOAD_PROBE_TOKENS + DECODE_HEADROOM_TOKENS, CONTEXT_LEN)
+        self.assertLessEqual(
+            DEFAULT_OFFLOAD_PROBE_TOKENS + DECODE_HEADROOM_TOKENS, CONTEXT_LEN
+        )
         plan = plan_eviction(
             device_pool_tokens=MAX_TOTAL_TOKENS,
-            probe_tokens=OFFLOAD_PROBE_TOKENS,
+            probe_tokens=DEFAULT_OFFLOAD_PROBE_TOKENS,
             hicache_ratio=float(HICACHE_RATIO),
         )
         self.assertEqual(plan.num_fillers, 3)
@@ -2144,7 +2171,9 @@ class TestPdGptOss120bMxint8Configuration(unittest.TestCase):
     def test_gates_build(self) -> None:
         from sglang.test.tpu.evals.model_config import build_gates
 
-        config = build_model_config("http://prefill:30000", "http://decode:30000")
+        config = build_model_config(
+            "http://prefill:30000", "http://decode:30000", env={}
+        )
         gates = build_gates(config)
         self.assertEqual(
             [g.name for g in gates],
@@ -2155,6 +2184,27 @@ class TestPdGptOss120bMxint8Configuration(unittest.TestCase):
         )
         self.assertTrue(all(callable(g.runner) for g in gates[1:]))
         self.assertIn("mxint8KV", config["variant"])
+
+    def test_operator_overrides_reach_the_run_but_not_the_cpu_checks(self) -> None:
+        # model_config_main also runs these CPU tests in the integration job,
+        # under its overrides (e.g. the combo job's kv_cache_dtype=bfloat16).
+        from unittest import mock
+
+        overrides = {
+            KV_CACHE_DTYPE_ENV: "bfloat16",
+            "MT_SESSIONS": "2",
+            "MT_TURNS": "4",
+        }
+        with mock.patch.dict(os.environ, overrides):
+            self.assertEqual(resolve_kv_cache_dtype(), "bfloat16")
+            self.assertEqual(default_multi_turn_plan()[:2], (2, 4))
+            self.assertIn("bfloat16KV", build_model_config("p", "d")["variant"])
+            self.assertEqual(resolve_kv_cache_dtype({}), "mxint8")
+            self.assertEqual(
+                default_multi_turn_plan(env={})[:2],
+                (DEFAULT_MT_SESSIONS, DEFAULT_MT_TURNS),
+            )
+            self.assertIn("mxint8KV", build_model_config("p", "d", env={})["variant"])
 
 
 if __name__ == "__main__":
