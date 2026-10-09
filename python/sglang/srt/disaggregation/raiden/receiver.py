@@ -328,7 +328,6 @@ class RaidenReceiverMixin:
         """
         try:
             engine.start_read(req_id, uuid, endpoint, remote, local)
-            return True
         except Exception as e:
             reason = f"Raiden receive failed: start_read {req_id} raised: {e}"
             logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
@@ -337,6 +336,17 @@ class RaidenReceiverMixin:
                 self._fail_room_locked(room, reason)
                 self._release_pull_slots_locked()
             return False
+        logger.info(
+            "RaidenKVManager rank%d decode pull started | room=%s req_id=%s "
+            "uuid=%d pages=%d from=%s",
+            self.attn_tp_rank,
+            room,
+            req_id,
+            uuid,
+            len(remote),
+            endpoint,
+        )
+        return True
 
     def _announcement_expired_locked(self, room: int, req_id: str) -> bool:
         """Fails ``room`` when its read ``req_id`` waited for a staging slot
