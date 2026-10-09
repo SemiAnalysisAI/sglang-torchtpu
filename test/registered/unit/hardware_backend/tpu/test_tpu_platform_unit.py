@@ -12,6 +12,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+import torch
 import torch.compiler.config as compiler_config
 
 from sglang.srt.environ import envs
@@ -23,6 +24,7 @@ from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang_tpu.tpu_platform import (
     TpuSRTPlatform,
     _validate_decode_context_parallel,
@@ -836,6 +838,86 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
     def test_piecewise_backend_raises(self):
         with self.assertRaises(NotImplementedError):
             self.platform.get_piecewise_backend_cls()
+
+
+def _built_bytes_per_token(pool_cls, *, num_kv_heads, head_dim, v_head_dim, dtype):
+    """Per-token, per-layer bytes of a pool actually built on the CPU."""
+    page_size = 16
+    pool = pool_cls(
+        size=4 * page_size,
+        page_size=page_size,
+        dtype=dtype,
+        head_num=num_kv_heads,
+        head_dim=head_dim,
+        v_head_dim=v_head_dim,
+        layer_num=1,
+        device="cpu",
+        enable_memory_saver=False,
+    )
+    buf = pool.kv_buffer[0]
+    return buf.numel() * buf.element_size() // (pool.num_blocks * page_size)
+
+
+class TestTpuKvPoolBytesPerToken(CustomTestCase):
+    """The KV budget is spent before any pool exists, so each pool's
+    ``kv_bytes_per_token_per_layer`` must track its ``_create_buffers``."""
+
+    def _check(self, pool_cls, expected, **shape):
+        dtype = shape.pop("dtype")
+        per_token = pool_cls.kv_bytes_per_token_per_layer(**shape, store_dtype=dtype)
+        self.assertEqual(per_token, expected)
+        self.assertEqual(
+            per_token, _built_bytes_per_token(pool_cls, **shape, dtype=dtype)
+        )
+
+    def test_head_dim_64_is_priced_at_the_padded_width(self):
+        """Bug regression: sizing priced heads * (head_dim + v_head_dim) while the
+        fused pool pads head_dim 64 to 128, so the pool was twice its budget."""
+        self._check(
+            TpuFusedMHATokenToKVPool,
+            8 * 2 * 128 * 2,
+            num_kv_heads=8,
+            head_dim=64,
+            v_head_dim=64,
+            dtype=torch.bfloat16,
+        )
+
+    def test_fp8_rounds_the_head_axis_up_to_the_lane_packing(self):
+        """fp8 packs 4 per 32-bit lane, so one KV head's K/V axis rounds 2 up to 4
+        on top of the head_dim padding."""
+        for heads in (1, 2):
+            self._check(
+                TpuFusedMHATokenToKVPool,
+                4 * 128,
+                num_kv_heads=heads,
+                head_dim=64,
+                v_head_dim=64,
+                dtype=torch.float8_e4m3fn,
+            )
+
+    def test_v_is_stored_at_the_padded_qk_width(self):
+        """The fused pool stores V in a slot of the padded qk width, so the
+        footprint is flat in v_head_dim, unlike head_dim + v_head_dim."""
+        for v_head_dim in (192, 128):
+            self._check(
+                TpuFusedMHATokenToKVPool,
+                8 * 256 * 2,
+                num_kv_heads=4,
+                head_dim=192,
+                v_head_dim=v_head_dim,
+                dtype=torch.bfloat16,
+            )
+
+    def test_platform_prices_only_the_padding_pools(self):
+        """A pool without padding reports None, so sizing keeps the generic formula."""
+        platform = TpuSRTPlatform()
+        shape = dict(
+            num_kv_heads=8, head_dim=64, v_head_dim=64, kv_cache_dtype=torch.bfloat16
+        )
+        with get_context().override_server_args(attention_backend="torch_native"):
+            self.assertIsNone(platform.get_mha_kv_bytes_per_token(**shape))
+        with get_context().override_server_args(attention_backend="pallas_tpu_rpa_v3"):
+            self.assertEqual(platform.get_mha_kv_bytes_per_token(**shape), 4096)
 
 
 if __name__ == "__main__":

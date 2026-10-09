@@ -277,6 +277,37 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
 
+    def test_padding_platform_budget_covers_the_padded_pool(self):
+        """Bug regression: sizing priced heads * (head_dim + v_head_dim) while
+        the built pool padded, so the allocation outgrew the HBM budget."""
+        available = 10_000_000
+        pad_to = 128
+
+        def padded_bytes(*, num_kv_heads, head_dim, v_head_dim, kv_cache_dtype):
+            del kv_cache_dtype
+            del v_head_dim  # the fused layout gives V a slot of K's padded width
+            return num_kv_heads * 2 * max(head_dim, pad_to) * KV_SIZE
+
+        with patch(
+            "sglang.srt.model_executor.pool_configurator.current_platform",
+            SimpleNamespace(get_mha_kv_bytes_per_token=padded_bytes),
+        ):
+            mr, _, config = self._run(available)
+
+        mc = mr.model_config
+        used = (
+            config.max_total_num_tokens
+            * mr.layer_info.num_effective_layers
+            * padded_bytes(
+                num_kv_heads=mc.get_num_kv_heads(1),
+                head_dim=mc.head_dim,
+                v_head_dim=mc.v_head_dim,
+                kv_cache_dtype=None,
+            )
+        )
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
+
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         side_effect=(576, 656),
@@ -578,6 +609,55 @@ class TestHybridSWAConfigurator(CustomTestCase):
             config.swa_max_total_num_tokens,
             int(config.full_max_total_num_tokens * 0.5),
         )
+
+    def test_padding_platform_budget_covers_the_padded_pool(self):
+        """Bug regression: sizing priced heads * (head_dim + v_head_dim) while
+        the built pool padded, so the allocation outgrew the HBM budget."""
+        available = 10_000_000
+        pad_to = 128
+
+        def padded_bytes(*, num_kv_heads, head_dim, v_head_dim, kv_cache_dtype):
+            del kv_cache_dtype
+            del v_head_dim  # the fused layout gives V a slot of K's padded width
+            return num_kv_heads * 2 * max(head_dim, pad_to) * KV_SIZE
+
+        mr = self._make_swa_runner(page_size=1)
+        with (
+            mock_cpu_env(),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.current_platform",
+                SimpleNamespace(
+                    get_mha_kv_bytes_per_token=padded_bytes,
+                    dcp_shards_every_kv_pool=lambda: False,
+                ),
+            ),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            config = create_memory_pool_configurator(mr).calculate_pool_sizes(
+                available, get_schedule().page_size
+            )
+
+        mc = mr.model_config
+        used = config.full_max_total_num_tokens * len(
+            mc.full_attention_layer_ids
+        ) * padded_bytes(
+            num_kv_heads=mc.get_num_kv_heads(1),
+            head_dim=mc.head_dim,
+            v_head_dim=mc.v_head_dim,
+            kv_cache_dtype=None,
+        ) + config.swa_max_total_num_tokens * len(
+            mc.swa_attention_layer_ids
+        ) * padded_bytes(
+            num_kv_heads=mc.get_swa_num_kv_heads(1),
+            head_dim=mc.swa_head_dim,
+            v_head_dim=mc.swa_v_head_dim,
+            kv_cache_dtype=None,
+        )
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
 
     def test_chunk_cache_cap_accounts_for_spec_topk_page_rounding(self):
         available = 1_000_000

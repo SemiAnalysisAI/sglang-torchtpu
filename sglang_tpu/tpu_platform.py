@@ -805,6 +805,26 @@ class TpuSRTPlatform(SRTPlatform):
 
         return _mha_kv_pool_cls(get_exec().kernel.attention_backend)
 
+    def get_mha_kv_bytes_per_token(
+        self,
+        *,
+        num_kv_heads: int,
+        head_dim: int,
+        v_head_dim: int,
+        kv_cache_dtype: torch.dtype,
+    ) -> Optional[int]:
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        pool_cls = self.get_mha_kv_pool_cls()
+        if not issubclass(pool_cls, TpuFusedMHATokenToKVPool):
+            return None
+        return pool_cls.kv_bytes_per_token_per_layer(
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim,
+            store_dtype=kv_cache_dtype,
+        )
+
     def get_mamba_pool_cls(self) -> type:
         # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state
         # in a TPU-native, Pallas-kernel-layout pool.
