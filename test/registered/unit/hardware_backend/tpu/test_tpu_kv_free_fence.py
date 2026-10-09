@@ -272,6 +272,9 @@ class TestRadixEvictionUnderFence(CustomTestCase):
                 page_size=PAGE,
                 eviction_policy="lru",
                 tree_components=(ComponentType.FULL,),
+                # The fence's release stamps live in the Python core, which a TPU
+                # allocator always resolves to; this CPU one would pick Rust.
+                tree_core_backend="python",
             )
         )
 
