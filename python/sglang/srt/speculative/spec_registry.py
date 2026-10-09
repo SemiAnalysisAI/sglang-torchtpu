@@ -123,6 +123,11 @@ class CustomSpecAlgo:
         # Conservative default: the larger KV reserve.
         return True
 
+    def carries_draft_hidden_states(self) -> bool:
+        # Disaggregated schedulers query this on every algorithm; only the
+        # EAGLE family relays draft hidden states from prefill to decode.
+        return False
+
     def handle_server_args(self, server_args: ServerArgs) -> None:
         pass
 
