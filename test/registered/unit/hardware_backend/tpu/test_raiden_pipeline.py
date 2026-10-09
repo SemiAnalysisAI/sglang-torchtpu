@@ -886,8 +886,9 @@ class TestPipelineInitialization(unittest.TestCase):
             self._initialize(legacy=True)
         self.assertEqual(local_ranks.call_args.args[3], 2)
 
-    def _initialize(self, legacy=False):
+    def _initialize(self, legacy=False, **overrides):
         events = []
+        engines = []
         buffers = groups(full=(0,), swa=())
         manager = SimpleNamespace(
             disaggregation_mode="decode",
@@ -907,6 +908,7 @@ class TestPipelineInitialization(unittest.TestCase):
             _max_request_blocks=lambda: 4,
             _num_slots=lambda *args: 2,
         )
+        vars(manager).update(overrides)
 
         def layout(tensor):
             self.assertTrue(tensor.materialized)
@@ -921,6 +923,7 @@ class TestPipelineInitialization(unittest.TestCase):
 
         def engine(**kwargs):
             events.append("engine")
+            engines.append(kwargs)
             for tensor in kwargs["kv_caches"]:
                 tensor.materialized = True
             return SimpleNamespace(
@@ -988,12 +991,28 @@ class TestPipelineInitialization(unittest.TestCase):
                 pipe.pools, staging_leases=2, staging_blocks_per_pool=[4]
             )
         pipe.executor.shutdown(wait=False)
+        return engines[0], client.register_work_unit.call_args.kwargs
 
     def test_layout_is_measured_after_native_materializes_the_cache(self):
         self._initialize()
 
     def test_legacy_pool_api_uses_checked_full_mirrors(self):
         self._initialize(legacy=True)
+
+    def test_engine_node_id_is_the_transfer_rank_on_a_context_parallel_stage(self):
+        # Stage 1 of PP4 x PCP2: its host rank counts the CP ranks (2), its
+        # transfer rank does not (1). Receivers look a push's schedule up by
+        # the pushing engine's node id, so the two must agree.
+        engine, unit = self._initialize(
+            disaggregation_mode="prefill",
+            pp_size=4,
+            pp_rank=1,
+            attn_cp_size=2,
+            attn_cp_rank=0,
+            _local_rank=2,
+        )
+        self.assertEqual(unit["transfer_rank"], 1)
+        self.assertEqual(engine["node_id"], unit["transfer_rank"])
 
     def test_bootstrap_messages_wait_for_pool_initialization(self):
         from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
