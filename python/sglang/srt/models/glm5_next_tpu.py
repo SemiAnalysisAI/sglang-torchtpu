@@ -435,6 +435,12 @@ class Glm5NextModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.start_layer, self.end_layer = 0, config.num_hidden_layers
         self.fused_mhc = envs.SGLANG_TPU_GLM_FLASH_FUSED_MHC.get()
+        if envs.SGLANG_TPU_FP8_LINEAR_SMALL_M_KERNEL.get():
+            from sglang_tpu.fp8_linear import (
+                register_fp8_linear_small_m_op,
+            )
+
+            register_fp8_linear_small_m_op()
         if self.fused_mhc:
             from sglang_tpu.glm_mhc import register_glm_mhc_ops
 

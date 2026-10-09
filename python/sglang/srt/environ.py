@@ -1995,6 +1995,9 @@ class Envs:
     SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT = EnvInt(None)
     # GLM-5.3-Flash: one fused Pallas kernel per mHC site instead of the torch reference.
     SGLANG_TPU_GLM_FLASH_FUSED_MHC = EnvBool(True)
+    # GLM-5.3-Flash: dense FP8 linears with <= 16 tokens run as one Pallas W8A8
+    # kernel (row quantize, FP8 dot, rescale) instead of the XLA chain.
+    SGLANG_TPU_FP8_LINEAR_SMALL_M_KERNEL = EnvBool(False)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)

@@ -3,7 +3,15 @@
 # Copyright 2025 Google LLC
 """TPU FP8 dense linear helpers."""
 
+from threading import Lock
+from typing import Callable, Optional
+
 import torch
+
+# Set by register_fp8_linear_small_m_op() at model init; the op cannot be built
+# inside a torch.compile trace.
+_SMALL_M_OP: Optional[Callable] = None
+_SMALL_M_LOCK = Lock()
 
 
 def _pad_rows_to_scaled_mm_alignment(x: torch.Tensor) -> tuple[torch.Tensor, int]:
@@ -64,6 +72,12 @@ def apply_tpu_fp8_linear(
     out_shape = (*x.shape[:-1], weight.shape[1])
     x_2d = x.reshape(-1, x.shape[-1])
     num_tokens = x_2d.shape[0]
+    if (
+        _SMALL_M_OP is not None
+        and bias is None
+        and _small_m_supports(num_tokens, weight.shape[0], weight.shape[1])
+    ):
+        return _SMALL_M_OP(x_2d, weight, weight_scale).reshape(out_shape)
     x_2d, pad = _pad_rows_to_scaled_mm_alignment(x_2d)
     x_q, x_scale = _quantize_activation_per_row(x_2d, weight.dtype)
 
@@ -146,3 +160,32 @@ def tpu_w8a8_block_fp8_linear(
     if bias is not None:
         out = out + bias
     return out
+
+
+def _small_m_supports(tokens: int, k: int, n: int) -> bool:
+    from sglang_tpu.kernels.fp8_linear_small_m import supports
+
+    return supports(tokens, k, n)
+
+
+def register_fp8_linear_small_m_op() -> None:
+    """Route decode-sized dense FP8 linears to the single-kernel W8A8 op."""
+    global _SMALL_M_OP
+    with _SMALL_M_LOCK:
+        if _SMALL_M_OP is not None:
+            return
+        import jax
+
+        from sglang_tpu.kernels.fp8_linear_small_m import (
+            fp8_linear_small_m,
+        )
+        from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
+        def _op(x: jax.Array, weight: jax.Array, weight_scale: jax.Array) -> jax.Array:
+            return fp8_linear_small_m(x, weight, weight_scale)
+
+        op = cpu_export_jax_op("sglang_tpu_pallas::fp8_linear_small_m", _op)
+        op.register_fake(
+            lambda x, weight, weight_scale: x.new_empty((x.shape[0], weight.shape[1]))
+        )
+        _SMALL_M_OP = op
