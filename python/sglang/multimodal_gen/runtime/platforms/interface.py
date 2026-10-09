@@ -148,6 +148,12 @@ class Platform:
         """Return the backend used to compile diffusion modules."""
         return self.simple_compile_backend
 
+    def get_spmd_region_wrapper(self) -> Callable | None:
+        """Decorator for --regional-compile regions that every rank runs with the
+        same graph (the model sets ``_compile_regions_spmd_safe``). The regions
+        should trace as one graph each."""
+        return None
+
     def get_compile_options(self, module: torch.nn.Module) -> dict[str, object] | None:
         """Return backend-specific options for a diffusion module."""
         return None

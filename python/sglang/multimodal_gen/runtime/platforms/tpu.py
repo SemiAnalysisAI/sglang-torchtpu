@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import functools
 import os
+from collections.abc import Callable
 
 import torch
 
@@ -207,6 +208,25 @@ class TpuPlatform(Platform):
 
     def get_device(self, local_rank: int) -> torch.device:
         return self.get_local_torch_device()
+
+    def get_spmd_region_wrapper(self) -> Callable | None:
+        # torch_tpu splits a compiled graph at every collective and re-lays out
+        # tensors at each split. Marking a region SPMD-safe keeps its
+        # collectives in one program. A whole-DiT program needs too much
+        # scratch, so only regions. The ranks must run identical programs: the
+        # fused collectives otherwise hang or exchange the wrong data.
+        import torch.compiler.config as compiler_config
+        from torch_tpu._internal.distributed.spmd_util import spmd_safe
+
+        # The region annotation is not part of the compile cache key; keep
+        # persisted executables of the two region policies apart.
+        tag = "spmd-safe-regions-v1"
+        existing_tag = str(compiler_config.cache_key_tag or "")
+        if tag not in existing_tag.split("|"):
+            compiler_config.cache_key_tag = (
+                f"{existing_tag}|{tag}" if existing_tag else tag
+            )
+        return spmd_safe
 
     @classmethod
     def set_device(cls, device: torch.device) -> None:
