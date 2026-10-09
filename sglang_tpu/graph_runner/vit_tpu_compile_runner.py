@@ -387,7 +387,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
 
         inputs = self.make_warmup_inputs(patch_count)
         if isinstance(self.compiled_fn, CompiledFunction):
-            return self.compiled_fn.warmup_async(*inputs).then(self._sync_warmup)
+            return self.compiled_fn.warmup(*inputs).then(self._sync_warmup)
         self._sync_warmup(self.compiled_fn(*inputs))
 
     @staticmethod

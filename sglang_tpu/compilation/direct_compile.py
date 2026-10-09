@@ -152,10 +152,9 @@ def direct_compile(
     values are graph inputs.
     Then, it lowers it to MLIR and then compiles it with XLA/PJRT.
 
-    ``CompiledFunction.warmup_async`` submits native asynchronous compilation.
-    Its returned ``PendingCall`` executes the warmup when ``wait`` is called.
-    ``CompiledFunction.precompile`` only compiles; waiting on its result never
-    executes the graph or retains its example runtime inputs.
+    ``CompiledFunction.warmup`` controls asynchronous compilation and execution
+    separately. Its returned ``PendingCall`` executes when ``wait`` is called,
+    unless ``execute=False`` skips execution and retaining example inputs.
 
     This API is specialized for SGLang inference. A more general API adds
     complexity and can be added when needed.
@@ -277,15 +276,21 @@ class CompiledFunction:
         artifact = self._get_artifact(args, kwargs)
         return artifact((args, kwargs))
 
-    def warmup_async(self, *args: Any, **kwargs: Any) -> PendingCall:
-        artifact = self._get_artifact(args, kwargs, async_compile=True)
-        return PendingCall(lambda: artifact((args, kwargs)))
-
-    def precompile(
-        self, *args: Any, async_compile: bool = False, **kwargs: Any
+    def warmup(
+        self,
+        *args: Any,
+        async_compile: bool = True,
+        execute: bool = True,
+        **kwargs: Any,
     ) -> PendingCall:
-        """Compile without executing the helper or retaining example inputs."""
+        """Compile, then optionally execute when the pending call is joined.
+
+        With ``execute=False``, example inputs are not retained after compilation
+        is submitted. ``async_compile=False`` finishes compilation before returning.
+        """
         artifact = self._get_artifact(args, kwargs, async_compile=async_compile)
+        if execute:
+            return PendingCall(lambda: artifact((args, kwargs)))
         return PendingCall(artifact.wait_for_compile)
 
     def _get_artifact(

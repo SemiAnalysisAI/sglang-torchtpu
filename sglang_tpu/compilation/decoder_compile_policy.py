@@ -694,7 +694,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         def warmup_async(*args: Any, **kwargs: Any) -> PendingCall:
             backend = get_forward_context().attn_backend
-            return compiled.warmup_async(
+            return compiled.warmup(
                 backend.forward_metadata,
                 *args,
                 attention_rank_tensors=get_attention_rank_tensors(

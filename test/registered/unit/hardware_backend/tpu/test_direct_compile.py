@@ -216,7 +216,7 @@ class TestDirectCompile(CustomTestCase):
         def compile_helper(fn, **kwargs):
             compiled = MagicMock(side_effect=fn)
             compiled.cache = {}
-            compiled.precompile.side_effect = lambda *args, **kwargs: PendingCall(
+            compiled.warmup.side_effect = lambda *args, **kwargs: PendingCall(
                 lambda: None
             )
             return compiled
@@ -240,7 +240,7 @@ class TestDirectCompile(CustomTestCase):
                     self.assertIsNone(warmup_compiled_op(op, x))
                     self.assertTrue(torch.equal(op(x), x * 3))
 
-    def test_precompile_releases_inputs_and_joins_without_execution(self):
+    def test_warmup_releases_inputs_and_joins_without_execution(self):
         for asynchronous in (False, True):
             with self.subTest(asynchronous=asynchronous):
                 compiled = direct_compile.direct_compile(
@@ -267,7 +267,9 @@ class TestDirectCompile(CustomTestCase):
                     reference = weakref.ref(inputs)
                     with collect_warmups() as queue:
                         queue.calls.append(
-                            compiled.precompile(inputs, async_compile=asynchronous)
+                            compiled.warmup(
+                                inputs, async_compile=asynchronous, execute=False
+                            )
                         )
                         del inputs
                         self.assertIsNone(reference())
@@ -318,9 +320,7 @@ class TestDirectCompile(CustomTestCase):
             )
 
         def run(compiled_fn, value, async_compile):
-            if async_compile:
-                return compiled_fn.warmup_async(value).wait()
-            return compiled_fn(value)
+            return compiled_fn.warmup(value, async_compile=async_compile).wait()
 
         for async_compile in (False, True):
             with self.subTest(async_compile=async_compile):
@@ -378,7 +378,7 @@ class TestDirectCompile(CustomTestCase):
             torch.no_grad(),
             patch.object(compiler, "execute", wraps=compiler.execute) as execute,
         ):
-            pending = [compiled.warmup_async(value) for value in values]
+            pending = [compiled.warmup(value) for value in values]
             execute.assert_not_called()
             self.assertEqual(len(compiled.cache), 3)
             self.assertEqual(callbacks, [])
@@ -427,12 +427,9 @@ class TestDirectCompile(CustomTestCase):
                 )
                 torch.manual_seed(113)
                 before = torch.tpu.get_rng_state()
-                if asynchronous:
-                    pending = compiled.warmup_async(value)
-                    self.assertTrue(torch.equal(before, torch.tpu.get_rng_state()))
-                    first = pending.wait().cpu()
-                else:
-                    first = compiled(value).cpu()
+                pending = compiled.warmup(value, async_compile=asynchronous)
+                self.assertTrue(torch.equal(before, torch.tpu.get_rng_state()))
+                first = pending.wait().cpu()
                 after_first = torch.tpu.get_rng_state()
                 with torch.compiler.set_stance("fail_on_recompile"):
                     second = compiled(value).cpu()
@@ -446,7 +443,7 @@ class TestDirectCompile(CustomTestCase):
             torch.tpu.set_rng_state(original_state)
 
     @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
-    def test_precompile_first_call_preserves_rng_without_recompilation(self):
+    def test_compile_only_warmup_first_call_preserves_rng_without_recompilation(self):
         value = torch.ones((2, 7), device="tpu")
         original_state = torch.tpu.get_rng_state()
 
