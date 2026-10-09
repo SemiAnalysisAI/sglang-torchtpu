@@ -120,6 +120,9 @@ def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) ->
 
 def is_cp_active(forward_batch) -> bool:
     """Return whether the current forward batch is running through CP."""
+    if getattr(forward_batch, "attn_cp_metadata", None) is not None:
+        return True
+
     forward_mode = getattr(forward_batch, "forward_mode", None)
     if forward_mode is None or not forward_mode.is_context_parallel_extend():
         return False
@@ -183,7 +186,8 @@ def cp_split_before_forward(
     forward_batch,
 ) -> Tuple[Optional[Any], Optional[Any]]:
     """Shard embeddings and positions for CP model-runner forwarding."""
-    assert is_cp_active(forward_batch)
+    if not is_cp_active(forward_batch):
+        return complete_hidden_states, complete_position_ids
     assert complete_hidden_states is not None
     assert getattr(forward_batch, "attn_cp_metadata", None) is not None
     return (
@@ -193,7 +197,8 @@ def cp_split_before_forward(
 
 
 def cp_shard_hidden_states(complete_hidden_states: Any, forward_batch):
-    assert is_cp_active(forward_batch)
+    if not is_cp_active(forward_batch):
+        return complete_hidden_states
     strategy = get_cp_strategy()
     assert strategy is not None
     assert complete_hidden_states is not None
@@ -203,7 +208,8 @@ def cp_shard_hidden_states(complete_hidden_states: Any, forward_batch):
 
 def cp_gather_full_sequence_states(sharded_states, forward_batch, stream=None):
     """Gather CP-sharded states into the full logical sequence order."""
-    assert is_cp_active(forward_batch)
+    if not is_cp_active(forward_batch):
+        return sharded_states
     strategy = get_cp_strategy()
     assert strategy is not None
     assert sharded_states is not None
@@ -212,7 +218,8 @@ def cp_gather_full_sequence_states(sharded_states, forward_batch, stream=None):
 
 
 def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
-    assert is_cp_active(forward_batch)
+    if not is_cp_active(forward_batch):
+        return complete_position_ids
     strategy = get_cp_strategy()
     assert strategy is not None
     assert complete_position_ids is not None
@@ -221,7 +228,8 @@ def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
 
 
 def cp_interleave_input_ids(input_ids: Any, forward_batch):
-    assert is_cp_active(forward_batch)
+    if not is_cp_active(forward_batch):
+        return input_ids
     if not get_moe_a2a_backend().is_none():
         return cp_shard_hidden_states(input_ids, forward_batch)
 
@@ -233,7 +241,8 @@ def cp_interleave_input_ids(input_ids: Any, forward_batch):
 
 def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None):
     """Gather CP hidden states at the model boundary when this batch is active."""
-    assert is_cp_active(forward_batch)
+    if not is_cp_active(forward_batch):
+        return x
     strategy = get_cp_strategy()
     assert strategy is not None
 
@@ -258,7 +267,8 @@ def cp_materialize_global_token_order(
     x: Any, forward_batch, stream: Optional[Any] = None
 ):
     """Materialize a CP tensor in the global logical token order."""
-    assert is_cp_active(forward_batch)
+    if not is_cp_active(forward_batch):
+        return x
     strategy = get_cp_strategy()
     assert strategy is not None
     return strategy.gather_kv_cache(x, forward_batch, stream)
@@ -272,7 +282,9 @@ def cp_shard_model_inputs(
     complete_input_ids: Optional[Any] = None,
 ):
     """Restore the shared batch so logits processing keeps full-batch metadata."""
-    assert is_cp_active(forward_batch)
+    if not is_cp_active(forward_batch):
+        yield complete_hidden_states, complete_position_ids, complete_input_ids
+        return
     sharded_hidden_states = cp_shard_hidden_states(
         complete_hidden_states, forward_batch
     )
