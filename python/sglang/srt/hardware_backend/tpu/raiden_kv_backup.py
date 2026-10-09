@@ -97,8 +97,26 @@ class RaidenKVBackup:
         self._transfer = RaidenKVTransfer(device_pool, num_host_pages)
         self._page_size = device_pool.page_size
         self._free: List[int] = list(range(num_host_pages))
+        # Host pages of backup DMAs abandoned past their deadline, held until
+        # the DMA lands so a later save is never handed a page still written.
+        self._quarantine: List[Tuple[object, List[int]]] = []
+
+    def _reclaim_quarantine(self) -> None:
+        pending = []
+        for event, pages in self._quarantine:
+            try:
+                done = event.query()
+            except RuntimeError:
+                done = True  # landed with an error; no longer a DMA target
+            if done:
+                self._free.extend(pages)
+            else:
+                pending.append((event, pages))
+        self._quarantine = pending
 
     def _alloc_pages(self, n: int) -> Optional[List[int]]:
+        if self._quarantine:
+            self._reclaim_quarantine()
         if len(self._free) < n:
             return None
         pages, self._free = self._free[:n], self._free[n:]
@@ -125,7 +143,27 @@ class RaidenKVBackup:
                 len(page_ids),
             )
             return None
-        self._transfer.backup(page_ids, host_pages).synchronize()
+        # The device pages are still intact here, so a failed DMA only costs
+        # this request the row path; raising would kill the scheduler.
+        event = self._transfer.backup(page_ids, host_pages)
+        try:
+            event.synchronize()
+        except TimeoutError as e:
+            self._quarantine.append((event, host_pages))
+            logger.warning(
+                "raiden retraction backup DMA timed out (%s); falling back to "
+                "the row path for this request",
+                e,
+            )
+            return None
+        except RuntimeError as e:
+            self._free_pages(host_pages)
+            logger.warning(
+                "raiden retraction backup DMA failed (%s); falling back to "
+                "the row path for this request",
+                e,
+            )
+            return None
         return RaidenKVBackupHandle(self, host_pages, first_offset, num_rows)
 
     def restore(self, handle: RaidenKVBackupHandle, indices: torch.Tensor) -> None:
