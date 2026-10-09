@@ -305,12 +305,20 @@ def build_pcp_batched_metadata(
         pcp_write = []
         kv_new_lens = []
         run = 0
+        meta_num_reqs = len(meta.actual_seq_q_prev_list)
         for i in range(num_reqs):
-            c_head = meta.actual_seq_q_prev_list[i]
-            c_tail = meta.actual_seq_q_next_list[i]
-            toff_head = meta.kv_len_prev_list[i] - c_head
-            toff_tail = meta.kv_len_next_list[i] - c_tail
-            ext_len = int(extend_lens[i])
+            if i < meta_num_reqs:
+                c_head = meta.actual_seq_q_prev_list[i]
+                c_tail = meta.actual_seq_q_next_list[i]
+                toff_head = meta.kv_len_prev_list[i] - c_head
+                toff_tail = meta.kv_len_next_list[i] - c_tail
+                ext_len = int(extend_lens[i]) if (extend_lens is not None and i < len(extend_lens)) else (c_head + c_tail) * two_p
+            else:
+                c_head = 0
+                c_tail = 0
+                toff_head = 0
+                toff_tail = 0
+                ext_len = 0
 
             # Head chunk (sequence 2*i)
             run += c_head
@@ -323,7 +331,7 @@ def build_pcp_batched_metadata(
             run += c_tail
             pcp_cu.append(run)
             q_pos_offsets.append(toff_tail)
-            pcp_write.append(True)  # Tail chunk commits cache
+            pcp_write.append(True if i < meta_num_reqs else False)  # Tail chunk commits cache
             kv_new_lens.append(ext_len)
 
         c_per_req = (
@@ -332,7 +340,7 @@ def build_pcp_batched_metadata(
             else 1
         )
     else:
-        c_sizes = [max(1, int(l) // two_p) for l in extend_lens]
+        c_sizes = [max(1, int(l) // two_p) for l in extend_lens] if extend_lens is not None else []
         c_per_req = c_sizes[0] if len(c_sizes) > 0 else 1
         pcp_cu = [0]
         q_pos_offsets = []
@@ -340,20 +348,22 @@ def build_pcp_batched_metadata(
         kv_new_lens = []
         run = 0
         for i in range(num_reqs):
-            c_len = c_sizes[i]
-            toff_head = prefix_lens_np[i] + cp_rank * c_len
+            c_len = c_sizes[i] if i < len(c_sizes) else 0
+            prefix_len = prefix_lens_np[i] if i < len(prefix_lens_np) else 0
+            ext_len = int(extend_lens[i]) if (extend_lens is not None and i < len(extend_lens)) else 0
+            toff_head = prefix_len + cp_rank * c_len
             run += c_len
             pcp_cu.append(run)
             q_pos_offsets.append(toff_head)
             pcp_write.append(False)
-            kv_new_lens.append(int(extend_lens[i]))
+            kv_new_lens.append(ext_len)
 
-            toff_tail = prefix_lens_np[i] + (two_p - 1 - cp_rank) * c_len
+            toff_tail = prefix_len + (two_p - 1 - cp_rank) * c_len
             run += c_len
             pcp_cu.append(run)
             q_pos_offsets.append(toff_tail)
-            pcp_write.append(True)
-            kv_new_lens.append(int(extend_lens[i]))
+            pcp_write.append(True if i < len(c_sizes) else False)
+            kv_new_lens.append(ext_len)
 
     pcp_cu_t = torch.tensor(pcp_cu, dtype=torch.int32, device=device)
     q_pos_t = torch.tensor(q_pos_offsets, dtype=torch.int32, device=device)
