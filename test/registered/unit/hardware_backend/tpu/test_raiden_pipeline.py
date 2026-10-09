@@ -1009,6 +1009,13 @@ class TestPipelineInitialization(unittest.TestCase):
         }
         with patch.dict(sys.modules, native):
             pipe = PipelineTransfer(manager, buffers)
+        if pipe.passive:
+            # A kv-head replica builds no engine and registers nothing.
+            self.assertEqual(events, [])
+            self.assertIsNone(pipe.engine)
+            client.register_work_unit.assert_not_called()
+            pipe.executor.shutdown(wait=False)
+            return None, None
         expected = ["engine", "pools", "layout", "work_unit"]
         if legacy:
             expected = ["materialize", "layout"] + expected
@@ -1043,9 +1050,28 @@ class TestPipelineInitialization(unittest.TestCase):
                 attn_cp_size=2,
                 attn_cp_rank=0,
                 _local_rank=2,
+                kv_args=SimpleNamespace(page_size=128, total_kv_head_num=8),
             )
         self.assertEqual(unit["transfer_rank"], 1)
         self.assertEqual(engine["node_id"], unit["transfer_rank"])
+
+    def test_kv_head_replicas_do_not_send(self):
+        # TP16 prefill of an 8-head model: ranks 2k and 2k+1 hold head k, and
+        # only rank 2k writes it, so the sources are the even ranks, numbered
+        # 0..7 (the planner takes contiguous transfer ranks).
+        addresses = ("10.0.0.1:32000", "10.0.0.1:32001")
+        tp_group = SimpleNamespace(broadcast_object=lambda obj, src: addresses)
+        fields = dict(
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            attn_tp_size=16,
+            kv_args=SimpleNamespace(page_size=128, total_kv_head_num=8),
+        )
+        with get_parallel().override(attn_tp_group=tp_group):
+            engine, unit = self._initialize(attn_tp_rank=6, _local_rank=6, **fields)
+            self.assertEqual(unit["transfer_rank"], 3)
+            self.assertEqual(unit["transfer_parallelism"], 8)
+            self.assertEqual(engine["node_id"], unit["transfer_rank"])
+            self.assertEqual(self._initialize(attn_tp_rank=7, **fields), (None, None))
 
     def test_bootstrap_messages_wait_for_pool_initialization(self):
         from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
@@ -1278,13 +1304,15 @@ class TestDecodeContextParallelSpans(unittest.TestCase):
         pages = {
             s: rng.integers(0, 256, page * src_row, dtype=np.uint8) for s in range(n)
         }
-        # Each source TP rank holds its kv heads of every token row.
-        slice_row = src_row // src_tp
-        tensors = [self._tensor(self.HEADS // src_tp) for _ in tags]
+        # Each source TP rank holds its kv heads of every token row; with more
+        # ranks than heads, consecutive ranks hold the same head.
+        rep = max(1, src_tp // self.HEADS)
+        slice_row = src_row // (src_tp // rep)
+        tensors = [self._tensor(max(1, self.HEADS // src_tp)) for _ in tags]
         rank_pages = {
             rank: {
                 s: data.reshape(page, src_row)[
-                    :, rank * slice_row : (rank + 1) * slice_row
+                    :, rank // rep * slice_row : (rank // rep + 1) * slice_row
                 ].reshape(-1)
                 for s, data in pages.items()
             }
@@ -1304,6 +1332,10 @@ class TestDecodeContextParallelSpans(unittest.TestCase):
             )
             for rank in range(src_tp)
         ]
+        for rank in range(src_tp):
+            if rank % rep:
+                # A replica of a head another rank writes sends nothing.
+                self.assertEqual([e.spans for e in per_rank[rank]], [[]] * len(tags))
         spans = [
             SimpleNamespace(
                 tag=entries[0].tag,
@@ -1368,6 +1400,15 @@ class TestDecodeContextParallelSpans(unittest.TestCase):
                 for tp in (dcp, 2 * dcp):
                     with self.subTest(tokens=tokens, dcp=dcp, tp=tp):
                         self._case(tokens, dcp, tp)
+
+    def test_source_with_more_ranks_than_kv_heads(self):
+        # TP16 prefill of an 8-head model into TP16 x DCP8, scaled down: each
+        # head lives on two source ranks and only the first one writes it.
+        for tokens in (1, 9, 17, 40, 65):
+            for dcp in (2, 4):
+                for tp in (dcp, 2 * dcp):
+                    with self.subTest(tokens=tokens, dcp=dcp, tp=tp):
+                        self._case(tokens, dcp, tp, src_tp=2 * self.HEADS)
 
     def test_sliding_window_starting_mid_dcp_page(self):
         for tokens in (9, 17, 30, 41, 64, 70):
