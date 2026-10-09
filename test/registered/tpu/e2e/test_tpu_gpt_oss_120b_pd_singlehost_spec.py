@@ -5,6 +5,7 @@ engines load the target and EAGLE3 draft model because the P/D handoff carries
 speculative bootstrap state in addition to target KV. The prefill pod also
 runs the mini router, verifies that requests really execute speculative
 verification after the handoff, and then scores GSM8K through that router.
+Last, it requires every choice of n > 1 requests to come back through the pair.
 """
 
 import argparse
@@ -19,7 +20,11 @@ from collections.abc import Mapping
 from typing import Any
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.utils.pd_singlehost_base import PDSingleHostTestCase, peer_hostname
+from sglang.test.tpu.utils.pd_singlehost_base import (
+    PDSingleHostTestCase,
+    parallel_sampling_runner,
+    peer_hostname,
+)
 
 register_tpu_ci(
     est_time=7200,
@@ -183,6 +188,11 @@ def build_model_config() -> dict[str, Any]:
                 # Match the other speculative GSM8K gates so their acceptance
                 # measurements use the same request contract.
                 "api": "chat",
+            },
+            {
+                "dataset": "parallel_sampling",
+                "label": "parallel-sampling",
+                "runner": parallel_sampling_runner,
             },
         ],
     }

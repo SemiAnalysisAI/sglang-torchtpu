@@ -1968,6 +1968,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
                     )
 
+    @staticmethod
+    def _shift_bootstrap_room(
+        obj: GenerateReqInput, tokenized_obj: TokenizedGenerateReqInput, *, offset: int
+    ) -> None:
+        # P/D pairs and keys transfers by room, so each sub-request needs its own room,
+        # derived the same way on both engines. A single room R gives prompt i R + i,
+        # so offsets step by batch_size.
+        if obj.bootstrap_room is not None:
+            obj.bootstrap_room += offset
+            tokenized_obj.bootstrap_room = obj.bootstrap_room
+
     async def _handle_batch_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -2039,11 +2050,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                     ]
                 tokenized_obj.rid = tmp_obj.regenerate_rid()
+                self._shift_bootstrap_room(
+                    tmp_obj, tokenized_obj, offset=obj.parallel_sample_num * batch_size
+                )
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
                 self._init_req_state(tmp_obj)
                 request_states[tmp_obj.rid] = self.rid_to_state[tmp_obj.rid]
+                tokenized_obj.time_stats = self.rid_to_state[tmp_obj.rid].time_stats
                 await self._send_one_request(tokenized_obj)
                 await self._wait_one_response(tmp_obj, request).__anext__()
 
@@ -2059,7 +2074,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for sample_idx in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
@@ -2069,6 +2084,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
+                    self._shift_bootstrap_room(
+                        tmp_obj, tokenized_obj, offset=sample_idx * batch_size
+                    )
                     self._init_req_state(tmp_obj)
                     state = self.rid_to_state[tmp_obj.rid]
                     request_states[tmp_obj.rid] = state

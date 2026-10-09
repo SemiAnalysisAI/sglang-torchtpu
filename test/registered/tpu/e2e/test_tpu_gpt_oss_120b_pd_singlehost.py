@@ -1,4 +1,7 @@
-"""GPT-OSS-120B P/D disaggregation GSM8K quality gate, one host per engine."""
+"""GPT-OSS-120B P/D disaggregation GSM8K quality gate, one host per engine.
+
+After GSM8K, it requires every choice of n > 1 requests to come back through the pair.
+"""
 
 import argparse
 import json
@@ -12,7 +15,12 @@ from collections.abc import Mapping
 from typing import Any
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.utils.pd_singlehost_base import PDSingleHostTestCase, peer_hostname
+from sglang.test.tpu.utils.pd_singlehost_base import (
+    PDSingleHostTestCase,
+    parallel_sampling_failures,
+    parallel_sampling_runner,
+    peer_hostname,
+)
 
 # Expected runtime: 45 minutes; CI uses this for scheduling and timeouts.
 register_tpu_ci(
@@ -171,6 +179,11 @@ def build_model_config(*, decode_host: str) -> dict[str, Any]:
                 "max_tokens": MAX_TOKENS,
                 "temperature": 0.0,
             },
+            {
+                "dataset": "parallel_sampling",
+                "label": "parallel-sampling",
+                "runner": parallel_sampling_runner,
+            },
         ],
     }
 
@@ -325,6 +338,30 @@ class TestPdSingleHostGptOss120bConfiguration(unittest.TestCase):
             ),
             [],
         )
+
+    def test_parallel_sampling_gate_requires_every_choice_to_finish(self) -> None:
+        def choice(reason):
+            return {"meta_info": {"finish_reason": {"type": reason}}}
+
+        batch = {"text": ["a", "b"], "sampling_params": {"n": 2}}
+        finished = [choice("length"), choice("stop"), choice("length"), choice("stop")]
+        self.assertEqual(parallel_sampling_failures(batch, finished), [])
+        self.assertTrue(parallel_sampling_failures(batch, finished[:3]))
+        self.assertTrue(
+            parallel_sampling_failures(batch, finished[:3] + [choice("abort")])
+        )
+        single = {"text": "a", "sampling_params": {"n": 1}}
+        self.assertEqual(parallel_sampling_failures(single, choice("length")), [])
+        self.assertTrue(parallel_sampling_failures(single, {"error": "Bad Request"}))
+        # A reply of any other shape fails the request instead of raising.
+        self.assertTrue(parallel_sampling_failures(single, 42))
+        malformed = [
+            None,
+            "stop",
+            {"meta_info": "stop"},
+            {"meta_info": {"finish_reason": "stop"}},
+        ]
+        self.assertTrue(parallel_sampling_failures(batch, malformed))
 
     def test_local_model_path_validation(self) -> None:
         with self.assertRaisesRegex(FileNotFoundError, MODEL_ENV):

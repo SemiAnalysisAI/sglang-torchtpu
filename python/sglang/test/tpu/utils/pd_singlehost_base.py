@@ -1,12 +1,29 @@
-"""Shared class fixture and role dispatch for one-host-per-engine P/D tests."""
+"""Shared class fixture, role dispatch, and gates for one-host-per-engine P/D tests."""
 
+import http.client
+import json
 import os
 import re
 import signal
+import time
+import urllib.request
 from pathlib import Path
 from typing import Any, ClassVar
 
 from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
+
+_PARALLEL_SAMPLING_PROMPT = "The three primary colors are"
+# Every choice of an n > 1 request, single or batched, must finish; n=1 is the control.
+_PARALLEL_SAMPLING_BODIES = tuple(
+    {"text": text, "sampling_params": {"temperature": 0, "max_new_tokens": 32, "n": n}}
+    for text, n in (
+        (_PARALLEL_SAMPLING_PROMPT, 1),
+        (_PARALLEL_SAMPLING_PROMPT, 2),
+        ([_PARALLEL_SAMPLING_PROMPT, "The capital of France is"], 2),
+    )
+)
+# In seconds. Passing requests take under 1 s on a warm pair; hung ones never return.
+_PARALLEL_SAMPLING_TIMEOUT = 120
 
 
 def peer_hostname(hostname: str, *, from_role: str, to_role: str) -> str:
@@ -15,6 +32,63 @@ def peer_hostname(hostname: str, *, from_role: str, to_role: str) -> str:
     if needle not in hostname:
         raise ValueError(f"hostname {hostname!r} has no {needle!r} segment")
     return hostname.replace(needle, replacement)
+
+
+def _finish_reasons(reply: Any) -> list[Any]:
+    reasons = []
+    for choice in reply if isinstance(reply, list) else [reply]:
+        meta = choice.get("meta_info") if isinstance(choice, dict) else None
+        finish = meta.get("finish_reason") if isinstance(meta, dict) else None
+        reasons.append(finish.get("type") if isinstance(finish, dict) else None)
+    return reasons
+
+
+def _label(body: dict[str, Any]) -> str:
+    return f"n={body['sampling_params']['n']} over {body['text']!r}"
+
+
+def parallel_sampling_failures(body: dict[str, Any], reply: Any) -> list[str]:
+    """Reject a /generate reply unless every choice of every prompt finished."""
+    text, n = body["text"], body["sampling_params"]["n"]
+    expected = (1 if isinstance(text, str) else len(text)) * n
+    reasons = _finish_reasons(reply)
+    if len(reasons) == expected and all(r in ("length", "stop") for r in reasons):
+        return []
+    return [f"{_label(body)}: expected {expected} finished choices, got {reasons}"]
+
+
+def parallel_sampling_runner(base_url: str) -> dict[str, Any]:
+    """Gate on every choice of every request finishing through the router."""
+    failures = []
+    for body in _PARALLEL_SAMPLING_BODIES:
+        request = urllib.request.Request(
+            f"{base_url}/generate",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        started = time.perf_counter()
+        try:
+            with urllib.request.urlopen(
+                request, timeout=_PARALLEL_SAMPLING_TIMEOUT
+            ) as response:
+                reply = json.loads(response.read().decode("utf-8"))
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            failures.append(f"{_label(body)}: {exc!r}")
+            outcome = repr(exc)
+        else:
+            failures += parallel_sampling_failures(body, reply)
+            outcome = f"finish reasons {_finish_reasons(reply)}"
+        print(
+            f"[pd-parallel-sampling] {_label(body)}: "
+            f"{time.perf_counter() - started:.2f} s, {outcome}",
+            flush=True,
+        )
+    return {
+        "score": 0.0 if failures else 1.0,
+        "_passed": not failures,
+        "_failures": failures,
+    }
 
 
 class PDSingleHostTestCase(TPULauncherTestCase):
