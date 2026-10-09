@@ -456,6 +456,7 @@ def calculate_block_sizes(
         "use_causal_mask",
         "skip_kv_update",
         "kv_layout",
+        "active_mode",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -486,6 +487,7 @@ def ragged_paged_attention(
     use_causal_mask: bool = True,
     skip_kv_update: bool = False,
     kv_layout: configs.KVLayout | None = None,
+    active_mode: configs.RpaCase | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -528,6 +530,10 @@ def ragged_paged_attention(
             layer reads its entire K/V span from the cache slot written by its
             target layer earlier in the same forward pass, ignores its own k/v
             inputs, and does not write the cache back.
+        active_mode: Optional static mode filter (`RpaCase.DECODE` or
+            `RpaCase.MIXED`). When set, only the specified mode's metadata
+            schedule and attention kernel are emitted; when `None`, both modes
+            are emitted sequentially.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -539,6 +545,10 @@ def ragged_paged_attention(
     if kv_layout is None:
         kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
 
+    if active_mode not in (None, configs.RpaCase.DECODE, configs.RpaCase.MIXED):
+        raise ValueError(
+            f"Expected {active_mode=} to be None, RpaCase.DECODE, or RpaCase.MIXED."
+        )
     if not use_causal_mask:
         raise ValueError("Only causal attention is supported.")
     if chunk_prefill_size is not None:
@@ -657,12 +667,15 @@ def ragged_paged_attention(
             cfgs=cfgs,
         )
 
-    o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(
-        configs.RpaCase.DECODE, q_hbm, kv_cache
-    )
-    o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(
-        configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache
-    )
+    o_hbm_alias_q_hbm = q_hbm
+    if active_mode in (None, configs.RpaCase.DECODE):
+        o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(
+            configs.RpaCase.DECODE, o_hbm_alias_q_hbm, kv_cache
+        )
+    if active_mode in (None, configs.RpaCase.MIXED):
+        o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(
+            configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache
+        )
 
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)

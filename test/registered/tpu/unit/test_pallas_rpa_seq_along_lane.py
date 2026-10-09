@@ -219,5 +219,103 @@ class TestPrefillBlockSizes(CustomTestCase):
         self.assertEqual(self._resolve().bkv_sz, derived)
 
 
+class TestActiveModeDispatch(CustomTestCase):
+    """Static active_mode can restrict emission to DECODE or MIXED only."""
+
+    def _trace_modes(self, active_mode=None):
+        from unittest import mock
+
+        import jax.numpy as jnp
+
+        from sglang.srt.hardware_backend.tpu.pallas_export import (
+            tpu_info_for_cpu_export,
+        )
+        from sglang.srt.layers.attention.pallas.batched_rpa import wrapper
+
+        dispatched_modes = []
+
+        def fake_generate_metadata(*args, cfgs, **kwargs):
+            dispatched_modes.append(cfgs.mode)
+            return None
+
+        def fake_rpa_kernel(
+            cu_q_lens,
+            kv_lens,
+            page_indices,
+            schedule_hbm,
+            o_hbm_alias_q_hbm,
+            new_kv_hbm,
+            kv_cache,
+            sink_table,
+            *,
+            cfgs,
+        ):
+            return o_hbm_alias_q_hbm, kv_cache
+
+        queries = jnp.zeros((256, 8, 128), dtype=jnp.bfloat16)
+        keys = jnp.zeros((256, 1, 128), dtype=jnp.bfloat16)
+        values = jnp.zeros((256, 1, 128), dtype=jnp.bfloat16)
+        kv_cache = jnp.zeros((16, 256, 1, 2, 128), dtype=jnp.bfloat16)
+        kv_lens = jnp.zeros((4,), dtype=jnp.int32)
+        page_indices = jnp.zeros((16,), dtype=jnp.int32)
+        cu_q_lens = jnp.zeros((5,), dtype=jnp.int32)
+        distribution = jnp.zeros((3,), dtype=jnp.int32)
+
+        with (
+            tpu_info_for_cpu_export(),
+            mock.patch.object(
+                wrapper.schedule,
+                "generate_rpa_metadata",
+                side_effect=fake_generate_metadata,
+            ),
+            mock.patch.object(
+                wrapper.kernel, "rpa_kernel", side_effect=fake_rpa_kernel
+            ),
+        ):
+            wrapper.ragged_paged_attention.__wrapped__(
+                queries,
+                keys,
+                values,
+                kv_cache,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                vmem_limit_bytes=67108864,
+                active_mode=active_mode,
+            )
+        return dispatched_modes
+
+    def test_default_dispatches_decode_then_mixed(self):
+        from sglang.srt.layers.attention.pallas.batched_rpa import configs
+
+        self.assertEqual(
+            self._trace_modes(None),
+            [configs.RpaCase.DECODE, configs.RpaCase.MIXED],
+        )
+
+    def test_mixed_only_skips_decode(self):
+        from sglang.srt.layers.attention.pallas.batched_rpa import configs
+
+        self.assertEqual(
+            self._trace_modes(configs.RpaCase.MIXED),
+            [configs.RpaCase.MIXED],
+        )
+
+    def test_decode_only_skips_mixed(self):
+        from sglang.srt.layers.attention.pallas.batched_rpa import configs
+
+        self.assertEqual(
+            self._trace_modes(configs.RpaCase.DECODE),
+            [configs.RpaCase.DECODE],
+        )
+
+    def test_invalid_active_mode_is_rejected(self):
+        from sglang.srt.layers.attention.pallas.batched_rpa import configs
+
+        with self.assertRaises(ValueError):
+            self._trace_modes(configs.RpaCase.PREFILL)
+
+
 if __name__ == "__main__":
     unittest.main()
