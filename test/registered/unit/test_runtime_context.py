@@ -2693,7 +2693,7 @@ class TestTheParallelPhase(CustomTestCase):
                 device="cpu",
                 dist_port=12345,
             )
-            self.assertGreater(bootstrap.init_parallel_runtime(**kwargs), 0.0)
+            bootstrap.init_parallel_runtime(**kwargs)
             with self.assertRaises(RuntimeError) as caught:
                 bootstrap.init_parallel_runtime(**kwargs)
         self.assertIn("ran twice", str(caught.exception))

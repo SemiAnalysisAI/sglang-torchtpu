@@ -95,8 +95,8 @@ def init_parallel_runtime(
     server_args: ServerArgs,
     device: str,
     dist_port: int,
-) -> float:
-    """Initialize the parallel runtime once and return its elapsed seconds.
+) -> None:
+    """Initialize the parallel runtime once, after publishing configuration.
 
     Set up CPU thread binding, the current device, and the shared Mooncake
     engine before creating process groups. Draft workers reuse their target's
@@ -175,9 +175,7 @@ def init_parallel_runtime(
     ):
         _prewarm_tp_lm_head_all_to_all()
 
-    elapsed = time.perf_counter() - tic
-    logger.info(f"Init parallel ends. elapsed={elapsed:.2f} s")
-    return elapsed
+    logger.info(f"Init parallel ends. elapsed={time.perf_counter() - tic:.2f} s")
 
 
 def measure_pre_model_load_memory(*, device: str, is_draft_worker: bool) -> float:

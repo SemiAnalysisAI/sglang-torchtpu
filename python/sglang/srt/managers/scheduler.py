@@ -529,7 +529,7 @@ class Scheduler(
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
 
-        self.distributed_init_time = bootstrap.init_parallel_runtime(
+        bootstrap.init_parallel_runtime(
             server_args=server_args,
             device=get_device().device,
             dist_port=self.nccl_port,
@@ -730,7 +730,10 @@ class Scheduler(
 
     def init_startup_timing_summary(self) -> None:
         self.startup_time = build_scheduler_startup_time(
-            distributed_init=self.distributed_init_time,
+            initialization=(
+                self.tp_worker.model_runner.weight_load_start_time
+                - self.scheduler_startup_begin
+            ),
             target_load_weight=self.tp_worker.weight_load_time,
             draft_load_weight=(
                 0.0 if self.draft_worker is None else self.draft_worker.weight_load_time
