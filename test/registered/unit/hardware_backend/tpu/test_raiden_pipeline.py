@@ -35,7 +35,7 @@ from sglang.srt.disaggregation.raiden.pipeline import (
 )
 from sglang.srt.disaggregation.raiden.serde import MessageTag
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -1004,14 +1004,16 @@ class TestPipelineInitialization(unittest.TestCase):
         # Stage 1 of PP4 x PCP2: its host rank counts the CP ranks (2), its
         # transfer rank does not (1). Receivers look a push's schedule up by
         # the pushing engine's node id, so the two must agree.
-        engine, unit = self._initialize(
-            disaggregation_mode=DisaggregationMode.PREFILL,
-            pp_size=4,
-            pp_rank=1,
-            attn_cp_size=2,
-            attn_cp_rank=0,
-            _local_rank=2,
-        )
+        stage_group = SimpleNamespace(broadcast_object=lambda obj, src: obj)
+        with get_parallel().override(pp_group=stage_group):
+            engine, unit = self._initialize(
+                disaggregation_mode=DisaggregationMode.PREFILL,
+                pp_size=4,
+                pp_rank=1,
+                attn_cp_size=2,
+                attn_cp_rank=0,
+                _local_rank=2,
+            )
         self.assertEqual(unit["transfer_rank"], 1)
         self.assertEqual(engine["node_id"], unit["transfer_rank"])
 
