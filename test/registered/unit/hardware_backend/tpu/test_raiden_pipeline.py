@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.raiden.pipeline import (
     warn_if_staging_exceeds_premapped,
 )
 from sglang.srt.disaggregation.raiden.serde import MessageTag
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -1004,7 +1005,7 @@ class TestPipelineInitialization(unittest.TestCase):
         # transfer rank does not (1). Receivers look a push's schedule up by
         # the pushing engine's node id, so the two must agree.
         engine, unit = self._initialize(
-            disaggregation_mode="prefill",
+            disaggregation_mode=DisaggregationMode.PREFILL,
             pp_size=4,
             pp_rank=1,
             attn_cp_size=2,
