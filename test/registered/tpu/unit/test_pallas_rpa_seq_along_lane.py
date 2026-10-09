@@ -152,7 +152,14 @@ class TestKvCacheDtypeDefault(CustomTestCase):
 class TestPrefillBlockSizes(CustomTestCase):
     """The prefill tile: one cell, and an operator override for the k block."""
 
-    def _resolve(self, num_q_heads=4, ctx_pages=133):
+    def _resolve(
+        self,
+        num_q_heads=4,
+        num_kv_heads=1,
+        head_dim=128,
+        sliding_window=None,
+        ctx_pages=133,
+    ):
         import jax.numpy as jnp
 
         from sglang.srt.hardware_backend.tpu.pallas_export import (
@@ -162,8 +169,9 @@ class TestPrefillBlockSizes(CustomTestCase):
 
         model = configs.ModelConfigs(
             num_q_heads=num_q_heads,
-            num_kv_heads=1,
-            head_dim=128,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            sliding_window=sliding_window,
             mask_value=float("-inf"),
         )
         with tpu_info_for_cpu_export():
@@ -203,6 +211,21 @@ class TestPrefillBlockSizes(CustomTestCase):
         self.assertLess(
             self._resolve(num_q_heads=12).bq_sz, self._resolve(num_q_heads=4).bq_sz
         )
+
+    def test_short_sliding_window_caps_prefill_blocks(self):
+        for nq, nkv, hd in [(64, 8, 64), (32, 4, 64), (16, 2, 64), (8, 1, 64), (4, 1, 128)]:
+            blocks = self._resolve(
+                num_q_heads=nq, num_kv_heads=nkv, head_dim=hd, sliding_window=128
+            )
+            self.assertEqual(blocks.bq_sz, 128)
+            self.assertEqual(blocks.bkv_sz, 256)
+            self.assertEqual(blocks.bq_sz % blocks.bq_c_sz, 0)
+        # Windows > 512 keep default VMEM-driven block sizes.
+        full_blocks = self._resolve(num_q_heads=4, num_kv_heads=1, sliding_window=None)
+        wide_sw_blocks = self._resolve(
+            num_q_heads=4, num_kv_heads=1, sliding_window=1024
+        )
+        self.assertEqual(wide_sw_blocks, full_blocks)
 
     def test_override_pins_the_k_block(self):
         with envs.SGLANG_TPU_FORCE_RPA_PREFILL_BKV.override(4096):

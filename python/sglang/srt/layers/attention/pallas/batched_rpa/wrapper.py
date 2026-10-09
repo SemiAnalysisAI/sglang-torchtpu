@@ -378,6 +378,28 @@ def calculate_block_sizes(
         if bkv_sz == 0:
             raise ValueError("Cannot find block sizes that fit within VMEM limit.")
 
+        # For short sliding windows (e.g., GPT-OSS-120B sliding_window=128),
+        # schedule.py skips KV blocks before start_k_idx = sw_start_idx // bkv_sz
+        # and writes back each new KV block on the first query block that attends
+        # to it (q_wb). Sizing prefill (bq_sz, bkv_sz) to the window span avoids
+        # computing 512..2048 masked keys per query block while keeping bq_sz <= bkv_sz
+        # so every new KV block is visited at q_wb.
+        if (
+            fixed_bq_sz is None
+            and model_cfgs.sliding_window is not None
+            and 0 < model_cfgs.sliding_window <= 512
+        ):
+            sw_bq_cap = max(
+                num_lanes, utils.align_to(model_cfgs.sliding_window, num_lanes)
+            )
+            sw_bkv_align = utils.align_to(serve_cfgs.page_size, mxu_column_size)
+            sw_bkv_cap = max(
+                sw_bkv_align,
+                utils.align_to(2 * model_cfgs.sliding_window, sw_bkv_align),
+            )
+            bq_sz = min(bq_sz, sw_bq_cap)
+            bkv_sz = min(bkv_sz, sw_bkv_cap)
+
         # Step 3: Given current tile size, calculate compute tile size.
 
         # Fixed threshold value based on hardware spec.
