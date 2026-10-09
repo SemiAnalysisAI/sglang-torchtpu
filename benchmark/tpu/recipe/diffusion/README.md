@@ -21,21 +21,22 @@ and scoped-VMEM defaults are added unless it sets them. Extra arguments are pass
 
 ## Performance
 
-tpu7x 2x2x1, steady-state request (the first request compiles), seed 42; stage times with
-`SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`. Shapes whose token count does not divide by the sequence-parallel size
-(the two I2V rows) pad the sequence; attention masks the padding.
+tpu7x 2x2x1, steady-state request (the first request compiles), seed 42. E2E and peak HBM come from a default run;
+denoise step and VAE decode from a run with `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`, which synchronizes the device at
+stage boundaries (otherwise queued denoising work is counted in the decode stage). Shapes whose token count does not
+divide by the sequence-parallel size (the two I2V rows) pad the sequence; attention masks the padding.
 
 | Model | Request | Cores | E2E | Denoise step | VAE decode | Peak HBM / core |
 | :--- | :--- | :---: | ---: | ---: | ---: | ---: |
-| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 1 | 0.86 s | 0.076 s | 0.33 s | 24.8 GB |
-| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 4 | 0.87 s | 0.050 s | 0.33 s | 19.2 GB |
-| Z-Image-Turbo | T2I 1024x1024, 9 steps | 1 | 1.33 s | 0.088 s | 0.33 s | 29.2 GB |
-| Z-Image-Turbo | T2I 1024x1024, 9 steps | 2 | 1.27 s | 0.069 s | 0.33 s | 25.2 GB |
-| Wan2.2-TI2V-5B | T2V 1280x704, 121 frames, 20 steps | 8 | 9.6 s | 0.272 s | 2.5 s | 29.8 GB |
-| Wan2.2-TI2V-5B | I2V 960x928 (from a square image), 121 frames, 20 steps | 8 | 11.7 s | 0.330 s | 2.6 s | 62.7 GB |
-| Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 20 steps | 8 | 59.0 s | 2.72 s | 2.2 s | 87.8 GB |
-| Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 17.9 s | 0.698 s | 1.2 s | 71.9 GB |
-| LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 23.2 s | 0.428 s | 2.4 s | 60.6 GB |
+| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 1 | 0.90 s | 0.076 s | 0.33 s | 24.8 GB |
+| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 4 | 0.85 s | 0.044 s | 0.33 s | 19.2 GB |
+| Z-Image-Turbo | T2I 1024x1024, 9 steps | 1 | 1.36 s | 0.088 s | 0.33 s | 29.2 GB |
+| Z-Image-Turbo | T2I 1024x1024, 9 steps | 2 | 1.31 s | 0.069 s | 0.33 s | 25.2 GB |
+| Wan2.2-TI2V-5B | T2V 1280x704, 121 frames, 20 steps | 8 | 9.6 s | 0.272 s | 2.5 s | 31.1 GB |
+| Wan2.2-TI2V-5B | I2V 960x928 (from a square image), 121 frames, 20 steps | 8 | 11.8 s | 0.331 s | 2.6 s | 67.2 GB |
+| Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 20 steps | 8 | 58.8 s | 2.72 s | 2.2 s | 87.8 GB |
+| Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 17.0 s | 0.698 s | 1.2 s | 71.9 GB |
+| LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 23.2 s | 0.433 s | 2.3 s | 60.6 GB |
 
 ## Example request
 
