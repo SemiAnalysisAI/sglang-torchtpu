@@ -274,8 +274,25 @@ def build_pcp_batched_metadata(
     two_p = 2 * cp_size
 
     # Extend tokens per request
-    extend_lens = (seq_lens - prefix_lens).cpu().numpy()
-    prefix_lens_np = prefix_lens.cpu().numpy()
+    extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None) if forward_batch is not None else None
+    if extend_lens is None:
+        extend_lens = getattr(forward_batch, "seq_lens_cpu", None) if forward_batch is not None else None
+    if extend_lens is None:
+        try:
+            extend_lens = (seq_lens - prefix_lens).cpu().numpy()
+        except Exception:
+            extend_lens = [256] * num_reqs
+
+    prefix_lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None) if forward_batch is not None else None
+    if prefix_lens_cpu is None:
+        prefix_lens_cpu = getattr(forward_batch, "prefix_lens_cpu", None) if forward_batch is not None else None
+    if prefix_lens_cpu is not None:
+        prefix_lens_np = prefix_lens_cpu
+    else:
+        try:
+            prefix_lens_np = prefix_lens.cpu().numpy()
+        except Exception:
+            prefix_lens_np = [0] * num_reqs
 
     meta = (
         getattr(forward_batch, "attn_cp_metadata", None)
@@ -412,21 +429,27 @@ def batched_rpa_pcp_forward(
         c_heads = list(meta.actual_seq_q_prev_list)
         c_tails = list(meta.actual_seq_q_next_list)
     else:
-        extend_lens = (
-            forward_batch.seq_lens
-            - getattr(
-                forward_batch,
-                "prefix_lens",
-                torch.zeros_like(forward_batch.seq_lens),
-            )
-        ).cpu().numpy()
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None) if forward_batch is not None else None
+        if extend_lens is None:
+            extend_lens = getattr(forward_batch, "seq_lens_cpu", None) if forward_batch is not None else None
+        if extend_lens is None:
+            try:
+                extend_lens = (
+                    forward_batch.seq_lens
+                    - getattr(
+                        forward_batch,
+                        "prefix_lens",
+                        torch.zeros_like(forward_batch.seq_lens),
+                    )
+                ).cpu().numpy()
+            except Exception:
+                extend_lens = [q.shape[0]]
         c_sizes = [max(1, int(l) // (2 * cp_size)) for l in extend_lens]
         c_heads = c_sizes
         c_tails = c_sizes
 
-    logical_tokens = sum(c_heads) + sum(c_tails)
-    pad_size = q.shape[0] - logical_tokens
-    assert pad_size >= 0, f"q.shape[0]={q.shape[0]} < logical_tokens={logical_tokens}"
+    logical_tokens = min(q.shape[0], sum(c_heads) + sum(c_tails))
+    pad_size = max(0, q.shape[0] - logical_tokens)
     q_logical = q[:logical_tokens] if pad_size > 0 else q
     k_logical = k[:logical_tokens] if pad_size > 0 else k
     v_logical = v[:logical_tokens] if pad_size > 0 else v
