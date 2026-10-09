@@ -736,7 +736,7 @@ class Envs:
     # closing read counts as a chunk, and a non-chunked transfer is one chunk.
     # Counted from registration on the prefill and from start_read on the
     # decode. Set the same on both.
-    SGLANG_RAIDEN_PER_CHUNK_TIMEOUT_S = EnvFloatWithAlias(
+    SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S = EnvFloatWithAlias(
         60.0, deprecated_name="SGLANG_RAIDEN_TIMEOUT_S"
     )
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
