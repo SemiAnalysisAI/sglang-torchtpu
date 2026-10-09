@@ -19,6 +19,7 @@ import numpy.typing as npt
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+from sglang.srt.environ import envs
 from sglang_tpu.disaggregation.raiden.chunk_plan import chunk_pull_window
 from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
 from sglang_tpu.disaggregation.raiden.serde import (
@@ -1136,6 +1137,9 @@ class RaidenKVReceiver(CommonKVReceiver):
     ):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self._started = False
+        # Bounds the room until send_metadata starts the waiting timeout.
+        self._handshake_start = time.time()
+        self._handshake_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
 
     def send_metadata(
         self,
@@ -1207,11 +1211,38 @@ class RaidenKVReceiver(CommonKVReceiver):
             return KVPoll.Success
         if self._check_waiting_timeout() is not None:
             return self._conclude_failed()
+        reason = self._check_handshake_timeout(status)
+        if reason is not None:
+            return self._conclude_failed(reason=reason)
         if self.kv_mgr.maybe_start_pull(self.bootstrap_room) and not self._started:
             # The manager turned the room Transferring inside the admission.
             self._started = True
             return KVPoll.Transferring
         return self.kv_mgr.check_status(self.bootstrap_room)
+
+    def _check_handshake_timeout(self, status: KVPoll) -> Optional[str]:
+        """Failure reason once the room has waited too long for
+        send_metadata.
+
+        Until then the prefill has not been told where to send the KV, and
+        nothing else bounds the wait: the room may never leave Bootstrapping,
+        or never get KV pages on this decode. The prefill bounds the same
+        window with the bootstrap timeout, so the decode uses it too.
+        """
+        if self.init_time is not None or status not in (
+            KVPoll.Bootstrapping,
+            KVPoll.WaitingForInput,
+        ):
+            return None
+        elapsed = time.time() - self._handshake_start
+        if elapsed < self._handshake_timeout:
+            return None
+        state = "Bootstrapping" if status == KVPoll.Bootstrapping else "WaitingForInput"
+        return (
+            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in "
+            f"KVPoll.{state} before its KV metadata was sent to the prefill. "
+            "Raise SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT to wait longer."
+        )
 
     def abort(self):
         """Explicit local abort: same terminal path as any failure, so active
