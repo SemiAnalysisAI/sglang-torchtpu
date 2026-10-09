@@ -514,7 +514,7 @@ fi
 if [[ "$USE_RAY" == "1" ]]; then
     args+=(--nnodes "$NNODES" --use-ray)
 elif [[ "$ENABLE_MULTIHOST" == "1" ]]; then
-    args+=(--nnodes "$NNODES" --node-rank "$NODE_RANK" --dist-init-addr "$DIST_INIT_ADDR")
+    args+=(--nnodes "$NNODES" --node-rank "$NODE_RANK" --dist-init-addr "$DIST_INIT_ADDR" --no-tpu-node-normalization)
 fi
 # KV offloading to host RAM (hierarchical cache); orthogonal to multihost.
 # --hicache-size (absolute GB) overrides --hicache-ratio in sglang, so pass only
