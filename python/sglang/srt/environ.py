@@ -732,10 +732,11 @@ class Envs:
     # Raiden: a decode starts a room's next read as soon as the prefill
     # announces it; 0 starts reads only on the next scheduler poll.
     SGLANG_RAIDEN_LISTENER_START_READ = EnvBool(True)
-    # Raiden: deadline of each read (one announced chunk, or a room's closing
-    # read), not of the whole request; counted from registration on the prefill
-    # and from start_read on the decode. Set the same on both.
-    SGLANG_RAIDEN_PER_READ_TIMEOUT_S = EnvFloatWithAlias(
+    # Raiden: deadline of each KV chunk transfer, not of the whole request; the
+    # closing read counts as a chunk, and a non-chunked transfer is one chunk.
+    # Counted from registration on the prefill and from start_read on the
+    # decode. Set the same on both.
+    SGLANG_RAIDEN_PER_CHUNK_TIMEOUT_S = EnvFloatWithAlias(
         60.0, deprecated_name="SGLANG_RAIDEN_TIMEOUT_S"
     )
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(

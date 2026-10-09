@@ -159,7 +159,7 @@ class RaidenKVManager(
             self.pp_size,
         )
         self._control_port = base_port + 4 * self._local_rank
-        self._timeout_s = envs.SGLANG_RAIDEN_PER_READ_TIMEOUT_S.get()
+        self._timeout_s = envs.SGLANG_RAIDEN_PER_CHUNK_TIMEOUT_S.get()
         # Raiden reads its own TPU_RAIDEN_DYNAMIC_HOST_STAGING when the engine is
         # built in this process. Store the resolved value back so later reads
         # do not mistake the variable set here for the deprecated alias.
