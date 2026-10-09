@@ -244,6 +244,75 @@ class TestPrefillAbortHandling(unittest.TestCase):
         # must stay rejected. It ages out on its own.
         self.assertTrue(mgr.is_aborted(ROOM))
 
+    def _sender_manager(self, dummy_cp_rank=False):
+        mgr = _gate_manager()
+        mgr._drain_engine = lambda: None
+        mgr._ensure_engine = lambda: None
+        mgr.is_dummy_cp_rank = dummy_cp_rank
+        return mgr
+
+    @staticmethod
+    def _new_sender(mgr, room=ROOM):
+        return _gate_sender(mgr, room)
+
+    def test_abort_before_sender_fails_the_room_at_creation(self):
+        """The decode can refuse a room before the prefill scheduler creates
+        its sender. That ABORT only tombstones the room; the sender must fail
+        it at once, not after the 300 s decode-silence deadline."""
+        mgr = self._sender_manager()
+        mgr._dispatch(_abort_frame(ROOM))
+
+        sender = self._new_sender(mgr)
+        other = self._new_sender(mgr, OTHER_ROOM)
+
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        # Untouched by the abort: still waiting for its decode's first request.
+        self.assertEqual(other.poll(), KVPoll.Bootstrapping)
+        with self.assertRaises(Exception) as cm:
+            sender.failure_exception()
+        self.assertIn("before the sender was created", str(cm.exception))
+        self.assertNotIn(ROOM, mgr.request_status)
+        self.assertNotIn(ROOM, mgr.failure_records)
+        self.assertNotIn(str(ROOM), mgr._failed)
+        self.assertTrue(mgr.is_aborted(ROOM))
+
+    def test_abort_after_sender_creation_still_fails_the_room(self):
+        mgr = self._sender_manager()
+        sender = self._new_sender(mgr)
+
+        mgr._dispatch(_abort_frame(ROOM))
+
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        with self.assertRaises(Exception) as cm:
+            sender.failure_exception()
+        self.assertIn("decode-side abort notification.", str(cm.exception))
+
+    def test_dummy_cp_rank_ignores_an_early_abort(self):
+        mgr = self._sender_manager(dummy_cp_rank=True)
+        mgr._dispatch(_abort_frame(ROOM))
+
+        sender = self._new_sender(mgr)
+
+        self.assertEqual(sender.poll(), KVPoll.Success)
+        self.assertNotIn(ROOM, mgr.failure_records)
+
+    def test_abort_racing_sender_creation_always_fails_the_room(self):
+        for _ in range(200):
+            mgr = self._sender_manager()
+            barrier = threading.Barrier(2)
+
+            def abort():
+                barrier.wait()
+                mgr._dispatch(_abort_frame(ROOM))
+
+            thread = threading.Thread(target=abort)
+            thread.start()
+            barrier.wait()
+            sender = self._new_sender(mgr)
+            thread.join()
+
+            self.assertEqual(sender.poll(), KVPoll.Failed)
+
     def test_abort_is_terminal_for_a_prefill_still_computing(self):
         """A send that lands after the abort must not revive the room."""
         mgr = _prefill_manager()
