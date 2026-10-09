@@ -136,9 +136,17 @@ def _coordinate_worker(local_rank, config, host_index, timeout, writer):
 
     import torch.distributed as dist
     from torch_tpu._internal.distributed import tpu_distributed
-    from torch_tpu._internal.distributed.launchers.multihost_wrapper import (
-        calculate_topological_node_rank,
-    )
+
+    try:
+        from torch_tpu._internal.distributed.launchers.multihost_wrapper import (
+            calculate_topological_node_rank,
+        )
+    except ModuleNotFoundError:
+        # torch_tpu after the 2026.9.22 release dropped the launcher module
+        # (6d10e1be) and kept the same function privately.
+        from torch_tpu._internal.distributed.distributed import (
+            _calculate_topological_node_rank as calculate_topological_node_rank,
+        )
 
     from sglang.srt.utils import kill_itself_when_parent_died
 
