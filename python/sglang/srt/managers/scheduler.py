@@ -1115,6 +1115,13 @@ class Scheduler(
                 self.draft_worker.init_cuda_graphs()
                 if current_platform.is_tpu():
                     self.precompile_tpu_spec_ops()
+            if current_platform.is_tpu():
+                from sglang.srt.hardware_backend.tpu import batch_rows
+
+                batch_rows.configure_capacity(
+                    self.tp_worker.model_runner.max_running_requests
+                )
+                batch_rows.precompile(torch.device(self.tp_worker.model_runner.device))
 
         # Independent DP groups repeat distributed ranks but run identical model
         # replicas. DP0 writes their shared bundles; DP-attention ranks are unique.

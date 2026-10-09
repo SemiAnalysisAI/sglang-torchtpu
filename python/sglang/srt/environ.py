@@ -1894,7 +1894,7 @@ class Envs:
     # https://github.com/sgl-project/sglang-torchtpu/issues/741
     SGLANG_TPU_MM_EMBED_ON_DEVICE = EnvBool(False)
     # Opt in to host padding for small prefill metadata tensors to avoid
-    # per-length XLA compilations.
+    # per-length XLA compilations. This adds a blocking TPU-to-CPU-to-TPU copy.
     SGLANG_TPU_HOST_PADDING = EnvBool(False)
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)

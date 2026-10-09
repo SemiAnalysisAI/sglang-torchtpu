@@ -96,6 +96,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.batch_rows import filter_rows, merge_rows
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
@@ -3731,22 +3732,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ).to(self.device, non_blocking=True)
 
         if self.model_config.is_encoder_decoder:
-            self.encoder_lens = self.encoder_lens[keep_indices_device]
+            self.encoder_lens = filter_rows(self.encoder_lens, keep_indices_device)
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
         self.reqs = [self.reqs[i] for i in keep_indices]
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
-        self.req_pool_indices = self.req_pool_indices[keep_indices_device]
+        self.req_pool_indices = filter_rows(self.req_pool_indices, keep_indices_device)
         self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
-        self.seq_lens = self.seq_lens[keep_indices_device]
-        self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
+        self.seq_lens = filter_rows(self.seq_lens, keep_indices_device)
+        self.orig_seq_lens = filter_rows(self.orig_seq_lens, keep_indices_device)
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 
         if self.input_ids is not None:
-            self.input_ids = self.input_ids[keep_indices_device]
+            self.input_ids = filter_rows(self.input_ids, keep_indices_device)
         # Optional under no-verify-sync; resolve_seq_lens repopulates before forward.
         if self.seq_lens_cpu is not None:
             self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
@@ -3793,16 +3794,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Encoder-decoder infos
         if self.model_config.is_encoder_decoder:
-            self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
+            self.encoder_lens = merge_rows(self.encoder_lens, other.encoder_lens)
             self.encoder_lens_cpu = self.encoder_lens_cpu + other.encoder_lens_cpu
-        self.req_pool_indices = torch.cat(
-            [self.req_pool_indices, other.req_pool_indices]
+        self.req_pool_indices = merge_rows(
+            self.req_pool_indices, other.req_pool_indices
         )
         self.req_pool_indices_cpu = torch.cat(
             [self.req_pool_indices_cpu, other.req_pool_indices_cpu]
         )
-        self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
-        self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
+        self.seq_lens = merge_rows(self.seq_lens, other.seq_lens)
+        self.orig_seq_lens = merge_rows(self.orig_seq_lens, other.orig_seq_lens)
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
@@ -3811,7 +3812,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # req_pool_indices. Mismatch arises e.g. with spec_v1, which keeps its
         # tensor while a relay-staged side is None -- there the worker rebuilds.
         if self.input_ids is not None and other.input_ids is not None:
-            self.input_ids = torch.cat([self.input_ids, other.input_ids])
+            self.input_ids = merge_rows(self.input_ids, other.input_ids)
         else:
             self.input_ids = None
         # Optional under no-verify-sync; drop the mirror if either side absent.

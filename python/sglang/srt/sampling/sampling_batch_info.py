@@ -12,6 +12,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarMask,
     GrammarRow,
 )
+from sglang.srt.hardware_backend.tpu.batch_rows import filter_rows, merge_rows
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
@@ -447,7 +448,7 @@ class SamplingBatchInfo:
         ]:
             value = getattr(self, item, None)
             if value is not None:
-                setattr(self, item, value[keep_indices_device])
+                setattr(self, item, filter_rows(value, keep_indices_device))
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
@@ -578,7 +579,7 @@ class SamplingBatchInfo:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
             if self_val is not None and other_val is not None:
-                setattr(self, item, torch.cat([self_val, other_val]))
+                setattr(self, item, merge_rows(self_val, other_val))
 
         self.is_all_greedy &= other.is_all_greedy
         self.is_any_greedy |= other.is_any_greedy
