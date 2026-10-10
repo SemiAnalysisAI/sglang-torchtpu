@@ -12,7 +12,6 @@ from unittest.mock import patch
 
 import torch.compiler.config as compiler_config
 
-from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     default_cuda_graph_config,
@@ -21,6 +20,7 @@ from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 # CPU suite: mocks torch_tpu, so it runs on the CPU runners -- never a TPU node.
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -76,12 +76,8 @@ class TestTpuPlatformInitialization(CustomTestCase):
     def test_rejects_backend_initialization_without_worker_world_size(self):
         with (
             patch.dict(os.environ, {}, clear=False),
-            patch(
-                "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
-            ) as prepare_tpu_env,
-            patch(
-                "sglang.srt.hardware_backend.tpu.patches.apply_tpu_patches"
-            ) as apply_tpu_patches,
+            patch("sglang_tpu.patches._prepare_tpu_env") as prepare_tpu_env,
+            patch("sglang_tpu.patches.apply_tpu_patches") as apply_tpu_patches,
         ):
             os.environ.pop("WORLD_SIZE", None)
             with self.assertRaisesRegex(RuntimeError, "requires worker WORLD_SIZE"):
@@ -107,18 +103,17 @@ class TestTpuPlatformInitialization(CustomTestCase):
             patch.dict(sys.modules, {"torch_tpu": fake_torch_tpu}),
             compiler_config.patch(cache_key_tag=""),
             patch(
-                "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env",
+                "sglang_tpu.patches._prepare_tpu_env",
                 side_effect=prepare,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compile_cache."
-                "add_tpu_kernel_inputs_to_compile_cache_key",
+                "sglang_tpu.compile_cache.add_tpu_kernel_inputs_to_compile_cache_key",
                 side_effect=lambda: calls.append(
                     ("cache_key", os.environ["LIBTPU_INIT_ARGS"])
                 ),
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.patches.apply_tpu_patches",
+                "sglang_tpu.patches.apply_tpu_patches",
                 side_effect=lambda: calls.append(("patch", None)),
             ),
         ):
@@ -202,6 +197,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             tp_size=1,
             pp_size=1,
             dp_size=1,
+            attn_dp_size=1,
             enable_dp_attention=False,
             enable_dp_lm_head=False,
             enable_dynamic_chunking=False,
@@ -222,7 +218,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
     def _apply(self, args):
         platform = TpuSRTPlatform()
-        with patch("sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"):
+        with patch("sglang_tpu.patches._prepare_tpu_env"):
             platform.apply_server_args_defaults(args)
 
     def _resolved(self, args, field):
@@ -384,9 +380,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         args = self._args(tp_size=16)
         platform = TpuSRTPlatform()
 
-        with patch(
-            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
-        ) as prepare_tpu_env:
+        with patch("sglang_tpu.patches._prepare_tpu_env") as prepare_tpu_env:
             platform.apply_server_args_defaults(args)
 
         prepare_tpu_env.assert_called_once_with(16, setup_slicebuilder=True)
@@ -403,9 +397,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
         with (
             patch.dict(os.environ, {}, clear=True),
-            patch(
-                "sglang.srt.hardware_backend.tpu.env_override.apply_tpu_env_overrides"
-            ),
+            patch("sglang_tpu.env_override.apply_tpu_env_overrides"),
             patch("builtins.__import__", side_effect=track_import),
         ):
             platform.apply_server_args_defaults(args)

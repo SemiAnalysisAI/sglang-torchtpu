@@ -12,15 +12,18 @@ from unittest.mock import patch
 
 import torch.compiler.config as compiler_config
 
+import sglang
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu import compile_cache
 from sglang.srt.utils.patch_torch import monkey_patch_torch_tpu_env
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope
+from sglang_tpu import compile_cache
+from sglang_tpu.envs import envs as tpu_envs
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
-_SGLANG_ROOT = Path(compile_cache.__file__).resolve().parents[3]
+_PACKAGE_ROOT = Path(compile_cache.__file__).resolve().parent
+_SGLANG_ROOT = Path(sglang.__file__).resolve().parent
 _SRT_ROOT = _SGLANG_ROOT / "srt"
 _TAG_PREFIX = "tpu-kernel-inputs-v1:"
 
@@ -34,19 +37,19 @@ class TestKernelInputsDigest(CustomTestCase):
 
     def setUp(self):
         self.root = Path(enter_scope(self, tempfile.TemporaryDirectory()))
-        self.write("hardware_backend/tpu/kv_page_write.py", "out = pages\n")
-        self.write("layers/attention/pallas/kernel.py", "block = 128\n")
+        self.write("sglang_tpu/kv_page_write.py", "out = pages\n")
+        self.write("sglang_tpu/attention/pallas/kernel.py", "block = 128\n")
         self.write(
-            "layers/moe/pallas/gmm.py",
+            "sglang_tpu/moe/pallas/gmm.py",
             "FP32 = envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.get()\n",
         )
         self.write(
-            "layers/moe/tpu_moe_utils.py",
+            "sglang/srt/layers/moe/tpu_moe_utils.py",
             "MODE = envs.SGLANG_TPU_INT4_MOE_MODE.get()\n",
         )
-        self.write("models/model.py", "envs.SGLANG_TPU_HOST_PADDING.get()\n")
+        self.write("sglang/srt/models/model.py", "envs.SGLANG_TPU_HOST_PADDING.get()\n")
         self.write(
-            "hardware_backend/tpu/monitor.py",
+            "sglang_tpu/monitor.py",
             "CHECK = envs.SGLANG_TPU_CHECK_RECOMPILATION.get()\n",
         )
         enter_scope(
@@ -84,14 +87,16 @@ class TestKernelInputsDigest(CustomTestCase):
         path.write_text(text)
 
     def digest(self):
-        return compile_cache.tpu_kernel_inputs_digest(srt_root=self.root)
+        return compile_cache.tpu_kernel_inputs_digest(
+            package_root=self.root / "sglang_tpu", srt_root=self.root / "sglang/srt"
+        )
 
     def test_kernel_source_edits_change_the_digest(self):
         for path in (
-            "hardware_backend/tpu/kv_page_write.py",
-            "layers/attention/pallas/kernel.py",
-            "layers/moe/pallas/gmm.py",
-            "layers/moe/tpu_moe_utils.py",
+            "sglang_tpu/kv_page_write.py",
+            "sglang_tpu/attention/pallas/kernel.py",
+            "sglang_tpu/moe/pallas/gmm.py",
+            "sglang/srt/layers/moe/tpu_moe_utils.py",
         ):
             with self.subTest(path=path):
                 original = (self.root / path).read_text()
@@ -100,18 +105,18 @@ class TestKernelInputsDigest(CustomTestCase):
                 self.write(path, original)
                 self.assertEqual(self.digest(), self.base)
 
-        self.write("hardware_backend/tpu/kernels/new_kernel.py", "x = 1\n")
+        self.write("sglang_tpu/kernels/new_kernel.py", "x = 1\n")
         self.assertNotEqual(self.digest(), self.base)
-        (self.root / "hardware_backend/tpu/kernels/new_kernel.py").unlink()
+        (self.root / "sglang_tpu/kernels/new_kernel.py").unlink()
 
         # Moving a file changes the key even with identical contents.
-        old = self.root / "layers/attention/pallas/kernel.py"
-        old.rename(self.root / "layers/attention/pallas/renamed.py")
+        old = self.root / "sglang_tpu/attention/pallas/kernel.py"
+        old.rename(self.root / "sglang_tpu/attention/pallas/renamed.py")
         self.assertNotEqual(self.digest(), self.base)
 
-    def test_code_outside_the_kernel_trees_is_left_to_the_fx_key(self):
-        self.write("models/model.py", "changed = True\n")
-        self.write("hardware_backend/tpu/README.md", "not python\n")
+    def test_code_outside_the_kernel_sources_is_left_to_the_fx_key(self):
+        self.write("sglang/srt/models/model.py", "changed = True\n")
+        self.write("sglang_tpu/README.md", "not python\n")
         self.assertEqual(self.digest(), self.base)
 
     def test_compiler_flags_change_the_digest(self):
@@ -165,23 +170,21 @@ class TestKernelInputsDigest(CustomTestCase):
         with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True):
             self.assertEqual(self.digest(), self.base)
 
-    def test_unkeyed_env_knobs_are_all_read_by_the_kernel_trees(self):
-        # No stale entries: each unkeyed name is a real field the trees read.
+    def test_unkeyed_env_knobs_are_all_read_by_the_kernel_sources(self):
+        # No stale entries: each unkeyed name is a real field the sources read.
         _, fields = compile_cache._scan_kernel_sources(
-            _SRT_ROOT,
-            compile_cache.TPU_KERNEL_SOURCE_TREES
-            + compile_cache.TPU_KERNEL_SOURCE_FILES,
+            compile_cache.kernel_source_roots()
         )
         self.assertLessEqual(compile_cache._ENV_FIELDS_NOT_KEYED, set(fields))
         for name in compile_cache._ENV_FIELDS_NOT_KEYED:
-            self.assertTrue(hasattr(envs, name), name)
+            self.assertTrue(hasattr(envs, name) or hasattr(tpu_envs, name), name)
 
     def test_env_knobs_read_by_kernel_sources_change_the_digest(self):
         with envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.override(True):
             self.assertNotEqual(self.digest(), self.base)
         with envs.SGLANG_TPU_INT4_MOE_MODE.override("vmem-bf16"):
             self.assertNotEqual(self.digest(), self.base)
-        # A knob read only outside the kernel trees reaches FX, not the digest.
+        # A knob read only outside the kernel sources reaches FX, not the digest.
         with envs.SGLANG_TPU_HOST_PADDING.override(True):
             self.assertEqual(self.digest(), self.base)
 
@@ -298,7 +301,7 @@ class TestKernelInputsTag(CustomTestCase):
 class TestKernelInputsDigestAcrossProcesses(CustomTestCase):
     def test_fresh_processes_compute_the_same_digest(self):
         script = (
-            "from sglang.srt.hardware_backend.tpu import compile_cache\n"
+            "from sglang_tpu import compile_cache\n"
             "print(compile_cache.tpu_kernel_inputs_digest())\n"
         )
         digests = set()
@@ -308,7 +311,12 @@ class TestKernelInputsDigestAcrossProcesses(CustomTestCase):
                 "PYTHONHASHSEED": seed,
                 "PYTHONPATH": os.pathsep.join(
                     filter(
-                        None, (str(_SGLANG_ROOT.parent), os.environ.get("PYTHONPATH"))
+                        None,
+                        (
+                            str(_SGLANG_ROOT.parent),
+                            str(_PACKAGE_ROOT.parent),
+                            os.environ.get("PYTHONPATH"),
+                        ),
                     )
                 ),
             }
@@ -362,6 +370,13 @@ def _uses_kernel_api(tree: ast.AST) -> bool:
     return False
 
 
+def _is_kernel_source(path: Path) -> bool:
+    source = path.read_bytes()
+    if b"jax" not in source and b"pallas" not in source:
+        return False
+    return _uses_kernel_api(ast.parse(source, filename=str(path)))
+
+
 class TestKernelSourcesAreHashed(CustomTestCase):
     def test_kernel_api_detector(self):
         for source, expected in (
@@ -378,38 +393,32 @@ class TestKernelSourcesAreHashed(CustomTestCase):
             with self.subTest(source=source):
                 self.assertEqual(_uses_kernel_api(ast.parse(source)), expected)
 
-    def test_pallas_and_jax_users_live_in_the_hashed_trees(self):
-        """A kernel outside the hashed trees would reuse stale executables."""
-        hashed = tuple(
-            _SRT_ROOT / tree for tree in compile_cache.TPU_KERNEL_SOURCE_TREES
+    def test_pallas_and_jax_users_live_in_the_hashed_sources(self):
+        """A kernel outside the hashed sources would reuse stale executables."""
+        core_files = {_SRT_ROOT / path for path in compile_cache.TPU_KERNEL_CORE_FILES}
+        for path in core_files:
+            self.assertTrue(path.is_file(), path)
+        self.assertTrue(
+            any(_is_kernel_source(path) for path in _PACKAGE_ROOT.rglob("*.py")),
+            "the kernel API detector matched nothing in sglang_tpu",
         )
-        for tree in hashed:
-            self.assertTrue(tree.is_dir(), tree)
         # multimodal_gen has its own TPU runtime and does not use this key;
         # sglang/test holds test helpers (e.g. Pallas mesh mocks), not kernels.
         excluded = (_SGLANG_ROOT / "multimodal_gen", _SGLANG_ROOT / "test")
-
-        found_inside = False
-        outside = []
-        for path in sorted(_SGLANG_ROOT.rglob("*.py")):
-            if any(path.is_relative_to(tree) for tree in excluded):
-                continue
-            source = path.read_bytes()
-            if b"jax" not in source and b"pallas" not in source:
-                continue
-            if not _uses_kernel_api(ast.parse(source, filename=str(path))):
-                continue
-            if any(path.is_relative_to(tree) for tree in hashed):
-                found_inside = True
-            else:
-                outside.append(str(path.relative_to(_SGLANG_ROOT)))
-        self.assertTrue(found_inside, "the kernel API detector matched nothing")
+        outside = [
+            str(path.relative_to(_SGLANG_ROOT))
+            for path in sorted(_SGLANG_ROOT.rglob("*.py"))
+            if not any(path.is_relative_to(tree) for tree in excluded)
+            and path not in core_files
+            and _is_kernel_source(path)
+        ]
         self.assertEqual(
             outside,
             [],
-            "These modules build Pallas/JAX kernels outside "
-            "compile_cache.TPU_KERNEL_SOURCE_TREES, so kernel edits would not "
-            "invalidate cached executables. Move them or extend the trees.",
+            "These modules build Pallas/JAX kernels outside the sglang_tpu "
+            "package, so kernel edits would not invalidate cached executables. "
+            "Move them to sglang_tpu or add them to "
+            "compile_cache.TPU_KERNEL_CORE_FILES.",
         )
 
 
