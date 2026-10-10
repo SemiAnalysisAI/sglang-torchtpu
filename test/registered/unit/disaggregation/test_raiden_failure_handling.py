@@ -379,17 +379,14 @@ class TestReceiverFailurePaths(unittest.TestCase):
         self.assertEqual(mgr.request_status[ROOM], KVPoll.Failed)
         self.assertIn("KVPoll.Bootstrapping", mgr.failure_records[ROOM])
 
-    def test_poll_fails_when_metadata_is_never_sent(self):
-        # The prefill knows the room, but the decode never got KV pages for it.
+    def test_handshake_deadline_skips_room_waiting_for_kv_pages(self):
+        # Handshake done, but the decode has no KV room yet: keep waiting.
         mgr = _decode_manager_stub()
         recv = _receiver(mgr)
         recv._handshake_timeout = 1
         recv._handshake_start = time.time() - 2
-        with patch.object(RaidenKVReceiver, "_send_abort_notification") as send_abort:
-            self.assertEqual(recv.poll(), KVPoll.Failed)
-            self.assertEqual(recv.poll(), KVPoll.Failed)
-        send_abort.assert_called_once()
-        self.assertIn("KVPoll.WaitingForInput", mgr.failure_records[ROOM])
+        self.assertEqual(recv.poll(), KVPoll.WaitingForInput)
+        self.assertNotIn(ROOM, mgr.failure_records)
 
     def test_handshake_deadline_stops_once_metadata_is_sent(self):
         mgr = _decode_manager_stub()
