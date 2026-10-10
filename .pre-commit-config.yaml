@@ -135,6 +135,12 @@ repos:
         entry: python3 tools/plugin/check_tpu_branches.py --files
         language: system
         files: ^python/sglang/.*\.py$
+      - id: check-tpu-plugin-inventory
+        name: TPU plugin HOOKS.md and PATCHES.md are current
+        entry: python3 tools/plugin/inventory.py --check
+        language: system
+        files: ^(sglang_tpu/.*\.py|sglang_tpu/(HOOKS|PATCHES)\.md|tools/plugin/inventory\.py)$
+        pass_filenames: false
       - id: rustfmt-sgl-model-gateway
         name: rustfmt sgl-model-gateway (nightly)
         entry: bash -c 'rustup component add --toolchain nightly rustfmt >/dev/null && cd sgl-model-gateway && cargo +nightly fmt -- --check'
