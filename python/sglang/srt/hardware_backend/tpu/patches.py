@@ -445,19 +445,22 @@ def _patch_compute_position_torch() -> None:
         prefix_lens = extend_prefix_lens.tolist()
         seq_lens = extend_seq_lens.tolist()
         positions_cpu = torch.cat(
-            [torch.arange(p, p + s) for p, s in zip(prefix_lens, seq_lens)],
+            [
+                torch.arange(p, p + s, device="cpu")
+                for p, s in zip(prefix_lens, seq_lens)
+            ],
             axis=0,
         ).to(torch.int64)
-        extend_start_loc = torch.zeros_like(extend_seq_lens)
-        if extend_seq_lens.numel() > 1:
-            # Set dtype to int32 rather than cumsum's default int64.
-            # 32-bit integers are TPU native while s64 requires emulation,
-            # and its buggy lowering can run into "Unsupported conversion
-            # from vmreg/vreg to U64". Token counts fit int32 comfortably.
-            extend_start_loc[1:] = torch.cumsum(
-                extend_seq_lens[:-1], dim=0, dtype=torch.int32
+        # Reuse the host lists from the readbacks above. Computing this on the
+        # input tensors would compile zeros/cumsum/view updates on TPU.
+        extend_start_loc_cpu = torch.zeros_like(extend_seq_lens, device="cpu")
+        if len(seq_lens) > 1:
+            extend_start_loc_cpu[1:] = torch.cumsum(
+                torch.tensor(seq_lens[:-1], dtype=torch.int32, device="cpu"),
+                dim=0,
+                dtype=torch.int32,
             )
-        return positions_cpu.to(device), extend_start_loc
+        return positions_cpu.to(device), extend_start_loc_cpu.to(device)
 
     forward_batch_info.compute_position_torch = compute_position_torch_cpu_staged
 
@@ -783,9 +786,13 @@ def _patch_raiden_is_load_back_event_done() -> None:
 
     The PD decode restore loop polls this method, which reads a per-layer
     ``finish_event`` from the done counter's slot. Raiden stores the combined
-    future-event itself in a ``BatchDoneCounter`` slot, and the answer must
-    agree across ranks before ``loading_check`` runs its collectives. Other
-    controllers keep the original method.
+    future-event itself in a ``BatchDoneCounter`` slot, and a raiden DMA can
+    land at different times on different ranks, so the answer is combined
+    over the cache's rank groups: every rank flips the request READY in the
+    same step. Like upstream's method (#41393) the poll only answers; the
+    tree-side bookkeeping (``loading_check``) runs from check_hicache_events,
+    which every rank enters together. Other controllers keep the original
+    method.
     """
     global _raiden_is_load_back_event_done_patched
     if _raiden_is_load_back_event_done_patched:
@@ -803,11 +810,7 @@ def _patch_raiden_is_load_back_event_done() -> None:
         controller = self.cache_controller
         if not isinstance(controller, TpuRaidenHybridCacheController):
             return orig_is_load_back_event_done(self, consumer_index)
-        if not controller.is_load_back_event_done(consumer_index, self._all_reduce):
-            return False
-        if consumer_index >= 0:
-            self.loading_check()
-        return True
+        return controller.is_load_back_event_done(consumer_index, self._all_reduce)
 
     UnifiedRadixCache.is_load_back_event_done = is_load_back_event_done
 
@@ -872,6 +875,16 @@ def _patch_pd_decode_swa_hicache() -> None:
     pd_decode_swa_hicache.install()
 
 
+def _patch_pd_decode_async_prefill_info() -> None:
+    """Fetch PD prefill parallel info off the decode scheduler thread.
+
+    See ``pd_decode_async_prefill_info``.
+    """
+    from sglang.srt.hardware_backend.tpu import pd_decode_async_prefill_info
+
+    pd_decode_async_prefill_info.install()
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
@@ -892,3 +905,4 @@ def apply_tpu_patches() -> None:
     _patch_raiden_is_load_back_event_done()
     _patch_prefill_transfer_finish_from_raiden()
     _patch_pd_decode_swa_hicache()
+    _patch_pd_decode_async_prefill_info()

@@ -24,6 +24,11 @@ from typing import Any, Callable, List, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.kv_free_fence import (
+    KVFreeFence,
+    assert_not_forward_write_target,
+    deferred_dma_read,
+)
 from sglang.srt.hardware_backend.tpu.raiden_transfer import (
     NOOP_EVENT,
     CombinedFutureEvent,
@@ -55,6 +60,9 @@ def _check_kv_page_pool(name: PoolName) -> None:
 class TpuRaidenHybridCacheController(HybridCacheController):
     """Hybrid (multi-pool) HiCache controller whose transfers go through
     raiden DMA, one all-layer call per pool entry."""
+
+    # Set by the scheduler for the tree's controller; see fence_hicache_backups.
+    kv_free_fence: Optional[KVFreeFence] = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -123,10 +131,7 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
-        # The fence keeps in-flight forward writes off only the pages allocated
-        # inside dma_write_target(); this DMA's targets are allocated below.
-        fence = self.mem_pool_device_allocator.kv_free_fence
-        assert fence is None or fence.in_dma_write_target
+        assert_not_forward_write_target(self.mem_pool_device_allocator)
         device_indices = super().load(
             host_indices=host_indices,
             priority=priority,
@@ -205,7 +210,10 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         op = CacheOperation.merge_ops(self.write_queue)
         self.write_queue.clear()
 
-        finish_event = CombinedFutureEvent(self._issue_pool_dmas(op, load=False))
+        finish_event = deferred_dma_read(
+            self.kv_free_fence,
+            lambda: CombinedFutureEvent(self._issue_pool_dmas(op, load=False)),
+        )
         self.ack_write_queue.append(
             HiCacheAck(
                 start_event=NOOP_EVENT,
