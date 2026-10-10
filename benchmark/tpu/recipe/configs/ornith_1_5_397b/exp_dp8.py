@@ -13,6 +13,9 @@ PER_RANK_CONC = (CONCURRENCY + DP - 1) // DP
 CHUNK_PER_RANK = 4096
 
 CONFIG = deepcopy(_BASE)
+# language_only is an encoder-disaggregation mode that requires the VL architecture;
+# the text-only entry has no vision tower to skip.
+del CONFIG["server_args"]["language_only"]
 CONFIG["server_args"].update(
     {
         # TPU DP attention needs the text-only entry (Qwen3_5MoeForCausalLM); the recipe
