@@ -29,7 +29,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.layer_ut_utils import init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
 
-_KERNEL_MODULE = "sglang.srt.hardware_backend.tpu.gated_rms_norm"
+_KERNEL_MODULE = "sglang_tpu.gated_rms_norm"
 _HIDDEN, _EPS = 256, 1e-5
 
 

@@ -57,7 +57,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sglang.srt.layers.attention.pallas.mla_ragged_paged_attention_v2 import (
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2 import (
     align_to,
     get_dtype_packing,
     get_kv_cache_shape,
@@ -65,7 +66,6 @@ from sglang.srt.layers.attention.pallas.mla_ragged_paged_attention_v2 import (
     prepare_kv_inputs,
     unsigned_align_to,
 )
-from sglang.test.test_utils import CustomTestCase
 
 _KV_LORA_RANK = 512
 _QK_NOPE_HEAD_DIM = 128

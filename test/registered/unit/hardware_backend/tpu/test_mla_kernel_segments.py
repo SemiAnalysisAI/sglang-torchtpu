@@ -6,14 +6,14 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.attention_pallas_mla import (
-    TpuPallasMlaAttnBackend,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention_pallas_mla import (
+    TpuPallasMlaAttnBackend,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -74,8 +74,7 @@ class TestMlaKernelSegments(CustomTestCase):
         )
         op = MagicMock(return_value=torch.zeros(T, H, R))
         with patch(
-            "sglang.srt.hardware_backend.tpu.attention_pallas_mla."
-            "_build_pallas_mla_kernel_op",
+            "sglang_tpu.attention_pallas_mla._build_pallas_mla_kernel_op",
             return_value=op,
         ):
             backend = TpuPallasMlaAttnBackend(model_runner)

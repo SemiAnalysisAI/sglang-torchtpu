@@ -55,7 +55,7 @@ class TestK3GatedRmsNorm(CustomTestCase):
         from sglang.kernels.ops.attention.fla.fused_norm_gate import (
             FusedRMSNormGated,
         )
-        from sglang.srt.hardware_backend.tpu.gated_rms_norm import (
+        from sglang_tpu.gated_rms_norm import (
             get_gated_rms_norm_op,
         )
 
@@ -83,7 +83,7 @@ class TestK3GatedRmsNorm(CustomTestCase):
         return self.norm.forward_native(core, gate).squeeze(0).flatten(-2)
 
     def _kernel(self, core, g, g_block):
-        from sglang.srt.hardware_backend.tpu.gated_rms_norm import (
+        from sglang_tpu.gated_rms_norm import (
             gated_rms_norm_tpu,
         )
 
@@ -117,7 +117,7 @@ class TestK3GatedRmsNorm(CustomTestCase):
         from sglang.kernels.ops.attention.fla.fused_norm_gate import (
             FusedRMSNormGated,
         )
-        from sglang.srt.hardware_backend.tpu.gated_rms_norm import (
+        from sglang_tpu.gated_rms_norm import (
             gated_rms_norm_tpu,
         )
 
@@ -157,7 +157,7 @@ class TestK3GatedRmsNorm(CustomTestCase):
         the compiled flag-off chain."""
         import torch._dynamo
 
-        from sglang.srt.hardware_backend.tpu.gated_rms_norm import (
+        from sglang_tpu.gated_rms_norm import (
             gated_rms_norm_tpu,
         )
 
