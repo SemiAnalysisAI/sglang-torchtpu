@@ -139,11 +139,11 @@ class VocabParallelEmbeddingShardIndices:
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu or _is_tpu)
 def get_masked_input_and_mask(
     input_: torch.Tensor,
-    org_vocab_start_index: int,
-    org_vocab_end_index: int,
-    num_org_vocab_padding: int,
-    added_vocab_start_index: int,
-    added_vocab_end_index: int,
+    org_vocab_start_index: int | torch.Tensor,
+    org_vocab_end_index: int | torch.Tensor,
+    num_org_vocab_padding: int | torch.Tensor,
+    added_vocab_start_index: int | torch.Tensor,
+    added_vocab_end_index: int | torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # torch.compile will fuse all of the pointwise ops below
     # into a single kernel, making it very fast
@@ -229,6 +229,10 @@ class VocabParallelEmbedding(torch.nn.Module):
     # LinearBase.scheme.
     scheme = None
 
+    _tpu_runtime_vocab_bounds: torch.Tensor | None
+    _tpu_runtime_vocab_bounds_required: bool = False
+    _tpu_runtime_vocab_bounds_values: tuple[int, int, int, int, int] | None = None
+
     def __init__(
         self,
         num_embeddings: int,
@@ -245,6 +249,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         use_presharded_weights: bool = False,
     ):
         super().__init__()
+        self.register_buffer("_tpu_runtime_vocab_bounds", None, persistent=False)
         self.quant_config = quant_config
         self.output_dtype = output_dtype
 
@@ -442,6 +447,39 @@ class VocabParallelEmbedding(torch.nn.Module):
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 
+    def prepare_tpu_runtime_vocab_bounds(self) -> None:
+        """Refresh runtime bounds after materialization, including dummy/reloads.
+
+        Values must not be initialized in the constructor: meta/to_empty loading
+        would discard them. Call again after replacing or rematerializing weights.
+        The model's TPU opt-in owns invocation; CPU staging is supported here.
+        """
+        if self.tp_size == 1:
+            return
+        self._tpu_runtime_vocab_bounds_required = True
+        if self.weight.device.type == "meta":
+            raise RuntimeError("Runtime vocabulary bounds require materialized weights")
+        indices = self.shard_indices
+        values = (
+            indices.org_vocab_start_index,
+            indices.org_vocab_end_index,
+            indices.num_org_vocab_padding,
+            indices.added_vocab_start_index,
+            indices.added_vocab_end_index,
+        )
+        prepared = torch.tensor(values, dtype=torch.int64, device=self.weight.device)
+        bounds = self._tpu_runtime_vocab_bounds
+        if (
+            bounds is not None
+            and bounds.device == prepared.device
+            and bounds.dtype == torch.int64
+            and bounds.shape == (5,)
+        ):
+            bounds.copy_(prepared)
+        else:
+            self._tpu_runtime_vocab_bounds = prepared
+        self._tpu_runtime_vocab_bounds_values = values
+
     def _use_triton_embedding(self, input_: torch.Tensor) -> bool:
         """Whether the fused Triton kernel can replace the mask+gather+fill unit."""
         if _is_npu:
@@ -493,14 +531,30 @@ class VocabParallelEmbedding(torch.nn.Module):
                 output_parallel = output_parallel.to(self.output_dtype)
             return output_parallel
         # Map out-of-shard ids to index 0, gather, then zero those rows.
-        masked_input, input_mask = get_masked_input_and_mask(
-            input_,
+        vocab_bounds: tuple[int | torch.Tensor, ...] = (
             self.shard_indices.org_vocab_start_index,
             self.shard_indices.org_vocab_end_index,
             self.shard_indices.num_org_vocab_padding,
             self.shard_indices.added_vocab_start_index,
             self.shard_indices.added_vocab_end_index,
         )
+        if _is_tpu and self._tpu_runtime_vocab_bounds_required:
+            # Read the module attribute so direct_compile sees its lifted buffer,
+            # not a captured tensor or rank-specialized Python bound constants.
+            bounds = self._tpu_runtime_vocab_bounds
+            if (
+                bounds is None
+                or bounds.device != input_.device
+                or bounds.dtype != torch.int64
+                or bounds.shape != (5,)
+                or self._tpu_runtime_vocab_bounds_values != vocab_bounds
+            ):
+                raise RuntimeError(
+                    "TPU runtime vocabulary bounds are missing, stale, or on the "
+                    "wrong device; run prepare_tpu_runtime_vocab_bounds after loading"
+                )
+            vocab_bounds = tuple(bounds[i] for i in range(5))
+        masked_input, input_mask = get_masked_input_and_mask(input_, *vocab_bounds)
         with symm_alloc:
             output_parallel = self.quant_method.embedding(self, masked_input.long())
         if self.output_dtype is not None:
