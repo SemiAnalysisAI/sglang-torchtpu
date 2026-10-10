@@ -22,7 +22,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
-_KERNEL_MODULE = "sglang.srt.hardware_backend.tpu.kimi_attn_residual"
+_KERNEL_MODULE = "sglang_tpu.kimi_attn_residual"
 
 
 def _tiny_config() -> KimiLinearConfig:

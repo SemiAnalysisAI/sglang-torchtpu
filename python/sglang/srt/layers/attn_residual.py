@@ -27,7 +27,7 @@ import triton.language as tl
 from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.utils import is_hip, is_npu, is_tpu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
 
 _is_tpu = is_tpu()
 
@@ -48,7 +48,7 @@ def _use_fast(hidden_size: int) -> bool:
     """The TMA kernel needs SM100+ except SM12x (tcgen05, cp.async.bulk)
     and its H=7168 template; everything else takes the triton pipeline."""
     global _FAST_SUPPORTED
-    if is_npu() or _is_tpu:
+    if not is_cuda():
         return False
     if _FAST_SUPPORTED is None:
         _FAST_SUPPORTED = _supports_attn_res_tma(torch.cuda.get_device_capability())
@@ -79,7 +79,7 @@ def _use_tpu_decode(
     with the kernel."""
     if not (_is_tpu and envs.SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL.get()):
         return False
-    from sglang.srt.hardware_backend.tpu.kimi_attn_residual import (
+    from sglang_tpu.kimi_attn_residual import (
         supports_attn_res_decode,
     )
 
@@ -351,7 +351,7 @@ def _aggregate_tpu_decode(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One TPU Pallas call for the pending add, mix and output norm. Returns
     (normed, prefix) with prefix = prefix_a + prefix_b (prefix_a if None)."""
-    from sglang.srt.hardware_backend.tpu.kimi_attn_residual import (
+    from sglang_tpu.kimi_attn_residual import (
         attention_residual_decode_tpu,
         get_norm_weight_f32,
     )

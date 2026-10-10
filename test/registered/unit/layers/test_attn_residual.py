@@ -19,7 +19,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
-_KERNEL_MODULE = "sglang.srt.hardware_backend.tpu.kimi_attn_residual"
+_KERNEL_MODULE = "sglang_tpu.kimi_attn_residual"
 
 
 class TestAttnResidual(unittest.TestCase):
