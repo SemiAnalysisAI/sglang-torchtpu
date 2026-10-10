@@ -199,6 +199,26 @@ class TestFfnExit(CustomTestCase):
         communicator.output._complete_now.assert_called_once()
         torch.testing.assert_close(hidden_states, self.hidden_states * 2 + 1)
 
+    def test_an_ffn_that_sums_its_own_output_owes_nothing(self):
+        """A complete output is neither left to the next layer nor summed."""
+        communicator = make_communicator(fuse=True, reduce_scatter=False)
+        with communicator.output.ffn_exit(
+            self.forward_batch, stream=ResidualStream(), output_complete=True
+        ) as ffn_exit:
+            hidden_states = self.hidden_states * 2
+        hidden_states, _ = finish_exit(ffn_exit, hidden_states, self.residual)
+
+        self.assertNotIsInstance(hidden_states, UnreducedOutput)
+        communicator.output._complete_now.assert_called_once()
+        self.assertFalse(communicator.output._complete_now.call_args.kwargs["owes_sum"])
+
+    def test_an_ffn_that_sums_its_own_output_refuses_a_reduce_scatter(self):
+        communicator = make_communicator(fuse=False, reduce_scatter=True)
+        with self.assertRaises(NotImplementedError):
+            communicator.output.ffn_exit(
+                self.forward_batch, stream=ResidualStream(), output_complete=True
+            )
+
     def test_finish_applies_the_decision_the_ffn_saw(self):
         """finish() applies the decision published to the FFN, even when the
         decision methods would answer differently by then."""

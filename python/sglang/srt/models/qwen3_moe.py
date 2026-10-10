@@ -966,9 +966,17 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         hidden_states = self.mlp(hidden_states, forward_batch)
-        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(
+            hidden_states, forward_batch, output_complete=self._ffn_output_complete
+        )
 
         return hidden_states
+
+    @property
+    def _ffn_output_complete(self) -> bool:
+        # TPU fused-RS experts return the summed output.
+        experts = getattr(self.mlp, "experts", None)
+        return getattr(experts, "handles_moe_reduction", False)
 
     def op_comm_prepare_attn(
         self,
@@ -999,7 +1007,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
     def op_comm_postprocess_layer(self, state):
         hidden_states = self.ffn_boundary.complete_now(
-            state.pop("hidden_states_mlp_output"), state.forward_batch
+            state.pop("hidden_states_mlp_output"),
+            state.forward_batch,
+            output_complete=self._ffn_output_complete,
         )
 
         output = dict(
