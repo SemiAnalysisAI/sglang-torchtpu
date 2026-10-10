@@ -16,7 +16,7 @@ from sglang.srt.runtime_context import get_context
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 # The scheduler delegates the stance to this TPU module, which logs it.
-_STANCE_MOD = "sglang.srt.hardware_backend.tpu.compilation.recompilation_checker"
+_STANCE_MOD = "sglang_tpu.compilation.recompilation_checker"
 
 
 class TestSchedulerRecompileStance(unittest.TestCase):
