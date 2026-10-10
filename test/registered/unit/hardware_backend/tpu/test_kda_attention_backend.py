@@ -76,7 +76,7 @@ class TestKDAAttentionBackend(unittest.TestCase):
         return backend
 
     def make_layer(self):
-        return RadixLinearAttention(
+        layer = RadixLinearAttention(
             layer_id=7,
             num_q_heads=2,
             num_k_heads=2,
@@ -89,6 +89,8 @@ class TestKDAAttentionBackend(unittest.TestCase):
             dt_bias=torch.zeros(8),
             lower_bound=-5.0,
         )
+        layer.kda_packed_weights = None
+        return layer
 
     def batch(self, mode):
         return SimpleNamespace(
@@ -189,6 +191,13 @@ class TestKDAAttentionBackend(unittest.TestCase):
                 self.assertEqual(args[8].shape, (2, 4))
                 self.assertIs(args[11], backend._distribution)
                 self.assertEqual(args[13:], (2, 2, 4, 4, 4, True, -5.0))
+                # One kernel pass: BATCHED rows on decode, PER_SEQ on extend.
+                kwargs = self.op.call_args.kwargs
+                decode = mode == ForwardMode.DECODE
+                self.assertEqual(
+                    (kwargs["batched_only"], kwargs["prefill_only"]),
+                    (decode, not decode),
+                )
 
 
 if __name__ == "__main__":

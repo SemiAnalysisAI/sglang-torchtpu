@@ -151,6 +151,11 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
             layer.conv_weights.shape[-1],
             True,
             None if lower_bound is None else float(lower_bound),
+            # Pure decode has no PER_SEQ rows and extend no BATCHED rows, so each
+            # runs one kernel pass.
+            batched_only=self._is_decode,
+            prefill_only=not self._is_decode,
+            packed_weights=layer.kda_packed_weights,
         )
         return out.view(tokens, n_v, d_v)
 

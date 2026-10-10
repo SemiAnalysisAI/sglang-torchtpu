@@ -18,6 +18,7 @@ from sglang.srt.configs.glm5_next import Glm5NextTextConfig
 from sglang.srt.distributed import divide
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang_tpu.kda_layout import pack_kda_weights
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -212,6 +213,8 @@ class Glm5NextLinearAttention(nn.Module):
         )
 
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
+        # [conv | dt_bias | A_log] as one f32 kernel operand, built after load.
+        self.attn.kda_packed_weights = None
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -636,6 +639,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
             if isinstance(attn, Glm5NextLinearAttention):
                 # The depthwise [dim, 1, K] parameter itself, not a view.
                 attn.attn.conv_weights = attn.qkv_conv1d.weight
+                attn.attn.kda_packed_weights = pack_kda_weights(
+                    attn.qkv_conv1d.weight,
+                    attn.dt_bias,
+                    attn.A_log,
+                    attn.local_num_heads,
+                    attn.head_k_dim,
+                ).to(attn.dt_bias.device)
         if self.model.fused_mhc:
             self.model.prepare_fused_mhc()
 
