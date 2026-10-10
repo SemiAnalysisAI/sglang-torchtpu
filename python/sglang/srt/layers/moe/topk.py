@@ -1642,6 +1642,29 @@ def biased_grouped_topk_impl(
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
+    if (
+        _is_tpu
+        and num_expert_group == 1
+        and topk_group == 1
+        and num_fused_shared_experts == 0
+        and renormalize
+    ):
+        from sglang_tpu.kernels.router_topk_small_m import (
+            supports,
+        )
+        from sglang_tpu.router_topk import router_topk_op
+
+        op = router_topk_op()
+        if op is not None and supports(*gating_output.shape, topk):
+            # One expert group: plain biased top-k, sigmoid through rescale in
+            # one kernel.
+            scale = (
+                float(routed_scaling_factor)
+                if apply_routed_scaling_factor_on_output
+                else 1.0
+            )
+            return op(gating_output, correction_bias, topk, scale)
+
     scores = gating_output.sigmoid()
     num_token = scores.shape[0]
     num_experts = scores.shape[1]

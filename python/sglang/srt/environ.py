@@ -1998,6 +1998,9 @@ class Envs:
     # GLM-5.3-Flash: dense FP8 linears with <= 16 tokens run as one Pallas W8A8
     # kernel (row quantize, FP8 dot, rescale) instead of the XLA chain.
     SGLANG_TPU_FP8_LINEAR_SMALL_M_KERNEL = EnvBool(False)
+    # GLM-5.3-Flash: the one-group sigmoid router (bias, top-k, renormalize) runs
+    # as one rank-based Pallas kernel for a single decode token.
+    SGLANG_TPU_ROUTER_TOPK_KERNEL = EnvBool(False)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)

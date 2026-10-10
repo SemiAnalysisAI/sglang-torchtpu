@@ -444,6 +444,12 @@ class Glm5NextModel(nn.Module):
             )
 
             register_fp8_linear_small_m_op()
+        if envs.SGLANG_TPU_ROUTER_TOPK_KERNEL.get():
+            from sglang_tpu.router_topk import (
+                register_router_topk_op,
+            )
+
+            register_router_topk_op()
         if self.fused_mhc:
             from sglang_tpu.glm_mhc import register_glm_mhc_ops
 
