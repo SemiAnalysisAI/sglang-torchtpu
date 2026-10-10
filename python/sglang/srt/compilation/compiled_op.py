@@ -121,7 +121,6 @@ def compiled_op(
                 return compiled_fn.warmup(
                     *args,
                     async_compile=envs.SGLANG_DIRECT_COMPILE_ASYNC.get(),
-                    execute=False,
                     **kwargs,
                 )
             return compiled_fn(*args, **kwargs)

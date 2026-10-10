@@ -837,7 +837,7 @@ class CompiledForwardShim:
         return self._call(self.fn, input_ids, positions, forward_batch, *args, **kwargs)
 
     def warmup_async(self, *args: Any, **kwargs: Any) -> Any:
-        """Queue direct compilation and defer execution until ``wait``."""
+        """Submit direct compilation without executing the warmup inputs."""
         return self._call(self.warmup_async_fn, *args, **kwargs)
 
     def _call(
@@ -998,19 +998,7 @@ class CompiledForwardShim:
             forward_batch.mm_input_embeds = None
         try:
             out = fn(input_ids, positions, forward_batch, *args, **kwargs)
-            if isinstance(out, PendingCall):
-                finalize_fields = {key: getattr(forward_batch, key) for key in saved}
-                finalize_fields["is_prefill_only"] = forward_batch.is_prefill_only
-
-                def finalize_pending(result: Any) -> Any:
-                    previous = _pin_fields(forward_batch, finalize_fields)
-                    try:
-                        return self._finalize_forward(result, forward_batch)
-                    finally:
-                        _restore_fields(forward_batch, previous)
-
-                out = out.then(finalize_pending)
-            else:
+            if not isinstance(out, PendingCall):
                 out = self._finalize_forward(out, forward_batch)
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
@@ -1033,7 +1021,7 @@ class CompiledForwardShim:
             return self._finish_forward(result, forward_batch, wants_input_logprob)
 
         if isinstance(out, PendingCall):
-            return out.then(finish)
+            return out
         return finish(out)
 
     def _finalize_forward(self, out: Any, forward_batch: Any) -> Any:

@@ -267,9 +267,7 @@ class TestDirectCompile(CustomTestCase):
                     reference = weakref.ref(inputs)
                     with collect_warmups() as queue:
                         queue.calls.append(
-                            compiled.warmup(
-                                inputs, async_compile=asynchronous, execute=False
-                            )
+                            compiled.warmup(inputs, async_compile=asynchronous)
                         )
                         del inputs
                         self.assertIsNone(reference())
@@ -320,7 +318,8 @@ class TestDirectCompile(CustomTestCase):
             )
 
         def run(compiled_fn, value, async_compile):
-            return compiled_fn.warmup(value, async_compile=async_compile).wait()
+            compiled_fn.warmup(value, async_compile=async_compile).wait()
+            return compiled_fn(value)
 
         for async_compile in (False, True):
             with self.subTest(async_compile=async_compile):
@@ -382,12 +381,17 @@ class TestDirectCompile(CustomTestCase):
             execute.assert_not_called()
             self.assertEqual(len(compiled.cache), 3)
             self.assertEqual(callbacks, [])
+            for warmup in pending:
+                self.assertIsNone(warmup.wait())
+            execute.assert_not_called()
+            self.assertEqual(callbacks, [])
             self.assertIs(pool.value, original_pool)
             self.assertTrue(torch.equal(pool.value.cpu(), torch.zeros(2)))
 
             expected_pool = torch.zeros(2)
-            for warmup, value in zip(pending, values):
-                actual = warmup.wait()
+            for value in values:
+                with torch.compiler.set_stance("fail_on_recompile"):
+                    actual = compiled(value)
                 expected = value.cpu() + 3
                 expected_pool += value.cpu().sum(dim=0)
                 self.assertTrue(torch.equal(actual.cpu(), expected))
@@ -429,7 +433,9 @@ class TestDirectCompile(CustomTestCase):
                 before = torch.tpu.get_rng_state()
                 pending = compiled.warmup(value, async_compile=asynchronous)
                 self.assertTrue(torch.equal(before, torch.tpu.get_rng_state()))
-                first = pending.wait().cpu()
+                self.assertIsNone(pending.wait())
+                self.assertTrue(torch.equal(before, torch.tpu.get_rng_state()))
+                first = compiled(value).cpu()
                 after_first = torch.tpu.get_rng_state()
                 with torch.compiler.set_stance("fail_on_recompile"):
                     second = compiled(value).cpu()
@@ -1480,8 +1486,9 @@ class TestDirectCompileDpRanks(unittest.TestCase):
             forward_context(ForwardContext(attn_backend=backend)),
         ):
             compiled, warmup_async = policy._direct_compile(model.forward)
+            self.assertIsNone(warmup_async(values, None, None).wait())
             torch.testing.assert_close(
-                warmup_async(values, None, None).wait().cpu(),
+                compiled(values, None, None).cpu(),
                 model(values, None, None).cpu(),
             )
             # Reuse one executable while changing both scalar rank buffers.
