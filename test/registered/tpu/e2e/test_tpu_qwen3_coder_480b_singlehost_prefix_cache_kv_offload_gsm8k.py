@@ -88,7 +88,7 @@ LAUNCH_ENV = {
     # host reload. Without this flag both read 0.
     "ENABLE_CACHE_REPORT": "1",
     "ENABLE_PROFILER_ENDPOINT": "0",
-    "EXTRA_ARGS": f"--served-model-name {SERVED_MODEL_NAME}",
+    "EXTRA_ARGS": f"--served-model-name {SERVED_MODEL_NAME} --moe-runner-backend pallas_tpu_fused_rs",
 }
 
 MODEL_CONFIG = {
