@@ -67,6 +67,7 @@ _ENV_FIELDS_NOT_KEYED = frozenset(
         "SGLANG_DIRECT_COMPILE_ASYNC",
         # Serving-time recompile monitor.
         "SGLANG_TPU_CHECK_RECOMPILATION",
+        "SGLANG_TPU_CHECK_RECOMPILATION_SITES",
         # PD KV transfer and its tracing, on the host.
         "SGLANG_RAIDEN_DYNAMIC_HOST_STAGING",
         "SGLANG_RAIDEN_LISTENER_START_READ",
