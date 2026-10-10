@@ -1908,7 +1908,7 @@ class KimiK3DeltaAttention(nn.Module):
     def _pack_tpu_kda_weights(self) -> torch.Tensor:
         """conv, dt_bias and A_log in one f32 operand (kda_layout): XLA stages
         every small kernel operand with its own copy."""
-        from sglang.srt.hardware_backend.tpu.kda_layout import pack_kda_weights
+        from sglang_tpu.kda_layout import pack_kda_weights
 
         attn = self.attn
         packed = pack_kda_weights(
@@ -3760,7 +3760,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             from sglang.srt.compilation.support_torch_compile import (
                 support_torch_compile,
             )
-            from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+            from sglang_tpu.compilation.decoder_compile_policy import (
                 KimiK3VLDecoderTpuCompilePolicy,
             )
 

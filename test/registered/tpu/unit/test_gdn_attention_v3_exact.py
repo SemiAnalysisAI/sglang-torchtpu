@@ -39,9 +39,9 @@ if _has_jax_tpu():
     import jax.numpy as jnp
     import numpy as np
 
-    from sglang.srt.hardware_backend.tpu.kda_layout import pack_kda_weights
-    from sglang.srt.layers.attention.pallas.gdn import fused_conv1d_gdn, memory_ref
-    from sglang.srt.layers.attention.pallas.gdn.config import AttentionMode
+    from sglang_tpu.attention.pallas.gdn import fused_conv1d_gdn, memory_ref
+    from sglang_tpu.attention.pallas.gdn.config import AttentionMode
+    from sglang_tpu.kda_layout import pack_kda_weights
 
 _K = 4
 _D = 128

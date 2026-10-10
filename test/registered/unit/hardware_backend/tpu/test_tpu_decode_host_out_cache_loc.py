@@ -9,15 +9,15 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.allocator_tpu import (
-    TpuPagedTokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache import allocation
 from sglang.srt.mem_cache.allocator import swa
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.allocator_tpu import (
+    TpuPagedTokenToKVPoolAllocator,
+)
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit")

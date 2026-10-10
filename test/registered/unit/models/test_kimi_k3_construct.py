@@ -6,7 +6,6 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
-from sglang.srt.hardware_backend.tpu.kda_layout import kda_packed_weights_shape
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     _unsupported_derived_weight_cache_error,
 )
@@ -20,6 +19,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.layer_ut_utils import init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.kda_layout import kda_packed_weights_shape
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
