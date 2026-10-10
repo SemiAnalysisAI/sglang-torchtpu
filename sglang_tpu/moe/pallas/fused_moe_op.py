@@ -69,6 +69,73 @@ logger = logging.getLogger(__name__)
 # single op covers every (topk, activation, dtype, shape) combination the
 # model will encounter.
 _PALLAS_MOE_OP = None
+# Process-static like GMM's arithmetic/buffering flags. Restart to change
+# this setting; a previously cached JAX trace keeps its selected branch.
+_MOE_STREAM_BS1 = envs.SGLANG_TPU_FUSED_MOE_STREAM_BS1.get()
+
+
+def _maybe_moe_stream_bs1(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights,
+    topk_ids,
+    w1_scale,
+    w2_scale,
+    w1_bias,
+    w2_bias,
+    *,
+    activation_name,
+    no_combine,
+    use_group_offset,
+    w_quant_bits,
+):
+    """One token with every expert local (EP = 1): stream the selected experts'
+    weights in one kernel, bit-identical to the route-meta + gmm_v2 path.
+    Returns None when the call falls outside that case."""
+    import jax.numpy as jnp
+
+    from sglang_tpu.kernels.moe_stream_bs1 import (
+        moe_stream_bs1,
+        supports,
+    )
+
+    num_experts, hidden, two_n = w1.shape
+    # Only the clamped SiLU runs gmm1 unfused (activation in JAX on the bf16
+    # gmm1 output), which the kernel reproduces; plain SiLU fuses the activation
+    # into gmm_v2 and keeps that path.
+    if not activation_name.startswith("silu_and_mul_clamp:"):
+        return None
+    clamp_limit = float(activation_name.split(":", 1)[1])
+    per_channel = (
+        w1_scale is not None
+        and w2_scale is not None
+        and w1_scale.shape == (num_experts, 1, 1, two_n)
+        and w2_scale.shape == (num_experts, 1, 1, w2.shape[2])
+    )
+    if (
+        no_combine
+        or use_group_offset
+        or w_quant_bits
+        or w1_bias is not None
+        or w2_bias is not None
+        or not per_channel
+        or w1.dtype != jnp.float8_e4m3fn
+        or w2.dtype != jnp.float8_e4m3fn
+        or not supports(hidden_states.shape[0], hidden, two_n)
+    ):
+        return None
+    return moe_stream_bs1(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        w1,
+        w1_scale,
+        w2,
+        w2_scale,
+        clamp_limit,
+    )
+
 
 # ---- JAX kernel body -------------------------------------------------------
 #
@@ -512,6 +579,24 @@ def _fused_moe_jax(
     m, hidden_size = hidden_states.shape
     num_experts = w1.shape[0]
     out_dtype = hidden_states.dtype
+    if _MOE_STREAM_BS1:
+        out = _maybe_moe_stream_bs1(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            activation_name=activation_name,
+            no_combine=no_combine,
+            use_group_offset=global_num_experts > num_experts,
+            w_quant_bits=w_quant_bits,
+        )
+        if out is not None:
+            return out
 
     # uint8 rhs = packed FP4 (2 float4 codes/byte along K); gmm_v2 unpacks to
     # float4_e2m1fn in-kernel when told packed_fp4=True (real K = shape[1] * 2).

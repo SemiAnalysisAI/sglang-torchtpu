@@ -2001,6 +2001,9 @@ class Envs:
     # GLM-5.3-Flash: the one-group sigmoid router (bias, top-k, renormalize) runs
     # as one rank-based Pallas kernel for a single decode token.
     SGLANG_TPU_ROUTER_TOPK_KERNEL = EnvBool(False)
+    # One-token fused MoE with every expert local (EP = 1) streams the selected
+    # experts' weights in one Pallas kernel, bit-identical to route-meta + gmm_v2.
+    SGLANG_TPU_FUSED_MOE_STREAM_BS1 = EnvBool(False)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)
