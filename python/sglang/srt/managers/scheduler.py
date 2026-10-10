@@ -5246,8 +5246,10 @@ class Scheduler(
             return
         from sglang_tpu.compilation.recompilation_checker import (
             arm_fail_on_recompile,
+            maybe_enable_site_tracing,
         )
 
+        maybe_enable_site_tracing()
         arm_fail_on_recompile(
             enable_torch_compile=get_exec().graph.enable_torch_compile,
             speculative_algorithm=get_spec().speculative_algorithm,

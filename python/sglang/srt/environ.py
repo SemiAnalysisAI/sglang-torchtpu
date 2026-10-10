@@ -1897,6 +1897,8 @@ class Envs:
     # per-length XLA compilations.
     SGLANG_TPU_HOST_PADDING = EnvBool(False)
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
+    # Also attribute eager compiles to sglang source lines. ~9 us per eager op.
+    SGLANG_TPU_CHECK_RECOMPILATION_SITES = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
     # Arm the post-warmup fail_on_recompile stance with skip_guard_eval_unsafe
     # to cut per-call guard cost. Dynamo then checks only global-state guards,
