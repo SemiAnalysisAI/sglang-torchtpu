@@ -55,6 +55,7 @@ def _gates_and_collapse(
     streams,
     fn_ref,
     vec_ref,
+    norm_ref,
     layer_ref,
     post_ref,
     comb_ref,
@@ -64,8 +65,10 @@ def _gates_and_collapse(
     iters,
     rms_eps,
     hc_eps,
+    norm_eps,
 ):
-    """hc_pre on f32 streams: writes the collapsed layer input, post and comb."""
+    """hc_pre on f32 streams: writes the collapsed layer input (RMS-normalized
+    by the sublayer's input norm when norm_ref is given), post and comb."""
     mix = (2 + hc) * hc
     sq = functools.reduce(
         jnp.add, [jnp.sum(s * s, axis=-1, keepdims=True) for s in streams]
@@ -122,20 +125,31 @@ def _gates_and_collapse(
 
     layer = functools.reduce(
         jnp.add, [pre[:, i : i + 1] * s for i, s in enumerate(streams)]
-    )
-    layer_ref[...] = layer.astype(layer_ref.dtype)
+    ).astype(layer_ref.dtype)
+    if norm_ref is not None:
+        # RMSNorm.forward_native on the bf16 collapse: f32 variance, rsqrt,
+        # f32 multiply by the weight, then round.
+        x = layer.astype(jnp.float32)
+        x = x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + norm_eps)
+        layer = (x * norm_ref[...]).astype(layer_ref.dtype)
+    layer_ref[...] = layer
 
 
-def _site_kernel(*refs, hc, d, has_post, has_pre, iters, rms_eps, hc_eps):
+def _site_kernel(
+    *refs, hc, d, has_post, has_pre, has_norm, iters, rms_eps, hc_eps, norm_eps
+):
     refs = list(refs)
     if has_post:
         x_ref, res_ref, post_in_ref, comb_in_ref = refs[:4]
         refs = refs[4:]
     else:
         res_ref = refs.pop(0)
+    norm_ref = None
     if has_pre:
         fn_ref, vec_ref = refs[:2]
         refs = refs[2:]
+        if has_norm:
+            norm_ref = refs.pop(0)
     outs = refs
     if has_post:
         new_res_ref = outs.pop(0)
@@ -152,6 +166,7 @@ def _site_kernel(*refs, hc, d, has_post, has_pre, iters, rms_eps, hc_eps):
             streams,
             fn_ref,
             vec_ref,
+            norm_ref,
             layer_ref,
             post_ref,
             comb_ref,
@@ -160,6 +175,7 @@ def _site_kernel(*refs, hc, d, has_post, has_pre, iters, rms_eps, hc_eps):
             iters=iters,
             rms_eps=rms_eps,
             hc_eps=hc_eps,
+            norm_eps=norm_eps,
         )
 
 
@@ -175,9 +191,12 @@ def mhc_site(
     iters: int,
     rms_eps: float,
     hc_eps: float,
+    norm_weight=None,
+    norm_eps: float = 0.0,
 ):
     """One mHC site. x/post/comb are None for the first hc_pre; fn/vec are None
-    for the final hc_post. Returns the outputs present among
+    for the final hc_post. norm_weight ([d], the next sublayer's RMSNorm) makes
+    layer_input the normalized sublayer input. Returns the outputs present among
     (new_res [T, hc*d], layer_input [T, d], post [T, hc], comb [T, hc*hc])."""
     has_post = x is not None
     has_pre = fn is not None
@@ -217,6 +236,9 @@ def mhc_site(
     if has_pre:
         operands += [fn.astype(jnp.float32), vec]
         in_specs += [full_spec((mix, width)), full_spec((1, VEC_WIDTH))]
+        if norm_weight is not None:
+            operands.append(norm_weight.astype(jnp.float32).reshape(1, d))
+            in_specs.append(full_spec((1, d)))
         out_shape += [
             jax.ShapeDtypeStruct((padded, d), res.dtype),
             jax.ShapeDtypeStruct((padded, hc), jnp.float32),
@@ -234,9 +256,11 @@ def mhc_site(
             d=d,
             has_post=has_post,
             has_pre=has_pre,
+            has_norm=has_pre and norm_weight is not None,
             iters=iters,
             rms_eps=rms_eps,
             hc_eps=hc_eps,
+            norm_eps=norm_eps,
         ),
         grid=(padded // bt,),
         in_specs=in_specs,

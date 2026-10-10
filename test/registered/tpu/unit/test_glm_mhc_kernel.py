@@ -28,7 +28,7 @@ register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit")
 
 HC, HIDDEN = 4, 4096
 CFG = SimpleNamespace(hc_mult=HC, rms_norm_eps=1e-5, hc_eps=1e-6, hc_sinkhorn_iters=20)
-SITE = (HC, CFG.hc_sinkhorn_iters, CFG.rms_norm_eps, CFG.hc_eps)
+SITE = (HC, CFG.hc_sinkhorn_iters, CFG.rms_norm_eps, CFG.hc_eps, CFG.rms_norm_eps)
 
 
 @unittest.skipUnless(torch_tpu is not None, "Requires torch_tpu")
@@ -44,6 +44,16 @@ class TestGlmMhcKernel(unittest.TestCase):
         self.vec = torch.zeros(1, VEC_WIDTH)
         self.vec[0, :mix] = self.base
         self.vec[0, mix : mix + 3] = self.scale
+        # The next sublayer's input RMSNorm, applied in-kernel to the collapse.
+        self.norm_weight = (
+            1 + 0.1 * torch.randn(HIDDEN, generator=self.gen)
+        ).bfloat16()
+        self.norm_w32 = self.norm_weight.float()
+
+    def ref_norm(self, layer_in):
+        x = layer_in.float()
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + CFG.rms_norm_eps)
+        return (x * self.norm_weight.float()).bfloat16()
 
     def ref_pre(self, streams):
         return hc_pre(streams, self.fn, self.scale, self.base, CFG)
@@ -63,10 +73,10 @@ class TestGlmMhcKernel(unittest.TestCase):
                 flat = streams.reshape(tokens, -1)
                 ref_in, ref_post, ref_comb = self.ref_pre(streams)
                 layer_in, post, comb = self.pre(
-                    tpu(flat), tpu(self.fn), tpu(self.vec), *SITE
+                    tpu(flat), tpu(self.fn), tpu(self.vec), tpu(self.norm_w32), *SITE
                 )
-                # Collapsed inputs are bf16: one rounding step of error.
-                self.assertClose(layer_in, ref_in, 4e-3)
+                # Normalized collapsed inputs are bf16: one rounding step of error.
+                self.assertClose(layer_in, self.ref_norm(ref_in), 4e-3)
                 self.assertClose(post, ref_post, 1e-5)
                 self.assertClose(comb.view(-1, HC, HC), ref_comb, 1e-5)
 
@@ -74,10 +84,16 @@ class TestGlmMhcKernel(unittest.TestCase):
                 ref_res = hc_post(out, streams, ref_post, ref_comb)
                 ref_in2, ref_post2, ref_comb2 = self.ref_pre(ref_res)
                 res, layer_in2, post2, comb2 = self.seam(
-                    tpu(out), tpu(flat), *gates, tpu(self.fn), tpu(self.vec), *SITE
+                    tpu(out),
+                    tpu(flat),
+                    *gates,
+                    tpu(self.fn),
+                    tpu(self.vec),
+                    tpu(self.norm_w32),
+                    *SITE,
                 )
                 self.assertClose(res.view(-1, HC, HIDDEN), ref_res, 4e-3)
-                self.assertClose(layer_in2, ref_in2, 4e-3)
+                self.assertClose(layer_in2, self.ref_norm(ref_in2), 4e-3)
                 self.assertClose(post2, ref_post2, 1e-4)
                 self.assertClose(comb2.view(-1, HC, HC), ref_comb2, 1e-4)
 

@@ -470,6 +470,16 @@ class Glm5NextModel(nn.Module):
                 vec[0, : base.numel()] = base
                 vec[0, base.numel() : base.numel() + 3] = scale
                 layer.register_buffer(f"hc_{site}_vec", vec, persistent=False)
+            # The kernel applies each sublayer's input RMSNorm; f32 weights once.
+            for site, norm in (
+                ("attn", layer.input_layernorm),
+                ("ffn", layer.post_attention_layernorm),
+            ):
+                layer.register_buffer(
+                    f"hc_{site}_norm_weight",
+                    norm.weight.detach().float().contiguous(),
+                    persistent=False,
+                )
 
     def _forward_fused_mhc(self, x, forward_batch):
         """Same math as Glm5NextDecoderLayer.forward, with each hc_post fused
@@ -479,20 +489,39 @@ class Glm5NextModel(nn.Module):
         pre_op, seam_op, post_op = glm_mhc_ops()
         c = self.config
         h = c.hc_mult
-        site = (h, c.hc_sinkhorn_iters, float(c.rms_norm_eps), float(c.hc_eps))
+        # Each site also applies the next sublayer's input RMSNorm in-kernel,
+        # so layer_in is already normalized.
+        eps = float(c.rms_norm_eps)
+        site = (h, c.hc_sinkhorn_iters, eps, float(c.hc_eps), eps)
         res = x.unsqueeze(-2).expand(-1, h, -1).reshape(x.shape[0], -1)
         first = self.layers[0]
-        layer_in, post, comb = pre_op(res, first.hc_attn_fn, first.hc_attn_vec, *site)
+        layer_in, post, comb = pre_op(
+            res, first.hc_attn_fn, first.hc_attn_vec, first.hc_attn_norm_weight, *site
+        )
         for i, layer in enumerate(self.layers):
-            out = layer.self_attn(layer.input_layernorm(layer_in), forward_batch)
+            out = layer.self_attn(layer_in, forward_batch)
             res, layer_in, post, comb = seam_op(
-                out, res, post, comb, layer.hc_ffn_fn, layer.hc_ffn_vec, *site
+                out,
+                res,
+                post,
+                comb,
+                layer.hc_ffn_fn,
+                layer.hc_ffn_vec,
+                layer.hc_ffn_norm_weight,
+                *site,
             )
-            out = layer.mlp(layer.post_attention_layernorm(layer_in), forward_batch)
+            out = layer.mlp(layer_in, forward_batch)
             if i + 1 < len(self.layers):
                 nxt = self.layers[i + 1]
                 res, layer_in, post, comb = seam_op(
-                    out, res, post, comb, nxt.hc_attn_fn, nxt.hc_attn_vec, *site
+                    out,
+                    res,
+                    post,
+                    comb,
+                    nxt.hc_attn_fn,
+                    nxt.hc_attn_vec,
+                    nxt.hc_attn_norm_weight,
+                    *site,
                 )
             else:
                 res = post_op(out, res, post, comb, h)

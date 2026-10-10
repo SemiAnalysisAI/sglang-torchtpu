@@ -29,10 +29,12 @@ def register_glm_mhc_ops() -> None:
             res: jax.Array,
             fn: jax.Array,
             vec: jax.Array,
+            norm_weight: jax.Array,
             hc: int,
             iters: int,
             rms_eps: float,
             hc_eps: float,
+            norm_eps: float,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
             return mhc_site(
                 None,
@@ -45,6 +47,8 @@ def register_glm_mhc_ops() -> None:
                 iters=iters,
                 rms_eps=rms_eps,
                 hc_eps=hc_eps,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
             )
 
         def _seam(
@@ -54,10 +58,12 @@ def register_glm_mhc_ops() -> None:
             comb: jax.Array,
             fn: jax.Array,
             vec: jax.Array,
+            norm_weight: jax.Array,
             hc: int,
             iters: int,
             rms_eps: float,
             hc_eps: float,
+            norm_eps: float,
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             return mhc_site(
                 x,
@@ -70,6 +76,8 @@ def register_glm_mhc_ops() -> None:
                 iters=iters,
                 rms_eps=rms_eps,
                 hc_eps=hc_eps,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
             )
 
         def _post(
@@ -101,10 +109,10 @@ def register_glm_mhc_ops() -> None:
             )
 
         pre = cpu_export_jax_op("sglang_tpu_pallas::glm_mhc_pre", _pre)
-        pre.register_fake(lambda res, fn, vec, hc, *_: _gates_like(res, hc))
+        pre.register_fake(lambda res, fn, vec, norm, hc, *_: _gates_like(res, hc))
         seam = cpu_export_jax_op("sglang_tpu_pallas::glm_mhc_seam", _seam)
         seam.register_fake(
-            lambda x, res, post, comb, fn, vec, hc, *_: (
+            lambda x, res, post, comb, fn, vec, norm, hc, *_: (
                 torch.empty_like(res),
                 *_gates_like(res, hc),
             )
