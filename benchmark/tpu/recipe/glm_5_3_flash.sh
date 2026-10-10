@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Initial GLM-5.3-Flash text-only TP8/EP8 recipe. DSA is exactly dense within
-# the configured context (2048 selected tokens); KDA remains recurrent.
+# GLM-5.3-Flash text-only TP8/EP8 recipe. DSA is exactly dense within the
+# configured context (2048 selected tokens); KDA runs on the GDN v3 Pallas kernel.
+# Decode speed flags (8k/1k c1 TPOT, measured on v7x TP8): route-meta MoE for
+# one token (threshold just above m_pad * topk = 16, so larger batches keep the
+# existing route), single-kernel W8A8 dense linears, f32 MoE scales (avoids a
+# per-step scale relayout).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 exec env \
@@ -22,5 +26,8 @@ exec env \
   DISABLE_OVERLAP_SCHEDULE=1 \
   ENABLE_PROFILER_ENDPOINT=0 \
   SGLANG_MAMBA_SSM_DTYPE=float32 \
+  SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD="${SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD:-17}" \
+  SGLANG_TPU_FP8_LINEAR_SMALL_M_KERNEL="${SGLANG_TPU_FP8_LINEAR_SMALL_M_KERNEL:-1}" \
+  SGLANG_TPU_FP8_MOE_FP32_SCALES="${SGLANG_TPU_FP8_MOE_FP32_SCALES:-1}" \
   EXTRA_ARGS="--language-model-only --watchdog-timeout 1800 --max-mamba-cache-size 4 --disable-shared-experts-fusion ${EXTRA_ARGS:-}" \
   bash launch_server.sh
