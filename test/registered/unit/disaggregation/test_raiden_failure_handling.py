@@ -272,6 +272,8 @@ def _receiver(mgr):
     recv._connection_pool_entries = {}
     recv._started = False
     recv.init_time = None
+    recv._handshake_start = time.time()
+    recv._handshake_timeout = 300
     return recv
 
 
@@ -364,6 +366,40 @@ class TestReceiverFailurePaths(unittest.TestCase):
         mgr = _decode_manager_stub(waiting_timeout=0)
         recv = _receiver(mgr)
         self.assertEqual(recv.poll(), KVPoll.WaitingForInput)
+
+    def test_poll_fails_when_stuck_bootstrapping(self):
+        mgr = _decode_manager_stub(request_status={ROOM: KVPoll.Bootstrapping})
+        recv = _receiver(mgr)
+        del recv.bootstrap_infos  # init() never ran
+        recv._handshake_timeout = 1
+        recv._handshake_start = time.time() - 2
+        with patch.object(RaidenKVReceiver, "_send_abort_notification") as send_abort:
+            self.assertEqual(recv.poll(), KVPoll.Failed)
+        send_abort.assert_not_called()
+        self.assertEqual(mgr.request_status[ROOM], KVPoll.Failed)
+        self.assertIn("KVPoll.Bootstrapping", mgr.failure_records[ROOM])
+
+    def test_handshake_deadline_skips_room_waiting_for_kv_pages(self):
+        # Handshake done, but the decode has no KV room yet: keep waiting.
+        mgr = _decode_manager_stub()
+        recv = _receiver(mgr)
+        recv._handshake_timeout = 1
+        recv._handshake_start = time.time() - 2
+        self.assertEqual(recv.poll(), KVPoll.WaitingForInput)
+        self.assertNotIn(ROOM, mgr.failure_records)
+
+    def test_handshake_deadline_stops_once_metadata_is_sent(self):
+        mgr = _decode_manager_stub()
+        recv = _receiver(mgr)
+        recv._handshake_timeout = 1
+        recv._handshake_start = time.time() - 2
+        recv.init_time = time.time()
+        self.assertEqual(recv.poll(), KVPoll.WaitingForInput)
+
+    def test_handshake_keeps_waiting_before_deadline(self):
+        mgr = _decode_manager_stub(request_status={ROOM: KVPoll.Bootstrapping})
+        recv = _receiver(mgr)
+        self.assertEqual(recv.poll(), KVPoll.Bootstrapping)
 
     def test_engine_failure_notifies_prefill_once(self):
         mgr = _decode_manager_stub(is_failed=lambda room: True)
