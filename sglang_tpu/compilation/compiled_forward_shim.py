@@ -1009,30 +1009,17 @@ class CompiledForwardShim:
                 mm_embeds = mm_embeds[:real_q]
             forward_batch.mm_input_embeds = mm_embeds
 
-        def finish(result: Any) -> Any:
-            # Re-attach the embeds the graph did not see; a hidden-state boundary
-            # leaves them on the batch for the wrapper's eager tail.
-            if (
-                mm_embeds is not None
-                and isinstance(result, LogitsProcessorOutput)
-                and result.mm_input_embeds is None
-            ):
-                result.mm_input_embeds = mm_embeds
-            return self._finish_forward(result, forward_batch, wants_input_logprob)
-
         if isinstance(out, PendingCall):
             return out
-        return finish(out)
 
-    def _finalize_forward(self, out: Any, forward_batch: Any) -> Any:
-        spec_info = forward_batch.spec_info
-        if spec_info is None or not spec_info.keep_outputs_padded:
-            out = self.policy.finalize_forward_batch(out, forward_batch)
-        return out
-
-    def _finish_forward(
-        self, out: Any, forward_batch: Any, wants_input_logprob: bool = False
-    ) -> Any:
+        # Re-attach the embeds the graph did not see; a hidden-state boundary
+        # leaves them on the batch for the wrapper's eager tail.
+        if (
+            mm_embeds is not None
+            and isinstance(out, LogitsProcessorOutput)
+            and out.mm_input_embeds is None
+        ):
+            out.mm_input_embeds = mm_embeds
         # After the restore: LogitsMetadata.from_forward_batch branches on
         # capture_hidden_mode, so the gather must see the caller's value.
         if wants_input_logprob:
@@ -1042,6 +1029,12 @@ class CompiledForwardShim:
                 model=self.policy.model_runner.model,
             )
 
+        return out
+
+    def _finalize_forward(self, out: Any, forward_batch: Any) -> Any:
+        spec_info = forward_batch.spec_info
+        if spec_info is None or not spec_info.keep_outputs_padded:
+            out = self.policy.finalize_forward_batch(out, forward_batch)
         return out
 
 
