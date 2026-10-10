@@ -35,6 +35,7 @@ from sglang.srt.utils import LazyValue, add_prefix
 logger = logging.getLogger(__name__)
 
 _MODEL_PREFIX = "model."
+_VL_LANGUAGE_MODEL_PREFIX = "model.language_model."
 
 
 class Qwen3_5ForCausalLM(nn.Module):
@@ -197,7 +198,13 @@ class Qwen3_5ForCausalLM(nn.Module):
         # across model processes can exceed host memory before GPU copies finish.
         def body_weights():
             for name, loaded_weight in weights:
-                if name.startswith(_MODEL_PREFIX):
+                # A multimodal checkpoint (Qwen3_5MoeForConditionalGeneration layout)
+                # served text-only: drop the tower and MTP, unwrap the language model.
+                if name.startswith(("model.visual.", "visual.", "mtp.")):
+                    continue
+                if name.startswith(_VL_LANGUAGE_MODEL_PREFIX):
+                    yield name[len(_VL_LANGUAGE_MODEL_PREFIX) :], loaded_weight
+                elif name.startswith(_MODEL_PREFIX):
                     yield name[len(_MODEL_PREFIX) :], loaded_weight
                 elif name == "lm_head.weight":
                     if self.config.tie_word_embeddings:

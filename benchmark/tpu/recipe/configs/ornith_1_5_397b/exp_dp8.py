@@ -15,6 +15,9 @@ CHUNK_PER_RANK = 4096
 CONFIG = deepcopy(_BASE)
 CONFIG["server_args"].update(
     {
+        # TPU DP attention needs the text-only entry (Qwen3_5MoeForCausalLM); the recipe
+        # builds this dir with TEXT_ENTRY=1: flat text config, weights symlinked.
+        "model_path": "/dev/shm/Ornith-1.5-397B-FP8-text",
         "context_length": CONTEXT,
         "max_running_requests": MAX_RUNNING,
         # sglang divides the chunk budget by dp_size; scale so 4096 is per rank.
