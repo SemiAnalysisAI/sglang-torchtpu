@@ -16,8 +16,9 @@ maybe_stub_sgl_kernel()
 import torch  # noqa: E402
 
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.hardware_backend.tpu.pp_wave import PPWave  # noqa: E402
-from sglang.srt.managers import scheduler_pp_mixin  # noqa: E402
+from sglang.srt.managers import pp_gc, scheduler_pp_mixin  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.managers.utils import GenerationBatchResult  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
@@ -310,89 +311,151 @@ def stage(fabric, rank, mode, schedule):
     return scheduler, wave
 
 
+class _FakeGc:
+    """Stands in for the gc module so the test process's collector is untouched."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.freezes = self.collections = 0
+        self.thresholds = []
+
+    def freeze(self):
+        with self.lock:
+            self.freezes += 1
+
+    def collect(self):
+        with self.lock:
+            self.collections += 1
+        return 0
+
+    def get_threshold(self):
+        return (700, 10, 10)
+
+    def set_threshold(self, *values):
+        with self.lock:
+            self.thresholds.append(values)
+
+
+class TestAlignedGc(unittest.TestCase):
+    def test_collects_every_n_iterations_and_freezes_only_at_start(self):
+        """Full collections come from the iteration count alone, so stages in
+        lockstep collect in the same iteration; survivors stay collectable."""
+        fake = _FakeGc()
+        aligned = pp_gc.AlignedGc(3, gc=fake)
+        aligned.start()
+        self.assertEqual(fake.thresholds, [(700, 10, pp_gc._NEVER)])
+        self.assertEqual(
+            [aligned.tick() for _ in range(7)],
+            [False, False, True, False, False, True, False],
+        )
+        self.assertEqual((fake.collections, aligned.collections), (2, 2))
+        self.assertEqual(fake.freezes, 1)
+
+
 class TestMultiStageDisaggregatedWave(unittest.TestCase):
     def test_pp8_cold_start_lone_prompt_idle_restart_and_prebuilt(self):
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
             with self.subTest(mode=mode):
-                forward = (
-                    ForwardMode.EXTEND
+                self._run_pp8(mode)
+
+    def test_aligned_gc_collects_on_every_stage_and_keeps_the_wave_in_step(self):
+        """SGLANG_PP_ALIGNED_GC_ITERS: every stage freezes its heap, turns off
+        automatic full collections and collects at the same loop iterations,
+        and the wave still completes in lockstep."""
+        fake = _FakeGc()
+        with (
+            envs.SGLANG_PP_ALIGNED_GC_ITERS.override(4),
+            patch.object(pp_gc, "_gc", fake),
+        ):
+            stages = self._run_pp8(DisaggregationMode.PREFILL)
+        for scheduler, _ in stages:
+            aligned = scheduler._pp_gc
+            self.assertGreater(aligned.collections, 0)
+            self.assertEqual(aligned.collections, aligned.iterations // 4)
+        self.assertEqual(fake.thresholds, [(700, 10, pp_gc._NEVER)] * 8)
+        self.assertEqual(fake.freezes, 8)
+
+    def _run_pp8(self, mode):
+        forward = (
+            ForwardMode.EXTEND
+            if mode == DisaggregationMode.PREFILL
+            else ForwardMode.DECODE
+        )
+        schedule = [forward] + [None] * 16 + [forward]
+        if mode == DisaggregationMode.DECODE:
+            schedule = (
+                [ForwardMode.PREBUILT, forward, ForwardMode.PREBUILT]
+                + [None] * 16
+                + [forward]
+            )
+        fabric = Fabric(8)
+        stages = [stage(fabric, rank, mode, schedule) for rank in range(8)]
+
+        def run(scheduler):
+            stage_parallel.value = scheduler.test_parallel
+            try:
+                loop = (
+                    scheduler.event_loop_pp_disagg_prefill
                     if mode == DisaggregationMode.PREFILL
-                    else ForwardMode.DECODE
+                    else scheduler.event_loop_pp_disagg_decode
                 )
-                schedule = [forward] + [None] * 16 + [forward]
-                if mode == DisaggregationMode.DECODE:
-                    schedule = (
-                        [ForwardMode.PREBUILT, forward, ForwardMode.PREBUILT]
-                        + [None] * 16
-                        + [forward]
-                    )
-                fabric = Fabric(8)
-                stages = [stage(fabric, rank, mode, schedule) for rank in range(8)]
+                loop()
+            except Stopped:
+                pass
+            except Exception as exc:
+                with fabric.lock:
+                    fabric.errors.append(exc)
+                fabric.stop.set()
 
-                def run(scheduler):
-                    stage_parallel.value = scheduler.test_parallel
-                    try:
-                        loop = (
-                            scheduler.event_loop_pp_disagg_prefill
-                            if mode == DisaggregationMode.PREFILL
-                            else scheduler.event_loop_pp_disagg_decode
-                        )
-                        loop()
-                    except Stopped:
-                        pass
-                    except Exception as exc:
-                        with fabric.lock:
-                            fabric.errors.append(exc)
-                        fabric.stop.set()
-
-                stage_parallel = threading.local()
-                with (
-                    patch.object(scheduler_pp_mixin, "_is_tpu", True),
-                    patch.object(
-                        scheduler_pp_mixin,
-                        "get_parallel",
-                        side_effect=lambda: stage_parallel.value,
-                    ),
-                    patch.object(
-                        scheduler_pp_mixin,
-                        "get_disagg",
-                        return_value=SimpleNamespace(
-                            disaggregation_decode_enable_offload_kvcache=False
-                        ),
-                    ),
-                    patch.object(
-                        scheduler_pp_mixin,
-                        "ScheduleBatch",
-                        side_effect=lambda **kw: SimpleNamespace(**kw),
-                    ),
-                ):
-                    threads = [
-                        threading.Thread(target=run, args=(scheduler,), daemon=True)
-                        for scheduler, _ in stages
-                    ]
-                    for thread in threads:
-                        thread.start()
-                    if not fabric.stop.wait(15):
-                        fabric.errors.append(
-                            TimeoutError(f"PD loops stalled: {fabric.describe()}")
-                        )
-                    fabric.stop.set()
-                    for thread in threads:
-                        thread.join(timeout=2)
-                self.assertFalse(any(thread.is_alive() for thread in threads))
-                self.assertEqual(fabric.errors, [])
-                self.assertEqual(fabric.done, set(range(8)))
-                self.assertEqual(len(set(fabric.counts)), 1)
-                packets_per_step = 5 if mode == DisaggregationMode.PREFILL else 7
-                for rank, (scheduler, _) in enumerate(stages):
-                    self.assertGreater(fabric.control_waits[rank], 0)
-                    self.assertLessEqual(
-                        fabric.max_pending_controls[rank],
-                        scheduler.pp_loop_size * packets_per_step,
-                    )
-                for _, wave in stages:
-                    self.assertEqual(wave.forwards, 2)
-                    self.assertEqual(wave.owed, 0)
+        stage_parallel = threading.local()
+        with (
+            patch.object(scheduler_pp_mixin, "_is_tpu", True),
+            patch.object(
+                scheduler_pp_mixin,
+                "get_parallel",
+                side_effect=lambda: stage_parallel.value,
+            ),
+            patch.object(
+                scheduler_pp_mixin,
+                "get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_decode_enable_offload_kvcache=False
+                ),
+            ),
+            patch.object(
+                scheduler_pp_mixin,
+                "ScheduleBatch",
+                side_effect=lambda **kw: SimpleNamespace(**kw),
+            ),
+        ):
+            threads = [
+                threading.Thread(target=run, args=(scheduler,), daemon=True)
+                for scheduler, _ in stages
+            ]
+            for thread in threads:
+                thread.start()
+            if not fabric.stop.wait(15):
+                fabric.errors.append(
+                    TimeoutError(f"PD loops stalled: {fabric.describe()}")
+                )
+            fabric.stop.set()
+            for thread in threads:
+                thread.join(timeout=2)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(fabric.errors, [])
+        self.assertEqual(fabric.done, set(range(8)))
+        self.assertEqual(len(set(fabric.counts)), 1)
+        packets_per_step = 5 if mode == DisaggregationMode.PREFILL else 7
+        for rank, (scheduler, _) in enumerate(stages):
+            self.assertGreater(fabric.control_waits[rank], 0)
+            self.assertLessEqual(
+                fabric.max_pending_controls[rank],
+                scheduler.pp_loop_size * packets_per_step,
+            )
+        for _, wave in stages:
+            self.assertEqual(wave.forwards, 2)
+            self.assertEqual(wave.owed, 0)
+        return stages
 
 
 if __name__ == "__main__":

@@ -670,6 +670,9 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # Pipeline stages: freeze the heap, no automatic full GC, and a full GC on
+    # every stage in the same loop iteration, every N (pp_gc). 0 keeps CPython's.
+    SGLANG_PP_ALIGNED_GC_ITERS = EnvInt(0)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)

@@ -344,6 +344,7 @@ from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capt
 from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logger,
+    configure_gc_warning,
     configure_logger,
     freeze_gc,
     get_available_gpu_memory,
@@ -1496,6 +1497,8 @@ class Scheduler(
         # Configure GC logger
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
+        if get_observability().gc_warning_threshold_secs > 0.0:
+            configure_gc_warning(get_observability().gc_warning_threshold_secs)
 
     def init_disaggregation(self):
         self.mm_receiver = None

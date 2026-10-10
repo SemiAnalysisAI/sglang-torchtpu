@@ -84,6 +84,17 @@ def _pp_exchange_outputs_before_forward(
     return not (cur_batch.forward_mode.is_extend() or cur_batch.is_extend_in_batch)
 
 
+def _pp_aligned_gc():
+    every_iters = envs.SGLANG_PP_ALIGNED_GC_ITERS.get()
+    if every_iters <= 0:
+        return None
+    from sglang.srt.managers.pp_gc import AlignedGc
+
+    aligned = AlignedGc(every_iters)
+    aligned.start()
+    return aligned
+
+
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
@@ -102,6 +113,8 @@ class SchedulerPPMixin:
     _pp_spec_relay: bool = False
     # The TPU ICI hand-off; init_pp_loop_state builds it on TPU only.
     _pp_wave = None
+    # SGLANG_PP_ALIGNED_GC_ITERS: init_pp_loop_state builds it when set.
+    _pp_gc = None
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -132,6 +145,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                self._pp_gc_tick()
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (
@@ -318,6 +332,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                self._pp_gc_tick()
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (
@@ -500,6 +515,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                self._pp_gc_tick()
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (
@@ -774,6 +790,13 @@ class SchedulerPPMixin:
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
         self._pp_wave = self._pp_init_wave() if _is_tpu else None
+        self._pp_gc = _pp_aligned_gc()
+
+    def _pp_gc_tick(self: Scheduler) -> None:
+        """SGLANG_PP_ALIGNED_GC_ITERS: the stage's full collection, in the
+        same loop iteration on every stage (pp_gc)."""
+        if self._pp_gc is not None:
+            self._pp_gc.tick()
 
     def process_bootstrapped_queue(
         self: Scheduler, bootstrapped_rids: Optional[List[str]]
