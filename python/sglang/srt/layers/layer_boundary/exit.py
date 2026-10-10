@@ -122,10 +122,15 @@ class ExitPolicy:
         hidden_states: torch.Tensor,
         stream: ResidualStream,
         forward_batch: ForwardBatch,
+        *,
+        output_complete: bool = False,
     ):
         """Complete the output of the operation-scheduled producer path, which
-        never defers: the sum it owes, then its move and write-back."""
+        never defers: the sum it owes, then its move and write-back.
+        ``output_complete``: see ``ffn_exit``."""
         steps = self.plan.path_for(forward_batch)
+        if output_complete:
+            _refuse_summing_move(steps.output_move_completes_sum)
         hidden_states, residual = self._complete_now(
             hidden_states,
             stream.residual,
@@ -134,7 +139,8 @@ class ExitPolicy:
             steps=steps,
             output_move=steps.output_move,
             owes_sum=steps.output.group is not None
-            and not steps.output_move_completes_sum,
+            and not steps.output_move_completes_sum
+            and not output_complete,
         )
         return self._record_output(
             hidden_states,
@@ -198,9 +204,12 @@ class ExitPolicy:
         group on a sparse layer, the TP group a dense MLP reduces over."""
         return _sum_group(steps.output.group)
 
-    def _decide(self, forward_batch: ForwardBatch, steps) -> ExitDecision:
+    def _decide(
+        self, forward_batch: ForwardBatch, steps, *, output_complete: bool = False
+    ) -> ExitDecision:
         """Decide once, before the FFN runs, what completes its output's sum:
-        the next layer's input, or this layer's postprocess step."""
+        the next layer's input, or this layer's postprocess step.
+        ``output_complete``: see ``ffn_exit``."""
         dp_step = self._dp_reduce_scatter_step(forward_batch, steps)
         sum_in_reduce_scatter = self._sum_in_reduce_scatter(steps, dp_step)
         complete_now = partial(
@@ -210,8 +219,18 @@ class ExitPolicy:
             steps=steps,
             output_move=steps.output_move,
             # A reduce-scatter completes the sum on its way back.
-            owes_sum=steps.output.group is not None and not sum_in_reduce_scatter,
+            owes_sum=steps.output.group is not None
+            and not sum_in_reduce_scatter
+            and not output_complete,
         )
+        if output_complete:
+            # A later all-reduce or reduce-scatter would sum the output again.
+            _refuse_summing_move(sum_in_reduce_scatter)
+            return ExitDecision(
+                defer_moe_finalize=False,
+                sum_in_reduce_scatter=False,
+                complete=complete_now,
+            )
         defer_moe_finalize = (
             self.plan.fusions is not None
             and self.plan.fusions.can_defer_finalize(self.plan, forward_batch)
@@ -317,12 +336,21 @@ class ExitPolicy:
         return MixerExit(self, forward_batch, stream=stream)
 
     def ffn_exit(
-        self, forward_batch: ForwardBatch, *, stream: ResidualStream
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        stream: ResidualStream,
+        output_complete: bool = False,
     ) -> FfnExit:
         """Decide once how this layer's FFN output reduction completes. Use the
         result as a context manager around the FFN call when the FFN may hand
-        off its MoE finalize, then call ``finish``."""
-        return FfnExit(self, forward_batch, stream=stream)
+        off its MoE finalize, then call ``finish``.
+
+        ``output_complete`` marks an FFN whose compute already summed its
+        output (TPU fused-RS experts): nothing completes or defers a sum."""
+        return FfnExit(
+            self, forward_batch, stream=stream, output_complete=output_complete
+        )
 
     def _sum_deferral_allowed(self, steps) -> bool:
         # Under the MoE-CP all-gather the fusion path would skip complete_now
@@ -440,6 +468,13 @@ def _defer(
     return wrap(hidden_states), residual
 
 
+def _refuse_summing_move(move_sums: bool) -> None:
+    if move_sums:
+        raise NotImplementedError(
+            "a reduce-scatter after an FFN that sums its own output"
+        )
+
+
 class MixerExit:
     """A mixer's (an attention-like stage's) output decision. The mixer leaves
     its output's sum; the stage either carries it to the next attention stage
@@ -536,11 +571,14 @@ class FfnExit:
         forward_batch: ForwardBatch,
         *,
         stream: ResidualStream,
+        output_complete: bool = False,
     ):
         self._stream = stream
         self.boundary = boundary
         steps = boundary.plan.path_for(forward_batch)
-        completion = boundary._decide(forward_batch, steps)
+        completion = boundary._decide(
+            forward_batch, steps, output_complete=output_complete
+        )
         self.defer_moe_finalize = completion.defer_moe_finalize
         self._complete = completion.complete
         self._update = steps.output.update
